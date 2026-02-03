@@ -1,0 +1,14 @@
+# Invalid: malformed YAML syntax
+workflow:
+  name: malformed
+  entry_point: agent1
+  # Missing colon after description
+  description This line has a syntax error
+
+agents
+  - name: agent1
+    model: gpt-4
+    prompt: "Hello"
+      # Bad indentation
+    routes:
+      - to: $end

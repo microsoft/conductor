@@ -1,0 +1,12 @@
+# Invalid: human_gate without options
+workflow:
+  name: gate-no-options
+  description: Invalid - human gate missing options
+  entry_point: gate1
+
+agents:
+  - name: gate1
+    type: human_gate
+    prompt: "Please choose an option"
+    routes:
+      - to: $end

@@ -1,0 +1,71 @@
+{
+  "analyze_item_0": {
+    "id": "msg_01ITEM0",
+    "type": "message",
+    "role": "assistant",
+    "content": [
+      {
+        "type": "tool_use",
+        "id": "toolu_01ITEM0",
+        "name": "emit_output",
+        "input": {
+          "item": "apple",
+          "analysis": "Apple is a fruit rich in fiber and vitamin C.",
+          "score": 85
+        }
+      }
+    ],
+    "model": "claude-3-5-sonnet-latest",
+    "stop_reason": "tool_use",
+    "usage": {
+      "input_tokens": 40,
+      "output_tokens": 60
+    }
+  },
+  "analyze_item_1": {
+    "id": "msg_01ITEM1",
+    "type": "message",
+    "role": "assistant",
+    "content": [
+      {
+        "type": "tool_use",
+        "id": "toolu_01ITEM1",
+        "name": "emit_output",
+        "input": {
+          "item": "banana",
+          "analysis": "Banana is a fruit high in potassium and carbohydrates.",
+          "score": 80
+        }
+      }
+    ],
+    "model": "claude-3-5-sonnet-latest",
+    "stop_reason": "tool_use",
+    "usage": {
+      "input_tokens": 42,
+      "output_tokens": 62
+    }
+  },
+  "analyze_item_2": {
+    "id": "msg_01ITEM2",
+    "type": "message",
+    "role": "assistant",
+    "content": [
+      {
+        "type": "tool_use",
+        "id": "toolu_01ITEM2",
+        "name": "emit_output",
+        "input": {
+          "item": "carrot",
+          "analysis": "Carrot is a vegetable rich in beta-carotene and vitamin A.",
+          "score": 90
+        }
+      }
+    ],
+    "model": "claude-3-5-sonnet-latest",
+    "stop_reason": "tool_use",
+    "usage": {
+      "input_tokens": 41,
+      "output_tokens": 61
+    }
+  }
+}

@@ -1,0 +1,12 @@
+# Workflow with required environment variable (no default)
+workflow:
+  name: required-env-workflow
+  description: Workflow requiring environment variable
+  entry_point: agent1
+
+agents:
+  - name: agent1
+    model: gpt-4
+    prompt: "Using API key: ${REQUIRED_API_KEY}"
+    routes:
+      - to: $end

@@ -1,0 +1,14 @@
+# Invalid: route targets non-existent agent
+workflow:
+  name: bad-route
+  description: Invalid workflow - route targets unknown agent
+  entry_point: agent1
+
+agents:
+  - name: agent1
+    model: gpt-4
+    prompt: "Hello"
+    routes:
+      - to: unknown_agent
+        when: "{{ output.success }}"
+      - to: $end

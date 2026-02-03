@@ -1,0 +1,60 @@
+# Simple Question-Answering Workflow
+#
+# This example demonstrates a basic linear workflow with a single agent
+# that answers questions. It shows:
+# - Basic workflow structure
+# - Input parameters
+# - Output schema validation
+# - Simple routing to $end
+#
+# Usage:
+#   conductor run examples/simple-qa.yaml --input question="What is Python?"
+
+workflow:
+  name: simple-qa
+  description: A simple question-answering workflow with a single agent
+  version: "1.0.0"
+  entry_point: answerer
+  
+  runtime:
+    provider: copilot # can be copilot or claude
+    temperature: 0.7
+    mcp_servers:
+      # Note: The Copilot CLI has a bug where 'env' vars in MCP server
+      # configs are not passed to MCP server subprocesses.
+      # See: https://github.com/github/copilot-sdk/issues/163
+      web-search:
+        command: sh
+        args: ["-c", "MODE=stdio DEFAULT_SEARCH_ENGINE=bing exec npx -y open-websearch@latest"]
+        tools: ["*"]
+        
+  input:
+    question:
+      type: string
+      required: true
+      description: The question to answer
+
+agents:
+  - name: answerer
+    description: Answers the user's question clearly and concisely
+    model: claude-haiku-4.5
+    prompt: |
+      You are a helpful assistant. Please answer the following question 
+      clearly and concisely:
+
+      Question: {{ workflow.input.question }}
+
+      Provide a direct answer without unnecessary preamble.
+    output:
+      answer:
+        type: string
+        description: The answer to the question
+      confidence:
+        type: string
+        description: Confidence level (high, medium, low)
+    routes:
+      - to: $end
+
+output:
+  answer: "{{ answerer.output.answer }}"
+  confidence: "{{ answerer.output.confidence }}"

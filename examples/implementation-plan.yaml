@@ -1,0 +1,254 @@
+# Design & Plan Workflow
+#
+# This example demonstrates a combined design and implementation planning workflow
+# that mirrors the /design and /plan command patterns. It shows:
+# - Architect agent for creating solution designs with implementation plans
+# - Reviewer agent for quality assessment of both design and actionability
+# - Loop-back pattern for refinement until quality threshold is met
+# - Structured output following design document and implementation plan templates
+#
+# Usage:
+#   conductor run examples/plan.yaml --input purpose="Build a user authentication system with OAuth2"
+#
+# Resume from existing plan:
+#   conductor run examples/plan.yaml --input purpose="..." --input existing_plan="path/to/plan.md"
+#
+# With verbose output:
+#   conductor -V run examples/plan.yaml --input purpose="..."
+
+workflow:
+  name: plan
+  description: Create a comprehensive solution design with implementation plan based on requirements
+  version: "1.0.0"
+  entry_point: architect
+
+  runtime:
+    provider: copilot # can be copilot or claude
+    mcp_servers:
+      # Note: The Copilot CLI has a bug where 'env' vars in MCP server
+      # configs are not passed to MCP server subprocesses.
+      # See: https://github.com/github/copilot-sdk/issues/163
+      web-search:
+        command: sh
+        args: ["-c", "MODE=stdio DEFAULT_SEARCH_ENGINE=bing exec npx -y open-websearch@latest"]
+        tools: ["*"]
+      context7:
+        command: npx
+        args: ["-y", "@upstash/context7-mcp@latest"]
+        tools: ["*"]
+
+  input:
+    purpose:
+      type: string
+      required: true
+      description: A clear description of the feature, change, or initiative to design
+    existing_plan:
+      type: string
+      required: false
+      description: Optional path to an existing plan file to resume from
+
+  context:
+    mode: accumulate
+
+  limits:
+    max_iterations: 50
+    # timeout_seconds is unlimited by default
+
+agents:
+  - name: architect
+    description: Creates or refines the solution design and implementation plan based on requirements and feedback
+    model: claude-opus-4.5
+    input:
+      - workflow.input.purpose
+      - workflow.input.existing_plan?
+      - reviewer.output?
+    system_prompt: |
+      You are a Software Architect agent. You analyze requirements deeply, design solutions, 
+      and produce clear technical documentation with actionable implementation plans.
+
+      Your core capabilities include:
+      - Designing scalable, maintainable architectures
+      - Identifying architectural patterns and dependencies
+      - Creating thorough, well-structured technical docs
+      - Documenting APIs, edge cases, and limitations
+      - Breaking complex designs into discrete, actionable epics
+      - Identifying file changes, dependencies, and prerequisites
+      - Creating task breakdowns with effort estimates
+    prompt: |
+      Create a comprehensive solution design based on the following purpose:
+
+      **Purpose:** {{ workflow.input.purpose }}
+
+      {% if workflow.input.existing_plan %}
+      **Existing Plan:** You have been provided with an existing plan to resume from.
+      Read the file at `{{ workflow.input.existing_plan }}` and use it as a starting point.
+      Review and refine the existing plan rather than starting from scratch.
+      {% endif %}
+
+      {% if reviewer is defined and reviewer.output and reviewer.output.score < 90 %}
+      **Previous Review Feedback (Score: {{ reviewer.output.score }}/100):**
+      {{ reviewer.output.feedback }}
+
+      Please revise your design to address this feedback.
+      
+      **IMPORTANT:** You are revising an existing design. Do NOT create a new document.
+      Read the existing document at `{{ architect.output.file_path }}` and update it directly
+      to address the feedback. Preserve the existing structure and content that is satisfactory.
+      {% endif %}
+
+      **Research**
+
+      Before drafting the design:
+      - Perform deep research of the relevant portions of the codebase.
+      - Identify existing components, patterns, and dependencies.
+      - Search the web for context on technologies, best practices, and similar designs.
+
+      **Design**
+
+      Create a solution design document with the following sections:
+
+      ## 1. Problem Statement
+      Describe the problem this solution addresses.
+
+      ## 2. Goals and Non-Goals
+      List specific, measurable outcomes and explicit exclusions.
+
+      ## 3. Requirements
+      Define functional and non-functional requirements.
+
+      ## 4. Solution Architecture
+      Provide:
+      - Overview of the solution approach
+      - Key components and their responsibilities
+      - Data flow description
+      - API contracts (if applicable)
+
+      ## 5. Dependencies
+      List external and internal dependencies.
+
+      ## 6. Risk Assessment
+      Identify risks with likelihood, impact, and mitigation strategies.
+
+      ## 7. Implementation Phases
+      Break down the implementation into logical phases with exit criteria.
+
+      ## 8. Files Affected
+      ### New Files
+      | File Path | Purpose |
+      |-----------|---------||
+
+      ### Modified Files
+      | File Path | Changes |
+      |-----------|---------|
+
+      ### Deleted Files
+      | File Path | Reason |
+      |-----------|--------|
+
+      ## 9. Implementation Plan
+
+      For each epic, provide:
+      - **Goal**: What this epic achieves
+      - **Prerequisites**: Dependencies on other epics
+      - **Tasks**: Table with Task ID, Type (IMPL/TEST), Description, Files, and Status (TO DO/IN PROGRESS/DONE)
+      - **Acceptance Criteria**: Checkboxes for completion
+
+      Keep epics focused—ideally affecting no more than 7 files and completable within 1-2 weeks.
+      Tests should be created alongside implementation tasks.
+
+      Be thorough, specific, and ensure the design is actionable.
+
+      ---
+
+      ## SAVING THE DOCUMENT
+
+      After creating the design document, save it to a file using the following naming convention:
+
+      - If the purpose input references a document path, derive the name from that document and save it in the same directory. Examples:
+        - `upgrade-database-v2.brainstorm.md` -> `upgrade-database-v2.plan.md`
+        - `add-user-authentication.md` -> `add-user-authentication.plan.md`
+      - Otherwise, use the following guidelines:
+        - Save the document in the current working directory.
+        - Use the following naming convention: `[purpose]-[component].plan.md`
+        - Examples:
+          - `upgrade-database-v2.plan.md`
+          - `add-user-authentication.plan.md`
+    output:
+      file_path:
+        type: string
+        description: The path where the design document was saved
+    routes:
+      - to: reviewer
+
+  - name: reviewer
+    description: Reviews the design document and implementation plan for quality, completeness, and actionability
+    model: claude-opus-4.5
+    input:
+      - workflow.input.purpose
+      - architect.output.file_path
+    system_prompt: |
+      You are a Reviewer agent specializing in design and implementation plan review.
+      Your task is to ensure designs are technically sound and plans are comprehensive, 
+      actionable, and properly structured for execution by development teams or AI systems.
+      Be critical but fair, and provide specific, actionable feedback.
+    prompt: |
+      Review the solution design document for quality and completeness.
+
+      **Original Purpose:**
+      {{ workflow.input.purpose }}
+
+      **Design Document Location:**
+      {{ architect.output.file_path }}
+
+      Read the design document from the file path above and review it.
+      
+      ---
+      
+      Perform research to validate the technical accuracy of the design.
+
+      ---
+
+      Evaluate the design based on these criteria:
+
+      | Criteria | Description |
+      |----------|-------------|
+      | **Clarity** | Is the design clear, concise, and understandable? |
+      | **Accuracy** | Are technical details correct and feasible? |
+      | **Completeness** | Are all necessary sections present without gaps? |
+      | **Best Practices** | Does it follow architectural conventions and patterns? |
+      | **Scope Discipline** | Is the design focused without unnecessary complexity? |
+      | **Risk Assessment** | Are risks properly identified with mitigations? |
+      | **Actionability** | Can tasks be executed without additional clarification? |
+      | **Traceability** | Do tasks trace back to requirements/design goals? |
+      | **Dependency Management** | Are prerequisites clearly identified? |
+
+      Provide:
+      1. A score from 0-100
+      2. Whether the design is approved (score >= 90)
+      3. Specific feedback for improvement
+      4. List of any critical issues that must be addressed
+    output:
+      score:
+        type: number
+        description: Quality score from 0-100
+      approved:
+        type: boolean
+        description: Whether the design meets quality threshold (score >= 90)
+      feedback:
+        type: string
+        description: Detailed feedback for improvement
+      critical_issues:
+        type: array
+        description: List of critical issues that must be addressed
+    routes:
+      - to: $end
+        when: "{{ output.approved }}"
+      - to: architect
+        when: "score < 90"
+      - to: $end
+
+output:
+  purpose: "{{ workflow.input.purpose }}"
+  plan_file: "{{ architect.output.file_path }}"
+  review_score: "{{ reviewer.output.score }}"
+  iterations: "{{ context.iteration }}"

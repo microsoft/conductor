@@ -1,0 +1,164 @@
+# Design Review Workflow
+#
+# This example demonstrates a loop-back pattern with human-in-the-loop
+# approval. It shows:
+# - Multiple agents with conditional routing
+# - Loop-back to previous agents for refinement
+# - Human gate for approval decisions
+# - Context accumulation between iterations
+# - Safety limits (max_iterations, timeout)
+#
+# Usage:
+#   conductor run examples/design-review.yaml --input requirement="Build a REST API"
+#
+# With skip-gates for automation:
+#   conductor run examples/design-review.yaml --input requirement="..." --skip-gates
+
+workflow:
+  name: design-review
+  description: Iterative design creation with human approval
+  version: "1.0.0"
+  entry_point: designer
+
+  input:
+    requirement:
+      type: string
+      required: true
+      description: The requirement or feature to design
+
+  context:
+    mode: accumulate  # All prior outputs available
+
+  limits:
+    max_iterations: 10
+    timeout_seconds: 300
+
+agents:
+  - name: designer
+    description: Creates or refines the design based on requirements and feedback
+    model: gpt-5.2
+    input:
+      - workflow.input.requirement
+      - reviewer.output?           # Optional: may not exist on first iteration
+      - human_approval.output?     # Optional: feedback from human
+    prompt: |
+      You are a software architect. Create a design based on the following requirement:
+
+      Requirement: {{ workflow.input.requirement }}
+
+      {% if reviewer is defined and reviewer.output %}
+      Previous Review Feedback:
+      {{ reviewer.output.feedback }}
+
+      Please revise your design to address this feedback.
+      {% endif %}
+
+      {% if human_approval is defined and human_approval.output and human_approval.output.feedback %}
+      Human Feedback:
+      {{ human_approval.output.feedback }}
+
+      Please incorporate this feedback into your design.
+      {% endif %}
+
+      Provide:
+      1. A clear design description
+      2. Key components and their responsibilities
+      3. API contracts or interfaces
+    output:
+      design:
+        type: string
+        description: The complete design description
+      components:
+        type: array
+        description: List of key components
+      summary:
+        type: string
+        description: Brief summary for review
+    routes:
+      - to: reviewer
+
+  - name: reviewer
+    description: Reviews the design for quality and completeness
+    model: gpt-5.2
+    input:
+      - designer.output
+      - workflow.input.requirement
+    prompt: |
+      You are a senior software architect reviewing a design.
+
+      Original Requirement:
+      {{ workflow.input.requirement }}
+
+      Design to Review:
+      {{ designer.output.design }}
+
+      Components:
+      {{ designer.output.components | json }}
+
+      Evaluate the design based on:
+      1. Does it meet the requirement?
+      2. Is it well-structured and maintainable?
+      3. Are edge cases considered?
+      4. Is the API design clean?
+
+      Provide a score from 1-10 and detailed feedback.
+    output:
+      score:
+        type: number
+        description: Quality score from 1-10
+      approved:
+        type: boolean
+        description: Whether the design is ready for human review
+      feedback:
+        type: string
+        description: Detailed feedback for improvement
+    routes:
+      - to: human_approval
+        when: "{{ output.approved }}"
+      - to: designer
+        when: "score < 7"
+      - to: human_approval
+
+  - name: human_approval
+    type: human_gate
+    description: Human review and approval of the design
+    prompt: |
+      ## Design Review Required
+
+      **Requirement:** {{ workflow.input.requirement }}
+
+      **Design Summary:**
+      {{ designer.output.summary }}
+
+      **AI Review Score:** {{ reviewer.output.score }}/10
+
+      **AI Feedback:**
+      {{ reviewer.output.feedback }}
+
+      ---
+
+      **Full Design:**
+      {{ designer.output.design }}
+
+      **Components:**
+      {% for component in designer.output.components %}
+      - {{ component }}
+      {% endfor %}
+    options:
+      - label: Approve Design
+        value: approved
+        route: $end
+      - label: Request Changes
+        value: changes
+        route: designer
+        prompt_for: feedback
+      - label: Reject Design
+        value: rejected
+        route: $end
+
+output:
+  design: "{{ designer.output.design }}"
+  components: "{{ designer.output.components | json }}"
+  review_score: "{{ reviewer.output.score }}"
+  decision: "{{ human_approval.output.selected }}"
+  iterations: "{{ context.iteration }}"

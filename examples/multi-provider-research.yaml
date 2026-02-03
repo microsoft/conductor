@@ -1,0 +1,111 @@
+# Multi-Provider Research Workflow
+#
+# This example demonstrates using different providers for different agents
+# within the same workflow. Claude is used for research tasks (known for
+# strong reasoning), while Copilot is used for code generation.
+#
+# Usage:
+#   uv run conductor run examples/multi-provider-research.yaml \
+#     --input topic="Python async programming"
+#
+# Requirements:
+#   - GitHub Copilot CLI configured (for copilot agents)
+#   - ANTHROPIC_API_KEY set (for claude agents)
+
+workflow:
+  name: multi-provider-research
+  version: "1.0"
+  description: >
+    Research a topic using Claude, then generate code examples using Copilot.
+    Demonstrates per-agent provider overrides for multi-provider workflows.
+
+  entry_point: claude_researcher
+
+  runtime:
+    provider: copilot  # Default provider
+    default_model: gpt-5.2
+
+  input:
+    topic:
+      type: string
+      required: true
+      description: The topic to research
+
+  limits:
+    max_iterations: 10
+    timeout_seconds: 300
+
+agents:
+  # Research phase - uses Claude for strong reasoning capabilities
+  - name: claude_researcher
+    provider: claude           # Override: use Claude for this agent
+    model: claude-sonnet-4.5
+    description: Research the topic and identify key concepts
+    prompt: |
+      Research the following topic and provide a comprehensive summary:
+
+      Topic: {{ workflow.input.topic }}
+
+      Please provide:
+      1. A brief overview (2-3 sentences)
+      2. Key concepts (3-5 bullet points)
+      3. Common use cases or applications
+
+      Format your response as JSON with keys: overview, concepts (array), use_cases (array)
+    output:
+      overview:
+        type: string
+        description: Brief overview of the topic
+      concepts:
+        type: array
+        items:
+          type: string
+        description: Key concepts
+      use_cases:
+        type: array
+        items:
+          type: string
+        description: Common use cases
+    routes:
+      - to: copilot_code_generator
+
+  # Code generation phase - uses Copilot for code expertise
+  - name: copilot_code_generator
+    # No provider specified - uses workflow default (copilot)
+    description: Generate example code based on research
+    prompt: |
+      Based on the following research about "{{ workflow.input.topic }}",
+      generate a Python code example that demonstrates the key concepts.
+
+      Research Summary:
+      {{ claude_researcher.output.overview }}
+
+      Key Concepts:
+      {% for concept in claude_researcher.output.concepts %}
+      - {{ concept }}
+      {% endfor %}
+
+      Generate a well-commented Python code example that demonstrates
+      at least 2 of these concepts. Include docstrings and type hints.
+
+      Format your response as JSON with keys:
+      - code: the Python code as a string
+      - explanation: brief explanation of what the code does
+    output:
+      code:
+        type: string
+        description: Python code example
+      explanation:
+        type: string
+        description: Explanation of the code
+    routes:
+      - to: $end
+
+# Final output combines both research and code
+output:
+  topic: "{{ workflow.input.topic }}"
+  overview: "{{ claude_researcher.output.overview }}"
+  concepts: "{{ claude_researcher.output.concepts }}"
+  use_cases: "{{ claude_researcher.output.use_cases }}"
+  code: "{{ copilot_code_generator.output.code }}"
+  code_explanation: "{{ copilot_code_generator.output.explanation }}"

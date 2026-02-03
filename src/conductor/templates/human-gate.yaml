@@ -1,0 +1,49 @@
+# Human gate workflow template
+# A workflow with human-in-the-loop approval
+
+workflow:
+  name: {{ name }}
+  description: A workflow with human gate for approval decisions
+  entry_point: content_creator
+
+agents:
+  - name: content_creator
+    model: gpt-5.2
+    prompt: |
+      Create content based on the following request:
+      {{ '{{' }} workflow.input.request {{ '}}' }}
+    output:
+      content:
+        type: string
+        description: The created content
+      summary:
+        type: string
+        description: A brief summary of the content
+    routes:
+      - to: human_review
+
+  - name: human_review
+    type: human_gate
+    prompt: |
+      Please review the following content:
+
+      {{ '{{' }} content_creator.output.summary {{ '}}' }}
+
+      ---
+      Full content:
+      {{ '{{' }} content_creator.output.content {{ '}}' }}
+    options:
+      - label: Approve
+        value: approved
+        route: $end
+      - label: Request Changes
+        value: changes
+        route: content_creator
+        prompt_for: feedback
+      - label: Reject
+        value: rejected
+        route: $end
+
+output:
+  content: "{{ '{{' }} content_creator.output.content {{ '}}' }}"
+  decision: "{{ '{{' }} human_review.output.decision {{ '}}' }}"

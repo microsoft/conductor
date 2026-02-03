@@ -1,0 +1,19 @@
+# Minimal valid workflow - simple linear flow
+workflow:
+  name: simple-workflow
+  description: A minimal valid workflow for testing
+  entry_point: greeter
+
+agents:
+  - name: greeter
+    model: gpt-4
+    prompt: "Say hello to {{ workflow.input.name }}"
+    output:
+      greeting:
+        type: string
+        description: The greeting message
+    routes:
+      - to: $end
+
+output:
+  message: "{{ greeter.output.greeting }}"

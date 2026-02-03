@@ -1,0 +1,236 @@
+# Research Assistant Workflow with Claude
+#
+# This example demonstrates a multi-agent workflow using Claude provider.
+# It shows:
+# - Multiple specialized agents with Claude
+# - Conditional routing based on research quality
+# - Context passing between agents
+# - Output schema validation
+# - Claude-specific runtime configuration
+# - Model selection (different models for different tasks)
+#
+# Note: Phase 1 does not support MCP tools, so this workflow operates
+# without external tool access. Tools will be added in Phase 2+.
+#
+# Usage:
+#   conductor run examples/research-assistant-claude.yaml --input topic="AI in healthcare"
+
+workflow:
+  name: research-assistant-claude
+  description: Multi-agent research and synthesis workflow using Claude
+  version: "1.0.0"
+  entry_point: planner
+
+  input:
+    topic:
+      type: string
+      required: true
+      description: The research topic to investigate
+    depth:
+      type: string
+      required: false
+      default: "moderate"
+      description: Research depth (quick, moderate, comprehensive)
+
+  runtime:
+    provider: claude
+    default_model: claude-sonnet-4.5
+    temperature: 0.7
+    max_tokens: 4096
+
+  context:
+    mode: explicit  # Only declared inputs are available
+
+  limits:
+    max_iterations: 15
+    timeout_seconds: 600
+
+agents:
+  - name: planner
+    description: Creates a research plan based on the topic
+    model: claude-sonnet-4.5
+    input:
+      - workflow.input.topic
+      - workflow.input.depth
+    prompt: |
+      You are a research planning expert. Create a research plan for the following topic:
+
+      Topic: {{ workflow.input.topic }}
+      Depth: {{ workflow.input.depth }}
+
+      Create a structured plan with:
+      1. Key questions to answer
+      2. Areas to investigate
+      3. Types of sources to consult
+      4. Expected deliverables
+
+      Return your response in JSON format with the specified fields.
+    output:
+      plan:
+        type: object
+        description: Structured research plan
+        properties:
+          questions:
+            type: array
+            description: List of key questions to investigate
+          areas:
+            type: array
+            description: Areas to investigate
+          sources:
+            type: array
+            description: Types of sources to consult
+      summary:
+        type: string
+        description: Brief plan summary
+    routes:
+      - to: researcher
+
+  - name: researcher
+    description: Conducts research based on the plan (knowledge-based, no external tools)
+    model: claude-sonnet-4.5
+    input:
+      - workflow.input.topic
+      - planner.output
+    system_prompt: |
+      You are a thorough researcher with extensive knowledge across many domains.
+      Use your training data to provide comprehensive, well-researched information.
+    prompt: |
+      Research the following topic according to the plan:
+
+      Topic: {{ workflow.input.topic }}
+
+      Research Plan:
+      {{ planner.output.plan | json }}
+
+      Based on your knowledge, provide comprehensive research findings that address
+      the key questions identified in the plan. Include relevant facts, concepts,
+      trends, and insights.
+
+      Focus on answering the key questions: {{ planner.output.plan.questions | json }}
+    output:
+      findings:
+        type: array
+        description: List of research findings
+      key_insights:
+        type: array
+        description: Key insights discovered
+      coverage:
+        type: number
+        description: Percentage of plan covered (0-100)
+    routes:
+      - to: synthesizer
+        when: "coverage >= 70"
+      - to: researcher
+        when: "context.iteration < 3"
+      - to: synthesizer
+
+  - name: synthesizer
+    description: Synthesizes research findings into a coherent report
+    model: claude-sonnet-4.5
+    input:
+      - workflow.input.topic
+      - planner.output
+      - researcher.output
+    prompt: |
+      Synthesize the following research findings into a comprehensive report:
+
+      Topic: {{ workflow.input.topic }}
+
+      Research Plan:
+      {{ planner.output.summary }}
+
+      Findings:
+      {% for finding in researcher.output.findings %}
+      - {{ finding }}
+      {% endfor %}
+
+      Key Insights:
+      {% for insight in researcher.output.key_insights %}
+      - {{ insight }}
+      {% endfor %}
+
+      Create a well-structured report with:
+      1. Executive summary (2-3 paragraphs)
+      2. Key findings (5-7 main points)
+      3. Detailed analysis (organized by research areas)
+      4. Conclusions and implications
+      5. Recommendations for further research
+
+      Return your response in JSON format with the specified fields.
+    output:
+      report:
+        type: string
+        description: The complete research report
+      executive_summary:
+        type: string
+        description: Brief executive summary
+      key_findings:
+        type: array
+        description: Top 5-7 key findings
+      confidence:
+        type: string
+        description: Confidence level in findings (high, medium, low)
+    routes:
+      - to: quality_checker
+
+  - name: quality_checker
+    description: Reviews the research report for quality
+    model: claude-haiku-4.5  # Use faster Haiku for simple review task
+    input:
+      - workflow.input.topic
+      - synthesizer.output
+      - planner.output.plan
+    prompt: |
+      Review the following research report for quality:
+
+      Topic: {{ workflow.input.topic }}
+
+      Executive Summary:
+      {{ synthesizer.output.executive_summary }}
+
+      Key Findings:
+      {{ synthesizer.output.key_findings | json }}
+
+      Plan Coverage:
+      Original questions: {{ planner.output.plan.questions | json }}
+
+      Evaluate:
+      1. Is the report well-structured?
+      2. Are the key questions from the plan addressed?
+      3. Is the analysis thorough and coherent?
+      4. Are conclusions justified by the findings?
+      5. Is the confidence level appropriate?
+
+      Provide a quality score (1-10) and indicate whether it passes.
+      A report passes if it scores >= 7.
+
+      Return your response in JSON format with the specified fields.
+    output:
+      score:
+        type: number
+        description: Quality score from 1-10
+      passed:
+        type: boolean
+        description: Whether report passes quality check (score >= 7)
+      issues:
+        type: array
+        description: List of issues found (empty if passed)
+      strengths:
+        type: array
+        description: List of report strengths
+    routes:
+      - to: $end
+        when: "{{ output.passed }}"
+      - to: synthesizer
+        when: "context.iteration < 5"
+      - to: $end
+
+output:
+  topic: "{{ workflow.input.topic }}"
+  report: "{{ synthesizer.output.report }}"
+  executive_summary: "{{ synthesizer.output.executive_summary }}"
+  key_findings: "{{ synthesizer.output.key_findings | json }}"
+  quality_score: "{{ quality_checker.output.score }}"
+  quality_passed: "{{ quality_checker.output.passed }}"
+  confidence: "{{ synthesizer.output.confidence }}"
+  iterations: "{{ context.iteration }}"

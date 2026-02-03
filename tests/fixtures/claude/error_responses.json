@@ -1,0 +1,30 @@
+{
+  "rate_limit": {
+    "error": {
+      "type": "rate_limit_error",
+      "message": "Rate limit exceeded. Please retry after 60 seconds."
+    },
+    "status_code": 429
+  },
+  "auth_failure": {
+    "error": {
+      "type": "authentication_error",
+      "message": "Invalid API key provided."
+    },
+    "status_code": 401
+  },
+  "invalid_model": {
+    "error": {
+      "type": "invalid_request_error",
+      "message": "Model 'invalid-model' not found. Available models: claude-3-5-sonnet-latest, claude-3-opus-20240229"
+    },
+    "status_code": 400
+  },
+  "overloaded": {
+    "error": {
+      "type": "overloaded_error",
+      "message": "API is currently overloaded. Please retry after a brief wait."
+    },
+    "status_code": 529
+  }
+}

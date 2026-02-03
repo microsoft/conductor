@@ -1,0 +1,227 @@
+# Research Assistant Workflow
+#
+# This example demonstrates a multi-agent workflow with tool usage.
+# It shows:
+# - Multiple specialized agents
+# - Tool configuration at workflow and agent levels
+# - MCP server configuration for web search
+# - Conditional routing based on research quality
+# - Context passing between agents
+# - Output schema validation
+#
+# Usage:
+#   conductor run examples/research-assistant.yaml --input topic="AI in healthcare"
+
+workflow:
+  name: research-assistant
+  description: Multi-agent research and synthesis workflow
+  version: "1.0.0"
+  entry_point: planner
+
+  input:
+    topic:
+      type: string
+      required: true
+      description: The research topic to investigate
+    depth:
+      type: string
+      required: false
+      default: "moderate"
+      description: Research depth (quick, moderate, comprehensive)
+
+  runtime:
+    provider: copilot
+    default_model: gpt-5.2
+    mcp_servers:
+      web-search:
+        command: sh
+        args: ["-c", "MODE=stdio DEFAULT_SEARCH_ENGINE=duckduckgo exec npx -y open-websearch@latest"]
+        tools: ["*"]
+
+  context:
+    mode: explicit  # Only declared inputs are available
+
+  limits:
+    max_iterations: 15
+    timeout_seconds: 600
+
+# Workflow-level tools available to agents
+tools:
+  - web_search
+  - document_retrieval
+  - citation_lookup
+
+agents:
+  - name: planner
+    description: Creates a research plan based on the topic
+    model: gpt-5.2
+    input:
+      - workflow.input.topic
+      - workflow.input.depth
+    tools: []  # No tools needed for planning
+    prompt: |
+      You are a research planning expert. Create a research plan for the following topic:
+
+      Topic: {{ workflow.input.topic }}
+      Depth: {{ workflow.input.depth }}
+
+      Create a structured plan with:
+      1. Key questions to answer
+      2. Areas to investigate
+      3. Types of sources to consult
+    output:
+      plan:
+        type: object
+        description: Structured research plan
+        properties:
+          questions:
+            type: array
+          areas:
+            type: array
+          sources:
+            type: array
+      summary:
+        type: string
+        description: Brief plan summary
+    routes:
+      - to: researcher
+
+  - name: researcher
+    description: Conducts research using available tools
+    model: gpt-5.2
+    input:
+      - workflow.input.topic
+      - planner.output
+    tools:
+      - web_search
+      - document_retrieval
+    system_prompt: |
+      You are a thorough researcher. Use the available tools to gather 
+      information relevant to the research plan.
+    prompt: |
+      Research the following topic according to the plan:
+
+      Topic: {{ workflow.input.topic }}
+
+      Research Plan:
+      {{ planner.output.plan | json }}
+
+      Use the web_search and document_retrieval tools to find relevant information.
+      Focus on answering the key questions identified in the plan.
+    output:
+      findings:
+        type: array
+        description: List of research findings
+      sources:
+        type: array
+        description: Sources consulted
+      coverage:
+        type: number
+        description: Percentage of plan covered (0-100)
+    routes:
+      - to: synthesizer
+        when: "coverage >= 70"
+      - to: researcher
+        when: "context.iteration < 3"
+      - to: synthesizer
+
+  - name: synthesizer
+    description: Synthesizes research findings into a coherent report
+    model: gpt-5.2
+    input:
+      - workflow.input.topic
+      - planner.output
+      - researcher.output
+    tools:
+      - citation_lookup
+    prompt: |
+      Synthesize the following research findings into a comprehensive report:
+
+      Topic: {{ workflow.input.topic }}
+
+      Research Plan:
+      {{ planner.output.summary }}
+
+      Findings:
+      {% for finding in researcher.output.findings %}
+      - {{ finding }}
+      {% endfor %}
+
+      Sources:
+      {{ researcher.output.sources | json }}
+
+      Create a well-structured report with:
+      1. Executive summary
+      2. Key findings
+      3. Analysis
+      4. Conclusions
+      5. References
+    output:
+      report:
+        type: string
+        description: The complete research report
+      executive_summary:
+        type: string
+        description: Brief executive summary
+      key_findings:
+        type: array
+        description: Top 5 key findings
+      confidence:
+        type: string
+        description: Confidence level in findings
+    routes:
+      - to: quality_checker
+
+  - name: quality_checker
+    description: Reviews the research report for quality
+    model: gpt-5.2
+    input:
+      - workflow.input.topic
+      - synthesizer.output
+      - researcher.output.sources
+    tools: []  # No tools for quality check
+    prompt: |
+      Review the following research report for quality:
+
+      Topic: {{ workflow.input.topic }}
+
+      Executive Summary:
+      {{ synthesizer.output.executive_summary }}
+
+      Key Findings:
+      {{ synthesizer.output.key_findings | json }}
+
+      Number of Sources: {{ researcher.output.sources | length }}
+
+      Evaluate:
+      1. Is the report well-structured?
+      2. Are claims supported by sources?
+      3. Is the analysis thorough?
+      4. Are conclusions justified?
+
+      Provide a quality score and any issues found.
+    output:
+      score:
+        type: number
+        description: Quality score from 1-10
+      passed:
+        type: boolean
+        description: Whether report passes quality check
+      issues:
+        type: array
+        description: List of issues found
+    routes:
+      - to: $end
+        when: "{{ output.passed }}"
+      - to: synthesizer
+        when: "context.iteration < 5"
+      - to: $end
+
+output:
+  topic: "{{ workflow.input.topic }}"
+  report: "{{ synthesizer.output.report }}"
+  executive_summary: "{{ synthesizer.output.executive_summary }}"
+  key_findings: "{{ synthesizer.output.key_findings | json }}"
+  quality_score: "{{ quality_checker.output.score }}"
+  sources_count: "{{ researcher.output.sources | length }}"
+  confidence: "{{ synthesizer.output.confidence }}"

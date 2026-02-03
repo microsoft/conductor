@@ -1,0 +1,22 @@
+# Simple linear workflow template
+# A minimal workflow with a single agent
+
+workflow:
+  name: {{ name }}
+  description: A simple linear workflow
+  entry_point: main_agent
+
+agents:
+  - name: main_agent
+    model: gpt-5.2
+    prompt: |
+      {{ '{{' }} workflow.input.question {{ '}}' }}
+    output:
+      answer:
+        type: string
+        description: The answer to the question
+    routes:
+      - to: $end
+
+output:
+  result: "{{ '{{' }} main_agent.output.answer {{ '}}' }}"

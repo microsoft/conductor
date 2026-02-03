@@ -1,0 +1,22 @@
+{
+  "id": "msg_01XYZ123456789",
+  "type": "message",
+  "role": "assistant",
+  "content": [
+    {
+      "type": "tool_use",
+      "id": "toolu_01ABC123",
+      "name": "emit_output",
+      "input": {
+        "answer": "Python is a high-level, interpreted programming language known for its simplicity and readability."
+      }
+    }
+  ],
+  "model": "claude-3-5-sonnet-latest",
+  "stop_reason": "tool_use",
+  "stop_sequence": null,
+  "usage": {
+    "input_tokens": 50,
+    "output_tokens": 100
+  }
+}

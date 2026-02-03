@@ -1,0 +1,454 @@
+# Parallel Validation Workflow
+#
+# This example demonstrates parallel validation with all_or_nothing failure mode.
+# It shows:
+# - Parallel execution of independent validation checks
+# - all_or_nothing failure mode (all must pass)
+# - Collecting all validation results before failing
+# - Comprehensive error reporting
+# - Conditional routing based on validation results
+#
+# Usage:
+#   conductor run examples/parallel-validation.yaml --input code="def hello(): print('world')"
+
+workflow:
+  name: parallel-validation
+  description: Validate code using multiple parallel checks
+  version: "1.0.0"
+  entry_point: code_analyzer
+
+  runtime:
+    provider: copilot
+    default_model: gpt-5.2
+
+  input:
+    code:
+      type: string
+      required: true
+      description: The code to validate
+    language:
+      type: string
+      required: false
+      default: "python"
+      description: Programming language
+    strict_mode:
+      type: boolean
+      required: false
+      default: false
+      description: Whether to enforce strict validation rules
+
+  context:
+    mode: explicit
+
+  limits:
+    max_iterations: 10
+    timeout_seconds: 300
+
+# Parallel execution groups
+parallel:
+  - name: parallel_validators
+    description: Run all validation checks in parallel
+    agents:
+      - syntax_validator
+      - security_validator
+      - style_validator
+      - logic_validator
+    failure_mode: all_or_nothing  # All must succeed
+    routes:
+      - to: validation_summary
+
+agents:
+  # 1. Initial analysis phase
+  - name: code_analyzer
+    description: Analyzes code structure and complexity
+    model: gpt-5.2
+    input:
+      - workflow.input.code
+      - workflow.input.language
+    tools: []
+    prompt: |
+      Analyze the following {{ workflow.input.language }} code:
+      
+      ```{{ workflow.input.language }}
+      {{ workflow.input.code }}
+      ```
+      
+      Provide:
+      1. Brief description of what the code does
+      2. Complexity assessment (simple, moderate, complex)
+      3. Key components identified
+      4. Recommended validation checks
+    output:
+      description:
+        type: string
+        description: What the code does
+      complexity:
+        type: string
+        description: Complexity level
+      components:
+        type: array
+        description: Key components identified
+      checks_needed:
+        type: array
+        description: Recommended validation checks
+    routes:
+      - to: parallel_validators
+
+  # Parallel Validator 1: Syntax and structure
+  - name: syntax_validator
+    description: Validates code syntax and structure
+    model: gpt-5.2
+    input:
+      - workflow.input.code
+      - workflow.input.language
+      - code_analyzer.output
+    tools: []
+    prompt: |
+      Validate the syntax and structure of this {{ workflow.input.language }} code:
+      
+      ```{{ workflow.input.language }}
+      {{ workflow.input.code }}
+      ```
+      
+      Code Analysis: {{ code_analyzer.output.description }}
+      Complexity: {{ code_analyzer.output.complexity }}
+      
+      Check for:
+      1. Syntax errors
+      2. Proper indentation and formatting
+      3. Balanced brackets/parentheses
+      4. Valid function/class definitions
+      5. Import statements correctness
+      
+      Report any syntax or structural issues found.
+    output:
+      passed:
+        type: boolean
+        description: Whether syntax validation passed
+      issues:
+        type: array
+        description: List of syntax issues found
+      severity:
+        type: string
+        description: Highest severity level (none, warning, error, critical)
+      details:
+        type: string
+        description: Detailed validation report
+
+  # Parallel Validator 2: Security checks
+  - name: security_validator
+    description: Validates code for security vulnerabilities
+    model: gpt-5.2
+    input:
+      - workflow.input.code
+      - workflow.input.language
+      - code_analyzer.output
+      - workflow.input.strict_mode
+    tools: []
+    prompt: |
+      Perform security validation on this {{ workflow.input.language }} code:
+      
+      ```{{ workflow.input.language }}
+      {{ workflow.input.code }}
+      ```
+      
+      Strict Mode: {{ workflow.input.strict_mode }}
+      
+      Check for:
+      1. SQL injection vulnerabilities
+      2. Command injection risks
+      3. Insecure use of eval() or exec()
+      4. Hardcoded credentials or secrets
+      5. Unsafe file operations
+      6. Cross-site scripting (XSS) potential
+      7. Insecure deserialization
+      
+      {% if workflow.input.strict_mode %}
+      In strict mode, flag any potential security concerns, even if minor.
+      {% else %}
+      Focus on critical and high-severity security issues.
+      {% endif %}
+      
+      Report any security vulnerabilities found.
+    output:
+      passed:
+        type: boolean
+        description: Whether security validation passed
+      vulnerabilities:
+        type: array
+        description: List of security vulnerabilities found
+      risk_level:
+        type: string
+        description: Overall risk level (none, low, medium, high, critical)
+      details:
+        type: string
+        description: Detailed security report
+
+  # Parallel Validator 3: Code style and best practices
+  - name: style_validator
+    description: Validates code style and best practices
+    model: gpt-5.2
+    input:
+      - workflow.input.code
+      - workflow.input.language
+      - code_analyzer.output
+    tools: []
+    prompt: |
+      Validate code style and best practices for this {{ workflow.input.language }} code:
+      
+      ```{{ workflow.input.language }}
+      {{ workflow.input.code }}
+      ```
+      
+      Components: {{ code_analyzer.output.components | json }}
+      
+      Check for:
+      1. Naming conventions (variables, functions, classes)
+      2. Code organization and modularity
+      3. Documentation (docstrings, comments)
+      4. DRY principle violations
+      5. Magic numbers/strings
+      6. Appropriate use of language features
+      
+      Apply language-specific style guides:
+      - Python: PEP 8
+      - JavaScript: Standard JS / Airbnb
+      - Java: Oracle conventions
+      - Go: Go fmt standards
+      
+      Report style violations and best practice issues.
+    output:
+      passed:
+        type: boolean
+        description: Whether style validation passed
+      violations:
+        type: array
+        description: List of style violations found
+      score:
+        type: number
+        description: Style quality score (0-100)
+      details:
+        type: string
+        description: Detailed style report
+
+  # Parallel Validator 4: Logic and correctness
+  - name: logic_validator
+    description: Validates code logic and correctness
+    model: gpt-5.2
+    input:
+      - workflow.input.code
+      - workflow.input.language
+      - code_analyzer.output
+    tools: []
+    prompt: |
+      Validate the logic and correctness of this {{ workflow.input.language }} code:
+      
+      ```{{ workflow.input.language }}
+      {{ workflow.input.code }}
+      ```
+      
+      Description: {{ code_analyzer.output.description }}
+      
+      Check for:
+      1. Logic errors and potential bugs
+      2. Edge case handling
+      3. Error handling completeness
+      4. Null/undefined checks
+      5. Off-by-one errors
+      6. Infinite loop risks
+      7. Resource leak potential
+      8. Race conditions (if concurrent)
+      
+      Report any logic issues or potential bugs found.
+    output:
+      passed:
+        type: boolean
+        description: Whether logic validation passed
+      issues:
+        type: array
+        description: List of logic issues found
+      bug_count:
+        type: number
+        description: Number of potential bugs identified
+      confidence:
+        type: string
+        description: Confidence in analysis (high, medium, low)
+      details:
+        type: string
+        description: Detailed logic report
+
+  # 3. Validation summary phase
+  - name: validation_summary
+    description: Summarizes all validation results
+    model: gpt-5.2
+    input:
+      - workflow.input.code
+      - code_analyzer.output
+      - parallel_validators.outputs
+    tools: []
+    prompt: |
+      Create a comprehensive validation summary for the code validation.
+      
+      Code Description: {{ code_analyzer.output.description }}
+      Complexity: {{ code_analyzer.output.complexity }}
+      
+      Validation Results:
+      
+      === Syntax Validation ===
+      Passed: {{ parallel_validators.outputs.syntax_validator.passed }}
+      Issues: {{ parallel_validators.outputs.syntax_validator.issues | length }}
+      Severity: {{ parallel_validators.outputs.syntax_validator.severity }}
+      
+      === Security Validation ===
+      Passed: {{ parallel_validators.outputs.security_validator.passed }}
+      Vulnerabilities: {{ parallel_validators.outputs.security_validator.vulnerabilities | length }}
+      Risk Level: {{ parallel_validators.outputs.security_validator.risk_level }}
+      
+      === Style Validation ===
+      Passed: {{ parallel_validators.outputs.style_validator.passed }}
+      Violations: {{ parallel_validators.outputs.style_validator.violations | length }}
+      Score: {{ parallel_validators.outputs.style_validator.score }}
+      
+      === Logic Validation ===
+      Passed: {{ parallel_validators.outputs.logic_validator.passed }}
+      Issues: {{ parallel_validators.outputs.logic_validator.issues | length }}
+      Bugs: {{ parallel_validators.outputs.logic_validator.bug_count }}
+      
+      Create a summary that includes:
+      1. Overall validation status (all checks passed/failed)
+      2. Total issues found across all validators
+      3. Priority recommendations for fixes
+      4. Approval decision (approved, conditional, rejected)
+    output:
+      overall_status:
+        type: string
+        description: Overall status (passed, failed)
+      total_issues:
+        type: number
+        description: Total issues found
+      critical_issues:
+        type: number
+        description: Number of critical issues
+      recommendations:
+        type: array
+        description: Priority recommendations
+      approval:
+        type: string
+        description: Approval decision (approved, conditional, rejected)
+      summary:
+        type: string
+        description: Human-readable summary
+    routes:
+      - to: auto_approve
+        when: "{{ output.approval == 'approved' }}"
+      - to: conditional_review
+        when: "{{ output.approval == 'conditional' }}"
+      - to: rejection_handler
+        when: "{{ output.approval == 'rejected' }}"
+
+  # 4a. Auto-approval path
+  - name: auto_approve
+    description: Automatically approves code that passed all checks
+    model: gpt-5.2
+    input:
+      - validation_summary.output
+    tools: []
+    prompt: |
+      The code has passed all validation checks. Generate an approval message.
+      
+      Summary: {{ validation_summary.output.summary }}
+      
+      Create a brief approval message suitable for a code review system.
+    output:
+      approval_message:
+        type: string
+        description: Approval message
+      approved_at:
+        type: string
+        description: Approval timestamp
+    routes:
+      - to: $end
+
+  # 4b. Conditional review path
+  - name: conditional_review
+    description: Handles code that passed with minor issues
+    model: gpt-5.2
+    input:
+      - validation_summary.output
+      - parallel_validators.outputs
+    tools: []
+    prompt: |
+      The code passed validation but has minor issues that should be addressed.
+      
+      Summary: {{ validation_summary.output.summary }}
+      Recommendations: {{ validation_summary.output.recommendations | json }}
+      
+      Create a conditional approval message with:
+      1. List of minor issues to fix
+      2. Recommended improvements
+      3. Conditions for final approval
+    output:
+      conditional_message:
+        type: string
+        description: Conditional approval message
+      conditions:
+        type: array
+        description: Conditions for approval
+      priority:
+        type: string
+        description: Priority level (low, medium, high)
+    routes:
+      - to: $end
+
+  # 4c. Rejection path
+  - name: rejection_handler
+    description: Handles code that failed validation
+    model: gpt-5.2
+    input:
+      - validation_summary.output
+      - parallel_validators.outputs
+    tools: []
+    prompt: |
+      The code failed validation and must be revised.
+      
+      Summary: {{ validation_summary.output.summary }}
+      Critical Issues: {{ validation_summary.output.critical_issues }}
+      
+      All Validation Details:
+      - Syntax: {{ parallel_validators.outputs.syntax_validator.details }}
+      - Security: {{ parallel_validators.outputs.security_validator.details }}
+      - Style: {{ parallel_validators.outputs.style_validator.details }}
+      - Logic: {{ parallel_validators.outputs.logic_validator.details }}
+      
+      Create a rejection message with:
+      1. Clear list of issues that must be fixed
+      2. Specific guidance for each issue
+      3. Priority order for fixes
+      4. Resources or references if applicable
+    output:
+      rejection_message:
+        type: string
+        description: Detailed rejection message
+      must_fix:
+        type: array
+        description: Issues that must be fixed
+      guidance:
+        type: string
+        description: Specific guidance for fixes
+      estimated_effort:
+        type: string
+        description: Estimated effort to fix (small, medium, large)
+    routes:
+      - to: $end
+
+output:
+  validation_status: "{{ validation_summary.output.overall_status }}"
+  approval_decision: "{{ validation_summary.output.approval }}"
+  total_issues: "{{ validation_summary.output.total_issues }}"
+  critical_issues: "{{ validation_summary.output.critical_issues }}"
+  summary: "{{ validation_summary.output.summary }}"
+  syntax_passed: "{{ parallel_validators.outputs.syntax_validator.passed }}"
+  security_passed: "{{ parallel_validators.outputs.security_validator.passed }}"
+  style_passed: "{{ parallel_validators.outputs.style_validator.passed }}"
+  logic_passed: "{{ parallel_validators.outputs.logic_validator.passed }}"
+  recommendations: "{{ validation_summary.output.recommendations | json }}"

@@ -1,0 +1,16 @@
+# Workflow with environment variable references
+workflow:
+  name: env-workflow
+  description: Workflow using environment variables
+  entry_point: agent1
+
+  runtime:
+    provider: ${PROVIDER:-copilot}
+    default_model: ${DEFAULT_MODEL:-gpt-4}
+
+agents:
+  - name: agent1
+    model: ${AGENT_MODEL:-gpt-4}
+    prompt: "API Key: ${API_KEY:-default_key}"
+    routes:
+      - to: $end

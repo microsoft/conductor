@@ -1,0 +1,12 @@
+# Invalid: entry_point references non-existent agent
+workflow:
+  name: missing-entry
+  description: Invalid workflow - entry point doesn't exist
+  entry_point: does_not_exist
+
+agents:
+  - name: agent1
+    model: gpt-4
+    prompt: "Hello"
+    routes:
+      - to: $end

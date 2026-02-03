@@ -1,0 +1,144 @@
+# Full-featured workflow with all configuration options
+workflow:
+  name: full-workflow
+  description: A workflow with all features for testing
+  version: "1.0.0"
+  entry_point: planner
+  
+  runtime:
+    provider: copilot
+    default_model: claude-sonnet-4
+  
+  input:
+    goal:
+      type: string
+      required: true
+      description: The goal to accomplish
+    max_steps:
+      type: number
+      required: false
+      default: 5
+      description: Maximum steps to take
+    debug:
+      type: boolean
+      required: false
+      default: false
+  
+  context:
+    mode: accumulate
+    max_tokens: 4000
+    trim_strategy: truncate
+  
+  limits:
+    max_iterations: 20
+    timeout_seconds: 300
+  
+  hooks:
+    on_start: "{{ workflow.input.goal }}"
+    on_complete: "completed"
+    on_error: "error occurred"
+
+tools:
+  - web_search
+  - file_reader
+  - code_executor
+
+agents:
+  - name: planner
+    description: Plans the approach
+    type: agent
+    model: ${MODEL:-gpt-4}
+    system_prompt: You are a helpful planning assistant.
+    prompt: |
+      Create a plan to accomplish the following goal:
+      {{ workflow.input.goal }}
+      
+      Maximum steps: {{ workflow.input.max_steps }}
+    input:
+      - workflow.input.goal
+      - workflow.input.max_steps
+    tools:
+      - web_search
+    output:
+      plan:
+        type: array
+        items:
+          type: object
+          properties:
+            step:
+              type: string
+            action:
+              type: string
+      confidence:
+        type: number
+    routes:
+      - to: reviewer
+        when: "{{ output.confidence >= 0.8 }}"
+      - to: refiner
+        when: "{{ output.confidence < 0.8 }}"
+
+  - name: refiner
+    description: Refines the plan
+    model: gpt-4
+    input:
+      - planner.output
+      - workflow.input.goal
+    prompt: |
+      The following plan needs improvement:
+      {{ planner.output.plan | json }}
+      
+      Goal: {{ workflow.input.goal }}
+      Please refine it.
+    output:
+      plan:
+        type: array
+      confidence:
+        type: number
+    routes:
+      - to: reviewer
+
+  - name: reviewer
+    description: Reviews and approves the plan
+    type: human_gate
+    prompt: |
+      Please review this plan:
+      {{ planner.output.plan | json }}
+    options:
+      - label: Approve
+        value: approved
+        route: executor
+      - label: Request Changes
+        value: changes_requested
+        route: planner
+        prompt_for: feedback
+      - label: Reject
+        value: rejected
+        route: $end
+
+  - name: executor
+    description: Executes the plan
+    model: gpt-4
+    input:
+      - planner.output
+      - reviewer.output?
+    tools:
+      - code_executor
+      - file_reader
+    prompt: |
+      Execute this plan:
+      {{ planner.output.plan | json }}
+    output:
+      result:
+        type: object
+        properties:
+          success:
+            type: boolean
+          output:
+            type: string
+    routes:
+      - to: $end
+
+output:
+  plan: "{{ planner.output.plan | json }}"
+  result: "{{ executor.output.result | json }}"
+  iterations: "{{ context.iteration }}"

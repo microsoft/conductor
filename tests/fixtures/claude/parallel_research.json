@@ -1,0 +1,68 @@
+{
+  "web_research": {
+    "id": "msg_01WEB123456789",
+    "type": "message",
+    "role": "assistant",
+    "content": [
+      {
+        "type": "tool_use",
+        "id": "toolu_01WEB",
+        "name": "emit_output",
+        "input": {
+          "findings": "Web research shows quantum computing uses quantum bits (qubits) for exponentially faster calculations.",
+          "sources": ["nature.com", "quantumjournal.org"]
+        }
+      }
+    ],
+    "model": "claude-3-5-sonnet-latest",
+    "stop_reason": "tool_use",
+    "usage": {
+      "input_tokens": 60,
+      "output_tokens": 80
+    }
+  },
+  "paper_research": {
+    "id": "msg_01PAPER123456789",
+    "type": "message",
+    "role": "assistant",
+    "content": [
+      {
+        "type": "tool_use",
+        "id": "toolu_01PAPER",
+        "name": "emit_output",
+        "input": {
+          "findings": "Academic papers highlight quantum supremacy achievements in 2019 and ongoing research in error correction.",
+          "papers": ["Arute et al. 2019", "Preskill 2018"]
+        }
+      }
+    ],
+    "model": "claude-3-5-sonnet-latest",
+    "stop_reason": "tool_use",
+    "usage": {
+      "input_tokens": 55,
+      "output_tokens": 75
+    }
+  },
+  "expert_research": {
+    "id": "msg_01EXPERT123456789",
+    "type": "message",
+    "role": "assistant",
+    "content": [
+      {
+        "type": "tool_use",
+        "id": "toolu_01EXPERT",
+        "name": "emit_output",
+        "input": {
+          "findings": "Experts predict practical quantum computers within 10-15 years, with applications in cryptography and drug discovery.",
+          "experts": ["Dr. John Preskill", "Dr. Michelle Simmons"]
+        }
+      }
+    ],
+    "model": "claude-3-5-sonnet-latest",
+    "stop_reason": "tool_use",
+    "usage": {
+      "input_tokens": 58,
+      "output_tokens": 82
+    }
+  }
+}

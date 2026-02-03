@@ -1,0 +1,348 @@
+# Parallel Research Workflow
+#
+# This example demonstrates parallel execution with multiple independent research agents.
+# It shows:
+# - Parallel execution of independent agents
+# - continue_on_error failure mode for resilient data gathering
+# - Output aggregation from multiple parallel agents
+# - Handling partial failures gracefully
+# - Accessing parallel outputs in downstream agents
+#
+# Usage:
+#   conductor run examples/parallel-research.yaml --input topic="AI in healthcare"
+
+workflow:
+  name: parallel-research
+  description: Research a topic using multiple parallel sources
+  version: "1.0.0"
+  entry_point: planner
+
+  runtime:
+    provider: copilot
+    default_model: gpt-5.2
+    mcp_servers:
+      # Note: The Copilot CLI has a bug where 'env' vars in MCP server
+      # configs are not passed to MCP server subprocesses.
+      # See: https://github.com/github/copilot-sdk/issues/163
+      web-search:
+        command: sh
+        args: ["-c", "MODE=stdio DEFAULT_SEARCH_ENGINE=duckduckgo exec npx -y open-websearch@latest"]
+        tools: ["*"]
+
+  input:
+    topic:
+      type: string
+      required: true
+      description: The research topic to investigate
+    depth:
+      type: string
+      required: false
+      default: "moderate"
+      description: Research depth (quick, moderate, comprehensive)
+
+  context:
+    mode: explicit  # Only declared inputs available to agents
+
+  limits:
+    max_iterations: 20
+    timeout_seconds: 600
+
+# Parallel execution groups
+parallel:
+  - name: parallel_researchers
+    description: Research from multiple independent sources in parallel
+    agents:
+      - academic_researcher
+      - web_researcher
+      - technical_researcher
+    failure_mode: continue_on_error  # Continue even if some sources fail
+    routes:
+      - to: synthesizer
+
+agents:
+  # 1. Planning phase - create research strategy
+  - name: planner
+    description: Creates a structured research plan
+    model: gpt-5.2
+    input:
+      - workflow.input.topic
+      - workflow.input.depth
+    tools: []
+    prompt: |
+      You are a research planning expert. Create a comprehensive research plan for:
+      
+      Topic: {{ workflow.input.topic }}
+      Depth: {{ workflow.input.depth }}
+      
+      Create a structured plan with:
+      1. 3-5 key questions to answer
+      2. 3-4 areas to investigate
+      3. Types of sources to consult (academic, news, expert opinions, technical docs)
+      
+      Be specific and actionable.
+    output:
+      plan:
+        type: object
+        description: Structured research plan
+        properties:
+          questions:
+            type: array
+          areas:
+            type: array
+          sources:
+            type: array
+      summary:
+        type: string
+        description: One-sentence plan summary
+    routes:
+      - to: parallel_researchers
+
+  # Parallel Agent 1: Academic research
+  - name: academic_researcher
+    description: Searches academic and scholarly sources
+    model: gpt-5.2
+    input:
+      - workflow.input.topic
+      - planner.output
+    tools: []  # No tools for testing
+    prompt: |
+      You are an academic researcher. Research academic and scholarly information on:
+      
+      Topic: {{ workflow.input.topic }}
+      
+      Research Plan:
+      {{ planner.output.plan | json }}
+      
+      Focus on:
+      - Academic papers and research studies
+      - University publications
+      - Scientific journals
+      - Research institutions
+      
+      Provide credible, well-sourced findings based on your knowledge.
+    output:
+      findings:
+        type: array
+        description: List of academic findings
+      sources:
+        type: array
+        description: Academic sources consulted
+      confidence:
+        type: string
+        description: Confidence level (high, medium, low)
+
+  # Parallel Agent 2: Web research
+  - name: web_researcher
+    description: Searches web sources and news
+    model: gpt-5.2
+    input:
+      - workflow.input.topic
+      - planner.output
+    tools: []  # No tools for testing
+    prompt: |
+      You are a web researcher. Research current and practical information on:
+      
+      Topic: {{ workflow.input.topic }}
+      
+      Research Plan:
+      {{ planner.output.plan | json }}
+      
+      Focus on:
+      - Recent news articles
+      - Industry blogs and publications
+      - Case studies and real-world examples
+      - Expert opinions and commentary
+      
+      Provide findings based on your knowledge of recent and authoritative sources.
+    output:
+      findings:
+        type: array
+        description: List of web findings
+      sources:
+        type: array
+        description: Web sources consulted
+      confidence:
+        type: string
+        description: Confidence level (high, medium, low)
+
+  # Parallel Agent 3: Technical research
+  - name: technical_researcher
+    description: Searches technical documentation and specifications
+    model: gpt-5.2
+    input:
+      - workflow.input.topic
+      - planner.output
+    tools: []  # No tools for testing
+    prompt: |
+      You are a technical researcher. Research technical information on:
+      
+      Topic: {{ workflow.input.topic }}
+      
+      Research Plan:
+      {{ planner.output.plan | json }}
+      
+      Focus on:
+      - Technical documentation
+      - API references and specifications
+      - Implementation guides
+      - Standards and best practices
+      
+      Provide findings based on your technical knowledge.
+    output:
+      findings:
+        type: array
+        description: List of technical findings
+      sources:
+        type: array
+        description: Technical sources consulted
+      confidence:
+        type: string
+        description: Confidence level (high, medium, low)
+
+  # 3. Synthesis phase - combine parallel results
+  - name: synthesizer
+    description: Synthesizes findings from all parallel researchers
+    model: gpt-5.2
+    input:
+      - workflow.input.topic
+      - planner.output
+      - parallel_researchers.outputs
+      - parallel_researchers.errors
+    tools: []
+    prompt: |
+      You are a research synthesizer. Combine findings from multiple parallel research sources.
+      
+      Topic: {{ workflow.input.topic }}
+      
+      Research Plan Summary: {{ planner.output.summary }}
+      
+      {% if parallel_researchers.errors %}
+      ⚠️  Warning: Some research sources failed:
+      {% for agent, error in parallel_researchers.errors.items() %}
+      - {{ agent }}: {{ error.message }}
+      {% endfor %}
+      
+      {% endif %}
+      Research Results:
+      
+      {% if 'academic_researcher' in parallel_researchers.outputs %}
+      === Academic Research ===
+      {{ parallel_researchers.outputs.academic_researcher.findings | json }}
+      Sources: {{ parallel_researchers.outputs.academic_researcher.sources | length }}
+      Confidence: {{ parallel_researchers.outputs.academic_researcher.confidence }}
+      
+      {% endif %}
+      {% if 'web_researcher' in parallel_researchers.outputs %}
+      === Web Research ===
+      {{ parallel_researchers.outputs.web_researcher.findings | json }}
+      Sources: {{ parallel_researchers.outputs.web_researcher.sources | length }}
+      Confidence: {{ parallel_researchers.outputs.web_researcher.confidence }}
+      
+      {% endif %}
+      {% if 'technical_researcher' in parallel_researchers.outputs %}
+      === Technical Research ===
+      {{ parallel_researchers.outputs.technical_researcher.findings | json }}
+      Sources: {{ parallel_researchers.outputs.technical_researcher.sources | length }}
+      Confidence: {{ parallel_researchers.outputs.technical_researcher.confidence }}
+      
+      {% endif %}
+      Create a comprehensive synthesis that:
+      1. Combines findings from all successful sources
+      2. Notes any discrepancies or conflicting information
+      3. Highlights key insights and patterns
+      4. Addresses the original research questions
+      5. Acknowledges failed sources and potential gaps
+      
+      Provide an executive summary and detailed analysis.
+    output:
+      executive_summary:
+        type: string
+        description: Brief executive summary (2-3 sentences)
+      key_insights:
+        type: array
+        description: Top 5 key insights from all sources
+      synthesis:
+        type: string
+        description: Detailed synthesis of all findings
+      sources_analyzed:
+        type: number
+        description: Total number of sources analyzed
+      research_quality:
+        type: string
+        description: Overall quality assessment
+    routes:
+      - to: quality_checker
+
+  # 4. Quality check phase - evaluate research completeness
+  - name: quality_checker
+    description: Evaluates research quality and completeness
+    model: gpt-5.2
+    input:
+      - workflow.input.topic
+      - planner.output
+      - synthesizer.output
+      - parallel_researchers.outputs
+    tools: []
+    prompt: |
+      You are a research quality evaluator. Assess the quality and completeness of this research:
+      
+      Topic: {{ workflow.input.topic }}
+      
+      Original Research Questions:
+      {{ planner.output.plan.questions | json }}
+      
+      Executive Summary:
+      {{ synthesizer.output.executive_summary }}
+      
+      Key Insights:
+      {{ synthesizer.output.key_insights | json }}
+      
+      Number of Sources: {{ synthesizer.output.sources_analyzed }}
+      Research Quality: {{ synthesizer.output.research_quality }}
+      
+      Number of Successful Researchers: {{ parallel_researchers.outputs | length }} / 3
+      
+      Evaluate:
+      1. Were the research questions adequately answered?
+      2. Is the coverage comprehensive?
+      3. Are findings well-supported by sources?
+      4. Are there any significant gaps?
+      5. Is the synthesis clear and actionable?
+      
+      Provide a quality score (1-10) and specific feedback.
+    output:
+      quality_score:
+        type: number
+        description: Overall quality score (1-10)
+      questions_answered:
+        type: number
+        description: Number of research questions answered (0-5)
+      coverage_complete:
+        type: boolean
+        description: Whether coverage is comprehensive
+      gaps:
+        type: array
+        description: Identified gaps or missing information
+      recommendation:
+        type: string
+        description: Accept, revise, or expand research
+    routes:
+      - to: $end
+        when: "{{ output.quality_score >= 7 }}"
+      - to: planner
+        when: "context.iteration < 3"
+        output:
+          feedback: "{{ quality_checker.output.gaps | json }}"
+      - to: $end
+
+output:
+  topic: "{{ workflow.input.topic }}"
+  executive_summary: "{{ synthesizer.output.executive_summary }}"
+  key_insights: "{{ synthesizer.output.key_insights | json }}"
+  synthesis: "{{ synthesizer.output.synthesis }}"
+  quality_score: "{{ quality_checker.output.quality_score }}"
+  sources_analyzed: "{{ synthesizer.output.sources_analyzed }}"
+  research_quality: "{{ synthesizer.output.research_quality }}"
+  researchers_succeeded: "{{ parallel_researchers.outputs | length }}"
+  researchers_failed: "{{ parallel_researchers.errors | length }}"
+  recommendation: "{{ quality_checker.output.recommendation }}"
