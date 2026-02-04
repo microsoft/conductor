@@ -16,16 +16,6 @@ A minimal workflow with a single agent that answers questions. Demonstrates:
 conductor run examples/simple-qa.yaml --input question="What is Python?"
 ```
 
-### simple-qa-claude.yaml
-
-The same simple Q&A workflow configured for Claude provider. Demonstrates:
-- Claude provider configuration
-- Model selection with `claude-sonnet-4.5`
-
-```bash
-export ANTHROPIC_API_KEY=sk-ant-...
-conductor run examples/simple-qa-claude.yaml --input question="What is Python?"
-```
 
 ## Parallel Execution Examples
 
@@ -123,20 +113,45 @@ conductor run examples/multi-provider-research.yaml --input topic="Cloud computi
 
 ## Planning and Implementation
 
-### implementation-plan.yaml
+### plan.yaml
 
-An implementation planning workflow with architect and reviewer agents. Demonstrates:
-- Architect agent for creating detailed implementation plans
-- Reviewer agent for plan quality assessment
-- Loop-back pattern until quality threshold is met
-- Structured output with epics, tasks, and file changes
+A comprehensive design and implementation planning workflow. Demonstrates:
+- Architect agent for creating solution designs with implementation plans
+- Reviewer agent for quality assessment of design and actionability
+- Loop-back pattern until quality threshold is met (score >= 85)
+- Structured output following design document and implementation plan templates
+- MCP server integration (web-search, context7) for research
 - Traceability between requirements and implementation tasks
 
 ```bash
-conductor run examples/implementation-plan.yaml --input design="Build a REST API with CRUD operations for users"
+conductor run examples/plan.yaml --input purpose="Build a user authentication system with OAuth2"
+
+# Resume from existing plan
+conductor run examples/plan.yaml --input purpose="..." --input existing_plan="path/to/plan.md"
 
 # With verbose output
-conductor -V run examples/implementation-plan.yaml --input design="./docs/my-feature.design.md"
+conductor -V run examples/plan.yaml --input purpose="..."
+```
+
+### implement.yaml
+
+An epic-based implementation workflow with multi-tier review. Demonstrates:
+- Coder agent (Opus 4.5) for deep research, analysis, and implementation
+- Epic reviewer agent (Opus 4.5) for per-epic quality assessment
+- Committer agent (Sonnet) for git commits and plan updates
+- Plan reviewer agent (Opus 4.5) for holistic review of all changes
+- Fixer agent (Opus 4.5) for addressing plan-level issues
+- Iterative epic-by-epic implementation with automatic plan tracking
+- Two-tier review: epic-level (fast) and plan-level (thorough)
+
+```bash
+conductor run examples/implement.yaml --input plan="path/to/implementation.plan.md"
+
+# With specific epic
+conductor run examples/implement.yaml --input plan="..." --input epic="EPIC-001"
+
+# With verbose output
+conductor -V run examples/implement.yaml --input plan="..."
 ```
 
 ## Running Examples

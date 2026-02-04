@@ -1,0 +1,588 @@
+# Implementation Workflow
+#
+# This example demonstrates an implementation workflow that mirrors
+# the /implement command pattern. It shows:
+# - Coder agent (Opus 4.5) for deep research, analysis, and implementation
+# - Epic reviewer agent (Sonnet) for per-epic quality assessment
+# - Committer agent (Sonnet) for git commits and plan updates
+# - Plan reviewer agent (Opus 4.5) for holistic review of all changes
+# - Fixer agent (Opus 4.5) for addressing plan-level issues
+#
+# Architecture Decision:
+# - Opus 4.5 excels at deep reasoning, codebase analysis, and implementation
+# - Sonnet excels at focused review and documentation tasks
+# - Two-tier review: epic-level (fast) and plan-level (thorough)
+#
+# Usage:
+#   conductor run examples/implement.yaml --input plan="Path to implementation plan document"
+#
+# With specific epic:
+#   conductor run examples/implement.yaml --input plan="..." --input epic="EPIC-001"
+#
+# With verbose output:
+#   conductor -V run examples/implement.yaml --input plan="..."
+
+workflow:
+  name: implement
+  description: Implement a feature based on an implementation plan document
+  version: "2.0.0"
+  entry_point: coder
+
+  input:
+    plan:
+      type: string
+      required: true
+      description: A link to an implementation plan (e.g., `.plan.md`) or the plan content itself
+    epic:
+      type: string
+      required: false
+      description: A specific epic ID to implement. If not provided, all incomplete epics are in scope
+
+  context:
+    mode: accumulate
+
+  limits:
+    max_iterations: 100
+    # timeout_seconds is unlimited by default
+
+agents:
+  - name: coder
+    description: Performs deep research, analysis, and implements code changes
+    model: claude-opus-4.5
+    input:
+      - workflow.input.plan
+      - workflow.input.epic?
+      - epic_reviewer.output?
+      - committer.output?
+    system_prompt: |
+      You are a Senior Software Engineer agent. Your task is to deeply analyze codebases,
+      understand implementation plans, and implement high-quality code changes.
+
+      Your core capabilities include:
+      - Deep codebase research to understand existing patterns, dependencies, and conventions
+      - Identifying all relevant code, modules, and integration points
+      - Writing clean, well-documented, production-ready code
+      - Anticipating edge cases and handling them properly
+      - Creating comprehensive tests
+      - Following existing code patterns and conventions precisely
+    prompt: |
+      Analyze the implementation plan, research the codebase, and implement the changes.
+
+      **Plan:**
+      {{ workflow.input.plan }}
+
+      {% if workflow.input.epic %}
+      **Requested Epic:** {{ workflow.input.epic }}
+      {% endif %}
+
+      {% if epic_reviewer is defined and epic_reviewer.output and epic_reviewer.output.decision == "REQUEST_CHANGES" %}
+      **Previous Implementation Failed Review:**
+      {{ epic_reviewer.output.feedback }}
+
+      **Issues to Address:**
+      {% for issue in epic_reviewer.output.issues %}
+      - {{ issue }}
+      {% endfor %}
+
+      Fix these issues in your implementation.
+      {% endif %}
+
+      {% if committer is defined and committer.output and committer.output.next_epic %}
+      **Previous Epic Completed:** {{ committer.output.epic_completed }}
+      **Next Epic to Implement:** {{ committer.output.next_epic }}
+      {% endif %}
+
+      ## RESEARCH, ANALYSIS, AND IMPLEMENTATION TASKS
+
+      1. **Parse the Plan Document**
+         - If the plan is a file path, read and analyze the document thoroughly
+         - Identify all epics and their current status (DONE, IN PROGRESS, NOT STARTED)
+         - Review any related documents referenced in the plan
+
+      2. **Determine Scope**
+         - If a specific epic was requested, focus only on that epic
+         - If continuing from a previous epic, implement the next epic
+         - Otherwise, find the FIRST epic that is NOT marked as DONE
+           - Scan epics in order (EPIC-001, EPIC-002, etc.)
+           - Select the first one with status "NOT STARTED" or "IN PROGRESS"
+           - Skip any epics already marked as "DONE"
+         - Check prerequisites/dependencies between epics
+         - Verify all prerequisite epics are DONE before starting
+
+      3. **Deep Codebase Research**
+         - Analyze the codebase to understand existing patterns and conventions
+         - Identify all files that will be created, modified, or deleted
+         - Review related modules and their interfaces
+         - Identify integration points and potential conflicts
+         - Document the coding style, naming conventions, and patterns used
+
+      4. **Update Plan Status to IN PROGRESS**
+         - Open the plan document and update the current epic's status to "IN PROGRESS"
+         - Update any task statuses within the epic from "TO DO" to "IN PROGRESS"
+         - Save the plan document with these status changes
+
+      5. **Implement the Changes**
+         For the current epic:
+         - Create or modify files as needed
+         - Follow existing code patterns and conventions exactly
+         - Handle all edge cases appropriately
+         - Add proper error handling and logging
+         - Write clean, well-documented code
+
+      6. **Create Tests**
+         - Write comprehensive tests for all new functionality
+         - Ensure tests cover edge cases and error conditions
+         - Run tests to verify they pass
+
+      7. **Document Your Changes**
+         - Add inline comments where helpful
+         - Update any relevant documentation
+
+      Complete the implementation for the current epic.
+    output:
+      plan_summary:
+        type: string
+        description: Summary of the implementation plan
+      epics_in_scope:
+        type: array
+        description: List of epic IDs/names that are in scope for implementation
+      current_epic:
+        type: string
+        description: The epic being implemented
+      epic_details:
+        type: string
+        description: Detailed description of the current epic including tasks and acceptance criteria
+      files_modified:
+        type: array
+        description: List of files that were created or modified
+      changes_made:
+        type: array
+        description: List of specific changes made during implementation
+      tests_added:
+        type: array
+        description: List of tests that were added or updated
+      edge_cases_handled:
+        type: array
+        description: List of edge cases that were handled
+      implementation_notes:
+        type: string
+        description: Notes about the implementation, decisions made, and any concerns
+      prerequisites_met:
+        type: boolean
+        description: Whether all prerequisites for the current epic are met
+    routes:
+      - to: epic_reviewer
+        when: "{{ output.prerequisites_met }}"
+      - to: $end
+
+  - name: epic_reviewer
+    description: Reviews the implementation for a single epic
+    model: claude-opus-4.5
+    input:
+      - coder.output
+    system_prompt: |
+      You are a Code Review agent. You conduct thorough reviews of code changes
+      to ensure quality, correctness, and adherence to best practices.
+
+      You are critical but constructive, providing specific, actionable feedback
+      that helps improve the code.
+    prompt: |
+      Review the implementation changes for the following epic.
+
+      **Epic:** {{ coder.output.current_epic }}
+
+      **Epic Details:**
+      {{ coder.output.epic_details }}
+
+      **Changes Made:**
+      {% for change in coder.output.changes_made %}
+      - {{ change }}
+      {% endfor %}
+
+      **Files Modified:**
+      {% for file in coder.output.files_modified %}
+      - {{ file }}
+      {% endfor %}
+
+      **Tests Added:**
+      {% for test in coder.output.tests_added %}
+      - {{ test }}
+      {% endfor %}
+
+      **Edge Cases Handled:**
+      {% for edge_case in coder.output.edge_cases_handled %}
+      - {{ edge_case }}
+      {% endfor %}
+
+      **Implementation Notes:**
+      {{ coder.output.implementation_notes }}
+
+      ## REVIEW TASKS
+
+      1. **Requirements Verification**
+         - Verify that all requirements from the epic are met
+         - Check that acceptance criteria are satisfied
+         - Ensure no requirements were missed
+
+      2. **Code Quality**
+         - Check for bugs, errors, or logical issues
+         - Verify proper error handling
+         - Ensure code is clean and well-documented
+         - Confirm code follows existing patterns and conventions
+
+      3. **Edge Case Verification**
+         - Confirm edge cases were handled appropriately
+         - Check error handling is comprehensive
+
+      4. **Test Coverage**
+         - Verify tests cover the new functionality
+         - Check that tests cover edge cases and error conditions
+
+      Provide your decision: APPROVE or REQUEST_CHANGES.
+
+      If REQUEST_CHANGES, provide specific, actionable feedback.
+    output:
+      decision:
+        type: string
+        description: Review decision - APPROVE or REQUEST_CHANGES
+      feedback:
+        type: string
+        description: Detailed feedback on the implementation
+      issues:
+        type: array
+        description: List of specific issues that need to be addressed
+      strengths:
+        type: array
+        description: List of things done well in the implementation
+      approved:
+        type: boolean
+        description: Whether the implementation is approved
+    routes:
+      - to: committer
+        when: "{{ output.approved }}"
+      - to: coder
+        when: "{{ output.decision == 'REQUEST_CHANGES' }}"
+
+  - name: committer
+    description: Commits the changes and updates the plan document
+    model: claude-sonnet-4.5
+    input:
+      - workflow.input.plan
+      - coder.output
+      - epic_reviewer.output
+    system_prompt: |
+      You are a Commit and Documentation agent. Your job is to:
+      - Create clear, descriptive git commits for completed work
+      - Update plan documents to reflect progress
+      - Determine if there are more epics to implement
+    prompt: |
+      The following epic has been implemented and approved.
+
+      **Epic:** {{ coder.output.current_epic }}
+
+      **Epic Details:**
+      {{ coder.output.epic_details }}
+
+      **Changes Made:**
+      {% for change in coder.output.changes_made %}
+      - {{ change }}
+      {% endfor %}
+
+      **Files Modified:**
+      {% for file in coder.output.files_modified %}
+      - {{ file }}
+      {% endfor %}
+
+      **Reviewer Feedback:**
+      {{ epic_reviewer.output.feedback }}
+
+      **Epics in Scope:**
+      {{ coder.output.epics_in_scope | json }}
+
+      ## COMMIT AND UPDATE TASKS
+
+      1. **Update Plan Document**
+         Open the plan document and make the following updates:
+
+         a. **Update Epic Status**
+            - Change the epic's status from "IN PROGRESS" to "DONE"
+
+         b. **Update Task Statuses**
+            - For each task in the epic, update the status field from "IN PROGRESS" or "TO DO" to "DONE"
+            - Example: Change `Status: IN PROGRESS` to `Status: DONE`
+            - Example: Change `Status: TO DO` to `Status: DONE`
+
+         c. **Check Acceptance Criteria Checkboxes**
+            - For each acceptance criterion that has been satisfied, check the checkbox
+            - Change `- [ ]` to `- [x]` for completed criteria
+            - Only check boxes for criteria that were actually implemented and verified
+
+         d. **Add Completion Notes**
+            - Add completion date if there's a field for it
+            - Add any relevant implementation notes
+
+         Save the updated plan document.
+
+      2. **Create Git Commit**
+         - Stage all modified files INCLUDING the updated plan document
+         - Create a clear commit message starting with the epic ID
+         - Example: "EPIC-001: Implement user authentication flow"
+
+      3. **Determine Next Steps**
+         - Re-read the plan document after updating it
+         - Scan ALL epics in order (EPIC-001, EPIC-002, etc.)
+         - Build a list of remaining epics that are NOT marked as "DONE"
+         - If there are remaining epics:
+           - Set `all_complete` to FALSE
+           - Set `next_epic` to the FIRST remaining epic (by ID order)
+           - Set `remaining_epics` to the full list of non-DONE epics
+         - ONLY set `all_complete` to TRUE if EVERY epic in the plan is marked as "DONE"
+
+      **IMPORTANT:** Do NOT set `all_complete` to true unless you have verified that
+      ALL epics in the entire plan document are marked as DONE. When in doubt, 
+      set `all_complete` to false and specify the next epic to implement.
+
+      Commit the changes and update the plan.
+    output:
+      epic_completed:
+        type: string
+        description: The epic that was completed
+      commit_message:
+        type: string
+        description: The git commit message used
+      plan_updated:
+        type: boolean
+        description: Whether the plan document was updated
+      remaining_epics:
+        type: array
+        description: List of ALL remaining epics (not marked DONE) in the plan, in order
+      all_complete:
+        type: boolean
+        description: TRUE only if EVERY epic in the plan is marked DONE. FALSE if any epic remains.
+      next_epic:
+        type: string
+        description: The FIRST remaining epic to implement (by ID order). Empty only if all_complete is true.
+    routes:
+      - to: coder
+        when: "{{ not output.all_complete }}"
+      - to: plan_reviewer
+        when: "{{ output.all_complete }}"
+
+  - name: plan_reviewer
+    description: Reviews the entire implementation plan and all commits holistically
+    model: claude-opus-4.5-latest
+    input:
+      - workflow.input.plan
+      - coder.output
+      - committer.output
+    system_prompt: |
+      You are a Senior Architecture Reviewer. Your job is to perform a holistic review
+      of the entire implementation after all epics have been completed.
+
+      You review:
+      - Overall architecture and design coherence
+      - Cross-cutting concerns (error handling, logging, security)
+      - Code consistency across all changes
+      - Integration between components
+      - Documentation completeness
+      - Test coverage across the entire feature
+
+      You are thorough and ensure the implementation is production-ready.
+    prompt: |
+      All epics have been implemented. Perform a holistic review of the entire implementation.
+
+      **Original Plan:**
+      {{ workflow.input.plan }}
+
+      **Plan Summary:**
+      {{ coder.output.plan_summary }}
+
+      **Epics Completed:**
+      {{ committer.output.epic_completed }}
+
+      **Final Commit:**
+      {{ committer.output.commit_message }}
+
+      ## HOLISTIC REVIEW TASKS
+
+      1. **Architecture Review**
+         - Review the overall architecture of the changes
+         - Ensure components integrate well together
+         - Check for proper separation of concerns
+         - Verify the design is maintainable and extensible
+
+      2. **Cross-Cutting Concerns**
+         - Review error handling across all components
+         - Check logging and observability
+         - Verify security considerations
+         - Ensure proper resource management
+
+      3. **Code Consistency**
+         - Check for consistent patterns across all changes
+         - Verify naming conventions are consistent
+         - Ensure code style is uniform
+
+      4. **Documentation Review**
+         - Verify documentation is complete and accurate
+         - Check that README or other docs are updated
+         - Ensure code comments are helpful
+
+      5. **Test Coverage**
+         - Review overall test coverage
+         - Identify any gaps in testing
+         - Verify integration tests exist where needed
+
+      6. **Git History Review**
+         - Review all commits made during implementation
+         - Ensure commit messages are clear and descriptive
+         - Check for any commits that should be squashed or amended
+
+      Provide your decision: APPROVE or REQUEST_CHANGES.
+
+      If REQUEST_CHANGES, provide specific issues that need to be fixed.
+    output:
+      decision:
+        type: string
+        description: Review decision - APPROVE or REQUEST_CHANGES
+      feedback:
+        type: string
+        description: Detailed holistic feedback on the implementation
+      architecture_issues:
+        type: array
+        description: List of architecture or design issues
+      code_issues:
+        type: array
+        description: List of code quality or consistency issues
+      documentation_issues:
+        type: array
+        description: List of documentation issues
+      test_gaps:
+        type: array
+        description: List of test coverage gaps
+      strengths:
+        type: array
+        description: List of things done well across the implementation
+      approved:
+        type: boolean
+        description: Whether the overall implementation is approved
+    routes:
+      - to: $end
+        when: "{{ output.approved }}"
+      - to: fixer
+        when: "{{ output.decision == 'REQUEST_CHANGES' }}"
+
+  - name: fixer
+    description: Fixes issues identified by the plan reviewer
+    model: claude-opus-4.5-latest
+    input:
+      - workflow.input.plan
+      - coder.output
+      - plan_reviewer.output
+    system_prompt: |
+      You are a Senior Software Engineer agent specializing in fixing issues
+      identified during holistic code review.
+
+      Your job is to address all issues raised by the plan reviewer:
+      - Architecture and design issues
+      - Code quality and consistency issues
+      - Documentation gaps
+      - Test coverage gaps
+
+      You make targeted, precise fixes while maintaining the overall integrity
+      of the implementation.
+    prompt: |
+      The plan reviewer has identified issues that need to be fixed.
+
+      **Original Plan:**
+      {{ workflow.input.plan }}
+
+      **Reviewer Decision:** {{ plan_reviewer.output.decision }}
+
+      **Reviewer Feedback:**
+      {{ plan_reviewer.output.feedback }}
+
+      **Architecture Issues:**
+      {% for issue in plan_reviewer.output.architecture_issues %}
+      - {{ issue }}
+      {% endfor %}
+
+      **Code Issues:**
+      {% for issue in plan_reviewer.output.code_issues %}
+      - {{ issue }}
+      {% endfor %}
+
+      **Documentation Issues:**
+      {% for issue in plan_reviewer.output.documentation_issues %}
+      - {{ issue }}
+      {% endfor %}
+
+      **Test Gaps:**
+      {% for gap in plan_reviewer.output.test_gaps %}
+      - {{ gap }}
+      {% endfor %}
+
+      ## FIX TASKS
+
+      1. **Address Architecture Issues**
+         - Review and fix any architecture or design problems
+         - Ensure proper component integration
+         - Maintain separation of concerns
+
+      2. **Fix Code Issues**
+         - Address all code quality issues
+         - Ensure consistency across all changes
+         - Fix any bugs or logical errors
+
+      3. **Complete Documentation**
+         - Fill in documentation gaps
+         - Update README or other docs as needed
+         - Add missing code comments
+
+      4. **Add Missing Tests**
+         - Write tests to cover identified gaps
+         - Add integration tests where needed
+         - Ensure comprehensive coverage
+
+      5. **Commit Fixes**
+         - Stage all fixes
+         - Create a clear commit message describing the fixes
+         - Example: "fix: Address plan review feedback - improve error handling and add tests"
+
+      Fix all identified issues.
+    output:
+      issues_fixed:
+        type: array
+        description: List of issues that were fixed
+      files_modified:
+        type: array
+        description: List of files that were modified during fixes
+      tests_added:
+        type: array
+        description: List of tests that were added
+      documentation_updated:
+        type: array
+        description: List of documentation that was updated
+      commit_message:
+        type: string
+        description: The git commit message for the fixes
+      fix_notes:
+        type: string
+        description: Notes about the fixes made
+      all_issues_resolved:
+        type: boolean
+        description: Whether all issues have been resolved
+    routes:
+      - to: plan_reviewer
+        when: "{{ output.all_issues_resolved }}"
+      - to: plan_reviewer
+
+output:
+  plan: "{{ workflow.input.plan }}"
+  epic_requested: "{{ workflow.input.epic | default('all') }}"
+  epics_completed: "{{ committer.output.epic_completed | default('') }}"
+  remaining_epics: "{{ committer.output.remaining_epics | default([]) | json }}"
+  all_complete: "{{ committer.output.all_complete | default(false) }}"
+  last_commit: "{{ committer.output.commit_message | default('') }}"
+  epic_review_decision: "{{ epic_reviewer.output.decision | default('') }}"
+  plan_review_decision: "{{ plan_reviewer.output.decision | default('') }}"
+  iterations: "{{ context.iteration }}"

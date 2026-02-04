@@ -23,7 +23,7 @@ workflow:
   entry_point: architect
 
   runtime:
-    provider: copilot # can be copilot or claude
+    provider: copilot
     mcp_servers:
       # Note: The Copilot CLI has a bug where 'env' vars in MCP server
       # configs are not passed to MCP server subprocesses.
@@ -57,7 +57,7 @@ workflow:
 agents:
   - name: architect
     description: Creates or refines the solution design and implementation plan based on requirements and feedback
-    model: claude-opus-4.5
+    model: claude-opus-4.5-latest
     input:
       - workflow.input.purpose
       - workflow.input.existing_plan?
@@ -85,7 +85,7 @@ agents:
       Review and refine the existing plan rather than starting from scratch.
       {% endif %}
 
-      {% if reviewer is defined and reviewer.output and reviewer.output.score < 90 %}
+      {% if reviewer is defined and reviewer.output and reviewer.output.score < 85 %}
       **Previous Review Feedback (Score: {{ reviewer.output.score }}/100):**
       {{ reviewer.output.feedback }}
 
@@ -182,7 +182,7 @@ agents:
 
   - name: reviewer
     description: Reviews the design document and implementation plan for quality, completeness, and actionability
-    model: claude-opus-4.5
+    model: claude-opus-4.5-latest
     input:
       - workflow.input.purpose
       - architect.output.file_path
@@ -224,7 +224,7 @@ agents:
 
       Provide:
       1. A score from 0-100
-      2. Whether the design is approved (score >= 90)
+      2. Whether the design is approved (score >= 85)
       3. Specific feedback for improvement
       4. List of any critical issues that must be addressed
     output:
@@ -233,7 +233,7 @@ agents:
         description: Quality score from 0-100
       approved:
         type: boolean
-        description: Whether the design meets quality threshold (score >= 90)
+        description: Whether the design meets quality threshold (score >= 85)
       feedback:
         type: string
         description: Detailed feedback for improvement
@@ -244,7 +244,7 @@ agents:
       - to: $end
         when: "{{ output.approved }}"
       - to: architect
-        when: "score < 90"
+        when: "score < 85"
       - to: $end
 
 output:
