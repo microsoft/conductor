@@ -30,7 +30,7 @@ if TYPE_CHECKING:
 _verbose_console = Console(stderr=True, highlight=False)
 
 # Pattern for resolving ${VAR} and ${VAR:-default} in env values
-_ENV_VAR_PATTERN = re.compile(r'\$\{([^}:]+)(?::-([^}]*))?\}')
+_ENV_VAR_PATTERN = re.compile(r"\$\{([^}:]+)(?::-([^}]*))?\}")
 
 
 def resolve_mcp_env_vars(env: dict[str, str]) -> dict[str, str]:
@@ -58,6 +58,7 @@ def resolve_mcp_env_vars(env: dict[str, str]) -> dict[str, str]:
         >>> resolve_mcp_env_vars({'API_KEY': '${MY_KEY}', 'DEBUG': '${DEBUG:-false}'})
         {'API_KEY': 'secret123', 'DEBUG': 'false'}
     """
+
     def replace_match(match: re.Match[str]) -> str:
         var_name = match.group(1)
         default_value = match.group(2)
@@ -67,7 +68,7 @@ def resolve_mcp_env_vars(env: dict[str, str]) -> dict[str, str]:
         elif default_value is not None:
             return default_value
         else:
-            return ''
+            return ""
 
     resolved: dict[str, str] = {}
     for key, value in env.items():

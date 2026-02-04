@@ -313,8 +313,7 @@ class TestClaudeRealAPI:
                     name="writer",
                     model="claude-3-5-sonnet-latest",
                     prompt=(
-                        "Write a long essay about the history of computing. "
-                        "Include many details."
+                        "Write a long essay about the history of computing. Include many details."
                     ),
                     output={"essay": OutputField(type="string")},
                     routes=[RouteDef(to="$end")],
@@ -337,8 +336,7 @@ class TestClaudeRealAPI:
                     name="writer",
                     model="claude-3-5-sonnet-latest",
                     prompt=(
-                        "Write a long essay about the history of computing. "
-                        "Include many details."
+                        "Write a long essay about the history of computing. Include many details."
                     ),
                     output={"essay": OutputField(type="string")},
                     routes=[RouteDef(to="$end")],
@@ -389,7 +387,7 @@ class TestClaudeRealAPI:
                 runtime=RuntimeConfig(
                     provider="claude",
                     temperature=0.0,  # Runtime default: deterministic
-                    max_tokens=100,   # Runtime default: short
+                    max_tokens=100,  # Runtime default: short
                 ),
             ),
             agents=[
@@ -403,8 +401,8 @@ class TestClaudeRealAPI:
                 AgentDef(
                     name="agent_override",
                     model="claude-3-5-sonnet-latest",
-                    temperature=1.0,    # Agent override: max randomness
-                    max_tokens=1000,     # Agent override: longer
+                    temperature=1.0,  # Agent override: max randomness
+                    max_tokens=1000,  # Agent override: longer
                     prompt="Write a detailed description of Python with many examples.",
                     output={"description": OutputField(type="string")},
                     routes=[RouteDef(to="$end")],

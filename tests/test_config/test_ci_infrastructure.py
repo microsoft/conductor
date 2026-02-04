@@ -58,15 +58,16 @@ class TestCIInfrastructure:
 
         # Verify key format follows Anthropic conventions (sk-ant-*)
         # but is clearly marked as fake/test
-        assert ci_fake_key.startswith("sk-ant-"), \
+        assert ci_fake_key.startswith("sk-ant-"), (
             "Fake key should follow Anthropic key format for compatibility"
+        )
 
-        assert "fake" in ci_fake_key or "test" in ci_fake_key or "mock" in ci_fake_key, \
+        assert "fake" in ci_fake_key or "test" in ci_fake_key or "mock" in ci_fake_key, (
             "Fake key should be clearly labeled as non-production"
+        )
 
         # Verify key length is reasonable (not too short, not excessive)
-        assert 20 <= len(ci_fake_key) <= 100, \
-            "Fake key should have realistic length"
+        assert 20 <= len(ci_fake_key) <= 100, "Fake key should have realistic length"
 
     def test_mock_tests_excluded_from_real_api_marker(self):
         """Verify that mock tests are properly excluded from real API calls.
@@ -80,7 +81,7 @@ class TestCIInfrastructure:
         # In CI, tests are run with: pytest -m "not real_api"
 
         # This test itself should NOT have the real_api marker
-        pytest.current_test_name if hasattr(pytest, 'current_test_name') else None
+        pytest.current_test_name if hasattr(pytest, "current_test_name") else None
 
         # The test structure verifies marker-based filtering works
         # (actual marker verification happens at pytest collection time)

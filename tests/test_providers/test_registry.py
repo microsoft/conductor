@@ -136,9 +136,7 @@ class TestProviderCaching:
 
     @patch("conductor.providers.registry.create_provider")
     @pytest.mark.asyncio
-    async def test_different_providers_created_separately(
-        self, mock_create: MagicMock
-    ) -> None:
+    async def test_different_providers_created_separately(self, mock_create: MagicMock) -> None:
         """Test that different provider types create different instances."""
         copilot_provider = MockProvider("copilot")
         claude_provider = MockProvider("claude")

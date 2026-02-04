@@ -18,9 +18,7 @@ def mock_anthropic_response():
     mock_response = Mock()
     mock_response.content = [Mock(text='{"result": "Test response from Claude"}', type="text")]
     mock_response.model = "claude-3-5-sonnet-20241022"
-    mock_response.usage = Mock(
-        input_tokens=10, output_tokens=20, cache_creation_input_tokens=0
-    )
+    mock_response.usage = Mock(input_tokens=10, output_tokens=20, cache_creation_input_tokens=0)
     mock_response.stop_reason = "end_turn"
     mock_response.id = "msg_123"
     mock_response.type = "message"
@@ -299,9 +297,7 @@ class TestClaudePerformanceIntegration:
         mock_response = Mock()
         mock_response.content = [Mock(text='{"result": "Test response"}', type="text")]
         mock_response.model = "claude-3-5-sonnet-20241022"
-        mock_response.usage = Mock(
-            input_tokens=10, output_tokens=20, cache_creation_input_tokens=0
-        )
+        mock_response.usage = Mock(input_tokens=10, output_tokens=20, cache_creation_input_tokens=0)
         mock_response.stop_reason = "end_turn"
         mock_response.id = "msg_123"
         mock_response.type = "message"

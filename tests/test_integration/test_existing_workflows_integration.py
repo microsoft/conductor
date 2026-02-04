@@ -19,6 +19,7 @@ from conductor.providers.copilot import CopilotProvider
 
 def create_mock_handler() -> Any:
     """Create a mock handler for Copilot provider that returns test responses."""
+
     def mock_handler(
         agent: AgentDef, rendered_prompt: str, context: dict[str, Any]
     ) -> dict[str, Any]:
@@ -38,6 +39,7 @@ def create_mock_handler() -> Any:
                     result[field_name] = {"key": "value"}
             return result
         return {"result": "Mock response"}
+
     return mock_handler
 
 
@@ -137,10 +139,7 @@ async def test_all_copilot_examples_load_and_validate(tmp_path):
         pytest.skip(f"Examples directory not found: {examples_dir}")
 
     # Find all non-Claude YAML files
-    copilot_examples = [
-        f for f in examples_dir.glob("*.yaml")
-        if "claude" not in f.stem.lower()
-    ]
+    copilot_examples = [f for f in examples_dir.glob("*.yaml") if "claude" not in f.stem.lower()]
 
     assert len(copilot_examples) > 0, "No Copilot example workflows found"
 

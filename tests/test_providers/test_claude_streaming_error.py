@@ -90,9 +90,7 @@ class TestClaudeStreamingDeferral:
             output={"answer": OutputField(type="string")},
         )
 
-        result = await provider.execute(
-            agent, {"workflow": {"input": {}}}, "Generate a response"
-        )
+        result = await provider.execute(agent, {"workflow": {"input": {}}}, "Generate a response")
 
         # Verify complete response returned
         assert result.content["answer"] == full_response

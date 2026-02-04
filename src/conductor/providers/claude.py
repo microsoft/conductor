@@ -217,7 +217,7 @@ class ClaudeProvider(AgentProvider):
         if not (0.0 <= temperature <= 1.0):
             raise ValidationError(
                 f"Temperature must be between 0.0 and 1.0 (schema validation), got {temperature}",
-                suggestion="Adjust temperature to be within the valid range"
+                suggestion="Adjust temperature to be within the valid range",
             )
 
     def _validate_max_tokens(self, max_tokens: int) -> None:
@@ -235,7 +235,7 @@ class ClaudeProvider(AgentProvider):
         if not (1 <= max_tokens <= 200000):
             raise ValidationError(
                 f"max_tokens must be between 1 and 200000 (schema validation), got {max_tokens}",
-                suggestion="Adjust max_tokens to be within the valid range"
+                suggestion="Adjust max_tokens to be within the valid range",
             )
 
     def get_retry_history(self) -> list[dict[str, Any]]:
@@ -363,11 +363,13 @@ class ClaudeProvider(AgentProvider):
             if tool_filter is not None and tool["name"] not in tool_filter:
                 continue
 
-            claude_tools.append({
-                "name": tool["name"],
-                "description": tool["description"],
-                "input_schema": tool["input_schema"],
-            })
+            claude_tools.append(
+                {
+                    "name": tool["name"],
+                    "description": tool["description"],
+                    "input_schema": tool["input_schema"],
+                }
+            )
 
         return claude_tools
 
@@ -751,9 +753,7 @@ class ClaudeProvider(AgentProvider):
         # All retries exhausted
         raise ProviderError(
             f"Claude API call failed after {config.max_attempts} attempts: {last_error}",
-            suggestion=(
-                f"Check API connectivity and rate limits. Last error: {last_error}"
-            ),
+            suggestion=(f"Check API connectivity and rate limits. Last error: {last_error}"),
             is_retryable=False,
         )
 
@@ -905,7 +905,8 @@ class ClaudeProvider(AgentProvider):
 
             # Check for tool_use blocks
             tool_uses = [
-                block for block in response.content
+                block
+                for block in response.content
                 if hasattr(block, "type") and block.type == "tool_use"
             ]
 
@@ -915,10 +916,7 @@ class ClaudeProvider(AgentProvider):
                 return response, total_tokens
 
             # Check if emit_output was called (structured output)
-            emit_output = next(
-                (t for t in tool_uses if t.name == "emit_output"),
-                None
-            )
+            emit_output = next((t for t in tool_uses if t.name == "emit_output"), None)
             if emit_output:
                 # Final output received, we're done
                 logger.debug("emit_output tool called, exiting agentic loop")
@@ -948,23 +946,26 @@ class ClaudeProvider(AgentProvider):
             for tool_use in mcp_tool_uses:
                 try:
                     result = await self._mcp_manager.call_tool(
-                        tool_use.name,
-                        dict(tool_use.input) if hasattr(tool_use, "input") else {}
+                        tool_use.name, dict(tool_use.input) if hasattr(tool_use, "input") else {}
                     )
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": tool_use.id,
-                        "content": result,
-                    })
+                    tool_results.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tool_use.id,
+                            "content": result,
+                        }
+                    )
                     logger.debug(f"MCP tool '{tool_use.name}' succeeded")
                 except Exception as e:
                     logger.error(f"MCP tool '{tool_use.name}' failed: {e}")
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": tool_use.id,
-                        "content": f"Error executing tool: {e}",
-                        "is_error": True,
-                    })
+                    tool_results.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tool_use.id,
+                            "content": f"Error executing tool: {e}",
+                            "is_error": True,
+                        }
+                    )
 
             # Build assistant message with the tool_use content
             # We need to serialize the content blocks properly
@@ -972,27 +973,35 @@ class ClaudeProvider(AgentProvider):
             for block in response.content:
                 if hasattr(block, "type"):
                     if block.type == "text":
-                        assistant_content.append({
-                            "type": "text",
-                            "text": block.text,
-                        })
+                        assistant_content.append(
+                            {
+                                "type": "text",
+                                "text": block.text,
+                            }
+                        )
                     elif block.type == "tool_use":
-                        assistant_content.append({
-                            "type": "tool_use",
-                            "id": block.id,
-                            "name": block.name,
-                            "input": dict(block.input) if hasattr(block, "input") else {},
-                        })
+                        assistant_content.append(
+                            {
+                                "type": "tool_use",
+                                "id": block.id,
+                                "name": block.name,
+                                "input": dict(block.input) if hasattr(block, "input") else {},
+                            }
+                        )
 
             # Add assistant response and tool results to message history
-            working_messages.append({
-                "role": "assistant",
-                "content": assistant_content,
-            })
-            working_messages.append({
-                "role": "user",
-                "content": tool_results,
-            })
+            working_messages.append(
+                {
+                    "role": "assistant",
+                    "content": assistant_content,
+                }
+            )
+            working_messages.append(
+                {
+                    "role": "user",
+                    "content": tool_results,
+                }
+            )
 
         # Max iterations exceeded
         raise ProviderError(

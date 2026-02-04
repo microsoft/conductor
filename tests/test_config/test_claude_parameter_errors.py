@@ -15,9 +15,7 @@ def test_temperature_out_of_range_low():
     """Verify temperature < 0 raises validation error."""
     with pytest.raises(ValidationError) as exc_info:
         RuntimeConfig(
-            provider="claude",
-            default_model="claude-3-5-sonnet-20241022",
-            temperature=-0.1
+            provider="claude", default_model="claude-3-5-sonnet-20241022", temperature=-0.1
         )
 
     errors = exc_info.value.errors()
@@ -28,9 +26,7 @@ def test_temperature_out_of_range_high():
     """Verify temperature > 1 raises validation error."""
     with pytest.raises(ValidationError) as exc_info:
         RuntimeConfig(
-            provider="claude",
-            default_model="claude-3-5-sonnet-20241022",
-            temperature=1.1
+            provider="claude", default_model="claude-3-5-sonnet-20241022", temperature=1.1
         )
 
     errors = exc_info.value.errors()
@@ -41,17 +37,13 @@ def test_temperature_at_boundaries():
     """Verify temperature at 0.0 and 1.0 boundaries is valid."""
     # Temperature = 0.0 should be valid
     config = RuntimeConfig(
-        provider="claude",
-        default_model="claude-3-5-sonnet-20241022",
-        temperature=0.0
+        provider="claude", default_model="claude-3-5-sonnet-20241022", temperature=0.0
     )
     assert config.temperature == 0.0
 
     # Temperature = 1.0 should be valid
     config = RuntimeConfig(
-        provider="claude",
-        default_model="claude-3-5-sonnet-20241022",
-        temperature=1.0
+        provider="claude", default_model="claude-3-5-sonnet-20241022", temperature=1.0
     )
     assert config.temperature == 1.0
 
@@ -59,11 +51,7 @@ def test_temperature_at_boundaries():
 def test_max_tokens_negative():
     """Verify negative max_tokens raises validation error."""
     with pytest.raises(ValidationError) as exc_info:
-        RuntimeConfig(
-            provider="claude",
-            default_model="claude-3-5-sonnet-20241022",
-            max_tokens=-1
-        )
+        RuntimeConfig(provider="claude", default_model="claude-3-5-sonnet-20241022", max_tokens=-1)
 
     errors = exc_info.value.errors()
     assert any("max_tokens" in str(e.get("loc", [])) for e in errors)
@@ -72,11 +60,7 @@ def test_max_tokens_negative():
 def test_max_tokens_zero():
     """Verify max_tokens=0 raises validation error."""
     with pytest.raises(ValidationError) as exc_info:
-        RuntimeConfig(
-            provider="claude",
-            default_model="claude-3-5-sonnet-20241022",
-            max_tokens=0
-        )
+        RuntimeConfig(provider="claude", default_model="claude-3-5-sonnet-20241022", max_tokens=0)
 
     errors = exc_info.value.errors()
     assert any("max_tokens" in str(e.get("loc", [])) for e in errors)
@@ -85,9 +69,7 @@ def test_max_tokens_zero():
 def test_max_tokens_valid():
     """Verify positive max_tokens is accepted."""
     config = RuntimeConfig(
-        provider="claude",
-        default_model="claude-3-5-sonnet-20241022",
-        max_tokens=4096
+        provider="claude", default_model="claude-3-5-sonnet-20241022", max_tokens=4096
     )
     assert config.max_tokens == 4096
 
@@ -109,10 +91,7 @@ def test_all_runtime_parameters_together():
 
 def test_parameters_default_to_none():
     """Verify optional parameters default to None when not specified."""
-    config = RuntimeConfig(
-        provider="copilot",
-        default_model="gpt-4"
-    )
+    config = RuntimeConfig(provider="copilot", default_model="gpt-4")
 
     assert config.temperature is None
     assert config.max_tokens is None

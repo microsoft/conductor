@@ -62,9 +62,7 @@ class MCPManager:
             ImportError: If MCP SDK is not installed.
         """
         if not MCP_SDK_AVAILABLE:
-            raise ImportError(
-                "MCP SDK not installed. Install with: uv add 'mcp>=1.0.0'"
-            )
+            raise ImportError("MCP SDK not installed. Install with: uv add 'mcp>=1.0.0'")
 
         self.sessions: dict[str, ClientSession] = {}
         self.tools: dict[str, list[dict[str, Any]]] = {}  # server -> tools
@@ -117,9 +115,7 @@ class MCPManager:
 
         try:
             # Enter the stdio_client context
-            transport = await self._exit_stack.enter_async_context(
-                stdio_client(server_params)
-            )
+            transport = await self._exit_stack.enter_async_context(stdio_client(server_params))
             read_stream, write_stream = transport
 
             # Create and initialize session

@@ -104,9 +104,7 @@ class TestBackwardCompatibility:
                 "description": "Test workflow",
                 "version": "1.0.0",
                 "entry_point": "agent1",
-                "runtime": {
-                    "provider": "copilot"
-                }
+                "runtime": {"provider": "copilot"},
             },
             "agents": [
                 {
@@ -114,9 +112,9 @@ class TestBackwardCompatibility:
                     "description": "Test agent",
                     "model": "haiku-4.5",
                     "prompt": "Test prompt",
-                    "routes": [{"to": "$end"}]
+                    "routes": [{"to": "$end"}],
                 }
-            ]
+            ],
         }
 
         # Validate the configuration
@@ -158,8 +156,7 @@ class TestBackwardCompatibility:
 
         # Verify runtime config is preserved
         assert (
-            reloaded_config.workflow.runtime.provider
-            == original_config.workflow.runtime.provider
+            reloaded_config.workflow.runtime.provider == original_config.workflow.runtime.provider
         )
 
         # Verify serialized dict does not contain optional fields when not set
@@ -192,9 +189,7 @@ class TestBackwardCompatibility:
                 "description": "Test workflow",
                 "version": "1.0.0",
                 "entry_point": "agent1",
-                "runtime": {
-                    "provider": "copilot"
-                }
+                "runtime": {"provider": "copilot"},
             },
             "agents": [
                 {
@@ -202,9 +197,9 @@ class TestBackwardCompatibility:
                     "description": "Test agent",
                     "model": "haiku-4.5",
                     "prompt": "Test prompt",
-                    "routes": [{"to": "$end"}]
+                    "routes": [{"to": "$end"}],
                 }
-            ]
+            ],
         }
 
         # Load configuration
@@ -231,9 +226,7 @@ class TestBackwardCompatibility:
                 "description": "Test workflow",
                 "version": "1.0.0",
                 "entry_point": "agent1",
-                "runtime": {
-                    "provider": "copilot"
-                }
+                "runtime": {"provider": "copilot"},
             },
             "agents": [
                 {
@@ -241,9 +234,9 @@ class TestBackwardCompatibility:
                     "description": "Test agent",
                     "model": "haiku-4.5",
                     "prompt": "Test prompt",
-                    "routes": [{"to": "$end"}]
+                    "routes": [{"to": "$end"}],
                 }
-            ]
+            ],
         }
 
         # Load configuration
@@ -349,7 +342,7 @@ class TestBackwardCompatibility:
                     temperature=0.7,
                     max_tokens=1024,
                     timeout=120.0,
-                )
+                ),
             ),
             agents=[
                 AgentDef(
@@ -358,9 +351,9 @@ class TestBackwardCompatibility:
                     model="claude-3-5-sonnet-latest",
                     prompt="Answer: What is 2+2?",
                     output={"answer": OutputField(type="string")},
-                    routes=[RouteDef(to="$end")]
+                    routes=[RouteDef(to="$end")],
                 )
-            ]
+            ],
         )
 
         # Verify schema validation passed and fields are set
@@ -401,9 +394,9 @@ class TestBackwardCompatibility:
                     "description": "Test agent",
                     "model": "haiku-4.5",
                     "prompt": "Test prompt",
-                    "routes": [{"to": "$end"}]
+                    "routes": [{"to": "$end"}],
                 }
-            ]
+            ],
         }
 
         # Load configuration
@@ -433,7 +426,7 @@ class TestBackwardCompatibility:
                 "entry_point": "agent1",
                 "runtime": {
                     # No provider field, should default to copilot
-                }
+                },
             },
             "agents": [
                 {
@@ -441,9 +434,9 @@ class TestBackwardCompatibility:
                     "description": "Test agent",
                     "model": "haiku-4.5",
                     "prompt": "Test prompt",
-                    "routes": [{"to": "$end"}]
+                    "routes": [{"to": "$end"}],
                 }
-            ]
+            ],
         }
 
         # Load configuration

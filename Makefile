@@ -23,9 +23,10 @@ test:
 test-cov:
 	uv run pytest --cov=conductor --cov-report=term-missing
 
-# Run linter
+# Run linter and formatter check
 lint:
 	uv run ruff check src tests
+	uv run ruff format --check src tests
 
 # Format code
 format:
@@ -56,4 +57,7 @@ run:
 
 # Validate example workflows
 validate-examples:
-	uv run conductor validate examples/*.yaml
+	@for file in examples/*.yaml; do \
+		echo "Validating $$file..."; \
+		uv run conductor validate "$$file" || exit 1; \
+	done

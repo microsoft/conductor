@@ -2068,9 +2068,7 @@ class TestClaudeProviderRetryLogic:
         mock_response.usage = Mock(input_tokens=10, output_tokens=20)
         mock_response.model = "claude-3-5-sonnet-latest"
 
-        mock_client.messages.create = AsyncMock(
-            side_effect=[MockRateLimitError(), mock_response]
-        )
+        mock_client.messages.create = AsyncMock(side_effect=[MockRateLimitError(), mock_response])
 
         mock_anthropic_class.return_value = mock_client
 
@@ -2287,9 +2285,7 @@ class TestClaudeProviderRetryLogic:
         mock_response.usage = Mock(input_tokens=10, output_tokens=20)
         mock_response.model = "claude-3-5-sonnet-latest"
 
-        mock_client.messages.create = AsyncMock(
-            side_effect=[MockRateLimitError(), mock_response]
-        )
+        mock_client.messages.create = AsyncMock(side_effect=[MockRateLimitError(), mock_response])
 
         mock_anthropic_class.return_value = mock_client
 
@@ -2306,4 +2302,3 @@ class TestClaudeProviderRetryLogic:
         # Verify retry-after header was used (delay should be 5.0)
         assert len(provider._retry_history) == 1
         assert provider._retry_history[0]["delay"] == 5.0
-

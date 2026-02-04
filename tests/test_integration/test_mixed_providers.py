@@ -436,4 +436,3 @@ agents:
         config = load_workflow(str(workflow_yaml))
         assert config.agents[0].provider is None
         assert config.workflow.runtime.provider == "claude"
-

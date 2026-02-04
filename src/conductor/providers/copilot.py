@@ -464,12 +464,12 @@ class CopilotProvider(AgentProvider):
                         # Accumulate usage from recovery calls
                         if recovery_response.input_tokens is not None:
                             total_input_tokens = (
-                                (total_input_tokens or 0) + recovery_response.input_tokens
-                            )
+                                total_input_tokens or 0
+                            ) + recovery_response.input_tokens
                         if recovery_response.output_tokens is not None:
                             total_output_tokens = (
-                                (total_output_tokens or 0) + recovery_response.output_tokens
-                            )
+                                total_output_tokens or 0
+                            ) + recovery_response.output_tokens
 
                 # All recovery attempts exhausted
                 expected_fields = list(agent.output.keys())

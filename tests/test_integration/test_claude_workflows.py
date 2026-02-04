@@ -106,9 +106,7 @@ def mock_claude_client():
             mock_client.messages.create = AsyncMock(side_effect=create_side_effect)
         else:
             # Single response
-            mock_client.messages.create = AsyncMock(
-                return_value=create_message_mock(responses)
-            )
+            mock_client.messages.create = AsyncMock(return_value=create_message_mock(responses))
 
         return mock_client
 
@@ -590,7 +588,7 @@ class TestErrorHandlingClaudeWorkflow:
                 error_data = error_responses["rate_limit"]
                 mock_response = Mock(
                     status_code=error_data["status_code"],
-                    headers={"retry-after": "0.01"}  # Short delay for test performance
+                    headers={"retry-after": "0.01"},  # Short delay for test performance
                 )
                 raise RateLimitError(
                     error_data["error"]["message"],

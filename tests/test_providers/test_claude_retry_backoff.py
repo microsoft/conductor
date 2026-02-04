@@ -172,9 +172,7 @@ class TestClaudeRetryBackoff:
 
         mock_response = Mock()
         mock_response.content = [mock_content_block]
-        mock_response.usage = Mock(
-            input_tokens=10, output_tokens=20, cache_creation_input_tokens=0
-        )
+        mock_response.usage = Mock(input_tokens=10, output_tokens=20, cache_creation_input_tokens=0)
         mock_response.model = "claude-3-5-sonnet-latest"
         mock_response.stop_reason = "end_turn"
         mock_response.id = "msg_123"
@@ -229,9 +227,7 @@ class TestClaudeRetryBackoff:
 
         mock_response = Mock()
         mock_response.content = [mock_content_block]
-        mock_response.usage = Mock(
-            input_tokens=10, output_tokens=20, cache_creation_input_tokens=0
-        )
+        mock_response.usage = Mock(input_tokens=10, output_tokens=20, cache_creation_input_tokens=0)
         mock_response.model = "claude-3-5-sonnet-latest"
         mock_response.stop_reason = "end_turn"
         mock_response.id = "msg_123"

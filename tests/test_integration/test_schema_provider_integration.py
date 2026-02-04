@@ -49,9 +49,7 @@ class TestSchemaToProviderIntegration:
         mock_message.role = "assistant"
         mock_message.model = "claude-3-5-sonnet-latest"
         mock_message.stop_reason = "end_turn"
-        mock_message.usage = Mock(
-            input_tokens=10, output_tokens=20, cache_creation_input_tokens=0
-        )
+        mock_message.usage = Mock(input_tokens=10, output_tokens=20, cache_creation_input_tokens=0)
         mock_message.content = [Mock(type="text", text='{"answer": "test"}')]
 
         mock_client.messages.create = AsyncMock(return_value=mock_message)
@@ -125,9 +123,7 @@ class TestSchemaToProviderIntegration:
         mock_message.role = "assistant"
         mock_message.model = "claude-3-5-sonnet-latest"
         mock_message.stop_reason = "end_turn"
-        mock_message.usage = Mock(
-            input_tokens=10, output_tokens=20, cache_creation_input_tokens=0
-        )
+        mock_message.usage = Mock(input_tokens=10, output_tokens=20, cache_creation_input_tokens=0)
         mock_message.content = [Mock(type="text", text='{"result": "ok"}')]
 
         mock_client.messages.create = AsyncMock(return_value=mock_message)
@@ -202,9 +198,7 @@ class TestSchemaToProviderIntegration:
         mock_message.role = "assistant"
         mock_message.model = "claude-3-5-sonnet-latest"
         mock_message.stop_reason = "end_turn"
-        mock_message.usage = Mock(
-            input_tokens=10, output_tokens=20, cache_creation_input_tokens=0
-        )
+        mock_message.usage = Mock(input_tokens=10, output_tokens=20, cache_creation_input_tokens=0)
         mock_message.content = [Mock(type="text", text='{"result": "ok"}')]
 
         mock_client.messages.create = AsyncMock(return_value=mock_message)
@@ -218,9 +212,7 @@ class TestSchemaToProviderIntegration:
                 description="Test agent overrides",
                 version="1.0.0",
                 entry_point="agent1",
-                runtime=RuntimeConfig(
-                    provider="claude", temperature=0.5, max_tokens=1024
-                ),
+                runtime=RuntimeConfig(provider="claude", temperature=0.5, max_tokens=1024),
             ),
             agents=[
                 AgentDef(

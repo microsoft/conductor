@@ -45,9 +45,7 @@ def create_response(content_blocks: list, msg_id: str = "msg_123") -> Mock:
     response.content = content_blocks
     response.model = "claude-3-5-sonnet-latest"
     response.stop_reason = "end_turn"
-    response.usage = Mock(
-        input_tokens=10, output_tokens=20, cache_creation_input_tokens=0
-    )
+    response.usage = Mock(input_tokens=10, output_tokens=20, cache_creation_input_tokens=0)
     response.type = "message"
     response.role = "assistant"
     return response
@@ -239,6 +237,7 @@ class TestClaudeParseRecovery:
 
         # Should raise an error after retries exhausted (ProviderError wraps the failure)
         from conductor.exceptions import ProviderError
+
         with pytest.raises((ExecutionError, ProviderError)):
             await provider.execute(agent, {"workflow": {"input": {}}}, "Test prompt")
 

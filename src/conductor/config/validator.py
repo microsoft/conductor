@@ -205,8 +205,8 @@ def _validate_input_references(
                     f"'{ref_parallel}' in input"
                 )
         # Note: We cannot validate the specific agent within the parallel group here
-            # as that would require knowing which agents are in which parallel groups
-            # That validation happens in _validate_parallel_groups
+        # as that would require knowing which agents are in which parallel groups
+        # That validation happens in _validate_parallel_groups
 
         # Check if referencing workflow input
         workflow_input = match.group("input")

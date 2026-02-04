@@ -27,9 +27,7 @@ def create_mock_response(content_dict: dict) -> Mock:
     response.content = [mock_content_block]
     response.model = "claude-3-5-sonnet-latest"
     response.stop_reason = "end_turn"
-    response.usage = Mock(
-        input_tokens=10, output_tokens=20, cache_creation_input_tokens=0
-    )
+    response.usage = Mock(input_tokens=10, output_tokens=20, cache_creation_input_tokens=0)
     response.type = "message"
     response.role = "assistant"
     return response
@@ -124,9 +122,7 @@ async def test_parse_recovery_latency():
     mock_response.content = [text_block]
     mock_response.model = "claude-3-5-sonnet-latest"
     mock_response.stop_reason = "end_turn"
-    mock_response.usage = Mock(
-        input_tokens=10, output_tokens=20, cache_creation_input_tokens=0
-    )
+    mock_response.usage = Mock(input_tokens=10, output_tokens=20, cache_creation_input_tokens=0)
     mock_response.type = "message"
     mock_response.role = "assistant"
 

@@ -982,9 +982,7 @@ class TestMaxIterationsWorkflowIntegration:
         assert error.max_iterations == 2
 
     @pytest.mark.asyncio
-    async def test_skip_gates_auto_stops(
-        self, looping_workflow_config: WorkflowConfig
-    ) -> None:
+    async def test_skip_gates_auto_stops(self, looping_workflow_config: WorkflowConfig) -> None:
         """Test that skip_gates mode auto-stops without prompting."""
 
         def mock_handler(agent, prompt, context):

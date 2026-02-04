@@ -23,9 +23,7 @@ class TestClaudeParameterPassing:
 
     @pytest.mark.asyncio
     @patch("conductor.providers.factory.ClaudeProvider")
-    async def test_common_parameters_passed_from_factory(
-        self, mock_claude_class: Mock
-    ) -> None:
+    async def test_common_parameters_passed_from_factory(self, mock_claude_class: Mock) -> None:
         """Test that factory passes common parameters to provider."""
         mock_instance = Mock()
         mock_instance.validate_connection = AsyncMock(return_value=True)
@@ -63,9 +61,7 @@ class TestClaudeParameterPassing:
 
         # Mock successful response
         mock_response = Mock()
-        mock_response.content = [
-            Mock(type="text", text="Test response")
-        ]
+        mock_response.content = [Mock(type="text", text="Test response")]
         mock_response.usage = Mock(input_tokens=10, output_tokens=20)
         mock_client.messages.create = AsyncMock(return_value=mock_response)
         mock_anthropic_class.return_value = mock_client
@@ -109,9 +105,7 @@ class TestClaudeParameterPassing:
 
         # Mock successful response
         mock_response = Mock()
-        mock_response.content = [
-            Mock(type="text", text="Test response")
-        ]
+        mock_response.content = [Mock(type="text", text="Test response")]
         mock_response.usage = Mock(input_tokens=10, output_tokens=20)
         mock_client.messages.create = AsyncMock(return_value=mock_response)
         mock_anthropic_class.return_value = mock_client
@@ -163,11 +157,7 @@ class TestClaudeParameterPassing:
         provider = ClaudeProvider(model="claude-3-5-sonnet-latest")
 
         # Execute agent with different model
-        agent = AgentDef(
-            name="test_agent",
-            prompt="Test prompt",
-            model="claude-3-opus-20240229"
-        )
+        agent = AgentDef(name="test_agent", prompt="Test prompt", model="claude-3-opus-20240229")
         context = {}
         rendered_prompt = "Test prompt"
 
