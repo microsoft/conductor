@@ -1,0 +1,2 @@
+This file has spaces in its filename.
+It should be handled correctly by the file input system.

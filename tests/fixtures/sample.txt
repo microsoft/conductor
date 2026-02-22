@@ -1,0 +1,3 @@
+This is a sample text file for testing file input support.
+It contains multiple lines of plain ASCII text.
+This should be read correctly without any encoding issues.

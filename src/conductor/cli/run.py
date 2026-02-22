@@ -566,15 +566,78 @@ def parse_input_flags(raw_inputs: list[str]) -> dict[str, Any]:
     return inputs
 
 
+def _read_file_input(file_path_str: str) -> str:
+    """Read contents from a file path for input parameter.
+
+    Args:
+        file_path_str: Path to the file (relative or absolute).
+
+    Returns:
+        File contents as string.
+
+    Raises:
+        typer.BadParameter: If file doesn't exist, isn't readable, or has encoding issues.
+    """
+    file_path = Path(file_path_str)
+
+    # Validate file exists
+    if not file_path.exists():
+        raise typer.BadParameter(
+            f"File not found: {file_path}\n"
+            f"Expected file at: {file_path.absolute()}"
+        )
+
+    # Validate it's a file (not directory)
+    if not file_path.is_file():
+        raise typer.BadParameter(
+            f"Path is not a file: {file_path}\n"
+            f"Use @filepath to reference file contents."
+        )
+
+    # Try to read with UTF-8, fallback to other encodings
+    encodings_to_try = ["utf-8", "utf-8-sig", "latin-1", "cp1252"]
+
+    for encoding in encodings_to_try:
+        try:
+            return file_path.read_text(encoding=encoding)
+        except UnicodeDecodeError:
+            continue
+        except PermissionError as e:
+            raise typer.BadParameter(f"Permission denied reading file: {file_path}") from e
+        except OSError as e:
+            raise typer.BadParameter(f"Error reading file {file_path}: {e}") from e
+
+    # If all encodings fail, raise error
+    raise typer.BadParameter(
+        f"Unable to decode file {file_path} with any supported encoding.\n"
+        f"Tried: {', '.join(encodings_to_try)}"
+    )
+
+
 def coerce_value(value: str) -> Any:
     """Coerce a string value to an appropriate Python type.
+
+    Supports file path references with @ prefix:
+        @filepath - Read contents from file
+        @@filepath - Literal '@filepath' string (escaped)
 
     Args:
         value: The string value to coerce.
 
     Returns:
-        The coerced value (bool, int, float, list, dict, or str).
+        The coerced value (bool, int, float, list, dict, str, or file contents).
+
+    Raises:
+        typer.BadParameter: If file path is invalid or file cannot be read.
     """
+    # Handle escaped @ (@@filepath -> @filepath literal)
+    if value.startswith("@@"):
+        return value[1:]  # Remove one @
+
+    # Handle file path references (@filepath)
+    if value.startswith("@"):
+        return _read_file_input(value[1:])
+
     # Handle booleans
     if value.lower() == "true":
         return True
