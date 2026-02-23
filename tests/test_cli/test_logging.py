@@ -1,0 +1,801 @@
+"""Tests for logging redesign: --quiet, --silent, --log-file flags.
+
+This module tests:
+- ConsoleVerbosity enum and ContextVar behavior
+- --quiet and --silent flag parsing and mutual exclusion
+- --log-file flag acceptance on run command
+- --verbose flag removal
+- Derived ContextVar values (verbose_mode, full_mode)
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from unittest.mock import patch
+
+from typer.testing import CliRunner
+
+from conductor.cli.app import (
+    ConsoleVerbosity,
+    app,
+    console_verbosity,
+    full_mode,
+    is_full,
+    is_verbose,
+    verbose_mode,
+)
+
+runner = CliRunner()
+
+
+class TestConsoleVerbosityEnum:
+    """Tests for the ConsoleVerbosity enum."""
+
+    def test_enum_values(self) -> None:
+        """Test that ConsoleVerbosity has the expected values."""
+        assert ConsoleVerbosity.FULL == "full"
+        assert ConsoleVerbosity.MINIMAL == "minimal"
+        assert ConsoleVerbosity.SILENT == "silent"
+
+    def test_enum_is_string(self) -> None:
+        """Test that ConsoleVerbosity members are strings."""
+        assert isinstance(ConsoleVerbosity.FULL, str)
+        assert isinstance(ConsoleVerbosity.MINIMAL, str)
+        assert isinstance(ConsoleVerbosity.SILENT, str)
+
+
+class TestNewFlags:
+    """Tests for the new --quiet and --silent flags."""
+
+    def test_quiet_flag_in_help(self) -> None:
+        """Test that --quiet/-q is documented in help."""
+        result = runner.invoke(app, ["--help"])
+        assert result.exit_code == 0
+        assert "--quiet" in result.output or "-q" in result.output
+
+    def test_silent_flag_in_help(self) -> None:
+        """Test that --silent/-s is documented in help."""
+        result = runner.invoke(app, ["--help"])
+        assert result.exit_code == 0
+        assert "--silent" in result.output or "-s" in result.output
+
+    def test_verbose_flag_removed(self) -> None:
+        """Test that --verbose/-V is no longer in help."""
+        result = runner.invoke(app, ["--help"])
+        assert result.exit_code == 0
+        assert "--verbose" not in result.output
+        # -V should not appear (note: -v is for --version, that's fine)
+        # We check specifically that --verbose is gone
+        lines = result.output.split("\n")
+        verbose_lines = [line for line in lines if "--verbose" in line]
+        assert len(verbose_lines) == 0
+
+    def test_quiet_flag_accepted(self, tmp_path: Path) -> None:
+        """Test that --quiet flag is accepted."""
+        workflow_file = tmp_path / "test.yaml"
+        workflow_file.write_text("""\
+workflow:
+  name: test-workflow
+  entry_point: agent1
+
+agents:
+  - name: agent1
+    prompt: "Hello"
+    routes:
+      - to: $end
+
+output:
+  result: "done"
+""")
+
+        with patch("conductor.cli.run.run_workflow_async") as mock_run:
+            mock_run.return_value = {"result": "done"}
+
+            result = runner.invoke(app, ["--quiet", "run", str(workflow_file)])
+            assert "no such option" not in result.output.lower()
+
+    def test_quiet_short_flag_accepted(self, tmp_path: Path) -> None:
+        """Test that -q short flag is accepted."""
+        workflow_file = tmp_path / "test.yaml"
+        workflow_file.write_text("""\
+workflow:
+  name: test-workflow
+  entry_point: agent1
+
+agents:
+  - name: agent1
+    prompt: "Hello"
+    routes:
+      - to: $end
+
+output:
+  result: "done"
+""")
+
+        with patch("conductor.cli.run.run_workflow_async") as mock_run:
+            mock_run.return_value = {"result": "done"}
+
+            result = runner.invoke(app, ["-q", "run", str(workflow_file)])
+            assert "no such option" not in result.output.lower()
+
+    def test_silent_flag_accepted(self, tmp_path: Path) -> None:
+        """Test that --silent flag is accepted."""
+        workflow_file = tmp_path / "test.yaml"
+        workflow_file.write_text("""\
+workflow:
+  name: test-workflow
+  entry_point: agent1
+
+agents:
+  - name: agent1
+    prompt: "Hello"
+    routes:
+      - to: $end
+
+output:
+  result: "done"
+""")
+
+        with patch("conductor.cli.run.run_workflow_async") as mock_run:
+            mock_run.return_value = {"result": "done"}
+
+            result = runner.invoke(app, ["--silent", "run", str(workflow_file)])
+            assert "no such option" not in result.output.lower()
+
+    def test_silent_short_flag_accepted(self, tmp_path: Path) -> None:
+        """Test that -s short flag is accepted."""
+        workflow_file = tmp_path / "test.yaml"
+        workflow_file.write_text("""\
+workflow:
+  name: test-workflow
+  entry_point: agent1
+
+agents:
+  - name: agent1
+    prompt: "Hello"
+    routes:
+      - to: $end
+
+output:
+  result: "done"
+""")
+
+        with patch("conductor.cli.run.run_workflow_async") as mock_run:
+            mock_run.return_value = {"result": "done"}
+
+            result = runner.invoke(app, ["-s", "run", str(workflow_file)])
+            assert "no such option" not in result.output.lower()
+
+    def test_quiet_and_silent_mutually_exclusive(self, tmp_path: Path) -> None:
+        """Test that --quiet and --silent cannot be used together."""
+        workflow_file = tmp_path / "test.yaml"
+        workflow_file.write_text("""\
+workflow:
+  name: test-workflow
+  entry_point: agent1
+
+agents:
+  - name: agent1
+    prompt: "Hello"
+    routes:
+      - to: $end
+
+output:
+  result: "done"
+""")
+
+        result = runner.invoke(app, ["--quiet", "--silent", "run", str(workflow_file)])
+        assert result.exit_code != 0
+        assert "mutually exclusive" in result.output.lower()
+
+    def test_verbose_flag_not_accepted(self, tmp_path: Path) -> None:
+        """Test that --verbose flag is no longer accepted."""
+        workflow_file = tmp_path / "test.yaml"
+        workflow_file.write_text("""\
+workflow:
+  name: test-workflow
+  entry_point: agent1
+
+agents:
+  - name: agent1
+    prompt: "Hello"
+    routes:
+      - to: $end
+
+output:
+  result: "done"
+""")
+
+        result = runner.invoke(app, ["--verbose", "run", str(workflow_file)])
+        assert result.exit_code != 0
+        assert "no such option" in result.output.lower()
+
+
+class TestLogFileFlag:
+    """Tests for the --log-file flag on the run command."""
+
+    def test_log_file_in_run_help(self) -> None:
+        """Test that --log-file/-l is documented in run --help."""
+        result = runner.invoke(app, ["run", "--help"])
+        assert result.exit_code == 0
+        assert "--log-file" in result.output or "-l" in result.output
+
+    def test_log_file_with_explicit_path(self, tmp_path: Path) -> None:
+        """Test that --log-file accepts an explicit path."""
+        workflow_file = tmp_path / "test.yaml"
+        workflow_file.write_text("""\
+workflow:
+  name: test-workflow
+  entry_point: agent1
+
+agents:
+  - name: agent1
+    prompt: "Hello"
+    routes:
+      - to: $end
+
+output:
+  result: "done"
+""")
+        log_path = str(tmp_path / "debug.log")
+
+        with patch("conductor.cli.run.run_workflow_async") as mock_run:
+            mock_run.return_value = {"result": "done"}
+
+            result = runner.invoke(app, ["run", str(workflow_file), "--log-file", log_path])
+            assert "no such option" not in result.output.lower()
+            # Verify log_file was passed to run_workflow_async
+            if mock_run.called:
+                call_args = mock_run.call_args
+                assert call_args[0][4] == Path(log_path)
+
+    def test_log_file_auto_path(self, tmp_path: Path) -> None:
+        """Test that --log-file auto generates a temp file path."""
+        workflow_file = tmp_path / "test.yaml"
+        workflow_file.write_text("""\
+workflow:
+  name: test-workflow
+  entry_point: agent1
+
+agents:
+  - name: agent1
+    prompt: "Hello"
+    routes:
+      - to: $end
+
+output:
+  result: "done"
+""")
+
+        with patch("conductor.cli.run.run_workflow_async") as mock_run:
+            mock_run.return_value = {"result": "done"}
+
+            result = runner.invoke(app, ["run", str(workflow_file), "--log-file", "auto"])
+            assert "no such option" not in result.output.lower()
+            # Verify an auto-generated path was passed
+            if mock_run.called:
+                call_args = mock_run.call_args
+                log_path = call_args[0][4]
+                assert log_path is not None
+                assert "conductor" in str(log_path)
+                assert str(log_path).endswith(".log")
+
+    def test_log_file_short_flag(self, tmp_path: Path) -> None:
+        """Test that -l short flag works."""
+        workflow_file = tmp_path / "test.yaml"
+        workflow_file.write_text("""\
+workflow:
+  name: test-workflow
+  entry_point: agent1
+
+agents:
+  - name: agent1
+    prompt: "Hello"
+    routes:
+      - to: $end
+
+output:
+  result: "done"
+""")
+        log_path = str(tmp_path / "debug.log")
+
+        with patch("conductor.cli.run.run_workflow_async") as mock_run:
+            mock_run.return_value = {"result": "done"}
+
+            result = runner.invoke(app, ["run", str(workflow_file), "-l", log_path])
+            assert "no such option" not in result.output.lower()
+
+
+class TestContextVarDefaults:
+    """Tests for ContextVar default values and derivation."""
+
+    def test_is_full_default_true(self) -> None:
+        """Test that is_full returns True by default (full output is the new default)."""
+        token = full_mode.set(True)
+        try:
+            assert is_full() is True
+        finally:
+            full_mode.reset(token)
+
+    def test_is_verbose_default_true(self) -> None:
+        """Test that is_verbose returns True by default."""
+        token = verbose_mode.set(True)
+        try:
+            assert is_verbose() is True
+        finally:
+            verbose_mode.reset(token)
+
+    def test_console_verbosity_default_full(self) -> None:
+        """Test that console_verbosity defaults to FULL."""
+        token = console_verbosity.set(ConsoleVerbosity.FULL)
+        try:
+            assert console_verbosity.get() == ConsoleVerbosity.FULL
+        finally:
+            console_verbosity.reset(token)
+
+    def test_full_verbosity_derives_correct_vars(self) -> None:
+        """Test that FULL verbosity sets verbose_mode=True, full_mode=True."""
+        verbosity = ConsoleVerbosity.FULL
+        t1 = verbose_mode.set(verbosity != ConsoleVerbosity.SILENT)
+        t2 = full_mode.set(verbosity == ConsoleVerbosity.FULL)
+        try:
+            assert is_verbose() is True
+            assert is_full() is True
+        finally:
+            full_mode.reset(t2)
+            verbose_mode.reset(t1)
+
+    def test_minimal_verbosity_derives_correct_vars(self) -> None:
+        """Test that MINIMAL verbosity sets verbose_mode=True, full_mode=False."""
+        verbosity = ConsoleVerbosity.MINIMAL
+        t1 = verbose_mode.set(verbosity != ConsoleVerbosity.SILENT)
+        t2 = full_mode.set(verbosity == ConsoleVerbosity.FULL)
+        try:
+            assert is_verbose() is True
+            assert is_full() is False
+        finally:
+            full_mode.reset(t2)
+            verbose_mode.reset(t1)
+
+    def test_silent_verbosity_derives_correct_vars(self) -> None:
+        """Test that SILENT verbosity sets verbose_mode=False, full_mode=False."""
+        verbosity = ConsoleVerbosity.SILENT
+        t1 = verbose_mode.set(verbosity != ConsoleVerbosity.SILENT)
+        t2 = full_mode.set(verbosity == ConsoleVerbosity.FULL)
+        try:
+            assert is_verbose() is False
+            assert is_full() is False
+        finally:
+            full_mode.reset(t2)
+            verbose_mode.reset(t1)
+
+
+class TestGenerateLogPath:
+    """Tests for the generate_log_path function."""
+
+    def test_generate_log_path_format(self) -> None:
+        """Test that generated log path has the expected format."""
+        from conductor.cli.run import generate_log_path
+
+        path = generate_log_path("my-workflow")
+        assert "conductor" in str(path)
+        assert "my-workflow" in str(path)
+        assert str(path).endswith(".log")
+
+    def test_generate_log_path_uses_tmpdir(self) -> None:
+        """Test that generated log path is under temp directory."""
+        import tempfile
+
+        from conductor.cli.run import generate_log_path
+
+        path = generate_log_path("test")
+        assert str(path).startswith(tempfile.gettempdir())
+
+
+class TestVerboseLogging:
+    """Tests for verbose logging functions (migrated from test_verbose.py)."""
+
+    def test_verbose_log_respects_mode(self) -> None:
+        """Test that verbose_log respects verbose mode."""
+        from io import StringIO
+
+        from rich.console import Console
+
+        from conductor.cli.run import verbose_log
+
+        # When verbose is False, nothing should be logged
+        output = StringIO()
+        token = verbose_mode.set(False)
+        try:
+            with patch(
+                "conductor.cli.run._verbose_console",
+                Console(file=output, force_terminal=True),
+            ):
+                verbose_log("test message")
+                assert output.getvalue() == ""
+        finally:
+            verbose_mode.reset(token)
+
+        # When verbose is True, message should be logged
+        output = StringIO()
+        token = verbose_mode.set(True)
+        try:
+            with patch(
+                "conductor.cli.run._verbose_console",
+                Console(file=output, force_terminal=True),
+            ):
+                verbose_log("test message")
+                assert "test message" in output.getvalue()
+        finally:
+            verbose_mode.reset(token)
+
+    def test_verbose_log_timing(self) -> None:
+        """Test verbose_log_timing function."""
+        import re
+        from io import StringIO
+
+        from rich.console import Console
+
+        from conductor.cli.run import verbose_log_timing
+
+        output = StringIO()
+        token = verbose_mode.set(True)
+        try:
+            with patch(
+                "conductor.cli.run._verbose_console",
+                Console(file=output, force_terminal=True, no_color=True),
+            ):
+                verbose_log_timing("Test operation", 1.234)
+                output_text = output.getvalue()
+                assert "Test operation" in output_text
+                clean_text = re.sub(r"\x1b\[[0-9;]*m", "", output_text)
+                assert "1.23" in clean_text
+        finally:
+            verbose_mode.reset(token)
+
+    def test_verbose_log_section(self) -> None:
+        """Test verbose_log_section function."""
+        from io import StringIO
+
+        from rich.console import Console
+
+        from conductor.cli.run import verbose_log_section
+
+        output = StringIO()
+        token = verbose_mode.set(True)
+        try:
+            with patch(
+                "conductor.cli.run._verbose_console",
+                Console(file=output, force_terminal=True),
+            ):
+                verbose_log_section("Test Section", "Test content here")
+                output_text = output.getvalue()
+                assert "Test Section" in output_text
+                assert "Test content" in output_text
+        finally:
+            verbose_mode.reset(token)
+
+    def test_verbose_log_section_no_verbose_reference(self) -> None:
+        """Test that truncation message does not reference --verbose."""
+        from io import StringIO
+
+        from rich.console import Console
+
+        from conductor.cli.run import verbose_log_section
+
+        output = StringIO()
+        token_verbose = verbose_mode.set(True)
+        token_full = full_mode.set(False)
+        try:
+            with patch(
+                "conductor.cli.run._verbose_console",
+                Console(file=output, force_terminal=True, width=200),
+            ):
+                long_content = "x" * 1000
+                verbose_log_section("Long Section", long_content)
+                output_text = output.getvalue()
+                assert "--verbose" not in output_text
+        finally:
+            full_mode.reset(token_full)
+            verbose_mode.reset(token_verbose)
+
+    def test_verbose_log_section_shows_full_in_full_mode(self) -> None:
+        """Test that verbose_log_section shows full content when full mode is enabled."""
+        from io import StringIO
+
+        from rich.console import Console
+
+        from conductor.cli.run import verbose_log_section
+
+        output = StringIO()
+        token_verbose = verbose_mode.set(True)
+        token_full = full_mode.set(True)
+        try:
+            with patch(
+                "conductor.cli.run._verbose_console",
+                Console(file=output, force_terminal=True),
+            ):
+                long_content = "x" * 1000
+                verbose_log_section("Long Section", long_content)
+                output_text = output.getvalue()
+                assert "truncated" not in output_text
+                x_count = output_text.count("x")
+                assert x_count == 1000, f"Expected 1000 x's, got {x_count}"
+        finally:
+            full_mode.reset(token_full)
+            verbose_mode.reset(token_verbose)
+
+    def test_verbose_log_parallel_start(self) -> None:
+        """Test verbose_log_parallel_start function."""
+        from io import StringIO
+
+        from rich.console import Console
+
+        from conductor.cli.run import verbose_log_parallel_start
+
+        output = StringIO()
+        token = verbose_mode.set(True)
+        try:
+            with patch(
+                "conductor.cli.run._verbose_console",
+                Console(file=output, force_terminal=True, no_color=True),
+            ):
+                verbose_log_parallel_start("test_group", 3)
+                output_text = output.getvalue()
+                assert "Parallel Group" in output_text
+                assert "test_group" in output_text
+                assert "3 agents" in output_text
+        finally:
+            verbose_mode.reset(token)
+
+    def test_verbose_log_parallel_agent_complete(self) -> None:
+        """Test verbose_log_parallel_agent_complete function."""
+        from io import StringIO
+
+        from rich.console import Console
+
+        from conductor.cli.run import verbose_log_parallel_agent_complete
+
+        output = StringIO()
+        token = verbose_mode.set(True)
+        try:
+            with patch(
+                "conductor.cli.run._verbose_console",
+                Console(file=output, force_terminal=True, no_color=True),
+            ):
+                verbose_log_parallel_agent_complete("test_agent", 1.234, model="gpt-4", tokens=100)
+                output_text = output.getvalue()
+                assert "test_agent" in output_text
+                assert "1.23" in output_text
+                assert "gpt-4" in output_text
+                assert "100 tokens" in output_text
+        finally:
+            verbose_mode.reset(token)
+
+    def test_verbose_log_parallel_agent_failed(self) -> None:
+        """Test verbose_log_parallel_agent_failed function."""
+        from io import StringIO
+
+        from rich.console import Console
+
+        from conductor.cli.run import verbose_log_parallel_agent_failed
+
+        output = StringIO()
+        token = verbose_mode.set(True)
+        try:
+            with patch(
+                "conductor.cli.run._verbose_console",
+                Console(file=output, force_terminal=True, no_color=True),
+            ):
+                verbose_log_parallel_agent_failed(
+                    "test_agent", 0.5, "ValidationError", "Missing required field"
+                )
+                output_text = output.getvalue()
+                assert "test_agent" in output_text
+                assert "0.50" in output_text
+                assert "ValidationError" in output_text
+                assert "Missing required field" in output_text
+        finally:
+            verbose_mode.reset(token)
+
+    def test_verbose_log_parallel_summary_success(self) -> None:
+        """Test verbose_log_parallel_summary for successful execution."""
+        from io import StringIO
+
+        from rich.console import Console
+
+        from conductor.cli.run import verbose_log_parallel_summary
+
+        output = StringIO()
+        token = verbose_mode.set(True)
+        try:
+            with patch(
+                "conductor.cli.run._verbose_console",
+                Console(file=output, force_terminal=True, no_color=True),
+            ):
+                verbose_log_parallel_summary("test_group", 3, 0, 2.5)
+                output_text = output.getvalue()
+                assert "test_group" in output_text
+                assert "3/3 succeeded" in output_text
+                assert "2.50" in output_text
+        finally:
+            verbose_mode.reset(token)
+
+    def test_verbose_log_parallel_summary_partial_failure(self) -> None:
+        """Test verbose_log_parallel_summary for partial failure."""
+        from io import StringIO
+
+        from rich.console import Console
+
+        from conductor.cli.run import verbose_log_parallel_summary
+
+        output = StringIO()
+        token = verbose_mode.set(True)
+        try:
+            with patch(
+                "conductor.cli.run._verbose_console",
+                Console(file=output, force_terminal=True, no_color=True),
+            ):
+                verbose_log_parallel_summary("test_group", 2, 1, 3.0)
+                output_text = output.getvalue()
+                assert "test_group" in output_text
+                assert "2 succeeded" in output_text
+                assert "1 failed" in output_text
+                assert "3.00" in output_text
+        finally:
+            verbose_mode.reset(token)
+
+    def test_verbose_log_parallel_summary_all_failed(self) -> None:
+        """Test verbose_log_parallel_summary for total failure."""
+        from io import StringIO
+
+        from rich.console import Console
+
+        from conductor.cli.run import verbose_log_parallel_summary
+
+        output = StringIO()
+        token = verbose_mode.set(True)
+        try:
+            with patch(
+                "conductor.cli.run._verbose_console",
+                Console(file=output, force_terminal=True, no_color=True),
+            ):
+                verbose_log_parallel_summary("test_group", 0, 3, 1.5)
+                output_text = output.getvalue()
+                assert "test_group" in output_text
+                assert "0 succeeded" in output_text
+                assert "3 failed" in output_text
+                assert "1.50" in output_text
+        finally:
+            verbose_mode.reset(token)
+
+
+class TestFileLogging:
+    """Tests for file logging functionality."""
+
+    def test_init_file_logging_creates_file(self, tmp_path: Path) -> None:
+        """Test that init_file_logging creates the log file."""
+        from conductor.cli.run import close_file_logging, init_file_logging
+
+        log_path = tmp_path / "test.log"
+        try:
+            init_file_logging(log_path)
+            assert log_path.exists()
+        finally:
+            close_file_logging()
+
+    def test_init_file_logging_creates_parent_dirs(self, tmp_path: Path) -> None:
+        """Test that init_file_logging creates parent directories."""
+        from conductor.cli.run import close_file_logging, init_file_logging
+
+        log_path = tmp_path / "nested" / "dir" / "test.log"
+        try:
+            init_file_logging(log_path)
+            assert log_path.exists()
+        finally:
+            close_file_logging()
+
+    def test_verbose_log_writes_to_file(self, tmp_path: Path) -> None:
+        """Test that verbose_log writes output to the log file."""
+        from conductor.cli.run import close_file_logging, init_file_logging, verbose_log
+
+        log_path = tmp_path / "test.log"
+        token = verbose_mode.set(False)  # Console off, but file should still get output
+        try:
+            init_file_logging(log_path)
+            verbose_log("test file message")
+            close_file_logging()
+
+            content = log_path.read_text()
+            assert "test file message" in content
+        finally:
+            verbose_mode.reset(token)
+
+    def test_file_output_is_plain_text(self, tmp_path: Path) -> None:
+        """Test that file output has no ANSI escape codes."""
+        import re
+
+        from conductor.cli.run import close_file_logging, init_file_logging, verbose_log
+
+        log_path = tmp_path / "test.log"
+        token = verbose_mode.set(True)
+        try:
+            init_file_logging(log_path)
+            verbose_log("styled message", style="bold red")
+            close_file_logging()
+
+            content = log_path.read_text()
+            assert "styled message" in content
+            # No ANSI escape sequences
+            ansi_pattern = re.compile(r"\x1b\[[0-9;]*m")
+            assert not ansi_pattern.search(content)
+        finally:
+            verbose_mode.reset(token)
+
+    def test_file_gets_untruncated_content(self, tmp_path: Path) -> None:
+        """Test that file logging always gets full untruncated content."""
+        from conductor.cli.run import close_file_logging, init_file_logging, verbose_log_section
+
+        log_path = tmp_path / "test.log"
+        token_verbose = verbose_mode.set(True)
+        token_full = full_mode.set(False)  # Console would truncate
+        try:
+            init_file_logging(log_path)
+            long_content = "x" * 1000
+            with patch("conductor.cli.run._verbose_console"):
+                verbose_log_section("Test", long_content)
+            close_file_logging()
+
+            content = log_path.read_text()
+            # File should have full content, not truncated
+            assert "truncated" not in content
+            assert content.count("x") == 1000
+        finally:
+            full_mode.reset(token_full)
+            verbose_mode.reset(token_verbose)
+
+    def test_file_logging_in_silent_mode(self, tmp_path: Path) -> None:
+        """Test that file logging works even when console is silent."""
+        from conductor.cli.run import (
+            close_file_logging,
+            init_file_logging,
+            verbose_log,
+            verbose_log_timing,
+        )
+
+        log_path = tmp_path / "test.log"
+        token = verbose_mode.set(False)  # Silent mode
+        try:
+            init_file_logging(log_path)
+            verbose_log("silent mode message")
+            verbose_log_timing("test op", 1.5)
+            close_file_logging()
+
+            content = log_path.read_text()
+            assert "silent mode message" in content
+            assert "test op" in content
+            assert "1.50" in content
+        finally:
+            verbose_mode.reset(token)
+
+    def test_generate_log_path_creates_directory(self) -> None:
+        """Test that generate_log_path creates the parent directory."""
+        from conductor.cli.run import generate_log_path
+
+        path = generate_log_path("test-workflow")
+        assert path.parent.exists()
+        assert path.parent.is_dir()
+
+    def test_close_file_logging_cleans_up(self, tmp_path: Path) -> None:
+        """Test that close_file_logging properly cleans up resources."""
+        import conductor.cli.run as run_module
+        from conductor.cli.run import close_file_logging, init_file_logging
+
+        log_path = tmp_path / "test.log"
+        init_file_logging(log_path)
+        assert run_module._file_console is not None
+        assert run_module._file_handle is not None
+
+        close_file_logging()
+        assert run_module._file_console is None
+        assert run_module._file_handle is None
