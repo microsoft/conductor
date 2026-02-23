@@ -336,6 +336,8 @@ Update all existing tests. Add new tests for `--quiet`, `--silent`, `--log-file`
 
 ### Epic 2: Verbosity-Aware Console Output
 
+**Status: DONE**
+
 **Goal:** Update all `verbose_log_*` functions to distinguish between FULL and MINIMAL output. FULL shows everything (prompts, tool args, tool results). MINIMAL shows only agent lifecycle and routing.
 
 **Prerequisites:** Epic 1
@@ -344,20 +346,22 @@ Update all existing tests. Add new tests for `--quiet`, `--silent`, `--log-file`
 
 | Task ID | Type | Description | Files | Status |
 |---------|------|-------------|-------|--------|
-| E2-T1 | IMPL | Update `verbose_log_section()`: remove 500-char truncation entirely (full is default now). In MINIMAL mode, skip sections entirely. Remove truncation message referencing `--verbose`. | `src/conductor/cli/run.py` | TO DO |
-| E2-T2 | IMPL | Update `verbose_log()`: in MINIMAL mode, still show general messages (these are lifecycle-level). In SILENT mode, suppress all. No behavior change for FULL. | `src/conductor/cli/run.py` | TO DO |
-| E2-T3 | IMPL | Verify `verbose_log_agent_start()`, `verbose_log_agent_complete()`, `verbose_log_route()`, `verbose_log_timing()` work in both FULL and MINIMAL modes (they should — they already check `is_verbose()` which is True for both). | `src/conductor/cli/run.py` | TO DO |
-| E2-T4 | IMPL | Update `_log_event_verbose()` in copilot.py: in FULL mode, show tool args, results, reasoning (currently gated on `full_mode`). In MINIMAL mode, show only tool names. Behavior is already correct since it receives `full_enabled` boolean. Verify no changes needed. | `src/conductor/providers/copilot.py` | TO DO |
-| E2-T5 | IMPL | Update `_verbose_log_section()` in `executor/agent.py` — since it delegates to `run.py`, just verify the wrapper passes through correctly. No truncation parameter changes needed. | `src/conductor/executor/agent.py` | TO DO |
-| E2-T6 | TEST | Add tests verifying: FULL mode shows prompt sections, MINIMAL mode hides prompt sections but shows agent lifecycle, SILENT mode shows nothing. | `tests/test_cli/test_logging.py` | TO DO |
-| E2-T7 | TEST | Update `test_verbose_log_section_truncates_by_default` — truncation no longer happens by default (full is default). Either remove or invert this test. | `tests/test_cli/test_logging.py` | TO DO |
+| E2-T1 | IMPL | Update `verbose_log_section()`: remove 500-char truncation entirely (full is default now). In MINIMAL mode, skip sections entirely. Remove truncation message referencing `--verbose`. | `src/conductor/cli/run.py` | DONE |
+| E2-T2 | IMPL | Update `verbose_log()`: in MINIMAL mode, still show general messages (these are lifecycle-level). In SILENT mode, suppress all. No behavior change for FULL. | `src/conductor/cli/run.py` | DONE |
+| E2-T3 | IMPL | Verify `verbose_log_agent_start()`, `verbose_log_agent_complete()`, `verbose_log_route()`, `verbose_log_timing()` work in both FULL and MINIMAL modes (they should — they already check `is_verbose()` which is True for both). | `src/conductor/cli/run.py` | DONE |
+| E2-T4 | IMPL | Update `_log_event_verbose()` in copilot.py: in FULL mode, show tool args, results, reasoning (currently gated on `full_mode`). In MINIMAL mode, show only tool names. Behavior is already correct since it receives `full_enabled` boolean. Verify no changes needed. | `src/conductor/providers/copilot.py` | DONE |
+| E2-T5 | IMPL | Update `_verbose_log_section()` in `executor/agent.py` — since it delegates to `run.py`, just verify the wrapper passes through correctly. No truncation parameter changes needed. | `src/conductor/executor/agent.py` | DONE |
+| E2-T6 | TEST | Add tests verifying: FULL mode shows prompt sections, MINIMAL mode hides prompt sections but shows agent lifecycle, SILENT mode shows nothing. | `tests/test_cli/test_logging.py` | DONE |
+| E2-T7 | TEST | Update `test_verbose_log_section_truncates_by_default` — truncation no longer happens by default (full is default). Either remove or invert this test. | `tests/test_cli/test_logging.py` | DONE |
 
 **Acceptance Criteria:**
-- [ ] Default run shows full untruncated prompts (no "truncated" message)
-- [ ] `--quiet` run shows agent start/complete and routing but not prompts or tool details
-- [ ] `--silent` run shows no progress output
-- [ ] No "use --verbose for full" message anywhere in the codebase
-- [ ] Tool event logging in copilot.py respects the new semantics
+- [x] Default run shows full untruncated prompts (no "truncated" message)
+- [x] `--quiet` run shows agent start/complete and routing but not prompts or tool details
+- [x] `--silent` run shows no progress output
+- [x] No "use --verbose for full" message anywhere in the codebase
+- [x] Tool event logging in copilot.py respects the new semantics
+
+**Completion Notes:** Updated `verbose_log_section()` to gate console output on `is_full()` in addition to `is_verbose()`, so MINIMAL mode (--quiet) skips sections entirely. Removed the 500-char truncation logic and `truncate` parameter — no longer needed since FULL is default and MINIMAL skips sections. The `_verbose_log_section` wrapper in `executor/agent.py` and `_log_event_verbose` in `copilot.py` were verified to already work correctly. Added 10 new tests for FULL/MINIMAL/SILENT behavior, replaced 3 existing section tests. All 1109 tests pass (excluding pre-existing failures in deprecated test_verbose.py).
 
 ---
 

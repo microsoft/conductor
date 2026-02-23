@@ -257,30 +257,27 @@ def verbose_log_route(target: str) -> None:
         _file_console.print(text)
 
 
-def verbose_log_section(title: str, content: str, truncate: bool = True) -> None:
-    """Log a section with title if verbose mode is enabled.
+def verbose_log_section(title: str, content: str) -> None:
+    """Log a section with title if full verbose mode is enabled.
+
+    Sections contain detailed content like prompts and tool arguments.
+    They are shown in FULL mode (default) but skipped in MINIMAL mode (--quiet).
+    File logging always receives full content regardless of console verbosity.
 
     Args:
         title: Section title.
         content: Section content.
-        truncate: If True, truncate content to 500 chars unless full mode is enabled.
     """
     from conductor.cli.app import is_full, is_verbose
 
-    should_console = is_verbose()
+    # Sections are detail-level: show on console only in FULL mode
+    should_console = is_verbose() and is_full()
     should_file = _file_console is not None
     if not should_console and not should_file:
         return
 
     if should_console:
-        display_content = content
-        # Truncate content unless full mode is enabled or truncate is False
-        if truncate and not is_full() and len(content) > 500:
-            display_content = content[:500] + "\n... [truncated, use default mode for full output]"
-
-        _verbose_console.print(
-            Panel(display_content, title=f"[cyan]{title}[/cyan]", border_style="dim")
-        )
+        _verbose_console.print(Panel(content, title=f"[cyan]{title}[/cyan]", border_style="dim"))
 
     # File always gets full untruncated content
     if should_file:

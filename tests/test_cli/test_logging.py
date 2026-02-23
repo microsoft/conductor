@@ -454,7 +454,7 @@ class TestVerboseLogging:
             verbose_mode.reset(token)
 
     def test_verbose_log_section(self) -> None:
-        """Test verbose_log_section function."""
+        """Test verbose_log_section function in FULL mode."""
         from io import StringIO
 
         from rich.console import Console
@@ -462,7 +462,8 @@ class TestVerboseLogging:
         from conductor.cli.run import verbose_log_section
 
         output = StringIO()
-        token = verbose_mode.set(True)
+        token_verbose = verbose_mode.set(True)
+        token_full = full_mode.set(True)
         try:
             with patch(
                 "conductor.cli.run._verbose_console",
@@ -473,10 +474,11 @@ class TestVerboseLogging:
                 assert "Test Section" in output_text
                 assert "Test content" in output_text
         finally:
-            verbose_mode.reset(token)
+            full_mode.reset(token_full)
+            verbose_mode.reset(token_verbose)
 
-    def test_verbose_log_section_no_verbose_reference(self) -> None:
-        """Test that truncation message does not reference --verbose."""
+    def test_verbose_log_section_skipped_in_minimal_mode(self) -> None:
+        """Test that verbose_log_section skips console output in MINIMAL mode."""
         from io import StringIO
 
         from rich.console import Console
@@ -485,22 +487,45 @@ class TestVerboseLogging:
 
         output = StringIO()
         token_verbose = verbose_mode.set(True)
-        token_full = full_mode.set(False)
+        token_full = full_mode.set(False)  # MINIMAL mode
         try:
             with patch(
                 "conductor.cli.run._verbose_console",
                 Console(file=output, force_terminal=True, width=200),
             ):
-                long_content = "x" * 1000
-                verbose_log_section("Long Section", long_content)
+                verbose_log_section("Long Section", "x" * 1000)
                 output_text = output.getvalue()
-                assert "--verbose" not in output_text
+                # In MINIMAL mode, sections are not shown on console at all
+                assert output_text == ""
+        finally:
+            full_mode.reset(token_full)
+            verbose_mode.reset(token_verbose)
+
+    def test_verbose_log_section_skipped_in_silent_mode(self) -> None:
+        """Test that verbose_log_section skips console output in SILENT mode."""
+        from io import StringIO
+
+        from rich.console import Console
+
+        from conductor.cli.run import verbose_log_section
+
+        output = StringIO()
+        token_verbose = verbose_mode.set(False)  # SILENT mode
+        token_full = full_mode.set(False)
+        try:
+            with patch(
+                "conductor.cli.run._verbose_console",
+                Console(file=output, force_terminal=True),
+            ):
+                verbose_log_section("Test Section", "Test content here")
+                output_text = output.getvalue()
+                assert output_text == ""
         finally:
             full_mode.reset(token_full)
             verbose_mode.reset(token_verbose)
 
     def test_verbose_log_section_shows_full_in_full_mode(self) -> None:
-        """Test that verbose_log_section shows full content when full mode is enabled."""
+        """Test that verbose_log_section shows full untruncated content in FULL mode."""
         from io import StringIO
 
         from rich.console import Console
@@ -799,3 +824,232 @@ class TestFileLogging:
         close_file_logging()
         assert run_module._file_console is None
         assert run_module._file_handle is None
+
+
+class TestVerbosityAwareOutput:
+    """Tests for verbosity-aware console output (Epic 2).
+
+    Verifies that FULL mode shows everything, MINIMAL mode shows only
+    agent lifecycle/routing, and SILENT mode suppresses all progress.
+    """
+
+    def test_full_mode_shows_sections(self) -> None:
+        """Test that FULL mode shows prompt sections on console."""
+        from io import StringIO
+
+        from rich.console import Console
+
+        from conductor.cli.run import verbose_log_section
+
+        output = StringIO()
+        token_verbose = verbose_mode.set(True)
+        token_full = full_mode.set(True)
+        try:
+            with patch(
+                "conductor.cli.run._verbose_console",
+                Console(file=output, force_terminal=True),
+            ):
+                verbose_log_section("Prompt for 'agent1'", "Hello world prompt")
+                output_text = output.getvalue()
+                assert "Prompt for 'agent1'" in output_text
+                assert "Hello world prompt" in output_text
+        finally:
+            full_mode.reset(token_full)
+            verbose_mode.reset(token_verbose)
+
+    def test_minimal_mode_hides_sections(self) -> None:
+        """Test that MINIMAL mode (--quiet) hides prompt sections."""
+        from io import StringIO
+
+        from rich.console import Console
+
+        from conductor.cli.run import verbose_log_section
+
+        output = StringIO()
+        token_verbose = verbose_mode.set(True)
+        token_full = full_mode.set(False)
+        try:
+            with patch(
+                "conductor.cli.run._verbose_console",
+                Console(file=output, force_terminal=True),
+            ):
+                verbose_log_section("Prompt for 'agent1'", "Hello world prompt")
+                assert output.getvalue() == ""
+        finally:
+            full_mode.reset(token_full)
+            verbose_mode.reset(token_verbose)
+
+    def test_minimal_mode_shows_agent_lifecycle(self) -> None:
+        """Test that MINIMAL mode shows agent start/complete messages."""
+        from io import StringIO
+
+        from rich.console import Console
+
+        from conductor.cli.run import verbose_log_agent_complete, verbose_log_agent_start
+
+        output = StringIO()
+        token_verbose = verbose_mode.set(True)
+        token_full = full_mode.set(False)
+        try:
+            with patch(
+                "conductor.cli.run._verbose_console",
+                Console(file=output, force_terminal=True, no_color=True),
+            ):
+                verbose_log_agent_start("test-agent", 1)
+                verbose_log_agent_complete("test-agent", 1.5, model="gpt-4")
+                output_text = output.getvalue()
+                assert "test-agent" in output_text
+        finally:
+            full_mode.reset(token_full)
+            verbose_mode.reset(token_verbose)
+
+    def test_minimal_mode_shows_routing(self) -> None:
+        """Test that MINIMAL mode shows routing decisions."""
+        from io import StringIO
+
+        from rich.console import Console
+
+        from conductor.cli.run import verbose_log_route
+
+        output = StringIO()
+        token_verbose = verbose_mode.set(True)
+        token_full = full_mode.set(False)
+        try:
+            with patch(
+                "conductor.cli.run._verbose_console",
+                Console(file=output, force_terminal=True, no_color=True),
+            ):
+                verbose_log_route("agent2")
+                output_text = output.getvalue()
+                assert "agent2" in output_text
+        finally:
+            full_mode.reset(token_full)
+            verbose_mode.reset(token_verbose)
+
+    def test_minimal_mode_shows_timing(self) -> None:
+        """Test that MINIMAL mode shows timing information."""
+        import re
+        from io import StringIO
+
+        from rich.console import Console
+
+        from conductor.cli.run import verbose_log_timing
+
+        output = StringIO()
+        token_verbose = verbose_mode.set(True)
+        token_full = full_mode.set(False)
+        try:
+            with patch(
+                "conductor.cli.run._verbose_console",
+                Console(file=output, force_terminal=True, no_color=True),
+            ):
+                verbose_log_timing("Workflow", 2.5)
+                output_text = output.getvalue()
+                clean_text = re.sub(r"\x1b\[[0-9;]*m", "", output_text)
+                assert "Workflow" in clean_text
+                assert "2.50" in clean_text
+        finally:
+            full_mode.reset(token_full)
+            verbose_mode.reset(token_verbose)
+
+    def test_minimal_mode_shows_general_log(self) -> None:
+        """Test that MINIMAL mode shows general verbose_log messages."""
+        from io import StringIO
+
+        from rich.console import Console
+
+        from conductor.cli.run import verbose_log
+
+        output = StringIO()
+        token_verbose = verbose_mode.set(True)
+        token_full = full_mode.set(False)
+        try:
+            with patch(
+                "conductor.cli.run._verbose_console",
+                Console(file=output, force_terminal=True),
+            ):
+                verbose_log("lifecycle message")
+                output_text = output.getvalue()
+                assert "lifecycle message" in output_text
+        finally:
+            full_mode.reset(token_full)
+            verbose_mode.reset(token_verbose)
+
+    def test_silent_mode_hides_everything(self) -> None:
+        """Test that SILENT mode suppresses all progress output."""
+        from io import StringIO
+
+        from rich.console import Console
+
+        from conductor.cli.run import (
+            verbose_log,
+            verbose_log_agent_complete,
+            verbose_log_agent_start,
+            verbose_log_route,
+            verbose_log_section,
+            verbose_log_timing,
+        )
+
+        output = StringIO()
+        token_verbose = verbose_mode.set(False)
+        token_full = full_mode.set(False)
+        try:
+            with patch(
+                "conductor.cli.run._verbose_console",
+                Console(file=output, force_terminal=True),
+            ):
+                verbose_log("should not appear")
+                verbose_log_section("Title", "content")
+                verbose_log_agent_start("agent1", 1)
+                verbose_log_agent_complete("agent1", 1.0)
+                verbose_log_route("agent2")
+                verbose_log_timing("op", 1.0)
+                assert output.getvalue() == ""
+        finally:
+            full_mode.reset(token_full)
+            verbose_mode.reset(token_verbose)
+
+    def test_file_gets_sections_in_minimal_mode(self, tmp_path: Path) -> None:
+        """Test that file logging gets sections even when console is in MINIMAL mode."""
+        from conductor.cli.run import close_file_logging, init_file_logging, verbose_log_section
+
+        log_path = tmp_path / "test.log"
+        token_verbose = verbose_mode.set(True)
+        token_full = full_mode.set(False)  # MINIMAL mode - console skips sections
+        try:
+            init_file_logging(log_path)
+            with patch("conductor.cli.run._verbose_console"):
+                verbose_log_section("Prompt", "full prompt content here")
+            close_file_logging()
+
+            content = log_path.read_text()
+            assert "Prompt" in content
+            assert "full prompt content here" in content
+        finally:
+            full_mode.reset(token_full)
+            verbose_mode.reset(token_verbose)
+
+    def test_no_truncation_in_default_mode(self) -> None:
+        """Test that default (FULL) mode never truncates content."""
+        from io import StringIO
+
+        from rich.console import Console
+
+        from conductor.cli.run import verbose_log_section
+
+        output = StringIO()
+        token_verbose = verbose_mode.set(True)
+        token_full = full_mode.set(True)
+        try:
+            with patch(
+                "conductor.cli.run._verbose_console",
+                Console(file=output, force_terminal=True),
+            ):
+                long_content = "x" * 2000
+                verbose_log_section("Long Prompt", long_content)
+                output_text = output.getvalue()
+                assert "truncated" not in output_text
+                assert output_text.count("x") == 2000
+        finally:
+            full_mode.reset(token_full)
+            verbose_mode.reset(token_verbose)
