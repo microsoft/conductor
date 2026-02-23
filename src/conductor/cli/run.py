@@ -166,7 +166,7 @@ def verbose_log_agent_start(agent_name: str, iteration: int) -> None:
     if should_console:
         _verbose_console.print()  # Empty line before agent
         _verbose_console.print(text)
-    if should_file:
+    if _file_console is not None:
         _file_console.print()
         _file_console.print(text)
 
@@ -224,7 +224,7 @@ def verbose_log_agent_complete(
 
     if should_console:
         _verbose_console.print(text)
-    if should_file:
+    if _file_console is not None:
         _file_console.print(text)
 
 
@@ -253,7 +253,7 @@ def verbose_log_route(target: str) -> None:
 
     if should_console:
         _verbose_console.print(text)
-    if should_file:
+    if _file_console is not None:
         _file_console.print(text)
 
 
@@ -280,7 +280,7 @@ def verbose_log_section(title: str, content: str) -> None:
         _verbose_console.print(Panel(content, title=f"[cyan]{title}[/cyan]", border_style="dim"))
 
     # File always gets full untruncated content
-    if should_file:
+    if _file_console is not None:
         _file_console.print(Panel(content, title=title, border_style="dim"))
 
 
@@ -324,7 +324,7 @@ def verbose_log_parallel_start(group_name: str, agent_count: int) -> None:
     if should_console:
         _verbose_console.print()
         _verbose_console.print(text)
-    if should_file:
+    if _file_console is not None:
         _file_console.print()
         _file_console.print(text)
 
@@ -370,7 +370,7 @@ def verbose_log_parallel_agent_complete(
 
     if should_console:
         _verbose_console.print(text)
-    if should_file:
+    if _file_console is not None:
         _file_console.print(text)
 
 
@@ -406,7 +406,7 @@ def verbose_log_parallel_agent_failed(
     if should_console:
         _verbose_console.print(text)
         _verbose_console.print(error_msg, style="red dim")
-    if should_file:
+    if _file_console is not None:
         _file_console.print(text)
         _file_console.print(error_msg)
 
@@ -457,7 +457,7 @@ def verbose_log_parallel_summary(
 
     if should_console:
         _verbose_console.print(text)
-    if should_file:
+    if _file_console is not None:
         _file_console.print(text)
 
 
@@ -495,7 +495,7 @@ def verbose_log_for_each_start(
     if should_console:
         _verbose_console.print()
         _verbose_console.print(text)
-    if should_file:
+    if _file_console is not None:
         _file_console.print()
         _file_console.print(text)
 
@@ -537,7 +537,7 @@ def verbose_log_for_each_item_complete(
 
     if should_console:
         _verbose_console.print(text)
-    if should_file:
+    if _file_console is not None:
         _file_console.print(text)
 
 
@@ -573,7 +573,7 @@ def verbose_log_for_each_item_failed(
     if should_console:
         _verbose_console.print(text)
         _verbose_console.print(error_msg, style="red dim")
-    if should_file:
+    if _file_console is not None:
         _file_console.print(text)
         _file_console.print(error_msg)
 
@@ -622,7 +622,7 @@ def verbose_log_for_each_summary(
 
     if should_console:
         _verbose_console.print(text)
-    if should_file:
+    if _file_console is not None:
         _file_console.print(text)
 
 
@@ -645,7 +645,7 @@ def display_usage_summary(usage_data: dict[str, Any], console: Console | None = 
     targets: list[Console] = []
     if should_console:
         targets.append(output_console)
-    if should_file:
+    if _file_console is not None:
         targets.append(_file_console)
 
     def _print(*args: Any, **kwargs: Any) -> None:

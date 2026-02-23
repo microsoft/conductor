@@ -883,7 +883,7 @@ agents:
 1. Check agent prompt is valid for the item structure
 2. Verify items match expected schema
 3. Test with a small sample first
-4. Check verbose logs: `conductor run --verbose`
+4. Check verbose logs: `conductor run --log-file debug.log`
 
 ### Memory Issues with Large Arrays
 

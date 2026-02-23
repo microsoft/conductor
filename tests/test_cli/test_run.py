@@ -267,7 +267,7 @@ class TestInputCollector:
             "--provider",
             "copilot",
             "--input.name=Alice",
-            "--verbose",
+            "--quiet",
         ]
         result = InputCollector.extract_from_args(args)
         assert result == {"name": "Alice"}

@@ -401,6 +401,8 @@ Update all existing tests. Add new tests for `--quiet`, `--silent`, `--log-file`
 
 ### Epic 4: Test Migration & Cleanup
 
+**Status: DONE**
+
 **Goal:** Remove old test file, ensure all existing tests pass with new defaults, clean up any remaining references to `--verbose`.
 
 **Prerequisites:** Epic 3
@@ -409,16 +411,18 @@ Update all existing tests. Add new tests for `--quiet`, `--silent`, `--log-file`
 
 | Task ID | Type | Description | Files | Status |
 |---------|------|-------------|-------|--------|
-| E4-T1 | TEST | Delete `tests/test_cli/test_verbose.py`. All test coverage has been migrated to `tests/test_cli/test_logging.py` in prior epics. | `tests/test_cli/test_verbose.py` | TO DO |
-| E4-T2 | TEST | Update `tests/test_cli/test_e2e.py` — grep for any `--verbose` or `-V` references and update to new flags. | `tests/test_cli/test_e2e.py` | TO DO |
-| E4-T3 | TEST | Update `tests/test_cli/test_run.py` — update `run_workflow_async` mock calls if signature changed (new `log_file` param). | `tests/test_cli/test_run.py` | TO DO |
-| E4-T4 | TEST | Verify `tests/test_integration/test_for_each_verbose.py` passes without changes (it mocks the wrapper functions, which still exist). | `tests/test_integration/test_for_each_verbose.py` | TO DO |
-| E4-T5 | IMPL | Grep entire codebase for "use --verbose" or "--verbose" string literals and remove/update any remaining references (help text, error messages, comments). | Multiple | TO DO |
-| E4-T6 | TEST | Run full test suite (`make test`), linter (`make lint`), and type checker (`make typecheck`). Fix any failures. | — | TO DO |
+| E4-T1 | TEST | Delete `tests/test_cli/test_verbose.py`. All test coverage has been migrated to `tests/test_cli/test_logging.py` in prior epics. | `tests/test_cli/test_verbose.py` | DONE |
+| E4-T2 | TEST | Update `tests/test_cli/test_e2e.py` — grep for any `--verbose` or `-V` references and update to new flags. | `tests/test_cli/test_e2e.py` | DONE |
+| E4-T3 | TEST | Update `tests/test_cli/test_run.py` — update `run_workflow_async` mock calls if signature changed (new `log_file` param). | `tests/test_cli/test_run.py` | DONE |
+| E4-T4 | TEST | Verify `tests/test_integration/test_for_each_verbose.py` passes without changes (it mocks the wrapper functions, which still exist). | `tests/test_integration/test_for_each_verbose.py` | DONE |
+| E4-T5 | IMPL | Grep entire codebase for "use --verbose" or "--verbose" string literals and remove/update any remaining references (help text, error messages, comments). | Multiple | DONE |
+| E4-T6 | TEST | Run full test suite (`make test`), linter (`make lint`), and type checker (`make typecheck`). Fix any failures. | — | DONE |
 
 **Acceptance Criteria:**
-- [ ] `make test` passes with 0 failures
-- [ ] `make lint` passes
-- [ ] `make typecheck` passes
-- [ ] No references to `--verbose` or `-V` flag remain in source code (except changelog/docs noting the removal)
-- [ ] `tests/test_cli/test_verbose.py` is deleted
+- [x] `make test` passes with 0 failures
+- [x] `make lint` passes
+- [x] `make typecheck` passes
+- [x] No references to `--verbose` or `-V` flag remain in source code (except changelog/docs noting the removal)
+- [x] `tests/test_cli/test_verbose.py` is deleted
+
+**Completion Notes:** Deleted `tests/test_cli/test_verbose.py` (19 tests, 5 of which were already failing). Updated `tests/test_cli/test_run.py` to replace `"--verbose"` with `"--quiet"` in `test_extract_ignores_other_flags`. No changes needed in `test_e2e.py` (no `--verbose` references) or `test_for_each_verbose.py` (passes unchanged). Updated user-facing docs: `docs/cli-reference.md` (replaced `--verbose` option and examples with `--quiet`/`--silent`/`--log-file`) and `docs/dynamic-parallel.md` (replaced troubleshooting reference). Fixed 18 type checker diagnostics in `src/conductor/cli/run.py` by replacing `if should_file:` guards with `if _file_console is not None:` for proper type narrowing. All 1131 tests pass, lint passes, typecheck passes.
