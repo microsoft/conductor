@@ -28,7 +28,7 @@ conductor run <workflow.yaml> [OPTIONS]
 | `--skip-gates` | | Auto-select first option at human gates |
 | `--quiet` | `-q` | Minimal output (agent lifecycle and routing only) |
 | `--silent` | `-s` | No progress output (JSON result only) |
-| `--log-file [PATH]` | `-l` | Write full debug output to a file |
+| `--log-file <auto\|PATH>` | `-l` | Write full debug output to a file |
 
 ### Examples
 

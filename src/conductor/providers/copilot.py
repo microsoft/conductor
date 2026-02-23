@@ -955,7 +955,7 @@ class CopilotProvider(AgentProvider):
                             f"{self._idle_recovery_config.idle_timeout_seconds}s "
                             "despite recovery prompts. This may indicate a persistent issue "
                             "with the SDK, network connection, or the agent's ability to "
-                            "complete the task. Check verbose output (-V) for details."
+                            "complete the task. Enable --log-file to capture full debug output."
                         ),
                         is_retryable=False,  # Don't retry at provider level
                     ) from e
