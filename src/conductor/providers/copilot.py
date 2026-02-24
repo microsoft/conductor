@@ -715,7 +715,14 @@ class CopilotProvider(AgentProvider):
         from rich.console import Console
         from rich.text import Text
 
+        from conductor.cli.run import _file_console
+
         console = Console(stderr=True, highlight=False)
+
+        def _print(renderable: Any) -> None:
+            console.print(renderable)
+            if _file_console is not None:
+                _file_console.print(renderable)
 
         # Log interesting events with Rich styling
         if event_type == "tool.execution_start":
@@ -727,7 +734,7 @@ class CopilotProvider(AgentProvider):
             text.append("    ├─ ", style="dim")
             text.append("🔧 ", style="")
             text.append(tool_name, style="cyan bold")
-            console.print(text)
+            _print(text)
 
             # In full mode, try to show arguments
             if full_mode:
@@ -739,7 +746,7 @@ class CopilotProvider(AgentProvider):
                     arg_text.append("    │     ", style="dim")
                     arg_text.append("args: ", style="dim italic")
                     arg_text.append(args_preview, style="dim")
-                    console.print(arg_text)
+                    _print(arg_text)
 
         elif event_type == "tool.execution_complete":
             # tool.execution_complete may not have tool name, just acknowledge completion
@@ -749,7 +756,7 @@ class CopilotProvider(AgentProvider):
                 text.append("    │  ", style="dim")
                 text.append("✓ ", style="green")
                 text.append(tool_name, style="dim")
-                console.print(text)
+                _print(text)
 
             # In full mode, try to show result preview
             if full_mode:
@@ -764,7 +771,7 @@ class CopilotProvider(AgentProvider):
                     result_text.append("    │     ", style="dim")
                     result_text.append("result: ", style="dim italic")
                     result_text.append(result_preview, style="dim")
-                    console.print(result_text)
+                    _print(result_text)
 
         elif event_type == "assistant.reasoning":
             # Only show reasoning in full mode
@@ -780,7 +787,7 @@ class CopilotProvider(AgentProvider):
                     text.append("    │  ", style="dim")
                     text.append("💭 ", style="")
                     text.append(display_reasoning.replace("\n", " "), style="italic dim")
-                    console.print(text)
+                    _print(text)
 
         elif event_type == "subagent.started":
             agent_name = getattr(event.data, "name", "unknown")
@@ -789,7 +796,7 @@ class CopilotProvider(AgentProvider):
             text.append("🤖 ", style="")
             text.append("Sub-agent: ", style="dim")
             text.append(agent_name, style="magenta bold")
-            console.print(text)
+            _print(text)
 
         elif event_type == "subagent.completed":
             agent_name = getattr(event.data, "name", "unknown")
@@ -797,7 +804,7 @@ class CopilotProvider(AgentProvider):
             text.append("    │  ", style="dim")
             text.append("✓ ", style="green")
             text.append(f"Sub-agent done: {agent_name}", style="dim")
-            console.print(text)
+            _print(text)
 
         elif event_type == "assistant.turn_start":
             # Only show processing indicator in full mode
@@ -808,7 +815,7 @@ class CopilotProvider(AgentProvider):
                 text.append("    │  ", style="dim")
                 text.append("⏳ ", style="yellow")
                 text.append(f"Processing{turn_info}...", style="dim italic")
-                console.print(text)
+                _print(text)
 
     def _build_recovery_prompt(
         self,
@@ -948,7 +955,7 @@ class CopilotProvider(AgentProvider):
                             f"{self._idle_recovery_config.idle_timeout_seconds}s "
                             "despite recovery prompts. This may indicate a persistent issue "
                             "with the SDK, network connection, or the agent's ability to "
-                            "complete the task. Check verbose output (-V) for details."
+                            "complete the task. Enable --log-file to capture full debug output."
                         ),
                         is_retryable=False,  # Don't retry at provider level
                     ) from e

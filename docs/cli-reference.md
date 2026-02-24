@@ -26,7 +26,9 @@ conductor run <workflow.yaml> [OPTIONS]
 | `--provider PROVIDER` | `-p` | Override provider (copilot, claude) |
 | `--dry-run` | | Show execution plan without running |
 | `--skip-gates` | | Auto-select first option at human gates |
-| `--verbose` | `-V` | Show detailed execution progress |
+| `--quiet` | `-q` | Minimal output (agent lifecycle and routing only) |
+| `--silent` | `-s` | No progress output (JSON result only) |
+| `--log-file <auto\|PATH>` | `-l` | Write full debug output to a file |
 
 ### Examples
 
@@ -59,11 +61,11 @@ conductor run workflow.yaml -p copilot
 # Preview execution plan without running
 conductor run workflow.yaml --dry-run
 
-# Verbose output for debugging
-conductor -V run workflow.yaml --input question="Test"
+# Quiet output (agent lifecycle only)
+conductor run workflow.yaml --quiet --input question="Test"
 
-# Combine dry-run with verbose
-conductor -V run workflow.yaml --dry-run
+# Write full debug log to a file
+conductor run workflow.yaml --log-file debug.log
 ```
 
 #### Automation Mode
@@ -72,8 +74,8 @@ conductor -V run workflow.yaml --dry-run
 # Skip human gates (auto-select first option)
 conductor run workflow.yaml --skip-gates
 
-# Useful for CI/CD pipelines
-conductor run workflow.yaml --skip-gates --input question="Automated test"
+# CI/CD pattern: silent console + full file log
+conductor run workflow.yaml --silent --log-file auto --skip-gates --input question="Automated test"
 ```
 
 #### Complex Inputs

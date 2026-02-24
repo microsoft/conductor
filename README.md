@@ -143,7 +143,9 @@ conductor run <workflow.yaml> [OPTIONS]
 | `-p, --provider PROVIDER` | Override provider |
 | `--dry-run` | Preview execution plan |
 | `--skip-gates` | Auto-select at human gates |
-| `-V, --verbose` | Show detailed progress |
+| `-q, --quiet` | Suppress progress output |
+| `-s, --silent` | Suppress all output except errors |
+| `-l, --log-file PATH` | Write logs to file |
 
 ### `conductor validate`
 

@@ -6,6 +6,7 @@ This module defines the main Typer app and global options.
 from __future__ import annotations
 
 import contextvars
+from enum import Enum
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -15,6 +16,15 @@ from rich.panel import Panel
 from rich.text import Text
 
 from conductor import __version__
+
+
+class ConsoleVerbosity(str, Enum):
+    """Console output verbosity level."""
+
+    FULL = "full"  # Default: everything, untruncated
+    MINIMAL = "minimal"  # Agent lifecycle + routing + timing only
+    SILENT = "silent"  # No progress output at all
+
 
 # Create the main Typer app
 app = typer.Typer(
@@ -31,8 +41,13 @@ output_console = Console()
 # Context variable for verbose mode (default True - show progress output)
 verbose_mode: contextvars.ContextVar[bool] = contextvars.ContextVar("verbose_mode", default=True)
 
-# Context variable for full verbose mode (--verbose flag - show full details)
-full_mode: contextvars.ContextVar[bool] = contextvars.ContextVar("full_mode", default=False)
+# Context variable for full verbose mode (default True - show full details)
+full_mode: contextvars.ContextVar[bool] = contextvars.ContextVar("full_mode", default=True)
+
+# Context variable for console verbosity level
+console_verbosity: contextvars.ContextVar[ConsoleVerbosity] = contextvars.ContextVar(
+    "console_verbosity", default=ConsoleVerbosity.FULL
+)
 
 
 def is_verbose() -> bool:
@@ -41,10 +56,11 @@ def is_verbose() -> bool:
 
 
 def is_full() -> bool:
-    """Check if full verbose mode is enabled (--verbose flag).
+    """Check if full verbose mode is enabled.
 
-    When full mode is enabled, prompts are shown untruncated and
+    Full mode is the default. When enabled, prompts are shown untruncated and
     additional details like tool arguments and reasoning are displayed.
+    Use --quiet to disable full mode while keeping progress output.
     """
     return full_mode.get()
 
@@ -149,17 +165,35 @@ def main(
             is_eager=True,
         ),
     ] = False,
-    verbose: Annotated[
+    quiet: Annotated[
         bool,
         typer.Option(
-            "--verbose",
-            "-V",
-            help="Show full prompts and detailed tool call information.",
+            "--quiet",
+            "-q",
+            help="Minimal output: agent lifecycle and routing only.",
+        ),
+    ] = False,
+    silent: Annotated[
+        bool,
+        typer.Option(
+            "--silent",
+            "-s",
+            help="No progress output. Only JSON result on stdout.",
         ),
     ] = False,
 ) -> None:
     """Conductor - Orchestrate multi-agent workflows defined in YAML."""
-    full_mode.set(verbose)
+    if quiet and silent:
+        raise typer.BadParameter("--quiet and --silent are mutually exclusive")
+    if silent:
+        verbosity = ConsoleVerbosity.SILENT
+    elif quiet:
+        verbosity = ConsoleVerbosity.MINIMAL
+    else:
+        verbosity = ConsoleVerbosity.FULL
+    console_verbosity.set(verbosity)
+    verbose_mode.set(verbosity != ConsoleVerbosity.SILENT)
+    full_mode.set(verbosity == ConsoleVerbosity.FULL)
 
 
 @app.command()
@@ -205,6 +239,17 @@ def run(
             help="Auto-select first option at human gates (for automation).",
         ),
     ] = False,
+    log_file: Annotated[
+        str | None,
+        typer.Option(
+            "--log-file",
+            "-l",
+            help=(
+                "Write full debug output to a file. "
+                "Pass a file path or 'auto' for auto-generated temp file."
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Run a workflow from a YAML file.
 
@@ -219,6 +264,9 @@ def run(
         conductor run workflow.yaml --provider copilot
         conductor run workflow.yaml --dry-run
         conductor run workflow.yaml --skip-gates
+        conductor run workflow.yaml --log-file auto
+        conductor run workflow.yaml --log-file debug.log
+        conductor run workflow.yaml --silent --log-file auto
     """
     import asyncio
     import json
@@ -228,6 +276,7 @@ def run(
         InputCollector,
         build_dry_run_plan,
         display_execution_plan,
+        generate_log_path,
         parse_input_flags,
         run_workflow_async,
     )
@@ -252,9 +301,19 @@ def run(
     # Also parse --input.name=value style from sys.argv
     inputs.update(InputCollector.extract_from_args())
 
+    # Resolve log file path
+    resolved_log_file: Path | None = None
+    if log_file is not None:
+        if log_file.lower() == "auto":
+            resolved_log_file = generate_log_path(workflow.stem)
+        else:
+            resolved_log_file = Path(log_file)
+
     try:
         # Run the workflow
-        result = asyncio.run(run_workflow_async(workflow, inputs, provider, skip_gates))
+        result = asyncio.run(
+            run_workflow_async(workflow, inputs, provider, skip_gates, resolved_log_file)
+        )
 
         # Output as JSON to stdout
         output_console.print_json(json.dumps(result))

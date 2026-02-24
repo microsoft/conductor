@@ -9,6 +9,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -29,8 +30,57 @@ if TYPE_CHECKING:
 # Verbose console for logging (stderr)
 _verbose_console = Console(stderr=True, highlight=False)
 
+# File console for file logging (None when not active)
+_file_console: Console | None = None
+_file_handle: Any = None
+
 # Pattern for resolving ${VAR} and ${VAR:-default} in env values
 _ENV_VAR_PATTERN = re.compile(r"\$\{([^}:]+)(?::-([^}]*))?\}")
+
+
+def generate_log_path(workflow_name: str) -> Path:
+    """Generate auto log file path.
+
+    Creates a path like: $TMPDIR/conductor/conductor-<workflow>-<timestamp>.log
+    The parent directory is created automatically if it doesn't exist.
+
+    Args:
+        workflow_name: Name of the workflow (used in the filename).
+
+    Returns:
+        Path to the auto-generated log file.
+    """
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    path = Path(tempfile.gettempdir()) / "conductor" / f"conductor-{workflow_name}-{timestamp}.log"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def init_file_logging(log_path: Path) -> None:
+    """Initialize file logging to the given path.
+
+    Creates a Rich Console writing to the specified file with no_color=True
+    for plain text output. The parent directory is created automatically.
+
+    Args:
+        log_path: Path to write log output to.
+
+    Raises:
+        OSError: If the file cannot be opened for writing.
+    """
+    global _file_console, _file_handle
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    _file_handle = open(log_path, "w")  # noqa: SIM115
+    _file_console = Console(file=_file_handle, no_color=True, highlight=False, width=200)
+
+
+def close_file_logging() -> None:
+    """Close file logging and clean up resources."""
+    global _file_console, _file_handle
+    _file_console = None
+    if _file_handle is not None:
+        _file_handle.close()
+        _file_handle = None
 
 
 def resolve_mcp_env_vars(env: dict[str, str]) -> dict[str, str]:
@@ -87,6 +137,8 @@ def verbose_log(message: str, style: str = "dim") -> None:
 
     if is_verbose():
         _verbose_console.print(f"[{style}]{message}[/{style}]")
+    if _file_console is not None:
+        _file_console.print(message)
 
 
 def verbose_log_agent_start(agent_name: str, iteration: int) -> None:
@@ -100,14 +152,23 @@ def verbose_log_agent_start(agent_name: str, iteration: int) -> None:
 
     from conductor.cli.app import is_verbose
 
-    if is_verbose():
+    should_console = is_verbose()
+    should_file = _file_console is not None
+    if not should_console and not should_file:
+        return
+
+    text = Text()
+    text.append("┌─ ", style="cyan")
+    text.append("Agent: ", style="cyan")
+    text.append(agent_name, style="cyan bold")
+    text.append(f" [iter {iteration}]", style="dim")
+
+    if should_console:
         _verbose_console.print()  # Empty line before agent
-        text = Text()
-        text.append("┌─ ", style="cyan")
-        text.append("Agent: ", style="cyan")
-        text.append(agent_name, style="cyan bold")
-        text.append(f" [iter {iteration}]", style="dim")
         _verbose_console.print(text)
+    if _file_console is not None:
+        _file_console.print()
+        _file_console.print(text)
 
 
 def verbose_log_agent_complete(
@@ -137,26 +198,34 @@ def verbose_log_agent_complete(
 
     from conductor.cli.app import is_verbose
 
-    if is_verbose():
-        # Build summary line
-        parts = [f"{elapsed:.2f}s"]
-        if model:
-            parts.append(model)
-        if input_tokens is not None and output_tokens is not None:
-            parts.append(f"{input_tokens} in/{output_tokens} out")
-        elif tokens:
-            parts.append(f"{tokens} tokens")
-        if cost_usd is not None:
-            parts.append(f"${cost_usd:.4f}")
-        if output_keys:
-            parts.append(f"→ {output_keys}")
+    should_console = is_verbose()
+    should_file = _file_console is not None
+    if not should_console and not should_file:
+        return
 
-        text = Text()
-        text.append("└─ ", style="green")
-        text.append("✓ ", style="green")
-        text.append(agent_name, style="green")
-        text.append(f"  ({', '.join(parts)})", style="dim")
+    # Build summary line
+    parts = [f"{elapsed:.2f}s"]
+    if model:
+        parts.append(model)
+    if input_tokens is not None and output_tokens is not None:
+        parts.append(f"{input_tokens} in/{output_tokens} out")
+    elif tokens:
+        parts.append(f"{tokens} tokens")
+    if cost_usd is not None:
+        parts.append(f"${cost_usd:.4f}")
+    if output_keys:
+        parts.append(f"→ {output_keys}")
+
+    text = Text()
+    text.append("└─ ", style="green")
+    text.append("✓ ", style="green")
+    text.append(agent_name, style="green")
+    text.append(f"  ({', '.join(parts)})", style="dim")
+
+    if should_console:
         _verbose_console.print(text)
+    if _file_console is not None:
+        _file_console.print(text)
 
 
 def verbose_log_route(target: str) -> None:
@@ -169,36 +238,50 @@ def verbose_log_route(target: str) -> None:
 
     from conductor.cli.app import is_verbose
 
-    if is_verbose():
-        text = Text()
-        text.append("   → ", style="yellow")
-        if target == "$end":
-            text.append("$end", style="yellow bold")
-        else:
-            text.append("next: ", style="dim")
-            text.append(target, style="yellow")
+    should_console = is_verbose()
+    should_file = _file_console is not None
+    if not should_console and not should_file:
+        return
+
+    text = Text()
+    text.append("   → ", style="yellow")
+    if target == "$end":
+        text.append("$end", style="yellow bold")
+    else:
+        text.append("next: ", style="dim")
+        text.append(target, style="yellow")
+
+    if should_console:
         _verbose_console.print(text)
+    if _file_console is not None:
+        _file_console.print(text)
 
 
-def verbose_log_section(title: str, content: str, truncate: bool = True) -> None:
-    """Log a section with title if verbose mode is enabled.
+def verbose_log_section(title: str, content: str) -> None:
+    """Log a section with title if full verbose mode is enabled.
+
+    Sections contain detailed content like prompts and tool arguments.
+    They are shown in FULL mode (default) but skipped in MINIMAL mode (--quiet).
+    File logging always receives full content regardless of console verbosity.
 
     Args:
         title: Section title.
         content: Section content.
-        truncate: If True, truncate content to 500 chars unless full mode is enabled.
     """
     from conductor.cli.app import is_full, is_verbose
 
-    if is_verbose():
-        display_content = content
-        # Truncate content unless full mode is enabled or truncate is False
-        if truncate and not is_full() and len(content) > 500:
-            display_content = content[:500] + "\n... [truncated, use --verbose for full]"
+    # Sections are detail-level: show on console only in FULL mode
+    should_console = is_verbose() and is_full()
+    should_file = _file_console is not None
+    if not should_console and not should_file:
+        return
 
-        _verbose_console.print(
-            Panel(display_content, title=f"[cyan]{title}[/cyan]", border_style="dim")
-        )
+    if should_console:
+        _verbose_console.print(Panel(content, title=f"[cyan]{title}[/cyan]", border_style="dim"))
+
+    # File always gets full untruncated content
+    if _file_console is not None:
+        _file_console.print(Panel(content, title=title, border_style="dim"))
 
 
 def verbose_log_timing(operation: str, elapsed: float) -> None:
@@ -212,6 +295,8 @@ def verbose_log_timing(operation: str, elapsed: float) -> None:
 
     if is_verbose():
         _verbose_console.print(f"[dim]⏱ {operation}: {elapsed:.2f}s[/dim]")
+    if _file_console is not None:
+        _file_console.print(f"⏱ {operation}: {elapsed:.2f}s")
 
 
 def verbose_log_parallel_start(group_name: str, agent_count: int) -> None:
@@ -225,14 +310,23 @@ def verbose_log_parallel_start(group_name: str, agent_count: int) -> None:
 
     from conductor.cli.app import is_verbose
 
-    if is_verbose():
-        text = Text()
-        text.append("┌─ ", style="magenta")
-        text.append("Parallel Group: ", style="magenta")
-        text.append(group_name, style="magenta bold")
-        text.append(f" ({agent_count} agents)", style="dim")
+    should_console = is_verbose()
+    should_file = _file_console is not None
+    if not should_console and not should_file:
+        return
+
+    text = Text()
+    text.append("┌─ ", style="magenta")
+    text.append("Parallel Group: ", style="magenta")
+    text.append(group_name, style="magenta bold")
+    text.append(f" ({agent_count} agents)", style="dim")
+
+    if should_console:
         _verbose_console.print()
         _verbose_console.print(text)
+    if _file_console is not None:
+        _file_console.print()
+        _file_console.print(text)
 
 
 def verbose_log_parallel_agent_complete(
@@ -256,20 +350,28 @@ def verbose_log_parallel_agent_complete(
 
     from conductor.cli.app import is_verbose
 
-    if is_verbose():
-        parts = [f"{elapsed:.2f}s"]
-        if model:
-            parts.append(model)
-        if tokens:
-            parts.append(f"{tokens} tokens")
-        if cost_usd is not None:
-            parts.append(f"${cost_usd:.4f}")
+    should_console = is_verbose()
+    should_file = _file_console is not None
+    if not should_console and not should_file:
+        return
 
-        text = Text()
-        text.append("  ✓ ", style="green")
-        text.append(agent_name, style="green")
-        text.append(f"  ({', '.join(parts)})", style="dim")
+    parts = [f"{elapsed:.2f}s"]
+    if model:
+        parts.append(model)
+    if tokens:
+        parts.append(f"{tokens} tokens")
+    if cost_usd is not None:
+        parts.append(f"${cost_usd:.4f}")
+
+    text = Text()
+    text.append("  ✓ ", style="green")
+    text.append(agent_name, style="green")
+    text.append(f"  ({', '.join(parts)})", style="dim")
+
+    if should_console:
         _verbose_console.print(text)
+    if _file_console is not None:
+        _file_console.print(text)
 
 
 def verbose_log_parallel_agent_failed(
@@ -290,13 +392,23 @@ def verbose_log_parallel_agent_failed(
 
     from conductor.cli.app import is_verbose
 
-    if is_verbose():
-        text = Text()
-        text.append("  ✗ ", style="red")
-        text.append(agent_name, style="red")
-        text.append(f"  ({elapsed:.2f}s)", style="dim")
+    should_console = is_verbose()
+    should_file = _file_console is not None
+    if not should_console and not should_file:
+        return
+
+    text = Text()
+    text.append("  ✗ ", style="red")
+    text.append(agent_name, style="red")
+    text.append(f"  ({elapsed:.2f}s)", style="dim")
+    error_msg = f"      {exception_type}: {message}"
+
+    if should_console:
         _verbose_console.print(text)
-        _verbose_console.print(f"      {exception_type}: {message}", style="red dim")
+        _verbose_console.print(error_msg, style="red dim")
+    if _file_console is not None:
+        _file_console.print(text)
+        _file_console.print(error_msg)
 
 
 def verbose_log_parallel_summary(
@@ -317,29 +429,36 @@ def verbose_log_parallel_summary(
 
     from conductor.cli.app import is_verbose
 
-    if is_verbose():
-        text = Text()
-        text.append("└─ ", style="cyan")
+    should_console = is_verbose()
+    should_file = _file_console is not None
+    if not should_console and not should_file:
+        return
 
-        if failure_count == 0:
-            text.append("✓ ", style="green")
-            text.append(group_name, style="green")
-            text.append(
-                f"  ({success_count}/{success_count} succeeded, {total_elapsed:.2f}s)",
-                style="dim",
-            )
-        else:
-            status_parts = []
-            # Always show succeeded count even if 0
-            status_parts.append(f"{success_count} succeeded")
-            status_parts.append(f"{failure_count} failed")
+    text = Text()
+    text.append("└─ ", style="cyan")
 
-            style = "yellow" if success_count > 0 else "red"
-            text.append("◆ ", style=style)
-            text.append(group_name, style=style)
-            text.append(f"  ({', '.join(status_parts)}, {total_elapsed:.2f}s)", style="dim")
+    if failure_count == 0:
+        text.append("✓ ", style="green")
+        text.append(group_name, style="green")
+        text.append(
+            f"  ({success_count}/{success_count} succeeded, {total_elapsed:.2f}s)",
+            style="dim",
+        )
+    else:
+        status_parts = []
+        # Always show succeeded count even if 0
+        status_parts.append(f"{success_count} succeeded")
+        status_parts.append(f"{failure_count} failed")
 
+        style = "yellow" if success_count > 0 else "red"
+        text.append("◆ ", style=style)
+        text.append(group_name, style=style)
+        text.append(f"  ({', '.join(status_parts)}, {total_elapsed:.2f}s)", style="dim")
+
+    if should_console:
         _verbose_console.print(text)
+    if _file_console is not None:
+        _file_console.print(text)
 
 
 def verbose_log_for_each_start(
@@ -360,16 +479,25 @@ def verbose_log_for_each_start(
 
     from conductor.cli.app import is_verbose
 
-    if is_verbose():
-        text = Text()
-        text.append("┌─ ", style="blue")
-        text.append("For-Each: ", style="blue")
-        text.append(group_name, style="blue bold")
-        text.append(
-            f" ({item_count} items, max_concurrent={max_concurrent}, {failure_mode})", style="dim"
-        )
+    should_console = is_verbose()
+    should_file = _file_console is not None
+    if not should_console and not should_file:
+        return
+
+    text = Text()
+    text.append("┌─ ", style="blue")
+    text.append("For-Each: ", style="blue")
+    text.append(group_name, style="blue bold")
+    text.append(
+        f" ({item_count} items, max_concurrent={max_concurrent}, {failure_mode})", style="dim"
+    )
+
+    if should_console:
         _verbose_console.print()
         _verbose_console.print(text)
+    if _file_console is not None:
+        _file_console.print()
+        _file_console.print(text)
 
 
 def verbose_log_for_each_item_complete(
@@ -391,18 +519,26 @@ def verbose_log_for_each_item_complete(
 
     from conductor.cli.app import is_verbose
 
-    if is_verbose():
-        parts = [f"{elapsed:.2f}s"]
-        if tokens:
-            parts.append(f"{tokens} tokens")
-        if cost_usd is not None:
-            parts.append(f"${cost_usd:.4f}")
+    should_console = is_verbose()
+    should_file = _file_console is not None
+    if not should_console and not should_file:
+        return
 
-        text = Text()
-        text.append("  ✓ ", style="green")
-        text.append(f"[{item_key}]", style="green")
-        text.append(f"  ({', '.join(parts)})", style="dim")
+    parts = [f"{elapsed:.2f}s"]
+    if tokens:
+        parts.append(f"{tokens} tokens")
+    if cost_usd is not None:
+        parts.append(f"${cost_usd:.4f}")
+
+    text = Text()
+    text.append("  ✓ ", style="green")
+    text.append(f"[{item_key}]", style="green")
+    text.append(f"  ({', '.join(parts)})", style="dim")
+
+    if should_console:
         _verbose_console.print(text)
+    if _file_console is not None:
+        _file_console.print(text)
 
 
 def verbose_log_for_each_item_failed(
@@ -423,13 +559,23 @@ def verbose_log_for_each_item_failed(
 
     from conductor.cli.app import is_verbose
 
-    if is_verbose():
-        text = Text()
-        text.append("  ✗ ", style="red")
-        text.append(f"[{item_key}]", style="red")
-        text.append(f"  ({elapsed:.2f}s)", style="dim")
+    should_console = is_verbose()
+    should_file = _file_console is not None
+    if not should_console and not should_file:
+        return
+
+    text = Text()
+    text.append("  ✗ ", style="red")
+    text.append(f"[{item_key}]", style="red")
+    text.append(f"  ({elapsed:.2f}s)", style="dim")
+    error_msg = f"      {exception_type}: {message}"
+
+    if should_console:
         _verbose_console.print(text)
-        _verbose_console.print(f"      {exception_type}: {message}", style="red dim")
+        _verbose_console.print(error_msg, style="red dim")
+    if _file_console is not None:
+        _file_console.print(text)
+        _file_console.print(error_msg)
 
 
 def verbose_log_for_each_summary(
@@ -450,27 +596,34 @@ def verbose_log_for_each_summary(
 
     from conductor.cli.app import is_verbose
 
-    if is_verbose():
-        text = Text()
-        text.append("└─ ", style="cyan")
+    should_console = is_verbose()
+    should_file = _file_console is not None
+    if not should_console and not should_file:
+        return
 
-        if failure_count == 0:
-            text.append("✓ ", style="green")
-            text.append(group_name, style="green")
-            text.append(
-                f"  ({success_count}/{success_count} succeeded, {total_elapsed:.2f}s)", style="dim"
-            )
-        else:
-            status_parts = []
-            status_parts.append(f"{success_count} succeeded")
-            status_parts.append(f"{failure_count} failed")
+    text = Text()
+    text.append("└─ ", style="cyan")
 
-            style = "yellow" if success_count > 0 else "red"
-            text.append("◆ ", style=style)
-            text.append(group_name, style=style)
-            text.append(f"  ({', '.join(status_parts)}, {total_elapsed:.2f}s)", style="dim")
+    if failure_count == 0:
+        text.append("✓ ", style="green")
+        text.append(group_name, style="green")
+        text.append(
+            f"  ({success_count}/{success_count} succeeded, {total_elapsed:.2f}s)", style="dim"
+        )
+    else:
+        status_parts = []
+        status_parts.append(f"{success_count} succeeded")
+        status_parts.append(f"{failure_count} failed")
 
+        style = "yellow" if success_count > 0 else "red"
+        text.append("◆ ", style=style)
+        text.append(group_name, style=style)
+        text.append(f"  ({', '.join(status_parts)}, {total_elapsed:.2f}s)", style="dim")
+
+    if should_console:
         _verbose_console.print(text)
+    if _file_console is not None:
+        _file_console.print(text)
 
 
 def display_usage_summary(usage_data: dict[str, Any], console: Console | None = None) -> None:
@@ -482,14 +635,26 @@ def display_usage_summary(usage_data: dict[str, Any], console: Console | None = 
     """
     from conductor.cli.app import is_verbose
 
-    if not is_verbose():
+    should_console = is_verbose()
+    should_file = _file_console is not None
+
+    if not should_console and not should_file:
         return
 
     output_console = console if console is not None else _verbose_console
+    targets: list[Console] = []
+    if should_console:
+        targets.append(output_console)
+    if _file_console is not None:
+        targets.append(_file_console)
 
-    output_console.print()
-    output_console.print("=" * 60, style="dim")
-    output_console.print("[bold cyan]Token Usage Summary[/bold cyan]")
+    def _print(*args: Any, **kwargs: Any) -> None:
+        for t in targets:
+            t.print(*args, **kwargs)
+
+    _print()
+    _print("=" * 60, style="dim")
+    _print("[bold cyan]Token Usage Summary[/bold cyan]")
 
     # Token totals
     total_input = usage_data.get("total_input_tokens", 0)
@@ -497,35 +662,35 @@ def display_usage_summary(usage_data: dict[str, Any], console: Console | None = 
     total_tokens = usage_data.get("total_tokens", 0)
 
     if total_tokens > 0:
-        output_console.print(f"  Input:  {total_input:,} tokens", style="dim")
-        output_console.print(f"  Output: {total_output:,} tokens", style="dim")
-        output_console.print(f"  Total:  {total_tokens:,} tokens", style="dim")
+        _print(f"  Input:  {total_input:,} tokens", style="dim")
+        _print(f"  Output: {total_output:,} tokens", style="dim")
+        _print(f"  Total:  {total_tokens:,} tokens", style="dim")
     else:
-        output_console.print("  [dim]No token data available[/dim]")
+        _print("  [dim]No token data available[/dim]")
 
     # Cost breakdown
     total_cost = usage_data.get("total_cost_usd")
     agents = usage_data.get("agents", [])
 
     if total_cost is not None and total_cost > 0:
-        output_console.print()
-        output_console.print("[bold cyan]Cost Breakdown:[/bold cyan]")
+        _print()
+        _print("[bold cyan]Cost Breakdown:[/bold cyan]")
 
         for agent in agents:
             agent_cost = agent.get("cost_usd")
             if agent_cost is not None and agent_cost > 0:
                 pct = (agent_cost / total_cost * 100) if total_cost > 0 else 0
-                output_console.print(
+                _print(
                     f"  {agent['agent_name']}: ${agent_cost:.4f} ({pct:.0f}%)",
                     style="dim",
                 )
 
-        output_console.print(f"  [bold]Total: ${total_cost:.4f}[/bold]")
+        _print(f"  [bold]Total: ${total_cost:.4f}[/bold]")
     elif total_tokens > 0:
-        output_console.print()
-        output_console.print("  [dim]Cost data unavailable (unknown model pricing)[/dim]")
+        _print()
+        _print("  [dim]Cost data unavailable (unknown model pricing)[/dim]")
 
-    output_console.print("=" * 60, style="dim")
+    _print("=" * 60, style="dim")
 
 
 def parse_input_flags(raw_inputs: list[str]) -> dict[str, Any]:
@@ -661,6 +826,7 @@ async def run_workflow_async(
     inputs: dict[str, Any],
     provider_override: str | None = None,
     skip_gates: bool = False,
+    log_file: Path | None = None,
 ) -> dict[str, Any]:
     """Execute a workflow asynchronously.
 
@@ -669,6 +835,7 @@ async def run_workflow_async(
         inputs: Workflow input values.
         provider_override: Optional provider name to override workflow config.
         skip_gates: If True, auto-selects first option at human gates.
+        log_file: Optional path to write full debug output to a file.
 
     Returns:
         The workflow output as a dictionary.
@@ -678,88 +845,103 @@ async def run_workflow_async(
     """
     start_time = time.time()
 
-    # Log workflow loading
-    verbose_log(f"Loading workflow: {workflow_path}")
+    # Initialize file logging if requested
+    if log_file is not None:
+        try:
+            init_file_logging(log_file)
+        except OSError as e:
+            _verbose_console.print(
+                f"[bold yellow]Warning:[/bold yellow] Cannot open log file {log_file}: {e}"
+            )
 
-    # Load configuration
-    load_start = time.time()
-    config = load_config(workflow_path)
-    verbose_log_timing("Configuration loaded", time.time() - load_start)
+    try:
+        # Log workflow loading
+        verbose_log(f"Loading workflow: {workflow_path}")
 
-    # Log workflow details
-    verbose_log(f"Workflow: {config.workflow.name}")
-    verbose_log(f"Entry point: {config.workflow.entry_point}")
-    verbose_log(f"Agents: {len(config.agents)}")
+        # Load configuration
+        load_start = time.time()
+        config = load_config(workflow_path)
+        verbose_log_timing("Configuration loaded", time.time() - load_start)
 
-    if inputs:
-        verbose_log_section("Workflow Inputs", json.dumps(inputs, indent=2))
+        # Log workflow details
+        verbose_log(f"Workflow: {config.workflow.name}")
+        verbose_log(f"Entry point: {config.workflow.entry_point}")
+        verbose_log(f"Agents: {len(config.agents)}")
 
-    # Apply provider override if specified
-    if provider_override:
-        verbose_log(f"Provider override: {provider_override}", style="yellow")
-        config.workflow.runtime.provider = provider_override  # type: ignore[assignment]
+        if inputs:
+            verbose_log_section("Workflow Inputs", json.dumps(inputs, indent=2))
 
-    # Convert MCP servers from workflow config to SDK format
-    mcp_servers: dict[str, Any] | None = None
-    if config.workflow.runtime.mcp_servers:
-        mcp_servers = {}
-        for name, server in config.workflow.runtime.mcp_servers.items():
-            # Convert Pydantic model to dict for SDK
-            if server.type in ("http", "sse"):
-                server_config: dict[str, Any] = {
-                    "type": server.type,
-                    "url": server.url,
-                    "tools": server.tools,
-                }
-                if server.headers:
-                    server_config["headers"] = server.headers
-                if server.timeout:
-                    server_config["timeout"] = server.timeout
-                # Resolve OAuth authentication for HTTP/SSE servers
-                server_config = await resolve_mcp_server_auth(name, server_config)
-            else:
-                # stdio/local type
-                server_config = {
-                    "type": "stdio",
-                    "command": server.command,
-                    "args": server.args,
-                    "tools": server.tools,
-                }
-                if server.env:
-                    # Resolve ${VAR} and ${VAR:-default} patterns at runtime
-                    server_config["env"] = resolve_mcp_env_vars(server.env)
-                if server.timeout:
-                    server_config["timeout"] = server.timeout
-            mcp_servers[name] = server_config
-        verbose_log(f"MCP servers configured: {list(mcp_servers.keys())}")
+        # Apply provider override if specified
+        if provider_override:
+            verbose_log(f"Provider override: {provider_override}", style="yellow")
+            config.workflow.runtime.provider = provider_override  # type: ignore[assignment]
 
-    # Check if workflow uses multiple providers (has per-agent provider overrides)
-    uses_multi_provider = any(agent.provider is not None for agent in config.agents)
+        # Convert MCP servers from workflow config to SDK format
+        mcp_servers: dict[str, Any] | None = None
+        if config.workflow.runtime.mcp_servers:
+            mcp_servers = {}
+            for name, server in config.workflow.runtime.mcp_servers.items():
+                # Convert Pydantic model to dict for SDK
+                if server.type in ("http", "sse"):
+                    server_config: dict[str, Any] = {
+                        "type": server.type,
+                        "url": server.url,
+                        "tools": server.tools,
+                    }
+                    if server.headers:
+                        server_config["headers"] = server.headers
+                    if server.timeout:
+                        server_config["timeout"] = server.timeout
+                    # Resolve OAuth authentication for HTTP/SSE servers
+                    server_config = await resolve_mcp_server_auth(name, server_config)
+                else:
+                    # stdio/local type
+                    server_config = {
+                        "type": "stdio",
+                        "command": server.command,
+                        "args": server.args,
+                        "tools": server.tools,
+                    }
+                    if server.env:
+                        # Resolve ${VAR} and ${VAR:-default} patterns at runtime
+                        server_config["env"] = resolve_mcp_env_vars(server.env)
+                    if server.timeout:
+                        server_config["timeout"] = server.timeout
+                mcp_servers[name] = server_config
+            verbose_log(f"MCP servers configured: {list(mcp_servers.keys())}")
 
-    if uses_multi_provider:
-        verbose_log("Multi-provider mode: agents use different providers", style="cyan")
-    else:
-        verbose_log(f"Single provider mode: {config.workflow.runtime.provider}")
+        # Check if workflow uses multiple providers (has per-agent provider overrides)
+        uses_multi_provider = any(agent.provider is not None for agent in config.agents)
 
-    # Use ProviderRegistry for multi-provider support
-    async with ProviderRegistry(config, mcp_servers=mcp_servers) as registry:
-        # Create and run workflow engine
-        verbose_log("Starting workflow execution...")
+        if uses_multi_provider:
+            verbose_log("Multi-provider mode: agents use different providers", style="cyan")
+        else:
+            verbose_log(f"Single provider mode: {config.workflow.runtime.provider}")
 
-        engine = WorkflowEngine(config, registry=registry, skip_gates=skip_gates)
-        result = await engine.run(inputs)
+        # Use ProviderRegistry for multi-provider support
+        async with ProviderRegistry(config, mcp_servers=mcp_servers) as registry:
+            # Create and run workflow engine
+            verbose_log("Starting workflow execution...")
 
-        # Log completion
-        verbose_log_timing("Total workflow execution", time.time() - start_time)
-        verbose_log("Workflow completed successfully", style="green")
+            engine = WorkflowEngine(config, registry=registry, skip_gates=skip_gates)
+            result = await engine.run(inputs)
 
-        # Display usage summary if cost tracking is enabled
-        if config.workflow.cost.show_summary:
-            summary = engine.get_execution_summary()
-            if "usage" in summary:
-                display_usage_summary(summary["usage"])
+            # Log completion
+            verbose_log_timing("Total workflow execution", time.time() - start_time)
+            verbose_log("Workflow completed successfully", style="green")
 
-        return result
+            # Display usage summary if cost tracking is enabled
+            if config.workflow.cost.show_summary:
+                summary = engine.get_execution_summary()
+                if "usage" in summary:
+                    display_usage_summary(summary["usage"])
+
+            return result
+    finally:
+        # Report log file path to stderr and close file logging
+        if log_file is not None and _file_console is not None:
+            _verbose_console.print(f"[dim]Log written to: {log_file}[/dim]")
+        close_file_logging()
 
 
 def format_routes(routes: list[dict[str, Any]]) -> str:
