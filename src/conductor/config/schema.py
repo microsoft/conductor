@@ -357,7 +357,7 @@ class AgentDef(BaseModel):
     description: str | None = None
     """Human-readable description of agent's purpose."""
 
-    type: Literal["agent", "human_gate"] | None = None
+    type: Literal["agent", "human_gate", "script"] | None = None
     """Agent type. Defaults to 'agent' if not specified."""
 
     provider: Literal["copilot", "claude"] | None = None
@@ -409,6 +409,29 @@ class AgentDef(BaseModel):
     options: list[GateOption] | None = None
     """Options for human_gate type agents."""
 
+    command: str | None = None
+    """Command to execute (required for script type). Supports Jinja2 templating."""
+
+    args: list[str] = Field(default_factory=list)
+    """Command-line arguments for script type. Each supports Jinja2 templating."""
+
+    env: dict[str, str] = Field(default_factory=dict)
+    """Environment variables for script subprocess."""
+
+    working_dir: str | None = None
+    """Working directory for script subprocess execution."""
+
+    timeout: int | None = None
+    """Per-script timeout in seconds."""
+
+    @field_validator("timeout")
+    @classmethod
+    def validate_timeout(cls, v: int | None) -> int | None:
+        """Ensure timeout is positive if set."""
+        if v is not None and v <= 0:
+            raise ValueError("timeout must be a positive integer")
+        return v
+
     @model_validator(mode="after")
     def validate_agent_type(self) -> AgentDef:
         """Ensure agent has required fields for its type."""
@@ -417,6 +440,26 @@ class AgentDef(BaseModel):
                 raise ValueError("human_gate agents require 'options'")
             if not self.prompt:
                 raise ValueError("human_gate agents require 'prompt'")
+        elif self.type == "script":
+            if not self.command:
+                raise ValueError("script agents require 'command'")
+            if self.prompt:
+                raise ValueError("script agents cannot have 'prompt'")
+            if self.provider:
+                raise ValueError("script agents cannot have 'provider'")
+            if self.model:
+                raise ValueError("script agents cannot have 'model'")
+            if self.tools is not None:
+                raise ValueError("script agents cannot have 'tools'")
+            if self.output:
+                raise ValueError(
+                    "script agents cannot have 'output' schema "
+                    "(output is always stdout/stderr/exit_code)"
+                )
+            if self.system_prompt:
+                raise ValueError("script agents cannot have 'system_prompt'")
+            if self.options:
+                raise ValueError("script agents cannot have 'options'")
         return self
 
 

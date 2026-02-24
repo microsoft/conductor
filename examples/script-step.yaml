@@ -1,0 +1,78 @@
+# Script Step Example
+#
+# This example demonstrates script steps in a workflow. Script steps
+# run shell commands and capture stdout, stderr, and exit_code.
+# They can route based on exit_code and pass output to agent steps.
+#
+# This workflow:
+# 1. Runs a script to check the Python version
+# 2. Routes based on exit_code (success → analyzer, failure → error handler)
+# 3. An agent analyzes the script output
+#
+# Usage:
+#   conductor run examples/script-step.yaml
+
+workflow:
+  name: script-step-demo
+  description: Demonstrates script steps with exit_code routing
+  version: "1.0.0"
+  entry_point: check_python
+
+  runtime:
+    provider: copilot
+
+  limits:
+    max_iterations: 10
+
+agents:
+  - name: check_python
+    type: script
+    description: Check the installed Python version
+    command: python3
+    args: ["--version"]
+    routes:
+      - to: analyze_version
+        when: "exit_code == 0"
+      - to: handle_error
+
+  - name: analyze_version
+    description: Analyze the Python version output
+    model: claude-haiku-4.5
+    prompt: |
+      The following command was run to check the Python version.
+
+      stdout: {{ check_python.output.stdout }}
+      exit_code: {{ check_python.output.exit_code }}
+
+      Please summarize what Python version is installed and whether
+      it meets the minimum requirement of Python 3.10+.
+    output:
+      summary:
+        type: string
+        description: Summary of Python version status
+      meets_requirement:
+        type: boolean
+        description: Whether the version meets the 3.10+ requirement
+    routes:
+      - to: $end
+
+  - name: handle_error
+    description: Handle the case where Python is not found
+    model: claude-haiku-4.5
+    prompt: |
+      The Python version check failed with:
+
+      stderr: {{ check_python.output.stderr }}
+      exit_code: {{ check_python.output.exit_code }}
+
+      Please provide a helpful error message explaining that Python
+      could not be found and suggesting installation steps.
+    output:
+      error_message:
+        type: string
+        description: Helpful error message with installation guidance
+    routes:
+      - to: $end
+
+output:
+  result: "{{ analyze_version.output.summary | default('') }}{{ handle_error.output.error_message | default('') }}"

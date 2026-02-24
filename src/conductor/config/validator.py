@@ -90,8 +90,8 @@ def validate_workflow_config(config: WorkflowConfig) -> list[str]:
         errors.extend(input_errors)
         warnings.extend(input_warnings)
 
-        # Validate tool references
-        if agent.tools is not None and agent.tools:
+        # Validate tool references (skip for script-type agents, they don't use tools)
+        if agent.tools is not None and agent.tools and agent.type != "script":
             tool_errors = _validate_tool_references(agent.name, agent.tools, set(config.tools))
             errors.extend(tool_errors)
 
@@ -99,6 +99,14 @@ def validate_workflow_config(config: WorkflowConfig) -> list[str]:
     if config.parallel:
         parallel_errors = _validate_parallel_groups(config)
         errors.extend(parallel_errors)
+
+    # Validate for_each groups: reject script steps as inline agents
+    for for_each_group in config.for_each:
+        if for_each_group.agent.type == "script":
+            errors.append(
+                f"For-each group '{for_each_group.name}' uses a script step as its "
+                "inline agent. Script steps cannot be used in for_each groups."
+            )
 
     # Validate workflow output references
     output_errors = _validate_output_references(
@@ -345,6 +353,13 @@ def _validate_parallel_groups(config: WorkflowConfig) -> list[str]:
                 errors.append(
                     f"Agent '{agent_name}' in parallel group '{pg.name}' is a human gate. "
                     "Human gates cannot be used in parallel groups."
+                )
+
+            # Validate no script steps in parallel groups
+            if agent.type == "script":
+                errors.append(
+                    f"Agent '{agent_name}' in parallel group '{pg.name}' is a script step. "
+                    "Script steps cannot be used in parallel groups."
                 )
 
         # PE-6.2: Validate parallel group route targets

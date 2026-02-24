@@ -19,6 +19,7 @@ from conductor.engine.router import Router, RouteResult
 from conductor.engine.usage import UsageTracker
 from conductor.exceptions import ConductorError, ExecutionError, MaxIterationsError
 from conductor.executor.agent import AgentExecutor
+from conductor.executor.script import ScriptExecutor, ScriptOutput
 from conductor.executor.template import TemplateRenderer
 from conductor.gates.human import (
     GateResult,
@@ -417,6 +418,7 @@ class WorkflowEngine:
         )
         self.gate_handler = HumanGateHandler(skip_gates=skip_gates)
         self.max_iterations_handler = MaxIterationsHandler(skip_gates=skip_gates)
+        self.script_executor = ScriptExecutor()
         self.usage_tracker = UsageTracker(
             pricing_overrides=self._build_pricing_overrides(),
         )
@@ -486,6 +488,24 @@ class WorkflowEngine:
                 "No provider configured for workflow execution",
                 suggestion="Provide either a provider or registry to WorkflowEngine",
             )
+
+    async def _execute_script(self, agent: AgentDef, context: dict[str, Any]) -> ScriptOutput:
+        """Execute a script step with workflow-level timeout enforcement.
+
+        Args:
+            agent: Script agent definition.
+            context: Workflow context for template rendering.
+
+        Returns:
+            ScriptOutput with stdout, stderr, and exit_code.
+
+        Raises:
+            ExecutionError: If script fails or times out.
+        """
+        return await self.limits.wait_for_with_timeout(
+            self.script_executor.execute(agent, context),
+            operation_name=f"script '{agent.name}'",
+        )
 
     async def run(self, inputs: dict[str, Any]) -> dict[str, Any]:
         """Execute the workflow from entry_point to $end.
@@ -722,6 +742,40 @@ class WorkflowEngine:
                                 self._execute_hook("on_complete", result=result)
                                 return result
                             current_agent_name = gate_result.route
+                            continue
+
+                        # Handle script steps
+                        if agent.type == "script":
+                            agent_context = self.context.build_for_agent(
+                                agent.name,
+                                agent.input,
+                                mode=self.config.workflow.context.mode,
+                            )
+                            _script_start = _time.time()
+                            script_output = await self._execute_script(agent, agent_context)
+                            _script_elapsed = _time.time() - _script_start
+
+                            _verbose_log_agent_complete(agent.name, _script_elapsed)
+
+                            # Store structured output in context
+                            output_content = {
+                                "stdout": script_output.stdout,
+                                "stderr": script_output.stderr,
+                                "exit_code": script_output.exit_code,
+                            }
+                            self.context.store(agent.name, output_content)
+                            self.limits.record_execution(agent.name)
+                            self.limits.check_timeout()
+
+                            route_result = self._evaluate_routes(agent, output_content)
+                            _verbose_log_route(route_result.target)
+
+                            if route_result.target == "$end":
+                                result = self._build_final_output(route_result.output_transform)
+                                self._execute_hook("on_complete", result=result)
+                                return result
+
+                            current_agent_name = route_result.target
                             continue
 
                         # Build context for this agent
