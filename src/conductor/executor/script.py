@@ -85,7 +85,9 @@ class ScriptExecutor:
         assert agent.command is not None
         rendered_command = self.renderer.render(agent.command, context)
         rendered_args = [self.renderer.render(arg, context) for arg in agent.args]
-        rendered_working_dir = self.renderer.render(agent.working_dir, context) if agent.working_dir else None
+        rendered_working_dir = (
+            self.renderer.render(agent.working_dir, context) if agent.working_dir else None
+        )
 
         # Build environment (merge os.environ + agent.env)
         # Note: ${VAR:-default} patterns in agent.env are already resolved
