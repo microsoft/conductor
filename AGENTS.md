@@ -80,8 +80,8 @@ make validate-examples    # validate all examples
 4. Parallel groups execute agents concurrently with context isolation (deep copy snapshot)
 5. For-each groups resolve source arrays at runtime, inject loop variables (`{{ item }}`, `{{ _index }}`, `{{ _key }}`)
 6. Script steps run shell commands via asyncio subprocess, expose stdout/stderr/exit_code to context
-6. Routes evaluated via `Router` using Jinja2 or simpleeval expressions
-7. Final output built from templates in `output:` section
+7. Routes evaluated via `Router` using Jinja2 or simpleeval expressions
+8. Final output built from templates in `output:` section
 
 ### Key Patterns
 

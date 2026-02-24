@@ -182,10 +182,7 @@ class TestScriptExecutorWorkingDir:
                 command="pwd",
                 working_dir="{{ target_dir }}",
             )
-            # Manually render working_dir before executing (executor uses it as-is from agent)
-            # working_dir is passed directly to subprocess; test by injecting a pre-rendered path
-            rendered_agent = agent.model_copy(update={"working_dir": tmpdir})
-            output = await executor.execute(rendered_agent, {"target_dir": tmpdir})
+            output = await executor.execute(agent, {"target_dir": tmpdir})
             assert os.path.realpath(output.stdout.strip()) == os.path.realpath(tmpdir)
 
 
