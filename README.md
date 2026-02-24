@@ -16,6 +16,7 @@ Conductor provides the patterns that work: evaluator-optimizer loops for iterati
 - **YAML-based workflows** - Define multi-agent workflows in readable YAML
 - **Multiple providers** - GitHub Copilot or Anthropic Claude with seamless switching
 - **Parallel execution** - Run agents concurrently (static groups or dynamic for-each)
+- **Script steps** - Run shell commands and route on exit code without an AI agent
 - **Conditional routing** - Route between agents based on output conditions
 - **Human-in-the-loop** - Pause for human decisions with Rich terminal UI
 - **Safety limits** - Max iterations and timeout enforcement
@@ -183,6 +184,7 @@ See the [`examples/`](./examples/) directory for complete workflows:
 | [for-each-simple.yaml](./examples/for-each-simple.yaml) | Dynamic parallel processing |
 | [parallel-research.yaml](./examples/parallel-research.yaml) | Static parallel execution |
 | [design-review.yaml](./examples/design-review.yaml) | Human gate with loop pattern |
+| [script-step.yaml](./examples/script-step.yaml) | Script step with exit_code routing |
 
 **More examples and running instructions:** [examples/README.md](./examples/README.md)
 

@@ -50,7 +50,7 @@ Agents are defined in the `agents` list. Each agent represents a unit of work.
 agents:
   - name: string                    # Required: Unique agent identifier
     description: string             # Optional: Purpose description
-    type: agent                     # agent | human_gate (default: agent)
+    type: agent                     # agent | human_gate | script (default: agent)
     model: string                   # Optional: Model identifier (e.g., 'claude-sonnet-4.5')
     
     prompt: |                       # Required for type=agent: Agent instructions
@@ -103,6 +103,62 @@ agents:
       - to: $end
         when: "{{ approval_gate.choice == 'reject' }}"
 ```
+
+### Script Steps
+
+Script steps run shell commands as workflow steps, capturing stdout, stderr, and exit code. Use them to integrate shell scripts, run tests, or invoke external tools without an AI agent.
+
+```yaml
+agents:
+  - name: run_tests
+    type: script
+    description: "Run the test suite"           # Optional
+    command: pytest                             # Required: command to execute (Jinja2 template)
+    args:                                       # Optional: list of arguments (each Jinja2 template)
+      - "{{ workflow.input.test_path }}"
+      - "--verbose"
+    env:                                        # Optional: environment variables for subprocess
+      CI: "true"
+      PYTHONPATH: "/app/src"
+    working_dir: "/app"                         # Optional: working directory (Jinja2 template)
+    timeout: 120                                # Optional: per-step timeout in seconds
+    routes:
+      - to: analyzer
+        when: "exit_code == 0"
+      - to: error_handler
+```
+
+**Output structure** — script step output is always available in context as:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `stdout` | string | Captured standard output |
+| `stderr` | string | Captured standard error |
+| `exit_code` | integer | Process exit code (0 = success) |
+
+Access in downstream agents:
+
+```yaml
+prompt: |
+  The test run produced:
+  {{ run_tests.output.stdout }}
+  Exit code: {{ run_tests.output.exit_code }}
+```
+
+**Routing on exit code** — use `exit_code` in route conditions to branch on success or failure:
+
+```yaml
+routes:
+  - to: success_handler
+    when: "exit_code == 0"           # simpleeval syntax
+  - to: failure_handler
+    when: "{{ output.exit_code != 0 }}"  # Jinja2 syntax
+  - to: $end
+```
+
+**Restrictions** — script steps cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, `output` schema, or `options`. Script steps also cannot be used inside `parallel` groups or `for_each` groups.
+
+**Environment variable note** — values in `env` are passed as-is to the subprocess (they are not rendered as Jinja2 templates). Use `${VAR}` syntax in the workflow YAML loader if you need environment variable substitution in env values.
 
 ## Parallel Groups
 

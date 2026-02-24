@@ -58,6 +58,7 @@ make validate-examples    # validate all examples
 
 - **executor/**: Agent execution
   - `agent.py` - `AgentExecutor` handles prompt rendering, tool resolution, and output validation for single agents
+  - `script.py` - `ScriptExecutor` runs shell commands as workflow steps, capturing stdout/stderr/exit_code
   - `template.py` - Jinja2 template rendering
   - `output.py` - JSON output parsing and schema validation
 
@@ -75,9 +76,10 @@ make validate-examples    # validate all examples
 
 1. CLI parses YAML via `config/loader.py` → `WorkflowConfig`
 2. `WorkflowEngine` initializes with config and provider
-3. Engine loops: find agent/parallel/for-each → execute → evaluate routes → next
+3. Engine loops: find agent/parallel/for-each/script → execute → evaluate routes → next
 4. Parallel groups execute agents concurrently with context isolation (deep copy snapshot)
 5. For-each groups resolve source arrays at runtime, inject loop variables (`{{ item }}`, `{{ _index }}`, `{{ _key }}`)
+6. Script steps run shell commands via asyncio subprocess, expose stdout/stderr/exit_code to context
 6. Routes evaluated via `Router` using Jinja2 or simpleeval expressions
 7. Final output built from templates in `output:` section
 

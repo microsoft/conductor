@@ -16,7 +16,11 @@ from conductor.executor.template import TemplateRenderer
 
 
 def _verbose_log(message: str, style: str = "dim") -> None:
-    """Lazy import wrapper for verbose_log to avoid circular imports."""
+    """Log a verbose message via the CLI run module.
+
+    Uses a deferred import to avoid a circular import between executor.script
+    and cli.run (cli.run imports WorkflowEngine which imports executor modules).
+    """
     from conductor.cli.run import verbose_log
 
     verbose_log(message, style)

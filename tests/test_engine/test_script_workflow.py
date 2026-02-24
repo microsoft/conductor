@@ -10,6 +10,7 @@ Tests cover:
 - Dry-run plan includes script steps
 - Jinja2-templated command with workflow input
 - Non-zero exit with no routes defaults to $end
+- Script step in parallel group is rejected at engine level
 """
 
 from __future__ import annotations
@@ -22,12 +23,14 @@ from conductor.config.schema import (
     AgentDef,
     ContextConfig,
     LimitsConfig,
+    ParallelGroup,
     RouteDef,
     RuntimeConfig,
     WorkflowConfig,
     WorkflowDef,
 )
 from conductor.engine.workflow import WorkflowEngine
+from conductor.exceptions import ConfigurationError
 from conductor.providers.copilot import CopilotProvider
 
 
@@ -425,3 +428,40 @@ class TestScriptDryRun:
         assert len(plan.steps) == 1
         assert plan.steps[0].agent_name == "setup"
         assert plan.steps[0].agent_type == "script"
+
+
+class TestScriptInParallelRejected:
+    """Tests that script steps are rejected in parallel groups at the engine level."""
+
+    def test_script_in_parallel_group_raises_configuration_error(self) -> None:
+        """Test that a WorkflowConfig with a script step in a parallel group raises at validation.
+
+        This is a negative integration test: script steps are forbidden in parallel groups.
+        The restriction is enforced by validate_workflow_config, which is called before
+        WorkflowEngine.run(). This test exercises the full config→validate path.
+        """
+        from conductor.config.validator import validate_workflow_config
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="bad-parallel",
+                entry_point="pg",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(name="agent_a", prompt="do something", routes=[RouteDef(to="$end")]),
+                AgentDef(name="script_b", type="script", command="echo"),
+            ],
+            parallel=[
+                ParallelGroup(
+                    name="pg",
+                    agents=["agent_a", "script_b"],
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+        )
+
+        with pytest.raises(ConfigurationError, match="script step"):
+            validate_workflow_config(config)
