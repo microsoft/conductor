@@ -11,6 +11,7 @@ This document provides a comprehensive reference for the Conductor workflow YAML
 - [Inputs and Outputs](#inputs-and-outputs)
 - [Limits and Safety](#limits-and-safety)
 - [Tools](#tools)
+- [External File References](#external-file-references)
 - [Hooks](#hooks)
 
 ## Workflow Configuration
@@ -390,6 +391,187 @@ agents:
 ```
 
 **Note**: Tool implementation depends on your provider. See provider documentation for available tools.
+
+## External File References
+
+The `!file` YAML tag lets you reference external files from any YAML field value. The file content is transparently inlined during loading, keeping workflow files concise and enabling reuse of prompts, schemas, and configuration across workflows.
+
+### Syntax
+
+Use the `!file` tag followed by a file path:
+
+```yaml
+field_name: !file path/to/file
+```
+
+The tag can be used on any scalar YAML value — string fields, output schemas, tool lists, or any other field.
+
+### Content-Type Detection
+
+The content of the referenced file is handled based on its structure:
+
+- **YAML dict or list** — If the file content parses as a YAML mapping or sequence, it is returned as structured data (dict or list). This is useful for output schemas, tool lists, or any structured configuration.
+- **Scalar or non-YAML** — If the file contains a YAML scalar (e.g., a plain string), is not valid YAML, or is a non-YAML format like Markdown, the raw file content is returned as a string.
+
+### Path Resolution
+
+File paths are resolved **relative to the directory containing the YAML file** that uses the `!file` tag, not relative to the current working directory.
+
+```
+project/
+├── workflows/
+│   └── review.yaml        # prompt: !file ../prompts/review.md
+├── prompts/
+│   └── review.md           # ← resolved relative to workflows/
+└── schemas/
+    └── output.yaml
+```
+
+When using `load_string()` programmatically:
+- If `source_path` is provided, paths resolve relative to `source_path.parent`
+- If `source_path` is not provided, paths resolve relative to the current working directory
+
+### Usage Examples
+
+#### Prompt from a Markdown File
+
+Keep long prompts in separate Markdown files for easier editing:
+
+```yaml
+# workflow.yaml
+agents:
+  - name: reviewer
+    model: gpt-4
+    prompt: !file prompts/review-prompt.md
+    routes:
+      - to: $end
+```
+
+```markdown
+# prompts/review-prompt.md
+You are a code review expert.
+
+Please analyze the following code and provide:
+- A summary of what the code does
+- Any bugs or issues found
+- Suggestions for improvement
+```
+
+#### Structured Output Schema from YAML
+
+Extract output schemas into reusable files:
+
+```yaml
+# workflow.yaml
+agents:
+  - name: analyzer
+    model: gpt-4
+    prompt: "Analyze the input data"
+    output: !file schemas/analysis-output.yaml
+    routes:
+      - to: $end
+```
+
+```yaml
+# schemas/analysis-output.yaml
+summary:
+  type: string
+  description: A brief summary of the analysis
+score:
+  type: number
+  description: A confidence score from 1 to 10
+```
+
+#### Tool List from External File
+
+Share tool configurations across agents:
+
+```yaml
+# workflow.yaml
+agents:
+  - name: researcher
+    model: gpt-4
+    prompt: "Research the topic"
+    tools: !file tools/research-tools.yaml
+    routes:
+      - to: $end
+```
+
+```yaml
+# tools/research-tools.yaml
+- web_search
+- arxiv_search
+- calculator
+```
+
+#### Nested Inclusion
+
+Included YAML files can themselves contain `!file` tags. Each nested reference resolves relative to its own file's directory:
+
+```yaml
+# workflow.yaml
+agents:
+  - name: agent1
+    model: gpt-4
+    prompt: "Hello"
+    output: !file schemas/nested.yaml
+    routes:
+      - to: $end
+```
+
+```yaml
+# schemas/nested.yaml
+summary:
+  type: string
+  description: !file ../descriptions/summary-desc.md
+```
+
+```markdown
+# descriptions/summary-desc.md
+A comprehensive summary of the analysis results.
+```
+
+### Environment Variables
+
+Environment variable references (`${VAR}` or `${VAR:-default}`) inside included files are resolved after inclusion, during the standard environment variable resolution pass. This means you can use env vars in external files just as you would inline:
+
+```markdown
+# prompts/greeting.md
+Hello ${USER_NAME:-User}, welcome to the system.
+```
+
+### Error Handling
+
+#### Missing Files
+
+If a referenced file does not exist, a `ConfigurationError` is raised with the file path and a suggestion:
+
+```
+ConfigurationError: File not found: 'prompts/missing.md' (resolved to '/absolute/path/prompts/missing.md')
+  💡 Suggestion: Check the file path is correct relative to the workflow file directory.
+```
+
+#### Circular References
+
+If `!file` tags form a cycle (e.g., file A includes file B which includes file A), a `ConfigurationError` is raised:
+
+```
+ConfigurationError: Circular file reference detected: 'a.yaml'
+  File inclusion chain: /path/main.yaml → /path/a.yaml → /path/b.yaml → /path/a.yaml
+  💡 Suggestion: Remove the circular !file reference.
+```
+
+#### Encoding Errors
+
+Only UTF-8 text files are supported. Non-UTF-8 files produce a `ConfigurationError` with encoding guidance.
+
+### Limitations
+
+- **UTF-8 only** — Only UTF-8 encoded text files are supported
+- **No glob patterns** — Wildcards like `!file prompts/*.md` are not supported
+- **No URLs** — Remote references like `!file https://...` are not supported
+- **No conditional includes** — File references cannot be parameterized or conditional
+- **No caching** — Each `!file` reference reads the file independently
 
 ## Hooks
 

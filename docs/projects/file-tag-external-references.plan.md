@@ -1,7 +1,7 @@
 # Solution Design: `!file` YAML Tag for External File References
 
 > **Feature:** #3 from `docs/projects/planned-features.md`
-> **Status:** Draft
+> **Status:** DONE
 > **Revision:** 1 — Initial draft
 
 ---
@@ -390,14 +390,14 @@ No new dependencies are required.
 
 | Task ID | Type | Description | Files | Status |
 |---------|------|-------------|-------|--------|
-| E3-T1 | IMPL | Add "External File References" section to `docs/workflow-syntax.md` after the "Tools" section. Include: syntax overview, path resolution rules, content-type behavior, nested inclusion, env var interaction, and error handling. | `docs/workflow-syntax.md` | TO DO |
-| E3-T2 | IMPL | Add usage examples showing: prompt from .md file, structured output schema from .yaml file, tools list from external file, and nested inclusion pattern. | `docs/workflow-syntax.md` | TO DO |
+| E3-T1 | IMPL | Add "External File References" section to `docs/workflow-syntax.md` after the "Tools" section. Include: syntax overview, path resolution rules, content-type behavior, nested inclusion, env var interaction, and error handling. | `docs/workflow-syntax.md` | DONE |
+| E3-T2 | IMPL | Add usage examples showing: prompt from .md file, structured output schema from .yaml file, tools list from external file, and nested inclusion pattern. | `docs/workflow-syntax.md` | DONE |
 
 **Acceptance Criteria:**
-- [ ] `docs/workflow-syntax.md` has a complete `!file` section
-- [ ] Examples cover string, structured, and nested use cases
-- [ ] Path resolution rules are clearly documented
-- [ ] Limitations (UTF-8 only, no URLs, no globs) are stated
+- [x] `docs/workflow-syntax.md` has a complete `!file` section
+- [x] Examples cover string, structured, and nested use cases
+- [x] Path resolution rules are clearly documented
+- [x] Limitations (UTF-8 only, no URLs, no globs) are stated
 
 ---
 
