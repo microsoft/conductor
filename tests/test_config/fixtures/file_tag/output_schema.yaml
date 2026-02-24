@@ -1,0 +1,6 @@
+summary:
+  type: string
+  description: A brief summary
+score:
+  type: number
+  description: A confidence score

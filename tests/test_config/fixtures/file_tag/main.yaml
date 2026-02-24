@@ -1,0 +1,11 @@
+workflow:
+  name: file-tag-test
+  entry_point: analyzer
+
+agents:
+  - name: analyzer
+    model: gpt-4
+    prompt: !file prompt.md
+    output: !file output_schema.yaml
+    routes:
+      - to: $end

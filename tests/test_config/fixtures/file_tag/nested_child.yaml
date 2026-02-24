@@ -1,0 +1,3 @@
+summary:
+  type: string
+  description: !file nested_leaf.md

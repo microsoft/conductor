@@ -1,0 +1,11 @@
+workflow:
+  name: nested-file-tag-test
+  entry_point: agent1
+
+agents:
+  - name: agent1
+    model: gpt-4
+    prompt: "Hello"
+    output: !file nested_child.yaml
+    routes:
+      - to: $end
