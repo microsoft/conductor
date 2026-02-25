@@ -8,10 +8,13 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import logging
 import time as _time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from conductor.engine.checkpoint import CheckpointManager
 from conductor.engine.context import WorkflowContext
 from conductor.engine.limits import LimitEnforcer
 from conductor.engine.pricing import ModelPricing
@@ -26,6 +29,8 @@ from conductor.gates.human import (
     HumanGateHandler,
     MaxIterationsHandler,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _verbose_log(message: str, style: str = "dim") -> None:
@@ -390,6 +395,7 @@ class WorkflowEngine:
         provider: AgentProvider | None = None,
         registry: ProviderRegistry | None = None,
         skip_gates: bool = False,
+        workflow_path: Path | None = None,
     ) -> None:
         """Initialize the WorkflowEngine.
 
@@ -401,6 +407,8 @@ class WorkflowEngine:
                 When provided, each agent can use a different provider based
                 on the agent's `provider` field or the workflow default.
             skip_gates: If True, auto-selects first option at human gates.
+            workflow_path: Path to the workflow YAML file. Used for checkpoint
+                metadata when saving state on failure.
 
         Note:
             If both provider and registry are provided, registry takes precedence.
@@ -409,6 +417,7 @@ class WorkflowEngine:
         """
         self.config = config
         self.skip_gates = skip_gates
+        self.workflow_path = workflow_path
         self.context = WorkflowContext()
         self.renderer = TemplateRenderer()
         self.router = Router()
@@ -436,6 +445,10 @@ class WorkflowEngine:
             # Create a placeholder - will be created per-agent when using registry
             self.executor = None
             self.provider = None
+
+        # Checkpoint tracking
+        self._current_agent_name: str | None = None
+        self._last_checkpoint_path: Path | None = None
 
     def _build_pricing_overrides(self) -> dict[str, ModelPricing] | None:
         """Build pricing overrides from workflow cost configuration.
@@ -540,9 +553,111 @@ class WorkflowEngine:
         # Execute on_start hook
         self._execute_hook("on_start")
 
+        return await self._execute_loop(current_agent_name)
+
+    async def resume(self, current_agent_name: str) -> dict[str, Any]:
+        """Resume workflow execution from a specific agent.
+
+        Assumes ``self.context`` and ``self.limits`` have been pre-loaded
+        from checkpoint data via :meth:`set_context` and :meth:`set_limits`.
+        Enters the main execution loop at *current_agent_name* without
+        resetting iteration counters.
+
+        Args:
+            current_agent_name: Name of the agent to resume from.
+
+        Returns:
+            Final output dict built from output templates.
+
+        Raises:
+            ExecutionError: If the agent is not found or execution fails.
+            MaxIterationsError: If max iterations limit is exceeded.
+            TimeoutError: If timeout limit is exceeded.
+        """
+        # Fresh timeout window for resumed execution
+        self.limits.start_time = _time.monotonic()
+
+        # Execute on_start hook (signals resume)
+        self._execute_hook("on_start")
+
+        return await self._execute_loop(current_agent_name)
+
+    def set_context(self, context: WorkflowContext) -> None:
+        """Replace the engine's workflow context with a restored one.
+
+        Used by the CLI resume path to inject context reconstructed from
+        a checkpoint file.
+
+        Args:
+            context: A WorkflowContext restored via ``WorkflowContext.from_dict()``.
+        """
+        self.context = context
+
+    def set_limits(self, limits: LimitEnforcer) -> None:
+        """Replace the engine's limit enforcer with a restored one.
+
+        Used by the CLI resume path to inject limits reconstructed from
+        a checkpoint file.
+
+        Args:
+            limits: A LimitEnforcer restored via ``LimitEnforcer.from_dict()``.
+        """
+        self.limits = limits
+
+    def _save_checkpoint_on_failure(self, error: BaseException) -> None:
+        """Attempt to save a checkpoint after a failure.
+
+        This method never raises — on failure it logs a warning so the
+        original error is not masked.
+
+        Args:
+            error: The exception that triggered the checkpoint save.
+        """
+        if self.workflow_path is None:
+            logger.debug("No workflow_path set; skipping checkpoint save")
+            return
+
+        # Collect session IDs from provider if available
+        copilot_session_ids: dict[str, str] | None = None
+        provider = self._single_provider
+        if provider is not None and hasattr(provider, "get_session_ids"):
+            copilot_session_ids = provider.get_session_ids()  # type: ignore[union-attr]
+        elif self._registry is not None:
+            for p in self._registry.get_active_providers().values():
+                if hasattr(p, "get_session_ids"):
+                    copilot_session_ids = p.get_session_ids()  # type: ignore[union-attr]
+                    break
+
+        checkpoint_path = CheckpointManager.save_checkpoint(
+            workflow_path=self.workflow_path,
+            context=self.context,
+            limits=self.limits,
+            current_agent=self._current_agent_name or "unknown",
+            error=error,
+            inputs=self.context.workflow_inputs,
+            copilot_session_ids=copilot_session_ids,
+        )
+        self._last_checkpoint_path = checkpoint_path
+
+    async def _execute_loop(self, current_agent_name: str) -> dict[str, Any]:
+        """Core execution loop shared by :meth:`run` and :meth:`resume`.
+
+        Iterates through agents following routing rules until ``$end`` is
+        reached.  On failure the current state is saved to a checkpoint
+        file (if ``workflow_path`` is set) and the original exception is
+        re-raised.
+
+        Args:
+            current_agent_name: Name of the first agent to execute.
+
+        Returns:
+            Final output dict built from output templates.
+        """
         try:
             async with self.limits.timeout_context():
                 while True:
+                    self._current_agent_name = current_agent_name
+
                     # Try to find agent, parallel group, or for-each group
                     agent = self._find_agent(current_agent_name)
                     parallel_group = self._find_parallel_group(current_agent_name)
@@ -831,13 +946,18 @@ class WorkflowEngine:
 
                         current_agent_name = route_result.target
 
+        except KeyboardInterrupt:
+            self._save_checkpoint_on_failure(KeyboardInterrupt("Workflow interrupted by user"))
+            raise
         except ConductorError as e:
             # Execute on_error hook with error information
             self._execute_hook("on_error", error=e)
+            self._save_checkpoint_on_failure(e)
             raise
         except Exception as e:
             # Execute on_error hook for unexpected errors
             self._execute_hook("on_error", error=e)
+            self._save_checkpoint_on_failure(e)
             raise
 
     def _apply_input_defaults(self, inputs: dict[str, Any]) -> dict[str, Any]:

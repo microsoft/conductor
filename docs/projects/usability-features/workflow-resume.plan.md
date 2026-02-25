@@ -551,6 +551,8 @@ Track session IDs in provider, include in checkpoints, attempt session resume on
 
 ### Epic 2: Checkpoint Manager
 
+**Status:** DONE
+
 **Goal:** Create a standalone `CheckpointManager` module that handles all checkpoint file operations: save, load, list, validate, and cleanup.
 
 **Prerequisites:** Epic 1 (state serialization methods).
@@ -559,17 +561,17 @@ Track session IDs in provider, include in checkpoints, attempt session resume on
 
 | Task ID | Type | Description | Files | Status |
 |---------|------|-------------|-------|--------|
-| E2-T1 | IMPL | Add `CheckpointError` exception to `exceptions.py` — inherits from `ConductorError`, used for checkpoint I/O failures (file not found, invalid format, version mismatch). | `src/conductor/exceptions.py` | TO DO |
-| E2-T2 | IMPL | Create `CheckpointData` dataclass in `checkpoint.py` — typed container for parsed checkpoint fields (`version`, `workflow_path`, `workflow_hash`, `created_at`, `failure`, `inputs`, `current_agent`, `context`, `limits`, `copilot_session_ids`, `file_path`). | `src/conductor/engine/checkpoint.py` | TO DO |
-| E2-T3 | IMPL | Implement `CheckpointManager.get_checkpoints_dir()` — returns `Path(tempfile.gettempdir()) / "conductor" / "checkpoints"`, creates directory if not exists. Follow existing `generate_log_path()` pattern from `run.py`. | `src/conductor/engine/checkpoint.py` | TO DO |
-| E2-T4 | IMPL | Implement `CheckpointManager.compute_workflow_hash(path)` — reads workflow file as bytes, returns `"sha256:<hex_digest>"`. | `src/conductor/engine/checkpoint.py` | TO DO |
-| E2-T5 | IMPL | Implement `CheckpointManager.save_checkpoint()` — accepts `workflow_path`, `context`, `limits`, `current_agent`, `error`, `inputs`, optional `copilot_session_ids`. Builds checkpoint dict, serializes to JSON with indent=2, writes atomically (write to `.tmp`, then rename). Sets file permissions to 0o600. Returns checkpoint file path. Wraps errors in `CheckpointError` but never raises (logs warning and returns None if save fails, to avoid masking the original error). | `src/conductor/engine/checkpoint.py` | TO DO |
-| E2-T6 | IMPL | Implement `CheckpointManager.load_checkpoint(path)` — reads JSON, validates version field, returns `CheckpointData`. Raises `CheckpointError` on file not found, invalid JSON, or unsupported version. | `src/conductor/engine/checkpoint.py` | TO DO |
-| E2-T7 | IMPL | Implement `CheckpointManager.find_latest_checkpoint(workflow_path)` — scans checkpoints dir for files matching `<workflow-name>-*.json`, returns path of the most recent by filename timestamp. Returns `None` if no checkpoints exist. | `src/conductor/engine/checkpoint.py` | TO DO |
-| E2-T8 | IMPL | Implement `CheckpointManager.list_checkpoints(workflow_path=None)` — lists all checkpoint files, optionally filtered by workflow name. Returns list of `CheckpointData` sorted by `created_at` descending. | `src/conductor/engine/checkpoint.py` | TO DO |
-| E2-T9 | IMPL | Implement `CheckpointManager.cleanup(path)` — deletes checkpoint file. Logs warning if file doesn't exist (idempotent). | `src/conductor/engine/checkpoint.py` | TO DO |
-| E2-T10 | IMPL | Add a `_make_json_serializable(obj)` helper — recursively converts non-JSON types to strings (handles bytes, datetime, Path, custom objects via `str()`). Used by `save_checkpoint()` to avoid serialization failures. | `src/conductor/engine/checkpoint.py` | TO DO |
-| E2-T11 | TEST | Unit tests for `CheckpointManager`: save/load round-trip, file format validation (version, required fields), hash computation, `find_latest_checkpoint` with multiple files, `list_checkpoints` with filtering, `cleanup` idempotent, atomic write (no partial files), file permissions, non-serializable value handling, `save_checkpoint` doesn't raise on failure. | `tests/test_engine/test_checkpoint.py` | TO DO |
+| E2-T1 | IMPL | Add `CheckpointError` exception to `exceptions.py` — inherits from `ConductorError`, used for checkpoint I/O failures (file not found, invalid format, version mismatch). | `src/conductor/exceptions.py` | DONE |
+| E2-T2 | IMPL | Create `CheckpointData` dataclass in `checkpoint.py` — typed container for parsed checkpoint fields (`version`, `workflow_path`, `workflow_hash`, `created_at`, `failure`, `inputs`, `current_agent`, `context`, `limits`, `copilot_session_ids`, `file_path`). | `src/conductor/engine/checkpoint.py` | DONE |
+| E2-T3 | IMPL | Implement `CheckpointManager.get_checkpoints_dir()` — returns `Path(tempfile.gettempdir()) / "conductor" / "checkpoints"`, creates directory if not exists. Follow existing `generate_log_path()` pattern from `run.py`. | `src/conductor/engine/checkpoint.py` | DONE |
+| E2-T4 | IMPL | Implement `CheckpointManager.compute_workflow_hash(path)` — reads workflow file as bytes, returns `"sha256:<hex_digest>"`. | `src/conductor/engine/checkpoint.py` | DONE |
+| E2-T5 | IMPL | Implement `CheckpointManager.save_checkpoint()` — accepts `workflow_path`, `context`, `limits`, `current_agent`, `error`, `inputs`, optional `copilot_session_ids`. Builds checkpoint dict, serializes to JSON with indent=2, writes atomically (write to `.tmp`, then rename). Sets file permissions to 0o600. Returns checkpoint file path. Wraps errors in `CheckpointError` but never raises (logs warning and returns None if save fails, to avoid masking the original error). | `src/conductor/engine/checkpoint.py` | DONE |
+| E2-T6 | IMPL | Implement `CheckpointManager.load_checkpoint(path)` — reads JSON, validates version field, returns `CheckpointData`. Raises `CheckpointError` on file not found, invalid JSON, or unsupported version. | `src/conductor/engine/checkpoint.py` | DONE |
+| E2-T7 | IMPL | Implement `CheckpointManager.find_latest_checkpoint(workflow_path)` — scans checkpoints dir for files matching `<workflow-name>-*.json`, returns path of the most recent by filename timestamp. Returns `None` if no checkpoints exist. | `src/conductor/engine/checkpoint.py` | DONE |
+| E2-T8 | IMPL | Implement `CheckpointManager.list_checkpoints(workflow_path=None)` — lists all checkpoint files, optionally filtered by workflow name. Returns list of `CheckpointData` sorted by `created_at` descending. | `src/conductor/engine/checkpoint.py` | DONE |
+| E2-T9 | IMPL | Implement `CheckpointManager.cleanup(path)` — deletes checkpoint file. Logs warning if file doesn't exist (idempotent). | `src/conductor/engine/checkpoint.py` | DONE |
+| E2-T10 | IMPL | Add a `_make_json_serializable(obj)` helper — recursively converts non-JSON types to strings (handles bytes, datetime, Path, custom objects via `str()`). Used by `save_checkpoint()` to avoid serialization failures. | `src/conductor/engine/checkpoint.py` | DONE |
+| E2-T11 | TEST | Unit tests for `CheckpointManager`: save/load round-trip, file format validation (version, required fields), hash computation, `find_latest_checkpoint` with multiple files, `list_checkpoints` with filtering, `cleanup` idempotent, atomic write (no partial files), file permissions, non-serializable value handling, `save_checkpoint` doesn't raise on failure. | `tests/test_engine/test_checkpoint.py` | DONE |
 
 **Acceptance Criteria:**
 - [ ] Checkpoint files are valid JSON matching the documented format
@@ -585,6 +587,8 @@ Track session IDs in provider, include in checkpoints, attempt session resume on
 
 ### Epic 3: Engine Integration
 
+**Status:** DONE
+
 **Goal:** Modify `WorkflowEngine` to save checkpoints on failure and support resuming from a checkpoint. Refactor the main execution loop to avoid duplication.
 
 **Prerequisites:** Epic 1, Epic 2.
@@ -593,26 +597,26 @@ Track session IDs in provider, include in checkpoints, attempt session resume on
 
 | Task ID | Type | Description | Files | Status |
 |---------|------|-------------|-------|--------|
-| E3-T1 | IMPL | Extract the main execution loop (workflow.py L544-841) into a private `_execute_loop(current_agent_name: str) -> dict[str, Any]` method. Both `run()` and the new `resume()` call this. The loop body is identical — the methods differ only in setup (context initialization vs. restoration). Keep the `try/except` in `_execute_loop()`. | `src/conductor/engine/workflow.py` | TO DO |
-| E3-T2 | IMPL | Add checkpoint save logic to the `except` blocks in `_execute_loop()`. After calling `on_error` hook, call `CheckpointManager.save_checkpoint()` with current state. Store `current_agent_name` by tracking it as `self._current_agent_name` (instance variable updated at each loop iteration). Store the returned checkpoint path as `self._last_checkpoint_path` so the CLI layer can read it for user-facing messages. | `src/conductor/engine/workflow.py` | TO DO |
-| E3-T3 | IMPL | Handle `KeyboardInterrupt` in `_execute_loop()` — catch it, save checkpoint, print resume message, re-raise. Currently not caught (L834-841 only catches `ConductorError` and `Exception`). | `src/conductor/engine/workflow.py` | TO DO |
-| E3-T4 | IMPL | Add `resume(current_agent_name: str) -> dict[str, Any]` method to `WorkflowEngine`. This method: (1) resets `self.limits.start_time` for a fresh timeout window, (2) calls `_execute_loop(current_agent_name)`. Assumes `self.context` and `self.limits` have been pre-populated from checkpoint data by the caller. | `src/conductor/engine/workflow.py` | TO DO |
-| E3-T5 | IMPL | Add `set_context(context: WorkflowContext)` and `set_limits(limits: LimitEnforcer)` methods to `WorkflowEngine` — allow external restoration of state from checkpoint (used by `resume_workflow_async()`). | `src/conductor/engine/workflow.py` | TO DO |
-| E3-T6 | IMPL | Store `workflow_path` on `WorkflowEngine` during construction (passed via config or explicitly). Needed by `CheckpointManager.save_checkpoint()` for checkpoint metadata. | `src/conductor/engine/workflow.py` | TO DO |
-| E3-T7 | TEST | Integration tests for checkpoint save on failure: create a workflow with a mock handler that raises `ProviderError` at a specific agent, verify checkpoint file is created with correct content (current_agent, context, limits, failure metadata). | `tests/test_engine/test_resume.py` | TO DO |
-| E3-T8 | TEST | Integration tests for resume: create a checkpoint with completed agents, call `engine.resume()`, verify execution continues from the checkpoint agent and produces correct final output. | `tests/test_engine/test_resume.py` | TO DO |
-| E3-T9 | TEST | Integration test: full round-trip — run a workflow that fails mid-execution, load the saved checkpoint, resume, verify the final output matches what a successful run would produce. | `tests/test_engine/test_resume.py` | TO DO |
-| E3-T10 | TEST | Test `KeyboardInterrupt` handling — verify checkpoint is saved when user presses Ctrl+C. | `tests/test_engine/test_resume.py` | TO DO |
-| E3-T11 | TEST | Test checkpoint cleanup — verify checkpoint file is deleted after successful resume. | `tests/test_engine/test_resume.py` | TO DO |
+| E3-T1 | IMPL | Extract the main execution loop (workflow.py L544-841) into a private `_execute_loop(current_agent_name: str) -> dict[str, Any]` method. Both `run()` and the new `resume()` call this. The loop body is identical — the methods differ only in setup (context initialization vs. restoration). Keep the `try/except` in `_execute_loop()`. | `src/conductor/engine/workflow.py` | DONE |
+| E3-T2 | IMPL | Add checkpoint save logic to the `except` blocks in `_execute_loop()`. After calling `on_error` hook, call `CheckpointManager.save_checkpoint()` with current state. Store `current_agent_name` by tracking it as `self._current_agent_name` (instance variable updated at each loop iteration). Store the returned checkpoint path as `self._last_checkpoint_path` so the CLI layer can read it for user-facing messages. | `src/conductor/engine/workflow.py` | DONE |
+| E3-T3 | IMPL | Handle `KeyboardInterrupt` in `_execute_loop()` — catch it, save checkpoint, print resume message, re-raise. Currently not caught (L834-841 only catches `ConductorError` and `Exception`). | `src/conductor/engine/workflow.py` | DONE |
+| E3-T4 | IMPL | Add `resume(current_agent_name: str) -> dict[str, Any]` method to `WorkflowEngine`. This method: (1) resets `self.limits.start_time` for a fresh timeout window, (2) calls `_execute_loop(current_agent_name)`. Assumes `self.context` and `self.limits` have been pre-populated from checkpoint data by the caller. | `src/conductor/engine/workflow.py` | DONE |
+| E3-T5 | IMPL | Add `set_context(context: WorkflowContext)` and `set_limits(limits: LimitEnforcer)` methods to `WorkflowEngine` — allow external restoration of state from checkpoint (used by `resume_workflow_async()`). | `src/conductor/engine/workflow.py` | DONE |
+| E3-T6 | IMPL | Store `workflow_path` on `WorkflowEngine` during construction (passed via config or explicitly). Needed by `CheckpointManager.save_checkpoint()` for checkpoint metadata. | `src/conductor/engine/workflow.py` | DONE |
+| E3-T7 | TEST | Integration tests for checkpoint save on failure: create a workflow with a mock handler that raises `ProviderError` at a specific agent, verify checkpoint file is created with correct content (current_agent, context, limits, failure metadata). | `tests/test_engine/test_resume.py` | DONE |
+| E3-T8 | TEST | Integration tests for resume: create a checkpoint with completed agents, call `engine.resume()`, verify execution continues from the checkpoint agent and produces correct final output. | `tests/test_engine/test_resume.py` | DONE |
+| E3-T9 | TEST | Integration test: full round-trip — run a workflow that fails mid-execution, load the saved checkpoint, resume, verify the final output matches what a successful run would produce. | `tests/test_engine/test_resume.py` | DONE |
+| E3-T10 | TEST | Test `KeyboardInterrupt` handling — verify checkpoint is saved when user presses Ctrl+C. | `tests/test_engine/test_resume.py` | DONE |
+| E3-T11 | TEST | Test checkpoint cleanup — verify checkpoint file is deleted after successful resume. | `tests/test_engine/test_resume.py` | DONE |
 
 **Acceptance Criteria:**
-- [ ] `run()` and `resume()` use the same `_execute_loop()` — no loop duplication
-- [ ] Checkpoint is saved on `ConductorError`, `KeyboardInterrupt`, and `Exception`
-- [ ] `resume()` correctly continues from the specified agent with full prior context
-- [ ] Checkpoint file is cleaned up after successful resume
-- [ ] Existing tests still pass (no regression from loop refactor)
-- [ ] Tests pass: `uv run pytest tests/test_engine/test_resume.py`
-- [ ] `make check` passes
+- [x] `run()` and `resume()` use the same `_execute_loop()` — no loop duplication
+- [x] Checkpoint is saved on `ConductorError`, `KeyboardInterrupt`, and `Exception`
+- [x] `resume()` correctly continues from the specified agent with full prior context
+- [x] Checkpoint file is cleaned up after successful resume
+- [x] Existing tests still pass (no regression from loop refactor)
+- [x] Tests pass: `uv run pytest tests/test_engine/test_resume.py`
+- [x] `make check` passes
 
 ---
 
