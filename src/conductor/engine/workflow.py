@@ -909,7 +909,10 @@ class WorkflowEngine:
                         # Execute agent (get executor for multi-provider support)
                         _agent_start = _time.time()
                         executor = await self._get_executor_for_agent(agent)
-                        output = await executor.execute(agent, agent_context)
+                        guidance_section = self.context.get_guidance_prompt_section()
+                        output = await executor.execute(
+                            agent, agent_context, guidance_section=guidance_section
+                        )
                         _agent_elapsed = _time.time() - _agent_start
 
                         # Record usage and calculate cost

@@ -1032,3 +1032,103 @@ class TestContextTrimmingWithParallelOutputs:
         final_tokens = ctx.trim_context(max_tokens, strategy="drop_oldest")
 
         assert final_tokens <= max_tokens
+
+
+class TestWorkflowContextGuidance:
+    """Tests for user guidance accumulation and prompt injection."""
+
+    def test_add_single_guidance(self) -> None:
+        """Test adding a single guidance entry."""
+        ctx = WorkflowContext()
+        ctx.add_guidance("Focus on Python 3 only")
+
+        assert ctx.user_guidance == ["Focus on Python 3 only"]
+
+    def test_add_multiple_guidance(self) -> None:
+        """Test accumulating multiple guidance entries."""
+        ctx = WorkflowContext()
+        ctx.add_guidance("Focus on Python 3 only")
+        ctx.add_guidance("Use async patterns")
+        ctx.add_guidance("Keep under 500 words")
+
+        assert ctx.user_guidance == [
+            "Focus on Python 3 only",
+            "Use async patterns",
+            "Keep under 500 words",
+        ]
+
+    def test_get_guidance_prompt_section_empty(self) -> None:
+        """Test that empty guidance returns None."""
+        ctx = WorkflowContext()
+
+        assert ctx.get_guidance_prompt_section() is None
+
+    def test_get_guidance_prompt_section_single(self) -> None:
+        """Test formatted section with single guidance entry."""
+        ctx = WorkflowContext()
+        ctx.add_guidance("Focus on Python 3 only")
+
+        section = ctx.get_guidance_prompt_section()
+
+        assert section is not None
+        assert "[User Guidance]" in section
+        assert "- Focus on Python 3 only" in section
+        assert "Incorporate this guidance" in section
+
+    def test_get_guidance_prompt_section_multiple(self) -> None:
+        """Test formatted section with multiple guidance entries."""
+        ctx = WorkflowContext()
+        ctx.add_guidance("Focus on Python 3 only")
+        ctx.add_guidance("Use async patterns")
+
+        section = ctx.get_guidance_prompt_section()
+
+        assert section is not None
+        assert "- Focus on Python 3 only" in section
+        assert "- Use async patterns" in section
+
+    def test_guidance_serialization_roundtrip(self) -> None:
+        """Test that guidance survives to_dict/from_dict roundtrip."""
+        ctx = WorkflowContext()
+        ctx.set_workflow_inputs({"q": "test"})
+        ctx.add_guidance("First guidance")
+        ctx.add_guidance("Second guidance")
+
+        serialized = ctx.to_dict()
+        restored = WorkflowContext.from_dict(serialized)
+
+        assert restored.user_guidance == ["First guidance", "Second guidance"]
+
+    def test_guidance_backward_compatible_from_dict(self) -> None:
+        """Test loading old checkpoint data without user_guidance key."""
+        old_data = {
+            "workflow_inputs": {"q": "test"},
+            "agent_outputs": {},
+            "current_iteration": 0,
+            "execution_history": [],
+        }
+
+        ctx = WorkflowContext.from_dict(old_data)
+
+        assert ctx.user_guidance == []
+        assert ctx.get_guidance_prompt_section() is None
+
+    def test_to_dict_includes_user_guidance(self) -> None:
+        """Test that to_dict includes user_guidance field."""
+        ctx = WorkflowContext()
+        ctx.add_guidance("some guidance")
+
+        data = ctx.to_dict()
+
+        assert "user_guidance" in data
+        assert data["user_guidance"] == ["some guidance"]
+
+    def test_guidance_section_starts_with_newlines(self) -> None:
+        """Test that guidance section starts with double newline for clean separation."""
+        ctx = WorkflowContext()
+        ctx.add_guidance("test")
+
+        section = ctx.get_guidance_prompt_section()
+
+        assert section is not None
+        assert section.startswith("\n\n")

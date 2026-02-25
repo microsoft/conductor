@@ -631,6 +631,8 @@ async def send_followup(
 
 ### Epic 3: Guidance Injection & Context Integration
 
+**Status:** DONE
+
 **Goal:** Store accumulated guidance in `WorkflowContext` and inject it into agent prompts via the executor.
 
 **Prerequisites:** Epic 2 (InterruptResult defines guidance format)
@@ -639,19 +641,21 @@ async def send_followup(
 
 | Task ID | Type | Description | Files | Status |
 |---------|------|-------------|-------|--------|
-| E3-T1 | IMPL | Add `user_guidance: list[str]` field to `WorkflowContext` dataclass. Add `add_guidance(text: str)` method that appends to list. Add `get_guidance_prompt_section()` that returns formatted `[User Guidance]` section or None if empty. Update `to_dict()` to include `user_guidance`. Update `from_dict()` to restore guidance with backward-compatible default: `data.get("user_guidance", [])` so old checkpoints without this field load correctly. | `src/conductor/engine/context.py` | TO DO |
-| E3-T2 | IMPL | Modify `AgentExecutor.execute()` to accept optional `guidance_section` parameter. If provided, append it to the rendered prompt before calling `provider.execute()`. The guidance section is appended to the rendered prompt text, not to the system prompt. | `src/conductor/executor/agent.py` | TO DO |
-| E3-T3 | IMPL | In `WorkflowEngine._execute_loop()`, before calling `executor.execute()`, get `guidance_section = self.context.get_guidance_prompt_section()` and pass it to the executor. | `src/conductor/engine/workflow.py` | TO DO |
-| E3-T4 | TEST | Test `WorkflowContext` guidance methods: add single guidance, add multiple, get formatted section, empty returns None, serialization roundtrip via `to_dict()`/`from_dict()`, backward compatibility (loading dict without `user_guidance` key). | `tests/test_engine/test_context.py` (extend existing) | TO DO |
-| E3-T5 | TEST | Test `AgentExecutor` guidance injection: verify guidance is appended to rendered prompt, verify None guidance does not change prompt, verify guidance appears before any schema instruction block. | `tests/test_executor/test_agent_guidance.py` | TO DO |
+| E3-T1 | IMPL | Add `user_guidance: list[str]` field to `WorkflowContext` dataclass. Add `add_guidance(text: str)` method that appends to list. Add `get_guidance_prompt_section()` that returns formatted `[User Guidance]` section or None if empty. Update `to_dict()` to include `user_guidance`. Update `from_dict()` to restore guidance with backward-compatible default: `data.get("user_guidance", [])` so old checkpoints without this field load correctly. | `src/conductor/engine/context.py` | DONE |
+| E3-T2 | IMPL | Modify `AgentExecutor.execute()` to accept optional `guidance_section` parameter. If provided, append it to the rendered prompt before calling `provider.execute()`. The guidance section is appended to the rendered prompt text, not to the system prompt. | `src/conductor/executor/agent.py` | DONE |
+| E3-T3 | IMPL | In `WorkflowEngine._execute_loop()`, before calling `executor.execute()`, get `guidance_section = self.context.get_guidance_prompt_section()` and pass it to the executor. | `src/conductor/engine/workflow.py` | DONE |
+| E3-T4 | TEST | Test `WorkflowContext` guidance methods: add single guidance, add multiple, get formatted section, empty returns None, serialization roundtrip via `to_dict()`/`from_dict()`, backward compatibility (loading dict without `user_guidance` key). | `tests/test_engine/test_context.py` (extend existing) | DONE |
+| E3-T5 | TEST | Test `AgentExecutor` guidance injection: verify guidance is appended to rendered prompt, verify None guidance does not change prompt, verify guidance appears before any schema instruction block. | `tests/test_executor/test_agent_guidance.py` | DONE |
 
 **Acceptance Criteria:**
-- [ ] Guidance accumulates correctly across multiple interrupts
-- [ ] Formatted `[User Guidance]` section is appended to agent rendered prompts
-- [ ] Empty guidance produces no modification to prompt
-- [ ] Guidance survives serialization/deserialization (checkpoint support)
-- [ ] Loading old checkpoints without `user_guidance` field works (backward compatible)
-- [ ] All tests pass
+- [x] Guidance accumulates correctly across multiple interrupts
+- [x] Formatted `[User Guidance]` section is appended to agent rendered prompts
+- [x] Empty guidance produces no modification to prompt
+- [x] Guidance survives serialization/deserialization (checkpoint support)
+- [x] Loading old checkpoints without `user_guidance` field works (backward compatible)
+- [x] All tests pass
+
+**Completion Notes:** Added `user_guidance: list[str]` field, `add_guidance()`, and `get_guidance_prompt_section()` to `WorkflowContext`. Updated `to_dict()`/`from_dict()` with backward-compatible serialization. `AgentExecutor.execute()` accepts optional `guidance_section` parameter appended after the rendered prompt. `WorkflowEngine._execute_loop()` passes guidance to executor for regular agent execution. 14 new tests cover guidance accumulation, prompt injection, serialization roundtrip, and backward compatibility.
 
 ---
 

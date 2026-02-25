@@ -110,6 +110,7 @@ class AgentExecutor:
         self,
         agent: AgentDef,
         context: dict[str, Any],
+        guidance_section: str | None = None,
     ) -> AgentOutput:
         """Execute an agent with the given context.
 
@@ -122,6 +123,9 @@ class AgentExecutor:
         Args:
             agent: Agent definition from workflow config.
             context: Context for prompt rendering, built by WorkflowContext.
+            guidance_section: Optional user guidance section to append to the
+                rendered prompt. When provided, this is appended after the
+                rendered prompt text.
 
         Returns:
             Validated agent output.
@@ -133,6 +137,10 @@ class AgentExecutor:
         """
         # Render prompt with context
         rendered_prompt = self.renderer.render(agent.prompt, context)
+
+        # Append user guidance section if provided
+        if guidance_section:
+            rendered_prompt = rendered_prompt + guidance_section
 
         # Verbose: Log rendered prompt
         _verbose_log_section(

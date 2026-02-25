@@ -34,6 +34,7 @@ class TestWorkflowContextToDict:
             "agent_outputs": {},
             "current_iteration": 0,
             "execution_history": [],
+            "user_guidance": [],
         }
 
     def test_single_agent_output(self) -> None:
