@@ -396,6 +396,7 @@ class WorkflowEngine:
         registry: ProviderRegistry | None = None,
         skip_gates: bool = False,
         workflow_path: Path | None = None,
+        interrupt_event: asyncio.Event | None = None,
     ) -> None:
         """Initialize the WorkflowEngine.
 
@@ -409,6 +410,8 @@ class WorkflowEngine:
             skip_gates: If True, auto-selects first option at human gates.
             workflow_path: Path to the workflow YAML file. Used for checkpoint
                 metadata when saving state on failure.
+            interrupt_event: Optional asyncio.Event for interrupt signaling.
+                When set, the engine checks for user interrupts between agents.
 
         Note:
             If both provider and registry are provided, registry takes precedence.
@@ -445,6 +448,9 @@ class WorkflowEngine:
             # Create a placeholder - will be created per-agent when using registry
             self.executor = None
             self.provider = None
+
+        # Interrupt support
+        self._interrupt_event = interrupt_event
 
         # Checkpoint tracking
         self._current_agent_name: str | None = None

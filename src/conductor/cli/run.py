@@ -5,6 +5,7 @@ This module provides helper functions for executing workflow files.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -827,6 +828,7 @@ async def run_workflow_async(
     provider_override: str | None = None,
     skip_gates: bool = False,
     log_file: Path | None = None,
+    no_interactive: bool = False,
 ) -> dict[str, Any]:
     """Execute a workflow asynchronously.
 
@@ -836,6 +838,7 @@ async def run_workflow_async(
         provider_override: Optional provider name to override workflow config.
         skip_gates: If True, auto-selects first option at human gates.
         log_file: Optional path to write full debug output to a file.
+        no_interactive: If True, disables the keyboard interrupt listener.
 
     Returns:
         The workflow output as a dictionary.
@@ -892,15 +895,35 @@ async def run_workflow_async(
             # Create and run workflow engine
             verbose_log("Starting workflow execution...")
 
+            # Set up interrupt listener if interactive mode is enabled
+            interrupt_event: asyncio.Event | None = None
+            listener = None
+            if not no_interactive and sys.stdin.isatty():
+                from conductor.interrupt.listener import KeyboardListener
+
+                interrupt_event = asyncio.Event()
+                listener = KeyboardListener(interrupt_event=interrupt_event)
+
             engine = WorkflowEngine(
-                config, registry=registry, skip_gates=skip_gates, workflow_path=workflow_path
+                config,
+                registry=registry,
+                skip_gates=skip_gates,
+                workflow_path=workflow_path,
+                interrupt_event=interrupt_event,
             )
 
             try:
+                if listener is not None:
+                    await listener.start()
+                    _verbose_console.print("[dim]Press Esc to interrupt and provide guidance[/dim]")
+
                 result = await engine.run(inputs)
             except BaseException:
                 _print_resume_instructions(engine)
                 raise
+            finally:
+                if listener is not None:
+                    await listener.stop()
 
             # Log completion
             verbose_log_timing("Total workflow execution", time.time() - start_time)
@@ -1130,6 +1153,7 @@ async def resume_workflow_async(
     checkpoint_path: Path | None = None,
     skip_gates: bool = False,
     log_file: Path | None = None,
+    no_interactive: bool = False,
 ) -> dict[str, Any]:
     """Resume a workflow from a checkpoint.
 
@@ -1143,6 +1167,7 @@ async def resume_workflow_async(
             precedence over ``workflow_path``.
         skip_gates: If True, auto-selects first option at human gates.
         log_file: Optional path to write full debug output to a file.
+        no_interactive: If True, disables the keyboard interrupt listener.
 
     Returns:
         The workflow output as a dictionary.
@@ -1249,20 +1274,37 @@ async def resume_workflow_async(
             if cp.copilot_session_ids:
                 registry.set_resume_session_ids(cp.copilot_session_ids)
 
+            # Set up interrupt listener if interactive mode is enabled
+            interrupt_event: asyncio.Event | None = None
+            listener = None
+            if not no_interactive and sys.stdin.isatty():
+                from conductor.interrupt.listener import KeyboardListener
+
+                interrupt_event = asyncio.Event()
+                listener = KeyboardListener(interrupt_event=interrupt_event)
+
             engine = WorkflowEngine(
                 config,
                 registry=registry,
                 skip_gates=skip_gates,
                 workflow_path=resolved_workflow_path,
+                interrupt_event=interrupt_event,
             )
             engine.set_context(restored_context)
             engine.set_limits(restored_limits)
 
             try:
+                if listener is not None:
+                    await listener.start()
+                    _verbose_console.print("[dim]Press Esc to interrupt and provide guidance[/dim]")
+
                 result = await engine.resume(cp.current_agent)
             except BaseException:
                 _print_resume_instructions(engine)
                 raise
+            finally:
+                if listener is not None:
+                    await listener.stop()
 
             # Log completion
             verbose_log_timing("Total resumed execution", time.time() - start_time)

@@ -748,9 +748,11 @@ class CopilotProvider(AgentProvider):
 
         # Log interesting events with Rich styling
         if event_type == "tool.execution_start":
-            tool_name = getattr(event.data, "tool_name", None) or getattr(
-                event.data, "name", None
-            ) or "unknown"
+            tool_name = (
+                getattr(event.data, "tool_name", None)
+                or getattr(event.data, "name", None)
+                or "unknown"
+            )
 
             text = Text()
             text.append("    ├─ ", style="dim")

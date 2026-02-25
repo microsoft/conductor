@@ -250,6 +250,13 @@ def run(
             ),
         ),
     ] = None,
+    no_interactive: Annotated[
+        bool,
+        typer.Option(
+            "--no-interactive",
+            help="Disable interactive interrupt capability (Esc to pause).",
+        ),
+    ] = False,
 ) -> None:
     """Run a workflow from a YAML file.
 
@@ -267,6 +274,7 @@ def run(
         conductor run workflow.yaml --log-file auto
         conductor run workflow.yaml --log-file debug.log
         conductor run workflow.yaml --silent --log-file auto
+        conductor run workflow.yaml --no-interactive
     """
     import asyncio
     import json
@@ -312,7 +320,9 @@ def run(
     try:
         # Run the workflow
         result = asyncio.run(
-            run_workflow_async(workflow, inputs, provider, skip_gates, resolved_log_file)
+            run_workflow_async(
+                workflow, inputs, provider, skip_gates, resolved_log_file, no_interactive
+            )
         )
 
         # Output as JSON to stdout
@@ -467,6 +477,13 @@ def resume(
             ),
         ),
     ] = None,
+    no_interactive: Annotated[
+        bool,
+        typer.Option(
+            "--no-interactive",
+            help="Disable interactive interrupt capability (Esc to pause).",
+        ),
+    ] = False,
 ) -> None:
     """Resume a workflow from a checkpoint after failure.
 
@@ -483,6 +500,7 @@ def resume(
         conductor resume --from /tmp/conductor/checkpoints/my-workflow-20260224-153000.json
         conductor resume workflow.yaml --skip-gates
         conductor resume workflow.yaml --log-file auto
+        conductor resume workflow.yaml --no-interactive
     """
     import asyncio
     import json
@@ -535,6 +553,7 @@ def resume(
                 checkpoint_path=resolved_checkpoint,
                 skip_gates=skip_gates,
                 log_file=resolved_log_file,
+                no_interactive=no_interactive,
             )
         )
 
