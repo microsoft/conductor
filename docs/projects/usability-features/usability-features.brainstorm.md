@@ -242,6 +242,144 @@ agents:
 
 ---
 
+## 5. Workflow Resume After Failure
+
+Allow users to resume a workflow that didn't complete — due to idle recovery exhaustion, process crash, timeout, max iterations, network failure, or any other error. Currently all state is lost on failure, forcing users to restart expensive multi-agent workflows from scratch.
+
+### The Problem
+
+All workflow state lives in memory:
+- `WorkflowContext`: `workflow_inputs`, `agent_outputs`, `current_iteration`, `execution_history`
+- `LimitEnforcer`: iteration counts, timing
+- `WorkflowEngine`: created fresh per `run()` call, no checkpoint/resume path
+
+When an error occurs (`workflow.py` L834-841), the `on_error` hook fires but no state is saved. A 10-minute research workflow that fails at the synthesizer step must re-run the planner and researcher from scratch.
+
+### Failure Modes
+
+| Failure | Cause | State in memory? |
+|---|---|---|
+| Idle recovery exhausted | Copilot SDK session stuck after max retries | Yes |
+| Max iterations reached | Loop-back workflows, user declines to add more | Yes |
+| Timeout exceeded | `workflow.limits.timeout_seconds` hit | Yes |
+| Network/API failure | Provider returns non-retryable error after retries | Yes |
+| Output validation error | Agent output doesn't match schema | Yes |
+| Ctrl+C / KeyboardInterrupt | User cancels | Yes (if caught) |
+| Process crash (SIGKILL, OOM) | OS kills process | No |
+
+Key insight: most failures happen with full context still in memory. The only case where state is truly lost is an ungraceful process kill.
+
+### Design: On-Failure State Dump
+
+Rather than continuous checkpointing (overhead, complexity), save state at the point of failure.
+
+#### How It Works
+
+1. Wrap the main `run()` loop in a try/except that catches `ConductorError`, `KeyboardInterrupt`, and `Exception`
+2. On failure: serialize `WorkflowContext` + failure metadata to a JSON checkpoint file
+3. Print to stderr: `Workflow state saved. Resume with: conductor resume workflow.yaml`
+4. On resume: reconstruct `WorkflowContext`, set `current_agent_name` to the agent that failed, and re-run it
+
+#### Checkpoint File
+
+Written to `$TMPDIR/conductor/checkpoints/<workflow>-<timestamp>.json`:
+
+```json
+{
+  "version": 1,
+  "workflow_path": "/absolute/path/to/workflow.yaml",
+  "workflow_hash": "sha256:abc123...",
+  "created_at": "2026-02-24T15:30:00Z",
+  "failure": {
+    "error_type": "ProviderError",
+    "message": "Session appears stuck after 3 recovery attempts",
+    "agent": "synthesizer",
+    "iteration": 4
+  },
+  "inputs": {"topic": "AI in healthcare", "depth": "comprehensive"},
+  "current_agent": "synthesizer",
+  "context": {
+    "workflow_inputs": {"topic": "AI in healthcare", "depth": "comprehensive"},
+    "agent_outputs": {
+      "planner": {"plan": {...}, "summary": "..."},
+      "researcher": {"findings": [...], "sources": [...], "coverage": 85}
+    },
+    "current_iteration": 3,
+    "execution_history": ["planner", "researcher", "researcher"]
+  },
+  "limits": {
+    "current_iteration": 3,
+    "max_iterations": 15
+  },
+  "copilot_session_ids": {
+    "planner": "session-abc",
+    "researcher": "session-def"
+  }
+}
+```
+
+#### CLI Commands
+
+```bash
+# Normal run — on failure, state is auto-saved
+conductor run workflow.yaml --input topic="AI"
+# → Error: Session appears stuck...
+# → Workflow state saved. Resume with: conductor resume workflow.yaml
+
+# Resume from most recent checkpoint for this workflow
+conductor resume workflow.yaml
+
+# Resume from a specific checkpoint file
+conductor resume --from /tmp/conductor/checkpoints/research-20260224-153000.json
+
+# List available checkpoints
+conductor checkpoints
+conductor checkpoints workflow.yaml
+```
+
+#### Resume Flow
+
+1. Load checkpoint file
+2. Load workflow YAML and compare `workflow_hash` — warn if workflow changed since checkpoint
+3. Reconstruct `WorkflowContext` from checkpoint data (set `workflow_inputs`, `agent_outputs`, `current_iteration`, `execution_history`)
+4. Reconstruct `LimitEnforcer` state (reset timeout clock, restore iteration count)
+5. Set `current_agent_name` to the agent recorded in `current_agent` (the one that failed)
+6. Re-run that agent — it gets all prior context, so it can pick up where the workflow left off
+7. Continue the normal main loop from there
+
+#### Copilot Session Resume
+
+The Copilot SDK supports session persistence:
+- `client.list_sessions()` — lists all sessions with IDs, timestamps, summaries
+- `client.resume_session(session_id)` — resumes a session with full conversation history
+- Sessions survive client restarts (persisted by the CLI server)
+
+On resume, if `copilot_session_ids` are in the checkpoint, Conductor can try `resume_session()` instead of creating a new session. This means the model retains the full conversation context from before the failure — it knows what it was doing and can continue naturally.
+
+If session resume fails (session expired, server restarted), fall back to creating a new session with the prior context injected via the prompt.
+
+#### Claude Resume
+
+The Anthropic SDK is stateless — no session persistence. On resume, the Claude provider simply starts a new API call. The prior agent outputs are available via `WorkflowContext`, so the agent's prompt template renders correctly with all prior context. This is functionally equivalent to a normal execution from that point in the workflow.
+
+### What This Doesn't Cover
+
+- **SIGKILL / OOM**: Process dies before the handler runs. State is lost. For this, continuous checkpointing (`--checkpoint` flag) could be added later as an enhancement.
+- **Partial agent output**: If an agent was mid-execution when the failure occurred, its output is lost. The re-run starts that agent fresh.
+- **Workflow changes**: If the user modifies the workflow YAML between failure and resume, the checkpoint may be incompatible (agents renamed, routes changed, schemas modified). A hash comparison warns about this but doesn't prevent resume.
+
+### Key Files
+
+- `src/conductor/engine/workflow.py` — `run()` error handling (L834-841): add checkpoint serialization
+- `src/conductor/engine/context.py` — `WorkflowContext`: add `to_dict()` / `from_dict()` serialization methods
+- `src/conductor/engine/limits.py` — `LimitEnforcer`: add serialization methods
+- `src/conductor/cli/app.py` — new `resume` and `checkpoints` commands
+- `src/conductor/cli/run.py` — `run_workflow_async()`: checkpoint save on failure, checkpoint load on resume
+- `src/conductor/providers/copilot.py` — save session IDs to checkpoint, use `resume_session()` on resume
+- Copilot SDK: `client.resume_session()`, `client.list_sessions()`
+
+---
+
 ## Implementation Order
 
 1. **~~Logging Redesign~~** — ✅ Shipped
@@ -251,3 +389,4 @@ agents:
    - Phase 1: Between-agent interrupts (hotkey + handler UI + guidance injection)
    - Phase 2: Mid-agent interrupts for Copilot (`session.abort()` + follow-up)
    - Phase 3: Mid-agent interrupts for Claude (agentic loop interrupt + forced emit_output)
+5. **Workflow Resume** — On-failure state dump + `conductor resume` command

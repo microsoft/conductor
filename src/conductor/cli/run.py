@@ -1245,6 +1245,10 @@ async def resume_workflow_async(
         async with ProviderRegistry(config, mcp_servers=mcp_servers) as registry:
             verbose_log("Starting resumed workflow execution...")
 
+            # Pass stored session IDs to registry for Copilot session resume
+            if cp.copilot_session_ids:
+                registry.set_resume_session_ids(cp.copilot_session_ids)
+
             engine = WorkflowEngine(
                 config,
                 registry=registry,

@@ -156,6 +156,8 @@ class CopilotProvider(AgentProvider):
         self._started = False
         self._idle_recovery_config = idle_recovery_config or IdleRecoveryConfig()
         self._temperature = temperature
+        self._session_ids: dict[str, str] = {}
+        self._resume_session_ids: dict[str, str] = {}
 
     async def execute(
         self,
@@ -385,8 +387,28 @@ class CopilotProvider(AgentProvider):
             if self._mcp_servers:
                 session_config["mcp_servers"] = self._mcp_servers
 
-            # Create a session and send the prompt
-            session = await self._client.create_session(session_config)
+            # Attempt to resume a previous session if one exists for this agent
+            session: Any = None
+            resume_sid = self._resume_session_ids.get(agent.name)
+            if resume_sid is not None:
+                try:
+                    session = await self._client.resume_session(resume_sid)
+                    logger.info(f"Resumed Copilot session {resume_sid} for agent '{agent.name}'")
+                except Exception as exc:
+                    logger.warning(
+                        f"Could not resume session {resume_sid} for agent "
+                        f"'{agent.name}': {exc}. Falling back to new session."
+                    )
+                    session = None
+
+            # Fall back to creating a new session
+            if session is None:
+                session = await self._client.create_session(session_config)
+
+            # Track session ID for checkpoint persistence
+            sid = getattr(session, "session_id", None)
+            if sid is not None:
+                self._session_ids[agent.name] = sid
 
             # Capture verbose state before callback (contextvars don't propagate to sync callbacks)
             from conductor.cli.app import is_full, is_verbose
@@ -1084,6 +1106,30 @@ class CopilotProvider(AgentProvider):
         self._started = False
         self._call_history.clear()
         self._retry_history.clear()
+
+    def get_session_ids(self) -> dict[str, str]:
+        """Get tracked session IDs for all executed agents.
+
+        Returns a copy of the mapping from agent name to Copilot session ID.
+        Session IDs are captured after ``create_session()`` and remain valid
+        even after ``session.destroy()`` (which only releases local resources).
+
+        Returns:
+            Dict mapping agent names to their Copilot session IDs.
+        """
+        return self._session_ids.copy()
+
+    def set_resume_session_ids(self, ids: dict[str, str]) -> None:
+        """Set session IDs to attempt resuming on next execution.
+
+        When executing an agent, the provider will check this mapping
+        for a stored session ID and attempt ``client.resume_session()``
+        before falling back to ``create_session()``.
+
+        Args:
+            ids: Mapping of agent names to session IDs from a checkpoint.
+        """
+        self._resume_session_ids = dict(ids)
 
     def get_call_history(self) -> list[dict[str, Any]]:
         """Get the history of execute calls.

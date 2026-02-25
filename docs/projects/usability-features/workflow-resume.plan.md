@@ -622,6 +622,8 @@ Track session IDs in provider, include in checkpoints, attempt session resume on
 
 ### Epic 4: CLI Commands
 
+**Status:** DONE
+
 **Goal:** Add `conductor resume` and `conductor checkpoints` CLI commands that wire the checkpoint/resume system to user-facing CLI.
 
 **Prerequisites:** Epic 3.
@@ -630,27 +632,29 @@ Track session IDs in provider, include in checkpoints, attempt session resume on
 
 | Task ID | Type | Description | Files | Status |
 |---------|------|-------------|-------|--------|
-| E4-T1 | IMPL | Add `resume` command to `app.py`. Parameters: `workflow` (optional Path argument), `--from` (optional checkpoint path), `--skip-gates`, `--log-file`. Validates that exactly one of `workflow` or `--from` is provided. Imports and calls `resume_workflow_async()`. Prints JSON result to stdout. | `src/conductor/cli/app.py` | TO DO |
-| E4-T2 | IMPL | Add `checkpoints` command to `app.py`. Parameters: `workflow` (optional Path argument). Calls `CheckpointManager.list_checkpoints()` and displays a formatted table (Rich) with columns: workflow name, timestamp, failed agent, error type, file path. | `src/conductor/cli/app.py` | TO DO |
-| E4-T3 | IMPL | Implement `resume_workflow_async()` in `run.py`. Steps: (1) Load checkpoint via `CheckpointManager`, (2) Load workflow YAML, (3) Compare hashes — warn if different, (4) Reconstruct `WorkflowContext.from_dict()` and `LimitEnforcer.from_dict()`, (5) Create `ProviderRegistry` and `WorkflowEngine`, (6) Set engine context and limits, (7) Call `engine.resume()`, (8) On success: cleanup checkpoint. | `src/conductor/cli/run.py` | TO DO |
-| E4-T4 | IMPL | Add resume message printing in `run_workflow_async()` — when `engine.run()` raises, print the checkpoint path and resume instructions to stderr (the checkpoint itself is saved by the engine in E3-T2; the CLI only prints the user-facing message). | `src/conductor/cli/run.py` | TO DO |
-| E4-T5 | TEST | CLI tests for `resume` command: test with `--from` path, test with workflow path (finds latest), test missing arguments error, test nonexistent checkpoint error. Use `typer.testing.CliRunner`. | `tests/test_cli/test_resume_command.py` | TO DO |
-| E4-T6 | TEST | CLI tests for `checkpoints` command: test with no checkpoints, test with multiple checkpoints, test filtered by workflow path. | `tests/test_cli/test_resume_command.py` | TO DO |
-| E4-T7 | TEST | Test workflow hash mismatch warning: modify workflow after checkpoint, resume, verify warning printed to stderr. | `tests/test_cli/test_resume_command.py` | TO DO |
+| E4-T1 | IMPL | Add `resume` command to `app.py`. Parameters: `workflow` (optional Path argument), `--from` (optional checkpoint path), `--skip-gates`, `--log-file`. Validates that exactly one of `workflow` or `--from` is provided. Imports and calls `resume_workflow_async()`. Prints JSON result to stdout. | `src/conductor/cli/app.py` | DONE |
+| E4-T2 | IMPL | Add `checkpoints` command to `app.py`. Parameters: `workflow` (optional Path argument). Calls `CheckpointManager.list_checkpoints()` and displays a formatted table (Rich) with columns: workflow name, timestamp, failed agent, error type, file path. | `src/conductor/cli/app.py` | DONE |
+| E4-T3 | IMPL | Implement `resume_workflow_async()` in `run.py`. Steps: (1) Load checkpoint via `CheckpointManager`, (2) Load workflow YAML, (3) Compare hashes — warn if different, (4) Reconstruct `WorkflowContext.from_dict()` and `LimitEnforcer.from_dict()`, (5) Create `ProviderRegistry` and `WorkflowEngine`, (6) Set engine context and limits, (7) Call `engine.resume()`, (8) On success: cleanup checkpoint. | `src/conductor/cli/run.py` | DONE |
+| E4-T4 | IMPL | Add resume message printing in `run_workflow_async()` — when `engine.run()` raises, print the checkpoint path and resume instructions to stderr (the checkpoint itself is saved by the engine in E3-T2; the CLI only prints the user-facing message). | `src/conductor/cli/run.py` | DONE |
+| E4-T5 | TEST | CLI tests for `resume` command: test with `--from` path, test with workflow path (finds latest), test missing arguments error, test nonexistent checkpoint error. Use `typer.testing.CliRunner`. | `tests/test_cli/test_resume_command.py` | DONE |
+| E4-T6 | TEST | CLI tests for `checkpoints` command: test with no checkpoints, test with multiple checkpoints, test filtered by workflow path. | `tests/test_cli/test_resume_command.py` | DONE |
+| E4-T7 | TEST | Test workflow hash mismatch warning: modify workflow after checkpoint, resume, verify warning printed to stderr. | `tests/test_cli/test_resume_command.py` | DONE |
 
 **Acceptance Criteria:**
-- [ ] `conductor resume workflow.yaml` finds latest checkpoint and resumes
-- [ ] `conductor resume --from <path>` loads specific checkpoint and resumes
-- [ ] `conductor checkpoints` lists all checkpoints in a readable table
-- [ ] `conductor checkpoints workflow.yaml` filters to that workflow's checkpoints
-- [ ] Hash mismatch warning is printed when workflow changes between checkpoint and resume
-- [ ] JSON result is printed to stdout on successful resume
-- [ ] Tests pass: `uv run pytest tests/test_cli/test_resume_command.py`
-- [ ] `make check` passes
+- [x] `conductor resume workflow.yaml` finds latest checkpoint and resumes
+- [x] `conductor resume --from <path>` loads specific checkpoint and resumes
+- [x] `conductor checkpoints` lists all checkpoints in a readable table
+- [x] `conductor checkpoints workflow.yaml` filters to that workflow's checkpoints
+- [x] Hash mismatch warning is printed when workflow changes between checkpoint and resume
+- [x] JSON result is printed to stdout on successful resume
+- [x] Tests pass: `uv run pytest tests/test_cli/test_resume_command.py`
+- [x] `make check` passes
 
 ---
 
 ### Epic 5: Copilot Session Resume (Optional Enhancement)
+
+**Status:** DONE
 
 **Goal:** Track Copilot SDK session IDs during execution and attempt session resume on workflow resume, falling back to new sessions gracefully.
 
@@ -668,18 +672,18 @@ Track session IDs in provider, include in checkpoints, attempt session resume on
 
 | Task ID | Type | Description | Files | Status |
 |---------|------|-------------|-------|--------|
-| E5-T1 | IMPL | Add `_session_ids: dict[str, str]` field to `CopilotProvider.__init__()`. In `_execute_sdk_call()`, after `session = await self._client.create_session(session_config)`, store `self._session_ids[agent.name] = session.session_id`. Add `get_session_ids() -> dict[str, str]` method that returns a copy. | `src/conductor/providers/copilot.py` | TO DO |
-| E5-T2 | IMPL | Add `set_resume_session_ids(ids: dict[str, str])` method to `CopilotProvider`. Stores `_resume_session_ids`. In `_execute_sdk_call()`, before `create_session()`, check `_resume_session_ids.get(agent.name)`. If present, attempt `session = await self._client.resume_session(session_id)`. Catch `RuntimeError` (SDK's error for non-existent sessions) and `Exception`, log warning, fall back to `create_session()`. | `src/conductor/providers/copilot.py` | TO DO |
-| E5-T3 | IMPL | Wire session ID collection into `WorkflowEngine` — after execution completes (or on failure), collect session IDs from the provider via `provider.get_session_ids()` (if provider has the method — duck-type check) and pass to `CheckpointManager.save_checkpoint()`. | `src/conductor/engine/workflow.py` | TO DO |
-| E5-T4 | IMPL | Wire session ID restoration in `resume_workflow_async()` — pass `copilot_session_ids` from checkpoint to provider via `set_resume_session_ids()` (if provider has the method) before calling `engine.resume()`. | `src/conductor/cli/run.py` | TO DO |
-| E5-T5 | TEST | Unit test for session ID tracking: mock `CopilotClient.create_session()` to return a session with a known `session_id`, verify `get_session_ids()` returns `{agent_name: session_id}`. | `tests/test_providers/test_copilot_resume.py` | TO DO |
-| E5-T6 | TEST | Unit test for session resume fallback: mock `CopilotClient.resume_session()` to raise `RuntimeError`, verify fallback to `create_session()` succeeds with warning logged. | `tests/test_providers/test_copilot_resume.py` | TO DO |
+| E5-T1 | IMPL | Add `_session_ids: dict[str, str]` field to `CopilotProvider.__init__()`. In `_execute_sdk_call()`, after `session = await self._client.create_session(session_config)`, store `self._session_ids[agent.name] = session.session_id`. Add `get_session_ids() -> dict[str, str]` method that returns a copy. | `src/conductor/providers/copilot.py` | DONE |
+| E5-T2 | IMPL | Add `set_resume_session_ids(ids: dict[str, str])` method to `CopilotProvider`. Stores `_resume_session_ids`. In `_execute_sdk_call()`, before `create_session()`, check `_resume_session_ids.get(agent.name)`. If present, attempt `session = await self._client.resume_session(session_id)`. Catch `RuntimeError` (SDK's error for non-existent sessions) and `Exception`, log warning, fall back to `create_session()`. | `src/conductor/providers/copilot.py` | DONE |
+| E5-T3 | IMPL | Wire session ID collection into `WorkflowEngine` — after execution completes (or on failure), collect session IDs from the provider via `provider.get_session_ids()` (if provider has the method — duck-type check) and pass to `CheckpointManager.save_checkpoint()`. | `src/conductor/engine/workflow.py` | DONE |
+| E5-T4 | IMPL | Wire session ID restoration in `resume_workflow_async()` — pass `copilot_session_ids` from checkpoint to provider via `set_resume_session_ids()` (if provider has the method) before calling `engine.resume()`. | `src/conductor/cli/run.py` | DONE |
+| E5-T5 | TEST | Unit test for session ID tracking: mock `CopilotClient.create_session()` to return a session with a known `session_id`, verify `get_session_ids()` returns `{agent_name: session_id}`. | `tests/test_providers/test_copilot_resume.py` | DONE |
+| E5-T6 | TEST | Unit test for session resume fallback: mock `CopilotClient.resume_session()` to raise `RuntimeError`, verify fallback to `create_session()` succeeds with warning logged. | `tests/test_providers/test_copilot_resume.py` | DONE |
 
 **Acceptance Criteria:**
-- [ ] Session IDs are tracked per agent during execution via `session.session_id`
-- [ ] Session IDs are included in checkpoint files
-- [ ] On resume, Copilot provider attempts `client.resume_session(session_id)` before `client.create_session()`
-- [ ] Failed session resume (RuntimeError) falls back gracefully with a logged warning
-- [ ] No changes to existing `session.destroy()` calls (confirmed compatible)
-- [ ] Tests pass: `uv run pytest tests/test_providers/test_copilot_resume.py`
-- [ ] `make check` passes
+- [x] Session IDs are tracked per agent during execution via `session.session_id`
+- [x] Session IDs are included in checkpoint files
+- [x] On resume, Copilot provider attempts `client.resume_session(session_id)` before `client.create_session()`
+- [x] Failed session resume (RuntimeError) falls back gracefully with a logged warning
+- [x] No changes to existing `session.destroy()` calls (confirmed compatible)
+- [x] Tests pass: `uv run pytest tests/test_providers/test_copilot_resume.py`
+- [x] `make check` passes

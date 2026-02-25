@@ -471,6 +471,34 @@ class HumanGateError(ExecutionError):
         super().__init__(message, suggestion, file_path, line_number)
 
 
+class CheckpointError(ConductorError):
+    """Raised when checkpoint operations fail.
+
+    This includes checkpoint file I/O failures, invalid checkpoint format,
+    version mismatches, and checkpoint not found errors.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        suggestion: str | None = None,
+        file_path: str | None = None,
+        line_number: int | None = None,
+        checkpoint_path: str | None = None,
+    ) -> None:
+        """Initialize a CheckpointError.
+
+        Args:
+            message: The error message describing what went wrong.
+            suggestion: Optional advice for resolving the error.
+            file_path: Optional path to the file where the error occurred.
+            line_number: Optional line number where the error occurred.
+            checkpoint_path: Optional path to the checkpoint file involved.
+        """
+        self.checkpoint_path = checkpoint_path
+        super().__init__(message, suggestion, file_path, line_number)
+
+
 class RetryableError(ConductorError):
     """Marker class for errors that should trigger automatic retry.
 

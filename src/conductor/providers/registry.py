@@ -52,6 +52,7 @@ class ProviderRegistry:
         self._mcp_servers = mcp_servers
         self._providers: dict[ProviderType, AgentProvider] = {}
         self._default_provider_type: ProviderType = config.workflow.runtime.provider
+        self._resume_session_ids: dict[str, str] = {}
 
     @property
     def default_provider_type(self) -> ProviderType:
@@ -117,6 +118,10 @@ class ProviderRegistry:
             timeout=runtime.timeout,
         )
 
+        # Pass stored resume session IDs to newly created providers
+        if self._resume_session_ids and hasattr(provider, "set_resume_session_ids"):
+            provider.set_resume_session_ids(self._resume_session_ids)  # type: ignore[union-attr]
+
         self._providers[provider_type] = provider
         return provider
 
@@ -166,3 +171,18 @@ class ProviderRegistry:
             True if the provider is active, False otherwise.
         """
         return provider_type in self._providers
+
+    def set_resume_session_ids(self, ids: dict[str, str]) -> None:
+        """Store session IDs for Copilot session resume.
+
+        The IDs are forwarded to providers that support
+        ``set_resume_session_ids`` — both already-active providers
+        and providers created lazily in the future.
+
+        Args:
+            ids: Mapping of agent names to Copilot session IDs.
+        """
+        self._resume_session_ids = dict(ids)
+        for provider in self._providers.values():
+            if hasattr(provider, "set_resume_session_ids"):
+                provider.set_resume_session_ids(ids)  # type: ignore[union-attr]
