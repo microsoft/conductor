@@ -20,6 +20,7 @@ from conductor.engine.limits import LimitEnforcer
 from conductor.engine.pricing import ModelPricing
 from conductor.engine.router import Router, RouteResult
 from conductor.engine.usage import UsageTracker
+from conductor.events import WorkflowEvent, WorkflowEventEmitter
 from conductor.exceptions import ConductorError, ExecutionError, InterruptError, MaxIterationsError
 from conductor.executor.agent import AgentExecutor
 from conductor.executor.script import ScriptExecutor, ScriptOutput
@@ -399,6 +400,7 @@ class WorkflowEngine:
         skip_gates: bool = False,
         workflow_path: Path | None = None,
         interrupt_event: asyncio.Event | None = None,
+        event_emitter: WorkflowEventEmitter | None = None,
     ) -> None:
         """Initialize the WorkflowEngine.
 
@@ -414,6 +416,10 @@ class WorkflowEngine:
                 metadata when saving state on failure.
             interrupt_event: Optional asyncio.Event for interrupt signaling.
                 When set, the engine checks for user interrupts between agents.
+            event_emitter: Optional event emitter for publishing workflow events.
+                When provided, the engine emits events at each execution point
+                (agent start/complete, routing, parallel groups, etc.).
+                When None, zero overhead (early return in _emit()).
 
         Note:
             If both provider and registry are provided, registry takes precedence.
@@ -455,6 +461,9 @@ class WorkflowEngine:
         self._interrupt_event = interrupt_event
         self._interrupt_handler = InterruptHandler(skip_gates=skip_gates)
 
+        # Event emitter for workflow observability
+        self._event_emitter = event_emitter
+
         # Checkpoint tracking
         self._current_agent_name: str | None = None
         self._last_checkpoint_path: Path | None = None
@@ -481,6 +490,21 @@ class WorkflowEngine:
                 cache_write_per_mtok=pricing_override.cache_write_per_mtok,
             )
         return overrides
+
+    def _emit(self, event_type: str, data: dict[str, Any]) -> None:
+        """Emit a workflow event if an emitter is configured.
+
+        Creates a WorkflowEvent and dispatches it to the emitter. When no
+        emitter is configured (None), this is a no-op with zero overhead.
+
+        Args:
+            event_type: The event type identifier (e.g., "agent_started").
+            data: Event-specific payload data.
+        """
+        if self._event_emitter is None:
+            return
+        event = WorkflowEvent(type=event_type, timestamp=_time.time(), data=data)
+        self._event_emitter.emit(event)
 
     async def _get_executor_for_agent(self, agent: AgentDef) -> AgentExecutor:
         """Get the appropriate executor for an agent.
@@ -811,6 +835,66 @@ class WorkflowEngine:
         """
         try:
             async with self.limits.timeout_context():
+                # Emit workflow_started before the execution loop
+                self._emit(
+                    "workflow_started",
+                    {
+                        "name": self.config.workflow.name,
+                        "entry_point": self.config.workflow.entry_point,
+                        "agents": [
+                            {
+                                "name": a.name,
+                                "type": a.type or "agent",
+                                "model": a.model,
+                            }
+                            for a in self.config.agents
+                        ],
+                        "parallel_groups": [
+                            {
+                                "name": p.name,
+                                "agents": p.agents,
+                            }
+                            for p in self.config.parallel
+                        ],
+                        "for_each_groups": [
+                            {
+                                "name": f.name,
+                                "source": f.source,
+                            }
+                            for f in self.config.for_each
+                        ],
+                        "routes": [
+                            {
+                                "from": a.name,
+                                "to": r.to,
+                                "when": r.when,
+                            }
+                            for a in self.config.agents
+                            for r in a.routes
+                        ]
+                        + [
+                            {
+                                "from": p.name,
+                                "to": r.to,
+                                "when": r.when,
+                            }
+                            for p in self.config.parallel
+                            for r in p.routes
+                        ]
+                        + [
+                            {
+                                "from": f.name,
+                                "to": r.to,
+                                "when": r.when,
+                            }
+                            for f in self.config.for_each
+                            for r in f.routes
+                        ],
+                    },
+                )
+
+                _workflow_start = _time.time()
+
                 while True:
                     self._current_agent_name = current_agent_name
 
@@ -894,8 +978,23 @@ class WorkflowEngine:
                         # Verbose: Log routing decision
                         _verbose_log_route(route_result.target)
 
+                        self._emit(
+                            "route_taken",
+                            {
+                                "from_agent": for_each_group.name,
+                                "to_agent": route_result.target,
+                            },
+                        )
+
                         if route_result.target == "$end":
                             result = self._build_final_output(route_result.output_transform)
+                            self._emit(
+                                "workflow_completed",
+                                {
+                                    "elapsed": _time.time() - _workflow_start,
+                                    "output": result,
+                                },
+                            )
                             self._execute_hook("on_complete", result=result)
                             return result
 
@@ -967,8 +1066,23 @@ class WorkflowEngine:
                         # Verbose: Log routing decision
                         _verbose_log_route(route_result.target)
 
+                        self._emit(
+                            "route_taken",
+                            {
+                                "from_agent": parallel_group.name,
+                                "to_agent": route_result.target,
+                            },
+                        )
+
                         if route_result.target == "$end":
                             result = self._build_final_output(route_result.output_transform)
+                            self._emit(
+                                "workflow_completed",
+                                {
+                                    "elapsed": _time.time() - _workflow_start,
+                                    "output": result,
+                                },
+                            )
                             self._execute_hook("on_complete", result=result)
                             return result
 
@@ -983,6 +1097,15 @@ class WorkflowEngine:
                         iteration = self.limits.current_iteration + 1
                         _verbose_log_agent_start(current_agent_name, iteration)
 
+                        self._emit(
+                            "agent_started",
+                            {
+                                "agent_name": agent.name,
+                                "iteration": iteration,
+                                "agent_type": agent.type or "agent",
+                            },
+                        )
+
                         # Trim context if max_tokens is configured
                         self._trim_context_if_needed()
 
@@ -991,9 +1114,28 @@ class WorkflowEngine:
                             # Build context for the gate prompt
                             agent_context = self.context.get_for_template()
 
+                            self._emit(
+                                "gate_presented",
+                                {
+                                    "agent_name": agent.name,
+                                    "options": [o.value for o in (agent.options or [])],
+                                    "prompt": agent.prompt,
+                                },
+                            )
+
                             # Use the gate handler for interaction
                             gate_result: GateResult = await self.gate_handler.handle_gate(
                                 agent, agent_context
+                            )
+
+                            self._emit(
+                                "gate_resolved",
+                                {
+                                    "agent_name": agent.name,
+                                    "selected_option": gate_result.selected_option.value,
+                                    "route": gate_result.route,
+                                    "additional_input": gate_result.additional_input,
+                                },
                             )
 
                             # Store gate result in context
@@ -1010,6 +1152,13 @@ class WorkflowEngine:
 
                             if gate_result.route == "$end":
                                 result = self._build_final_output()
+                                self._emit(
+                                    "workflow_completed",
+                                    {
+                                        "elapsed": _time.time() - _workflow_start,
+                                        "output": result,
+                                    },
+                                )
                                 self._execute_hook("on_complete", result=result)
                                 return result
                             current_agent_name = gate_result.route
@@ -1023,10 +1172,43 @@ class WorkflowEngine:
                                 mode=self.config.workflow.context.mode,
                             )
                             _script_start = _time.time()
-                            script_output = await self._execute_script(agent, agent_context)
+
+                            self._emit(
+                                "script_started",
+                                {
+                                    "agent_name": agent.name,
+                                    "iteration": self.limits.current_iteration + 1,
+                                },
+                            )
+
+                            try:
+                                script_output = await self._execute_script(agent, agent_context)
+                            except Exception as exc:
+                                _script_elapsed = _time.time() - _script_start
+                                self._emit(
+                                    "script_failed",
+                                    {
+                                        "agent_name": agent.name,
+                                        "elapsed": _script_elapsed,
+                                        "error_type": type(exc).__name__,
+                                        "message": str(exc),
+                                    },
+                                )
+                                raise
                             _script_elapsed = _time.time() - _script_start
 
                             _verbose_log_agent_complete(agent.name, _script_elapsed)
+
+                            self._emit(
+                                "script_completed",
+                                {
+                                    "agent_name": agent.name,
+                                    "elapsed": _script_elapsed,
+                                    "stdout": script_output.stdout,
+                                    "stderr": script_output.stderr,
+                                    "exit_code": script_output.exit_code,
+                                },
+                            )
 
                             # Store structured output in context
                             output_content = {
@@ -1041,8 +1223,23 @@ class WorkflowEngine:
                             route_result = self._evaluate_routes(agent, output_content)
                             _verbose_log_route(route_result.target)
 
+                            self._emit(
+                                "route_taken",
+                                {
+                                    "from_agent": agent.name,
+                                    "to_agent": route_result.target,
+                                },
+                            )
+
                             if route_result.target == "$end":
                                 result = self._build_final_output(route_result.output_transform)
+                                self._emit(
+                                    "workflow_completed",
+                                    {
+                                        "elapsed": _time.time() - _workflow_start,
+                                        "output": result,
+                                    },
+                                )
                                 self._execute_hook("on_complete", result=result)
                                 return result
 
@@ -1105,6 +1302,19 @@ class WorkflowEngine:
                             output_tokens=output.output_tokens,
                         )
 
+                        self._emit(
+                            "agent_completed",
+                            {
+                                "agent_name": agent.name,
+                                "elapsed": _agent_elapsed,
+                                "model": output.model,
+                                "tokens": output.tokens_used,
+                                "cost_usd": usage.cost_usd,
+                                "output": output.content,
+                                "output_keys": output_keys,
+                            },
+                        )
+
                         # Store output
                         self.context.store(agent.name, output.content)
 
@@ -1120,8 +1330,23 @@ class WorkflowEngine:
                         # Verbose: Log routing decision
                         _verbose_log_route(route_result.target)
 
+                        self._emit(
+                            "route_taken",
+                            {
+                                "from_agent": agent.name,
+                                "to_agent": route_result.target,
+                            },
+                        )
+
                         if route_result.target == "$end":
                             result = self._build_final_output(route_result.output_transform)
+                            self._emit(
+                                "workflow_completed",
+                                {
+                                    "elapsed": _time.time() - _workflow_start,
+                                    "output": result,
+                                },
+                            )
                             self._execute_hook("on_complete", result=result)
                             return result
 
@@ -1138,11 +1363,27 @@ class WorkflowEngine:
             self._save_checkpoint_on_failure(KeyboardInterrupt("Workflow interrupted by user"))
             raise
         except ConductorError as e:
+            self._emit(
+                "workflow_failed",
+                {
+                    "error_type": type(e).__name__,
+                    "message": str(e),
+                    "agent_name": self._current_agent_name,
+                },
+            )
             # Execute on_error hook with error information
             self._execute_hook("on_error", error=e)
             self._save_checkpoint_on_failure(e)
             raise
         except Exception as e:
+            self._emit(
+                "workflow_failed",
+                {
+                    "error_type": type(e).__name__,
+                    "message": str(e),
+                    "agent_name": self._current_agent_name,
+                },
+            )
             # Execute on_error hook for unexpected errors
             self._execute_hook("on_error", error=e)
             self._save_checkpoint_on_failure(e)
@@ -1542,6 +1783,14 @@ class WorkflowEngine:
         # Verbose: Log parallel group start
         _verbose_log_parallel_start(parallel_group.name, len(parallel_group.agents))
 
+        self._emit(
+            "parallel_started",
+            {
+                "group_name": parallel_group.name,
+                "agents": parallel_group.agents,
+            },
+        )
+
         # Track timing for summary
         _group_start = _time.time()
 
@@ -1595,6 +1844,18 @@ class WorkflowEngine:
                     cost_usd=usage.cost_usd,
                 )
 
+                self._emit(
+                    "parallel_agent_completed",
+                    {
+                        "group_name": parallel_group.name,
+                        "agent_name": agent.name,
+                        "elapsed": _agent_elapsed,
+                        "model": output.model,
+                        "tokens": output.tokens_used,
+                        "cost_usd": usage.cost_usd,
+                    },
+                )
+
                 # Individual parallel agents are counted toward iteration limit
                 # at the parallel group level after all agents complete
                 return (agent.name, output.content)
@@ -1607,6 +1868,17 @@ class WorkflowEngine:
                     _agent_elapsed,
                     type(e).__name__,
                     str(e),
+                )
+
+                self._emit(
+                    "parallel_agent_failed",
+                    {
+                        "group_name": parallel_group.name,
+                        "agent_name": agent.name,
+                        "elapsed": _agent_elapsed,
+                        "error_type": type(e).__name__,
+                        "message": str(e),
+                    },
                 )
 
                 # Wrap exception with agent name and timing for better error reporting
@@ -1661,6 +1933,15 @@ class WorkflowEngine:
                     len(parallel_output.errors),
                     _group_elapsed,
                 )
+                self._emit(
+                    "parallel_completed",
+                    {
+                        "group_name": parallel_group.name,
+                        "success_count": len(parallel_output.outputs),
+                        "failure_count": len(parallel_output.errors),
+                        "elapsed": _group_elapsed,
+                    },
+                )
 
         elif parallel_group.failure_mode == "continue_on_error":
             # Collect all results and exceptions
@@ -1695,6 +1976,15 @@ class WorkflowEngine:
                 len(parallel_output.outputs),
                 len(parallel_output.errors),
                 _group_elapsed,
+            )
+            self._emit(
+                "parallel_completed",
+                {
+                    "group_name": parallel_group.name,
+                    "success_count": len(parallel_output.outputs),
+                    "failure_count": len(parallel_output.errors),
+                    "elapsed": _group_elapsed,
+                },
             )
 
             # Fail if ALL agents failed
@@ -1747,6 +2037,15 @@ class WorkflowEngine:
                 len(parallel_output.outputs),
                 len(parallel_output.errors),
                 _group_elapsed,
+            )
+            self._emit(
+                "parallel_completed",
+                {
+                    "group_name": parallel_group.name,
+                    "success_count": len(parallel_output.outputs),
+                    "failure_count": len(parallel_output.errors),
+                    "elapsed": _group_elapsed,
+                },
             )
 
             # Fail if ANY agent failed
@@ -1842,6 +2141,16 @@ class WorkflowEngine:
             for_each_group.failure_mode,
         )
 
+        self._emit(
+            "for_each_started",
+            {
+                "group_name": for_each_group.name,
+                "item_count": len(items),
+                "max_concurrent": for_each_group.max_concurrent,
+                "failure_mode": for_each_group.failure_mode,
+            },
+        )
+
         # Track timing for summary
         _group_start = _time.time()
 
@@ -1867,6 +2176,16 @@ class WorkflowEngine:
                 Exception: Any exception from agent execution (wrapped with metadata).
             """
             _item_start = _time.time()
+
+            self._emit(
+                "for_each_item_started",
+                {
+                    "group_name": for_each_group.name,
+                    "item_key": key,
+                    "index": index,
+                },
+            )
+
             try:
                 # Build context for this item using the snapshot
                 agent_context = context_snapshot.build_for_agent(
@@ -1902,6 +2221,17 @@ class WorkflowEngine:
                     cost_usd=usage.cost_usd,
                 )
 
+                self._emit(
+                    "for_each_item_completed",
+                    {
+                        "group_name": for_each_group.name,
+                        "item_key": key,
+                        "elapsed": _item_elapsed,
+                        "tokens": output.tokens_used,
+                        "cost_usd": usage.cost_usd,
+                    },
+                )
+
                 return (key, output.content)
             except Exception as e:
                 _item_elapsed = _time.time() - _item_start
@@ -1912,6 +2242,17 @@ class WorkflowEngine:
                     _item_elapsed,
                     type(e).__name__,
                     str(e),
+                )
+
+                self._emit(
+                    "for_each_item_failed",
+                    {
+                        "group_name": for_each_group.name,
+                        "item_key": key,
+                        "elapsed": _item_elapsed,
+                        "error_type": type(e).__name__,
+                        "message": str(e),
+                    },
                 )
 
                 # Attach metadata for error reporting
@@ -2053,6 +2394,15 @@ class WorkflowEngine:
             success_count,
             failure_count,
             _group_elapsed,
+        )
+        self._emit(
+            "for_each_completed",
+            {
+                "group_name": for_each_group.name,
+                "success_count": success_count,
+                "failure_count": failure_count,
+                "elapsed": _group_elapsed,
+            },
         )
 
         # Apply failure mode policy (for continue_on_error and all_or_nothing)
