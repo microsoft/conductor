@@ -4,9 +4,875 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Conductor Dashboard</title>
+<style>
+  :root {
+    --bg: #1a1a2e;
+    --surface: #16213e;
+    --surface2: #0f3460;
+    --text: #e4e4e4;
+    --text-muted: #999;
+    --border: #2a2a4a;
+    --pending: #6b6b6b;
+    --running: #4a9eff;
+    --completed: #4caf50;
+    --failed: #e53935;
+    --waiting: #ffc107;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace; background: var(--bg); color: var(--text); height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+
+  /* Header */
+  #header { display: flex; align-items: center; justify-content: space-between; padding: 8px 16px; background: var(--surface); border-bottom: 1px solid var(--border); flex-shrink: 0; }
+  #header h1 { font-size: 16px; font-weight: 600; }
+  #header h1 span { color: var(--running); }
+  #header .wf-name { color: var(--text-muted); font-weight: 400; margin-left: 8px; }
+  #header .version { color: var(--text-muted); font-size: 12px; }
+
+  /* Main area */
+  #main { display: flex; flex: 1; overflow: hidden; }
+
+  /* Graph panel */
+  #graph-panel { flex: 1; position: relative; }
+  #cy { width: 100%; height: 100%; }
+
+  /* Detail panel */
+  #detail-panel { width: 360px; background: var(--surface); border-left: 1px solid var(--border); display: flex; flex-direction: column; overflow: hidden; flex-shrink: 0; }
+  #detail-panel.collapsed { width: 0; border-left: none; }
+  #detail-header { padding: 12px 16px; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; flex-shrink: 0; }
+  #detail-header h2 { font-size: 14px; font-weight: 600; }
+  #detail-close { background: none; border: none; color: var(--text-muted); cursor: pointer; font-size: 18px; padding: 2px 6px; }
+  #detail-close:hover { color: var(--text); }
+  #detail-body { flex: 1; overflow-y: auto; padding: 12px 16px; }
+  .detail-section { margin-bottom: 16px; }
+  .detail-section h3 { font-size: 11px; text-transform: uppercase; color: var(--text-muted); margin-bottom: 6px; letter-spacing: 0.5px; }
+  .detail-meta { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; font-size: 13px; }
+  .detail-meta dt { color: var(--text-muted); }
+  .detail-meta dd { color: var(--text); word-break: break-word; }
+  .status-badge { display: inline-block; padding: 2px 8px; border-radius: 3px; font-size: 11px; font-weight: 600; text-transform: uppercase; }
+  .status-badge.pending { background: var(--pending); }
+  .status-badge.running { background: var(--running); }
+  .status-badge.completed { background: var(--completed); }
+  .status-badge.failed { background: var(--failed); }
+  .status-badge.waiting { background: var(--waiting); color: #333; }
+  #detail-output { background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 12px; font-family: 'SF Mono', 'Fira Code', monospace; font-size: 12px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; max-height: 400px; overflow-y: auto; color: var(--text); }
+  #detail-placeholder { color: var(--text-muted); text-align: center; padding: 40px 16px; font-size: 13px; }
+
+  /* Status bar */
+  #status-bar { display: flex; align-items: center; gap: 16px; padding: 6px 16px; background: var(--surface); border-top: 1px solid var(--border); font-size: 12px; flex-shrink: 0; }
+  .status-indicator { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+  .status-indicator.running { background: var(--running); animation: pulse 1.5s ease-in-out infinite; }
+  .status-indicator.completed { background: var(--completed); }
+  .status-indicator.failed { background: var(--failed); }
+  .status-indicator.pending { background: var(--pending); }
+  #status-text { color: var(--text); }
+  .status-detail { color: var(--text-muted); }
+  .status-spacer { flex: 1; }
+  #ws-status { color: var(--text-muted); }
+
+  /* CDN error fallback */
+  #cdn-error { display: none; position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); text-align: center; color: var(--failed); padding: 24px; }
+  #cdn-error h2 { margin-bottom: 8px; }
+  #cdn-error p { color: var(--text-muted); font-size: 14px; }
+
+  /* Pulse animation for running nodes */
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.5; }
+  }
+</style>
 </head>
 <body>
-<h1>Conductor Dashboard</h1>
-<p>Placeholder — full frontend will be implemented in Epic 4.</p>
+
+<div id="header">
+  <h1><span>●</span> Conductor<span class="wf-name" id="wf-name"></span></h1>
+  <span class="version">Dashboard v0.1</span>
+</div>
+
+<div id="main">
+  <div id="graph-panel">
+    <div id="cy"></div>
+    <div id="cdn-error">
+      <h2>⚠ Failed to load Cytoscape.js from CDN</h2>
+      <p>Please check your internet connection and reload the page.</p>
+    </div>
+  </div>
+  <div id="detail-panel">
+    <div id="detail-header">
+      <h2 id="detail-title">Agent Detail</h2>
+      <button id="detail-close" title="Close panel">✕</button>
+    </div>
+    <div id="detail-body">
+      <div id="detail-placeholder">Click a node in the graph to view details</div>
+      <div id="detail-content" style="display:none">
+        <div class="detail-section">
+          <h3>Info</h3>
+          <dl class="detail-meta" id="detail-meta"></dl>
+        </div>
+        <div class="detail-section" id="detail-output-section" style="display:none">
+          <h3>Output</h3>
+          <pre id="detail-output"></pre>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="status-bar">
+  <span class="status-indicator pending" id="status-dot"></span>
+  <span id="status-text">Waiting for workflow…</span>
+  <span class="status-detail" id="status-agents"></span>
+  <span class="status-detail" id="status-elapsed"></span>
+  <span class="status-spacer"></span>
+  <span id="ws-status">⏳ Connecting…</span>
+</div>
+
+<script>
+  // Track CDN load state
+  var _cdnLoaded = { cytoscape: false, dagre: false, cytoscapeDagre: false };
+  var _cdnFailed = false;
+  function _onCdnError(lib) {
+    _cdnFailed = true;
+    document.getElementById('cdn-error').style.display = 'block';
+    document.getElementById('cy').style.display = 'none';
+  }
+</script>
+<script src="https://unpkg.com/cytoscape@3.30.4/dist/cytoscape.min.js" onerror="_onCdnError('cytoscape')"></script>
+<script src="https://unpkg.com/dagre@0.8.5/dist/dagre.min.js" onerror="_onCdnError('dagre')"></script>
+<script src="https://unpkg.com/cytoscape-dagre@2.5.0/cytoscape-dagre.js" onerror="_onCdnError('cytoscape-dagre')"></script>
+
+<script>
+(function() {
+  'use strict';
+
+  // --- State ---
+  var cy = null;
+  var nodeData = {};       // agent_name -> { status, elapsed, model, tokens, cost_usd, output, type }
+  var groupProgress = {};  // group_name -> { total, completed, failed }
+  var workflowStatus = 'pending';  // pending | running | completed | failed
+  var workflowName = '';
+  var agentsCompleted = 0;
+  var agentsTotal = 0;
+  var workflowStartTime = null;
+  var elapsedTimer = null;
+  var selectedNode = null;
+  var workflowFailure = null;
+  var ws = null;
+  var wsReconnectDelay = 1000;
+  var wsMaxDelay = 30000;
+
+  // --- DOM refs ---
+  var $wfName = document.getElementById('wf-name');
+  var $statusDot = document.getElementById('status-dot');
+  var $statusText = document.getElementById('status-text');
+  var $statusAgents = document.getElementById('status-agents');
+  var $statusElapsed = document.getElementById('status-elapsed');
+  var $wsStatus = document.getElementById('ws-status');
+  var $detailTitle = document.getElementById('detail-title');
+  var $detailMeta = document.getElementById('detail-meta');
+  var $detailOutput = document.getElementById('detail-output');
+  var $detailOutputSection = document.getElementById('detail-output-section');
+  var $detailPlaceholder = document.getElementById('detail-placeholder');
+  var $detailContent = document.getElementById('detail-content');
+  var $detailClose = document.getElementById('detail-close');
+
+  // --- Helpers ---
+  function formatElapsed(seconds) {
+    if (seconds == null) return '—';
+    if (seconds < 1) return (seconds * 1000).toFixed(0) + 'ms';
+    if (seconds < 60) return seconds.toFixed(1) + 's';
+    var m = Math.floor(seconds / 60);
+    var s = (seconds % 60).toFixed(0);
+    return m + 'm ' + s + 's';
+  }
+
+  function formatOutput(output) {
+    if (output == null) return '';
+    if (typeof output === 'string') return output;
+    try { return JSON.stringify(output, null, 2); }
+    catch(e) { return String(output); }
+  }
+
+  function escapeHtml(str) {
+    var div = document.createElement('div');
+    div.textContent = str;
+    return div.innerHTML;
+  }
+
+  // --- Cytoscape Init ---
+  function initGraph() {
+    if (_cdnFailed || typeof cytoscape === 'undefined') return;
+
+    // Register dagre layout
+    if (typeof cytoscapeDagre !== 'undefined') {
+      cytoscape.use(cytoscapeDagre);
+    }
+
+    cy = cytoscape({
+      container: document.getElementById('cy'),
+      elements: [],
+      style: [
+        // Nodes
+        { selector: 'node',
+          style: {
+            'label': 'data(label)',
+            'text-valign': 'center',
+            'text-halign': 'center',
+            'font-size': '12px',
+            'font-family': '-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, monospace',
+            'color': '#e4e4e4',
+            'text-outline-color': '#1a1a2e',
+            'text-outline-width': 1,
+            'background-color': '#6b6b6b',
+            'border-width': 2,
+            'border-color': '#6b6b6b',
+            'width': 'label',
+            'height': 30,
+            'padding': '12px',
+            'shape': 'round-rectangle',
+            'text-wrap': 'wrap',
+            'text-max-width': '120px'
+          }
+        },
+        // Compound/parent nodes (groups)
+        { selector: 'node:parent',
+          style: {
+            'background-color': '#16213e',
+            'background-opacity': 0.7,
+            'border-width': 2,
+            'border-color': '#2a2a4a',
+            'border-style': 'dashed',
+            'text-valign': 'top',
+            'text-halign': 'center',
+            'font-size': '11px',
+            'color': '#999',
+            'padding': '16px',
+            'shape': 'round-rectangle'
+          }
+        },
+        // $end node
+        { selector: 'node[type="end"]',
+          style: {
+            'shape': 'ellipse',
+            'width': 40,
+            'height': 40,
+            'background-color': '#2a2a4a',
+            'border-color': '#4a4a6a',
+            'font-size': '11px'
+          }
+        },
+        // State colors
+        { selector: 'node.pending',
+          style: { 'background-color': '#6b6b6b', 'border-color': '#6b6b6b' }
+        },
+        { selector: 'node.running',
+          style: { 'background-color': '#4a9eff', 'border-color': '#4a9eff' }
+        },
+        { selector: 'node.completed',
+          style: { 'background-color': '#4caf50', 'border-color': '#4caf50' }
+        },
+        { selector: 'node.failed',
+          style: { 'background-color': '#e53935', 'border-color': '#e53935' }
+        },
+        { selector: 'node.waiting',
+          style: { 'background-color': '#ffc107', 'border-color': '#ffc107', 'color': '#333' }
+        },
+        // Edges
+        { selector: 'edge',
+          style: {
+            'width': 2,
+            'line-color': '#3a3a5a',
+            'target-arrow-color': '#3a3a5a',
+            'target-arrow-shape': 'triangle',
+            'curve-style': 'bezier',
+            'arrow-scale': 0.8
+          }
+        },
+        // Conditional edges (with when clause)
+        { selector: 'edge[?when]',
+          style: {
+            'line-style': 'dashed',
+            'line-dash-pattern': [6, 3]
+          }
+        },
+        // Highlighted edges
+        { selector: 'edge.highlighted',
+          style: {
+            'line-color': '#4a9eff',
+            'target-arrow-color': '#4a9eff',
+            'width': 3,
+            'z-index': 10
+          }
+        },
+        { selector: 'edge.taken',
+          style: {
+            'line-color': '#4caf50',
+            'target-arrow-color': '#4caf50',
+            'width': 3
+          }
+        }
+      ],
+      layout: { name: 'preset' },
+      userZoomingEnabled: true,
+      userPanningEnabled: true,
+      boxSelectionEnabled: false,
+      wheelSensitivity: 0.3
+    });
+
+    // Node click handler
+    cy.on('tap', 'node', function(evt) {
+      var node = evt.target;
+      if (node.isParent()) return;
+      selectedNode = node.id();
+      showDetail(node.id());
+    });
+
+    // Click background to deselect
+    cy.on('tap', function(evt) {
+      if (evt.target === cy) {
+        selectedNode = null;
+      }
+    });
+  }
+
+  // --- Graph Construction from workflow_started ---
+  function buildGraph(data) {
+    if (!cy) return;
+
+    workflowName = data.name || '';
+    $wfName.textContent = workflowName ? ' — ' + workflowName : '';
+    document.title = 'Conductor' + (workflowName ? ' — ' + workflowName : '');
+
+    var elements = [];
+    var agentNames = new Set();
+    var groupAgents = new Set(); // agents that belong to a group
+
+    // Identify agents in parallel groups
+    (data.parallel_groups || []).forEach(function(pg) {
+      (pg.agents || []).forEach(function(a) { groupAgents.add(a); });
+    });
+
+    // Identify agents in for-each groups
+    (data.for_each_groups || []).forEach(function(fg) {
+      // for-each groups use a single agent template, not listed in main agents
+    });
+
+    // Create parallel group compound nodes and their children
+    (data.parallel_groups || []).forEach(function(pg) {
+      elements.push({ group: 'nodes', data: { id: pg.name, label: '⫘ ' + pg.name, type: 'parallel_group' } });
+      groupProgress[pg.name] = { total: pg.agents.length, completed: 0, failed: 0 };
+      (pg.agents || []).forEach(function(agentName) {
+        elements.push({ group: 'nodes', data: { id: agentName, label: agentName, parent: pg.name, type: 'agent' } });
+        nodeData[agentName] = { status: 'pending', type: 'agent' };
+      });
+      agentNames.add(pg.name);
+      nodeData[pg.name] = { status: 'pending', type: 'parallel_group' };
+    });
+
+    // Create for-each group compound nodes
+    (data.for_each_groups || []).forEach(function(fg) {
+      elements.push({ group: 'nodes', data: { id: fg.name, label: '∀ ' + fg.name, type: 'for_each_group' } });
+      agentNames.add(fg.name);
+      nodeData[fg.name] = { status: 'pending', type: 'for_each_group' };
+      groupProgress[fg.name] = { total: 0, completed: 0, failed: 0 };
+    });
+
+    // Create agent nodes (skip those already in groups)
+    (data.agents || []).forEach(function(a) {
+      if (!agentNames.has(a.name) && !groupAgents.has(a.name)) {
+        var nodeType = a.type || 'agent';
+        var labelPrefix = '';
+        if (nodeType === 'script') labelPrefix = '⚙ ';
+        else if (nodeType === 'human_gate') labelPrefix = '⊘ ';
+        elements.push({ group: 'nodes', data: { id: a.name, label: labelPrefix + a.name, type: nodeType } });
+        agentNames.add(a.name);
+        nodeData[a.name] = { status: 'pending', type: nodeType, model: a.model };
+      }
+    });
+
+    agentsTotal = agentNames.size;
+
+    // Collect all route targets to find $end
+    var hasEnd = false;
+    (data.routes || []).forEach(function(r) {
+      if (r.to === '$end') hasEnd = true;
+    });
+
+    // Add $end node if referenced
+    if (hasEnd) {
+      elements.push({ group: 'nodes', data: { id: '$end', label: '$end', type: 'end' } });
+    }
+
+    // Create edges from routes
+    (data.routes || []).forEach(function(r) {
+      var edgeData = { source: r.from, target: r.to };
+      if (r.when) edgeData.when = r.when;
+      elements.push({ group: 'edges', data: edgeData });
+    });
+
+    cy.add(elements);
+
+    // Apply dagre layout
+    var layoutOpts = {
+      name: 'dagre',
+      rankDir: 'TB',
+      nodeSep: 40,
+      rankSep: 60,
+      padding: 30,
+      animate: false
+    };
+
+    try {
+      cy.layout(layoutOpts).run();
+    } catch(e) {
+      // Fallback to grid if dagre fails
+      cy.layout({ name: 'grid', padding: 30 }).run();
+    }
+
+    cy.fit(undefined, 40);
+
+    // Set all nodes to pending class
+    cy.nodes().addClass('pending');
+  }
+
+  // --- Node State Updates ---
+  function setNodeState(name, state) {
+    if (!cy) return;
+    var node = cy.getElementById(name);
+    if (node.length === 0) return;
+    node.removeClass('pending running completed failed waiting');
+    node.addClass(state);
+    if (nodeData[name]) nodeData[name].status = state;
+  }
+
+  // --- Event Handlers ---
+  var eventHandlers = {
+    workflow_started: function(data) {
+      workflowStatus = 'running';
+      workflowStartTime = Date.now() / 1000;
+      buildGraph(data);
+      updateStatusBar();
+      startElapsedTimer();
+    },
+
+    agent_started: function(data) {
+      setNodeState(data.agent_name, 'running');
+      if (nodeData[data.agent_name]) {
+        nodeData[data.agent_name].iteration = data.iteration;
+      }
+      updateStatusBar();
+    },
+
+    agent_completed: function(data) {
+      setNodeState(data.agent_name, 'completed');
+      agentsCompleted++;
+      if (nodeData[data.agent_name]) {
+        var nd = nodeData[data.agent_name];
+        nd.elapsed = data.elapsed;
+        nd.model = data.model;
+        nd.tokens = data.tokens;
+        nd.cost_usd = data.cost_usd;
+        nd.output = data.output;
+        nd.output_keys = data.output_keys;
+      }
+      if (selectedNode === data.agent_name) showDetail(data.agent_name);
+      updateStatusBar();
+    },
+
+    agent_failed: function(data) {
+      setNodeState(data.agent_name, 'failed');
+      if (nodeData[data.agent_name]) {
+        var nd = nodeData[data.agent_name];
+        nd.elapsed = data.elapsed;
+        nd.error_type = data.error_type;
+        nd.error_message = data.message;
+      }
+      if (selectedNode === data.agent_name) showDetail(data.agent_name);
+      updateStatusBar();
+    },
+
+    script_started: function(data) {
+      setNodeState(data.agent_name, 'running');
+      updateStatusBar();
+    },
+
+    script_completed: function(data) {
+      setNodeState(data.agent_name, 'completed');
+      agentsCompleted++;
+      if (nodeData[data.agent_name]) {
+        var nd = nodeData[data.agent_name];
+        nd.elapsed = data.elapsed;
+        nd.stdout = data.stdout;
+        nd.stderr = data.stderr;
+        nd.exit_code = data.exit_code;
+      }
+      if (selectedNode === data.agent_name) showDetail(data.agent_name);
+      updateStatusBar();
+    },
+
+    script_failed: function(data) {
+      setNodeState(data.agent_name, 'failed');
+      if (nodeData[data.agent_name]) {
+        var nd = nodeData[data.agent_name];
+        nd.elapsed = data.elapsed;
+        nd.error_type = data.error_type;
+        nd.error_message = data.message;
+      }
+      if (selectedNode === data.agent_name) showDetail(data.agent_name);
+      updateStatusBar();
+    },
+
+    gate_presented: function(data) {
+      setNodeState(data.agent_name, 'waiting');
+      if (nodeData[data.agent_name]) {
+        nodeData[data.agent_name].options = data.options;
+        nodeData[data.agent_name].prompt = data.prompt;
+      }
+      updateStatusBar();
+    },
+
+    gate_resolved: function(data) {
+      setNodeState(data.agent_name, 'completed');
+      agentsCompleted++;
+      if (nodeData[data.agent_name]) {
+        var nd = nodeData[data.agent_name];
+        nd.selected_option = data.selected_option;
+        nd.route = data.route;
+        nd.additional_input = data.additional_input;
+      }
+      if (selectedNode === data.agent_name) showDetail(data.agent_name);
+      updateStatusBar();
+    },
+
+    route_taken: function(data) {
+      if (!cy) return;
+      // Find and highlight the edge
+      var edges = cy.edges().filter(function(edge) {
+        return edge.data('source') === data.from_agent && edge.data('target') === data.to_agent;
+      });
+      edges.addClass('highlighted');
+      // Animate: flash then settle to taken
+      setTimeout(function() {
+        edges.removeClass('highlighted');
+        edges.addClass('taken');
+      }, 800);
+    },
+
+    parallel_started: function(data) {
+      setNodeState(data.group_name, 'running');
+      if (groupProgress[data.group_name]) {
+        groupProgress[data.group_name].total = data.agents.length;
+        groupProgress[data.group_name].completed = 0;
+        groupProgress[data.group_name].failed = 0;
+      }
+      updateGroupBadge(data.group_name);
+    },
+
+    parallel_agent_completed: function(data) {
+      if (groupProgress[data.group_name]) {
+        groupProgress[data.group_name].completed++;
+      }
+      // Also update the individual agent node
+      setNodeState(data.agent_name, 'completed');
+      if (nodeData[data.agent_name]) {
+        nodeData[data.agent_name].elapsed = data.elapsed;
+        nodeData[data.agent_name].model = data.model;
+        nodeData[data.agent_name].tokens = data.tokens;
+        nodeData[data.agent_name].cost_usd = data.cost_usd;
+      }
+      updateGroupBadge(data.group_name);
+      if (selectedNode === data.agent_name) showDetail(data.agent_name);
+      updateStatusBar();
+    },
+
+    parallel_agent_failed: function(data) {
+      if (groupProgress[data.group_name]) {
+        groupProgress[data.group_name].failed++;
+      }
+      setNodeState(data.agent_name, 'failed');
+      if (nodeData[data.agent_name]) {
+        nodeData[data.agent_name].elapsed = data.elapsed;
+        nodeData[data.agent_name].error_type = data.error_type;
+        nodeData[data.agent_name].error_message = data.message;
+      }
+      updateGroupBadge(data.group_name);
+      if (selectedNode === data.agent_name) showDetail(data.agent_name);
+      updateStatusBar();
+    },
+
+    parallel_completed: function(data) {
+      agentsCompleted++;
+      var allOk = data.failure_count === 0;
+      setNodeState(data.group_name, allOk ? 'completed' : 'failed');
+      updateGroupBadge(data.group_name);
+      updateStatusBar();
+    },
+
+    for_each_started: function(data) {
+      setNodeState(data.group_name, 'running');
+      if (groupProgress[data.group_name]) {
+        groupProgress[data.group_name].total = data.item_count;
+        groupProgress[data.group_name].completed = 0;
+        groupProgress[data.group_name].failed = 0;
+      }
+      updateGroupBadge(data.group_name);
+    },
+
+    for_each_item_started: function(data) {
+      updateGroupBadge(data.group_name);
+    },
+
+    for_each_item_completed: function(data) {
+      if (groupProgress[data.group_name]) {
+        groupProgress[data.group_name].completed++;
+      }
+      updateGroupBadge(data.group_name);
+      updateStatusBar();
+    },
+
+    for_each_item_failed: function(data) {
+      if (groupProgress[data.group_name]) {
+        groupProgress[data.group_name].failed++;
+      }
+      updateGroupBadge(data.group_name);
+      updateStatusBar();
+    },
+
+    for_each_completed: function(data) {
+      agentsCompleted++;
+      var allOk = data.failure_count === 0;
+      setNodeState(data.group_name, allOk ? 'completed' : 'failed');
+      if (nodeData[data.group_name]) {
+        nodeData[data.group_name].elapsed = data.elapsed;
+        nodeData[data.group_name].success_count = data.success_count;
+        nodeData[data.group_name].failure_count = data.failure_count;
+      }
+      updateGroupBadge(data.group_name);
+      if (selectedNode === data.group_name) showDetail(data.group_name);
+      updateStatusBar();
+    },
+
+    workflow_completed: function(data) {
+      workflowStatus = 'completed';
+      stopElapsedTimer();
+      if (nodeData['$end']) setNodeState('$end', 'completed');
+      updateStatusBar();
+    },
+
+    workflow_failed: function(data) {
+      workflowStatus = 'failed';
+      stopElapsedTimer();
+      if (data.agent_name) setNodeState(data.agent_name, 'failed');
+      workflowFailure = { error_type: data.error_type, message: data.message };
+      updateStatusBar();
+    }
+  };
+
+  // --- Group Badge Update ---
+  function updateGroupBadge(groupName) {
+    if (!cy) return;
+    var node = cy.getElementById(groupName);
+    if (node.length === 0) return;
+    var gp = groupProgress[groupName];
+    if (!gp) return;
+    var done = gp.completed + gp.failed;
+    var badge = done + '/' + gp.total;
+    if (gp.failed > 0) badge += ' (' + gp.failed + ' failed)';
+    var prefix = nodeData[groupName] && nodeData[groupName].type === 'for_each_group' ? '∀ ' : '⫘ ';
+    node.data('label', prefix + groupName + '\n' + badge);
+  }
+
+  // --- Detail Panel ---
+  function showDetail(name) {
+    var nd = nodeData[name];
+    if (!nd) return;
+
+    $detailPlaceholder.style.display = 'none';
+    $detailContent.style.display = 'block';
+    $detailTitle.textContent = name;
+
+    // Build meta info
+    var html = '';
+    html += '<dt>Status</dt><dd><span class="status-badge ' + nd.status + '">' + nd.status + '</span></dd>';
+    if (nd.type) html += '<dt>Type</dt><dd>' + escapeHtml(nd.type) + '</dd>';
+    if (nd.elapsed != null) html += '<dt>Elapsed</dt><dd>' + formatElapsed(nd.elapsed) + '</dd>';
+    if (nd.model) html += '<dt>Model</dt><dd>' + escapeHtml(nd.model) + '</dd>';
+    if (nd.tokens != null) html += '<dt>Tokens</dt><dd>' + nd.tokens.toLocaleString() + '</dd>';
+    if (nd.cost_usd != null) html += '<dt>Cost</dt><dd>$' + nd.cost_usd.toFixed(4) + '</dd>';
+    if (nd.iteration != null) html += '<dt>Iteration</dt><dd>' + nd.iteration + '</dd>';
+    if (nd.exit_code != null) html += '<dt>Exit Code</dt><dd>' + nd.exit_code + '</dd>';
+    if (nd.error_type) html += '<dt>Error</dt><dd>' + escapeHtml(nd.error_type) + '</dd>';
+    if (nd.error_message) html += '<dt>Message</dt><dd>' + escapeHtml(nd.error_message) + '</dd>';
+    if (nd.selected_option) html += '<dt>Selected</dt><dd>' + escapeHtml(nd.selected_option) + '</dd>';
+    if (nd.success_count != null) html += '<dt>Success</dt><dd>' + nd.success_count + '</dd>';
+    if (nd.failure_count != null) html += '<dt>Failures</dt><dd>' + nd.failure_count + '</dd>';
+    $detailMeta.innerHTML = html;
+
+    // Output section
+    var outputText = '';
+    if (nd.output != null) {
+      outputText = formatOutput(nd.output);
+    } else if (nd.stdout != null) {
+      outputText = '';
+      if (nd.stdout) outputText += nd.stdout;
+      if (nd.stderr) outputText += (outputText ? '\n\n--- stderr ---\n' : '') + nd.stderr;
+    }
+
+    if (outputText) {
+      $detailOutputSection.style.display = 'block';
+      $detailOutput.textContent = outputText;
+    } else {
+      $detailOutputSection.style.display = 'none';
+    }
+  }
+
+  // Close detail panel
+  $detailClose.addEventListener('click', function() {
+    selectedNode = null;
+    $detailPlaceholder.style.display = 'block';
+    $detailContent.style.display = 'none';
+  });
+
+  // --- Status Bar ---
+  function updateStatusBar() {
+    // Status dot
+    $statusDot.className = 'status-indicator ' + workflowStatus;
+
+    // Status text
+    var text = '';
+    if (workflowStatus === 'pending') {
+      text = 'Waiting for workflow…';
+    } else if (workflowStatus === 'running') {
+      text = 'Running';
+    } else if (workflowStatus === 'completed') {
+      text = 'Completed';
+    } else if (workflowStatus === 'failed') {
+      text = failureMessage();
+    }
+    $statusText.textContent = text;
+
+    // Agent count
+    if (agentsTotal > 0) {
+      $statusAgents.textContent = agentsCompleted + '/' + agentsTotal + ' agents';
+    }
+  }
+
+  function failureMessage() {
+    if (!workflowFailure) return 'Failed';
+    var et = workflowFailure.error_type || '';
+    if (et === 'MaxIterationsError') return 'Failed: exceeded maximum iterations';
+    if (et === 'TimeoutError') return 'Failed: workflow timed out';
+    if (workflowFailure.message) return 'Failed: ' + workflowFailure.message;
+    return 'Failed: ' + et;
+  }
+
+  function startElapsedTimer() {
+    stopElapsedTimer();
+    elapsedTimer = setInterval(function() {
+      if (workflowStartTime) {
+        var elapsed = Date.now() / 1000 - workflowStartTime;
+        $statusElapsed.textContent = formatElapsed(elapsed);
+      }
+    }, 500);
+  }
+
+  function stopElapsedTimer() {
+    if (elapsedTimer) {
+      clearInterval(elapsedTimer);
+      elapsedTimer = null;
+    }
+  }
+
+  // --- Event Dispatch ---
+  function processEvent(event) {
+    var handler = eventHandlers[event.type];
+    if (handler) {
+      try { handler(event.data || {}); }
+      catch(e) { console.error('Event handler error:', event.type, e); }
+    }
+  }
+
+  // --- Late-Joiner: Replay State ---
+  function replayState(events) {
+    // Reset counters before replay
+    agentsCompleted = 0;
+    events.forEach(processEvent);
+  }
+
+  // --- WebSocket Client ---
+  function connectWebSocket() {
+    var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    var wsUrl = proto + '//' + location.host + '/ws';
+
+    try {
+      ws = new WebSocket(wsUrl);
+    } catch(e) {
+      scheduleReconnect();
+      return;
+    }
+
+    ws.onopen = function() {
+      wsReconnectDelay = 1000;
+      $wsStatus.textContent = '● Connected';
+      $wsStatus.style.color = '#4caf50';
+    };
+
+    ws.onmessage = function(evt) {
+      try {
+        var event = JSON.parse(evt.data);
+        processEvent(event);
+      } catch(e) {
+        console.error('Failed to parse WebSocket message:', e);
+      }
+    };
+
+    ws.onclose = function() {
+      $wsStatus.textContent = '○ Disconnected';
+      $wsStatus.style.color = '#e53935';
+      ws = null;
+      scheduleReconnect();
+    };
+
+    ws.onerror = function() {
+      // onclose will fire after onerror
+    };
+  }
+
+  function scheduleReconnect() {
+    $wsStatus.textContent = '⏳ Reconnecting in ' + (wsReconnectDelay / 1000) + 's…';
+    $wsStatus.style.color = '#ffc107';
+    setTimeout(function() {
+      wsReconnectDelay = Math.min(wsReconnectDelay * 2, wsMaxDelay);
+      connectWebSocket();
+    }, wsReconnectDelay);
+  }
+
+  // --- Init ---
+  function init() {
+    initGraph();
+
+    // Late-joiner: fetch existing state, then connect WebSocket
+    fetch('/api/state')
+      .then(function(resp) { return resp.json(); })
+      .then(function(events) {
+        if (events && events.length > 0) {
+          replayState(events);
+        }
+        connectWebSocket();
+      })
+      .catch(function(err) {
+        console.error('Failed to fetch state:', err);
+        connectWebSocket();
+      });
+  }
+
+  // Start when DOM is ready
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init);
+  } else {
+    init();
+  }
+
+})();
+</script>
 </body>
 </html>

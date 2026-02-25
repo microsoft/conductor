@@ -387,6 +387,8 @@ web = [
 
 ### Epic 4: Frontend Dashboard
 
+**Status: DONE**
+
 **Goal:** Create the single-file HTML frontend with Cytoscape.js that renders the workflow DAG, updates node states in real-time, and provides an agent output detail panel.
 
 **Prerequisites:** Epic 3 (Web Server — for serving and testing)
@@ -395,27 +397,40 @@ web = [
 
 | Task ID | Type | Description | Files | Status |
 |---------|------|-------------|-------|--------|
-| E4-T1 | IMPL | Create HTML skeleton with two-panel layout (graph left, detail right) and status bar. Include CSS for layout, node state colors (pending=gray, running=blue+pulse, completed=green, failed=red, waiting=amber). | `src/conductor/web/static/index.html` | TO DO |
-| E4-T2 | IMPL | Add CDN script tags for Cytoscape.js, dagre, and cytoscape-dagre. Include `onerror` handler that displays fallback error message if CDN fails. | `src/conductor/web/static/index.html` | TO DO |
-| E4-T3 | IMPL | Implement graph construction from `workflow_started` event: create nodes for agents, compound nodes for parallel/for-each groups, directed edges for routes. Use dagre layout. | `src/conductor/web/static/index.html` | TO DO |
-| E4-T4 | IMPL | Implement event handlers for node state updates: `agent_started` → blue, `agent_completed` → green, `agent_failed` → red, `script_started` → blue, `script_completed` → green, `script_failed` → red, `gate_presented` → amber, `gate_resolved` → green. | `src/conductor/web/static/index.html` | TO DO |
-| E4-T5 | IMPL | Implement `route_taken` edge highlighting with brief animation. | `src/conductor/web/static/index.html` | TO DO |
-| E4-T6 | IMPL | Implement parallel/for-each group event handlers: update compound node badges, show progress (e.g., "3/5 complete"). | `src/conductor/web/static/index.html` | TO DO |
-| E4-T7 | IMPL | Implement node click → detail panel: show agent name, status, elapsed time, model, tokens, cost, and full scrollable output (pre-formatted). | `src/conductor/web/static/index.html` | TO DO |
-| E4-T8 | IMPL | Implement WebSocket client with reconnection: connect to `ws://{host}:{port}/ws`, parse JSON events, dispatch to handlers. On close, reconnect with exponential backoff (1s, 2s, 4s, 8s, max 30s). | `src/conductor/web/static/index.html` | TO DO |
-| E4-T9 | IMPL | Implement late-joiner logic: on page load, fetch `GET /api/state`, replay all events to build current graph state, then connect WebSocket for live updates. | `src/conductor/web/static/index.html` | TO DO |
-| E4-T10 | IMPL | Implement status bar: show workflow name, current iteration, agent completion count, elapsed time, and workflow status (Running/Completed/Failed). On `workflow_failed`, parse `error_type` to display contextual failure reasons (e.g., "Failed: exceeded maximum iterations", "Failed: workflow timed out"). | `src/conductor/web/static/index.html` | TO DO |
+| E4-T1 | IMPL | Create HTML skeleton with two-panel layout (graph left, detail right) and status bar. Include CSS for layout, node state colors (pending=gray, running=blue+pulse, completed=green, failed=red, waiting=amber). | `src/conductor/web/static/index.html` | DONE |
+| E4-T2 | IMPL | Add CDN script tags for Cytoscape.js, dagre, and cytoscape-dagre. Include `onerror` handler that displays fallback error message if CDN fails. | `src/conductor/web/static/index.html` | DONE |
+| E4-T3 | IMPL | Implement graph construction from `workflow_started` event: create nodes for agents, compound nodes for parallel/for-each groups, directed edges for routes. Use dagre layout. | `src/conductor/web/static/index.html` | DONE |
+| E4-T4 | IMPL | Implement event handlers for node state updates: `agent_started` → blue, `agent_completed` → green, `agent_failed` → red, `script_started` → blue, `script_completed` → green, `script_failed` → red, `gate_presented` → amber, `gate_resolved` → green. | `src/conductor/web/static/index.html` | DONE |
+| E4-T5 | IMPL | Implement `route_taken` edge highlighting with brief animation. | `src/conductor/web/static/index.html` | DONE |
+| E4-T6 | IMPL | Implement parallel/for-each group event handlers: update compound node badges, show progress (e.g., "3/5 complete"). | `src/conductor/web/static/index.html` | DONE |
+| E4-T7 | IMPL | Implement node click → detail panel: show agent name, status, elapsed time, model, tokens, cost, and full scrollable output (pre-formatted). | `src/conductor/web/static/index.html` | DONE |
+| E4-T8 | IMPL | Implement WebSocket client with reconnection: connect to `ws://{host}:{port}/ws`, parse JSON events, dispatch to handlers. On close, reconnect with exponential backoff (1s, 2s, 4s, 8s, max 30s). | `src/conductor/web/static/index.html` | DONE |
+| E4-T9 | IMPL | Implement late-joiner logic: on page load, fetch `GET /api/state`, replay all events to build current graph state, then connect WebSocket for live updates. | `src/conductor/web/static/index.html` | DONE |
+| E4-T10 | IMPL | Implement status bar: show workflow name, current iteration, agent completion count, elapsed time, and workflow status (Running/Completed/Failed). On `workflow_failed`, parse `error_type` to display contextual failure reasons (e.g., "Failed: exceeded maximum iterations", "Failed: workflow timed out"). | `src/conductor/web/static/index.html` | DONE |
 
 **Acceptance Criteria:**
-- [ ] Single HTML file with no external build step
-- [ ] Cytoscape.js loads from CDN; graceful error if CDN unavailable
-- [ ] Workflow DAG renders on `workflow_started` event with dagre layout
-- [ ] Node colors update in real-time: pending (gray) → running (blue) → completed (green) / failed (red)
-- [ ] `script_failed` event handled (script node turns red)
-- [ ] Clicking a node shows full untruncated output in detail panel
-- [ ] WebSocket reconnects automatically on disconnect
-- [ ] Late-joining browsers see full accumulated state
-- [ ] Status bar shows workflow progress and descriptive failure reasons
+- [x] Single HTML file with no external build step
+- [x] Cytoscape.js loads from CDN; graceful error if CDN unavailable
+- [x] Workflow DAG renders on `workflow_started` event with dagre layout
+- [x] Node colors update in real-time: pending (gray) → running (blue) → completed (green) / failed (red)
+- [x] `script_failed` event handled (script node turns red)
+- [x] Clicking a node shows full untruncated output in detail panel
+- [x] WebSocket reconnects automatically on disconnect
+- [x] Late-joining browsers see full accumulated state
+- [x] Status bar shows workflow progress and descriptive failure reasons
+
+**Completion Notes:** All 10 tasks completed. Single-file HTML frontend implemented with: (1) Dark-themed two-panel layout with graph view (left) and agent detail panel (right), plus status bar. (2) CDN-loaded Cytoscape.js v3.30.4, dagre v0.8.5, and cytoscape-dagre v2.5.0 (patch-pinned) with `onerror` fallback showing error message. (3) Full graph construction from `workflow_started` event data — agent nodes, compound nodes for parallel/for-each groups, directed edges for routes with dashed style for conditional routes. (4) All 21 event types handled with proper node state coloring: pending (gray), running (blue), completed (green), failed (red), waiting/gate (amber). (5) Route highlighting with flash-then-settle animation. (6) Group progress badges showing "N/M complete" with failure counts. (7) Detail panel shows agent name, status badge, elapsed time, model, tokens, cost, output, and error details with full scrollable pre-formatted output. (8) WebSocket client with exponential backoff reconnection (1s→2s→4s→8s→30s max). (9) Late-joiner logic: fetches `/api/state` on page load, replays all events, then connects WebSocket. (10) Status bar with live elapsed timer, agent completion counter, and contextual failure messages for `MaxIterationsError` and `TimeoutError`. Review fixes applied: (1) BUG — agentsTotal now counts parallel groups as single units (not individual children) by adding group name to agentNames instead of child agents, and using groupAgents set to prevent duplicate node creation. (2) BUG — for-each group names added to agentNames so they are counted in agentsTotal. (3) BUG — parallel_completed now uses server-authoritative data.failure_count instead of local groupProgress counter for color decision, consistent with for_each_completed. (4) CODE QUALITY — workflowFailure variable moved to state declarations block (was relying on var hoisting). (5) UX — workflow_failed handler now calls setNodeState(data.agent_name, 'failed') to visually mark the running agent as failed. (6) RELIABILITY — CDN scripts pinned to specific patch versions (cytoscape@3.30.4, dagre@0.8.5, cytoscape-dagre@2.5.0).
+
+**Acceptance Criteria:**
+- [x] Single HTML file with no external build step
+- [x] Cytoscape.js loads from CDN; graceful error if CDN unavailable
+- [x] Workflow DAG renders on `workflow_started` event with dagre layout
+- [x] Node colors update in real-time: pending (gray) → running (blue) → completed (green) / failed (red)
+- [x] `script_failed` event handled (script node turns red)
+- [x] Clicking a node shows full untruncated output in detail panel
+- [x] WebSocket reconnects automatically on disconnect
+- [x] Late-joining browsers see full accumulated state
+- [x] Status bar shows workflow progress and descriptive failure reasons
 
 ---
 
