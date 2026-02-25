@@ -64,6 +64,52 @@ class LimitEnforcer:
     current_agent: str | None = None
     """Currently executing agent name."""
 
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize limit state to a JSON-compatible dict.
+
+        Only persists iteration-related state. Transient fields
+        (``start_time``, ``current_agent``) are excluded because they
+        are reset on resume.
+
+        Returns:
+            Dict containing iteration state for checkpoint/restore.
+        """
+        return {
+            "current_iteration": self.current_iteration,
+            "max_iterations": self.max_iterations,
+            "execution_history": list(self.execution_history),
+        }
+
+    @classmethod
+    def from_dict(
+        cls,
+        data: dict[str, Any],
+        timeout_seconds: int | None = None,
+    ) -> LimitEnforcer:
+        """Reconstruct a LimitEnforcer from a serialized dict.
+
+        Uses ``max_iterations`` from the checkpoint (it may have been
+        increased by the user) and ``timeout_seconds`` from the current
+        workflow config so that the resumed run gets a fresh timeout
+        window.
+
+        Args:
+            data: Dict previously produced by ``to_dict()``.
+            timeout_seconds: Timeout from the workflow config (fresh window).
+
+        Returns:
+            A new LimitEnforcer with restored iteration state and a fresh
+            ``start_time``.
+        """
+        enforcer = cls(
+            max_iterations=data.get("max_iterations", 10),
+            timeout_seconds=timeout_seconds,
+        )
+        enforcer.current_iteration = data.get("current_iteration", 0)
+        enforcer.execution_history = list(data.get("execution_history", []))
+        enforcer.start_time = time.monotonic()
+        return enforcer
+
     def start(self) -> None:
         """Mark workflow start for timeout tracking.
 

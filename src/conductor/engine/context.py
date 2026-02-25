@@ -434,6 +434,40 @@ class WorkflowContext:
                     f"'{group_name}' is not a for-each group (no 'count' field available)"
                 )
 
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize context to a JSON-compatible dict.
+
+        Returns:
+            Dict containing all context state needed for checkpoint/restore.
+        """
+        import copy
+
+        return {
+            "workflow_inputs": copy.deepcopy(self.workflow_inputs),
+            "agent_outputs": copy.deepcopy(self.agent_outputs),
+            "current_iteration": self.current_iteration,
+            "execution_history": list(self.execution_history),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> WorkflowContext:
+        """Reconstruct a WorkflowContext from a serialized dict.
+
+        Args:
+            data: Dict previously produced by ``to_dict()``.
+
+        Returns:
+            A new WorkflowContext with restored state.
+        """
+        import copy
+
+        ctx = cls()
+        ctx.workflow_inputs = copy.deepcopy(data.get("workflow_inputs", {}))
+        ctx.agent_outputs = copy.deepcopy(data.get("agent_outputs", {}))
+        ctx.current_iteration = data.get("current_iteration", 0)
+        ctx.execution_history = list(data.get("execution_history", []))
+        return ctx
+
     def get_for_template(self) -> dict[str, Any]:
         """Get full context for template rendering.
 
