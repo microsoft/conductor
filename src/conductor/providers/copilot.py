@@ -749,13 +749,13 @@ class CopilotProvider(AgentProvider):
         # Log interesting events with Rich styling
         if event_type == "tool.execution_start":
             tool_name = getattr(event.data, "tool_name", None) or getattr(
-                event.data, "name", "unknown"
-            )
+                event.data, "name", None
+            ) or "unknown"
 
             text = Text()
             text.append("    ├─ ", style="dim")
             text.append("🔧 ", style="")
-            text.append(tool_name, style="cyan bold")
+            text.append(str(tool_name), style="cyan bold")
             _print(text)
 
             # In full mode, try to show arguments
@@ -777,7 +777,7 @@ class CopilotProvider(AgentProvider):
                 text = Text()
                 text.append("    │  ", style="dim")
                 text.append("✓ ", style="green")
-                text.append(tool_name, style="dim")
+                text.append(str(tool_name), style="dim")
                 _print(text)
 
             # In full mode, try to show result preview
@@ -812,16 +812,16 @@ class CopilotProvider(AgentProvider):
                     _print(text)
 
         elif event_type == "subagent.started":
-            agent_name = getattr(event.data, "name", "unknown")
+            agent_name = getattr(event.data, "name", None) or "unknown"
             text = Text()
             text.append("    ├─ ", style="dim")
             text.append("🤖 ", style="")
             text.append("Sub-agent: ", style="dim")
-            text.append(agent_name, style="magenta bold")
+            text.append(str(agent_name), style="magenta bold")
             _print(text)
 
         elif event_type == "subagent.completed":
-            agent_name = getattr(event.data, "name", "unknown")
+            agent_name = getattr(event.data, "name", None) or "unknown"
             text = Text()
             text.append("    │  ", style="dim")
             text.append("✓ ", style="green")
@@ -949,18 +949,34 @@ class CopilotProvider(AgentProvider):
             ProviderError: If all recovery attempts are exhausted.
         """
         recovery_attempts = 0
+        idle_timeout = self._idle_recovery_config.idle_timeout_seconds
 
         while True:
             try:
                 # Wait for done with idle timeout
                 await asyncio.wait_for(
                     done.wait(),
-                    timeout=self._idle_recovery_config.idle_timeout_seconds,
+                    timeout=idle_timeout,
                 )
                 return  # Completed successfully
 
             except TimeoutError as e:
-                # No activity for idle_timeout_seconds - attempt recovery
+                # Timeout fired — but check if events were recently received.
+                # The agent may be actively working (tool calls, reasoning) without
+                # having reached session.idle yet. Only consider it stuck if no
+                # events at all arrived within the idle timeout window.
+                last_event_time = last_activity_ref[2]
+                time_since_last_event = time.monotonic() - last_event_time
+
+                if time_since_last_event < idle_timeout:
+                    # Events are still flowing — the agent is actively working,
+                    # just hasn't finished yet. Reset recovery counter (new task)
+                    # and keep waiting.
+                    recovery_attempts = 0
+                    done.clear()
+                    continue
+
+                # Genuinely idle — no events for the full timeout period
                 recovery_attempts += 1
 
                 last_event_type = last_activity_ref[0]
@@ -974,7 +990,7 @@ class CopilotProvider(AgentProvider):
                         f"{stuck_info}",
                         suggestion=(
                             f"The agent did not respond for "
-                            f"{self._idle_recovery_config.idle_timeout_seconds}s "
+                            f"{idle_timeout}s "
                             "despite recovery prompts. This may indicate a persistent issue "
                             "with the SDK, network connection, or the agent's ability to "
                             "complete the task. Enable --log-file to capture full debug output."

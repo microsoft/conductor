@@ -1,6 +1,7 @@
 """Unit tests for idle detection and recovery in CopilotProvider."""
 
 import asyncio
+import time
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -334,6 +335,121 @@ class TestWaitWithIdleDetection:
 
         # Should have sent 2 recovery messages before completing
         assert mock_session.send.call_count >= 2
+
+    @pytest.mark.asyncio
+    async def test_no_recovery_when_events_still_flowing(self) -> None:
+        """Test that recovery does NOT fire when events are still flowing.
+
+        This is the core fix for the false-positive idle detection bug:
+        if the agent is actively working (tool calls, reasoning) and events
+        keep arriving, we should NOT send recovery prompts even if
+        session.idle hasn't fired within the timeout window.
+        """
+        config = IdleRecoveryConfig(
+            idle_timeout_seconds=0.1,  # 100ms timeout
+            max_recovery_attempts=2,
+        )
+        provider = CopilotProvider(
+            mock_handler=stub_handler,
+            idle_recovery_config=config,
+        )
+
+        done = asyncio.Event()
+        mock_session = MagicMock()
+        mock_session.send = AsyncMock()
+
+        # Simulate events flowing by continuously updating last_activity_ref
+        last_activity_ref: list[Any] = ["tool.execution_start", "bash", time.monotonic()]
+
+        async def simulate_active_session():
+            """Simulate an active session by updating the timestamp every 50ms."""
+            for _ in range(6):  # 6 * 50ms = 300ms total (3x the idle timeout)
+                await asyncio.sleep(0.05)
+                last_activity_ref[0] = "tool.execution_complete"
+                last_activity_ref[1] = "bash"
+                last_activity_ref[2] = time.monotonic()
+            # After simulating active work, signal completion
+            done.set()
+
+        await asyncio.gather(
+            provider._wait_with_idle_detection(
+                done=done,
+                session=mock_session,
+                verbose_enabled=False,
+                full_enabled=False,
+                last_activity_ref=last_activity_ref,
+            ),
+            simulate_active_session(),
+        )
+
+        # No recovery messages should have been sent — events were flowing
+        assert mock_session.send.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_recovery_counter_resets_between_tasks(self) -> None:
+        """Test that recovery attempts reset when new activity is detected.
+
+        Each 'task' (tool call, reasoning step) gets its own budget of
+        max_recovery_attempts. If tool call #1 gets stuck and uses recovery
+        attempts, then the agent resumes work (events flow), the counter
+        resets so the next stuck tool call gets a fresh budget.
+        """
+        config = IdleRecoveryConfig(
+            idle_timeout_seconds=0.05,  # 50ms timeout
+            max_recovery_attempts=2,
+        )
+        provider = CopilotProvider(
+            mock_handler=stub_handler,
+            idle_recovery_config=config,
+        )
+
+        done = asyncio.Event()
+        mock_session = MagicMock()
+
+        last_activity_ref: list[Any] = ["tool.execution_start", "tool_1", 0.0]
+        send_count = [0]
+
+        async def send_side_effect(msg: Any) -> None:
+            send_count[0] += 1
+            if send_count[0] == 1:
+                # After first recovery for tool_1: simulate agent resuming work.
+                # A background task provides events for a brief window, which
+                # will cause the counter to reset when the next timeout fires.
+                async def provide_events() -> None:
+                    for _ in range(3):
+                        await asyncio.sleep(0.02)
+                        last_activity_ref[0] = "tool.execution_complete"
+                        last_activity_ref[1] = "tool_1"
+                        last_activity_ref[2] = time.monotonic()
+                    # Events stop → tool_2 gets stuck
+                    last_activity_ref[0] = "tool.execution_start"
+                    last_activity_ref[1] = "tool_2"
+
+                asyncio.create_task(provide_events())
+            elif send_count[0] == 3:
+                # Third recovery overall (1 for tool_1, 2 for tool_2) → done.
+                # Schedule with a small delay so it takes effect AFTER
+                # the done.clear() that follows session.send() in the method.
+                async def finish() -> None:
+                    await asyncio.sleep(0.01)
+                    done.set()
+
+                asyncio.create_task(finish())
+
+        mock_session.send = AsyncMock(side_effect=send_side_effect)
+
+        await provider._wait_with_idle_detection(
+            done=done,
+            session=mock_session,
+            verbose_enabled=False,
+            full_enabled=False,
+            last_activity_ref=last_activity_ref,
+        )
+
+        # 3 total recovery messages sent. This is impossible without the
+        # counter resetting, since max_recovery_attempts=2 would cause a
+        # ProviderError on the 3rd attempt without a reset in between.
+        assert mock_session.send.call_count == 3
 
 
 class TestIdleRecoveryIntegration:
