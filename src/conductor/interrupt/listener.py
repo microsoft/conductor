@@ -15,6 +15,7 @@ import asyncio
 import atexit
 import contextlib
 import logging
+import select
 import signal
 import sys
 import threading
@@ -143,6 +144,13 @@ class KeyboardListener:
                 await self._task
             self._task = None
 
+        # Join the reader thread to ensure it exits before interpreter shutdown.
+        # The select()-based polling in _reader_thread_main checks _stop_flag
+        # every 100ms, so the thread should exit within that window.
+        if self._reader_thread is not None:
+            self._reader_thread.join(timeout=0.5)
+            self._reader_thread = None
+
         self._restore_terminal()
         logger.debug("Keyboard listener stopped")
 
@@ -181,12 +189,28 @@ class KeyboardListener:
     def _reader_thread_main(self) -> None:
         """Dedicated daemon thread that reads stdin bytes into the async queue.
 
+        Uses ``select()`` with a 100ms timeout to poll stdin, allowing the
+        thread to check ``_stop_flag`` periodically and exit cleanly on
+        shutdown. This prevents the thread from holding a lock on
+        ``sys.stdin.buffer`` during interpreter finalization.
+
         Uses ``loop.call_soon_threadsafe`` to safely deliver bytes to the
         asyncio queue from this thread.
         """
         assert self._loop is not None
 
         while not self._stop_flag:
+            # Poll stdin with a short timeout so we can check _stop_flag
+            try:
+                ready, _, _ = select.select([sys.stdin], [], [], 0.1)
+            except (OSError, ValueError):
+                # stdin closed or invalid
+                break
+
+            if not ready:
+                # Timeout — no data, loop back to check _stop_flag
+                continue
+
             byte_val = self._read_byte_blocking()
             try:
                 self._loop.call_soon_threadsafe(self._byte_queue.put_nowait, byte_val)

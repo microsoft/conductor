@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -369,7 +370,12 @@ class TestReaderThread:
             listener._stop_flag = True
             return None
 
-        with patch.object(listener, "_read_byte_blocking", side_effect=mock_read):
+        with (
+            patch.object(listener, "_read_byte_blocking", side_effect=mock_read),
+            patch("conductor.interrupt.listener.select") as mock_select,
+        ):
+            # Make select always report stdin as ready
+            mock_select.select.return_value = ([sys.stdin], [], [])
             listener._reader_thread_main()
 
         # Allow event loop to process call_soon_threadsafe callbacks
