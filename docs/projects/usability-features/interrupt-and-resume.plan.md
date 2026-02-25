@@ -601,6 +601,8 @@ async def send_followup(
 
 ### Epic 2: Interrupt Handler UI
 
+**Status:** DONE
+
 **Goal:** Create the Rich-based interrupt interaction panel that displays workflow state and collects user decisions.
 
 **Prerequisites:** None (can be developed in parallel with Epic 1)
@@ -609,19 +611,21 @@ async def send_followup(
 
 | Task ID | Type | Description | Files | Status |
 |---------|------|-------------|-------|--------|
-| E2-T1 | IMPL | Create `InterruptAction` enum (`continue_with_guidance`, `skip_to_agent`, `stop`, `cancel`) and `InterruptResult` dataclass (`action`, `guidance`, `skip_target`). | `src/conductor/gates/interrupt.py` | TO DO |
-| E2-T2 | IMPL | Create `InterruptHandler` class with `skip_gates: bool` constructor param. Implement `handle_interrupt()` method: display Rich panel with current agent, iteration, last output preview (truncated to 500 chars), accumulated guidance list, and numbered action options. Collect selection via `IntPrompt`. For "continue with guidance": collect text via `Prompt.ask()`. For "skip to agent": display available agents (top-level only, not nested in parallel/for-each), validate selection. If `skip_gates` is True, auto-select cancel (log message). Return `InterruptResult`. | `src/conductor/gates/interrupt.py` | TO DO |
-| E2-T3 | IMPL | Add `InterruptError` exception to exceptions.py, subclass of `ExecutionError`. Used when user selects "stop workflow" from interrupt menu. Includes `agent_name` field and message "Workflow stopped by user interrupt". | `src/conductor/exceptions.py` | TO DO |
-| E2-T4 | TEST | Test `InterruptHandler`: mock Rich console, verify panel content for various states, verify action selection flow, verify guidance text collection, verify skip-to-agent validation rejects invalid names and re-prompts, verify cancel returns no-op result, verify skip_gates auto-cancels. | `tests/test_interrupt/test_handler.py` | TO DO |
+| E2-T1 | IMPL | Create `InterruptAction` enum (`continue_with_guidance`, `skip_to_agent`, `stop`, `cancel`) and `InterruptResult` dataclass (`action`, `guidance`, `skip_target`). | `src/conductor/gates/interrupt.py` | DONE |
+| E2-T2 | IMPL | Create `InterruptHandler` class with `skip_gates: bool` constructor param. Implement `handle_interrupt()` method: display Rich panel with current agent, iteration, last output preview (truncated to 500 chars), accumulated guidance list, and numbered action options. Collect selection via `IntPrompt`. For "continue with guidance": collect text via `Prompt.ask()`. For "skip to agent": display available agents (top-level only, not nested in parallel/for-each), validate selection. If `skip_gates` is True, auto-select cancel (log message). Return `InterruptResult`. | `src/conductor/gates/interrupt.py` | DONE |
+| E2-T3 | IMPL | Add `InterruptError` exception to exceptions.py, subclass of `ExecutionError`. Used when user selects "stop workflow" from interrupt menu. Includes `agent_name` field and message "Workflow stopped by user interrupt". | `src/conductor/exceptions.py` | DONE |
+| E2-T4 | TEST | Test `InterruptHandler`: mock Rich console, verify panel content for various states, verify action selection flow, verify guidance text collection, verify skip-to-agent validation rejects invalid names and re-prompts, verify cancel returns no-op result, verify skip_gates auto-cancels. | `tests/test_interrupt/test_handler.py` | DONE |
 
 **Acceptance Criteria:**
-- [ ] Rich panel displays current agent, iteration, output preview, and accumulated guidance
-- [ ] All four actions work correctly (continue, skip, stop, cancel)
-- [ ] Skip-to-agent validates target exists in available agents list (top-level only)
-- [ ] Guidance text is captured and returned in result
-- [ ] Panel follows same visual style as `MaxIterationsHandler`
-- [ ] `skip_gates` mode auto-selects cancel
-- [ ] All tests pass
+- [x] Rich panel displays current agent, iteration, output preview, and accumulated guidance
+- [x] All four actions work correctly (continue, skip, stop, cancel)
+- [x] Skip-to-agent validates target exists in available agents list (top-level only)
+- [x] Guidance text is captured and returned in result
+- [x] Panel follows same visual style as `MaxIterationsHandler`
+- [x] `skip_gates` mode auto-selects cancel
+- [x] All tests pass
+
+**Completion Notes:** Implemented `InterruptAction` enum, `InterruptResult` dataclass, and `InterruptHandler` class in `src/conductor/gates/interrupt.py`. Added `InterruptError` exception to `src/conductor/exceptions.py`. Skip-to-agent supports selection by both name and number with validation and re-prompting. 35 tests cover all action flows, panel content, edge cases (empty guidance, invalid agents, KeyboardInterrupt, EOFError). Review fixes applied: Rich markup escaping via `rich.markup.escape()` for output previews and guidance items, guidance text stripped before storing to prevent whitespace injection into prompts.
 
 ---
 
