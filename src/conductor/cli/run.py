@@ -877,38 +877,7 @@ async def run_workflow_async(
             config.workflow.runtime.provider = provider_override  # type: ignore[assignment]
 
         # Convert MCP servers from workflow config to SDK format
-        mcp_servers: dict[str, Any] | None = None
-        if config.workflow.runtime.mcp_servers:
-            mcp_servers = {}
-            for name, server in config.workflow.runtime.mcp_servers.items():
-                # Convert Pydantic model to dict for SDK
-                if server.type in ("http", "sse"):
-                    server_config: dict[str, Any] = {
-                        "type": server.type,
-                        "url": server.url,
-                        "tools": server.tools,
-                    }
-                    if server.headers:
-                        server_config["headers"] = server.headers
-                    if server.timeout:
-                        server_config["timeout"] = server.timeout
-                    # Resolve OAuth authentication for HTTP/SSE servers
-                    server_config = await resolve_mcp_server_auth(name, server_config)
-                else:
-                    # stdio/local type
-                    server_config = {
-                        "type": "stdio",
-                        "command": server.command,
-                        "args": server.args,
-                        "tools": server.tools,
-                    }
-                    if server.env:
-                        # Resolve ${VAR} and ${VAR:-default} patterns at runtime
-                        server_config["env"] = resolve_mcp_env_vars(server.env)
-                    if server.timeout:
-                        server_config["timeout"] = server.timeout
-                mcp_servers[name] = server_config
-            verbose_log(f"MCP servers configured: {list(mcp_servers.keys())}")
+        mcp_servers = await _build_mcp_servers(config)
 
         # Check if workflow uses multiple providers (has per-agent provider overrides)
         uses_multi_provider = any(agent.provider is not None for agent in config.agents)
@@ -923,8 +892,15 @@ async def run_workflow_async(
             # Create and run workflow engine
             verbose_log("Starting workflow execution...")
 
-            engine = WorkflowEngine(config, registry=registry, skip_gates=skip_gates)
-            result = await engine.run(inputs)
+            engine = WorkflowEngine(
+                config, registry=registry, skip_gates=skip_gates, workflow_path=workflow_path
+            )
+
+            try:
+                result = await engine.run(inputs)
+            except BaseException:
+                _print_resume_instructions(engine)
+                raise
 
             # Log completion
             verbose_log_timing("Total workflow execution", time.time() - start_time)
@@ -1122,3 +1098,228 @@ def build_dry_run_plan(workflow_path: Path) -> ExecutionPlan:
 
     engine = WorkflowEngine(config, provider=_MockProvider())
     return engine.build_execution_plan()
+
+
+def _print_resume_instructions(engine: WorkflowEngine) -> None:
+    """Print checkpoint path and resume instructions to stderr.
+
+    Called after ``engine.run()`` raises. Only prints if the engine
+    successfully saved a checkpoint (``_last_checkpoint_path`` is set).
+
+    Args:
+        engine: The workflow engine that failed.
+    """
+    checkpoint_path = engine._last_checkpoint_path
+    if checkpoint_path is None:
+        return
+
+    _verbose_console.print()
+    _verbose_console.print(f"[bold yellow]Workflow state saved to:[/bold yellow] {checkpoint_path}")
+    _verbose_console.print(
+        f"[bold yellow]Resume with:[/bold yellow] conductor resume --from {checkpoint_path}"
+    )
+    if engine.workflow_path is not None:
+        _verbose_console.print(
+            f"[dim]Or resume latest checkpoint:[/dim] conductor resume {engine.workflow_path}"
+        )
+    _verbose_console.print()
+
+
+async def resume_workflow_async(
+    workflow_path: Path | None = None,
+    checkpoint_path: Path | None = None,
+    skip_gates: bool = False,
+    log_file: Path | None = None,
+) -> dict[str, Any]:
+    """Resume a workflow from a checkpoint.
+
+    Loads a checkpoint file, reconstructs workflow state, and resumes
+    execution from the failed agent.
+
+    Args:
+        workflow_path: Path to the workflow YAML file. Used to find
+            the latest checkpoint if ``checkpoint_path`` is not provided.
+        checkpoint_path: Explicit path to a checkpoint file. Takes
+            precedence over ``workflow_path``.
+        skip_gates: If True, auto-selects first option at human gates.
+        log_file: Optional path to write full debug output to a file.
+
+    Returns:
+        The workflow output as a dictionary.
+
+    Raises:
+        CheckpointError: If the checkpoint cannot be loaded or is invalid.
+        ConductorError: If workflow execution fails.
+    """
+    from conductor.engine.checkpoint import CheckpointManager
+    from conductor.engine.context import WorkflowContext
+    from conductor.engine.limits import LimitEnforcer
+    from conductor.exceptions import CheckpointError
+
+    start_time = time.time()
+
+    # Initialize file logging if requested
+    if log_file is not None:
+        try:
+            init_file_logging(log_file)
+        except OSError as e:
+            _verbose_console.print(
+                f"[bold yellow]Warning:[/bold yellow] Cannot open log file {log_file}: {e}"
+            )
+
+    try:
+        # Resolve checkpoint file
+        if checkpoint_path is not None:
+            verbose_log(f"Loading checkpoint: {checkpoint_path}")
+            cp = CheckpointManager.load_checkpoint(checkpoint_path)
+        elif workflow_path is not None:
+            verbose_log(f"Finding latest checkpoint for: {workflow_path}")
+            latest = CheckpointManager.find_latest_checkpoint(workflow_path)
+            if latest is None:
+                raise CheckpointError(
+                    f"No checkpoints found for workflow: {workflow_path.name}",
+                    suggestion=f"Run the workflow first: conductor run {workflow_path}",
+                )
+            verbose_log(f"Found checkpoint: {latest}")
+            cp = CheckpointManager.load_checkpoint(latest)
+        else:
+            raise CheckpointError(
+                "Either workflow path or --from checkpoint path is required",
+                suggestion="Use: conductor resume workflow.yaml "
+                "or conductor resume --from <checkpoint.json>",
+            )
+
+        # Resolve workflow path from checkpoint if not provided
+        resolved_workflow_path = workflow_path or Path(cp.workflow_path)
+        if not resolved_workflow_path.exists():
+            raise CheckpointError(
+                f"Workflow file not found: {resolved_workflow_path}",
+                suggestion="Ensure the workflow file exists at the original path",
+                checkpoint_path=str(cp.file_path),
+            )
+
+        # Compare workflow hashes — warn if different
+        current_hash = CheckpointManager.compute_workflow_hash(resolved_workflow_path)
+        if current_hash != cp.workflow_hash:
+            _verbose_console.print(
+                "[bold yellow]⚠ Warning:[/bold yellow] "
+                "Workflow file has changed since checkpoint was created. "
+                "Resume may produce unexpected results."
+            )
+
+        # Log checkpoint details
+        verbose_log(f"Resuming from agent: {cp.current_agent}")
+        verbose_log(
+            f"Checkpoint created: {cp.created_at} (failed at: {cp.failure.get('agent', 'unknown')})"
+        )
+
+        # Load workflow config
+        config = load_config(resolved_workflow_path)
+
+        # Verify the current_agent exists in the workflow
+        agent_names = {a.name for a in config.agents}
+        parallel_names = {g.name for g in config.parallel} if config.parallel else set()
+        for_each_names = {g.name for g in config.for_each} if config.for_each else set()
+        all_names = agent_names | parallel_names | for_each_names
+        if cp.current_agent not in all_names:
+            raise CheckpointError(
+                f"Agent '{cp.current_agent}' from checkpoint not found in workflow",
+                suggestion=(
+                    "The workflow may have been modified. "
+                    "Check that the agent still exists, or re-run the workflow."
+                ),
+                checkpoint_path=str(cp.file_path),
+            )
+
+        # Reconstruct state from checkpoint
+        restored_context = WorkflowContext.from_dict(cp.context)
+        restored_limits = LimitEnforcer.from_dict(
+            cp.limits,
+            timeout_seconds=config.workflow.limits.timeout_seconds,
+        )
+
+        # Build MCP servers config (same as run_workflow_async)
+        mcp_servers = await _build_mcp_servers(config)
+
+        # Create engine and restore state
+        async with ProviderRegistry(config, mcp_servers=mcp_servers) as registry:
+            verbose_log("Starting resumed workflow execution...")
+
+            engine = WorkflowEngine(
+                config,
+                registry=registry,
+                skip_gates=skip_gates,
+                workflow_path=resolved_workflow_path,
+            )
+            engine.set_context(restored_context)
+            engine.set_limits(restored_limits)
+
+            try:
+                result = await engine.resume(cp.current_agent)
+            except BaseException:
+                _print_resume_instructions(engine)
+                raise
+
+            # Log completion
+            verbose_log_timing("Total resumed execution", time.time() - start_time)
+            verbose_log("Workflow resumed successfully", style="green")
+
+            # Display usage summary if cost tracking is enabled
+            if config.workflow.cost.show_summary:
+                summary = engine.get_execution_summary()
+                if "usage" in summary:
+                    display_usage_summary(summary["usage"])
+
+            # Cleanup checkpoint after successful resume
+            CheckpointManager.cleanup(cp.file_path)
+            verbose_log(f"Checkpoint cleaned up: {cp.file_path}", style="dim")
+
+            return result
+    finally:
+        # Report log file path to stderr and close file logging
+        if log_file is not None and _file_console is not None:
+            _verbose_console.print(f"[dim]Log written to: {log_file}[/dim]")
+        close_file_logging()
+
+
+async def _build_mcp_servers(config: Any) -> dict[str, Any] | None:
+    """Build MCP server configurations from workflow config.
+
+    Extracted from ``run_workflow_async`` for reuse in ``resume_workflow_async``.
+
+    Args:
+        config: The workflow configuration.
+
+    Returns:
+        MCP server configurations dict, or None if none configured.
+    """
+    if not config.workflow.runtime.mcp_servers:
+        return None
+
+    mcp_servers: dict[str, Any] = {}
+    for name, server in config.workflow.runtime.mcp_servers.items():
+        if server.type in ("http", "sse"):
+            server_config: dict[str, Any] = {
+                "type": server.type,
+                "url": server.url,
+                "tools": server.tools,
+            }
+            if server.headers:
+                server_config["headers"] = server.headers
+            if server.timeout:
+                server_config["timeout"] = server.timeout
+            server_config = await resolve_mcp_server_auth(name, server_config)
+        else:
+            server_config = {
+                "type": "stdio",
+                "command": server.command,
+                "args": server.args,
+                "tools": server.tools,
+            }
+            if server.env:
+                server_config["env"] = resolve_mcp_env_vars(server.env)
+            if server.timeout:
+                server_config["timeout"] = server.timeout
+        mcp_servers[name] = server_config
+    verbose_log(f"MCP servers configured: {list(mcp_servers.keys())}")
+    return mcp_servers
