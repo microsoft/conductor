@@ -28,7 +28,7 @@ from pydantic import BaseModel
 
 from conductor.exceptions import ProviderError, ValidationError
 from conductor.executor.output import validate_output
-from conductor.providers.base import AgentOutput, AgentProvider
+from conductor.providers.base import AgentOutput, AgentProvider, EventCallback
 
 if TYPE_CHECKING:
     from conductor.config.schema import AgentDef, OutputField
@@ -394,6 +394,7 @@ class ClaudeProvider(AgentProvider):
         rendered_prompt: str,
         tools: list[str] | None = None,
         interrupt_signal: asyncio.Event | None = None,
+        event_callback: EventCallback | None = None,
     ) -> AgentOutput:
         """Execute an agent using the Claude SDK.
 

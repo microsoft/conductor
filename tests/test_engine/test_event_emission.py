@@ -484,6 +484,7 @@ class TestEventSequence:
         assert types == [
             "workflow_started",
             "agent_started",
+            "agent_prompt_rendered",
             "agent_completed",
             "route_taken",
             "workflow_completed",

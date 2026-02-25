@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from conductor.exceptions import ProviderError
-from conductor.providers.base import AgentOutput, AgentProvider
+from conductor.providers.base import AgentOutput, AgentProvider, EventCallback
 
 if TYPE_CHECKING:
     from conductor.config.schema import AgentDef
@@ -170,6 +170,7 @@ class CopilotProvider(AgentProvider):
         rendered_prompt: str,
         tools: list[str] | None = None,
         interrupt_signal: asyncio.Event | None = None,
+        event_callback: EventCallback | None = None,
     ) -> AgentOutput:
         """Execute an agent using the Copilot SDK.
 
@@ -184,6 +185,7 @@ class CopilotProvider(AgentProvider):
             interrupt_signal: Optional event for mid-agent interrupt signaling.
                 When set during execution, the provider will attempt to abort
                 the current session and return partial output.
+            event_callback: Optional callback for streaming SDK events upstream.
 
         Returns:
             Normalized AgentOutput with structured content.
@@ -208,7 +210,12 @@ class CopilotProvider(AgentProvider):
 
         # Use retry logic for both mock and real SDK calls
         return await self._execute_with_retry(
-            agent, context, rendered_prompt, tools, interrupt_signal=interrupt_signal
+            agent,
+            context,
+            rendered_prompt,
+            tools,
+            interrupt_signal=interrupt_signal,
+            event_callback=event_callback,
         )
 
     async def _execute_with_retry(
@@ -218,6 +225,7 @@ class CopilotProvider(AgentProvider):
         rendered_prompt: str,
         tools: list[str] | None = None,
         interrupt_signal: asyncio.Event | None = None,
+        event_callback: EventCallback | None = None,
     ) -> AgentOutput:
         """Execute with exponential backoff retry logic.
 
@@ -227,6 +235,7 @@ class CopilotProvider(AgentProvider):
             rendered_prompt: Jinja2-rendered user prompt.
             tools: List of tool names available to this agent.
             interrupt_signal: Optional event for mid-agent interrupt signaling.
+            event_callback: Optional callback for streaming SDK events upstream.
 
         Returns:
             Normalized AgentOutput with structured content.
@@ -245,6 +254,7 @@ class CopilotProvider(AgentProvider):
                     context,
                     tools,
                     interrupt_signal=interrupt_signal,
+                    event_callback=event_callback,
                 )
                 # Extract usage data from SDK response if available
                 input_tokens = sdk_response.input_tokens if sdk_response else None
@@ -339,6 +349,7 @@ class CopilotProvider(AgentProvider):
         context: dict[str, Any],
         tools: list[str] | None = None,
         interrupt_signal: asyncio.Event | None = None,
+        event_callback: EventCallback | None = None,
     ) -> tuple[dict[str, Any], SDKResponse | None]:
         """Execute the actual SDK call or mock handler.
 
@@ -348,6 +359,7 @@ class CopilotProvider(AgentProvider):
             context: Accumulated workflow context.
             tools: List of tool names available to this agent.
             interrupt_signal: Optional event for mid-agent interrupt signaling.
+            event_callback: Optional callback for streaming SDK events upstream.
 
         Returns:
             Tuple of (content dict, SDKResponse with usage data or None for mock).
@@ -447,6 +459,7 @@ class CopilotProvider(AgentProvider):
                     verbose_enabled,
                     full_enabled,
                     interrupt_signal=interrupt_signal,
+                    event_callback=event_callback,
                 )
                 response_content = sdk_response.content
 
@@ -572,6 +585,7 @@ class CopilotProvider(AgentProvider):
         verbose_enabled: bool,
         full_enabled: bool,
         interrupt_signal: asyncio.Event | None = None,
+        event_callback: EventCallback | None = None,
     ) -> SDKResponse:
         """Send a prompt to the session and wait for response.
 
@@ -583,6 +597,7 @@ class CopilotProvider(AgentProvider):
             interrupt_signal: Optional event for mid-agent interrupt signaling.
                 When set, the method will attempt to abort the session and
                 return partial content with ``partial=True``.
+            event_callback: Optional callback for streaming SDK events upstream.
 
         Returns:
             SDKResponse with content and usage data. If interrupted,
@@ -638,6 +653,10 @@ class CopilotProvider(AgentProvider):
                     event.data, "name", "unknown"
                 )
                 last_activity_ref[1] = tool_name
+
+            # Forward structured events upstream via event_callback
+            if event_callback is not None:
+                self._forward_event(event_type, event, event_callback)
 
             # Verbose logging for intermediate progress
             if verbose_enabled:
@@ -1073,6 +1092,67 @@ class CopilotProvider(AgentProvider):
                 text.append("⏳ ", style="yellow")
                 text.append(f"Processing{turn_info}...", style="dim italic")
                 _print(text)
+
+    @staticmethod
+    def _forward_event(event_type: str, event: Any, callback: EventCallback) -> None:
+        """Forward an SDK event to an upstream callback as a structured dict.
+
+        Maps SDK event types to Conductor streaming event types and extracts
+        relevant data from each event.
+
+        Args:
+            event_type: The raw SDK event type string.
+            event: The SDK event object.
+            callback: The upstream callback to invoke with (event_type, data).
+        """
+        try:
+            if event_type == "assistant.reasoning":
+                content = getattr(event.data, "content", "")
+                if content:
+                    callback("agent_reasoning", {"content": content})
+
+            elif event_type == "tool.execution_start":
+                tool_name = (
+                    getattr(event.data, "tool_name", None)
+                    or getattr(event.data, "name", None)
+                    or "unknown"
+                )
+                arguments = getattr(event.data, "arguments", None) or getattr(
+                    event.data, "args", None
+                )
+                callback(
+                    "agent_tool_start",
+                    {
+                        "tool_name": str(tool_name),
+                        "arguments": str(arguments)[:500] if arguments else None,
+                    },
+                )
+
+            elif event_type == "tool.execution_complete":
+                tool_name = getattr(event.data, "tool_name", None) or getattr(
+                    event.data, "name", None
+                )
+                result = getattr(event.data, "result", None) or getattr(event.data, "output", None)
+                callback(
+                    "agent_tool_complete",
+                    {
+                        "tool_name": str(tool_name) if tool_name else None,
+                        "result": str(result)[:500] if result else None,
+                    },
+                )
+
+            elif event_type == "assistant.turn_start":
+                turn = getattr(event.data, "turn", None)
+                callback("agent_turn_start", {"turn": turn})
+
+            elif event_type == "assistant.message":
+                content = getattr(event.data, "content", "")
+                if content:
+                    callback("agent_message", {"content": content})
+
+        except Exception:
+            # Never let callback errors break the SDK event loop
+            logger.debug("Error forwarding event %s to callback", event_type, exc_info=True)
 
     def _build_recovery_prompt(
         self,

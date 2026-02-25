@@ -25,6 +25,7 @@ class MockProvider(AgentProvider):
         rendered_prompt: str,
         tools: list[str] | None = None,
         interrupt_signal: asyncio.Event | None = None,
+        event_callback=None,
     ) -> AgentOutput:
         return AgentOutput(content={"result": "mock"}, raw_response="mock")
 

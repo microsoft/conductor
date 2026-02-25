@@ -872,18 +872,11 @@ async def run_workflow_async(
     dashboard: Any = None
 
     if web:
-        # Lazy-import web dependencies with actionable error
-        try:
-            from conductor.web.server import WebDashboard
-        except ImportError:
-            _verbose_console.print(
-                "[bold red]Error:[/bold red] Web dashboard dependencies are not installed.\n"
-                "Install them with: [bold]pip install conductor-cli\\[web][/bold]"
-            )
-            raise typer.Exit(code=1) from None
+        from conductor.web.server import WebDashboard
 
         emitter = WorkflowEventEmitter()
-        dashboard = WebDashboard(emitter, host="127.0.0.1", port=web_port, bg=web_bg)
+        bg_mode = web_bg or os.environ.get("CONDUCTOR_WEB_BG") == "1"
+        dashboard = WebDashboard(emitter, host="127.0.0.1", port=web_port, bg=bg_mode)
 
         try:
             await dashboard.start()
@@ -935,9 +928,10 @@ async def run_workflow_async(
             verbose_log("Starting workflow execution...")
 
             # Set up interrupt listener if interactive mode is enabled
+            # Disabled in --web mode since the CLI isn't used for interaction
             interrupt_event: asyncio.Event | None = None
             listener = None
-            if not no_interactive and sys.stdin.isatty():
+            if not no_interactive and not web and sys.stdin.isatty():
                 from conductor.interrupt.listener import KeyboardListener
 
                 interrupt_event = asyncio.Event()
@@ -977,7 +971,10 @@ async def run_workflow_async(
 
             # Post-execution dashboard lifecycle
             if dashboard is not None:
-                if web_bg:
+                # Auto-shutdown if either --web-bg was passed directly or
+                # this is a background child process (CONDUCTOR_WEB_BG env var)
+                is_bg = web_bg or os.environ.get("CONDUCTOR_WEB_BG") == "1"
+                if is_bg:
                     await dashboard.wait_for_clients_disconnect()
                 else:
                     _verbose_console.print(
@@ -1167,6 +1164,7 @@ def build_dry_run_plan(workflow_path: Path) -> ExecutionPlan:
             rendered_prompt: str,
             tools: list[str] | None = None,
             interrupt_signal: asyncio.Event | None = None,
+            event_callback: Any = None,
         ) -> AgentOutput:
             return AgentOutput(content={}, raw_response="")
 

@@ -19,6 +19,10 @@ conductor run <workflow.yaml> [OPTIONS]
 | `--provider`, `-p PROVIDER` | Override provider (copilot, claude) |
 | `--dry-run` | Show execution plan only |
 | `--skip-gates` | Auto-select first option at human gates |
+| `--web` | Start real-time web dashboard |
+| `--web-bg` | Run in background, print dashboard URL, exit |
+| `--web-port PORT` | Port for web dashboard (0 = auto) |
+| `--no-interactive` | Disable Esc-to-interrupt capability |
 
 **Global options** (before the subcommand):
 
@@ -49,7 +53,15 @@ conductor run workflow.yaml --dry-run
 
 # Override provider
 conductor run workflow.yaml -p claude
+
+# Start real-time web dashboard
+conductor run workflow.yaml --web --input question="Hello"
+
+# Background mode: prints URL and exits immediately
+conductor run workflow.yaml --web-bg --input question="Hello"
 ```
+
+The `--web` flag opens a browser dashboard with a DAG visualization showing live agent status, streaming reasoning/tool calls, and an agent detail panel. The `--web-bg` flag forks a background process and exits immediately. `--web` and `--web-bg` are mutually exclusive.
 
 ### conductor validate
 
@@ -162,6 +174,14 @@ conductor run workflow.yaml --dry-run
 ```
 
 Preview execution plan without running agents. Shows the workflow graph, agent order, and configuration.
+
+### Web Dashboard
+
+```bash
+conductor run workflow.yaml --web --input question="test"
+```
+
+Visualize execution in real-time with a browser dashboard. Shows agent prompts, reasoning, tool calls, and outputs as they stream in.
 
 ### Validate First
 

@@ -191,6 +191,23 @@ See detailed execution progress:
 conductor -V run examples/simple-qa.yaml --input question="Hello"
 ```
 
+## Web Dashboard
+
+### web-dashboard-test.yaml
+
+A multi-pattern workflow for testing the web dashboard. Demonstrates:
+- Real-time DAG visualization with live node state updates
+- Agent detail panel with streaming reasoning and tool calls
+- Sequential, parallel, and script step patterns in a single workflow
+
+```bash
+# Foreground dashboard (keeps running after workflow completes)
+conductor run examples/web-dashboard-test.yaml --web --input topic="Python async programming"
+
+# Background mode (prints URL and exits immediately)
+conductor run examples/web-dashboard-test.yaml --web-bg --input topic="Rust vs Go"
+```
+
 ## Creating Your Own Workflows
 
 Use the `init` command to create a new workflow from a template:

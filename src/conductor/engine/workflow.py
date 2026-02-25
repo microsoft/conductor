@@ -506,6 +506,27 @@ class WorkflowEngine:
         event = WorkflowEvent(type=event_type, timestamp=_time.time(), data=data)
         self._event_emitter.emit(event)
 
+    def _make_event_callback(self, agent_name: str) -> Any:
+        """Create an event callback for an agent that forwards to the emitter.
+
+        Returns None when no emitter is configured, so the callback plumbing
+        is entirely skipped in non-dashboard mode.
+
+        Args:
+            agent_name: The agent name to inject into forwarded events.
+
+        Returns:
+            An EventCallback function, or None if no emitter is configured.
+        """
+        if self._event_emitter is None:
+            return None
+
+        def _callback(event_type: str, data: dict[str, Any]) -> None:
+            data_with_agent = {"agent_name": agent_name, **data}
+            self._emit(event_type, data_with_agent)
+
+        return _callback
+
     async def _get_executor_for_agent(self, agent: AgentDef) -> AgentExecutor:
         """Get the appropriate executor for an agent.
 
@@ -1264,11 +1285,13 @@ class WorkflowEngine:
                         _agent_start = _time.time()
                         executor = await self._get_executor_for_agent(agent)
                         guidance_section = self.context.get_guidance_prompt_section()
+                        event_callback = self._make_event_callback(agent.name)
                         output = await executor.execute(
                             agent,
                             agent_context,
                             guidance_section=guidance_section,
                             interrupt_signal=self._interrupt_event,
+                            event_callback=event_callback,
                         )
                         _agent_elapsed = _time.time() - _agent_start
 
@@ -1309,6 +1332,8 @@ class WorkflowEngine:
                                 "elapsed": _agent_elapsed,
                                 "model": output.model,
                                 "tokens": output.tokens_used,
+                                "input_tokens": output.input_tokens,
+                                "output_tokens": output.output_tokens,
                                 "cost_usd": usage.cost_usd,
                                 "output": output.content,
                                 "output_keys": output_keys,
@@ -1829,7 +1854,12 @@ class WorkflowEngine:
 
                 # Execute agent (get executor for multi-provider support)
                 executor = await self._get_executor_for_agent(agent)
-                output = await executor.execute(agent, agent_context)
+                event_callback = self._make_event_callback(agent.name)
+                output = await executor.execute(
+                    agent,
+                    agent_context,
+                    event_callback=event_callback,
+                )
                 _agent_elapsed = _time.time() - _agent_start
 
                 # Record usage and calculate cost
@@ -2205,7 +2235,12 @@ class WorkflowEngine:
 
                 # Execute agent with injected context (get executor for multi-provider)
                 executor = await self._get_executor_for_agent(for_each_group.agent)
-                output = await executor.execute(for_each_group.agent, agent_context)
+                event_callback = self._make_event_callback(for_each_group.name)
+                output = await executor.execute(
+                    for_each_group.agent,
+                    agent_context,
+                    event_callback=event_callback,
+                )
                 _item_elapsed = _time.time() - _item_start
 
                 # Record usage and calculate cost

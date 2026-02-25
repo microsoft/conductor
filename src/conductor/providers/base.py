@@ -8,11 +8,16 @@ from __future__ import annotations
 
 import asyncio
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from conductor.config.schema import AgentDef
+
+# Type alias for event callbacks that receive structured SDK events.
+# Callback signature: (event_type: str, data: dict[str, Any]) -> None
+EventCallback = Callable[[str, dict[str, Any]], None]
 
 
 @dataclass
@@ -91,6 +96,7 @@ class AgentProvider(ABC):
         rendered_prompt: str,
         tools: list[str] | None = None,
         interrupt_signal: asyncio.Event | None = None,
+        event_callback: EventCallback | None = None,
     ) -> AgentOutput:
         """Execute an agent and return normalized output.
 
@@ -105,6 +111,9 @@ class AgentProvider(ABC):
                 execution and return partial output when it fires.
                 Providers that do not support mid-agent interrupts may
                 ignore this parameter.
+            event_callback: Optional callback for streaming SDK events
+                upstream (reasoning, tool calls, messages). Called with
+                (event_type, data_dict) for each interesting SDK event.
 
         Returns:
             Normalized AgentOutput with structured content.

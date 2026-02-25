@@ -3,5 +3,8 @@
 This package provides a real-time web dashboard that visualizes workflow
 execution using FastAPI, uvicorn, and WebSocket broadcasting.
 
-Requires optional dependencies: ``pip install conductor-cli[web]``
+Usage::
+
+    conductor run workflow.yaml --web
+    conductor run workflow.yaml --web-bg
 """

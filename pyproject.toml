@@ -40,10 +40,6 @@ dependencies = [
     "github-copilot-sdk>=0.1.0",
     "anthropic>=0.77.0,<1.0.0",
     "mcp>=1.0.0",
-]
-
-[project.optional-dependencies]
-web = [
     "fastapi>=0.115.0",
     "uvicorn>=0.30.0",
     "websockets>=12.0",

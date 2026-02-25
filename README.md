@@ -20,6 +20,7 @@ Conductor provides the patterns that work: evaluator-optimizer loops for iterati
 - **Conditional routing** - Route between agents based on output conditions
 - **Human-in-the-loop** - Pause for human decisions with Rich terminal UI
 - **Safety limits** - Max iterations and timeout enforcement
+- **Web dashboard** - Real-time DAG visualization with agent detail streaming
 - **Validation** - Validate workflows before execution
 
 ## Installation
@@ -144,6 +145,9 @@ conductor run <workflow.yaml> [OPTIONS]
 | `-p, --provider PROVIDER` | Override provider |
 | `--dry-run` | Preview execution plan |
 | `--skip-gates` | Auto-select at human gates |
+| `--web` | Start real-time web dashboard |
+| `--web-bg` | Run in background, print dashboard URL, exit |
+| `--web-port PORT` | Port for web dashboard (0 = auto) |
 | `-q, --quiet` | Suppress progress output |
 | `-s, --silent` | Suppress all output except errors |
 | `-l, --log-file PATH` | Write logs to file |

@@ -275,7 +275,11 @@ def run(
         bool,
         typer.Option(
             "--web-bg",
-            help="Auto-shutdown dashboard after workflow completes and clients disconnect.",
+            help=(
+                "Run workflow + dashboard in a background process. "
+                "Prints the dashboard URL and exits immediately. "
+                "Does not require --web."
+            ),
         ),
     ] = False,
 ) -> None:
@@ -298,7 +302,7 @@ def run(
         conductor run workflow.yaml --no-interactive
         conductor run workflow.yaml --web
         conductor run workflow.yaml --web --web-port 8080
-        conductor run workflow.yaml --web --web-bg
+        conductor run workflow.yaml --web-bg
     """
     import asyncio
     import json
@@ -323,6 +327,10 @@ def run(
             print_error(e)
             raise typer.Exit(code=1) from None
 
+    # Validate mutually exclusive flags
+    if web and web_bg:
+        raise typer.BadParameter("--web and --web-bg are mutually exclusive")
+
     # Collect inputs from both --input and --input.* patterns
     inputs: dict[str, Any] = {}
 
@@ -340,6 +348,30 @@ def run(
             resolved_log_file = generate_log_path(workflow.stem)
         else:
             resolved_log_file = Path(log_file)
+
+    # Handle --web-bg: fork a background process and exit immediately
+    if web_bg:
+        from conductor.cli.bg_runner import launch_background
+
+        try:
+            url = launch_background(
+                workflow_path=workflow,
+                inputs=inputs,
+                provider_override=provider,
+                skip_gates=skip_gates,
+                log_file=resolved_log_file,
+                no_interactive=True,  # Always non-interactive in background
+                web_port=web_port,
+            )
+            console.print(f"[bold cyan]Dashboard:[/bold cyan] {url}")
+            console.print(
+                "[dim]Workflow running in background. Dashboard auto-shuts down after "
+                "workflow completes and all clients disconnect.[/dim]"
+            )
+        except Exception as e:
+            print_error(e)
+            raise typer.Exit(code=1) from None
+        return
 
     try:
         # Run the workflow

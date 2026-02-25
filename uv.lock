@@ -154,6 +154,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "anthropic" },
+    { name = "fastapi" },
     { name = "github-copilot-sdk" },
     { name = "jinja2" },
     { name = "mcp" },
@@ -162,11 +163,6 @@ dependencies = [
     { name = "ruamel-yaml" },
     { name = "simpleeval" },
     { name = "typer" },
-]
-
-[package.optional-dependencies]
-web = [
-    { name = "fastapi" },
     { name = "uvicorn" },
     { name = "websockets" },
 ]
@@ -183,7 +179,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "anthropic", specifier = ">=0.77.0,<1.0.0" },
-    { name = "fastapi", marker = "extra == 'web'", specifier = ">=0.115.0" },
+    { name = "fastapi", specifier = ">=0.115.0" },
     { name = "github-copilot-sdk", specifier = ">=0.1.0" },
     { name = "jinja2", specifier = ">=3.1.0" },
     { name = "mcp", specifier = ">=1.0.0" },
@@ -192,10 +188,9 @@ requires-dist = [
     { name = "ruamel-yaml", specifier = ">=0.18.0" },
     { name = "simpleeval", specifier = ">=1.0.0" },
     { name = "typer", specifier = ">=0.12.0" },
-    { name = "uvicorn", marker = "extra == 'web'", specifier = ">=0.30.0" },
-    { name = "websockets", marker = "extra == 'web'", specifier = ">=12.0" },
+    { name = "uvicorn", specifier = ">=0.30.0" },
+    { name = "websockets", specifier = ">=12.0" },
 ]
-provides-extras = ["web"]
 
 [package.metadata.requires-dev]
 dev = [

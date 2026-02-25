@@ -72,16 +72,16 @@ class TestWebFlagAcceptance:
             assert kwargs["web_port"] == 8080
 
     def test_web_bg_flag_passed(self, workflow_file: Path) -> None:
-        """Test --web-bg flag is passed through."""
-        with patch("conductor.cli.run.run_workflow_async") as mock_run:
-            mock_run.return_value = {"result": "done"}
+        """Test --web-bg flag forks a background process (does not call run_workflow_async)."""
+        with patch("conductor.cli.bg_runner.launch_background") as mock_launch:
+            mock_launch.return_value = "http://127.0.0.1:9999"
 
-            runner.invoke(app, ["run", str(workflow_file), "--web", "--web-bg"])
+            result = runner.invoke(app, ["run", str(workflow_file), "--web-bg"])
 
-            assert mock_run.called
-            _, kwargs = mock_run.call_args
-            assert kwargs["web"] is True
-            assert kwargs["web_bg"] is True
+            assert result.exit_code == 0
+            assert mock_launch.called
+            _, kwargs = mock_launch.call_args
+            assert kwargs["workflow_path"] == workflow_file
 
     def test_web_flags_default_values(self, workflow_file: Path) -> None:
         """Test that web flags default to False/0 when not specified."""
@@ -114,47 +114,13 @@ class TestWebFlagAcceptance:
             assert kwargs["web"] is True
 
 
-class TestWebDependencyCheck:
-    """Test actionable error when web dependencies are missing."""
+class TestWebBgMutualExclusion:
+    """Test that --web and --web-bg are mutually exclusive."""
 
-    def test_missing_web_deps_exits_with_code_1(self, workflow_file: Path) -> None:
-        """Test that missing web deps produce exit code 1.
-
-        Mocks run_workflow_async to raise SystemExit(1) as the real function
-        would via typer.Exit when the import fails.
-        """
-        import typer
-
-        with patch("conductor.cli.run.run_workflow_async") as mock_run:
-            mock_run.side_effect = typer.Exit(code=1)
-            result = runner.invoke(app, ["run", str(workflow_file), "--web"])
-            assert result.exit_code == 1
-
-    @pytest.mark.asyncio
-    async def test_import_error_in_run_workflow_async(self) -> None:
-        """Test that run_workflow_async raises typer.Exit on missing web deps.
-
-        Directly tests the import-guarded code path by patching builtins.__import__.
-        """
-        from click.exceptions import Exit as ClickExit
-
-        from conductor.cli.run import run_workflow_async
-
-        real_import = __import__
-
-        def blocking_import(name, *args, **kwargs):
-            if name == "conductor.web.server":
-                raise ImportError("No module named 'fastapi'")
-            return real_import(name, *args, **kwargs)
-
-        with patch("builtins.__import__", side_effect=blocking_import):
-            with pytest.raises(ClickExit) as exc_info:
-                await run_workflow_async(
-                    Path("/tmp/fake.yaml"),
-                    {},
-                    web=True,
-                )
-            assert exc_info.value.exit_code == 1
+    def test_web_and_web_bg_mutually_exclusive(self, workflow_file: Path) -> None:
+        """Test that --web and --web-bg together produce an error."""
+        result = runner.invoke(app, ["run", str(workflow_file), "--web", "--web-bg"])
+        assert result.exit_code != 0
 
 
 class TestDashboardStartupFailure:

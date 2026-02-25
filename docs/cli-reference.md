@@ -29,6 +29,10 @@ conductor run <workflow.yaml> [OPTIONS]
 | `--quiet` | `-q` | Minimal output (agent lifecycle and routing only) |
 | `--silent` | `-s` | No progress output (JSON result only) |
 | `--log-file <auto\|PATH>` | `-l` | Write full debug output to a file |
+| `--web` | | Start a real-time web dashboard |
+| `--web-bg` | | Run in background, print dashboard URL, exit |
+| `--web-port PORT` | | Port for web dashboard (0 = auto-select) |
+| `--no-interactive` | | Disable Esc-to-interrupt capability |
 
 ### Examples
 
@@ -67,6 +71,29 @@ conductor run workflow.yaml --quiet --input question="Test"
 # Write full debug log to a file
 conductor run workflow.yaml --log-file debug.log
 ```
+
+#### Web Dashboard
+
+```bash
+# Start dashboard in foreground (keeps running after workflow completes)
+conductor run workflow.yaml --web --input question="Test"
+
+# Start dashboard on a specific port
+conductor run workflow.yaml --web --web-port 8080 --input question="Test"
+
+# Background mode: prints URL and exits immediately
+conductor run workflow.yaml --web-bg --input question="Test"
+# Dashboard auto-shuts down after workflow completes and clients disconnect
+```
+
+The `--web` flag starts a real-time browser dashboard showing:
+- DAG visualization of the workflow graph with live node state updates
+- Agent detail panel with rendered prompt, reasoning, tool calls, and output
+- Streaming activity as agents execute (reasoning chunks, tool invocations)
+
+The `--web-bg` flag is a convenience shortcut: it forks a background process running the workflow with the dashboard, prints the URL, and exits the CLI immediately. The background process shuts down automatically after the workflow completes and all browser clients disconnect.
+
+`--web` and `--web-bg` are mutually exclusive.
 
 #### Automation Mode
 

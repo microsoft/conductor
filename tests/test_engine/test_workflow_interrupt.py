@@ -246,7 +246,13 @@ class TestInterruptBetweenAgents:
         # Trigger interrupt after agent_a
         original_execute = engine.executor.execute
 
-        async def mock_execute(agent, context, guidance_section=None, interrupt_signal=None):
+        async def mock_execute(
+            agent,
+            context,
+            guidance_section=None,
+            interrupt_signal=None,
+            event_callback=None,
+        ):
             result = await original_execute(agent, context, guidance_section=guidance_section)
             if agent.name == "agent_a":
                 event.set()
@@ -288,7 +294,13 @@ class TestInterruptBetweenAgents:
         # Trigger interrupt after agent_a, skip to agent_c
         original_execute = engine.executor.execute
 
-        async def mock_execute(agent, context, guidance_section=None, interrupt_signal=None):
+        async def mock_execute(
+            agent,
+            context,
+            guidance_section=None,
+            interrupt_signal=None,
+            event_callback=None,
+        ):
             result = await original_execute(agent, context, guidance_section=guidance_section)
             if agent.name == "agent_a":
                 event.set()
@@ -757,7 +769,13 @@ class TestPartialOutputHandling:
         original_execute = engine.executor.execute
         execute_calls = 0
 
-        async def mock_execute(agent, context, guidance_section=None, interrupt_signal=None):
+        async def mock_execute(
+            agent,
+            context,
+            guidance_section=None,
+            interrupt_signal=None,
+            event_callback=None,
+        ):
             nonlocal execute_calls
             execute_calls += 1
             result = await original_execute(agent, context, guidance_section=guidance_section)
@@ -804,7 +822,13 @@ class TestPartialOutputHandling:
         original_execute = engine.executor.execute
         execute_calls: list[tuple] = []
 
-        async def mock_execute(agent, context, guidance_section=None, interrupt_signal=None):
+        async def mock_execute(
+            agent,
+            context,
+            guidance_section=None,
+            interrupt_signal=None,
+            event_callback=None,
+        ):
             execute_calls.append((agent.name, guidance_section))
             result = await original_execute(agent, context, guidance_section=guidance_section)
             if (
@@ -852,7 +876,13 @@ class TestPartialOutputHandling:
 
         original_execute = engine.executor.execute
 
-        async def mock_execute(agent, context, guidance_section=None, interrupt_signal=None):
+        async def mock_execute(
+            agent,
+            context,
+            guidance_section=None,
+            interrupt_signal=None,
+            event_callback=None,
+        ):
             result = await original_execute(agent, context, guidance_section=guidance_section)
             if agent.name == "planner":
                 return AgentOutput(
@@ -888,6 +918,7 @@ class TestPartialOutputHandling:
                 rendered_prompt: str,
                 tools: list[str] | None = None,
                 interrupt_signal: asyncio.Event | None = None,
+                event_callback=None,
             ) -> AgentOutput:
                 return AgentOutput(content={"result": "mock"}, raw_response="mock")
 

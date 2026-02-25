@@ -36,7 +36,7 @@
   #cy { width: 100%; height: 100%; }
 
   /* Detail panel */
-  #detail-panel { width: 360px; background: var(--surface); border-left: 1px solid var(--border); display: flex; flex-direction: column; overflow: hidden; flex-shrink: 0; }
+  #detail-panel { width: 420px; background: var(--surface); border-left: 1px solid var(--border); display: flex; flex-direction: column; overflow: hidden; flex-shrink: 0; }
   #detail-panel.collapsed { width: 0; border-left: none; }
   #detail-header { padding: 12px 16px; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; flex-shrink: 0; }
   #detail-header h2 { font-size: 14px; font-weight: 600; }
@@ -44,7 +44,9 @@
   #detail-close:hover { color: var(--text); }
   #detail-body { flex: 1; overflow-y: auto; padding: 12px 16px; }
   .detail-section { margin-bottom: 16px; }
-  .detail-section h3 { font-size: 11px; text-transform: uppercase; color: var(--text-muted); margin-bottom: 6px; letter-spacing: 0.5px; }
+  .detail-section h3 { font-size: 11px; text-transform: uppercase; color: var(--text-muted); margin-bottom: 6px; letter-spacing: 0.5px; cursor: pointer; user-select: none; }
+  .detail-section h3:hover { color: var(--text); }
+  .detail-section h3 .toggle { font-size: 9px; margin-right: 4px; }
   .detail-meta { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; font-size: 13px; }
   .detail-meta dt { color: var(--text-muted); }
   .detail-meta dd { color: var(--text); word-break: break-word; }
@@ -54,8 +56,25 @@
   .status-badge.completed { background: var(--completed); }
   .status-badge.failed { background: var(--failed); }
   .status-badge.waiting { background: var(--waiting); color: #333; }
+
+  /* Code/pre blocks in detail panel */
+  .detail-pre { background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 12px; font-family: 'SF Mono', 'Fira Code', monospace; font-size: 12px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; max-height: 300px; overflow-y: auto; color: var(--text); }
   #detail-output { background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 12px; font-family: 'SF Mono', 'Fira Code', monospace; font-size: 12px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; max-height: 400px; overflow-y: auto; color: var(--text); }
   #detail-placeholder { color: var(--text-muted); text-align: center; padding: 40px 16px; font-size: 13px; }
+
+  /* Activity stream */
+  #activity-stream { max-height: 500px; overflow-y: auto; }
+  .activity-entry { padding: 6px 0; border-bottom: 1px solid var(--border); font-size: 12px; line-height: 1.4; }
+  .activity-entry:last-child { border-bottom: none; }
+  .activity-entry .act-icon { display: inline-block; width: 18px; text-align: center; flex-shrink: 0; }
+  .activity-entry .act-label { color: var(--text-muted); font-size: 11px; text-transform: uppercase; margin-right: 6px; }
+  .activity-entry .act-content { color: var(--text); word-break: break-word; }
+  .activity-entry.reasoning .act-content { color: #b0b0d0; font-style: italic; }
+  .activity-entry.tool-start .act-content { color: #4db8ff; }
+  .activity-entry.tool-complete .act-content { color: #66bb6a; }
+  .activity-entry.turn .act-content { color: var(--waiting); font-weight: 600; }
+  .activity-entry.message .act-content { color: var(--text); }
+  .act-detail { margin-top: 4px; padding: 4px 8px; background: var(--bg); border-radius: 3px; font-family: 'SF Mono', 'Fira Code', monospace; font-size: 11px; color: var(--text-muted); white-space: pre-wrap; word-break: break-word; max-height: 120px; overflow-y: auto; }
 
   /* Status bar */
   #status-bar { display: flex; align-items: center; gap: 16px; padding: 6px 16px; background: var(--surface); border-top: 1px solid var(--border); font-size: 12px; flex-shrink: 0; }
@@ -85,7 +104,7 @@
 
 <div id="header">
   <h1><span>●</span> Conductor<span class="wf-name" id="wf-name"></span></h1>
-  <span class="version">Dashboard v0.1</span>
+  <span class="version">Dashboard v0.2</span>
 </div>
 
 <div id="main">
@@ -107,6 +126,14 @@
         <div class="detail-section">
           <h3>Info</h3>
           <dl class="detail-meta" id="detail-meta"></dl>
+        </div>
+        <div class="detail-section" id="detail-input-section" style="display:none">
+          <h3 id="detail-input-toggle"><span class="toggle">▶</span> Input / Prompt</h3>
+          <pre class="detail-pre" id="detail-input" style="display:none"></pre>
+        </div>
+        <div class="detail-section" id="detail-activity-section" style="display:none">
+          <h3><span class="toggle">▼</span> Activity</h3>
+          <div id="activity-stream"></div>
         </div>
         <div class="detail-section" id="detail-output-section" style="display:none">
           <h3>Output</h3>
@@ -146,7 +173,7 @@
 
   // --- State ---
   var cy = null;
-  var nodeData = {};       // agent_name -> { status, elapsed, model, tokens, cost_usd, output, type }
+  var nodeData = {};       // agent_name -> { status, elapsed, model, tokens, cost_usd, output, type, prompt, activity[] }
   var groupProgress = {};  // group_name -> { total, completed, failed }
   var workflowStatus = 'pending';  // pending | running | completed | failed
   var workflowName = '';
@@ -171,6 +198,11 @@
   var $detailMeta = document.getElementById('detail-meta');
   var $detailOutput = document.getElementById('detail-output');
   var $detailOutputSection = document.getElementById('detail-output-section');
+  var $detailInputSection = document.getElementById('detail-input-section');
+  var $detailInput = document.getElementById('detail-input');
+  var $detailInputToggle = document.getElementById('detail-input-toggle');
+  var $detailActivitySection = document.getElementById('detail-activity-section');
+  var $activityStream = document.getElementById('activity-stream');
   var $detailPlaceholder = document.getElementById('detail-placeholder');
   var $detailContent = document.getElementById('detail-content');
   var $detailClose = document.getElementById('detail-close');
@@ -196,6 +228,16 @@
     var div = document.createElement('div');
     div.textContent = str;
     return div.innerHTML;
+  }
+
+  function ensureNodeData(name) {
+    if (!nodeData[name]) {
+      nodeData[name] = { status: 'pending', type: 'agent', activity: [] };
+    }
+    if (!nodeData[name].activity) {
+      nodeData[name].activity = [];
+    }
+    return nodeData[name];
   }
 
   // --- Cytoscape Init ---
@@ -362,17 +404,20 @@
       groupProgress[pg.name] = { total: pg.agents.length, completed: 0, failed: 0 };
       (pg.agents || []).forEach(function(agentName) {
         elements.push({ group: 'nodes', data: { id: agentName, label: agentName, parent: pg.name, type: 'agent' } });
-        nodeData[agentName] = { status: 'pending', type: 'agent' };
+        ensureNodeData(agentName);
+        nodeData[agentName].type = 'agent';
       });
       agentNames.add(pg.name);
-      nodeData[pg.name] = { status: 'pending', type: 'parallel_group' };
+      ensureNodeData(pg.name);
+      nodeData[pg.name].type = 'parallel_group';
     });
 
     // Create for-each group compound nodes
     (data.for_each_groups || []).forEach(function(fg) {
       elements.push({ group: 'nodes', data: { id: fg.name, label: '∀ ' + fg.name, type: 'for_each_group' } });
       agentNames.add(fg.name);
-      nodeData[fg.name] = { status: 'pending', type: 'for_each_group' };
+      ensureNodeData(fg.name);
+      nodeData[fg.name].type = 'for_each_group';
       groupProgress[fg.name] = { total: 0, completed: 0, failed: 0 };
     });
 
@@ -385,7 +430,9 @@
         else if (nodeType === 'human_gate') labelPrefix = '⊘ ';
         elements.push({ group: 'nodes', data: { id: a.name, label: labelPrefix + a.name, type: nodeType } });
         agentNames.add(a.name);
-        nodeData[a.name] = { status: 'pending', type: nodeType, model: a.model };
+        ensureNodeData(a.name);
+        nodeData[a.name].type = nodeType;
+        nodeData[a.name].model = a.model;
       }
     });
 
@@ -444,6 +491,47 @@
     if (nodeData[name]) nodeData[name].status = state;
   }
 
+  // --- Activity Stream Helpers ---
+  function addActivity(agentName, entry) {
+    var nd = ensureNodeData(agentName);
+    nd.activity.push(entry);
+    // If this is the currently selected node, append to the DOM
+    if (selectedNode === agentName) {
+      appendActivityEntry(entry);
+    }
+  }
+
+  function appendActivityEntry(entry) {
+    var div = document.createElement('div');
+    div.className = 'activity-entry ' + (entry.type || '');
+
+    var html = '<span class="act-icon">' + (entry.icon || '') + '</span>';
+    html += '<span class="act-label">' + escapeHtml(entry.label || '') + '</span>';
+    html += '<span class="act-content">' + escapeHtml(entry.text || '') + '</span>';
+    if (entry.detail) {
+      html += '<div class="act-detail">' + escapeHtml(entry.detail) + '</div>';
+    }
+    div.innerHTML = html;
+
+    $activityStream.appendChild(div);
+    // Auto-scroll to bottom
+    $activityStream.scrollTop = $activityStream.scrollHeight;
+
+    // Show the activity section
+    $detailActivitySection.style.display = 'block';
+  }
+
+  function renderActivityStream(agentName) {
+    $activityStream.innerHTML = '';
+    var nd = nodeData[agentName];
+    if (!nd || !nd.activity || nd.activity.length === 0) {
+      $detailActivitySection.style.display = 'none';
+      return;
+    }
+    $detailActivitySection.style.display = 'block';
+    nd.activity.forEach(appendActivityEntry);
+  }
+
   // --- Event Handlers ---
   var eventHandlers = {
     workflow_started: function(data) {
@@ -456,38 +544,92 @@
 
     agent_started: function(data) {
       setNodeState(data.agent_name, 'running');
-      if (nodeData[data.agent_name]) {
-        nodeData[data.agent_name].iteration = data.iteration;
-      }
+      var nd = ensureNodeData(data.agent_name);
+      nd.iteration = data.iteration;
+      // Clear activity for new iteration
+      nd.activity = [];
       updateStatusBar();
+      if (selectedNode === data.agent_name) showDetail(data.agent_name);
     },
 
     agent_completed: function(data) {
       setNodeState(data.agent_name, 'completed');
       agentsCompleted++;
-      if (nodeData[data.agent_name]) {
-        var nd = nodeData[data.agent_name];
-        nd.elapsed = data.elapsed;
-        nd.model = data.model;
-        nd.tokens = data.tokens;
-        nd.cost_usd = data.cost_usd;
-        nd.output = data.output;
-        nd.output_keys = data.output_keys;
-      }
+      var nd = ensureNodeData(data.agent_name);
+      nd.elapsed = data.elapsed;
+      nd.model = data.model;
+      nd.tokens = data.tokens;
+      nd.input_tokens = data.input_tokens;
+      nd.output_tokens = data.output_tokens;
+      nd.cost_usd = data.cost_usd;
+      nd.output = data.output;
+      nd.output_keys = data.output_keys;
       if (selectedNode === data.agent_name) showDetail(data.agent_name);
       updateStatusBar();
     },
 
     agent_failed: function(data) {
       setNodeState(data.agent_name, 'failed');
-      if (nodeData[data.agent_name]) {
-        var nd = nodeData[data.agent_name];
-        nd.elapsed = data.elapsed;
-        nd.error_type = data.error_type;
-        nd.error_message = data.message;
-      }
+      var nd = ensureNodeData(data.agent_name);
+      nd.elapsed = data.elapsed;
+      nd.error_type = data.error_type;
+      nd.error_message = data.message;
       if (selectedNode === data.agent_name) showDetail(data.agent_name);
       updateStatusBar();
+    },
+
+    // --- Streaming events ---
+    agent_prompt_rendered: function(data) {
+      var nd = ensureNodeData(data.agent_name);
+      nd.prompt = data.rendered_prompt;
+      nd.context_keys = data.context_keys;
+      if (selectedNode === data.agent_name) showDetail(data.agent_name);
+    },
+
+    agent_reasoning: function(data) {
+      addActivity(data.agent_name, {
+        type: 'reasoning',
+        icon: '💭',
+        label: 'thinking',
+        text: data.content
+      });
+    },
+
+    agent_tool_start: function(data) {
+      addActivity(data.agent_name, {
+        type: 'tool-start',
+        icon: '🔧',
+        label: 'tool',
+        text: data.tool_name,
+        detail: data.arguments || null
+      });
+    },
+
+    agent_tool_complete: function(data) {
+      addActivity(data.agent_name, {
+        type: 'tool-complete',
+        icon: '✓',
+        label: 'result',
+        text: data.tool_name || 'done',
+        detail: data.result || null
+      });
+    },
+
+    agent_turn_start: function(data) {
+      addActivity(data.agent_name, {
+        type: 'turn',
+        icon: '⏳',
+        label: 'turn',
+        text: 'Turn ' + (data.turn || '?')
+      });
+    },
+
+    agent_message: function(data) {
+      // Update latest message content (replace, don't accumulate — SDK sends full content)
+      var nd = ensureNodeData(data.agent_name);
+      nd.latest_message = data.content;
+      // Don't add to activity stream — these are high-frequency and the full
+      // content is captured in the final output
     },
 
     script_started: function(data) {
@@ -697,6 +839,9 @@
     if (nd.elapsed != null) html += '<dt>Elapsed</dt><dd>' + formatElapsed(nd.elapsed) + '</dd>';
     if (nd.model) html += '<dt>Model</dt><dd>' + escapeHtml(nd.model) + '</dd>';
     if (nd.tokens != null) html += '<dt>Tokens</dt><dd>' + nd.tokens.toLocaleString() + '</dd>';
+    if (nd.input_tokens != null && nd.output_tokens != null) {
+      html += '<dt>In / Out</dt><dd>' + nd.input_tokens.toLocaleString() + ' / ' + nd.output_tokens.toLocaleString() + '</dd>';
+    }
     if (nd.cost_usd != null) html += '<dt>Cost</dt><dd>$' + nd.cost_usd.toFixed(4) + '</dd>';
     if (nd.iteration != null) html += '<dt>Iteration</dt><dd>' + nd.iteration + '</dd>';
     if (nd.exit_code != null) html += '<dt>Exit Code</dt><dd>' + nd.exit_code + '</dd>';
@@ -706,6 +851,17 @@
     if (nd.success_count != null) html += '<dt>Success</dt><dd>' + nd.success_count + '</dd>';
     if (nd.failure_count != null) html += '<dt>Failures</dt><dd>' + nd.failure_count + '</dd>';
     $detailMeta.innerHTML = html;
+
+    // Input/Prompt section
+    if (nd.prompt) {
+      $detailInputSection.style.display = 'block';
+      $detailInput.textContent = nd.prompt;
+    } else {
+      $detailInputSection.style.display = 'none';
+    }
+
+    // Activity stream section
+    renderActivityStream(name);
 
     // Output section
     var outputText = '';
@@ -724,6 +880,14 @@
       $detailOutputSection.style.display = 'none';
     }
   }
+
+  // Toggle input section visibility
+  $detailInputToggle.addEventListener('click', function() {
+    var isHidden = $detailInput.style.display === 'none';
+    $detailInput.style.display = isHidden ? 'block' : 'none';
+    var toggle = $detailInputToggle.querySelector('.toggle');
+    if (toggle) toggle.textContent = isHidden ? '▼' : '▶';
+  });
 
   // Close detail panel
   $detailClose.addEventListener('click', function() {

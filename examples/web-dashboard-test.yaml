@@ -1,0 +1,160 @@
+# Web Dashboard Test Workflow
+#
+# A workflow designed to exercise multiple execution patterns for testing
+# the --web dashboard visualization. It includes:
+# - Sequential agents with routing
+# - A parallel group with multiple agents
+# - A script step with exit_code routing
+# - Conditional routing (branching)
+# - A synthesizer that aggregates results
+#
+# This produces a non-trivial DAG with enough agents and transitions to
+# verify graph rendering, node state updates, edge animations, and the
+# detail panel in the web dashboard.
+#
+# Usage:
+#   conductor run examples/web-dashboard-test.yaml --web --input topic="Python async programming"
+#   conductor run examples/web-dashboard-test.yaml --web-bg --input topic="Rust vs Go"
+
+workflow:
+  name: web-dashboard-test
+  description: Multi-pattern workflow for testing the web dashboard
+  version: "1.0.0"
+  entry_point: check_environment
+
+  runtime:
+    provider: copilot
+    default_model: claude-haiku-4.5
+
+  input:
+    topic:
+      type: string
+      required: true
+      description: The topic to research and analyze
+
+  context:
+    mode: accumulate
+
+  limits:
+    max_iterations: 20
+    timeout_seconds: 300
+
+# Parallel group: two researchers run concurrently
+parallel:
+  - name: research_team
+    description: Two researchers investigate the topic in parallel
+    agents:
+      - researcher_a
+      - researcher_b
+    failure_mode: continue_on_error
+    routes:
+      - to: synthesizer
+
+agents:
+  # Step 1: Script step — quick environment check
+  - name: check_environment
+    type: script
+    description: Verify the environment is ready
+    command: echo
+    args: ["Environment ready. Topic received."]
+    routes:
+      - to: planner
+        when: "exit_code == 0"
+      - to: synthesizer  # fallback if script fails
+
+  # Step 2: Planner creates a research strategy
+  - name: planner
+    description: Creates a research plan for the topic
+    tools: []
+    prompt: |
+      You are a research planner. Create a brief research plan for:
+
+      Topic: {{ workflow.input.topic }}
+
+      Provide two research angles and a synthesis goal.
+      Keep each to a single sentence.
+    output:
+      angle_a:
+        type: string
+        description: First research angle as a single plain-text sentence
+      angle_b:
+        type: string
+        description: Second research angle as a single plain-text sentence
+      synthesis_goal:
+        type: string
+        description: What the synthesis should achieve as a single plain-text sentence
+    routes:
+      - to: research_team
+
+  # Step 3a: Researcher A (runs in parallel)
+  - name: researcher_a
+    description: Investigates the first angle of the topic
+    tools: []
+    prompt: |
+      You are a researcher. Investigate this angle of "{{ workflow.input.topic }}":
+
+      Angle: {{ planner.output.angle_a }}
+
+      Provide 2-3 key findings. Be concise.
+    output:
+      findings:
+        type: string
+        description: Key findings from this research angle
+      confidence:
+        type: string
+        description: How confident you are (high, medium, low)
+
+  # Step 3b: Researcher B (runs in parallel)
+  - name: researcher_b
+    description: Investigates the second angle of the topic
+    tools: []
+    prompt: |
+      You are a researcher. Investigate this angle of "{{ workflow.input.topic }}":
+
+      Angle: {{ planner.output.angle_b }}
+
+      Provide 2-3 key findings. Be concise.
+    output:
+      findings:
+        type: string
+        description: Key findings from this research angle
+      confidence:
+        type: string
+        description: How confident you are (high, medium, low)
+
+  # Step 4: Synthesizer combines results
+  - name: synthesizer
+    description: Combines all research findings into a final summary
+    tools: []
+    prompt: |
+      You are a research synthesizer. Combine the following findings into a
+      brief, coherent summary about "{{ workflow.input.topic }}".
+
+      {% if planner is defined and planner.output is defined %}
+      Synthesis Goal: {{ planner.output.synthesis_goal }}
+      {% endif %}
+
+      {% if researcher_a is defined and researcher_a.output is defined %}
+      Researcher A Findings: {{ researcher_a.output.findings }}
+      (Confidence: {{ researcher_a.output.confidence }})
+      {% endif %}
+
+      {% if researcher_b is defined and researcher_b.output is defined %}
+      Researcher B Findings: {{ researcher_b.output.findings }}
+      (Confidence: {{ researcher_b.output.confidence }})
+      {% endif %}
+
+      Provide a 3-5 sentence summary that integrates the key insights.
+    output:
+      summary:
+        type: string
+        description: Integrated research summary
+      key_insight:
+        type: string
+        description: The single most important takeaway
+    routes:
+      - to: $end
+
+output:
+  summary: "{{ synthesizer.output.summary }}"
+  key_insight: "{{ synthesizer.output.key_insight }}"

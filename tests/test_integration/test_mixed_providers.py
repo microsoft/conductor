@@ -187,6 +187,7 @@ class MockProvider(AgentProvider):
         rendered_prompt: str,
         tools: list[str] | None = None,
         interrupt_signal: asyncio.Event | None = None,
+        event_callback=None,
     ) -> AgentOutput:
         self.executed_agents.append(agent.name)
         return AgentOutput(
