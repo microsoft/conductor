@@ -6,6 +6,7 @@ all provider implementations must use to ensure a consistent interface.
 
 from __future__ import annotations
 
+import asyncio
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -56,6 +57,9 @@ class AgentOutput:
     model: str | None = None
     """Actual model used (may differ from requested if aliased)."""
 
+    partial: bool = False
+    """Whether this output is partial (from a mid-agent interrupt)."""
+
 
 class AgentProvider(ABC):
     """Abstract base class for SDK providers.
@@ -86,6 +90,7 @@ class AgentProvider(ABC):
         context: dict[str, Any],
         rendered_prompt: str,
         tools: list[str] | None = None,
+        interrupt_signal: asyncio.Event | None = None,
     ) -> AgentOutput:
         """Execute an agent and return normalized output.
 
@@ -94,6 +99,12 @@ class AgentProvider(ABC):
             context: Accumulated workflow context.
             rendered_prompt: Jinja2-rendered user prompt.
             tools: List of tool names available to this agent.
+            interrupt_signal: Optional event that, when set, signals a
+                mid-agent interrupt request. Providers that support
+                mid-agent interrupts should monitor this event during
+                execution and return partial output when it fires.
+                Providers that do not support mid-agent interrupts may
+                ignore this parameter.
 
         Returns:
             Normalized AgentOutput with structured content.

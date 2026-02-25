@@ -30,6 +30,7 @@ from conductor.gates.human import (
     MaxIterationsHandler,
 )
 from conductor.gates.interrupt import InterruptAction, InterruptHandler, InterruptResult
+from conductor.providers.base import AgentOutput
 
 logger = logging.getLogger(__name__)
 
@@ -726,6 +727,74 @@ class WorkflowEngine:
             case InterruptAction.CANCEL:
                 return current_agent_name
 
+    async def _handle_partial_output(
+        self,
+        agent: AgentDef,
+        partial_output: AgentOutput,
+        agent_context: dict[str, Any],
+        guidance_section: str | None,
+        executor: AgentExecutor,
+        agent_start_time: float,
+    ) -> AgentOutput:
+        """Handle partial output from a mid-agent interrupt.
+
+        Invokes the interrupt handler to collect user guidance, then either:
+        - Sends a follow-up to the interrupted session (Copilot provider), or
+        - Re-executes the agent with guidance appended (other providers).
+
+        Args:
+            agent: The agent that was interrupted.
+            partial_output: The partial output from the interrupted agent.
+            agent_context: The context used for the agent execution.
+            guidance_section: The guidance section used in the original execution.
+            executor: The executor used for the agent.
+            agent_start_time: The start time of the agent execution.
+
+        Returns:
+            The final (non-partial) AgentOutput after handling the interrupt.
+        """
+        import json as _json
+
+        from conductor.providers.copilot import CopilotProvider
+
+        # Build preview from partial output
+        try:
+            preview = _json.dumps(partial_output.content, indent=2, default=str)[:500]
+        except (TypeError, ValueError):
+            preview = str(partial_output.content)[:500]
+
+        # Invoke the interrupt handler
+        interrupt_result = await self._interrupt_handler.handle_interrupt(
+            current_agent=agent.name,
+            iteration=self.context.current_iteration,
+            last_output_preview=preview,
+            available_agents=self._get_top_level_agent_names(),
+            accumulated_guidance=list(self.context.user_guidance),
+        )
+
+        # Apply the interrupt result
+        if interrupt_result.action == InterruptAction.STOP:
+            raise InterruptError(agent_name=agent.name)
+
+        if interrupt_result.action == InterruptAction.CANCEL or not interrupt_result.guidance:
+            # No guidance provided — use partial output as final
+            partial_output.partial = False
+            return partial_output
+
+        # Add guidance to context
+        self.context.add_guidance(interrupt_result.guidance)
+
+        # Try Copilot follow-up if provider supports it
+        provider = executor.provider
+        if isinstance(provider, CopilotProvider):
+            session = provider.get_interrupted_session()
+            if session is not None:
+                return await provider.send_followup(session, interrupt_result.guidance)
+
+        # Fallback: re-execute the agent with guidance appended to prompt
+        new_guidance_section = self.context.get_guidance_prompt_section()
+        return await executor.execute(agent, agent_context, guidance_section=new_guidance_section)
+
     async def _execute_loop(self, current_agent_name: str) -> dict[str, Any]:
         """Core execution loop shared by :meth:`run` and :meth:`resume`.
 
@@ -999,9 +1068,24 @@ class WorkflowEngine:
                         executor = await self._get_executor_for_agent(agent)
                         guidance_section = self.context.get_guidance_prompt_section()
                         output = await executor.execute(
-                            agent, agent_context, guidance_section=guidance_section
+                            agent,
+                            agent_context,
+                            guidance_section=guidance_section,
+                            interrupt_signal=self._interrupt_event,
                         )
                         _agent_elapsed = _time.time() - _agent_start
+
+                        # Handle mid-agent interrupt (partial output)
+                        if output.partial:
+                            output = await self._handle_partial_output(
+                                agent,
+                                output,
+                                agent_context,
+                                guidance_section,
+                                executor,
+                                _agent_start,
+                            )
+                            _agent_elapsed = _time.time() - _agent_start
 
                         # Record usage and calculate cost
                         usage = self.usage_tracker.record(agent.name, output, _agent_elapsed)

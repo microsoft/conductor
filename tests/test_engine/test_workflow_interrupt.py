@@ -246,7 +246,7 @@ class TestInterruptBetweenAgents:
         # Trigger interrupt after agent_a
         original_execute = engine.executor.execute
 
-        async def mock_execute(agent, context, guidance_section=None):
+        async def mock_execute(agent, context, guidance_section=None, interrupt_signal=None):
             result = await original_execute(agent, context, guidance_section=guidance_section)
             if agent.name == "agent_a":
                 event.set()
@@ -288,7 +288,7 @@ class TestInterruptBetweenAgents:
         # Trigger interrupt after agent_a, skip to agent_c
         original_execute = engine.executor.execute
 
-        async def mock_execute(agent, context, guidance_section=None):
+        async def mock_execute(agent, context, guidance_section=None, interrupt_signal=None):
             result = await original_execute(agent, context, guidance_section=guidance_section)
             if agent.name == "agent_a":
                 event.set()
@@ -731,3 +731,179 @@ class TestHandleInterruptResult:
         next_agent = await engine._handle_interrupt_result(result, "executor")
 
         assert next_agent == "executor"
+
+
+class TestPartialOutputHandling:
+    """Tests for mid-agent interrupt partial output handling in the engine."""
+
+    @pytest.mark.asyncio
+    async def test_partial_output_triggers_interrupt_handler(
+        self, two_agent_config: WorkflowConfig
+    ) -> None:
+        """When provider returns partial output, interrupt handler is invoked."""
+        from conductor.providers.base import AgentOutput
+
+        handler_called = False
+
+        def mock_handler(agent, prompt, context):
+            key = list(agent.output.keys())[0]
+            return {key: f"result from {agent.name}"}
+
+        event = asyncio.Event()
+        provider = CopilotProvider(mock_handler=mock_handler)
+        engine = WorkflowEngine(two_agent_config, provider, interrupt_event=event)
+
+        # Replace executor.execute to return partial output on first call
+        original_execute = engine.executor.execute
+        execute_calls = 0
+
+        async def mock_execute(agent, context, guidance_section=None, interrupt_signal=None):
+            nonlocal execute_calls
+            execute_calls += 1
+            result = await original_execute(agent, context, guidance_section=guidance_section)
+            if agent.name == "planner" and execute_calls == 1:
+                result = AgentOutput(
+                    content={"plan": "partial plan"},
+                    raw_response="partial",
+                    partial=True,
+                )
+            return result
+
+        engine.executor.execute = mock_execute
+
+        cancel_result = InterruptResult(action=InterruptAction.CANCEL)
+
+        async def mock_handle_interrupt(*args, **kwargs):
+            nonlocal handler_called
+            handler_called = True
+            return cancel_result
+
+        with patch.object(
+            engine._interrupt_handler,
+            "handle_interrupt",
+            side_effect=mock_handle_interrupt,
+        ):
+            result = await engine.run({"goal": "test"})
+
+        assert handler_called
+        assert result["result"] == "result from executor"
+
+    @pytest.mark.asyncio
+    async def test_partial_output_continue_with_guidance_re_executes(
+        self, two_agent_config: WorkflowConfig
+    ) -> None:
+        """When user provides guidance after partial output, agent is re-executed."""
+        from conductor.providers.base import AgentOutput
+
+        event = asyncio.Event()
+        provider = CopilotProvider(
+            mock_handler=lambda a, p, c: {list(a.output.keys())[0]: f"result from {a.name}"}
+        )
+        engine = WorkflowEngine(two_agent_config, provider, interrupt_event=event)
+
+        original_execute = engine.executor.execute
+        execute_calls: list[tuple] = []
+
+        async def mock_execute(agent, context, guidance_section=None, interrupt_signal=None):
+            execute_calls.append((agent.name, guidance_section))
+            result = await original_execute(agent, context, guidance_section=guidance_section)
+            if (
+                agent.name == "planner"
+                and len([c for c in execute_calls if c[0] == "planner"]) == 1
+            ):
+                return AgentOutput(
+                    content={"plan": "partial plan"},
+                    raw_response="partial",
+                    partial=True,
+                )
+            return result
+
+        engine.executor.execute = mock_execute
+
+        guidance_result = InterruptResult(
+            action=InterruptAction.CONTINUE,
+            guidance="Be more specific",
+        )
+        with patch.object(
+            engine._interrupt_handler,
+            "handle_interrupt",
+            return_value=guidance_result,
+        ):
+            await engine.run({"goal": "test"})
+
+        # Guidance should be accumulated
+        assert "Be more specific" in engine.context.user_guidance
+        # Planner should have been called twice (first partial, then re-execute)
+        planner_calls = [c for c in execute_calls if c[0] == "planner"]
+        assert len(planner_calls) == 2
+
+    @pytest.mark.asyncio
+    async def test_partial_output_stop_raises_interrupt_error(
+        self, two_agent_config: WorkflowConfig
+    ) -> None:
+        """When user selects stop after partial output, InterruptError is raised."""
+        from conductor.providers.base import AgentOutput
+
+        event = asyncio.Event()
+        provider = CopilotProvider(
+            mock_handler=lambda a, p, c: {list(a.output.keys())[0]: f"result from {a.name}"}
+        )
+        engine = WorkflowEngine(two_agent_config, provider, interrupt_event=event)
+
+        original_execute = engine.executor.execute
+
+        async def mock_execute(agent, context, guidance_section=None, interrupt_signal=None):
+            result = await original_execute(agent, context, guidance_section=guidance_section)
+            if agent.name == "planner":
+                return AgentOutput(
+                    content={"plan": "partial"},
+                    raw_response="partial",
+                    partial=True,
+                )
+            return result
+
+        engine.executor.execute = mock_execute
+
+        stop_result = InterruptResult(action=InterruptAction.STOP)
+        with (
+            patch.object(
+                engine._interrupt_handler,
+                "handle_interrupt",
+                return_value=stop_result,
+            ),
+            pytest.raises(InterruptError),
+        ):
+            await engine.run({"goal": "test"})
+
+    @pytest.mark.asyncio
+    async def test_mock_providers_work_after_abc_change(self) -> None:
+        """Verify all mock providers still instantiate and run after ABC signature change."""
+        from conductor.providers.base import AgentOutput, AgentProvider
+
+        class TestMockProvider(AgentProvider):
+            async def execute(
+                self,
+                agent: AgentDef,
+                context: dict,
+                rendered_prompt: str,
+                tools: list[str] | None = None,
+                interrupt_signal: asyncio.Event | None = None,
+            ) -> AgentOutput:
+                return AgentOutput(content={"result": "mock"}, raw_response="mock")
+
+            async def validate_connection(self) -> bool:
+                return True
+
+            async def close(self) -> None:
+                pass
+
+        provider = TestMockProvider()
+        agent = AgentDef(name="test", model="gpt-4", prompt="test")
+        result = await provider.execute(agent, {}, "prompt")
+        assert result.content == {"result": "mock"}
+        assert result.partial is False
+
+        # With interrupt_signal
+        event = asyncio.Event()
+        result2 = await provider.execute(agent, {}, "prompt", interrupt_signal=event)
+        assert result2.content == {"result": "mock"}

@@ -7,6 +7,7 @@ UPDATE: Multi-provider support has been added. Agents can now specify
 a `provider` field to override the workflow default.
 """
 
+import asyncio
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -185,6 +186,7 @@ class MockProvider(AgentProvider):
         context: dict[str, Any],
         rendered_prompt: str,
         tools: list[str] | None = None,
+        interrupt_signal: asyncio.Event | None = None,
     ) -> AgentOutput:
         self.executed_agents.append(agent.name)
         return AgentOutput(

@@ -6,6 +6,7 @@ with prompt rendering and output validation.
 
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING, Any
 
 from conductor.exceptions import ValidationError
@@ -111,6 +112,7 @@ class AgentExecutor:
         agent: AgentDef,
         context: dict[str, Any],
         guidance_section: str | None = None,
+        interrupt_signal: asyncio.Event | None = None,
     ) -> AgentOutput:
         """Execute an agent with the given context.
 
@@ -126,6 +128,8 @@ class AgentExecutor:
             guidance_section: Optional user guidance section to append to the
                 rendered prompt. When provided, this is appended after the
                 rendered prompt text.
+            interrupt_signal: Optional event for mid-agent interrupt signaling.
+                Forwarded to the provider's execute method.
 
         Returns:
             Validated agent output.
@@ -166,6 +170,7 @@ class AgentExecutor:
             context=context,
             rendered_prompt=rendered_prompt,
             tools=resolved_tools,
+            interrupt_signal=interrupt_signal,
         )
 
         # Ensure output.content is a dict
@@ -187,8 +192,8 @@ class AgentExecutor:
                     model=output.model,
                 )
 
-        # Validate output against schema
-        if agent.output:
+        # Validate output against schema (skip for partial output from interrupts)
+        if agent.output and not output.partial:
             validate_output(output.content, agent.output)
 
         return output

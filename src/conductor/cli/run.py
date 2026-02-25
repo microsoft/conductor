@@ -1110,6 +1110,7 @@ def build_dry_run_plan(workflow_path: Path) -> ExecutionPlan:
             context: dict[str, Any],
             rendered_prompt: str,
             tools: list[str] | None = None,
+            interrupt_signal: asyncio.Event | None = None,
         ) -> AgentOutput:
             return AgentOutput(content={}, raw_response="")
 

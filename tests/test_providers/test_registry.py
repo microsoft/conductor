@@ -1,5 +1,6 @@
 """Unit tests for the ProviderRegistry."""
 
+import asyncio
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -23,6 +24,7 @@ class MockProvider(AgentProvider):
         context: dict[str, Any],
         rendered_prompt: str,
         tools: list[str] | None = None,
+        interrupt_signal: asyncio.Event | None = None,
     ) -> AgentOutput:
         return AgentOutput(content={"result": "mock"}, raw_response="mock")
 

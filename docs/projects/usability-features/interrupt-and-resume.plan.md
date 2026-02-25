@@ -696,6 +696,8 @@ async def send_followup(
 
 ### Epic 5: Mid-Agent Interrupt — Copilot Provider (Phase 2)
 
+**Status:** DONE
+
 **Goal:** Enable mid-execution interrupts for the Copilot provider. Requires runtime verification of SDK abort capability.
 
 **Prerequisites:** Epic 4. Must empirically verify Copilot SDK abort support before implementation.
@@ -704,27 +706,27 @@ async def send_followup(
 
 | Task ID | Type | Description | Files | Status |
 |---------|------|-------------|-------|--------|
-| E5-T1 | IMPL | Add `partial: bool = False` field to `AgentOutput` dataclass. | `src/conductor/providers/base.py` | TO DO |
-| E5-T2 | IMPL | Add `interrupt_signal` parameter to `AgentProvider.execute()` abstract method. Update docstring. | `src/conductor/providers/base.py` | TO DO |
-| E5-T3 | IMPL | Update all concrete `execute()` implementations and test mocks to include the new parameter: `CopilotProvider.execute()`, `ClaudeProvider.execute()`, `_MockProvider` in `cli/run.py`, `MockProvider` in `test_registry.py`, `MockProvider` in `test_mixed_providers.py`. All non-Copilot implementations accept and ignore the parameter for now. | `src/conductor/providers/copilot.py`, `src/conductor/providers/claude.py`, `src/conductor/cli/run.py`, `tests/test_providers/test_registry.py`, `tests/test_integration/test_mixed_providers.py` | TO DO |
-| E5-T4 | IMPL | Update `AgentExecutor.execute()` to accept and forward `interrupt_signal` to `provider.execute()`. | `src/conductor/executor/agent.py` | TO DO |
-| E5-T5 | IMPL | Add runtime abort capability detection to `CopilotProvider`: check `hasattr(session, 'abort')` at session creation. If unavailable, try raw RPC. Store capability flag. | `src/conductor/providers/copilot.py` | TO DO |
-| E5-T6 | IMPL | Create `CopilotProvider._execute_with_interrupt()` method: creates session, sends prompt, monitors `interrupt_signal` alongside `done` event in `_send_and_wait()`. If interrupt: call abort (method or RPC), wait for post-abort event (idle/error/5s timeout), capture partial content, return `(AgentOutput(partial=True), session_handle)` without destroying session. | `src/conductor/providers/copilot.py` | TO DO |
-| E5-T7 | IMPL | Create `CopilotProvider.send_followup(session_handle, guidance)` method: sends guidance as follow-up `session.send()`, waits for response, destroys session, returns `AgentOutput`. | `src/conductor/providers/copilot.py` | TO DO |
-| E5-T8 | IMPL | In `WorkflowEngine._execute_loop()`: detect `output.partial == True` after agent execution. If partial: invoke interrupt handler, then if user provides guidance, call `provider.send_followup()` for Copilot. For non-Copilot providers, re-invoke `execute()` with guidance appended to prompt. | `src/conductor/engine/workflow.py` | TO DO |
-| E5-T9 | TEST | Test Copilot interrupt: mock session with abort support, verify partial content captured, verify post-abort event handling (idle, error, timeout), verify follow-up send with guidance, verify fallback when abort unavailable. | `tests/test_providers/test_copilot_interrupt.py` | TO DO |
-| E5-T10 | TEST | Test engine partial output handling: mock provider returning partial output, verify interrupt handler invoked, verify re-execution with guidance. Test that all mock providers still work after ABC signature change. | `tests/test_engine/test_workflow_interrupt.py` (extend) | TO DO |
+| E5-T1 | IMPL | Add `partial: bool = False` field to `AgentOutput` dataclass. | `src/conductor/providers/base.py` | DONE |
+| E5-T2 | IMPL | Add `interrupt_signal` parameter to `AgentProvider.execute()` abstract method. Update docstring. | `src/conductor/providers/base.py` | DONE |
+| E5-T3 | IMPL | Update all concrete `execute()` implementations and test mocks to include the new parameter: `CopilotProvider.execute()`, `ClaudeProvider.execute()`, `_MockProvider` in `cli/run.py`, `MockProvider` in `test_registry.py`, `MockProvider` in `test_mixed_providers.py`. All non-Copilot implementations accept and ignore the parameter for now. | `src/conductor/providers/copilot.py`, `src/conductor/providers/claude.py`, `src/conductor/cli/run.py`, `tests/test_providers/test_registry.py`, `tests/test_integration/test_mixed_providers.py` | DONE |
+| E5-T4 | IMPL | Update `AgentExecutor.execute()` to accept and forward `interrupt_signal` to `provider.execute()`. | `src/conductor/executor/agent.py` | DONE |
+| E5-T5 | IMPL | Add runtime abort capability detection to `CopilotProvider`: check `hasattr(session, 'abort')` at session creation. If unavailable, try raw RPC. Store capability flag. | `src/conductor/providers/copilot.py` | DONE |
+| E5-T6 | IMPL | Create `CopilotProvider._execute_with_interrupt()` method: creates session, sends prompt, monitors `interrupt_signal` alongside `done` event in `_send_and_wait()`. If interrupt: call abort (method or RPC), wait for post-abort event (idle/error/5s timeout), capture partial content, return `(AgentOutput(partial=True), session_handle)` without destroying session. | `src/conductor/providers/copilot.py` | DONE |
+| E5-T7 | IMPL | Create `CopilotProvider.send_followup(session_handle, guidance)` method: sends guidance as follow-up `session.send()`, waits for response, destroys session, returns `AgentOutput`. | `src/conductor/providers/copilot.py` | DONE |
+| E5-T8 | IMPL | In `WorkflowEngine._execute_loop()`: detect `output.partial == True` after agent execution. If partial: invoke interrupt handler, then if user provides guidance, call `provider.send_followup()` for Copilot. For non-Copilot providers, re-invoke `execute()` with guidance appended to prompt. | `src/conductor/engine/workflow.py` | DONE |
+| E5-T9 | TEST | Test Copilot interrupt: mock session with abort support, verify partial content captured, verify post-abort event handling (idle, error, timeout), verify follow-up send with guidance, verify fallback when abort unavailable. | `tests/test_providers/test_copilot_interrupt.py` | DONE |
+| E5-T10 | TEST | Test engine partial output handling: mock provider returning partial output, verify interrupt handler invoked, verify re-execution with guidance. Test that all mock providers still work after ABC signature change. | `tests/test_engine/test_workflow_interrupt.py` (extend) | DONE |
 
 **Acceptance Criteria:**
-- [ ] `interrupt_signal` parameter added to provider ABC (backward compatible via default None)
-- [ ] All concrete provider implementations and test mocks updated
-- [ ] Copilot provider detects abort capability at runtime
-- [ ] Copilot provider calls abort when interrupt signal is set (with RPC fallback)
-- [ ] Partial output is captured and returned with `partial=True`
-- [ ] Post-abort session is kept alive for follow-up
-- [ ] `send_followup()` sends guidance and destroys session
-- [ ] Graceful fallback if abort is unavailable (between-agent interrupt behavior)
-- [ ] All tests pass
+- [x] `interrupt_signal` parameter added to provider ABC (backward compatible via default None)
+- [x] All concrete provider implementations and test mocks updated
+- [x] Copilot provider detects abort capability at runtime
+- [x] Copilot provider calls abort when interrupt signal is set (with RPC fallback)
+- [x] Partial output is captured and returned with `partial=True`
+- [x] Post-abort session is kept alive for follow-up
+- [x] `send_followup()` sends guidance and destroys session
+- [x] Graceful fallback if abort is unavailable (between-agent interrupt behavior)
+- [x] All tests pass
 
 ---
 

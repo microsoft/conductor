@@ -89,6 +89,7 @@ class SDKResponse:
         output_tokens: Number of output tokens generated (from assistant.usage event).
         cache_read_tokens: Tokens read from cache (if available).
         cache_write_tokens: Tokens written to cache (if available).
+        partial: Whether this response is partial (from a mid-agent interrupt).
     """
 
     content: str
@@ -96,6 +97,7 @@ class SDKResponse:
     output_tokens: int | None = None
     cache_read_tokens: int | None = None
     cache_write_tokens: int | None = None
+    partial: bool = False
 
 
 class CopilotProvider(AgentProvider):
@@ -158,6 +160,8 @@ class CopilotProvider(AgentProvider):
         self._temperature = temperature
         self._session_ids: dict[str, str] = {}
         self._resume_session_ids: dict[str, str] = {}
+        self._interrupted_session: Any = None
+        self._abort_supported: bool | None = None
 
     async def execute(
         self,
@@ -165,6 +169,7 @@ class CopilotProvider(AgentProvider):
         context: dict[str, Any],
         rendered_prompt: str,
         tools: list[str] | None = None,
+        interrupt_signal: asyncio.Event | None = None,
     ) -> AgentOutput:
         """Execute an agent using the Copilot SDK.
 
@@ -176,6 +181,9 @@ class CopilotProvider(AgentProvider):
             context: Accumulated workflow context.
             rendered_prompt: Jinja2-rendered user prompt.
             tools: List of tool names available to this agent.
+            interrupt_signal: Optional event for mid-agent interrupt signaling.
+                When set during execution, the provider will attempt to abort
+                the current session and return partial output.
 
         Returns:
             Normalized AgentOutput with structured content.
@@ -199,7 +207,9 @@ class CopilotProvider(AgentProvider):
         logger.debug(f"Prompt length: {len(rendered_prompt)} chars, Tools: {tools}")
 
         # Use retry logic for both mock and real SDK calls
-        return await self._execute_with_retry(agent, context, rendered_prompt, tools)
+        return await self._execute_with_retry(
+            agent, context, rendered_prompt, tools, interrupt_signal=interrupt_signal
+        )
 
     async def _execute_with_retry(
         self,
@@ -207,6 +217,7 @@ class CopilotProvider(AgentProvider):
         context: dict[str, Any],
         rendered_prompt: str,
         tools: list[str] | None = None,
+        interrupt_signal: asyncio.Event | None = None,
     ) -> AgentOutput:
         """Execute with exponential backoff retry logic.
 
@@ -215,6 +226,7 @@ class CopilotProvider(AgentProvider):
             context: Accumulated workflow context.
             rendered_prompt: Jinja2-rendered user prompt.
             tools: List of tool names available to this agent.
+            interrupt_signal: Optional event for mid-agent interrupt signaling.
 
         Returns:
             Normalized AgentOutput with structured content.
@@ -228,7 +240,11 @@ class CopilotProvider(AgentProvider):
         for attempt in range(1, config.max_attempts + 1):
             try:
                 content, sdk_response = await self._execute_sdk_call(
-                    agent, rendered_prompt, context, tools
+                    agent,
+                    rendered_prompt,
+                    context,
+                    tools,
+                    interrupt_signal=interrupt_signal,
                 )
                 # Extract usage data from SDK response if available
                 input_tokens = sdk_response.input_tokens if sdk_response else None
@@ -239,6 +255,9 @@ class CopilotProvider(AgentProvider):
                 if input_tokens is not None and output_tokens is not None:
                     tokens_used = input_tokens + output_tokens
 
+                # Detect partial result from mid-agent interrupt
+                is_partial = sdk_response.partial if sdk_response else False
+
                 return AgentOutput(
                     content=content,
                     raw_response=json.dumps(content),
@@ -248,6 +267,7 @@ class CopilotProvider(AgentProvider):
                     cache_read_tokens=cache_read,
                     cache_write_tokens=cache_write,
                     model=agent.model or self._default_model,
+                    partial=is_partial,
                 )
             except ProviderError as e:
                 last_error = e
@@ -318,6 +338,7 @@ class CopilotProvider(AgentProvider):
         rendered_prompt: str,
         context: dict[str, Any],
         tools: list[str] | None = None,
+        interrupt_signal: asyncio.Event | None = None,
     ) -> tuple[dict[str, Any], SDKResponse | None]:
         """Execute the actual SDK call or mock handler.
 
@@ -326,6 +347,7 @@ class CopilotProvider(AgentProvider):
             rendered_prompt: Jinja2-rendered user prompt.
             context: Accumulated workflow context.
             tools: List of tool names available to this agent.
+            interrupt_signal: Optional event for mid-agent interrupt signaling.
 
         Returns:
             Tuple of (content dict, SDKResponse with usage data or None for mock).
@@ -416,12 +438,37 @@ class CopilotProvider(AgentProvider):
             verbose_enabled = is_verbose()
             full_enabled = is_full()
 
+            session_destroyed = False
             try:
                 # Send initial prompt and get response
                 sdk_response = await self._send_and_wait(
-                    session, full_prompt, verbose_enabled, full_enabled
+                    session,
+                    full_prompt,
+                    verbose_enabled,
+                    full_enabled,
+                    interrupt_signal=interrupt_signal,
                 )
                 response_content = sdk_response.content
+
+                # Handle mid-agent interrupt: return partial content
+                # and keep session alive for follow-up
+                if sdk_response.partial:
+                    self._interrupted_session = session
+                    session_destroyed = True  # Prevent finally from destroying it
+                    partial_content: dict[str, Any]
+                    try:
+                        partial_content = self._extract_json(response_content)
+                    except (json.JSONDecodeError, ValueError):
+                        partial_content = {"result": response_content}
+                    partial_usage = SDKResponse(
+                        content=response_content,
+                        input_tokens=sdk_response.input_tokens,
+                        output_tokens=sdk_response.output_tokens,
+                        cache_read_tokens=sdk_response.cache_read_tokens,
+                        cache_write_tokens=sdk_response.cache_write_tokens,
+                        partial=True,
+                    )
+                    return partial_content, partial_usage
 
                 # Track cumulative usage across potential recovery calls
                 total_input_tokens = sdk_response.input_tokens
@@ -505,8 +552,9 @@ class CopilotProvider(AgentProvider):
                 )
 
             finally:
-                # Always destroy session when done
-                await session.destroy()
+                # Destroy session unless it was kept alive for follow-up
+                if not session_destroyed:
+                    await session.destroy()
 
         except ProviderError:
             raise
@@ -523,6 +571,7 @@ class CopilotProvider(AgentProvider):
         prompt: str,
         verbose_enabled: bool,
         full_enabled: bool,
+        interrupt_signal: asyncio.Event | None = None,
     ) -> SDKResponse:
         """Send a prompt to the session and wait for response.
 
@@ -531,9 +580,13 @@ class CopilotProvider(AgentProvider):
             prompt: The prompt to send.
             verbose_enabled: Whether verbose logging is enabled.
             full_enabled: Whether full logging mode is enabled.
+            interrupt_signal: Optional event for mid-agent interrupt signaling.
+                When set, the method will attempt to abort the session and
+                return partial content with ``partial=True``.
 
         Returns:
-            SDKResponse with content and usage data.
+            SDKResponse with content and usage data. If interrupted,
+            ``SDKResponse.partial`` will be True.
 
         Raises:
             ProviderError: If an error occurs during the SDK call or session gets stuck.
@@ -593,10 +646,31 @@ class CopilotProvider(AgentProvider):
         session.on(on_event)
         await session.send({"prompt": prompt})
 
-        # Wait with idle detection and recovery
-        await self._wait_with_idle_detection(
-            done, session, verbose_enabled, full_enabled, last_activity_ref
-        )
+        # If interrupt_signal is provided, race between done and interrupt
+        if interrupt_signal is not None:
+            was_interrupted = await self._wait_with_interrupt(
+                done,
+                session,
+                interrupt_signal,
+                last_activity_ref,
+                verbose_enabled,
+                full_enabled,
+            )
+            if was_interrupted:
+                # Return partial content (don't check error_message for partial)
+                return SDKResponse(
+                    content=response_content,
+                    input_tokens=usage_ref[0],
+                    output_tokens=usage_ref[1],
+                    cache_read_tokens=usage_ref[2],
+                    cache_write_tokens=usage_ref[3],
+                    partial=True,
+                )
+        else:
+            # Wait with idle detection and recovery (original path)
+            await self._wait_with_idle_detection(
+                done, session, verbose_enabled, full_enabled, last_activity_ref
+            )
 
         if error_message:
             raise ProviderError(
@@ -611,6 +685,165 @@ class CopilotProvider(AgentProvider):
             cache_read_tokens=usage_ref[2],
             cache_write_tokens=usage_ref[3],
         )
+
+    async def _wait_with_interrupt(
+        self,
+        done: asyncio.Event,
+        session: Any,
+        interrupt_signal: asyncio.Event,
+        last_activity_ref: list[Any],
+        verbose_enabled: bool,
+        full_enabled: bool,
+    ) -> bool:
+        """Wait for session completion or interrupt signal, whichever comes first.
+
+        If the interrupt signal fires first, attempts to abort the session
+        and waits briefly for a post-abort event (idle or error) before
+        returning.
+
+        Args:
+            done: Event that signals session completion.
+            session: The Copilot SDK session.
+            interrupt_signal: Event that signals a user interrupt request.
+            last_activity_ref: Mutable [last_event_type, last_tool_call, timestamp].
+            verbose_enabled: Whether verbose logging is enabled.
+            full_enabled: Whether full logging mode is enabled.
+
+        Returns:
+            True if interrupted, False if completed normally.
+        """
+        # Create tasks for both events
+        done_waiter = asyncio.create_task(done.wait())
+        interrupt_waiter = asyncio.create_task(interrupt_signal.wait())
+
+        try:
+            finished, pending = await asyncio.wait(
+                {done_waiter, interrupt_waiter},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            # Cancel pending tasks
+            for task in pending:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+
+            if interrupt_waiter in finished:
+                # Interrupt fired — attempt to abort the session
+                interrupt_signal.clear()
+                logger.info("Mid-agent interrupt received, attempting session abort")
+                await self._abort_session(session, done)
+                return True
+
+            # Normal completion
+            return False
+
+        except Exception:
+            # Cleanup on unexpected error
+            for t in (done_waiter, interrupt_waiter):
+                if not t.done():
+                    t.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await t
+            raise
+
+    async def _abort_session(self, session: Any, done: asyncio.Event) -> None:
+        """Attempt to abort a Copilot SDK session.
+
+        Tries ``session.abort()`` first, then falls back to a raw RPC
+        call. After aborting, waits up to 5 seconds for a post-abort
+        event (session.idle or error).
+
+        Args:
+            session: The Copilot SDK session to abort.
+            done: Event that signals session completion (may be set by
+                post-abort events).
+        """
+        # Skip abort if previously determined to be unsupported
+        if self._abort_supported is False:
+            logger.debug("Skipping abort — previously detected as unsupported")
+            return
+
+        abort_called = False
+
+        # Try method-based abort first
+        if hasattr(session, "abort") and callable(session.abort):
+            try:
+                await session.abort()
+                abort_called = True
+                logger.debug("Session aborted via session.abort()")
+            except Exception as exc:
+                logger.warning(f"session.abort() failed: {exc}")
+
+        # Fallback to raw RPC if abort method not available or failed
+        if not abort_called and hasattr(session, "rpc"):
+            try:
+                await session.rpc("session/abort", {})
+                abort_called = True
+                logger.debug("Session aborted via raw RPC")
+            except Exception as exc:
+                logger.warning(f"RPC abort failed: {exc}")
+
+        if not abort_called:
+            logger.warning("Could not abort session — abort capability not available")
+            self._abort_supported = False
+            return
+
+        self._abort_supported = True
+
+        # Wait briefly for post-abort event (idle or error)
+        try:
+            await asyncio.wait_for(done.wait(), timeout=5.0)
+        except TimeoutError:
+            logger.debug("Post-abort wait timed out after 5s")
+
+    async def send_followup(self, session: Any, guidance: str) -> AgentOutput:
+        """Send follow-up guidance to an interrupted session.
+
+        After a mid-agent interrupt, the session is kept alive so that
+        the user's guidance can be sent as a follow-up message. This
+        method sends the guidance, waits for the response, and then
+        destroys the session.
+
+        Args:
+            session: The Copilot SDK session handle (kept alive after interrupt).
+            guidance: User-provided guidance text to send as follow-up.
+
+        Returns:
+            AgentOutput with the follow-up response content.
+        """
+        from conductor.cli.app import is_full, is_verbose
+
+        verbose_enabled = is_verbose()
+        full_enabled = is_full()
+
+        try:
+            sdk_response = await self._send_and_wait(
+                session, guidance, verbose_enabled, full_enabled
+            )
+
+            content: dict[str, Any]
+            try:
+                content = self._extract_json(sdk_response.content)
+            except (json.JSONDecodeError, ValueError):
+                content = {"result": sdk_response.content}
+
+            tokens_used = None
+            if sdk_response.input_tokens is not None and sdk_response.output_tokens is not None:
+                tokens_used = sdk_response.input_tokens + sdk_response.output_tokens
+
+            return AgentOutput(
+                content=content,
+                raw_response=sdk_response.content,
+                tokens_used=tokens_used,
+                input_tokens=sdk_response.input_tokens,
+                output_tokens=sdk_response.output_tokens,
+                cache_read_tokens=sdk_response.cache_read_tokens,
+                cache_write_tokens=sdk_response.cache_write_tokens,
+                model=self._default_model,
+            )
+        finally:
+            await session.destroy()
 
     def _log_parse_recovery(
         self,
@@ -1148,6 +1381,17 @@ class CopilotProvider(AgentProvider):
             ids: Mapping of agent names to session IDs from a checkpoint.
         """
         self._resume_session_ids = dict(ids)
+
+    def get_interrupted_session(self) -> Any | None:
+        """Get the session handle kept alive after a mid-agent interrupt.
+
+        Returns:
+            The Copilot SDK session if one was interrupted, None otherwise.
+            The session handle is cleared after retrieval.
+        """
+        session = self._interrupted_session
+        self._interrupted_session = None
+        return session
 
     def get_call_history(self) -> list[dict[str, Any]]:
         """Get the history of execute calls.

@@ -393,6 +393,7 @@ class ClaudeProvider(AgentProvider):
         context: dict[str, Any],
         rendered_prompt: str,
         tools: list[str] | None = None,
+        interrupt_signal: asyncio.Event | None = None,
     ) -> AgentOutput:
         """Execute an agent using the Claude SDK.
 
@@ -401,6 +402,9 @@ class ClaudeProvider(AgentProvider):
             context: Accumulated workflow context.
             rendered_prompt: Jinja2-rendered user prompt.
             tools: List of tool names available to this agent (currently unused).
+            interrupt_signal: Optional event for mid-agent interrupt signaling.
+                Accepted for ABC compatibility; Claude interrupt support is
+                implemented in a separate epic.
 
         Returns:
             Normalized AgentOutput with structured content.
