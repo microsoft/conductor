@@ -344,6 +344,8 @@ web = [
 
 ### Epic 3: Web Server (`WebDashboard`)
 
+**Status: DONE**
+
 **Goal:** Implement the FastAPI+uvicorn web server that subscribes to the event emitter, broadcasts events over WebSocket, serves the frontend, and supports late-joiner and auto-shutdown modes.
 
 **Prerequisites:** Epic 1 (Event System Foundation)
@@ -352,32 +354,34 @@ web = [
 
 | Task ID | Type | Description | Files | Status |
 |---------|------|-------------|-------|--------|
-| E3-T1 | IMPL | Create `src/conductor/web/__init__.py` package init. | `src/conductor/web/__init__.py` | TO DO |
-| E3-T2 | IMPL | Implement `WebDashboard.__init__()`: create FastAPI app, register routes (`/`, `/api/state`, `/ws`), subscribe to event emitter, init state (`_event_history`, `_connections`, `_workflow_completed`, `_bg_event`, `_queue`). The `_queue` is an `asyncio.Queue` — safe for `put_nowait()` from the emitter callback because both run on the same OS thread. | `src/conductor/web/server.py` | TO DO |
-| E3-T3 | IMPL | Implement `GET /` endpoint: serve `index.html` from `web/static/` directory using `FileResponse` or inline. | `src/conductor/web/server.py` | TO DO |
-| E3-T4 | IMPL | Implement `GET /api/state` endpoint: return `self._event_history` as JSON array. | `src/conductor/web/server.py` | TO DO |
-| E3-T5 | IMPL | Implement `WS /ws` endpoint: accept WebSocket, add to `self._connections`, loop receiving (keep-alive), remove on disconnect. Cancel grace timer on new connect. | `src/conductor/web/server.py` | TO DO |
-| E3-T6 | IMPL | Implement event subscriber callback: serialize `WorkflowEvent` to dict, append to `_event_history`, call `_queue.put_nowait()`. Set `_workflow_completed` on `workflow_completed`/`workflow_failed` events. | `src/conductor/web/server.py` | TO DO |
-| E3-T7 | IMPL | Implement async broadcaster task: read from `_queue`, broadcast to all connections in `self._connections`. Wrap each `send_json()` in try/except, remove failed connections. | `src/conductor/web/server.py` | TO DO |
-| E3-T8 | IMPL | Implement `start()` method: create `uvicorn.Config` and `uvicorn.Server`, launch `server.serve()` as asyncio task, wait for socket bind, extract actual port. | `src/conductor/web/server.py` | TO DO |
-| E3-T9 | IMPL | Implement `stop()` method: set `server.should_exit = True`, cancel grace timer, await serve task. | `src/conductor/web/server.py` | TO DO |
-| E3-T10 | IMPL | Implement auto-shutdown logic for `--web-bg` mode: on WebSocket disconnect, if workflow completed and no connections remain, start 30s grace timer. If timer expires, set `_bg_event`. Implement `wait_for_clients_disconnect()` that awaits `_bg_event`. | `src/conductor/web/server.py` | TO DO |
-| E3-T11 | IMPL | Add `url` property returning `http://{host}:{port}`. | `src/conductor/web/server.py` | TO DO |
-| E3-T12 | TEST | Test `GET /api/state` returns empty list initially, accumulates events. | `tests/test_web/test_server.py` | TO DO |
-| E3-T13 | TEST | Test WebSocket endpoint: connect, receive broadcast event, verify JSON structure. | `tests/test_web/test_server.py` | TO DO |
-| E3-T14 | TEST | Test late-joiner: emit events, then connect new client, verify `/api/state` returns all prior events. | `tests/test_web/test_server.py` | TO DO |
-| E3-T15 | TEST | Test auto-shutdown: emit `workflow_completed`, disconnect all clients, verify `wait_for_clients_disconnect()` resolves after grace period. | `tests/test_web/test_server.py` | TO DO |
-| E3-T16 | TEST | Test broadcast error isolation: verify that a failed WebSocket send doesn't crash the broadcaster or affect other clients. | `tests/test_web/test_server.py` | TO DO |
+| E3-T1 | IMPL | Create `src/conductor/web/__init__.py` package init. | `src/conductor/web/__init__.py` | DONE |
+| E3-T2 | IMPL | Implement `WebDashboard.__init__()`: create FastAPI app, register routes (`/`, `/api/state`, `/ws`), subscribe to event emitter, init state (`_event_history`, `_connections`, `_workflow_completed`, `_bg_event`, `_queue`). The `_queue` is an `asyncio.Queue` — safe for `put_nowait()` from the emitter callback because both run on the same OS thread. | `src/conductor/web/server.py` | DONE |
+| E3-T3 | IMPL | Implement `GET /` endpoint: serve `index.html` from `web/static/` directory using `FileResponse` or inline. | `src/conductor/web/server.py` | DONE |
+| E3-T4 | IMPL | Implement `GET /api/state` endpoint: return `self._event_history` as JSON array. | `src/conductor/web/server.py` | DONE |
+| E3-T5 | IMPL | Implement `WS /ws` endpoint: accept WebSocket, add to `self._connections`, loop receiving (keep-alive), remove on disconnect. Cancel grace timer on new connect. | `src/conductor/web/server.py` | DONE |
+| E3-T6 | IMPL | Implement event subscriber callback: serialize `WorkflowEvent` to dict, append to `_event_history`, call `_queue.put_nowait()`. Set `_workflow_completed` on `workflow_completed`/`workflow_failed` events. | `src/conductor/web/server.py` | DONE |
+| E3-T7 | IMPL | Implement async broadcaster task: read from `_queue`, broadcast to all connections in `self._connections`. Wrap each `send_json()` in try/except, remove failed connections. | `src/conductor/web/server.py` | DONE |
+| E3-T8 | IMPL | Implement `start()` method: create `uvicorn.Config` and `uvicorn.Server`, launch `server.serve()` as asyncio task, wait for socket bind, extract actual port. | `src/conductor/web/server.py` | DONE |
+| E3-T9 | IMPL | Implement `stop()` method: set `server.should_exit = True`, cancel grace timer, await serve task. | `src/conductor/web/server.py` | DONE |
+| E3-T10 | IMPL | Implement auto-shutdown logic for `--web-bg` mode: on WebSocket disconnect, if workflow completed and no connections remain, start 30s grace timer. If timer expires, set `_bg_event`. Implement `wait_for_clients_disconnect()` that awaits `_bg_event`. | `src/conductor/web/server.py` | DONE |
+| E3-T11 | IMPL | Add `url` property returning `http://{host}:{port}`. | `src/conductor/web/server.py` | DONE |
+| E3-T12 | TEST | Test `GET /api/state` returns empty list initially, accumulates events. | `tests/test_web/test_server.py` | DONE |
+| E3-T13 | TEST | Test WebSocket endpoint: connect, receive broadcast event, verify JSON structure. | `tests/test_web/test_server.py` | DONE |
+| E3-T14 | TEST | Test late-joiner: emit events, then connect new client, verify `/api/state` returns all prior events. | `tests/test_web/test_server.py` | DONE |
+| E3-T15 | TEST | Test auto-shutdown: emit `workflow_completed`, disconnect all clients, verify `wait_for_clients_disconnect()` resolves after grace period. | `tests/test_web/test_server.py` | DONE |
+| E3-T16 | TEST | Test broadcast error isolation: verify that a failed WebSocket send doesn't crash the broadcaster or affect other clients. | `tests/test_web/test_server.py` | DONE |
 
 **Acceptance Criteria:**
-- [ ] `WebDashboard` starts uvicorn in-process as asyncio task
-- [ ] `GET /` serves the HTML frontend
-- [ ] `GET /api/state` returns accumulated event history
-- [ ] `WS /ws` streams events to connected clients in real-time
-- [ ] Late-joining browsers receive full event history via `/api/state`
-- [ ] `--web-bg` auto-shutdown works with 30s grace period
-- [ ] Failed WebSocket sends are silently handled
-- [ ] All tests pass with `uv run pytest tests/test_web/`
+- [x] `WebDashboard` starts uvicorn in-process as asyncio task
+- [x] `GET /` serves the HTML frontend
+- [x] `GET /api/state` returns accumulated event history
+- [x] `WS /ws` streams events to connected clients in real-time
+- [x] Late-joining browsers receive full event history via `/api/state`
+- [x] `--web-bg` auto-shutdown works with 30s grace period
+- [x] Failed WebSocket sends are silently handled
+- [x] All tests pass with `uv run pytest tests/test_web/`
+
+**Completion Notes:** All 16 tasks completed. `WebDashboard` implemented with FastAPI lifespan managing the broadcaster task (ensures it runs in both TestClient and production contexts). The server subscribes to `WorkflowEventEmitter`, accumulates event history for late-joiners, broadcasts via WebSocket, and supports `--web-bg` auto-shutdown with 30s grace period. Placeholder `index.html` created (full frontend in Epic 4). 27 tests pass covering all acceptance criteria. Review fixes applied: (1) BUG — `start()` polling loop now checks `self._serve_task.done()` and raises `RuntimeError` if the server task fails before setting `started=True`. (2) Replaced all `asyncio.ensure_future()` calls with `asyncio.create_task()` (3 call sites in server.py, 1 in tests). (3) Renamed misleading test `test_failed_ws_removed_from_connections` to `test_event_queued_despite_bad_connection` to match what it actually validates. (4) Added guard clause in `wait_for_clients_disconnect()` that raises `RuntimeError` when `bg=False`. (5) Added thread-safety note to `_on_event` docstring about `put_nowait()` cross-thread limitations. (6) BUG — `start()` polling loop now checks `self._serve_task.cancelled()` before calling `.exception()` to avoid `CancelledError` propagation. (7) Rewrote `test_start_raises_on_server_failure` to call `await dashboard.start()` with mocked `Server.serve` instead of inlining polling logic. Added `test_start_raises_on_cancelled_task` test for the new cancelled guard.
 
 ---
 
