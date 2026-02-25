@@ -48,7 +48,7 @@ File output is **always full/untruncated** regardless of console level. This ena
 
 ---
 
-## 2. Interrupt & Resume: User Guidance During Workflow Execution
+## 2. ~~Interrupt & Resume: User Guidance During Workflow Execution~~ ✅ Shipped
 
 Allow users to interrupt a running workflow, provide guidance or redirect, and resume execution. Uses an explicit interrupt model (hotkey) rather than passive stdin reading to avoid output interleaving issues and unclear timing.
 
@@ -242,7 +242,7 @@ agents:
 
 ---
 
-## 5. Workflow Resume After Failure
+## 5. ~~Workflow Resume After Failure~~ ✅ Shipped
 
 Allow users to resume a workflow that didn't complete — due to idle recovery exhaustion, process crash, timeout, max iterations, network failure, or any other error. Currently all state is lost on failure, forcing users to restart expensive multi-agent workflows from scratch.
 
@@ -385,8 +385,5 @@ The Anthropic SDK is stateless — no session persistence. On resume, the Claude
 1. **~~Logging Redesign~~** — ✅ Shipped
 2. **~~`!file` References~~** — ✅ Shipped
 3. **~~Script Steps~~** — ✅ Shipped
-4. **Interrupt & Resume** — Three-phase rollout:
-   - Phase 1: Between-agent interrupts (hotkey + handler UI + guidance injection)
-   - Phase 2: Mid-agent interrupts for Copilot (`session.abort()` + follow-up)
-   - Phase 3: Mid-agent interrupts for Claude (agentic loop interrupt + forced emit_output)
-5. **Workflow Resume** — On-failure state dump + `conductor resume` command
+4. **~~Interrupt & Resume~~** — ✅ Shipped
+5. **~~Workflow Resume~~** — ✅ Shipped

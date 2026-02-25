@@ -403,8 +403,9 @@ class ClaudeProvider(AgentProvider):
             rendered_prompt: Jinja2-rendered user prompt.
             tools: List of tool names available to this agent (currently unused).
             interrupt_signal: Optional event for mid-agent interrupt signaling.
-                Accepted for ABC compatibility; Claude interrupt support is
-                implemented in a separate epic.
+                When set during the agentic loop, Claude is asked to emit
+                partial output via the ``emit_output`` tool, and the result
+                is returned with ``partial=True``.
 
         Returns:
             Normalized AgentOutput with structured content.
@@ -414,7 +415,9 @@ class ClaudeProvider(AgentProvider):
             ValidationError: If output doesn't match schema.
         """
         # Use retry logic wrapper for execution
-        return await self._execute_with_retry(agent, context, rendered_prompt, tools)
+        return await self._execute_with_retry(
+            agent, context, rendered_prompt, tools, interrupt_signal=interrupt_signal
+        )
 
     def _is_retryable_error(self, exception: Exception) -> bool:
         """Determine if an error should trigger a retry.
@@ -538,6 +541,7 @@ class ClaudeProvider(AgentProvider):
         context: dict[str, Any],
         rendered_prompt: str,
         tools: list[str] | None = None,
+        interrupt_signal: asyncio.Event | None = None,
     ) -> AgentOutput:
         """Execute with exponential backoff retry logic and MCP tool support.
 
@@ -552,6 +556,7 @@ class ClaudeProvider(AgentProvider):
             context: Accumulated workflow context.
             rendered_prompt: Jinja2-rendered user prompt.
             tools: List of tool names available to this agent (for MCP tool filtering).
+            interrupt_signal: Optional event for mid-agent interrupt signaling.
 
         Returns:
             Normalized AgentOutput with structured content.
@@ -618,7 +623,7 @@ class ClaudeProvider(AgentProvider):
         for attempt in range(1, config.max_attempts + 1):
             try:
                 # Execute with agentic tool loop
-                response, total_tokens = await self._execute_agentic_loop(
+                response, total_tokens, is_partial = await self._execute_agentic_loop(
                     messages=messages,
                     model=model,
                     temperature=temperature,
@@ -626,7 +631,28 @@ class ClaudeProvider(AgentProvider):
                     tools=request_tools,
                     output_schema=agent.output,
                     has_output_schema=has_output_schema,
+                    interrupt_signal=interrupt_signal,
                 )
+
+                # Handle partial output from mid-agent interrupt
+                if is_partial:
+                    partial_content: dict[str, Any]
+                    try:
+                        partial_content = self._extract_output(response, agent.output)
+                    except Exception:
+                        # Best-effort extraction; fall back to text content
+                        partial_content = self._extract_text_content(response)
+
+                    tokens_used = (
+                        total_tokens if total_tokens else self._extract_token_usage(response)
+                    )
+                    return AgentOutput(
+                        content=partial_content,
+                        raw_response=response,
+                        tokens_used=tokens_used,
+                        model=model,
+                        partial=True,
+                    )
 
                 # Extract structured output
                 content = self._extract_output(response, agent.output)
@@ -848,7 +874,8 @@ class ClaudeProvider(AgentProvider):
         output_schema: dict[str, OutputField] | None,
         has_output_schema: bool,
         max_iterations: int = 10,
-    ) -> tuple[ClaudeResponse, int | None]:
+        interrupt_signal: asyncio.Event | None = None,
+    ) -> tuple[ClaudeResponse, int | None, bool]:
         """Execute an agentic loop that handles MCP tool calls.
 
         This method implements a tool-use loop:
@@ -856,6 +883,10 @@ class ClaudeProvider(AgentProvider):
         2. If Claude returns tool_use blocks (other than emit_output), execute them
         3. Send tool results back and continue the loop
         4. Terminate when Claude returns emit_output or a final text response
+
+        If ``interrupt_signal`` is set at the start of an iteration, the loop
+        appends a user message asking Claude to call ``emit_output`` with its
+        best partial result. The response is returned with ``partial=True``.
 
         Args:
             messages: Initial message history.
@@ -866,9 +897,10 @@ class ClaudeProvider(AgentProvider):
             output_schema: Expected output schema.
             has_output_schema: Whether agent has output schema defined.
             max_iterations: Maximum number of tool-use iterations to prevent infinite loops.
+            interrupt_signal: Optional event that signals a mid-agent interrupt.
 
         Returns:
-            Tuple of (final_response, total_tokens_used).
+            Tuple of (final_response, total_tokens_used, is_partial).
 
         Raises:
             ProviderError: If execution fails or max iterations exceeded.
@@ -881,6 +913,23 @@ class ClaudeProvider(AgentProvider):
         while iteration < max_iterations:
             iteration += 1
             logger.debug(f"Agentic loop iteration {iteration}/{max_iterations}")
+
+            # Check for mid-agent interrupt at top of each iteration
+            if interrupt_signal is not None and interrupt_signal.is_set():
+                interrupt_signal.clear()
+                logger.info("Mid-agent interrupt detected in Claude agentic loop")
+
+                # Ask Claude to emit partial output via a user message
+                interrupt_response, interrupt_tokens = await self._request_partial_output(
+                    working_messages=working_messages,
+                    model=model,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    tools=tools,
+                    has_output_schema=has_output_schema,
+                )
+                total_tokens += interrupt_tokens
+                return interrupt_response, total_tokens, True
 
             # Execute API call (with parse recovery for structured output)
             if has_output_schema:
@@ -917,28 +966,28 @@ class ClaudeProvider(AgentProvider):
             if not tool_uses:
                 # No tool calls, we're done
                 logger.debug("No tool_use in response, exiting agentic loop")
-                return response, total_tokens
+                return response, total_tokens, False
 
             # Check if emit_output was called (structured output)
             emit_output = next((t for t in tool_uses if t.name == "emit_output"), None)
             if emit_output:
                 # Final output received, we're done
                 logger.debug("emit_output tool called, exiting agentic loop")
-                return response, total_tokens
+                return response, total_tokens, False
 
             # Handle MCP tool calls
             mcp_tool_uses = [t for t in tool_uses if t.name != "emit_output"]
 
             if not mcp_tool_uses:
                 # No MCP tools to execute
-                return response, total_tokens
+                return response, total_tokens, False
 
             if not self._mcp_manager:
                 logger.warning(
                     f"Claude called MCP tools but no MCP manager available: "
                     f"{[t.name for t in mcp_tool_uses]}"
                 )
-                return response, total_tokens
+                return response, total_tokens, False
 
             logger.info(
                 f"Executing {len(mcp_tool_uses)} MCP tool call(s): "
@@ -1012,6 +1061,63 @@ class ClaudeProvider(AgentProvider):
             f"Agentic loop exceeded maximum iterations ({max_iterations})",
             suggestion="The agent may be stuck in a tool-use loop. Check your MCP tools.",
         )
+
+    async def _request_partial_output(
+        self,
+        working_messages: list[dict[str, Any]],
+        model: str,
+        temperature: float | None,
+        max_tokens: int,
+        tools: list[dict[str, Any]] | None,
+        has_output_schema: bool,
+    ) -> tuple[Any, int]:
+        """Send a final API call requesting partial output after interrupt.
+
+        Appends a user message asking Claude to call ``emit_output`` with
+        its best partial result. If ``emit_output`` is not available (no
+        output schema), asks for a text summary instead.
+
+        Args:
+            working_messages: Current message history (will be extended).
+            model: Model identifier.
+            temperature: Temperature setting.
+            max_tokens: Maximum output tokens.
+            tools: Tool definitions (may include emit_output).
+            has_output_schema: Whether the agent defines an output schema.
+
+        Returns:
+            Tuple of (response, tokens_used_in_this_call).
+        """
+        if has_output_schema:
+            interrupt_prompt = (
+                "The user has interrupted execution. Please immediately call the "
+                "'emit_output' tool with your best partial result based on the work "
+                "completed so far. Return whatever you have, even if incomplete."
+            )
+        else:
+            interrupt_prompt = (
+                "The user has interrupted execution. Please immediately provide "
+                "your best partial result based on the work completed so far. "
+                "Return whatever you have, even if incomplete."
+            )
+
+        working_messages.append({"role": "user", "content": interrupt_prompt})
+
+        response = await self._execute_api_call(
+            messages=working_messages,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            tools=tools,
+        )
+
+        call_tokens = 0
+        if hasattr(response, "usage"):
+            call_tokens = getattr(response.usage, "input_tokens", 0) + getattr(
+                response.usage, "output_tokens", 0
+            )
+
+        return response, call_tokens
 
     async def _execute_with_parse_recovery(
         self,

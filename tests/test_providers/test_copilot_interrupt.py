@@ -536,9 +536,7 @@ class TestAbortCapabilityDetection:
         provider = CopilotProvider(mock_handler=lambda a, p, c: {})
 
         done = asyncio.Event()
-        session = FakeSession(
-            has_abort=True, post_abort_event="session.idle", done_event=done
-        )
+        session = FakeSession(has_abort=True, post_abort_event="session.idle", done_event=done)
 
         await provider._abort_session(session, done)
 

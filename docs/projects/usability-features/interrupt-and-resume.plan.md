@@ -1,7 +1,7 @@
 # Interrupt & Resume: User Guidance During Workflow Execution
 
 > **Revision:** 2 — Addressing technical review feedback
-> **Status:** In Progress
+> **Status:** DONE
 > **Feature ref:** usability-features.brainstorm.md — Feature #2
 
 ---
@@ -732,6 +732,8 @@ async def send_followup(
 
 ### Epic 6: Mid-Agent Interrupt — Claude Provider (Phase 3)
 
+**Status:** DONE
+
 **Goal:** Enable mid-execution interrupts for the Claude provider by checking the interrupt flag between agentic loop iterations.
 
 **Prerequisites:** Epic 5 (provider ABC changes)
@@ -740,20 +742,22 @@ async def send_followup(
 
 | Task ID | Type | Description | Files | Status |
 |---------|------|-------------|-------|--------|
-| E6-T1 | IMPL | In `ClaudeProvider._execute_agentic_loop()`: accept `interrupt_signal` parameter. At the top of each `while` loop iteration (after `iteration += 1`), check `interrupt_signal.is_set()`. If set: clear the event, append a **user message** (not system message) to the messages list asking Claude to call the `emit_output` tool with its best partial result. Send one final API call. Parse the `emit_output` tool_use response. Return the response as partial. | `src/conductor/providers/claude.py` | TO DO |
-| E6-T2 | IMPL | Update `ClaudeProvider.execute()` to forward `interrupt_signal` to `_execute_with_retry()` and then to `_execute_agentic_loop()`. | `src/conductor/providers/claude.py` | TO DO |
-| E6-T3 | IMPL | In `WorkflowEngine._execute_loop()`: when re-executing after Claude interrupt, append user guidance to the rendered prompt (Claude starts a fresh conversation on each `execute()` call, so the guidance + original prompt provides context). | `src/conductor/engine/workflow.py` | TO DO |
-| E6-T4 | TEST | Test Claude interrupt: mock API responses, verify interrupt check between iterations, verify user message (not system) requesting `emit_output` is sent, verify `emit_output` tool_use response is parsed as partial output, verify partial output is NOT schema-validated. | `tests/test_providers/test_claude_interrupt.py` | TO DO |
-| E6-T5 | TEST | Test Claude re-invocation with guidance: verify guidance is appended to rendered prompt, verify conversation starts fresh with guidance context. | `tests/test_providers/test_claude_interrupt.py` | TO DO |
+| E6-T1 | IMPL | In `ClaudeProvider._execute_agentic_loop()`: accept `interrupt_signal` parameter. At the top of each `while` loop iteration (after `iteration += 1`), check `interrupt_signal.is_set()`. If set: clear the event, append a **user message** (not system message) to the messages list asking Claude to call the `emit_output` tool with its best partial result. Send one final API call. Parse the `emit_output` tool_use response. Return the response as partial. | `src/conductor/providers/claude.py` | DONE |
+| E6-T2 | IMPL | Update `ClaudeProvider.execute()` to forward `interrupt_signal` to `_execute_with_retry()` and then to `_execute_agentic_loop()`. | `src/conductor/providers/claude.py` | DONE |
+| E6-T3 | IMPL | In `WorkflowEngine._execute_loop()`: when re-executing after Claude interrupt, append user guidance to the rendered prompt (Claude starts a fresh conversation on each `execute()` call, so the guidance + original prompt provides context). | `src/conductor/engine/workflow.py` | DONE |
+| E6-T4 | TEST | Test Claude interrupt: mock API responses, verify interrupt check between iterations, verify user message (not system) requesting `emit_output` is sent, verify `emit_output` tool_use response is parsed as partial output, verify partial output is NOT schema-validated. | `tests/test_providers/test_claude_interrupt.py` | DONE |
+| E6-T5 | TEST | Test Claude re-invocation with guidance: verify guidance is appended to rendered prompt, verify conversation starts fresh with guidance context. | `tests/test_providers/test_claude_interrupt.py` | DONE |
 
 **Acceptance Criteria:**
-- [ ] Interrupt signal is checked at the start of each agentic loop iteration
-- [ ] Final emit_output request is sent as a user message (tool_use request, not system instruction)
-- [ ] Partial output from `emit_output` tool_use is parsed correctly
-- [ ] Partial output is not schema-validated (may be incomplete)
-- [ ] User guidance is appended to rendered prompt for re-invocation
-- [ ] Re-invocation starts a fresh conversation (Claude agentic loop does not persist state)
-- [ ] All tests pass
+- [x] Interrupt signal is checked at the start of each agentic loop iteration
+- [x] Final emit_output request is sent as a user message (tool_use request, not system instruction)
+- [x] Partial output from `emit_output` tool_use is parsed correctly
+- [x] Partial output is not schema-validated (may be incomplete)
+- [x] User guidance is appended to rendered prompt for re-invocation
+- [x] Re-invocation starts a fresh conversation (Claude agentic loop does not persist state)
+- [x] All tests pass
+
+**Completion Notes:** Added `interrupt_signal` parameter to `_execute_agentic_loop()` (forwarded through `execute()` → `_execute_with_retry()`). At the top of each loop iteration, the signal is checked; if set, a user message requesting `emit_output` is sent via new `_request_partial_output()` helper. The agentic loop now returns a 3-tuple `(response, total_tokens, is_partial)`. `_execute_with_retry()` handles partial output by skipping schema validation and returning `AgentOutput(partial=True)`. E6-T3 required no changes — the existing `_handle_partial_output()` fallback path already re-executes with guidance appended to the rendered prompt. 17 tests cover interrupt detection, user message format, partial output parsing, schema validation skip, signal clearing, token accounting, re-invocation with guidance, and fresh conversation semantics.
 
 ---
 
