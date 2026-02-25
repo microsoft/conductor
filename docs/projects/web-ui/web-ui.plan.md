@@ -287,17 +287,17 @@ web = [
 
 | Task ID | Type | Description | Files | Status |
 |---------|------|-------------|-------|--------|
-| E1-T1 | IMPL | Create `WorkflowEvent` dataclass with `type: str`, `timestamp: float`, `data: dict[str, Any]` fields | `src/conductor/events.py` | TO DO |
-| E1-T2 | IMPL | Implement `WorkflowEventEmitter` class with `subscribe(callback)`, `unsubscribe(callback)`, and `emit(event)` methods. Use `threading.Lock` to protect subscriber list during iteration in `emit()`. Callbacks are `Callable[[WorkflowEvent], None]`. The Lock protects only the emitter's own subscriber list — it does NOT make downstream consumers (e.g., `asyncio.Queue.put_nowait()`) thread-safe. See NFR-2. | `src/conductor/events.py` | TO DO |
-| E1-T3 | TEST | Unit tests: subscribe/emit delivery, multiple subscribers, unsubscribe, emit with no subscribers, thread safety (concurrent emit from multiple threads doesn't corrupt subscriber list), callback exception isolation (one failing callback doesn't prevent others) | `tests/test_events.py` | TO DO |
+| E1-T1 | IMPL | Create `WorkflowEvent` dataclass with `type: str`, `timestamp: float`, `data: dict[str, Any]` fields | `src/conductor/events.py` | DONE |
+| E1-T2 | IMPL | Implement `WorkflowEventEmitter` class with `subscribe(callback)`, `unsubscribe(callback)`, and `emit(event)` methods. Use `threading.Lock` to protect subscriber list during iteration in `emit()`. Callbacks are `Callable[[WorkflowEvent], None]`. The Lock protects only the emitter's own subscriber list — it does NOT make downstream consumers (e.g., `asyncio.Queue.put_nowait()`) thread-safe. See NFR-2. | `src/conductor/events.py` | DONE |
+| E1-T3 | TEST | Unit tests: subscribe/emit delivery, multiple subscribers, unsubscribe, emit with no subscribers, thread safety (concurrent emit from multiple threads doesn't corrupt subscriber list), callback exception isolation (one failing callback doesn't prevent others) | `tests/test_events.py` | DONE |
 
 **Acceptance Criteria:**
-- [ ] `WorkflowEvent` dataclass has `type`, `timestamp`, `data` fields
-- [ ] `WorkflowEventEmitter.subscribe()` registers callback
-- [ ] `WorkflowEventEmitter.emit()` calls all registered callbacks synchronously
-- [ ] `threading.Lock` protects subscriber list during iteration
-- [ ] One failing callback doesn't prevent other callbacks from executing
-- [ ] All tests pass with `uv run pytest tests/test_events.py`
+- [x] `WorkflowEvent` dataclass has `type`, `timestamp`, `data` fields
+- [x] `WorkflowEventEmitter.subscribe()` registers callback
+- [x] `WorkflowEventEmitter.emit()` calls all registered callbacks synchronously
+- [x] `threading.Lock` protects subscriber list during iteration
+- [x] One failing callback doesn't prevent other callbacks from executing
+- [x] All tests pass with `uv run pytest tests/test_events.py`
 
 ---
 
