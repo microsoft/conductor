@@ -436,6 +436,8 @@ web = [
 
 ### Epic 5: CLI Wiring & Dependency Group
 
+**Status: DONE**
+
 **Goal:** Add `--web`, `--web-port`, `--web-bg` CLI flags to the `run` command, wire up emitter and dashboard lifecycle in `run_workflow_async()`, and add the `web` optional dependency extra to `pyproject.toml`.
 
 **Prerequisites:** Epic 2 (Engine Integration), Epic 3 (Web Server), Epic 4 (Frontend)
@@ -444,28 +446,30 @@ web = [
 
 | Task ID | Type | Description | Files | Status |
 |---------|------|-------------|-------|--------|
-| E5-T1 | IMPL | Add `[project.optional-dependencies]` section to `pyproject.toml` with `web` extra: `web = ["fastapi>=0.115.0", "uvicorn>=0.30.0", "websockets>=12.0"]`. This must be `[project.optional-dependencies]` (PEP 621), NOT `[dependency-groups]` (PEP 735). The `[dependency-groups]` section is already used for dev deps but does not support pip extras syntax (`pip install conductor-cli[web]`). | `pyproject.toml` | TO DO |
-| E5-T2 | IMPL | Add `--web` (bool, default False), `--web-port` (int, default 0), `--web-bg` (bool, default False) options to the `run` command in `cli/app.py`. Pass values through to `run_workflow_async()`. | `src/conductor/cli/app.py` | TO DO |
-| E5-T3 | IMPL | Update `run_workflow_async()` signature to accept `web`, `web_port`, `web_bg` parameters. | `src/conductor/cli/run.py` | TO DO |
-| E5-T4 | IMPL | In `run_workflow_async()`: create `WorkflowEventEmitter`, pass to `WorkflowEngine(event_emitter=emitter)`. | `src/conductor/cli/run.py` | TO DO |
-| E5-T5 | IMPL | In `run_workflow_async()`: if `--web`, lazy-import `WebDashboard` with try/except `ImportError` producing actionable error message (`"pip install conductor-cli[web]"`). Instantiate `WebDashboard(emitter, host="127.0.0.1", port=web_port, bg=web_bg)`, call `await dashboard.start()`, print URL to stderr. Wrap `start()` in try/except: on failure, print warning and continue without dashboard. | `src/conductor/cli/run.py` | TO DO |
-| E5-T6 | IMPL | In `run_workflow_async()` post-execution: if `--web-bg`, call `await dashboard.wait_for_clients_disconnect()` then `await dashboard.stop()`. If default `--web` (no bg), print "Dashboard running at {url}. Press Ctrl+C to stop." and `await asyncio.Event().wait()`. Always `await dashboard.stop()` in finally block. | `src/conductor/cli/run.py` | TO DO |
-| E5-T7 | IMPL | Ensure `--web` URL is printed to stderr regardless of `--silent`/`--quiet` mode (URL is essential, not "progress output"). | `src/conductor/cli/run.py` | TO DO |
-| E5-T8 | TEST | Test CLI: `--web` flag is accepted, `--web-port` sets port, `--web-bg` is accepted. Test mutual compatibility with existing flags. | `tests/test_cli/test_web_flags.py` | TO DO |
-| E5-T9 | TEST | Test dependency check: mock `ImportError` for `fastapi`, verify actionable error message is printed and exit code is 1. | `tests/test_cli/test_web_flags.py` | TO DO |
-| E5-T10 | TEST | Test dashboard startup failure: mock `dashboard.start()` raising `OSError`, verify warning is printed and workflow continues. | `tests/test_cli/test_web_flags.py` | TO DO |
+| E5-T1 | IMPL | Add `[project.optional-dependencies]` section to `pyproject.toml` with `web` extra: `web = ["fastapi>=0.115.0", "uvicorn>=0.30.0", "websockets>=12.0"]`. This must be `[project.optional-dependencies]` (PEP 621), NOT `[dependency-groups]` (PEP 735). The `[dependency-groups]` section is already used for dev deps but does not support pip extras syntax (`pip install conductor-cli[web]`). | `pyproject.toml` | DONE |
+| E5-T2 | IMPL | Add `--web` (bool, default False), `--web-port` (int, default 0), `--web-bg` (bool, default False) options to the `run` command in `cli/app.py`. Pass values through to `run_workflow_async()`. | `src/conductor/cli/app.py` | DONE |
+| E5-T3 | IMPL | Update `run_workflow_async()` signature to accept `web`, `web_port`, `web_bg` parameters. | `src/conductor/cli/run.py` | DONE |
+| E5-T4 | IMPL | In `run_workflow_async()`: create `WorkflowEventEmitter`, pass to `WorkflowEngine(event_emitter=emitter)`. | `src/conductor/cli/run.py` | DONE |
+| E5-T5 | IMPL | In `run_workflow_async()`: if `--web`, lazy-import `WebDashboard` with try/except `ImportError` producing actionable error message (`"pip install conductor-cli[web]"`). Instantiate `WebDashboard(emitter, host="127.0.0.1", port=web_port, bg=web_bg)`, call `await dashboard.start()`, print URL to stderr. Wrap `start()` in try/except: on failure, print warning and continue without dashboard. | `src/conductor/cli/run.py` | DONE |
+| E5-T6 | IMPL | In `run_workflow_async()` post-execution: if `--web-bg`, call `await dashboard.wait_for_clients_disconnect()` then `await dashboard.stop()`. If default `--web` (no bg), print "Dashboard running at {url}. Press Ctrl+C to stop." and `await asyncio.Event().wait()`. Always `await dashboard.stop()` in finally block. | `src/conductor/cli/run.py` | DONE |
+| E5-T7 | IMPL | Ensure `--web` URL is printed to stderr regardless of `--silent`/`--quiet` mode (URL is essential, not "progress output"). | `src/conductor/cli/run.py` | DONE |
+| E5-T8 | TEST | Test CLI: `--web` flag is accepted, `--web-port` sets port, `--web-bg` is accepted. Test mutual compatibility with existing flags. | `tests/test_cli/test_web_flags.py` | DONE |
+| E5-T9 | TEST | Test dependency check: mock `ImportError` for `fastapi`, verify actionable error message is printed and exit code is 1. | `tests/test_cli/test_web_flags.py` | DONE |
+| E5-T10 | TEST | Test dashboard startup failure: mock `dashboard.start()` raising `OSError`, verify warning is printed and workflow continues. | `tests/test_cli/test_web_flags.py` | DONE |
 
 **Acceptance Criteria:**
-- [ ] `pyproject.toml` has `[project.optional-dependencies]` section with `web` extra (not `[dependency-groups]`)
-- [ ] `pip install conductor-cli[web]` installs fastapi, uvicorn, websockets
-- [ ] `conductor run workflow.yaml --web` starts dashboard and prints URL
-- [ ] `conductor run workflow.yaml --web --web-port 8080` uses specified port
-- [ ] `conductor run workflow.yaml --web --web-bg` auto-shuts down after workflow + client disconnect
-- [ ] Missing `fastapi`/`uvicorn` produces clear error: `"pip install conductor-cli[web]"`
-- [ ] Dashboard startup failure is non-fatal (warning printed, workflow continues)
-- [ ] `--web` with `--silent` still prints dashboard URL to stderr
-- [ ] All existing tests pass without modification
-- [ ] `make lint && make typecheck && make test` pass
+- [x] `pyproject.toml` has `[project.optional-dependencies]` section with `web` extra (not `[dependency-groups]`)
+- [x] `pip install conductor-cli[web]` installs fastapi, uvicorn, websockets
+- [x] `conductor run workflow.yaml --web` starts dashboard and prints URL
+- [x] `conductor run workflow.yaml --web --web-port 8080` uses specified port
+- [x] `conductor run workflow.yaml --web --web-bg` auto-shuts down after workflow + client disconnect
+- [x] Missing `fastapi`/`uvicorn` produces clear error: `"pip install conductor-cli[web]"`
+- [x] Dashboard startup failure is non-fatal (warning printed, workflow continues)
+- [x] `--web` with `--silent` still prints dashboard URL to stderr
+- [x] All existing tests pass without modification
+- [x] `make lint && make typecheck && make test` pass
+
+**Completion Notes:** All 10 tasks completed. `pyproject.toml` updated with `[project.optional-dependencies]` section (PEP 621) containing `web` extra with fastapi, uvicorn, websockets. Three CLI flags (`--web`, `--web-port`, `--web-bg`) added to the `run` command in `cli/app.py` and passed through to `run_workflow_async()`. `run_workflow_async()` updated with full dashboard lifecycle: (1) creates `WorkflowEventEmitter` when `--web` is set, (2) lazy-imports `WebDashboard` with try/except ImportError producing actionable `pip install conductor-cli[web]` error, (3) starts dashboard with try/except for non-fatal startup failures, (4) prints URL to stderr via `_verbose_console` (always shown regardless of `--silent`/`--quiet`), (5) passes `event_emitter` to `WorkflowEngine`, (6) post-execution: `--web-bg` calls `wait_for_clients_disconnect()`, default `--web` blocks on `asyncio.Event().wait()` with Ctrl+C messaging, (7) `dashboard.stop()` always called in finally block. 9 tests added covering flag acceptance (5), dependency check (2), and startup failure (2). All 1538 tests pass, lint and typecheck clean.
 
 ---
 

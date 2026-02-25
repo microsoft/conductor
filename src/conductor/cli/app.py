@@ -257,6 +257,27 @@ def run(
             help="Disable interactive interrupt capability (Esc to pause).",
         ),
     ] = False,
+    web: Annotated[
+        bool,
+        typer.Option(
+            "--web",
+            help="Start a real-time web dashboard for workflow visualization.",
+        ),
+    ] = False,
+    web_port: Annotated[
+        int,
+        typer.Option(
+            "--web-port",
+            help="Port for the web dashboard (0 = auto-select).",
+        ),
+    ] = 0,
+    web_bg: Annotated[
+        bool,
+        typer.Option(
+            "--web-bg",
+            help="Auto-shutdown dashboard after workflow completes and clients disconnect.",
+        ),
+    ] = False,
 ) -> None:
     """Run a workflow from a YAML file.
 
@@ -275,6 +296,9 @@ def run(
         conductor run workflow.yaml --log-file debug.log
         conductor run workflow.yaml --silent --log-file auto
         conductor run workflow.yaml --no-interactive
+        conductor run workflow.yaml --web
+        conductor run workflow.yaml --web --web-port 8080
+        conductor run workflow.yaml --web --web-bg
     """
     import asyncio
     import json
@@ -321,7 +345,15 @@ def run(
         # Run the workflow
         result = asyncio.run(
             run_workflow_async(
-                workflow, inputs, provider, skip_gates, resolved_log_file, no_interactive
+                workflow,
+                inputs,
+                provider,
+                skip_gates,
+                resolved_log_file,
+                no_interactive,
+                web=web,
+                web_port=web_port,
+                web_bg=web_bg,
             )
         )
 

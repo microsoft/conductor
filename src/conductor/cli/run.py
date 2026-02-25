@@ -6,6 +6,7 @@ This module provides helper functions for executing workflow files.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import re
@@ -829,6 +830,10 @@ async def run_workflow_async(
     skip_gates: bool = False,
     log_file: Path | None = None,
     no_interactive: bool = False,
+    *,
+    web: bool = False,
+    web_port: int = 0,
+    web_bg: bool = False,
 ) -> dict[str, Any]:
     """Execute a workflow asynchronously.
 
@@ -839,6 +844,9 @@ async def run_workflow_async(
         skip_gates: If True, auto-selects first option at human gates.
         log_file: Optional path to write full debug output to a file.
         no_interactive: If True, disables the keyboard interrupt listener.
+        web: If True, start a real-time web dashboard.
+        web_port: Port for the web dashboard (0 = auto-select).
+        web_bg: If True, auto-shutdown dashboard after workflow + client disconnect.
 
     Returns:
         The workflow output as a dictionary.
@@ -846,6 +854,8 @@ async def run_workflow_async(
     Raises:
         ConductorError: If workflow execution fails.
     """
+    from conductor.events import WorkflowEventEmitter
+
     start_time = time.time()
 
     # Initialize file logging if requested
@@ -856,6 +866,35 @@ async def run_workflow_async(
             _verbose_console.print(
                 f"[bold yellow]Warning:[/bold yellow] Cannot open log file {log_file}: {e}"
             )
+
+    # Create event emitter when --web is requested
+    emitter: WorkflowEventEmitter | None = None
+    dashboard: Any = None
+
+    if web:
+        # Lazy-import web dependencies with actionable error
+        try:
+            from conductor.web.server import WebDashboard
+        except ImportError:
+            _verbose_console.print(
+                "[bold red]Error:[/bold red] Web dashboard dependencies are not installed.\n"
+                "Install them with: [bold]pip install conductor-cli\\[web][/bold]"
+            )
+            raise typer.Exit(code=1) from None
+
+        emitter = WorkflowEventEmitter()
+        dashboard = WebDashboard(emitter, host="127.0.0.1", port=web_port, bg=web_bg)
+
+        try:
+            await dashboard.start()
+            # Print URL to stderr regardless of --silent/--quiet
+            _verbose_console.print(f"[bold cyan]Dashboard:[/bold cyan] {dashboard.url}")
+        except Exception as e:
+            _verbose_console.print(
+                f"[bold yellow]Warning:[/bold yellow] "
+                f"Dashboard failed to start: {e}. Continuing without dashboard."
+            )
+            dashboard = None
 
     try:
         # Log workflow loading
@@ -910,6 +949,7 @@ async def run_workflow_async(
                 skip_gates=skip_gates,
                 workflow_path=workflow_path,
                 interrupt_event=interrupt_event,
+                event_emitter=emitter,
             )
 
             try:
@@ -935,8 +975,24 @@ async def run_workflow_async(
                 if "usage" in summary:
                     display_usage_summary(summary["usage"])
 
+            # Post-execution dashboard lifecycle
+            if dashboard is not None:
+                if web_bg:
+                    await dashboard.wait_for_clients_disconnect()
+                else:
+                    _verbose_console.print(
+                        f"[bold cyan]Dashboard running at {dashboard.url}. "
+                        f"Press Ctrl+C to stop.[/bold cyan]"
+                    )
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await asyncio.Event().wait()
+
             return result
     finally:
+        # Stop dashboard if it was started
+        if dashboard is not None:
+            await dashboard.stop()
+
         # Report log file path to stderr and close file logging
         if log_file is not None and _file_console is not None:
             _verbose_console.print(f"[dim]Log written to: {log_file}[/dim]")
