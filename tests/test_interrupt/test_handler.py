@@ -435,7 +435,7 @@ class TestInterruptHandlerPanel:
             await handler.handle_interrupt(
                 current_agent="agent1",
                 iteration=1,
-                last_output_preview='[red]error[/red] and [bold]text[/bold]',
+                last_output_preview="[red]error[/red] and [bold]text[/bold]",
                 available_agents=[],
                 accumulated_guidance=[],
             )
@@ -450,6 +450,7 @@ class TestInterruptHandlerPanel:
         content = panel_call.renderable
         # The raw markup tags should be escaped (rendered as literal text)
         from rich.markup import escape
+
         assert escape("[red]error[/red]") in content
 
     @pytest.mark.asyncio
@@ -476,6 +477,7 @@ class TestInterruptHandlerPanel:
         assert panel_call is not None
         content = panel_call.renderable
         from rich.markup import escape
+
         assert escape("[bold]inject markup[/bold]") in content
 
 

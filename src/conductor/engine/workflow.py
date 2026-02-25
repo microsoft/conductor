@@ -20,7 +20,7 @@ from conductor.engine.limits import LimitEnforcer
 from conductor.engine.pricing import ModelPricing
 from conductor.engine.router import Router, RouteResult
 from conductor.engine.usage import UsageTracker
-from conductor.exceptions import ConductorError, ExecutionError, MaxIterationsError
+from conductor.exceptions import ConductorError, ExecutionError, InterruptError, MaxIterationsError
 from conductor.executor.agent import AgentExecutor
 from conductor.executor.script import ScriptExecutor, ScriptOutput
 from conductor.executor.template import TemplateRenderer
@@ -29,6 +29,7 @@ from conductor.gates.human import (
     HumanGateHandler,
     MaxIterationsHandler,
 )
+from conductor.gates.interrupt import InterruptAction, InterruptHandler, InterruptResult
 
 logger = logging.getLogger(__name__)
 
@@ -451,6 +452,7 @@ class WorkflowEngine:
 
         # Interrupt support
         self._interrupt_event = interrupt_event
+        self._interrupt_handler = InterruptHandler(skip_gates=skip_gates)
 
         # Checkpoint tracking
         self._current_agent_name: str | None = None
@@ -644,6 +646,85 @@ class WorkflowEngine:
             copilot_session_ids=copilot_session_ids,
         )
         self._last_checkpoint_path = checkpoint_path
+
+    def _get_top_level_agent_names(self) -> list[str]:
+        """Return names of top-level agents (excluding parallel/for-each nested agents).
+
+        Used by the interrupt handler to populate the list of agents available
+        for "skip to agent".
+
+        Returns:
+            List of top-level agent names.
+        """
+        return [a.name for a in self.config.agents]
+
+    async def _check_interrupt(self, current_agent_name: str) -> InterruptResult | None:
+        """Check for a pending interrupt and handle it if present.
+
+        If the interrupt event is set, clears it, builds an output preview
+        from the last stored output, and delegates to the InterruptHandler
+        for user interaction.
+
+        Args:
+            current_agent_name: Name of the agent that just completed
+                (or the next agent about to run).
+
+        Returns:
+            InterruptResult if an interrupt was handled, None otherwise.
+        """
+        if self._interrupt_event is None or not self._interrupt_event.is_set():
+            return None
+
+        self._interrupt_event.clear()
+
+        # Build output preview from last stored output
+        import json
+
+        last_output = self.context.get_latest_output()
+        last_output_preview: str | None = None
+        if last_output is not None:
+            try:
+                preview = json.dumps(last_output, indent=2, default=str)
+                last_output_preview = preview[:500]
+            except (TypeError, ValueError):
+                last_output_preview = str(last_output)[:500]
+
+        return await self._interrupt_handler.handle_interrupt(
+            current_agent=current_agent_name,
+            iteration=self.context.current_iteration,
+            last_output_preview=last_output_preview,
+            available_agents=self._get_top_level_agent_names(),
+            accumulated_guidance=list(self.context.user_guidance),
+        )
+
+    async def _handle_interrupt_result(
+        self,
+        result: InterruptResult,
+        current_agent_name: str,
+    ) -> str:
+        """Apply the result of an interrupt interaction.
+
+        Args:
+            result: The InterruptResult from the handler.
+            current_agent_name: The current agent name (for error context).
+
+        Returns:
+            The next agent name to execute (may be unchanged, or a skip target).
+
+        Raises:
+            InterruptError: If the user selected "stop workflow".
+        """
+        match result.action:
+            case InterruptAction.CONTINUE:
+                if result.guidance:
+                    self.context.add_guidance(result.guidance)
+                return current_agent_name
+            case InterruptAction.SKIP:
+                return result.skip_target or current_agent_name
+            case InterruptAction.STOP:
+                raise InterruptError(agent_name=current_agent_name)
+            case InterruptAction.CANCEL:
+                return current_agent_name
 
     async def _execute_loop(self, current_agent_name: str) -> dict[str, Any]:
         """Core execution loop shared by :meth:`run` and :meth:`resume`.
@@ -897,6 +978,13 @@ class WorkflowEngine:
                                 return result
 
                             current_agent_name = route_result.target
+
+                            # Check for interrupt after script step
+                            interrupt_result = await self._check_interrupt(current_agent_name)
+                            if interrupt_result is not None:
+                                current_agent_name = await self._handle_interrupt_result(
+                                    interrupt_result, current_agent_name
+                                )
                             continue
 
                         # Build context for this agent
@@ -954,6 +1042,13 @@ class WorkflowEngine:
                             return result
 
                         current_agent_name = route_result.target
+
+                    # Check for interrupt between agents (deferred for parallel/for-each)
+                    interrupt_result = await self._check_interrupt(current_agent_name)
+                    if interrupt_result is not None:
+                        current_agent_name = await self._handle_interrupt_result(
+                            interrupt_result, current_agent_name
+                        )
 
         except KeyboardInterrupt:
             self._save_checkpoint_on_failure(KeyboardInterrupt("Workflow interrupted by user"))

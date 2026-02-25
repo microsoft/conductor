@@ -661,6 +661,8 @@ async def send_followup(
 
 ### Epic 4: Engine Interrupt Integration (Between-Agent)
 
+**Status:** DONE
+
 **Goal:** Wire the interrupt event check into `_execute_loop()` and handle all `InterruptResult` actions.
 
 **Prerequisites:** Epic 1, Epic 2, Epic 3
@@ -669,24 +671,26 @@ async def send_followup(
 
 | Task ID | Type | Description | Files | Status |
 |---------|------|-------------|-------|--------|
-| E4-T1 | IMPL | Add `interrupt_event` parameter to `WorkflowEngine.__init__()`. Store as `self._interrupt_event`. Create `InterruptHandler` instance (stored as `self._interrupt_handler`), passing `skip_gates` to its constructor. | `src/conductor/engine/workflow.py` | TO DO |
-| E4-T2 | IMPL | Add `_check_interrupt()` async method to `WorkflowEngine`. Checks `self._interrupt_event.is_set()`. If set: clear event, build output preview from last stored output (truncated), call `self._interrupt_handler.handle_interrupt()` with current agent, iteration, preview, list of top-level agent names (excluding parallel/for-each nested agents), and accumulated guidance. Return `InterruptResult`. | `src/conductor/engine/workflow.py` | TO DO |
-| E4-T3 | IMPL | Insert interrupt check in `_execute_loop()` at the end of the while loop body, after route evaluation and before the next iteration. Handle all actions: `CONTINUE` calls `self.context.add_guidance(result.guidance)`, `SKIP` sets `current_agent_name = result.skip_target`, `STOP` raises `InterruptError(agent_name=current_agent_name)`, `CANCEL` is a no-op. On `STOP`, the existing `ConductorError` handler will save a checkpoint. | `src/conductor/engine/workflow.py` | TO DO |
-| E4-T4 | IMPL | Handle interrupt queuing for parallel/for-each groups: if interrupt fires during parallel/for-each execution, defer handling until after the group completes (check at the same point as regular agents). | `src/conductor/engine/workflow.py` | TO DO |
-| E4-T5 | IMPL | Update `run_workflow_async()` and `resume_workflow_async()` to pass `interrupt_event` to `WorkflowEngine()` constructor. For `resume`, accumulated guidance from the checkpoint is preserved (restored via `WorkflowContext.from_dict()`). | `src/conductor/cli/run.py` | TO DO |
-| E4-T6 | TEST | Integration test: mock interrupt event, verify engine pauses and calls handler, verify guidance is injected, verify skip changes next agent, verify stop raises InterruptError, verify cancel continues normally, verify Ctrl+C still works (KeyboardInterrupt is distinct from InterruptError). | `tests/test_engine/test_workflow_interrupt.py` | TO DO |
-| E4-T7 | TEST | Test interrupt queuing: fire interrupt during parallel group, verify it is handled after group completes. | `tests/test_engine/test_workflow_interrupt.py` | TO DO |
+| E4-T1 | IMPL | Add `interrupt_event` parameter to `WorkflowEngine.__init__()`. Store as `self._interrupt_event`. Create `InterruptHandler` instance (stored as `self._interrupt_handler`), passing `skip_gates` to its constructor. | `src/conductor/engine/workflow.py` | DONE |
+| E4-T2 | IMPL | Add `_check_interrupt()` async method to `WorkflowEngine`. Checks `self._interrupt_event.is_set()`. If set: clear event, build output preview from last stored output (truncated), call `self._interrupt_handler.handle_interrupt()` with current agent, iteration, preview, list of top-level agent names (excluding parallel/for-each nested agents), and accumulated guidance. Return `InterruptResult`. | `src/conductor/engine/workflow.py` | DONE |
+| E4-T3 | IMPL | Insert interrupt check in `_execute_loop()` at the end of the while loop body, after route evaluation and before the next iteration. Handle all actions: `CONTINUE` calls `self.context.add_guidance(result.guidance)`, `SKIP` sets `current_agent_name = result.skip_target`, `STOP` raises `InterruptError(agent_name=current_agent_name)`, `CANCEL` is a no-op. On `STOP`, the existing `ConductorError` handler will save a checkpoint. | `src/conductor/engine/workflow.py` | DONE |
+| E4-T4 | IMPL | Handle interrupt queuing for parallel/for-each groups: if interrupt fires during parallel/for-each execution, defer handling until after the group completes (check at the same point as regular agents). | `src/conductor/engine/workflow.py` | DONE |
+| E4-T5 | IMPL | Update `run_workflow_async()` and `resume_workflow_async()` to pass `interrupt_event` to `WorkflowEngine()` constructor. For `resume`, accumulated guidance from the checkpoint is preserved (restored via `WorkflowContext.from_dict()`). | `src/conductor/cli/run.py` | DONE |
+| E4-T6 | TEST | Integration test: mock interrupt event, verify engine pauses and calls handler, verify guidance is injected, verify skip changes next agent, verify stop raises InterruptError, verify cancel continues normally, verify Ctrl+C still works (KeyboardInterrupt is distinct from InterruptError). | `tests/test_engine/test_workflow_interrupt.py` | DONE |
+| E4-T7 | TEST | Test interrupt queuing: fire interrupt during parallel group, verify it is handled after group completes. | `tests/test_engine/test_workflow_interrupt.py` | DONE |
 
 **Acceptance Criteria:**
-- [ ] Engine pauses on interrupt event between agents
-- [ ] All four actions (continue, skip, stop, cancel) behave correctly
-- [ ] Guidance from "continue" action persists for subsequent agents
-- [ ] Skip-to-agent overrides normal routing
-- [ ] Stop raises `InterruptError` with checkpoint saved
-- [ ] Interrupts during parallel/for-each are deferred to after group completion
-- [ ] No interrupt check when `interrupt_event` is None (backward compatible)
-- [ ] Ctrl+C behavior unchanged (KeyboardInterrupt, not InterruptError)
-- [ ] All tests pass
+- [x] Engine pauses on interrupt event between agents
+- [x] All four actions (continue, skip, stop, cancel) behave correctly
+- [x] Guidance from "continue" action persists for subsequent agents
+- [x] Skip-to-agent overrides normal routing
+- [x] Stop raises `InterruptError` with checkpoint saved
+- [x] Interrupts during parallel/for-each are deferred to after group completion
+- [x] No interrupt check when `interrupt_event` is None (backward compatible)
+- [x] Ctrl+C behavior unchanged (KeyboardInterrupt, not InterruptError)
+- [x] All tests pass
+
+**Completion Notes:** Added `InterruptHandler` creation in `WorkflowEngine.__init__()`, `_check_interrupt()` and `_handle_interrupt_result()` methods, and `_get_top_level_agent_names()` helper. Interrupt checks are placed at the end of the main while loop body (after route evaluation for regular agents, parallel groups, and for-each groups) and before the `continue` for script steps. Human gates are excluded per spec (user is already interacting). Parallel/for-each groups naturally defer interrupts because the check only occurs after the group completes. 25 tests cover all four actions, guidance accumulation, skip routing, checkpoint save on stop, backward compatibility, and parallel group queuing. E4-T5 was already implemented in Epic 1 (CLI already passes `interrupt_event` to `WorkflowEngine`).
 
 ---
 
