@@ -1,4 +1,4 @@
-.PHONY: install install-cli dev test test-cov lint format typecheck check clean build all
+.PHONY: install install-cli dev test test-cov lint format typecheck check clean build all build-frontend dev-frontend
 
 # Default target
 all: check test
@@ -61,3 +61,11 @@ validate-examples:
 		echo "Validating $$file..."; \
 		uv run conductor validate "$$file" || exit 1; \
 	done
+
+# Build frontend dashboard (output to src/conductor/web/static/)
+build-frontend:
+	cd src/conductor/web/frontend && npm install && npm run build
+
+# Run frontend dev server (with proxy to FastAPI backend)
+dev-frontend:
+	cd src/conductor/web/frontend && npm run dev

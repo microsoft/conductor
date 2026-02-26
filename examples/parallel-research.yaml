@@ -21,12 +21,13 @@ workflow:
     provider: copilot
     default_model: gpt-5.2
     mcp_servers:
-      # Note: The Copilot CLI has a bug where 'env' vars in MCP server
-      # configs are not passed to MCP server subprocesses.
-      # See: https://github.com/github/copilot-sdk/issues/163
       web-search:
-        command: sh
-        args: ["-c", "MODE=stdio DEFAULT_SEARCH_ENGINE=duckduckgo exec npx -y open-websearch@latest"]
+        command: npx
+        args: ["-y", "open-websearch@latest"]
+        env:
+          MODE: stdio
+          DEFAULT_SEARCH_ENGINE: duckduckgo
+          ALLOWED_SEARCH_ENGINES: duckduckgo,brave,exa
         tools: ["*"]
 
   input:

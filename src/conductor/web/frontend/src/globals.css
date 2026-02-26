@@ -1,0 +1,175 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:is(.dark *));
+
+:root {
+  --bg: #0a0a0f;
+  --bg-subtle: #111118;
+  --surface: #16161e;
+  --surface-hover: #1c1c26;
+  --surface-raised: #1e1e28;
+  --border: #2a2a3a;
+  --border-subtle: #222233;
+  --text: #e4e4ef;
+  --text-secondary: #a0a0b8;
+  --text-muted: #6b6b80;
+
+  /* Status colors */
+  --pending: #52525b;
+  --running: #3b82f6;
+  --running-glow: #3b82f680;
+  --completed: #22c55e;
+  --completed-muted: #22c55e40;
+  --failed: #ef4444;
+  --failed-muted: #ef444440;
+  --waiting: #f59e0b;
+  --waiting-muted: #f59e0b40;
+  --skipped: #6b7280;
+
+  /* Accent */
+  --accent: #6366f1;
+  --accent-muted: #6366f140;
+
+  /* Graph */
+  --node-bg: #1e1e2a;
+  --node-border: #2e2e42;
+  --edge-color: #2e2e42;
+  --edge-active: #3b82f6;
+  --edge-taken: #22c55e;
+  --minimap-bg: #0d0d14;
+  --minimap-mask: #ffffff10;
+  --minimap-node: #3b82f680;
+
+  /* Font */
+  --font-sans: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono",
+    monospace;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+}
+
+body {
+  font-family: var(--font-sans);
+  background: var(--bg);
+  color: var(--text);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* React Flow overrides */
+.react-flow__background {
+  background: var(--bg) !important;
+}
+
+.react-flow__minimap {
+  background: var(--minimap-bg) !important;
+  border: 1px solid var(--border) !important;
+  border-radius: 8px !important;
+}
+
+.react-flow__controls {
+  border: 1px solid var(--border) !important;
+  border-radius: 8px !important;
+  overflow: hidden;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4) !important;
+}
+
+.react-flow__controls-button {
+  background: var(--surface) !important;
+  border: none !important;
+  border-bottom: 1px solid var(--border) !important;
+  color: var(--text-secondary) !important;
+  fill: var(--text-secondary) !important;
+  width: 32px !important;
+  height: 32px !important;
+}
+
+.react-flow__controls-button:hover {
+  background: var(--surface-hover) !important;
+  color: var(--text) !important;
+  fill: var(--text) !important;
+}
+
+.react-flow__controls-button:last-child {
+  border-bottom: none !important;
+}
+
+/* Pulse animation for running nodes */
+@keyframes pulse-ring {
+  0% {
+    box-shadow: 0 0 0 0 var(--running-glow);
+  }
+  70% {
+    box-shadow: 0 0 0 6px transparent;
+  }
+  100% {
+    box-shadow: 0 0 0 0 transparent;
+  }
+}
+
+@keyframes subtle-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.7;
+  }
+}
+
+/* Edge animation */
+@keyframes dash-flow {
+  to {
+    stroke-dashoffset: -20;
+  }
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-muted);
+}
+
+/* Resizable panels handle */
+[data-panel-group-direction="horizontal"] > [data-resize-handle-active] {
+  background-color: var(--accent) !important;
+}
+
+[data-panel-group-direction="vertical"] > [data-resize-handle-active] {
+  background-color: var(--accent) !important;
+}
+
+[data-resize-handle] {
+  background-color: var(--border) !important;
+  transition: background-color 150ms ease;
+}
+
+[data-resize-handle]:hover {
+  background-color: var(--text-muted) !important;
+}

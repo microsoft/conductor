@@ -4,7 +4,7 @@ This module provides the ``WebDashboard`` class that runs a FastAPI+uvicorn
 server in-process as an asyncio task.  It subscribes to the
 ``WorkflowEventEmitter``, accumulates event history for late-joiners,
 broadcasts events to connected WebSocket clients, and serves the
-single-file Cytoscape.js frontend.
+React frontend built from ``frontend/`` into ``static/``.
 
 Example::
 
@@ -28,6 +28,7 @@ from typing import Any
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from conductor.events import WorkflowEvent, WorkflowEventEmitter
 
@@ -44,7 +45,7 @@ class WebDashboard:
 
     Subscribes to a ``WorkflowEventEmitter``, accumulates event history,
     and broadcasts events over WebSocket to connected browsers.  Serves
-    a single-file HTML frontend at ``GET /``.
+    a React frontend at ``GET /`` with hashed JS/CSS assets.
 
     Args:
         emitter: The event emitter to subscribe to.
@@ -142,6 +143,11 @@ class WebDashboard:
             finally:
                 self._connections.discard(ws)
                 self._maybe_start_grace_timer()
+
+        # Mount static assets (Vite build output: hashed JS/CSS bundles)
+        assets_dir = _STATIC_DIR / "assets"
+        if assets_dir.is_dir():
+            app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
 
         return app
 

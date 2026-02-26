@@ -77,3 +77,6 @@ dmypy.json
 # OS
 .DS_Store
 Thumbs.db
+
+# Frontend
+src/conductor/web/frontend/node_modules/

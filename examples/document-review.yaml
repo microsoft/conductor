@@ -44,8 +44,12 @@ workflow:
     default_model: claude-opus-4.6
     mcp_servers:
       web-search:
-        command: sh
-        args: ["-c", "MODE=stdio DEFAULT_SEARCH_ENGINE=duckduckgo exec npx -y open-websearch@latest"]
+        command: npx
+        args: ["-y", "open-websearch@latest"]
+        env:
+          MODE: stdio
+          DEFAULT_SEARCH_ENGINE: duckduckgo
+          ALLOWED_SEARCH_ENGINES: duckduckgo,brave,exa
         tools: ["*"]
       context7:
         command: npx
