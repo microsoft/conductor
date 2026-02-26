@@ -1,0 +1,332 @@
+# Web Dashboard Test Workflow
+#
+# A workflow designed to exercise many Conductor features so you can
+# visually verify the web dashboard. It includes:
+# - Linear agent chain
+# - Parallel group (3 agents running concurrently)
+# - Conditional routing / branching
+# - Loop-back pattern with iteration
+# - Script step
+# - Human gate
+# - For-each dynamic parallel group
+#
+# Usage:
+#   conductor run examples/web-dashboard-test.yaml --web --input topic="distributed systems"
+#
+# Background mode (prints URL and exits):
+#   conductor run examples/web-dashboard-test.yaml --web-bg --input topic="distributed systems"
+#
+# Skip human gates for fully automated run:
+#   conductor run examples/web-dashboard-test.yaml --web --skip-gates --input topic="distributed systems"
+
+workflow:
+  name: web-dashboard-test
+  description: Multi-feature workflow for testing the web dashboard
+  version: "1.0.0"
+  entry_point: check_env
+
+  runtime:
+    provider: copilot
+    default_model: gpt-4.1
+
+  input:
+    topic:
+      type: string
+      required: true
+      description: A topic to research and analyze
+
+  context:
+    mode: accumulate
+
+  limits:
+    max_iterations: 25
+    timeout_seconds: 300
+
+  cost:
+    show_summary: true
+
+# ── Parallel group ──────────────────────────────────────────────
+parallel:
+  - name: parallel_analysts
+    description: Three analysts research the topic concurrently
+    agents:
+      - pros_analyst
+      - cons_analyst
+      - history_analyst
+    failure_mode: continue_on_error
+    routes:
+      - to: synthesizer
+
+# ── For-each group ──────────────────────────────────────────────
+for_each:
+  - name: deep_dive_items
+    type: for_each
+    description: Deep-dive into each sub-topic identified by the synthesizer
+    source: synthesizer.output.subtopics
+    as: subtopic
+    max_concurrent: 3
+    failure_mode: continue_on_error
+    agent:
+      name: deep_diver
+      model: gpt-4.1
+      tools: []
+      prompt: |
+        You are a subject-matter expert. Write a concise 2-3 sentence
+        deep-dive on this sub-topic of "{{ workflow.input.topic }}":
+
+        Sub-topic: {{ subtopic }}
+      output:
+        subtopic:
+          type: string
+          description: The sub-topic examined
+        insight:
+          type: string
+          description: The deep-dive insight
+    routes:
+      - to: final_report
+
+# ── Agents ──────────────────────────────────────────────────────
+agents:
+  # 0. Script step – quick env check
+  - name: check_env
+    type: script
+    description: Verify runtime environment
+    command: echo
+    args: ["Dashboard test workflow starting — environment OK"]
+    routes:
+      - to: planner
+        when: "exit_code == 0"
+      - to: planner   # always continue
+
+  # 1. Planner – kicks things off
+  - name: planner
+    description: Creates a research plan for the topic
+    model: gpt-4.1
+    tools: []
+    input:
+      - workflow.input.topic
+      - check_env.output
+    prompt: |
+      You are a research planner. The user wants to explore:
+
+      Topic: {{ workflow.input.topic }}
+
+      Create a short research plan with 3 angles to investigate
+      (pros, cons, history). Keep it to 2-3 sentences per angle.
+    output:
+      plan:
+        type: object
+        description: The research plan
+      ready:
+        type: boolean
+        description: Whether the plan is ready to execute
+    routes:
+      - to: parallel_analysts
+        when: "{{ output.ready }}"
+      - to: parallel_analysts   # fallback – always proceed
+
+  # ── Parallel analysts ────────────────────────────────────────
+  - name: pros_analyst
+    description: Researches advantages and benefits
+    model: gpt-4.1
+    tools: []
+    input:
+      - workflow.input.topic
+      - planner.output
+    prompt: |
+      Topic: {{ workflow.input.topic }}
+      Plan: {{ planner.output.plan }}
+
+      List 3 key advantages or benefits of this topic. Be concise (1-2 sentences each).
+    output:
+      points:
+        type: array
+        description: List of advantage points
+      summary:
+        type: string
+        description: One-line summary
+
+  - name: cons_analyst
+    description: Researches disadvantages and risks
+    model: gpt-4.1
+    tools: []
+    input:
+      - workflow.input.topic
+      - planner.output
+    prompt: |
+      Topic: {{ workflow.input.topic }}
+      Plan: {{ planner.output.plan }}
+
+      List 3 key disadvantages or risks of this topic. Be concise (1-2 sentences each).
+    output:
+      points:
+        type: array
+        description: List of risk/disadvantage points
+      summary:
+        type: string
+        description: One-line summary
+
+  - name: history_analyst
+    description: Researches the history and evolution
+    model: gpt-4.1
+    tools: []
+    input:
+      - workflow.input.topic
+      - planner.output
+    prompt: |
+      Topic: {{ workflow.input.topic }}
+      Plan: {{ planner.output.plan }}
+
+      Give a brief 3-point timeline of this topic's history and evolution.
+    output:
+      timeline:
+        type: array
+        description: Key historical milestones
+      summary:
+        type: string
+        description: One-line summary
+
+  # 3. Synthesizer – merges parallel outputs, may loop
+  - name: synthesizer
+    description: Combines parallel research into a coherent analysis
+    model: gpt-4.1
+    tools: []
+    input:
+      - workflow.input.topic
+      - parallel_analysts.outputs
+      - quality_checker.output?
+    prompt: |
+      You are an expert synthesizer. Combine the following research on
+      "{{ workflow.input.topic }}" into a coherent analysis.
+
+      **Pros:**
+      {{ parallel_analysts.outputs.pros_analyst.summary }}
+
+      **Cons:**
+      {{ parallel_analysts.outputs.cons_analyst.summary }}
+
+      **History:**
+      {{ parallel_analysts.outputs.history_analyst.summary }}
+
+      {% if quality_checker is defined and quality_checker.output %}
+      **Quality feedback to address:**
+      {{ quality_checker.output.feedback }}
+
+      Please revise your synthesis to address this feedback.
+      {% endif %}
+
+      Also identify 3 interesting sub-topics worth a deeper look.
+    output:
+      synthesis:
+        type: string
+        description: Combined analysis
+      subtopics:
+        type: array
+        description: 3 sub-topics for deeper investigation
+      quality_score:
+        type: number
+        description: Self-assessed quality 1-10
+    routes:
+      - to: quality_checker
+
+  # 4. Quality checker – may loop back to synthesizer
+  - name: quality_checker
+    description: Evaluates synthesis quality, may request revision
+    model: gpt-4.1
+    tools: []
+    input:
+      - synthesizer.output
+    prompt: |
+      Review this synthesis for quality and completeness:
+
+      {{ synthesizer.output.synthesis }}
+
+      Score it 1-10. If score < 7, provide specific feedback for improvement.
+    output:
+      score:
+        type: number
+        description: Quality score 1-10
+      approved:
+        type: boolean
+        description: Whether the synthesis passes quality review
+      feedback:
+        type: string
+        description: Feedback for improvement (if any)
+    routes:
+      - to: human_review
+        when: "{{ output.approved }}"
+      - to: synthesizer
+        when: "score < 7"
+      - to: human_review
+
+  # 5. Human gate
+  - name: human_review
+    type: human_gate
+    description: Human reviews the synthesis before deep-dive
+    prompt: |
+      ## Research Synthesis Review
+
+      **Topic:** {{ workflow.input.topic }}
+
+      **Quality Score:** {{ quality_checker.output.score }}/10
+
+      **Synthesis:**
+      {{ synthesizer.output.synthesis }}
+
+      **Proposed sub-topics for deep-dive:**
+      {% for st in synthesizer.output.subtopics %}
+      - {{ st }}
+      {% endfor %}
+    options:
+      - label: Approve & Deep-Dive
+        value: approved
+        route: deep_dive_items
+      - label: Revise Synthesis
+        value: revise
+        route: synthesizer
+        prompt_for: feedback
+      - label: Skip to Report
+        value: skip
+        route: final_report
+
+  # 6. Final report
+  - name: final_report
+    description: Produces the final report from all gathered insights
+    model: gpt-4.1
+    tools: []
+    input:
+      - workflow.input.topic
+      - synthesizer.output
+      - deep_dive_items.outputs?
+    prompt: |
+      Produce a final report on "{{ workflow.input.topic }}".
+
+      **Main synthesis:**
+      {{ synthesizer.output.synthesis }}
+
+      {% if deep_dive_items is defined and deep_dive_items.outputs %}
+      **Deep-dive insights:**
+      {% for item in deep_dive_items.outputs %}
+      - {{ item.subtopic }}: {{ item.insight }}
+      {% endfor %}
+      {% endif %}
+
+      Write a well-structured final report with sections:
+      1. Executive Summary (2-3 sentences)
+      2. Key Findings
+      3. Conclusion
+    output:
+      report:
+        type: object
+        description: The complete final report
+      title:
+        type: string
+        description: Report title
+    routes:
+      - to: $end
+
+# ── Final output ────────────────────────────────────────────────
+output:
+  title: "{{ final_report.output.title }}"
+  report: "{{ final_report.output.report }}"
+  quality_score: "{{ quality_checker.output.score }}"
