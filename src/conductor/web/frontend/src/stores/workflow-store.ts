@@ -35,6 +35,21 @@ export interface ActivityEntry {
   detail?: string | null;
 }
 
+export interface IterationSnapshot {
+  iteration: number;
+  prompt?: string;
+  output?: unknown;
+  elapsed?: number;
+  model?: string;
+  tokens?: number;
+  input_tokens?: number;
+  output_tokens?: number;
+  cost_usd?: number;
+  activity: ActivityEntry[];
+  error_type?: string;
+  error_message?: string;
+}
+
 export interface NodeData {
   name: string;
   status: NodeStatus;
@@ -67,6 +82,8 @@ export interface NodeData {
   failure_count?: number;
   // Activity
   activity: ActivityEntry[];
+  // Iteration history (snapshots of completed previous iterations)
+  iterationHistory?: IterationSnapshot[];
 }
 
 export interface GroupProgress {
@@ -335,9 +352,34 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
   agent_started: (state, _data) => {
     const data = _data as unknown as AgentStartedData;
     const nd = ensureNode(state.nodes, data.agent_name);
+
+    // Snapshot previous iteration before clearing
+    if (nd.iteration != null && (nd.output != null || nd.error_type != null)) {
+      if (!nd.iterationHistory) nd.iterationHistory = [];
+      nd.iterationHistory.push({
+        iteration: nd.iteration,
+        prompt: nd.prompt,
+        output: nd.output,
+        elapsed: nd.elapsed,
+        model: nd.model,
+        tokens: nd.tokens,
+        input_tokens: nd.input_tokens,
+        output_tokens: nd.output_tokens,
+        cost_usd: nd.cost_usd,
+        activity: nd.activity,
+        error_type: nd.error_type,
+        error_message: nd.error_message,
+      });
+    }
+
     nd.status = 'running';
     nd.iteration = data.iteration;
     nd.activity = [];
+    // Clear stale fields from previous iteration
+    nd.prompt = undefined;
+    nd.output = undefined;
+    nd.error_type = undefined;
+    nd.error_message = undefined;
   },
 
   agent_completed: (state, _data) => {
