@@ -176,7 +176,7 @@ export function WorkflowGraph() {
         minZoom={0.2}
         maxZoom={2}
         proOptions={{ hideAttribution: true }}
-        nodesDraggable={false}
+        nodesDraggable
         nodesConnectable={false}
         elementsSelectable={true}
       >
