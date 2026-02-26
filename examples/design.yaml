@@ -1,21 +1,23 @@
-# Design & Plan Workflow
+# Design Workflow
 #
-# This workflow creates a comprehensive solution design with implementation plan.
-# It mirrors the /design and /plan command patterns featuring:
-# - Architect agent (Opus 1M) for deep research, design, and actionable planning
-# - Technical Reviewer (Opus 1M) for accuracy, feasibility, and completeness
-# - Readability Reviewer (Gemini) for structure, clarity, and audience fit
-# - Loop-back pattern for refinement until quality thresholds are met
+# This workflow creates a high-level solution design document that is closely
+# grounded in the codebase. Unlike the plan workflow (which produces actionable
+# implementation plans with epics and tasks), this workflow focuses on
+# architectural decisions, trade-offs, alternatives considered, and design
+# rationale — suitable for cross-team alignment and technical review.
 #
-# The plan passes through two independent review cycles:
+# The design passes through two independent review cycles:
 #   1. Technical Reviewer — validates accuracy, feasibility, and completeness
 #   2. Readability Reviewer — ensures clarity, structure, and audience fit
 #
 # Usage:
-#   conductor run workflows/plan.yaml --input purpose="Build a user authentication system with OAuth2"
+#   conductor run workflows/design.yaml --input purpose="Migrate authentication from session-based to JWT tokens"
+#
+# With explicit output path:
+#   conductor run workflows/design.yaml --input purpose="..." --input output_path="docs/auth-migration.design.md"
 #
 # With verbose output:
-#   conductor -V run workflows/plan.yaml --input purpose="..."
+#   conductor -V run workflows/design.yaml --input purpose="..."
 #
 # Flow:
 #   architect → technical_reviewer
@@ -23,8 +25,8 @@
 #       → $end
 
 workflow:
-  name: plan
-  description: Create a comprehensive solution design with implementation plan based on requirements
+  name: design
+  description: Create a high-level solution design document grounded in the codebase, with technical and readability review cycles
   version: "1.0.0"
   entry_point: architect
 
@@ -47,43 +49,53 @@ workflow:
         type: http
         url: https://learn.microsoft.com/api/mcp
         tools: ["*"]
-
+        
   input:
     purpose:
       type: string
       required: true
       description: A clear description of the feature, change, or initiative to design
-      
+    output_path:
+      type: string
+      required: false
+      description: Optional file path for the design document (e.g. docs/my-feature.design.md)
+
   context:
     mode: explicit
 
   limits:
     max_iterations: 50
-    # timeout_seconds is unlimited by default
 
 agents:
   - name: architect
-    description: Creates or refines the solution design and implementation plan based on requirements and feedback
+    description: Researches the codebase and broader context, then authors a high-level solution design document
     model: claude-opus-4.6-1m
     input:
       - workflow.input.purpose
+      - workflow.input.output_path?
       - architect.output?
       - technical_reviewer.output?
       - readability_reviewer.output?
     system_prompt: |
-      You are a Software Architect agent. You analyze requirements deeply, design solutions, 
-      and produce clear technical documentation with actionable implementation plans.
+      You are a Principal Software Architect. You analyze requirements deeply, research the
+      existing codebase, and produce clear, high-level technical design documents focused
+      on architecture, decisions, and rationale.
 
       Your core capabilities include:
       - Designing scalable, maintainable architectures
-      - Identifying architectural patterns and dependencies
-      - Creating thorough, well-structured technical docs
-      - Documenting APIs, edge cases, and limitations
-      - Breaking complex designs into discrete, actionable epics
-      - Identifying file changes, dependencies, and prerequisites
-      - Creating task breakdowns with effort estimates
+      - Analyzing existing codebases to ground designs in reality
+      - Identifying architectural patterns, trade-offs, and alternatives
+      - Writing precise, fact-based design documents for cross-team alignment
+      - Documenting APIs, data flows, and component interactions
+      - Identifying risks, dependencies, and open questions
+
+      Your documents are:
+      - High-level but grounded in the actual codebase (not abstract hand-waving)
+      - Focused on *what* and *why*, not implementation-level *how*
+      - Structured for engineering and architecture audiences
+      - Honest about trade-offs, risks, and open questions
     prompt: |
-      Create a comprehensive solution design based on the following purpose:
+      Create a high-level solution design document based on the following purpose:
 
       **Purpose:** {{ workflow.input.purpose }}
 
@@ -119,67 +131,106 @@ agents:
       Preserve content that is satisfactory.
       {% endif %}
 
-      **Research**
+      ---
 
-      Before drafting the design:
-      - Perform deep research of the relevant portions of the codebase.
-      - Identify existing components, patterns, and dependencies.
-      - Search the web for context on technologies, best practices, and similar designs.
+      ## Phase 1: Research
 
-      **Design**
+      Before drafting the design, perform thorough research:
 
-      Create a solution design document with the following sections:
+      ### Codebase Analysis
+      - Explore the relevant portions of the codebase deeply
+      - Identify existing components, patterns, abstractions, and conventions
+      - Understand the current architecture and how data flows
+      - Map out dependencies between components
+      - Note any technical debt or constraints that affect the design
 
-      ## 1. Problem Statement
-      Describe the problem this solution addresses.
+      ### External Research
+      - Search the web for context on relevant technologies and best practices
+      - Research similar designs and architectural patterns
+      - Look up documentation for key libraries, frameworks, or protocols involved
+      - Identify industry standards or conventions that apply
 
-      ## 2. Goals and Non-Goals
-      List specific, measurable outcomes and explicit exclusions.
+      ---
 
-      ## 3. Requirements
-      Define functional and non-functional requirements.
+      ## Phase 2: Design Document
 
-      ## 4. Solution Architecture
-      Provide:
-      - Overview of the solution approach
-      - Key components and their responsibilities
-      - Data flow description
-      - API contracts (if applicable)
+      Write the design document with the following sections:
 
-      ## 5. Dependencies
-      List external and internal dependencies.
+      ### Executive Summary
+      One paragraph describing the proposal, its motivation, and expected outcome.
 
-      ## 6. Risk Assessment
-      Identify risks with likelihood, impact, and mitigation strategies.
+      ### Background
+      - Current state of the system and relevant architecture
+      - Context that motivates this design (why now, what changed)
+      - Prior art or related work in the codebase
 
-      ## 7. Implementation Phases
-      Break down the implementation into logical phases with exit criteria.
+      ### Problem Statement
+      Clearly define the problem(s) this design addresses. Be specific about
+      pain points, limitations, or gaps in the current system.
 
-      ## 8. Files Affected
-      ### New Files
-      | File Path | Purpose |
-      |-----------|---------||
+      ### Goals and Non-Goals
+      **Goals** — specific, measurable outcomes this design aims to achieve.
+      **Non-Goals** — explicit exclusions to keep scope focused.
 
-      ### Modified Files
-      | File Path | Changes |
-      |-----------|---------|
+      ### Proposed Design
 
-      ### Deleted Files
-      | File Path | Reason |
-      |-----------|--------|
+      Provide the core of the design:
+      - **Architecture Overview** — high-level component diagram and how pieces fit together
+      - **Key Components** — each major component with its responsibilities and interfaces
+      - **Data Flow** — how data moves through the system for key operations
+      - **API Contracts** — public interfaces, protocols, or contracts (if applicable)
+      - **Design Decisions** — key decisions made and the rationale behind each
 
-      ## 9. Implementation Plan
+      ### Alternatives Considered *(optional)*
+      For each significant design decision, describe:
+      - What alternatives were evaluated
+      - Pros and cons of each
+      - Why the chosen approach was selected
 
-      For each epic, provide:
-      - **Goal**: What this epic achieves
-      - **Prerequisites**: Dependencies on other epics
-      - **Tasks**: Table with Task ID, Type (IMPL/TEST), Description, Files, and Status (TO DO/IN PROGRESS/DONE)
-      - **Acceptance Criteria**: Checkboxes for completion
+      Include this section when the design involves non-obvious choices between
+      viable approaches. Skip if the solution is straightforward.
 
-      Keep epics focused—ideally affecting no more than 7 files and completable within 1-2 weeks.
-      Tests should be created alongside implementation tasks.
+      ### Dependencies *(optional)*
+      - External dependencies (libraries, services, infrastructure)
+      - Internal dependencies (other components, teams, systems)
+      - Sequencing constraints (what must happen before this design can proceed)
 
-      Be thorough, specific, and ensure the design is actionable.
+      Include this section when the design introduces new dependencies or has
+      meaningful coordination requirements. Skip if dependencies are trivial.
+
+      ### Impact Analysis *(optional)*
+      - Components and areas of the codebase affected
+      - Backward compatibility considerations
+      - Performance implications
+      - Operational impact (deployment, monitoring, debugging)
+
+      Include this section when the design touches multiple components or has
+      compatibility/performance implications. Skip for isolated changes.
+
+      ### Security Considerations *(optional)*
+      - Authentication, authorization, and access control implications
+      - Data protection and privacy concerns
+      - Attack surface changes
+
+      Include this section when the design affects security boundaries, handles
+      sensitive data, or changes the attack surface. Skip if not applicable.
+
+      ### Risks and Mitigations *(optional)*
+      Table with: Risk, Likelihood (Low/Medium/High), Impact (Low/Medium/High), Mitigation.
+
+      Include this section when the design carries meaningful technical, operational,
+      or schedule risks. Skip for low-risk changes.
+
+      ### Open Questions
+      Items requiring further discussion, investigation, or decision from stakeholders.
+
+      ### References
+      Links to relevant documentation, prior art, RFCs, or external resources.
+
+      ---
+
+      Be thorough and specific. Ground every claim in evidence from the codebase or research.
+      Avoid vague or aspirational language — if something is uncertain, call it out as an open question.
 
       ---
 
@@ -188,9 +239,9 @@ agents:
       {% if technical_reviewer is defined or readability_reviewer is defined %}
       After revising the document, provide a concise summary of what you changed and why
       in your `revision_notes` output. Structure it as a bullet list, e.g.:
-      - Corrected dependency versions per technical reviewer feedback
-      - Rewrote Problem Statement for clarity per readability feedback
-      - Added missing risk mitigation for data migration
+      - Corrected gRPC version numbers per technical reviewer feedback
+      - Rewrote Executive Summary for clarity per readability feedback
+      - Added missing risk mitigation for database migration
 
       This helps reviewers understand what changed.
       {% else %}
@@ -201,17 +252,24 @@ agents:
 
       ## SAVING THE DOCUMENT
 
-      After creating the design document, save it to a file using the following naming convention:
+      After creating the design document, save it to a file.
 
-      - If the purpose input references a document path, derive the name from that document and save it in the same directory. Examples:
-        - `upgrade-database-v2.brainstorm.md` -> `upgrade-database-v2.plan.md`
-        - `add-user-authentication.md` -> `add-user-authentication.plan.md`
-      - Otherwise, use the following guidelines:
+      {% if workflow.input.output_path %}
+      Save the document to: `{{ workflow.input.output_path }}`
+      {% else %}
+      Choose a file path using the following convention:
+
+      - If the purpose input references a document path, derive the name from that document
+        and save it in the same directory. Examples:
+        - `upgrade-database-v2.brainstorm.md` → `upgrade-database-v2.design.md`
+        - `add-user-authentication.md` → `add-user-authentication.design.md`
+      - Otherwise:
         - Save the document in the current working directory.
-        - Use the following naming convention: `[purpose]-[component].plan.md`
+        - Use the naming convention: `[descriptive-slug].design.md`
         - Examples:
-          - `upgrade-database-v2.plan.md`
-          - `add-user-authentication.plan.md`
+          - `jwt-authentication-migration.design.md`
+          - `event-sourcing-pipeline.design.md`
+      {% endif %}
     output:
       file_path:
         type: string
@@ -223,7 +281,7 @@ agents:
       - to: technical_reviewer
 
   - name: technical_reviewer
-    description: Reviews the plan for technical accuracy, feasibility, and completeness
+    description: Reviews the design document for technical accuracy, feasibility, and completeness
     model: claude-opus-4.6-1m
     input:
       - workflow.input.purpose
@@ -231,8 +289,8 @@ agents:
       - architect.output.revision_notes
     system_prompt: |
       You are a Senior Engineering Reviewer with broad expertise in software architecture,
-      distributed systems, and cloud-native development. You review design and planning
-      documents for technical accuracy, feasibility, and completeness.
+      distributed systems, and .NET/cloud-native development. You review design documents
+      for technical accuracy, feasibility, and completeness.
 
       You are especially attentive to:
       - Factual accuracy of technical claims (versions, API names, compatibility)
@@ -240,18 +298,17 @@ agents:
       - Completeness of the problem analysis and proposed solution
       - Soundness of design decisions and whether alternatives were fairly evaluated
       - Practical feasibility of the proposed architecture
-      - Whether the implementation plan is actionable and properly sequenced
       - Whether risks are realistically assessed
     prompt: |
-      Review the plan document for **technical accuracy and completeness**.
+      Review the design document for **technical accuracy and completeness**.
 
       **Original Purpose:**
       {{ workflow.input.purpose }}
 
-      **Plan Document Location:**
+      **Design Document Location:**
       {{ architect.output.file_path }}
 
-      Read the plan document from the file path above.
+      Read the design document from the file path above.
 
       {% if architect.output.revision_notes and architect.output.revision_notes != "Initial draft." %}
       **Architect's Revision Notes:**
@@ -284,10 +341,9 @@ agents:
       | **Completeness** | Are all aspects of the problem addressed? Are there gaps? |
       | **Design Soundness** | Are the architectural decisions well-reasoned and defensible? |
       | **Alternatives Analysis** | Were alternatives fairly evaluated with honest trade-offs? |
+      | **Impact Analysis** | Are all affected components identified? Are side effects considered? |
       | **Risk Assessment** | Are risks realistic? Are mitigations concrete and actionable? |
       | **Feasibility** | Can this design actually be implemented given the existing system? |
-      | **Plan Actionability** | Are epics properly scoped, sequenced, and actionable? |
-      | **Dependency Management** | Are prerequisites clearly identified between epics? |
 
       Do NOT evaluate structure, readability, or formatting — a separate reviewer handles that.
 
@@ -317,7 +373,7 @@ agents:
       - to: readability_reviewer
 
   - name: readability_reviewer
-    description: Reviews the plan for structure, clarity, and readability
+    description: Reviews the design document for structure, clarity, and readability
     model: gemini-3.1-pro-preview
     input:
       - workflow.input.purpose
@@ -326,26 +382,26 @@ agents:
       - technical_reviewer.output
     system_prompt: |
       You are a Senior Technical Writer and Document Reviewer. You specialize in
-      evaluating design and planning documents for structure, clarity, and readability.
-      You ensure documents are well-organized, appropriately detailed for their audience,
-      and ready for cross-team review.
+      evaluating design documents for structure, clarity, and readability. You ensure
+      documents are well-organized, appropriately detailed for their audience, and
+      ready for cross-team review.
 
       You focus on:
       - Document structure and logical flow
       - Clarity of writing and precision of language
       - Appropriate detail level for the target audience
       - Effective use of tables, diagrams, lists, and section organization
-      - Whether the implementation plan is clearly structured and easy to follow
+      - Whether decision points and open questions are clearly framed
     prompt: |
-      Review the plan document for **structure, clarity, and readability**.
+      Review the design document for **structure, clarity, and readability**.
 
       **Original Purpose:**
       {{ workflow.input.purpose }}
 
-      **Plan Document Location:**
+      **Design Document Location:**
       {{ architect.output.file_path }}
 
-      Read the plan document from the file path above.
+      Read the design document from the file path above.
 
       **Technical Review Status:** This document scored {{ technical_reviewer.output.score }}/100
       on technical accuracy.
@@ -363,18 +419,20 @@ agents:
       ## Expected Document Structure
 
       The document should contain the following sections:
-      1. Problem Statement
-      2. Goals and Non-Goals
-      3. Requirements (functional and non-functional)
-      4. Solution Architecture (overview, components, data flow, API contracts)
-      5. Dependencies
-      6. Risk Assessment
-      7. Implementation Phases
-      8. Files Affected (new, modified, deleted)
-      9. Implementation Plan (epics with tasks, acceptance criteria)
+      1. Executive Summary (one paragraph)
+      2. Background (current state, motivation, prior art)
+      3. Problem Statement (specific problems being solved)
+      4. Goals and Non-Goals
+      5. Proposed Design (architecture overview, key components, data flow, API contracts, design decisions)
+      6. Alternatives Considered *(optional — include when non-obvious choices exist)*
+      7. Dependencies *(optional — include when new or cross-team dependencies exist)*
+      8. Impact Analysis *(optional — include for multi-component or compatibility-sensitive changes)*
+      9. Security Considerations *(optional — include when security boundaries are affected)*
+      10. Risks and Mitigations *(optional — include for meaningful risks)*
+      11. Open Questions
+      12. References
 
-      The audience is engineers and architects involved in the design review,
-      and developers or AI agents who will execute the implementation plan.
+      The audience is engineers and architects involved in the design review.
 
       ---
 
@@ -387,11 +445,11 @@ agents:
       | **Document Structure** | Does it follow the expected sections? Is information logically organized? |
       | **Clarity** | Is the writing clear, precise, and free of ambiguity? |
       | **Audience Fit** | Is the detail level appropriate for engineers and architects? |
+      | **Decision Framing** | Are design decisions and open questions clearly framed with context? |
       | **Cohesion** | Does the document read as a unified work with connected sections? |
       | **Formatting** | Are tables, lists, diagrams, and code references used effectively? |
-      | **Plan Readability** | Are epics, tasks, and acceptance criteria clearly structured and easy to follow? |
-      | **Traceability** | Do tasks trace back to requirements and design goals? |
-      | **Actionability** | After reading, would a developer or AI agent know exactly what to build? |
+      | **Executive Summary** | Does it convey the problem, approach, and outcome in one paragraph? |
+      | **Actionability** | After reading, would reviewers know exactly what to evaluate and decide? |
 
       Do NOT evaluate technical correctness — that has been handled by a separate reviewer.
 
@@ -422,7 +480,7 @@ agents:
 
 output:
   purpose: "{{ workflow.input.purpose }}"
-  plan_file: "{{ architect.output.file_path }}"
+  design_file: "{{ architect.output.file_path }}"
   technical_review_score: "{{ technical_reviewer.output.score }}"
   readability_review_score: "{{ readability_reviewer.output.score }}"
   technical_review_feedback: "{{ technical_reviewer.output.feedback }}"

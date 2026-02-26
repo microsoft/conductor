@@ -28,6 +28,26 @@ workflow:
   version: "2.0.0"
   entry_point: coder
 
+  runtime:
+    provider: copilot
+    mcp_servers:
+      web-search:
+        command: npx
+        args: ["-y", "open-websearch@latest"]
+        env:
+          MODE: stdio
+          DEFAULT_SEARCH_ENGINE: duckduckgo
+          ALLOWED_SEARCH_ENGINES: duckduckgo,brave,exa
+        tools: ["*"]
+      context7:
+        command: npx
+        args: ["-y", "@upstash/context7-mcp@latest"]
+        tools: ["*"]
+      ms-learn:
+        type: http
+        url: https://learn.microsoft.com/api/mcp
+        tools: ["*"]
+        
   input:
     plan:
       type: string
@@ -48,7 +68,7 @@ workflow:
 agents:
   - name: coder
     description: Performs deep research, analysis, and implements code changes
-    model: claude-opus-4.5
+    model: claude-opus-4.6-1m
     input:
       - workflow.input.plan
       - workflow.input.epic?
@@ -103,7 +123,7 @@ agents:
          - If a specific epic was requested, focus only on that epic
          - If continuing from a previous epic, implement the next epic
          - Otherwise, find the FIRST epic that is NOT marked as DONE
-           - Scan epics in order (EPIC-001, EPIC-002, etc.)
+           - Scan epics in order (EPIC-001, EPIC-002, etc.). Consider all epics in the plan, across all sections, phases, etc.
            - Select the first one with status "NOT STARTED" or "IN PROGRESS"
            - Skip any epics already marked as "DONE"
          - Check prerequisites/dependencies between epics
@@ -177,7 +197,7 @@ agents:
 
   - name: epic_reviewer
     description: Reviews the implementation for a single epic
-    model: claude-opus-4.5
+    model: claude-sonnet-4.6
     input:
       - coder.output
     system_prompt: |
@@ -265,7 +285,7 @@ agents:
 
   - name: committer
     description: Commits the changes and updates the plan document
-    model: claude-sonnet-4.5
+    model: claude-sonnet-4.6
     input:
       - workflow.input.plan
       - coder.output
@@ -370,7 +390,7 @@ agents:
 
   - name: plan_reviewer
     description: Reviews the entire implementation plan and all commits holistically
-    model: claude-opus-4.5-latest
+    model: claude-opus-4.6-1m
     input:
       - workflow.input.plan
       - coder.output
@@ -473,7 +493,7 @@ agents:
 
   - name: fixer
     description: Fixes issues identified by the plan reviewer
-    model: claude-opus-4.5-latest
+    model: claude-sonnet-4.6
     input:
       - workflow.input.plan
       - coder.output
