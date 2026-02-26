@@ -35,7 +35,7 @@ export function AgentDetail({ node }: AgentDetailProps) {
 
       {/* Prompt */}
       {node.prompt && (
-        <OutputViewer output={node.prompt} title="Input / Prompt" defaultExpanded={false} />
+        <OutputViewer output={node.prompt} title="Input / Prompt" defaultExpanded={true} />
       )}
 
       {/* Activity stream */}

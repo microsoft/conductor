@@ -978,8 +978,9 @@ async def run_workflow_async(
                     await dashboard.wait_for_clients_disconnect()
                 else:
                     _verbose_console.print(
-                        f"[bold cyan]Dashboard running at {dashboard.url}. "
-                        f"Press Ctrl+C to stop.[/bold cyan]"
+                        f"\n[bold green]Workflow complete.[/bold green] "
+                        f"Dashboard still running at {dashboard.url} — "
+                        f"press [bold]Ctrl+C[/bold] to exit."
                     )
                     with contextlib.suppress(asyncio.CancelledError):
                         await asyncio.Event().wait()

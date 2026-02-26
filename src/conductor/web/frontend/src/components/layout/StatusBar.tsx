@@ -1,4 +1,4 @@
-import { Wifi, WifiOff, Loader2 } from 'lucide-react';
+import { Wifi, WifiOff, Loader2, Coins, Hash } from 'lucide-react';
 import { useWorkflowStore } from '@/stores/workflow-store';
 import { useElapsedTimer } from '@/hooks/use-elapsed-timer';
 import { cn } from '@/lib/utils';
@@ -7,6 +7,8 @@ export function StatusBar() {
   const workflowStatus = useWorkflowStore((s) => s.workflowStatus);
   const agentsCompleted = useWorkflowStore((s) => s.agentsCompleted);
   const agentsTotal = useWorkflowStore((s) => s.agentsTotal);
+  const totalCost = useWorkflowStore((s) => s.totalCost);
+  const totalTokens = useWorkflowStore((s) => s.totalTokens);
   const wsStatus = useWorkflowStore((s) => s.wsStatus);
   const workflowFailure = useWorkflowStore((s) => s.workflowFailure);
   const elapsed = useElapsedTimer();
@@ -81,6 +83,18 @@ export function StatusBar() {
       )}
       {workflowStatus !== 'pending' && (
         <span className="text-[var(--text-muted)] font-mono">{elapsed}</span>
+      )}
+      {totalTokens > 0 && (
+        <span className="flex items-center gap-1 text-[var(--text-muted)]" title="Total tokens used">
+          <Hash className="w-3 h-3" />
+          <span className="font-mono">{totalTokens.toLocaleString()}</span>
+        </span>
+      )}
+      {totalCost > 0 && (
+        <span className="flex items-center gap-1 text-[var(--text-muted)]" title="Total cost">
+          <Coins className="w-3 h-3" />
+          <span className="font-mono">${totalCost.toFixed(4)}</span>
+        </span>
       )}
       <span className="flex-1" />
       {wsIndicator}

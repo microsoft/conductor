@@ -62,12 +62,12 @@ function ActivityEntryRow({ entry }: { entry: ActivityEntry }) {
           {entry.label}
         </span>
         <span className={cn('break-words', typeColors[entry.type] || 'text-[var(--text)]')}>
-          {entry.text}
+          {typeof entry.text === 'object' ? JSON.stringify(entry.text) : entry.text}
         </span>
       </div>
       {entry.detail && (
         <div className="mt-1 ml-[4.25rem] px-2 py-1 bg-[var(--bg)] rounded text-[10px] font-mono text-[var(--text-muted)] whitespace-pre-wrap break-words max-h-24 overflow-y-auto">
-          {entry.detail}
+          {typeof entry.detail === 'object' ? JSON.stringify(entry.detail, null, 2) : entry.detail}
         </div>
       )}
     </div>

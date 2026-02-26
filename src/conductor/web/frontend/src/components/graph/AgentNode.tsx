@@ -1,20 +1,36 @@
-import { memo } from 'react';
+import { memo, useMemo } from 'react';
 import { Handle, Position, type NodeProps } from '@xyflow/react';
 import { Bot } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { NODE_STATUS_HEX } from '@/lib/constants';
+import { useWorkflowStore } from '@/stores/workflow-store';
 import type { GraphNodeData } from './graph-layout';
 import type { NodeStatus } from '@/lib/constants';
 
-export const AgentNode = memo(function AgentNode({ data, selected }: NodeProps) {
+export const AgentNode = memo(function AgentNode({ data, id, selected }: NodeProps) {
   const nodeData = data as unknown as GraphNodeData;
   const status = (nodeData.status || 'pending') as NodeStatus;
   const borderColor = NODE_STATUS_HEX[status] || NODE_STATUS_HEX.pending;
+
+  const elapsed = useWorkflowStore((s) => s.nodes[id]?.elapsed);
+  const model = useWorkflowStore((s) => s.nodes[id]?.model);
+  const tokens = useWorkflowStore((s) => s.nodes[id]?.tokens);
+  const costUsd = useWorkflowStore((s) => s.nodes[id]?.cost_usd);
+
+  const tooltip = useMemo(() => {
+    const parts: string[] = [`Status: ${status}`];
+    if (elapsed != null) parts.push(`Elapsed: ${formatSec(elapsed)}`);
+    if (model) parts.push(`Model: ${model}`);
+    if (tokens != null) parts.push(`Tokens: ${tokens.toLocaleString()}`);
+    if (costUsd != null) parts.push(`Cost: $${costUsd.toFixed(4)}`);
+    return parts.join('\n');
+  }, [status, elapsed, model, tokens, costUsd]);
 
   return (
     <>
       <Handle type="target" position={Position.Top} className="!bg-[var(--border)] !border-none !w-2 !h-2" />
       <div
+        title={tooltip}
         className={cn(
           'flex items-center gap-2 px-3 py-2 rounded-lg border-2 bg-[var(--node-bg)] min-w-[140px] max-w-[200px] transition-all duration-300',
           selected && 'ring-2 ring-[var(--accent)] ring-offset-1 ring-offset-[var(--bg)]',
@@ -37,3 +53,11 @@ export const AgentNode = memo(function AgentNode({ data, selected }: NodeProps) 
     </>
   );
 });
+
+function formatSec(s: number): string {
+  if (s < 1) return `${(s * 1000).toFixed(0)}ms`;
+  if (s < 60) return `${s.toFixed(1)}s`;
+  const m = Math.floor(s / 60);
+  const sec = (s % 60).toFixed(0);
+  return `${m}m ${sec}s`;
+}

@@ -14,7 +14,12 @@ export function GateDetail({ node }: GateDetailProps) {
   const items: Array<{ label: string; value: string | number | null | undefined }> = [];
   if (node.selected_option) items.push({ label: 'Selected', value: node.selected_option });
   if (node.route) items.push({ label: 'Route', value: node.route });
-  if (node.additional_input) items.push({ label: 'Input', value: node.additional_input });
+  if (node.additional_input) {
+    const inputStr = typeof node.additional_input === 'object'
+      ? JSON.stringify(node.additional_input)
+      : node.additional_input;
+    items.push({ label: 'Input', value: inputStr });
+  }
 
   return (
     <div className="space-y-4">

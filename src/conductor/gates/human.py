@@ -6,6 +6,7 @@ for user selection via Rich interactive prompts.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -146,10 +147,12 @@ class HumanGateHandler:
         for i, option in enumerate(options, 1):
             self.console.print(f"  [cyan][{i}][/cyan] {option.label}")
 
-        # Get user selection
+        # Get user selection — run in thread to avoid blocking the event loop
+        # (blocking here prevents the web dashboard from updating)
         valid_choices = [str(i) for i in range(1, len(options) + 1)]
         while True:
-            choice = Prompt.ask(
+            choice = await asyncio.to_thread(
+                Prompt.ask,
                 "\n[bold]Select option[/bold]",
                 choices=valid_choices,
                 show_choices=True,
@@ -178,7 +181,7 @@ class HumanGateHandler:
         """
         self.console.print()
         self.console.print(f"[bold]Please provide {field_name}:[/bold]")
-        value = Prompt.ask(f"  {field_name}")
+        value = await asyncio.to_thread(Prompt.ask, f"  {field_name}")
         return {field_name: value}
 
     def _auto_select(self, option: GateOption) -> GateResult:
@@ -350,7 +353,8 @@ class MaxIterationsHandler:
         """
         self.console.print()
         try:
-            value = IntPrompt.ask(
+            value = await asyncio.to_thread(
+                IntPrompt.ask,
                 "[bold]How many more iterations would you like to allow?[/bold]",
                 default=0,
             )

@@ -148,6 +148,8 @@ interface WorkflowState {
   // Counters
   agentsCompleted: number;
   agentsTotal: number;
+  totalCost: number;
+  totalTokens: number;
 
   // UI state
   selectedNode: string | null;
@@ -196,6 +198,8 @@ export const useWorkflowStore = create<WorkflowState>((set) => ({
   highlightedEdges: [],
   agentsCompleted: 0,
   agentsTotal: 0,
+  totalCost: 0,
+  totalTokens: 0,
   selectedNode: null,
   wsStatus: 'connecting',
   eventLog: [],
@@ -226,6 +230,8 @@ export const useWorkflowStore = create<WorkflowState>((set) => ({
       const newState: WorkflowState = {
         ...state,
         agentsCompleted: 0,
+        totalCost: 0,
+        totalTokens: 0,
         nodes: {},
         groupProgress: {},
         highlightedEdges: [],
@@ -347,6 +353,8 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     nd.cost_usd = data.cost_usd;
     nd.output = data.output;
     nd.output_keys = data.output_keys;
+    if (data.cost_usd) state.totalCost += data.cost_usd;
+    if (data.tokens) state.totalTokens += data.tokens;
   },
 
   agent_failed: (state, _data) => {
@@ -490,6 +498,8 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     nd.model = data.model;
     nd.tokens = data.tokens;
     nd.cost_usd = data.cost_usd;
+    if (data.cost_usd) state.totalCost += data.cost_usd;
+    if (data.tokens) state.totalTokens += data.tokens;
   },
 
   parallel_agent_failed: (state, _data) => {
@@ -557,6 +567,8 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     if (state.nodes['$end']) {
       state.nodes['$end']!.status = 'completed';
     }
+    // Clear flowing-dot edge animations now that workflow is done
+    state.highlightedEdges = [];
   },
 
   workflow_failed: (state, _data) => {
@@ -566,6 +578,8 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
       state.nodes[data.agent_name]!.status = 'failed';
     }
     state.workflowFailure = { error_type: data.error_type, message: data.message };
+    // Clear flowing-dot edge animations now that workflow is done
+    state.highlightedEdges = [];
   },
 };
 

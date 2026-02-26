@@ -7,6 +7,7 @@ import {
   BackgroundVariant,
   useNodesState,
   useEdgesState,
+  useReactFlow,
   type Node,
   type Edge,
   type NodeTypes,
@@ -24,6 +25,7 @@ import { EndNode } from './EndNode';
 import { AnimatedEdge } from './AnimatedEdge';
 import { NODE_STATUS_HEX } from '@/lib/constants';
 import type { NodeStatus } from '@/lib/constants';
+import { Loader2, Maximize } from 'lucide-react';
 
 const nodeTypes: NodeTypes = {
   agentNode: AgentNode,
@@ -69,6 +71,7 @@ export function WorkflowGraph() {
   const groupProgress = useWorkflowStore((s) => s.groupProgress);
   const selectNode = useWorkflowStore((s) => s.selectNode);
   const selectedNode = useWorkflowStore((s) => s.selectedNode);
+  const workflowStatus = useWorkflowStore((s) => s.workflowStatus);
 
   const [flowNodes, setFlowNodes, onNodesChange] = useNodesState<Node<GraphNodeData>>([]);
   const [flowEdges, setFlowEdges, onEdgesChange] = useEdgesState<Edge>([]);
@@ -158,9 +161,19 @@ export function WorkflowGraph() {
     );
   }, [selectedNode, setFlowNodes]);
 
+  const showEmptyState = workflowStatus === 'pending' && agents.length === 0;
+
   return (
     <div className="w-full h-full relative">
       <EdgeMarkers />
+      {showEmptyState && (
+        <div className="absolute inset-0 z-10 flex flex-col items-center justify-center pointer-events-none">
+          <Loader2 className="w-8 h-8 text-[var(--text-muted)] animate-spin mb-3 opacity-40" />
+          <p className="text-sm text-[var(--text-muted)] animate-pulse">
+            Waiting for workflow&hellip;
+          </p>
+        </div>
+      )}
       <ReactFlow
         nodes={flowNodes}
         edges={flowEdges}
@@ -188,8 +201,49 @@ export function WorkflowGraph() {
           pannable
           zoomable
         />
-        <Controls showInteractive={false} />
+        <Controls showInteractive={false}>
+          <FitViewButton />
+        </Controls>
+        <FitViewKeyboardShortcut />
       </ReactFlow>
     </div>
   );
+}
+
+/** Inner component that uses useReactFlow (must be inside ReactFlow) */
+function FitViewButton() {
+  const { fitView } = useReactFlow();
+
+  const handleFitView = useCallback(() => {
+    fitView({ padding: 0.2, duration: 300 });
+  }, [fitView]);
+
+  return (
+    <button
+      onClick={handleFitView}
+      className="react-flow__controls-button"
+      title="Fit view (F)"
+      style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+    >
+      <Maximize className="w-3.5 h-3.5" />
+    </button>
+  );
+}
+
+function FitViewKeyboardShortcut() {
+  const { fitView } = useReactFlow();
+
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      const tag = (e.target as HTMLElement)?.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+      if (e.key === 'f' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        fitView({ padding: 0.2, duration: 300 });
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [fitView]);
+
+  return null;
 }

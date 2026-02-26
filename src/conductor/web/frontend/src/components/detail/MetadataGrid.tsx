@@ -14,7 +14,9 @@ export function MetadataGrid({ items }: MetadataGridProps) {
       {filtered.map(({ label, value }) => (
         <div key={label} className="contents">
           <dt className="text-[var(--text-muted)] whitespace-nowrap">{label}</dt>
-          <dd className="text-[var(--text)] break-words">{String(value)}</dd>
+          <dd className="text-[var(--text)] break-words">
+            {typeof value === 'object' ? JSON.stringify(value) : String(value)}
+          </dd>
         </div>
       ))}
     </dl>

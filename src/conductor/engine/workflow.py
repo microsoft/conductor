@@ -1140,7 +1140,9 @@ class WorkflowEngine:
                                 {
                                     "agent_name": agent.name,
                                     "options": [o.value for o in (agent.options or [])],
-                                    "prompt": agent.prompt,
+                                    "prompt": self.renderer.render(
+                                        agent.prompt, agent_context
+                                    ),
                                 },
                             )
 

@@ -3,16 +3,20 @@ import { Handle, Position, type NodeProps } from '@xyflow/react';
 import { GitBranch, Repeat } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { NODE_STATUS_HEX } from '@/lib/constants';
+import { useWorkflowStore } from '@/stores/workflow-store';
 import type { GraphNodeData } from './graph-layout';
 import type { NodeStatus } from '@/lib/constants';
 
-export const GroupNode = memo(function GroupNode({ data, selected }: NodeProps) {
+export const GroupNode = memo(function GroupNode({ data, id, selected }: NodeProps) {
   const nodeData = data as unknown as GraphNodeData;
-  const status = (nodeData.status || 'pending') as NodeStatus;
-  const borderColor = NODE_STATUS_HEX[status] || NODE_STATUS_HEX.pending;
   const isForEach = nodeData.type === 'for_each_group';
   const Icon = isForEach ? Repeat : GitBranch;
   const progress = nodeData.progress;
+
+  // Subscribe to store status directly so we always reflect the latest state
+  const storeStatus = useWorkflowStore((s) => s.nodes[id]?.status);
+  const status = (storeStatus || nodeData.status || 'pending') as NodeStatus;
+  const borderColor = NODE_STATUS_HEX[status] || NODE_STATUS_HEX.pending;
 
   const progressText = progress
     ? `${progress.completed + progress.failed}/${progress.total}${progress.failed > 0 ? ` (${progress.failed} failed)` : ''}`

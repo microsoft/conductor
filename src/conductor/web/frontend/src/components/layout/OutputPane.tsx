@@ -1,9 +1,16 @@
-import { useRef, useEffect, useState, useCallback } from 'react';
-import { TerminalSquare, FileOutput, Activity, ChevronDown, ChevronUp, Copy, Check } from 'lucide-react';
+import { useRef, useEffect, useState, useCallback, useMemo } from 'react';
+import { TerminalSquare, FileOutput, Activity, ChevronDown, ChevronUp, Copy, Check, Search, X } from 'lucide-react';
 import { useWorkflowStore, type LogEntry, type ActivityLogEntry } from '@/stores/workflow-store';
 import { formatOutput, cn } from '@/lib/utils';
 
 type Tab = 'log' | 'activity' | 'output';
+
+/** Safely convert any value to a display string */
+function toStr(v: unknown): string {
+  if (v == null) return '';
+  if (typeof v === 'string') return v;
+  try { return JSON.stringify(v, null, 2); } catch { return String(v); }
+}
 
 export function OutputPane() {
   const eventLog = useWorkflowStore((s) => s.eventLog);
@@ -13,6 +20,26 @@ export function OutputPane() {
   const [activeTab, setActiveTab] = useState<Tab>('log');
   const [isCollapsed, setIsCollapsed] = useState(false);
 
+  // Track "seen" counts for unread badges
+  const [seenLogCount, setSeenLogCount] = useState(0);
+  const [seenActivityCount, setSeenActivityCount] = useState(0);
+
+  // When switching to a tab, mark its entries as seen
+  const handleTabChange = useCallback((tab: Tab) => {
+    setActiveTab(tab);
+    if (tab === 'log') setSeenLogCount(eventLog.length);
+    if (tab === 'activity') setSeenActivityCount(activityLog.length);
+  }, [eventLog.length, activityLog.length]);
+
+  // Update seen counts when tab is active and new entries arrive
+  useEffect(() => {
+    if (activeTab === 'log') setSeenLogCount(eventLog.length);
+  }, [activeTab, eventLog.length]);
+
+  useEffect(() => {
+    if (activeTab === 'activity') setSeenActivityCount(activityLog.length);
+  }, [activeTab, activityLog.length]);
+
   // Auto-switch to output tab when workflow completes with output
   useEffect(() => {
     if (workflowStatus === 'completed' && workflowOutput != null) {
@@ -21,6 +48,9 @@ export function OutputPane() {
   }, [workflowStatus, workflowOutput]);
 
   const hasOutput = workflowOutput != null;
+
+  const logUnread = activeTab !== 'log' ? Math.max(0, eventLog.length - seenLogCount) : 0;
+  const activityUnread = activeTab !== 'activity' ? Math.max(0, activityLog.length - seenActivityCount) : 0;
 
   if (isCollapsed) {
     return (
@@ -47,21 +77,23 @@ export function OutputPane() {
         <div className="flex items-center gap-0.5">
           <TabButton
             active={activeTab === 'log'}
-            onClick={() => setActiveTab('log')}
+            onClick={() => handleTabChange('log')}
             icon={<TerminalSquare className="w-3 h-3" />}
             label="Log"
             count={eventLog.length}
+            unread={logUnread}
           />
           <TabButton
             active={activeTab === 'activity'}
-            onClick={() => setActiveTab('activity')}
+            onClick={() => handleTabChange('activity')}
             icon={<Activity className="w-3 h-3" />}
             label="Activity"
             count={activityLog.length}
+            unread={activityUnread}
           />
           <TabButton
             active={activeTab === 'output'}
-            onClick={() => setActiveTab('output')}
+            onClick={() => handleTabChange('output')}
             icon={<FileOutput className="w-3 h-3" />}
             label="Output"
             badge={hasOutput ? (workflowStatus === 'failed' ? 'error' : 'success') : undefined}
@@ -99,6 +131,7 @@ function TabButton({
   label,
   count,
   badge,
+  unread,
 }: {
   active: boolean;
   onClick: () => void;
@@ -106,12 +139,13 @@ function TabButton({
   label: string;
   count?: number;
   badge?: 'success' | 'error';
+  unread?: number;
 }) {
   return (
     <button
       onClick={onClick}
       className={cn(
-        'flex items-center gap-1.5 px-3 py-1.5 text-xs transition-colors border-b-2 -mb-px',
+        'relative flex items-center gap-1.5 px-3 py-1.5 text-xs transition-colors border-b-2 -mb-px',
         active
           ? 'text-[var(--text)] border-[var(--accent)]'
           : 'text-[var(--text-muted)] border-transparent hover:text-[var(--text-secondary)]',
@@ -129,6 +163,14 @@ function TabButton({
             badge === 'success' ? 'bg-[var(--completed)]' : 'bg-[var(--failed)]',
           )}
         />
+      )}
+      {/* Unread indicator dot */}
+      {!active && unread != null && unread > 0 && (
+        <span className="absolute -top-0.5 -right-0.5 flex h-3.5 min-w-[14px] items-center justify-center rounded-full bg-[var(--accent)] px-1">
+          <span className="text-[8px] font-bold text-white leading-none tabular-nums">
+            {unread > 99 ? '99+' : unread}
+          </span>
+        </span>
       )}
     </button>
   );
@@ -149,6 +191,7 @@ function ActivityView({ entries }: { entries: ActivityLogEntry[] }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const autoScrollRef = useRef(true);
   const selectNode = useWorkflowStore((s) => s.selectNode);
+  const [filter, setFilter] = useState('');
 
   const handleScroll = useCallback(() => {
     const el = scrollRef.current;
@@ -157,11 +200,21 @@ function ActivityView({ entries }: { entries: ActivityLogEntry[] }) {
     autoScrollRef.current = atBottom;
   }, []);
 
+  const filteredEntries = useMemo(() => {
+    if (!filter) return entries;
+    const lower = filter.toLowerCase();
+    return entries.filter(
+      (e) =>
+        e.source.toLowerCase().includes(lower) ||
+        toStr(e.message).toLowerCase().includes(lower),
+    );
+  }, [entries, filter]);
+
   useEffect(() => {
     if (scrollRef.current && autoScrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
-  }, [entries.length]);
+  }, [filteredEntries.length]);
 
   if (entries.length === 0) {
     return (
@@ -172,41 +225,75 @@ function ActivityView({ entries }: { entries: ActivityLogEntry[] }) {
   }
 
   return (
-    <div
-      ref={scrollRef}
-      onScroll={handleScroll}
-      className="h-full overflow-y-auto font-mono text-[11px] leading-[1.6] px-3 py-2"
-    >
-      {entries.map((entry, i) => {
-        const style = ACTIVITY_TYPE_STYLES[entry.type] || ACTIVITY_TYPE_STYLES.message;
-        const time = formatTimestamp(entry.timestamp);
+    <div className="h-full flex flex-col">
+      {/* Filter bar */}
+      <div className="flex items-center gap-2 px-3 py-1.5 border-b border-[var(--border-subtle)] flex-shrink-0">
+        <Search className="w-3 h-3 text-[var(--text-muted)] flex-shrink-0" />
+        <input
+          type="text"
+          value={filter}
+          onChange={(e) => setFilter(e.target.value)}
+          placeholder="Filter by agent or message…"
+          className="flex-1 bg-transparent text-[11px] text-[var(--text)] placeholder:text-[var(--text-muted)] outline-none min-w-0"
+        />
+        {filter && (
+          <>
+            <span className="text-[10px] text-[var(--text-muted)] tabular-nums flex-shrink-0">
+              {filteredEntries.length} of {entries.length}
+            </span>
+            <button
+              onClick={() => setFilter('')}
+              className="text-[var(--text-muted)] hover:text-[var(--text)] transition-colors flex-shrink-0"
+              title="Clear filter"
+            >
+              <X className="w-3 h-3" />
+            </button>
+          </>
+        )}
+      </div>
 
-        return (
-          <div key={i} className="group">
-            <div className="flex gap-1.5 hover:bg-[var(--surface-hover)] rounded px-1 -mx-1">
-              <span className="text-[var(--text-muted)] flex-shrink-0 select-none tabular-nums">{time}</span>
-              <span className={cn('flex-shrink-0 w-[5ch] text-[10px] font-semibold tabular-nums select-none', style!.labelColor)}>{style!.label}</span>
-              <button
-                onClick={() => selectNode(entry.source)}
-                className="text-[var(--text-secondary)] flex-shrink-0 min-w-[8ch] max-w-[16ch] truncate hover:text-[var(--accent)] hover:underline transition-colors text-left"
-                title={`Select ${entry.source}`}
-              >
-                {entry.source}
-              </button>
-              <span className={cn('break-words min-w-0', style!.color,
-                entry.type === 'reasoning' && 'italic',
-              )}>
-                {entry.message}
-              </span>
-            </div>
-            {entry.detail && (
-              <div className="ml-[calc(7ch+5ch+8ch+1rem)] px-2 py-1 my-0.5 bg-[var(--bg)] rounded text-[10px] text-[var(--text-muted)] whitespace-pre-wrap break-words max-h-24 overflow-y-auto border-l-2 border-[var(--border)]">
-                {entry.detail}
+      {/* Entries */}
+      <div
+        ref={scrollRef}
+        onScroll={handleScroll}
+        className="flex-1 overflow-y-auto font-mono text-[11px] leading-[1.6] px-3 py-2"
+      >
+        {filteredEntries.map((entry, i) => {
+          const style = ACTIVITY_TYPE_STYLES[entry.type] || ACTIVITY_TYPE_STYLES.message;
+          const time = formatTimestamp(entry.timestamp);
+
+          return (
+            <div key={i} className="group">
+              <div className="flex gap-1.5 hover:bg-[var(--surface-hover)] rounded px-1 -mx-1">
+                <span className="text-[var(--text-muted)] flex-shrink-0 select-none tabular-nums">{time}</span>
+                <span className={cn('flex-shrink-0 w-[5ch] text-[10px] font-semibold tabular-nums select-none', style!.labelColor)}>{style!.label}</span>
+                <button
+                  onClick={() => selectNode(entry.source)}
+                  className="text-[var(--text-secondary)] flex-shrink-0 min-w-[8ch] max-w-[16ch] truncate hover:text-[var(--accent)] hover:underline transition-colors text-left"
+                  title={`Select ${entry.source}`}
+                >
+                  {entry.source}
+                </button>
+                <span className={cn('break-words min-w-0', style!.color,
+                  entry.type === 'reasoning' && 'italic',
+                )}>
+                  {toStr(entry.message)}
+                </span>
               </div>
-            )}
+              {entry.detail && (
+                <div className="ml-[calc(7ch+5ch+8ch+1rem)] px-2 py-1 my-0.5 bg-[var(--bg)] rounded text-[10px] text-[var(--text-muted)] whitespace-pre-wrap break-words max-h-24 overflow-y-auto border-l-2 border-[var(--border)]">
+                  {toStr(entry.detail)}
+                </div>
+              )}
+            </div>
+          );
+        })}
+        {filter && filteredEntries.length === 0 && (
+          <div className="flex items-center justify-center py-4">
+            <p className="text-xs text-[var(--text-muted)]">No matches for "{filter}"</p>
           </div>
-        );
-      })}
+        )}
+      </div>
     </div>
   );
 }
@@ -224,6 +311,7 @@ const LEVEL_STYLES: Record<string, { color: string; icon: string }> = {
 function LogView({ entries }: { entries: LogEntry[] }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const autoScrollRef = useRef(true);
+  const selectNode = useWorkflowStore((s) => s.selectNode);
 
   const handleScroll = useCallback(() => {
     const el = scrollRef.current;
@@ -260,9 +348,15 @@ function LogView({ entries }: { entries: LogEntry[] }) {
           <div key={i} className="flex gap-2 hover:bg-[var(--surface-hover)] rounded px-1 -mx-1">
             <span className="text-[var(--text-muted)] flex-shrink-0 select-none tabular-nums">{time}</span>
             <span className={cn('flex-shrink-0 w-3 text-center select-none', style!.color)}>{style!.icon}</span>
-            <span className="text-[var(--text-secondary)] flex-shrink-0 min-w-[8ch] max-w-[16ch] truncate">{entry.source}</span>
+            <button
+              onClick={() => selectNode(entry.source)}
+              className="text-[var(--text-secondary)] flex-shrink-0 min-w-[8ch] max-w-[16ch] truncate hover:text-[var(--accent)] hover:underline transition-colors text-left"
+              title={`Select ${entry.source}`}
+            >
+              {entry.source}
+            </button>
             <span className={cn('break-words', entry.level === 'error' ? 'text-red-400' : entry.level === 'success' ? 'text-green-400' : 'text-[var(--text)]')}>
-              {entry.message}
+              {toStr(entry.message)}
             </span>
           </div>
         );

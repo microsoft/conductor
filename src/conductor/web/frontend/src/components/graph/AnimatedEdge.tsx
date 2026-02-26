@@ -1,6 +1,7 @@
 import { memo, useMemo } from 'react';
 import {
   BaseEdge,
+  EdgeLabelRenderer,
   getBezierPath,
   type EdgeProps,
 } from '@xyflow/react';
@@ -24,7 +25,7 @@ export const AnimatedEdge = memo(function AnimatedEdge({
     return highlightedEdges.find((e) => e.from === source && e.to === target);
   }, [highlightedEdges, source, target]);
 
-  const [edgePath] = getBezierPath({
+  const [edgePath, labelX, labelY] = getBezierPath({
     sourceX,
     sourceY,
     targetX,
@@ -33,7 +34,8 @@ export const AnimatedEdge = memo(function AnimatedEdge({
     targetPosition,
   });
 
-  const hasWhen = !!(data as Record<string, unknown> | undefined)?.when;
+  const whenExpr = (data as Record<string, unknown> | undefined)?.when as string | undefined;
+  const hasWhen = !!whenExpr;
   const isTaken = edgeHighlight?.state === 'taken';
   const isHighlighted = edgeHighlight?.state === 'highlighted';
 
@@ -66,6 +68,31 @@ export const AnimatedEdge = memo(function AnimatedEdge({
         }}
         markerEnd={`url(#arrow-${isTaken ? 'taken' : isHighlighted ? 'active' : 'default'})`}
       />
+      {/* Condition label for conditional edges */}
+      {hasWhen && (
+        <EdgeLabelRenderer>
+          <div
+            className="nodrag nopan"
+            style={{
+              position: 'absolute',
+              transform: `translate(-50%, -50%) translate(${labelX}px,${labelY}px)`,
+              pointerEvents: 'all',
+            }}
+          >
+            <span
+              className="inline-block px-1.5 py-0.5 rounded-full text-[9px] font-mono leading-tight max-w-[140px] truncate"
+              style={{
+                backgroundColor: isTaken ? 'var(--edge-taken)' : 'var(--surface)',
+                color: isTaken ? 'var(--bg)' : 'var(--text-muted)',
+                border: `1px solid ${isTaken ? 'var(--edge-taken)' : 'var(--border)'}`,
+              }}
+              title={whenExpr}
+            >
+              {whenExpr}
+            </span>
+          </div>
+        </EdgeLabelRenderer>
+      )}
       {/* Flowing dot animation for taken edges */}
       {isTaken && (
         <circle r="3" fill="var(--edge-taken)">
