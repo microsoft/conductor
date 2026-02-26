@@ -38,6 +38,7 @@ export function AgentDetail({ node }: AgentDetailProps) {
         <IterationSection
           label={`Iteration ${node.iteration ?? '?'} (current)`}
           defaultExpanded={true}
+          status={status}
           snapshot={{
             iteration: node.iteration ?? 0,
             prompt: node.prompt,
@@ -64,7 +65,7 @@ export function AgentDetail({ node }: AgentDetailProps) {
           )}
 
           {/* Activity stream */}
-          <ActivityStream activity={node.activity} />
+          <ActivityStream activity={node.activity} defaultExpanded={status !== 'completed'} />
 
           {/* Output */}
           {node.output != null && (
@@ -80,6 +81,7 @@ export function AgentDetail({ node }: AgentDetailProps) {
             key={snap.iteration}
             label={`Iteration ${snap.iteration}`}
             defaultExpanded={false}
+            status={status}
             snapshot={snap}
           />
         ))}
@@ -91,9 +93,10 @@ interface IterationSectionProps {
   label: string;
   defaultExpanded: boolean;
   snapshot: IterationSnapshot;
+  status: NodeStatus;
 }
 
-function IterationSection({ label, defaultExpanded, snapshot }: IterationSectionProps) {
+function IterationSection({ label, defaultExpanded, snapshot, status }: IterationSectionProps) {
   const [expanded, setExpanded] = useState(defaultExpanded);
 
   return (
@@ -125,7 +128,7 @@ function IterationSection({ label, defaultExpanded, snapshot }: IterationSection
           )}
 
           {/* Activity stream */}
-          <ActivityStream activity={snapshot.activity} />
+          <ActivityStream activity={snapshot.activity} defaultExpanded={defaultExpanded && status !== 'completed'} />
 
           {/* Output */}
           {snapshot.output != null && (

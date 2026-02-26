@@ -39,6 +39,7 @@ export type EventType =
 
 export interface WorkflowStartedData {
   name: string;
+  entry_point?: string;
   agents: Array<{ name: string; type?: string; model?: string }>;
   routes: Array<{ from: string; to: string; when?: string }>;
   parallel_groups?: Array<{ name: string; agents: string[] }>;

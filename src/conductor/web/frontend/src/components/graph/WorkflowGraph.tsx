@@ -22,6 +22,7 @@ import { ScriptNode } from './ScriptNode';
 import { GateNode } from './GateNode';
 import { GroupNode } from './GroupNode';
 import { EndNode } from './EndNode';
+import { StartNode } from './StartNode';
 import { AnimatedEdge } from './AnimatedEdge';
 import { NODE_STATUS_HEX } from '@/lib/constants';
 import type { NodeStatus } from '@/lib/constants';
@@ -33,6 +34,7 @@ const nodeTypes: NodeTypes = {
   gateNode: GateNode,
   groupNode: GroupNode,
   endNode: EndNode,
+  startNode: StartNode,
 };
 
 const edgeTypes: EdgeTypes = {
@@ -72,6 +74,7 @@ export function WorkflowGraph() {
   const selectNode = useWorkflowStore((s) => s.selectNode);
   const selectedNode = useWorkflowStore((s) => s.selectedNode);
   const workflowStatus = useWorkflowStore((s) => s.workflowStatus);
+  const entryPoint = useWorkflowStore((s) => s.entryPoint);
 
   const [flowNodes, setFlowNodes, onNodesChange] = useNodesState<Node<GraphNodeData>>([]);
   const [flowEdges, setFlowEdges, onEdgesChange] = useEdgesState<Edge>([]);
@@ -85,11 +88,11 @@ export function WorkflowGraph() {
     graphBuilt.current = true;
 
     const { nodes, edges } = buildGraphElements(
-      agents, routes, parallelGroups, forEachGroups, storeNodes, groupProgress
+      agents, routes, parallelGroups, forEachGroups, storeNodes, groupProgress, entryPoint
     );
     setFlowNodes(nodes);
     setFlowEdges(edges);
-  }, [agents, routes, parallelGroups, forEachGroups, storeNodes, groupProgress, setFlowNodes, setFlowEdges]);
+  }, [agents, routes, parallelGroups, forEachGroups, storeNodes, groupProgress, entryPoint, setFlowNodes, setFlowEdges]);
 
   // Update node data when store nodes change (status, progress, etc.)
   useEffect(() => {

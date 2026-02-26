@@ -5,10 +5,11 @@ import { cn } from '@/lib/utils';
 
 interface ActivityStreamProps {
   activity: ActivityEntry[];
+  defaultExpanded?: boolean;
 }
 
-export function ActivityStream({ activity }: ActivityStreamProps) {
-  const [expanded, setExpanded] = useState(true);
+export function ActivityStream({ activity, defaultExpanded = true }: ActivityStreamProps) {
+  const [expanded, setExpanded] = useState(defaultExpanded);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   // Auto-scroll on new entries

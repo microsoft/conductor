@@ -49,8 +49,7 @@ def create_implement_mock_handler(
                 return {
                     "plan_summary": "Test plan with epics",
                     "all_epics": [
-                        {"id": f"EPIC-{i:03d}", "status": "DONE"}
-                        for i in range(1, total_epics + 1)
+                        {"id": f"EPIC-{i:03d}", "status": "DONE"} for i in range(1, total_epics + 1)
                     ],
                     "current_epic": "",
                     "epic_details": "",
@@ -77,10 +76,10 @@ def create_implement_mock_handler(
 
         elif agent.name == "coder":
             # Extract epic from context
-            epic = "EPIC-???"
+            _epic = "EPIC-???"
             for line in rendered_prompt.split("\n"):
                 if "EPIC-" in line and "Implement" in line:
-                    epic = line.strip().split("**")[-2] if "**" in line else line.strip()
+                    _epic = line.strip().split("**")[-2] if "**" in line else line.strip()
                     break
 
             return {
@@ -121,9 +120,7 @@ def create_implement_mock_handler(
                 "epic_completed": f"EPIC-{current:03d}",
                 "commit_message": f"EPIC-{current:03d}: Implement feature {current}",
                 "plan_updated": True,
-                "remaining_epics": [
-                    f"EPIC-{i:03d}" for i in range(current + 1, total_epics + 1)
-                ],
+                "remaining_epics": [f"EPIC-{i:03d}" for i in range(current + 1, total_epics + 1)],
                 "all_complete": remaining == 0,
                 "next_epic": f"EPIC-{current + 1:03d}" if remaining > 0 else "",
             }
@@ -169,7 +166,7 @@ class TestImplementWorkflowFlow:
 
     @pytest.mark.asyncio
     async def test_single_epic_flow(self, implement_config) -> None:
-        """Test flow with 1 epic: selector → coder → reviewer → committer → selector → plan_reviewer."""
+        """Test flow with 1 epic: selector → coder → reviewer → committer."""
         mock_handler, agent_calls = create_implement_mock_handler(total_epics=1)
         provider = CopilotProvider(mock_handler=mock_handler)
         engine = WorkflowEngine(implement_config, provider)
@@ -179,9 +176,9 @@ class TestImplementWorkflowFlow:
         # Verify agent call sequence
         assert agent_calls == [
             "epic_selector",  # Selects EPIC-001
-            "coder",          # Implements EPIC-001
+            "coder",  # Implements EPIC-001
             "epic_reviewer",  # Reviews EPIC-001
-            "committer",      # Commits, reports all_complete=True
+            "committer",  # Commits, reports all_complete=True
             "plan_reviewer",  # Holistic review, approves
         ]
         assert result is not None
@@ -210,9 +207,7 @@ class TestImplementWorkflowFlow:
     @pytest.mark.asyncio
     async def test_epic_reviewer_reject_loops_to_coder(self, implement_config) -> None:
         """Test that REQUEST_CHANGES from epic_reviewer routes back to coder, not epic_selector."""
-        mock_handler, agent_calls = create_implement_mock_handler(
-            total_epics=1, reject_epic=1
-        )
+        mock_handler, agent_calls = create_implement_mock_handler(total_epics=1, reject_epic=1)
         provider = CopilotProvider(mock_handler=mock_handler)
         engine = WorkflowEngine(implement_config, provider)
 
@@ -221,13 +216,13 @@ class TestImplementWorkflowFlow:
         # Epic 1: selector → coder → reviewer (REJECT) → coder → reviewer (APPROVE) → committer
         # Then: plan_reviewer
         assert agent_calls == [
-            "epic_selector",   # Selects EPIC-001
-            "coder",           # Implements (first attempt)
-            "epic_reviewer",   # Rejects
-            "coder",           # Re-implements
-            "epic_reviewer",   # Approves
-            "committer",       # Commits, all_complete
-            "plan_reviewer",   # Holistic review
+            "epic_selector",  # Selects EPIC-001
+            "coder",  # Implements (first attempt)
+            "epic_reviewer",  # Rejects
+            "coder",  # Re-implements
+            "epic_reviewer",  # Approves
+            "committer",  # Commits, all_complete
+            "plan_reviewer",  # Holistic review
         ]
         assert result is not None
         await provider.close()

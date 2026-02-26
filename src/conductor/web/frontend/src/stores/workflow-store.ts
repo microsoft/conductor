@@ -148,6 +148,7 @@ interface WorkflowState {
   workflowStatus: WorkflowStatus;
   workflowStartTime: number | null;
   workflowFailure: { error_type?: string; message?: string } | null;
+  entryPoint: string | null;
 
   // Graph structure
   agents: WorkflowAgent[];
@@ -206,6 +207,7 @@ export const useWorkflowStore = create<WorkflowState>((set) => ({
   workflowStatus: 'pending',
   workflowStartTime: null,
   workflowFailure: null,
+  entryPoint: null,
   agents: [],
   routes: [],
   parallelGroups: [],
@@ -308,10 +310,15 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     state.workflowStatus = 'running';
     state.workflowStartTime = Date.now() / 1000;
     state.workflowName = data.name || '';
+    state.entryPoint = data.entry_point || null;
     state.agents = data.agents || [];
     state.routes = data.routes || [];
     state.parallelGroups = data.parallel_groups || [];
     state.forEachGroups = data.for_each_groups || [];
+
+    // Set $start node to running
+    ensureNode(state.nodes, '$start', 'start');
+    state.nodes['$start']!.status = 'running';
 
     const groupAgents = new Set<string>();
     const agentNames = new Set<string>();
@@ -609,6 +616,9 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     if (state.nodes['$end']) {
       state.nodes['$end']!.status = 'completed';
     }
+    if (state.nodes['$start']) {
+      state.nodes['$start']!.status = 'completed';
+    }
     // Clear flowing-dot edge animations now that workflow is done
     state.highlightedEdges = [];
   },
@@ -620,6 +630,9 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
       state.nodes[data.agent_name]!.status = 'failed';
     }
     state.workflowFailure = { error_type: data.error_type, message: data.message };
+    if (state.nodes['$start']) {
+      state.nodes['$start']!.status = 'completed';
+    }
     // Clear flowing-dot edge animations now that workflow is done
     state.highlightedEdges = [];
   },

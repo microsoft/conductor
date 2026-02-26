@@ -26,6 +26,7 @@ export function buildGraphElements(
   forEachGroups: ForEachGroup[],
   nodes: Record<string, NodeData>,
   groupProgress: Record<string, GroupProgress>,
+  entryPoint: string | null,
 ): { nodes: Node<GraphNodeData>[]; edges: Edge[] } {
   const flowNodes: Node<GraphNodeData>[] = [];
   const flowEdges: Edge[] = [];
@@ -147,6 +148,31 @@ export function buildGraphElements(
         type: 'end',
         status: nd?.status || 'pending',
       },
+    });
+  }
+
+  // Always add $start node if we have an entry point
+  if (entryPoint) {
+    const nd = nodes['$start'];
+    flowNodes.push({
+      id: '$start',
+      type: 'startNode',
+      position: { x: 0, y: 0 },
+      data: {
+        label: '$start',
+        type: 'start',
+        status: nd?.status || 'pending',
+      },
+    });
+
+    // Add edge from $start to entry point
+    flowEdges.push({
+      id: '$start->$entryPoint',
+      source: '$start',
+      target: entryPoint,
+      type: 'animatedEdge',
+      data: {},
+      animated: false,
     });
   }
 
