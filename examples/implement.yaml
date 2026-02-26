@@ -2,15 +2,17 @@
 #
 # This example demonstrates an implementation workflow that mirrors
 # the /implement command pattern. It shows:
-# - Coder agent (Opus 4.5) for deep research, analysis, and implementation
+# - Epic selector agent (Sonnet) for identifying the next epic to implement
+# - Coder agent (Opus) for deep research, analysis, and implementation
 # - Epic reviewer agent (Sonnet) for per-epic quality assessment
 # - Committer agent (Sonnet) for git commits and plan updates
-# - Plan reviewer agent (Opus 4.5) for holistic review of all changes
-# - Fixer agent (Opus 4.5) for addressing plan-level issues
+# - Plan reviewer agent (Opus) for holistic review of all changes
+# - Fixer agent (Sonnet) for addressing plan-level issues
 #
 # Architecture Decision:
-# - Opus 4.5 excels at deep reasoning, codebase analysis, and implementation
-# - Sonnet excels at focused review and documentation tasks
+# - Epic selector enforces one-epic-at-a-time execution
+# - Opus excels at deep reasoning, codebase analysis, and implementation
+# - Sonnet excels at focused review, selection, and documentation tasks
 # - Two-tier review: epic-level (fast) and plan-level (thorough)
 #
 # Usage:
@@ -26,7 +28,7 @@ workflow:
   name: implement
   description: Implement a feature based on an implementation plan document
   version: "2.0.0"
-  entry_point: coder
+  entry_point: epic_selector
 
   runtime:
     provider: copilot
@@ -66,17 +68,113 @@ workflow:
     # timeout_seconds is unlimited by default
 
 agents:
-  - name: coder
-    description: Performs deep research, analysis, and implements code changes
-    model: claude-opus-4.6-1m
+  - name: epic_selector
+    description: Reads the plan and selects exactly one epic to implement next
+    model: claude-sonnet-4.6
     input:
       - workflow.input.plan
       - workflow.input.epic?
-      - epic_reviewer.output?
       - committer.output?
     system_prompt: |
-      You are a Senior Software Engineer agent. Your task is to deeply analyze codebases,
-      understand implementation plans, and implement high-quality code changes.
+      You are an Implementation Planner agent. Your ONLY job is to read an implementation
+      plan document and identify the SINGLE next epic that needs to be implemented.
+
+      You do NOT implement anything. You do NOT write code. You ONLY:
+      1. Read and parse the plan document
+      2. Identify epic statuses (DONE, IN PROGRESS, NOT STARTED, TO DO)
+      3. Select the first incomplete epic
+      4. Extract that epic's details for the implementation agent
+
+      You must be precise about epic identification and status tracking.
+    prompt: |
+      Read the implementation plan and identify the next epic to implement.
+
+      **Plan:**
+      {{ workflow.input.plan }}
+
+      {% if workflow.input.epic %}
+      **Requested Epic:** {{ workflow.input.epic }}
+      Only select this specific epic. If it is already DONE, report all_complete as true.
+      {% endif %}
+
+      {% if committer is defined and committer.output %}
+      **Previous Epic Completed:** {{ committer.output.epic_completed }}
+      **Committer's Remaining Epics:** {{ committer.output.remaining_epics | json }}
+      **Committer's Next Epic Suggestion:** {{ committer.output.next_epic }}
+      {% endif %}
+
+      ## YOUR TASKS
+
+      1. **Read the Plan Document**
+         - If the plan is a file path, read the file to get the full plan content
+         - Parse the entire document to identify ALL epics
+         - For each epic, determine its current status:
+           - Look at task status fields (DONE, IN PROGRESS, NOT STARTED, TO DO)
+           - An epic is DONE only if ALL its tasks are marked DONE
+           - An epic is IN PROGRESS if any task is IN PROGRESS
+           - Otherwise it is NOT STARTED
+
+      2. **Select the Next Epic**
+         - If a specific epic was requested via input, select that epic
+         - If the committer suggested a next epic, verify it is indeed incomplete and select it
+         - Otherwise, scan epics in order (Epic 1, Epic 2, etc.) and select the FIRST one that is NOT DONE
+         - Check prerequisites: verify all prerequisite epics are DONE before selecting
+         - If ALL epics are DONE, set `all_complete` to true
+
+      3. **Extract Epic Details**
+         - Copy the FULL epic details including:
+           - Epic title and description/goal
+           - All tasks with their descriptions and file paths
+           - Acceptance criteria
+           - Prerequisites
+           - Any technical notes relevant to the epic
+         - This will be the ONLY information the implementation agent receives about the epic
+
+      4. **Create a Plan Summary**
+         - Summarize the overall plan (what is being built)
+         - List all epics with their current status
+
+      **CRITICAL:** Do NOT implement anything. Do NOT write or modify any code.
+      Your output will be passed to the implementation agent.
+    output:
+      plan_summary:
+        type: string
+        description: Summary of the overall implementation plan
+      all_epics:
+        type: array
+        description: List of all epic IDs/names with their current status
+      current_epic:
+        type: string
+        description: The epic ID/name selected for implementation
+      epic_details:
+        type: string
+        description: Full details of the selected epic (tasks, acceptance criteria, files, prerequisites)
+      prerequisites_met:
+        type: boolean
+        description: Whether all prerequisites for the selected epic are satisfied
+      all_complete:
+        type: boolean
+        description: True only if ALL epics in the plan are marked DONE
+      remaining_count:
+        type: number
+        description: Number of epics still remaining (not DONE)
+    routes:
+      - to: coder
+        when: "{{ not output.all_complete and output.prerequisites_met }}"
+      - to: plan_reviewer
+        when: "{{ output.all_complete }}"
+      - to: $end
+
+  - name: coder
+    description: Implements code changes for a single epic
+    model: claude-opus-4.6-1m
+    input:
+      - workflow.input.plan
+      - epic_selector.output
+      - epic_reviewer.output?
+    system_prompt: |
+      You are a Senior Software Engineer agent. Your task is to implement code changes
+      for ONE specific epic that has been assigned to you.
 
       Your core capabilities include:
       - Deep codebase research to understand existing patterns, dependencies, and conventions
@@ -85,93 +183,75 @@ agents:
       - Anticipating edge cases and handling them properly
       - Creating comprehensive tests
       - Following existing code patterns and conventions precisely
-    prompt: |
-      Analyze the implementation plan, research the codebase, and implement the changes.
 
-      **Plan:**
+      CRITICAL CONSTRAINT: You must implement ONLY the epic specified below.
+      Do NOT implement any other epics, even if you can see them in the plan.
+      After completing this ONE epic, stop and report your results.
+    prompt: |
+      Implement the following epic. Do NOT implement any other epics.
+
+      **Epic to Implement:** {{ epic_selector.output.current_epic }}
+
+      **Epic Details:**
+      {{ epic_selector.output.epic_details }}
+
+      **Plan Context (for reference only - do NOT implement other epics):**
+      {{ epic_selector.output.plan_summary }}
+
+      **Plan Document:**
       {{ workflow.input.plan }}
 
-      {% if workflow.input.epic %}
-      **Requested Epic:** {{ workflow.input.epic }}
-      {% endif %}
-
       {% if epic_reviewer is defined and epic_reviewer.output and epic_reviewer.output.decision == "REQUEST_CHANGES" %}
-      **Previous Implementation Failed Review:**
+      **Previous Implementation Failed Review - Fix These Issues:**
       {{ epic_reviewer.output.feedback }}
 
-      **Issues to Address:**
+      **Specific Issues to Address:**
       {% for issue in epic_reviewer.output.issues %}
       - {{ issue }}
       {% endfor %}
-
-      Fix these issues in your implementation.
       {% endif %}
 
-      {% if committer is defined and committer.output and committer.output.next_epic %}
-      **Previous Epic Completed:** {{ committer.output.epic_completed }}
-      **Next Epic to Implement:** {{ committer.output.next_epic }}
-      {% endif %}
+      ## IMPLEMENTATION TASKS
 
-      ## RESEARCH, ANALYSIS, AND IMPLEMENTATION TASKS
+      You are implementing ONLY: **{{ epic_selector.output.current_epic }}**
 
-      1. **Parse the Plan Document**
-         - If the plan is a file path, read and analyze the document thoroughly
-         - Identify all epics and their current status (DONE, IN PROGRESS, NOT STARTED)
-         - Review any related documents referenced in the plan
-
-      2. **Determine Scope**
-         - If a specific epic was requested, focus only on that epic
-         - If continuing from a previous epic, implement the next epic
-         - Otherwise, find the FIRST epic that is NOT marked as DONE
-           - Scan epics in order (EPIC-001, EPIC-002, etc.). Consider all epics in the plan, across all sections, phases, etc.
-           - Select the first one with status "NOT STARTED" or "IN PROGRESS"
-           - Skip any epics already marked as "DONE"
-         - Check prerequisites/dependencies between epics
-         - Verify all prerequisite epics are DONE before starting
-
-      3. **Deep Codebase Research**
+      1. **Deep Codebase Research**
          - Analyze the codebase to understand existing patterns and conventions
-         - Identify all files that will be created, modified, or deleted
+         - Identify all files that will be created, modified, or deleted for THIS epic
          - Review related modules and their interfaces
          - Identify integration points and potential conflicts
          - Document the coding style, naming conventions, and patterns used
 
-      4. **Update Plan Status to IN PROGRESS**
-         - Open the plan document and update the current epic's status to "IN PROGRESS"
-         - Update any task statuses within the epic from "TO DO" to "IN PROGRESS"
-         - Save the plan document with these status changes
+      2. **Update Plan Status to IN PROGRESS**
+         - Open the plan document and update this epic's status to "IN PROGRESS"
+         - Update task statuses within this epic from "TO DO" or "NOT STARTED" to "IN PROGRESS"
+         - Save the plan document
 
-      5. **Implement the Changes**
-         For the current epic:
-         - Create or modify files as needed
+      3. **Implement the Changes**
+         For THIS epic only:
+         - Create or modify files as specified in the epic details
          - Follow existing code patterns and conventions exactly
          - Handle all edge cases appropriately
          - Add proper error handling and logging
          - Write clean, well-documented code
 
-      6. **Create Tests**
-         - Write comprehensive tests for all new functionality
+      4. **Create Tests**
+         - Write comprehensive tests for all new functionality in THIS epic
          - Ensure tests cover edge cases and error conditions
          - Run tests to verify they pass
 
-      7. **Document Your Changes**
+      5. **Document Your Changes**
          - Add inline comments where helpful
          - Update any relevant documentation
 
-      Complete the implementation for the current epic.
+      **STOP after completing this epic. Do NOT continue to the next epic.**
     output:
-      plan_summary:
-        type: string
-        description: Summary of the implementation plan
-      epics_in_scope:
-        type: array
-        description: List of epic IDs/names that are in scope for implementation
       current_epic:
         type: string
-        description: The epic being implemented
+        description: The epic that was implemented
       epic_details:
         type: string
-        description: Detailed description of the current epic including tasks and acceptance criteria
+        description: Detailed description of the implemented epic
       files_modified:
         type: array
         description: List of files that were created or modified
@@ -187,13 +267,8 @@ agents:
       implementation_notes:
         type: string
         description: Notes about the implementation, decisions made, and any concerns
-      prerequisites_met:
-        type: boolean
-        description: Whether all prerequisites for the current epic are met
     routes:
       - to: epic_reviewer
-        when: "{{ output.prerequisites_met }}"
-      - to: $end
 
   - name: epic_reviewer
     description: Reviews the implementation for a single epic
@@ -281,7 +356,6 @@ agents:
       - to: committer
         when: "{{ output.approved }}"
       - to: coder
-        when: "{{ output.decision == 'REQUEST_CHANGES' }}"
 
   - name: committer
     description: Commits the changes and updates the plan document
@@ -316,8 +390,8 @@ agents:
       **Reviewer Feedback:**
       {{ epic_reviewer.output.feedback }}
 
-      **Epics in Scope:**
-      {{ coder.output.epics_in_scope | json }}
+      **All Epics:**
+      {{ epic_selector.output.all_epics | json }}
 
       ## COMMIT AND UPDATE TASKS
 
@@ -383,7 +457,7 @@ agents:
         type: string
         description: The FIRST remaining epic to implement (by ID order). Empty only if all_complete is true.
     routes:
-      - to: coder
+      - to: epic_selector
         when: "{{ not output.all_complete }}"
       - to: plan_reviewer
         when: "{{ output.all_complete }}"
@@ -393,6 +467,7 @@ agents:
     model: claude-opus-4.6-1m
     input:
       - workflow.input.plan
+      - epic_selector.output
       - coder.output
       - committer.output
     system_prompt: |
@@ -415,13 +490,17 @@ agents:
       {{ workflow.input.plan }}
 
       **Plan Summary:**
-      {{ coder.output.plan_summary }}
+      {{ epic_selector.output.plan_summary }}
 
+      {% if committer is defined and committer.output %}
       **Epics Completed:**
       {{ committer.output.epic_completed }}
 
       **Final Commit:**
       {{ committer.output.commit_message }}
+      {% else %}
+      **Note:** All epics were already marked DONE in the plan. No implementation was performed.
+      {% endif %}
 
       ## HOLISTIC REVIEW TASKS
 
@@ -599,10 +678,10 @@ agents:
 output:
   plan: "{{ workflow.input.plan }}"
   epic_requested: "{{ workflow.input.epic | default('all') }}"
-  epics_completed: "{{ committer.output.epic_completed | default('') }}"
-  remaining_epics: "{{ committer.output.remaining_epics | default([]) | json }}"
-  all_complete: "{{ committer.output.all_complete | default(false) }}"
-  last_commit: "{{ committer.output.commit_message | default('') }}"
-  epic_review_decision: "{{ epic_reviewer.output.decision | default('') }}"
-  plan_review_decision: "{{ plan_reviewer.output.decision | default('') }}"
+  epics_completed: "{{ committer.output.epic_completed if committer is defined else '' }}"
+  remaining_epics: "{{ committer.output.remaining_epics | json if committer is defined else '[]' }}"
+  all_complete: "{{ committer.output.all_complete if committer is defined else false }}"
+  last_commit: "{{ committer.output.commit_message if committer is defined else '' }}"
+  epic_review_decision: "{{ epic_reviewer.output.decision if epic_reviewer is defined else '' }}"
+  plan_review_decision: "{{ plan_reviewer.output.decision if plan_reviewer is defined else '' }}"
   iterations: "{{ context.iteration }}"
