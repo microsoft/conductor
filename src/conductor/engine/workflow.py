@@ -7,6 +7,7 @@ multi-agent workflow execution.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import copy
 import logging
 import time as _time
@@ -188,8 +189,10 @@ def _verbose_log_for_each_summary(
 
 if TYPE_CHECKING:
     from conductor.config.schema import AgentDef, ForEachDef, ParallelGroup, WorkflowConfig
+    from conductor.interrupt.listener import KeyboardListener
     from conductor.providers.base import AgentProvider
     from conductor.providers.registry import ProviderRegistry
+    from conductor.web.server import WebDashboard
 
 
 @dataclass
@@ -401,6 +404,8 @@ class WorkflowEngine:
         workflow_path: Path | None = None,
         interrupt_event: asyncio.Event | None = None,
         event_emitter: WorkflowEventEmitter | None = None,
+        keyboard_listener: KeyboardListener | None = None,
+        web_dashboard: WebDashboard | None = None,
     ) -> None:
         """Initialize the WorkflowEngine.
 
@@ -410,7 +415,7 @@ class WorkflowEngine:
                 If both provider and registry are None, agents cannot be executed.
             registry: Provider registry for multi-provider support.
                 When provided, each agent can use a different provider based
-                on the agent's `provider` field or the workflow default.
+                on the agent's ``provider`` field or the workflow default.
             skip_gates: If True, auto-selects first option at human gates.
             workflow_path: Path to the workflow YAML file. Used for checkpoint
                 metadata when saving state on failure.
@@ -420,6 +425,13 @@ class WorkflowEngine:
                 When provided, the engine emits events at each execution point
                 (agent start/complete, routing, parallel groups, etc.).
                 When None, zero overhead (early return in _emit()).
+            keyboard_listener: Optional keyboard listener to suspend/resume
+                around interactive prompts (human gates, max iterations).
+                When provided, the listener is suspended before stdin reads
+                and resumed afterward, preventing cbreak mode conflicts.
+            web_dashboard: Optional web dashboard for bidirectional gate input.
+                When provided and connected, gate input is accepted from
+                both CLI stdin and web UI, with first response winning.
 
         Note:
             If both provider and registry are provided, registry takes precedence.
@@ -460,9 +472,13 @@ class WorkflowEngine:
         # Interrupt support
         self._interrupt_event = interrupt_event
         self._interrupt_handler = InterruptHandler(skip_gates=skip_gates)
+        self._keyboard_listener = keyboard_listener
 
         # Event emitter for workflow observability
         self._event_emitter = event_emitter
+
+        # Web dashboard for bidirectional gate input
+        self._web_dashboard = web_dashboard
 
         # Checkpoint tracking
         self._current_agent_name: str | None = None
@@ -704,6 +720,106 @@ class WorkflowEngine:
         """
         return [a.name for a in self.config.agents]
 
+    async def _suspend_listener(self) -> None:
+        """Suspend the keyboard listener before interactive stdin prompts."""
+        if self._keyboard_listener is not None:
+            await self._keyboard_listener.suspend()
+
+    async def _resume_listener(self) -> None:
+        """Resume the keyboard listener after interactive stdin prompts."""
+        if self._keyboard_listener is not None:
+            await self._keyboard_listener.resume()
+
+    async def _handle_gate_with_web(
+        self,
+        agent: AgentDef,
+        agent_context: dict[str, Any],
+    ) -> GateResult:
+        """Handle a human gate, racing CLI input against web dashboard input.
+
+        When a web dashboard is connected, both the CLI prompt and the web
+        dashboard wait concurrently.  The first response wins and the other
+        is cancelled.  When no web dashboard is available, falls back to
+        CLI-only input.
+
+        Args:
+            agent: The human_gate agent definition.
+            agent_context: Current workflow context for template rendering.
+
+        Returns:
+            GateResult from whichever input source responded first.
+        """
+        # If no web dashboard or no connections, use CLI only
+        if self._web_dashboard is None or not self._web_dashboard.has_connections():
+            return await self.gate_handler.handle_gate(agent, agent_context)
+
+        # Race CLI vs web input
+        cli_task = asyncio.create_task(
+            self.gate_handler.handle_gate(agent, agent_context),
+            name="gate_cli",
+        )
+        web_task = asyncio.create_task(
+            self._wait_for_web_gate(agent),
+            name="gate_web",
+        )
+
+        done, pending = await asyncio.wait(
+            {cli_task, web_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        # Cancel the loser
+        for task in pending:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        # Get the result from the winner
+        winner = done.pop()
+        return winner.result()
+
+    async def _wait_for_web_gate(self, agent: AgentDef) -> GateResult:
+        """Wait for a gate response from the web dashboard.
+
+        Translates the raw JSON message from the web client into a
+        ``GateResult`` by matching ``selected_value`` against the
+        agent's options.
+
+        Args:
+            agent: The human_gate agent definition with options.
+
+        Returns:
+            GateResult with the selected option, route, and any
+            additional input from the web client.
+
+        Raises:
+            HumanGateError: If the selected value doesn't match any option.
+        """
+        from conductor.exceptions import HumanGateError
+
+        assert self._web_dashboard is not None  # noqa: S101
+
+        msg = await self._web_dashboard.wait_for_gate_response(agent.name)
+        selected_value = msg.get("selected_value", "")
+
+        # Find matching option
+        for option in agent.options or []:
+            if option.value == selected_value:
+                additional_input = msg.get("additional_input", {})
+                if not isinstance(additional_input, dict):
+                    additional_input = {}
+                return GateResult(
+                    selected_option=option,
+                    route=option.route,
+                    additional_input=additional_input,
+                )
+
+        raise HumanGateError(
+            f"Web gate response value '{selected_value}' does not match any option "
+            f"for gate '{agent.name}'",
+            suggestion="Check the option values in the workflow YAML",
+        )
+
     async def _check_interrupt(self, current_agent_name: str) -> InterruptResult | None:
         """Check for a pending interrupt and handle it if present.
 
@@ -735,13 +851,18 @@ class WorkflowEngine:
             except (TypeError, ValueError):
                 last_output_preview = str(last_output)[:500]
 
-        return await self._interrupt_handler.handle_interrupt(
-            current_agent=current_agent_name,
-            iteration=self.context.current_iteration,
-            last_output_preview=last_output_preview,
-            available_agents=self._get_top_level_agent_names(),
-            accumulated_guidance=list(self.context.user_guidance),
-        )
+        # Suspend keyboard listener so stdin works normally for the prompt
+        await self._suspend_listener()
+        try:
+            return await self._interrupt_handler.handle_interrupt(
+                current_agent=current_agent_name,
+                iteration=self.context.current_iteration,
+                last_output_preview=last_output_preview,
+                available_agents=self._get_top_level_agent_names(),
+                accumulated_guidance=list(self.context.user_guidance),
+            )
+        finally:
+            await self._resume_listener()
 
     async def _handle_interrupt_result(
         self,
@@ -1135,19 +1256,34 @@ class WorkflowEngine:
                             # Build context for the gate prompt
                             agent_context = self.context.get_for_template()
 
+                            # Emit gate_presented with full option details for web UI
+                            gate_options_data = [
+                                {
+                                    "label": o.label,
+                                    "value": o.value,
+                                    "route": o.route,
+                                    "prompt_for": o.prompt_for,
+                                }
+                                for o in (agent.options or [])
+                            ]
+
                             self._emit(
                                 "gate_presented",
                                 {
                                     "agent_name": agent.name,
                                     "options": [o.value for o in (agent.options or [])],
+                                    "option_details": gate_options_data,
                                     "prompt": self.renderer.render(agent.prompt, agent_context),
                                 },
                             )
 
                             # Use the gate handler for interaction
-                            gate_result: GateResult = await self.gate_handler.handle_gate(
-                                agent, agent_context
-                            )
+                            # Suspend keyboard listener so stdin works normally
+                            await self._suspend_listener()
+                            try:
+                                gate_result = await self._handle_gate_with_web(agent, agent_context)
+                            finally:
+                                await self._resume_listener()
 
                             self._emit(
                                 "gate_resolved",
@@ -1561,11 +1697,15 @@ class WorkflowEngine:
             self.limits.check_iteration(agent_name)
         except MaxIterationsError:
             # Prompt user for more iterations
-            result = await self.max_iterations_handler.handle_limit_reached(
-                current_iteration=self.limits.current_iteration,
-                max_iterations=self.limits.max_iterations,
-                agent_history=self.limits.execution_history,
-            )
+            await self._suspend_listener()
+            try:
+                result = await self.max_iterations_handler.handle_limit_reached(
+                    current_iteration=self.limits.current_iteration,
+                    max_iterations=self.limits.max_iterations,
+                    agent_history=self.limits.execution_history,
+                )
+            finally:
+                await self._resume_listener()
             if result.continue_execution:
                 self.limits.increase_limit(result.additional_iterations)
                 # Re-check should now pass
@@ -1592,11 +1732,15 @@ class WorkflowEngine:
             self.limits.check_parallel_group_iteration(group_name, agent_count)
         except MaxIterationsError:
             # Prompt user for more iterations
-            result = await self.max_iterations_handler.handle_limit_reached(
-                current_iteration=self.limits.current_iteration,
-                max_iterations=self.limits.max_iterations,
-                agent_history=self.limits.execution_history,
-            )
+            await self._suspend_listener()
+            try:
+                result = await self.max_iterations_handler.handle_limit_reached(
+                    current_iteration=self.limits.current_iteration,
+                    max_iterations=self.limits.max_iterations,
+                    agent_history=self.limits.execution_history,
+                )
+            finally:
+                await self._resume_listener()
             if result.continue_execution:
                 self.limits.increase_limit(result.additional_iterations)
                 # Re-check should now pass
@@ -2235,7 +2379,13 @@ class WorkflowEngine:
 
                 # Execute agent with injected context (get executor for multi-provider)
                 executor = await self._get_executor_for_agent(for_each_group.agent)
-                event_callback = self._make_event_callback(for_each_group.name)
+
+                # Item-scoped event callback that tags all streaming events with item_key
+                def _item_callback(event_type: str, data: dict[str, Any]) -> None:
+                    data_with_agent = {"agent_name": for_each_group.name, "item_key": key, **data}
+                    self._emit(event_type, data_with_agent)
+
+                event_callback = _item_callback if self._event_emitter else None
                 output = await executor.execute(
                     for_each_group.agent,
                     agent_context,
@@ -2264,6 +2414,7 @@ class WorkflowEngine:
                         "elapsed": _item_elapsed,
                         "tokens": output.tokens_used,
                         "cost_usd": usage.cost_usd,
+                        "output": output.content,
                     },
                 )
 

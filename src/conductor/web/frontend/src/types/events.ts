@@ -141,10 +141,18 @@ export interface ScriptFailedData {
 
 // --- Gate events ---
 
+export interface GateOptionDetail {
+  label: string;
+  value: string;
+  route: string;
+  prompt_for?: string | null;
+}
+
 export interface GatePresentedData {
   agent_name: string;
   prompt?: string;
   options?: string[];
+  option_details?: GateOptionDetail[];
 }
 
 export interface GateResolvedData {
@@ -199,18 +207,26 @@ export interface ForEachStartedData {
 
 export interface ForEachItemStartedData {
   group_name: string;
+  item_key: string;
   index: number;
-  item: unknown;
+  item?: unknown;
 }
 
 export interface ForEachItemCompletedData {
   group_name: string;
+  item_key: string;
   index: number;
+  elapsed?: number;
+  tokens?: number;
+  cost_usd?: number;
+  output?: unknown;
 }
 
 export interface ForEachItemFailedData {
   group_name: string;
+  item_key: string;
   index: number;
+  elapsed?: number;
   error_type?: string;
   message?: string;
 }

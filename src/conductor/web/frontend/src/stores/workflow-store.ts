@@ -16,12 +16,14 @@ import type {
   ScriptFailedData,
   GatePresentedData,
   GateResolvedData,
+  GateOptionDetail,
   RouteTakenData,
   ParallelStartedData,
   ParallelAgentCompletedData,
   ParallelAgentFailedData,
   ParallelCompletedData,
   ForEachStartedData,
+  ForEachItemStartedData,
   ForEachItemCompletedData,
   ForEachItemFailedData,
   ForEachCompletedData,
@@ -50,6 +52,20 @@ export interface IterationSnapshot {
   error_message?: string;
 }
 
+export interface ForEachItemData {
+  key: string;
+  index: number;
+  status: 'running' | 'completed' | 'failed';
+  elapsed?: number;
+  tokens?: number;
+  cost_usd?: number;
+  error_type?: string;
+  error_message?: string;
+  prompt?: string;
+  output?: unknown;
+  activity: ActivityEntry[];
+}
+
 export interface NodeData {
   name: string;
   status: NodeStatus;
@@ -74,12 +90,15 @@ export interface NodeData {
   exit_code?: number;
   // Gate-specific
   options?: string[];
+  option_details?: GateOptionDetail[];
   selected_option?: string;
   route?: string;
   additional_input?: string;
   // Group-specific
   success_count?: number;
   failure_count?: number;
+  // For-each per-item tracking
+  for_each_items?: ForEachItemData[];
   // Activity
   activity: ActivityEntry[];
   // Iteration history (snapshots of completed previous iterations)
@@ -185,6 +204,11 @@ interface WorkflowState {
   setWsStatus: (status: WsStatus) => void;
   setEdgeHighlight: (from: string, to: string, state: 'highlighted' | 'taken') => void;
   clearEdgeHighlight: (from: string, to: string) => void;
+
+  // WebSocket send function (set by use-websocket hook)
+  _wsSend: ((data: object) => void) | null;
+  setWsSend: (fn: ((data: object) => void) | null) => void;
+  sendGateResponse: (agentName: string, selectedValue: string, additionalInput?: Record<string, string>) => void;
 }
 
 function ensureNode(nodes: Record<string, NodeData>, name: string, type: NodeType = 'agent'): NodeData {
@@ -200,6 +224,23 @@ function ensureNode(nodes: Record<string, NodeData>, name: string, type: NodeTyp
 function addActivity(nodes: Record<string, NodeData>, agentName: string, entry: ActivityEntry) {
   const nd = ensureNode(nodes, agentName);
   nd.activity.push(entry);
+}
+
+/** Create a new reference for a node to ensure React/ReactFlow detects the change. */
+function replaceNode(nodes: Record<string, NodeData>, name: string): void {
+  if (nodes[name]) {
+    nodes[name] = { ...nodes[name]! };
+  }
+}
+
+/** Add an activity entry to a for-each item's activity array. */
+function addForEachItemActivity(nodes: Record<string, NodeData>, groupName: string, itemKey: string, entry: ActivityEntry): void {
+  const nd = nodes[groupName];
+  if (!nd?.for_each_items) return;
+  const item = nd.for_each_items.find((i) => i.key === itemKey);
+  if (item) {
+    item.activity.push(entry);
+  }
 }
 
 export const useWorkflowStore = create<WorkflowState>((set) => ({
@@ -224,6 +265,23 @@ export const useWorkflowStore = create<WorkflowState>((set) => ({
   eventLog: [],
   activityLog: [],
   workflowOutput: null,
+  _wsSend: null,
+
+  setWsSend: (fn) => {
+    set({ _wsSend: fn });
+  },
+
+  sendGateResponse: (agentName, selectedValue, additionalInput) => {
+    const send = useWorkflowStore.getState()._wsSend;
+    if (send) {
+      send({
+        type: 'gate_response',
+        agent_name: agentName,
+        selected_value: selectedValue,
+        additional_input: additionalInput || {},
+      });
+    }
+  },
 
   processEvent: (event: WorkflowEvent) => {
     const handler = eventHandlers[event.type];
@@ -319,6 +377,7 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     // Set $start node to running
     ensureNode(state.nodes, '$start', 'start');
     state.nodes['$start']!.status = 'running';
+    replaceNode(state.nodes, '$start');
 
     const groupAgents = new Set<string>();
     const agentNames = new Set<string>();
@@ -387,6 +446,7 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     nd.output = undefined;
     nd.error_type = undefined;
     nd.error_message = undefined;
+    replaceNode(state.nodes, data.agent_name);
   },
 
   agent_completed: (state, _data) => {
@@ -404,6 +464,7 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     nd.output_keys = data.output_keys;
     if (data.cost_usd) state.totalCost += data.cost_usd;
     if (data.tokens) state.totalTokens += data.tokens;
+    replaceNode(state.nodes, data.agent_name);
   },
 
   agent_failed: (state, _data) => {
@@ -413,67 +474,111 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     nd.elapsed = data.elapsed;
     nd.error_type = data.error_type;
     nd.error_message = data.message;
+    replaceNode(state.nodes, data.agent_name);
   },
 
   agent_prompt_rendered: (state, _data) => {
     const data = _data as unknown as AgentPromptRenderedData;
+    const itemKey = (_data as Record<string, unknown>).item_key as string | undefined;
     const nd = ensureNode(state.nodes, data.agent_name);
     nd.prompt = data.rendered_prompt;
     nd.context_keys = data.context_keys;
+    // Route to per-item data when item_key is present (for-each)
+    if (itemKey) {
+      addForEachItemActivity(state.nodes, data.agent_name, itemKey, {
+        type: 'prompt',
+        icon: '📝',
+        label: 'prompt',
+        text: 'Prompt rendered',
+        detail: data.rendered_prompt?.slice(0, 500) || null,
+      });
+      const itemNd = state.nodes[data.agent_name];
+      if (itemNd?.for_each_items) {
+        const item = itemNd.for_each_items.find((i) => i.key === itemKey);
+        if (item) item.prompt = data.rendered_prompt;
+      }
+    }
+    replaceNode(state.nodes, data.agent_name);
   },
 
   agent_reasoning: (state, _data) => {
     const data = _data as unknown as AgentReasoningData;
-    addActivity(state.nodes, data.agent_name, {
+    const itemKey = (_data as Record<string, unknown>).item_key as string | undefined;
+    const entry: ActivityEntry = {
       type: 'reasoning',
       icon: '💭',
       label: 'thinking',
       text: data.content,
-    });
+    };
+    addActivity(state.nodes, data.agent_name, entry);
+    if (itemKey) {
+      addForEachItemActivity(state.nodes, data.agent_name, itemKey, entry);
+    }
+    replaceNode(state.nodes, data.agent_name);
   },
 
   agent_tool_start: (state, _data) => {
     const data = _data as unknown as AgentToolStartData;
-    addActivity(state.nodes, data.agent_name, {
+    const itemKey = (_data as Record<string, unknown>).item_key as string | undefined;
+    const entry: ActivityEntry = {
       type: 'tool-start',
       icon: '🔧',
       label: 'tool',
       text: data.tool_name,
       detail: data.arguments || null,
-    });
+    };
+    addActivity(state.nodes, data.agent_name, entry);
+    if (itemKey) {
+      addForEachItemActivity(state.nodes, data.agent_name, itemKey, entry);
+    }
+    replaceNode(state.nodes, data.agent_name);
   },
 
   agent_tool_complete: (state, _data) => {
     const data = _data as unknown as AgentToolCompleteData;
-    addActivity(state.nodes, data.agent_name, {
+    const itemKey = (_data as Record<string, unknown>).item_key as string | undefined;
+    const entry: ActivityEntry = {
       type: 'tool-complete',
       icon: '✓',
       label: 'result',
       text: data.tool_name || 'done',
       detail: data.result || null,
-    });
+    };
+    addActivity(state.nodes, data.agent_name, entry);
+    if (itemKey) {
+      addForEachItemActivity(state.nodes, data.agent_name, itemKey, entry);
+    }
+    replaceNode(state.nodes, data.agent_name);
   },
 
   agent_turn_start: (state, _data) => {
     const data = _data as unknown as AgentTurnStartData;
-    addActivity(state.nodes, data.agent_name, {
+    const itemKey = (_data as Record<string, unknown>).item_key as string | undefined;
+    const entry: ActivityEntry = {
       type: 'turn',
       icon: '⏳',
       label: 'turn',
       text: `Turn ${data.turn ?? '?'}`,
-    });
+    };
+    addActivity(state.nodes, data.agent_name, entry);
+    if (itemKey) {
+      addForEachItemActivity(state.nodes, data.agent_name, itemKey, entry);
+    }
+    replaceNode(state.nodes, data.agent_name);
   },
 
   agent_message: (state, _data) => {
     const data = _data as unknown as AgentMessageData;
     const nd = ensureNode(state.nodes, data.agent_name);
     nd.latest_message = data.content;
+    replaceNode(state.nodes, data.agent_name);
   },
 
   script_started: (state, _data) => {
     const data = _data as { agent_name: string };
     const nd = ensureNode(state.nodes, data.agent_name);
     nd.status = 'running';
+    replaceNode(state.nodes, data.agent_name);
   },
 
   script_completed: (state, _data) => {
@@ -485,6 +590,7 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     nd.stdout = data.stdout;
     nd.stderr = data.stderr;
     nd.exit_code = data.exit_code;
+    replaceNode(state.nodes, data.agent_name);
   },
 
   script_failed: (state, _data) => {
@@ -494,6 +600,7 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     nd.elapsed = data.elapsed;
     nd.error_type = data.error_type;
     nd.error_message = data.message;
+    replaceNode(state.nodes, data.agent_name);
   },
 
   gate_presented: (state, _data) => {
@@ -501,7 +608,9 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     const nd = ensureNode(state.nodes, data.agent_name);
     nd.status = 'waiting';
     nd.options = data.options;
+    nd.option_details = data.option_details;
     nd.prompt = data.prompt;
+    replaceNode(state.nodes, data.agent_name);
   },
 
   gate_resolved: (state, _data) => {
@@ -512,6 +621,7 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     nd.selected_option = data.selected_option;
     nd.route = data.route;
     nd.additional_input = data.additional_input;
+    replaceNode(state.nodes, data.agent_name);
   },
 
   route_taken: (state, _data) => {
@@ -534,6 +644,7 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
       state.groupProgress[data.group_name]!.completed = 0;
       state.groupProgress[data.group_name]!.failed = 0;
     }
+    replaceNode(state.nodes, data.group_name);
   },
 
   parallel_agent_completed: (state, _data) => {
@@ -549,6 +660,8 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     nd.cost_usd = data.cost_usd;
     if (data.cost_usd) state.totalCost += data.cost_usd;
     if (data.tokens) state.totalTokens += data.tokens;
+    replaceNode(state.nodes, data.agent_name);
+    replaceNode(state.nodes, data.group_name);
   },
 
   parallel_agent_failed: (state, _data) => {
@@ -561,6 +674,8 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     nd.elapsed = data.elapsed;
     nd.error_type = data.error_type;
     nd.error_message = data.message;
+    replaceNode(state.nodes, data.agent_name);
+    replaceNode(state.nodes, data.group_name);
   },
 
   parallel_completed: (state, _data) => {
@@ -568,21 +683,33 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     state.agentsCompleted++;
     const nd = ensureNode(state.nodes, data.group_name, 'parallel_group');
     nd.status = data.failure_count === 0 ? 'completed' : 'failed';
+    replaceNode(state.nodes, data.group_name);
   },
 
   for_each_started: (state, _data) => {
     const data = _data as unknown as ForEachStartedData;
     const nd = ensureNode(state.nodes, data.group_name, 'for_each_group');
     nd.status = 'running';
+    nd.for_each_items = [];
     if (state.groupProgress[data.group_name]) {
       state.groupProgress[data.group_name]!.total = data.item_count;
       state.groupProgress[data.group_name]!.completed = 0;
       state.groupProgress[data.group_name]!.failed = 0;
     }
+    replaceNode(state.nodes, data.group_name);
   },
 
-  for_each_item_started: (_state, _data) => {
-    // No-op for now
+  for_each_item_started: (state, _data) => {
+    const data = _data as unknown as ForEachItemStartedData;
+    const nd = ensureNode(state.nodes, data.group_name, 'for_each_group');
+    if (!nd.for_each_items) nd.for_each_items = [];
+    nd.for_each_items.push({
+      key: data.item_key ?? String(data.index),
+      index: data.index,
+      status: 'running',
+      activity: [],
+    });
+    replaceNode(state.nodes, data.group_name);
   },
 
   for_each_item_completed: (state, _data) => {
@@ -590,6 +717,19 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     if (state.groupProgress[data.group_name]) {
       state.groupProgress[data.group_name]!.completed++;
     }
+    const nd = ensureNode(state.nodes, data.group_name, 'for_each_group');
+    if (nd.for_each_items) {
+      const itemKey = data.item_key ?? String(data.index);
+      const item = nd.for_each_items.find((i) => i.key === itemKey);
+      if (item) {
+        item.status = 'completed';
+        item.elapsed = data.elapsed;
+        item.tokens = data.tokens;
+        item.cost_usd = data.cost_usd;
+        item.output = data.output;
+      }
+    }
+    replaceNode(state.nodes, data.group_name);
   },
 
   for_each_item_failed: (state, _data) => {
@@ -597,6 +737,18 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     if (state.groupProgress[data.group_name]) {
       state.groupProgress[data.group_name]!.failed++;
     }
+    const nd = ensureNode(state.nodes, data.group_name, 'for_each_group');
+    if (nd.for_each_items) {
+      const itemKey = data.item_key ?? String(data.index);
+      const item = nd.for_each_items.find((i) => i.key === itemKey);
+      if (item) {
+        item.status = 'failed';
+        item.elapsed = data.elapsed;
+        item.error_type = data.error_type;
+        item.error_message = data.message;
+      }
+    }
+    replaceNode(state.nodes, data.group_name);
   },
 
   for_each_completed: (state, _data) => {
@@ -607,6 +759,7 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     nd.elapsed = data.elapsed;
     nd.success_count = data.success_count;
     nd.failure_count = data.failure_count;
+    replaceNode(state.nodes, data.group_name);
   },
 
   workflow_completed: (state, _data) => {
@@ -615,9 +768,11 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     state.workflowOutput = data.output ?? null;
     if (state.nodes['$end']) {
       state.nodes['$end']!.status = 'completed';
+      replaceNode(state.nodes, '$end');
     }
     if (state.nodes['$start']) {
       state.nodes['$start']!.status = 'completed';
+      replaceNode(state.nodes, '$start');
     }
     // Clear flowing-dot edge animations now that workflow is done
     state.highlightedEdges = [];
@@ -628,10 +783,12 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     state.workflowStatus = 'failed';
     if (data.agent_name && state.nodes[data.agent_name]) {
       state.nodes[data.agent_name]!.status = 'failed';
+      replaceNode(state.nodes, data.agent_name);
     }
     state.workflowFailure = { error_type: data.error_type, message: data.message };
     if (state.nodes['$start']) {
       state.nodes['$start']!.status = 'completed';
+      replaceNode(state.nodes, '$start');
     }
     // Clear flowing-dot edge animations now that workflow is done
     state.highlightedEdges = [];
