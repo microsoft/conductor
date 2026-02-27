@@ -137,8 +137,12 @@ export function WorkflowGraph() {
   // Handle node selection
   const onNodeClick = useCallback(
     (_: React.MouseEvent, node: Node) => {
-      // Don't select group parent nodes
-      if (node.type === 'groupNode') return;
+      // Don't select parallel group parent nodes (they contain clickable child nodes).
+      // For-each groups are standalone nodes and should be selectable.
+      if (node.type === 'groupNode') {
+        const nodeData = node.data as GraphNodeData;
+        if (nodeData.type !== 'for_each_group') return;
+      }
       selectNode(node.id);
     },
     [selectNode],

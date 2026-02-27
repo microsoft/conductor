@@ -944,6 +944,8 @@ async def run_workflow_async(
                 workflow_path=workflow_path,
                 interrupt_event=interrupt_event,
                 event_emitter=emitter,
+                keyboard_listener=listener,
+                web_dashboard=dashboard,
             )
 
             try:
@@ -1345,6 +1347,7 @@ async def resume_workflow_async(
                 skip_gates=skip_gates,
                 workflow_path=resolved_workflow_path,
                 interrupt_event=interrupt_event,
+                keyboard_listener=listener,
             )
             engine.set_context(restored_context)
             engine.set_limits(restored_limits)

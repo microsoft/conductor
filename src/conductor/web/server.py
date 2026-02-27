@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
@@ -73,6 +74,9 @@ class WebDashboard:
         self._connections: set[WebSocket] = set()
         self._workflow_completed = False
         self._queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+        # Gate response channel (web client → engine)
+        self._gate_response_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
 
         # Auto-shutdown support (--web-bg)
         self._bg_event = asyncio.Event()
@@ -136,8 +140,14 @@ class WebDashboard:
                 self._grace_task = None
             try:
                 while True:
-                    # Keep-alive: wait for any client message (ping/pong)
-                    await ws.receive_text()
+                    # Read messages from client (keep-alive pings or gate responses)
+                    raw = await ws.receive_text()
+                    try:
+                        msg = json.loads(raw)
+                        if isinstance(msg, dict) and msg.get("type") == "gate_response":
+                            self._gate_response_queue.put_nowait(msg)
+                    except (json.JSONDecodeError, TypeError):
+                        pass  # Ignore non-JSON messages (keep-alive pings)
             except WebSocketDisconnect:
                 pass
             finally:
@@ -192,6 +202,41 @@ class WebDashboard:
             for ws in failed:
                 self._connections.discard(ws)
                 self._maybe_start_grace_timer()
+
+    # ------------------------------------------------------------------
+    # Gate response channel (web client → engine)
+    # ------------------------------------------------------------------
+
+    def has_connections(self) -> bool:
+        """Check if any WebSocket clients are connected.
+
+        Returns:
+            True if at least one web client is connected.
+        """
+        return len(self._connections) > 0
+
+    async def wait_for_gate_response(self, agent_name: str) -> dict[str, Any]:
+        """Wait for a gate response from a web client.
+
+        Blocks until a ``gate_response`` message is received via WebSocket
+        that matches the given agent name.  Non-matching messages are
+        re-queued so they are not lost.
+
+        Args:
+            agent_name: The name of the human_gate agent to wait for.
+
+        Returns:
+            The gate response payload dict with keys ``selected_value``
+            and optionally ``additional_input``.
+        """
+        while True:
+            msg = await self._gate_response_queue.get()
+            if msg.get("agent_name") == agent_name:
+                return msg
+            # Not for this agent — put it back
+            self._gate_response_queue.put_nowait(msg)
+            # Yield to avoid busy-loop
+            await asyncio.sleep(0.01)
 
     # ------------------------------------------------------------------
     # Auto-shutdown (--web-bg)

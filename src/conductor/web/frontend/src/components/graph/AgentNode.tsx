@@ -9,7 +9,10 @@ import type { NodeStatus } from '@/lib/constants';
 
 export const AgentNode = memo(function AgentNode({ data, id, selected }: NodeProps) {
   const nodeData = data as unknown as GraphNodeData;
-  const status = (nodeData.status || 'pending') as NodeStatus;
+  // Read status directly from the store so parallel-group child nodes update
+  // immediately instead of waiting for the graph-data sync useEffect.
+  const storeStatus = useWorkflowStore((s) => s.nodes[id]?.status);
+  const status = (storeStatus || nodeData.status || 'pending') as NodeStatus;
   const borderColor = NODE_STATUS_HEX[status] || NODE_STATUS_HEX.pending;
 
   const elapsed = useWorkflowStore((s) => s.nodes[id]?.elapsed);

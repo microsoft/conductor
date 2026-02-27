@@ -148,7 +148,7 @@ agents:
 
   - name: cons_analyst
     description: Researches disadvantages and risks
-    model: gpt-4.1
+    model: gr
     tools: []
     input:
       - workflow.input.topic

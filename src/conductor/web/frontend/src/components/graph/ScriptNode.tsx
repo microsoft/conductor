@@ -9,7 +9,9 @@ import type { NodeStatus } from '@/lib/constants';
 
 export const ScriptNode = memo(function ScriptNode({ data, id, selected }: NodeProps) {
   const nodeData = data as unknown as GraphNodeData;
-  const status = (nodeData.status || 'pending') as NodeStatus;
+  // Read status directly from the store for immediate updates
+  const storeStatus = useWorkflowStore((s) => s.nodes[id]?.status);
+  const status = (storeStatus || nodeData.status || 'pending') as NodeStatus;
   const borderColor = NODE_STATUS_HEX[status] || NODE_STATUS_HEX.pending;
 
   const elapsed = useWorkflowStore((s) => s.nodes[id]?.elapsed);

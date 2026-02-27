@@ -154,6 +154,72 @@ class KeyboardListener:
         self._restore_terminal()
         logger.debug("Keyboard listener stopped")
 
+    async def suspend(self) -> None:
+        """Temporarily suspend listening and restore normal terminal mode.
+
+        Use this before any operation that needs normal stdin access
+        (e.g., human gates, max iterations prompts). Call ``resume()``
+        afterward to re-enter cbreak mode and restart listening.
+        """
+        self._stop_flag = True
+
+        if self._task is not None:
+            self._task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._task
+            self._task = None
+
+        if self._reader_thread is not None:
+            self._reader_thread.join(timeout=0.5)
+            self._reader_thread = None
+
+        # Restore terminal but keep _original_settings for resume()
+        if self._original_settings is not None:
+            try:
+                import termios
+
+                termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, self._original_settings)
+            except (ImportError, termios.error, ValueError, OSError):
+                pass
+
+        logger.debug("Keyboard listener suspended")
+
+    async def resume(self) -> None:
+        """Resume listening after a ``suspend()`` call.
+
+        Re-enters cbreak mode and restarts the reader thread and listen loop.
+        No-op if the listener was never started or original settings are gone.
+        """
+        if self._original_settings is None or self._loop is None:
+            return
+
+        try:
+            import tty
+        except ImportError:
+            return
+
+        # Re-enter cbreak mode
+        try:
+            tty.setcbreak(sys.stdin.fileno())
+        except Exception:
+            logger.debug("Failed to re-enter cbreak mode on resume")
+            return
+
+        self._stop_flag = False
+
+        # Reset the queue to discard any stale bytes
+        self._byte_queue = asyncio.Queue()
+
+        # Restart the reader thread
+        self._reader_thread = threading.Thread(
+            target=self._reader_thread_main, daemon=True, name="keyboard-listener"
+        )
+        self._reader_thread.start()
+
+        # Restart the listen loop
+        self._task = asyncio.create_task(self._listen_loop())
+        logger.debug("Keyboard listener resumed")
+
     def _restore_terminal(self) -> None:
         """Restore original terminal settings."""
         if self._original_settings is not None:

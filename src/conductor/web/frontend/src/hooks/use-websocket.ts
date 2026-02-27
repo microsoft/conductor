@@ -8,6 +8,7 @@ export function useWebSocket() {
   const processEvent = useWorkflowStore((s) => s.processEvent);
   const replayState = useWorkflowStore((s) => s.replayState);
   const setWsStatus = useWorkflowStore((s) => s.setWsStatus);
+  const setWsSend = useWorkflowStore((s) => s.setWsSend);
 
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectDelayRef = useRef(1000);
@@ -24,6 +25,12 @@ export function useWebSocket() {
       ws.onopen = () => {
         reconnectDelayRef.current = 1000;
         setWsStatus('connected');
+        // Expose send function to the store
+        setWsSend((data: object) => {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify(data));
+          }
+        });
       };
 
       ws.onmessage = (evt) => {
@@ -37,6 +44,7 @@ export function useWebSocket() {
 
       ws.onclose = () => {
         setWsStatus('disconnected');
+        setWsSend(null);
         wsRef.current = null;
         scheduleReconnect();
       };
@@ -47,7 +55,7 @@ export function useWebSocket() {
     } catch {
       scheduleReconnect();
     }
-  }, [processEvent, setWsStatus]);
+  }, [processEvent, setWsStatus, setWsSend]);
 
   const scheduleReconnect = useCallback(() => {
     setWsStatus('reconnecting');
@@ -84,6 +92,7 @@ export function useWebSocket() {
       if (wsRef.current) {
         wsRef.current.close();
       }
+      setWsSend(null);
     };
-  }, [connect, replayState, setWsStatus]);
+  }, [connect, replayState, setWsStatus, setWsSend]);
 }
