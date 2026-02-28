@@ -15,6 +15,7 @@ Tests cover:
 from __future__ import annotations
 
 import os
+import sys
 import tempfile
 
 import pytest
@@ -46,18 +47,30 @@ class TestScriptExecutorBasic:
 
     @pytest.mark.asyncio
     async def test_simple_echo(self, executor: ScriptExecutor) -> None:
-        """Test simple echo command captures stdout."""
-        agent = AgentDef(name="test_echo", type="script", command="echo", args=["hello"])
+        """Test simple command captures stdout."""
+        agent = AgentDef(
+            name="test_echo",
+            type="script",
+            command=sys.executable,
+            args=["-c", "print('hello')"],
+        )
         output = await executor.execute(agent, {})
-        assert output.stdout == "hello\n"
-        assert output.stderr == ""
+        assert output.stdout.strip() == "hello"
         assert output.exit_code == 0
 
     @pytest.mark.asyncio
     async def test_command_with_multiple_args(self, executor: ScriptExecutor) -> None:
         """Test command with multiple arguments."""
         agent = AgentDef(
-            name="test_printf", type="script", command="printf", args=["%s %s", "hello", "world"]
+            name="test_printf",
+            type="script",
+            command=sys.executable,
+            args=[
+                "-c",
+                "import sys; print(sys.argv[1] + ' ' + sys.argv[2], end='')",
+                "hello",
+                "world",
+            ],
         )
         output = await executor.execute(agent, {})
         assert output.stdout == "hello world"
@@ -66,7 +79,12 @@ class TestScriptExecutorBasic:
     @pytest.mark.asyncio
     async def test_failing_command_exit_code(self, executor: ScriptExecutor) -> None:
         """Test that non-zero exit code is captured correctly (not 0)."""
-        agent = AgentDef(name="test_false", type="script", command="false")
+        agent = AgentDef(
+            name="test_false",
+            type="script",
+            command=sys.executable,
+            args=["-c", "import sys; sys.exit(1)"],
+        )
         output = await executor.execute(agent, {})
         assert output.exit_code == 1
         assert output.exit_code != 0
@@ -77,8 +95,8 @@ class TestScriptExecutorBasic:
         agent = AgentDef(
             name="test_stderr",
             type="script",
-            command="sh",
-            args=["-c", "echo out; echo err >&2"],
+            command=sys.executable,
+            args=["-c", "import sys; print('out'); print('err', file=sys.stderr)"],
         )
         output = await executor.execute(agent, {})
         assert "out" in output.stdout
@@ -92,7 +110,11 @@ class TestScriptExecutorTimeout:
     async def test_timeout_kills_process(self, executor: ScriptExecutor) -> None:
         """Test that timeout kills process and raises ExecutionError."""
         agent = AgentDef(
-            name="test_timeout", type="script", command="sleep", args=["10"], timeout=1
+            name="test_timeout",
+            type="script",
+            command=sys.executable,
+            args=["-c", "import time; time.sleep(10)"],
+            timeout=1,
         )
         with pytest.raises(ExecutionError, match="timed out after 1s"):
             await executor.execute(agent, {})
@@ -100,7 +122,12 @@ class TestScriptExecutorTimeout:
     @pytest.mark.asyncio
     async def test_no_timeout_default(self, executor: ScriptExecutor) -> None:
         """Test that no timeout allows command to complete."""
-        agent = AgentDef(name="test_quick", type="script", command="echo", args=["fast"])
+        agent = AgentDef(
+            name="test_quick",
+            type="script",
+            command=sys.executable,
+            args=["-c", "print('fast')"],
+        )
         output = await executor.execute(agent, {})
         assert output.exit_code == 0
 
@@ -114,8 +141,8 @@ class TestScriptExecutorEnvironment:
         agent = AgentDef(
             name="test_env",
             type="script",
-            command="sh",
-            args=["-c", "echo $MY_TEST_VAR"],
+            command=sys.executable,
+            args=["-c", "import os; print(os.environ['MY_TEST_VAR'])"],
             env={"MY_TEST_VAR": "custom_value"},
         )
         output = await executor.execute(agent, {})
@@ -127,8 +154,8 @@ class TestScriptExecutorEnvironment:
         agent = AgentDef(
             name="test_env_merge",
             type="script",
-            command="sh",
-            args=["-c", "echo $PATH"],
+            command=sys.executable,
+            args=["-c", "import os; print(os.environ.get('PATH', ''))"],
             env={"MY_EXTRA": "val"},
         )
         output = await executor.execute(agent, {})
@@ -146,8 +173,8 @@ class TestScriptExecutorEnvironment:
         agent = AgentDef(
             name="test_env_no_render",
             type="script",
-            command="sh",
-            args=["-c", "echo $MY_VAR"],
+            command=sys.executable,
+            args=["-c", "import os; print(os.environ['MY_VAR'])"],
             env={"MY_VAR": "{{ literal_braces }}"},
         )
         output = await executor.execute(agent, {"literal_braces": "should_not_appear"})
@@ -165,7 +192,8 @@ class TestScriptExecutorWorkingDir:
             agent = AgentDef(
                 name="test_cwd",
                 type="script",
-                command="pwd",
+                command=sys.executable,
+                args=["-c", "import os; print(os.getcwd())"],
                 working_dir=tmpdir,
             )
             output = await executor.execute(agent, {})
@@ -179,7 +207,8 @@ class TestScriptExecutorWorkingDir:
             agent = AgentDef(
                 name="test_cwd_tpl",
                 type="script",
-                command="pwd",
+                command=sys.executable,
+                args=["-c", "import os; print(os.getcwd())"],
                 working_dir="{{ target_dir }}",
             )
             output = await executor.execute(agent, {"target_dir": tmpdir})
@@ -196,8 +225,9 @@ class TestScriptExecutorTemplating:
             name="test_cmd_tpl",
             type="script",
             command="{{ cmd }}",
+            args=["-c", "print('ok')"],
         )
-        output = await executor.execute(agent, {"cmd": "echo"})
+        output = await executor.execute(agent, {"cmd": sys.executable})
         assert output.exit_code == 0
 
     @pytest.mark.asyncio
@@ -206,8 +236,8 @@ class TestScriptExecutorTemplating:
         agent = AgentDef(
             name="test_args_tpl",
             type="script",
-            command="echo",
-            args=["{{ greeting }}"],
+            command=sys.executable,
+            args=["-c", "print('{{ greeting }}')"],
         )
         output = await executor.execute(agent, {"greeting": "hi there"})
         assert "hi there" in output.stdout
@@ -218,8 +248,8 @@ class TestScriptExecutorTemplating:
         agent = AgentDef(
             name="test_ctx_tpl",
             type="script",
-            command="echo",
-            args=["{{ workflow.input.message }}"],
+            command=sys.executable,
+            args=["-c", "print('{{ workflow.input.message }}')"],
         )
         context = {"workflow": {"input": {"message": "from workflow"}}}
         output = await executor.execute(agent, context)
@@ -246,8 +276,8 @@ class TestScriptExecutorErrors:
         agent = AgentDef(
             name="test_exit42",
             type="script",
-            command="sh",
-            args=["-c", "exit 42"],
+            command=sys.executable,
+            args=["-c", "import sys; sys.exit(42)"],
         )
         output = await executor.execute(agent, {})
         assert output.exit_code == 42

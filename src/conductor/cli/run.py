@@ -72,7 +72,7 @@ def init_file_logging(log_path: Path) -> None:
     """
     global _file_console, _file_handle
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    _file_handle = open(log_path, "w")  # noqa: SIM115
+    _file_handle = open(log_path, "w", encoding="utf-8")  # noqa: SIM115
     _file_console = Console(file=_file_handle, no_color=True, highlight=False, width=200)
 
 

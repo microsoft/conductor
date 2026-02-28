@@ -20,7 +20,7 @@ import os
 import stat
 import sys
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 from unittest.mock import patch
 
@@ -106,13 +106,13 @@ class TestMakeJsonSerializable:
         assert _make_json_serializable(p) == str(p)
 
     def test_dict_recursive(self) -> None:
-        d = {"path": Path("/a"), "nested": {"b": b"data"}}
+        d = {"path": PurePosixPath("/a"), "nested": {"b": b"data"}}
         result = _make_json_serializable(d)
         assert result["path"] == "/a"
         assert result["nested"]["b"] == "data"
 
     def test_list_recursive(self) -> None:
-        result = _make_json_serializable([Path("/a"), 42, [b"x"]])
+        result = _make_json_serializable([PurePosixPath("/a"), 42, [b"x"]])
         assert result == ["/a", 42, ["x"]]
 
     def test_set_converted_to_sorted_list(self) -> None:
@@ -244,7 +244,7 @@ class TestSaveCheckpoint:
         limits = _make_limits()
         error = RuntimeError("err")
 
-        inputs_with_path: dict[str, Any] = {"file": Path("/tmp/x"), "data": b"bytes"}
+        inputs_with_path: dict[str, Any] = {"file": PurePosixPath("/tmp/x"), "data": b"bytes"}
 
         with patch.object(CheckpointManager, "get_checkpoints_dir", return_value=tmp_path):
             path = CheckpointManager.save_checkpoint(wf, ctx, limits, "a", error, inputs_with_path)

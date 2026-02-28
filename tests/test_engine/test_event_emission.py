@@ -7,6 +7,7 @@ covered (20 from design doc + script_failed).
 
 from __future__ import annotations
 
+import sys
 from unittest.mock import MagicMock
 
 import pytest
@@ -510,8 +511,8 @@ class TestScriptEvents:
                 AgentDef(
                     name="run_echo",
                     type="script",
-                    command="echo",
-                    args=["hello"],
+                    command=sys.executable,
+                    args=["-c", "print('hello')"],
                     routes=[RouteDef(to="$end")],
                 ),
             ],

@@ -15,6 +15,7 @@ Tests cover:
 
 from __future__ import annotations
 
+import sys
 from unittest.mock import MagicMock
 
 import pytest
@@ -52,8 +53,8 @@ class TestScriptWorkflowLinear:
                 AgentDef(
                     name="run_echo",
                     type="script",
-                    command="echo",
-                    args=["hello world"],
+                    command=sys.executable,
+                    args=["-c", "print('hello world')"],
                     routes=[RouteDef(to="$end")],
                 ),
             ],
@@ -83,8 +84,8 @@ class TestScriptWorkflowLinear:
                 AgentDef(
                     name="checker",
                     type="script",
-                    command="echo",
-                    args=["test output"],
+                    command=sys.executable,
+                    args=["-c", "print('test output')"],
                     routes=[RouteDef(to="processor")],
                 ),
                 AgentDef(
@@ -131,7 +132,8 @@ class TestScriptRouting:
                 AgentDef(
                     name="checker",
                     type="script",
-                    command="true",
+                    command=sys.executable,
+                    args=["-c", "import sys; sys.exit(0)"],
                     routes=[
                         RouteDef(to="success_handler", when="exit_code == 0"),
                         RouteDef(to="failure_handler"),
@@ -175,7 +177,8 @@ class TestScriptRouting:
                 AgentDef(
                     name="checker",
                     type="script",
-                    command="false",
+                    command=sys.executable,
+                    args=["-c", "import sys; sys.exit(1)"],
                     routes=[
                         RouteDef(to="success_handler", when="exit_code == 0"),
                         RouteDef(to="failure_handler"),
@@ -219,7 +222,8 @@ class TestScriptRouting:
                 AgentDef(
                     name="checker",
                     type="script",
-                    command="true",
+                    command=sys.executable,
+                    args=["-c", "import sys; sys.exit(0)"],
                     routes=[
                         RouteDef(to="success_handler", when="{{ output.exit_code == 0 }}"),
                         RouteDef(to="failure_handler"),
@@ -267,15 +271,15 @@ class TestScriptLimits:
                 AgentDef(
                     name="step1",
                     type="script",
-                    command="echo",
-                    args=["step1"],
+                    command=sys.executable,
+                    args=["-c", "print('step1')"],
                     routes=[RouteDef(to="step2")],
                 ),
                 AgentDef(
                     name="step2",
                     type="script",
-                    command="echo",
-                    args=["step2"],
+                    command=sys.executable,
+                    args=["-c", "print('step2')"],
                     routes=[RouteDef(to="$end")],
                 ),
             ],
@@ -303,7 +307,8 @@ class TestScriptLimits:
                 AgentDef(
                     name="failing",
                     type="script",
-                    command="false",
+                    command=sys.executable,
+                    args=["-c", "import sys; sys.exit(1)"],
                 ),
             ],
             output={
@@ -337,8 +342,8 @@ class TestScriptMixed:
                 AgentDef(
                     name="setup_script",
                     type="script",
-                    command="echo",
-                    args=["setup complete"],
+                    command=sys.executable,
+                    args=["-c", "print('setup complete')"],
                     routes=[RouteDef(to="analyzer")],
                 ),
                 AgentDef(
@@ -380,8 +385,8 @@ class TestScriptTemplating:
                 AgentDef(
                     name="runner",
                     type="script",
-                    command="echo",
-                    args=["{{ workflow.input.message }}"],
+                    command=sys.executable,
+                    args=["-c", "import sys; print(sys.argv[1])", "{{ workflow.input.message }}"],
                     routes=[RouteDef(to="$end")],
                 ),
             ],

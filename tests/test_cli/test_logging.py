@@ -11,9 +11,11 @@ This module tests:
 from __future__ import annotations
 
 import contextlib
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 from typer.testing import CliRunner
 
 from conductor.cli.app import (
@@ -732,7 +734,7 @@ class TestFileLogging:
             verbose_log("test file message")
             close_file_logging()
 
-            content = log_path.read_text()
+            content = log_path.read_text(encoding="utf-8")
             assert "test file message" in content
         finally:
             verbose_mode.reset(token)
@@ -750,7 +752,7 @@ class TestFileLogging:
             verbose_log("styled message", style="bold red")
             close_file_logging()
 
-            content = log_path.read_text()
+            content = log_path.read_text(encoding="utf-8")
             assert "styled message" in content
             # No ANSI escape sequences
             ansi_pattern = re.compile(r"\x1b\[[0-9;]*m")
@@ -772,7 +774,7 @@ class TestFileLogging:
                 verbose_log_section("Test", long_content)
             close_file_logging()
 
-            content = log_path.read_text()
+            content = log_path.read_text(encoding="utf-8")
             # File should have full content, not truncated
             assert "truncated" not in content
             assert content.count("x") == 1000
@@ -797,7 +799,7 @@ class TestFileLogging:
             verbose_log_timing("test op", 1.5)
             close_file_logging()
 
-            content = log_path.read_text()
+            content = log_path.read_text(encoding="utf-8")
             assert "silent mode message" in content
             assert "test op" in content
             assert "1.50" in content
@@ -1023,7 +1025,7 @@ class TestVerbosityAwareOutput:
                 verbose_log_section("Prompt", "full prompt content here")
             close_file_logging()
 
-            content = log_path.read_text()
+            content = log_path.read_text(encoding="utf-8")
             assert "Prompt" in content
             assert "full prompt content here" in content
         finally:
@@ -1078,7 +1080,7 @@ class TestFileLoggingDualWrite:
             verbose_log_agent_start("test-agent", 1)
             close_file_logging()
 
-            content = log_path.read_text()
+            content = log_path.read_text(encoding="utf-8")
             assert "test-agent" in content
             assert "iter 1" in content
         finally:
@@ -1101,7 +1103,7 @@ class TestFileLoggingDualWrite:
             )
             close_file_logging()
 
-            content = log_path.read_text()
+            content = log_path.read_text(encoding="utf-8")
             assert "test-agent" in content
             assert "1.50" in content
             assert "gpt-4" in content
@@ -1120,7 +1122,7 @@ class TestFileLoggingDualWrite:
             verbose_log_route("next-agent")
             close_file_logging()
 
-            content = log_path.read_text()
+            content = log_path.read_text(encoding="utf-8")
             assert "next-agent" in content
         finally:
             verbose_mode.reset(token)
@@ -1136,7 +1138,7 @@ class TestFileLoggingDualWrite:
             verbose_log_route("$end")
             close_file_logging()
 
-            content = log_path.read_text()
+            content = log_path.read_text(encoding="utf-8")
             assert "$end" in content
         finally:
             verbose_mode.reset(token)
@@ -1152,7 +1154,7 @@ class TestFileLoggingDualWrite:
             verbose_log_timing("Workflow execution", 3.456)
             close_file_logging()
 
-            content = log_path.read_text()
+            content = log_path.read_text(encoding="utf-8")
             assert "Workflow execution" in content
             assert "3.46" in content
         finally:
@@ -1173,7 +1175,7 @@ class TestFileLoggingDualWrite:
             verbose_log_parallel_start("parallel-group", 3)
             close_file_logging()
 
-            content = log_path.read_text()
+            content = log_path.read_text(encoding="utf-8")
             assert "parallel-group" in content
             assert "3 agents" in content
         finally:
@@ -1194,7 +1196,7 @@ class TestFileLoggingDualWrite:
             verbose_log_parallel_agent_complete("agent-a", 2.0, model="gpt-4", tokens=200)
             close_file_logging()
 
-            content = log_path.read_text()
+            content = log_path.read_text(encoding="utf-8")
             assert "agent-a" in content
             assert "2.00" in content
         finally:
@@ -1215,7 +1217,7 @@ class TestFileLoggingDualWrite:
             verbose_log_parallel_agent_failed("agent-b", 0.5, "RuntimeError", "Something broke")
             close_file_logging()
 
-            content = log_path.read_text()
+            content = log_path.read_text(encoding="utf-8")
             assert "agent-b" in content
             assert "RuntimeError" in content
             assert "Something broke" in content
@@ -1237,7 +1239,7 @@ class TestFileLoggingDualWrite:
             verbose_log_parallel_summary("group1", 2, 1, 3.0)
             close_file_logging()
 
-            content = log_path.read_text()
+            content = log_path.read_text(encoding="utf-8")
             assert "group1" in content
             assert "2 succeeded" in content
             assert "1 failed" in content
@@ -1259,7 +1261,7 @@ class TestFileLoggingDualWrite:
             verbose_log_for_each_start("loop-group", 5, 2, "fail_fast")
             close_file_logging()
 
-            content = log_path.read_text()
+            content = log_path.read_text(encoding="utf-8")
             assert "loop-group" in content
             assert "5 items" in content
         finally:
@@ -1280,7 +1282,7 @@ class TestFileLoggingDualWrite:
             verbose_log_for_each_item_complete("item-0", 1.2, tokens=50)
             close_file_logging()
 
-            content = log_path.read_text()
+            content = log_path.read_text(encoding="utf-8")
             assert "item-0" in content
             assert "1.20" in content
         finally:
@@ -1301,7 +1303,7 @@ class TestFileLoggingDualWrite:
             verbose_log_for_each_item_failed("item-2", 0.3, "ValueError", "bad input")
             close_file_logging()
 
-            content = log_path.read_text()
+            content = log_path.read_text(encoding="utf-8")
             assert "item-2" in content
             assert "ValueError" in content
             assert "bad input" in content
@@ -1323,7 +1325,7 @@ class TestFileLoggingDualWrite:
             verbose_log_for_each_summary("loop1", 4, 1, 5.0)
             close_file_logging()
 
-            content = log_path.read_text()
+            content = log_path.read_text(encoding="utf-8")
             assert "loop1" in content
             assert "4 succeeded" in content
             assert "1 failed" in content
@@ -1351,7 +1353,7 @@ class TestFileLoggingDualWrite:
             )
             close_file_logging()
 
-            content = log_path.read_text()
+            content = log_path.read_text(encoding="utf-8")
             assert "Token Usage" in content
             assert "500" in content
             assert "200" in content
@@ -1371,7 +1373,7 @@ class TestFileLoggingDualWrite:
             verbose_log_section("Prompt", "full prompt content")
             close_file_logging()
 
-            content = log_path.read_text()
+            content = log_path.read_text(encoding="utf-8")
             assert "Prompt" in content
             assert "full prompt content" in content
         finally:
@@ -1528,6 +1530,7 @@ output:
 class TestFileLoggingErrorHandling:
     """Tests for file logging error handling."""
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="Unix-specific chmod permissions")
     def test_init_file_logging_permission_denied(self, tmp_path: Path) -> None:
         """Test that init_file_logging raises OSError for permission issues."""
         import os
@@ -1551,6 +1554,7 @@ class TestFileLoggingErrorHandling:
             # Restore permissions for cleanup
             os.chmod(readonly_dir, 0o755)
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="Unix-specific path behavior")
     def test_run_workflow_handles_log_file_error_gracefully(self, tmp_path: Path) -> None:
         """Test that run_workflow_async handles log file errors gracefully."""
         import asyncio
@@ -1635,7 +1639,7 @@ output:
             verbose_log_timing("operation", 1.5)
             close_file_logging()
 
-            content = log_path.read_text()
+            content = log_path.read_text(encoding="utf-8")
             ansi_pattern = re.compile(r"\x1b\[[0-9;]*m")
             assert not ansi_pattern.search(content), f"ANSI codes found in file output: {content}"
         finally:
