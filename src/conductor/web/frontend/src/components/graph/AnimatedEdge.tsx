@@ -38,12 +38,16 @@ export const AnimatedEdge = memo(function AnimatedEdge({
   const hasWhen = !!whenExpr;
   const isTaken = edgeHighlight?.state === 'taken';
   const isHighlighted = edgeHighlight?.state === 'highlighted';
+  const isFailed = edgeHighlight?.state === 'failed';
 
   let strokeColor = 'var(--edge-color)';
   let strokeWidth = 2;
   let strokeDasharray: string | undefined;
 
-  if (isTaken) {
+  if (isFailed) {
+    strokeColor = 'var(--failed)';
+    strokeWidth = 3;
+  } else if (isTaken) {
     strokeColor = 'var(--edge-taken)';
     strokeWidth = 3;
   } else if (isHighlighted) {
@@ -51,9 +55,11 @@ export const AnimatedEdge = memo(function AnimatedEdge({
     strokeWidth = 3;
   }
 
-  if (hasWhen && !isTaken && !isHighlighted) {
+  if (hasWhen && !isTaken && !isHighlighted && !isFailed) {
     strokeDasharray = '6 3';
   }
+
+  const markerSuffix = isFailed ? 'failed' : isTaken ? 'taken' : isHighlighted ? 'active' : 'default';
 
   return (
     <>
@@ -66,7 +72,7 @@ export const AnimatedEdge = memo(function AnimatedEdge({
           strokeDasharray,
           transition: 'stroke 0.3s ease, stroke-width 0.3s ease',
         }}
-        markerEnd={`url(#arrow-${isTaken ? 'taken' : isHighlighted ? 'active' : 'default'})`}
+        markerEnd={`url(#arrow-${markerSuffix})`}
       />
       {/* Condition label for conditional edges */}
       {hasWhen && (
@@ -82,9 +88,13 @@ export const AnimatedEdge = memo(function AnimatedEdge({
             <span
               className="inline-block px-1.5 py-0.5 rounded-full text-[9px] font-mono leading-tight max-w-[140px] truncate"
               style={{
-                backgroundColor: isTaken ? 'var(--edge-taken)' : 'var(--surface)',
-                color: isTaken ? 'var(--bg)' : 'var(--text-muted)',
-                border: `1px solid ${isTaken ? 'var(--edge-taken)' : 'var(--border)'}`,
+                backgroundColor: isFailed
+                  ? 'var(--failed)'
+                  : isTaken
+                    ? 'var(--edge-taken)'
+                    : 'var(--surface)',
+                color: isFailed || isTaken ? 'var(--bg)' : 'var(--text-muted)',
+                border: `1px solid ${isFailed ? 'var(--failed)' : isTaken ? 'var(--edge-taken)' : 'var(--border)'}`,
               }}
               title={whenExpr}
             >
@@ -97,6 +107,12 @@ export const AnimatedEdge = memo(function AnimatedEdge({
       {isTaken && (
         <circle r="3" fill="var(--edge-taken)">
           <animateMotion dur="1s" repeatCount="indefinite" path={edgePath} />
+        </circle>
+      )}
+      {/* Pulsing dot for failed edges */}
+      {isFailed && (
+        <circle r="3" fill="var(--failed)" opacity="0.8">
+          <animateMotion dur="1.5s" repeatCount="indefinite" path={edgePath} />
         </circle>
       )}
     </>

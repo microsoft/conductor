@@ -13,10 +13,12 @@ export function StatusBar() {
   const workflowFailure = useWorkflowStore((s) => s.workflowFailure);
   const elapsed = useElapsedTimer();
 
+  const isFailed = workflowStatus === 'failed';
+
   const statusText = (() => {
     switch (workflowStatus) {
       case 'pending':
-        return 'Waiting for workflow…';
+        return 'Waiting for workflow\u2026';
       case 'running':
         return 'Running';
       case 'completed':
@@ -26,7 +28,12 @@ export function StatusBar() {
         const et = workflowFailure.error_type || '';
         if (et === 'MaxIterationsError') return 'Failed: exceeded maximum iterations';
         if (et === 'TimeoutError') return 'Failed: workflow timed out';
-        if (workflowFailure.message) return `Failed: ${workflowFailure.message}`;
+        if (workflowFailure.message) {
+          const msg = workflowFailure.message.length > 60
+            ? workflowFailure.message.slice(0, 57) + '...'
+            : workflowFailure.message;
+          return `Failed: ${msg}`;
+        }
         return `Failed: ${et}`;
       }
     }
@@ -59,39 +66,50 @@ export function StatusBar() {
         return (
           <span className="flex items-center gap-1 text-[var(--waiting)]">
             <Loader2 className="w-3 h-3 animate-spin" />
-            <span>Reconnecting…</span>
+            <span>Reconnecting\u2026</span>
           </span>
         );
       case 'connecting':
         return (
           <span className="flex items-center gap-1 text-[var(--text-muted)]">
             <Loader2 className="w-3 h-3 animate-spin" />
-            <span>Connecting…</span>
+            <span>Connecting\u2026</span>
           </span>
         );
     }
   })();
 
   return (
-    <footer className="flex items-center gap-4 px-4 py-1.5 bg-[var(--surface)] border-t border-[var(--border)] text-xs flex-shrink-0">
+    <footer
+      className={cn(
+        'flex items-center gap-4 px-4 py-1.5 border-t text-xs flex-shrink-0 transition-colors duration-300',
+        isFailed
+          ? 'bg-red-950/50 border-red-500/30'
+          : 'bg-[var(--surface)] border-[var(--border)]',
+      )}
+    >
       <span className={cn('w-2 h-2 rounded-full flex-shrink-0', statusDotColor)} />
-      <span className="text-[var(--text)]">{statusText}</span>
+      <span className={cn(isFailed ? 'text-red-300' : 'text-[var(--text)]')}>
+        {statusText}
+      </span>
       {agentsTotal > 0 && (
-        <span className="text-[var(--text-muted)]">
+        <span className={cn(isFailed ? 'text-red-400/60' : 'text-[var(--text-muted)]')}>
           {agentsCompleted}/{agentsTotal} agents
         </span>
       )}
       {workflowStatus !== 'pending' && (
-        <span className="text-[var(--text-muted)] font-mono">{elapsed}</span>
+        <span className={cn('font-mono', isFailed ? 'text-red-400/60' : 'text-[var(--text-muted)]')}>
+          {elapsed}
+        </span>
       )}
       {totalTokens > 0 && (
-        <span className="flex items-center gap-1 text-[var(--text-muted)]" title="Total tokens used">
+        <span className={cn('flex items-center gap-1', isFailed ? 'text-red-400/60' : 'text-[var(--text-muted)]')} title="Total tokens used">
           <Hash className="w-3 h-3" />
           <span className="font-mono">{totalTokens.toLocaleString()}</span>
         </span>
       )}
       {totalCost > 0 && (
-        <span className="flex items-center gap-1 text-[var(--text-muted)]" title="Total cost">
+        <span className={cn('flex items-center gap-1', isFailed ? 'text-red-400/60' : 'text-[var(--text-muted)]')} title="Total cost">
           <Coins className="w-3 h-3" />
           <span className="font-mono">${totalCost.toFixed(4)}</span>
         </span>

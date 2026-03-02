@@ -1,54 +1,90 @@
-import { memo, useMemo } from 'react';
+import { memo, useEffect, useRef, useState } from 'react';
 import { Handle, Position, type NodeProps } from '@xyflow/react';
 import { ShieldCheck } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { NODE_STATUS_HEX } from '@/lib/constants';
 import { useWorkflowStore } from '@/stores/workflow-store';
+import { NodeTooltip } from './NodeTooltip';
 import type { GraphNodeData } from './graph-layout';
 import type { NodeStatus } from '@/lib/constants';
 
 export const GateNode = memo(function GateNode({ data, id, selected }: NodeProps) {
   const nodeData = data as unknown as GraphNodeData;
-  // Read status directly from the store for immediate updates
   const storeStatus = useWorkflowStore((s) => s.nodes[id]?.status);
   const status = (storeStatus || nodeData.status || 'pending') as NodeStatus;
   const borderColor = NODE_STATUS_HEX[status] || NODE_STATUS_HEX.pending;
 
   const selectedOption = useWorkflowStore((s) => s.nodes[id]?.selected_option);
-  const route = useWorkflowStore((s) => s.nodes[id]?.route);
 
-  const tooltip = useMemo(() => {
-    const parts: string[] = [`Status: ${status}`];
-    if (selectedOption) parts.push(`Selected: ${selectedOption}`);
-    if (route) parts.push(`Route: ${route}`);
-    return parts.join('\n');
-  }, [status, selectedOption, route]);
+  // Status transition animation
+  const transitionClass = useStatusTransition(status);
 
   return (
     <>
       <Handle type="target" position={Position.Top} className="!bg-[var(--border)] !border-none !w-2 !h-2" />
-      <div
-        title={tooltip}
-        className={cn(
-          'flex items-center gap-2 px-3 py-2 rounded-lg border-2 border-dashed bg-[var(--node-bg)] min-w-[140px] max-w-[200px] transition-all duration-300',
-          selected && 'ring-2 ring-[var(--accent)] ring-offset-1 ring-offset-[var(--bg)]',
-          status === 'waiting' && 'shadow-[0_0_12px_var(--waiting-muted)]',
-          status === 'running' && 'shadow-[0_0_12px_var(--running-glow)]',
-        )}
-        style={{ borderColor }}
+      <NodeTooltip
+        data={{
+          status,
+          selectedOption,
+        }}
       >
         <div
           className={cn(
-            'flex items-center justify-center w-6 h-6 rounded-md flex-shrink-0',
-            status === 'waiting' && 'animate-pulse',
+            'flex items-center gap-2 px-3 py-1.5 rounded-lg border-2 border-dashed bg-[var(--node-bg)] min-w-[140px] max-w-[220px] transition-all duration-300',
+            selected && 'ring-2 ring-[var(--accent)] ring-offset-1 ring-offset-[var(--bg)]',
+            status === 'waiting' && 'shadow-[0_0_12px_var(--waiting-muted)]',
+            status === 'running' && 'shadow-[0_0_12px_var(--running-glow)]',
+            transitionClass,
           )}
-          style={{ backgroundColor: `${borderColor}20` }}
+          style={{ borderColor }}
         >
-          <ShieldCheck className="w-3.5 h-3.5" style={{ color: borderColor }} />
+          <div
+            className={cn(
+              'flex items-center justify-center w-6 h-6 rounded-md flex-shrink-0',
+              status === 'waiting' && 'animate-pulse',
+            )}
+            style={{ backgroundColor: `${borderColor}20` }}
+          >
+            <ShieldCheck className="w-3.5 h-3.5" style={{ color: borderColor }} />
+          </div>
+          <div className="flex flex-col min-w-0 flex-1">
+            <span className="text-xs font-medium text-[var(--text)] truncate">{nodeData.label}</span>
+            {status === 'waiting' && (
+              <span className="text-[10px] text-[var(--waiting)] truncate leading-tight">
+                Awaiting input...
+              </span>
+            )}
+            {status === 'completed' && selectedOption && (
+              <span className="text-[10px] text-[var(--text-muted)] truncate leading-tight">
+                {selectedOption}
+              </span>
+            )}
+          </div>
         </div>
-        <span className="text-xs font-medium text-[var(--text)] truncate">{nodeData.label}</span>
-      </div>
+      </NodeTooltip>
       <Handle type="source" position={Position.Bottom} className="!bg-[var(--border)] !border-none !w-2 !h-2" />
     </>
   );
 });
+
+function useStatusTransition(status: NodeStatus): string {
+  const prevStatusRef = useRef<NodeStatus>(status);
+  const [transitionClass, setTransitionClass] = useState('');
+
+  useEffect(() => {
+    const prev = prevStatusRef.current;
+    prevStatusRef.current = status;
+    if (prev === status) return;
+
+    if (prev === 'pending' && (status === 'running' || status === 'waiting')) {
+      setTransitionClass('node-activate');
+    } else if ((prev === 'running' || prev === 'waiting') && status === 'completed') {
+      setTransitionClass('node-complete');
+    }
+
+    const timer = setTimeout(() => setTransitionClass(''), 400);
+    return () => clearTimeout(timer);
+  }, [status]);
+
+  return transitionClass;
+}

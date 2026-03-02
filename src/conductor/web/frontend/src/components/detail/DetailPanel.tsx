@@ -1,14 +1,24 @@
+import { useEffect, useState } from 'react';
 import { X } from 'lucide-react';
 import { useWorkflowStore } from '@/stores/workflow-store';
 import { AgentDetail } from './AgentDetail';
 import { ScriptDetail } from './ScriptDetail';
 import { GateDetail } from './GateDetail';
 import { GroupDetail } from './GroupDetail';
+import { cn } from '@/lib/utils';
 
 export function DetailPanel() {
   const selectedNode = useWorkflowStore((s) => s.selectedNode);
   const nodes = useWorkflowStore((s) => s.nodes);
   const selectNode = useWorkflowStore((s) => s.selectNode);
+
+  // Slide-in animation state
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => {
+    // Trigger animation on next frame after mount
+    requestAnimationFrame(() => setMounted(true));
+    return () => setMounted(false);
+  }, [selectedNode]);
 
   const node = selectedNode ? nodes[selectedNode] : null;
 
@@ -40,7 +50,12 @@ export function DetailPanel() {
   })();
 
   return (
-    <div className="h-full flex flex-col bg-[var(--surface)]">
+    <div
+      className={cn(
+        'h-full flex flex-col bg-[var(--surface)] transition-all duration-150 ease-out',
+        mounted ? 'translate-x-0 opacity-100' : 'translate-x-4 opacity-0',
+      )}
+    >
       {/* Header */}
       <div className="flex items-center justify-between px-4 py-3 border-b border-[var(--border)] flex-shrink-0">
         <h2 className="text-sm font-semibold text-[var(--text)] truncate">{selectedNode}</h2>
