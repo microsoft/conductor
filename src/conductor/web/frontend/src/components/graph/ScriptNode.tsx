@@ -1,61 +1,139 @@
-import { memo, useMemo } from 'react';
+import { memo, useEffect, useRef, useState } from 'react';
 import { Handle, Position, type NodeProps } from '@xyflow/react';
 import { Terminal } from 'lucide-react';
-import { cn } from '@/lib/utils';
+import { cn, formatElapsed } from '@/lib/utils';
 import { NODE_STATUS_HEX } from '@/lib/constants';
 import { useWorkflowStore } from '@/stores/workflow-store';
+import { NodeTooltip } from './NodeTooltip';
 import type { GraphNodeData } from './graph-layout';
 import type { NodeStatus } from '@/lib/constants';
 
 export const ScriptNode = memo(function ScriptNode({ data, id, selected }: NodeProps) {
   const nodeData = data as unknown as GraphNodeData;
-  // Read status directly from the store for immediate updates
   const storeStatus = useWorkflowStore((s) => s.nodes[id]?.status);
   const status = (storeStatus || nodeData.status || 'pending') as NodeStatus;
   const borderColor = NODE_STATUS_HEX[status] || NODE_STATUS_HEX.pending;
 
   const elapsed = useWorkflowStore((s) => s.nodes[id]?.elapsed);
   const exitCode = useWorkflowStore((s) => s.nodes[id]?.exit_code);
+  const errorType = useWorkflowStore((s) => s.nodes[id]?.error_type);
+  const errorMessage = useWorkflowStore((s) => s.nodes[id]?.error_message);
 
-  const tooltip = useMemo(() => {
-    const parts: string[] = [`Status: ${status}`];
-    if (elapsed != null) parts.push(`Elapsed: ${formatSec(elapsed)}`);
-    if (exitCode != null) parts.push(`Exit code: ${exitCode}`);
-    return parts.join('\n');
-  }, [status, elapsed, exitCode]);
+  // Live elapsed timer
+  const liveElapsed = useLiveElapsed(status);
+
+  // Status transition animation
+  const transitionClass = useStatusTransition(status);
+
+  // Build stats line
+  const statsLine = (() => {
+    if (status === 'failed' && errorMessage) {
+      const msg = errorMessage.length > 40 ? errorMessage.slice(0, 37) + '...' : errorMessage;
+      return { text: msg, className: 'text-red-400' };
+    }
+    if (status === 'running') {
+      return { text: liveElapsed, className: 'text-[var(--text-muted)]' };
+    }
+    if (status === 'completed') {
+      const parts: string[] = [];
+      if (elapsed != null) parts.push(formatElapsed(elapsed));
+      if (exitCode != null) parts.push(`exit ${exitCode}`);
+      return { text: parts.join(' · ') || null, className: 'text-[var(--text-muted)]' };
+    }
+    return { text: null, className: '' };
+  })();
 
   return (
     <>
       <Handle type="target" position={Position.Top} className="!bg-[var(--border)] !border-none !w-2 !h-2" />
-      <div
-        title={tooltip}
-        className={cn(
-          'flex items-center gap-2 px-3 py-2 rounded-lg border-2 bg-[var(--node-bg)] min-w-[140px] max-w-[200px] transition-all duration-300',
-          selected && 'ring-2 ring-[var(--accent)] ring-offset-1 ring-offset-[var(--bg)]',
-          status === 'running' && 'shadow-[0_0_12px_var(--running-glow)]',
-        )}
-        style={{ borderColor }}
+      <NodeTooltip
+        data={{
+          status,
+          elapsed,
+          exitCode,
+          errorType,
+          errorMessage,
+        }}
       >
         <div
           className={cn(
-            'flex items-center justify-center w-6 h-6 rounded-md flex-shrink-0',
-            status === 'running' && 'animate-pulse',
+            'flex items-center gap-2 px-3 py-1.5 rounded-lg border-2 bg-[var(--node-bg)] min-w-[140px] max-w-[220px] transition-all duration-300',
+            selected && 'ring-2 ring-[var(--accent)] ring-offset-1 ring-offset-[var(--bg)]',
+            status === 'running' && 'shadow-[0_0_12px_var(--running-glow)]',
+            transitionClass,
           )}
-          style={{ backgroundColor: `${borderColor}20` }}
+          style={{ borderColor }}
         >
-          <Terminal className="w-3.5 h-3.5" style={{ color: borderColor }} />
+          <div
+            className={cn(
+              'flex items-center justify-center w-6 h-6 rounded-md flex-shrink-0',
+              status === 'running' && 'animate-pulse',
+            )}
+            style={{ backgroundColor: `${borderColor}20` }}
+          >
+            <Terminal className="w-3.5 h-3.5" style={{ color: borderColor }} />
+          </div>
+          <div className="flex flex-col min-w-0 flex-1">
+            <span className="text-xs font-medium text-[var(--text)] truncate">{nodeData.label}</span>
+            {statsLine.text && (
+              <span className={cn('text-[10px] truncate leading-tight', statsLine.className)}>
+                {statsLine.text}
+              </span>
+            )}
+          </div>
         </div>
-        <span className="text-xs font-medium text-[var(--text)] truncate">{nodeData.label}</span>
-      </div>
+      </NodeTooltip>
       <Handle type="source" position={Position.Bottom} className="!bg-[var(--border)] !border-none !w-2 !h-2" />
     </>
   );
 });
 
-function formatSec(s: number): string {
-  if (s < 1) return `${(s * 1000).toFixed(0)}ms`;
-  if (s < 60) return `${s.toFixed(1)}s`;
-  const m = Math.floor(s / 60);
-  const sec = (s % 60).toFixed(0);
-  return `${m}m ${sec}s`;
+function useLiveElapsed(status: NodeStatus): string {
+  const [display, setDisplay] = useState('0.0s');
+  const startRef = useRef<number | null>(null);
+  const rafRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  useEffect(() => {
+    if (status === 'running') {
+      startRef.current = Date.now();
+      const tick = () => {
+        if (startRef.current != null) {
+          const sec = (Date.now() - startRef.current) / 1000;
+          setDisplay(formatElapsed(sec));
+        }
+      };
+      tick();
+      rafRef.current = setInterval(tick, 1000);
+      return () => {
+        if (rafRef.current) clearInterval(rafRef.current);
+      };
+    } else {
+      if (rafRef.current) clearInterval(rafRef.current);
+      startRef.current = null;
+    }
+  }, [status]);
+
+  return display;
+}
+
+function useStatusTransition(status: NodeStatus): string {
+  const prevStatusRef = useRef<NodeStatus>(status);
+  const [transitionClass, setTransitionClass] = useState('');
+
+  useEffect(() => {
+    const prev = prevStatusRef.current;
+    prevStatusRef.current = status;
+    if (prev === status) return;
+
+    if (prev === 'pending' && status === 'running') {
+      setTransitionClass('node-activate');
+    } else if (prev === 'running' && (status === 'completed' || status === 'failed')) {
+      setTransitionClass(status === 'completed' ? 'node-complete' : 'node-fail');
+    }
+
+    const timer = setTimeout(() => setTransitionClass(''), 400);
+    return () => clearTimeout(timer);
+  }, [status]);
+
+  return transitionClass;
 }

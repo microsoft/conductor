@@ -24,9 +24,10 @@ import { GroupNode } from './GroupNode';
 import { EndNode } from './EndNode';
 import { StartNode } from './StartNode';
 import { AnimatedEdge } from './AnimatedEdge';
+import { WorkflowErrorBanner, WorkflowSuccessBanner } from '@/components/layout/ErrorBanner';
 import { NODE_STATUS_HEX } from '@/lib/constants';
 import type { NodeStatus } from '@/lib/constants';
-import { Loader2, Maximize } from 'lucide-react';
+import { Loader2, Maximize, Zap } from 'lucide-react';
 
 const nodeTypes: NodeTypes = {
   agentNode: AgentNode,
@@ -59,6 +60,9 @@ function EdgeMarkers() {
         <marker id="arrow-taken" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
           <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--edge-taken)" />
         </marker>
+        <marker id="arrow-failed" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--failed)" />
+        </marker>
       </defs>
     </svg>
   );
@@ -75,6 +79,8 @@ export function WorkflowGraph() {
   const selectedNode = useWorkflowStore((s) => s.selectedNode);
   const workflowStatus = useWorkflowStore((s) => s.workflowStatus);
   const entryPoint = useWorkflowStore((s) => s.entryPoint);
+  const wsStatus = useWorkflowStore((s) => s.wsStatus);
+  const workflowFailedAgent = useWorkflowStore((s) => s.workflowFailedAgent);
 
   const [flowNodes, setFlowNodes, onNodesChange] = useNodesState<Node<GraphNodeData>>([]);
   const [flowEdges, setFlowEdges, onEdgesChange] = useEdgesState<Edge>([]);
@@ -168,16 +174,43 @@ export function WorkflowGraph() {
     );
   }, [selectedNode, setFlowNodes]);
 
+  // Auto-select failed agent when workflow fails
+  useEffect(() => {
+    if (workflowStatus === 'failed' && workflowFailedAgent) {
+      selectNode(workflowFailedAgent);
+    }
+  }, [workflowStatus, workflowFailedAgent, selectNode]);
+
   const showEmptyState = workflowStatus === 'pending' && agents.length === 0;
+
+  // Better empty state message based on ws status
+  const emptyMessage = (() => {
+    switch (wsStatus) {
+      case 'connecting':
+        return 'Connecting to workflow\u2026';
+      case 'reconnecting':
+        return 'Reconnecting\u2026';
+      case 'disconnected':
+        return 'Connection lost. Retrying\u2026';
+      default:
+        return 'Waiting for workflow\u2026';
+    }
+  })();
 
   return (
     <div className="w-full h-full relative">
       <EdgeMarkers />
+      {/* Workflow status banners */}
+      <WorkflowErrorBanner />
+      <WorkflowSuccessBanner />
       {showEmptyState && (
         <div className="absolute inset-0 z-10 flex flex-col items-center justify-center pointer-events-none">
-          <Loader2 className="w-8 h-8 text-[var(--text-muted)] animate-spin mb-3 opacity-40" />
+          <div className="relative mb-3">
+            <Zap className="w-8 h-8 text-[var(--accent)] opacity-20" />
+            <Loader2 className="w-8 h-8 text-[var(--text-muted)] animate-spin absolute inset-0 opacity-40" />
+          </div>
           <p className="text-sm text-[var(--text-muted)] animate-pulse">
-            Waiting for workflow&hellip;
+            {emptyMessage}
           </p>
         </div>
       )}

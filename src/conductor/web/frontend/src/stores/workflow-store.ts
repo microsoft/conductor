@@ -138,7 +138,7 @@ export type WsStatus = 'connecting' | 'connected' | 'disconnected' | 'reconnecti
 export interface HighlightedEdge {
   from: string;
   to: string;
-  state: 'highlighted' | 'taken';
+  state: 'highlighted' | 'taken' | 'failed';
 }
 
 export type LogLevel = 'info' | 'success' | 'error' | 'warning' | 'debug';
@@ -167,6 +167,7 @@ interface WorkflowState {
   workflowStatus: WorkflowStatus;
   workflowStartTime: number | null;
   workflowFailure: { error_type?: string; message?: string } | null;
+  workflowFailedAgent: string | null;
   entryPoint: string | null;
 
   // Graph structure
@@ -202,7 +203,7 @@ interface WorkflowState {
   replayState: (events: WorkflowEvent[]) => void;
   selectNode: (name: string | null) => void;
   setWsStatus: (status: WsStatus) => void;
-  setEdgeHighlight: (from: string, to: string, state: 'highlighted' | 'taken') => void;
+  setEdgeHighlight: (from: string, to: string, state: 'highlighted' | 'taken' | 'failed') => void;
   clearEdgeHighlight: (from: string, to: string) => void;
 
   // WebSocket send function (set by use-websocket hook)
@@ -248,6 +249,7 @@ export const useWorkflowStore = create<WorkflowState>((set) => ({
   workflowStatus: 'pending',
   workflowStartTime: null,
   workflowFailure: null,
+  workflowFailedAgent: null,
   entryPoint: null,
   agents: [],
   routes: [],
@@ -315,6 +317,7 @@ export const useWorkflowStore = create<WorkflowState>((set) => ({
         eventLog: [],
         activityLog: [],
         workflowOutput: null,
+        workflowFailedAgent: null,
       };
       for (const event of events) {
         const handler = eventHandlers[event.type];
@@ -342,7 +345,7 @@ export const useWorkflowStore = create<WorkflowState>((set) => ({
     set({ wsStatus: status });
   },
 
-  setEdgeHighlight: (from: string, to: string, state: 'highlighted' | 'taken') => {
+  setEdgeHighlight: (from: string, to: string, state: 'highlighted' | 'taken' | 'failed') => {
     set((prev) => ({
       highlightedEdges: [
         ...prev.highlightedEdges.filter((e) => !(e.from === from && e.to === to)),
@@ -474,6 +477,17 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     nd.elapsed = data.elapsed;
     nd.error_type = data.error_type;
     nd.error_message = data.message;
+    // Highlight edges leading to the failed agent in red
+    for (const route of state.routes) {
+      if (route.to === data.agent_name) {
+        state.highlightedEdges = [
+          ...state.highlightedEdges.filter(
+            (e) => !(e.from === route.from && e.to === route.to)
+          ),
+          { from: route.from, to: route.to, state: 'failed' },
+        ];
+      }
+    }
     replaceNode(state.nodes, data.agent_name);
   },
 
@@ -781,17 +795,27 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
   workflow_failed: (state, _data) => {
     const data = _data as { agent_name?: string; error_type?: string; message?: string };
     state.workflowStatus = 'failed';
+    state.workflowFailedAgent = data.agent_name || null;
     if (data.agent_name && state.nodes[data.agent_name]) {
       state.nodes[data.agent_name]!.status = 'failed';
       replaceNode(state.nodes, data.agent_name);
+      // Highlight edges leading to the failed agent in red
+      for (const route of state.routes) {
+        if (route.to === data.agent_name) {
+          state.highlightedEdges = [
+            ...state.highlightedEdges.filter(
+              (e) => !(e.from === route.from && e.to === route.to)
+            ),
+            { from: route.from, to: route.to, state: 'failed' },
+          ];
+        }
+      }
     }
     state.workflowFailure = { error_type: data.error_type, message: data.message };
     if (state.nodes['$start']) {
       state.nodes['$start']!.status = 'completed';
       replaceNode(state.nodes, '$start');
     }
-    // Clear flowing-dot edge animations now that workflow is done
-    state.highlightedEdges = [];
   },
 };
 

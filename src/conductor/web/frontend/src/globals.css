@@ -137,6 +137,79 @@ body {
   }
 }
 
+/* Node status transition animations */
+@keyframes node-activate {
+  0% {
+    transform: scale(1);
+  }
+  50% {
+    transform: scale(1.03);
+  }
+  100% {
+    transform: scale(1);
+  }
+}
+
+@keyframes node-complete-glow {
+  0% {
+    box-shadow: 0 0 0 0 var(--completed-muted);
+  }
+  50% {
+    box-shadow: 0 0 16px 4px var(--completed-muted);
+  }
+  100% {
+    box-shadow: 0 0 0 0 transparent;
+  }
+}
+
+@keyframes node-fail-glow {
+  0% {
+    box-shadow: 0 0 0 0 var(--failed-muted);
+  }
+  50% {
+    box-shadow: 0 0 16px 4px var(--failed-muted);
+  }
+  100% {
+    box-shadow: 0 0 0 0 transparent;
+  }
+}
+
+.node-activate {
+  animation: node-activate 300ms ease-out;
+}
+
+.node-complete {
+  animation: node-complete-glow 400ms ease-out;
+}
+
+.node-fail {
+  animation: node-fail-glow 400ms ease-out;
+}
+
+/* Tooltip fade-in */
+@keyframes tooltip-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, 4px);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, 0);
+  }
+}
+
+/* Banner slide-in */
+@keyframes banner-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, -8px);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, 0);
+  }
+}
+
 /* Scrollbar styling */
 ::-webkit-scrollbar {
   width: 6px;

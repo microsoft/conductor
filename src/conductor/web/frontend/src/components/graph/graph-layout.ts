@@ -12,8 +12,8 @@ export interface GraphNodeData {
   [key: string]: unknown;
 }
 
-const NODE_WIDTH = 180;
-const NODE_HEIGHT = 44;
+const NODE_WIDTH = 200;
+const NODE_HEIGHT = 56;
 const GROUP_PADDING_X = 20;
 const GROUP_PADDING_TOP = 40;
 const GROUP_PADDING_BOTTOM = 20;
