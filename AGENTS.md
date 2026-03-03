@@ -38,6 +38,11 @@ uv run conductor run workflow.yaml --web --input question="What is Python?"
 # Run in background (prints dashboard URL and exits)
 uv run conductor run workflow.yaml --web-bg --input question="What is Python?"
 
+# Stop a background workflow
+uv run conductor stop                  # auto-stop if one running, list if multiple
+uv run conductor stop --port 8080      # stop specific port
+uv run conductor stop --all            # stop all background workflows
+
 # Validate a workflow
 uv run conductor validate examples/simple-qa.yaml
 make validate-examples    # validate all examples
@@ -47,10 +52,11 @@ make validate-examples    # validate all examples
 
 ### Core Package Structure (`src/conductor/`)
 
-- **cli/**: Typer-based CLI with commands `run`, `validate`, `init`, `templates`
+- **cli/**: Typer-based CLI with commands `run`, `validate`, `init`, `templates`, `stop`
   - `app.py` - Main entry point, defines the Typer application
   - `run.py` - Workflow execution command with verbose logging helpers
   - `bg_runner.py` - Background process forking for `--web-bg` mode
+  - `pid.py` - PID file utilities for tracking/stopping background processes
 
 - **config/**: YAML loading and Pydantic schema validation
   - `schema.py` - Pydantic models for all workflow YAML structures (WorkflowConfig, AgentDef, ParallelGroup, ForEachDef, etc.)
@@ -78,7 +84,7 @@ make validate-examples    # validate all examples
   - `human.py` - Rich terminal UI for human gate interactions
 
 - **web/**: Real-time web dashboard for workflow visualization
-  - `server.py` - FastAPI + uvicorn server with WebSocket broadcasting and late-joiner state replay
+  - `server.py` - FastAPI + uvicorn server with WebSocket broadcasting, late-joiner state replay, and `POST /api/stop` endpoint
   - `static/index.html` - Single-file Cytoscape.js frontend with DAG graph, agent detail panel, and streaming activity
 
 - **events.py**: Pub/sub event system decoupling workflow execution from rendering (console, web dashboard)

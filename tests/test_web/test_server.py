@@ -356,6 +356,69 @@ class TestWaitForClientsDisconnectGuard:
             await dashboard.wait_for_clients_disconnect()
 
 
+class TestApiStop:
+    """Tests for POST /api/stop endpoint."""
+
+    def test_stop_sets_stop_event(self) -> None:
+        """POST /api/stop sets the internal stop event."""
+        emitter, dashboard = _make_dashboard(bg=True)
+        assert not dashboard.stop_requested
+
+        with TestClient(dashboard.app) as client:
+            resp = client.post("/api/stop")
+            assert resp.status_code == 200
+            assert resp.json() == {"status": "stopping"}
+
+        assert dashboard.stop_requested
+
+    def test_stop_sets_bg_event(self) -> None:
+        """POST /api/stop also sets the bg auto-shutdown event."""
+        emitter, dashboard = _make_dashboard(bg=True)
+        assert not dashboard._bg_event.is_set()
+
+        with TestClient(dashboard.app) as client:
+            client.post("/api/stop")
+
+        assert dashboard._bg_event.is_set()
+
+    def test_stop_works_without_bg_mode(self) -> None:
+        """POST /api/stop works even when bg=False."""
+        emitter, dashboard = _make_dashboard(bg=False)
+
+        with TestClient(dashboard.app) as client:
+            resp = client.post("/api/stop")
+            assert resp.status_code == 200
+
+        assert dashboard.stop_requested
+
+    @pytest.mark.asyncio
+    async def test_wait_for_stop_resolves(self) -> None:
+        """wait_for_stop() resolves when stop event is set."""
+        emitter, dashboard = _make_dashboard()
+
+        async def set_stop() -> None:
+            await asyncio.sleep(0.05)
+            dashboard._stop_event.set()
+
+        asyncio.create_task(set_stop())
+        # Should resolve quickly, not hang
+        await asyncio.wait_for(dashboard.wait_for_stop(), timeout=2.0)
+
+    @pytest.mark.asyncio
+    async def test_stop_unblocks_wait_for_clients_disconnect(self) -> None:
+        """POST /api/stop unblocks wait_for_clients_disconnect()."""
+        emitter, dashboard = _make_dashboard(bg=True)
+
+        async def trigger_stop() -> None:
+            await asyncio.sleep(0.05)
+            dashboard._stop_event.set()
+            dashboard._bg_event.set()
+
+        asyncio.create_task(trigger_stop())
+        # Should resolve because _bg_event is set
+        await asyncio.wait_for(dashboard.wait_for_clients_disconnect(), timeout=2.0)
+
+
 class TestServerStartupFailure:
     """Tests for server startup failure handling."""
 

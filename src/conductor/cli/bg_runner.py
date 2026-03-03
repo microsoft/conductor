@@ -129,9 +129,10 @@ def launch_background(
         # Windows: CREATE_NEW_PROCESS_GROUP for detachment
         kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
 
-    # Set environment variable to signal bg mode to the child
+    # Set environment variables to signal bg mode to the child
     env = os.environ.copy()
     env["CONDUCTOR_WEB_BG"] = "1"
+    env["CONDUCTOR_WEB_PORT"] = str(web_port)
     kwargs["env"] = env
 
     try:
@@ -152,6 +153,11 @@ def launch_background(
             f"Dashboard did not start within 15 seconds on port {web_port}. "
             f"The background process (PID {proc.pid}) may still be starting."
         )
+
+    # Write PID file so `conductor stop` can find this process
+    from conductor.cli.pid import write_pid_file
+
+    write_pid_file(proc.pid, web_port, workflow_path)
 
     return f"http://127.0.0.1:{web_port}"
 

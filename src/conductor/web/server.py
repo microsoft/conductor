@@ -82,6 +82,9 @@ class WebDashboard:
         self._bg_event = asyncio.Event()
         self._grace_task: asyncio.Task[None] | None = None
 
+        # Stop signal — set by POST /api/stop to cancel the running workflow
+        self._stop_event = asyncio.Event()
+
         # Server internals
         self._server: Any = None
         self._serve_task: asyncio.Task[None] | None = None
@@ -129,6 +132,13 @@ class WebDashboard:
         @app.get("/api/state")
         async def get_state() -> JSONResponse:
             return JSONResponse(content=self._event_history)
+
+        @app.post("/api/stop")
+        async def stop_workflow() -> JSONResponse:
+            self._stop_event.set()
+            # Also trigger bg auto-shutdown so wait_for_clients_disconnect unblocks
+            self._bg_event.set()
+            return JSONResponse({"status": "stopping"})
 
         @app.websocket("/ws")
         async def websocket_endpoint(ws: WebSocket) -> None:
@@ -267,7 +277,8 @@ class WebDashboard:
 
         For ``--web-bg`` mode: after workflow completes and all clients
         disconnect, a 30-second grace period starts.  This method awaits
-        that signal.
+        that signal.  Also unblocks immediately if a stop was requested
+        via the ``/api/stop`` endpoint.
 
         Raises:
             RuntimeError: If called when ``bg=False`` (the event would
@@ -276,6 +287,19 @@ class WebDashboard:
         if not self._bg:
             raise RuntimeError("wait_for_clients_disconnect() requires bg=True")
         await self._bg_event.wait()
+
+    @property
+    def stop_requested(self) -> bool:
+        """Check whether a stop has been requested via ``/api/stop``."""
+        return self._stop_event.is_set()
+
+    async def wait_for_stop(self) -> None:
+        """Block until a stop is requested via ``/api/stop``.
+
+        Used by the run loop to race the workflow engine against a
+        user-initiated stop from the web dashboard.
+        """
+        await self._stop_event.wait()
 
     # ------------------------------------------------------------------
     # Server lifecycle

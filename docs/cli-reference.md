@@ -5,6 +5,7 @@ Complete command-line reference for Conductor.
 ## Table of Contents
 
 - [`conductor run`](#conductor-run)
+- [`conductor stop`](#conductor-stop)
 - [`conductor validate`](#conductor-validate)
 - [`conductor init`](#conductor-init)
 - [`conductor templates`](#conductor-templates)
@@ -95,6 +96,8 @@ The `--web-bg` flag is a convenience shortcut: it forks a background process run
 
 `--web` and `--web-bg` are mutually exclusive.
 
+Background workflows can be stopped with `conductor stop` (see below) or via the stop button in the web dashboard.
+
 #### Automation Mode
 
 ```bash
@@ -118,6 +121,42 @@ conductor run workflow.yaml --input config='{"key": "value", "count": 5}'
 conductor run workflow.yaml --input text="Line 1
 Line 2
 Line 3"
+```
+
+## `conductor stop`
+
+Stop background workflow processes launched with `--web-bg`.
+
+```bash
+conductor stop [OPTIONS]
+```
+
+### Options
+
+| Option | Description |
+|--------|-------------|
+| `--port PORT` | Stop the workflow running on this specific port |
+| `--all` | Stop all background conductor workflows |
+
+With no options, `conductor stop` lists running background workflows. If exactly one is found, it stops automatically. If multiple are running, it prints the list and asks you to specify `--port`.
+
+### How It Works
+
+When a workflow is launched with `--web-bg`, Conductor writes a PID file to `~/.conductor/runs/` tracking the background process. The `stop` command reads these PID files, sends `SIGTERM` to the process, and cleans up the file. PID files are also automatically cleaned up when a background workflow completes normally.
+
+The web dashboard also has a stop button that cancels the running workflow directly via `POST /api/stop`.
+
+### Examples
+
+```bash
+# Stop the only running background workflow
+conductor stop
+
+# Stop a specific workflow by port
+conductor stop --port 8080
+
+# Stop all running background workflows
+conductor stop --all
 ```
 
 ## `conductor validate`

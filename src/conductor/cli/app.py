@@ -6,6 +6,7 @@ This module defines the main Typer app and global options.
 from __future__ import annotations
 
 import contextvars
+import os
 from enum import Enum
 from pathlib import Path
 from typing import Annotated, Any
@@ -690,3 +691,132 @@ def checkpoints(
 
     output_console.print(table)
     output_console.print(f"\n[dim]Total: {len(checkpoint_list)} checkpoint(s)[/dim]")
+
+
+@app.command()
+def stop(
+    port: Annotated[
+        int | None,
+        typer.Option(
+            "--port",
+            help="Stop the background workflow running on this port.",
+        ),
+    ] = None,
+    all_workflows: Annotated[
+        bool,
+        typer.Option(
+            "--all",
+            help="Stop all background conductor workflows.",
+        ),
+    ] = False,
+) -> None:
+    """Stop background workflow processes launched with --web-bg.
+
+    With no arguments, lists running background workflows. If exactly one
+    is found, stops it automatically. If multiple are found, prints the
+    list and asks you to specify --port.
+
+    \b
+    Examples:
+        conductor stop
+        conductor stop --port 8080
+        conductor stop --all
+    """
+    from conductor.cli.pid import read_pid_files, remove_pid_file
+
+    running = read_pid_files()
+
+    if not running:
+        console.print("[dim]No background workflows are currently running.[/dim]")
+        return
+
+    if all_workflows:
+        for entry in running:
+            _stop_process(entry, console)
+            remove_pid_file(entry["port"])
+        return
+
+    if port is not None:
+        # Find the entry for the specified port
+        match = [e for e in running if e["port"] == port]
+        if not match:
+            console.print(
+                f"[bold red]Error:[/bold red] No background workflow found on port {port}."
+            )
+            console.print("[dim]Running workflows:[/dim]")
+            _print_running_list(running, console)
+            raise typer.Exit(code=1)
+        _stop_process(match[0], console)
+        remove_pid_file(port)
+        return
+
+    # No flags: auto-stop if exactly one, otherwise list
+    if len(running) == 1:
+        entry = running[0]
+        _stop_process(entry, console)
+        remove_pid_file(entry["port"])
+    else:
+        console.print(
+            f"[bold yellow]Multiple background workflows running ({len(running)}).[/bold yellow]"
+        )
+        console.print("[dim]Specify --port to stop a specific one, or --all to stop all.[/dim]\n")
+        _print_running_list(running, console)
+
+
+def _stop_process(entry: dict, con: Console) -> None:
+    """Send SIGTERM (or equivalent) to a background workflow process.
+
+    Args:
+        entry: A PID-file dict with ``pid``, ``port``, ``workflow`` keys.
+        con: Rich Console for output.
+    """
+    import signal
+    import sys
+
+    pid = entry["pid"]
+    port = entry["port"]
+    workflow = Path(entry.get("workflow", "unknown")).stem
+
+    try:
+        if sys.platform == "win32":
+            os.kill(pid, signal.CTRL_BREAK_EVENT)
+        else:
+            os.kill(pid, signal.SIGTERM)
+        con.print(
+            f"[green]Stopped[/green] workflow [cyan]'{workflow}'[/cyan] (PID {pid}, port {port})"
+        )
+    except ProcessLookupError:
+        con.print(
+            f"[dim]Process already exited:[/dim] workflow '{workflow}' (PID {pid}, port {port})"
+        )
+    except PermissionError:
+        con.print(
+            f"[bold red]Permission denied:[/bold red] could not stop PID {pid}. "
+            f"Try running with elevated privileges."
+        )
+
+
+def _print_running_list(entries: list[dict], con: Console) -> None:
+    """Print a table of running background workflows.
+
+    Args:
+        entries: List of PID-file dicts.
+        con: Rich Console for output.
+    """
+    from rich.table import Table
+
+    table = Table(show_lines=False)
+    table.add_column("Port", style="cyan")
+    table.add_column("PID", style="yellow")
+    table.add_column("Workflow", style="white")
+    table.add_column("Started", style="dim")
+
+    for e in entries:
+        table.add_row(
+            str(e["port"]),
+            str(e["pid"]),
+            Path(e.get("workflow", "unknown")).stem,
+            e.get("started_at", "?"),
+        )
+
+    con.print(table)

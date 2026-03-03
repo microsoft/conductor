@@ -63,6 +63,36 @@ conductor run workflow.yaml --web-bg --input question="Hello"
 
 The `--web` flag opens a browser dashboard with a DAG visualization showing live agent status, streaming reasoning/tool calls, and an agent detail panel. The `--web-bg` flag forks a background process and exits immediately. `--web` and `--web-bg` are mutually exclusive.
 
+Background workflows can be stopped with `conductor stop` (see below) or via the stop button in the web dashboard.
+
+### conductor stop
+
+Stop background workflow processes launched with `--web-bg`:
+
+```bash
+conductor stop [OPTIONS]
+```
+
+| Option | Description |
+|--------|-------------|
+| `--port PORT` | Stop the workflow running on this specific port |
+| `--all` | Stop all background conductor workflows |
+
+With no options, lists running workflows and auto-stops if exactly one is found.
+
+**Examples:**
+
+```bash
+# Stop the only running background workflow
+conductor stop
+
+# Stop a specific workflow by port
+conductor stop --port 8080
+
+# Stop all running background workflows
+conductor stop --all
+```
+
 ### conductor validate
 
 Validate without executing:

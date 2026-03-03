@@ -823,6 +823,54 @@ class InputCollector:
         return inputs
 
 
+async def _run_with_stop_signal(
+    engine: Any,
+    inputs: dict[str, Any],
+    dashboard: Any | None,
+) -> dict[str, Any]:
+    """Run the workflow engine, racing against a dashboard stop signal.
+
+    When the web dashboard has a stop button clicked (``/api/stop``), the
+    engine task is cancelled and an ``ExecutionError`` is raised.
+
+    If no dashboard is present, this simply awaits ``engine.run()`` directly.
+
+    Args:
+        engine: The ``WorkflowEngine`` instance.
+        inputs: Workflow input values.
+        dashboard: The ``WebDashboard`` instance, or None.
+
+    Returns:
+        The workflow result dict.
+
+    Raises:
+        ExecutionError: If the workflow was stopped via the dashboard.
+    """
+    if dashboard is None:
+        return await engine.run(inputs)
+
+    engine_task = asyncio.create_task(engine.run(inputs))
+    stop_task = asyncio.create_task(dashboard.wait_for_stop())
+
+    done, pending = await asyncio.wait(
+        {engine_task, stop_task},
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+
+    for task in pending:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    if engine_task in done:
+        return engine_task.result()
+
+    # Stop was requested — raise an error so the workflow is treated as failed
+    from conductor.exceptions import ExecutionError
+
+    raise ExecutionError("Workflow stopped by user via dashboard")
+
+
 async def run_workflow_async(
     workflow_path: Path,
     inputs: dict[str, Any],
@@ -953,7 +1001,7 @@ async def run_workflow_async(
                     await listener.start()
                     _verbose_console.print("[dim]Press Esc to interrupt and provide guidance[/dim]")
 
-                result = await engine.run(inputs)
+                result = await _run_with_stop_signal(engine, inputs, dashboard)
             except BaseException:
                 _print_resume_instructions(engine)
                 raise
@@ -989,6 +1037,13 @@ async def run_workflow_async(
 
             return result
     finally:
+        # Clean up PID file if this is a background child process
+        is_bg_child = os.environ.get("CONDUCTOR_WEB_BG") == "1"
+        if is_bg_child:
+            from conductor.cli.pid import remove_pid_file_for_current_process
+
+            remove_pid_file_for_current_process()
+
         # Stop dashboard if it was started
         if dashboard is not None:
             await dashboard.stop()
