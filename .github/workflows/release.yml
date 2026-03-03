@@ -1,0 +1,158 @@
+# Release workflow for Conductor
+#
+# Runs on:
+#   - Push of v* tags (e.g., v0.1.0, v1.0.0-beta.1)
+#
+# Jobs:
+#   - lint: Runs ruff linter and formatter check
+#   - typecheck: Runs ty (Red Knot) type checker
+#   - test: Runs pytest on Python 3.12 and 3.13
+#   - release: Builds package and creates GitHub Release with artifacts
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.12"
+
+permissions:
+  contents: write
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      - name: Run ruff linter
+        run: uv run ruff check src tests
+
+      - name: Run ruff formatter check
+        run: uv run ruff format --check src tests
+
+  typecheck:
+    name: Type Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      - name: Run ty type checker
+        run: uv run ty check src
+
+  test:
+    name: Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    needs: [lint, typecheck]
+    strategy:
+      matrix:
+        python-version: ["3.12", "3.13"]
+      fail-fast: false
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+          enable-cache: true
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      - name: Run tests
+        run: uv run pytest -m "not real_api"
+        env:
+          ANTHROPIC_API_KEY: "sk-ant-test-fake-key-for-mocking"
+
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    needs: [test]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install ${{ env.PYTHON_VERSION }}
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          # Detect pre-release: any tag with a hyphen after the version (e.g., v0.2.0-beta.1)
+          if [[ "$VERSION" == *-* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build package
+        run: uv build
+
+      - name: Verify package contents
+        run: |
+          ls -la dist/
+          uv run python -m zipfile -l dist/*.whl
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PRERELEASE_FLAG=""
+          if [[ "${{ steps.version.outputs.prerelease }}" == "true" ]]; then
+            PRERELEASE_FLAG="--prerelease"
+          fi
+          gh release create "${{ github.ref_name }}" \
+            dist/* \
+            --generate-notes \
+            $PRERELEASE_FLAG

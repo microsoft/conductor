@@ -410,20 +410,22 @@ conductor update
 
 ### Epic 1: GitHub Release Workflow
 
+**Status:** DONE
+
 **Goal:** Create a tag-triggered CI/CD workflow that produces GitHub Releases.
 
 **Prerequisites:** None.
 
 | Task ID | Type | Description | Files | Status |
 |---------|------|-------------|-------|--------|
-| E1-T1 | IMPL | Create `.github/workflows/release.yml` with tag trigger (`v*`), Python + uv setup, lint/typecheck/test jobs, build step, version extraction from tag, pre-release detection, and `gh release create` with `--generate-notes` and artifact upload. | `.github/workflows/release.yml` | TO DO |
+| E1-T1 | IMPL | Create `.github/workflows/release.yml` with tag trigger (`v*`), Python + uv setup, lint/typecheck/test jobs, build step, version extraction from tag, pre-release detection, and `gh release create` with `--generate-notes` and artifact upload. | `.github/workflows/release.yml` | DONE |
 
 **Acceptance Criteria:**
-- [ ] Workflow YAML is valid and follows the patterns established in `ci.yml`
-- [ ] Workflow triggers only on `v*` tag pushes (not branches)
-- [ ] Quality gates (lint, typecheck, test) run before release creation
-- [ ] Pre-release tags produce pre-release GitHub Releases
-- [ ] Build artifacts (`.whl`, `.tar.gz`) are attached to the release
+- [x] Workflow YAML is valid and follows the patterns established in `ci.yml`
+- [x] Workflow triggers only on `v*` tag pushes (not branches)
+- [x] Quality gates (lint, typecheck, test) run before release creation
+- [x] Pre-release tags produce pre-release GitHub Releases
+- [x] Build artifacts (`.whl`, `.tar.gz`) are attached to the release
 
 ---
 
