@@ -163,6 +163,20 @@ class CopilotProvider(AgentProvider):
         self._interrupted_session: Any = None
         self._abort_supported: bool | None = None
 
+    @staticmethod
+    def _default_permission_handler(
+        request: dict[str, Any],
+        invocation: dict[str, str],
+    ) -> dict[str, Any]:
+        """Default permission handler that approves all requests.
+
+        SDK v0.1.28+ requires a permission handler on session creation.
+        In orchestration mode, we approve all tool permissions since the
+        workflow author controls which tools are available to each agent.
+        """
+        logger.debug("auto-approved permission request: %s", request)
+        return {"kind": "approved"}
+
     async def execute(
         self,
         agent: AgentDef,
@@ -411,9 +425,7 @@ class CopilotProvider(AgentProvider):
             # Build session config with MCP servers from workflow configuration
             session_config: dict[str, Any] = {
                 "model": model,
-                # Auto-approve all permission requests (shell, write, mcp, read, url)
-                # since Conductor workflows run non-interactively.
-                "on_permission_request": lambda _req, _ctx: {"kind": "approved"},
+                "on_permission_request": self._default_permission_handler,
             }
 
             # Add temperature if configured
@@ -429,7 +441,10 @@ class CopilotProvider(AgentProvider):
             resume_sid = self._resume_session_ids.get(agent.name)
             if resume_sid is not None:
                 try:
-                    session = await self._client.resume_session(resume_sid)
+                    session = await self._client.resume_session(
+                        resume_sid,
+                        {"on_permission_request": self._default_permission_handler},
+                    )
                     logger.info(f"Resumed Copilot session {resume_sid} for agent '{agent.name}'")
                 except Exception as exc:
                     logger.warning(
@@ -627,10 +642,12 @@ class CopilotProvider(AgentProvider):
             # Log every SDK event for debugging stalls (visible via --log-file)
             if logger.isEnabledFor(logging.DEBUG):
                 tool_info = ""
-                if event_type == "tool.execution_start":
-                    tn = getattr(event.data, "tool_name", None) or getattr(
-                        event.data, "name", "?"
-                    )
+                if (
+                    event_type == "tool.execution_start"
+                    and hasattr(event, "data")
+                    and event.data is not None
+                ):
+                    tn = getattr(event.data, "tool_name", None) or getattr(event.data, "name", "?")
                     tool_info = f" tool={tn}"
                 logger.debug("sdk_event: %s%s", event_type, tool_info)
 

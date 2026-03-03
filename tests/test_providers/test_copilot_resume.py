@@ -161,7 +161,10 @@ class TestSessionResumeFallback:
         ):
             await provider.execute(agent, {}, "Continue research")
 
-        mock_client.resume_session.assert_called_once_with(resumed_sid)
+        mock_client.resume_session.assert_called_once_with(
+            resumed_sid,
+            {"on_permission_request": CopilotProvider._default_permission_handler},
+        )
         mock_client.create_session.assert_not_called()
 
     @pytest.mark.asyncio
@@ -201,7 +204,10 @@ class TestSessionResumeFallback:
         ):
             await provider.execute(agent, {}, "Continue research")
 
-        mock_client.resume_session.assert_called_once_with("stale-sid")
+        mock_client.resume_session.assert_called_once_with(
+            "stale-sid",
+            {"on_permission_request": CopilotProvider._default_permission_handler},
+        )
         mock_client.create_session.assert_called_once()
         # Session ID should now reflect the new session
         assert provider.get_session_ids()["researcher"] == "sess-new"
