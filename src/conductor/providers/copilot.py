@@ -411,6 +411,9 @@ class CopilotProvider(AgentProvider):
             # Build session config with MCP servers from workflow configuration
             session_config: dict[str, Any] = {
                 "model": model,
+                # Auto-approve all permission requests (shell, write, mcp, read, url)
+                # since Conductor workflows run non-interactively.
+                "on_permission_request": lambda _req, _ctx: {"kind": "approved"},
             }
 
             # Add temperature if configured
@@ -620,6 +623,16 @@ class CopilotProvider(AgentProvider):
         def on_event(event: Any) -> None:
             nonlocal response_content, error_message
             event_type = event.type.value if hasattr(event.type, "value") else str(event.type)
+
+            # Log every SDK event for debugging stalls (visible via --log-file)
+            if logger.isEnabledFor(logging.DEBUG):
+                tool_info = ""
+                if event_type == "tool.execution_start":
+                    tn = getattr(event.data, "tool_name", None) or getattr(
+                        event.data, "name", "?"
+                    )
+                    tool_info = f" tool={tn}"
+                logger.debug("sdk_event: %s%s", event_type, tool_info)
 
             # Update last activity on EVERY event (this is key for idle detection!)
             last_activity_ref[0] = event_type
@@ -1267,6 +1280,11 @@ class CopilotProvider(AgentProvider):
         idle_timeout = self._idle_recovery_config.idle_timeout_seconds
 
         while True:
+            # Check if done was already set (avoids race where session.idle
+            # arrived between a previous done.clear() and the next wait).
+            if done.is_set():
+                return
+
             try:
                 # Wait for done with idle timeout
                 await asyncio.wait_for(
@@ -1288,7 +1306,11 @@ class CopilotProvider(AgentProvider):
                     # just hasn't finished yet. Reset recovery counter (new task)
                     # and keep waiting.
                     recovery_attempts = 0
-                    done.clear()
+                    # Only clear if done hasn't been set in the meantime
+                    # (prevents race where session.idle arrives right as we
+                    # check time_since_last_event).
+                    if not done.is_set():
+                        done.clear()
                     continue
 
                 # Genuinely idle — no events for the full timeout period
@@ -1321,9 +1343,10 @@ class CopilotProvider(AgentProvider):
                 recovery_prompt = self._build_recovery_prompt(last_event_type, last_tool_call)
                 await session.send({"prompt": recovery_prompt})
 
-                # Reset the done event to wait again
-                # (it may have been set by a previous partial response)
-                done.clear()
+                # Reset the done event to wait again — but only if it hasn't
+                # been set since the recovery prompt was sent.
+                if not done.is_set():
+                    done.clear()
 
     async def _ensure_client_started(self) -> None:
         """Ensure the Copilot client is started."""
