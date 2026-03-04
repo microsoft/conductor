@@ -487,20 +487,24 @@ conductor update
 
 ### Epic 4: Documentation & Skill Updates
 
+**Status:** DONE
+
 **Goal:** Update all documentation and skill files to reflect the new `conductor update` command.
 
 **Prerequisites:** Epics 2-3.
 
 | Task ID | Type | Description | Files | Status |
 |---------|------|-------------|-------|--------|
-| E4-T1 | IMPL | Add `conductor update` to `AGENTS.md` Common Commands section, after the `conductor stop` entries. | `AGENTS.md` | TO DO |
-| E4-T2 | IMPL | Add `conductor update` to `.claude/skills/conductor/SKILL.md` Quick Reference section. | `.claude/skills/conductor/SKILL.md` | TO DO |
-| E4-T3 | IMPL | Add a `### conductor update` section to `.claude/skills/conductor/references/execution.md` after the `### conductor stop` section, documenting the command, its behavior, and examples. | `.claude/skills/conductor/references/execution.md` | TO DO |
+| E4-T1 | IMPL | Add `conductor update` to `AGENTS.md` Common Commands section, after the `conductor stop` entries. | `AGENTS.md` | DONE |
+| E4-T2 | IMPL | Add `conductor update` to `.claude/skills/conductor/SKILL.md` Quick Reference section. | `.claude/skills/conductor/SKILL.md` | DONE |
+| E4-T3 | IMPL | Add a `### conductor update` section to `.claude/skills/conductor/references/execution.md` after the `### conductor stop` section, documenting the command, its behavior, and examples. | `.claude/skills/conductor/references/execution.md` | DONE |
+| E4-T4 | IMPL | Add `update.py` entry to `AGENTS.md` cli/ architecture bullet list, after the `pid.py` entry. | `AGENTS.md` | DONE |
 
 **Acceptance Criteria:**
-- [ ] `AGENTS.md` lists `conductor update` in Common Commands
-- [ ] Skill Quick Reference includes `conductor update`
-- [ ] Execution reference documents the `update` command with examples
+- [x] `AGENTS.md` lists `conductor update` in Common Commands
+- [x] Skill Quick Reference includes `conductor update`
+- [x] Execution reference documents the `update` command with examples
+- [x] `AGENTS.md` architecture section lists `update.py` in the cli/ bullet list
 
 ---
 

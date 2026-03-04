@@ -43,6 +43,9 @@ uv run conductor stop                  # auto-stop if one running, list if multi
 uv run conductor stop --port 8080      # stop specific port
 uv run conductor stop --all            # stop all background workflows
 
+# Update conductor
+uv run conductor update                # check for and install latest version
+
 # Validate a workflow
 uv run conductor validate examples/simple-qa.yaml
 make validate-examples    # validate all examples
@@ -52,11 +55,12 @@ make validate-examples    # validate all examples
 
 ### Core Package Structure (`src/conductor/`)
 
-- **cli/**: Typer-based CLI with commands `run`, `validate`, `init`, `templates`, `stop`
+- **cli/**: Typer-based CLI with commands `run`, `validate`, `init`, `templates`, `stop`, `update`
   - `app.py` - Main entry point, defines the Typer application
   - `run.py` - Workflow execution command with verbose logging helpers
   - `bg_runner.py` - Background process forking for `--web-bg` mode
   - `pid.py` - PID file utilities for tracking/stopping background processes
+  - `update.py` - Update check, version comparison, and self-upgrade via `uv tool install`
 
 - **config/**: YAML loading and Pydantic schema validation
   - `schema.py` - Pydantic models for all workflow YAML structures (WorkflowConfig, AgentDef, ParallelGroup, ForEachDef, etc.)

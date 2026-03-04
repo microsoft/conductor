@@ -16,6 +16,7 @@ conductor validate workflow.yaml                         # Validate only
 conductor init my-workflow --template simple              # Create from template
 conductor templates                                      # List templates
 conductor stop                                           # Stop background workflow
+conductor update                                         # Check for and install latest version
 ```
 
 Progress output is shown by default. Use `-V` (verbose) for full prompts and detailed tool call info.
