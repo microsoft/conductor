@@ -431,31 +431,33 @@ conductor update
 
 ### Epic 2: Update Check Module
 
+**Status:** DONE
+
 **Goal:** Implement the core update-check logic with cache, fetch, comparison, hint display, and update execution.
 
 **Prerequisites:** None (can be developed in parallel with Epic 1).
 
 | Task ID | Type | Description | Files | Status |
 |---------|------|-------------|-------|--------|
-| E2-T1 | IMPL | Create `src/conductor/cli/update.py` with: `get_cache_path()` returning `~/.conductor/update-check.json`; `read_cache()` that returns cached data or `None` if missing/expired/invalid; `write_cache(version, tag_name, url)` that writes JSON with `tag_name` and `checked_at` timestamp. | `src/conductor/cli/update.py` | TO DO |
-| E2-T2 | IMPL | Add `fetch_latest_version()` using `urllib.request.urlopen` with 2s timeout to GET `api.github.com/repos/microsoft/conductor/releases/latest`, parse JSON response for `tag_name` and `html_url`, strip leading `v` for version, return `(version, tag_name, url)` 3-tuple or `None` on any error. | `src/conductor/cli/update.py` | TO DO |
-| E2-T3 | IMPL | Add `parse_version(version_str)` that strips leading `v`, splits on `-` to remove pre-release suffix, splits on `.`, converts to `tuple[int, ...]`. Add `has_prerelease(version_str)` that returns `True` if the version contains a `-` after the numeric portion. Add `is_newer(remote, local)` that compares parsed tuples; additionally, if tuples are equal but local has a pre-release suffix and remote does not, return `True` (pre-release → release upgrade). | `src/conductor/cli/update.py` | TO DO |
-| E2-T4 | IMPL | Add `check_for_update_hint(console)` that reads cache (or fetches if stale), compares versions with `is_newer()`, and prints a one-line Rich hint: `💡 Conductor vX.Y.Z available (you have vCURRENT). Run 'conductor update' to upgrade.` | `src/conductor/cli/update.py` | TO DO |
-| E2-T5 | IMPL | Add `run_update(console)` that fetches latest version (bypassing cache), compares with local, runs `subprocess.run(["uv", "tool", "install", "--force", "git+https://github.com/microsoft/conductor.git@{tag_name}"])` where `{tag_name}` is the raw tag from the API (e.g., `v0.3.0`), prints before/after versions, and deletes the cache file. | `src/conductor/cli/update.py` | TO DO |
-| E2-T6 | TEST | Create `tests/test_cli/test_update.py` with tests for: `get_cache_path()` returns correct path; `read_cache()` returns `None` for missing/expired/invalid files and valid data for fresh cache; `write_cache()` creates valid JSON with `tag_name` field; `parse_version()` handles `"0.1.0"`, `"v0.2.0"`, `"0.3.0-beta.1"`; `has_prerelease()` returns correct results; `is_newer()` for various version pairs including pre-release → release upgrade (e.g., `is_newer("0.3.0", "0.3.0-beta.1")` → `True`). | `tests/test_cli/test_update.py` | TO DO |
-| E2-T7 | TEST | Add tests for `fetch_latest_version()` with mocked `urllib.request.urlopen` (success returns 3-tuple, timeout, HTTP error, malformed JSON). Add tests for `check_for_update_hint()` with mocked fetch and cache (fresh cache newer, fresh cache same, stale cache triggers fetch, non-TTY skips, silent mode skips, `update` subcommand skips). | `tests/test_cli/test_update.py` | TO DO |
-| E2-T8 | TEST | Add tests for `run_update()` with mocked subprocess (success with version-pinned install, failure, already up to date). Verify the subprocess command includes `@{tag_name}` suffix. Verify cache is cleared on success. Verify before/after version display. | `tests/test_cli/test_update.py` | TO DO |
+| E2-T1 | IMPL | Create `src/conductor/cli/update.py` with: `get_cache_path()` returning `~/.conductor/update-check.json`; `read_cache()` that returns cached data or `None` if missing/expired/invalid; `write_cache(version, tag_name, url)` that writes JSON with `tag_name` and `checked_at` timestamp. | `src/conductor/cli/update.py` | DONE |
+| E2-T2 | IMPL | Add `fetch_latest_version()` using `urllib.request.urlopen` with 2s timeout to GET `api.github.com/repos/microsoft/conductor/releases/latest`, parse JSON response for `tag_name` and `html_url`, strip leading `v` for version, return `(version, tag_name, url)` 3-tuple or `None` on any error. | `src/conductor/cli/update.py` | DONE |
+| E2-T3 | IMPL | Add `parse_version(version_str)` that strips leading `v`, splits on `-` to remove pre-release suffix, splits on `.`, converts to `tuple[int, ...]`. Add `has_prerelease(version_str)` that returns `True` if the version contains a `-` after the numeric portion. Add `is_newer(remote, local)` that compares parsed tuples; additionally, if tuples are equal but local has a pre-release suffix and remote does not, return `True` (pre-release → release upgrade). | `src/conductor/cli/update.py` | DONE |
+| E2-T4 | IMPL | Add `check_for_update_hint(console)` that reads cache (or fetches if stale), compares versions with `is_newer()`, and prints a one-line Rich hint: `💡 Conductor vX.Y.Z available (you have vCURRENT). Run 'conductor update' to upgrade.` | `src/conductor/cli/update.py` | DONE |
+| E2-T5 | IMPL | Add `run_update(console)` that fetches latest version (bypassing cache), compares with local, runs `subprocess.run(["uv", "tool", "install", "--force", "git+https://github.com/microsoft/conductor.git@{tag_name}"])` where `{tag_name}` is the raw tag from the API (e.g., `v0.3.0`), prints before/after versions, and deletes the cache file. | `src/conductor/cli/update.py` | DONE |
+| E2-T6 | TEST | Create `tests/test_cli/test_update.py` with tests for: `get_cache_path()` returns correct path; `read_cache()` returns `None` for missing/expired/invalid files and valid data for fresh cache; `write_cache()` creates valid JSON with `tag_name` field; `parse_version()` handles `"0.1.0"`, `"v0.2.0"`, `"0.3.0-beta.1"`; `has_prerelease()` returns correct results; `is_newer()` for various version pairs including pre-release → release upgrade (e.g., `is_newer("0.3.0", "0.3.0-beta.1")` → `True`). | `tests/test_cli/test_update.py` | DONE |
+| E2-T7 | TEST | Add tests for `fetch_latest_version()` with mocked `urllib.request.urlopen` (success returns 3-tuple, timeout, HTTP error, malformed JSON). Add tests for `check_for_update_hint()` with mocked fetch and cache (fresh cache newer, fresh cache same, stale cache triggers fetch, non-TTY skips, silent mode skips, `update` subcommand skips). | `tests/test_cli/test_update.py` | DONE |
+| E2-T8 | TEST | Add tests for `run_update()` with mocked subprocess (success with version-pinned install, failure, already up to date). Verify the subprocess command includes `@{tag_name}` suffix. Verify cache is cleared on success. Verify before/after version display. | `tests/test_cli/test_update.py` | DONE |
 
 **Acceptance Criteria:**
-- [ ] All functions in `update.py` have docstrings and type hints
-- [ ] Cache read/write/expiry logic works correctly; cache includes `tag_name` field
-- [ ] `fetch_latest_version()` handles all error cases silently and returns 3-tuple
-- [ ] `is_newer()` correctly compares semver versions including pre-release → release upgrade
-- [ ] `has_prerelease()` correctly identifies pre-release version strings
-- [ ] `check_for_update_hint()` respects TTY and verbosity guards, skips when subcommand is `update`
-- [ ] `run_update()` runs `uv tool install --force git+...@{tag_name}` with version-pinned install and reports results
-- [ ] All tests pass; no new dependencies added
-- [ ] `make lint` and `make typecheck` pass
+- [x] All functions in `update.py` have docstrings and type hints
+- [x] Cache read/write/expiry logic works correctly; cache includes `tag_name` field
+- [x] `fetch_latest_version()` handles all error cases silently and returns 3-tuple
+- [x] `is_newer()` correctly compares semver versions including pre-release → release upgrade
+- [x] `has_prerelease()` correctly identifies pre-release version strings
+- [x] `check_for_update_hint()` respects TTY and verbosity guards, skips when subcommand is `update`
+- [x] `run_update()` runs `uv tool install --force git+...@{tag_name}` with version-pinned install and reports results
+- [x] All tests pass; no new dependencies added
+- [x] `make lint` and `make typecheck` pass
 
 ---
 
