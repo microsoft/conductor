@@ -18,7 +18,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from rich.console import Console
+from typer.testing import CliRunner
 
+from conductor.cli.app import app
 from conductor.cli.update import (
     _CACHE_TTL_SECONDS,
     check_for_update_hint,
@@ -502,3 +504,89 @@ class TestRunUpdate:
         install_arg = [a for a in args if a.startswith("git+")]
         assert len(install_arg) == 1
         assert install_arg[0].endswith("@v2.0.0")
+
+
+# ===================================================================
+# E3-T3: CLI-level tests
+# ===================================================================
+
+runner = CliRunner()
+
+
+class TestUpdateCommand:
+    """CLI tests for ``conductor update``."""
+
+    def test_update_command_invokes_run_update(self, cache_dir: Path) -> None:
+        """``conductor update`` should call ``run_update``."""
+        with patch("conductor.cli.update.run_update") as mock_run:
+            result = runner.invoke(app, ["update"])
+        assert result.exit_code == 0
+        mock_run.assert_called_once()
+
+    def test_update_command_visible_in_help(self) -> None:
+        """``update`` should appear in ``conductor --help``."""
+        result = runner.invoke(app, ["--help"])
+        assert result.exit_code == 0
+        assert "update" in result.output
+
+    def test_update_command_error_exits_with_code_1(self, cache_dir: Path) -> None:
+        """Errors during update should exit with code 1."""
+        with patch(
+            "conductor.cli.update.run_update",
+            side_effect=RuntimeError("boom"),
+        ):
+            result = runner.invoke(app, ["update"])
+        assert result.exit_code == 1
+
+
+class TestUpdateHintCLI:
+    """CLI tests for update hint integration in ``main()`` callback."""
+
+    def test_hint_appears_in_tty_non_silent(self, cache_dir: Path) -> None:
+        """Hint is called when console.is_terminal is True and not silent."""
+        mock_console = MagicMock(spec=Console)
+        mock_console.is_terminal = True
+        with (
+            patch("conductor.cli.app.console", mock_console),
+            patch("conductor.cli.update.check_for_update_hint") as mock_hint,
+            patch("sys.argv", ["conductor", "validate", "--help"]),
+        ):
+            runner.invoke(app, ["validate", "--help"])
+        mock_hint.assert_called_once_with(mock_console)
+
+    def test_hint_not_shown_in_silent_mode(self, cache_dir: Path) -> None:
+        """Hint should NOT appear when ``--silent`` is passed."""
+        mock_console = MagicMock(spec=Console)
+        mock_console.is_terminal = True
+        with (
+            patch("conductor.cli.app.console", mock_console),
+            patch("conductor.cli.update.check_for_update_hint") as mock_hint,
+            patch("sys.argv", ["conductor", "--silent", "validate", "--help"]),
+        ):
+            runner.invoke(app, ["--silent", "validate", "--help"])
+        mock_hint.assert_not_called()
+
+    def test_hint_not_shown_for_update_subcommand(self, cache_dir: Path) -> None:
+        """Hint should NOT appear when the subcommand is ``update``."""
+        mock_console = MagicMock(spec=Console)
+        mock_console.is_terminal = True
+        with (
+            patch("conductor.cli.app.console", mock_console),
+            patch("conductor.cli.update.check_for_update_hint") as mock_hint,
+            patch("sys.argv", ["conductor", "update"]),
+            patch("conductor.cli.update.run_update"),
+        ):
+            runner.invoke(app, ["update"])
+        mock_hint.assert_not_called()
+
+    def test_hint_not_shown_when_not_tty(self, cache_dir: Path) -> None:
+        """Hint should NOT appear when console is not a TTY."""
+        mock_console = MagicMock(spec=Console)
+        mock_console.is_terminal = False
+        with (
+            patch("conductor.cli.app.console", mock_console),
+            patch("conductor.cli.update.check_for_update_hint") as mock_hint,
+            patch("sys.argv", ["conductor", "validate", "--help"]),
+        ):
+            runner.invoke(app, ["validate", "--help"])
+        mock_hint.assert_not_called()

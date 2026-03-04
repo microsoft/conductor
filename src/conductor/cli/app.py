@@ -196,6 +196,18 @@ def main(
     verbose_mode.set(verbosity != ConsoleVerbosity.SILENT)
     full_mode.set(verbosity == ConsoleVerbosity.FULL)
 
+    # Show update hint (deferred import to avoid startup overhead)
+    if console.is_terminal and verbosity != ConsoleVerbosity.SILENT:
+        import sys
+
+        # Skip when the subcommand is 'update'
+        args = sys.argv[1:]
+        subcommand = next((a for a in args if not a.startswith("-")), None)
+        if subcommand != "update":
+            from conductor.cli.update import check_for_update_hint
+
+            check_for_update_hint(console)
+
 
 @app.command()
 def run(
@@ -820,3 +832,23 @@ def _print_running_list(entries: list[dict], con: Console) -> None:
         )
 
     con.print(table)
+
+
+@app.command()
+def update() -> None:
+    """Check for and install the latest version of Conductor.
+
+    Fetches the latest release from GitHub and upgrades using
+    ``uv tool install --force``.
+
+    \b
+    Examples:
+        conductor update
+    """
+    from conductor.cli.update import run_update
+
+    try:
+        run_update(console)
+    except Exception as e:
+        print_error(e)
+        raise typer.Exit(code=1) from None

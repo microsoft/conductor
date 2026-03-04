@@ -463,23 +463,25 @@ conductor update
 
 ### Epic 3: CLI Integration
 
+**Status:** DONE
+
 **Goal:** Wire the update module into the CLI app.
 
 **Prerequisites:** Epic 2.
 
 | Task ID | Type | Description | Files | Status |
 |---------|------|-------------|-------|--------|
-| E3-T1 | IMPL | In `app.py` `main()` callback, add a call to `check_for_update_hint(console)` at the end, guarded by `console.is_terminal` and `console_verbosity.get() != ConsoleVerbosity.SILENT`. Skip when the invoked subcommand is `update` (check `sys.argv`). Use deferred import to avoid startup overhead. | `src/conductor/cli/app.py` | TO DO |
-| E3-T2 | IMPL | In `app.py`, add a new `@app.command() def update()` command that imports and calls `run_update(console)`, wrapping errors in `print_error()` and `typer.Exit(code=1)`. | `src/conductor/cli/app.py` | TO DO |
-| E3-T3 | TEST | Add CLI-level tests using `CliRunner` to verify: `conductor update` invokes `run_update`; update hint appears in non-silent TTY mode; update hint does not appear in silent mode; update hint does not appear when subcommand is `update`. | `tests/test_cli/test_update.py` | TO DO |
+| E3-T1 | IMPL | In `app.py` `main()` callback, add a call to `check_for_update_hint(console)` at the end, guarded by `console.is_terminal` and `console_verbosity.get() != ConsoleVerbosity.SILENT`. Skip when the invoked subcommand is `update` (check `sys.argv`). Use deferred import to avoid startup overhead. | `src/conductor/cli/app.py` | DONE |
+| E3-T2 | IMPL | In `app.py`, add a new `@app.command() def update()` command that imports and calls `run_update(console)`, wrapping errors in `print_error()` and `typer.Exit(code=1)`. | `src/conductor/cli/app.py` | DONE |
+| E3-T3 | TEST | Add CLI-level tests using `CliRunner` to verify: `conductor update` invokes `run_update`; update hint appears in non-silent TTY mode; update hint does not appear in silent mode; update hint does not appear when subcommand is `update`. | `tests/test_cli/test_update.py` | DONE |
 
 **Acceptance Criteria:**
-- [ ] `conductor update` is a registered command visible in `conductor --help`
-- [ ] Update hints appear in TTY, non-silent mode when a newer version is cached
-- [ ] Update hints do NOT appear in `--silent` mode or when piped
-- [ ] Update hints do NOT appear when the subcommand is `update`
-- [ ] All existing tests still pass
-- [ ] `make lint` and `make typecheck` pass
+- [x] `conductor update` is a registered command visible in `conductor --help`
+- [x] Update hints appear in TTY, non-silent mode when a newer version is cached
+- [x] Update hints do NOT appear in `--silent` mode or when piped
+- [x] Update hints do NOT appear when the subcommand is `update`
+- [x] All existing tests still pass
+- [x] `make lint` and `make typecheck` pass
 
 ---
 
