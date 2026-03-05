@@ -30,7 +30,7 @@ for_each:
     type: for_each
     description: Process each item found by the item_finder
     
-    source: item_finder.output.items  # Reference to array in context
+    source: item_finder.output.topics  # Reference to array in context
     as: item                           # Loop variable name
     max_concurrent: 3                  # Process 3 items at a time
     failure_mode: continue_on_error    # Continue even if some items fail
@@ -69,9 +69,9 @@ agents:
       Return them as a simple array of strings.
       Examples: "functional programming", "type systems", "concurrency"
     output:
-      items:
+      topics:
         type: array
-        description: List of items (strings) to process
+        description: List of topics (strings) to process
     routes:
       - to: item_processors
   
@@ -85,8 +85,8 @@ agents:
     prompt: |
       Summarize the batch processing results:
       
-      Original Items ({{ item_finder.output.items | length }}):
-      {% for item in item_finder.output.items %}
+      Original Items ({{ item_finder.output.topics | length }}):
+      {% for item in item_finder.output.topics %}
       {{ loop.index }}. {{ item }}
       {% endfor %}
       
@@ -125,7 +125,7 @@ output:
   summary: "{{ aggregator.output.summary }}"
   insights: "{{ aggregator.output.insights | json }}"
   success_rate: "{{ aggregator.output.success_rate }}"
-  total_items: "{{ item_finder.output.items | length }}"
+  total_items: "{{ item_finder.output.topics | length }}"
   processed: "{{ item_processors.outputs | length }}"
   failed: "{% if item_processors.errors is defined %}{{ item_processors.errors | length }}{% else %}0{% endif %}"
 

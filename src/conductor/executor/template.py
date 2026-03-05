@@ -15,6 +15,30 @@ from jinja2 import UndefinedError as Jinja2UndefinedError
 from conductor.exceptions import TemplateError
 
 
+class _DictSafeEnvironment(Environment):
+    """Jinja2 Environment that prefers dict key lookup over attribute access.
+
+    The default Jinja2 ``getattr`` tries Python ``getattr()`` first, then
+    ``__getitem__``.  This means ``some_dict.items`` resolves to the
+    ``dict.items`` **method** rather than ``some_dict["items"]``, which
+    breaks templates like ``{{ agent.output.items | length }}``.
+
+    This subclass reverses the priority for ``dict`` objects so that key
+    lookup is attempted first — matching the intuitive expectation for
+    YAML-authored workflow templates.
+    """
+
+    def getattr(self, obj: Any, attribute: str) -> Any:  # noqa: ANN401
+        """Get *attribute* from *obj*, preferring dict keys for dicts."""
+        if isinstance(obj, dict):
+            try:
+                return obj[attribute]
+            except KeyError:
+                pass
+        # Fall back to the default resolution (getattr → getitem → undefined)
+        return super().getattr(obj, attribute)
+
+
 class TemplateRenderer:
     """Jinja2-based template renderer for prompts and expressions.
 
@@ -31,7 +55,7 @@ class TemplateRenderer:
 
     def __init__(self) -> None:
         """Initialize the template renderer with Jinja2 environment."""
-        self.env = Environment(
+        self.env = _DictSafeEnvironment(
             loader=BaseLoader(),
             undefined=StrictUndefined,  # Fail fast on missing variables
             autoescape=False,  # No HTML escaping for prompts
