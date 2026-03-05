@@ -235,7 +235,8 @@ def run(
         typer.Option(
             "--input",
             "-i",
-            help="Workflow inputs in name=value format. Can be repeated.",
+            help="Workflow inputs in name=value format. "
+            "Use @filepath to read from file. Can be repeated.",
         ),
     ] = None,
     dry_run: Annotated[
@@ -301,11 +302,26 @@ def run(
     Execute a multi-agent workflow defined in the specified YAML file.
     Workflow inputs can be provided using --input flags.
 
+    File Input Support:
+        Use @filepath to read string inputs from files:
+            --input document=@README.md
+            --input config=@config.json
+
+        Works with relative or absolute paths:
+            --input doc=@./docs/file.md
+            --input doc=@C:\\Users\\name\\file.txt (Windows)
+            --input doc=@/home/user/file.md (Unix)
+
+        Use @@ to escape literal @ character:
+            --input email=@@example.com
+
     \b
     Examples:
         conductor run workflow.yaml
         conductor run workflow.yaml --input question="What is Python?"
+        conductor run workflow.yaml --input document=@my-file.md
         conductor run workflow.yaml -i question="Hello" -i context="Programming"
+        conductor run workflow.yaml --input doc=@README.md --input audience="developers"
         conductor run workflow.yaml --provider copilot
         conductor run workflow.yaml --dry-run
         conductor run workflow.yaml --skip-gates

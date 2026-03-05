@@ -104,6 +104,32 @@ conductor run my-workflow.yaml --input question="What is Python?"
 }
 ```
 
+## File Input Support
+
+For workflows that accept large text inputs (documents, code files, etc.), you can read from files using the `@filepath` syntax:
+
+```bash
+# Read document from file
+conductor run document-review.yaml \
+  --input document=@my-document.md \
+  --input audience="developers"
+
+# Works with relative paths
+conductor run workflow.yaml --input content=@./data/input.txt
+
+# Works with absolute paths (cross-platform)
+conductor run workflow.yaml --input content=@/home/user/file.txt
+
+# Escape @ for literal values
+conductor run workflow.yaml --input email=@@example.com
+```
+
+**Benefits over shell substitution:**
+- ✅ Works identically on Windows, Linux, and macOS
+- ✅ No command line length limits (supports multi-MB files)
+- ✅ Clear error messages if file not found
+- ✅ Automatic encoding detection (UTF-8, UTF-8 BOM, Latin-1)
+
 ## Providers
 
 Conductor supports multiple AI providers. Choose based on your needs:

@@ -980,3 +980,263 @@ output:
         # agent1 should be marked as a loop target
         agent1_step = next(s for s in plan.steps if s.agent_name == "agent1")
         assert agent1_step.is_loop_target is True
+
+
+class TestCoerceValueFileSupport:
+    """Tests for file input support in coerce_value function."""
+
+    def test_coerce_file_path_simple(self) -> None:
+        """Test basic @file.txt syntax."""
+        fixtures_dir = Path(__file__).parent.parent / "fixtures"
+        sample_file = fixtures_dir / "sample.txt"
+        result = coerce_value(f"@{sample_file}")
+        assert "sample text file" in result
+        assert "multiple lines" in result
+
+    def test_coerce_file_path_relative(self) -> None:
+        """Test relative paths from CWD."""
+        result = coerce_value("@tests/fixtures/sample.txt")
+        assert "sample text file" in result
+
+    def test_coerce_file_path_absolute(self) -> None:
+        """Test absolute paths."""
+        fixtures_dir = Path(__file__).parent.parent / "fixtures"
+        sample_file = fixtures_dir / "sample.txt"
+        absolute_path = sample_file.absolute()
+        result = coerce_value(f"@{absolute_path}")
+        assert "sample text file" in result
+
+    def test_coerce_file_path_with_spaces(self) -> None:
+        """Test files with spaces in filename."""
+        result = coerce_value("@tests/fixtures/sample with spaces.txt")
+        assert "spaces in its filename" in result
+
+    def test_coerce_file_path_not_found(self) -> None:
+        """Test that missing file raises clear error."""
+        import typer
+
+        with pytest.raises(typer.BadParameter, match="File not found"):
+            coerce_value("@nonexistent-file.txt")
+
+    def test_coerce_file_path_is_directory(self) -> None:
+        """Test that directories raise clear error."""
+        import typer
+
+        with pytest.raises(typer.BadParameter, match="not a file"):
+            coerce_value("@tests/fixtures")
+
+    def test_coerce_file_path_empty_file(self) -> None:
+        """Test that empty files return empty string."""
+        result = coerce_value("@tests/fixtures/sample-empty.txt")
+        assert result == ""
+
+    def test_coerce_file_path_large_file(self) -> None:
+        """Test that large files (>1MB) work correctly."""
+        result = coerce_value("@tests/fixtures/sample-large.txt")
+        # Should be 2 million x's
+        assert len(result) == 2_000_001  # 2M chars + newline
+        assert result.strip() == "x" * 2_000_000
+
+    def test_coerce_file_path_utf8(self) -> None:
+        """Test UTF-8 encoded files with special characters."""
+        result = coerce_value("@tests/fixtures/sample-utf8.txt")
+        assert "émojis 🎉" in result
+        assert "ñoño" in result
+        assert "中文" in result
+        assert "Кириллица" in result
+
+    def test_coerce_literal_at_sign(self) -> None:
+        """Test @@file.txt escapes to literal @file.txt."""
+        result = coerce_value("@@example.com")
+        assert result == "@example.com"
+
+    def test_coerce_literal_double_at(self) -> None:
+        """Test @@@ returns @@."""
+        result = coerce_value("@@@test")
+        assert result == "@@test"
+
+    def test_coerce_file_path_windows_style(self, tmp_path: Path) -> None:
+        """Test Windows-style backslash paths."""
+        test_file = tmp_path / "test.txt"
+        test_file.write_text("Windows path test")
+
+        # Use string representation with backslashes if on Windows
+        if os.name == "nt":
+            path_str = str(test_file).replace("/", "\\")
+            result = coerce_value(f"@{path_str}")
+            assert result == "Windows path test"
+
+    def test_coerce_file_path_preserves_whitespace(self, tmp_path: Path) -> None:
+        """Test that file contents preserve leading/trailing whitespace."""
+        test_file = tmp_path / "whitespace.txt"
+        test_file.write_text("  leading and trailing  \n")
+
+        result = coerce_value(f"@{test_file}")
+        assert result == "  leading and trailing  \n"
+
+    def test_coerce_mixed_file_and_literal(self) -> None:
+        """Test that file syntax only works at the start."""
+        # @ in the middle should be treated as literal
+        result = coerce_value("email@example.com")
+        assert result == "email@example.com"
+
+
+class TestParseInputFlagsWithFiles:
+    """Tests for parse_input_flags with file input support."""
+
+    def test_parse_file_input(self) -> None:
+        """Test integration with parse_input_flags."""
+        result = parse_input_flags(["document=@tests/fixtures/sample.txt"])
+        assert "sample text file" in result["document"]
+
+    def test_parse_mixed_file_and_literal(self) -> None:
+        """Test mix of @file and regular values."""
+        result = parse_input_flags([
+            "document=@tests/fixtures/sample.txt",
+            "audience=developers",
+            "count=42",
+        ])
+        assert "sample text file" in result["document"]
+        assert result["audience"] == "developers"
+        assert result["count"] == 42
+
+    def test_parse_multiple_file_inputs(self) -> None:
+        """Test multiple @file inputs."""
+        result = parse_input_flags([
+            "doc1=@tests/fixtures/sample.txt",
+            "doc2=@tests/fixtures/sample-utf8.txt",
+        ])
+        assert "sample text file" in result["doc1"]
+        assert "émojis" in result["doc2"]
+
+    def test_parse_escaped_at_sign(self) -> None:
+        """Test @@filepath escapes correctly."""
+        result = parse_input_flags(["email=@@example.com"])
+        assert result["email"] == "@example.com"
+
+
+class TestRunCommandWithFileInput:
+    """Integration tests for run command with file inputs."""
+
+    def test_run_command_with_file_input(self, tmp_path: Path) -> None:
+        """Test E2E with temp file input."""
+        # Create workflow
+        workflow_file = tmp_path / "test.yaml"
+        workflow_file.write_text("""\
+workflow:
+  name: test-workflow
+  entry_point: processor
+
+agents:
+  - name: processor
+    model: gpt-4
+    prompt: "Process: {{ workflow.input.document }}"
+    output:
+      result:
+        type: string
+    routes:
+      - to: $end
+
+output:
+  result: "{{ processor.output.result }}"
+""")
+
+        # Create input file
+        input_file = tmp_path / "input.txt"
+        input_file.write_text("Test document content")
+
+        # Mock execution
+        with patch("conductor.cli.run.run_workflow_async") as mock_run:
+            mock_run.return_value = {"result": "processed"}
+
+            result = runner.invoke(
+                app,
+                [
+                    "run",
+                    str(workflow_file),
+                    "--input",
+                    f"document=@{input_file}",
+                ],
+            )
+
+            # Should succeed
+            assert result.exit_code == 0
+            # Verify file content was passed
+            call_args = mock_run.call_args
+            assert call_args[0][1]["document"] == "Test document content"
+
+    def test_run_command_file_not_found_error(self, tmp_path: Path) -> None:
+        """Test error message validation for missing file."""
+        workflow_file = tmp_path / "test.yaml"
+        workflow_file.write_text("""\
+workflow:
+  name: test-workflow
+  entry_point: agent1
+
+agents:
+  - name: agent1
+    prompt: "Hello"
+    routes:
+      - to: $end
+
+output:
+  result: "done"
+""")
+
+        result = runner.invoke(
+            app,
+            [
+                "run",
+                str(workflow_file),
+                "--input",
+                "document=@nonexistent.txt",
+            ],
+        )
+
+        # Should fail
+        assert result.exit_code != 0
+        assert "File not found" in result.output
+
+    def test_run_command_multiple_file_inputs(self, tmp_path: Path) -> None:
+        """Test multiple @file inputs in run command."""
+        workflow_file = tmp_path / "test.yaml"
+        workflow_file.write_text("""\
+workflow:
+  name: test-workflow
+  entry_point: agent1
+
+agents:
+  - name: agent1
+    prompt: "Process {{ workflow.input.doc1 }} and {{ workflow.input.doc2 }}"
+    routes:
+      - to: $end
+
+output:
+  result: "done"
+""")
+
+        # Create input files
+        file1 = tmp_path / "file1.txt"
+        file1.write_text("Content 1")
+        file2 = tmp_path / "file2.txt"
+        file2.write_text("Content 2")
+
+        with patch("conductor.cli.run.run_workflow_async") as mock_run:
+            mock_run.return_value = {"result": "done"}
+
+            result = runner.invoke(
+                app,
+                [
+                    "run",
+                    str(workflow_file),
+                    "--input",
+                    f"doc1=@{file1}",
+                    "--input",
+                    f"doc2=@{file2}",
+                ],
+            )
+
+            assert result.exit_code == 0
+            call_args = mock_run.call_args
+            assert call_args[0][1]["doc1"] == "Content 1"
+            assert call_args[0][1]["doc2"] == "Content 2"
