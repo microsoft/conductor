@@ -3,12 +3,17 @@
 # This example demonstrates dynamic parallel execution with for-each groups.
 # It shows:
 # - Processing variable-length arrays with for-each
+# - Optional workflow inputs with fallback behavior
 # - Loop variables ({{ item }}, {{ _index }}, {{ _key }})
 # - Index-based output aggregation
 # - Batched parallel execution
 # - Accessing for-each outputs in downstream agents
 #
 # Usage:
+#   # With explicit items:
+#   conductor run examples/for-each-simple.yaml --input items='["apple", "banana", "cherry"]'
+#
+#   # Without items (agent generates random topics):
 #   conductor run examples/for-each-simple.yaml
 
 workflow:
@@ -23,6 +28,13 @@ workflow:
   
   limits:
     max_iterations: 20
+
+# Optional input: if provided, items are used directly; otherwise generated
+input:
+  items:
+    type: string
+    required: false
+    description: JSON array of items to process (e.g. '["apple", "banana"]')
 
 # For-each group definition
 for_each:
@@ -59,15 +71,21 @@ for_each:
       - to: aggregator
 
 agents:
-  # Agent 1: Find items to process
+  # Agent 1: Resolve items to process (pass-through or generate)
   - name: item_finder
-    description: Finds a list of items to process
+    description: Returns items to process — uses provided input or generates random topics
     model: claude-sonnet-4.5
     prompt: |
+      {% if workflow.input.items %}
+      The user provided the following items to process. Return them exactly
+      as your topics array without modification:
+      {{ workflow.input.items }}
+      {% else %}
       Generate a list of 5 interesting programming concepts to analyze.
       
       Return them as a simple array of strings.
       Examples: "functional programming", "type systems", "concurrency"
+      {% endif %}
     output:
       topics:
         type: array
@@ -86,8 +104,8 @@ agents:
       Summarize the batch processing results:
       
       Original Items ({{ item_finder.output.topics | length }}):
-      {% for item in item_finder.output.topics %}
-      {{ loop.index }}. {{ item }}
+      {% for topic in item_finder.output.topics %}
+      {{ loop.index }}. {{ topic }}
       {% endfor %}
       
       Successfully Processed ({{ item_processors.outputs | length }}):

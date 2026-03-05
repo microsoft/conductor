@@ -1784,19 +1784,18 @@ class WorkflowEngine:
     def _resolve_array_reference(self, source: str) -> list[Any]:
         """Resolve a source reference to a runtime array from workflow context.
 
-        Navigates dotted path notation to extract an array from agent outputs.
-        Handles the same wrapping logic as build_for_agent (regular agents are
-        wrapped with {"output": ...}, parallel/for-each groups are stored directly).
+        Navigates dotted path notation to extract an array from agent outputs
+        or workflow inputs. Handles the same wrapping logic as build_for_agent
+        (regular agents are wrapped with {"output": ...}, parallel/for-each
+        groups are stored directly).
 
-        Example:
-            source = "finder.output.kpis"
-            1. Lookup agent_outputs["finder"]
-            2. Wrap with {"output": ...} if not a parallel/for-each group
-            3. Navigate to ["output"]["kpis"]
-            4. Return the array value
+        Supports two reference styles:
+        - Agent output: ``finder.output.kpis`` → agent_outputs["finder"]["output"]["kpis"]
+        - Workflow input: ``workflow.input.items`` → workflow_inputs["items"]
 
         Args:
-            source: Dotted path reference (e.g., 'finder.output.kpis').
+            source: Dotted path reference (e.g., 'finder.output.kpis'
+                or 'workflow.input.items').
 
         Returns:
             The resolved array (list).
@@ -1809,8 +1808,15 @@ class WorkflowEngine:
         if len(parts) < 3:
             raise ExecutionError(
                 f"Invalid source reference format: '{source}'",
-                suggestion="Source must have at least 3 parts (e.g., 'agent_name.output.field')",
+                suggestion=(
+                    "Source must have at least 3 parts "
+                    "(e.g., 'agent_name.output.field' or 'workflow.input.field')"
+                ),
             )
+
+        # Handle workflow.input.* references
+        if parts[0] == "workflow" and parts[1] == "input":
+            return self._resolve_workflow_input_array(source, parts[2:])
 
         # First part is the agent name
         agent_name = parts[0]
@@ -1881,6 +1887,89 @@ class WorkflowEngine:
             )
 
         return current
+
+    def _resolve_workflow_input_array(self, source: str, field_parts: list[str]) -> list[Any]:
+        """Resolve a workflow.input.* reference to a runtime array.
+
+        Navigates into ``self.context.workflow_inputs`` using the remaining
+        dotted path segments after ``workflow.input``.
+
+        Args:
+            source: The full dotted source string (for error messages).
+            field_parts: Path segments after ``workflow.input``
+                (e.g., ``["items"]`` for ``workflow.input.items``).
+
+        Returns:
+            The resolved array (list).
+
+        Raises:
+            ExecutionError: If the path doesn't exist or value is not an array.
+        """
+        if not field_parts:
+            raise ExecutionError(
+                f"Invalid source reference: '{source}'",
+                suggestion="workflow.input references need a field name "
+                "(e.g., 'workflow.input.items')",
+            )
+
+        current: Any = self.context.workflow_inputs
+        path_traversed = ["workflow", "input"]
+
+        for part in field_parts:
+            path_traversed.append(part)
+
+            if not isinstance(current, dict):
+                parent_path = ".".join(path_traversed[:-1])
+                raise ExecutionError(
+                    f"Cannot navigate to '{part}' in source '{source}': "
+                    f"'{parent_path}' is not a dictionary (type: {type(current).__name__})",
+                    suggestion=f"Check that '{parent_path}' returns a dictionary structure",
+                )
+
+            if part not in current:
+                parent_path = ".".join(path_traversed[:-1])
+                available_keys = list(current.keys()) if isinstance(current, dict) else []
+                raise ExecutionError(
+                    f"Field '{part}' not found in '{parent_path}' for source '{source}'",
+                    suggestion=(
+                        f"Available keys: {available_keys}"
+                        if available_keys
+                        else "Check the workflow input parameters"
+                    ),
+                )
+
+            current = current[part]
+
+        # Handle JSON string inputs (CLI passes arrays as strings)
+        if isinstance(current, str):
+            import json as _json
+
+            try:
+                parsed = _json.loads(current)
+            except (ValueError, TypeError):
+                raise ExecutionError(
+                    f"Source '{source}' resolved to a string that is not valid JSON: "
+                    f"{current!r}",
+                    suggestion="Ensure the input is a JSON array string "
+                    "(e.g., --input items='[\"a\", \"b\"]')",
+                )
+            if not isinstance(parsed, list):
+                raise ExecutionError(
+                    f"Source '{source}' parsed from JSON string but got "
+                    f"{type(parsed).__name__}, expected array",
+                    suggestion="Ensure the input is a JSON array "
+                    "(e.g., --input items='[\"a\", \"b\"]')",
+                )
+            return parsed
+
+        if not isinstance(current, (list, tuple)):
+            raise ExecutionError(
+                f"Source '{source}' resolved to {type(current).__name__}, "
+                f"expected list or tuple",
+                suggestion=f"Ensure '{source}' contains an array value",
+            )
+
+        return list(current)
 
     def _inject_loop_variables(
         self,

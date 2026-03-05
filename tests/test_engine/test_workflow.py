@@ -1619,6 +1619,106 @@ class TestResolveArrayReference:
         assert len(result) == 3
         assert result == ("item1", "item2", "item3")
 
+    def test_resolve_workflow_input_array(self, workflow_engine_with_context: WorkflowEngine):
+        """Test resolving an array from workflow.input.*."""
+        workflow_engine_with_context.context.set_workflow_inputs(
+            {"items": ["apple", "banana", "cherry"]}
+        )
+
+        result = workflow_engine_with_context._resolve_array_reference("workflow.input.items")
+
+        assert isinstance(result, list)
+        assert result == ["apple", "banana", "cherry"]
+
+    def test_resolve_workflow_input_json_string(self, workflow_engine_with_context: WorkflowEngine):
+        """Test resolving a JSON string array from workflow.input.* (CLI passes strings)."""
+        workflow_engine_with_context.context.set_workflow_inputs(
+            {"items": '["apple", "banana", "cherry"]'}
+        )
+
+        result = workflow_engine_with_context._resolve_array_reference("workflow.input.items")
+
+        assert isinstance(result, list)
+        assert result == ["apple", "banana", "cherry"]
+
+    def test_resolve_workflow_input_nested(self, workflow_engine_with_context: WorkflowEngine):
+        """Test resolving a nested path from workflow.input.*."""
+        workflow_engine_with_context.context.set_workflow_inputs(
+            {"config": {"tasks": ["task1", "task2"]}}
+        )
+
+        result = workflow_engine_with_context._resolve_array_reference(
+            "workflow.input.config.tasks"
+        )
+
+        assert isinstance(result, list)
+        assert result == ["task1", "task2"]
+
+    def test_resolve_workflow_input_missing_field(
+        self, workflow_engine_with_context: WorkflowEngine
+    ):
+        """Test error when workflow input field doesn't exist."""
+        workflow_engine_with_context.context.set_workflow_inputs({"other": "value"})
+
+        with pytest.raises(ExecutionError) as exc_info:
+            workflow_engine_with_context._resolve_array_reference("workflow.input.items")
+
+        assert "Field 'items' not found" in str(exc_info.value)
+        assert "Available keys:" in str(exc_info.value.suggestion)
+
+    def test_resolve_workflow_input_not_array(self, workflow_engine_with_context: WorkflowEngine):
+        """Test error when workflow input value is not an array."""
+        workflow_engine_with_context.context.set_workflow_inputs({"items": 42})
+
+        with pytest.raises(ExecutionError) as exc_info:
+            workflow_engine_with_context._resolve_array_reference("workflow.input.items")
+
+        assert "resolved to int" in str(exc_info.value)
+
+    def test_resolve_workflow_input_invalid_json_string(
+        self, workflow_engine_with_context: WorkflowEngine
+    ):
+        """Test error when workflow input string is not valid JSON."""
+        workflow_engine_with_context.context.set_workflow_inputs({"items": "not json at all"})
+
+        with pytest.raises(ExecutionError) as exc_info:
+            workflow_engine_with_context._resolve_array_reference("workflow.input.items")
+
+        assert "not valid JSON" in str(exc_info.value)
+
+    def test_resolve_workflow_input_json_string_not_array(
+        self, workflow_engine_with_context: WorkflowEngine
+    ):
+        """Test error when workflow input JSON string parses to non-array."""
+        workflow_engine_with_context.context.set_workflow_inputs(
+            {"items": '{"key": "value"}'}
+        )
+
+        with pytest.raises(ExecutionError) as exc_info:
+            workflow_engine_with_context._resolve_array_reference("workflow.input.items")
+
+        assert "parsed from JSON string but got dict" in str(exc_info.value)
+
+    def test_resolve_workflow_input_empty_array(
+        self, workflow_engine_with_context: WorkflowEngine
+    ):
+        """Test resolving an empty array from workflow.input.*."""
+        workflow_engine_with_context.context.set_workflow_inputs({"items": []})
+
+        result = workflow_engine_with_context._resolve_array_reference("workflow.input.items")
+
+        assert isinstance(result, list)
+        assert len(result) == 0
+
+    def test_resolve_workflow_input_no_field_parts(
+        self, workflow_engine_with_context: WorkflowEngine
+    ):
+        """Test error when workflow.input has no field name."""
+        # This would be caught by the len(parts) < 3 check since
+        # "workflow.input" only has 2 parts, but test the boundary.
+        with pytest.raises(ExecutionError):
+            workflow_engine_with_context._resolve_array_reference("workflow.input")
+
 
 class TestInjectLoopVariables:
     """Tests for _inject_loop_variables() method."""
