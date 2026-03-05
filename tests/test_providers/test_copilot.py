@@ -1,7 +1,9 @@
 """Unit tests for the CopilotProvider implementation."""
 
 import contextlib
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -556,3 +558,74 @@ class TestLogParseRecovery:
             max_attempts=5,
             error=long_error,
         )
+
+
+class TestVerboseAgentAttribution:
+    """Tests for agent attribution in verbose provider logs."""
+
+    def test_log_event_verbose_prefixes_agent_name(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Verbose tool logs include an agent prefix when provided."""
+        provider = CopilotProvider(mock_handler=stub_handler)
+        captured: list[str] = []
+
+        import rich.console as rich_console
+
+        def _patched_print(self: Any, *args: Any, **kwargs: Any) -> None:
+            if args:
+                captured.append(getattr(args[0], "plain", str(args[0])))
+
+        monkeypatch.setattr(rich_console.Console, "print", _patched_print)
+
+        event = SimpleNamespace(
+            data=SimpleNamespace(tool_name="view", arguments={"path": "/tmp/file.py"})
+        )
+        provider._log_event_verbose(
+            "tool.execution_start",
+            event,
+            full_mode=False,
+            agent_name="analyzer[item_a]",
+        )
+
+        assert any("[analyzer[item_a]]" in line and "view" in line for line in captured)
+
+    @pytest.mark.asyncio
+    async def test_send_and_wait_passes_agent_name_to_verbose_logger(self) -> None:
+        """_send_and_wait forwards agent_name to verbose event logging calls."""
+        provider = CopilotProvider(mock_handler=stub_handler)
+
+        class _FakeSession:
+            def __init__(self) -> None:
+                self._callback: Any = None
+
+            def on(self, callback: Any) -> None:
+                self._callback = callback
+
+            async def send(self, _message: dict[str, Any]) -> None:
+                assert self._callback is not None
+                self._callback(
+                    SimpleNamespace(
+                        type=SimpleNamespace(value="tool.execution_start"),
+                        data=SimpleNamespace(tool_name="view"),
+                    )
+                )
+                self._callback(
+                    SimpleNamespace(
+                        type=SimpleNamespace(value="session.idle"),
+                        data=SimpleNamespace(),
+                    )
+                )
+
+        provider._log_event_verbose = MagicMock()
+        session = _FakeSession()
+
+        await provider._send_and_wait(
+            session,
+            prompt="test",
+            verbose_enabled=True,
+            full_enabled=False,
+            agent_name="analyzer[item_a]",
+        )
+
+        first_call = provider._log_event_verbose.call_args_list[0]
+        assert first_call.args[0] == "tool.execution_start"
+        assert first_call.kwargs["agent_name"] == "analyzer[item_a]"
