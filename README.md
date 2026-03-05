@@ -218,6 +218,27 @@ cd conductor
 make dev
 ```
 
+### Windows
+
+On Windows, use `uv` directly instead of `make`:
+
+```powershell
+uv sync --all-extras    # instead of make dev
+uv run pytest tests/    # instead of make test
+uv run ruff check .     # instead of make lint
+uv run ruff format .    # instead of make format
+```
+
+**Copilot CLI path:** Windows `subprocess` cannot resolve `.bat`/`.ps1` wrappers by name alone. If you see `[WinError 2] The system cannot find the file specified` when running workflows, set the full path to the Copilot CLI:
+
+```powershell
+# Find your copilot CLI
+Get-Command copilot* | Format-Table Name, Source
+
+# Set the path (use the .cmd variant from npm)
+$env:COPILOT_CLI_PATH = "C:\Users\<you>\AppData\Roaming\npm\copilot.cmd"
+```
+
 ### Common Commands
 
 ```bash
