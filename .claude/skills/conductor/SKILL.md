@@ -10,16 +10,20 @@ CLI tool for defining and running multi-agent workflows with the GitHub Copilot 
 ## Quick Reference
 
 ```bash
-conductor run workflow.yaml --input question="Hello"     # Execute (progress shown by default)
-conductor run workflow.yaml -V --input question="Hello"  # Full verbose (untruncated prompts, tool args)
+conductor run workflow.yaml --input question="Hello"     # Execute (full output by default)
+conductor run workflow.yaml -q --input question="Hello"  # Quiet: lifecycle + routing only
+conductor run workflow.yaml -s --input question="Hello"  # Silent: JSON result only
+conductor run workflow.yaml --log-file auto               # Log full debug output to file
 conductor validate workflow.yaml                         # Validate only
 conductor init my-workflow --template simple              # Create from template
 conductor templates                                      # List templates
 conductor stop                                           # Stop background workflow
 conductor update                                         # Check for and install latest version
+conductor resume workflow.yaml                           # Resume from last checkpoint
+conductor checkpoints                                    # List available checkpoints
 ```
 
-Progress output is shown by default. Use `-V` (verbose) for full prompts and detailed tool call info.
+Full output is shown by default. Use `-q` (quiet) for minimal output or `-s` (silent) for JSON-only.
 
 ## When to Use Each Guide
 
@@ -32,9 +36,10 @@ Progress output is shown by default. Use `-V` (verbose) for full prompts and det
 - Cost tracking configuration
 
 **Running or debugging workflows?** → See [references/execution.md](references/execution.md)
-- CLI options and flags
+- CLI options and flags (run, resume, checkpoints, stop, update)
 - Debugging techniques
 - Error troubleshooting
+- Checkpoint/resume after failures
 - Environment setup and providers
 
 **Need complete YAML schema?** → See [references/yaml-schema.md](references/yaml-schema.md)
@@ -82,13 +87,16 @@ output:
 |---------|-------------|
 | `entry_point` | First agent/group to execute |
 | `routes` | Where agent goes next (`$end` to finish, `self` to loop) |
+| `type: script` | Shell command step (captures stdout, stderr, exit_code) |
 | `parallel` | Static parallel groups (fixed agent list) |
 | `for_each` | Dynamic parallel groups (runtime-determined array) |
 | `human_gate` | Pauses for user decision with options |
+| `!file` tag | Include external file content in YAML (`prompt: !file prompt.md`) |
 | `context.mode` | How agents share data (accumulate, last_only, explicit) |
 | `limits` | Safety bounds (max_iterations up to 500, timeout_seconds) |
 | `cost` | Token usage and cost tracking configuration |
 | `runtime` | Provider, model, temperature, max_tokens, MCP servers |
+| checkpoint | Auto-saved on failure; resume with `conductor resume` |
 
 ## Common Patterns
 
@@ -125,7 +133,7 @@ parallel:
 for_each:
   - name: processors
     type: for_each
-    source: finder.output.items
+    source: finder.output.topics
     as: item
     max_concurrent: 5
     agent:
@@ -134,6 +142,27 @@ for_each:
         result: { type: string }
     routes:
       - to: aggregator
+```
+
+**Script step** (shell command):
+```yaml
+agents:
+  - name: check_version
+    type: script
+    command: python3
+    args: ["--version"]
+    routes:
+      - to: analyzer
+        when: "exit_code == 0"
+      - to: error_handler
+```
+
+**File include** (`!file` tag):
+```yaml
+agents:
+  - name: analyzer
+    system_prompt: !file prompts/system.md
+    prompt: !file prompts/analyze.md
 ```
 
 **Human gate**:

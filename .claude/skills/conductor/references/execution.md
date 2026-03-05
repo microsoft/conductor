@@ -23,24 +23,35 @@ conductor run <workflow.yaml> [OPTIONS]
 | `--web-bg` | Run in background, print dashboard URL, exit |
 | `--web-port PORT` | Port for web dashboard (0 = auto) |
 | `--no-interactive` | Disable Esc-to-interrupt capability |
+| `--log-file`, `-l PATH` | Write full debug output to file (`auto` for auto-generated) |
 
 **Global options** (before the subcommand):
 
 | Option | Description |
 |--------|-------------|
-| `--verbose`, `-V` | Show full prompts and detailed tool call information |
+| `--quiet`, `-q` | Minimal output: agent lifecycle and routing only |
+| `--silent`, `-s` | No progress output. Only JSON result on stdout |
 | `--version`, `-v` | Show version and exit |
 
-> **Note:** Progress output is shown by default. Use `-V` for full untruncated prompts, tool arguments, and reasoning details.
+> **Note:** Full output is shown by default (prompts, tool calls, reasoning). Use `-q` for minimal output or `-s` for JSON-only. `--quiet` and `--silent` are mutually exclusive.
 
 **Examples:**
 
 ```bash
-# Standard run (progress shown by default)
+# Standard run (full output by default)
 conductor run workflow.yaml --input question="Hello"
 
-# Full verbose mode (untruncated prompts, tool args, reasoning)
-conductor -V run workflow.yaml --input question="Hello"
+# Quiet mode (lifecycle + routing only)
+conductor -q run workflow.yaml --input question="Hello"
+
+# Silent mode (JSON result only, no progress)
+conductor -s run workflow.yaml --input question="Hello"
+
+# Log full debug output to auto-generated file
+conductor run workflow.yaml --log-file auto
+
+# Silent terminal + full file logging
+conductor -s run workflow.yaml --log-file auto
 
 # Multiple inputs
 conductor run workflow.yaml -i topic="AI" -i depth="detailed"
@@ -116,6 +127,62 @@ If already up to date, prints a confirmation message and exits.
 conductor update
 ```
 
+### conductor resume
+
+Resume a workflow from a checkpoint after failure:
+
+```bash
+conductor resume <workflow.yaml> [OPTIONS]
+conductor resume --from <checkpoint.json> [OPTIONS]
+```
+
+| Option | Description |
+|--------|-------------|
+| `--from PATH` | Resume from a specific checkpoint file |
+| `--skip-gates` | Auto-select first option at human gates |
+| `--log-file`, `-l PATH` | Write debug output to file |
+| `--no-interactive` | Disable Esc-to-interrupt |
+
+When a workflow fails, Conductor automatically saves a checkpoint to `$TMPDIR/conductor/checkpoints/`. The checkpoint contains all prior agent outputs and workflow state, enabling seamless resumption from the failed agent.
+
+**Examples:**
+
+```bash
+# Resume the latest checkpoint for a workflow
+conductor resume workflow.yaml
+
+# Resume from a specific checkpoint file
+conductor resume --from /tmp/conductor/checkpoints/my-workflow-20260303-153000.json
+
+# Resume with log file
+conductor resume workflow.yaml --log-file auto
+```
+
+**Behavior:**
+- If the workflow file has changed since the checkpoint was saved, a warning is displayed
+- Execution resumes from the exact agent that failed
+- All prior agent outputs are restored from the checkpoint
+
+### conductor checkpoints
+
+List available workflow checkpoints:
+
+```bash
+conductor checkpoints [workflow.yaml]
+```
+
+Shows all checkpoint files with metadata: workflow name, timestamp, failed agent, and error type. Optionally filter by workflow file.
+
+**Examples:**
+
+```bash
+# List all checkpoints
+conductor checkpoints
+
+# List checkpoints for a specific workflow
+conductor checkpoints workflow.yaml
+```
+
 ### conductor validate
 
 Validate without executing:
@@ -188,7 +255,7 @@ conductor templates
 
 ## Cost Tracking
 
-Conductor tracks token usage and costs automatically when using verbose output:
+Conductor tracks token usage and costs automatically:
 
 ```yaml
 cost:
@@ -206,10 +273,12 @@ Output includes input/output token counts and estimated costs per agent and in t
 
 ## Debugging
 
-### Use Full Verbose Mode
+### Default Output
+
+Full output is shown by default:
 
 ```bash
-conductor -V run workflow.yaml --input question="test"
+conductor run workflow.yaml --input question="test"
 ```
 
 Shows:
@@ -219,6 +288,17 @@ Shows:
 - Route decisions
 - Tool call arguments and reasoning
 - Token usage and costs per agent
+
+Use `--quiet` for minimal output (lifecycle + routing only) or `--silent` for JSON-only.
+
+### Log File
+
+```bash
+conductor run workflow.yaml --log-file auto
+conductor -s run workflow.yaml --log-file debug.log
+```
+
+Capture full debug output to a file. Combine with `--silent` for quiet terminal with full logging. Auto mode generates files in `$TMPDIR/conductor/`.
 
 ### Dry Run
 
@@ -425,3 +505,41 @@ Environment variables in YAML configs support `${VAR}` and `${VAR:-default}` int
 8. [ ] Verify for-each `source` resolves to an array
 9. [ ] Check parallel groups have 2+ agents
 10. [ ] Review cost output for unexpected token usage
+
+## Interactive Interrupt
+
+During execution, press **Esc** or **Ctrl+G** to pause the workflow. An interactive menu appears with these actions:
+
+| Action | Description |
+|--------|-------------|
+| **Continue with guidance** | Provide text guidance that is appended to subsequent agent prompts |
+| **Skip to agent** | Jump to a specific agent in the workflow |
+| **Stop** | Stop the workflow entirely |
+| **Cancel** | Resume execution as-is |
+
+Guidance text accumulates across multiple interrupts and is injected into agent context.
+
+Disable with `--no-interactive`. In `--skip-gates` mode, interrupts auto-cancel.
+
+## Checkpoint & Resume
+
+When a workflow fails, Conductor automatically saves a checkpoint containing:
+- All completed agent outputs
+- Current workflow state and iteration count
+- Workflow file hash (to detect changes)
+- Failure details (agent, error type, message)
+
+Checkpoints are stored in `$TMPDIR/conductor/checkpoints/`.
+
+```bash
+# List available checkpoints
+conductor checkpoints
+
+# Resume from latest checkpoint for a workflow
+conductor resume workflow.yaml
+
+# Resume from a specific checkpoint file
+conductor resume --from /tmp/conductor/checkpoints/my-workflow-20260303-153000.json
+```
+
+If the workflow file has changed since the checkpoint was saved, a warning is displayed but resumption proceeds.

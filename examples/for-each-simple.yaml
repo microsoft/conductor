@@ -104,8 +104,8 @@ agents:
       Summarize the batch processing results:
       
       Original Items ({{ item_finder.output.topics | length }}):
-      {% for topic in item_finder.output.topics %}
-      {{ loop.index }}. {{ topic }}
+      {% for item in item_finder.output.topics %}
+      {{ loop.index }}. {{ item }}
       {% endfor %}
       
       Successfully Processed ({{ item_processors.outputs | length }}):

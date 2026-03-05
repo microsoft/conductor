@@ -46,6 +46,10 @@ uv run conductor stop --all            # stop all background workflows
 # Update conductor
 uv run conductor update                # check for and install latest version
 
+# Resume a failed workflow from checkpoint
+uv run conductor resume workflow.yaml  # resume from latest checkpoint
+uv run conductor checkpoints           # list available checkpoints
+
 # Validate a workflow
 uv run conductor validate examples/simple-qa.yaml
 make validate-examples    # validate all examples
@@ -55,7 +59,7 @@ make validate-examples    # validate all examples
 
 ### Core Package Structure (`src/conductor/`)
 
-- **cli/**: Typer-based CLI with commands `run`, `validate`, `init`, `templates`, `stop`, `update`
+- **cli/**: Typer-based CLI with commands `run`, `validate`, `init`, `templates`, `stop`, `update`, `resume`, `checkpoints`
   - `app.py` - Main entry point, defines the Typer application
   - `run.py` - Workflow execution command with verbose logging helpers
   - `bg_runner.py` - Background process forking for `--web-bg` mode
@@ -64,7 +68,7 @@ make validate-examples    # validate all examples
 
 - **config/**: YAML loading and Pydantic schema validation
   - `schema.py` - Pydantic models for all workflow YAML structures (WorkflowConfig, AgentDef, ParallelGroup, ForEachDef, etc.)
-  - `loader.py` - YAML parsing with environment variable resolution (${VAR:-default})
+  - `loader.py` - YAML parsing with environment variable resolution (${VAR:-default}) and `!file` tag support
   - `validator.py` - Cross-reference validation (agent names, routes, parallel groups)
 
 - **engine/**: Workflow execution orchestration
@@ -72,6 +76,7 @@ make validate-examples    # validate all examples
   - `context.py` - `WorkflowContext` manages accumulated agent outputs with three modes: accumulate, last_only, explicit
   - `router.py` - Route evaluation with Jinja2 templates and simpleeval expressions
   - `limits.py` - Safety enforcement (max iterations, timeout)
+  - `checkpoint.py` - Automatic checkpoint saving on failure and resume support
 
 - **executor/**: Agent execution
   - `agent.py` - `AgentExecutor` handles prompt rendering, tool resolution, and output validation for single agents
@@ -86,6 +91,9 @@ make validate-examples    # validate all examples
 
 - **gates/**: Human-in-the-loop support
   - `human.py` - Rich terminal UI for human gate interactions
+
+- **interrupt/**: Interactive workflow interruption (Esc/Ctrl+G to pause)
+  - `listener.py` - Keyboard listener daemon thread for Esc/Ctrl+G detection
 
 - **web/**: Real-time web dashboard for workflow visualization
   - `server.py` - FastAPI + uvicorn server with WebSocket broadcasting, late-joiner state replay, and `POST /api/stop` endpoint
