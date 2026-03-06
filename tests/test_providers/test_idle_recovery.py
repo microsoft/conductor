@@ -610,7 +610,7 @@ class TestSessionTimeout:
         events keep resetting the idle clock, the hard cap still fires.
         """
         config = IdleRecoveryConfig(
-            idle_timeout_seconds=60.0,  # Very high — won't trigger idle
+            idle_timeout_seconds=0.05,  # Short — loop iterates quickly
             max_recovery_attempts=10,
             max_session_seconds=0.15,  # Short wall-clock limit
         )
@@ -644,6 +644,7 @@ class TestSessionTimeout:
             )
 
         assert "exceeded maximum duration" in str(exc_info.value)
+        assert not exc_info.value.is_retryable
 
     @pytest.mark.asyncio
     async def test_session_completes_before_timeout(self) -> None:

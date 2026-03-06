@@ -411,7 +411,7 @@ class CopilotProvider(AgentProvider):
                 is_retryable=False,
             )
 
-        # Ensure client is started (lock handles fast-path internally)
+        # Ensure client is started; lock serializes concurrent first calls
         await self._ensure_client_started()
 
         model = agent.model or self._default_model
