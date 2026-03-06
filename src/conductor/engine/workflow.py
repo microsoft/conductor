@@ -1948,24 +1948,22 @@ class WorkflowEngine:
                 parsed = _json.loads(current)
             except (ValueError, TypeError):
                 raise ExecutionError(
-                    f"Source '{source}' resolved to a string that is not valid JSON: "
-                    f"{current!r}",
+                    f"Source '{source}' resolved to a string that is not valid JSON: {current!r}",
                     suggestion="Ensure the input is a JSON array string "
-                    "(e.g., --input items='[\"a\", \"b\"]')",
-                )
+                    '(e.g., --input items=\'["a", "b"]\')',
+                ) from None
             if not isinstance(parsed, list):
                 raise ExecutionError(
                     f"Source '{source}' parsed from JSON string but got "
                     f"{type(parsed).__name__}, expected array",
                     suggestion="Ensure the input is a JSON array "
-                    "(e.g., --input items='[\"a\", \"b\"]')",
+                    '(e.g., --input items=\'["a", "b"]\')',
                 )
             return parsed
 
         if not isinstance(current, (list, tuple)):
             raise ExecutionError(
-                f"Source '{source}' resolved to {type(current).__name__}, "
-                f"expected list or tuple",
+                f"Source '{source}' resolved to {type(current).__name__}, expected list or tuple",
                 suggestion=f"Ensure '{source}' contains an array value",
             )
 

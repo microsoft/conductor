@@ -1690,18 +1690,14 @@ class TestResolveArrayReference:
         self, workflow_engine_with_context: WorkflowEngine
     ):
         """Test error when workflow input JSON string parses to non-array."""
-        workflow_engine_with_context.context.set_workflow_inputs(
-            {"items": '{"key": "value"}'}
-        )
+        workflow_engine_with_context.context.set_workflow_inputs({"items": '{"key": "value"}'})
 
         with pytest.raises(ExecutionError) as exc_info:
             workflow_engine_with_context._resolve_array_reference("workflow.input.items")
 
         assert "parsed from JSON string but got dict" in str(exc_info.value)
 
-    def test_resolve_workflow_input_empty_array(
-        self, workflow_engine_with_context: WorkflowEngine
-    ):
+    def test_resolve_workflow_input_empty_array(self, workflow_engine_with_context: WorkflowEngine):
         """Test resolving an empty array from workflow.input.*."""
         workflow_engine_with_context.context.set_workflow_inputs({"items": []})
 
