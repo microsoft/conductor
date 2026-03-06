@@ -1373,6 +1373,39 @@ class CopilotProvider(AgentProvider):
             await self._client.start()
             self._started = True
 
+            # Ensure subprocess pipes are in blocking mode to prevent
+            # BlockingIOError on large payloads. The asyncio event loop
+            # may set O_NONBLOCK on inherited file descriptors.
+            self._fix_pipe_blocking_mode()
+
+    def _fix_pipe_blocking_mode(self) -> None:
+        """Clear O_NONBLOCK on the Copilot CLI subprocess pipes.
+
+        Large JSON-RPC messages (e.g., prompts with many gathered articles)
+        can exceed the OS pipe buffer. When O_NONBLOCK is set, writes raise
+        BlockingIOError instead of blocking until the reader drains the pipe.
+        Since the SDK already runs writes in a thread-pool executor, blocking
+        is safe and correct here.
+        """
+        import fcntl
+        import os
+
+        process = getattr(self._client, "_process", None)
+        if not process:
+            return
+
+        for name, stream in [("stdin", process.stdin), ("stdout", process.stdout)]:
+            if stream is None:
+                continue
+            try:
+                fd = stream.fileno()
+                flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+                if flags & os.O_NONBLOCK:
+                    fcntl.fcntl(fd, fcntl.F_SETFL, flags & ~os.O_NONBLOCK)
+                    logger.debug(f"Cleared O_NONBLOCK on Copilot CLI {name}")
+            except (OSError, ValueError):
+                pass  # fd may already be closed or invalid
+
     def _calculate_delay(self, attempt: int, config: RetryConfig) -> float:
         """Calculate delay with exponential backoff and jitter.
 
