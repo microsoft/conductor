@@ -2464,17 +2464,26 @@ class WorkflowEngine:
                     key if for_each_group.key_by else None,
                 )
 
+                # Qualify per-item agent names so concurrent verbose logs are attributable.
+                qualified_agent = for_each_group.agent.model_copy(
+                    update={"name": f"{for_each_group.agent.name}[{key}]"}
+                )
+
                 # Execute agent with injected context (get executor for multi-provider)
-                executor = await self._get_executor_for_agent(for_each_group.agent)
+                executor = await self._get_executor_for_agent(qualified_agent)
 
                 # Item-scoped event callback that tags all streaming events with item_key
                 def _item_callback(event_type: str, data: dict[str, Any]) -> None:
-                    data_with_agent = {"agent_name": for_each_group.name, "item_key": key, **data}
+                    data_with_agent = {
+                        "agent_name": qualified_agent.name,
+                        "item_key": key,
+                        **data,
+                    }
                     self._emit(event_type, data_with_agent)
 
                 event_callback = _item_callback if self._event_emitter else None
                 output = await executor.execute(
-                    for_each_group.agent,
+                    qualified_agent,
                     agent_context,
                     event_callback=event_callback,
                 )

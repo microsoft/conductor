@@ -611,7 +611,7 @@ class TestForEachExecution:
             await asyncio.sleep(0.1)  # Simulate processing time
             return AgentOutput(
                 content={"result": "ok"}
-                if agent.name == "processor"
+                if agent.name == "processor" or agent.name.startswith("processor[")
                 else {"items": ["A", "B", "C", "D", "E"]},
                 raw_response={},
                 model="gpt-4",

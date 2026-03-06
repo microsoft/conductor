@@ -1,0 +1,68 @@
+# For-Each Agent Attribution
+#
+# This example focuses on verbose log attribution for parallel for_each execution.
+# Run with:
+#   uv run conductor run examples/for-each-agent-attribution.yaml --verbose
+
+workflow:
+  name: for-each-agent-attribution
+  description: Demonstrates per-item qualified agent names in for_each execution
+  version: "1.0.0"
+  entry_point: finder
+
+  runtime:
+    provider: copilot
+    default_model: claude-sonnet-4.5
+
+  limits:
+    max_iterations: 20
+
+for_each:
+  - name: analyze_items
+    type: for_each
+    source: finder.output.items
+    as: item
+    key_by: id
+    max_concurrent: 3
+    failure_mode: continue_on_error
+
+    agent:
+      name: analyzer
+      model: claude-sonnet-4.5
+      prompt: |
+        Analyze item {{ item.id }} with value: {{ item.value }}
+      output:
+        id:
+          type: string
+        summary:
+          type: string
+
+    routes:
+      - to: aggregator
+
+agents:
+  - name: finder
+    model: claude-sonnet-4.5
+    prompt: |
+      Return three objects with fields id and value.
+    output:
+      items:
+        type: array
+    routes:
+      - to: analyze_items
+
+  - name: aggregator
+    model: claude-sonnet-4.5
+    input:
+      - analyze_items.outputs
+    prompt: |
+      Summarize the outputs from all analyzed items.
+    output:
+      final:
+        type: string
+    routes:
+      - to: $end
+
+output:
+  final: "{{ aggregator.output.final }}"
+  analyzed_count: "{{ analyze_items.outputs | length }}"

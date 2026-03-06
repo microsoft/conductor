@@ -495,6 +495,7 @@ class CopilotProvider(AgentProvider):
                     full_enabled,
                     interrupt_signal=interrupt_signal,
                     event_callback=event_callback,
+                    agent_name=agent.name,
                 )
                 response_content = sdk_response.content
 
@@ -574,7 +575,11 @@ class CopilotProvider(AgentProvider):
 
                         # Send recovery prompt and get new response
                         recovery_response = await self._send_and_wait(
-                            session, recovery_prompt, verbose_enabled, full_enabled
+                            session,
+                            recovery_prompt,
+                            verbose_enabled,
+                            full_enabled,
+                            agent_name=agent.name,
                         )
                         response_content = recovery_response.content
 
@@ -621,6 +626,7 @@ class CopilotProvider(AgentProvider):
         full_enabled: bool,
         interrupt_signal: asyncio.Event | None = None,
         event_callback: EventCallback | None = None,
+        agent_name: str | None = None,
     ) -> SDKResponse:
         """Send a prompt to the session and wait for response.
 
@@ -633,6 +639,7 @@ class CopilotProvider(AgentProvider):
                 When set, the method will attempt to abort the session and
                 return partial content with ``partial=True``.
             event_callback: Optional callback for streaming SDK events upstream.
+            agent_name: Optional agent name for attributing verbose event logs.
 
         Returns:
             SDKResponse with content and usage data. If interrupted,
@@ -710,7 +717,12 @@ class CopilotProvider(AgentProvider):
 
             # Verbose logging for intermediate progress
             if verbose_enabled:
-                self._log_event_verbose(event_type, event, full_enabled)
+                self._log_event_verbose(
+                    event_type,
+                    event,
+                    full_enabled,
+                    agent_name=agent_name,
+                )
 
         session.on(on_event)
         await session.send({"prompt": prompt})
@@ -888,7 +900,10 @@ class CopilotProvider(AgentProvider):
 
         try:
             sdk_response = await self._send_and_wait(
-                session, guidance, verbose_enabled, full_enabled
+                session,
+                guidance,
+                verbose_enabled,
+                full_enabled,
             )
 
             content: dict[str, Any]
@@ -1025,7 +1040,13 @@ class CopilotProvider(AgentProvider):
             f"than the raw JSON object."
         )
 
-    def _log_event_verbose(self, event_type: str, event: Any, full_mode: bool) -> None:
+    def _log_event_verbose(
+        self,
+        event_type: str,
+        event: Any,
+        full_mode: bool,
+        agent_name: str | None = None,
+    ) -> None:
         """Log SDK events in verbose mode for progress visibility.
 
         Note: Caller must check is_verbose() before calling - contextvars
@@ -1035,6 +1056,7 @@ class CopilotProvider(AgentProvider):
             event_type: The event type string.
             event: The event object.
             full_mode: If True, show full details (args, results, reasoning).
+            agent_name: Optional agent name to prepend for attribution.
         """
         from rich.console import Console
         from rich.text import Text
@@ -1058,6 +1080,8 @@ class CopilotProvider(AgentProvider):
 
             text = Text()
             text.append("    ├─ ", style="dim")
+            if agent_name:
+                text.append(f"[{agent_name}] ", style="magenta")
             text.append("🔧 ", style="")
             text.append(str(tool_name), style="cyan bold")
             _print(text)
@@ -1080,6 +1104,8 @@ class CopilotProvider(AgentProvider):
             if tool_name:
                 text = Text()
                 text.append("    │  ", style="dim")
+                if agent_name:
+                    text.append(f"[{agent_name}] ", style="magenta")
                 text.append("✓ ", style="green")
                 text.append(str(tool_name), style="dim")
                 _print(text)
@@ -1111,25 +1137,31 @@ class CopilotProvider(AgentProvider):
                         display_reasoning = reasoning
                     text = Text()
                     text.append("    │  ", style="dim")
+                    if agent_name:
+                        text.append(f"[{agent_name}] ", style="magenta")
                     text.append("💭 ", style="")
                     text.append(display_reasoning.replace("\n", " "), style="italic dim")
                     _print(text)
 
         elif event_type == "subagent.started":
-            agent_name = getattr(event.data, "name", None) or "unknown"
+            subagent_name = getattr(event.data, "name", None) or "unknown"
             text = Text()
             text.append("    ├─ ", style="dim")
+            if agent_name:
+                text.append(f"[{agent_name}] ", style="magenta")
             text.append("🤖 ", style="")
             text.append("Sub-agent: ", style="dim")
-            text.append(str(agent_name), style="magenta bold")
+            text.append(str(subagent_name), style="magenta bold")
             _print(text)
 
         elif event_type == "subagent.completed":
-            agent_name = getattr(event.data, "name", None) or "unknown"
+            subagent_name = getattr(event.data, "name", None) or "unknown"
             text = Text()
             text.append("    │  ", style="dim")
+            if agent_name:
+                text.append(f"[{agent_name}] ", style="magenta")
             text.append("✓ ", style="green")
-            text.append(f"Sub-agent done: {agent_name}", style="dim")
+            text.append(f"Sub-agent done: {subagent_name}", style="dim")
             _print(text)
 
         elif event_type == "assistant.turn_start":
@@ -1139,6 +1171,8 @@ class CopilotProvider(AgentProvider):
                 turn_info = f" (turn {turn})" if turn else ""
                 text = Text()
                 text.append("    │  ", style="dim")
+                if agent_name:
+                    text.append(f"[{agent_name}] ", style="magenta")
                 text.append("⏳ ", style="yellow")
                 text.append(f"Processing{turn_info}...", style="dim italic")
                 _print(text)

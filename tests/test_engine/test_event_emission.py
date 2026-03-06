@@ -836,6 +836,110 @@ class TestForEachGroupEvents:
         assert completed.data["success_count"] == 1
         assert completed.data["failure_count"] == 1
 
+    @pytest.mark.asyncio
+    async def test_for_each_qualifies_agent_names_in_call_history(self) -> None:
+        """Each for-each item executes with a qualified per-item agent name."""
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="foreach-agent-name-test",
+                entry_point="finder",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=20),
+            ),
+            agents=[
+                AgentDef(
+                    name="finder",
+                    model="gpt-4",
+                    prompt="find items",
+                    output={"items": OutputField(type="array")},
+                    routes=[RouteDef(to="process_items")],
+                ),
+            ],
+            for_each=[
+                ForEachDef(
+                    name="process_items",
+                    type="for_each",
+                    source="finder.output.items",
+                    **{"as": "item"},
+                    agent=AgentDef(
+                        name="processor",
+                        model="gpt-4",
+                        prompt="process {{ item }}",
+                        output={"result": OutputField(type="string")},
+                    ),
+                    max_concurrent=5,
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"result": "done"},
+        )
+
+        def handler(a, p, c):
+            if a.name == "finder":
+                return {"items": ["a", "b", "c"]}
+            return {"result": f"processed-{a.name}"}
+
+        provider = CopilotProvider(mock_handler=handler)
+        engine = WorkflowEngine(config, provider)
+        await engine.run({})
+
+        call_names = {entry["agent_name"] for entry in provider.get_call_history()}
+        assert "finder" in call_names
+        assert {"processor[0]", "processor[1]", "processor[2]"}.issubset(call_names)
+
+    @pytest.mark.asyncio
+    async def test_for_each_qualifies_agent_names_with_key_by(self) -> None:
+        """for_each key_by values are reflected in qualified per-item agent names."""
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="foreach-key-by-agent-name-test",
+                entry_point="finder",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=20),
+            ),
+            agents=[
+                AgentDef(
+                    name="finder",
+                    model="gpt-4",
+                    prompt="find items",
+                    output={"items": OutputField(type="array")},
+                    routes=[RouteDef(to="process_items")],
+                ),
+            ],
+            for_each=[
+                ForEachDef(
+                    name="process_items",
+                    type="for_each",
+                    source="finder.output.items",
+                    key_by="id",
+                    **{"as": "item"},
+                    agent=AgentDef(
+                        name="processor",
+                        model="gpt-4",
+                        prompt="process {{ item.id }}",
+                        output={"result": OutputField(type="string")},
+                    ),
+                    max_concurrent=5,
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"result": "done"},
+        )
+
+        def handler(a, p, c):
+            if a.name == "finder":
+                return {"items": [{"id": "item_a"}, {"id": "item_b"}]}
+            return {"result": f"processed-{a.name}"}
+
+        provider = CopilotProvider(mock_handler=handler)
+        engine = WorkflowEngine(config, provider)
+        await engine.run({})
+
+        call_names = {entry["agent_name"] for entry in provider.get_call_history()}
+        assert {"processor[item_a]", "processor[item_b]"}.issubset(call_names)
+
 
 class TestTimestamps:
     """Tests that all events have valid timestamps."""
