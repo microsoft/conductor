@@ -10,6 +10,7 @@ import pytest
 from conductor.config.schema import AgentDef
 from conductor.exceptions import ProviderError
 from conductor.providers.copilot import (
+    _IDLE_IGNORED_EVENTS,
     CopilotProvider,
     IdleRecoveryConfig,
 )
@@ -28,6 +29,7 @@ class TestIdleRecoveryConfig:
         config = IdleRecoveryConfig()
         assert config.idle_timeout_seconds == 300.0
         assert config.max_recovery_attempts == 3
+        assert config.max_session_seconds == 1800.0
         assert "{last_activity}" in config.recovery_prompt
 
     def test_custom_values(self) -> None:
@@ -35,10 +37,12 @@ class TestIdleRecoveryConfig:
         config = IdleRecoveryConfig(
             idle_timeout_seconds=60.0,
             max_recovery_attempts=5,
+            max_session_seconds=600.0,
             recovery_prompt="Custom prompt: {last_activity}",
         )
         assert config.idle_timeout_seconds == 60.0
         assert config.max_recovery_attempts == 5
+        assert config.max_session_seconds == 600.0
         assert config.recovery_prompt == "Custom prompt: {last_activity}"
 
 
@@ -503,3 +507,236 @@ class TestActivityTracking:
         assert ref[0] == "tool.execution_start"
         assert ref[1] == "web_search"
         assert ref[2] == 123.456
+
+
+class TestIdleIgnoredEvents:
+    """Tests for the _IDLE_IGNORED_EVENTS constant and filtering behavior."""
+
+    def test_ignored_events_is_frozenset(self) -> None:
+        """Test that _IDLE_IGNORED_EVENTS is an immutable frozenset."""
+        assert isinstance(_IDLE_IGNORED_EVENTS, frozenset)
+
+    def test_ignored_events_contains_expected_members(self) -> None:
+        """Test that all expected bookkeeping events are in the set."""
+        assert "pending_messages.modified" in _IDLE_IGNORED_EVENTS
+        assert "session.start" in _IDLE_IGNORED_EVENTS
+        assert "session.info" in _IDLE_IGNORED_EVENTS
+
+    def test_real_events_not_in_ignored_set(self) -> None:
+        """Test that real agent-work events are NOT in the ignored set."""
+        real_events = [
+            "assistant.message",
+            "assistant.reasoning",
+            "tool.execution_start",
+            "tool.execution_complete",
+            "session.idle",
+        ]
+        for event in real_events:
+            assert event not in _IDLE_IGNORED_EVENTS, f"{event} should not be ignored"
+
+
+class TestSessionTimeout:
+    """Tests for max_session_seconds wall-clock timeout."""
+
+    @pytest.mark.asyncio
+    async def test_session_timeout_raises_provider_error(self) -> None:
+        """Test that exceeding max_session_seconds raises ProviderError."""
+        config = IdleRecoveryConfig(
+            idle_timeout_seconds=0.05,
+            max_recovery_attempts=10,
+            max_session_seconds=0.01,  # Very short — will fire quickly
+        )
+        provider = CopilotProvider(
+            mock_handler=stub_handler,
+            idle_recovery_config=config,
+        )
+
+        done = asyncio.Event()  # Never set
+        mock_session = MagicMock()
+        mock_session.send = AsyncMock()
+
+        last_activity_ref: list[Any] = [None, None, time.monotonic()]
+
+        with pytest.raises(ProviderError) as exc_info:
+            await provider._wait_with_idle_detection(
+                done=done,
+                session=mock_session,
+                verbose_enabled=False,
+                full_enabled=False,
+                last_activity_ref=last_activity_ref,
+            )
+
+        assert "exceeded maximum duration" in str(exc_info.value)
+        assert not exc_info.value.is_retryable
+
+    @pytest.mark.asyncio
+    async def test_session_timeout_includes_time_since_last_event(self) -> None:
+        """Test that the timeout error includes time since last real event."""
+        config = IdleRecoveryConfig(
+            idle_timeout_seconds=0.05,
+            max_recovery_attempts=10,
+            max_session_seconds=0.01,
+        )
+        provider = CopilotProvider(
+            mock_handler=stub_handler,
+            idle_recovery_config=config,
+        )
+
+        done = asyncio.Event()
+        mock_session = MagicMock()
+        mock_session.send = AsyncMock()
+
+        last_activity_ref: list[Any] = ["tool.execution_start", "stuck_tool", time.monotonic()]
+
+        with pytest.raises(ProviderError) as exc_info:
+            await provider._wait_with_idle_detection(
+                done=done,
+                session=mock_session,
+                verbose_enabled=False,
+                full_enabled=False,
+                last_activity_ref=last_activity_ref,
+            )
+
+        error_msg = str(exc_info.value)
+        assert "stuck_tool" in error_msg
+        assert "Last real event" in error_msg
+        assert "ago" in error_msg
+
+    @pytest.mark.asyncio
+    async def test_session_timeout_fires_even_with_flowing_events(self) -> None:
+        """Test that wall-clock timeout fires even when events keep flowing.
+
+        This is the key distinction from idle timeout: even if non-ignored
+        events keep resetting the idle clock, the hard cap still fires.
+        """
+        config = IdleRecoveryConfig(
+            idle_timeout_seconds=60.0,  # Very high — won't trigger idle
+            max_recovery_attempts=10,
+            max_session_seconds=0.15,  # Short wall-clock limit
+        )
+        provider = CopilotProvider(
+            mock_handler=stub_handler,
+            idle_recovery_config=config,
+        )
+
+        done = asyncio.Event()
+        mock_session = MagicMock()
+        mock_session.send = AsyncMock()
+
+        last_activity_ref: list[Any] = ["assistant.message", None, time.monotonic()]
+
+        # Keep updating the activity timestamp to simulate flowing events
+        async def simulate_events() -> None:
+            while not done.is_set():
+                await asyncio.sleep(0.02)
+                last_activity_ref[2] = time.monotonic()
+
+        with pytest.raises(ProviderError) as exc_info:
+            await asyncio.gather(
+                provider._wait_with_idle_detection(
+                    done=done,
+                    session=mock_session,
+                    verbose_enabled=False,
+                    full_enabled=False,
+                    last_activity_ref=last_activity_ref,
+                ),
+                simulate_events(),
+            )
+
+        assert "exceeded maximum duration" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_session_completes_before_timeout(self) -> None:
+        """Test that sessions completing before max_session_seconds are fine."""
+        config = IdleRecoveryConfig(
+            idle_timeout_seconds=10.0,
+            max_session_seconds=10.0,  # Won't be reached
+        )
+        provider = CopilotProvider(
+            mock_handler=stub_handler,
+            idle_recovery_config=config,
+        )
+
+        done = asyncio.Event()
+        mock_session = MagicMock()
+
+        last_activity_ref: list[Any] = [None, None, time.monotonic()]
+
+        async def complete_quickly() -> None:
+            await asyncio.sleep(0.02)
+            done.set()
+
+        # Should not raise
+        await asyncio.gather(
+            provider._wait_with_idle_detection(
+                done=done,
+                session=mock_session,
+                verbose_enabled=False,
+                full_enabled=False,
+                last_activity_ref=last_activity_ref,
+            ),
+            complete_quickly(),
+        )
+
+
+class TestStartupRace:
+    """Tests for asyncio.Lock in _ensure_client_started."""
+
+    def test_start_lock_exists(self) -> None:
+        """Test that the provider has a _start_lock attribute."""
+        provider = CopilotProvider(mock_handler=stub_handler)
+        assert isinstance(provider._start_lock, asyncio.Lock)
+
+    @pytest.mark.asyncio
+    async def test_concurrent_ensure_started_calls_start_once(self) -> None:
+        """Test that concurrent _ensure_client_started calls only start once.
+
+        Simulates the for-each / parallel group race: multiple coroutines
+        all call _ensure_client_started() concurrently, but start() should
+        only be invoked once.
+        """
+        provider = CopilotProvider(mock_handler=stub_handler)
+
+        start_call_count = 0
+
+        class MockClient:
+            async def start(self_inner) -> None:
+                nonlocal start_call_count
+                start_call_count += 1
+                # Simulate slow startup to widen the race window
+                await asyncio.sleep(0.05)
+
+        provider._client = MockClient()
+        provider._started = False
+
+        # Stub out _fix_pipe_blocking_mode since we don't have real pipes
+        provider._fix_pipe_blocking_mode = lambda: None  # type: ignore[assignment]
+
+        # Launch 5 concurrent calls
+        await asyncio.gather(*[provider._ensure_client_started() for _ in range(5)])
+
+        assert start_call_count == 1
+        assert provider._started is True
+
+    @pytest.mark.asyncio
+    async def test_fix_pipe_blocking_mode_called_once(self) -> None:
+        """Test that _fix_pipe_blocking_mode is called exactly once under concurrency."""
+        provider = CopilotProvider(mock_handler=stub_handler)
+
+        fix_pipe_count = 0
+
+        class MockClient:
+            async def start(self_inner) -> None:
+                await asyncio.sleep(0.02)
+
+        def mock_fix_pipe() -> None:
+            nonlocal fix_pipe_count
+            fix_pipe_count += 1
+
+        provider._client = MockClient()
+        provider._started = False
+        provider._fix_pipe_blocking_mode = mock_fix_pipe  # type: ignore[assignment]
+
+        await asyncio.gather(*[provider._ensure_client_started() for _ in range(3)])
+
+        assert fix_pipe_count == 1
