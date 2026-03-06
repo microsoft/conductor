@@ -1326,8 +1326,7 @@ class CopilotProvider(AgentProvider):
                 last_tool_call = last_activity_ref[1]
                 stuck_info = self._build_stuck_info(last_event_type, last_tool_call)
                 raise ProviderError(
-                    f"Session exceeded maximum duration of {max_session:.0f}s. "
-                    f"{stuck_info}",
+                    f"Session exceeded maximum duration of {max_session:.0f}s. {stuck_info}",
                     suggestion=(
                         f"The session ran for {elapsed:.0f}s without completing. "
                         "This may indicate a stuck MCP server, infinite tool loop, "
