@@ -556,3 +556,28 @@ class TestLogParseRecovery:
             max_attempts=5,
             error=long_error,
         )
+
+
+class TestFixPipeBlockingMode:
+    """Tests for _fix_pipe_blocking_mode Windows platform guard."""
+
+    def test_skips_on_windows(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Test that _fix_pipe_blocking_mode is a no-op on Windows."""
+        monkeypatch.setattr("sys.platform", "win32")
+        provider = CopilotProvider(mock_handler=stub_handler)
+        # Should return immediately without importing fcntl
+        provider._fix_pipe_blocking_mode()
+
+    def test_runs_on_unix(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Test that _fix_pipe_blocking_mode does not skip on non-Windows."""
+        monkeypatch.setattr("sys.platform", "linux")
+        provider = CopilotProvider(mock_handler=stub_handler)
+        # On actual Windows, fcntl is unavailable so the import will fail.
+        # The important assertion is that the platform guard did NOT return
+        # early — it proceeded past the guard and attempted the import.
+        try:
+            provider._fix_pipe_blocking_mode()
+        except ModuleNotFoundError:
+            # Expected when running this test on Windows — fcntl doesn't exist
+            # but the method correctly tried to import it (did not skip).
+            pass

@@ -1437,7 +1437,15 @@ class CopilotProvider(AgentProvider):
         BlockingIOError instead of blocking until the reader drains the pipe.
         Since the SDK already runs writes in a thread-pool executor, blocking
         is safe and correct here.
+
+        Skipped on Windows where O_NONBLOCK does not exist and pipes are
+        always blocking.
         """
+        import sys
+
+        if sys.platform == "win32":
+            return
+
         import fcntl
         import os
 
