@@ -329,6 +329,7 @@ class TestConfigPassing:
             temperature=0.7,
             max_tokens=4096,
             timeout=60.0,
+            max_session_seconds=None,
         )
 
     @patch("conductor.providers.registry.create_provider")

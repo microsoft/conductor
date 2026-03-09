@@ -741,3 +741,111 @@ class TestStartupRace:
         await asyncio.gather(*[provider._ensure_client_started() for _ in range(3)])
 
         assert fix_pipe_count == 1
+
+
+class TestPerAgentMaxSessionSeconds:
+    """Tests for per-agent max_session_seconds override in _wait_with_idle_detection."""
+
+    @pytest.mark.asyncio
+    async def test_override_uses_shorter_timeout(self) -> None:
+        """Test that per-agent max_session_seconds overrides the provider-level default."""
+        config = IdleRecoveryConfig(
+            idle_timeout_seconds=0.05,
+            max_recovery_attempts=10,
+            max_session_seconds=10.0,  # Provider default: 10 seconds
+        )
+        provider = CopilotProvider(
+            mock_handler=stub_handler,
+            idle_recovery_config=config,
+        )
+
+        done = asyncio.Event()  # Never set
+        mock_session = MagicMock()
+        mock_session.send = AsyncMock()
+
+        last_activity_ref: list[Any] = [None, None, time.monotonic()]
+
+        # Pass a very short per-agent override — should fire quickly
+        with pytest.raises(ProviderError) as exc_info:
+            await provider._wait_with_idle_detection(
+                done=done,
+                session=mock_session,
+                verbose_enabled=False,
+                full_enabled=False,
+                last_activity_ref=last_activity_ref,
+                max_session_seconds=0.01,  # Per-agent override: 10ms
+            )
+
+        assert "exceeded maximum duration" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_none_override_falls_back_to_config(self) -> None:
+        """Test that None max_session_seconds falls back to IdleRecoveryConfig default."""
+        config = IdleRecoveryConfig(
+            idle_timeout_seconds=0.05,
+            max_recovery_attempts=10,
+            max_session_seconds=0.01,  # Provider default: 10ms (very short)
+        )
+        provider = CopilotProvider(
+            mock_handler=stub_handler,
+            idle_recovery_config=config,
+        )
+
+        done = asyncio.Event()  # Never set
+        mock_session = MagicMock()
+        mock_session.send = AsyncMock()
+
+        last_activity_ref: list[Any] = [None, None, time.monotonic()]
+
+        # Pass None — should use the config default (0.01s)
+        with pytest.raises(ProviderError) as exc_info:
+            await provider._wait_with_idle_detection(
+                done=done,
+                session=mock_session,
+                verbose_enabled=False,
+                full_enabled=False,
+                last_activity_ref=last_activity_ref,
+                max_session_seconds=None,
+            )
+
+        assert "exceeded maximum duration" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_override_does_not_affect_idle_timeout(self) -> None:
+        """Test that per-agent max_session_seconds doesn't change idle detection behavior."""
+        config = IdleRecoveryConfig(
+            idle_timeout_seconds=0.1,
+            max_recovery_attempts=2,
+            max_session_seconds=100.0,  # Provider default: high
+        )
+        provider = CopilotProvider(
+            mock_handler=stub_handler,
+            idle_recovery_config=config,
+        )
+
+        done = asyncio.Event()
+        mock_session = MagicMock()
+        mock_session.send = AsyncMock()
+
+        # Set done after first recovery attempt
+        async def set_done_after_delay():
+            await asyncio.sleep(0.15)
+            done.set()
+
+        last_activity_ref: list[Any] = ["tool.execution_start", "web_search", 0.0]
+
+        # Per-agent max_session_seconds is high — idle recovery should still work
+        await asyncio.gather(
+            provider._wait_with_idle_detection(
+                done=done,
+                session=mock_session,
+                verbose_enabled=False,
+                full_enabled=False,
+                last_activity_ref=last_activity_ref,
+                max_session_seconds=100.0,
+            ),
+            set_done_after_delay(),
+        )
+
+        # Should have sent at least one recovery message via idle detection
+        assert mock_session.send.call_count >= 1

@@ -11,7 +11,7 @@ from typing import Any, Literal
 from conductor.exceptions import ProviderError
 from conductor.providers.base import AgentProvider
 from conductor.providers.claude import ANTHROPIC_SDK_AVAILABLE, ClaudeProvider
-from conductor.providers.copilot import CopilotProvider
+from conductor.providers.copilot import CopilotProvider, IdleRecoveryConfig
 
 
 async def create_provider(
@@ -22,6 +22,7 @@ async def create_provider(
     temperature: float | None = None,
     max_tokens: int | None = None,
     timeout: float | None = None,
+    max_session_seconds: float | None = None,
 ) -> AgentProvider:
     """Factory function to create the appropriate provider.
 
@@ -40,6 +41,8 @@ async def create_provider(
         temperature: Default temperature for generation (0.0-1.0).
         max_tokens: Maximum output tokens.
         timeout: Request timeout in seconds.
+        max_session_seconds: Maximum wall-clock duration for Copilot SDK sessions.
+            Only applies to the Copilot provider.
 
     Returns:
         Configured AgentProvider instance.
@@ -54,10 +57,16 @@ async def create_provider(
     """
     match provider_type:
         case "copilot":
+            idle_recovery_config = None
+            if max_session_seconds is not None:
+                idle_recovery_config = IdleRecoveryConfig(
+                    max_session_seconds=max_session_seconds,
+                )
             provider = CopilotProvider(
                 mcp_servers=mcp_servers,
                 model=default_model,
                 temperature=temperature,
+                idle_recovery_config=idle_recovery_config,
             )
         case "openai-agents":
             raise ProviderError(
@@ -125,6 +134,7 @@ class ProviderFactory:
         temperature = getattr(runtime_config, "temperature", None)
         max_tokens = getattr(runtime_config, "max_tokens", None)
         timeout = getattr(runtime_config, "timeout", None)
+        max_session_seconds = getattr(runtime_config, "max_session_seconds", None)
 
         return await create_provider(
             provider_type=provider_type,
@@ -133,4 +143,5 @@ class ProviderFactory:
             temperature=temperature,
             max_tokens=max_tokens,
             timeout=timeout,
+            max_session_seconds=max_session_seconds,
         )

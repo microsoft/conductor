@@ -165,3 +165,35 @@ class TestProviderValidation:
         provider = await create_provider("copilot", validate=False)
         assert isinstance(provider, CopilotProvider)
         await provider.close()
+
+
+class TestMaxSessionSeconds:
+    """Tests for max_session_seconds parameter in create_provider."""
+
+    @pytest.mark.asyncio
+    async def test_max_session_seconds_flows_to_copilot_idle_recovery_config(self) -> None:
+        """Test that max_session_seconds is plumbed into CopilotProvider's IdleRecoveryConfig."""
+        provider = await create_provider("copilot", validate=False, max_session_seconds=120.0)
+        assert isinstance(provider, CopilotProvider)
+        assert provider._idle_recovery_config.max_session_seconds == 120.0
+        await provider.close()
+
+    @pytest.mark.asyncio
+    async def test_default_max_session_seconds_without_override(self) -> None:
+        """Test that without max_session_seconds, the default (1800s) is used."""
+        provider = await create_provider("copilot", validate=False)
+        assert isinstance(provider, CopilotProvider)
+        assert provider._idle_recovery_config.max_session_seconds == 1800.0
+        await provider.close()
+
+    @pytest.mark.asyncio
+    async def test_max_session_seconds_preserves_other_idle_recovery_defaults(self) -> None:
+        """Test that setting max_session_seconds doesn't change other defaults."""
+        provider = await create_provider("copilot", validate=False, max_session_seconds=300.0)
+        assert isinstance(provider, CopilotProvider)
+        # max_session_seconds should be overridden
+        assert provider._idle_recovery_config.max_session_seconds == 300.0
+        # Other fields should retain their defaults
+        assert provider._idle_recovery_config.idle_timeout_seconds == 300.0
+        assert provider._idle_recovery_config.max_recovery_attempts == 3
+        await provider.close()
