@@ -575,9 +575,5 @@ class TestFixPipeBlockingMode:
         # On actual Windows, fcntl is unavailable so the import will fail.
         # The important assertion is that the platform guard did NOT return
         # early — it proceeded past the guard and attempted the import.
-        try:
+        with contextlib.suppress(ModuleNotFoundError):
             provider._fix_pipe_blocking_mode()
-        except ModuleNotFoundError:
-            # Expected when running this test on Windows — fcntl doesn't exist
-            # but the method correctly tried to import it (did not skip).
-            pass
