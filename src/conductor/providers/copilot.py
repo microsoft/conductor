@@ -174,7 +174,6 @@ class CopilotProvider(AgentProvider):
         self._mcp_servers = mcp_servers or {}
         self._started = False
         self._start_lock = asyncio.Lock()
-        self._session_create_lock = asyncio.Lock()
         self._idle_recovery_config = idle_recovery_config or IdleRecoveryConfig()
         self._temperature = temperature
         self._session_ids: dict[str, str] = {}
@@ -471,15 +470,9 @@ class CopilotProvider(AgentProvider):
                     )
                     session = None
 
-            # Fall back to creating a new session.
-            # Serialize session creation to prevent a race condition in the
-            # Copilot SDK where overlapping create_session calls (e.g. from
-            # for-each groups with max_concurrent > 1) can cause the CLI to
-            # send permission.request for a session not yet registered in
-            # _sessions, raising "Permission denied".  See #27 / #29.
+            # Fall back to creating a new session
             if session is None:
-                async with self._session_create_lock:
-                    session = await self._client.create_session(session_config)
+                session = await self._client.create_session(session_config)
 
             # Track session ID for checkpoint persistence
             sid = getattr(session, "session_id", None)
