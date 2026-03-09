@@ -180,7 +180,7 @@ dev = [
 requires-dist = [
     { name = "anthropic", specifier = ">=0.77.0,<1.0.0" },
     { name = "fastapi", specifier = ">=0.115.0" },
-    { name = "github-copilot-sdk", specifier = ">=0.1.0,<0.1.32" },
+    { name = "github-copilot-sdk", specifier = ">=0.1.0,<0.1.31" },
     { name = "jinja2", specifier = ">=3.1.0" },
     { name = "mcp", specifier = ">=1.0.0" },
     { name = "pydantic", specifier = ">=2.0.0" },
