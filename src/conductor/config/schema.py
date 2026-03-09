@@ -424,6 +424,16 @@ class AgentDef(BaseModel):
     timeout: int | None = None
     """Per-script timeout in seconds."""
 
+    max_session_seconds: float | None = Field(None, ge=1.0)
+    """Maximum wall-clock duration for this agent's Copilot SDK session in seconds.
+
+    Overrides the workflow-level runtime.max_session_seconds for this agent.
+    Only applies to Copilot provider agents (not script or human_gate).
+
+    Example: A source-gathering agent that should finish in ~60s can set
+    max_session_seconds: 60 instead of using the default 30-minute timeout.
+    """
+
     @field_validator("timeout")
     @classmethod
     def validate_timeout(cls, v: int | None) -> int | None:
@@ -460,6 +470,8 @@ class AgentDef(BaseModel):
                 raise ValueError("script agents cannot have 'system_prompt'")
             if self.options:
                 raise ValueError("script agents cannot have 'options'")
+            if self.max_session_seconds:
+                raise ValueError("script agents cannot have 'max_session_seconds'")
         return self
 
 
@@ -563,6 +575,16 @@ class RuntimeConfig(BaseModel):
 
     For workflow-level timeout enforcement, use `limits.timeout_seconds` instead,
     which limits the total wall-clock time for the entire workflow.
+    """
+
+    max_session_seconds: float | None = Field(None, ge=1.0)
+    """Maximum wall-clock duration for Copilot SDK sessions in seconds.
+
+    Sets the default max_session_seconds for all agents using the Copilot provider.
+    Individual agents can override this with their own max_session_seconds field.
+
+    Default is None, which uses the Copilot provider's built-in default (1800s / 30 min).
+    Set a lower value for workflows where agents should finish quickly.
     """
 
 

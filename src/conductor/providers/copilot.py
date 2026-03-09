@@ -492,6 +492,11 @@ class CopilotProvider(AgentProvider):
             verbose_enabled = is_verbose()
             full_enabled = is_full()
 
+            # Resolve per-agent max_session_seconds override
+            effective_max_session = (
+                agent.max_session_seconds or self._idle_recovery_config.max_session_seconds
+            )
+
             session_destroyed = False
             try:
                 # Send initial prompt and get response
@@ -502,6 +507,7 @@ class CopilotProvider(AgentProvider):
                     full_enabled,
                     interrupt_signal=interrupt_signal,
                     event_callback=event_callback,
+                    max_session_seconds=effective_max_session,
                 )
                 response_content = sdk_response.content
 
@@ -628,6 +634,7 @@ class CopilotProvider(AgentProvider):
         full_enabled: bool,
         interrupt_signal: asyncio.Event | None = None,
         event_callback: EventCallback | None = None,
+        max_session_seconds: float | None = None,
     ) -> SDKResponse:
         """Send a prompt to the session and wait for response.
 
@@ -640,6 +647,8 @@ class CopilotProvider(AgentProvider):
                 When set, the method will attempt to abort the session and
                 return partial content with ``partial=True``.
             event_callback: Optional callback for streaming SDK events upstream.
+            max_session_seconds: Per-agent wall-clock session limit override.
+                If None, uses the provider-level IdleRecoveryConfig default.
 
         Returns:
             SDKResponse with content and usage data. If interrupted,
@@ -745,7 +754,12 @@ class CopilotProvider(AgentProvider):
         else:
             # Wait with idle detection and recovery (original path)
             await self._wait_with_idle_detection(
-                done, session, verbose_enabled, full_enabled, last_activity_ref
+                done,
+                session,
+                verbose_enabled,
+                full_enabled,
+                last_activity_ref,
+                max_session_seconds=max_session_seconds,
             )
 
         if error_message:
@@ -1301,6 +1315,7 @@ class CopilotProvider(AgentProvider):
         verbose_enabled: bool,
         full_enabled: bool,
         last_activity_ref: list[Any],
+        max_session_seconds: float | None = None,
     ) -> None:
         """Wait for session completion with idle detection and recovery.
 
@@ -1316,6 +1331,8 @@ class CopilotProvider(AgentProvider):
             full_enabled: Whether full logging mode is enabled.
             last_activity_ref: Mutable [last_event_type, last_tool_call, timestamp]
                               for tracking last activity.
+            max_session_seconds: Per-agent wall-clock session limit override.
+                If None, uses the provider-level IdleRecoveryConfig default.
 
         Raises:
             ProviderError: If all recovery attempts are exhausted, or if the
@@ -1324,7 +1341,7 @@ class CopilotProvider(AgentProvider):
         recovery_attempts = 0
         idle_timeout = self._idle_recovery_config.idle_timeout_seconds
         session_start = time.monotonic()
-        max_session = self._idle_recovery_config.max_session_seconds
+        max_session = max_session_seconds or self._idle_recovery_config.max_session_seconds
 
         while True:
             # Check if done was already set (avoids race where session.idle

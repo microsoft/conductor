@@ -310,6 +310,64 @@ class TestAgentDef:
         assert "prompt" in str(exc_info.value)
 
 
+class TestAgentDefMaxSessionSeconds:
+    """Tests for max_session_seconds on AgentDef."""
+
+    def test_default_is_none(self) -> None:
+        """Test that max_session_seconds defaults to None."""
+        agent = AgentDef(name="a", model="gpt-4", prompt="test")
+        assert agent.max_session_seconds is None
+
+    def test_accepts_valid_value(self) -> None:
+        """Test that max_session_seconds accepts valid float values."""
+        agent = AgentDef(name="a", model="gpt-4", prompt="test", max_session_seconds=60.0)
+        assert agent.max_session_seconds == 60.0
+
+    def test_accepts_integer_value(self) -> None:
+        """Test that max_session_seconds accepts integer values."""
+        agent = AgentDef(name="a", model="gpt-4", prompt="test", max_session_seconds=120)
+        assert agent.max_session_seconds == 120.0
+
+    def test_minimum_boundary(self) -> None:
+        """Test that max_session_seconds accepts the minimum value of 1.0."""
+        agent = AgentDef(name="a", model="gpt-4", prompt="test", max_session_seconds=1.0)
+        assert agent.max_session_seconds == 1.0
+
+    def test_rejects_zero(self) -> None:
+        """Test that max_session_seconds rejects zero."""
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(name="a", model="gpt-4", prompt="test", max_session_seconds=0)
+        assert "greater than or equal to 1" in str(exc_info.value)
+
+    def test_rejects_negative(self) -> None:
+        """Test that max_session_seconds rejects negative values."""
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(name="a", model="gpt-4", prompt="test", max_session_seconds=-5.0)
+        assert "greater than or equal to 1" in str(exc_info.value)
+
+    def test_rejected_on_script_agent(self) -> None:
+        """Test that script agents cannot have max_session_seconds."""
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(
+                name="s",
+                type="script",
+                command="echo hello",
+                max_session_seconds=60.0,
+            )
+        assert "max_session_seconds" in str(exc_info.value)
+
+    def test_allowed_on_regular_agent(self) -> None:
+        """Test that regular agents can have max_session_seconds."""
+        agent = AgentDef(
+            name="a",
+            type="agent",
+            model="gpt-4",
+            prompt="test",
+            max_session_seconds=90.0,
+        )
+        assert agent.max_session_seconds == 90.0
+
+
 class TestRuntimeConfig:
     """Tests for RuntimeConfig model."""
 
@@ -470,6 +528,55 @@ class TestRuntimeConfig:
         assert restored.temperature == original.temperature
         assert restored.max_tokens == original.max_tokens
         assert restored.timeout == original.timeout
+
+
+class TestRuntimeConfigMaxSessionSeconds:
+    """Tests for max_session_seconds on RuntimeConfig."""
+
+    def test_default_is_none(self) -> None:
+        """Test that max_session_seconds defaults to None."""
+        config = RuntimeConfig()
+        assert config.max_session_seconds is None
+
+    def test_accepts_valid_value(self) -> None:
+        """Test that max_session_seconds accepts valid float values."""
+        config = RuntimeConfig(max_session_seconds=60.0)
+        assert config.max_session_seconds == 60.0
+
+    def test_accepts_integer_value(self) -> None:
+        """Test that max_session_seconds accepts integer values."""
+        config = RuntimeConfig(max_session_seconds=120)
+        assert config.max_session_seconds == 120.0
+
+    def test_minimum_boundary(self) -> None:
+        """Test that max_session_seconds accepts the minimum value of 1.0."""
+        config = RuntimeConfig(max_session_seconds=1.0)
+        assert config.max_session_seconds == 1.0
+
+    def test_rejects_zero(self) -> None:
+        """Test that max_session_seconds rejects zero."""
+        with pytest.raises(ValidationError) as exc_info:
+            RuntimeConfig(max_session_seconds=0)
+        assert "greater than or equal to 1" in str(exc_info.value)
+
+    def test_rejects_negative(self) -> None:
+        """Test that max_session_seconds rejects negative values."""
+        with pytest.raises(ValidationError) as exc_info:
+            RuntimeConfig(max_session_seconds=-10.0)
+        assert "greater than or equal to 1" in str(exc_info.value)
+
+    def test_serialization_excludes_when_none(self) -> None:
+        """Test that max_session_seconds is excluded from serialization when None."""
+        config = RuntimeConfig()
+        serialized = config.model_dump(exclude_none=True)
+        assert "max_session_seconds" not in serialized
+
+    def test_serialization_includes_when_set(self) -> None:
+        """Test that max_session_seconds is included in serialization when set."""
+        config = RuntimeConfig(max_session_seconds=90.0)
+        serialized = config.model_dump(exclude_none=True)
+        assert "max_session_seconds" in serialized
+        assert serialized["max_session_seconds"] == 90.0
 
 
 class TestWorkflowDef:

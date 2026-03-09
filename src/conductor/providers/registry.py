@@ -116,6 +116,7 @@ class ProviderRegistry:
             temperature=runtime.temperature,
             max_tokens=runtime.max_tokens,
             timeout=runtime.timeout,
+            max_session_seconds=runtime.max_session_seconds,
         )
 
         # Pass stored resume session IDs to newly created providers
