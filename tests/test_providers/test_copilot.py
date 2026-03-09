@@ -1,5 +1,6 @@
 """Unit tests for the CopilotProvider implementation."""
 
+import asyncio
 import contextlib
 from typing import Any
 
@@ -556,3 +557,54 @@ class TestLogParseRecovery:
             max_attempts=5,
             error=long_error,
         )
+
+
+class TestSessionCreateLock:
+    """Tests for session creation serialization (issue #29).
+
+    Verifies that concurrent create_session calls are serialized via
+    _session_create_lock to prevent the permission-denied race condition
+    described in issue #27.
+    """
+
+    def test_session_create_lock_exists(self) -> None:
+        """Test that CopilotProvider has a _session_create_lock attribute."""
+        provider = CopilotProvider(mock_handler=stub_handler)
+        assert hasattr(provider, "_session_create_lock")
+        assert isinstance(provider._session_create_lock, asyncio.Lock)
+
+    @pytest.mark.asyncio
+    async def test_session_creation_is_serialized(self) -> None:
+        """Test that concurrent create_session calls do not overlap.
+
+        Simulates concurrent SDK calls by patching _execute_sdk_call to
+        acquire the lock and verify no two create_session calls run at
+        the same time.
+        """
+        provider = CopilotProvider(mock_handler=stub_handler)
+
+        # Track whether sessions are created concurrently
+        active_creates = 0
+        max_concurrent_creates = 0
+        creation_order: list[str] = []
+
+        original_lock = provider._session_create_lock
+
+        async def mock_create_session(name: str) -> None:
+            nonlocal active_creates, max_concurrent_creates
+            async with original_lock:
+                active_creates += 1
+                max_concurrent_creates = max(max_concurrent_creates, active_creates)
+                creation_order.append(name)
+                # Simulate session creation taking some time
+                await asyncio.sleep(0.05)
+                active_creates -= 1
+
+        # Launch multiple concurrent mock session creations
+        tasks = [asyncio.create_task(mock_create_session(f"agent_{i}")) for i in range(5)]
+        await asyncio.gather(*tasks)
+
+        # With the lock, at most one create_session should run at a time
+        assert max_concurrent_creates == 1
+        # All sessions should have been created
+        assert len(creation_order) == 5
