@@ -208,6 +208,75 @@ class TestAgentExecutorPromptRendering:
         assert "Test question?" in rendered
 
 
+class TestAgentExecutorModelRendering:
+    """Tests for model field template rendering."""
+
+    @pytest.mark.asyncio
+    async def test_model_template_is_rendered(self) -> None:
+        """Test that model field with Jinja2 template is resolved."""
+        agent = AgentDef(
+            name="test",
+            model="{{ workflow.input.selected_model }}",
+            prompt="Do something",
+            output=None,
+        )
+
+        def mock_handler(agent, prompt, context):
+            return {"result": "ok"}
+
+        provider = CopilotProvider(mock_handler=mock_handler)
+        executor = AgentExecutor(provider)
+
+        context = {"workflow": {"input": {"selected_model": "claude-opus-4.6-1m"}}}
+        await executor.execute(agent, context)
+
+        call_history = provider.get_call_history()
+        assert call_history[0]["model"] == "claude-opus-4.6-1m"
+
+    @pytest.mark.asyncio
+    async def test_static_model_is_unchanged(self) -> None:
+        """Test that a static model string passes through unchanged."""
+        agent = AgentDef(
+            name="test",
+            model="gpt-4",
+            prompt="Do something",
+            output=None,
+        )
+
+        def mock_handler(agent, prompt, context):
+            return {"result": "ok"}
+
+        provider = CopilotProvider(mock_handler=mock_handler)
+        executor = AgentExecutor(provider)
+
+        await executor.execute(agent, {})
+
+        call_history = provider.get_call_history()
+        assert call_history[0]["model"] == "gpt-4"
+
+    @pytest.mark.asyncio
+    async def test_model_template_does_not_mutate_original(self) -> None:
+        """Test that rendering model creates a copy, not mutating the original."""
+        agent = AgentDef(
+            name="test",
+            model="{{ workflow.input.model_name }}",
+            prompt="Do something",
+            output=None,
+        )
+
+        def mock_handler(agent, prompt, context):
+            return {"result": "ok"}
+
+        provider = CopilotProvider(mock_handler=mock_handler)
+        executor = AgentExecutor(provider)
+
+        context = {"workflow": {"input": {"model_name": "gpt-5.4"}}}
+        await executor.execute(agent, context)
+
+        # Original agent should still have the template
+        assert agent.model == "{{ workflow.input.model_name }}"
+
+
 class TestAgentExecutorWithTools:
     """Tests for agent execution with tools."""
 

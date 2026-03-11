@@ -145,6 +145,11 @@ class AgentExecutor:
             ProviderError: If agent execution fails.
             ValidationError: If output doesn't match schema or tools are invalid.
         """
+        # Render model field if it contains template expressions
+        if agent.model and ("{{" in agent.model or "{%" in agent.model):
+            rendered_model = self.renderer.render(agent.model, context)
+            agent = agent.model_copy(update={"model": rendered_model})
+
         # Render prompt with context
         rendered_prompt = self.renderer.render(agent.prompt, context)
 
