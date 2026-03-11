@@ -385,6 +385,7 @@ class AgentDef(BaseModel):
       'claude-3-haiku-20240307'
 
     Supports environment variables: ${MODEL:-default_value}
+    Supports Jinja2 templates: {{ workflow.input.model_name }}
     """
 
     input: list[str] = Field(default_factory=list)
