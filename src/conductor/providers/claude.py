@@ -1170,6 +1170,11 @@ class ClaudeProvider(AgentProvider):
             logger.debug("Successfully extracted structured output from tool_use block")
             return response
 
+        # Check for MCP tool calls — return to agentic loop for execution
+        if self._has_mcp_tool_use(response):
+            logger.debug("Response contains MCP tool calls, returning to agentic loop")
+            return response
+
         # Check if we can extract JSON from text (fallback success path)
         json_content = self._extract_json_fallback(response)
         if json_content is not None:
@@ -1223,6 +1228,14 @@ class ClaudeProvider(AgentProvider):
             # Check if recovery succeeded (tool_use)
             if self._extract_structured_output(response) is not None:
                 logger.info(f"Parse recovery succeeded on attempt {attempt} (tool_use)")
+                return response
+
+            # Check for MCP tool calls — return to agentic loop for execution
+            if self._has_mcp_tool_use(response):
+                logger.debug(
+                    f"Recovery attempt {attempt} returned MCP tool calls, "
+                    "returning to agentic loop"
+                )
                 return response
 
             # Check if recovery succeeded (JSON fallback)
@@ -1573,6 +1586,20 @@ class ClaudeProvider(AgentProvider):
             if is_tool_use and block.name == "emit_output":
                 return dict(block.input)
         return None
+
+    def _has_mcp_tool_use(self, response: Any) -> bool:
+        """Check if response contains non-emit_output tool_use blocks (MCP tool calls).
+
+        Args:
+            response: Claude API response.
+
+        Returns:
+            True if response contains MCP tool calls that the agentic loop should handle.
+        """
+        return any(
+            hasattr(block, "type") and block.type == "tool_use" and block.name != "emit_output"
+            for block in response.content
+        )
 
     def _extract_json_fallback(self, response: Any) -> dict[str, Any] | None:
         """Fallback: parse JSON from text content.
