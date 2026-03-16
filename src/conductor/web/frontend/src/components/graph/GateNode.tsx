@@ -76,7 +76,7 @@ function useStatusTransition(status: NodeStatus): string {
     prevStatusRef.current = status;
     if (prev === status) return;
 
-    if (prev === 'pending' && (status === 'running' || status === 'waiting')) {
+    if (status === 'running' || status === 'waiting') {
       setTransitionClass('node-activate');
     } else if ((prev === 'running' || prev === 'waiting') && status === 'completed') {
       setTransitionClass('node-complete');

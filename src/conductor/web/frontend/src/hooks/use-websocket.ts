@@ -13,49 +13,9 @@ export function useWebSocket() {
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectDelayRef = useRef(1000);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  const connect = useCallback(() => {
-    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${proto}//${window.location.host}/ws`;
-
-    try {
-      const ws = new WebSocket(wsUrl);
-      wsRef.current = ws;
-
-      ws.onopen = () => {
-        reconnectDelayRef.current = 1000;
-        setWsStatus('connected');
-        // Expose send function to the store
-        setWsSend((data: object) => {
-          if (ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify(data));
-          }
-        });
-      };
-
-      ws.onmessage = (evt) => {
-        try {
-          const event = JSON.parse(evt.data) as WorkflowEvent;
-          processEvent(event);
-        } catch (e) {
-          console.error('Failed to parse WebSocket message:', e);
-        }
-      };
-
-      ws.onclose = () => {
-        setWsStatus('disconnected');
-        setWsSend(null);
-        wsRef.current = null;
-        scheduleReconnect();
-      };
-
-      ws.onerror = () => {
-        // onclose fires after onerror
-      };
-    } catch {
-      scheduleReconnect();
-    }
-  }, [processEvent, setWsStatus, setWsSend]);
+  const fetchAbortRef = useRef<AbortController | null>(null);
+  // Use a ref to break the circular dependency between connect and scheduleReconnect
+  const connectRef = useRef<() => void>(() => {});
 
   const scheduleReconnect = useCallback(() => {
     setWsStatus('reconnecting');
@@ -64,28 +24,86 @@ export function useWebSocket() {
         reconnectDelayRef.current * 2,
         MAX_RECONNECT_DELAY,
       );
-      connect();
+      connectRef.current();
     }, reconnectDelayRef.current);
-  }, [connect, setWsStatus]);
+  }, [setWsStatus]);
 
-  useEffect(() => {
-    // Fetch existing state for late-joiners, then connect
+  const connect = useCallback(() => {
     setWsStatus('connecting');
 
-    fetch('/api/state')
+    // Cancel any in-flight fetch from a previous connect attempt
+    if (fetchAbortRef.current) {
+      fetchAbortRef.current.abort();
+    }
+    const abortController = new AbortController();
+    fetchAbortRef.current = abortController;
+
+    // Always fetch full state before opening WebSocket (handles initial + reconnect)
+    fetch('/api/state', { signal: abortController.signal })
       .then((resp) => resp.json())
       .then((events: WorkflowEvent[]) => {
         if (events && events.length > 0) {
           replayState(events);
         }
-        connect();
+
+        const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const wsUrl = `${proto}//${window.location.host}/ws`;
+
+        try {
+          const ws = new WebSocket(wsUrl);
+          wsRef.current = ws;
+
+          ws.onopen = () => {
+            reconnectDelayRef.current = 1000;
+            setWsStatus('connected');
+            // Expose send function to the store
+            setWsSend((data: object) => {
+              if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify(data));
+              }
+            });
+          };
+
+          ws.onmessage = (evt) => {
+            try {
+              const event = JSON.parse(evt.data) as WorkflowEvent;
+              processEvent(event);
+            } catch (e) {
+              console.error('Failed to parse WebSocket message:', e);
+            }
+          };
+
+          ws.onclose = () => {
+            setWsStatus('disconnected');
+            setWsSend(null);
+            wsRef.current = null;
+            scheduleReconnect();
+          };
+
+          ws.onerror = () => {
+            // onclose fires after onerror
+          };
+        } catch {
+          scheduleReconnect();
+        }
       })
       .catch((err) => {
+        if (abortController.signal.aborted) return;
         console.error('Failed to fetch state:', err);
-        connect();
+        scheduleReconnect();
       });
+  }, [processEvent, replayState, setWsStatus, setWsSend, scheduleReconnect]);
+
+  // Keep the ref in sync with the latest connect callback
+  connectRef.current = connect;
+
+  useEffect(() => {
+    connect();
 
     return () => {
+      if (fetchAbortRef.current) {
+        fetchAbortRef.current.abort();
+      }
       if (reconnectTimerRef.current) {
         clearTimeout(reconnectTimerRef.current);
       }
@@ -94,5 +112,5 @@ export function useWebSocket() {
       }
       setWsSend(null);
     };
-  }, [connect, replayState, setWsStatus, setWsSend]);
+  }, [connect, setWsSend]);
 }
