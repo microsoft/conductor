@@ -360,7 +360,7 @@ class ClaudeProvider(AgentProvider):
         claude_tools: list[dict[str, Any]] = []
         for tool in self._mcp_manager.get_all_tools():
             # Apply filter if specified
-            if tool_filter is not None and tool["name"] not in tool_filter:
+            if tool_filter and tool["name"] not in tool_filter:
                 continue
 
             claude_tools.append(
