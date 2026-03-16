@@ -15,7 +15,7 @@ of "no filter — include all MCP tools".
 from __future__ import annotations
 
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, Mock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -31,7 +31,6 @@ from conductor.config.schema import (
 )
 from conductor.engine.workflow import WorkflowEngine
 from conductor.providers.claude import ClaudeProvider
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -139,7 +138,6 @@ class TestMcpToolsReachApiInWorkflow:
 
         # Capture the tools kwarg passed to _execute_agentic_loop
         captured: dict[str, Any] = {}
-        original_agentic_loop = provider._execute_agentic_loop
 
         async def spy_agentic_loop(**kwargs: Any) -> Any:
             captured["tools"] = kwargs.get("tools")

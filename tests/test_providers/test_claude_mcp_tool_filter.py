@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from conductor.config.schema import OutputField
+from conductor.exceptions import ProviderError
 from conductor.providers.claude import ClaudeProvider
 
 
@@ -286,7 +287,7 @@ class TestParseRecoveryMcpPassthrough:
         text_response = _make_response([_make_text_block("I cannot use tools")])
         provider._execute_api_call = AsyncMock(return_value=text_response)
 
-        with pytest.raises(Exception):
+        with pytest.raises(ProviderError):
             # Should exhaust recovery attempts and raise
             await provider._execute_with_parse_recovery(
                 messages=[{"role": "user", "content": "test"}],
