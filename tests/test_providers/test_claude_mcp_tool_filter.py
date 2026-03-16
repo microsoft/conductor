@@ -84,9 +84,7 @@ class TestConvertMcpToolsFilter:
     def test_specific_filter_includes_only_matching_tools(self) -> None:
         """tool_filter=['name'] should include only matching tools."""
         provider = _make_provider_with_mcp_tools(FAKE_MCP_TOOLS)
-        result = provider._convert_mcp_tools_to_claude(
-            tool_filter=["filesystem__read_file"]
-        )
+        result = provider._convert_mcp_tools_to_claude(tool_filter=["filesystem__read_file"])
         assert len(result) == 1
         assert result[0]["name"] == "filesystem__read_file"
 
@@ -103,9 +101,7 @@ class TestConvertMcpToolsFilter:
     def test_filter_with_nonexistent_tool_excludes_it(self) -> None:
         """tool_filter with names not in MCP tools should return no matches for those."""
         provider = _make_provider_with_mcp_tools(FAKE_MCP_TOOLS)
-        result = provider._convert_mcp_tools_to_claude(
-            tool_filter=["nonexistent_tool"]
-        )
+        result = provider._convert_mcp_tools_to_claude(tool_filter=["nonexistent_tool"])
         assert len(result) == 0
 
     def test_no_mcp_manager_returns_empty(self) -> None:
@@ -202,10 +198,12 @@ class TestHasMcpToolUse:
     def test_mixed_emit_and_mcp(self) -> None:
         """Response with both emit_output and MCP tool_use should return True."""
         provider = _make_bare_provider()
-        response = _make_response([
-            _make_tool_use_block("emit_output", {"result": "hi"}),
-            _make_tool_use_block("filesystem__read_file"),
-        ])
+        response = _make_response(
+            [
+                _make_tool_use_block("emit_output", {"result": "hi"}),
+                _make_tool_use_block("filesystem__read_file"),
+            ]
+        )
         assert provider._has_mcp_tool_use(response) is True
 
     def test_text_only_response(self) -> None:
@@ -238,9 +236,11 @@ class TestParseRecoveryMcpPassthrough:
         """Initial API response with MCP tool_use should be returned directly."""
         provider = _make_bare_provider()
 
-        mcp_response = _make_response([
-            _make_tool_use_block("filesystem__read_file", {"path": "/tmp/test.txt"}),
-        ])
+        mcp_response = _make_response(
+            [
+                _make_tool_use_block("filesystem__read_file", {"path": "/tmp/test.txt"}),
+            ]
+        )
         provider._execute_api_call = AsyncMock(return_value=mcp_response)
 
         result = await provider._execute_with_parse_recovery(
@@ -262,9 +262,11 @@ class TestParseRecoveryMcpPassthrough:
         """emit_output response should still be returned on the fast path."""
         provider = _make_bare_provider()
 
-        emit_response = _make_response([
-            _make_tool_use_block("emit_output", {"content": "result"}),
-        ])
+        emit_response = _make_response(
+            [
+                _make_tool_use_block("emit_output", {"content": "result"}),
+            ]
+        )
         provider._execute_api_call = AsyncMock(return_value=emit_response)
 
         result = await provider._execute_with_parse_recovery(

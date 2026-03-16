@@ -173,17 +173,14 @@ class TestMcpToolsReachApiInWorkflow:
 
         # THE KEY ASSERTION: MCP tools must be included
         assert "filesystem__read_file" in tool_names, (
-            "MCP tool 'filesystem__read_file' was filtered out — "
-            "this is the bug from issue #37"
+            "MCP tool 'filesystem__read_file' was filtered out — this is the bug from issue #37"
         )
         assert "filesystem__write_file" in tool_names
         assert "web_search__search" in tool_names
         assert len(tool_names) == 4  # 3 MCP + 1 emit_output
 
     @pytest.mark.asyncio
-    async def test_mcp_tools_included_in_full_workflow_engine_run(
-        self, tmp_path
-    ) -> None:
+    async def test_mcp_tools_included_in_full_workflow_engine_run(self, tmp_path) -> None:
         """End-to-end: WorkflowEngine → AgentExecutor → ClaudeProvider with MCP.
 
         Wires up a real WorkflowConfig (no ``tools:`` section) and verifies

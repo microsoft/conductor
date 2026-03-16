@@ -1233,8 +1233,7 @@ class ClaudeProvider(AgentProvider):
             # Check for MCP tool calls — return to agentic loop for execution
             if self._has_mcp_tool_use(response):
                 logger.debug(
-                    f"Recovery attempt {attempt} returned MCP tool calls, "
-                    "returning to agentic loop"
+                    f"Recovery attempt {attempt} returned MCP tool calls, returning to agentic loop"
                 )
                 return response
 
