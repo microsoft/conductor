@@ -30,6 +30,8 @@ Modules:
     exceptions: Custom exception hierarchy.
 """
 
-__version__ = "0.1.0"
+from importlib.metadata import version as _pkg_version
+
+__version__ = _pkg_version("conductor-cli")
 
 __all__ = ["__version__"]
