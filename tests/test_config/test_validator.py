@@ -6,8 +6,10 @@ import pytest
 
 from conductor.config.schema import (
     AgentDef,
+    ForEachDef,
     GateOption,
     InputDef,
+    ParallelGroup,
     RouteDef,
     WorkflowConfig,
     WorkflowDef,
@@ -345,3 +347,261 @@ class TestOutputReferenceValidation:
         with pytest.raises(ConfigurationError) as exc_info:
             validate_workflow_config(config)
         assert "unknown_agent" in str(exc_info.value)
+
+
+class TestOutputPathCoverage:
+    """Tests for output template path coverage validation."""
+
+    def test_no_warning_linear_workflow(self) -> None:
+        """Linear A→B→$end with output refs to both produces no warnings."""
+        config = WorkflowConfig(
+            workflow=WorkflowDef(name="test", entry_point="agent_a"),
+            agents=[
+                AgentDef(
+                    name="agent_a",
+                    model="gpt-4",
+                    prompt="A",
+                    routes=[RouteDef(to="agent_b")],
+                ),
+                AgentDef(
+                    name="agent_b",
+                    model="gpt-4",
+                    prompt="B",
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={
+                "a_result": "{{ agent_a.output }}",
+                "b_result": "{{ agent_b.output }}",
+            },
+        )
+        warnings = validate_workflow_config(config)
+        assert not warnings
+
+    def test_warning_conditionally_skipped_agent(self) -> None:
+        """Evaluator routes to deployer OR $end; output refs deployer → warning."""
+        config = WorkflowConfig(
+            workflow=WorkflowDef(name="test", entry_point="evaluator"),
+            agents=[
+                AgentDef(
+                    name="evaluator",
+                    model="gpt-4",
+                    prompt="Evaluate",
+                    routes=[
+                        RouteDef(to="deployer", when="{{ evaluator.output.approved }}"),
+                        RouteDef(to="$end"),
+                    ],
+                ),
+                AgentDef(
+                    name="deployer",
+                    model="gpt-4",
+                    prompt="Deploy",
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"summary": "{{ deployer.output.summary }}"},
+        )
+        warnings = validate_workflow_config(config)
+        assert any("deployer" in w for w in warnings)
+
+    def test_no_warning_agent_on_all_branches(self) -> None:
+        """Router routes to A on both branches; output refs A → no warning."""
+        config = WorkflowConfig(
+            workflow=WorkflowDef(name="test", entry_point="router"),
+            agents=[
+                AgentDef(
+                    name="router",
+                    model="gpt-4",
+                    prompt="Route",
+                    routes=[
+                        RouteDef(to="agent_a", when="{{ router.output.fast }}"),
+                        RouteDef(to="agent_a"),
+                    ],
+                ),
+                AgentDef(
+                    name="agent_a",
+                    model="gpt-4",
+                    prompt="Do work",
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"result": "{{ agent_a.output }}"},
+        )
+        warnings = validate_workflow_config(config)
+        assert not warnings
+
+    def test_parallel_group_member_available(self) -> None:
+        """Entry→pg(a,b)→$end, output refs member 'a' via pg → no warning."""
+        config = WorkflowConfig(
+            workflow=WorkflowDef(name="test", entry_point="entry"),
+            agents=[
+                AgentDef(name="entry", model="gpt-4", prompt="Go", routes=[RouteDef(to="pg")]),
+                AgentDef(name="agent_a", model="gpt-4", prompt="A"),
+                AgentDef(name="agent_b", model="gpt-4", prompt="B"),
+            ],
+            parallel=[
+                ParallelGroup(
+                    name="pg",
+                    agents=["agent_a", "agent_b"],
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"a_out": "{{ agent_a.output }}"},
+        )
+        warnings = validate_workflow_config(config)
+        assert not warnings
+
+    def test_warning_skippable_parallel_group(self) -> None:
+        """Router→(pg→$end OR $end), output refs pg member agent → warning."""
+        config = WorkflowConfig(
+            workflow=WorkflowDef(name="test", entry_point="router"),
+            agents=[
+                AgentDef(
+                    name="router",
+                    model="gpt-4",
+                    prompt="Route",
+                    routes=[
+                        RouteDef(to="pg", when="{{ router.output.needs_parallel }}"),
+                        RouteDef(to="$end"),
+                    ],
+                ),
+                AgentDef(name="agent_a", model="gpt-4", prompt="A"),
+                AgentDef(name="agent_b", model="gpt-4", prompt="B"),
+            ],
+            parallel=[
+                ParallelGroup(
+                    name="pg",
+                    agents=["agent_a", "agent_b"],
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"a_out": "{{ agent_a.output }}"},
+        )
+        warnings = validate_workflow_config(config)
+        assert any("agent_a" in w for w in warnings)
+
+    def test_human_gate_conditional_paths(self) -> None:
+        """Gate(opt1→agent_a, opt2→$end), output refs agent_a → warning."""
+        config = WorkflowConfig(
+            workflow=WorkflowDef(name="test", entry_point="gate"),
+            agents=[
+                AgentDef(
+                    name="gate",
+                    type="human_gate",
+                    prompt="Choose:",
+                    options=[
+                        GateOption(label="Approve", value="yes", route="agent_a"),
+                        GateOption(label="Reject", value="no", route="$end"),
+                    ],
+                ),
+                AgentDef(
+                    name="agent_a",
+                    model="gpt-4",
+                    prompt="Do work",
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"result": "{{ agent_a.output }}"},
+        )
+        warnings = validate_workflow_config(config)
+        assert any("agent_a" in w for w in warnings)
+
+    def test_no_warning_when_no_output_section(self) -> None:
+        """No output dict → no warnings."""
+        config = WorkflowConfig(
+            workflow=WorkflowDef(name="test", entry_point="agent1"),
+            agents=[
+                AgentDef(
+                    name="agent1",
+                    model="gpt-4",
+                    prompt="Hello",
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+        )
+        warnings = validate_workflow_config(config)
+        assert not warnings
+
+    def test_loop_does_not_crash(self) -> None:
+        """A→B→(A OR $end), output refs A and B → no crash, no warnings."""
+        config = WorkflowConfig(
+            workflow=WorkflowDef(name="test", entry_point="agent_a"),
+            agents=[
+                AgentDef(
+                    name="agent_a",
+                    model="gpt-4",
+                    prompt="A",
+                    routes=[RouteDef(to="agent_b")],
+                ),
+                AgentDef(
+                    name="agent_b",
+                    model="gpt-4",
+                    prompt="B",
+                    routes=[
+                        RouteDef(to="agent_a", when="{{ agent_b.output.retry }}"),
+                        RouteDef(to="$end"),
+                    ],
+                ),
+            ],
+            output={
+                "a_result": "{{ agent_a.output }}",
+                "b_result": "{{ agent_b.output }}",
+            },
+        )
+        warnings = validate_workflow_config(config)
+        assert not warnings
+
+    def test_warning_message_format(self) -> None:
+        """Warning contains path string and {% if suggestion."""
+        config = WorkflowConfig(
+            workflow=WorkflowDef(name="test", entry_point="evaluator"),
+            agents=[
+                AgentDef(
+                    name="evaluator",
+                    model="gpt-4",
+                    prompt="Evaluate",
+                    routes=[
+                        RouteDef(to="deployer", when="{{ evaluator.output.approved }}"),
+                        RouteDef(to="$end"),
+                    ],
+                ),
+                AgentDef(
+                    name="deployer",
+                    model="gpt-4",
+                    prompt="Deploy",
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"summary": "{{ deployer.output.summary }}"},
+        )
+        warnings = validate_workflow_config(config)
+        assert len(warnings) == 1
+        warning = warnings[0]
+        assert "deployer" in warning
+        assert "evaluator" in warning
+        assert "$end" in warning
+        assert "{% if deployer is defined %}" in warning
+
+    def test_for_each_on_every_path(self) -> None:
+        """Entry→fe→$end, output refs fe.outputs → no warning.
+
+        Uses a for-each group on the only path to $end, so the reference
+        should not produce a path coverage warning.
+        """
+        config = WorkflowConfig(
+            workflow=WorkflowDef(name="test", entry_point="analyzers"),
+            agents=[],
+            for_each=[
+                ForEachDef(
+                    name="analyzers",
+                    type="for_each",
+                    source="workflow.input.items",
+                    **{"as": "item"},
+                    agent=AgentDef(name="analyzer", model="gpt-4", prompt="Analyze {{ item }}"),
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"results": "{{ analyzers.outputs }}"},
+        )
+        warnings = validate_workflow_config(config)
+        assert not warnings
