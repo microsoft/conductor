@@ -16,9 +16,15 @@ if TYPE_CHECKING:
     from conductor.config.schema import WorkflowConfig
 
 
-# Matches agent/group name references in output templates
-# Catches {{ name.output.field }}, {{ group.outputs.member }}, and {% if name.output %}
+# Matches agent/group name references in output templates.
+# Catches {{ name.output.field }}, {{ group.outputs.member }}, and {% if name.output %}.
+# Note: this is intentionally broader than the agent_ref_pattern in _validate_output_references
+# (which only matches {{ }} blocks with .output singular). This pattern also matches {% %} blocks
+# and .outputs plural for path coverage analysis.
 _OUTPUT_REF_PATTERN = re.compile(r"(?:\{\{|\{%)[^}%]*?(\w+)\.outputs?\b")
+
+# DFS path cap: larger workflows may get partial coverage analysis
+_MAX_ENUMERATED_PATHS = 100
 
 # Pattern for input references:
 # - agent.output(.field)?
@@ -52,7 +58,7 @@ def validate_workflow_config(config: WorkflowConfig) -> list[str]:
     errors: list[str] = []
     warnings: list[str] = []
 
-    # Build index of agent names and parallel group names
+    # Build index of all addressable node names
     agent_names = {agent.name for agent in config.agents}
     parallel_names = {pg.name for pg in config.parallel}
     for_each_names = {fe.name for fe in config.for_each}
@@ -143,7 +149,7 @@ def _validate_agent_routes(
     Args:
         agent_name: Name of the agent whose routes are being validated.
         routes: List of RouteDef objects.
-        valid_targets: Set of valid target names (agents and parallel groups).
+        valid_targets: Set of valid target names (agents, parallel groups, and for-each groups).
 
     Returns:
         List of error messages.
@@ -153,8 +159,9 @@ def _validate_agent_routes(
     for i, route in enumerate(routes):
         if route.to != "$end" and route.to not in valid_targets:
             errors.append(
-                f"Agent '{agent_name}' route {i} targets unknown agent or "
-                f"parallel group '{route.to}'. Use '$end' to terminate or one of: "
+                f"Agent '{agent_name}' route {i} targets unknown agent, "
+                f"parallel group, or for-each group '{route.to}'. "
+                f"Use '$end' to terminate or one of: "
                 f"{', '.join(sorted(valid_targets))}"
             )
 
@@ -373,7 +380,8 @@ def _validate_parallel_groups(config: WorkflowConfig) -> list[str]:
                 )
 
         # PE-6.2: Validate parallel group route targets
-        all_names = agent_names | parallel_names
+        for_each_names = {fe.name for fe in config.for_each}
+        all_names = agent_names | parallel_names | for_each_names
         route_errors = _validate_agent_routes(pg.name, pg.routes, all_names)
         errors.extend(route_errors)
 
@@ -442,7 +450,7 @@ def _enumerate_paths_to_end(
     graph: dict[str, list[tuple[str, bool]]],
     max_depth: int = 50,
 ) -> list[list[str]]:
-    """Enumerate all paths from start to $end via DFS.
+    """Enumerate paths from start to $end via DFS, up to _MAX_ENUMERATED_PATHS.
 
     Args:
         start: Entry point node name.
@@ -450,13 +458,15 @@ def _enumerate_paths_to_end(
         max_depth: Maximum path depth (prevents infinite exploration).
 
     Returns:
-        List of paths, where each path is a list of node names.
+        List of paths (up to _MAX_ENUMERATED_PATHS), where each path is a list
+        of node names. If the graph has more paths than the cap, returns the
+        first ones found. Callers should treat results as best-effort for
+        highly branchy workflows.
     """
-    MAX_PATHS = 100
     paths: list[list[str]] = []
 
     def dfs(current: str, path: list[str], visited: set[str]) -> None:
-        if len(paths) >= MAX_PATHS or len(path) > max_depth:
+        if len(paths) >= _MAX_ENUMERATED_PATHS or len(path) > max_depth:
             return
         if current == "$end":
             paths.append(list(path))
@@ -496,6 +506,8 @@ def _name_on_path(name: str, path: list[str], config: WorkflowConfig) -> bool:
     """Check if an agent/group name appears on a given execution path.
 
     Checks both direct presence and membership in a parallel group on the path.
+    Note: for-each inline agents are not checked here because users reference
+    the group name (e.g., analyzers.outputs), not the inner agent name directly.
 
     Args:
         name: Agent or group name to check.
@@ -526,7 +538,8 @@ def _validate_output_path_coverage(config: WorkflowConfig) -> list[str]:
         return []
 
     graph = _build_routing_graph(config)
-    max_depth = config.workflow.limits.max_iterations
+    node_count = len(config.agents) + len(config.parallel) + len(config.for_each)
+    max_depth = max(config.workflow.limits.max_iterations, node_count)
     paths = _enumerate_paths_to_end(config.workflow.entry_point, graph, max_depth)
 
     if not paths:
