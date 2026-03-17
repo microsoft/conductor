@@ -14,6 +14,8 @@ conductor run workflow.yaml --input question="Hello"     # Execute (full output 
 conductor run workflow.yaml -q --input question="Hello"  # Quiet: lifecycle + routing only
 conductor run workflow.yaml -s --input question="Hello"  # Silent: JSON result only
 conductor run workflow.yaml --log-file auto               # Log full debug output to file
+conductor run workflow.yaml --web --input q="Hello"       # Real-time web dashboard
+conductor run workflow.yaml --web-bg --input q="Hello"    # Background mode (prints URL, exits)
 conductor validate workflow.yaml                         # Validate only
 conductor init my-workflow --template simple              # Create from template
 conductor templates                                      # List templates
@@ -96,7 +98,8 @@ output:
 | `limits` | Safety bounds (max_iterations up to 500, timeout_seconds) |
 | `cost` | Token usage and cost tracking configuration |
 | `runtime` | Provider, model, temperature, max_tokens, MCP servers |
-| checkpoint | Auto-saved on failure; resume with `conductor resume` |
+| `--web` | Real-time web dashboard with DAG graph, live streaming, in-browser human gates |
+| `checkpoint` | Auto-saved on failure; resume with `conductor resume` |
 
 ## Common Patterns
 

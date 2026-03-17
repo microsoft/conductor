@@ -17,6 +17,8 @@ workflow:
     temperature: 0.7             # 0.0-1.0 (optional)
     max_tokens: 4096             # Max output tokens per response (optional)
     timeout: 600                 # Per-request timeout in seconds (optional)
+    max_agent_iterations: 50     # Max tool-use roundtrips per agent (1-500, optional)
+    max_session_seconds: 120     # Wall-clock timeout per agent session (optional)
 
   input:                         # Define workflow inputs
     param_name:
@@ -70,6 +72,9 @@ agents:
 
     tools:                       # null = all, [] = none, [list] = subset
       - web_search
+
+    max_agent_iterations: 100    # Override workflow default for this agent (optional)
+    max_session_seconds: 60      # Wall-clock timeout for this agent (optional)
 
     routes:                      # Where to go next
       - to: next_agent
