@@ -314,7 +314,22 @@ Preview execution plan without running agents. Shows the workflow graph, agent o
 conductor run workflow.yaml --web --input question="test"
 ```
 
-Visualize execution in real-time with a browser dashboard. Shows agent prompts, reasoning, tool calls, and outputs as they stream in.
+Real-time browser dashboard for visualizing and interacting with workflows as they run:
+
+- **Interactive DAG graph** — Zoomable, draggable workflow graph with animated edges showing execution flow and conditional routing
+- **Live agent streaming** — Watch agent reasoning, tool calls, and outputs stream in real-time as each step executes
+- **Three-pane layout** — Resizable panels for the graph, agent detail, and a tabbed output pane (Log, Activity, Output)
+- **In-browser human gates** — Respond to human-in-the-loop decisions directly in the dashboard
+- **Per-node detail** — Click any node to see its prompt, metadata (model, tokens, cost), activity stream, and output
+- **Background mode** — Run with `--web-bg` to start in background, print URL, and exit
+
+```bash
+# Background mode: prints dashboard URL and exits
+conductor run workflow.yaml --web-bg --input question="test"
+
+# Stop background workflow
+conductor stop
+```
 
 ### Validate First
 

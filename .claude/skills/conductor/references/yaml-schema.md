@@ -32,6 +32,8 @@ workflow:
     temperature: float              # 0.0-1.0, controls randomness (optional)
     max_tokens: integer             # Max OUTPUT tokens per response, 1-200000 (optional)
     timeout: float                  # Per-request timeout in seconds (optional, default: 600)
+    max_agent_iterations: integer   # Max tool-use roundtrips per agent (1-500, optional)
+    max_session_seconds: float      # Wall-clock timeout per agent session in seconds (optional)
     mcp_servers:                    # MCP server configurations
       <server_name>:
         type: string                # "stdio" (default), "http", or "sse"
@@ -123,6 +125,10 @@ agents:
     # Agent-level tools
     tools:                          # null = all workflow tools, [] = none, [list] = subset
       - string
+
+    # Agent-level limits (override workflow runtime defaults)
+    max_agent_iterations: integer   # Max tool-use roundtrips for this agent (1-500, optional)
+    max_session_seconds: float      # Wall-clock timeout for this agent session (optional)
 
     # Script-only fields (type: script)
     command: string                 # Command to execute (Jinja2 templated)
