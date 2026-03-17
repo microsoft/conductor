@@ -126,7 +126,7 @@ agents:
       - to: synthesizer
         when: "coverage >= 70"
       - to: researcher
-        when: "context.iteration < 3"
+        when: "{{ context.iteration < 3 }}"
       - to: synthesizer
 
   - name: synthesizer
@@ -218,7 +218,7 @@ agents:
       - to: $end
         when: "{{ output.passed }}"
       - to: synthesizer
-        when: "context.iteration < 5"
+        when: "{{ context.iteration < 5 }}"
       - to: $end
 
 output:

@@ -20,7 +20,7 @@ Conductor provides the patterns that work: evaluator-optimizer loops for iterati
 - **Conditional routing** - Route between agents based on output conditions
 - **Human-in-the-loop** - Pause for human decisions with Rich terminal UI
 - **Safety limits** - Max iterations and timeout enforcement
-- **Web dashboard** - Real-time DAG visualization with agent detail streaming
+- **[Web dashboard](#web-dashboard)** - Real-time workflow visualization with interactive DAG graph, live streaming, and in-browser human gates
 - **Validation** - Validate workflows before execution
 
 ## Installation
@@ -102,6 +102,33 @@ conductor run my-workflow.yaml --input question="What is Python?"
 {
   "answer": "Python is a high-level, interpreted programming language..."
 }
+```
+
+## Web Dashboard
+
+Conductor includes a built-in real-time web dashboard that lets you visualize and interact with your workflows as they run. Launch it with `--web`:
+
+```bash
+conductor run workflow.yaml --web --input question="What is Python?"
+```
+
+![Web Dashboard](docs/img/web-dashboard.png)
+
+**Key features:**
+
+- **Interactive DAG graph** — Zoomable, draggable workflow graph with animated edges showing execution flow and conditional routing
+- **Live agent streaming** — Watch agent reasoning, tool calls, and outputs stream in real-time as each step executes
+- **Three-pane layout** — Resizable panels for the graph, agent detail, and a tabbed output pane (Log, Activity, Output)
+- **In-browser human gates** — Respond to human-in-the-loop decision points directly in the dashboard, no terminal needed
+- **Per-node detail** — Click any node to see its prompt, metadata (model, tokens, cost), activity stream, and output
+- **Background mode** — Run with `--web-bg` to start the dashboard in the background, print the URL, and exit. Use `conductor stop` to shut it down later.
+
+```bash
+# Run in background — prints dashboard URL and exits
+conductor run workflow.yaml --web-bg --input topic="AI in healthcare"
+
+# Stop a background workflow
+conductor stop
 ```
 
 ## Providers
