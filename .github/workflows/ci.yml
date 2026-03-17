@@ -101,7 +101,15 @@ jobs:
       - name: Install dependencies
         run: uv sync --group dev
 
+      - name: Remove bundled Copilot CLI binary
+        run: |
+          # The github-copilot-sdk >=0.1.23 bundles a CLI binary that tries to
+          # authenticate with GitHub on startup. Remove it so tests that invoke
+          # the real CLI path fail fast instead of hanging on auth.
+          find .venv -path '*/copilot/bin/copilot*' -delete 2>/dev/null || true
+
       - name: Run tests with coverage
+        timeout-minutes: 10
         run: uv run pytest --cov=src/conductor --cov-report=xml --cov-report=term-missing -m "not real_api"
         env:
           # Fake API key for mock tests to prevent accidental real API calls.

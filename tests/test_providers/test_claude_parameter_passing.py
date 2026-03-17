@@ -45,6 +45,8 @@ class TestClaudeParameterPassing:
             max_tokens=4096,
             timeout=120.0,
             mcp_servers=None,
+            max_agent_iterations=None,
+            max_session_seconds=None,
         )
 
     @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)

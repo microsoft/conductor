@@ -117,6 +117,7 @@ class ProviderRegistry:
             max_tokens=runtime.max_tokens,
             timeout=runtime.timeout,
             max_session_seconds=runtime.max_session_seconds,
+            max_agent_iterations=runtime.max_agent_iterations,
         )
 
         # Pass stored resume session IDs to newly created providers

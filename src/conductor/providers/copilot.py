@@ -149,6 +149,7 @@ class CopilotProvider(AgentProvider):
         mcp_servers: dict[str, Any] | None = None,
         idle_recovery_config: IdleRecoveryConfig | None = None,
         temperature: float | None = None,
+        max_agent_iterations: int | None = None,
     ) -> None:
         """Initialize the Copilot provider.
 
@@ -164,6 +165,8 @@ class CopilotProvider(AgentProvider):
             idle_recovery_config: Optional idle detection and recovery configuration.
                                   Uses default if not provided.
             temperature: Default temperature for generation (0.0-1.0). Optional.
+            max_agent_iterations: Maximum tool-use iterations per agent execution.
+                None means no iteration limit (only wall-clock timeout applies).
         """
         self._client: Any = None  # Will hold Copilot SDK client
         self._mock_handler = mock_handler
@@ -176,6 +179,7 @@ class CopilotProvider(AgentProvider):
         self._start_lock = asyncio.Lock()
         self._idle_recovery_config = idle_recovery_config or IdleRecoveryConfig()
         self._temperature = temperature
+        self._default_max_agent_iterations = max_agent_iterations
         self._session_ids: dict[str, str] = {}
         self._resume_session_ids: dict[str, str] = {}
         self._interrupted_session: Any = None
@@ -490,6 +494,13 @@ class CopilotProvider(AgentProvider):
                 agent.max_session_seconds or self._idle_recovery_config.max_session_seconds
             )
 
+            # Resolve per-agent max_agent_iterations override
+            effective_max_iterations = (
+                agent.max_agent_iterations
+                if agent.max_agent_iterations is not None
+                else self._default_max_agent_iterations
+            )
+
             session_destroyed = False
             try:
                 # Send initial prompt and get response
@@ -501,6 +512,7 @@ class CopilotProvider(AgentProvider):
                     interrupt_signal=interrupt_signal,
                     event_callback=event_callback,
                     max_session_seconds=effective_max_session,
+                    max_agent_iterations=effective_max_iterations,
                 )
                 response_content = sdk_response.content
 
@@ -628,6 +640,7 @@ class CopilotProvider(AgentProvider):
         interrupt_signal: asyncio.Event | None = None,
         event_callback: EventCallback | None = None,
         max_session_seconds: float | None = None,
+        max_agent_iterations: int | None = None,
     ) -> SDKResponse:
         """Send a prompt to the session and wait for response.
 
@@ -642,6 +655,8 @@ class CopilotProvider(AgentProvider):
             event_callback: Optional callback for streaming SDK events upstream.
             max_session_seconds: Per-agent wall-clock session limit override.
                 If None, uses the provider-level IdleRecoveryConfig default.
+            max_agent_iterations: Maximum tool-use iterations for this session.
+                None means no iteration limit.
 
         Returns:
             SDKResponse with content and usage data. If interrupted,
@@ -660,6 +675,9 @@ class CopilotProvider(AgentProvider):
 
         # Mutable container for usage data: [input_tokens, output_tokens, cache_read, cache_write]
         usage_ref: list[int | None] = [None, None, None, None]
+
+        # Mutable container for tool iteration counting
+        tool_iteration_ref: list[int] = [0]
 
         def on_event(event: Any) -> None:
             nonlocal response_content, error_message
@@ -712,6 +730,8 @@ class CopilotProvider(AgentProvider):
                     event.data, "name", "unknown"
                 )
                 last_activity_ref[1] = tool_name
+                # Count tool-use iterations
+                tool_iteration_ref[0] += 1
 
             # Forward structured events upstream via event_callback
             if event_callback is not None:
@@ -753,6 +773,8 @@ class CopilotProvider(AgentProvider):
                 full_enabled,
                 last_activity_ref,
                 max_session_seconds=max_session_seconds,
+                tool_iteration_ref=tool_iteration_ref,
+                max_agent_iterations=max_agent_iterations,
             )
 
         if error_message:
@@ -1309,6 +1331,8 @@ class CopilotProvider(AgentProvider):
         full_enabled: bool,
         last_activity_ref: list[Any],
         max_session_seconds: float | None = None,
+        tool_iteration_ref: list[int] | None = None,
+        max_agent_iterations: int | None = None,
     ) -> None:
         """Wait for session completion with idle detection and recovery.
 
@@ -1326,10 +1350,14 @@ class CopilotProvider(AgentProvider):
                               for tracking last activity.
             max_session_seconds: Per-agent wall-clock session limit override.
                 If None, uses the provider-level IdleRecoveryConfig default.
+            tool_iteration_ref: Mutable [count] tracking tool execution starts.
+            max_agent_iterations: Maximum tool-use iterations allowed.
+                None means no iteration limit.
 
         Raises:
-            ProviderError: If all recovery attempts are exhausted, or if the
-                session exceeds max_session_seconds wall-clock duration.
+            ProviderError: If all recovery attempts are exhausted, if the
+                session exceeds max_session_seconds wall-clock duration, or
+                if max_agent_iterations is exceeded.
         """
         recovery_attempts = 0
         idle_timeout = self._idle_recovery_config.idle_timeout_seconds
@@ -1362,6 +1390,22 @@ class CopilotProvider(AgentProvider):
                         "or provider issue. Enable --log-file to capture full debug output."
                     ),
                     is_retryable=False,  # Don't retry — same root cause will recur
+                )
+
+            # Check tool-use iteration limit
+            if (
+                max_agent_iterations is not None
+                and tool_iteration_ref is not None
+                and tool_iteration_ref[0] > max_agent_iterations
+            ):
+                raise ProviderError(
+                    f"Agent exceeded maximum tool-use iterations ({max_agent_iterations})",
+                    suggestion=(
+                        "The agent performed too many tool calls. "
+                        "Increase max_agent_iterations in runtime config or per-agent "
+                        "settings if the agent legitimately needs more iterations."
+                    ),
+                    is_retryable=False,
                 )
 
             try:

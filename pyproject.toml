@@ -37,7 +37,7 @@ dependencies = [
     "ruamel.yaml>=0.18.0",
     "jinja2>=3.1.0",
     "simpleeval>=1.0.0",
-    "github-copilot-sdk>=0.1.0,<0.1.31",  # 0.1.31+ has permission-denied regression, see #27
+    "github-copilot-sdk>=0.1.28,<0.1.31",  # >=0.1.28 for on_permission_request; <0.1.31 regression, see #27
     "anthropic>=0.77.0,<1.0.0",
     "mcp>=1.0.0",
     "fastapi>=0.115.0",

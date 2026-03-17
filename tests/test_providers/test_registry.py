@@ -330,6 +330,7 @@ class TestConfigPassing:
             max_tokens=4096,
             timeout=60.0,
             max_session_seconds=None,
+            max_agent_iterations=None,
         )
 
     @patch("conductor.providers.registry.create_provider")

@@ -22,6 +22,7 @@ import asyncio
 import json
 import logging
 import random
+import time
 from typing import TYPE_CHECKING, Any, Protocol
 
 from pydantic import BaseModel
@@ -112,6 +113,8 @@ class ClaudeProvider(AgentProvider):
         timeout: float = 600.0,
         retry_config: RetryConfig | None = None,
         mcp_servers: dict[str, Any] | None = None,
+        max_agent_iterations: int | None = None,
+        max_session_seconds: float | None = None,
     ) -> None:
         """Initialize the Claude provider.
 
@@ -127,6 +130,10 @@ class ClaudeProvider(AgentProvider):
             retry_config: Optional retry configuration. Uses default if not provided.
             mcp_servers: Optional MCP server configurations for tool support.
                 Each server config should have: command, args, env (optional).
+            max_agent_iterations: Maximum tool-use iterations per agent execution.
+                Defaults to 50 if not specified.
+            max_session_seconds: Maximum wall-clock duration for agent sessions.
+                Defaults to None (unlimited).
 
         Raises:
             ProviderError: If SDK is not installed.
@@ -157,6 +164,10 @@ class ClaudeProvider(AgentProvider):
         self._retry_history: list[dict[str, Any]] = []  # For testing/debugging retries
         self._max_parse_recovery_attempts = 2  # Max retry attempts for malformed JSON
         self._max_schema_depth = 10  # Max nesting depth for recursive schema building
+        self._default_max_agent_iterations = (
+            max_agent_iterations if max_agent_iterations is not None else 50
+        )
+        self._default_max_session_seconds = max_session_seconds
 
         # MCP server configuration for tool support
         self._mcp_servers_config = mcp_servers
@@ -590,6 +601,18 @@ class ClaudeProvider(AgentProvider):
         temperature = self._default_temperature
         max_tokens = self._default_max_tokens
 
+        # Resolve per-agent iteration and session limits
+        max_agent_iterations = (
+            agent.max_agent_iterations
+            if agent.max_agent_iterations is not None
+            else self._default_max_agent_iterations
+        )
+        max_session_seconds = (
+            agent.max_session_seconds
+            if agent.max_session_seconds is not None
+            else self._default_max_session_seconds
+        )
+
         # Validate max_tokens against model-specific limits
         if "haiku" in model.lower():
             if max_tokens > 4096:
@@ -639,6 +662,8 @@ class ClaudeProvider(AgentProvider):
                     tools=request_tools,
                     output_schema=agent.output,
                     has_output_schema=has_output_schema,
+                    max_iterations=max_agent_iterations,
+                    max_session_seconds=max_session_seconds,
                     interrupt_signal=interrupt_signal,
                     event_callback=event_callback,
                 )
@@ -882,7 +907,8 @@ class ClaudeProvider(AgentProvider):
         tools: list[dict[str, Any]] | None,
         output_schema: dict[str, OutputField] | None,
         has_output_schema: bool,
-        max_iterations: int = 10,
+        max_iterations: int = 50,
+        max_session_seconds: float | None = None,
         interrupt_signal: asyncio.Event | None = None,
         event_callback: EventCallback | None = None,
     ) -> tuple[ClaudeResponse, int | None, bool]:
@@ -907,6 +933,8 @@ class ClaudeProvider(AgentProvider):
             output_schema: Expected output schema.
             has_output_schema: Whether agent has output schema defined.
             max_iterations: Maximum number of tool-use iterations to prevent infinite loops.
+            max_session_seconds: Maximum wall-clock duration for this agentic loop.
+                None means no time limit.
             interrupt_signal: Optional event that signals a mid-agent interrupt.
             event_callback: Optional callback for streaming SDK events upstream.
 
@@ -920,10 +948,21 @@ class ClaudeProvider(AgentProvider):
         working_messages = list(messages)
         total_tokens = 0
         iteration = 0
+        session_start = time.monotonic()
 
         while iteration < max_iterations:
             iteration += 1
             logger.debug(f"Agentic loop iteration {iteration}/{max_iterations}")
+
+            # Check wall-clock session timeout
+            if max_session_seconds is not None:
+                elapsed = time.monotonic() - session_start
+                if elapsed > max_session_seconds:
+                    raise ProviderError(
+                        f"Agent exceeded maximum session duration of {max_session_seconds:.0f}s "
+                        f"after {iteration} tool-use iterations",
+                        is_retryable=False,
+                    )
 
             # Emit turn start event
             if event_callback:
