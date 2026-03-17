@@ -82,16 +82,15 @@ agents:
       
       Be specific and actionable.
     output:
-      plan:
-        type: object
-        description: Structured research plan
-        properties:
-          questions:
-            type: array
-          areas:
-            type: array
-          sources:
-            type: array
+      questions:
+        type: array
+        description: 3-5 key research questions to answer
+      areas:
+        type: array
+        description: 3-4 areas to investigate
+      sources:
+        type: array
+        description: Types of sources to consult
       summary:
         type: string
         description: One-sentence plan summary
@@ -111,14 +110,11 @@ agents:
       
       Topic: {{ workflow.input.topic }}
       
-      Research Plan:
-      {{ planner.output.plan | json }}
-      
-      Focus on:
-      - Academic papers and research studies
-      - University publications
-      - Scientific journals
-      - Research institutions
+      Research Questions:
+      {{ planner.output.questions | json }}
+
+      Research Areas:
+      {{ planner.output.areas | json }}
       
       Provide credible, well-sourced findings based on your knowledge.
     output:
@@ -145,14 +141,11 @@ agents:
       
       Topic: {{ workflow.input.topic }}
       
-      Research Plan:
-      {{ planner.output.plan | json }}
-      
-      Focus on:
-      - Recent news articles
-      - Industry blogs and publications
-      - Case studies and real-world examples
-      - Expert opinions and commentary
+      Research Questions:
+      {{ planner.output.questions | json }}
+
+      Research Areas:
+      {{ planner.output.areas | json }}
       
       Provide findings based on your knowledge of recent and authoritative sources.
     output:
@@ -179,14 +172,11 @@ agents:
       
       Topic: {{ workflow.input.topic }}
       
-      Research Plan:
-      {{ planner.output.plan | json }}
-      
-      Focus on:
-      - Technical documentation
-      - API references and specifications
-      - Implementation guides
-      - Standards and best practices
+      Research Questions:
+      {{ planner.output.questions | json }}
+
+      Research Areas:
+      {{ planner.output.areas | json }}
       
       Provide findings based on your technical knowledge.
     output:
@@ -290,7 +280,7 @@ agents:
       Topic: {{ workflow.input.topic }}
       
       Original Research Questions:
-      {{ planner.output.plan.questions | json }}
+      {{ planner.output.questions | json }}
       
       Executive Summary:
       {{ synthesizer.output.executive_summary }}
@@ -331,7 +321,7 @@ agents:
       - to: $end
         when: "{{ output.quality_score >= 7 }}"
       - to: planner
-        when: "context.iteration < 3"
+        when: "{{ context.iteration < 3 }}"
         output:
           feedback: "{{ quality_checker.output.gaps | json }}"
       - to: $end
