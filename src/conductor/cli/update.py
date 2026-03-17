@@ -13,8 +13,10 @@ so they never block the CLI.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
+import shutil
 import subprocess
 import sys
 import urllib.error
@@ -273,6 +275,18 @@ def _print_hint(console: Console, remote_version: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _get_conductor_exe() -> Path | None:
+    """Return the path to the ``conductor`` executable, or ``None`` if not found.
+
+    Uses :func:`shutil.which` to locate the executable on ``$PATH``.
+
+    Returns:
+        A :class:`Path` to the executable, or ``None``.
+    """
+    which = shutil.which("conductor")
+    return Path(which) if which else None
+
+
 def run_update(console: Console) -> None:
     """Fetch the latest version and self-upgrade via ``uv tool install``.
 
@@ -301,31 +315,35 @@ def run_update(console: Console) -> None:
     install_url = f"git+{_REPO_GIT_URL}@{tag_name}"
     cmd = ["uv", "tool", "install", "--force", install_url]
 
+    # On Windows, rename our exe out of the way so uv can write the new one.
+    # Windows locks running executables but allows renaming them.
+    old_exe: Path | None = None
     if sys.platform == "win32":
-        # Windows locks running executables — spawn uv detached and exit
-        # so conductor.exe releases its file lock before uv overwrites it.
-        DETACHED_PROCESS = 0x00000008
-        CREATE_NEW_PROCESS_GROUP = 0x00000200
-        subprocess.Popen(  # noqa: S603
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
-        )
-        console.print(f"Upgrade to v{version} started in background. It will complete momentarily.")
-        # Clear cache so next run re-checks
-        cache_path = get_cache_path()
-        cache_path.unlink(missing_ok=True)
-        return
+        exe_path = _get_conductor_exe()
+        if exe_path and exe_path.exists():
+            old_exe = exe_path.with_suffix(".exe.old")
+            # Clean up leftover .old from a previous successful update
+            if old_exe.exists():
+                with contextlib.suppress(OSError):
+                    old_exe.unlink()
+            try:
+                exe_path.rename(old_exe)
+            except OSError:
+                old_exe = None  # rename failed; proceed anyway, uv will report the error
 
     proc = subprocess.run(cmd, capture_output=True, text=True)  # noqa: S603
 
     if proc.returncode == 0:
         console.print(f"[green]Successfully upgraded to v{version}[/green]")
-        # Clear cache so next run re-checks
         cache_path = get_cache_path()
         cache_path.unlink(missing_ok=True)
     else:
         console.print(f"[bold red]Upgrade failed[/bold red] (exit code {proc.returncode})")
         if proc.stderr:
             console.print(f"[dim]{proc.stderr.strip()}[/dim]")
+        # On Windows, restore the original exe if uv failed to write a new one
+        if old_exe and old_exe.exists():
+            exe_path = old_exe.with_suffix("")  # .exe.old → .exe
+            if not exe_path.exists():
+                with contextlib.suppress(OSError):
+                    old_exe.rename(exe_path)

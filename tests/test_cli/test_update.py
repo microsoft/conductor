@@ -505,14 +505,19 @@ class TestRunUpdate:
         assert len(install_arg) == 1
         assert install_arg[0].endswith("@v2.0.0")
 
-    def test_windows_uses_detached_process(self, cache_dir: Path) -> None:
-        """On Windows, ``run_update`` spawns a detached ``Popen`` and exits early."""
-        import subprocess as sp
+    def test_windows_renames_exe_before_install(self, cache_dir: Path, tmp_path: Path) -> None:
+        """On Windows, ``run_update`` renames the exe to ``.exe.old`` before calling ``uv``."""
+        # Create a fake conductor.exe
+        fake_exe = tmp_path / "conductor.exe"
+        fake_exe.write_text("fake")
 
         cache_file = cache_dir / "update-check.json"
         cache_file.write_text("{}")
 
         c, buf = _make_console(is_terminal=True)
+        mock_proc = MagicMock()
+        mock_proc.returncode = 0
+        mock_proc.stderr = ""
 
         with (
             patch(
@@ -520,33 +525,88 @@ class TestRunUpdate:
                 return_value=("99.0.0", "v99.0.0", "https://example.com"),
             ),
             patch("conductor.cli.update.sys.platform", "win32"),
-            patch("conductor.cli.update.subprocess.Popen") as mock_popen,
-            patch("conductor.cli.update.subprocess.run") as mock_run,
+            patch("conductor.cli.update._get_conductor_exe", return_value=fake_exe),
+            patch("conductor.cli.update.subprocess.run", return_value=mock_proc) as mock_run,
         ):
             run_update(c)
 
-        # Popen must be called with DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
-        mock_popen.assert_called_once()
-        call_kwargs = mock_popen.call_args[1]
-        DETACHED_PROCESS = 0x00000008
-        CREATE_NEW_PROCESS_GROUP = 0x00000200
-        expected_flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
-        assert call_kwargs["creationflags"] == expected_flags
-        assert call_kwargs["stdout"] == sp.DEVNULL
-        assert call_kwargs["stderr"] == sp.DEVNULL
+        # The exe should have been renamed to .exe.old
+        old_exe = tmp_path / "conductor.exe.old"
+        assert old_exe.exists()
 
-        # subprocess.run must NOT be called on Windows
-        mock_run.assert_not_called()
+        # subprocess.run must be called (not Popen)
+        mock_run.assert_called_once()
 
-        # Output should mention background
+        # Output should say successful (synchronous path)
         output = buf.getvalue()
-        assert "started in background" in output
+        assert "Successfully upgraded" in output
 
         # Cache should be cleared
         assert not cache_file.exists()
 
-    def test_unix_uses_synchronous_subprocess(self, cache_dir: Path) -> None:
-        """On non-Windows platforms, ``run_update`` uses synchronous ``subprocess.run``."""
+    def test_windows_restores_exe_on_failure(self, cache_dir: Path, tmp_path: Path) -> None:
+        """On Windows, if ``uv`` fails and doesn't write a new exe, the old one is restored."""
+        # Create a fake conductor.exe
+        fake_exe = tmp_path / "conductor.exe"
+        fake_exe.write_text("fake")
+
+        c, buf = _make_console(is_terminal=True)
+        mock_proc = MagicMock()
+        mock_proc.returncode = 1
+        mock_proc.stderr = "install failed"
+
+        with (
+            patch(
+                "conductor.cli.update.fetch_latest_version",
+                return_value=("99.0.0", "v99.0.0", "https://example.com"),
+            ),
+            patch("conductor.cli.update.sys.platform", "win32"),
+            patch("conductor.cli.update._get_conductor_exe", return_value=fake_exe),
+            patch("conductor.cli.update.subprocess.run", return_value=mock_proc),
+        ):
+            run_update(c)
+
+        # The .old file should have been renamed back to .exe since uv didn't write a new one
+        assert fake_exe.exists()
+        old_exe = tmp_path / "conductor.exe.old"
+        assert not old_exe.exists()
+
+        # Output should report failure
+        output = buf.getvalue()
+        assert "Upgrade failed" in output
+
+    def test_windows_cleans_up_previous_old_exe(self, cache_dir: Path, tmp_path: Path) -> None:
+        """On Windows, a leftover ``.exe.old`` from a previous update is deleted first."""
+        # Create a fake conductor.exe and a pre-existing .old file
+        fake_exe = tmp_path / "conductor.exe"
+        fake_exe.write_text("new-fake")
+        old_leftover = tmp_path / "conductor.exe.old"
+        old_leftover.write_text("stale-old")
+
+        c, buf = _make_console(is_terminal=True)
+        mock_proc = MagicMock()
+        mock_proc.returncode = 0
+        mock_proc.stderr = ""
+
+        with (
+            patch(
+                "conductor.cli.update.fetch_latest_version",
+                return_value=("99.0.0", "v99.0.0", "https://example.com"),
+            ),
+            patch("conductor.cli.update.sys.platform", "win32"),
+            patch("conductor.cli.update._get_conductor_exe", return_value=fake_exe),
+            patch("conductor.cli.update.subprocess.run", return_value=mock_proc),
+        ):
+            run_update(c)
+
+        # The old leftover should be gone, replaced by the newly renamed exe
+        old_exe = tmp_path / "conductor.exe.old"
+        assert old_exe.exists()
+        # The content should be "new-fake" (current exe), not "stale-old"
+        assert old_exe.read_text() == "new-fake"
+
+    def test_unix_skips_rename(self, cache_dir: Path) -> None:
+        """On non-Windows platforms, ``_get_conductor_exe`` is not called."""
         c, buf = _make_console(is_terminal=True)
         mock_proc = MagicMock()
         mock_proc.returncode = 0
@@ -559,17 +619,17 @@ class TestRunUpdate:
             ),
             patch("conductor.cli.update.sys.platform", "linux"),
             patch("conductor.cli.update.subprocess.run", return_value=mock_proc) as mock_run,
-            patch("conductor.cli.update.subprocess.Popen") as mock_popen,
+            patch("conductor.cli.update._get_conductor_exe") as mock_get_exe,
         ):
             run_update(c)
 
-        # subprocess.run must be called on Linux
+        # _get_conductor_exe must NOT be called on Linux
+        mock_get_exe.assert_not_called()
+
+        # subprocess.run must be called
         mock_run.assert_called_once()
 
-        # Popen must NOT be called on Linux
-        mock_popen.assert_not_called()
-
-        # Output should mention successful upgrade (synchronous path)
+        # Output should mention successful upgrade
         output = buf.getvalue()
         assert "Successfully upgraded" in output
 
