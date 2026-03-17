@@ -80,11 +80,9 @@ class TestParallelExamples:
             """Mock handler for testing parallel research workflow."""
             agent_outputs = {
                 "planner": {
-                    "plan": {
-                        "questions": ["Q1", "Q2", "Q3"],
-                        "areas": ["A1", "A2"],
-                        "sources": ["academic", "web", "technical"],
-                    },
+                    "questions": ["Q1", "Q2", "Q3"],
+                    "areas": ["A1", "A2"],
+                    "sources": ["academic", "web", "technical"],
                     "summary": "Research AI in healthcare",
                 },
                 "academic_researcher": {
