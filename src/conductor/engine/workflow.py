@@ -1239,11 +1239,17 @@ class WorkflowEngine:
                         iteration = self.limits.current_iteration + 1
                         _verbose_log_agent_start(current_agent_name, iteration)
 
+                        # Count how many times this specific agent has been executed
+                        # (for per-agent iteration tracking in the web dashboard)
+                        agent_execution_count = (
+                            self.limits.get_agent_execution_count(agent.name) + 1
+                        )
+
                         self._emit(
                             "agent_started",
                             {
                                 "agent_name": agent.name,
-                                "iteration": iteration,
+                                "iteration": agent_execution_count,
                                 "agent_type": agent.type or "agent",
                             },
                         )
@@ -1330,11 +1336,17 @@ class WorkflowEngine:
                             )
                             _script_start = _time.time()
 
+                            # Count how many times this specific script has been executed
+                            # (for per-agent iteration tracking in the web dashboard)
+                            script_execution_count = (
+                                self.limits.get_agent_execution_count(agent.name) + 1
+                            )
+
                             self._emit(
                                 "script_started",
                                 {
                                     "agent_name": agent.name,
-                                    "iteration": self.limits.current_iteration + 1,
+                                    "iteration": script_execution_count,
                                 },
                             )
 

@@ -249,6 +249,31 @@ class LimitEnforcer:
             return 0.0
         return time.monotonic() - self.start_time
 
+    def get_agent_execution_count(self, agent_name: str) -> int:
+        """Get the number of times a specific agent has been executed.
+
+        Counts occurrences of agent_name in execution_history to determine
+        how many times this agent has run. This is used for per-agent
+        iteration tracking in the web dashboard.
+
+        Args:
+            agent_name: Name of the agent to count.
+
+        Returns:
+            Number of times the agent has been executed (0 if never executed).
+
+        Example:
+            >>> enforcer = LimitEnforcer()
+            >>> enforcer.execution_history = ["agent1", "agent2", "agent1", "agent1"]
+            >>> enforcer.get_agent_execution_count("agent1")
+            3
+            >>> enforcer.get_agent_execution_count("agent2")
+            1
+            >>> enforcer.get_agent_execution_count("agent3")
+            0
+        """
+        return self.execution_history.count(agent_name)
+
     def get_remaining_timeout(self) -> float | None:
         """Get the remaining time before timeout.
 
