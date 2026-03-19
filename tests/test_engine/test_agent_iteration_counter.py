@@ -10,7 +10,7 @@ import pytest
 from conductor.config.schema import AgentDef, RouteDef, WorkflowConfig, WorkflowDef
 from conductor.engine.workflow import WorkflowEngine
 from conductor.events import WorkflowEvent, WorkflowEventEmitter
-from conductor.providers.factory import create_provider
+from conductor.providers.copilot import CopilotProvider
 
 
 class EventCollector(WorkflowEventEmitter):
@@ -59,32 +59,29 @@ class TestPerAgentIterationCounter:
             output={"result": "done"},
         )
 
-        provider = await create_provider("claude", validate=False)
+        # Use mock provider to avoid external dependencies
+        provider = CopilotProvider(mock_handler=lambda a, p, c: {"result": "ok"})
         collector = EventCollector()
 
-        try:
-            engine = WorkflowEngine(
-                config,
-                provider=provider,
-                event_emitter=collector,
-                skip_gates=True,
-            )
+        engine = WorkflowEngine(
+            config,
+            provider=provider,
+            event_emitter=collector,
+            skip_gates=True,
+        )
 
-            await engine.run({})
+        await engine.run({})
 
-            # Get agent_started events for 'looper'
-            looper_events = collector.get_agent_started_events("looper")
+        # Get agent_started events for 'looper'
+        looper_events = collector.get_agent_started_events("looper")
 
-            # Loop runs while context.iteration < 3 (iterations 0, 1, 2)
-            assert len(looper_events) == 3
+        # Loop runs while context.iteration < 3 (iterations 0, 1, 2)
+        assert len(looper_events) == 3
 
-            # Check iteration counts - should be [1, 2, 3]
-            # (first execution is iteration 1, second is 2, third is 3)
-            iterations = [e.data["iteration"] for e in looper_events]
-            assert iterations == [1, 2, 3]
-
-        finally:
-            await provider.close()
+        # Check iteration counts - should be [1, 2, 3]
+        # (first execution is iteration 1, second is 2, third is 3)
+        iterations = [e.data["iteration"] for e in looper_events]
+        assert iterations == [1, 2, 3]
 
     @pytest.mark.asyncio
     async def test_multi_agent_loop_counter(self):
@@ -119,36 +116,33 @@ class TestPerAgentIterationCounter:
             output={"result": "done"},
         )
 
-        provider = await create_provider("claude", validate=False)
+        # Use mock provider to avoid external dependencies
+        provider = CopilotProvider(mock_handler=lambda a, p, c: {"result": "ok"})
         collector = EventCollector()
 
-        try:
-            engine = WorkflowEngine(
-                config,
-                provider=provider,
-                event_emitter=collector,
-                skip_gates=True,
-            )
+        engine = WorkflowEngine(
+            config,
+            provider=provider,
+            event_emitter=collector,
+            skip_gates=True,
+        )
 
-            await engine.run({})
+        await engine.run({})
 
-            # Get agent_started events for each agent
-            agent_a_events = collector.get_agent_started_events("agent_a")
-            agent_b_events = collector.get_agent_started_events("agent_b")
+        # Get agent_started events for each agent
+        agent_a_events = collector.get_agent_started_events("agent_a")
+        agent_b_events = collector.get_agent_started_events("agent_b")
 
-            # agent_a runs 3 times (iterations 0, 2, 4)
-            assert len(agent_a_events) == 3
-            # agent_b runs 3 times (iterations 1, 3, 5)
-            assert len(agent_b_events) == 3
+        # agent_a runs 3 times (iterations 0, 2, 4)
+        assert len(agent_a_events) == 3
+        # agent_b runs 3 times (iterations 1, 3, 5)
+        assert len(agent_b_events) == 3
 
-            # Check that each agent's iteration counter is independent
-            # agent_a should have iteration counts [1, 2, 3]
-            agent_a_iterations = [e.data["iteration"] for e in agent_a_events]
-            assert agent_a_iterations == [1, 2, 3]
+        # Check that each agent's iteration counter is independent
+        # agent_a should have iteration counts [1, 2, 3]
+        agent_a_iterations = [e.data["iteration"] for e in agent_a_events]
+        assert agent_a_iterations == [1, 2, 3]
 
-            # agent_b should have iteration counts [1, 2, 3]
-            agent_b_iterations = [e.data["iteration"] for e in agent_b_events]
-            assert agent_b_iterations == [1, 2, 3]
-
-        finally:
-            await provider.close()
+        # agent_b should have iteration counts [1, 2, 3]
+        agent_b_iterations = [e.data["iteration"] for e in agent_b_events]
+        assert agent_b_iterations == [1, 2, 3]
