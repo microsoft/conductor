@@ -19,6 +19,7 @@ This distinction ensures clear error classification and appropriate retry behavi
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import random
@@ -1005,13 +1006,59 @@ class ClaudeProvider(AgentProvider):
                     output_schema=output_schema,
                 )
             else:
-                response = await self._execute_api_call(
-                    messages=working_messages,
-                    model=model,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    tools=tools,
-                )
+                # Race API call against interrupt signal so user can abort
+                # a long-running API call (not just between iterations)
+                if interrupt_signal is not None:
+                    api_task = asyncio.create_task(
+                        self._execute_api_call(
+                            messages=working_messages,
+                            model=model,
+                            temperature=temperature,
+                            max_tokens=max_tokens,
+                            tools=tools,
+                        )
+                    )
+                    interrupt_task = asyncio.create_task(interrupt_signal.wait())
+                    try:
+                        finished, pending = await asyncio.wait(
+                            {api_task, interrupt_task},
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        for t in pending:
+                            t.cancel()
+                            with contextlib.suppress(asyncio.CancelledError):
+                                await t
+                    except Exception:
+                        for t in (api_task, interrupt_task):
+                            if not t.done():
+                                t.cancel()
+                                with contextlib.suppress(asyncio.CancelledError):
+                                    await t
+                        raise
+
+                    if interrupt_task in finished:
+                        interrupt_signal.clear()
+                        logger.info("Mid-agent interrupt during Claude API call")
+                        partial_resp, partial_tokens = await self._request_partial_output(
+                            working_messages=working_messages,
+                            model=model,
+                            temperature=temperature,
+                            max_tokens=max_tokens,
+                            tools=tools,
+                            has_output_schema=has_output_schema,
+                        )
+                        total_tokens += partial_tokens
+                        return partial_resp, total_tokens, True
+
+                    response = api_task.result()
+                else:
+                    response = await self._execute_api_call(
+                        messages=working_messages,
+                        model=model,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        tools=tools,
+                    )
 
             # Accumulate token usage
             if hasattr(response, "usage"):

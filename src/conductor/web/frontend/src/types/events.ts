@@ -34,7 +34,9 @@ export type EventType =
   | 'for_each_completed'
   | 'workflow_completed'
   | 'workflow_failed'
-  | 'checkpoint_saved';
+  | 'checkpoint_saved'
+  | 'agent_paused'
+  | 'agent_resumed';
 
 // --- Workflow lifecycle ---
 

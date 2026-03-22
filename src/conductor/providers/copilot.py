@@ -750,37 +750,29 @@ class CopilotProvider(AgentProvider):
 
         await session.send({"prompt": prompt})
 
-        # If interrupt_signal is provided, race between done and interrupt
-        if interrupt_signal is not None:
-            was_interrupted = await self._wait_with_interrupt(
-                done,
-                session,
-                interrupt_signal,
-                last_activity_ref,
-                verbose_enabled,
-                full_enabled,
-            )
-            if was_interrupted:
-                # Return partial content (don't check error_message for partial)
-                return SDKResponse(
-                    content=response_content,
-                    input_tokens=usage_ref[0],
-                    output_tokens=usage_ref[1],
-                    cache_read_tokens=usage_ref[2],
-                    cache_write_tokens=usage_ref[3],
-                    partial=True,
-                )
-        else:
-            # Wait with idle detection and recovery (original path)
-            await self._wait_with_idle_detection(
-                done,
-                session,
-                verbose_enabled,
-                full_enabled,
-                last_activity_ref,
-                max_session_seconds=max_session_seconds,
-                tool_iteration_ref=tool_iteration_ref,
-                max_agent_iterations=max_agent_iterations,
+        # If interrupt_signal is provided, race between done and interrupt,
+        # while also running idle detection. If no interrupt_signal, just
+        # run idle detection alone.
+        was_interrupted = await self._wait_with_idle_detection(
+            done,
+            session,
+            verbose_enabled,
+            full_enabled,
+            last_activity_ref,
+            max_session_seconds=max_session_seconds,
+            tool_iteration_ref=tool_iteration_ref,
+            max_agent_iterations=max_agent_iterations,
+            interrupt_signal=interrupt_signal,
+        )
+        if was_interrupted:
+            # Return partial content (don't check error_message for partial)
+            return SDKResponse(
+                content=response_content,
+                input_tokens=usage_ref[0],
+                output_tokens=usage_ref[1],
+                cache_read_tokens=usage_ref[2],
+                cache_write_tokens=usage_ref[3],
+                partial=True,
             )
 
         if error_message:
@@ -1339,13 +1331,14 @@ class CopilotProvider(AgentProvider):
         max_session_seconds: float | None = None,
         tool_iteration_ref: list[int] | None = None,
         max_agent_iterations: int | None = None,
-    ) -> None:
-        """Wait for session completion with idle detection and recovery.
+        interrupt_signal: asyncio.Event | None = None,
+    ) -> bool:
+        """Wait for session completion with idle detection, recovery, and optional interrupt.
 
-        This method replaces a simple `await done.wait()` with intelligent
-        idle detection. If no SDK events are received for the configured
-        idle timeout, it sends a recovery prompt to nudge the session to
-        continue.
+        Combines idle detection (sending recovery prompts to stuck sessions)
+        with interrupt support (aborting on user request). When the model is
+        actively working (SDK events flowing), the idle timer continuously
+        resets — so long-running tasks are never interrupted.
 
         Args:
             done: Event that signals session completion.
@@ -1359,6 +1352,11 @@ class CopilotProvider(AgentProvider):
             tool_iteration_ref: Mutable [count] tracking tool execution starts.
             max_agent_iterations: Maximum tool-use iterations allowed.
                 None means no iteration limit.
+            interrupt_signal: Optional event that signals user interrupt/revive.
+                When set, aborts the session and returns True.
+
+        Returns:
+            True if interrupted, False if completed normally.
 
         Raises:
             ProviderError: If all recovery attempts are exhausted, if the
@@ -1374,7 +1372,7 @@ class CopilotProvider(AgentProvider):
             # Check if done was already set (avoids race where session.idle
             # arrived between a previous done.clear() and the next wait).
             if done.is_set():
-                return
+                return False
 
             # Hard wall-clock limit — prevents sessions from hanging
             # indefinitely even if events keep flowing (e.g. repeated
@@ -1415,12 +1413,45 @@ class CopilotProvider(AgentProvider):
                 )
 
             try:
-                # Wait for done with idle timeout
-                await asyncio.wait_for(
-                    done.wait(),
-                    timeout=idle_timeout,
-                )
-                return  # Completed successfully
+                # Wait for done with idle timeout, also racing interrupt signal
+                if interrupt_signal is not None:
+                    done_waiter = asyncio.create_task(done.wait())
+                    interrupt_waiter = asyncio.create_task(interrupt_signal.wait())
+                    try:
+                        finished, pending = await asyncio.wait(
+                            {done_waiter, interrupt_waiter},
+                            timeout=idle_timeout,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        for t in pending:
+                            t.cancel()
+                            with contextlib.suppress(asyncio.CancelledError):
+                                await t
+                    except Exception:
+                        for t in (done_waiter, interrupt_waiter):
+                            if not t.done():
+                                t.cancel()
+                                with contextlib.suppress(asyncio.CancelledError):
+                                    await t
+                        raise
+
+                    if interrupt_waiter in finished:
+                        interrupt_signal.clear()
+                        logger.info("Mid-agent interrupt received, attempting session abort")
+                        await self._abort_session(session, done)
+                        return True
+
+                    if done_waiter in finished:
+                        return False  # Completed successfully
+
+                    # Neither finished → idle timeout (fall through to idle check)
+                    raise TimeoutError()
+                else:
+                    await asyncio.wait_for(
+                        done.wait(),
+                        timeout=idle_timeout,
+                    )
+                    return False  # Completed successfully
 
             except TimeoutError as e:
                 # Timeout fired — but check if events were recently received.

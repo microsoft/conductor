@@ -25,7 +25,7 @@ export const AgentNode = memo(function AgentNode({ data, id, selected }: NodePro
   const errorMessage = useWorkflowStore((s) => s.nodes[id]?.error_message);
 
   // Live elapsed timer for running nodes
-  const liveElapsed = useLiveElapsed(status);
+  const liveElapsed = useLiveElapsed(id, status);
 
   // Status transition animation
   const transitionClass = useStatusTransition(status);
@@ -113,19 +113,17 @@ export const AgentNode = memo(function AgentNode({ data, id, selected }: NodePro
 });
 
 /** Hook that returns a live-ticking elapsed string while status is 'running'. */
-function useLiveElapsed(status: NodeStatus): string {
+function useLiveElapsed(id: string, status: NodeStatus): string {
+  const startedAt = useWorkflowStore((s) => s.nodes[id]?.startedAt);
   const [display, setDisplay] = useState('0.0s');
-  const startRef = useRef<number | null>(null);
   const rafRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
     if (status === 'running') {
-      startRef.current = Date.now();
+      const origin = startedAt != null ? startedAt * 1000 : Date.now();
       const tick = () => {
-        if (startRef.current != null) {
-          const sec = (Date.now() - startRef.current) / 1000;
-          setDisplay(formatElapsed(sec));
-        }
+        const sec = (Date.now() - origin) / 1000;
+        setDisplay(formatElapsed(sec));
       };
       tick();
       rafRef.current = setInterval(tick, 1000);
@@ -134,9 +132,8 @@ function useLiveElapsed(status: NodeStatus): string {
       };
     } else {
       if (rafRef.current) clearInterval(rafRef.current);
-      startRef.current = null;
     }
-  }, [status]);
+  }, [status, startedAt]);
 
   return display;
 }

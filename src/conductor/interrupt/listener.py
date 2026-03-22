@@ -57,7 +57,7 @@ class KeyboardListener:
     """
 
     interrupt_event: asyncio.Event
-    """Event that is set when an interrupt key is detected."""
+    """Event that is set when an interrupt key (Esc/Ctrl+G) is detected."""
 
     _original_settings: Any = field(default=None, repr=False)
     """Saved terminal settings for restoration."""

@@ -82,8 +82,14 @@ class WebDashboard:
         self._bg_event = asyncio.Event()
         self._grace_task: asyncio.Task[None] | None = None
 
-        # Stop signal — set by POST /api/stop to cancel the running workflow
+        # Stop signal — set by POST /api/kill to cancel the running workflow
         self._stop_event = asyncio.Event()
+
+        # Resume signal — set by POST /api/resume after an agent is paused
+        self._resume_event = asyncio.Event()
+
+        # Interrupt event — shared with engine for POST /api/stop to abort agent
+        self._interrupt_event: asyncio.Event | None = None
 
         # Server internals
         self._server: Any = None
@@ -152,10 +158,27 @@ class WebDashboard:
 
         @app.post("/api/stop")
         async def stop_workflow() -> JSONResponse:
+            # Abort the current agent via interrupt (not kill workflow)
+            if self._interrupt_event is not None:
+                self._interrupt_event.set()
+                return JSONResponse({"status": "stopping"})
+            # Fallback: hard stop
             self._stop_event.set()
-            # Also trigger bg auto-shutdown so wait_for_clients_disconnect unblocks
             self._bg_event.set()
             return JSONResponse({"status": "stopping"})
+
+        @app.post("/api/kill")
+        async def kill_workflow() -> JSONResponse:
+            """Hard-stop the workflow (no resume possible)."""
+            self._stop_event.set()
+            self._bg_event.set()
+            return JSONResponse({"status": "killing"})
+
+        @app.post("/api/resume")
+        async def resume_agent() -> JSONResponse:
+            """Resume a paused agent after stop."""
+            self._resume_event.set()
+            return JSONResponse({"status": "resuming"})
 
         @app.websocket("/ws")
         async def websocket_endpoint(ws: WebSocket) -> None:
@@ -406,3 +429,16 @@ class WebDashboard:
     def app(self) -> FastAPI:
         """Return the FastAPI application (useful for testing)."""
         return self._app
+
+    @property
+    def resume_event(self) -> asyncio.Event:
+        """The resume event, set when a user clicks Resume in the dashboard."""
+        return self._resume_event
+
+    def set_interrupt_event(self, event: asyncio.Event) -> None:
+        """Set the interrupt event reference shared with the engine.
+
+        Called during engine setup so POST /api/stop can abort the
+        current agent via the same event the engine monitors.
+        """
+        self._interrupt_event = event

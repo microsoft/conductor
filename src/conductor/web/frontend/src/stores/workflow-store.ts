@@ -101,6 +101,8 @@ export interface NodeData {
   for_each_items?: ForEachItemData[];
   // Activity
   activity: ActivityEntry[];
+  // Timestamp when the agent started (for elapsed timer on refresh)
+  startedAt?: number;
   // Iteration history (snapshots of completed previous iterations)
   iterationHistory?: IterationSnapshot[];
 }
@@ -198,6 +200,7 @@ interface WorkflowState {
   activityLog: ActivityLogEntry[];
   workflowOutput: unknown | null;
   lastEventTime: number | null;
+  isPaused: boolean;
 
   // Actions
   processEvent: (event: WorkflowEvent) => void;
@@ -269,6 +272,7 @@ export const useWorkflowStore = create<WorkflowState>((set) => ({
   activityLog: [],
   workflowOutput: null,
   lastEventTime: null,
+  isPaused: false,
   _wsSend: null,
 
   setWsSend: (fn) => {
@@ -292,7 +296,7 @@ export const useWorkflowStore = create<WorkflowState>((set) => ({
     set((state) => {
       const newState = { ...state, nodes: { ...state.nodes }, groupProgress: { ...state.groupProgress }, eventLog: [...state.eventLog], activityLog: [...state.activityLog], lastEventTime: event.timestamp };
       if (handler) {
-        handler(newState, event.data);
+        handler(newState, event.data, event.timestamp);
       }
       const logEntry = buildLogEntry(event);
       if (logEntry) {
@@ -324,7 +328,7 @@ export const useWorkflowStore = create<WorkflowState>((set) => ({
       for (const event of events) {
         const handler = eventHandlers[event.type];
         if (handler) {
-          handler(newState, event.data);
+          handler(newState, event.data, event.timestamp);
         }
         const logEntry = buildLogEntry(event);
         if (logEntry) {
@@ -334,6 +338,8 @@ export const useWorkflowStore = create<WorkflowState>((set) => ({
         if (activityEntry) {
           newState.activityLog.push(activityEntry);
         }
+        // Track timestamp of the last replayed event
+        newState.lastEventTime = event.timestamp;
       }
       return newState;
     });
@@ -367,11 +373,11 @@ export const useWorkflowStore = create<WorkflowState>((set) => ({
 
 type MutableState = WorkflowState;
 
-const eventHandlers: Record<string, (state: MutableState, data: Record<string, unknown>) => void> = {
-  workflow_started: (state, _data) => {
+const eventHandlers: Record<string, (state: MutableState, data: Record<string, unknown>, timestamp?: number) => void> = {
+  workflow_started: (state, _data, timestamp) => {
     const data = _data as unknown as WorkflowStartedData;
     state.workflowStatus = 'running';
-    state.workflowStartTime = Date.now() / 1000;
+    state.workflowStartTime = timestamp ?? Date.now() / 1000;
     state.workflowName = data.name || '';
     state.entryPoint = data.entry_point || null;
     state.agents = data.agents || [];
@@ -420,7 +426,7 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     state.agentsTotal = agentNames.size;
   },
 
-  agent_started: (state, _data) => {
+  agent_started: (state, _data, timestamp) => {
     const data = _data as unknown as AgentStartedData;
     const nd = ensureNode(state.nodes, data.agent_name);
 
@@ -445,6 +451,7 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
 
     nd.status = 'running';
     nd.iteration = data.iteration;
+    nd.startedAt = timestamp ?? Date.now() / 1000;
     nd.activity = [];
     // Clear stale fields from previous iteration
     nd.prompt = undefined;
@@ -590,10 +597,11 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     replaceNode(state.nodes, data.agent_name);
   },
 
-  script_started: (state, _data) => {
+  script_started: (state, _data, timestamp) => {
     const data = _data as { agent_name: string };
     const nd = ensureNode(state.nodes, data.agent_name);
     nd.status = 'running';
+    nd.startedAt = timestamp ?? Date.now() / 1000;
     replaceNode(state.nodes, data.agent_name);
   },
 
@@ -826,6 +834,34 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
       state.workflowFailure = { ...state.workflowFailure, checkpoint_path: data.path };
     }
   },
+
+  agent_paused: (state, _data) => {
+    const data = _data as { agent_name: string };
+    const nd = ensureNode(state.nodes, data.agent_name);
+    nd.status = 'waiting';
+    nd.activity.push({
+      type: 'agent_paused',
+      icon: '⏸',
+      label: 'Paused',
+      text: 'Agent paused — click Resume to retry',
+    });
+    replaceNode(state.nodes, data.agent_name);
+    state.isPaused = true;
+  },
+
+  agent_resumed: (state, _data) => {
+    const data = _data as { agent_name: string };
+    const nd = ensureNode(state.nodes, data.agent_name);
+    nd.status = 'running';
+    nd.activity.push({
+      type: 'agent_resumed',
+      icon: '▶',
+      label: 'Resumed',
+      text: 'Agent resumed — re-executing',
+    });
+    replaceNode(state.nodes, data.agent_name);
+    state.isPaused = false;
+  },
 };
 
 // --- Build log entries from events ---
@@ -898,6 +934,12 @@ function buildLogEntry(event: WorkflowEvent): LogEntry | null {
 
     case 'checkpoint_saved':
       return { timestamp: ts, level: 'info', source: 'workflow', message: `Checkpoint saved: ${(d.path as string)?.split('/').pop() || 'unknown'}` };
+
+    case 'agent_paused':
+      return { timestamp: ts, level: 'warning', source: String(d.agent_name), message: 'Agent paused — waiting for resume' };
+
+    case 'agent_resumed':
+      return { timestamp: ts, level: 'info', source: String(d.agent_name), message: 'Agent resumed — re-executing' };
 
     // Skip high-frequency streaming events from the log
     default:

@@ -60,8 +60,8 @@ print(elapsed)
         assert result.returncode == 0, f"Import failed: {result.stderr}"
         elapsed = float(result.stdout.strip())
 
-        # Allow 500ms for CLI import
-        assert elapsed < 0.5, f"CLI import took {elapsed:.3f}s, expected <0.5s"
+        # Allow 1s for CLI import (generous to avoid flakiness on slow CI/hotspot)
+        assert elapsed < 1.0, f"CLI import took {elapsed:.3f}s, expected <1.0s"
 
     def test_config_load_time(self, fixtures_dir) -> None:
         """Test that loading and validating a config is fast."""

@@ -1,11 +1,13 @@
 import { useState } from 'react';
-import { Activity, Square, Download } from 'lucide-react';
+import { Activity, Square, Play, X, Download } from 'lucide-react';
 import { useWorkflowStore } from '@/stores/workflow-store';
 
 export function Header() {
   const workflowName = useWorkflowStore((s) => s.workflowName);
   const workflowStatus = useWorkflowStore((s) => s.workflowStatus);
+  const isPaused = useWorkflowStore((s) => s.isPaused);
   const [stopping, setStopping] = useState(false);
+  const [resuming, setResuming] = useState(false);
 
   const isRunning = workflowStatus === 'running' || workflowStatus === 'pending';
 
@@ -14,9 +16,30 @@ export function Header() {
     try {
       await fetch('/api/stop', { method: 'POST' });
     } catch {
-      // Server may already be shutting down
+      // ignore
     }
   };
+
+  const handleResume = async () => {
+    setResuming(true);
+    try {
+      await fetch('/api/resume', { method: 'POST' });
+    } catch {
+      // ignore
+    }
+  };
+
+  const handleKill = async () => {
+    try {
+      await fetch('/api/kill', { method: 'POST' });
+    } catch {
+      // ignore
+    }
+  };
+
+  // Reset button states when transitioning out of paused
+  if (!isPaused && stopping) setStopping(false);
+  if (!isPaused && resuming) setResuming(false);
 
   return (
     <header className="flex items-center justify-between px-4 py-2 bg-[var(--surface)] border-b border-[var(--border)] flex-shrink-0">
@@ -32,7 +55,34 @@ export function Header() {
         )}
       </div>
       <div className="flex items-center gap-3">
-        {isRunning && (
+        {isPaused ? (
+          <>
+            <button
+              onClick={handleResume}
+              disabled={resuming}
+              className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded
+                bg-emerald-500/10 text-emerald-400 border border-emerald-500/20
+                hover:bg-emerald-500/20 hover:border-emerald-500/30
+                disabled:opacity-50 disabled:cursor-not-allowed
+                transition-colors"
+              title="Re-execute the paused agent"
+            >
+              <Play className="w-3 h-3" />
+              {resuming ? 'Resuming...' : 'Resume'}
+            </button>
+            <button
+              onClick={handleKill}
+              className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded
+                bg-red-500/10 text-red-400 border border-red-500/20
+                hover:bg-red-500/20 hover:border-red-500/30
+                transition-colors"
+              title="Stop workflow entirely (checkpoint saved for CLI resume)"
+            >
+              <X className="w-3 h-3" />
+              Kill
+            </button>
+          </>
+        ) : isRunning ? (
           <button
             onClick={handleStop}
             disabled={stopping}
@@ -45,7 +95,7 @@ export function Header() {
             <Square className="w-3 h-3" />
             {stopping ? 'Stopping...' : 'Stop'}
           </button>
-        )}
+        ) : null}
         <a
           href="/api/logs"
           download="conductor-logs.json"

@@ -687,6 +687,10 @@ class WorkflowEngine:
             suggestion="Check the option values in the workflow YAML",
         )
 
+    # ------------------------------------------------------------------
+    # Interrupt support
+    # ------------------------------------------------------------------
+
     async def _check_interrupt(self, current_agent_name: str) -> InterruptResult | None:
         """Check for a pending interrupt and handle it if present.
 
@@ -760,6 +764,70 @@ class WorkflowEngine:
             case InterruptAction.CANCEL:
                 return current_agent_name
 
+    async def _handle_web_pause(self, agent_name: str, partial_output: AgentOutput) -> bool:
+        """Handle a mid-agent interrupt when the web dashboard is connected.
+
+        Emits an ``agent_paused`` event and waits for the user to click
+        Resume (or Kill) in the dashboard. Returns True if the agent
+        should be re-executed, False to fall through to CLI handling.
+
+        Args:
+            agent_name: The name of the interrupted agent.
+            partial_output: The partial output from the interrupted agent.
+
+        Returns:
+            True if the user chose Resume (caller should ``continue``),
+            False if web dashboard is not connected (fall through to CLI).
+
+        Raises:
+            InterruptError: If the user chose Kill.
+        """
+        if self._web_dashboard is None or not self._web_dashboard.has_connections():
+            return False
+
+        import json as _json
+
+        try:
+            preview = _json.dumps(partial_output.content, indent=2, default=str)[:500]
+        except (TypeError, ValueError):
+            preview = str(partial_output.content)[:500]
+
+        self._emit(
+            "agent_paused",
+            {"agent_name": agent_name, "partial_content": preview},
+        )
+        logger.info("Agent '%s' paused — waiting for dashboard resume", agent_name)
+
+        resume_event = self._web_dashboard.resume_event
+        resume_event.clear()
+        stop_event = self._web_dashboard._stop_event
+
+        resume_task = asyncio.create_task(resume_event.wait())
+        kill_task = asyncio.create_task(stop_event.wait())
+        try:
+            done, pending = await asyncio.wait(
+                {resume_task, kill_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for t in pending:
+                t.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await t
+        except Exception:
+            for t in (resume_task, kill_task):
+                if not t.done():
+                    t.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await t
+            raise
+
+        if kill_task in done:
+            raise InterruptError(agent_name=agent_name)
+
+        self._emit("agent_resumed", {"agent_name": agent_name})
+        logger.info("Agent '%s' resumed — re-executing", agent_name)
+        return True
+
     async def _handle_partial_output(
         self,
         agent: AgentDef,
@@ -795,6 +863,8 @@ class WorkflowEngine:
             preview = _json.dumps(partial_output.content, indent=2, default=str)[:500]
         except (TypeError, ValueError):
             preview = str(partial_output.content)[:500]
+
+        # CLI mode: invoke interactive interrupt handler
 
         # Invoke the interrupt handler
         interrupt_result = await self._interrupt_handler.handle_interrupt(
@@ -1271,6 +1341,9 @@ class WorkflowEngine:
 
                         # Handle mid-agent interrupt (partial output)
                         if output.partial:
+                            if await self._handle_web_pause(agent.name, output):
+                                # Web mode: agent paused then resumed → re-execute
+                                continue
                             output = await self._handle_partial_output(
                                 agent,
                                 output,
@@ -1375,6 +1448,8 @@ class WorkflowEngine:
             self._execute_hook("on_error", error=e)
             self._save_checkpoint_on_failure(e)
             raise
+        finally:
+            pass
 
     def _apply_input_defaults(self, inputs: dict[str, Any]) -> dict[str, Any]:
         """Apply default values from input schema for missing optional inputs.

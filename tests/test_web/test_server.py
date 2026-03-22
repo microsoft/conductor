@@ -359,8 +359,8 @@ class TestWaitForClientsDisconnectGuard:
 class TestApiStop:
     """Tests for POST /api/stop endpoint."""
 
-    def test_stop_sets_stop_event(self) -> None:
-        """POST /api/stop sets the internal stop event."""
+    def test_stop_falls_back_to_stop_event_without_interrupt(self) -> None:
+        """POST /api/stop falls back to stop_event when no interrupt_event is set."""
         emitter, dashboard = _make_dashboard(bg=True)
         assert not dashboard.stop_requested
 
@@ -371,8 +371,21 @@ class TestApiStop:
 
         assert dashboard.stop_requested
 
-    def test_stop_sets_bg_event(self) -> None:
-        """POST /api/stop also sets the bg auto-shutdown event."""
+    def test_stop_sets_interrupt_event_when_available(self) -> None:
+        """POST /api/stop sets interrupt_event when one is configured."""
+        emitter, dashboard = _make_dashboard()
+        interrupt = asyncio.Event()
+        dashboard.set_interrupt_event(interrupt)
+
+        with TestClient(dashboard.app) as client:
+            resp = client.post("/api/stop")
+            assert resp.status_code == 200
+
+        assert interrupt.is_set()
+        assert not dashboard.stop_requested  # should NOT set hard stop
+
+    def test_stop_sets_bg_event_as_fallback(self) -> None:
+        """POST /api/stop also sets the bg auto-shutdown event in fallback mode."""
         emitter, dashboard = _make_dashboard(bg=True)
         assert not dashboard._bg_event.is_set()
 
@@ -380,16 +393,6 @@ class TestApiStop:
             client.post("/api/stop")
 
         assert dashboard._bg_event.is_set()
-
-    def test_stop_works_without_bg_mode(self) -> None:
-        """POST /api/stop works even when bg=False."""
-        emitter, dashboard = _make_dashboard(bg=False)
-
-        with TestClient(dashboard.app) as client:
-            resp = client.post("/api/stop")
-            assert resp.status_code == 200
-
-        assert dashboard.stop_requested
 
     @pytest.mark.asyncio
     async def test_wait_for_stop_resolves(self) -> None:
@@ -417,6 +420,38 @@ class TestApiStop:
         asyncio.create_task(trigger_stop())
         # Should resolve because _bg_event is set
         await asyncio.wait_for(dashboard.wait_for_clients_disconnect(), timeout=2.0)
+
+
+class TestApiResume:
+    """Tests for POST /api/resume endpoint."""
+
+    def test_resume_sets_resume_event(self) -> None:
+        """POST /api/resume sets the internal resume event."""
+        emitter, dashboard = _make_dashboard()
+        assert not dashboard.resume_event.is_set()
+
+        with TestClient(dashboard.app) as client:
+            resp = client.post("/api/resume")
+            assert resp.status_code == 200
+            assert resp.json() == {"status": "resuming"}
+
+        assert dashboard.resume_event.is_set()
+
+
+class TestApiKill:
+    """Tests for POST /api/kill endpoint."""
+
+    def test_kill_sets_stop_event(self) -> None:
+        """POST /api/kill sets the internal stop event."""
+        emitter, dashboard = _make_dashboard(bg=True)
+        assert not dashboard.stop_requested
+
+        with TestClient(dashboard.app) as client:
+            resp = client.post("/api/kill")
+            assert resp.status_code == 200
+            assert resp.json() == {"status": "killing"}
+
+        assert dashboard.stop_requested
 
 
 class TestServerStartupFailure:
