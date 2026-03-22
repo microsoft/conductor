@@ -22,7 +22,15 @@ from conductor.engine.pricing import ModelPricing
 from conductor.engine.router import Router, RouteResult
 from conductor.engine.usage import UsageTracker
 from conductor.events import WorkflowEvent, WorkflowEventEmitter
-from conductor.exceptions import ConductorError, ExecutionError, InterruptError, MaxIterationsError
+from conductor.exceptions import (
+    ConductorError,
+    ExecutionError,
+    InterruptError,
+    MaxIterationsError,
+)
+from conductor.exceptions import (
+    TimeoutError as ConductorTimeoutError,
+)
 from conductor.executor.agent import AgentExecutor
 from conductor.executor.script import ScriptExecutor, ScriptOutput
 from conductor.executor.template import TemplateRenderer
@@ -708,6 +716,15 @@ class WorkflowEngine:
             copilot_session_ids=copilot_session_ids,
         )
         self._last_checkpoint_path = checkpoint_path
+        if checkpoint_path is not None:
+            self._emit(
+                "checkpoint_saved",
+                {
+                    "path": str(checkpoint_path),
+                    "agent_name": self._current_agent_name,
+                    "error_type": type(error).__name__,
+                },
+            )
 
     def _get_top_level_agent_names(self) -> list[str]:
         """Return names of top-level agents (excluding parallel/for-each nested agents).
@@ -1536,14 +1553,16 @@ class WorkflowEngine:
             self._save_checkpoint_on_failure(KeyboardInterrupt("Workflow interrupted by user"))
             raise
         except ConductorError as e:
-            self._emit(
-                "workflow_failed",
-                {
-                    "error_type": type(e).__name__,
-                    "message": str(e),
-                    "agent_name": self._current_agent_name,
-                },
-            )
+            fail_data: dict[str, Any] = {
+                "error_type": type(e).__name__,
+                "message": str(e),
+                "agent_name": self._current_agent_name,
+            }
+            if isinstance(e, ConductorTimeoutError):
+                fail_data["elapsed_seconds"] = e.elapsed_seconds
+                fail_data["timeout_seconds"] = e.timeout_seconds
+                fail_data["current_agent"] = e.current_agent
+            self._emit("workflow_failed", fail_data)
             # Execute on_error hook with error information
             self._execute_hook("on_error", error=e)
             self._save_checkpoint_on_failure(e)

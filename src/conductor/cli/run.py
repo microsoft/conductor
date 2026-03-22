@@ -915,14 +915,14 @@ async def run_workflow_async(
                 f"[bold yellow]Warning:[/bold yellow] Cannot open log file {log_file}: {e}"
             )
 
-    # Create event emitter when --web is requested
-    emitter: WorkflowEventEmitter | None = None
+    # Always create event emitter and JSONL log subscriber
+    emitter = WorkflowEventEmitter()
+    event_log_subscriber: Any = None
     dashboard: Any = None
 
     if web:
         from conductor.web.server import WebDashboard
 
-        emitter = WorkflowEventEmitter()
         bg_mode = web_bg or os.environ.get("CONDUCTOR_WEB_BG") == "1"
         dashboard = WebDashboard(emitter, host="127.0.0.1", port=web_port, bg=bg_mode)
 
@@ -950,6 +950,12 @@ async def run_workflow_async(
         verbose_log(f"Workflow: {config.workflow.name}")
         verbose_log(f"Entry point: {config.workflow.entry_point}")
         verbose_log(f"Agents: {len(config.agents)}")
+
+        # Start JSONL event log subscriber (always-on structured diagnostics)
+        from conductor.engine.event_log import EventLogSubscriber
+
+        event_log_subscriber = EventLogSubscriber(config.workflow.name)
+        emitter.subscribe(event_log_subscriber.on_event)
 
         if inputs:
             verbose_log_section("Workflow Inputs", json.dumps(inputs, indent=2))
@@ -1047,6 +1053,11 @@ async def run_workflow_async(
         # Stop dashboard if it was started
         if dashboard is not None:
             await dashboard.stop()
+
+        # Close JSONL event log and report path
+        if event_log_subscriber is not None:
+            event_log_subscriber.close()
+            _verbose_console.print(f"[dim]Event log written to: {event_log_subscriber.path}[/dim]")
 
         # Report log file path to stderr and close file logging
         if log_file is not None and _file_console is not None:
