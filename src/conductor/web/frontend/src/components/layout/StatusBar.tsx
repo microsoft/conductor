@@ -1,4 +1,5 @@
-import { Wifi, WifiOff, Loader2, Coins, Hash } from 'lucide-react';
+import { useState, useEffect } from 'react';
+import { Wifi, WifiOff, Loader2, Coins, Hash, Clock } from 'lucide-react';
 import { useWorkflowStore } from '@/stores/workflow-store';
 import { useElapsedTimer } from '@/hooks/use-elapsed-timer';
 import { cn } from '@/lib/utils';
@@ -11,7 +12,23 @@ export function StatusBar() {
   const totalTokens = useWorkflowStore((s) => s.totalTokens);
   const wsStatus = useWorkflowStore((s) => s.wsStatus);
   const workflowFailure = useWorkflowStore((s) => s.workflowFailure);
+  const lastEventTime = useWorkflowStore((s) => s.lastEventTime);
   const elapsed = useElapsedTimer();
+
+  // "Last activity X ago" — ticks every second while running
+  const [idleSeconds, setIdleSeconds] = useState<number | null>(null);
+  useEffect(() => {
+    if (workflowStatus !== 'running' || lastEventTime == null) {
+      setIdleSeconds(null);
+      return;
+    }
+    const tick = () => {
+      setIdleSeconds(Math.floor(Date.now() / 1000 - lastEventTime));
+    };
+    tick();
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
+  }, [workflowStatus, lastEventTime]);
 
   const isFailed = workflowStatus === 'failed';
 
@@ -112,6 +129,22 @@ export function StatusBar() {
         <span className={cn('flex items-center gap-1', isFailed ? 'text-red-400/60' : 'text-[var(--text-muted)]')} title="Total cost">
           <Coins className="w-3 h-3" />
           <span className="font-mono">${totalCost.toFixed(4)}</span>
+        </span>
+      )}
+      {idleSeconds != null && idleSeconds >= 5 && (
+        <span
+          className={cn(
+            'flex items-center gap-1 font-mono',
+            idleSeconds >= 60 ? 'text-amber-400' : 'text-[var(--text-muted)]',
+          )}
+          title="Time since last event from the provider"
+        >
+          <Clock className="w-3 h-3" />
+          <span>
+            {idleSeconds >= 60
+              ? `${Math.floor(idleSeconds / 60)}m ${idleSeconds % 60}s idle`
+              : `${idleSeconds}s idle`}
+          </span>
         </span>
       )}
       <span className="flex-1" />

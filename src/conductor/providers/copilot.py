@@ -742,6 +742,12 @@ class CopilotProvider(AgentProvider):
                 self._log_event_verbose(event_type, event, full_enabled)
 
         session.on(on_event)
+
+        # Signal that we're about to call the SDK — this marks the start
+        # of the "dead zone" where we're waiting for the model's response
+        if event_callback is not None:
+            event_callback("agent_turn_start", {"turn": "awaiting_model"})
+
         await session.send({"prompt": prompt})
 
         # If interrupt_signal is provided, race between done and interrupt

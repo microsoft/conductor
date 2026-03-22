@@ -197,6 +197,7 @@ interface WorkflowState {
   eventLog: LogEntry[];
   activityLog: ActivityLogEntry[];
   workflowOutput: unknown | null;
+  lastEventTime: number | null;
 
   // Actions
   processEvent: (event: WorkflowEvent) => void;
@@ -267,6 +268,7 @@ export const useWorkflowStore = create<WorkflowState>((set) => ({
   eventLog: [],
   activityLog: [],
   workflowOutput: null,
+  lastEventTime: null,
   _wsSend: null,
 
   setWsSend: (fn) => {
@@ -287,21 +289,21 @@ export const useWorkflowStore = create<WorkflowState>((set) => ({
 
   processEvent: (event: WorkflowEvent) => {
     const handler = eventHandlers[event.type];
-    if (handler) {
-      set((state) => {
-        const newState = { ...state, nodes: { ...state.nodes }, groupProgress: { ...state.groupProgress }, eventLog: [...state.eventLog], activityLog: [...state.activityLog] };
+    set((state) => {
+      const newState = { ...state, nodes: { ...state.nodes }, groupProgress: { ...state.groupProgress }, eventLog: [...state.eventLog], activityLog: [...state.activityLog], lastEventTime: event.timestamp };
+      if (handler) {
         handler(newState, event.data);
-        const logEntry = buildLogEntry(event);
-        if (logEntry) {
-          newState.eventLog.push(logEntry);
-        }
-        const activityEntry = buildActivityLogEntry(event);
-        if (activityEntry) {
-          newState.activityLog.push(activityEntry);
-        }
-        return newState;
-      });
-    }
+      }
+      const logEntry = buildLogEntry(event);
+      if (logEntry) {
+        newState.eventLog.push(logEntry);
+      }
+      const activityEntry = buildActivityLogEntry(event);
+      if (activityEntry) {
+        newState.activityLog.push(activityEntry);
+      }
+      return newState;
+    });
   },
 
   replayState: (events: WorkflowEvent[]) => {

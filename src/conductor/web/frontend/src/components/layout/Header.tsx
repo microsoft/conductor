@@ -46,20 +46,18 @@ export function Header() {
             {stopping ? 'Stopping...' : 'Stop'}
           </button>
         )}
-        {!isRunning && (
-          <a
-            href="/api/logs"
-            download="conductor-logs.json"
-            className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded
-              bg-[var(--surface-hover)] text-[var(--text-secondary)] border border-[var(--border)]
-              hover:text-[var(--text)] hover:bg-[var(--surface)]
-              transition-colors"
-            title="Download full event log as JSON"
-          >
-            <Download className="w-3 h-3" />
-            Logs
-          </a>
-        )}
+        <a
+          href="/api/logs"
+          download="conductor-logs.json"
+          className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded
+            bg-[var(--surface-hover)] text-[var(--text-secondary)] border border-[var(--border)]
+            hover:text-[var(--text)] hover:bg-[var(--surface)]
+            transition-colors"
+          title="Download full event log as JSON"
+        >
+          <Download className="w-3 h-3" />
+          Logs
+        </a>
         <span className="text-xs text-[var(--text-muted)]">Dashboard v1.0</span>
       </div>
     </header>
