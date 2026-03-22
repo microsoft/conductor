@@ -121,8 +121,9 @@ class TestAgentTurnStartEvent:
         )
 
         turn_events = [(t, d) for t, d in events if t == "agent_turn_start"]
-        assert len(turn_events) == 1
+        assert len(turn_events) == 2
         assert turn_events[0][1] == {"turn": 1}
+        assert turn_events[1][1] == {"turn": "awaiting_model"}
 
     @pytest.mark.asyncio
     async def test_emitted_on_multiple_iterations(self) -> None:
@@ -153,9 +154,11 @@ class TestAgentTurnStartEvent:
         )
 
         turn_events = [(t, d) for t, d in events if t == "agent_turn_start"]
-        assert len(turn_events) == 2
+        assert len(turn_events) == 4
         assert turn_events[0][1] == {"turn": 1}
-        assert turn_events[1][1] == {"turn": 2}
+        assert turn_events[1][1] == {"turn": "awaiting_model"}
+        assert turn_events[2][1] == {"turn": 2}
+        assert turn_events[3][1] == {"turn": "awaiting_model"}
 
 
 # ---------------------------------------------------------------------------
@@ -554,10 +557,11 @@ class TestEventCallbackThreading:
             event_callback=lambda t, d: events.append((t, d)),
         )
 
-        # Should have received at least an agent_turn_start event
+        # Should have received agent_turn_start events (iteration + awaiting_model)
         turn_events = [(t, d) for t, d in events if t == "agent_turn_start"]
-        assert len(turn_events) == 1
+        assert len(turn_events) == 2
         assert turn_events[0][1] == {"turn": 1}
+        assert turn_events[1][1] == {"turn": "awaiting_model"}
 
         # Should have received an agent_message event
         msg_events = [(t, d) for t, d in events if t == "agent_message"]
@@ -610,9 +614,11 @@ class TestFullEventSequence:
         event_types = [t for t, _ in events]
         assert event_types == [
             "agent_turn_start",  # Turn 1 starts
+            "agent_turn_start",  # awaiting_model before API call
             "agent_message",  # "Let me read that file."
             "agent_tool_start",  # filesystem__read_file starts
             "agent_tool_complete",  # filesystem__read_file completes
             "agent_turn_start",  # Turn 2 starts
+            "agent_turn_start",  # awaiting_model before API call
             "agent_message",  # "The file contains: hello"
         ]

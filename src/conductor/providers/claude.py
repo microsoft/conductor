@@ -989,6 +989,12 @@ class ClaudeProvider(AgentProvider):
                 return interrupt_response, total_tokens, True
 
             # Execute API call (with parse recovery for structured output)
+            if event_callback:
+                try:
+                    event_callback("agent_turn_start", {"turn": "awaiting_model"})
+                except Exception:
+                    logger.debug("Error in event_callback for awaiting_model", exc_info=True)
+
             if has_output_schema:
                 response = await self._execute_with_parse_recovery(
                     messages=working_messages,

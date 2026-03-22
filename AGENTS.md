@@ -87,6 +87,7 @@ make validate-examples    # validate all examples
 - **providers/**: SDK provider abstraction
   - `base.py` - `AgentProvider` ABC defining `execute()`, `validate_connection()`, `close()`
   - `copilot.py` - GitHub Copilot SDK implementation
+  - `claude.py` - Anthropic Claude API implementation
   - `factory.py` - Provider instantiation
 
 - **gates/**: Human-in-the-loop support
@@ -142,3 +143,20 @@ Use `pytest.mark.performance` for performance tests (exclude with `-m "not perfo
 - Type hints required, checked with ty (Red Knot)
 - Pydantic v2 for data validation
 - async/await for all provider operations
+
+### Provider Parity
+
+All providers (`copilot.py`, `claude.py`) must maintain feature parity. Any change to one provider's behavior, contract, or capabilities must be applied to all providers. This includes:
+
+- **Event callbacks**: Same event types emitted at the same semantic points
+  - `agent_turn_start` with `{"turn": "awaiting_model"}` — immediately before each API call
+  - `agent_turn_start` with `{"turn": N}` — at the start of each agentic loop iteration
+  - `agent_message` — for text content in responses
+  - `agent_reasoning` — for reasoning/thinking content
+  - `agent_tool_start` / `agent_tool_complete` — around tool executions
+- **Retry and error handling**: Same retry semantics, error classification (retryable vs. fatal), and timeout behavior
+- **Output contract**: Same `AgentOutput` structure with consistent field population (model, tokens, input_tokens, output_tokens, content)
+- **Tool execution**: Same MCP tool calling interface and result handling
+- **Session management**: Same lifecycle (`validate_connection()`, `execute()`, `close()`)
+
+When modifying any provider, check all other providers for the same change. The dashboard, JSONL logger, console subscriber, and workflow engine all depend on consistent behavior across providers.
