@@ -27,7 +27,7 @@ from conductor.mcp_auth import resolve_mcp_server_auth
 from conductor.providers.registry import ProviderRegistry
 
 if TYPE_CHECKING:
-    pass
+    from conductor.events import WorkflowEvent
 
 # Verbose console for logging (stderr)
 _verbose_console = Console(stderr=True, highlight=False)
@@ -628,6 +628,108 @@ def verbose_log_for_each_summary(
         _file_console.print(text)
 
 
+# ------------------------------------------------------------------
+# Console event subscriber — bridges the event emitter to verbose_log
+# ------------------------------------------------------------------
+
+
+class ConsoleEventSubscriber:
+    """Subscribes to WorkflowEventEmitter and drives console/file logging.
+
+    Maps each event type to the corresponding ``verbose_log_*`` call so that
+    ``workflow.py`` only needs to emit events — display logic stays here.
+    """
+
+    def on_event(self, event: WorkflowEvent) -> None:
+        d = event.data
+        t = event.type
+
+        if t == "agent_started":
+            verbose_log_agent_start(d.get("agent_name", "?"), d.get("iteration", 0))
+
+        elif t == "agent_completed":
+            verbose_log_agent_complete(
+                d.get("agent_name", "?"),
+                d.get("elapsed", 0.0),
+                model=d.get("model"),
+                tokens=d.get("tokens"),
+                output_keys=d.get("output_keys"),
+                cost_usd=d.get("cost_usd"),
+                input_tokens=d.get("input_tokens"),
+                output_tokens=d.get("output_tokens"),
+            )
+
+        elif t == "route_taken":
+            verbose_log_route(d.get("to_agent", "?"))
+
+        elif t == "parallel_started":
+            agents = d.get("agents", [])
+            verbose_log_parallel_start(d.get("group_name", "?"), len(agents))
+
+        elif t == "parallel_agent_completed":
+            verbose_log_parallel_agent_complete(
+                d.get("agent_name", "?"),
+                d.get("elapsed", 0.0),
+                model=d.get("model"),
+                tokens=d.get("tokens"),
+                cost_usd=d.get("cost_usd"),
+            )
+
+        elif t == "parallel_agent_failed":
+            verbose_log_parallel_agent_failed(
+                d.get("agent_name", "?"),
+                d.get("elapsed", 0.0),
+                d.get("error_type", "Error"),
+                d.get("message", "unknown"),
+            )
+
+        elif t == "parallel_completed":
+            verbose_log_parallel_summary(
+                d.get("group_name", "?"),
+                d.get("success_count", 0),
+                d.get("failure_count", 0),
+                d.get("elapsed", 0.0),
+            )
+
+        elif t == "for_each_started":
+            verbose_log_for_each_start(
+                d.get("group_name", "?"),
+                d.get("item_count", 0),
+                d.get("max_concurrent", 1),
+                d.get("failure_mode", "fail_fast"),
+            )
+
+        elif t == "for_each_item_completed":
+            verbose_log_for_each_item_complete(
+                d.get("item_key", "?"),
+                d.get("elapsed", 0.0),
+                tokens=d.get("tokens"),
+                cost_usd=d.get("cost_usd"),
+            )
+
+        elif t == "for_each_item_failed":
+            verbose_log_for_each_item_failed(
+                d.get("item_key", "?"),
+                d.get("elapsed", 0.0),
+                d.get("error_type", "Error"),
+                d.get("message", "unknown"),
+            )
+
+        elif t == "for_each_completed":
+            verbose_log_for_each_summary(
+                d.get("group_name", "?"),
+                d.get("success_count", 0),
+                d.get("failure_count", 0),
+                d.get("elapsed", 0.0),
+            )
+
+        elif t == "script_completed":
+            verbose_log_agent_complete(
+                d.get("agent_name", "?"),
+                d.get("elapsed", 0.0),
+            )
+
+
 def display_usage_summary(usage_data: dict[str, Any], console: Console | None = None) -> None:
     """Display final usage summary with token counts and costs.
 
@@ -956,6 +1058,10 @@ async def run_workflow_async(
 
         event_log_subscriber = EventLogSubscriber(config.workflow.name)
         emitter.subscribe(event_log_subscriber.on_event)
+
+        # Subscribe console output to the event emitter
+        console_subscriber = ConsoleEventSubscriber()
+        emitter.subscribe(console_subscriber.on_event)
 
         if inputs:
             verbose_log_section("Workflow Inputs", json.dumps(inputs, indent=2))

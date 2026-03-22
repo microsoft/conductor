@@ -45,156 +45,6 @@ from conductor.providers.base import AgentOutput
 logger = logging.getLogger(__name__)
 
 
-def _verbose_log(message: str, style: str = "dim") -> None:
-    """Lazy import wrapper for verbose_log to avoid circular imports."""
-    from conductor.cli.run import verbose_log
-
-    verbose_log(message, style)
-
-
-def _verbose_log_timing(operation: str, elapsed: float) -> None:
-    """Lazy import wrapper for verbose_log_timing to avoid circular imports."""
-    from conductor.cli.run import verbose_log_timing
-
-    verbose_log_timing(operation, elapsed)
-
-
-def _verbose_log_agent_start(agent_name: str, iteration: int) -> None:
-    """Lazy import wrapper for verbose_log_agent_start to avoid circular imports."""
-    from conductor.cli.run import verbose_log_agent_start
-
-    verbose_log_agent_start(agent_name, iteration)
-
-
-def _verbose_log_agent_complete(
-    agent_name: str,
-    elapsed: float,
-    *,
-    model: str | None = None,
-    tokens: int | None = None,
-    output_keys: list[str] | None = None,
-    cost_usd: float | None = None,
-    input_tokens: int | None = None,
-    output_tokens: int | None = None,
-) -> None:
-    """Lazy import wrapper for verbose_log_agent_complete to avoid circular imports."""
-    from conductor.cli.run import verbose_log_agent_complete
-
-    verbose_log_agent_complete(
-        agent_name,
-        elapsed,
-        model=model,
-        tokens=tokens,
-        output_keys=output_keys,
-        cost_usd=cost_usd,
-        input_tokens=input_tokens,
-        output_tokens=output_tokens,
-    )
-
-
-def _verbose_log_route(target: str) -> None:
-    """Lazy import wrapper for verbose_log_route to avoid circular imports."""
-    from conductor.cli.run import verbose_log_route
-
-    verbose_log_route(target)
-
-
-def _verbose_log_parallel_start(group_name: str, agent_count: int) -> None:
-    """Lazy import wrapper for verbose_log_parallel_start to avoid circular imports."""
-    from conductor.cli.run import verbose_log_parallel_start
-
-    verbose_log_parallel_start(group_name, agent_count)
-
-
-def _verbose_log_parallel_agent_complete(
-    agent_name: str,
-    elapsed: float,
-    *,
-    model: str | None = None,
-    tokens: int | None = None,
-    cost_usd: float | None = None,
-) -> None:
-    """Lazy import wrapper for verbose_log_parallel_agent_complete to avoid circular imports."""
-    from conductor.cli.run import verbose_log_parallel_agent_complete
-
-    verbose_log_parallel_agent_complete(
-        agent_name, elapsed, model=model, tokens=tokens, cost_usd=cost_usd
-    )
-
-
-def _verbose_log_parallel_agent_failed(
-    agent_name: str,
-    elapsed: float,
-    exception_type: str,
-    message: str,
-) -> None:
-    """Lazy import wrapper for verbose_log_parallel_agent_failed to avoid circular imports."""
-    from conductor.cli.run import verbose_log_parallel_agent_failed
-
-    verbose_log_parallel_agent_failed(agent_name, elapsed, exception_type, message)
-
-
-def _verbose_log_parallel_summary(
-    group_name: str,
-    success_count: int,
-    failure_count: int,
-    total_elapsed: float,
-) -> None:
-    """Lazy import wrapper for verbose_log_parallel_summary to avoid circular imports."""
-    from conductor.cli.run import verbose_log_parallel_summary
-
-    verbose_log_parallel_summary(group_name, success_count, failure_count, total_elapsed)
-
-
-def _verbose_log_for_each_start(
-    group_name: str,
-    item_count: int,
-    max_concurrent: int,
-    failure_mode: str,
-) -> None:
-    """Lazy import wrapper for verbose_log_for_each_start to avoid circular imports."""
-    from conductor.cli.run import verbose_log_for_each_start
-
-    verbose_log_for_each_start(group_name, item_count, max_concurrent, failure_mode)
-
-
-def _verbose_log_for_each_item_complete(
-    item_key: str,
-    elapsed: float,
-    *,
-    tokens: int | None = None,
-    cost_usd: float | None = None,
-) -> None:
-    """Lazy import wrapper for verbose_log_for_each_item_complete to avoid circular imports."""
-    from conductor.cli.run import verbose_log_for_each_item_complete
-
-    verbose_log_for_each_item_complete(item_key, elapsed, tokens=tokens, cost_usd=cost_usd)
-
-
-def _verbose_log_for_each_item_failed(
-    item_key: str,
-    elapsed: float,
-    exception_type: str,
-    message: str,
-) -> None:
-    """Lazy import wrapper for verbose_log_for_each_item_failed to avoid circular imports."""
-    from conductor.cli.run import verbose_log_for_each_item_failed
-
-    verbose_log_for_each_item_failed(item_key, elapsed, exception_type, message)
-
-
-def _verbose_log_for_each_summary(
-    group_name: str,
-    success_count: int,
-    failure_count: int,
-    total_elapsed: float,
-) -> None:
-    """Lazy import wrapper for verbose_log_for_each_summary to avoid circular imports."""
-    from conductor.cli.run import verbose_log_for_each_summary
-
-    verbose_log_for_each_summary(group_name, success_count, failure_count, total_elapsed)
-
-
 if TYPE_CHECKING:
     from conductor.config.schema import AgentDef, ForEachDef, ParallelGroup, WorkflowConfig
     from conductor.interrupt.listener import KeyboardListener
@@ -1077,15 +927,6 @@ class WorkflowEngine:
                         # For safety, check with current limit before resolving array
                         await self._check_iteration_with_prompt(for_each_group.name)
 
-                        # Verbose: Log for-each group execution start
-                        iteration = self.limits.current_iteration + 1
-                        _verbose_log(
-                            f"[{iteration}] Executing for-each group: {for_each_group.name} "
-                            f"(source: {for_each_group.source}, "
-                            f"{for_each_group.failure_mode} mode)",
-                            style="bold cyan",
-                        )
-
                         # Trim context if max_tokens is configured
                         self._trim_context_if_needed()
 
@@ -1096,11 +937,6 @@ class WorkflowEngine:
                             operation_name=f"for-each group '{for_each_group.name}'",
                         )
                         _group_elapsed = _time.time() - _group_start
-
-                        # Verbose: Log for-each group completion
-                        _verbose_log_timing(
-                            f"For-each group '{for_each_group.name}' completed", _group_elapsed
-                        )
 
                         # Store for-each group output in context
                         # Format: {type: 'for_each', outputs: [...] or {...},
@@ -1134,9 +970,6 @@ class WorkflowEngine:
                             for_each_group, for_each_output_dict
                         )
 
-                        # Verbose: Log routing decision
-                        _verbose_log_route(route_result.target)
-
                         self._emit(
                             "route_taken",
                             {
@@ -1166,15 +999,6 @@ class WorkflowEngine:
                             parallel_group.name, len(parallel_group.agents)
                         )
 
-                        # Verbose: Log parallel group execution start
-                        iteration = self.limits.current_iteration + 1
-                        _verbose_log(
-                            f"[{iteration}] Executing parallel group: {parallel_group.name} "
-                            f"({len(parallel_group.agents)} agents, "
-                            f"{parallel_group.failure_mode} mode)",
-                            style="bold cyan",
-                        )
-
                         # Trim context if max_tokens is configured
                         self._trim_context_if_needed()
 
@@ -1185,11 +1009,6 @@ class WorkflowEngine:
                             operation_name=f"parallel group '{parallel_group.name}'",
                         )
                         _group_elapsed = _time.time() - _group_start
-
-                        # Verbose: Log parallel group completion
-                        _verbose_log_timing(
-                            f"Parallel group '{parallel_group.name}' completed", _group_elapsed
-                        )
 
                         # Store parallel group output in context
                         # Format: {type: 'parallel', outputs: {agent1: {...}, ...},
@@ -1222,9 +1041,6 @@ class WorkflowEngine:
                             parallel_group, parallel_output_dict
                         )
 
-                        # Verbose: Log routing decision
-                        _verbose_log_route(route_result.target)
-
                         self._emit(
                             "route_taken",
                             {
@@ -1251,10 +1067,6 @@ class WorkflowEngine:
                     if agent is not None:
                         # Check iteration limit before executing
                         await self._check_iteration_with_prompt(current_agent_name)
-
-                        # Verbose: Log agent execution start (1-indexed for user display)
-                        iteration = self.limits.current_iteration + 1
-                        _verbose_log_agent_start(current_agent_name, iteration)
 
                         # Count how many times this specific agent has been executed
                         # (for per-agent iteration tracking in the web dashboard)
@@ -1383,8 +1195,6 @@ class WorkflowEngine:
                                 raise
                             _script_elapsed = _time.time() - _script_start
 
-                            _verbose_log_agent_complete(agent.name, _script_elapsed)
-
                             self._emit(
                                 "script_completed",
                                 {
@@ -1407,7 +1217,6 @@ class WorkflowEngine:
                             self.limits.check_timeout()
 
                             route_result = self._evaluate_routes(agent, output_content)
-                            _verbose_log_route(route_result.target)
 
                             self._emit(
                                 "route_taken",
@@ -1475,19 +1284,8 @@ class WorkflowEngine:
                         # Record usage and calculate cost
                         usage = self.usage_tracker.record(agent.name, output, _agent_elapsed)
 
-                        # Verbose: Log agent output summary with cost
                         output_keys = (
                             list(output.content.keys()) if isinstance(output.content, dict) else []
-                        )
-                        _verbose_log_agent_complete(
-                            agent.name,
-                            _agent_elapsed,
-                            model=output.model,
-                            tokens=output.tokens_used,
-                            output_keys=output_keys,
-                            cost_usd=usage.cost_usd,
-                            input_tokens=output.input_tokens,
-                            output_tokens=output.output_tokens,
                         )
 
                         self._emit(
@@ -1516,9 +1314,6 @@ class WorkflowEngine:
 
                         # Evaluate routes using the Router
                         route_result = self._evaluate_routes(agent, output.content)
-
-                        # Verbose: Log routing decision
-                        _verbose_log_route(route_result.target)
 
                         self._emit(
                             "route_taken",
@@ -1698,10 +1493,9 @@ class WorkflowEngine:
                     provider = self._registry.get_active_providers().get(default_type)
                 # If no provider is active yet, fall back to drop_oldest
                 if provider is None:
-                    _verbose_log(
+                    logger.debug(
                         "Summarize strategy unavailable in multi-provider mode "
-                        "before first agent execution. Falling back to drop_oldest.",
-                        style="yellow dim",
+                        "before first agent execution. Falling back to drop_oldest."
                     )
                     strategy = "drop_oldest"
 
@@ -2068,8 +1862,6 @@ class WorkflowEngine:
                 - continue_on_error: If all agents fail
         """
         # Verbose: Log parallel group start
-        _verbose_log_parallel_start(parallel_group.name, len(parallel_group.agents))
-
         self._emit(
             "parallel_started",
             {
@@ -2127,15 +1919,6 @@ class WorkflowEngine:
                 # Record usage and calculate cost
                 usage = self.usage_tracker.record(agent.name, output, _agent_elapsed)
 
-                # Verbose: Log agent completion with cost
-                _verbose_log_parallel_agent_complete(
-                    agent.name,
-                    _agent_elapsed,
-                    model=output.model,
-                    tokens=output.tokens_used,
-                    cost_usd=usage.cost_usd,
-                )
-
                 self._emit(
                     "parallel_agent_completed",
                     {
@@ -2155,13 +1938,6 @@ class WorkflowEngine:
                 _agent_elapsed = _time.time() - _agent_start
 
                 # Verbose: Log agent failure
-                _verbose_log_parallel_agent_failed(
-                    agent.name,
-                    _agent_elapsed,
-                    type(e).__name__,
-                    str(e),
-                )
-
                 self._emit(
                     "parallel_agent_failed",
                     {
@@ -2219,12 +1995,6 @@ class WorkflowEngine:
             finally:
                 # Verbose: Log summary even on failure
                 _group_elapsed = _time.time() - _group_start
-                _verbose_log_parallel_summary(
-                    parallel_group.name,
-                    len(parallel_output.outputs),
-                    len(parallel_output.errors),
-                    _group_elapsed,
-                )
                 self._emit(
                     "parallel_completed",
                     {
@@ -2263,12 +2033,6 @@ class WorkflowEngine:
 
             # Verbose: Log summary
             _group_elapsed = _time.time() - _group_start
-            _verbose_log_parallel_summary(
-                parallel_group.name,
-                len(parallel_output.outputs),
-                len(parallel_output.errors),
-                _group_elapsed,
-            )
             self._emit(
                 "parallel_completed",
                 {
@@ -2324,12 +2088,6 @@ class WorkflowEngine:
 
             # Verbose: Log summary
             _group_elapsed = _time.time() - _group_start
-            _verbose_log_parallel_summary(
-                parallel_group.name,
-                len(parallel_output.outputs),
-                len(parallel_output.errors),
-                _group_elapsed,
-            )
             self._emit(
                 "parallel_completed",
                 {
@@ -2382,10 +2140,12 @@ class WorkflowEngine:
             return str(current)
         except (KeyError, AttributeError, IndexError) as e:
             # Fallback to index-based key if extraction fails
-            _verbose_log(
-                f"Warning: Failed to extract key from item {fallback_index} "
-                f"using '{key_by_path}': {e}. Falling back to index-based key.",
-                style="dim yellow",
+            logger.debug(
+                "Failed to extract key from item %s using '%s': %s. "
+                "Falling back to index-based key.",
+                fallback_index,
+                key_by_path,
+                e,
             )
             return str(fallback_index)
 
@@ -2417,21 +2177,13 @@ class WorkflowEngine:
 
         # Handle empty arrays gracefully
         if not items:
-            _verbose_log(
-                f"For-each group '{for_each_group.name}': Empty array, skipping execution",
-                style="dim yellow",
+            logger.debug(
+                "For-each group '%s': Empty array, skipping execution",
+                for_each_group.name,
             )
             # Return empty output with appropriate structure
             empty_outputs = {} if for_each_group.key_by else []
             return ForEachGroupOutput(outputs=empty_outputs, errors={}, count=0)
-
-        # Verbose: Log for-each group start
-        _verbose_log_for_each_start(
-            for_each_group.name,
-            len(items),
-            for_each_group.max_concurrent,
-            for_each_group.failure_mode,
-        )
 
         self._emit(
             "for_each_started",
@@ -2516,14 +2268,6 @@ class WorkflowEngine:
                     f"{for_each_group.name}[{key}]", output, _item_elapsed
                 )
 
-                # Verbose: Log item completion with cost
-                _verbose_log_for_each_item_complete(
-                    key,
-                    _item_elapsed,
-                    tokens=output.tokens_used,
-                    cost_usd=usage.cost_usd,
-                )
-
                 self._emit(
                     "for_each_item_completed",
                     {
@@ -2541,13 +2285,6 @@ class WorkflowEngine:
                 _item_elapsed = _time.time() - _item_start
 
                 # Verbose: Log item failure
-                _verbose_log_for_each_item_failed(
-                    key,
-                    _item_elapsed,
-                    type(e).__name__,
-                    str(e),
-                )
-
                 self._emit(
                     "for_each_item_failed",
                     {
@@ -2580,12 +2317,6 @@ class WorkflowEngine:
             batch_end_idx = min((batch_idx + 1) * max_concurrent, len(items))
             batch_items = items[batch_start_idx:batch_end_idx]
             batch_keys = item_keys[batch_start_idx:batch_end_idx]
-
-            _verbose_log(
-                f"Batch {batch_idx + 1}/{batch_count}: "
-                f"Processing items {batch_start_idx} to {batch_end_idx - 1}",
-                style="dim cyan",
-            )
 
             # Execute based on failure mode
             if for_each_group.failure_mode == "fail_fast":
@@ -2693,12 +2424,6 @@ class WorkflowEngine:
             else len(for_each_output.outputs)
         )
         failure_count = len(for_each_output.errors)
-        _verbose_log_for_each_summary(
-            for_each_group.name,
-            success_count,
-            failure_count,
-            _group_elapsed,
-        )
         self._emit(
             "for_each_completed",
             {

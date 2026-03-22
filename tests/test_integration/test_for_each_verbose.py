@@ -1,12 +1,13 @@
-"""Test verbose logging for for-each execution.
+"""Test event emission for for-each execution.
 
-This module tests that verbose logging functions are called correctly
-during for-each execution.
+This module tests that workflow events are emitted correctly
+during for-each execution, which drives console output via
+the ConsoleEventSubscriber.
 """
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -22,19 +23,20 @@ from conductor.config.schema import (
     WorkflowDef,
 )
 from conductor.engine.workflow import WorkflowEngine
+from conductor.events import WorkflowEvent, WorkflowEventEmitter
 from conductor.providers.base import AgentOutput
 
 
-class TestForEachVerboseLogging:
-    """Tests for verbose logging during for-each execution."""
+class TestForEachEventEmission:
+    """Tests for event emission during for-each execution."""
 
     @pytest.mark.asyncio
-    async def test_verbose_logging_called_for_each_execution(self):
-        """Test that verbose logging functions are called during for-each execution."""
+    async def test_events_emitted_for_each_execution(self):
+        """Test that correct events are emitted during for-each execution."""
         # Create a minimal workflow with for-each
         config = WorkflowConfig(
             workflow=WorkflowDef(
-                name="verbose-test",
+                name="event-test",
                 entry_point="finder",
                 runtime=RuntimeConfig(provider="copilot"),
                 context=ContextConfig(mode="accumulate"),
@@ -89,55 +91,48 @@ class TestForEachVerboseLogging:
             AgentOutput(content={"result": "ok-C"}, raw_response={}, model="gpt-4", tokens_used=10),
         ]
 
-        # Mock the verbose logging functions
-        mock_path_start = "conductor.engine.workflow._verbose_log_for_each_start"
-        mock_path_complete = "conductor.engine.workflow._verbose_log_for_each_item_complete"
-        mock_path_failed = "conductor.engine.workflow._verbose_log_for_each_item_failed"
-        mock_path_summary = "conductor.engine.workflow._verbose_log_for_each_summary"
+        # Capture emitted events
+        emitter = WorkflowEventEmitter()
+        events: list[WorkflowEvent] = []
+        emitter.subscribe(lambda e: events.append(e))
 
-        with (
-            patch(mock_path_start) as mock_start,
-            patch(mock_path_complete) as mock_complete,
-            patch(mock_path_failed) as mock_failed,
-            patch(mock_path_summary) as mock_summary,
-        ):
-            engine = WorkflowEngine(config, provider)
-            result = await engine.run({})
+        engine = WorkflowEngine(config, provider, event_emitter=emitter)
+        result = await engine.run({})
 
-            # Verify verbose_log_for_each_start was called
-            mock_start.assert_called_once_with(
-                "processors",
-                3,  # item_count
-                2,  # max_concurrent
-                "continue_on_error",
-            )
+        # Verify for_each_started was emitted
+        started = [e for e in events if e.type == "for_each_started"]
+        assert len(started) == 1
+        assert started[0].data["group_name"] == "processors"
+        assert started[0].data["item_count"] == 3
+        assert started[0].data["max_concurrent"] == 2
+        assert started[0].data["failure_mode"] == "continue_on_error"
 
-            # Verify verbose_log_for_each_item_complete was called for each item
-            assert mock_complete.call_count == 3
-            # Check the calls were made with correct keys (0, 1, 2 as strings)
-            item_keys = [call[0][0] for call in mock_complete.call_args_list]
-            assert set(item_keys) == {"0", "1", "2"}
+        # Verify for_each_item_completed was emitted for each item
+        completed = [e for e in events if e.type == "for_each_item_completed"]
+        assert len(completed) == 3
+        item_keys = {e.data["item_key"] for e in completed}
+        assert item_keys == {"0", "1", "2"}
 
-            # Verify verbose_log_for_each_item_failed was NOT called (no failures)
-            mock_failed.assert_not_called()
+        # Verify no item failures
+        failed = [e for e in events if e.type == "for_each_item_failed"]
+        assert len(failed) == 0
 
-            # Verify verbose_log_for_each_summary was called
-            mock_summary.assert_called_once()
-            call_args = mock_summary.call_args[0]
-            assert call_args[0] == "processors"  # group_name
-            assert call_args[1] == 3  # success_count
-            assert call_args[2] == 0  # failure_count
-            # call_args[3] is elapsed time, which we don't validate precisely
+        # Verify for_each_completed summary
+        summary = [e for e in events if e.type == "for_each_completed"]
+        assert len(summary) == 1
+        assert summary[0].data["group_name"] == "processors"
+        assert summary[0].data["success_count"] == 3
+        assert summary[0].data["failure_count"] == 0
 
-            # Verify the workflow completed successfully
-            assert result["count"] == 3
+        # Verify the workflow completed successfully
+        assert result["count"] == 3
 
     @pytest.mark.asyncio
-    async def test_verbose_logging_failure_handling(self):
-        """Test verbose logging when items fail."""
+    async def test_events_emitted_for_each_failures(self):
+        """Test event emission when items fail."""
         config = WorkflowConfig(
             workflow=WorkflowDef(
-                name="verbose-fail-test",
+                name="event-fail-test",
                 entry_point="finder",
                 runtime=RuntimeConfig(provider="copilot"),
                 context=ContextConfig(mode="accumulate"),
@@ -192,36 +187,30 @@ class TestForEachVerboseLogging:
             AgentOutput(content={"result": "ok-C"}, raw_response={}, model="gpt-4", tokens_used=10),
         ]
 
-        # Mock the verbose logging functions
-        mock_path_start = "conductor.engine.workflow._verbose_log_for_each_start"
-        mock_path_complete = "conductor.engine.workflow._verbose_log_for_each_item_complete"
-        mock_path_failed = "conductor.engine.workflow._verbose_log_for_each_item_failed"
-        mock_path_summary = "conductor.engine.workflow._verbose_log_for_each_summary"
+        # Capture emitted events
+        emitter = WorkflowEventEmitter()
+        events: list[WorkflowEvent] = []
+        emitter.subscribe(lambda e: events.append(e))
 
-        with (
-            patch(mock_path_start) as _mock_start,
-            patch(mock_path_complete) as mock_complete,
-            patch(mock_path_failed) as mock_failed,
-            patch(mock_path_summary) as mock_summary,
-        ):
-            engine = WorkflowEngine(config, provider)
-            result = await engine.run({})
+        engine = WorkflowEngine(config, provider, event_emitter=emitter)
+        result = await engine.run({})
 
-            # Verify verbose_log_for_each_item_complete was called twice (for A and C)
-            assert mock_complete.call_count == 2
+        # Verify for_each_item_completed was emitted twice (for A and C)
+        completed = [e for e in events if e.type == "for_each_item_completed"]
+        assert len(completed) == 2
 
-            # Verify verbose_log_for_each_item_failed was called once (for B)
-            assert mock_failed.call_count == 1
-            failed_call = mock_failed.call_args[0]
-            assert failed_call[0] == "1"  # item_key for second item
-            assert failed_call[2] == "Exception"  # exception_type
-            assert "Processing failed" in failed_call[3]  # message
+        # Verify for_each_item_failed was emitted once (for B)
+        failed = [e for e in events if e.type == "for_each_item_failed"]
+        assert len(failed) == 1
+        assert failed[0].data["item_key"] == "1"
+        assert failed[0].data["error_type"] == "Exception"
+        assert "Processing failed" in failed[0].data["message"]
 
-            # Verify summary shows 2 succeeded, 1 failed
-            mock_summary.assert_called_once()
-            call_args = mock_summary.call_args[0]
-            assert call_args[1] == 2  # success_count
-            assert call_args[2] == 1  # failure_count
+        # Verify summary shows 2 succeeded, 1 failed
+        summary = [e for e in events if e.type == "for_each_completed"]
+        assert len(summary) == 1
+        assert summary[0].data["success_count"] == 2
+        assert summary[0].data["failure_count"] == 1
 
-            # Verify workflow completed (continue_on_error allows this)
-            assert result["count"] == 3
+        # Verify workflow completed (continue_on_error allows this)
+        assert result["count"] == 3
