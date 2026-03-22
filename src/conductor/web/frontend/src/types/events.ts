@@ -33,7 +33,8 @@ export type EventType =
   | 'for_each_item_failed'
   | 'for_each_completed'
   | 'workflow_completed'
-  | 'workflow_failed';
+  | 'workflow_failed'
+  | 'checkpoint_saved';
 
 // --- Workflow lifecycle ---
 

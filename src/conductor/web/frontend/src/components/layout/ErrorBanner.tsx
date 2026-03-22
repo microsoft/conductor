@@ -13,6 +13,7 @@ export function WorkflowErrorBanner() {
   if (workflowStatus !== 'failed' || !workflowFailure) return null;
 
   const errorText = workflowFailure.message || workflowFailure.error_type || 'Unknown error';
+  const isTimeout = workflowFailure.error_type === 'TimeoutError';
 
   return (
     <div className="absolute top-3 left-1/2 -translate-x-1/2 z-20 animate-[banner-in_200ms_ease-out]">
@@ -20,13 +21,23 @@ export function WorkflowErrorBanner() {
         className={cn(
           'flex items-center gap-2 px-4 py-2 rounded-lg',
           'bg-red-950/90 border border-red-500/40 shadow-lg shadow-red-500/10',
-          'backdrop-blur-sm max-w-[480px]',
+          'backdrop-blur-sm max-w-[560px]',
         )}
       >
         <AlertTriangle className="w-4 h-4 text-red-400 flex-shrink-0" />
         <div className="flex flex-col min-w-0">
           <span className="text-xs font-medium text-red-300">Workflow Failed</span>
           <span className="text-[11px] text-red-400/80 truncate">{errorText}</span>
+          {isTimeout && workflowFailure.current_agent && (
+            <span className="text-[10px] text-red-400/60 truncate">
+              Timed out on agent: {workflowFailure.current_agent}
+            </span>
+          )}
+          {workflowFailure.checkpoint_path && (
+            <span className="text-[10px] text-red-400/50 truncate" title={workflowFailure.checkpoint_path}>
+              Checkpoint: {workflowFailure.checkpoint_path.split('/').pop()}
+            </span>
+          )}
         </div>
         {workflowFailedAgent && (
           <button

@@ -140,6 +140,16 @@ class WebDashboard:
         async def get_state() -> JSONResponse:
             return JSONResponse(content=self._event_history)
 
+        @app.get("/api/logs")
+        async def download_logs() -> JSONResponse:
+            """Download the full event history as a JSON file."""
+            return JSONResponse(
+                content=self._event_history,
+                headers={
+                    "Content-Disposition": 'attachment; filename="conductor-logs.json"',
+                },
+            )
+
         @app.post("/api/stop")
         async def stop_workflow() -> JSONResponse:
             self._stop_event.set()
