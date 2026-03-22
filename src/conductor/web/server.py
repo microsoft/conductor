@@ -129,6 +129,13 @@ class WebDashboard:
                 media_type="text/html",
             )
 
+        @app.get("/favicon.svg")
+        async def favicon() -> FileResponse:
+            return FileResponse(
+                _STATIC_DIR / "favicon.svg",
+                media_type="image/svg+xml",
+            )
+
         @app.get("/api/state")
         async def get_state() -> JSONResponse:
             return JSONResponse(content=self._event_history)
