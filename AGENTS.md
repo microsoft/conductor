@@ -64,7 +64,7 @@ make validate-examples    # validate all examples
   - `run.py` - Workflow execution command with verbose logging helpers
   - `bg_runner.py` - Background process forking for `--web-bg` mode
   - `pid.py` - PID file utilities for tracking/stopping background processes
-  - `update.py` - Update check, version comparison, and self-upgrade via `uv tool install`
+  - `update.py` - Update check, version comparison, and self-upgrade via `uv tool install --locked`
 
 - **config/**: YAML loading and Pydantic schema validation
   - `schema.py` - Pydantic models for all workflow YAML structures (WorkflowConfig, AgentDef, ParallelGroup, ForEachDef, etc.)

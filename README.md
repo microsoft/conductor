@@ -28,8 +28,8 @@ Conductor provides the patterns that work: evaluator-optimizer loops for iterati
 ### Using uv (Recommended)
 
 ```bash
-# Install from GitHub
-uv tool install git+https://github.com/microsoft/conductor.git
+# Install from GitHub (--locked ensures reproducible dependency versions)
+uv tool install --locked git+https://github.com/microsoft/conductor.git
 
 # Run the CLI
 conductor run workflow.yaml
@@ -38,9 +38,9 @@ conductor run workflow.yaml
 uvx --from git+https://github.com/microsoft/conductor.git conductor run workflow.yaml
 
 # Install a specific branch, tag, or commit
-uv tool install git+https://github.com/microsoft/conductor.git@branch-name
-uv tool install git+https://github.com/microsoft/conductor.git@v1.0.0
-uv tool install git+https://github.com/microsoft/conductor.git@abc1234
+uv tool install --locked git+https://github.com/microsoft/conductor.git@branch-name
+uv tool install --locked git+https://github.com/microsoft/conductor.git@v1.0.0
+uv tool install --locked git+https://github.com/microsoft/conductor.git@abc1234
 ```
 
 ### Using pipx

@@ -313,7 +313,7 @@ def run_update(console: Console) -> None:
     console.print(f"Upgrading Conductor: v{current} → v{version}")
 
     install_url = f"git+{_REPO_GIT_URL}@{tag_name}"
-    cmd = ["uv", "tool", "install", "--force", install_url]
+    cmd = ["uv", "tool", "install", "--force", "--locked", install_url]
 
     # On Windows, rename our exe out of the way so uv can write the new one.
     # Windows locks running executables but allows renaming them.

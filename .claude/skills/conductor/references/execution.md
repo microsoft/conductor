@@ -115,7 +115,7 @@ conductor update
 The command:
 1. Fetches the latest release from the GitHub Releases API
 2. Compares the remote version with the locally installed version
-3. If a newer version is available, runs `uv tool install --force git+https://github.com/microsoft/conductor.git@v{version}` to upgrade
+3. If a newer version is available, runs `uv tool install --force --locked git+https://github.com/microsoft/conductor.git@v{version}` to upgrade
 4. Clears the update-check cache on success so the next invocation re-checks cleanly
 
 If already up to date, prints a confirmation message and exits.

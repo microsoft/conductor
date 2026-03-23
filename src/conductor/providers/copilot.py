@@ -89,7 +89,7 @@ class IdleRecoveryConfig:
     """
 
     idle_timeout_seconds: float = 90.0  # 90 seconds
-    max_recovery_attempts: int = 3
+    max_recovery_attempts: int = 5
     max_session_seconds: float = 1800.0  # 30 minutes
     recovery_prompt: str = (
         "It appears you may have gotten stuck or stopped responding. "
