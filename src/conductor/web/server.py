@@ -82,12 +82,13 @@ class WebDashboard:
         self._bg_event = asyncio.Event()
         self._grace_task: asyncio.Task[None] | None = None
 
-        # Stop signal — set by POST /api/kill to cancel the running workflow
+        # Stop signal — set by POST /api/stop (fallback) or POST /api/kill
+        # to cancel the running workflow via _run_with_stop_signal.
         self._stop_event = asyncio.Event()
 
-        # Kill signal — set by POST /api/kill during a pause to hard-stop.
-        # Unlike _stop_event, this is cleared after each consumption so
-        # it doesn't permanently poison subsequent pause cycles.
+        # Kill signal — set by POST /api/kill while an agent is paused.
+        # Cleared at the start of each pause cycle in _handle_web_pause
+        # so it doesn't permanently poison subsequent pause cycles.
         self._kill_event = asyncio.Event()
 
         # Resume signal — set by POST /api/resume after an agent is paused
@@ -171,7 +172,10 @@ class WebDashboard:
             if self._interrupt_event is not None:
                 self._interrupt_event.set()
                 return JSONResponse({"status": "stopping"})
-            # Fallback: hard stop
+            # Fallback for the window before engine sets the interrupt event
+            # (e.g., during startup). This triggers _run_with_stop_signal to
+            # cancel the engine task, which may not emit workflow_failed.
+            logger.warning("POST /api/stop: interrupt_event not set; falling back to hard stop")
             self._stop_event.set()
             self._bg_event.set()
             return JSONResponse({"status": "stopping"})
@@ -452,8 +456,8 @@ class WebDashboard:
     def kill_event(self) -> asyncio.Event:
         """The kill event, set when a user clicks Kill in the dashboard.
 
-        Unlike ``_stop_event``, this is intended to be cleared after each
-        consumption so it doesn't permanently poison subsequent pause cycles.
+        Cleared at the start of each pause cycle by ``_handle_web_pause``
+        so it doesn't permanently poison subsequent pause cycles.
         """
         return self._kill_event
 

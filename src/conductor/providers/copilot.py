@@ -454,6 +454,16 @@ class CopilotProvider(AgentProvider):
                 "working_directory": os.getcwd(),
             }
 
+            # Note: Copilot SDK >=0.2.0 does not support temperature as a
+            # session parameter. If a temperature was configured, log a warning
+            # so the user knows it's being ignored (provider parity with Claude).
+            if self._temperature is not None:
+                logger.warning(
+                    "Copilot SDK does not support 'temperature' as a session parameter; "
+                    "ignoring configured value %.2f",
+                    self._temperature,
+                )
+
             # Add MCP servers if configured
             if self._mcp_servers:
                 session_kwargs["mcp_servers"] = self._mcp_servers

@@ -240,3 +240,14 @@ export interface ForEachCompletedData {
   success_count?: number;
   failure_count?: number;
 }
+
+// --- Pause/Resume ---
+
+export interface AgentPausedData {
+  agent_name: string;
+  partial_content?: string;
+}
+
+export interface AgentResumedData {
+  agent_name: string;
+}

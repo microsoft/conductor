@@ -27,6 +27,8 @@ import type {
   ForEachItemCompletedData,
   ForEachItemFailedData,
   ForEachCompletedData,
+  AgentPausedData,
+  AgentResumedData,
 } from '@/types/events';
 
 export interface ActivityEntry {
@@ -789,6 +791,7 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
   workflow_completed: (state, _data) => {
     const data = _data as { output?: unknown };
     state.workflowStatus = 'completed';
+    state.isPaused = false;
     state.workflowOutput = data.output ?? null;
     if (state.nodes['$end']) {
       state.nodes['$end']!.status = 'completed';
@@ -805,6 +808,7 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
   workflow_failed: (state, _data) => {
     const data = _data as { agent_name?: string; error_type?: string; message?: string; elapsed_seconds?: number; timeout_seconds?: number; current_agent?: string };
     state.workflowStatus = 'failed';
+    state.isPaused = false;
     state.workflowFailedAgent = data.agent_name || null;
     if (data.agent_name && state.nodes[data.agent_name]) {
       state.nodes[data.agent_name]!.status = 'failed';
@@ -836,7 +840,7 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
   },
 
   agent_paused: (state, _data) => {
-    const data = _data as { agent_name: string };
+    const data = _data as unknown as AgentPausedData;
     const nd = ensureNode(state.nodes, data.agent_name);
     nd.status = 'waiting';
     nd.activity.push({
@@ -850,7 +854,7 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
   },
 
   agent_resumed: (state, _data) => {
-    const data = _data as { agent_name: string };
+    const data = _data as unknown as AgentResumedData;
     const nd = ensureNode(state.nodes, data.agent_name);
     nd.status = 'running';
     nd.activity.push({

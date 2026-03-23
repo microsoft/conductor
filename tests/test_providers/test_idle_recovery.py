@@ -27,8 +27,8 @@ class TestIdleRecoveryConfig:
     def test_default_values(self) -> None:
         """Test default configuration values."""
         config = IdleRecoveryConfig()
-        assert config.idle_timeout_seconds == 300.0
-        assert config.max_recovery_attempts == 3
+        assert config.idle_timeout_seconds == 90.0
+        assert config.max_recovery_attempts == 5
         assert config.max_session_seconds == 1800.0
         assert "{last_activity}" in config.recovery_prompt
 
@@ -294,8 +294,9 @@ class TestWaitWithIdleDetection:
         )
 
         # Verify the recovery prompt contains the tool name
+        # session.send() now receives a plain string (not a dict)
         call_args = mock_session.send.call_args_list[0][0][0]
-        assert "my_tool" in call_args["prompt"]
+        assert "my_tool" in call_args
 
     @pytest.mark.asyncio
     async def test_done_event_cleared_after_timeout(self) -> None:
@@ -477,8 +478,8 @@ class TestIdleRecoveryIntegration:
     async def test_provider_uses_default_config_when_none(self) -> None:
         """Test that provider uses default config when none provided."""
         provider = CopilotProvider(mock_handler=stub_handler)
-        assert provider._idle_recovery_config.idle_timeout_seconds == 300.0
-        assert provider._idle_recovery_config.max_recovery_attempts == 3
+        assert provider._idle_recovery_config.idle_timeout_seconds == 90.0
+        assert provider._idle_recovery_config.max_recovery_attempts == 5
 
 
 class TestActivityTracking:

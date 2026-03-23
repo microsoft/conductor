@@ -716,8 +716,11 @@ class WorkflowEngine:
         self._interrupt_event.clear()
 
         # In web mode, the interrupt was already handled at the provider level
-        # (partial output → _handle_web_pause). Just consume the stale flag.
-        if self._web_dashboard is not None and self._web_dashboard.has_connections():
+        # (partial output → _handle_web_pause). Consume the stale flag silently.
+        # We check for dashboard presence only (not has_connections) because in
+        # --web/--web-bg mode the CLI interactive handler is never appropriate,
+        # even if clients are transiently disconnected.
+        if self._web_dashboard is not None:
             return None
 
         # Build output preview from last stored output
@@ -806,16 +809,24 @@ class WorkflowEngine:
         logger.info("Agent '%s' paused — waiting for dashboard resume", agent_name)
 
         resume_event = self._web_dashboard.resume_event
-        resume_event.clear()
         kill_event = self._web_dashboard.kill_event
-        kill_event.clear()
         disconnect_event = self._web_dashboard.disconnect_event
+
+        # Clear stale signals from prior pause cycles, then create wait tasks.
+        # We must check is_set() after creating tasks to close the race window
+        # where an HTTP handler sets the event between clear() and wait().
+        resume_event.clear()
+        kill_event.clear()
         disconnect_event.clear()
 
         resume_task = asyncio.create_task(resume_event.wait())
         kill_task = asyncio.create_task(kill_event.wait())
         disconnect_task = asyncio.create_task(disconnect_event.wait())
         tasks = {resume_task, kill_task, disconnect_task}
+
+        # If any event was set between clear() and task creation, the task
+        # will already be done — no need to wait, but we still fall through
+        # to the normal done/pending handling below.
         try:
             done, pending = await asyncio.wait(
                 tasks,
@@ -841,6 +852,10 @@ class WorkflowEngine:
                 "All dashboard clients disconnected while '%s' was paused — auto-resuming",
                 agent_name,
             )
+
+        # Clear resume_event after consumption so a stale signal from a
+        # double-click or prior API call doesn't skip the next legitimate pause.
+        resume_event.clear()
 
         self._emit("agent_resumed", {"agent_name": agent_name})
         logger.info("Agent '%s' resumed — re-executing", agent_name)
@@ -1356,7 +1371,22 @@ class WorkflowEngine:
                         # Handle mid-agent interrupt (partial output)
                         if output.partial:
                             if await self._handle_web_pause(agent.name, output):
-                                # Web mode: agent paused then resumed → re-execute
+                                # Web mode: agent paused then resumed → re-execute.
+                                # Clear interrupt_event to prevent the re-executed agent
+                                # from seeing the stale signal and returning partial again.
+                                if self._interrupt_event is not None:
+                                    self._interrupt_event.clear()
+                                continue
+                            # In web mode with no connections, auto-resume rather than
+                            # falling through to the CLI interactive handler (which would
+                            # block on stdin with no tty in --web-bg mode).
+                            if self._web_dashboard is not None:
+                                logger.info(
+                                    "No dashboard connections for '%s' — auto-resuming",
+                                    agent.name,
+                                )
+                                if self._interrupt_event is not None:
+                                    self._interrupt_event.clear()
                                 continue
                             output = await self._handle_partial_output(
                                 agent,

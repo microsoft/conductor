@@ -1054,7 +1054,7 @@ class ClaudeProvider(AgentProvider):
                     total_tokens += partial_tokens
                     return partial_resp, total_tokens, True
 
-                response = api_task.result()
+                response = await api_task
             elif has_output_schema:
                 response = await self._execute_with_parse_recovery(
                     messages=working_messages,
