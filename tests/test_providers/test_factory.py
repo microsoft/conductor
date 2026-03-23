@@ -194,6 +194,6 @@ class TestMaxSessionSeconds:
         # max_session_seconds should be overridden
         assert provider._idle_recovery_config.max_session_seconds == 300.0
         # Other fields should retain their defaults
-        assert provider._idle_recovery_config.idle_timeout_seconds == 300.0
-        assert provider._idle_recovery_config.max_recovery_attempts == 3
+        assert provider._idle_recovery_config.idle_timeout_seconds == 90.0
+        assert provider._idle_recovery_config.max_recovery_attempts == 5
         await provider.close()
