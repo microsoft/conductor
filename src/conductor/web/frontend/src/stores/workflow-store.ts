@@ -843,7 +843,7 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
       type: 'agent_paused',
       icon: '⏸',
       label: 'Paused',
-      text: 'Agent paused — click Resume to retry',
+      text: 'Agent paused — click Resume to re-execute',
     });
     replaceNode(state.nodes, data.agent_name);
     state.isPaused = true;

@@ -380,6 +380,7 @@ class TestApiStop:
         with TestClient(dashboard.app) as client:
             resp = client.post("/api/stop")
             assert resp.status_code == 200
+            assert resp.json() == {"status": "stopping"}
 
         assert interrupt.is_set()
         assert not dashboard.stop_requested  # should NOT set hard stop
@@ -441,10 +442,12 @@ class TestApiResume:
 class TestApiKill:
     """Tests for POST /api/kill endpoint."""
 
-    def test_kill_sets_stop_event(self) -> None:
-        """POST /api/kill sets the internal stop event."""
+    def test_kill_sets_stop_and_kill_events(self) -> None:
+        """POST /api/kill sets the internal stop, kill, and bg events."""
         emitter, dashboard = _make_dashboard(bg=True)
         assert not dashboard.stop_requested
+        assert not dashboard.kill_event.is_set()
+        assert not dashboard._bg_event.is_set()
 
         with TestClient(dashboard.app) as client:
             resp = client.post("/api/kill")
@@ -452,6 +455,8 @@ class TestApiKill:
             assert resp.json() == {"status": "killing"}
 
         assert dashboard.stop_requested
+        assert dashboard.kill_event.is_set()
+        assert dashboard._bg_event.is_set()
 
 
 class TestServerStartupFailure:

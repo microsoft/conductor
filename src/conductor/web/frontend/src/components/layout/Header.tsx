@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { Activity, Square, Play, X, Download } from 'lucide-react';
 import { useWorkflowStore } from '@/stores/workflow-store';
 
@@ -8,15 +8,26 @@ export function Header() {
   const isPaused = useWorkflowStore((s) => s.isPaused);
   const [stopping, setStopping] = useState(false);
   const [resuming, setResuming] = useState(false);
+  const [killing, setKilling] = useState(false);
 
   const isRunning = workflowStatus === 'running' || workflowStatus === 'pending';
+
+  // Reset button states when transitioning out of paused
+  useEffect(() => {
+    if (!isPaused) {
+      setStopping(false);
+      setResuming(false);
+      setKilling(false);
+    }
+  }, [isPaused]);
 
   const handleStop = async () => {
     setStopping(true);
     try {
       await fetch('/api/stop', { method: 'POST' });
-    } catch {
-      // ignore
+    } catch (err) {
+      console.error('Failed to stop agent:', err);
+      setStopping(false);
     }
   };
 
@@ -24,22 +35,21 @@ export function Header() {
     setResuming(true);
     try {
       await fetch('/api/resume', { method: 'POST' });
-    } catch {
-      // ignore
+    } catch (err) {
+      console.error('Failed to resume agent:', err);
+      setResuming(false);
     }
   };
 
   const handleKill = async () => {
+    setKilling(true);
     try {
       await fetch('/api/kill', { method: 'POST' });
-    } catch {
-      // ignore
+    } catch (err) {
+      console.error('Failed to kill workflow:', err);
+      setKilling(false);
     }
   };
-
-  // Reset button states when transitioning out of paused
-  if (!isPaused && stopping) setStopping(false);
-  if (!isPaused && resuming) setResuming(false);
 
   return (
     <header className="flex items-center justify-between px-4 py-2 bg-[var(--surface)] border-b border-[var(--border)] flex-shrink-0">
@@ -72,14 +82,16 @@ export function Header() {
             </button>
             <button
               onClick={handleKill}
+              disabled={killing}
               className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded
                 bg-red-500/10 text-red-400 border border-red-500/20
                 hover:bg-red-500/20 hover:border-red-500/30
+                disabled:opacity-50 disabled:cursor-not-allowed
                 transition-colors"
               title="Stop workflow entirely (checkpoint saved for CLI resume)"
             >
               <X className="w-3 h-3" />
-              Kill
+              {killing ? 'Killing...' : 'Kill'}
             </button>
           </>
         ) : isRunning ? (

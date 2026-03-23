@@ -789,67 +789,6 @@ class CopilotProvider(AgentProvider):
             cache_write_tokens=usage_ref[3],
         )
 
-    async def _wait_with_interrupt(
-        self,
-        done: asyncio.Event,
-        session: Any,
-        interrupt_signal: asyncio.Event,
-        last_activity_ref: list[Any],
-        verbose_enabled: bool,
-        full_enabled: bool,
-    ) -> bool:
-        """Wait for session completion or interrupt signal, whichever comes first.
-
-        If the interrupt signal fires first, attempts to abort the session
-        and waits briefly for a post-abort event (idle or error) before
-        returning.
-
-        Args:
-            done: Event that signals session completion.
-            session: The Copilot SDK session.
-            interrupt_signal: Event that signals a user interrupt request.
-            last_activity_ref: Mutable [last_event_type, last_tool_call, timestamp].
-            verbose_enabled: Whether verbose logging is enabled.
-            full_enabled: Whether full logging mode is enabled.
-
-        Returns:
-            True if interrupted, False if completed normally.
-        """
-        # Create tasks for both events
-        done_waiter = asyncio.create_task(done.wait())
-        interrupt_waiter = asyncio.create_task(interrupt_signal.wait())
-
-        try:
-            finished, pending = await asyncio.wait(
-                {done_waiter, interrupt_waiter},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-
-            # Cancel pending tasks
-            for task in pending:
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
-
-            if interrupt_waiter in finished:
-                # Interrupt fired — attempt to abort the session
-                interrupt_signal.clear()
-                logger.info("Mid-agent interrupt received, attempting session abort")
-                await self._abort_session(session, done)
-                return True
-
-            # Normal completion
-            return False
-
-        except Exception:
-            # Cleanup on unexpected error
-            for t in (done_waiter, interrupt_waiter):
-                if not t.done():
-                    t.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await t
-            raise
-
     async def _abort_session(self, session: Any, done: asyncio.Event) -> None:
         """Attempt to abort a Copilot SDK session.
 
@@ -1338,7 +1277,9 @@ class CopilotProvider(AgentProvider):
         Combines idle detection (sending recovery prompts to stuck sessions)
         with interrupt support (aborting on user request). When the model is
         actively working (SDK events flowing), the idle timer continuously
-        resets — so long-running tasks are never interrupted.
+        resets — so stuck-detection is suppressed while the model is actively
+        working. The interrupt signal, however, is always raced regardless of
+        activity.
 
         Args:
             done: Event that signals session completion.
@@ -1436,8 +1377,8 @@ class CopilotProvider(AgentProvider):
                         raise
 
                     if interrupt_waiter in finished:
-                        interrupt_signal.clear()
                         logger.info("Mid-agent interrupt received, attempting session abort")
+                        interrupt_signal.clear()
                         await self._abort_session(session, done)
                         return True
 

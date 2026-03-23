@@ -930,9 +930,9 @@ async def _run_with_stop_signal(
     inputs: dict[str, Any],
     dashboard: Any | None,
 ) -> dict[str, Any]:
-    """Run the workflow engine, racing against a dashboard stop signal.
+    """Run the workflow engine, racing against a dashboard kill signal.
 
-    When the web dashboard has a stop button clicked (``/api/stop``), the
+    When the web dashboard's Kill button is clicked (``/api/kill``), the
     engine task is cancelled and an ``ExecutionError`` is raised.
 
     If no dashboard is present, this simply awaits ``engine.run()`` directly.
@@ -946,7 +946,7 @@ async def _run_with_stop_signal(
         The workflow result dict.
 
     Raises:
-        ExecutionError: If the workflow was stopped via the dashboard.
+        ExecutionError: If the workflow was killed via the dashboard.
     """
     if dashboard is None:
         return await engine.run(inputs)
@@ -1098,7 +1098,7 @@ async def run_workflow_async(
                 listener = KeyboardListener(interrupt_event=interrupt_event)
             elif web:
                 # In --web mode: no keyboard listener, but still need interrupt_event
-                # so the dashboard stop/resume and provider idle detection work
+                # so POST /api/stop can interrupt the running agent mid-execution
                 interrupt_event = asyncio.Event()
 
             engine = WorkflowEngine(

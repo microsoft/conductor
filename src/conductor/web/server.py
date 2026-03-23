@@ -85,8 +85,17 @@ class WebDashboard:
         # Stop signal — set by POST /api/kill to cancel the running workflow
         self._stop_event = asyncio.Event()
 
+        # Kill signal — set by POST /api/kill during a pause to hard-stop.
+        # Unlike _stop_event, this is cleared after each consumption so
+        # it doesn't permanently poison subsequent pause cycles.
+        self._kill_event = asyncio.Event()
+
         # Resume signal — set by POST /api/resume after an agent is paused
         self._resume_event = asyncio.Event()
+
+        # Disconnect signal — set when all WebSocket clients disconnect.
+        # Used by _handle_web_pause to avoid blocking forever.
+        self._disconnect_event = asyncio.Event()
 
         # Interrupt event — shared with engine for POST /api/stop to abort agent
         self._interrupt_event: asyncio.Event | None = None
@@ -171,12 +180,13 @@ class WebDashboard:
         async def kill_workflow() -> JSONResponse:
             """Hard-stop the workflow (no resume possible)."""
             self._stop_event.set()
+            self._kill_event.set()
             self._bg_event.set()
             return JSONResponse({"status": "killing"})
 
         @app.post("/api/resume")
         async def resume_agent() -> JSONResponse:
-            """Resume a paused agent after stop."""
+            """Resume a paused agent after it was interrupted by ``POST /api/stop``."""
             self._resume_event.set()
             return JSONResponse({"status": "resuming"})
 
@@ -184,6 +194,7 @@ class WebDashboard:
         async def websocket_endpoint(ws: WebSocket) -> None:
             await ws.accept()
             self._connections.add(ws)
+            self._disconnect_event.clear()
             # Cancel any pending grace timer on new connection
             if self._grace_task is not None:
                 self._grace_task.cancel()
@@ -202,6 +213,8 @@ class WebDashboard:
                 pass
             finally:
                 self._connections.discard(ws)
+                if not self._connections:
+                    self._disconnect_event.set()
                 self._maybe_start_grace_timer()
 
         # Mount static assets (Vite build output: hashed JS/CSS bundles)
@@ -317,8 +330,8 @@ class WebDashboard:
 
         For ``--web-bg`` mode: after workflow completes and all clients
         disconnect, a 30-second grace period starts.  This method awaits
-        that signal.  Also unblocks immediately if a stop was requested
-        via the ``/api/stop`` endpoint.
+        that signal.  Also unblocks immediately if a kill was requested
+        via the ``/api/kill`` endpoint.
 
         Raises:
             RuntimeError: If called when ``bg=False`` (the event would
@@ -330,14 +343,14 @@ class WebDashboard:
 
     @property
     def stop_requested(self) -> bool:
-        """Check whether a stop has been requested via ``/api/stop``."""
+        """Check whether a hard stop has been requested via ``/api/kill``."""
         return self._stop_event.is_set()
 
     async def wait_for_stop(self) -> None:
-        """Block until a stop is requested via ``/api/stop``.
+        """Block until a hard stop is requested via ``/api/kill``.
 
         Used by the run loop to race the workflow engine against a
-        user-initiated stop from the web dashboard.
+        user-initiated kill from the web dashboard.
         """
         await self._stop_event.wait()
 
@@ -434,6 +447,24 @@ class WebDashboard:
     def resume_event(self) -> asyncio.Event:
         """The resume event, set when a user clicks Resume in the dashboard."""
         return self._resume_event
+
+    @property
+    def kill_event(self) -> asyncio.Event:
+        """The kill event, set when a user clicks Kill in the dashboard.
+
+        Unlike ``_stop_event``, this is intended to be cleared after each
+        consumption so it doesn't permanently poison subsequent pause cycles.
+        """
+        return self._kill_event
+
+    @property
+    def disconnect_event(self) -> asyncio.Event:
+        """Event set when all WebSocket clients disconnect.
+
+        Cleared automatically when a new client connects. Used by the
+        engine to detect browser disconnection during a pause.
+        """
+        return self._disconnect_event
 
     def set_interrupt_event(self, event: asyncio.Event) -> None:
         """Set the interrupt event reference shared with the engine.
