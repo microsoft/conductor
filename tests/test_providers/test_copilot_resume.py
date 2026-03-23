@@ -44,7 +44,7 @@ class TestSessionIdTracking:
         # Build a fake session object returned by create_session
         mock_session = AsyncMock()
         mock_session.session_id = known_sid
-        mock_session.destroy = AsyncMock()
+        mock_session.disconnect = AsyncMock()
 
         # The on() callback must trigger session.idle so _send_and_wait resolves
         def _fake_on(callback: Any) -> None:
@@ -129,7 +129,7 @@ class TestSessionResumeFallback:
 
         mock_session = AsyncMock()
         mock_session.session_id = "sess-resumed"
-        mock_session.destroy = AsyncMock()
+        mock_session.disconnect = AsyncMock()
 
         def _fake_on(callback: Any) -> None:
             mock_session._callback = callback
@@ -163,7 +163,7 @@ class TestSessionResumeFallback:
 
         mock_client.resume_session.assert_called_once_with(
             resumed_sid,
-            {"on_permission_request": CopilotProvider._default_permission_handler},
+            on_permission_request=CopilotProvider._default_permission_handler,
         )
         mock_client.create_session.assert_not_called()
 
@@ -172,7 +172,7 @@ class TestSessionResumeFallback:
         """When resume_session raises RuntimeError, falls back to create_session."""
         mock_new_session = AsyncMock()
         mock_new_session.session_id = "sess-new"
-        mock_new_session.destroy = AsyncMock()
+        mock_new_session.disconnect = AsyncMock()
 
         def _fake_on(callback: Any) -> None:
             mock_new_session._callback = callback
@@ -206,7 +206,7 @@ class TestSessionResumeFallback:
 
         mock_client.resume_session.assert_called_once_with(
             "stale-sid",
-            {"on_permission_request": CopilotProvider._default_permission_handler},
+            on_permission_request=CopilotProvider._default_permission_handler,
         )
         mock_client.create_session.assert_called_once()
         # Session ID should now reflect the new session
@@ -217,7 +217,7 @@ class TestSessionResumeFallback:
         """When resume_session raises a generic Exception, falls back gracefully."""
         mock_new_session = AsyncMock()
         mock_new_session.session_id = "sess-fallback"
-        mock_new_session.destroy = AsyncMock()
+        mock_new_session.disconnect = AsyncMock()
 
         def _fake_on(callback: Any) -> None:
             mock_new_session._callback = callback
@@ -257,7 +257,7 @@ class TestSessionResumeFallback:
         """Fallback on resume failure logs a warning."""
         mock_new_session = AsyncMock()
         mock_new_session.session_id = "sess-new"
-        mock_new_session.destroy = AsyncMock()
+        mock_new_session.disconnect = AsyncMock()
 
         def _fake_on(callback: Any) -> None:
             mock_new_session._callback = callback
@@ -298,7 +298,7 @@ class TestSessionResumeFallback:
         """When no stored session ID exists for an agent, create_session is used."""
         mock_session = AsyncMock()
         mock_session.session_id = "sess-brand-new"
-        mock_session.destroy = AsyncMock()
+        mock_session.disconnect = AsyncMock()
 
         def _fake_on(callback: Any) -> None:
             mock_session._callback = callback
@@ -339,7 +339,7 @@ class TestSessionResumeFallback:
         """When resume_session_ids is empty, create_session is used directly."""
         mock_session = AsyncMock()
         mock_session.session_id = "sess-fresh"
-        mock_session.destroy = AsyncMock()
+        mock_session.disconnect = AsyncMock()
 
         def _fake_on(callback: Any) -> None:
             mock_session._callback = callback

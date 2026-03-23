@@ -8,7 +8,7 @@ Tests cover:
 - Post-abort event handling (idle, error, timeout)
 - Partial content captured correctly
 - Session kept alive for follow-up after interrupt
-- send_followup() sends guidance and destroys session
+- send_followup() sends guidance and disconnects session
 - AgentOutput.partial flag propagation
 """
 
@@ -55,7 +55,7 @@ class FakeSession:
         self._post_abort_event = post_abort_event
         self._post_abort_delay = post_abort_delay
         self._callback: Any = None
-        self._destroyed = False
+        self._disconnected = False
         self._abort_called = False
         self._rpc_called = False
         self.session_id = "test-session-id"
@@ -99,8 +99,8 @@ class FakeSession:
         if self._done_event is not None:
             self._done_event.set()
 
-    async def destroy(self) -> None:
-        self._destroyed = True
+    async def disconnect(self) -> None:
+        self._disconnected = True
 
 
 @pytest.fixture
@@ -389,11 +389,11 @@ class TestSendFollowup:
         assert result.content == {"result": "followup response"}
         assert result.partial is False
         assert result.model == "gpt-4o"
-        assert session._destroyed is True
+        assert session._disconnected is True
 
     @pytest.mark.asyncio
-    async def test_send_followup_destroys_session(self) -> None:
-        """send_followup always destroys the session, even on error."""
+    async def test_send_followup_disconnects_session(self) -> None:
+        """send_followup always disconnects the session, even on error."""
         provider = CopilotProvider(mock_handler=lambda a, p, c: {})
         session = FakeSession(response_content="not json")
 
@@ -414,11 +414,11 @@ class TestSendFollowup:
 
         # Non-JSON response should be wrapped
         assert result.content == {"result": "not json"}
-        assert session._destroyed is True
+        assert session._disconnected is True
 
     @pytest.mark.asyncio
-    async def test_send_followup_on_error_destroys_session(self) -> None:
-        """send_followup destroys session even if send fails."""
+    async def test_send_followup_on_error_disconnects_session(self) -> None:
+        """send_followup disconnects session even if send fails."""
         from conductor.exceptions import ProviderError
 
         provider = CopilotProvider(mock_handler=lambda a, p, c: {})
@@ -438,7 +438,7 @@ class TestSendFollowup:
         ):
             await provider.send_followup(session, "guidance")
 
-        assert session._destroyed is True
+        assert session._disconnected is True
 
 
 class TestExecuteSdkCallWithInterrupt:

@@ -10,6 +10,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import random
 import time
 from collections.abc import Callable
@@ -40,12 +41,13 @@ _IDLE_IGNORED_EVENTS: frozenset[str] = frozenset(
 
 # Try to import the Copilot SDK
 try:
-    from copilot import CopilotClient
+    from copilot import CopilotClient, PermissionHandler
 
     COPILOT_SDK_AVAILABLE = True
 except ImportError:
     COPILOT_SDK_AVAILABLE = False
     CopilotClient = None  # type: ignore[misc, assignment]
+    PermissionHandler = None  # type: ignore[misc, assignment]
 
 
 @dataclass
@@ -86,7 +88,7 @@ class IdleRecoveryConfig:
             Use {last_activity} placeholder for context about what was happening.
     """
 
-    idle_timeout_seconds: float = 300.0  # 5 minutes
+    idle_timeout_seconds: float = 90.0  # 90 seconds
     max_recovery_attempts: int = 3
     max_session_seconds: float = 1800.0  # 30 minutes
     recovery_prompt: str = (
@@ -187,17 +189,19 @@ class CopilotProvider(AgentProvider):
 
     @staticmethod
     def _default_permission_handler(
-        request: dict[str, Any],
+        request: Any,
         invocation: dict[str, str],
-    ) -> dict[str, Any]:
+    ) -> Any:
         """Default permission handler that approves all requests.
 
-        SDK v0.1.28+ requires a permission handler on session creation.
+        The SDK requires a permission handler on session creation.
         In orchestration mode, we approve all tool permissions since the
         workflow author controls which tools are available to each agent.
+
+        Returns a PermissionRequestResult from the SDK.
         """
         logger.debug("auto-approved permission request: %s", request)
-        return {"kind": "approved"}
+        return PermissionHandler.approve_all(request, invocation)
 
     async def execute(
         self,
@@ -443,19 +447,16 @@ class CopilotProvider(AgentProvider):
             )
 
         try:
-            # Build session config with MCP servers from workflow configuration
-            session_config: dict[str, Any] = {
+            # Build session kwargs for the SDK
+            session_kwargs: dict[str, Any] = {
                 "model": model,
                 "on_permission_request": self._default_permission_handler,
+                "working_directory": os.getcwd(),
             }
-
-            # Add temperature if configured
-            if self._temperature is not None:
-                session_config["temperature"] = self._temperature
 
             # Add MCP servers if configured
             if self._mcp_servers:
-                session_config["mcp_servers"] = self._mcp_servers
+                session_kwargs["mcp_servers"] = self._mcp_servers
 
             # Attempt to resume a previous session if one exists for this agent
             session: Any = None
@@ -464,7 +465,7 @@ class CopilotProvider(AgentProvider):
                 try:
                     session = await self._client.resume_session(
                         resume_sid,
-                        {"on_permission_request": self._default_permission_handler},
+                        on_permission_request=self._default_permission_handler,
                     )
                     logger.info(f"Resumed Copilot session {resume_sid} for agent '{agent.name}'")
                 except Exception as exc:
@@ -476,7 +477,7 @@ class CopilotProvider(AgentProvider):
 
             # Fall back to creating a new session
             if session is None:
-                session = await self._client.create_session(session_config)
+                session = await self._client.create_session(**session_kwargs)
 
             # Track session ID for checkpoint persistence
             sid = getattr(session, "session_id", None)
@@ -618,9 +619,9 @@ class CopilotProvider(AgentProvider):
                 )
 
             finally:
-                # Destroy session unless it was kept alive for follow-up
+                # Disconnect session unless it was kept alive for follow-up
                 if not session_destroyed:
-                    await session.destroy()
+                    await session.disconnect()
 
         except ProviderError:
             raise
@@ -748,7 +749,7 @@ class CopilotProvider(AgentProvider):
         if event_callback is not None:
             event_callback("agent_turn_start", {"turn": "awaiting_model"})
 
-        await session.send({"prompt": prompt})
+        await session.send(prompt)
 
         # If interrupt_signal is provided, race between done and interrupt,
         # while also running idle detection. If no interrupt_signal, just
@@ -845,7 +846,7 @@ class CopilotProvider(AgentProvider):
         After a mid-agent interrupt, the session is kept alive so that
         the user's guidance can be sent as a follow-up message. This
         method sends the guidance, waits for the response, and then
-        destroys the session.
+        disconnects the session.
 
         Args:
             session: The Copilot SDK session handle (kept alive after interrupt).
@@ -885,7 +886,7 @@ class CopilotProvider(AgentProvider):
                 model=self._default_model,
             )
         finally:
-            await session.destroy()
+            await session.disconnect()
 
     def _log_parse_recovery(
         self,
@@ -1442,7 +1443,7 @@ class CopilotProvider(AgentProvider):
 
                 # Send recovery message
                 recovery_prompt = self._build_recovery_prompt(last_event_type, last_tool_call)
-                await session.send({"prompt": recovery_prompt})
+                await session.send(recovery_prompt)
 
                 # Reset the done event to wait again — but only if it hasn't
                 # been set since the recovery prompt was sent.
