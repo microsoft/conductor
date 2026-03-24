@@ -1,11 +1,24 @@
 ---
 name: conductor
-description: Create, validate, and run workflows. Use when orchestrating AI agents via YAML workflow files, creating new workflows, debugging execution, configuring routing between agents, setting up human-in-the-loop gates, or understanding workflow YAML schema.
+description: Validate, run, and execute workflows; creating new workflows when explicitly asked. Use when orchestrating AI agents via YAML workflow files, executing an existing workflow, debugging execution, configuring routing between agents, setting up human-in-the-loop gates, or understanding workflow YAML schema. Only create new workflows when explicitly asked.
 ---
 
 # Conductor
 
 CLI tool for defining and running multi-agent workflows with the GitHub Copilot SDK or Anthropic Claude.
+
+> **DO NOT create new workflow files unless the user explicitly asks you to create one.** Default to running, validating, or debugging existing workflows. If the user's request is ambiguous, assume they want to run or modify an existing workflow rather than create a new one.
+
+## Error Handling
+
+> **CRITICAL — do NOT improvise workarounds.** If `conductor` fails for any reason (installation failure, provider error, missing dependency, platform bug), you MUST:
+>
+> 1. **Report the exact error** to the user — include the full error message.
+> 2. **Stop and wait for user direction.** Do NOT attempt to simulate, replicate, or approximate the multi-agent workflow yourself. The value of this skill is the structured multi-agent orchestration — a single-agent attempt is not an equivalent substitute.
+
+## Setup
+
+Conductor is installed automatically when needed. If a `conductor` command fails with "command not found", install it. For installation instructions, see [references/setup.md](references/setup.md).
 
 ## Quick Reference
 
@@ -49,39 +62,28 @@ Full output is shown by default. Use `-q` (quiet) for minimal output or `-s` (si
 - Validation rules
 - Type definitions
 
-## Workflow Structure Overview
+## Minimal Workflow Example
 
 ```yaml
 workflow:
   name: my-workflow
-  entry_point: first_agent
-  runtime:
-    provider: copilot               # or claude
-    default_model: gpt-5.2
-    temperature: 0.7
+  entry_point: answerer
   input:
-    question:
-      type: string
-  context:
-    mode: accumulate                # accumulate, last_only, explicit
-  limits:
-    max_iterations: 10
-  cost:
-    show_summary: true
+    question: { type: string }
 
 agents:
-  - name: first_agent
-    prompt: |
-      Answer: {{ workflow.input.question }}
+  - name: answerer
+    prompt: "Answer: {{ workflow.input.question }}"
     output:
-      answer:
-        type: string
+      answer: { type: string }
     routes:
       - to: $end
 
 output:
-  answer: "{{ first_agent.output.answer }}"
+  answer: "{{ answerer.output.answer }}"
 ```
+
+For runtime config, context modes, limits, and cost tracking, see [references/authoring.md](references/authoring.md).
 
 ## Key Concepts
 
@@ -101,108 +103,4 @@ output:
 | `--web` | Real-time web dashboard with DAG graph, live streaming, in-browser human gates |
 | `checkpoint` | Auto-saved on failure; resume with `conductor resume` |
 
-## Common Patterns
-
-**Linear pipeline**: `agent1 → agent2 → agent3 → $end`
-
-**Loop until quality**:
-```yaml
-routes:
-  - to: $end
-    when: "{{ output.score >= 90 }}"
-  - to: self
-```
-
-**Conditional branching**:
-```yaml
-routes:
-  - to: success_path
-    when: "{{ output.approved }}"
-  - to: failure_path
-```
-
-**Parallel execution**:
-```yaml
-parallel:
-  - name: researchers
-    agents: [web_researcher, academic_researcher]
-    failure_mode: continue_on_error
-    routes:
-      - to: synthesizer
-```
-
-**For-each (dynamic parallel)**:
-```yaml
-for_each:
-  - name: processors
-    type: for_each
-    source: finder.output.topics
-    as: item
-    max_concurrent: 5
-    agent:
-      prompt: "Process {{ item }} (index: {{ _index }})"
-      output:
-        result: { type: string }
-    routes:
-      - to: aggregator
-```
-
-**Script step** (shell command):
-```yaml
-agents:
-  - name: check_version
-    type: script
-    command: python3
-    args: ["--version"]
-    routes:
-      - to: analyzer
-        when: "exit_code == 0"
-      - to: error_handler
-```
-
-**File include** (`!file` tag):
-```yaml
-agents:
-  - name: analyzer
-    system_prompt: !file prompts/system.md
-    prompt: !file prompts/analyze.md
-```
-
-**Human gate**:
-```yaml
-- name: review
-  type: human_gate
-  prompt: "Review: {{ designer.output.summary }}"
-  options:
-    - label: Approve
-      value: approved
-      route: $end
-    - label: Revise
-      value: changes
-      route: designer
-      prompt_for: feedback
-```
-
-## Template Variables (Jinja2)
-
-```jinja2
-{{ workflow.input.param }}                  # Input parameter
-{{ workflow.name }}                         # Workflow name
-{{ agent_name.output.field }}               # Agent output
-{{ output.field }}                          # Current output (in routes)
-{{ group.outputs.agent.field }}             # Parallel group outputs
-{{ group.outputs[0].field }}                # For-each outputs (index)
-{{ group.outputs["key"].field }}            # For-each outputs (key_by)
-{% if agent is defined %}...{% endif %}     # Conditional
-{% for item in list %}...{% endfor %}       # Loop
-{{ value | default("fallback") }}           # Filter
-```
-
-## Providers
-
-| Provider | Auth | MCP Support |
-|----------|------|-------------|
-| `copilot` | `GITHUB_TOKEN` | ✅ Full |
-| `claude` | `ANTHROPIC_API_KEY` | ✅ Full |
-
-Per-agent provider override: `provider: claude` on any agent definition for multi-provider workflows.
+For pattern examples (linear, loop, conditional, parallel, for-each, human gate) and template syntax, see [references/authoring.md](references/authoring.md).

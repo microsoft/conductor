@@ -839,7 +839,7 @@ def update() -> None:
     """Check for and install the latest version of Conductor.
 
     Fetches the latest release from GitHub and upgrades using
-    ``uv tool install --force``.
+    ``uv tool install --locked --force git+https://github.com/microsoft/conductor.git@v{version}``.
 
     \b
     Examples:

@@ -120,12 +120,7 @@ The command:
 
 If already up to date, prints a confirmation message and exits.
 
-**Examples:**
-
-```bash
-# Check for updates and install if available
-conductor update
-```
+**Passive update hints:** On every CLI invocation, Conductor checks for updates (cached 24 hours, 2-second timeout) and prints a one-line hint if a newer version is available. Hints only appear when stderr is a TTY and `--silent` is not set.
 
 ### conductor resume
 
@@ -337,7 +332,7 @@ conductor stop
 conductor validate workflow.yaml
 ```
 
-Catch configuration errors before execution. Reports agent count, parallel groups, for-each groups, human gates, and more.
+Catch configuration errors before execution of new workflows. Reports agent count, parallel groups, for-each groups, human gates, and more.
 
 ### Check Exit Codes
 
@@ -444,6 +439,44 @@ conductor run workflow.yaml --skip-gates
 
 Auto-selects the first option at each gate.
 
+## Interactive Interrupt
+
+During execution, press **Esc** or **Ctrl+G** to pause the workflow. An interactive menu appears with these actions:
+
+| Action | Description |
+|--------|-------------|
+| **Continue with guidance** | Provide text guidance that is appended to subsequent agent prompts |
+| **Skip to agent** | Jump to a specific agent in the workflow |
+| **Stop** | Stop the workflow entirely |
+| **Cancel** | Resume execution as-is |
+
+Guidance text accumulates across multiple interrupts and is injected into agent context.
+
+Disable with `--no-interactive`. In `--skip-gates` mode, interrupts auto-cancel.
+
+## Checkpoint & Resume
+
+When a workflow fails, Conductor automatically saves a checkpoint containing:
+- All completed agent outputs
+- Current workflow state and iteration count
+- Workflow file hash (to detect changes)
+- Failure details (agent, error type, message)
+
+Checkpoints are stored in `$TMPDIR/conductor/checkpoints/`.
+
+```bash
+# List available checkpoints
+conductor checkpoints
+
+# Resume from latest checkpoint for a workflow
+conductor resume workflow.yaml
+
+# Resume from a specific checkpoint file
+conductor resume --from /tmp/conductor/checkpoints/my-workflow-20260303-153000.json
+```
+
+If the workflow file has changed since the checkpoint was saved, a warning is displayed but resumption proceeds.
+
 ## Provider Configuration
 
 ### Override Provider
@@ -515,46 +548,7 @@ Environment variables in YAML configs support `${VAR}` and `${VAR:-default}` int
 3. [ ] Verify entry_point exists as an agent, parallel group, or for-each group
 4. [ ] Ensure all paths lead to `$end`
 5. [ ] Test with `--dry-run` first
-6. [ ] Use `-V` to trace execution with full details
-7. [ ] Check template variables are defined before use
-8. [ ] Verify for-each `source` resolves to an array
-9. [ ] Check parallel groups have 2+ agents
-10. [ ] Review cost output for unexpected token usage
-
-## Interactive Interrupt
-
-During execution, press **Esc** or **Ctrl+G** to pause the workflow. An interactive menu appears with these actions:
-
-| Action | Description |
-|--------|-------------|
-| **Continue with guidance** | Provide text guidance that is appended to subsequent agent prompts |
-| **Skip to agent** | Jump to a specific agent in the workflow |
-| **Stop** | Stop the workflow entirely |
-| **Cancel** | Resume execution as-is |
-
-Guidance text accumulates across multiple interrupts and is injected into agent context.
-
-Disable with `--no-interactive`. In `--skip-gates` mode, interrupts auto-cancel.
-
-## Checkpoint & Resume
-
-When a workflow fails, Conductor automatically saves a checkpoint containing:
-- All completed agent outputs
-- Current workflow state and iteration count
-- Workflow file hash (to detect changes)
-- Failure details (agent, error type, message)
-
-Checkpoints are stored in `$TMPDIR/conductor/checkpoints/`.
-
-```bash
-# List available checkpoints
-conductor checkpoints
-
-# Resume from latest checkpoint for a workflow
-conductor resume workflow.yaml
-
-# Resume from a specific checkpoint file
-conductor resume --from /tmp/conductor/checkpoints/my-workflow-20260303-153000.json
-```
-
-If the workflow file has changed since the checkpoint was saved, a warning is displayed but resumption proceeds.
+6. [ ] Check template variables are defined before use
+7. [ ] Verify for-each `source` resolves to an array
+8. [ ] Check parallel groups have 2+ agents
+9. [ ] Review cost output for unexpected token usage
