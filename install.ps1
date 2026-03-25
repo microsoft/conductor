@@ -105,12 +105,31 @@ try {
     }
     Write-Ok "Checksum verified"
 
-    # --- Install ---
-    Write-Info "Installing Conductor $tagName…"
-    uv tool install --force "git+https://github.com/$Repo.git@$tagName" -c $constraintsFile
+    # --- Install (with retry for Windows Defender file locking) ---
+    $maxRetries = 3
+    $installed = $false
+    for ($attempt = 1; $attempt -le $maxRetries; $attempt++) {
+        if ($attempt -eq 1) {
+            Write-Info "Installing Conductor $tagName…"
+        } else {
+            Write-Info "Retrying install (attempt $attempt/$maxRetries)…"
+            Start-Sleep -Seconds 2
+        }
+        uv tool install --force "git+https://github.com/$Repo.git@$tagName" -c $constraintsFile 2>$null
+        if ($LASTEXITCODE -eq 0) {
+            $installed = $true
+            break
+        }
+    }
 
-    if ($LASTEXITCODE -ne 0) {
-        Write-Err "uv tool install failed with exit code $LASTEXITCODE"
+    if (-not $installed) {
+        Write-Host ""
+        Write-Info "Install failed after $maxRetries attempts. This is often caused by"
+        Write-Info "Windows Defender scanning files during install. Try:"
+        Write-Info "  1. Add a Defender exclusion: Add-MpExclusion -Path `"$env:LOCALAPPDATA\uv`""
+        Write-Info "  2. Re-run this installer"
+        Write-Host ""
+        Write-Err "uv tool install failed"
     }
 
     Write-Ok "Conductor $tagName installed"
