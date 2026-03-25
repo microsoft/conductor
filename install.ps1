@@ -62,7 +62,7 @@ $existingConductor = Get-Command conductor -ErrorAction SilentlyContinue
 if ($existingConductor) {
     $currentVersion = $null
     try {
-        $versionOutput = conductor --version 2>$null
+        $versionOutput = (conductor --version 2>&1) | Out-String
         if ($versionOutput -match '(\d+\.\d+\.\d+[^ ]*)') {
             $currentVersion = $Matches[1]
         }
@@ -75,7 +75,7 @@ if ($existingConductor) {
             Write-Host ""
             Write-Host "  Run 'conductor --help' to get started."
             Write-Host ""
-            exit 0
+            return
         }
         Write-Info "Upgrading Conductor: v$currentVersion → $tagName"
     }
