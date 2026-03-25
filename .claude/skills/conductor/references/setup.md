@@ -16,20 +16,6 @@ irm https://aka.ms/conductor/install.ps1 | iex
 
 The installer checks for uv (installs it if missing), fetches the latest release with pinned dependencies, and verifies integrity via SHA-256 checksum.
 
-### Manual Install
-
-If you prefer to install manually:
-
-```bash
-uv tool install git+https://github.com/microsoft/conductor.git
-```
-
-If `uv` is also not available, install it first:
-
-```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-```
-
 ## Updating
 
 ```bash
