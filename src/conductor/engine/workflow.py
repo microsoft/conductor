@@ -449,6 +449,33 @@ class WorkflowEngine:
             operation_name=f"script '{agent.name}'",
         )
 
+    def _get_context_window_for_agent(self, agent: AgentDef) -> int | None:
+        """Return the context window size for an agent's model."""
+        import re
+
+        from conductor.providers.claude import _CLAUDE_CONTEXT_WINDOWS
+        from conductor.providers.copilot import _COPILOT_CONTEXT_WINDOWS
+
+        model = agent.model
+        if not model:
+            return None
+
+        for table in (_CLAUDE_CONTEXT_WINDOWS, _COPILOT_CONTEXT_WINDOWS):
+            if model in table:
+                return table[model]
+
+        stripped = re.sub(r"-(\d{8}|latest|preview)$", "", model)
+        for table in (_CLAUDE_CONTEXT_WINDOWS, _COPILOT_CONTEXT_WINDOWS):
+            if stripped in table:
+                return table[stripped]
+
+        for table in (_CLAUDE_CONTEXT_WINDOWS, _COPILOT_CONTEXT_WINDOWS):
+            for key, size in table.items():
+                if stripped.startswith(key) or key.startswith(stripped):
+                    return size
+
+        return None
+
     async def run(self, inputs: dict[str, Any]) -> dict[str, Any]:
         """Execute the workflow from entry_point to $end.
 
@@ -1179,6 +1206,7 @@ class WorkflowEngine:
                                 "agent_name": agent.name,
                                 "iteration": agent_execution_count,
                                 "agent_type": agent.type or "agent",
+                                "context_window_max": self._get_context_window_for_agent(agent),
                             },
                         )
 
@@ -1417,6 +1445,8 @@ class WorkflowEngine:
                                 "cost_usd": usage.cost_usd,
                                 "output": output.content,
                                 "output_keys": output_keys,
+                                "context_window_used": output.input_tokens,
+                                "context_window_max": self._get_context_window_for_agent(agent),
                             },
                         )
 
@@ -2043,6 +2073,8 @@ class WorkflowEngine:
                         "model": output.model,
                         "tokens": output.tokens_used,
                         "cost_usd": usage.cost_usd,
+                        "context_window_used": output.input_tokens,
+                        "context_window_max": self._get_context_window_for_agent(agent),
                     },
                 )
 

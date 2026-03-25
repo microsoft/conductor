@@ -49,6 +49,25 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# Context window sizes for Claude models (in tokens)
+# Source: https://docs.anthropic.com/en/docs/about-claude/models
+_CLAUDE_CONTEXT_WINDOWS: dict[str, int] = {
+    "claude-opus-4": 200_000,
+    "claude-sonnet-4": 200_000,
+    "claude-sonnet-4.5": 200_000,
+    "claude-haiku-4": 200_000,
+    "claude-haiku-4.5": 200_000,
+    "claude-3-7-sonnet": 200_000,
+    "claude-3.7-sonnet": 200_000,
+    "claude-3-5-sonnet": 200_000,
+    "claude-3.5-sonnet": 200_000,
+    "claude-3-5-haiku": 200_000,
+    "claude-3.5-haiku": 200_000,
+    "claude-3-opus": 200_000,
+    "claude-3-sonnet": 200_000,
+    "claude-3-haiku": 200_000,
+}
+
 
 # Protocol for Claude API response structure (improves type safety)
 class ClaudeContentBlock(Protocol):

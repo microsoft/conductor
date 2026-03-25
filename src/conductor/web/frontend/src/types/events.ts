@@ -65,6 +65,7 @@ export interface WorkflowFailedData {
 export interface AgentStartedData {
   agent_name: string;
   iteration?: number;
+  context_window_max?: number;
 }
 
 export interface AgentCompletedData {
@@ -75,6 +76,8 @@ export interface AgentCompletedData {
   input_tokens?: number;
   output_tokens?: number;
   cost_usd?: number;
+  context_window_used?: number;
+  context_window_max?: number;
   output?: unknown;
   output_keys?: string[];
 }
@@ -114,6 +117,8 @@ export interface AgentToolCompleteData {
 export interface AgentTurnStartData {
   agent_name: string;
   turn?: number;
+  context_window_used?: number;
+  context_window_max?: number;
 }
 
 export interface AgentMessageData {
@@ -186,6 +191,8 @@ export interface ParallelAgentCompletedData {
   model?: string;
   tokens?: number;
   cost_usd?: number;
+  context_window_used?: number;
+  context_window_max?: number;
 }
 
 export interface ParallelAgentFailedData {
@@ -222,6 +229,8 @@ export interface ForEachItemCompletedData {
   elapsed?: number;
   tokens?: number;
   cost_usd?: number;
+  context_window_used?: number;
+  context_window_max?: number;
   output?: unknown;
 }
 

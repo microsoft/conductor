@@ -39,6 +39,21 @@ _IDLE_IGNORED_EVENTS: frozenset[str] = frozenset(
     }
 )
 
+# Context window sizes for Copilot/OpenAI models (in tokens)
+# Claude models are in _CLAUDE_CONTEXT_WINDOWS (providers/claude.py);
+# both tables are consulted by the engine lookup.
+_COPILOT_CONTEXT_WINDOWS: dict[str, int] = {
+    "gpt-4o": 128_000,
+    "gpt-4o-mini": 128_000,
+    "gpt-4": 8_192,
+    "gpt-4-turbo": 128_000,
+    "gpt-3.5-turbo": 16_385,
+    "o1": 200_000,
+    "o1-mini": 128_000,
+    "o1-preview": 128_000,
+    "o3-mini": 200_000,
+}
+
 # Try to import the Copilot SDK
 try:
     from copilot import CopilotClient, PermissionHandler
