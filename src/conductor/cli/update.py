@@ -414,8 +414,7 @@ def _download_constraints(tag_name: str, console: Console) -> Path | None:
     except Exception:  # noqa: BLE001
         logger.debug("Failed to download constraints file", exc_info=True)
         console.print(
-            "[dim]Constraints file not available for this release,"
-            " installing without.[/dim]"
+            "[dim]Constraints file not available for this release, installing without.[/dim]"
         )
         with contextlib.suppress(OSError):
             constraints_path.unlink()
