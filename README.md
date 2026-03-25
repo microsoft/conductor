@@ -25,11 +25,31 @@ Conductor provides the patterns that work: evaluator-optimizer loops for iterati
 
 ## Installation
 
-### Using uv (Recommended)
+### Quick Install (Recommended)
+
+**macOS / Linux:**
+```bash
+curl -sSfL https://aka.ms/conductor/install.sh | sh
+```
+
+**Windows (PowerShell):**
+```powershell
+irm https://aka.ms/conductor/install.ps1 | iex
+```
+
+The installer checks for [uv](https://docs.astral.sh/uv/) (installs it if missing), fetches the latest release with pinned dependencies, and verifies integrity via SHA-256 checksum.
+
+### Updating
 
 ```bash
-# Install from GitHub (--locked ensures reproducible dependency versions)
-uv tool install --locked git+https://github.com/microsoft/conductor.git
+conductor update
+```
+
+### Manual Install
+
+```bash
+# Install from GitHub
+uv tool install git+https://github.com/microsoft/conductor.git
 
 # Run the CLI
 conductor run workflow.yaml
@@ -38,9 +58,9 @@ conductor run workflow.yaml
 uvx --from git+https://github.com/microsoft/conductor.git conductor run workflow.yaml
 
 # Install a specific branch, tag, or commit
-uv tool install --locked git+https://github.com/microsoft/conductor.git@branch-name
-uv tool install --locked git+https://github.com/microsoft/conductor.git@v1.0.0
-uv tool install --locked git+https://github.com/microsoft/conductor.git@abc1234
+uv tool install git+https://github.com/microsoft/conductor.git@branch-name
+uv tool install git+https://github.com/microsoft/conductor.git@v1.0.0
+uv tool install git+https://github.com/microsoft/conductor.git@abc1234
 ```
 
 ### Using pipx

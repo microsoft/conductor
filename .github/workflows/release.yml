@@ -144,6 +144,12 @@ jobs:
           ls -la dist/
           uv run python -m zipfile -l dist/*.whl
 
+      - name: Generate constraints file
+        run: |
+          uv export --no-hashes --frozen --no-emit-project --no-annotate \
+            -o dist/constraints.txt
+          sha256sum dist/constraints.txt > dist/constraints.txt.sha256
+
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}

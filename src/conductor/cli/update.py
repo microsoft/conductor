@@ -14,11 +14,13 @@ so they never block the CLI.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import logging
 import shutil
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 from datetime import UTC, datetime
@@ -35,6 +37,7 @@ _CACHE_TTL_SECONDS = 86_400  # 24 hours
 _API_URL = "https://api.github.com/repos/microsoft/conductor/releases/latest"
 _FETCH_TIMEOUT_SECONDS = 2
 _REPO_GIT_URL = "https://github.com/microsoft/conductor.git"
+_RELEASE_DL_URL = "https://github.com/microsoft/conductor/releases/download"
 
 
 # ---------------------------------------------------------------------------
@@ -293,6 +296,9 @@ def run_update(console: Console) -> None:
     This always bypasses the cache and fetches from the network.  On success
     the cache file is deleted so the next invocation will re-check cleanly.
 
+    The upgrade pins transitive dependencies using a constraints file
+    published with each GitHub Release, verified via SHA-256 checksum.
+
     Args:
         console: Rich console for output.
     """
@@ -313,7 +319,13 @@ def run_update(console: Console) -> None:
     console.print(f"Upgrading Conductor: v{current} → v{version}")
 
     install_url = f"git+{_REPO_GIT_URL}@{tag_name}"
-    cmd = ["uv", "tool", "install", "--force", "--locked", install_url]
+
+    # Download constraints file and verify checksum
+    constraints_path = _download_constraints(tag_name, console)
+
+    cmd = ["uv", "tool", "install", "--force", install_url]
+    if constraints_path:
+        cmd.extend(["-c", str(constraints_path)])
 
     # On Windows, rename our exe out of the way so uv can write the new one.
     # Windows locks running executables but allows renaming them.
@@ -331,19 +343,81 @@ def run_update(console: Console) -> None:
             except OSError:
                 old_exe = None  # rename failed; proceed anyway, uv will report the error
 
-    proc = subprocess.run(cmd, capture_output=True, text=True)  # noqa: S603
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True)  # noqa: S603
 
-    if proc.returncode == 0:
-        console.print(f"[green]Successfully upgraded to v{version}[/green]")
-        cache_path = get_cache_path()
-        cache_path.unlink(missing_ok=True)
-    else:
-        console.print(f"[bold red]Upgrade failed[/bold red] (exit code {proc.returncode})")
-        if proc.stderr:
-            console.print(f"[dim]{proc.stderr.strip()}[/dim]")
-        # On Windows, restore the original exe if uv failed to write a new one
-        if old_exe and old_exe.exists():
-            exe_path = old_exe.with_suffix("")  # .exe.old → .exe
-            if not exe_path.exists():
-                with contextlib.suppress(OSError):
-                    old_exe.rename(exe_path)
+        if proc.returncode == 0:
+            console.print(f"[green]Successfully upgraded to v{version}[/green]")
+            cache_path = get_cache_path()
+            cache_path.unlink(missing_ok=True)
+        else:
+            console.print(f"[bold red]Upgrade failed[/bold red] (exit code {proc.returncode})")
+            if proc.stderr:
+                console.print(f"[dim]{proc.stderr.strip()}[/dim]")
+            # On Windows, restore the original exe if uv failed to write a new one
+            if old_exe and old_exe.exists():
+                exe_path = old_exe.with_suffix("")  # .exe.old → .exe
+                if not exe_path.exists():
+                    with contextlib.suppress(OSError):
+                        old_exe.rename(exe_path)
+    finally:
+        # Clean up temp constraints file
+        if constraints_path:
+            with contextlib.suppress(OSError):
+                constraints_path.unlink()
+                constraints_path.parent.rmdir()
+
+
+def _download_constraints(tag_name: str, console: Console) -> Path | None:
+    """Download and verify the constraints file for a release.
+
+    Args:
+        tag_name: The release tag (e.g. ``v0.3.0``).
+        console: Rich console for status output.
+
+    Returns:
+        Path to the downloaded constraints file, or ``None`` if unavailable.
+    """
+    constraints_url = f"{_RELEASE_DL_URL}/{tag_name}/constraints.txt"
+    checksum_url = f"{_RELEASE_DL_URL}/{tag_name}/constraints.txt.sha256"
+
+    tmpdir = Path(tempfile.mkdtemp(prefix="conductor-update-"))
+    constraints_path = tmpdir / "constraints.txt"
+
+    try:
+        # Download constraints file
+        req = urllib.request.Request(constraints_url)
+        with urllib.request.urlopen(req, timeout=10) as resp:  # noqa: S310
+            constraints_path.write_bytes(resp.read())
+
+        # Download checksum
+        req = urllib.request.Request(checksum_url)
+        with urllib.request.urlopen(req, timeout=10) as resp:  # noqa: S310
+            checksum_content = resp.read().decode().strip()
+        expected_hash = checksum_content.split()[0]
+
+        # Verify
+        actual_hash = hashlib.sha256(constraints_path.read_bytes()).hexdigest()
+        if actual_hash != expected_hash:
+            console.print(
+                "[bold red]Error:[/bold red] Constraints file checksum mismatch — "
+                "skipping constraints."
+            )
+            with contextlib.suppress(OSError):
+                constraints_path.unlink()
+                tmpdir.rmdir()
+            return None
+
+        console.print("[dim]Constraints verified ✓[/dim]")
+        return constraints_path
+
+    except Exception:  # noqa: BLE001
+        logger.debug("Failed to download constraints file", exc_info=True)
+        console.print(
+            "[dim]Constraints file not available for this release,"
+            " installing without.[/dim]"
+        )
+        with contextlib.suppress(OSError):
+            constraints_path.unlink()
+            tmpdir.rmdir()
+        return None
