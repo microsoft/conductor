@@ -130,6 +130,16 @@ body {
   }
 }
 
+@keyframes context-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.4;
+  }
+}
+
 /* Edge animation */
 @keyframes dash-flow {
   to {

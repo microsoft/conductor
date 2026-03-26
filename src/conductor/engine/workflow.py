@@ -449,6 +449,17 @@ class WorkflowEngine:
             operation_name=f"script '{agent.name}'",
         )
 
+    def _get_context_window_for_agent(self, agent: AgentDef) -> int | None:
+        """Return the context window size for an agent's model."""
+        from conductor.engine.pricing import get_pricing
+
+        model = agent.model
+        if not model:
+            return None
+
+        pricing = get_pricing(model)
+        return pricing.context_window if pricing else None
+
     async def run(self, inputs: dict[str, Any]) -> dict[str, Any]:
         """Execute the workflow from entry_point to $end.
 
@@ -1179,6 +1190,7 @@ class WorkflowEngine:
                                 "agent_name": agent.name,
                                 "iteration": agent_execution_count,
                                 "agent_type": agent.type or "agent",
+                                "context_window_max": self._get_context_window_for_agent(agent),
                             },
                         )
 
@@ -1417,6 +1429,8 @@ class WorkflowEngine:
                                 "cost_usd": usage.cost_usd,
                                 "output": output.content,
                                 "output_keys": output_keys,
+                                "context_window_used": output.input_tokens,
+                                "context_window_max": self._get_context_window_for_agent(agent),
                             },
                         )
 
@@ -2043,6 +2057,8 @@ class WorkflowEngine:
                         "model": output.model,
                         "tokens": output.tokens_used,
                         "cost_usd": usage.cost_usd,
+                        "context_window_used": output.input_tokens,
+                        "context_window_max": self._get_context_window_for_agent(agent),
                     },
                 )
 

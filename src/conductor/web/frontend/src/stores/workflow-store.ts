@@ -74,6 +74,10 @@ export interface NodeData {
   type: NodeType;
   elapsed?: number;
   model?: string;
+  // Context window tracking
+  context_pct?: number;
+  context_window_used?: number;
+  context_window_max?: number;
   tokens?: number;
   input_tokens?: number;
   output_tokens?: number;
@@ -455,6 +459,10 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     nd.iteration = data.iteration;
     nd.startedAt = timestamp ?? Date.now() / 1000;
     nd.activity = [];
+    // Store context window max from agent_started for early availability
+    if (data.context_window_max != null) {
+      nd.context_window_max = data.context_window_max;
+    }
     // Clear stale fields from previous iteration
     nd.prompt = undefined;
     nd.output = undefined;
@@ -476,6 +484,12 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     nd.cost_usd = data.cost_usd;
     nd.output = data.output;
     nd.output_keys = data.output_keys;
+    // Context window tracking
+    nd.context_window_used = data.context_window_used;
+    nd.context_window_max = data.context_window_max;
+    if (data.context_window_used != null && data.context_window_max != null && data.context_window_max > 0) {
+      nd.context_pct = Math.round((data.context_window_used / data.context_window_max) * 100);
+    }
     if (data.cost_usd) state.totalCost += data.cost_usd;
     if (data.tokens) state.totalTokens += data.tokens;
     replaceNode(state.nodes, data.agent_name);
@@ -684,6 +698,12 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     nd.model = data.model;
     nd.tokens = data.tokens;
     nd.cost_usd = data.cost_usd;
+    // Context window tracking
+    nd.context_window_used = data.context_window_used;
+    nd.context_window_max = data.context_window_max;
+    if (data.context_window_used != null && data.context_window_max != null && data.context_window_max > 0) {
+      nd.context_pct = Math.round((data.context_window_used / data.context_window_max) * 100);
+    }
     if (data.cost_usd) state.totalCost += data.cost_usd;
     if (data.tokens) state.totalTokens += data.tokens;
     replaceNode(state.nodes, data.agent_name);
