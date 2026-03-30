@@ -129,13 +129,44 @@ class WorkflowContext:
         This method updates the agent_outputs dictionary, appends the agent
         to execution_history, and increments the iteration counter.
 
+        For stage-qualified agents (name contains ``:``, e.g. ``vp:review``),
+        the output is stored under both the full qualified name and the base
+        agent name. This preserves backward-compatible ``{{ agent.output }}``
+        access which always returns the latest output from any stage.
+
         Args:
             agent_name: The name of the agent whose output is being stored.
             output: The structured output from the agent.
         """
         self.agent_outputs[agent_name] = output
+        # Dual-key storage: stage-qualified agents also update the base name
+        # so {{ agent.output }} always returns the latest output
+        if ":" in agent_name:
+            base_name = agent_name.split(":")[0]
+            self.agent_outputs[base_name] = output
         self.execution_history.append(agent_name)
         self.current_iteration += 1
+
+    def _build_stages_dict(self) -> dict[str, dict[str, dict[str, Any]]]:
+        """Build the nested ``stages`` dict for Jinja2 template access.
+
+        Since colons cannot appear in Jinja2 identifiers, stage-qualified
+        outputs (e.g. ``vp:review``) are made accessible via a nested dict::
+
+            stages.vp.review.output.field
+
+        Returns:
+            Dict mapping base_name → stage_name → {"output": output_dict}.
+            Empty dict if no stage-qualified outputs exist.
+        """
+        stages: dict[str, dict[str, dict[str, Any]]] = {}
+        for key, output in self.agent_outputs.items():
+            if ":" in key:
+                base_name, stage_name = key.split(":", 1)
+                if base_name not in stages:
+                    stages[base_name] = {}
+                stages[base_name][stage_name] = {"output": output}
+        return stages
 
     def build_for_agent(
         self,
@@ -215,6 +246,9 @@ class WorkflowContext:
                     ctx[last_agent] = last_output
                 else:
                     ctx[last_agent] = {"output": last_output}
+
+        # Inject stages dict for Jinja2 access to stage-qualified outputs
+        ctx["stages"] = self._build_stages_dict()
 
         return ctx
 

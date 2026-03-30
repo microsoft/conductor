@@ -1,0 +1,145 @@
+# Staged Review Workflow
+#
+# This example demonstrates staged agent re-invocation, where the same
+# agent appears at multiple stages in a workflow with different prompts.
+# The VP plans the project, the IC implements it, and then the same VP
+# reviews the implementation — without needing a duplicate agent definition.
+#
+# Key features demonstrated:
+# - stages: dict on AgentDef for multi-invocation
+# - Stage-qualified route targets (vp:review)
+# - Stage-specific context access (stages.vp.default.output)
+# - Conditional loop-back from review to IC
+#
+# Usage:
+#   conductor run examples/staged-review.yaml --input project="Build a REST API"
+
+workflow:
+  name: staged-review
+  description: Demonstrates staged agent re-invocation (VP→IC→VP:review)
+  version: "1.0.0"
+  entry_point: vp
+
+  runtime:
+    provider: copilot
+    default_model: gpt-4.1
+
+  input:
+    project:
+      type: string
+      required: true
+      description: The project to plan, implement, and review
+
+  context:
+    mode: accumulate
+
+  limits:
+    max_iterations: 10
+    timeout_seconds: 300
+
+agents:
+  # VP: appears twice — once to plan, once to review
+  - name: vp
+    description: VP of Engineering — plans and reviews
+    model: gpt-4.1
+    tools: []
+    system_prompt: |
+      You are the VP of Engineering. You set technical direction
+      and review your team's execution quality.
+
+    prompt: |
+      Create a technical plan for: {{ workflow.input.project }}
+
+      Define:
+      1. Architecture approach
+      2. Key components to build
+      3. Success criteria for the implementation
+    input:
+      - workflow.input.project
+    output:
+      plan:
+        type: string
+        description: The technical plan
+      components:
+        type: array
+        description: Key components to build
+      success_criteria:
+        type: array
+        description: Criteria for successful implementation
+    routes:
+      - to: ic
+
+    stages:
+      review:
+        description: Reviews IC implementation against the original plan
+        prompt: |
+          Review the IC's implementation against your original plan.
+
+          YOUR ORIGINAL PLAN:
+          {{ stages.vp.default.output.plan }}
+
+          SUCCESS CRITERIA:
+          {{ stages.vp.default.output.success_criteria | json }}
+
+          IC IMPLEMENTATION:
+          {{ ic.output | json }}
+
+          Evaluate:
+          1. Does the implementation match the plan?
+          2. Are success criteria met?
+          3. What improvements are needed?
+        input:
+          - vp:default.output
+          - ic.output
+        output:
+          approved:
+            type: boolean
+            description: Whether the implementation meets the plan
+          score:
+            type: number
+            description: Quality score from 1-10
+          feedback:
+            type: string
+            description: Detailed review feedback
+        routes:
+          - to: ic
+            when: "{{ not output.approved }}"
+          - to: "$end"
+
+  # IC: implements the VP's plan
+  - name: ic
+    description: Individual Contributor — implements the plan
+    model: gpt-4.1
+    tools: []
+    prompt: |
+      Implement the VP's technical plan.
+
+      PLAN: {{ vp.output.plan }}
+      COMPONENTS: {{ vp.output.components | json }}
+
+      {% if stages.vp.review is defined %}
+      VP FEEDBACK FROM PREVIOUS REVIEW:
+      {{ stages.vp.review.output.feedback }}
+      {% endif %}
+
+      Produce a detailed implementation for each component.
+    input:
+      - vp.output
+      - vp:review.output?
+    output:
+      implementation:
+        type: object
+        description: Implementation details for each component
+      status:
+        type: string
+        description: Overall implementation status
+    routes:
+      - to: vp:review
+
+output:
+  project: "{{ workflow.input.project }}"
+  plan: "{{ stages.vp.default.output.plan }}"
+  implementation: "{{ ic.output.implementation | json }}"
+  approved: "{{ stages.vp.review.output.approved }}"
+  score: "{{ stages.vp.review.output.score }}"
+  feedback: "{{ stages.vp.review.output.feedback }}"

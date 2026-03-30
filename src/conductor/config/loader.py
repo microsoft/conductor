@@ -16,6 +16,7 @@ from ruamel.yaml import YAML
 from ruamel.yaml.constructor import RoundTripConstructor
 from ruamel.yaml.error import YAMLError
 
+from conductor.config.expander import expand_stages
 from conductor.config.schema import WorkflowConfig
 from conductor.exceptions import ConfigurationError
 
@@ -324,7 +325,8 @@ class ConfigLoader:
             ConfigurationError: If the data fails schema validation.
         """
         try:
-            return WorkflowConfig.model_validate(data)
+            config = WorkflowConfig.model_validate(data)
+            return expand_stages(config)
         except Exception as e:
             # Format Pydantic validation errors nicely
             error_msg = str(e)

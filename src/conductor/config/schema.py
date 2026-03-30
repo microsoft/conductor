@@ -268,6 +268,29 @@ class GateOption(BaseModel):
     """Optional: field name to prompt for text input."""
 
 
+class StageDef(BaseModel):
+    """Per-stage overrides for a staged agent.
+
+    Each field, when set, overrides the corresponding field on the base AgentDef.
+    When None/omitted, the base agent's value is inherited.
+    """
+
+    prompt: str | None = None
+    """Override prompt template for this stage."""
+
+    input: list[str] | None = None
+    """Override input dependencies for this stage."""
+
+    output: dict[str, OutputField] | None = None
+    """Override output schema for this stage."""
+
+    routes: list[RouteDef] | None = None
+    """Override routes for this stage (replaces base routes entirely)."""
+
+    description: str | None = None
+    """Override description for this stage."""
+
+
 class ContextConfig(BaseModel):
     """Configuration for context accumulation behavior."""
 
@@ -407,6 +430,15 @@ class AgentDef(BaseModel):
     routes: list[RouteDef] = Field(default_factory=list)
     """Routing rules evaluated in order after execution."""
 
+    stages: dict[str, StageDef] | None = None
+    """Named stages for multi-invocation workflows.
+
+    Allows the same agent to appear at multiple workflow stages with
+    different prompts, inputs, and outputs while sharing model, tools,
+    and system prompt. Stages are expanded into synthetic agents at
+    config load time.
+    """
+
     options: list[GateOption] | None = None
     """Options for human_gate type agents."""
 
@@ -485,6 +517,21 @@ class AgentDef(BaseModel):
                 raise ValueError("script agents cannot have 'max_session_seconds'")
             if self.max_agent_iterations is not None:
                 raise ValueError("script agents cannot have 'max_agent_iterations'")
+
+        # Validate stages
+        if self.stages is not None:
+            if self.type == "script":
+                raise ValueError("script agents cannot have 'stages'")
+            if self.type == "human_gate":
+                raise ValueError("human_gate agents cannot have 'stages'")
+            for stage_name in self.stages:
+                if stage_name == "default":
+                    raise ValueError(
+                        "Stage name 'default' is reserved. "
+                        "The base agent definition is the implicit default stage."
+                    )
+                if not stage_name.isidentifier():
+                    raise ValueError(f"Stage name '{stage_name}' is not a valid Python identifier")
         return self
 
 
@@ -674,8 +721,17 @@ class WorkflowConfig(BaseModel):
         parallel_names = {p.name for p in self.parallel}
         for_each_names = {f.name for f in self.for_each}
 
+        # Build stage-qualified names for agents with stages
+        stage_qualified_names: set[str] = set()
+        for agent in self.agents:
+            if agent.stages:
+                stage_qualified_names.add(f"{agent.name}:default")
+                for stage_name in agent.stages:
+                    stage_qualified_names.add(f"{agent.name}:{stage_name}")
+
+        all_names = agent_names | parallel_names | for_each_names | stage_qualified_names
+
         # Validate entry_point exists
-        all_names = agent_names | parallel_names | for_each_names
         if self.workflow.entry_point not in all_names:
             raise ValueError(
                 f"entry_point '{self.workflow.entry_point}' not found in "
@@ -690,6 +746,16 @@ class WorkflowConfig(BaseModel):
                         f"Agent '{agent.name}' routes to unknown agent, "
                         f"parallel group, or for-each group '{route.to}'"
                     )
+            # Validate routes inside stages
+            if agent.stages:
+                for stage_name, stage_def in agent.stages.items():
+                    if stage_def.routes:
+                        for route in stage_def.routes:
+                            if route.to != "$end" and route.to not in all_names:
+                                raise ValueError(
+                                    f"Agent '{agent.name}' stage '{stage_name}' "
+                                    f"routes to unknown target '{route.to}'"
+                                )
 
         # Validate parallel group agent references exist
         for parallel_group in self.parallel:

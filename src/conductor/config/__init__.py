@@ -4,6 +4,7 @@ This module handles YAML parsing, Pydantic schema validation,
 and environment variable resolution.
 """
 
+from conductor.config.expander import expand_stages
 from conductor.config.loader import (
     ConfigLoader,
     load_config,
@@ -20,6 +21,7 @@ from conductor.config.schema import (
     OutputField,
     RouteDef,
     RuntimeConfig,
+    StageDef,
     WorkflowConfig,
     WorkflowDef,
 )
@@ -30,6 +32,7 @@ __all__ = [
     "ConfigLoader",
     "load_config",
     "load_config_string",
+    "expand_stages",
     "resolve_env_vars",
     # Schema models
     "AgentDef",
@@ -40,6 +43,7 @@ __all__ = [
     "LimitsConfig",
     "OutputField",
     "RouteDef",
+    "StageDef",
     "RuntimeConfig",
     "WorkflowConfig",
     "WorkflowDef",
