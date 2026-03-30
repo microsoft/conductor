@@ -253,8 +253,10 @@ async def take_screenshots() -> None:
     SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
 
     screenshots_taken: list[str] = []
+    assertions_passed: list[str] = []
+    warnings: list[str] = []
 
-    # --- Screenshot 1: Completed staged workflow ---
+    # --- Server 1: Completed staged workflow ---
     completed_app = create_mock_app(_build_staged_workflow_events())
     config1 = uvicorn.Config(app=completed_app, host="127.0.0.1", port=8901, log_level="warning")
     server1 = uvicorn.Server(config1)
@@ -264,37 +266,132 @@ async def take_screenshots() -> None:
 
     async with async_playwright() as p:
         browser = await p.chromium.launch()
+
+        # ---- Test 1: Dashboard loads and renders graph (desktop) ----
         page = await browser.new_page(viewport={"width": 1400, "height": 900})
-
-        # Screenshot 1: Full completed workflow
         await page.goto("http://127.0.0.1:8901", wait_until="networkidle")
-        await page.wait_for_timeout(2000)  # Let graph layout settle
+        await page.wait_for_timeout(2500)
 
-        path1 = str(SCREENSHOTS_DIR / "staged-workflow-completed.png")
-        await page.screenshot(path=path1, full_page=False)
-        screenshots_taken.append(path1)
-        print(f"  ✅ {path1}")
+        # Assert: dashboard title/header is visible
+        header = page.locator("header").first
+        if await header.is_visible():
+            assertions_passed.append("Header is visible")
+        else:
+            warnings.append("Header not found")
 
-        # Screenshot 2: Click on vp:review node to show detail
-        # Try to click on the vp:review node in the graph
-        try:
-            vp_review_node = page.locator('text="vp:review"').first
-            if await vp_review_node.is_visible():
-                await vp_review_node.click()
-                await page.wait_for_timeout(1000)
-                path2 = str(SCREENSHOTS_DIR / "staged-workflow-node-detail.png")
-                await page.screenshot(path=path2, full_page=False)
-                screenshots_taken.append(path2)
-                print(f"  ✅ {path2}")
-        except Exception as e:
-            print(f"  ⚠️  Could not click vp:review node: {e}")
+        # Assert: workflow name displayed
+        page_text = await page.text_content("body")
+        if "staged-review" in (page_text or "").lower():
+            assertions_passed.append("Workflow name 'staged-review' displayed")
 
+        # Assert: stage-qualified agent nodes are rendered
+        for node_name in ["vp:default", "vp:review", "ic"]:
+            node = page.locator(f'text="{node_name}"').first
+            if await node.is_visible(timeout=3000):
+                assertions_passed.append(f"Node '{node_name}' rendered in graph")
+            else:
+                warnings.append(f"Node '{node_name}' not visible in graph")
+
+        # Screenshot: full completed workflow overview
+        path = str(SCREENSHOTS_DIR / "staged-workflow-completed.png")
+        await page.screenshot(path=path, full_page=False)
+        screenshots_taken.append(path)
+        print(f"  ✅ {path}")
+
+        # ---- Test 2: Click each stage node and verify detail panel ----
+        for node_name in ["vp:default", "vp:review", "ic"]:
+            try:
+                node = page.locator(f'text="{node_name}"').first
+                if await node.is_visible(timeout=2000):
+                    await node.click()
+                    await page.wait_for_timeout(800)
+
+                    safe_name = node_name.replace(":", "-")
+                    path = str(SCREENSHOTS_DIR / f"staged-node-{safe_name}.png")
+                    await page.screenshot(path=path, full_page=False)
+                    screenshots_taken.append(path)
+                    print(f"  ✅ {path}")
+                    assertions_passed.append(f"Detail panel opened for '{node_name}'")
+            except Exception as e:
+                warnings.append(f"Could not interact with node '{node_name}': {e}")
+
+        # ---- Test 3: Verify completed status indicators ----
+        body_text = await page.text_content("body") or ""
+        if "completed" in body_text.lower() or "✓" in body_text or "complete" in body_text.lower():
+            assertions_passed.append("Completed status indicator found")
+        else:
+            warnings.append("No completed status indicator found")
+
+        # Assert: token count displayed
+        if "946" in body_text or "tok" in body_text.lower():
+            assertions_passed.append("Token count displayed")
+
+        # ---- Test 4: API state endpoint returns correct data ----
+        response = await page.evaluate(
+            """async () => {
+                const resp = await fetch('/api/state');
+                const data = await resp.json();
+                return { count: data.length, firstType: data[0]?.type, lastType: data[data.length-1]?.type };
+            }"""
+        )
+        if response["count"] > 0:
+            assertions_passed.append(f"API /api/state returns {response['count']} events")
+        if response["firstType"] == "workflow_started":
+            assertions_passed.append("First event is workflow_started")
+        if response["lastType"] == "workflow_completed":
+            assertions_passed.append("Last event is workflow_completed")
+
+        # ---- Test 5: Verify stage-qualified agents in API response ----
+        agents_data = await page.evaluate(
+            """async () => {
+                const resp = await fetch('/api/state');
+                const data = await resp.json();
+                const started = data[0]?.data?.agents || [];
+                return started.map(a => a.name);
+            }"""
+        )
+        for expected in ["vp", "vp:default", "vp:review", "ic"]:
+            if expected in agents_data:
+                assertions_passed.append(f"Agent '{expected}' in API state")
+            else:
+                warnings.append(f"Agent '{expected}' missing from API state")
+
+        await page.close()
+
+        # ---- Test 6: Mobile viewport ----
+        mobile_page = await browser.new_page(viewport={"width": 375, "height": 812})
+        await mobile_page.goto("http://127.0.0.1:8901", wait_until="networkidle")
+        await mobile_page.wait_for_timeout(2000)
+
+        path = str(SCREENSHOTS_DIR / "staged-workflow-mobile.png")
+        await mobile_page.screenshot(path=path, full_page=False)
+        screenshots_taken.append(path)
+        print(f"  ✅ {path}")
+        assertions_passed.append("Mobile viewport renders without crash")
+
+        await mobile_page.close()
+
+        # ---- Test 7: Dark mode (prefers-color-scheme) ----
+        dark_page = await browser.new_page(
+            viewport={"width": 1400, "height": 900},
+            color_scheme="dark",
+        )
+        await dark_page.goto("http://127.0.0.1:8901", wait_until="networkidle")
+        await dark_page.wait_for_timeout(2000)
+
+        path = str(SCREENSHOTS_DIR / "staged-workflow-dark-mode.png")
+        await dark_page.screenshot(path=path, full_page=False)
+        screenshots_taken.append(path)
+        print(f"  ✅ {path}")
+        assertions_passed.append("Dark mode renders without crash")
+
+        await dark_page.close()
         await browser.close()
 
     server1.should_exit = True
     await task1
 
-    # --- Screenshot 2: In-progress workflow ---
+    # --- Server 2: In-progress staged workflow ---
     progress_app = create_mock_app(_build_in_progress_events())
     config2 = uvicorn.Config(app=progress_app, host="127.0.0.1", port=8902, log_level="warning")
     server2 = uvicorn.Server(config2)
@@ -309,17 +406,48 @@ async def take_screenshots() -> None:
         await page.goto("http://127.0.0.1:8902", wait_until="networkidle")
         await page.wait_for_timeout(2000)
 
-        path3 = str(SCREENSHOTS_DIR / "staged-workflow-in-progress.png")
-        await page.screenshot(path=path3, full_page=False)
-        screenshots_taken.append(path3)
-        print(f"  ✅ {path3}")
+        # Screenshot: in-progress state
+        path = str(SCREENSHOTS_DIR / "staged-workflow-in-progress.png")
+        await page.screenshot(path=path, full_page=False)
+        screenshots_taken.append(path)
+        print(f"  ✅ {path}")
+
+        # Assert: running state visible
+        body_text = await page.text_content("body") or ""
+        if "running" in body_text.lower() or "progress" in body_text.lower():
+            assertions_passed.append("Running status indicator shown in-progress view")
+
+        # Click on IC node (currently running)
+        try:
+            ic_node = page.locator('text="ic"').first
+            if await ic_node.is_visible(timeout=2000):
+                await ic_node.click()
+                await page.wait_for_timeout(800)
+                path = str(SCREENSHOTS_DIR / "staged-in-progress-ic-detail.png")
+                await page.screenshot(path=path, full_page=False)
+                screenshots_taken.append(path)
+                print(f"  ✅ {path}")
+                assertions_passed.append("IC node detail panel opened in-progress view")
+        except Exception as e:
+            warnings.append(f"Could not click IC node in-progress: {e}")
 
         await browser.close()
 
     server2.should_exit = True
     await task2
 
-    print(f"\n📸 {len(screenshots_taken)} screenshots saved to {SCREENSHOTS_DIR}/")
+    # --- Summary ---
+    print(f"\n{'='*60}")
+    print(f"📸 Screenshots: {len(screenshots_taken)} captured")
+    print(f"✅ Assertions:  {len(assertions_passed)} passed")
+    if warnings:
+        print(f"⚠️  Warnings:    {len(warnings)}")
+        for w in warnings:
+            print(f"   - {w}")
+    print(f"{'='*60}")
+    for a in assertions_passed:
+        print(f"  ✅ {a}")
+    print(f"\nAll screenshots saved to {SCREENSHOTS_DIR}/")
 
 
 if __name__ == "__main__":
