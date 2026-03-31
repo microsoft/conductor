@@ -390,6 +390,15 @@ class WorkflowEngine:
         except OSError:
             return {}
 
+    @staticmethod
+    def _conductor_version() -> str:
+        """Return the installed conductor-cli version."""
+        try:
+            from conductor import __version__
+            return __version__
+        except Exception:
+            return "unknown"
+
     def _make_event_callback(self, agent_name: str) -> Any:
         """Create an event callback for an agent that forwards to the emitter.
 
@@ -968,6 +977,7 @@ class WorkflowEngine:
                     "workflow_started",
                     {
                         "name": self.config.workflow.name,
+                        "version": self._conductor_version(),
                         "entry_point": self.config.workflow.entry_point,
                         "agents": [
                             {

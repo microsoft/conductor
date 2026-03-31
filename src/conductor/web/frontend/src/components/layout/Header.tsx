@@ -8,6 +8,7 @@ export function Header() {
   const workflowStatus = useWorkflowStore((s) => s.workflowStatus);
   const isPaused = useWorkflowStore((s) => s.isPaused);
   const workflowYaml = useWorkflowStore((s) => s.workflowYaml);
+  const conductorVersion = useWorkflowStore((s) => s.conductorVersion);
   const [stopping, setStopping] = useState(false);
   const [resuming, setResuming] = useState(false);
   const [killing, setKilling] = useState(false);
@@ -136,7 +137,7 @@ export function Header() {
           <Download className="w-3 h-3" />
           Logs
         </a>
-        <span className="text-xs text-[var(--text-muted)]">Dashboard v1.0</span>
+        <span className="text-xs text-[var(--text-muted)]">v{conductorVersion ?? '—'}</span>
       </div>
       {showYaml && workflowYaml && (
         <YamlViewer yaml={workflowYaml} onClose={() => setShowYaml(false)} />
