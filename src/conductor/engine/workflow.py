@@ -381,6 +381,15 @@ class WorkflowEngine:
         event = WorkflowEvent(type=event_type, timestamp=_time.time(), data=data)
         self._event_emitter.emit(event)
 
+    def _yaml_source_field(self) -> dict[str, str]:
+        """Return ``{"yaml_source": <text>}`` if the workflow file is readable."""
+        if self.workflow_path is None:
+            return {}
+        try:
+            return {"yaml_source": self.workflow_path.read_text(encoding="utf-8")}
+        except OSError:
+            return {}
+
     def _make_event_callback(self, agent_name: str) -> Any:
         """Create an event callback for an agent that forwards to the emitter.
 
@@ -1009,6 +1018,7 @@ class WorkflowEngine:
                             for f in self.config.for_each
                             for r in f.routes
                         ],
+                        **self._yaml_source_field(),
                     },
                 )
 

@@ -176,6 +176,7 @@ interface WorkflowState {
   workflowStartTime: number | null;
   workflowFailure: { error_type?: string; message?: string; elapsed_seconds?: number; timeout_seconds?: number; current_agent?: string; checkpoint_path?: string } | null;
   workflowFailedAgent: string | null;
+  workflowYaml: string | null;
   entryPoint: string | null;
 
   // Graph structure
@@ -274,6 +275,7 @@ export const useWorkflowStore = create<WorkflowState>((set) => ({
   workflowStartTime: null,
   workflowFailure: null,
   workflowFailedAgent: null,
+  workflowYaml: null,
   entryPoint: null,
   agents: [],
   routes: [],
@@ -488,6 +490,7 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     state.workflowStatus = 'running';
     state.workflowStartTime = timestamp ?? Date.now() / 1000;
     state.workflowName = data.name || '';
+    state.workflowYaml = (data as Record<string, unknown>).yaml_source as string ?? null;
     state.entryPoint = data.entry_point || null;
     state.agents = data.agents || [];
     state.routes = data.routes || [];

@@ -1,14 +1,17 @@
 import { useState, useEffect } from 'react';
-import { Activity, Square, Play, X, Download } from 'lucide-react';
+import { Activity, Square, Play, X, Download, FileCode } from 'lucide-react';
 import { useWorkflowStore } from '@/stores/workflow-store';
+import { YamlViewer } from '@/components/layout/YamlViewer';
 
 export function Header() {
   const workflowName = useWorkflowStore((s) => s.workflowName);
   const workflowStatus = useWorkflowStore((s) => s.workflowStatus);
   const isPaused = useWorkflowStore((s) => s.isPaused);
+  const workflowYaml = useWorkflowStore((s) => s.workflowYaml);
   const [stopping, setStopping] = useState(false);
   const [resuming, setResuming] = useState(false);
   const [killing, setKilling] = useState(false);
+  const [showYaml, setShowYaml] = useState(false);
 
   const isRunning = workflowStatus === 'running' || workflowStatus === 'pending';
 
@@ -108,6 +111,19 @@ export function Header() {
             {stopping ? 'Stopping...' : 'Stop'}
           </button>
         ) : null}
+        {workflowYaml && (
+          <button
+            onClick={() => setShowYaml(true)}
+            className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded
+              bg-[var(--surface-hover)] text-[var(--text-secondary)] border border-[var(--border)]
+              hover:text-[var(--text)] hover:bg-[var(--surface)]
+              transition-colors"
+            title="View workflow YAML configuration"
+          >
+            <FileCode className="w-3 h-3" />
+            YAML
+          </button>
+        )}
         <a
           href="/api/logs"
           download="conductor-logs.json"
@@ -122,6 +138,9 @@ export function Header() {
         </a>
         <span className="text-xs text-[var(--text-muted)]">Dashboard v1.0</span>
       </div>
+      {showYaml && workflowYaml && (
+        <YamlViewer yaml={workflowYaml} onClose={() => setShowYaml(false)} />
+      )}
     </header>
   );
 }
