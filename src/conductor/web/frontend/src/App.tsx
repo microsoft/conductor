@@ -1,15 +1,37 @@
-import { useEffect } from 'react';
+import { useState, useEffect } from 'react';
 import { Header } from '@/components/layout/Header';
 import { StatusBar } from '@/components/layout/StatusBar';
+import { ReplayBar } from '@/components/layout/ReplayBar';
 import { ResizableLayout } from '@/components/layout/ResizableLayout';
 import { useWebSocket } from '@/hooks/use-websocket';
+import { useReplay } from '@/hooks/use-replay';
 import { useWorkflowStore } from '@/stores/workflow-store';
 
-export default function App() {
+function LiveMode() {
   useWebSocket();
+  return null;
+}
 
+function ReplayMode() {
+  useReplay();
+  return null;
+}
+
+export default function App() {
+  const [isReplayMode, setIsReplayMode] = useState<boolean | null>(null);
+  const replayMode = useWorkflowStore((s) => s.replayMode);
   const selectNode = useWorkflowStore((s) => s.selectNode);
   const workflowName = useWorkflowStore((s) => s.workflowName);
+
+  // Detect replay mode on mount
+  useEffect(() => {
+    fetch('/api/replay/info')
+      .then((r) => {
+        if (r.ok) setIsReplayMode(true);
+        else setIsReplayMode(false);
+      })
+      .catch(() => setIsReplayMode(false));
+  }, []);
 
   // Update document title
   useEffect(() => {
@@ -27,11 +49,14 @@ export default function App() {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [selectNode]);
 
+  if (isReplayMode === null) return null;
+
   return (
     <div className="h-full flex flex-col bg-[var(--bg)]">
+      {isReplayMode ? <ReplayMode /> : <LiveMode />}
       <Header />
       <ResizableLayout />
-      <StatusBar />
+      {replayMode ? <ReplayBar /> : <StatusBar />}
     </div>
   );
 }

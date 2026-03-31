@@ -706,6 +706,69 @@ def checkpoints(
 
 
 @app.command()
+def replay(
+    log_file: Annotated[
+        Path,
+        typer.Argument(
+            help="Path to a JSON or JSONL event log file.",
+            exists=True,
+            readable=True,
+        ),
+    ],
+    web_port: Annotated[
+        int,
+        typer.Option(
+            "--web-port",
+            help="Port for the replay dashboard (0 = auto-select).",
+        ),
+    ] = 0,
+) -> None:
+    """Replay a recorded workflow from a JSON/JSONL event log.
+
+    Opens the web dashboard in replay mode with a timeline slider
+    for scrubbing through the workflow history.
+
+    The log file can be:
+    - A JSON array downloaded from the dashboard (GET /api/logs)
+    - A JSONL file written by the EventLogSubscriber
+
+    Example:
+        conductor replay conductor-logs.json
+        conductor replay /tmp/conductor/conductor-my-workflow-20260101-120000.events.jsonl
+    """
+    import asyncio
+
+    async def _run_replay() -> None:
+        from conductor.web.replay import ReplayDashboard
+
+        try:
+            dashboard = ReplayDashboard(
+                log_file.resolve(),
+                host="127.0.0.1",
+                port=web_port,
+            )
+        except ValueError as exc:
+            print_error(exc)
+            raise typer.Exit(1) from exc
+
+        await dashboard.start()
+        console.print(f"\n[bold green]▶ Replay dashboard:[/] {dashboard.url}\n")
+        console.print("[dim]Press Ctrl+C to exit[/dim]\n")
+
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            pass
+        finally:
+            await dashboard.stop()
+
+    try:
+        asyncio.run(_run_replay())
+    except KeyboardInterrupt:
+        console.print("\n[dim]Replay stopped.[/dim]")
+
+
+@app.command()
 def stop(
     port: Annotated[
         int | None,
