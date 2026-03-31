@@ -386,8 +386,8 @@ class WorkflowEngine:
         if self.workflow_path is None:
             return {}
         try:
-            return {"yaml_source": self.workflow_path.read_text(encoding="utf-8")}
-        except OSError:
+            return {"yaml_source": Path(self.workflow_path).read_text(encoding="utf-8")}
+        except (OSError, ValueError):
             return {}
 
     @staticmethod
