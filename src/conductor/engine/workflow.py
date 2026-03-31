@@ -395,6 +395,7 @@ class WorkflowEngine:
         """Return the installed conductor-cli version."""
         try:
             from conductor import __version__
+
             return __version__
         except Exception:
             return "unknown"
