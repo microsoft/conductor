@@ -2,7 +2,7 @@ import { memo, useEffect, useRef, useState } from 'react';
 import { Handle, Position, type NodeProps } from '@xyflow/react';
 import { Bot } from 'lucide-react';
 import { cn, formatElapsed, formatTokens, formatCost } from '@/lib/utils';
-import { NODE_STATUS_HEX } from '@/lib/constants';
+import { NODE_STATUS_HEX, CONTEXT_WARN_PCT, CONTEXT_DANGER_PCT } from '@/lib/constants';
 import { useWorkflowStore } from '@/stores/workflow-store';
 import { NodeTooltip } from './NodeTooltip';
 import type { GraphNodeData } from './graph-layout';
@@ -23,6 +23,7 @@ export const AgentNode = memo(function AgentNode({ data, id, selected }: NodePro
   const iteration = useWorkflowStore((s) => s.nodes[id]?.iteration);
   const errorType = useWorkflowStore((s) => s.nodes[id]?.error_type);
   const errorMessage = useWorkflowStore((s) => s.nodes[id]?.error_message);
+  const contextPct = useWorkflowStore((s) => s.nodes[id]?.context_pct);
 
   // Live elapsed timer for running nodes
   const liveElapsed = useLiveElapsed(id, status);
@@ -105,6 +106,23 @@ export const AgentNode = memo(function AgentNode({ data, id, selected }: NodePro
               </span>
             )}
           </div>
+          {/* Context window progress bar */}
+          {contextPct != null && (
+            <div className="absolute bottom-0 left-0 right-0 h-[2px] rounded-b-lg overflow-hidden"
+              style={{ backgroundColor: 'rgba(255,255,255,0.06)' }}
+            >
+              <div
+                className={cn(
+                  'h-full transition-all duration-500',
+                  contextPct >= CONTEXT_DANGER_PCT ? 'animate-[context-pulse_2s_ease-in-out_infinite]' : ''
+                )}
+                style={{
+                  width: `${Math.min(contextPct, 100)}%`,
+                  backgroundColor: contextPct >= CONTEXT_DANGER_PCT ? '#ef4444' : contextPct >= CONTEXT_WARN_PCT ? '#f59e0b' : '#22c55e',
+                }}
+              />
+            </div>
+          )}
         </div>
       </NodeTooltip>
       <Handle type="source" position={Position.Bottom} className="!bg-[var(--border)] !border-none !w-2 !h-2" />
