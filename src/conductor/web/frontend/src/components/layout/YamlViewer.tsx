@@ -100,7 +100,10 @@ export function YamlViewer({ yaml, onClose }: YamlViewerProps) {
 
         {/* Content */}
         <div className="flex-1 overflow-auto">
-          <pre className="text-[13px] font-mono whitespace-pre leading-6 p-8">
+          <pre
+            className="text-[13px] font-mono whitespace-pre leading-6"
+            style={{ padding: '2rem' }}
+          >
             {highlighted}
           </pre>
         </div>
