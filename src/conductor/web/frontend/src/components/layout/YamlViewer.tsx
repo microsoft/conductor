@@ -99,7 +99,7 @@ export function YamlViewer({ yaml, onClose }: YamlViewerProps) {
         </div>
 
         {/* Content */}
-        <div className="flex-1 overflow-auto p-6">
+        <div className="flex-1 overflow-auto p-8">
           <pre className="text-[13px] font-mono whitespace-pre leading-6">
             {highlighted}
           </pre>
