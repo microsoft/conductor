@@ -133,11 +133,21 @@ export const AgentNode = memo(function AgentNode({ data, id, selected }: NodePro
 /** Hook that returns a live-ticking elapsed string while status is 'running'. */
 function useLiveElapsed(id: string, status: NodeStatus): string {
   const startedAt = useWorkflowStore((s) => s.nodes[id]?.startedAt);
+  const replayMode = useWorkflowStore((s) => s.replayMode);
+  const lastEventTime = useWorkflowStore((s) => s.lastEventTime);
   const [display, setDisplay] = useState('0.0s');
   const rafRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
     if (status === 'running') {
+      if (replayMode) {
+        // In replay mode, use event timestamps instead of wall clock
+        if (rafRef.current) clearInterval(rafRef.current);
+        const origin = startedAt ?? (lastEventTime ?? 0);
+        const now = lastEventTime ?? origin;
+        setDisplay(formatElapsed(now - origin));
+        return;
+      }
       const origin = startedAt != null ? startedAt * 1000 : Date.now();
       const tick = () => {
         const sec = (Date.now() - origin) / 1000;
@@ -151,7 +161,7 @@ function useLiveElapsed(id: string, status: NodeStatus): string {
     } else {
       if (rafRef.current) clearInterval(rafRef.current);
     }
-  }, [status, startedAt]);
+  }, [status, startedAt, replayMode, lastEventTime]);
 
   return display;
 }
