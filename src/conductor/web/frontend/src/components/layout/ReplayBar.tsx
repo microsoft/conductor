@@ -2,7 +2,7 @@ import { Play, Pause } from 'lucide-react';
 import { useWorkflowStore } from '@/stores/workflow-store';
 import { cn } from '@/lib/utils';
 
-const SPEEDS = [1, 5, 10, 20] as const;
+const SPEEDS = [1, 5, 10, 20, 50] as const;
 
 function formatRelativeTime(events: { timestamp: number }[], position: number): string {
   if (position === 0 || events.length === 0) return '+0.0s';
