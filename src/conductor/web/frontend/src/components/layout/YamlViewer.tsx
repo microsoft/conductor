@@ -81,12 +81,12 @@ export function YamlViewer({ yaml, onClose }: YamlViewerProps) {
   const highlighted = useMemo(() => highlightYaml(yaml), [yaml]);
 
   return (
-    <div className="fixed inset-0 z-50 flex">
+    <div className="fixed inset-0 z-50 flex items-center justify-center">
       {/* Backdrop */}
       <div className="absolute inset-0 bg-black/50" onClick={onClose} />
 
       {/* Panel — 80% width */}
-      <div className="relative mx-auto w-[80%] h-[90%] my-auto flex flex-col bg-[var(--bg)] border border-[var(--border)] rounded-lg shadow-2xl">
+      <div className="relative w-[80%] h-[90%] flex flex-col bg-[var(--bg)] border border-[var(--border)] rounded-lg shadow-2xl">
         {/* Header */}
         <div className="flex items-center justify-between px-4 py-2 border-b border-[var(--border)] rounded-t-lg bg-[var(--surface)]">
           <span className="text-sm font-semibold text-[var(--text)]">Workflow YAML</span>
