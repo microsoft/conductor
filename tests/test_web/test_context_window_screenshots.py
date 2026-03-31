@@ -38,10 +38,13 @@ def _build_events(
                 "workflow_name": "context-window-test",
                 "entry_point": "agent1",
                 "agents": [
-                    {"name": "agent1", "type": "agent", "model": model,
-                     "routes": [{"to": "agent2"}]},
-                    {"name": "agent2", "type": "agent", "model": model,
-                     "routes": [{"to": "$end"}]},
+                    {
+                        "name": "agent1",
+                        "type": "agent",
+                        "model": model,
+                        "routes": [{"to": "agent2"}],
+                    },
+                    {"name": "agent2", "type": "agent", "model": model, "routes": [{"to": "$end"}]},
                 ],
                 "parallel": [],
                 "for_each": [],
@@ -183,8 +186,8 @@ async def run_tests() -> None:
     scenarios = [
         ("green-14pct", 18_000, 128_000, "#22c55e", 8910),  # 14% → green
         ("amber-74pct", 95_000, 128_000, "#f59e0b", 8911),  # 74% → amber
-        ("red-93pct", 119_000, 128_000, "#ef4444", 8912),    # 93% → red
-        ("unknown-no-bar", None, None, None, 8913),          # unknown → no bar
+        ("red-93pct", 119_000, 128_000, "#ef4444", 8912),  # 93% → red
+        ("unknown-no-bar", None, None, None, 8913),  # unknown → no bar
     ]
 
     for label, used, max_ctx, expected_color, port in scenarios:
@@ -304,14 +307,14 @@ async def run_tests() -> None:
     await task
 
     # Summary
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"📸 Screenshots: {len(screenshots)} captured")
     print(f"✅ Assertions:  {len(assertions)} passed")
     if failures:
         print(f"❌ Failures:    {len(failures)}")
         for f in failures:
             print(f"   - {f}")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     for a in assertions:
         print(f"  ✅ {a}")
     print(f"\nAll screenshots saved to {SCREENSHOTS_DIR}/")
