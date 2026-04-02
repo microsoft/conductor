@@ -14,12 +14,13 @@ import os
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+# Force a wide terminal so Rich doesn't truncate option names in help text.
+# Must be set BEFORE importing app, which creates Rich Console objects at module level.
+os.environ["COLUMNS"] = "120"
+
 from typer.testing import CliRunner
 
 from conductor.cli.app import app
-
-# Force a wide terminal so Rich doesn't truncate option names in help text.
-os.environ["COLUMNS"] = "120"
 
 runner = CliRunner()
 
