@@ -381,6 +381,25 @@ class WorkflowEngine:
         event = WorkflowEvent(type=event_type, timestamp=_time.time(), data=data)
         self._event_emitter.emit(event)
 
+    def _yaml_source_field(self) -> dict[str, str]:
+        """Return ``{"yaml_source": <text>}`` if the workflow file is readable."""
+        if self.workflow_path is None:
+            return {}
+        try:
+            return {"yaml_source": Path(self.workflow_path).read_text(encoding="utf-8")}
+        except (OSError, ValueError):
+            return {}
+
+    @staticmethod
+    def _conductor_version() -> str:
+        """Return the installed conductor-cli version."""
+        try:
+            from conductor import __version__
+
+            return __version__
+        except Exception:
+            return "unknown"
+
     def _make_event_callback(self, agent_name: str) -> Any:
         """Create an event callback for an agent that forwards to the emitter.
 
@@ -959,6 +978,7 @@ class WorkflowEngine:
                     "workflow_started",
                     {
                         "name": self.config.workflow.name,
+                        "version": self._conductor_version(),
                         "entry_point": self.config.workflow.entry_point,
                         "agents": [
                             {
@@ -1009,6 +1029,7 @@ class WorkflowEngine:
                             for f in self.config.for_each
                             for r in f.routes
                         ],
+                        **self._yaml_source_field(),
                     },
                 )
 

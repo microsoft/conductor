@@ -176,6 +176,8 @@ interface WorkflowState {
   workflowStartTime: number | null;
   workflowFailure: { error_type?: string; message?: string; elapsed_seconds?: number; timeout_seconds?: number; current_agent?: string; checkpoint_path?: string } | null;
   workflowFailedAgent: string | null;
+  workflowYaml: string | null;
+  conductorVersion: string | null;
   entryPoint: string | null;
 
   // Graph structure
@@ -208,6 +210,14 @@ interface WorkflowState {
   lastEventTime: number | null;
   isPaused: boolean;
 
+  // Replay mode state
+  replayMode: boolean;
+  replayEvents: WorkflowEvent[];
+  replayPosition: number;
+  replayTotalEvents: number;
+  replayPlaying: boolean;
+  replaySpeed: number;
+
   // Actions
   processEvent: (event: WorkflowEvent) => void;
   replayState: (events: WorkflowEvent[]) => void;
@@ -215,6 +225,12 @@ interface WorkflowState {
   setWsStatus: (status: WsStatus) => void;
   setEdgeHighlight: (from: string, to: string, state: 'highlighted' | 'taken' | 'failed') => void;
   clearEdgeHighlight: (from: string, to: string) => void;
+
+  // Replay actions
+  setReplayMode: (events: WorkflowEvent[]) => void;
+  setReplayPosition: (position: number) => void;
+  setReplayPlaying: (playing: boolean) => void;
+  setReplaySpeed: (speed: number) => void;
 
   // WebSocket send function (set by use-websocket hook)
   _wsSend: ((data: object) => void) | null;
@@ -260,6 +276,8 @@ export const useWorkflowStore = create<WorkflowState>((set) => ({
   workflowStartTime: null,
   workflowFailure: null,
   workflowFailedAgent: null,
+  workflowYaml: null,
+  conductorVersion: null,
   entryPoint: null,
   agents: [],
   routes: [],
@@ -279,6 +297,12 @@ export const useWorkflowStore = create<WorkflowState>((set) => ({
   workflowOutput: null,
   lastEventTime: null,
   isPaused: false,
+  replayMode: false,
+  replayEvents: [],
+  replayPosition: 0,
+  replayTotalEvents: 0,
+  replayPlaying: false,
+  replaySpeed: 1,
   _wsSend: null,
 
   setWsSend: (fn) => {
@@ -355,6 +379,89 @@ export const useWorkflowStore = create<WorkflowState>((set) => ({
     set({ selectedNode: name });
   },
 
+  setReplayMode: (events: WorkflowEvent[]) => {
+    set((state) => {
+      const newState: WorkflowState = {
+        ...state,
+        replayMode: true,
+        replayEvents: events,
+        replayTotalEvents: events.length,
+        replayPosition: events.length,
+        replayPlaying: false,
+        replaySpeed: 1,
+        agentsCompleted: 0,
+        totalCost: 0,
+        totalTokens: 0,
+        nodes: {},
+        groupProgress: {},
+        highlightedEdges: [],
+        eventLog: [],
+        activityLog: [],
+        workflowOutput: null,
+        workflowFailedAgent: null,
+      };
+      for (const event of events) {
+        const handler = eventHandlers[event.type];
+        if (handler) handler(newState, event.data, event.timestamp);
+        const logEntry = buildLogEntry(event);
+        if (logEntry) newState.eventLog.push(logEntry);
+        const activityEntry = buildActivityLogEntry(event);
+        if (activityEntry) newState.activityLog.push(activityEntry);
+        newState.lastEventTime = event.timestamp;
+      }
+      return newState;
+    });
+  },
+
+  setReplayPosition: (position: number) => {
+    set((state) => {
+      const events = state.replayEvents.slice(0, position);
+      const newState: WorkflowState = {
+        ...state,
+        replayPosition: position,
+        agentsCompleted: 0,
+        totalCost: 0,
+        totalTokens: 0,
+        nodes: {},
+        groupProgress: {},
+        highlightedEdges: [],
+        eventLog: [],
+        activityLog: [],
+        workflowOutput: null,
+        workflowFailedAgent: null,
+        workflowStatus: 'pending',
+        workflowStartTime: null,
+        workflowName: '',
+        workflowFailure: null,
+        entryPoint: null,
+        agents: [],
+        routes: [],
+        parallelGroups: [],
+        forEachGroups: [],
+        isPaused: false,
+        lastEventTime: null,
+      };
+      for (const event of events) {
+        const handler = eventHandlers[event.type];
+        if (handler) handler(newState, event.data, event.timestamp);
+        const logEntry = buildLogEntry(event);
+        if (logEntry) newState.eventLog.push(logEntry);
+        const activityEntry = buildActivityLogEntry(event);
+        if (activityEntry) newState.activityLog.push(activityEntry);
+        newState.lastEventTime = event.timestamp;
+      }
+      return newState;
+    });
+  },
+
+  setReplayPlaying: (playing: boolean) => {
+    set({ replayPlaying: playing });
+  },
+
+  setReplaySpeed: (speed: number) => {
+    set({ replaySpeed: speed });
+  },
+
   setWsStatus: (status: WsStatus) => {
     set({ wsStatus: status });
   },
@@ -385,6 +492,8 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     state.workflowStatus = 'running';
     state.workflowStartTime = timestamp ?? Date.now() / 1000;
     state.workflowName = data.name || '';
+    state.workflowYaml = (data as Record<string, unknown>).yaml_source as string ?? null;
+    state.conductorVersion = (data as Record<string, unknown>).version as string ?? null;
     state.entryPoint = data.entry_point || null;
     state.agents = data.agents || [];
     state.routes = data.routes || [];
