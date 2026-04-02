@@ -10,12 +10,16 @@ Tests cover:
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from typer.testing import CliRunner
 
 from conductor.cli.app import app
+
+# Force a wide terminal so Rich doesn't truncate option names in help text.
+os.environ["COLUMNS"] = "120"
 
 runner = CliRunner()
 
