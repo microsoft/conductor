@@ -10,19 +10,17 @@ Tests cover:
 from __future__ import annotations
 
 import json
-import os
+import re
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
-
-# Force a wide terminal so Rich doesn't truncate option names in help text.
-# Must be set BEFORE importing app, which creates Rich Console objects at module level.
-os.environ["COLUMNS"] = "120"
 
 from typer.testing import CliRunner
 
 from conductor.cli.app import app
 
 runner = CliRunner()
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
 # ---------------------------------------------------------------------------
@@ -55,7 +53,8 @@ class TestReplayCommand:
         """Replay command shows help text."""
         result = runner.invoke(app, ["replay", "--help"])
         assert result.exit_code == 0
-        assert "Replay a recorded workflow" in result.output
+        clean = _ANSI_RE.sub("", result.output)
+        assert "Replay a recorded workflow" in clean
 
     def test_missing_file(self, tmp_path: Path) -> None:
         """Replay with a nonexistent file shows error."""
@@ -80,4 +79,5 @@ class TestReplayCommand:
     def test_custom_port_option(self) -> None:
         """Replay command accepts --web-port option."""
         result = runner.invoke(app, ["replay", "--help"])
-        assert "--web-port" in result.output
+        clean = _ANSI_RE.sub("", result.output)
+        assert "--web-port" in clean
