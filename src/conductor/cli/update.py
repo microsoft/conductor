@@ -329,19 +329,9 @@ def run_update(console: Console) -> None:
 
     # On Windows, rename our exe out of the way so uv can write the new one.
     # Windows locks running executables but allows renaming them.
-    old_exe: Path | None = None
+    renamed_exes: list[tuple[Path, Path]] = []
     if sys.platform == "win32":
-        exe_path = _get_conductor_exe()
-        if exe_path and exe_path.exists():
-            old_exe = exe_path.with_suffix(".exe.old")
-            # Clean up leftover .old from a previous successful update
-            if old_exe.exists():
-                with contextlib.suppress(OSError):
-                    old_exe.unlink()
-            try:
-                exe_path.rename(old_exe)
-            except OSError:
-                old_exe = None  # rename failed; proceed anyway, uv will report the error
+        renamed_exes = _rename_windows_exes()
 
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True)  # noqa: S603
@@ -350,22 +340,82 @@ def run_update(console: Console) -> None:
             console.print(f"[green]Successfully upgraded to v{version}[/green]")
             cache_path = get_cache_path()
             cache_path.unlink(missing_ok=True)
+        elif sys.platform == "win32" and "Failed to install entrypoint" in (proc.stderr or ""):
+            # On Windows, uv may fail to copy the entrypoint because the running
+            # executable is locked.  The package itself was installed successfully.
+            console.print(f"[green]Successfully upgraded to v{version}[/green]")
+            console.print(
+                "[dim]Note: restart your terminal for the update to take full effect.[/dim]"
+            )
+            cache_path = get_cache_path()
+            cache_path.unlink(missing_ok=True)
         else:
             console.print(f"[bold red]Upgrade failed[/bold red] (exit code {proc.returncode})")
             if proc.stderr:
                 console.print(f"[dim]{proc.stderr.strip()}[/dim]")
-            # On Windows, restore the original exe if uv failed to write a new one
-            if old_exe and old_exe.exists():
-                exe_path = old_exe.with_suffix("")  # .exe.old → .exe
-                if not exe_path.exists():
+            # On Windows, restore the original exe(s) if uv failed
+            for orig, backup in renamed_exes:
+                if backup.exists() and not orig.exists():
                     with contextlib.suppress(OSError):
-                        old_exe.rename(exe_path)
+                        backup.rename(orig)
     finally:
         # Clean up temp constraints file
         if constraints_path:
             with contextlib.suppress(OSError):
                 constraints_path.unlink()
                 constraints_path.parent.rmdir()
+
+
+def _rename_windows_exes() -> list[tuple[Path, Path]]:
+    """Rename conductor executables on Windows so ``uv`` can overwrite them.
+
+    Windows locks running executables, preventing overwrite.  Renaming is
+    still allowed, so we move them out of the way before ``uv tool install``.
+
+    We target both the executable found on ``PATH`` (the one currently running)
+    and the standard ``uv`` entrypoint location at ``~/.local/bin``, deduplicating
+    by resolved path.
+
+    Returns:
+        A list of ``(original_path, backup_path)`` tuples for later restoration.
+    """
+    renamed: list[tuple[Path, Path]] = []
+    seen: set[str] = set()
+    candidates: list[Path] = []
+
+    # 1. The exe on PATH (the one currently running)
+    exe_from_which = _get_conductor_exe()
+    if exe_from_which:
+        candidates.append(exe_from_which)
+
+    # 2. The standard uv entrypoint location
+    uv_bin_exe = Path.home() / ".local" / "bin" / "conductor.exe"
+    candidates.append(uv_bin_exe)
+
+    for exe_path in candidates:
+        if not exe_path.exists():
+            continue
+
+        # Deduplicate by resolved path (case-insensitive on Windows)
+        try:
+            key = str(exe_path.resolve()).lower()
+        except OSError:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+
+        old_path = exe_path.with_suffix(".exe.old")
+        try:
+            # replace() overwrites an existing .old file, unlike rename() which
+            # fails on Windows when the destination already exists (e.g. from a
+            # previous interrupted update).
+            exe_path.replace(old_path)
+            renamed.append((exe_path, old_path))
+        except OSError:
+            pass  # rename failed; proceed, uv will report the error
+
+    return renamed
 
 
 def _download_constraints(tag_name: str, console: Console) -> Path | None:
