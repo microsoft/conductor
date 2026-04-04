@@ -633,6 +633,41 @@ class TestRunUpdate:
         output = buf.getvalue()
         assert "Successfully upgraded" in output
 
+    def test_windows_entrypoint_failure_reports_success(
+        self, cache_dir: Path, tmp_path: Path
+    ) -> None:
+        """On Windows, if uv installs the package but fails to copy the entrypoint,
+        report success with a restart note instead of failure."""
+        fake_exe = tmp_path / "conductor.exe"
+        fake_exe.write_text("fake")
+
+        cache_file = cache_dir / "update-check.json"
+        cache_file.write_text("{}")
+
+        c, buf = _make_console(is_terminal=True)
+        mock_proc = MagicMock()
+        mock_proc.returncode = 2
+        mock_proc.stderr = "error: Failed to install entrypoint\n  Caused by: failed to copy file"
+
+        with (
+            patch(
+                "conductor.cli.update.fetch_latest_version",
+                return_value=("99.0.0", "v99.0.0", "https://example.com"),
+            ),
+            patch("conductor.cli.update.sys.platform", "win32"),
+            patch("conductor.cli.update._get_conductor_exe", return_value=fake_exe),
+            patch("conductor.cli.update.subprocess.run", return_value=mock_proc),
+        ):
+            run_update(c)
+
+        output = buf.getvalue()
+        assert "Successfully upgraded" in output
+        assert "restart your terminal" in output
+        assert "Upgrade failed" not in output
+
+        # Cache should be cleared on partial success
+        assert not cache_file.exists()
+
 
 # ===================================================================
 # E3-T3: CLI-level tests
