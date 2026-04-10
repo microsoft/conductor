@@ -1120,7 +1120,7 @@ class CopilotProvider(AgentProvider):
         elif event_type == "assistant.turn_start":
             # Only show processing indicator in full mode
             if full_mode:
-                turn = getattr(event.data, "turn", None)
+                turn = getattr(event.data, "turn_id", None)
                 turn_info = f" (turn {turn})" if turn else ""
                 text = Text()
                 text.append("    │  ", style="dim")
@@ -1177,7 +1177,7 @@ class CopilotProvider(AgentProvider):
                 )
 
             elif event_type == "assistant.turn_start":
-                turn = getattr(event.data, "turn", None)
+                turn = getattr(event.data, "turn_id", None)
                 callback("agent_turn_start", {"turn": turn})
 
             elif event_type == "assistant.message":
