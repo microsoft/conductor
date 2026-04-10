@@ -50,7 +50,7 @@ Agents are defined in the `agents` list. Each agent represents a unit of work.
 agents:
   - name: string                    # Required: Unique agent identifier
     description: string             # Optional: Purpose description
-    type: agent                     # agent | human_gate | script (default: agent)
+    type: agent                     # agent | human_gate | script | workflow (default: agent)
     model: string                   # Optional: Model identifier (e.g., 'claude-sonnet-4.5')
     
     prompt: |                       # Required for type=agent: Agent instructions
@@ -159,6 +159,42 @@ routes:
 **Restrictions** — script steps cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, `output` schema, or `options`. Script steps also cannot be used inside `parallel` groups or `for_each` groups.
 
 **Environment variable note** — values in `env` are passed as-is to the subprocess (they are not rendered as Jinja2 templates). Use `${VAR}` syntax in the workflow YAML loader if you need environment variable substitution in env values.
+
+### Sub-Workflow Steps
+
+Sub-workflow steps reference external workflow YAML files, enabling composable and reusable workflow building blocks. The sub-workflow runs as a black box — its internal agents are not visible to the parent.
+
+```yaml
+agents:
+  - name: deep_research
+    type: workflow
+    workflow: ./research-pipeline.yaml   # Required: path to sub-workflow YAML
+    input:                               # Optional: explicit input declarations
+      - workflow.input.topic
+    output:                              # Optional: output schema for validation
+      findings:
+        type: string
+    routes:
+      - to: synthesizer
+```
+
+**Key semantics:**
+
+- The `workflow` path is resolved relative to the parent workflow file
+- Sub-workflow inherits the parent's provider configuration
+- Sub-workflow output is stored in context and accessible via `{{ agent_name.output.field }}`
+- Recursive composition is supported (sub-workflows can reference other sub-workflows) with a depth limit of 10
+- Circular references (a workflow referencing itself) are detected and rejected
+
+**Access sub-workflow output in downstream agents:**
+
+```yaml
+prompt: |
+  The research findings were:
+  {{ deep_research.output.findings }}
+```
+
+**Restrictions** — workflow steps cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, `command`, or `options`. Workflow steps also cannot be used inside `parallel` groups or `for_each` groups.
 
 ## Parallel Groups
 

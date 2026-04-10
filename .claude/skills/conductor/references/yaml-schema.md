@@ -90,7 +90,7 @@ agents:
     name: string                    # Unique agent identifier
 
     # Optional fields
-    type: string                    # "agent" (default), "human_gate", or "script"
+    type: string                    # "agent" (default), "human_gate", "script", or "workflow"
     description: string             # What this agent does
     model: string                   # Override default_model
     provider: string                # Per-agent provider override ("copilot" or "claude")

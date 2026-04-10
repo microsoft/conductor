@@ -45,6 +45,10 @@ from conductor.providers.base import AgentOutput
 
 logger = logging.getLogger(__name__)
 
+# Maximum nesting depth for sub-workflow composition.
+# Prevents runaway recursion when workflows reference each other.
+MAX_SUBWORKFLOW_DEPTH = 10
+
 
 if TYPE_CHECKING:
     from conductor.config.schema import AgentDef, ForEachDef, ParallelGroup, WorkflowConfig
@@ -265,6 +269,7 @@ class WorkflowEngine:
         event_emitter: WorkflowEventEmitter | None = None,
         keyboard_listener: KeyboardListener | None = None,
         web_dashboard: WebDashboard | None = None,
+        _subworkflow_depth: int = 0,
     ) -> None:
         """Initialize the WorkflowEngine.
 
@@ -291,6 +296,9 @@ class WorkflowEngine:
             web_dashboard: Optional web dashboard for bidirectional gate input.
                 When provided and connected, gate input is accepted from
                 both CLI stdin and web UI, with first response winning.
+            _subworkflow_depth: Current nesting depth for sub-workflow composition.
+                Used internally to enforce MAX_SUBWORKFLOW_DEPTH. Callers should
+                not set this directly.
 
         Note:
             If both provider and registry are provided, registry takes precedence.
@@ -342,6 +350,9 @@ class WorkflowEngine:
         # Checkpoint tracking
         self._current_agent_name: str | None = None
         self._last_checkpoint_path: Path | None = None
+
+        # Sub-workflow depth tracking
+        self._subworkflow_depth = _subworkflow_depth
 
     def _build_pricing_overrides(self) -> dict[str, ModelPricing] | None:
         """Build pricing overrides from workflow cost configuration.
@@ -467,6 +478,100 @@ class WorkflowEngine:
             self.script_executor.execute(agent, context),
             operation_name=f"script '{agent.name}'",
         )
+
+    async def _execute_subworkflow(
+        self,
+        agent: AgentDef,
+        context: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Execute a sub-workflow as a black-box step.
+
+        Loads the referenced workflow YAML, creates a child WorkflowEngine,
+        and runs it with the parent agent's context as input. The sub-workflow's
+        final output is returned as the agent's output.
+
+        Args:
+            agent: Workflow agent definition with ``workflow`` path.
+            context: Workflow context for template rendering (used as sub-workflow input).
+
+        Returns:
+            The sub-workflow's final output dict.
+
+        Raises:
+            ExecutionError: If the sub-workflow file cannot be loaded,
+                depth limit is exceeded, or execution fails.
+        """
+        from conductor.config.loader import load_config
+
+        if self._subworkflow_depth >= MAX_SUBWORKFLOW_DEPTH:
+            raise ExecutionError(
+                f"Sub-workflow depth limit exceeded ({MAX_SUBWORKFLOW_DEPTH}). "
+                f"Agent '{agent.name}' cannot invoke sub-workflow '{agent.workflow}'.",
+                suggestion=(
+                    "Check for circular sub-workflow references or reduce nesting depth."
+                ),
+            )
+
+        assert agent.workflow is not None  # noqa: S101
+
+        # Resolve sub-workflow path relative to parent workflow file
+        if self.workflow_path is not None:
+            base_dir = Path(self.workflow_path).resolve().parent
+        else:
+            base_dir = Path.cwd()
+
+        sub_path = (base_dir / agent.workflow).resolve()
+
+        if not sub_path.exists():
+            raise ExecutionError(
+                f"Sub-workflow file not found: {sub_path} "
+                f"(referenced by agent '{agent.name}')",
+                suggestion="Check that the 'workflow' path is correct and the file exists.",
+            )
+
+        # Detect circular references via file path
+        current_path = (
+            Path(self.workflow_path).resolve() if self.workflow_path else None
+        )
+        if current_path is not None and sub_path == current_path:
+            raise ExecutionError(
+                f"Circular sub-workflow reference: agent '{agent.name}' "
+                f"references its own workflow file '{agent.workflow}'.",
+                suggestion="A workflow cannot reference itself as a sub-workflow.",
+            )
+
+        try:
+            sub_config = load_config(sub_path)
+        except Exception as exc:
+            raise ExecutionError(
+                f"Failed to load sub-workflow '{sub_path}' "
+                f"(referenced by agent '{agent.name}'): {exc}",
+                suggestion="Check the sub-workflow YAML for syntax or validation errors.",
+            ) from exc
+
+        # Build sub-workflow inputs from the parent context
+        # Extract workflow.input.* values from the parent context
+        sub_inputs: dict[str, Any] = {}
+        if "workflow" in context and isinstance(context["workflow"], dict):
+            workflow_ctx = context["workflow"]
+            if "input" in workflow_ctx and isinstance(workflow_ctx["input"], dict):
+                sub_inputs.update(workflow_ctx["input"])
+
+        # Create child engine inheriting provider/registry but with deeper depth
+        child_engine = WorkflowEngine(
+            config=sub_config,
+            provider=self._single_provider,
+            registry=self._registry,
+            skip_gates=self.skip_gates,
+            workflow_path=sub_path,
+            interrupt_event=self._interrupt_event,
+            event_emitter=self._event_emitter,
+            keyboard_listener=self._keyboard_listener,
+            web_dashboard=self._web_dashboard,
+            _subworkflow_depth=self._subworkflow_depth + 1,
+        )
+
+        return await child_engine.run(sub_inputs)
 
     def _get_context_window_for_agent(self, agent: AgentDef) -> int | None:
         """Return the context window size for an agent's model."""
@@ -1373,6 +1478,92 @@ class WorkflowEngine:
                             current_agent_name = route_result.target
 
                             # Check for interrupt after script step
+                            interrupt_result = await self._check_interrupt(current_agent_name)
+                            if interrupt_result is not None:
+                                current_agent_name = await self._handle_interrupt_result(
+                                    interrupt_result, current_agent_name
+                                )
+                            continue
+
+                        # Handle sub-workflow steps
+                        if agent.type == "workflow":
+                            agent_context = self.context.build_for_agent(
+                                agent.name,
+                                agent.input,
+                                mode=self.config.workflow.context.mode,
+                            )
+                            _sub_start = _time.time()
+
+                            sub_execution_count = (
+                                self.limits.get_agent_execution_count(agent.name) + 1
+                            )
+
+                            self._emit(
+                                "subworkflow_started",
+                                {
+                                    "agent_name": agent.name,
+                                    "iteration": sub_execution_count,
+                                    "workflow": agent.workflow,
+                                },
+                            )
+
+                            try:
+                                sub_output = await self._execute_subworkflow(
+                                    agent, agent_context
+                                )
+                            except Exception as exc:
+                                _sub_elapsed = _time.time() - _sub_start
+                                self._emit(
+                                    "subworkflow_failed",
+                                    {
+                                        "agent_name": agent.name,
+                                        "elapsed": _sub_elapsed,
+                                        "error_type": type(exc).__name__,
+                                        "message": str(exc),
+                                    },
+                                )
+                                raise
+                            _sub_elapsed = _time.time() - _sub_start
+
+                            self._emit(
+                                "subworkflow_completed",
+                                {
+                                    "agent_name": agent.name,
+                                    "elapsed": _sub_elapsed,
+                                    "output": sub_output,
+                                },
+                            )
+
+                            # Store sub-workflow output in context
+                            self.context.store(agent.name, sub_output)
+                            self.limits.record_execution(agent.name)
+                            self.limits.check_timeout()
+
+                            route_result = self._evaluate_routes(agent, sub_output)
+
+                            self._emit(
+                                "route_taken",
+                                {
+                                    "from_agent": agent.name,
+                                    "to_agent": route_result.target,
+                                },
+                            )
+
+                            if route_result.target == "$end":
+                                result = self._build_final_output(route_result.output_transform)
+                                self._emit(
+                                    "workflow_completed",
+                                    {
+                                        "elapsed": _time.time() - _workflow_start,
+                                        "output": result,
+                                    },
+                                )
+                                self._execute_hook("on_complete", result=result)
+                                return result
+
+                            current_agent_name = route_result.target
+
+                            # Check for interrupt after sub-workflow step
                             interrupt_result = await self._check_interrupt(current_agent_name)
                             if interrupt_result is not None:
                                 current_agent_name = await self._handle_interrupt_result(
