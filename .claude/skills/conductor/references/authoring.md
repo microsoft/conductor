@@ -48,7 +48,7 @@ workflow:
 ```yaml
 agents:
   - name: my_agent               # Required: unique identifier
-    type: agent                  # agent (default), human_gate, or script
+    type: agent                  # agent (default), human_gate, script, or workflow
     description: What it does
     model: gpt-5.2               # Override workflow default
     provider: claude             # Optional: per-agent provider override

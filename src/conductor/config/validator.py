@@ -111,12 +111,17 @@ def validate_workflow_config(config: WorkflowConfig) -> list[str]:
         parallel_errors = _validate_parallel_groups(config)
         errors.extend(parallel_errors)
 
-    # Validate for_each groups: reject script steps as inline agents
+    # Validate for_each groups: reject script and workflow steps as inline agents
     for for_each_group in config.for_each:
         if for_each_group.agent.type == "script":
             errors.append(
                 f"For-each group '{for_each_group.name}' uses a script step as its "
                 "inline agent. Script steps cannot be used in for_each groups."
+            )
+        if for_each_group.agent.type == "workflow":
+            errors.append(
+                f"For-each group '{for_each_group.name}' uses a workflow step as its "
+                "inline agent. Workflow steps cannot be used in for_each groups."
             )
 
     # Validate workflow output references
@@ -377,6 +382,13 @@ def _validate_parallel_groups(config: WorkflowConfig) -> list[str]:
                 errors.append(
                     f"Agent '{agent_name}' in parallel group '{pg.name}' is a script step. "
                     "Script steps cannot be used in parallel groups."
+                )
+
+            # Validate no workflow steps in parallel groups
+            if agent.type == "workflow":
+                errors.append(
+                    f"Agent '{agent_name}' in parallel group '{pg.name}' is a workflow step. "
+                    "Workflow steps cannot be used in parallel groups."
                 )
 
         # PE-6.2: Validate parallel group route targets
