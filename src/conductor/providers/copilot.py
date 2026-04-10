@@ -60,6 +60,8 @@ class RetryConfig:
         base_delay: Base delay in seconds before first retry.
         max_delay: Maximum delay in seconds between retries.
         jitter: Maximum random jitter to add to delay (0.0 to 1.0 fraction of delay).
+        backoff: Backoff strategy: "exponential" or "fixed".
+        retry_on: Error categories that trigger a retry ("provider_error", "timeout").
         max_parse_recovery_attempts: Maximum number of in-session recovery attempts
             for JSON parse failures. When parsing fails, a follow-up message is sent
             to the same session asking the model to correct its response format.
@@ -69,6 +71,8 @@ class RetryConfig:
     base_delay: float = 1.0
     max_delay: float = 30.0
     jitter: float = 0.25
+    backoff: str = "exponential"
+    retry_on: list[str] | None = None
     max_parse_recovery_attempts: int = 5
 
 
@@ -259,6 +263,34 @@ class CopilotProvider(AgentProvider):
             event_callback=event_callback,
         )
 
+    def _resolve_retry_config(self, agent: AgentDef) -> RetryConfig:
+        """Resolve the retry config for an agent.
+
+        If the agent has a per-agent retry policy, build a RetryConfig from it.
+        Otherwise, fall back to the provider-level default.
+
+        Args:
+            agent: Agent definition that may contain a retry policy.
+
+        Returns:
+            RetryConfig to use for this agent's execution.
+        """
+        from conductor.config.schema import RetryPolicy
+
+        retry = getattr(agent, "retry", None)
+        if not isinstance(retry, RetryPolicy):
+            return self._retry_config
+
+        return RetryConfig(
+            max_attempts=retry.max_attempts,
+            base_delay=retry.delay_seconds,
+            max_delay=self._retry_config.max_delay,
+            jitter=self._retry_config.jitter,
+            backoff=retry.backoff,
+            retry_on=list(retry.retry_on),
+            max_parse_recovery_attempts=self._retry_config.max_parse_recovery_attempts,
+        )
+
     async def _execute_with_retry(
         self,
         agent: AgentDef,
@@ -269,6 +301,9 @@ class CopilotProvider(AgentProvider):
         event_callback: EventCallback | None = None,
     ) -> AgentOutput:
         """Execute with exponential backoff retry logic.
+
+        Uses the per-agent retry policy if configured on the agent, otherwise
+        falls back to the provider-level retry config.
 
         Args:
             agent: Agent definition from workflow config.
@@ -285,7 +320,7 @@ class CopilotProvider(AgentProvider):
             ProviderError: If execution fails after all retry attempts.
         """
         last_error: Exception | None = None
-        config = self._retry_config
+        config = self._resolve_retry_config(agent)
 
         for attempt in range(1, config.max_attempts + 1):
             try:
@@ -341,17 +376,38 @@ class CopilotProvider(AgentProvider):
                 if not e.is_retryable:
                     raise
 
+                # Check retry_on filter if per-agent retry is configured
+                if config.retry_on is not None:
+                    error_category = self._classify_error(e)
+                    if error_category not in config.retry_on:
+                        raise
+
                 # Don't retry if this was the last attempt
                 if attempt >= config.max_attempts:
                     break
 
-                # Calculate delay with exponential backoff
+                # Calculate delay with backoff
                 delay = self._calculate_delay(attempt, config)
 
                 logger.debug(f"Retrying agent '{agent.name}' in {delay:.2f}s")
 
                 # Log retry attempt (for testing visibility)
                 self._retry_history[-1]["delay"] = delay
+
+                # Emit agent_retry event
+                if event_callback is not None:
+                    with contextlib.suppress(Exception):
+                        event_callback(
+                            "agent_retry",
+                            {
+                                "agent_name": agent.name,
+                                "attempt": attempt,
+                                "max_attempts": config.max_attempts,
+                                "error": str(e),
+                                "error_type": type(e).__name__,
+                                "delay": delay,
+                            },
+                        )
 
                 await asyncio.sleep(delay)
 
@@ -374,6 +430,22 @@ class CopilotProvider(AgentProvider):
 
                 delay = self._calculate_delay(attempt, config)
                 self._retry_history[-1]["delay"] = delay
+
+                # Emit agent_retry event for unexpected errors too
+                if event_callback is not None:
+                    with contextlib.suppress(Exception):
+                        event_callback(
+                            "agent_retry",
+                            {
+                                "agent_name": agent.name,
+                                "attempt": attempt,
+                                "max_attempts": config.max_attempts,
+                                "error": str(e),
+                                "error_type": type(e).__name__,
+                                "delay": delay,
+                            },
+                        )
+
                 await asyncio.sleep(delay)
 
         # All retries exhausted
@@ -1517,7 +1589,9 @@ class CopilotProvider(AgentProvider):
                 pass  # fd may already be closed or invalid
 
     def _calculate_delay(self, attempt: int, config: RetryConfig) -> float:
-        """Calculate delay with exponential backoff and jitter.
+        """Calculate delay with backoff and jitter.
+
+        Supports both exponential and fixed backoff strategies.
 
         Args:
             attempt: Current attempt number (1-indexed).
@@ -1526,8 +1600,11 @@ class CopilotProvider(AgentProvider):
         Returns:
             Delay in seconds before next retry.
         """
-        # Exponential backoff: base * 2^(attempt-1)
-        delay = config.base_delay * (2 ** (attempt - 1))
+        if config.backoff == "fixed":
+            delay = config.base_delay
+        else:
+            # Exponential backoff: base * 2^(attempt-1)
+            delay = config.base_delay * (2 ** (attempt - 1))
 
         # Cap at max delay
         delay = min(delay, config.max_delay)
@@ -1538,6 +1615,30 @@ class CopilotProvider(AgentProvider):
             delay += jitter_amount
 
         return delay
+
+    @staticmethod
+    def _classify_error(error: Exception) -> str:
+        """Classify an error into a retry category.
+
+        Maps exception types to the retry_on categories used in per-agent
+        retry policies.
+
+        Args:
+            error: The exception to classify.
+
+        Returns:
+            Error category string: "provider_error" or "timeout".
+        """
+        from conductor.exceptions import TimeoutError as ConductorTimeoutError
+
+        if isinstance(error, (ConductorTimeoutError, asyncio.TimeoutError)):
+            return "timeout"
+        if isinstance(error, ProviderError):
+            if error.status_code == 408:
+                return "timeout"
+            if "timeout" in str(error).lower():
+                return "timeout"
+        return "provider_error"
 
     def _generate_stub_output(self, agent: AgentDef) -> dict[str, Any]:
         """Generate stub output based on agent's output schema.

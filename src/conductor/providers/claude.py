@@ -76,6 +76,8 @@ class RetryConfig(BaseModel):
         base_delay: Base delay in seconds before first retry.
         max_delay: Maximum delay in seconds between retries.
         jitter: Maximum random jitter to add to delay (0.0 to 1.0 fraction of delay).
+        backoff: Backoff strategy: "exponential" or "fixed".
+        retry_on: Error categories that trigger a retry ("provider_error", "timeout").
         max_parse_recovery_attempts: Maximum number of in-session recovery attempts
             for JSON parse failures. When parsing fails, a follow-up message is sent
             to the same session asking the model to correct its response format.
@@ -85,6 +87,8 @@ class RetryConfig(BaseModel):
     base_delay: float = 1.0
     max_delay: float = 30.0
     jitter: float = 0.25
+    backoff: str = "exponential"
+    retry_on: list[str] | None = None
     max_parse_recovery_attempts: int = 2  # Claude: 2 attempts (less than Copilot's 5)
 
 
@@ -437,6 +441,59 @@ class ClaudeProvider(AgentProvider):
             event_callback=event_callback,
         )
 
+    def _resolve_retry_config(self, agent: AgentDef) -> RetryConfig:
+        """Resolve the retry config for an agent.
+
+        If the agent has a per-agent retry policy, build a RetryConfig from it.
+        Otherwise, fall back to the provider-level default.
+
+        Args:
+            agent: Agent definition that may contain a retry policy.
+
+        Returns:
+            RetryConfig to use for this agent's execution.
+        """
+        from conductor.config.schema import RetryPolicy
+
+        retry = getattr(agent, "retry", None)
+        if not isinstance(retry, RetryPolicy):
+            return self._retry_config
+
+        return RetryConfig(
+            max_attempts=retry.max_attempts,
+            base_delay=retry.delay_seconds,
+            max_delay=self._retry_config.max_delay,
+            jitter=self._retry_config.jitter,
+            backoff=retry.backoff,
+            retry_on=list(retry.retry_on),
+            max_parse_recovery_attempts=self._retry_config.max_parse_recovery_attempts,
+        )
+
+    @staticmethod
+    def _classify_error(error: Exception) -> str:
+        """Classify an error into a retry category.
+
+        Maps exception types to the retry_on categories used in per-agent
+        retry policies.
+
+        Args:
+            error: The exception to classify.
+
+        Returns:
+            Error category string: "provider_error" or "timeout".
+        """
+        from conductor.exceptions import ProviderError
+        from conductor.exceptions import TimeoutError as ConductorTimeoutError
+
+        if isinstance(error, (ConductorTimeoutError, asyncio.TimeoutError)):
+            return "timeout"
+        if isinstance(error, ProviderError):
+            if error.status_code == 408:
+                return "timeout"
+            if "timeout" in str(error).lower():
+                return "timeout"
+        return "provider_error"
+
     def _is_retryable_error(self, exception: Exception) -> bool:
         """Determine if an error should trigger a retry.
 
@@ -531,7 +588,9 @@ class ClaudeProvider(AgentProvider):
         return None
 
     def _calculate_delay(self, attempt: int, config: RetryConfig) -> float:
-        """Calculate delay with exponential backoff and jitter.
+        """Calculate delay with backoff and jitter.
+
+        Supports both exponential and fixed backoff strategies.
 
         Args:
             attempt: Current attempt number (1-indexed).
@@ -540,8 +599,11 @@ class ClaudeProvider(AgentProvider):
         Returns:
             Delay in seconds before next retry.
         """
-        # Exponential backoff: base * 2^(attempt-1)
-        delay = config.base_delay * (2 ** (attempt - 1))
+        if config.backoff == "fixed":
+            delay = config.base_delay
+        else:
+            # Exponential backoff: base * 2^(attempt-1)
+            delay = config.base_delay * (2 ** (attempt - 1))
 
         # Cap at max delay
         delay = min(delay, config.max_delay)
@@ -592,7 +654,7 @@ class ClaudeProvider(AgentProvider):
         await self._ensure_mcp_connected()
 
         last_error: Exception | None = None
-        config = self._retry_config
+        config = self._resolve_retry_config(agent)
 
         # Build messages
         messages = self._build_messages(rendered_prompt)
@@ -788,6 +850,12 @@ class ClaudeProvider(AgentProvider):
                             is_retryable=False,
                         ) from e
 
+                # Check retry_on filter if per-agent retry is configured
+                if config.retry_on is not None:
+                    error_category = self._classify_error(e)
+                    if error_category not in config.retry_on:
+                        raise
+
                 # Don't retry if this was the last attempt
                 if attempt >= config.max_attempts:
                     break
@@ -800,11 +868,9 @@ class ClaudeProvider(AgentProvider):
                         f"Rate limit hit (HTTP 429), respecting retry-after header: {delay}s"
                     )
                 else:
-                    # Calculate delay with exponential backoff
+                    # Calculate delay with backoff
                     delay = self._calculate_delay(attempt, config)
-                    logger.info(
-                        f"Calculated exponential backoff delay: {delay:.2f}s for attempt {attempt}"
-                    )
+                    logger.info(f"Calculated backoff delay: {delay:.2f}s for attempt {attempt}")
 
                 # Log retry attempt with full context
                 logger.warning(
@@ -812,6 +878,21 @@ class ClaudeProvider(AgentProvider):
                     f"due to {type(e).__name__}: {e}"
                 )
                 retry_entry["delay"] = delay
+
+                # Emit agent_retry event
+                if event_callback is not None:
+                    with contextlib.suppress(Exception):
+                        event_callback(
+                            "agent_retry",
+                            {
+                                "agent_name": agent.name,
+                                "attempt": attempt,
+                                "max_attempts": config.max_attempts,
+                                "error": str(e),
+                                "error_type": type(e).__name__,
+                                "delay": delay,
+                            },
+                        )
 
                 await asyncio.sleep(delay)
 

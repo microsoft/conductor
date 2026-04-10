@@ -130,6 +130,14 @@ agents:
     max_agent_iterations: integer   # Max tool-use roundtrips for this agent (1-500, optional)
     max_session_seconds: float      # Wall-clock timeout for this agent session (optional)
 
+    # Per-agent retry policy (optional, not allowed for script agents)
+    retry:
+      max_attempts: integer         # Max attempts including first (1-10, default: 1 = no retry)
+      backoff: string               # "exponential" (default) or "fixed"
+      delay_seconds: float          # Base delay in seconds (0-300, default: 2.0)
+      retry_on:                     # Error categories to retry (default: all)
+        - string                    # "provider_error" (API 500s, rate limits) or "timeout"
+
     # Script-only fields (type: script)
     command: string                 # Command to execute (Jinja2 templated)
     args: [string]                  # Command arguments (each Jinja2 templated)
@@ -138,7 +146,7 @@ agents:
     timeout: integer                # Per-script timeout in seconds
 ```
 
-**Script agent restrictions:** Cannot have `prompt`, `provider`, `model`, `tools`, `output`, `system_prompt`, `options`. Output is always `{stdout, stderr, exit_code}`.
+**Script agent restrictions:** Cannot have `prompt`, `provider`, `model`, `tools`, `output`, `system_prompt`, `options`, `retry`. Output is always `{stdout, stderr, exit_code}`.
 
 ## Script Agent Schema
 
