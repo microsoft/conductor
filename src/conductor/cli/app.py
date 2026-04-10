@@ -463,7 +463,11 @@ def init(
         typer.Option(
             "--template",
             "-t",
-            help="Template to use (see 'conductor templates' for options).",
+            help=(
+                "Template to use. Use 'registry:<name>' for community templates "
+                "(see 'conductor templates' for local options, "
+                "'conductor templates --remote' for community options)."
+            ),
         ),
     ] = "simple",
     output: Annotated[
@@ -479,46 +483,133 @@ def init(
 
     Creates a new workflow YAML file based on the specified template.
     Use 'conductor templates' to see available templates.
+    Use 'registry:<name>' to scaffold from a community template.
 
     \b
     Examples:
         conductor init my-workflow
         conductor init my-workflow --template loop
         conductor init my-workflow -t human-gate -o ./workflows/my-workflow.yaml
+        conductor init my-workflow -t registry:research-pipeline
     """
-    from conductor.cli.init import create_workflow_file, get_template
+    if template.startswith("registry:"):
+        # Remote registry template
+        from conductor.cli.registry import RegistryError, render_remote_template
 
-    # Check if template exists
-    template_info = get_template(template)
-    if template_info is None:
-        console.print(f"[bold red]Error:[/bold red] Template '{template}' not found.")
-        console.print("[dim]Use 'conductor templates' to see available templates.[/dim]")
-        raise typer.Exit(code=1)
+        remote_name = template[len("registry:") :]
+        if not remote_name:
+            console.print("[bold red]Error:[/bold red] Missing template name after 'registry:'.")
+            console.print(
+                "[dim]Use 'conductor templates --remote' to see available "
+                "community templates.[/dim]"
+            )
+            raise typer.Exit(code=1)
 
-    try:
-        create_workflow_file(name, template, output, output_console)
-    except FileExistsError as e:
-        console.print(f"[bold red]Error:[/bold red] {e}")
-        console.print("[dim]Use --output to specify a different path.[/dim]")
-        raise typer.Exit(code=1) from None
-    except ValueError as e:
-        console.print(f"[bold red]Error:[/bold red] {e}")
-        raise typer.Exit(code=1) from None
+        # Determine output path
+        if output is None:
+            safe_name = name.replace(" ", "-").lower()
+            output = Path(f"{safe_name}.yaml")
+
+        if output.exists():
+            console.print(f"[bold red]Error:[/bold red] File already exists: {output}")
+            console.print("[dim]Use --output to specify a different path.[/dim]")
+            raise typer.Exit(code=1)
+
+        try:
+            content = render_remote_template(remote_name, name)
+            output.write_text(content, encoding="utf-8")
+            output_console.print(f"[green]Created workflow file:[/green] {output}")
+            output_console.print(f"[dim]Template used:[/dim] registry:{remote_name}")
+        except RegistryError as e:
+            console.print(f"[bold red]Error:[/bold red] {e}")
+            raise typer.Exit(code=1) from None
+    else:
+        # Local template
+        from conductor.cli.init import create_workflow_file, get_template
+
+        # Check if template exists
+        template_info = get_template(template)
+        if template_info is None:
+            console.print(f"[bold red]Error:[/bold red] Template '{template}' not found.")
+            console.print("[dim]Use 'conductor templates' to see available templates.[/dim]")
+            raise typer.Exit(code=1)
+
+        try:
+            create_workflow_file(name, template, output, output_console)
+        except FileExistsError as e:
+            console.print(f"[bold red]Error:[/bold red] {e}")
+            console.print("[dim]Use --output to specify a different path.[/dim]")
+            raise typer.Exit(code=1) from None
+        except ValueError as e:
+            console.print(f"[bold red]Error:[/bold red] {e}")
+            raise typer.Exit(code=1) from None
 
 
 @app.command()
-def templates() -> None:
+def templates(
+    remote: Annotated[
+        bool,
+        typer.Option(
+            "--remote",
+            help="List community workflow templates from the remote registry.",
+        ),
+    ] = False,
+) -> None:
     """List available workflow templates.
 
     Shows all templates that can be used with 'conductor init'.
+    Use --remote to discover community workflows from the registry.
 
     \b
     Examples:
         conductor templates
+        conductor templates --remote
     """
-    from conductor.cli.init import display_templates
+    if remote:
+        from conductor.cli.registry import display_remote_templates
 
-    display_templates(output_console)
+        display_remote_templates(output_console)
+    else:
+        from conductor.cli.init import display_templates
+
+        display_templates(output_console)
+
+
+@app.command()
+def publish(
+    workflow: Annotated[
+        Path,
+        typer.Argument(
+            help="Path to the workflow YAML file to publish.",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+            resolve_path=True,
+        ),
+    ],
+) -> None:
+    """Validate a workflow for publishing to the community registry.
+
+    Checks the workflow file for:
+    - Valid YAML syntax and schema
+    - Required metadata (name, description)
+    - No suspicious or unsafe patterns
+    - No hardcoded secrets or credentials
+
+    If validation passes, instructions for sharing the workflow are displayed.
+
+    \b
+    Examples:
+        conductor publish my-workflow.yaml
+    """
+    from conductor.cli.registry import display_publish_result, validate_for_publish
+
+    result = validate_for_publish(workflow)
+    display_publish_result(result, workflow, output_console)
+
+    if not result.is_valid:
+        raise typer.Exit(code=1)
 
 
 @app.command()
