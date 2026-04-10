@@ -41,7 +41,8 @@ _IDLE_IGNORED_EVENTS: frozenset[str] = frozenset(
 
 # Try to import the Copilot SDK
 try:
-    from copilot import CopilotClient, PermissionHandler
+    from copilot import CopilotClient
+    from copilot.session import PermissionHandler
 
     COPILOT_SDK_AVAILABLE = True
 except ImportError:
