@@ -69,6 +69,7 @@ def get_azure_token(scope: str) -> str | None:
             ],
             capture_output=True,
             text=True,
+            encoding="utf-8",
             timeout=30,
         )
         if result.returncode == 0:
