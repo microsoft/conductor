@@ -334,7 +334,7 @@ def run_update(console: Console) -> None:
         renamed_exes = _rename_windows_exes()
 
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True)  # noqa: S603
+        proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8")  # noqa: S603
 
         if proc.returncode == 0:
             console.print(f"[green]Successfully upgraded to v{version}[/green]")
