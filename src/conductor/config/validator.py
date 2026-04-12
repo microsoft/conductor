@@ -21,7 +21,7 @@ if TYPE_CHECKING:
 # Note: this is intentionally broader than the agent_ref_pattern in _validate_output_references
 # (which only matches {{ }} blocks with .output singular). This pattern also matches {% %} blocks
 # and .outputs plural for path coverage analysis.
-_OUTPUT_REF_PATTERN = re.compile(r"(?:\{\{|\{%)[^}%]*?(\w+)\.outputs?\b")
+_OUTPUT_REF_PATTERN = re.compile(r"(?:\{\{|\{%)[^}%]*?(?:stages\.\w+\.)?(\w+)\.outputs?\b")
 
 # DFS path cap: larger workflows may get partial coverage analysis
 _MAX_ENUMERATED_PATHS = 100
@@ -33,7 +33,7 @@ _MAX_ENUMERATED_PATHS = 100
 # All with optional ? suffix
 INPUT_REF_PATTERN = re.compile(
     r"^(?:"
-    r"(?P<agent>[a-zA-Z_][a-zA-Z0-9_]*)\.output(?:\.(?P<field>[a-zA-Z_][a-zA-Z0-9_]*))?|"
+    r"(?P<agent>[a-zA-Z_][a-zA-Z0-9_]*)(?::(?P<stage>[a-zA-Z_][a-zA-Z0-9_]*))?\.output(?:\.(?P<field>[a-zA-Z_][a-zA-Z0-9_]*))?|"
     r"(?P<parallel>[a-zA-Z_][a-zA-Z0-9_]*)\.outputs\.(?P<pg_agent>[a-zA-Z_][a-zA-Z0-9_]*)(?:\.(?P<pg_field>[a-zA-Z_][a-zA-Z0-9_]*))?|"
     r"workflow\.input\.(?P<input>[a-zA-Z_][a-zA-Z0-9_]*)"
     r")(?P<optional>\?)?$"
@@ -111,12 +111,17 @@ def validate_workflow_config(config: WorkflowConfig) -> list[str]:
         parallel_errors = _validate_parallel_groups(config)
         errors.extend(parallel_errors)
 
-    # Validate for_each groups: reject script steps as inline agents
+    # Validate for_each groups: reject script steps and staged agents as inline agents
     for for_each_group in config.for_each:
         if for_each_group.agent.type == "script":
             errors.append(
                 f"For-each group '{for_each_group.name}' uses a script step as its "
                 "inline agent. Script steps cannot be used in for_each groups."
+            )
+        if for_each_group.agent.stages:
+            errors.append(
+                f"For-each group '{for_each_group.name}' inline agent has stages. "
+                "Stages are not supported on for-each inline agents."
             )
 
     # Validate workflow output references
@@ -204,16 +209,22 @@ def _validate_input_references(
 
         # Check if referencing another agent's output
         ref_agent = match.group("agent")
-        if ref_agent and ref_agent not in agent_names:
-            is_optional = match.group("optional") == "?"
-            if is_optional:
-                warnings.append(
-                    f"Agent '{agent_name}' has optional reference to unknown agent '{ref_agent}'"
-                )
-            else:
-                errors.append(
-                    f"Agent '{agent_name}' references unknown agent '{ref_agent}' in input"
-                )
+        ref_stage = match.group("stage")
+        if ref_agent:
+            # Build the full agent name (with optional stage qualifier)
+            full_agent_name = f"{ref_agent}:{ref_stage}" if ref_stage else ref_agent
+            if full_agent_name not in agent_names:
+                is_optional = match.group("optional") == "?"
+                if is_optional:
+                    warnings.append(
+                        f"Agent '{agent_name}' has optional reference to "
+                        f"unknown agent '{full_agent_name}'"
+                    )
+                else:
+                    errors.append(
+                        f"Agent '{agent_name}' references unknown agent "
+                        f"'{full_agent_name}' in input"
+                    )
 
         # Check if referencing parallel group output
         ref_parallel = match.group("parallel")
@@ -301,12 +312,12 @@ def _validate_output_references(
     errors: list[str] = []
 
     # Pattern to find potential agent references in templates
-    agent_ref_pattern = re.compile(r"\{\{\s*(\w+)\.output")
+    agent_ref_pattern = re.compile(r"\{\{\s*(?:stages\.)?(\w+)\.(?:\w+\.)?output")
 
     for field, template in output.items():
         matches = agent_ref_pattern.findall(template)
         for ref in matches:
-            if ref not in valid_names and ref not in ("workflow", "context"):
+            if ref not in valid_names and ref not in ("workflow", "context", "stages"):
                 errors.append(f"Workflow output '{field}' references unknown agent '{ref}'")
 
     return errors
@@ -377,6 +388,13 @@ def _validate_parallel_groups(config: WorkflowConfig) -> list[str]:
                 errors.append(
                     f"Agent '{agent_name}' in parallel group '{pg.name}' is a script step. "
                     "Script steps cannot be used in parallel groups."
+                )
+
+            # Validate no staged agents in parallel groups
+            if agent.stages:
+                errors.append(
+                    f"Agent '{agent_name}' in parallel group '{pg.name}' has stages. "
+                    "Agents with stages cannot be used in parallel groups."
                 )
 
         # PE-6.2: Validate parallel group route targets
