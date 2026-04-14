@@ -17,6 +17,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import os
 import shutil
 import subprocess
 import sys
@@ -334,7 +335,10 @@ def run_update(console: Console) -> None:
         renamed_exes = _rename_windows_exes()
 
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8")  # noqa: S603
+        # Set PYTHONUTF8=1 so child Python processes use UTF-8 encoding
+        # instead of the system default (cp1252 on Windows).
+        env = {**os.environ, "PYTHONUTF8": "1"}
+        proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", env=env)  # noqa: S603
 
         if proc.returncode == 0:
             console.print(f"[green]Successfully upgraded to v{version}[/green]")
