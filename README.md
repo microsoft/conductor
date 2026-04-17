@@ -207,23 +207,29 @@ Validate a workflow file without executing.
 conductor validate <workflow.yaml>
 ```
 
-### `conductor init`
-
-Create a new workflow from a template.
-
-```bash
-conductor init <name> --template <template> --output <path>
-```
-
-### `conductor templates`
-
-List available workflow templates.
-
-```bash
-conductor templates
-```
-
 **Full CLI documentation:** [docs/cli-reference.md](docs/cli-reference.md)
+
+## Workflow Registries
+
+Conductor supports named workflow registries — GitHub repos or local directories
+containing shared workflows. Configure a registry once, then run workflows by
+short name.
+
+### Quick start
+
+```bash
+# Add a registry
+conductor registry add official myorg/conductor-workflows --default
+
+# List available workflows
+conductor registry list official
+
+# Run a workflow from the registry
+conductor run qa-bot                    # latest from default registry
+conductor run qa-bot@official@1.2.3    # specific version
+```
+
+See [docs/design/registry.md](docs/design/registry.md) for the full design.
 
 ## Examples
 

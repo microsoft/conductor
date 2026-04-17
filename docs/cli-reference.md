@@ -7,8 +7,7 @@ Complete command-line reference for Conductor.
 - [`conductor run`](#conductor-run)
 - [`conductor stop`](#conductor-stop)
 - [`conductor validate`](#conductor-validate)
-- [`conductor init`](#conductor-init)
-- [`conductor templates`](#conductor-templates)
+- [`conductor registry`](#conductor-registry)
 
 ## `conductor run`
 
@@ -190,68 +189,75 @@ for f in examples/*.yaml; do conductor validate "$f"; done
 - Circular dependency detection
 - Input/output schema validation
 
-## `conductor init`
+## `conductor registry`
 
-Create a new workflow file from a template.
+Manage workflow registries — named sources (GitHub repos or local directories) for shared workflows.
 
 ```bash
-conductor init <name> [OPTIONS]
+conductor registry <subcommand> [OPTIONS]
 ```
+
+### Subcommands
+
+| Subcommand | Description |
+|------------|-------------|
+| `list [NAME]` | List registries, or list workflows in a specific registry |
+| `add <NAME> <SOURCE>` | Add a new registry (GitHub `owner/repo` or local path) |
+| `remove <NAME>` | Remove a registry |
+| `set-default <NAME>` | Set the default registry |
+| `update [NAME]` | Update cached registry index (all or specific) |
+| `show <NAME>` | Show registry details and status |
 
 ### Options
 
-| Option | Short | Description |
-|--------|-------|-------------|
-| `--template TEMPLATE` | `-t` | Template to use (default: simple) |
-| `--output PATH` | `-o` | Output file path |
+| Option | Description |
+|--------|-------------|
+| `--default` | Mark as the default registry (with `add`) |
 
 ### Examples
 
 ```bash
-# Create a simple workflow (default template)
-conductor init my-workflow
+# Add a GitHub-hosted registry and set it as default
+conductor registry add official myorg/conductor-workflows --default
 
-# Create from a specific template
-conductor init my-workflow --template loop
+# Add a local directory registry
+conductor registry add local ./my-workflows
 
-# Specify output path
-conductor init my-workflow -t human-gate -o ./workflows/review.yaml
+# List all configured registries
+conductor registry list
 
-# Create a parallel workflow
-conductor init research --template parallel -o research.yaml
+# List workflows in a specific registry
+conductor registry list official
+
+# Show registry details
+conductor registry show official
+
+# Set a different default
+conductor registry set-default local
+
+# Update cached registry index
+conductor registry update
+
+# Remove a registry
+conductor registry remove local
 ```
 
-### Available Templates
+### Running Workflows from a Registry
 
-Use `conductor templates` to see the full list. Common templates:
-
-- `simple` - Single agent, basic Q&A (default)
-- `loop` - Agent with loop-back pattern
-- `parallel` - Static parallel execution
-- `human-gate` - Workflow with human approval gate
-- `for-each` - Dynamic parallel processing
-
-## `conductor templates`
-
-List available workflow templates with descriptions.
+Once a registry is configured, `conductor run` accepts short workflow names:
 
 ```bash
-conductor templates
+# Run from default registry (latest version)
+conductor run qa-bot
+
+# Run from a specific registry
+conductor run qa-bot@official
+
+# Run a specific version
+conductor run qa-bot@official@1.2.3
 ```
 
-### Example Output
-
-```
-Available templates:
-
-  simple      Single agent workflow for basic Q&A
-  loop        Agent with conditional loop-back
-  parallel    Static parallel agent execution
-  human-gate  Workflow with human approval gate
-  for-each    Dynamic parallel (for-each) processing
-
-Use: conductor init <name> --template <template>
-```
+See [design/registry.md](./design/registry.md) for the full design.
 
 ## Environment Variables
 
