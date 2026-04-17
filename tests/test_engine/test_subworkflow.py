@@ -52,7 +52,7 @@ class TestSubWorkflowLinear:
     async def test_subworkflow_runs_to_end(self, tmp_workflow_dir: Path) -> None:
         """Test linear workflow with a sub-workflow step that completes."""
         # Create the sub-workflow file
-        sub_path = _write_yaml(
+        _write_yaml(
             tmp_workflow_dir / "sub.yaml",
             """\
             workflow:
@@ -109,7 +109,7 @@ class TestSubWorkflowLinear:
     @pytest.mark.asyncio
     async def test_subworkflow_output_in_context(self, tmp_workflow_dir: Path) -> None:
         """Test sub-workflow output accessible in subsequent agent's context."""
-        sub_path = _write_yaml(
+        _write_yaml(
             tmp_workflow_dir / "sub.yaml",
             """\
             workflow:
@@ -181,7 +181,7 @@ class TestSubWorkflowDepthLimit:
     @pytest.mark.asyncio
     async def test_depth_limit_exceeded(self, tmp_workflow_dir: Path) -> None:
         """Test that exceeding max sub-workflow depth raises ExecutionError."""
-        sub_path = _write_yaml(
+        _write_yaml(
             tmp_workflow_dir / "sub.yaml",
             """\
             workflow:
