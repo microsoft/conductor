@@ -499,6 +499,46 @@ class TestServerStartupFailure:
             await dashboard.start()
 
 
+class TestWaitForGateResponse:
+    """Tests for WebDashboard.wait_for_gate_response stale-message handling."""
+
+    @pytest.mark.asyncio
+    async def test_returns_matching_response(self) -> None:
+        """Returns the message whose agent_name matches the awaited agent."""
+        _, dashboard = _make_dashboard()
+        await dashboard._gate_response_queue.put(
+            {"agent_name": "plan_approval", "selected_value": "approved"}
+        )
+
+        msg = await asyncio.wait_for(dashboard.wait_for_gate_response("plan_approval"), timeout=1.0)
+
+        assert msg["selected_value"] == "approved"
+
+    @pytest.mark.asyncio
+    async def test_discards_stale_non_matching_messages(self) -> None:
+        """Non-matching gate_response messages are discarded, not re-queued.
+
+        Regression test for the busy-loop bug where stale messages (e.g. a
+        duplicate click for a previously-resolved gate) were re-queued with
+        a 10ms sleep, spinning at ~100Hz forever because ``asyncio.Queue``
+        has no dedup.
+        """
+        _, dashboard = _make_dashboard()
+        # Enqueue a stale message followed by the matching one.
+        await dashboard._gate_response_queue.put(
+            {"agent_name": "old_gate", "selected_value": "approved"}
+        )
+        await dashboard._gate_response_queue.put(
+            {"agent_name": "current_gate", "selected_value": "rejected"}
+        )
+
+        msg = await asyncio.wait_for(dashboard.wait_for_gate_response("current_gate"), timeout=1.0)
+
+        assert msg["agent_name"] == "current_gate"
+        assert msg["selected_value"] == "rejected"
+        assert dashboard._gate_response_queue.empty()
+
+
 async def _short_grace(event: asyncio.Event, delay: float) -> None:
     """Helper for testing: short grace period."""
     await asyncio.sleep(delay)

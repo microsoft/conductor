@@ -286,8 +286,14 @@ class WebDashboard:
         """Wait for a gate response from a web client.
 
         Blocks until a ``gate_response`` message is received via WebSocket
-        that matches the given agent name.  Non-matching messages are
-        re-queued so they are not lost.
+        that matches the given agent name.
+
+        Non-matching messages are discarded with a warning. Because
+        conductor only presents one gate at a time, any ``gate_response``
+        addressed to a different agent is stale (e.g. a duplicate click
+        from a dashboard that missed the first resolution) and cannot be
+        delivered — re-queueing would only cause it to be re-examined on
+        every subsequent gate with no chance of ever matching.
 
         Args:
             agent_name: The name of the human_gate agent to wait for.
@@ -300,10 +306,11 @@ class WebDashboard:
             msg = await self._gate_response_queue.get()
             if msg.get("agent_name") == agent_name:
                 return msg
-            # Not for this agent — put it back
-            self._gate_response_queue.put_nowait(msg)
-            # Yield to avoid busy-loop
-            await asyncio.sleep(0.01)
+            logger.warning(
+                "Discarding stale gate_response for agent %r while waiting on %r",
+                msg.get("agent_name"),
+                agent_name,
+            )
 
     # ------------------------------------------------------------------
     # Auto-shutdown (--web-bg)
