@@ -507,9 +507,7 @@ class WorkflowEngine:
             raise ExecutionError(
                 f"Sub-workflow depth limit exceeded ({MAX_SUBWORKFLOW_DEPTH}). "
                 f"Agent '{agent.name}' cannot invoke sub-workflow '{agent.workflow}'.",
-                suggestion=(
-                    "Check for circular sub-workflow references or reduce nesting depth."
-                ),
+                suggestion=("Check for circular sub-workflow references or reduce nesting depth."),
             )
 
         assert agent.workflow is not None  # noqa: S101
@@ -524,15 +522,12 @@ class WorkflowEngine:
 
         if not sub_path.exists():
             raise ExecutionError(
-                f"Sub-workflow file not found: {sub_path} "
-                f"(referenced by agent '{agent.name}')",
+                f"Sub-workflow file not found: {sub_path} (referenced by agent '{agent.name}')",
                 suggestion="Check that the 'workflow' path is correct and the file exists.",
             )
 
         # Detect circular references via file path
-        current_path = (
-            Path(self.workflow_path).resolve() if self.workflow_path else None
-        )
+        current_path = Path(self.workflow_path).resolve() if self.workflow_path else None
         if current_path is not None and sub_path == current_path:
             raise ExecutionError(
                 f"Circular sub-workflow reference: agent '{agent.name}' "
@@ -552,9 +547,9 @@ class WorkflowEngine:
         # Build sub-workflow inputs from the parent context
         # Extract workflow.input.* values from the parent context
         workflow_ctx = context.get("workflow", {})
-        sub_inputs: dict[str, Any] = dict(workflow_ctx.get("input", {})) if isinstance(
-            workflow_ctx, dict
-        ) else {}
+        sub_inputs: dict[str, Any] = (
+            dict(workflow_ctx.get("input", {})) if isinstance(workflow_ctx, dict) else {}
+        )
 
         # Create child engine inheriting provider/registry but with deeper depth
         child_engine = WorkflowEngine(
@@ -1507,9 +1502,7 @@ class WorkflowEngine:
                             )
 
                             try:
-                                sub_output = await self._execute_subworkflow(
-                                    agent, agent_context
-                                )
+                                sub_output = await self._execute_subworkflow(agent, agent_context)
                             except Exception as exc:
                                 _sub_elapsed = _time.time() - _sub_start
                                 self._emit(

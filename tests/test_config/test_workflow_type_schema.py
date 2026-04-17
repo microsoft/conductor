@@ -126,24 +126,18 @@ class TestWorkflowAgentDef:
         with pytest.raises(
             ValidationError, match="workflow agents cannot have 'max_session_seconds'"
         ):
-            AgentDef(
-                name="bad", type="workflow", workflow="./s.yaml", max_session_seconds=60.0
-            )
+            AgentDef(name="bad", type="workflow", workflow="./s.yaml", max_session_seconds=60.0)
 
     def test_workflow_with_max_agent_iterations_raises(self) -> None:
         """Test that workflow agent with max_agent_iterations raises ValidationError."""
         with pytest.raises(
             ValidationError, match="workflow agents cannot have 'max_agent_iterations'"
         ):
-            AgentDef(
-                name="bad", type="workflow", workflow="./s.yaml", max_agent_iterations=100
-            )
+            AgentDef(name="bad", type="workflow", workflow="./s.yaml", max_agent_iterations=100)
 
     def test_workflow_with_retry_raises(self) -> None:
         """Test that workflow agent with retry raises ValidationError."""
-        with pytest.raises(
-            ValidationError, match="workflow agents cannot have 'retry'"
-        ):
+        with pytest.raises(ValidationError, match="workflow agents cannot have 'retry'"):
             AgentDef(
                 name="bad",
                 type="workflow",

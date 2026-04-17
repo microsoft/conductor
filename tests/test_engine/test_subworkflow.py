@@ -474,9 +474,7 @@ class TestSubWorkflowIterationCounting:
     """Tests for sub-workflow iteration limit counting."""
 
     @pytest.mark.asyncio
-    async def test_subworkflow_counts_toward_iteration_limit(
-        self, tmp_workflow_dir: Path
-    ) -> None:
+    async def test_subworkflow_counts_toward_iteration_limit(self, tmp_workflow_dir: Path) -> None:
         """Test that sub-workflow step counts as one iteration in parent."""
         _write_yaml(
             tmp_workflow_dir / "sub.yaml",
