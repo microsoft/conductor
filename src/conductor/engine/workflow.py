@@ -746,11 +746,16 @@ class WorkflowEngine:
         Returns:
             GateResult from whichever input source responded first.
         """
-        # If no web dashboard or no connections, use CLI only
-        if self._web_dashboard is None or not self._web_dashboard.has_connections():
+        # If no web dashboard at all, use CLI only.
+        if self._web_dashboard is None:
             return await self.gate_handler.handle_gate(agent, agent_context)
 
-        # Race CLI vs web input
+        # Race CLI vs web input. We start the web task unconditionally (not only
+        # when a client is currently connected), because the human often opens
+        # the per-run dashboard AFTER seeing the gate-waiting notification.
+        # If we bail early when ``has_connections()`` is False, a later click
+        # in the dashboard pushes a message to ``_gate_response_queue`` that
+        # nobody is awaiting, and the workflow hangs forever.
         cli_task = asyncio.create_task(
             self.gate_handler.handle_gate(agent, agent_context),
             name="gate_cli",
