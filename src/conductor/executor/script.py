@@ -92,7 +92,11 @@ class ScriptExecutor:
         # Build environment (merge os.environ + agent.env)
         # Note: ${VAR:-default} patterns in agent.env are already resolved
         # by the config loader during YAML parsing.
-        env = {**os.environ, **agent.env} if agent.env else None
+        # Always set PYTHONUTF8=1 so child Python processes use UTF-8 encoding
+        # instead of the system default (cp1252 on Windows), preventing garbled
+        # Unicode characters in script output.
+        base_env = {**os.environ, "PYTHONUTF8": "1"}
+        env = {**base_env, **agent.env} if agent.env else base_env
 
         _verbose_log(f"  Script: {rendered_command} {' '.join(rendered_args)}")
 

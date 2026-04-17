@@ -52,7 +52,13 @@ def generate_log_path(workflow_name: str) -> Path:
     Returns:
         Path to the auto-generated log file.
     """
+    import secrets
+
     timestamp = time.strftime("%Y%m%d-%H%M%S")
+    # Append random suffix to avoid filename collisions
+    # when multiple runs start in the same second
+    suffix = secrets.token_hex(4)
+    timestamp = f"{timestamp}-{suffix}"
     path = Path(tempfile.gettempdir()) / "conductor" / f"conductor-{workflow_name}-{timestamp}.log"
     path.parent.mkdir(parents=True, exist_ok=True)
     return path

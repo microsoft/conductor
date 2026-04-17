@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import subprocess
 import urllib.request
 from typing import Any
@@ -55,6 +56,9 @@ def get_azure_token(scope: str) -> str | None:
         The access token string, or None if token acquisition fails.
     """
     try:
+        # Set PYTHONUTF8=1 so child Python processes use UTF-8 encoding
+        # instead of the system default (cp1252 on Windows).
+        env = {**os.environ, "PYTHONUTF8": "1"}
         result = subprocess.run(
             [
                 "az",
@@ -69,6 +73,8 @@ def get_azure_token(scope: str) -> str | None:
             ],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            env=env,
             timeout=30,
         )
         if result.returncode == 0:

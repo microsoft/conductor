@@ -56,7 +56,13 @@ class EventLogSubscriber:
     """
 
     def __init__(self, workflow_name: str) -> None:
+        import secrets
+
         ts = time.strftime("%Y%m%d-%H%M%S")
+        # Append random suffix to avoid filename collisions
+        # when multiple runs start in the same second
+        suffix = secrets.token_hex(4)
+        ts = f"{ts}-{suffix}"
         self._path = (
             Path(tempfile.gettempdir())
             / "conductor"

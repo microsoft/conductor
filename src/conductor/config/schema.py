@@ -348,6 +348,45 @@ class HooksConfig(BaseModel):
     """Expression evaluated when workflow fails."""
 
 
+class RetryPolicy(BaseModel):
+    """Per-agent retry policy for transient failure resilience.
+
+    Controls how an agent retries on transient failures such as API errors,
+    rate limits, and timeouts. Retry counter resets per agent execution.
+
+    Example YAML::
+
+        retry:
+          max_attempts: 3
+          backoff: exponential
+          delay_seconds: 2
+          retry_on:
+            - provider_error
+            - timeout
+    """
+
+    max_attempts: int = Field(default=1, ge=1, le=10)
+    """Maximum number of attempts (including the first). 1 = no retry."""
+
+    backoff: Literal["fixed", "exponential"] = "exponential"
+    """Backoff strategy between retries."""
+
+    delay_seconds: float = Field(default=2.0, ge=0.0, le=300.0)
+    """Base delay in seconds before the first retry."""
+
+    retry_on: list[Literal["provider_error", "timeout"]] = Field(
+        default_factory=lambda: ["provider_error", "timeout"]
+    )
+    """Error categories that trigger a retry.
+
+    - ``provider_error``: API 500s, rate limits, transient provider failures.
+    - ``timeout``: Agent-level timeout exceeded.
+
+    Validation errors (output schema mismatches) are never retried because
+    they indicate prompt/schema issues, not transience.
+    """
+
+
 class AgentDef(BaseModel):
     """Definition for a single agent in the workflow."""
 
@@ -456,6 +495,24 @@ class AgentDef(BaseModel):
     max_agent_iterations: 200 instead of using the default limit.
     """
 
+    retry: RetryPolicy | None = None
+    """Per-agent retry policy for transient failures.
+
+    When set, the provider wraps agent execution in a retry loop with
+    the specified backoff strategy. Only applies to provider-backed agents
+    (not script or human_gate).
+
+    Example YAML::
+
+        retry:
+          max_attempts: 3
+          backoff: exponential
+          delay_seconds: 2
+          retry_on:
+            - provider_error
+            - timeout
+    """
+
     @field_validator("timeout")
     @classmethod
     def validate_timeout(cls, v: int | None) -> int | None:
@@ -496,6 +553,8 @@ class AgentDef(BaseModel):
                 raise ValueError("script agents cannot have 'max_session_seconds'")
             if self.max_agent_iterations is not None:
                 raise ValueError("script agents cannot have 'max_agent_iterations'")
+            if self.retry is not None:
+                raise ValueError("script agents cannot have 'retry'")
         elif self.type == "workflow":
             if not self.workflow:
                 raise ValueError("workflow agents require 'workflow' path")
@@ -517,6 +576,8 @@ class AgentDef(BaseModel):
                 raise ValueError("workflow agents cannot have 'max_session_seconds'")
             if self.max_agent_iterations is not None:
                 raise ValueError("workflow agents cannot have 'max_agent_iterations'")
+            if self.retry is not None:
+                raise ValueError("workflow agents cannot have 'retry'")
         return self
 
 

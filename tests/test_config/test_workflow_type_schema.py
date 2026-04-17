@@ -19,6 +19,7 @@ from conductor.config.schema import (
     LimitsConfig,
     OutputField,
     ParallelGroup,
+    RetryPolicy,
     RouteDef,
     RuntimeConfig,
     WorkflowConfig,
@@ -136,6 +137,18 @@ class TestWorkflowAgentDef:
         ):
             AgentDef(
                 name="bad", type="workflow", workflow="./s.yaml", max_agent_iterations=100
+            )
+
+    def test_workflow_with_retry_raises(self) -> None:
+        """Test that workflow agent with retry raises ValidationError."""
+        with pytest.raises(
+            ValidationError, match="workflow agents cannot have 'retry'"
+        ):
+            AgentDef(
+                name="bad",
+                type="workflow",
+                workflow="./s.yaml",
+                retry=RetryPolicy(max_attempts=3),
             )
 
 

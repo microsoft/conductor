@@ -167,7 +167,13 @@ class CheckpointManager:
                 workflow_hash = "sha256:unknown"
 
             # Build checkpoint dict
+            import secrets
+
             timestamp = time.strftime("%Y%m%d-%H%M%S")
+            # Append random suffix to avoid filename collisions
+            # when multiple runs start in the same second
+            suffix = secrets.token_hex(4)
+            timestamp = f"{timestamp}-{suffix}"
             created_at = datetime.now(UTC).isoformat()
             workflow_name = workflow_path.stem
 

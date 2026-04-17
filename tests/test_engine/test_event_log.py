@@ -76,6 +76,26 @@ class TestEventLogSubscriber:
         sub.on_event(WorkflowEvent(type="late", timestamp=time.time(), data={}))
         sub.close()  # Double close should be safe
 
+    def test_filenames_unique_for_simultaneous_starts(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("TMPDIR", str(tmp_path))
+        subs = [EventLogSubscriber("same-workflow") for _ in range(3)]
+        paths = [s.path for s in subs]
+        # All paths must be distinct even when created in rapid succession
+        assert len(set(paths)) == len(paths), f"Expected unique paths, got {paths}"
+        for s in subs:
+            s.close()
+
+    def test_filename_contains_random_suffix(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("TMPDIR", str(tmp_path))
+        sub = EventLogSubscriber("ts-test")
+        # Filename should match pattern: conductor-<name>-YYYYMMDD-HHMMSS-<8 hex chars>.events.jsonl
+        import re
+
+        assert re.search(r"\d{8}-\d{6}-[0-9a-f]{8}\.events\.jsonl$", sub.path.name), (
+            f"Filename lacks random suffix: {sub.path.name}"
+        )
+        sub.close()
+
     def test_integrates_with_emitter(self, tmp_path, monkeypatch):
         from conductor.events import WorkflowEventEmitter
 
