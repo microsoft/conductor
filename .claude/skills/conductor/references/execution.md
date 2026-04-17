@@ -195,40 +195,45 @@ Checks:
 - Parallel group agent references
 - For-each source format and reserved names
 
-### conductor init
+### conductor registry
 
-Create workflow from template:
+Manage workflow registries — named sources of shared workflows (GitHub repos or local directories).
 
 ```bash
-conductor init <name> [OPTIONS]
+conductor registry <subcommand> [OPTIONS]
 ```
 
-| Option | Description |
-|--------|-------------|
-| `--template`, `-t TEMPLATE` | Template to use (default: simple) |
-| `--output`, `-o PATH` | Output file path |
+| Subcommand | Description |
+|------------|-------------|
+| `list [name]` | List registries, or workflows in a specific registry |
+| `add <name> <source>` | Add a registry (`--type github\|path`, `--default`) |
+| `remove <name>` | Remove a registry |
+| `set-default <name>` | Set the default registry |
+| `update [name]` | Refresh index and re-resolve latest versions |
+| `show <ref>` | Show metadata for a workflow reference |
 
 **Examples:**
 
 ```bash
-conductor init my-workflow
-conductor init my-workflow --template loop
-conductor init review -t human-gate -o ./workflows/review.yaml
+conductor registry add official myorg/conductor-workflows --default
+conductor registry add local /path/to/workflows --type path
+conductor registry list                        # show configured registries
+conductor registry list official               # show workflows in a registry
+conductor registry set-default official
+conductor registry update                      # refresh all indexes
+conductor registry show qa-bot@official@1.0.0  # show workflow metadata
 ```
 
-### conductor templates
-
-List available templates:
+**Running from a registry:**
 
 ```bash
-conductor templates
+conductor run qa-bot                     # latest from default registry
+conductor run qa-bot@official            # latest from named registry
+conductor run qa-bot@official@1.2.3      # explicit version
+conductor run qa-bot@@1.2.3              # explicit version from default registry
 ```
 
-| Template | Description |
-|----------|-------------|
-| `simple` | Single agent with basic I/O |
-| `loop` | Iterative refinement pattern |
-| `human-gate` | Workflow with approval gate |
+Registry workflows are cached locally at `~/.conductor/cache/registries/` and reused on subsequent runs. Explicit versions are immutable; `latest` is re-resolved on `conductor registry update`.
 
 ## Execution Flow
 

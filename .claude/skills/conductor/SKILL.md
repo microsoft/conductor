@@ -30,8 +30,9 @@ conductor run workflow.yaml --log-file auto               # Log full debug outpu
 conductor run workflow.yaml --web --input q="Hello"       # Real-time web dashboard
 conductor run workflow.yaml --web-bg --input q="Hello"    # Background mode (prints URL, exits)
 conductor validate workflow.yaml                         # Validate only
-conductor init my-workflow --template simple              # Create from template
-conductor templates                                      # List templates
+conductor registry add official myorg/workflows --default # Add a registry
+conductor registry list official                          # List registry workflows
+conductor run qa-bot@official@1.0.0 --input q="Hello"    # Run from registry
 conductor stop                                           # Stop background workflow
 conductor update                                         # Check for and install latest version
 conductor resume workflow.yaml                           # Resume from last checkpoint
@@ -102,5 +103,6 @@ For runtime config, context modes, limits, and cost tracking, see [references/au
 | `runtime` | Provider, model, temperature, max_tokens, MCP servers |
 | `--web` | Real-time web dashboard with DAG graph, live streaming, in-browser human gates |
 | `checkpoint` | Auto-saved on failure; resume with `conductor resume` |
+| `registry` | Named workflow sources (GitHub repo or local dir) for sharing workflows |
 
 For pattern examples (linear, loop, conditional, parallel, for-each, human gate) and template syntax, see [references/authoring.md](references/authoring.md).

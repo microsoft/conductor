@@ -35,6 +35,11 @@ app = typer.Typer(
     no_args_is_help=True,
 )
 
+# Register subcommand groups
+from conductor.cli.registry import registry_app  # noqa: E402
+
+app.add_typer(registry_app)
+
 # Rich console for formatted output
 console = Console(stderr=True)
 output_console = Console()
@@ -212,14 +217,9 @@ def main(
 @app.command()
 def run(
     workflow: Annotated[
-        Path,
+        str,
         typer.Argument(
-            help="Path to the workflow YAML file.",
-            exists=True,
-            file_okay=True,
-            dir_okay=False,
-            readable=True,
-            resolve_path=True,
+            help="Workflow file path or registry reference (name[@registry][@version]).",
         ),
     ],
     provider: Annotated[
@@ -320,6 +320,25 @@ def run(
     import asyncio
     import json
 
+    from conductor.registry.cache import fetch_workflow as fetch_registry_workflow
+    from conductor.registry.errors import RegistryError
+    from conductor.registry.resolver import resolve_ref
+
+    try:
+        ref = resolve_ref(workflow)
+        if ref.kind == "file":
+            workflow_path = ref.path
+        else:
+            workflow_path = fetch_registry_workflow(
+                registry_name=ref.registry_name,
+                registry_entry=ref.registry_entry,
+                workflow_name=ref.workflow,
+                version=ref.version,
+            )
+    except RegistryError as e:
+        print_error(e)
+        raise typer.Exit(code=1) from None
+
     # Import here to avoid circular imports and defer heavy imports
     from conductor.cli.run import (
         InputCollector,
@@ -333,7 +352,7 @@ def run(
     # Handle dry-run mode
     if dry_run:
         try:
-            plan = build_dry_run_plan(workflow)
+            plan = build_dry_run_plan(workflow_path)
             display_execution_plan(plan, output_console)
             return
         except Exception as e:
@@ -358,7 +377,7 @@ def run(
     resolved_log_file: Path | None = None
     if log_file is not None:
         if log_file.lower() == "auto":
-            resolved_log_file = generate_log_path(workflow.stem)
+            resolved_log_file = generate_log_path(workflow_path.stem)
         else:
             resolved_log_file = Path(log_file)
 
@@ -368,7 +387,7 @@ def run(
 
         try:
             url = launch_background(
-                workflow_path=workflow,
+                workflow_path=workflow_path,
                 inputs=inputs,
                 provider_override=provider,
                 skip_gates=skip_gates,
@@ -390,7 +409,7 @@ def run(
         # Run the workflow
         result = asyncio.run(
             run_workflow_async(
-                workflow,
+                workflow_path,
                 inputs,
                 provider,
                 skip_gates,
@@ -413,14 +432,9 @@ def run(
 @app.command()
 def validate(
     workflow: Annotated[
-        Path,
+        str,
         typer.Argument(
-            help="Path to the workflow YAML file to validate.",
-            exists=True,
-            file_okay=True,
-            dir_okay=False,
-            readable=True,
-            resolve_path=True,
+            help="Workflow file path or registry reference (name[@registry][@version]).",
         ),
     ],
 ) -> None:
@@ -436,97 +450,49 @@ def validate(
     Examples:
         conductor validate workflow.yaml
         conductor validate ./examples/my-workflow.yaml
+        conductor validate qa-bot@team@1.0.0
     """
+    from conductor.registry.cache import fetch_workflow as fetch_registry_workflow
+    from conductor.registry.errors import RegistryError
+    from conductor.registry.resolver import resolve_ref
+
+    try:
+        ref = resolve_ref(workflow)
+        if ref.kind == "file":
+            workflow_path = ref.path
+        else:
+            workflow_path = fetch_registry_workflow(
+                registry_name=ref.registry_name,
+                registry_entry=ref.registry_entry,
+                workflow_name=ref.workflow,
+                version=ref.version,
+            )
+    except RegistryError as e:
+        print_error(e)
+        raise typer.Exit(code=1) from None
+
     from conductor.cli.validate import (
         display_validation_success,
         validate_workflow,
     )
 
-    is_valid, config = validate_workflow(workflow, output_console)
+    is_valid, config = validate_workflow(workflow_path, output_console)
 
     if is_valid and config is not None:
-        display_validation_success(config, workflow, output_console)
+        display_validation_success(config, workflow_path, output_console)
     else:
         raise typer.Exit(code=1)
 
 
 @app.command()
-def init(
-    name: Annotated[
-        str,
-        typer.Argument(
-            help="Name for the new workflow.",
-        ),
-    ],
-    template: Annotated[
-        str,
-        typer.Option(
-            "--template",
-            "-t",
-            help="Template to use (see 'conductor templates' for options).",
-        ),
-    ] = "simple",
-    output: Annotated[
-        Path | None,
-        typer.Option(
-            "--output",
-            "-o",
-            help="Output file path. Defaults to <name>.yaml in current directory.",
-        ),
-    ] = None,
-) -> None:
-    """Initialize a new workflow file from a template.
-
-    Creates a new workflow YAML file based on the specified template.
-    Use 'conductor templates' to see available templates.
-
-    \b
-    Examples:
-        conductor init my-workflow
-        conductor init my-workflow --template loop
-        conductor init my-workflow -t human-gate -o ./workflows/my-workflow.yaml
-    """
-    from conductor.cli.init import create_workflow_file, get_template
-
-    # Check if template exists
-    template_info = get_template(template)
-    if template_info is None:
-        console.print(f"[bold red]Error:[/bold red] Template '{template}' not found.")
-        console.print("[dim]Use 'conductor templates' to see available templates.[/dim]")
-        raise typer.Exit(code=1)
-
-    try:
-        create_workflow_file(name, template, output, output_console)
-    except FileExistsError as e:
-        console.print(f"[bold red]Error:[/bold red] {e}")
-        console.print("[dim]Use --output to specify a different path.[/dim]")
-        raise typer.Exit(code=1) from None
-    except ValueError as e:
-        console.print(f"[bold red]Error:[/bold red] {e}")
-        raise typer.Exit(code=1) from None
-
-
-@app.command()
-def templates() -> None:
-    """List available workflow templates.
-
-    Shows all templates that can be used with 'conductor init'.
-
-    \b
-    Examples:
-        conductor templates
-    """
-    from conductor.cli.init import display_templates
-
-    display_templates(output_console)
-
-
-@app.command()
 def resume(
     workflow: Annotated[
-        Path | None,
+        str | None,
         typer.Argument(
-            help="Path to the workflow YAML file. Finds the latest checkpoint for this workflow.",
+            help=(
+                "Workflow file path or registry reference (name[@registry][@version]). "
+                "Finds the latest checkpoint for this workflow."
+            ),
         ),
     ] = None,
     from_checkpoint: Annotated[
@@ -596,13 +562,32 @@ def resume(
         )
         raise typer.Exit(code=1)
 
-    # Resolve workflow path if provided (Typer doesn't auto-resolve optional args)
+    # Resolve workflow ref if provided
     resolved_workflow: Path | None = None
     if workflow is not None:
-        resolved_workflow = workflow.resolve()
-        if not resolved_workflow.exists():
-            console.print(f"[bold red]Error:[/bold red] Workflow file not found: {workflow}")
-            raise typer.Exit(code=1)
+        from conductor.registry.cache import fetch_workflow as fetch_registry_workflow
+        from conductor.registry.errors import RegistryError
+        from conductor.registry.resolver import resolve_ref
+
+        try:
+            ref = resolve_ref(workflow)
+            if ref.kind == "file":
+                resolved_workflow = ref.path.resolve()
+                if not resolved_workflow.exists():
+                    console.print(
+                        f"[bold red]Error:[/bold red] Workflow file not found: {workflow}"
+                    )
+                    raise typer.Exit(code=1)
+            else:
+                resolved_workflow = fetch_registry_workflow(
+                    registry_name=ref.registry_name,
+                    registry_entry=ref.registry_entry,
+                    workflow_name=ref.workflow,
+                    version=ref.version,
+                )
+        except RegistryError as e:
+            print_error(e)
+            raise typer.Exit(code=1) from None
 
     # Resolve checkpoint path if provided
     resolved_checkpoint: Path | None = None
@@ -618,7 +603,7 @@ def resume(
     resolved_log_file: Path | None = None
     if log_file is not None:
         if log_file.lower() == "auto":
-            name = workflow.stem if workflow else "resume"
+            name = resolved_workflow.stem if resolved_workflow else "resume"
             resolved_log_file = generate_log_path(name)
         else:
             resolved_log_file = Path(log_file)
