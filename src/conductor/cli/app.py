@@ -560,12 +560,11 @@ def show(
         if ref.version:
             output_console.print(f"[bold]Version:[/bold]     {ref.version}")
 
-    inputs = wf.input
-    if not inputs:
-        output_console.print("\n[dim]This workflow has no inputs.[/dim]")
-    else:
-        from rich.table import Table
+    from rich.table import Table
 
+    # --- Inputs ---
+    inputs = wf.input
+    if inputs:
         output_console.print()
         table = Table(title="Inputs")
         table.add_column("Name", style="cyan")
@@ -582,6 +581,48 @@ def show(
             )
 
         output_console.print(table)
+
+    # --- Agents ---
+    output_console.print()
+    agent_table = Table(title="Agents")
+    agent_table.add_column("Name", style="cyan")
+    agent_table.add_column("Type", style="green")
+    agent_table.add_column("Description")
+    agent_table.add_column("Routes")
+
+    for agent in config.agents:
+        agent_type = agent.type or "agent"
+        routes = ", ".join(
+            r.to + (f" (when {r.when})" if r.when else "") for r in agent.routes
+        )
+        agent_table.add_row(
+            agent.name, agent_type, agent.description or "-", routes or "-"
+        )
+
+    # Include parallel groups
+    for pg in config.parallel:
+        members = ", ".join(pg.agents)
+        agent_table.add_row(pg.name, "parallel", members, "-")
+
+    # Include for-each groups
+    for fe in config.for_each:
+        agent_table.add_row(fe.name, "for_each", fe.source or "-", "-")
+
+    output_console.print(agent_table)
+
+    # --- Outputs ---
+    if config.output:
+        output_console.print()
+        out_table = Table(title="Outputs")
+        out_table.add_column("Field", style="cyan")
+        out_table.add_column("Template")
+
+        for field, template in config.output.items():
+            # Truncate long templates
+            display = template if len(template) <= 60 else template[:57] + "..."
+            out_table.add_row(field, display)
+
+        output_console.print(out_table)
 
     # Show example run command
     ref_str = workflow if ref.kind == "registry" else str(workflow_path)
