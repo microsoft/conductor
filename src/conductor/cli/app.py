@@ -327,8 +327,12 @@ def run(
     try:
         ref = resolve_ref(workflow)
         if ref.kind == "file":
+            assert ref.path is not None
             workflow_path = ref.path
         else:
+            assert ref.registry_name is not None
+            assert ref.registry_entry is not None
+            assert ref.workflow is not None
             workflow_path = fetch_registry_workflow(
                 registry_name=ref.registry_name,
                 registry_entry=ref.registry_entry,
@@ -459,8 +463,12 @@ def validate(
     try:
         ref = resolve_ref(workflow)
         if ref.kind == "file":
+            assert ref.path is not None
             workflow_path = ref.path
         else:
+            assert ref.registry_name is not None
+            assert ref.registry_entry is not None
+            assert ref.workflow is not None
             workflow_path = fetch_registry_workflow(
                 registry_name=ref.registry_name,
                 registry_entry=ref.registry_entry,
@@ -572,6 +580,7 @@ def resume(
         try:
             ref = resolve_ref(workflow)
             if ref.kind == "file":
+                assert ref.path is not None
                 resolved_workflow = ref.path.resolve()
                 if not resolved_workflow.exists():
                     console.print(
@@ -579,6 +588,9 @@ def resume(
                     )
                     raise typer.Exit(code=1)
             else:
+                assert ref.registry_name is not None
+                assert ref.registry_entry is not None
+                assert ref.workflow is not None
                 resolved_workflow = fetch_registry_workflow(
                     registry_name=ref.registry_name,
                     registry_entry=ref.registry_entry,
