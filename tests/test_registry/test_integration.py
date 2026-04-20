@@ -12,7 +12,7 @@ import pytest
 from typer.testing import CliRunner
 
 from conductor.cli.app import app
-from conductor.registry.cache import fetch_workflow, get_cached_workflow_path
+from conductor.registry.cache import fetch_workflow
 from conductor.registry.config import (
     RegistryType,
     add_registry,
