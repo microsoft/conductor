@@ -9,14 +9,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import httpx
 from pydantic import BaseModel
 from ruamel.yaml import YAML, YAMLError
 
 from conductor.registry.config import RegistryEntry, RegistryType
 from conductor.registry.errors import RegistryError
 
-_GITHUB_RAW_BASE = "https://raw.githubusercontent.com"
 _GITHUB_BRANCHES = ("main", "master")
 _INDEX_FILENAMES = ("index.yaml", "index.json")
 
@@ -197,21 +195,19 @@ def _parse_json_file(path: Path) -> RegistryIndex:
 
 
 def _load_github_index(source: str) -> RegistryIndex:
-    """Fetch index from a GitHub repository via raw.githubusercontent.com."""
-    # source is "owner/repo"
+    """Fetch index from a GitHub repository using the shared GitHub helpers."""
+    from conductor.registry.github import fetch_file_text, parse_github_source
+
+    owner, repo = parse_github_source(source)
+
     for filename in _INDEX_FILENAMES:
         for branch in _GITHUB_BRANCHES:
-            url = f"{_GITHUB_RAW_BASE}/{source}/{branch}/{filename}"
             try:
-                resp = httpx.get(url, timeout=30, follow_redirects=True)
-            except httpx.HTTPError as exc:
-                raise RegistryError(
-                    f"Failed to fetch registry index from {url}: {exc}",
-                    suggestion="Check your network connection and the registry source.",
-                ) from exc
+                text = fetch_file_text(owner, repo, filename, ref=branch)
+            except RegistryError:
+                continue
 
-            if resp.status_code == 200:
-                return _parse_github_response(resp.text, filename, url)
+            return _parse_github_response(text, filename, f"{source}/{branch}/{filename}")
 
     raise RegistryError(
         f"No index.yaml or index.json found in GitHub repo '{source}' "

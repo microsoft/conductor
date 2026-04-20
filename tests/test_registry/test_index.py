@@ -167,8 +167,9 @@ class TestLoadPathIndex:
 class TestLoadGitHubIndex:
     """Tests for loading index from GitHub registries."""
 
-    @patch("conductor.registry.index.httpx.get")
-    def test_fetch_yaml_main(self, mock_get: MagicMock) -> None:
+    @patch("conductor.registry.github.fetch_file_text")
+    @patch("conductor.registry.github.parse_github_source", return_value=("myorg", "myrepo"))
+    def test_fetch_yaml_main(self, _mock_parse: MagicMock, mock_fetch: MagicMock) -> None:
         """Fetches index.yaml from main branch."""
         yaml = YAML(typ="safe")
         from io import StringIO
@@ -177,18 +178,17 @@ class TestLoadGitHubIndex:
         yaml.dump(_SAMPLE_INDEX, stream)
         yaml_text = stream.getvalue()
 
-        mock_get.return_value = _make_response(200, yaml_text)
+        mock_fetch.return_value = yaml_text
 
         idx = load_index(_github_entry("myorg/myrepo"))
         assert "qa-bot" in idx.workflows
 
-        mock_get.assert_called_once()
-        call_url = mock_get.call_args[0][0]
-        assert "myorg/myrepo/main/index.yaml" in call_url
+        mock_fetch.assert_called_once_with("myorg", "myrepo", "index.yaml", ref="main")
 
-    @patch("conductor.registry.index.httpx.get")
-    def test_fallback_to_master(self, mock_get: MagicMock) -> None:
-        """Falls back to master branch when main returns 404."""
+    @patch("conductor.registry.github.fetch_file_text")
+    @patch("conductor.registry.github.parse_github_source", return_value=("myorg", "myrepo"))
+    def test_fallback_to_master(self, _mock_parse: MagicMock, mock_fetch: MagicMock) -> None:
+        """Falls back to master branch when main raises RegistryError."""
         yaml = YAML(typ="safe")
         from io import StringIO
 
@@ -196,59 +196,52 @@ class TestLoadGitHubIndex:
         yaml.dump(_SAMPLE_INDEX, stream)
         yaml_text = stream.getvalue()
 
-        # main returns 404, master returns 200
-        mock_get.side_effect = [
-            _make_response(404),
-            _make_response(200, yaml_text),
+        # main raises error, master succeeds
+        mock_fetch.side_effect = [
+            RegistryError("not found"),
+            yaml_text,
         ]
 
         idx = load_index(_github_entry("myorg/myrepo"))
         assert "qa-bot" in idx.workflows
-        assert mock_get.call_count == 2
+        assert mock_fetch.call_count == 2
 
-        # First call was main, second was master
-        calls = [c[0][0] for c in mock_get.call_args_list]
-        assert "main/index.yaml" in calls[0]
-        assert "master/index.yaml" in calls[1]
-
-    @patch("conductor.registry.index.httpx.get")
-    def test_fallback_to_json(self, mock_get: MagicMock) -> None:
+    @patch("conductor.registry.github.fetch_file_text")
+    @patch("conductor.registry.github.parse_github_source", return_value=("myorg", "myrepo"))
+    def test_fallback_to_json(self, _mock_parse: MagicMock, mock_fetch: MagicMock) -> None:
         """Falls back to index.json when index.yaml not found on any branch."""
         json_text = json.dumps(_SAMPLE_INDEX)
 
-        # yaml on main → 404, yaml on master → 404, json on main → 200
-        mock_get.side_effect = [
-            _make_response(404),
-            _make_response(404),
-            _make_response(200, json_text),
+        # yaml on main → error, yaml on master → error, json on main → success
+        mock_fetch.side_effect = [
+            RegistryError("not found"),
+            RegistryError("not found"),
+            json_text,
         ]
 
         idx = load_index(_github_entry("myorg/myrepo"))
         assert "qa-bot" in idx.workflows
-        assert mock_get.call_count == 3
+        assert mock_fetch.call_count == 3
 
-        calls = [c[0][0] for c in mock_get.call_args_list]
-        assert "index.json" in calls[2]
-
-    @patch("conductor.registry.index.httpx.get")
-    def test_all_404_raises(self, mock_get: MagicMock) -> None:
-        """RegistryError when all fetch attempts return 404."""
-        mock_get.return_value = _make_response(404)
+    @patch("conductor.registry.github.fetch_file_text")
+    @patch("conductor.registry.github.parse_github_source", return_value=("myorg", "myrepo"))
+    def test_all_404_raises(self, _mock_parse: MagicMock, mock_fetch: MagicMock) -> None:
+        """RegistryError when all fetch attempts fail."""
+        mock_fetch.side_effect = RegistryError("not found")
 
         with pytest.raises(RegistryError, match="No index.yaml or index.json"):
             load_index(_github_entry("myorg/myrepo"))
 
         # yaml(main, master) + json(main, master) = 4 attempts
-        assert mock_get.call_count == 4
+        assert mock_fetch.call_count == 4
 
-    @patch("conductor.registry.index.httpx.get")
-    def test_network_error_raises(self, mock_get: MagicMock) -> None:
-        """RegistryError on network failure."""
-        import httpx as _httpx
+    @patch("conductor.registry.github.fetch_file_text")
+    @patch("conductor.registry.github.parse_github_source", return_value=("myorg", "myrepo"))
+    def test_network_error_raises(self, _mock_parse: MagicMock, mock_fetch: MagicMock) -> None:
+        """RegistryError on network failure propagates."""
+        mock_fetch.side_effect = RegistryError("Failed to fetch: connection refused")
 
-        mock_get.side_effect = _httpx.ConnectError("connection refused")
-
-        with pytest.raises(RegistryError, match="Failed to fetch"):
+        with pytest.raises(RegistryError, match="No index.yaml or index.json"):
             load_index(_github_entry("myorg/myrepo"))
 
 
