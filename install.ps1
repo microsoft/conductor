@@ -115,7 +115,12 @@ try {
             Write-Info "Retrying install (attempt $attempt/$maxRetries)…"
             Start-Sleep -Seconds 2
         }
-        uv tool install --force "git+https://github.com/$Repo.git@$tagName" -c $constraintsFile 2>$null
+        $output = $null
+        try {
+            $output = & uv tool install --force "git+https://github.com/$Repo.git@$tagName" -c $constraintsFile 2>&1
+        } catch {
+            # PowerShell treats native stderr as errors when ErrorActionPreference=Stop
+        }
         if ($LASTEXITCODE -eq 0) {
             $installed = $true
             break
