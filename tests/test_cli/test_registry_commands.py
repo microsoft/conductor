@@ -175,9 +175,9 @@ class TestSetDefault:
 
 
 class TestShow:
-    """Showing workflow metadata."""
+    """Showing registry details."""
 
-    def test_show_workflow(self) -> None:
+    def test_show_registry(self) -> None:
         runner.invoke(app, ["registry", "add", "team", "acme/workflows", "--default"])
 
         mock_index = RegistryIndex(
@@ -189,21 +189,17 @@ class TestShow:
         )
 
         with patch("conductor.cli.registry.load_index", return_value=mock_index):
-            result = runner.invoke(app, ["registry", "show", "qa-bot"])
+            result = runner.invoke(app, ["registry", "show", "team"])
 
         assert result.exit_code == 0
+        assert "team" in result.output
+        assert "acme/workflows" in result.output
         assert "qa-bot" in result.output
         assert "QA helper" in result.output
-        assert "qa/bot.yaml" in result.output
-        assert "1.0" in result.output
+        assert "conductor show" in result.output
 
-    def test_show_unknown_workflow(self) -> None:
-        runner.invoke(app, ["registry", "add", "team", "acme/workflows", "--default"])
-
-        mock_index = RegistryIndex(workflows={})
-
-        with patch("conductor.cli.registry.load_index", return_value=mock_index):
-            result = runner.invoke(app, ["registry", "show", "missing"])
+    def test_show_unknown_registry(self) -> None:
+        result = runner.invoke(app, ["registry", "show", "missing"])
 
         assert result.exit_code == 1
         assert "not found" in result.output

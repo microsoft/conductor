@@ -8,7 +8,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from conductor.registry.cache import clear_cache, fetch_workflow, get_cached_workflow_path
+from conductor.registry.cache import clear_cache
 from conductor.registry.config import (
     RegistryEntry,
     RegistryType,
@@ -20,7 +20,6 @@ from conductor.registry.config import (
 )
 from conductor.registry.errors import RegistryError
 from conductor.registry.index import load_index
-from conductor.registry.resolver import ResolvedRef, resolve_ref
 
 registry_app = typer.Typer(
     name="registry",
@@ -91,6 +90,9 @@ def _list_registry_workflows(name: str) -> None:
         table.add_row(wf_name, info.description or "-", versions)
 
     output_console.print(table)
+    output_console.print(
+        "\n[dim]Use 'conductor show <workflow>' to see inputs and details.[/dim]"
+    )
 
 
 @registry_app.command()
@@ -189,64 +191,15 @@ def update(
 
 @registry_app.command()
 def show(
-    ref: Annotated[
+    name: Annotated[
         str,
-        typer.Argument(help="Workflow reference (name[@registry][@version]) or registry name."),
+        typer.Argument(help="Registry name."),
     ],
 ) -> None:
-    """Show metadata and cached path for a workflow reference.
-
-    If the argument matches a configured registry name, shows that registry's
-    workflows instead (equivalent to ``conductor registry list <name>``).
-    """
-    # If the argument is a known registry name, show its workflows instead
-    config = load_config()
-    if ref in config.registries:
-        try:
-            _show_registry(ref, config.registries[ref])
-        except RegistryError as e:
-            console.print(f"[bold red]Error:[/bold red] {e}")
-            raise typer.Exit(code=1) from None
-        return
-
+    """Show details and workflows for a configured registry."""
     try:
-        resolved = resolve_ref(ref)
-        if resolved.kind == "file":
-            output_console.print(f"Local file: {resolved.path}")
-            return
-
-        assert resolved.registry_entry is not None
-        assert resolved.registry_name is not None
-        assert resolved.workflow is not None
-
-        index = load_index(resolved.registry_entry)
-        if resolved.workflow not in index.workflows:
-            raise RegistryError(
-                f"Workflow '{resolved.workflow}' not found in registry '{resolved.registry_name}'",
-                suggestion=(
-                    f"Run 'conductor registry list {resolved.registry_name}' "
-                    "to see available workflows."
-                ),
-            )
-
-        info = index.workflows[resolved.workflow]
-        version = resolved.version or (info.versions[-1] if info.versions else None)
-
-        output_console.print(f"[bold]Workflow:[/bold]  {resolved.workflow}")
-        output_console.print(f"[bold]Registry:[/bold]  {resolved.registry_name}")
-        output_console.print(f"[bold]Description:[/bold] {info.description or '-'}")
-        output_console.print(f"[bold]Path:[/bold]      {info.path}")
-        output_console.print(
-            f"[bold]Versions:[/bold]  {', '.join(info.versions) if info.versions else '-'}"
-        )
-        output_console.print(f"[bold]Version:[/bold]   {version or 'latest'}")
-
-        if version:
-            cached = get_cached_workflow_path(resolved.registry_name, resolved.workflow, version)
-            output_console.print(f"[bold]Cached:[/bold]    {cached or 'not cached'}")
-
-        # Fetch and display workflow inputs
-        _show_workflow_inputs(resolved, version)
+        entry = get_registry(name)
+        _show_registry(name, entry)
     except RegistryError as e:
         console.print(f"[bold red]Error:[/bold red] {e}")
         raise typer.Exit(code=1) from None
@@ -274,52 +227,6 @@ def _show_registry(name: str, entry: RegistryEntry) -> None:
         table.add_row(wf_name, info.description or "-", versions)
 
     output_console.print(table)
-
-
-def _show_workflow_inputs(resolved: ResolvedRef, version: str | None) -> None:
-    """Fetch the workflow and display its input parameters."""
-    assert resolved.registry_entry is not None
-    assert resolved.registry_name is not None
-    assert resolved.workflow is not None
-
-    try:
-        workflow_path = fetch_workflow(
-            registry_name=resolved.registry_name,
-            registry_entry=resolved.registry_entry,
-            workflow_name=resolved.workflow,
-            version=version,
-        )
-    except RegistryError:
-        return
-
-    try:
-        from conductor.config.loader import load_config as load_workflow_config
-
-        config = load_workflow_config(workflow_path)
-    except Exception:
-        return
-
-    inputs = config.workflow.input
-    if not inputs:
-        output_console.print("\n[bold]Inputs:[/bold]    (none)")
-        return
-
-    output_console.print()
-    table = Table(title="Inputs")
-    table.add_column("Name", style="cyan")
-    table.add_column("Type", style="green")
-    table.add_column("Required", justify="center")
-    table.add_column("Default")
-    table.add_column("Description")
-
-    for name, input_def in inputs.items():
-        required = "✓" if input_def.required else ""
-        default = str(input_def.default) if input_def.default is not None else "-"
-        table.add_row(name, input_def.type, required, default, input_def.description or "-")
-
-    output_console.print(table)
-
-    input_args = " ".join(f'--input {name}="..."' for name in inputs)
     output_console.print(
-        f"\n[dim]Example: conductor run {resolved.workflow} {input_args}[/dim]"
+        "\n[dim]Use 'conductor show <workflow>' to see inputs and details.[/dim]"
     )

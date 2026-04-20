@@ -493,6 +493,106 @@ def validate(
 
 
 @app.command()
+def show(
+    workflow: Annotated[
+        str,
+        typer.Argument(
+            help="Workflow file path or registry reference (name[@registry][@version]).",
+        ),
+    ],
+) -> None:
+    """Show details and inputs for a workflow.
+
+    Accepts a local file path or a registry reference. Displays the workflow
+    name, description, and a table of input parameters.
+
+    \b
+    Examples:
+        conductor show ./my-workflow.yaml
+        conductor show qa-bot
+        conductor show qa-bot@my-registry@1.0.0
+    """
+    from conductor.registry.cache import fetch_workflow as fetch_registry_workflow
+    from conductor.registry.errors import RegistryError
+    from conductor.registry.resolver import resolve_ref
+
+    try:
+        ref = resolve_ref(workflow)
+        if ref.kind == "file":
+            assert ref.path is not None
+            workflow_path = ref.path
+            if not workflow_path.exists():
+                console.print(
+                    f"[bold red]Error:[/bold red] Workflow file not found: {workflow}"
+                )
+                raise typer.Exit(code=1)
+        else:
+            assert ref.registry_name is not None
+            assert ref.registry_entry is not None
+            assert ref.workflow is not None
+            workflow_path = fetch_registry_workflow(
+                registry_name=ref.registry_name,
+                registry_entry=ref.registry_entry,
+                workflow_name=ref.workflow,
+                version=ref.version,
+            )
+    except RegistryError as e:
+        print_error(e)
+        raise typer.Exit(code=1) from None
+
+    try:
+        from conductor.config.loader import load_config as load_workflow_config
+
+        config = load_workflow_config(workflow_path)
+    except Exception as e:
+        console.print(f"[bold red]Error:[/bold red] Failed to parse workflow: {e}")
+        raise typer.Exit(code=1) from None
+
+    wf = config.workflow
+    output_console.print(f"[bold]Name:[/bold]        {wf.name}")
+    if wf.description:
+        output_console.print(f"[bold]Description:[/bold] {wf.description}")
+    output_console.print(f"[bold]Entry point:[/bold] {wf.entry_point}")
+    output_console.print(f"[bold]Source:[/bold]      {workflow_path}")
+
+    if ref.kind == "registry":
+        output_console.print(f"[bold]Registry:[/bold]    {ref.registry_name}")
+        if ref.version:
+            output_console.print(f"[bold]Version:[/bold]     {ref.version}")
+
+    inputs = wf.input
+    if not inputs:
+        output_console.print("\n[dim]This workflow has no inputs.[/dim]")
+    else:
+        from rich.table import Table
+
+        output_console.print()
+        table = Table(title="Inputs")
+        table.add_column("Name", style="cyan")
+        table.add_column("Type", style="green")
+        table.add_column("Required", justify="center")
+        table.add_column("Default")
+        table.add_column("Description")
+
+        for name, input_def in inputs.items():
+            required = "✓" if input_def.required else ""
+            default = str(input_def.default) if input_def.default is not None else "-"
+            table.add_row(
+                name, input_def.type, required, default, input_def.description or "-"
+            )
+
+        output_console.print(table)
+
+    # Show example run command
+    ref_str = workflow if ref.kind == "registry" else str(workflow_path)
+    if inputs:
+        input_args = " ".join(f'--input {name}="..."' for name in inputs)
+        output_console.print(f"\n[dim]conductor run {ref_str} {input_args}[/dim]")
+    else:
+        output_console.print(f"\n[dim]conductor run {ref_str}[/dim]")
+
+
+@app.command()
 def resume(
     workflow: Annotated[
         str | None,
