@@ -575,6 +575,14 @@ class WorkflowEngine:
                 suggestion=("Check for circular sub-workflow references or reduce nesting depth."),
             )
 
+        # Per-agent depth limit (stricter than global MAX_SUBWORKFLOW_DEPTH)
+        if agent.max_depth is not None and self._subworkflow_depth >= agent.max_depth:
+            raise ExecutionError(
+                f"Agent '{agent.name}' max_depth ({agent.max_depth}) exceeded "
+                f"at depth {self._subworkflow_depth}.",
+                suggestion="Increase max_depth or restructure to reduce nesting.",
+            )
+
         assert agent.workflow is not None  # noqa: S101
 
         # Resolve sub-workflow path relative to parent workflow file
@@ -589,15 +597,6 @@ class WorkflowEngine:
             raise ExecutionError(
                 f"Sub-workflow file not found: {sub_path} (referenced by agent '{agent.name}')",
                 suggestion="Check that the 'workflow' path is correct and the file exists.",
-            )
-
-        # Detect circular references via file path
-        current_path = Path(self.workflow_path).resolve() if self.workflow_path else None
-        if current_path is not None and sub_path == current_path:
-            raise ExecutionError(
-                f"Circular sub-workflow reference: agent '{agent.name}' "
-                f"references its own workflow file '{agent.workflow}'.",
-                suggestion="A workflow cannot reference itself as a sub-workflow.",
             )
 
         try:
@@ -681,6 +680,14 @@ class WorkflowEngine:
                 suggestion="Check for circular sub-workflow references or reduce nesting depth.",
             )
 
+        # Per-agent depth limit (stricter than global MAX_SUBWORKFLOW_DEPTH)
+        if agent.max_depth is not None and self._subworkflow_depth >= agent.max_depth:
+            raise ExecutionError(
+                f"Agent '{agent.name}' max_depth ({agent.max_depth}) exceeded "
+                f"at depth {self._subworkflow_depth}.",
+                suggestion="Increase max_depth or restructure to reduce nesting.",
+            )
+
         assert agent.workflow is not None  # noqa: S101
 
         if self.workflow_path is not None:
@@ -694,15 +701,6 @@ class WorkflowEngine:
             raise ExecutionError(
                 f"Sub-workflow file not found: {sub_path} (referenced by agent '{agent.name}')",
                 suggestion="Check that the 'workflow' path is correct and the file exists.",
-            )
-
-        # Detect circular references via file path
-        current_path = Path(self.workflow_path).resolve() if self.workflow_path else None
-        if current_path is not None and sub_path == current_path:
-            raise ExecutionError(
-                f"Circular sub-workflow reference: agent '{agent.name}' "
-                f"references its own workflow file '{agent.workflow}'.",
-                suggestion="A workflow cannot reference itself as a sub-workflow.",
             )
 
         try:
