@@ -10,6 +10,7 @@ from rich.table import Table
 
 from conductor.registry.cache import clear_cache, get_cached_workflow_path
 from conductor.registry.config import (
+    RegistryEntry,
     RegistryType,
     add_registry,
     get_registry,
@@ -190,10 +191,24 @@ def update(
 def show(
     ref: Annotated[
         str,
-        typer.Argument(help="Workflow reference (name[@registry][@version])."),
+        typer.Argument(help="Workflow reference (name[@registry][@version]) or registry name."),
     ],
 ) -> None:
-    """Show metadata and cached path for a workflow reference."""
+    """Show metadata and cached path for a workflow reference.
+
+    If the argument matches a configured registry name, shows that registry's
+    workflows instead (equivalent to ``conductor registry list <name>``).
+    """
+    # If the argument is a known registry name, show its workflows instead
+    config = load_config()
+    if ref in config.registries:
+        try:
+            _show_registry(ref, config.registries[ref])
+        except RegistryError as e:
+            console.print(f"[bold red]Error:[/bold red] {e}")
+            raise typer.Exit(code=1) from None
+        return
+
     try:
         resolved = resolve_ref(ref)
         if resolved.kind == "file":
@@ -208,6 +223,10 @@ def show(
         if resolved.workflow not in index.workflows:
             raise RegistryError(
                 f"Workflow '{resolved.workflow}' not found in registry '{resolved.registry_name}'",
+                suggestion=(
+                    f"Run 'conductor registry list {resolved.registry_name}' "
+                    "to see available workflows."
+                ),
             )
 
         info = index.workflows[resolved.workflow]
@@ -228,3 +247,27 @@ def show(
     except RegistryError as e:
         console.print(f"[bold red]Error:[/bold red] {e}")
         raise typer.Exit(code=1) from None
+
+
+def _show_registry(name: str, entry: RegistryEntry) -> None:
+    """Show a registry's details and its workflows."""
+    output_console.print(f"[bold]Registry:[/bold]  {name}")
+    output_console.print(f"[bold]Type:[/bold]      {entry.type.value}")
+    output_console.print(f"[bold]Source:[/bold]    {entry.source}")
+    output_console.print()
+
+    index = load_index(entry)
+    if not index.workflows:
+        output_console.print("No workflows found.")
+        return
+
+    table = Table(title="Workflows")
+    table.add_column("Name", style="cyan")
+    table.add_column("Description")
+    table.add_column("Versions", style="green")
+
+    for wf_name, info in index.workflows.items():
+        versions = ", ".join(info.versions) if info.versions else "-"
+        table.add_row(wf_name, info.description or "-", versions)
+
+    output_console.print(table)
