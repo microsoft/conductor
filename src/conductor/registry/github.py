@@ -1,6 +1,12 @@
-"""Helpers for fetching files, tags, and directory contents from public GitHub repos."""
+"""Helpers for fetching files, tags, and directory contents from GitHub repos.
+
+Supports both public and private repos. Authentication is resolved
+automatically via the ``gh`` CLI (``gh auth token``) when available.
+"""
 
 from __future__ import annotations
+
+import subprocess
 
 import httpx
 
@@ -17,6 +23,36 @@ _API_HEADERS = {
 }
 
 
+def _get_auth_token() -> str | None:
+    """Attempt to get a GitHub token from the ``gh`` CLI.
+
+    Returns:
+        A token string, or ``None`` if the ``gh`` CLI is not available or
+        not authenticated.
+    """
+    try:
+        result = subprocess.run(  # noqa: S603, S607
+            ["gh", "auth", "token"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return None
+
+
+def _build_headers(*, api: bool = False) -> dict[str, str]:
+    """Build request headers, adding auth if a token is available."""
+    base = dict(_API_HEADERS if api else _HEADERS)
+    token = _get_auth_token()
+    if token:
+        base["Authorization"] = f"Bearer {token}"
+    return base
+
+
 def _raise_for_status(response: httpx.Response, *, context: str) -> None:
     """Check response status and raise RegistryError with helpful messages."""
     if response.is_success:
@@ -24,7 +60,8 @@ def _raise_for_status(response: httpx.Response, *, context: str) -> None:
     status = response.status_code
     if status == 404:
         raise RegistryError(
-            f"{context}: not found (404). Check that the repository is public and the ref exists."
+            f"{context}: not found (404). Check that the repository exists and the ref is valid.",
+            suggestion="If this is a private repo, ensure 'gh auth login' has been run.",
         )
     if status in (403, 429):
         raise RegistryError(
@@ -52,7 +89,9 @@ def fetch_file(owner: str, repo: str, path: str, ref: str = "main") -> bytes:
     """
     url = f"{GITHUB_RAW_BASE}/{owner}/{repo}/{ref}/{path}"
     try:
-        response = httpx.get(url, headers=_HEADERS, timeout=DEFAULT_TIMEOUT, follow_redirects=True)
+        response = httpx.get(
+            url, headers=_build_headers(), timeout=DEFAULT_TIMEOUT, follow_redirects=True
+        )
     except httpx.TimeoutException as exc:
         raise RegistryError(f"Timeout fetching {owner}/{repo}/{path} at ref {ref}") from exc
     except httpx.HTTPError as exc:
@@ -100,7 +139,7 @@ def list_tags(owner: str, repo: str) -> list[str]:
     url = f"{GITHUB_API_BASE}/repos/{owner}/{repo}/tags"
     try:
         response = httpx.get(
-            url, headers=_API_HEADERS, timeout=DEFAULT_TIMEOUT, follow_redirects=True
+            url, headers=_build_headers(api=True), timeout=DEFAULT_TIMEOUT, follow_redirects=True
         )
     except httpx.TimeoutException as exc:
         raise RegistryError(f"Timeout listing tags for {owner}/{repo}") from exc
@@ -137,7 +176,7 @@ def list_directory(owner: str, repo: str, path: str, ref: str = "main") -> list[
         response = httpx.get(
             url,
             params=params,
-            headers=_API_HEADERS,
+            headers=_build_headers(api=True),
             timeout=DEFAULT_TIMEOUT,
             follow_redirects=True,
         )
