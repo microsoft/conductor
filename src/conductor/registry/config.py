@@ -173,6 +173,9 @@ def add_registry(
 ) -> RegistriesConfig:
     """Add a new registry entry and persist the config.
 
+    If this is the first registry being added (no default is set), it is
+    automatically set as the default.
+
     Args:
         name: Unique name for the registry.
         source: Location — ``owner/repo`` for github, filesystem path for path.
@@ -196,7 +199,7 @@ def add_registry(
     resolved_type = registry_type if registry_type is not None else _infer_type(source)
 
     config.registries[name] = RegistryEntry(type=resolved_type, source=source)
-    if set_default:
+    if set_default or config.default is None:
         config.default = name
 
     save_config(config)
