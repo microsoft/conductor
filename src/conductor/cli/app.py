@@ -522,9 +522,7 @@ def show(
             assert ref.path is not None
             workflow_path = ref.path
             if not workflow_path.exists():
-                console.print(
-                    f"[bold red]Error:[/bold red] Workflow file not found: {workflow}"
-                )
+                console.print(f"[bold red]Error:[/bold red] Workflow file not found: {workflow}")
                 raise typer.Exit(code=1)
         else:
             assert ref.registry_name is not None
@@ -576,9 +574,7 @@ def show(
         for name, input_def in inputs.items():
             required = "✓" if input_def.required else ""
             default = str(input_def.default) if input_def.default is not None else "-"
-            table.add_row(
-                name, input_def.type, required, default, input_def.description or "-"
-            )
+            table.add_row(name, input_def.type, required, default, input_def.description or "-")
 
         output_console.print(table)
 
@@ -592,12 +588,8 @@ def show(
 
     for agent in config.agents:
         agent_type = agent.type or "agent"
-        routes = ", ".join(
-            r.to + (f" (when {r.when})" if r.when else "") for r in agent.routes
-        )
-        agent_table.add_row(
-            agent.name, agent_type, agent.description or "-", routes or "-"
-        )
+        routes = ", ".join(r.to + (f" (when {r.when})" if r.when else "") for r in agent.routes)
+        agent_table.add_row(agent.name, agent_type, agent.description or "-", routes or "-")
 
     # Include parallel groups
     for pg in config.parallel:

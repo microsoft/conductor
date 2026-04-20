@@ -90,9 +90,7 @@ def _list_registry_workflows(name: str) -> None:
         table.add_row(wf_name, info.description or "-", versions)
 
     output_console.print(table)
-    output_console.print(
-        "\n[dim]Use 'conductor show <workflow>' to see inputs and details.[/dim]"
-    )
+    output_console.print("\n[dim]Use 'conductor show <workflow>' to see inputs and details.[/dim]")
 
 
 @registry_app.command()
@@ -227,6 +225,4 @@ def _show_registry(name: str, entry: RegistryEntry) -> None:
         table.add_row(wf_name, info.description or "-", versions)
 
     output_console.print(table)
-    output_console.print(
-        "\n[dim]Use 'conductor show <workflow>' to see inputs and details.[/dim]"
-    )
+    output_console.print("\n[dim]Use 'conductor show <workflow>' to see inputs and details.[/dim]")
