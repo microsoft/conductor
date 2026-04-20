@@ -149,10 +149,11 @@ class TestFetchWorkflowPath:
         )
 
     @patch("conductor.registry.cache.load_index")
-    def test_fetches_and_caches(
+    def test_returns_source_path_directly(
         self, mock_load_index: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        home = _setup_conductor_home(tmp_path, monkeypatch)
+        """Path registries return the source file directly (no caching)."""
+        _setup_conductor_home(tmp_path, monkeypatch)
         registry_dir = _create_path_registry(tmp_path)
         mock_load_index.return_value = self._make_index()  # type: ignore[union-attr]
 
@@ -161,53 +162,45 @@ class TestFetchWorkflowPath:
 
         assert result.exists()
         assert result.name == "qa-bot.yaml"
-        assert "local" in str(result)
-        assert "1.0.0" in str(result)
-
-        # Sibling file should be cached too
-        sibling = result.parent / "prompt.txt"
-        assert sibling.exists()
-
-        # Verify cache directory is under CONDUCTOR_HOME
-        assert str(result).startswith(str(home))
+        # Should point to the source directory, not the cache
+        assert str(result).startswith(str(registry_dir))
 
     @patch("conductor.registry.cache.load_index")
-    def test_second_fetch_returns_cached(
+    def test_version_is_ignored(
         self, mock_load_index: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """Path registries ignore the version — same file regardless."""
         _setup_conductor_home(tmp_path, monkeypatch)
         registry_dir = _create_path_registry(tmp_path)
         mock_load_index.return_value = self._make_index()  # type: ignore[union-attr]
 
         entry = RegistryEntry(type=RegistryType.path, source=str(registry_dir))
 
-        first = fetch_workflow("local", entry, "qa-bot", version="1.0.0")
-        second = fetch_workflow("local", entry, "qa-bot", version="1.0.0")
+        v1 = fetch_workflow("local", entry, "qa-bot", version="1.0.0")
+        v2 = fetch_workflow("local", entry, "qa-bot", version="2.0.0")
+        latest = fetch_workflow("local", entry, "qa-bot", version=None)
 
-        assert first == second
-        # load_index is still called (to check workflow exists + resolve version),
-        # but the file system copy should only happen once
-        assert mock_load_index.call_count == 2  # type: ignore[union-attr]
+        # All return the same source file
+        assert v1 == v2 == latest
 
-    @patch("conductor.registry.cache.resolve_latest", return_value="2.0.0")
     @patch("conductor.registry.cache.load_index")
-    def test_resolves_latest(
-        self,
-        mock_load_index: object,
-        mock_resolve_latest: object,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
+    def test_edits_reflected_immediately(
+        self, mock_load_index: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """Changes to the source file are visible without cache refresh."""
         _setup_conductor_home(tmp_path, monkeypatch)
         registry_dir = _create_path_registry(tmp_path)
         mock_load_index.return_value = self._make_index()  # type: ignore[union-attr]
 
         entry = RegistryEntry(type=RegistryType.path, source=str(registry_dir))
-        result = fetch_workflow("local", entry, "qa-bot", version=None)
+        result = fetch_workflow("local", entry, "qa-bot", version="1.0.0")
 
-        mock_resolve_latest.assert_called_once()  # type: ignore[union-attr]
-        assert result.exists()
-        assert "2.0.0" in str(result)
+        original = result.read_text()
+        result.write_text(original + "\n# edited")
+
+        # Re-fetch returns the same path with the edit visible
+        result2 = fetch_workflow("local", entry, "qa-bot", version="1.0.0")
+        assert "# edited" in result2.read_text()
 
     @patch("conductor.registry.cache.load_index")
     def test_missing_workflow_raises(
@@ -227,7 +220,6 @@ class TestFetchWorkflowPath:
         _setup_conductor_home(tmp_path, monkeypatch)
         mock_load_index.return_value = self._make_index()  # type: ignore[union-attr]
 
-        # Source dir exists but the workflow file doesn't
         empty_registry = tmp_path / "empty-registry"
         empty_registry.mkdir()
         entry = RegistryEntry(type=RegistryType.path, source=str(empty_registry))

@@ -210,8 +210,8 @@ class TestLatestVersionResolution:
         cached = fetch_workflow("ver-reg", ref.registry_entry, "multi-ver")
         assert cached.exists()
 
-        # The cache directory should be under the "2.0.0" version folder
-        assert "2.0.0" in str(cached)
+        # Path registries return source path directly (version is ignored)
+        assert str(cached).startswith(str(reg_dir))
 
 
 # ---------------------------------------------------------------------------
@@ -246,15 +246,13 @@ class TestCacheReuse:
         # First fetch
         path1 = fetch_workflow("cache-reg", ref.registry_entry, "cached-wf", version="1.0.0")
 
-        # Second fetch — should return the same cached path
+        # Second fetch — should return the same source path
         path2 = fetch_workflow("cache-reg", ref.registry_entry, "cached-wf", version="1.0.0")
 
         assert path1 == path2
         assert path1.exists()
-
-        # Also verify via the direct cache lookup API
-        cached = get_cached_workflow_path("cache-reg", "cached-wf", "1.0.0")
-        assert cached == path1
+        # Path registries don't use cache — returns source directly
+        assert str(path1).startswith(str(reg_dir))
 
 
 # ---------------------------------------------------------------------------

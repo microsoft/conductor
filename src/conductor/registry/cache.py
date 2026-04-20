@@ -1,9 +1,12 @@
 """Local workflow cache management.
 
 Manages the on-disk cache at ``~/.conductor/cache/registries/`` (or under
-``$CONDUCTOR_HOME``).  Workflows fetched from remote registries are stored
+``$CONDUCTOR_HOME``).  Workflows fetched from GitHub registries are stored
 here so that subsequent runs can resolve to a stable filesystem path — a
 requirement for ``!file`` tag resolution and checkpoint identity.
+
+Path registries are read directly from the source directory (no caching)
+so that local edits are reflected immediately.
 
 Cache layout::
 
@@ -117,11 +120,7 @@ def fetch_workflow(
     # 1. Load the index
     index = load_index(registry_entry)
 
-    # 2. Resolve version
-    if version is None:
-        version = resolve_latest(index, workflow_name)
-
-    # 3. Look up workflow metadata from the index
+    # 2. Look up workflow metadata from the index
     if workflow_name not in index.workflows:
         raise RegistryError(
             f"Workflow '{workflow_name}' not found in registry '{registry_name}'",
@@ -129,21 +128,33 @@ def fetch_workflow(
         )
     workflow_info = index.workflows[workflow_name]
 
-    # 4. Check cache (explicit versions are immutable)
+    # 3. For path registries, read directly from source (no caching, no versioning)
+    if registry_entry.type == RegistryType.path:
+        source_path = Path(registry_entry.source) / workflow_info.path
+        if not source_path.exists():
+            raise RegistryError(
+                f"Workflow file not found at '{source_path}'",
+                suggestion="Verify the 'path' field in the registry's index.yaml.",
+                file_path=str(source_path),
+            )
+        return source_path
+
+    # 4. For GitHub registries, resolve version
+    if version is None:
+        version = resolve_latest(index, workflow_name)
+
+    # 5. Check cache (explicit versions are immutable)
     cached = get_cached_workflow_path(registry_name, workflow_name, version)
     if cached is not None:
         return cached
 
-    # 5. Prepare cache directory
+    # 6. Prepare cache directory
     version_dir = get_cache_base() / registry_name / workflow_name / version
     version_dir.mkdir(parents=True, exist_ok=True)
 
-    # 6. Fetch based on registry type
+    # 7. Fetch from GitHub
     try:
-        if registry_entry.type == RegistryType.github:
-            _fetch_github(registry_entry, workflow_info.path, version, version_dir)
-        else:
-            _fetch_path(registry_entry, workflow_info.path, version_dir)
+        _fetch_github(registry_entry, workflow_info.path, version, version_dir)
     except RegistryError:
         raise
     except Exception as exc:
@@ -152,7 +163,7 @@ def fetch_workflow(
             suggestion="Check your network connection and registry configuration.",
         ) from exc
 
-    # 7. Return the cached workflow path
+    # 8. Return the cached workflow path
     workflow_filename = Path(workflow_info.path).name
     result = version_dir / workflow_filename
     if not result.exists():
@@ -208,41 +219,6 @@ def _fetch_github(
         except Exception:
             # Best-effort for siblings — don't fail the whole fetch
             pass
-
-
-# ---------------------------------------------------------------------------
-# Path (local) fetch
-# ---------------------------------------------------------------------------
-
-
-def _fetch_path(
-    registry_entry: RegistryEntry,
-    workflow_path: str,
-    dest_dir: Path,
-) -> None:
-    """Copy a workflow and its sibling files from a local path registry.
-
-    Args:
-        registry_entry: Registry entry with ``source`` as a filesystem path.
-        workflow_path: Relative path to the workflow YAML within the source.
-        dest_dir: Local directory to write files into.
-    """
-    source_root = Path(registry_entry.source)
-    source_file = source_root / workflow_path
-
-    if not source_file.exists():
-        raise RegistryError(
-            f"Workflow file not found at '{source_file}'",
-            suggestion="Verify the 'path' field in the registry's index.yaml.",
-            file_path=str(source_file),
-        )
-
-    source_dir = source_file.parent
-
-    # Copy all files in the workflow's directory
-    for item in source_dir.iterdir():
-        if item.is_file():
-            shutil.copy2(item, dest_dir / item.name)
 
 
 # ---------------------------------------------------------------------------
