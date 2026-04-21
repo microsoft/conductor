@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 2
 requires-python = ">=3.12"
 
 [[package]]
@@ -128,6 +128,23 @@ wheels = [
 ]
 
 [[package]]
+name = "claude-agent-sdk"
+version = "0.1.64"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "anyio" },
+    { name = "mcp" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/31/0b/900fcdd70384da09d717ec7eea595dbe241e93aca92505483351b3a31d52/claude_agent_sdk-0.1.64.tar.gz", hash = "sha256:147e513cb45095b57c37d74b8d01dd41b5f3ec7f70e408edce43a6590159c27d", size = 213492, upload-time = "2026-04-20T22:29:56.427Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ca/3b/3acc290014ca3ff75e90bf02f444d4e245091717178e61ad4bce23eb5d08/claude_agent_sdk-0.1.64-py3-none-macosx_11_0_arm64.whl", hash = "sha256:4cf47a9e40c0a683a05afff4fac1e3d5ea7965b1e9f72a8e266c8d2efbf65904", size = 60642119, upload-time = "2026-04-20T22:30:02.639Z" },
+    { url = "https://files.pythonhosted.org/packages/0c/e7/4e01c53350d7851b1ec1b12873ada29bbfc4bac7e4b75e6d7cbd95dd338e/claude_agent_sdk-0.1.64-py3-none-macosx_11_0_x86_64.whl", hash = "sha256:7fe765c6482c74bc6b0b4491ad3bddd1349c25f4cdf4483191c68ea9c1336825", size = 62473618, upload-time = "2026-04-20T22:30:09.988Z" },
+    { url = "https://files.pythonhosted.org/packages/82/75/59b9df9bafe6df4e2286d086a9aaad950b79e0286f78da6e0d645b60bdce/claude_agent_sdk-0.1.64-py3-none-manylinux_2_17_aarch64.whl", hash = "sha256:605eebf46e7590e4f878572c2743954fba3f3530dfd99e10ff3b8b41a9fee757", size = 73918731, upload-time = "2026-04-20T22:30:17.972Z" },
+    { url = "https://files.pythonhosted.org/packages/78/77/6d7b064224b59bc7b411636aaa0e4dff745bdcec32f2c1b15558914ac814/claude_agent_sdk-0.1.64-py3-none-manylinux_2_17_x86_64.whl", hash = "sha256:bbb1373ee0b4494e2db24aa10d312d22b86895b4b8f18eb5b58f99f14d827237", size = 74019300, upload-time = "2026-04-20T22:30:25.603Z" },
+    { url = "https://files.pythonhosted.org/packages/c6/e6/e475efffa4eb13f3c268de2266f2c1027b4ee0e1fb8037789d804b0c74cf/claude_agent_sdk-0.1.64-py3-none-win_amd64.whl", hash = "sha256:453fa251e2a4aeed580c72d4c7b2cb98fc8d8d26012798126f5cb11a9829cd71", size = 76184108, upload-time = "2026-04-20T22:30:33.129Z" },
+]
+
+[[package]]
 name = "click"
 version = "8.3.1"
 source = { registry = "https://pypi.org/simple" }
@@ -150,10 +167,11 @@ wheels = [
 
 [[package]]
 name = "conductor-cli"
-version = "0.1.8"
+version = "0.1.9"
 source = { editable = "." }
 dependencies = [
     { name = "anthropic" },
+    { name = "claude-agent-sdk" },
     { name = "fastapi" },
     { name = "github-copilot-sdk" },
     { name = "httpx" },
@@ -168,6 +186,11 @@ dependencies = [
     { name = "websockets" },
 ]
 
+[package.optional-dependencies]
+claude-agent-sdk = [
+    { name = "claude-agent-sdk" },
+]
+
 [package.dev-dependencies]
 dev = [
     { name = "pytest" },
@@ -180,6 +203,8 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "anthropic", specifier = ">=0.77.0,<1.0.0" },
+    { name = "claude-agent-sdk", specifier = ">=0.1.64" },
+    { name = "claude-agent-sdk", marker = "extra == 'claude-agent-sdk'", specifier = ">=0.1.0" },
     { name = "fastapi", specifier = ">=0.115.0" },
     { name = "github-copilot-sdk", specifier = ">=0.2.2" },
     { name = "httpx", specifier = ">=0.27.0" },
@@ -193,6 +218,7 @@ requires-dist = [
     { name = "uvicorn", specifier = ">=0.30.0" },
     { name = "websockets", specifier = ">=12.0" },
 ]
+provides-extras = ["claude-agent-sdk"]
 
 [package.metadata.requires-dev]
 dev = [

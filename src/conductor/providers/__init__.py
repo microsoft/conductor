@@ -6,12 +6,14 @@ for different LLM providers (Copilot SDK, Claude SDK, etc.).
 
 from conductor.providers.base import AgentOutput, AgentProvider
 from conductor.providers.claude import ClaudeProvider
+from conductor.providers.claude_agent_sdk import ClaudeAgentSdkProvider
 from conductor.providers.copilot import CopilotProvider
 from conductor.providers.factory import create_provider
 
 __all__ = [
     "AgentOutput",
     "AgentProvider",
+    "ClaudeAgentSdkProvider",
     "ClaudeProvider",
     "CopilotProvider",
     "create_provider",

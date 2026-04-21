@@ -23,7 +23,7 @@ conductor run <workflow.yaml> [OPTIONS]
 |--------|-------|-------------|
 | `--input NAME=VALUE` | `-i` | Workflow input (repeatable) |
 | `--input.NAME=VALUE` | | Alternative input syntax |
-| `--provider PROVIDER` | `-p` | Override provider (copilot, claude) |
+| `--provider PROVIDER` | `-p` | Override provider (copilot, claude, claude-agent-sdk) |
 | `--dry-run` | | Show execution plan without running |
 | `--skip-gates` | | Auto-select first option at human gates |
 | `--quiet` | `-q` | Minimal output (agent lifecycle and routing only) |

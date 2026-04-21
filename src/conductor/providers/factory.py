@@ -11,11 +11,15 @@ from typing import Any, Literal
 from conductor.exceptions import ProviderError
 from conductor.providers.base import AgentProvider
 from conductor.providers.claude import ANTHROPIC_SDK_AVAILABLE, ClaudeProvider
+from conductor.providers.claude_agent_sdk import (
+    CLAUDE_AGENT_SDK_AVAILABLE,
+    ClaudeAgentSdkProvider,
+)
 from conductor.providers.copilot import CopilotProvider, IdleRecoveryConfig
 
 
 async def create_provider(
-    provider_type: Literal["copilot", "openai-agents", "claude"] = "copilot",
+    provider_type: Literal["copilot", "openai-agents", "claude", "claude-agent-sdk"] = "copilot",
     validate: bool = True,
     mcp_servers: dict[str, Any] | None = None,
     default_model: str | None = None,
@@ -90,10 +94,21 @@ async def create_provider(
                 max_agent_iterations=max_agent_iterations,
                 max_session_seconds=max_session_seconds,
             )
+        case "claude-agent-sdk":
+            if not CLAUDE_AGENT_SDK_AVAILABLE:
+                raise ProviderError(
+                    "Claude Agent SDK provider requires claude-agent-sdk package",
+                    suggestion="Install with: uv add 'claude-agent-sdk>=0.1.0'",
+                )
+            provider = ClaudeAgentSdkProvider(
+                model=default_model,
+                max_turns=max_agent_iterations,
+                max_session_seconds=max_session_seconds,
+            )
         case _:
             raise ProviderError(
                 f"Unknown provider: {provider_type}",
-                suggestion="Valid providers are: copilot, openai-agents, claude",
+                suggestion="Valid providers are: copilot, openai-agents, claude, claude-agent-sdk",
             )
 
     if validate and not await provider.validate_connection():
