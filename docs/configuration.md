@@ -11,7 +11,7 @@ The `runtime` section of your workflow defines provider settings and global defa
 ```yaml
 workflow:
   runtime:
-    provider: copilot  # or 'claude'
+    provider: copilot  # or 'claude' or 'claude-agent-sdk'
     default_model: gpt-5.2
     # Provider-specific settings...
 ```

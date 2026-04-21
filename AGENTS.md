@@ -88,6 +88,7 @@ make validate-examples    # validate all examples
   - `base.py` - `AgentProvider` ABC defining `execute()`, `validate_connection()`, `close()`
   - `copilot.py` - GitHub Copilot SDK implementation
   - `claude.py` - Anthropic Claude API implementation
+  - `claude_agent_sdk.py` - Claude Agent SDK implementation (uses `claude-agent-sdk` package)
   - `factory.py` - Provider instantiation
 
 - **gates/**: Human-in-the-loop support
@@ -146,7 +147,7 @@ Use `pytest.mark.performance` for performance tests (exclude with `-m "not perfo
 
 ### Provider Parity
 
-All providers (`copilot.py`, `claude.py`) must maintain feature parity. Any change to one provider's behavior, contract, or capabilities must be applied to all providers. This includes:
+All providers must maintain feature parity where applicable. Any change to one provider's behavior, contract, or capabilities must be applied to all providers. This includes:
 
 - **Event callbacks**: Same event types emitted at the same semantic points
   - `agent_turn_start` with `{"turn": "awaiting_model"}` — immediately before each API call
@@ -160,3 +161,11 @@ All providers (`copilot.py`, `claude.py`) must maintain feature parity. Any chan
 - **Session management**: Same lifecycle (`validate_connection()`, `execute()`, `close()`)
 
 When modifying any provider, check all other providers for the same change. The dashboard, JSONL logger, console subscriber, and workflow engine all depend on consistent behavior across providers.
+
+#### `claude_agent_sdk.py` parity notes
+
+The Claude Agent SDK provider (`claude_agent_sdk.py`) delegates the agentic loop to the `claude` CLI via the `claude-agent-sdk` package. This achieves **event and output parity** but the following are managed by the SDK rather than Conductor:
+
+- **Retry and error handling**: The SDK handles retries, backoff, and parse recovery internally. The provider wraps SDK errors in `ProviderError` but does not implement its own retry logic.
+- **Tool execution**: Tools and MCP servers are managed by the `claude` CLI's own configuration. Workflow-level `tools` and `runtime.mcp_servers` fields are ignored.
+- **Runtime config**: `temperature`, `max_tokens`, and `timeout` are not configurable per-workflow — they are controlled by the CLI.

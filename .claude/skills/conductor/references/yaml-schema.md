@@ -6,7 +6,7 @@ Complete reference for all YAML configuration options. Derived from the Pydantic
 
 ```yaml
 workflow: WorkflowDef              # Required: workflow configuration
-tools: [string]                    # Optional: workflow-level tool names
+tools: [string]                    # Optional: workflow-level tool names (ignored by claude-agent-sdk — uses CLI config)
 agents: [AgentDef]                 # Required: agent definitions
 parallel: [ParallelGroup]         # Optional: static parallel groups
 for_each: [ForEachDef]            # Optional: dynamic parallel groups
@@ -27,14 +27,14 @@ workflow:
 
   # Runtime configuration
   runtime:
-    provider: string                # "copilot" (default) or "claude"
+    provider: string                # "copilot" (default), "claude", or "claude-agent-sdk"
     default_model: string           # Default model for all agents
-    temperature: float              # 0.0-1.0, controls randomness (optional)
-    max_tokens: integer             # Max OUTPUT tokens per response, 1-200000 (optional)
-    timeout: float                  # Per-request timeout in seconds (optional, default: 600)
+    temperature: float              # 0.0-1.0, controls randomness (optional, copilot/claude only)
+    max_tokens: integer             # Max OUTPUT tokens per response, 1-200000 (optional, copilot/claude only)
+    timeout: float                  # Per-request timeout in seconds (optional, default: 600, copilot/claude only)
     max_agent_iterations: integer   # Max tool-use roundtrips per agent (1-500, optional)
     max_session_seconds: float      # Wall-clock timeout per agent session in seconds (optional)
-    mcp_servers:                    # MCP server configurations
+    mcp_servers:                    # MCP server configurations (ignored by claude-agent-sdk — uses CLI config)
       <server_name>:
         type: string                # "stdio" (default), "http", or "sse"
         command: string             # Command to run (required for stdio)
@@ -93,7 +93,7 @@ agents:
     type: string                    # "agent" (default), "human_gate", "script", or "workflow"
     description: string             # What this agent does
     model: string                   # Override default_model
-    provider: string                # Per-agent provider override ("copilot" or "claude")
+    provider: string                # Per-agent provider override ("copilot", "claude", or "claude-agent-sdk")
 
     # Input specification (for explicit context mode)
     input:

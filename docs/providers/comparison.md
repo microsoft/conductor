@@ -1,21 +1,21 @@
-# Provider Comparison: Copilot vs Claude
+# Provider Comparison: Copilot vs Claude vs Claude Agent SDK
 
-This guide helps you choose between GitHub Copilot and Anthropic Claude providers for your workflows.
+This guide helps you choose between GitHub Copilot, Anthropic Claude, and Claude Agent SDK providers for your workflows.
 
 ## Quick Comparison
 
-| Feature | Copilot | Claude | Winner |
-|---------|---------|--------|--------|
-| **Context Window** | 8K-128K | 200K (all models) | Claude |
-| **Pricing Model** | Subscription ($10-39/mo) | Pay-per-token | Depends |
-| **Setup** | GitHub auth | API key | Copilot (easier) |
-| **Model Selection** | GPT-5.2, o1 | Haiku, Sonnet, Opus | Tie |
-| **Streaming** | Yes | No (Phase 1) | Copilot |
-| **Tool Support** | Yes (MCP) | No (Phase 1) | Copilot |
-| **Speed** | Fast | Fast | Tie |
-| **Output Quality** | Excellent | Excellent | Tie |
-| **Cost Predictability** | High (flat rate) | Variable (usage-based) | Copilot |
-| **Multi-provider** | No | Yes (via Conductor) | Claude |
+| Feature | Copilot | Claude | Claude Agent SDK |
+|---------|---------|--------|------------------|
+| **Context Window** | 8K-128K | 200K (all models) | 200K |
+| **Pricing Model** | Subscription ($10-39/mo) | Pay-per-token | Via Claude Code CLI |
+| **Setup** | GitHub auth | API key | `claude` CLI auth |
+| **Model Selection** | GPT-5.2, o1 | Haiku, Sonnet, Opus | Haiku, Sonnet, Opus |
+| **Streaming** | Yes | No (Phase 1) | Yes |
+| **Tool Support** | Yes (MCP) | No (Phase 1) | Yes (built-in) |
+| **Speed** | Fast | Fast | Fast |
+| **Output Quality** | Excellent | Excellent | Excellent |
+| **Cost Predictability** | High (flat rate) | Variable (usage-based) | Variable |
+| **Agentic Loop** | SDK-managed | Manual (provider code) | SDK-managed |
 
 ## When to Use Copilot
 
@@ -109,6 +109,51 @@ workflow:
 agents:
   - name: analyzer
     prompt: "Analyze the following document ({{ document | length }} chars)"
+```
+
+## When to Use Claude Agent SDK
+
+### ✅ Choose Claude Agent SDK if:
+
+1. **You want built-in tool support with Claude models**
+   - WebSearch, WebFetch, Bash, file operations out of the box
+   - No MCP server configuration needed for common tools
+   - Full Claude Code toolset available
+
+2. **You already use the `claude` CLI**
+   - Authentication handled by the CLI
+   - No separate API key management
+   - Settings inherited from your Claude Code environment
+
+3. **You want the SDK to manage the agentic loop**
+   - Retry logic, tool execution, and structured output handled by the SDK
+   - Less provider code to maintain
+   - Native interrupt support
+
+4. **You need streaming with Claude models**
+   - Real-time message streaming (unlike the raw Claude provider)
+   - Typed message objects for each event
+
+### Important: Tools and MCP Servers
+
+The `claude-agent-sdk` provider delegates tool and MCP server management entirely to the `claude` CLI. This means:
+
+- Workflow-level `tools` and `runtime.mcp_servers` fields are **ignored** — configure tools and MCP servers through your Claude Code settings instead
+- The full Claude Code toolset (WebSearch, Bash, Read, Write, etc.) is available automatically
+- `temperature`, `max_tokens`, and `timeout` are also managed by the CLI and not configurable per-workflow
+
+### Example Claude Agent SDK Workflow
+
+```yaml
+workflow:
+  name: sdk-workflow
+  runtime:
+    provider: claude-agent-sdk
+    default_model: claude-sonnet-4-6
+
+agents:
+  - name: researcher
+    prompt: "Research {{ topic }} using web search"
 ```
 
 ## Cost Comparison
@@ -298,6 +343,8 @@ Use this matrix to decide:
 | Process long documents | **Claude** |
 | Complex reasoning tasks | **Claude** (Opus) |
 | Simple high-volume tasks | **Claude** (Haiku 4.5) |
+| Already use `claude` CLI | **Claude Agent SDK** |
+| Want streaming with Claude | **Claude Agent SDK** |
 
 ## Multi-Provider Strategy
 
@@ -347,4 +394,11 @@ workflow:
 - ✅ Long document processing
 - ✅ Cost optimization (Haiku)
 
-**Bottom line**: Both are excellent. Choose based on your usage patterns, budget, and feature requirements. Conductor makes it easy to switch between them or use both strategically.
+**Choose Claude Agent SDK** for:
+- ✅ Built-in tools (WebSearch, Bash, etc.)
+- ✅ Streaming with Claude models
+- ✅ SDK-managed agentic loop
+- ✅ Existing `claude` CLI users
+- ✅ No API key management
+
+**Bottom line**: All three are excellent. Choose based on your usage patterns, budget, and feature requirements. Conductor makes it easy to switch between them or use all three strategically.
