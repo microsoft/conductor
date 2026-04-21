@@ -2688,9 +2688,7 @@ class WorkflowEngine:
                     else:
                         wf_ctx = agent_context.get("workflow", {})
                         sub_inputs = (
-                            dict(wf_ctx.get("input", {}))
-                            if isinstance(wf_ctx, dict)
-                            else {}
+                            dict(wf_ctx.get("input", {})) if isinstance(wf_ctx, dict) else {}
                         )
 
                     # Execute sub-workflow
