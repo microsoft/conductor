@@ -4,13 +4,14 @@ import { Bot } from 'lucide-react';
 import { cn, formatElapsed, formatTokens, formatCost } from '@/lib/utils';
 import { NODE_STATUS_HEX, CONTEXT_WARN_PCT, CONTEXT_DANGER_PCT } from '@/lib/constants';
 import { useWorkflowStore } from '@/stores/workflow-store';
+import { useViewedNodes } from '@/hooks/use-viewed-context';
 import { NodeTooltip } from './NodeTooltip';
 import type { GraphNodeData } from './graph-layout';
 import type { NodeStatus } from '@/lib/constants';
 
 export const AgentNode = memo(function AgentNode({ data, id, selected }: NodeProps) {
   const nodeData = data as unknown as GraphNodeData;
-  const viewedNodes = useWorkflowStore((s) => s.getViewedContext().nodes);
+  const viewedNodes = useViewedNodes();
   const storeStatus = viewedNodes[id]?.status;
   const status = (storeStatus || nodeData.status || 'pending') as NodeStatus;
   const borderColor = NODE_STATUS_HEX[status] || NODE_STATUS_HEX.pending;
@@ -134,7 +135,7 @@ export const AgentNode = memo(function AgentNode({ data, id, selected }: NodePro
 
 /** Hook that returns a live-ticking elapsed string while status is 'running'. */
 function useLiveElapsed(id: string, status: NodeStatus): string {
-  const startedAt = useWorkflowStore((s) => s.getViewedContext().nodes[id]?.startedAt);
+  const startedAt = useViewedNodes()[id]?.startedAt;
   const replayMode = useWorkflowStore((s) => s.replayMode);
   const lastEventTime = useWorkflowStore((s) => s.lastEventTime);
   const [display, setDisplay] = useState('0.0s');

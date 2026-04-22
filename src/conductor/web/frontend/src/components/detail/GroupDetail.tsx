@@ -6,7 +6,7 @@ import { ActivityStream } from './ActivityStream';
 import type { NodeData, ForEachItemData } from '@/stores/workflow-store';
 import { NODE_STATUS_HEX } from '@/lib/constants';
 import { formatElapsed, formatCost, formatTokens } from '@/lib/utils';
-import { useWorkflowStore } from '@/stores/workflow-store';
+import { useViewedGroupProgress } from '@/hooks/use-viewed-context';
 import type { NodeStatus } from '@/lib/constants';
 
 interface GroupDetailProps {
@@ -16,8 +16,8 @@ interface GroupDetailProps {
 export function GroupDetail({ node }: GroupDetailProps) {
   const status = node.status as NodeStatus;
   const statusColor = NODE_STATUS_HEX[status] || NODE_STATUS_HEX.pending;
-  const viewedCtx = useWorkflowStore((s) => s.getViewedContext());
-  const progress = viewedCtx.groupProgress[node.name];
+  const viewedProgress = useViewedGroupProgress();
+  const progress = viewedProgress[node.name];
   const isForEach = node.type === 'for_each_group';
 
   const [showItems, setShowItems] = useState(true);
