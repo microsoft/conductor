@@ -1,6 +1,7 @@
 import { Layers, ChevronRight, Coins, Hash } from 'lucide-react';
 import { MetadataGrid } from './MetadataGrid';
 import { useWorkflowStore } from '@/stores/workflow-store';
+import { useViewedSubworkflowContexts } from '@/hooks/use-viewed-context';
 import type { NodeData, SubworkflowContext } from '@/stores/workflow-store';
 import { NODE_STATUS_HEX } from '@/lib/constants';
 import { formatElapsed, formatCost, formatTokens } from '@/lib/utils';
@@ -14,8 +15,8 @@ export function SubworkflowDetail({ node }: SubworkflowDetailProps) {
   const status = node.status as NodeStatus;
   const statusColor = NODE_STATUS_HEX[status] || NODE_STATUS_HEX.pending;
   const navigateIntoSubworkflow = useWorkflowStore((s) => s.navigateIntoSubworkflow);
-  const viewedCtx = useWorkflowStore((s) => s.getViewedContext());
-  const subContexts = viewedCtx.subworkflowContexts.filter((c) => c.parentAgent === node.name);
+  const allSubContexts = useViewedSubworkflowContexts();
+  const subContexts = allSubContexts.filter((c) => c.parentAgent === node.name);
 
   const items: Array<{ label: string; value: string | number | null | undefined }> = [];
   if (node.elapsed != null) items.push({ label: 'Elapsed', value: formatElapsed(node.elapsed) });
