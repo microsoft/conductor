@@ -1122,6 +1122,8 @@ async def run_workflow_async(
                 event_emitter=emitter,
                 keyboard_listener=listener,
                 web_dashboard=dashboard,
+                run_id=event_log_subscriber.run_id if event_log_subscriber else "",
+                log_file=str(event_log_subscriber.path) if event_log_subscriber else "",
             )
 
             # Share interrupt_event with dashboard so POST /api/stop can abort agents

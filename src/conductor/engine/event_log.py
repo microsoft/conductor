@@ -61,8 +61,8 @@ class EventLogSubscriber:
         ts = time.strftime("%Y%m%d-%H%M%S")
         # Append random suffix to avoid filename collisions
         # when multiple runs start in the same second
-        suffix = secrets.token_hex(4)
-        ts = f"{ts}-{suffix}"
+        self._run_id = secrets.token_hex(4)
+        ts = f"{ts}-{self._run_id}"
         self._path = (
             Path(tempfile.gettempdir())
             / "conductor"
@@ -70,6 +70,11 @@ class EventLogSubscriber:
         )
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._handle = open(self._path, "w", encoding="utf-8")  # noqa: SIM115
+
+    @property
+    def run_id(self) -> str:
+        """Unique run identifier (8-char hex)."""
+        return self._run_id
 
     @property
     def path(self) -> Path:

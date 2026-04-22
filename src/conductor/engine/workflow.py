@@ -270,6 +270,8 @@ class WorkflowEngine:
         keyboard_listener: KeyboardListener | None = None,
         web_dashboard: WebDashboard | None = None,
         _subworkflow_depth: int = 0,
+        run_id: str = "",
+        log_file: str = "",
     ) -> None:
         """Initialize the WorkflowEngine.
 
@@ -308,6 +310,8 @@ class WorkflowEngine:
         self.config = config
         self.skip_gates = skip_gates
         self.workflow_path = workflow_path
+        self._run_id = run_id
+        self._log_file = log_file
         self.context = WorkflowContext()
         self.renderer = TemplateRenderer()
         self.router = Router()
@@ -1135,6 +1139,8 @@ class WorkflowEngine:
                         ],
                         **self._yaml_source_field(),
                         "metadata": self.config.workflow.metadata,
+                        "run_id": self._run_id,
+                        "log_file": self._log_file,
                     },
                 )
 
