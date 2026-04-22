@@ -21,6 +21,7 @@ import { AgentNode } from './AgentNode';
 import { ScriptNode } from './ScriptNode';
 import { GateNode } from './GateNode';
 import { GroupNode } from './GroupNode';
+import { WorkflowNode } from './WorkflowNode';
 import { EndNode } from './EndNode';
 import { StartNode } from './StartNode';
 import { AnimatedEdge } from './AnimatedEdge';
@@ -34,6 +35,7 @@ const nodeTypes: NodeTypes = {
   scriptNode: ScriptNode,
   gateNode: GateNode,
   groupNode: GroupNode,
+  workflowNode: WorkflowNode,
   endNode: EndNode,
   startNode: StartNode,
 };

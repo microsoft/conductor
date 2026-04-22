@@ -13,7 +13,7 @@ export const GroupNode = memo(function GroupNode({ data, id, selected }: NodePro
   const Icon = isForEach ? Repeat : GitBranch;
   const progress = nodeData.progress;
 
-  const storeStatus = useWorkflowStore((s) => s.nodes[id]?.status);
+  const storeStatus = useWorkflowStore((s) => s.getViewedContext().nodes[id]?.status);
   const status = (storeStatus || nodeData.status || 'pending') as NodeStatus;
   const borderColor = NODE_STATUS_HEX[status] || NODE_STATUS_HEX.pending;
 

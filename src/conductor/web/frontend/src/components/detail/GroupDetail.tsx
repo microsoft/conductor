@@ -16,8 +16,8 @@ interface GroupDetailProps {
 export function GroupDetail({ node }: GroupDetailProps) {
   const status = node.status as NodeStatus;
   const statusColor = NODE_STATUS_HEX[status] || NODE_STATUS_HEX.pending;
-  const groupProgress = useWorkflowStore((s) => s.groupProgress);
-  const progress = groupProgress[node.name];
+  const viewedCtx = useWorkflowStore((s) => s.getViewedContext());
+  const progress = viewedCtx.groupProgress[node.name];
   const isForEach = node.type === 'for_each_group';
 
   const [showItems, setShowItems] = useState(true);

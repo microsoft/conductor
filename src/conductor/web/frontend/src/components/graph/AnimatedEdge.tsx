@@ -19,7 +19,7 @@ export const AnimatedEdge = memo(function AnimatedEdge({
   target,
   data,
 }: EdgeProps) {
-  const highlightedEdges = useWorkflowStore((s) => s.highlightedEdges);
+  const highlightedEdges = useWorkflowStore((s) => s.getViewedContext().highlightedEdges);
 
   const edgeHighlight = useMemo(() => {
     return highlightedEdges.find((e) => e.from === source && e.to === target);
