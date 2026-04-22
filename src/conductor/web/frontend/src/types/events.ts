@@ -32,6 +32,9 @@ export type EventType =
   | 'for_each_item_completed'
   | 'for_each_item_failed'
   | 'for_each_completed'
+  | 'subworkflow_started'
+  | 'subworkflow_completed'
+  | 'subworkflow_failed'
   | 'workflow_completed'
   | 'workflow_failed'
   | 'checkpoint_saved'
@@ -255,4 +258,25 @@ export interface AgentPausedData {
 
 export interface AgentResumedData {
   agent_name: string;
+}
+
+// --- Subworkflow lifecycle ---
+
+export interface SubworkflowStartedData {
+  agent_name: string;
+  iteration?: number;
+  workflow: string;
+}
+
+export interface SubworkflowCompletedData {
+  agent_name: string;
+  elapsed?: number;
+  output?: unknown;
+}
+
+export interface SubworkflowFailedData {
+  agent_name: string;
+  elapsed?: number;
+  error_type?: string;
+  message?: string;
 }

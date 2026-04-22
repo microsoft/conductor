@@ -10,20 +10,22 @@ import type { NodeStatus } from '@/lib/constants';
 
 export const AgentNode = memo(function AgentNode({ data, id, selected }: NodeProps) {
   const nodeData = data as unknown as GraphNodeData;
-  const storeStatus = useWorkflowStore((s) => s.nodes[id]?.status);
+  const viewedNodes = useWorkflowStore((s) => s.getViewedContext().nodes);
+  const storeStatus = viewedNodes[id]?.status;
   const status = (storeStatus || nodeData.status || 'pending') as NodeStatus;
   const borderColor = NODE_STATUS_HEX[status] || NODE_STATUS_HEX.pending;
 
-  const elapsed = useWorkflowStore((s) => s.nodes[id]?.elapsed);
-  const model = useWorkflowStore((s) => s.nodes[id]?.model);
-  const tokens = useWorkflowStore((s) => s.nodes[id]?.tokens);
-  const inputTokens = useWorkflowStore((s) => s.nodes[id]?.input_tokens);
-  const outputTokens = useWorkflowStore((s) => s.nodes[id]?.output_tokens);
-  const costUsd = useWorkflowStore((s) => s.nodes[id]?.cost_usd);
-  const iteration = useWorkflowStore((s) => s.nodes[id]?.iteration);
-  const errorType = useWorkflowStore((s) => s.nodes[id]?.error_type);
-  const errorMessage = useWorkflowStore((s) => s.nodes[id]?.error_message);
-  const contextPct = useWorkflowStore((s) => s.nodes[id]?.context_pct);
+  const nd = viewedNodes[id];
+  const elapsed = nd?.elapsed;
+  const model = nd?.model;
+  const tokens = nd?.tokens;
+  const inputTokens = nd?.input_tokens;
+  const outputTokens = nd?.output_tokens;
+  const costUsd = nd?.cost_usd;
+  const iteration = nd?.iteration;
+  const errorType = nd?.error_type;
+  const errorMessage = nd?.error_message;
+  const contextPct = nd?.context_pct;
 
   // Live elapsed timer for running nodes
   const liveElapsed = useLiveElapsed(id, status);
@@ -132,7 +134,7 @@ export const AgentNode = memo(function AgentNode({ data, id, selected }: NodePro
 
 /** Hook that returns a live-ticking elapsed string while status is 'running'. */
 function useLiveElapsed(id: string, status: NodeStatus): string {
-  const startedAt = useWorkflowStore((s) => s.nodes[id]?.startedAt);
+  const startedAt = useWorkflowStore((s) => s.getViewedContext().nodes[id]?.startedAt);
   const replayMode = useWorkflowStore((s) => s.replayMode);
   const lastEventTime = useWorkflowStore((s) => s.lastEventTime);
   const [display, setDisplay] = useState('0.0s');

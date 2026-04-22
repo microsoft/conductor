@@ -21,6 +21,7 @@ import { AgentNode } from './AgentNode';
 import { ScriptNode } from './ScriptNode';
 import { GateNode } from './GateNode';
 import { GroupNode } from './GroupNode';
+import { WorkflowNode } from './WorkflowNode';
 import { EndNode } from './EndNode';
 import { StartNode } from './StartNode';
 import { AnimatedEdge } from './AnimatedEdge';
@@ -34,6 +35,7 @@ const nodeTypes: NodeTypes = {
   scriptNode: ScriptNode,
   gateNode: GateNode,
   groupNode: GroupNode,
+  workflowNode: WorkflowNode,
   endNode: EndNode,
   startNode: StartNode,
 };
@@ -69,27 +71,43 @@ function EdgeMarkers() {
 }
 
 export function WorkflowGraph() {
-  const agents = useWorkflowStore((s) => s.agents);
-  const routes = useWorkflowStore((s) => s.routes);
-  const parallelGroups = useWorkflowStore((s) => s.parallelGroups);
-  const forEachGroups = useWorkflowStore((s) => s.forEachGroups);
-  const storeNodes = useWorkflowStore((s) => s.nodes);
-  const groupProgress = useWorkflowStore((s) => s.groupProgress);
+  const getViewedContext = useWorkflowStore((s) => s.getViewedContext);
+  const viewContextPath = useWorkflowStore((s) => s.viewContextPath);
   const selectNode = useWorkflowStore((s) => s.selectNode);
   const selectedNode = useWorkflowStore((s) => s.selectedNode);
   const workflowStatus = useWorkflowStore((s) => s.workflowStatus);
-  const entryPoint = useWorkflowStore((s) => s.entryPoint);
   const wsStatus = useWorkflowStore((s) => s.wsStatus);
   const workflowFailedAgent = useWorkflowStore((s) => s.workflowFailedAgent);
+  const navigateIntoSubworkflow = useWorkflowStore((s) => s.navigateIntoSubworkflow);
+
+  // Get the data for the currently viewed context
+  const viewCtx = getViewedContext();
+  const { agents, routes, parallelGroups, forEachGroups, nodes: storeNodes, groupProgress, entryPoint, subworkflowContexts } = viewCtx;
 
   const [flowNodes, setFlowNodes, onNodesChange] = useNodesState<Node<GraphNodeData>>([]);
   const [flowEdges, setFlowEdges, onEdgesChange] = useEdgesState<Edge>([]);
 
   const graphBuilt = useRef(false);
+  const prevViewPath = useRef<string>('');
 
-  // Build graph when agents first appear
+  // Rebuild graph when context changes (breadcrumb navigation) or when agents first appear
+  const viewPathKey = JSON.stringify(viewContextPath);
   useEffect(() => {
-    if (agents.length === 0) return;
+    if (agents.length === 0) {
+      // Reset if navigated to empty context
+      if (prevViewPath.current !== viewPathKey) {
+        graphBuilt.current = false;
+        prevViewPath.current = viewPathKey;
+      }
+      return;
+    }
+
+    // Force rebuild on context switch
+    if (prevViewPath.current !== viewPathKey) {
+      graphBuilt.current = false;
+      prevViewPath.current = viewPathKey;
+    }
+
     if (graphBuilt.current) return;
     graphBuilt.current = true;
 
@@ -98,7 +116,7 @@ export function WorkflowGraph() {
     );
     setFlowNodes(nodes);
     setFlowEdges(edges);
-  }, [agents, routes, parallelGroups, forEachGroups, storeNodes, groupProgress, entryPoint, setFlowNodes, setFlowEdges]);
+  }, [agents, routes, parallelGroups, forEachGroups, storeNodes, groupProgress, entryPoint, setFlowNodes, setFlowEdges, viewPathKey]);
 
   // Update node data when store nodes change (status, progress, etc.)
   useEffect(() => {
@@ -152,6 +170,18 @@ export function WorkflowGraph() {
       selectNode(node.id);
     },
     [selectNode],
+  );
+
+  // Double-click on workflow agent nodes to navigate into subworkflow
+  const onNodeDoubleClick = useCallback(
+    (_: React.MouseEvent, node: Node) => {
+      // Check if this node has a subworkflow context
+      const hasSubworkflow = subworkflowContexts.some((c) => c.parentAgent === node.id);
+      if (hasSubworkflow) {
+        navigateIntoSubworkflow(node.id);
+      }
+    },
+    [subworkflowContexts, navigateIntoSubworkflow],
   );
 
   const onPaneClick = useCallback(() => {
@@ -220,6 +250,7 @@ export function WorkflowGraph() {
         onNodesChange={onNodesChange}
         onEdgesChange={onEdgesChange}
         onNodeClick={onNodeClick}
+        onNodeDoubleClick={onNodeDoubleClick}
         onPaneClick={onPaneClick}
         nodeTypes={nodeTypes}
         edgeTypes={edgeTypes}
