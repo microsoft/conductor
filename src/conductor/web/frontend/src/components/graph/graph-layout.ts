@@ -116,6 +116,7 @@ export function buildGraphElements(
       let flowNodeType = 'agentNode';
       if (nodeType === 'script') flowNodeType = 'scriptNode';
       else if (nodeType === 'human_gate') flowNodeType = 'gateNode';
+      else if (nodeType === 'workflow') flowNodeType = 'workflowNode';
 
       flowNodes.push({
         id: a.name,

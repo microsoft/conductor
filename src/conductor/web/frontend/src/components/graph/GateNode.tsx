@@ -10,11 +10,12 @@ import type { NodeStatus } from '@/lib/constants';
 
 export const GateNode = memo(function GateNode({ data, id, selected }: NodeProps) {
   const nodeData = data as unknown as GraphNodeData;
-  const storeStatus = useWorkflowStore((s) => s.nodes[id]?.status);
+  const viewedNodes = useWorkflowStore((s) => s.getViewedContext().nodes);
+  const storeStatus = viewedNodes[id]?.status;
   const status = (storeStatus || nodeData.status || 'pending') as NodeStatus;
   const borderColor = NODE_STATUS_HEX[status] || NODE_STATUS_HEX.pending;
 
-  const selectedOption = useWorkflowStore((s) => s.nodes[id]?.selected_option);
+  const selectedOption = viewedNodes[id]?.selected_option;
 
   // Status transition animation
   const transitionClass = useStatusTransition(status);

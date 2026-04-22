@@ -10,14 +10,16 @@ import type { NodeStatus } from '@/lib/constants';
 
 export const ScriptNode = memo(function ScriptNode({ data, id, selected }: NodeProps) {
   const nodeData = data as unknown as GraphNodeData;
-  const storeStatus = useWorkflowStore((s) => s.nodes[id]?.status);
+  const viewedNodes = useWorkflowStore((s) => s.getViewedContext().nodes);
+  const storeStatus = viewedNodes[id]?.status;
   const status = (storeStatus || nodeData.status || 'pending') as NodeStatus;
   const borderColor = NODE_STATUS_HEX[status] || NODE_STATUS_HEX.pending;
 
-  const elapsed = useWorkflowStore((s) => s.nodes[id]?.elapsed);
-  const exitCode = useWorkflowStore((s) => s.nodes[id]?.exit_code);
-  const errorType = useWorkflowStore((s) => s.nodes[id]?.error_type);
-  const errorMessage = useWorkflowStore((s) => s.nodes[id]?.error_message);
+  const nd = viewedNodes[id];
+  const elapsed = nd?.elapsed;
+  const exitCode = nd?.exit_code;
+  const errorType = nd?.error_type;
+  const errorMessage = nd?.error_message;
 
   // Live elapsed timer
   const liveElapsed = useLiveElapsed(id, status);
@@ -89,7 +91,7 @@ export const ScriptNode = memo(function ScriptNode({ data, id, selected }: NodeP
 });
 
 function useLiveElapsed(id: string, status: NodeStatus): string {
-  const startedAt = useWorkflowStore((s) => s.nodes[id]?.startedAt);
+  const startedAt = useWorkflowStore((s) => s.getViewedContext().nodes[id]?.startedAt);
   const replayMode = useWorkflowStore((s) => s.replayMode);
   const lastEventTime = useWorkflowStore((s) => s.lastEventTime);
   const [display, setDisplay] = useState('0.0s');
