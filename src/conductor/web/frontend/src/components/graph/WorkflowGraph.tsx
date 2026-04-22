@@ -16,6 +16,7 @@ import {
 import '@xyflow/react/dist/style.css';
 
 import { useWorkflowStore } from '@/stores/workflow-store';
+import { useViewedGraphData } from '@/hooks/use-viewed-context';
 import { buildGraphElements, type GraphNodeData } from './graph-layout';
 import { AgentNode } from './AgentNode';
 import { ScriptNode } from './ScriptNode';
@@ -71,7 +72,7 @@ function EdgeMarkers() {
 }
 
 export function WorkflowGraph() {
-  const getViewedContext = useWorkflowStore((s) => s.getViewedContext);
+  const viewCtx = useViewedGraphData();
   const viewContextPath = useWorkflowStore((s) => s.viewContextPath);
   const selectNode = useWorkflowStore((s) => s.selectNode);
   const selectedNode = useWorkflowStore((s) => s.selectedNode);
@@ -81,7 +82,6 @@ export function WorkflowGraph() {
   const navigateIntoSubworkflow = useWorkflowStore((s) => s.navigateIntoSubworkflow);
 
   // Get the data for the currently viewed context
-  const viewCtx = getViewedContext();
   const { agents, routes, parallelGroups, forEachGroups, nodes: storeNodes, groupProgress, entryPoint, subworkflowContexts } = viewCtx;
 
   const [flowNodes, setFlowNodes, onNodesChange] = useNodesState<Node<GraphNodeData>>([]);
