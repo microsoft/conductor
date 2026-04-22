@@ -957,10 +957,11 @@ class WorkflowEngine:
 
         # In web mode, the interrupt was already handled at the provider level
         # (partial output → _handle_web_pause). Consume the stale flag silently.
-        # We check for dashboard presence only (not has_connections) because in
-        # --web/--web-bg mode the CLI interactive handler is never appropriate,
-        # even if clients are transiently disconnected.
+        # EXCEPTION: in subworkflows (depth > 0), propagate the interrupt so it
+        # unwinds the child engine back to the parent, stopping the workflow.
         if self._web_dashboard is not None:
+            if self._subworkflow_depth > 0:
+                raise InterruptError(agent_name=current_agent_name)
             return None
 
         # Build output preview from last stored output
@@ -1064,6 +1065,15 @@ class WorkflowEngine:
         disconnect_task = asyncio.create_task(disconnect_event.wait())
         tasks = {resume_task, kill_task, disconnect_task}
 
+        # In subworkflows, also watch the interrupt_event so that a second
+        # Stop click while paused will stop the workflow without requiring
+        # the user to first Resume then wait for the next between-agent check.
+        stop_task = None
+        if self._subworkflow_depth > 0 and self._interrupt_event is not None:
+            self._interrupt_event.clear()
+            stop_task = asyncio.create_task(self._interrupt_event.wait())
+            tasks.add(stop_task)
+
         # If any event was set between clear() and task creation, the task
         # will already be done — no need to wait, but we still fall through
         # to the normal done/pending handling below.
@@ -1085,6 +1095,12 @@ class WorkflowEngine:
             raise
 
         if kill_task in done:
+            raise InterruptError(agent_name=agent_name)
+
+        # Stop-while-paused in a subworkflow: treat as interrupt
+        if stop_task is not None and stop_task in done:
+            if self._interrupt_event is not None:
+                self._interrupt_event.clear()
             raise InterruptError(agent_name=agent_name)
 
         if disconnect_task in done:
