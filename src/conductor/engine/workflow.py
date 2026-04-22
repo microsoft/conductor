@@ -569,6 +569,14 @@ class WorkflowEngine:
             _subworkflow_depth=self._subworkflow_depth + 1,
         )
 
+        # Inject parent agent outputs into the child workflow's context.
+        # This allows sub-workflow agents that declare parent agents in their
+        # input: list (e.g., task_manager.output?) to access parent state
+        # even when input_mapping doesn't cover all fields.
+        for key, value in context.items():
+            if key not in ("workflow", "context") and isinstance(value, dict):
+                child_engine.context.agent_outputs[key] = value.get("output", value)
+
         return await child_engine.run(sub_inputs)
 
     def _get_context_window_for_agent(self, agent: AgentDef) -> int | None:
