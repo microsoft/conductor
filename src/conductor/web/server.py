@@ -156,6 +156,25 @@ class WebDashboard:
         async def get_state() -> JSONResponse:
             return JSONResponse(content=self._event_history)
 
+        @app.get("/api/info")
+        async def get_info() -> JSONResponse:
+            """Return run identity for dashboard linking."""
+            # Extract from first workflow_started event
+            info: dict[str, Any] = {}
+            for event in self._event_history:
+                if event.get("type") == "workflow_started":
+                    data = event.get("data", {})
+                    info = {
+                        "run_id": data.get("run_id", ""),
+                        "log_file": data.get("log_file", ""),
+                        "workflow_name": data.get("name", ""),
+                        "started_at": event.get("timestamp", 0),
+                        "metadata": data.get("metadata", {}),
+                        "system": data.get("system", {}),
+                    }
+                    break
+            return JSONResponse(content=info)
+
         @app.get("/api/logs")
         async def download_logs() -> JSONResponse:
             """Download the full event history as a JSON file."""

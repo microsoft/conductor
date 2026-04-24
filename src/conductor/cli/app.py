@@ -238,6 +238,17 @@ def run(
             help="Workflow inputs in name=value format. Can be repeated.",
         ),
     ] = None,
+    raw_metadata: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--metadata",
+            "-m",
+            help=(
+                "Workflow metadata in key=value format. "
+                "Merged on top of YAML metadata. Can be repeated."
+            ),
+        ),
+    ] = None,
     dry_run: Annotated[
         bool,
         typer.Option(
@@ -300,12 +311,14 @@ def run(
 
     Execute a multi-agent workflow defined in the specified YAML file.
     Workflow inputs can be provided using --input flags.
+    Metadata can be provided using --metadata flags (merged on top of YAML metadata).
 
     \b
     Examples:
         conductor run workflow.yaml
         conductor run workflow.yaml --input question="What is Python?"
         conductor run workflow.yaml -i question="Hello" -i context="Programming"
+        conductor run workflow.yaml --metadata tracker=ado -m work_item_id=1814
         conductor run workflow.yaml --provider copilot
         conductor run workflow.yaml --dry-run
         conductor run workflow.yaml --skip-gates
@@ -377,6 +390,11 @@ def run(
     # Also parse --input.name=value style from sys.argv
     inputs.update(InputCollector.extract_from_args())
 
+    # Parse --metadata key=value flags (separate from inputs)
+    cli_metadata: dict[str, str] = {}
+    if raw_metadata:
+        cli_metadata.update(parse_input_flags(raw_metadata))
+
     # Resolve log file path
     resolved_log_file: Path | None = None
     if log_file is not None:
@@ -398,6 +416,7 @@ def run(
                 log_file=resolved_log_file,
                 no_interactive=True,  # Always non-interactive in background
                 web_port=web_port,
+                metadata=cli_metadata,
             )
             console.print(f"[bold cyan]Dashboard:[/bold cyan] {url}")
             console.print(
@@ -422,6 +441,7 @@ def run(
                 web=web,
                 web_port=web_port,
                 web_bg=web_bg,
+                metadata=cli_metadata,
             )
         )
 

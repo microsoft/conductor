@@ -606,6 +606,44 @@ class TestWorkflowDef:
         assert workflow.context.mode == "explicit"
         assert workflow.limits.max_iterations == 20
 
+    def test_metadata_defaults_to_empty_dict(self) -> None:
+        """Test that metadata defaults to empty dict when not specified."""
+        workflow = WorkflowDef(name="test", entry_point="agent1")
+        assert workflow.metadata == {}
+
+    def test_metadata_accepts_arbitrary_keys(self) -> None:
+        """Test that metadata accepts any key-value pairs."""
+        workflow = WorkflowDef(
+            name="test",
+            entry_point="agent1",
+            metadata={
+                "tracker": "ado",
+                "project_url": "https://dev.azure.com/org/Project",
+                "work_item_id": "1814",
+                "nested": {"key": "value"},
+                "count": 42,
+            },
+        )
+        assert workflow.metadata["tracker"] == "ado"
+        assert workflow.metadata["project_url"] == "https://dev.azure.com/org/Project"
+        assert workflow.metadata["work_item_id"] == "1814"
+        assert workflow.metadata["nested"] == {"key": "value"}
+        assert workflow.metadata["count"] == 42
+
+    def test_metadata_does_not_affect_other_fields(self) -> None:
+        """Test that metadata is independent from input, context, etc."""
+        workflow = WorkflowDef(
+            name="test",
+            entry_point="agent1",
+            input={"goal": InputDef(type="string")},
+            metadata={"tracker": "ado"},
+        )
+        assert workflow.metadata == {"tracker": "ado"}
+        assert "goal" in workflow.input
+        # Metadata and input are completely separate
+        assert "tracker" not in workflow.input
+        assert "goal" not in workflow.metadata
+
 
 class TestWorkflowConfig:
     """Tests for WorkflowConfig model."""
