@@ -94,10 +94,12 @@ export function WorkflowGraph() {
   const viewPathKey = JSON.stringify(viewContextPath);
   useEffect(() => {
     if (agents.length === 0) {
-      // Reset if navigated to empty context
+      // Clear stale graph elements when navigated to an empty context
       if (prevViewPath.current !== viewPathKey) {
         graphBuilt.current = false;
         prevViewPath.current = viewPathKey;
+        setFlowNodes([]);
+        setFlowEdges([]);
       }
       return;
     }
