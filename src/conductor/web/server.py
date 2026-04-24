@@ -41,11 +41,31 @@ _STATIC_DIR = Path(__file__).parent / "static"
 _BG_GRACE_SECONDS = 30
 
 # File API: allowed text extensions and max file size
-_FILE_ALLOWED_EXTENSIONS = frozenset({
-    ".md", ".txt", ".yaml", ".yml", ".json", ".log",
-    ".py", ".ts", ".js", ".tsx", ".jsx", ".css", ".html",
-    ".toml", ".cfg", ".ini", ".csv", ".xml", ".sh", ".bat", ".ps1",
-})
+_FILE_ALLOWED_EXTENSIONS = frozenset(
+    {
+        ".md",
+        ".txt",
+        ".yaml",
+        ".yml",
+        ".json",
+        ".log",
+        ".py",
+        ".ts",
+        ".js",
+        ".tsx",
+        ".jsx",
+        ".css",
+        ".html",
+        ".toml",
+        ".cfg",
+        ".ini",
+        ".csv",
+        ".xml",
+        ".sh",
+        ".bat",
+        ".ps1",
+    }
+)
 _FILE_MAX_SIZE = 1 * 1024 * 1024  # 1 MB
 
 
@@ -270,12 +290,14 @@ class WebDashboard:
                 )
 
             rel_path = str(target.relative_to(self._workflow_root)).replace("\\", "/")
-            return JSONResponse({
-                "path": rel_path,
-                "content": content,
-                "size": file_size,
-                "extension": target.suffix.lower(),
-            })
+            return JSONResponse(
+                {
+                    "path": rel_path,
+                    "content": content,
+                    "size": file_size,
+                    "extension": target.suffix.lower(),
+                }
+            )
 
         @app.websocket("/ws")
         async def websocket_endpoint(ws: WebSocket) -> None:

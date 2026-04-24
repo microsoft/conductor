@@ -27,9 +27,7 @@ def _make_dashboard(
 ) -> tuple[WorkflowEventEmitter, WebDashboard]:
     """Create an emitter and dashboard pair for testing."""
     emitter = WorkflowEventEmitter()
-    dashboard = WebDashboard(
-        emitter, host="127.0.0.1", port=0, bg=bg, workflow_root=workflow_root
-    )
+    dashboard = WebDashboard(emitter, host="127.0.0.1", port=0, bg=bg, workflow_root=workflow_root)
     return emitter, dashboard
 
 
