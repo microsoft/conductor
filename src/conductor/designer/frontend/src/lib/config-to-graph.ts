@@ -74,10 +74,10 @@ export function configToGraph(
     });
 
     // Routes → edges
-    for (const route of agent.routes ?? []) {
+    (agent.routes ?? []).forEach((route, ri) => {
       if (route.to === '$end') {
         edges.push({
-          id: `e-${agent.name}-end`,
+          id: `e-${agent.name}-end-${ri}`,
           source: id,
           target: '__end__',
           label: route.when ?? undefined,
@@ -87,7 +87,7 @@ export function configToGraph(
         const targetId = entityToNodeId(route.to, config);
         if (targetId) {
           edges.push({
-            id: `e-${agent.name}-${route.to}`,
+            id: `e-${agent.name}-${route.to}-${ri}`,
             source: id,
             target: targetId,
             label: route.when ?? undefined,
@@ -95,7 +95,7 @@ export function configToGraph(
           });
         }
       }
-    }
+    });
   }
 
   // ── Parallel groups ──────────────────────────────────────────
@@ -121,18 +121,18 @@ export function configToGraph(
     });
 
     // Routes from parallel group
-    for (const route of pg.routes ?? []) {
+    (pg.routes ?? []).forEach((route, ri) => {
       const targetId = route.to === '$end' ? '__end__' : entityToNodeId(route.to, config);
       if (targetId) {
         edges.push({
-          id: `e-${pg.name}-${route.to}`,
+          id: `e-${pg.name}-${route.to}-${ri}`,
           source: groupId,
           target: targetId,
           label: route.when ?? undefined,
           style: { stroke: '#6b7280' },
         });
       }
-    }
+    });
   }
 
   // ── For-each groups (composite node, NOT container) ──────────
@@ -154,18 +154,18 @@ export function configToGraph(
     });
 
     // Routes from for-each group
-    for (const route of fe.routes ?? []) {
+    (fe.routes ?? []).forEach((route, ri) => {
       const targetId = route.to === '$end' ? '__end__' : entityToNodeId(route.to, config);
       if (targetId) {
         edges.push({
-          id: `e-${fe.name}-${route.to}`,
+          id: `e-${fe.name}-${route.to}-${ri}`,
           source: feId,
           target: targetId,
           label: route.when ?? undefined,
           style: { stroke: '#6b7280' },
         });
       }
-    }
+    });
   }
 
   // ── End node ─────────────────────────────────────────────────
