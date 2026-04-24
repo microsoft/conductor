@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from rich.console import Console
+from rich.markdown import Markdown as RichMarkdown
 from rich.panel import Panel
 from rich.prompt import IntPrompt, Prompt
 
@@ -131,11 +132,11 @@ class HumanGateHandler:
         Returns:
             The selected GateOption.
         """
-        # Display the prompt in a styled panel
+        # Display the prompt in a styled panel (render as Markdown for rich formatting)
         self.console.print()
         self.console.print(
             Panel(
-                prompt_text,
+                RichMarkdown(prompt_text),
                 title="[bold cyan]Decision Required[/bold cyan]",
                 border_style="cyan",
             )

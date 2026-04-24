@@ -40,6 +40,34 @@ _STATIC_DIR = Path(__file__).parent / "static"
 # Grace period (seconds) before auto-shutdown in --web-bg mode
 _BG_GRACE_SECONDS = 30
 
+# File API: allowed text extensions and max file size
+_FILE_ALLOWED_EXTENSIONS = frozenset(
+    {
+        ".md",
+        ".txt",
+        ".yaml",
+        ".yml",
+        ".json",
+        ".log",
+        ".py",
+        ".ts",
+        ".js",
+        ".tsx",
+        ".jsx",
+        ".css",
+        ".html",
+        ".toml",
+        ".cfg",
+        ".ini",
+        ".csv",
+        ".xml",
+        ".sh",
+        ".bat",
+        ".ps1",
+    }
+)
+_FILE_MAX_SIZE = 1 * 1024 * 1024  # 1 MB
+
 
 class WebDashboard:
     """Real-time web dashboard for workflow visualization.
@@ -63,11 +91,13 @@ class WebDashboard:
         host: str = "127.0.0.1",
         port: int = 0,
         bg: bool = False,
+        workflow_root: Path | None = None,
     ) -> None:
         self._emitter = emitter
         self._host = host
         self._port = port
         self._bg = bg
+        self._workflow_root = workflow_root.resolve() if workflow_root else None
 
         # State
         self._event_history: list[dict[str, Any]] = []
@@ -193,6 +223,81 @@ class WebDashboard:
             """Resume a paused agent after it was interrupted by ``POST /api/stop``."""
             self._resume_event.set()
             return JSONResponse({"status": "resuming"})
+
+        @app.get("/api/files/{file_path:path}")
+        async def get_file(file_path: str) -> JSONResponse:
+            """Serve a local file relative to the workflow root directory.
+
+            Used by the web dashboard to render files linked in human gate
+            Markdown prompts (e.g. ``[plan](./plans/design.md)``).
+
+            Security: rejects absolute paths, path traversal, disallowed
+            extensions, and files larger than 1 MB.
+            """
+            if self._workflow_root is None:
+                return JSONResponse(
+                    {"error": "No workflow root configured"},
+                    status_code=404,
+                )
+
+            # Reject absolute, drive-qualified, UNC, and scheme-prefixed paths
+            if (
+                file_path.startswith(("/", "\\"))
+                or "://" in file_path
+                or (len(file_path) >= 2 and file_path[1] == ":")
+            ):
+                return JSONResponse(
+                    {"error": "Absolute paths are not allowed"},
+                    status_code=403,
+                )
+
+            try:
+                target = (self._workflow_root / file_path).resolve(strict=True)
+            except (OSError, ValueError):
+                return JSONResponse({"error": "File not found"}, status_code=404)
+
+            # Containment check — target must be inside workflow root
+            try:
+                target.relative_to(self._workflow_root)
+            except ValueError:
+                return JSONResponse(
+                    {"error": "Access denied — path outside workflow directory"},
+                    status_code=403,
+                )
+
+            # Extension allowlist
+            if target.suffix.lower() not in _FILE_ALLOWED_EXTENSIONS:
+                return JSONResponse(
+                    {"error": f"File type '{target.suffix}' is not supported"},
+                    status_code=403,
+                )
+
+            # Size check
+            file_size = target.stat().st_size
+            if file_size > _FILE_MAX_SIZE:
+                return JSONResponse(
+                    {"error": f"File too large ({file_size:,} bytes, max {_FILE_MAX_SIZE:,})"},
+                    status_code=413,
+                )
+
+            # Read as text
+            try:
+                content = target.read_text(encoding="utf-8")
+            except (UnicodeDecodeError, OSError) as e:
+                return JSONResponse(
+                    {"error": f"Cannot read file: {e}"},
+                    status_code=422,
+                )
+
+            rel_path = str(target.relative_to(self._workflow_root)).replace("\\", "/")
+            return JSONResponse(
+                {
+                    "path": rel_path,
+                    "content": content,
+                    "size": file_size,
+                    "extension": target.suffix.lower(),
+                }
+            )
 
         @app.websocket("/ws")
         async def websocket_endpoint(ws: WebSocket) -> None:

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -21,10 +22,12 @@ from conductor.events import WorkflowEvent, WorkflowEventEmitter
 from conductor.web.server import WebDashboard
 
 
-def _make_dashboard(*, bg: bool = False) -> tuple[WorkflowEventEmitter, WebDashboard]:
+def _make_dashboard(
+    *, bg: bool = False, workflow_root: Path | None = None
+) -> tuple[WorkflowEventEmitter, WebDashboard]:
     """Create an emitter and dashboard pair for testing."""
     emitter = WorkflowEventEmitter()
-    dashboard = WebDashboard(emitter, host="127.0.0.1", port=0, bg=bg)
+    dashboard = WebDashboard(emitter, host="127.0.0.1", port=0, bg=bg, workflow_root=workflow_root)
     return emitter, dashboard
 
 
@@ -543,3 +546,120 @@ async def _short_grace(event: asyncio.Event, delay: float) -> None:
     """Helper for testing: short grace period."""
     await asyncio.sleep(delay)
     event.set()
+
+
+class TestFileApi:
+    """Tests for GET /api/files/{file_path} endpoint.
+
+    Covers security checks (path traversal, extension filtering, size limits,
+    absolute path rejection) and the happy-path for reading files.
+    """
+
+    @pytest.fixture
+    def workflow_dir(self, tmp_path: Path) -> Path:
+        """Create a temporary workflow directory with sample files."""
+        (tmp_path / "plan.md").write_text("# My Plan\nSome content", encoding="utf-8")
+        (tmp_path / "data.json").write_text('{"key": "value"}', encoding="utf-8")
+        (tmp_path / "sub").mkdir()
+        (tmp_path / "sub" / "nested.yaml").write_text("key: value", encoding="utf-8")
+        (tmp_path / "secret.exe").write_bytes(b"\x00binary")
+        (tmp_path / "image.png").write_bytes(b"\x89PNG")
+        return tmp_path
+
+    def _client(self, workflow_dir: Path) -> TestClient:
+        _, dashboard = _make_dashboard(workflow_root=workflow_dir)
+        return TestClient(dashboard.app)
+
+    def test_read_markdown_file(self, workflow_dir: Path) -> None:
+        """Happy path: read a .md file."""
+        with self._client(workflow_dir) as client:
+            resp = client.get("/api/files/plan.md")
+            assert resp.status_code == 200
+            body = resp.json()
+            assert body["path"] == "plan.md"
+            assert "# My Plan" in body["content"]
+            assert body["extension"] == ".md"
+            assert body["size"] > 0
+
+    def test_read_nested_file(self, workflow_dir: Path) -> None:
+        """Read a file in a subdirectory."""
+        with self._client(workflow_dir) as client:
+            resp = client.get("/api/files/sub/nested.yaml")
+            assert resp.status_code == 200
+            assert resp.json()["path"] == "sub/nested.yaml"
+
+    def test_read_json_file(self, workflow_dir: Path) -> None:
+        """Read a JSON file."""
+        with self._client(workflow_dir) as client:
+            resp = client.get("/api/files/data.json")
+            assert resp.status_code == 200
+            assert '"key"' in resp.json()["content"]
+
+    def test_file_not_found(self, workflow_dir: Path) -> None:
+        """Non-existent file returns 404."""
+        with self._client(workflow_dir) as client:
+            resp = client.get("/api/files/nonexistent.md")
+            assert resp.status_code == 404
+
+    def test_path_traversal_dotdot(self, workflow_dir: Path) -> None:
+        """Path traversal with .. is blocked (403 containment check)."""
+        # Create a file outside workflow_dir to prove it can't be reached
+        outside = workflow_dir.parent / "secret.txt"
+        outside.write_text("top secret", encoding="utf-8")
+        with self._client(workflow_dir) as client:
+            resp = client.get("/api/files/../secret.txt")
+            assert resp.status_code in (403, 404)
+
+    def test_absolute_path_rejected(self, workflow_dir: Path) -> None:
+        """Absolute path is rejected with 403."""
+        with self._client(workflow_dir) as client:
+            resp = client.get("/api/files//etc/passwd")
+            assert resp.status_code == 403
+
+    def test_drive_path_rejected(self, workflow_dir: Path) -> None:
+        """Windows drive-qualified path is rejected."""
+        with self._client(workflow_dir) as client:
+            resp = client.get("/api/files/C:/Windows/system32/cmd.exe")
+            assert resp.status_code == 403
+
+    def test_scheme_rejected(self, workflow_dir: Path) -> None:
+        """URL scheme in path is rejected."""
+        with self._client(workflow_dir) as client:
+            resp = client.get("/api/files/file:///etc/passwd")
+            assert resp.status_code == 403
+
+    def test_disallowed_extension(self, workflow_dir: Path) -> None:
+        """Binary/disallowed extension returns 403."""
+        with self._client(workflow_dir) as client:
+            resp = client.get("/api/files/secret.exe")
+            assert resp.status_code == 403
+            assert "not supported" in resp.json()["error"]
+
+    def test_disallowed_image_extension(self, workflow_dir: Path) -> None:
+        """Image extension is not in the allowlist."""
+        with self._client(workflow_dir) as client:
+            resp = client.get("/api/files/image.png")
+            assert resp.status_code == 403
+
+    def test_large_file_rejected(self, workflow_dir: Path) -> None:
+        """File larger than 1MB is rejected with 413."""
+        big = workflow_dir / "huge.txt"
+        big.write_text("x" * (1024 * 1024 + 1), encoding="utf-8")
+        with self._client(workflow_dir) as client:
+            resp = client.get("/api/files/huge.txt")
+            assert resp.status_code == 413
+            assert "too large" in resp.json()["error"].lower()
+
+    def test_no_workflow_root_returns_404(self) -> None:
+        """When workflow_root is None, endpoint returns 404."""
+        _, dashboard = _make_dashboard(workflow_root=None)
+        with TestClient(dashboard.app) as client:
+            resp = client.get("/api/files/plan.md")
+            assert resp.status_code == 404
+            assert "No workflow root" in resp.json()["error"]
+
+    def test_unc_path_rejected(self, workflow_dir: Path) -> None:
+        """UNC path (\\\\server\\share) is rejected."""
+        with self._client(workflow_dir) as client:
+            resp = client.get("/api/files/\\\\server\\share\\file.txt")
+            assert resp.status_code in (403, 404)
