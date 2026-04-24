@@ -1065,3 +1065,61 @@ def update() -> None:
     except Exception as e:
         print_error(e)
         raise typer.Exit(code=1) from None
+
+
+@app.command()
+def designer(
+    workflow: Annotated[
+        str | None,
+        typer.Argument(
+            help="Optional workflow YAML file to open for editing.",
+        ),
+    ] = None,
+    port: Annotated[
+        int,
+        typer.Option(
+            "--port",
+            help="Port to run the designer server on (0 = auto-select).",
+        ),
+    ] = 0,
+    no_open: Annotated[
+        bool,
+        typer.Option(
+            "--no-open",
+            help="Don't auto-open the browser.",
+        ),
+    ] = False,
+    host: Annotated[
+        str,
+        typer.Option(
+            "--host",
+            help="Host to bind the server to.",
+        ),
+    ] = "127.0.0.1",
+) -> None:
+    """Launch the visual workflow designer.
+
+    Opens a web-based drag-and-drop editor for creating and editing
+    conductor workflow YAML files.
+
+    \b
+    Examples:
+        conductor designer                          # Create new workflow
+        conductor designer workflow.yaml            # Edit existing file
+        conductor designer --port 3000              # Use specific port
+        conductor designer workflow.yaml --no-open  # Don't open browser
+    """
+    from conductor.designer.cli import run_designer
+
+    try:
+        run_designer(
+            workflow_path=workflow,
+            host=host,
+            port=port,
+            no_open=no_open,
+        )
+    except KeyboardInterrupt:
+        console.print("\n[dim]Designer stopped.[/dim]")
+    except Exception as e:
+        print_error(e)
+        raise typer.Exit(code=1) from None
