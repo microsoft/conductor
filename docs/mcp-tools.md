@@ -171,6 +171,41 @@ mcp_servers:
 
 Environment variables are resolved at runtime from the current process environment, not at YAML load time. This allows sensitive values like API keys to remain outside the workflow file.
 
+### Passing values from the command line
+
+You can pass configuration to MCP servers at runtime by setting environment variables before running the workflow:
+
+```bash
+# Pass an API key to the MCP server
+MY_API_KEY=sk-abc123 uv run conductor run workflow.yaml --input.question="test"
+
+# Or export first
+export MY_API_KEY=sk-abc123
+uv run conductor run workflow.yaml --input.question="test"
+```
+
+```yaml
+# workflow.yaml
+workflow:
+  runtime:
+    mcp_servers:
+      my-server:
+        command: node
+        args: ["server.js"]
+        env:
+          API_KEY: ${MY_API_KEY}            # Resolved from OS environment at runtime
+          ENDPOINT: ${API_ENDPOINT:-https://api.example.com}
+```
+
+On Windows (PowerShell):
+
+```powershell
+$env:MY_API_KEY = "sk-abc123"
+uv run conductor run workflow.yaml --input.question="test"
+```
+
+> **Note:** Workflow inputs (`--input.*`) and MCP server environment variables are separate systems. `--input.*` values are available in Jinja2 templates (agent prompts, routes) as `{{ workflow.input.name }}`, while MCP server `env` values come from OS environment variables via `${VAR}` syntax.
+
 > **Known issue (Copilot provider):** The Copilot SDK has a bug where `env` variables in MCP server configs are not passed to MCP server subprocesses. As a workaround, you can inline env vars into the command using shell syntax:
 > ```yaml
 > mcp_servers:
