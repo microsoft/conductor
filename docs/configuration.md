@@ -122,11 +122,9 @@ workflow:
 
 **Note**: This is output tokens, not context window (200K separate limit)
 
-## Copilot-Specific Configuration
+## MCP Servers
 
-### MCP Servers
-
-Configure Model Context Protocol servers for tool access:
+Configure [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) servers for tool access. Both the Copilot and Claude providers support MCP tools.
 
 ```yaml
 workflow:
@@ -144,7 +142,9 @@ workflow:
         tools: ["*"]
 ```
 
-**Note**: MCP servers not available with Claude provider in Phase 1
+> **Provider note:** The Claude provider supports `stdio` servers only. HTTP and SSE servers are Copilot-only.
+
+For full details on server types, tool filtering, environment variables, and OAuth authentication, see the [MCP Tools guide](mcp-tools.md).
 
 ## Context Configuration
 
@@ -358,18 +358,13 @@ default_model: claude-sonnet-4.5
 default_model: claude-3.5-sonnet  # Wrong: dot instead of dash
 ```
 
-### "MCP servers not supported" (Claude)
+### MCP servers not working (Claude)
 
-Remove `mcp_servers` when using Claude provider (Phase 1):
-
-```yaml
-runtime:
-  provider: claude
-  # Remove mcp_servers section
-```
+The Claude provider only supports `stdio` MCP servers. If you are using `http` or `sse` servers, switch to the Copilot provider or use a stdio-based server instead. See the [MCP Tools guide](mcp-tools.md) for provider-specific details.
 
 ## See Also
 
+- [MCP Tools](mcp-tools.md)
 - [Claude Provider Documentation](providers/claude.md)
 - [Provider Comparison](providers/comparison.md)
 - [Migration Guide](providers/migration.md)
