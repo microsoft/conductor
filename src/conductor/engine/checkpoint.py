@@ -136,6 +136,7 @@ class CheckpointManager:
         error: BaseException,
         inputs: dict[str, Any],
         copilot_session_ids: dict[str, str] | None = None,
+        system_metadata: dict[str, Any] | None = None,
     ) -> Path | None:
         """Serialize workflow state to a checkpoint file.
 
@@ -153,6 +154,7 @@ class CheckpointManager:
             error: The exception that triggered the checkpoint.
             inputs: Workflow inputs.
             copilot_session_ids: Optional mapping of agent names to session IDs.
+            system_metadata: Optional system metadata captured at workflow start.
 
         Returns:
             Path to the saved checkpoint file, or ``None`` if saving failed.
@@ -193,6 +195,7 @@ class CheckpointManager:
                 "context": _make_json_serializable(context.to_dict()),
                 "limits": _make_json_serializable(limits.to_dict()),
                 "copilot_session_ids": copilot_session_ids or {},
+                "system": system_metadata or {},
             }
 
             # Serialize to JSON

@@ -170,6 +170,7 @@ class WebDashboard:
                         "workflow_name": data.get("name", ""),
                         "started_at": event.get("timestamp", 0),
                         "metadata": data.get("metadata", {}),
+                        "system": data.get("system", {}),
                     }
                     break
             return JSONResponse(content=info)
