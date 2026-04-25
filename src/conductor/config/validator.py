@@ -42,13 +42,14 @@ _MAX_ENUMERATED_PATHS = 100
 # Pattern for input references:
 # - agent.output(.field)?
 # - parallel_group.outputs.agent(.field)?
-# - workflow.input.param
+# - workflow.input (all inputs)
+# - workflow.input.param (single input)
 # All with optional ? suffix
 INPUT_REF_PATTERN = re.compile(
     r"^(?:"
     r"(?P<agent>[a-zA-Z_][a-zA-Z0-9_]*)\.output(?:\.(?P<field>[a-zA-Z_][a-zA-Z0-9_]*))?|"
     r"(?P<parallel>[a-zA-Z_][a-zA-Z0-9_]*)\.outputs\.(?P<pg_agent>[a-zA-Z_][a-zA-Z0-9_]*)(?:\.(?P<pg_field>[a-zA-Z_][a-zA-Z0-9_]*))?|"
-    r"workflow\.input\.(?P<input>[a-zA-Z_][a-zA-Z0-9_]*)"
+    r"workflow\.input(?:\.(?P<input>[a-zA-Z_][a-zA-Z0-9_]*))?"
     r")(?P<optional>\?)?$"
 )
 
@@ -221,7 +222,7 @@ def _validate_input_references(
                 f"Agent '{agent_name}' has invalid input reference '{input_ref}'. "
                 "Expected format: 'agent_name.output', 'agent_name.output.field', "
                 "'parallel_group.outputs.agent_name', 'parallel_group.outputs.agent_name.field', "
-                "or 'workflow.input.param_name' (append '?' for optional)"
+                "or 'workflow.input' or 'workflow.input.param_name' (append '?' for optional)"
             )
             continue
 

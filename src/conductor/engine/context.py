@@ -275,8 +275,8 @@ class WorkflowContext:
             return
 
         if parts[0] == "workflow":
-            # workflow.input.param_name format
             if len(parts) >= 3 and parts[1] == "input":
+                # workflow.input.param_name — inject a single workflow input
                 param_name = parts[2]
                 # Ensure workflow.input exists in ctx
                 if "workflow" not in ctx:
@@ -291,6 +291,14 @@ class WorkflowContext:
                     ctx["workflow"]["input"][param_name] = None
                 else:
                     raise KeyError(f"Missing required workflow input: {param_name}")
+            elif len(parts) == 2 and parts[1] == "input":
+                # workflow.input — inject ALL workflow inputs (merge to preserve
+                # any individual refs already processed)
+                if "workflow" not in ctx:
+                    ctx["workflow"] = {"input": {}}
+                elif "input" not in ctx["workflow"]:
+                    ctx["workflow"]["input"] = {}
+                ctx["workflow"]["input"].update(self.workflow_inputs)
         else:
             # Could be agent_name.output or parallel_group.outputs
             entity_name = parts[0]

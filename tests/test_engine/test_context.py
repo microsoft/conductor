@@ -266,6 +266,49 @@ class TestWorkflowContextExplicitMode:
                 mode="explicit",
             )
 
+    def test_explicit_mode_workflow_input_all(self) -> None:
+        """Test explicit mode with 2-part workflow.input injects all inputs."""
+        ctx = WorkflowContext()
+        ctx.set_workflow_inputs({"question": "What?", "mode": "fast", "count": 3})
+
+        agent_ctx = ctx.build_for_agent(
+            "agent",
+            ["workflow.input"],
+            mode="explicit",
+        )
+
+        assert agent_ctx["workflow"]["input"]["question"] == "What?"
+        assert agent_ctx["workflow"]["input"]["mode"] == "fast"
+        assert agent_ctx["workflow"]["input"]["count"] == 3
+
+    def test_explicit_mode_workflow_input_all_with_individual(self) -> None:
+        """Test 2-part workflow.input merges with individual 3-part refs."""
+        ctx = WorkflowContext()
+        ctx.set_workflow_inputs({"question": "What?", "mode": "fast"})
+
+        # Mix individual and all-inputs refs
+        agent_ctx = ctx.build_for_agent(
+            "agent",
+            ["workflow.input.question", "workflow.input"],
+            mode="explicit",
+        )
+
+        assert agent_ctx["workflow"]["input"]["question"] == "What?"
+        assert agent_ctx["workflow"]["input"]["mode"] == "fast"
+
+    def test_explicit_mode_workflow_input_all_optional(self) -> None:
+        """Test 2-part workflow.input? with no inputs doesn't raise."""
+        ctx = WorkflowContext()
+        ctx.set_workflow_inputs({})
+
+        agent_ctx = ctx.build_for_agent(
+            "agent",
+            ["workflow.input?"],
+            mode="explicit",
+        )
+
+        assert agent_ctx["workflow"]["input"] == {}
+
 
 class TestWorkflowContextOptionalDeps:
     """Tests for optional dependencies with ? suffix."""

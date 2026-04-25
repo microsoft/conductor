@@ -259,6 +259,45 @@ class TestInputReferenceValidation:
         warnings = validate_workflow_config(config)
         assert any("unknown" in w for w in warnings)
 
+    def test_valid_workflow_input_all_reference(self) -> None:
+        """Test that 2-part workflow.input reference is accepted."""
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="test",
+                entry_point="agent1",
+                input={"goal": InputDef(type="string")},
+            ),
+            agents=[
+                AgentDef(
+                    name="agent1",
+                    model="gpt-4",
+                    prompt="Goal: {{ workflow.input.goal }}",
+                    input=["workflow.input"],
+                    routes=[RouteDef(to="$end")],
+                )
+            ],
+        )
+        # Should not raise and should suppress explicit-mode warnings
+        warnings = validate_workflow_config(config)
+        assert not any("workflow.input.goal" in w for w in warnings)
+
+    def test_valid_workflow_input_all_optional_reference(self) -> None:
+        """Test that 2-part workflow.input? reference is accepted."""
+        config = WorkflowConfig(
+            workflow=WorkflowDef(name="test", entry_point="agent1"),
+            agents=[
+                AgentDef(
+                    name="agent1",
+                    model="gpt-4",
+                    prompt="Hello",
+                    input=["workflow.input?"],
+                    routes=[RouteDef(to="$end")],
+                )
+            ],
+        )
+        # Should not raise
+        validate_workflow_config(config)
+
 
 class TestToolValidation:
     """Tests for tool reference validation."""
