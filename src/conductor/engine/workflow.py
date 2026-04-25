@@ -1716,11 +1716,25 @@ class WorkflowEngine:
             self._save_checkpoint_on_failure(e)
             raise
 
+    # Type-appropriate zero values for optional inputs with no declared default.
+    # Using None causes templates to render "None" instead of empty string,
+    # and | default() won't catch None without the boolean=true flag.
+    _TYPE_ZERO_VALUES: dict[str, Any] = {
+        "string": "",
+        "number": 0,
+        "boolean": False,
+        "array": [],
+        "object": {},
+    }
+
     def _apply_input_defaults(self, inputs: dict[str, Any]) -> dict[str, Any]:
         """Apply default values from input schema for missing optional inputs.
 
         This ensures all defined inputs are present in the context, either
-        with provided values or their schema defaults (None if no default).
+        with provided values or their schema defaults. Optional inputs
+        without an explicit default get a type-appropriate zero value
+        (empty string, 0, false, [], {}) so they render cleanly in
+        templates without requiring ``| default()`` guards.
 
         Args:
             inputs: The input values provided at runtime.
@@ -1736,8 +1750,9 @@ class WorkflowEngine:
                 if input_def.default is not None:
                     merged[name] = input_def.default
                 elif not input_def.required:
-                    # Optional with no default - set to None so templates can check it
-                    merged[name] = None
+                    # Optional with no explicit default — use type-appropriate
+                    # zero value so templates render cleanly (not "None").
+                    merged[name] = self._TYPE_ZERO_VALUES.get(input_def.type, None)
 
         return merged
 
