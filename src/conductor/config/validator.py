@@ -29,14 +29,10 @@ _OUTPUT_REF_PATTERN = re.compile(r"(?:\{\{|\{%)[^}%]*?(\w+)\.outputs?\b")
 #   {{ agent_name.output }}
 #   {% if agent_name.output.field %}
 # Excludes built-in namespaces: workflow, context, item, _index, _key
-_TEMPLATE_REF_PATTERN = re.compile(
-    r"(?:\{\{|\{%)[^}%]*?\b(\w+)\.(?:output|outputs)\b"
-)
+_TEMPLATE_REF_PATTERN = re.compile(r"(?:\{\{|\{%)[^}%]*?\b(\w+)\.(?:output|outputs)\b")
 
 # Matches workflow.input.X references in templates
-_WORKFLOW_INPUT_REF_PATTERN = re.compile(
-    r"(?:\{\{|\{%)[^}%]*?\bworkflow\.input\.(\w+)\b"
-)
+_WORKFLOW_INPUT_REF_PATTERN = re.compile(r"(?:\{\{|\{%)[^}%]*?\bworkflow\.input\.(\w+)\b")
 
 _BUILTIN_NAMES = frozenset({"workflow", "context", "item", "_index", "_key", "loop"})
 
@@ -681,7 +677,10 @@ def _validate_template_references(
         templates = _collect_template_strings(agent)
 
         # Extract declared input agent references for explicit mode checks
+        # Extract declared input references for explicit mode checks
         declared_agents: set[str] = set()
+        declared_workflow_inputs: set[str] = set()
+        has_full_workflow_input = False
         for ref in agent.input:
             match = INPUT_REF_PATTERN.match(ref.rstrip("?"))
             if match:
@@ -691,6 +690,12 @@ def _validate_template_references(
                 ref_parallel = match.group("parallel")
                 if ref_parallel:
                     declared_agents.add(ref_parallel)
+                ref_input = match.group("input")
+                if ref_input:
+                    declared_workflow_inputs.add(ref_input)
+            clean_ref = ref.rstrip("?")
+            if clean_ref == "workflow.input":
+                has_full_workflow_input = True
 
         for source, template in templates:
             # Check agent/group output references
@@ -723,6 +728,18 @@ def _validate_template_references(
                     errors.append(
                         f"{source} references unknown workflow input '{input_name}'. "
                         f"Declared inputs: {', '.join(sorted(workflow_input_names))}"
+                    )
+                elif (
+                    is_explicit
+                    and agent.type not in ("script", "workflow")
+                    and not has_full_workflow_input
+                    and input_name not in declared_workflow_inputs
+                ):
+                    warnings.append(
+                        f"{source} references 'workflow.input.{input_name}' but "
+                        f"agent '{agent.name}' does not declare "
+                        f"'workflow.input.{input_name}' in its input: list "
+                        f"(explicit context mode)"
                     )
 
     # Check workflow output templates
