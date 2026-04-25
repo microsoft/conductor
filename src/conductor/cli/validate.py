@@ -40,7 +40,6 @@ def validate_workflow(
 
     try:
         config = load_config(workflow_path)
-        return True, config
     except ConductorError as e:
         # Display structured error
         display_validation_error(e, workflow_path, output_console)
@@ -55,6 +54,20 @@ def validate_workflow(
             )
         )
         return False, None
+
+    # Semantic validation: cross-field references, template refs, etc.
+    try:
+        from conductor.config.validator import validate_workflow_config
+
+        warnings = validate_workflow_config(config, workflow_path=workflow_path)
+        if warnings:
+            for warning in warnings:
+                output_console.print(f"  [yellow]⚠[/yellow] {warning}")
+    except ConductorError as e:
+        display_validation_error(e, workflow_path, output_console)
+        return False, None
+
+    return True, config
 
 
 def display_validation_error(
