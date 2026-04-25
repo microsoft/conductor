@@ -298,6 +298,46 @@ class TestWorkflowEngineContextModes:
         # Workflow.input.goal should not be in agent2's context since it's not in input list
         assert "other" not in agent2_context.get("workflow", {}).get("input", {})
 
+    @pytest.mark.asyncio
+    async def test_script_json_stdout_parsed_into_output(self) -> None:
+        """Test that script stdout containing JSON is auto-parsed into output fields."""
+        config = WorkflowConfig(
+            workflow=WorkflowDef(name="json-script", entry_point="detector"),
+            agents=[
+                AgentDef(
+                    name="detector",
+                    type="script",
+                    command="pwsh",
+                    args=[
+                        "-Command",
+                        'Write-Output \'{"plan_exists": true, "route": "planning"}\'; exit 0',
+                    ],
+                    routes=[
+                        RouteDef(to="planner", when="route == 'planning'"),
+                        RouteDef(to="$end"),
+                    ],
+                ),
+                AgentDef(
+                    name="planner",
+                    type="script",
+                    command="pwsh",
+                    args=["-Command", "Write-Output 'done'; exit 0"],
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+        )
+
+        provider = CopilotProvider(mock_handler=lambda a, p, c: {})
+        engine = WorkflowEngine(config, provider)
+        await engine.run({})
+
+        det = engine.context.agent_outputs["detector"]
+        assert det["plan_exists"] is True
+        assert det["route"] == "planning"
+        assert "stdout" in det
+        assert det["exit_code"] == 0
+        assert "planner" in engine.context.agent_outputs
+
 
 class TestWorkflowEngineRouting:
     """Tests for workflow routing."""
