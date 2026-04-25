@@ -298,6 +298,43 @@ class TestWorkflowEngineContextModes:
         # Workflow.input.goal should not be in agent2's context since it's not in input list
         assert "other" not in agent2_context.get("workflow", {}).get("input", {})
 
+    @pytest.mark.asyncio
+    async def test_explicit_mode_script_gets_workflow_inputs(self) -> None:
+        """Regression: script agents in explicit mode must see workflow.input.
+
+        In explicit mode, workflow.input was empty {} for script agents that
+        didn't declare inputs. Script args are rendered locally (no LLM cost),
+        so workflow inputs must always be available for template resolution.
+        """
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="explicit-script",
+                entry_point="detector",
+                context=ContextConfig(mode="explicit"),
+            ),
+            agents=[
+                AgentDef(
+                    name="detector",
+                    type="script",
+                    command="pwsh",
+                    args=[
+                        "-Command",
+                        "Write-Output '{{ workflow.input.work_item_id }}'; exit 0",
+                    ],
+                    # No input: list — should still see workflow.input
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+        )
+
+        provider = CopilotProvider(mock_handler=lambda a, p, c: {})
+        engine = WorkflowEngine(config, provider)
+
+        await engine.run({"work_item_id": 42})
+
+        # Script should have rendered the template successfully
+        assert engine.context.agent_outputs["detector"]["stdout"].strip() == "42"
+
 
 class TestWorkflowEngineRouting:
     """Tests for workflow routing."""

@@ -1399,6 +1399,13 @@ class WorkflowEngine:
                                 agent.input,
                                 mode=self.config.workflow.context.mode,
                             )
+                            # Script args are rendered locally (no LLM cost), so
+                            # workflow inputs must always be available for template
+                            # resolution — even in explicit mode where they'd
+                            # otherwise be filtered out.
+                            agent_context.setdefault("workflow", {})["input"] = (
+                                self.context.workflow_inputs.copy()
+                            )
                             _script_start = _time.time()
 
                             # Count how many times this specific script has been executed
@@ -1490,6 +1497,12 @@ class WorkflowEngine:
                                 agent.name,
                                 agent.input,
                                 mode=self.config.workflow.context.mode,
+                            )
+                            # input_mapping templates are rendered locally (no LLM
+                            # cost), so workflow inputs must always be available —
+                            # even in explicit mode.
+                            agent_context.setdefault("workflow", {})["input"] = (
+                                self.context.workflow_inputs.copy()
                             )
                             _sub_start = _time.time()
 
