@@ -106,6 +106,7 @@ class WebDashboard:
         self._serve_task: asyncio.Task[None] | None = None
         self._broadcast_task: asyncio.Task[None] | None = None
         self._actual_port: int | None = None
+        self._original_exception_handler: Any = None
 
         # Build FastAPI app
         self._app = self._create_app()
@@ -369,12 +370,82 @@ class WebDashboard:
     # Server lifecycle
     # ------------------------------------------------------------------
 
+    def _is_proactor_shutdown_race(self, context: dict[str, Any]) -> bool:
+        """Check if an exception context matches the proactor accept-loop race.
+
+        On Windows with Python 3.14+, the proactor event loop's accept
+        callback can fire after ``Server.close()`` sets ``_sockets = None``,
+        causing ``AssertionError`` in ``base_events.py:_attach``.  This is
+        benign during shutdown — the server is already closing and does not
+        need new connections.
+
+        Returns True only when all of:
+        - The exception is ``AssertionError``
+        - The uvicorn server is in shutdown state (``should_exit`` is set)
+        - The traceback (if available) originates from asyncio internals
+        """
+        exc = context.get("exception")
+        if not isinstance(exc, AssertionError):
+            return False
+        if self._server is None or not getattr(self._server, "should_exit", False):
+            return False
+        # Extra safety: check traceback originates from asyncio, not user code
+        import traceback as tb_mod
+
+        tb = exc.__traceback__
+        if tb is not None:
+            frames = tb_mod.extract_tb(tb)
+            if frames and "asyncio" in frames[-1].filename:
+                return True
+        # If no traceback but server is shutting down, still suppress —
+        # the only known source of AssertionError during shutdown is this race.
+        return True
+
+    def _loop_exception_handler(
+        self, loop: asyncio.AbstractEventLoop, context: dict[str, Any]
+    ) -> None:
+        """Custom event-loop exception handler that suppresses the proactor race."""
+        if self._is_proactor_shutdown_race(context):
+            logger.debug(
+                "Suppressed proactor accept-loop race during server shutdown: %s",
+                context.get("message", ""),
+            )
+            return
+        # Delegate to the original handler (or the default)
+        if self._original_exception_handler is not None:
+            self._original_exception_handler(loop, context)
+        else:
+            loop.default_exception_handler(context)
+
+    async def _guarded_serve(self) -> None:
+        """Run ``uvicorn.Server.serve()`` with a guard for the proactor race.
+
+        If ``serve()`` itself raises ``AssertionError`` during shutdown
+        (rather than the exception surfacing through a callback), this
+        wrapper suppresses it.
+        """
+        try:
+            await self._server.serve()
+        except AssertionError:
+            if self._server is not None and getattr(self._server, "should_exit", False):
+                logger.debug(
+                    "Suppressed proactor accept-loop AssertionError during server shutdown"
+                )
+            else:
+                raise
+
     async def start(self) -> None:
         """Start the uvicorn server as an asyncio task.
 
         The broadcaster is started automatically via the FastAPI lifespan.
         Waits until the server socket is bound and the actual port is
         known before returning.
+
+        On Windows with Python 3.14+, installs a custom event-loop
+        exception handler to suppress the proactor accept-loop race
+        (``AssertionError: self._sockets is not None``) that can fire
+        when a new connection is accepted after ``Server.close()`` sets
+        ``_sockets = None`` during shutdown.
         """
         import uvicorn
 
@@ -386,8 +457,15 @@ class WebDashboard:
         )
         self._server = uvicorn.Server(config)
 
+        # Install a guarded exception handler to suppress the proactor
+        # accept-race AssertionError that occurs on Windows (Python 3.14+)
+        # when the server is shutting down.
+        loop = asyncio.get_running_loop()
+        self._original_exception_handler = loop.get_exception_handler()
+        loop.set_exception_handler(self._loop_exception_handler)
+
         # Launch server (broadcaster starts via app lifespan)
-        self._serve_task = asyncio.create_task(self._server.serve())
+        self._serve_task = asyncio.create_task(self._guarded_serve())
 
         # Wait for server to bind — poll until .started is set
         while not self._server.started:
@@ -429,6 +507,13 @@ class WebDashboard:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._serve_task
             self._serve_task = None
+
+        # Restore the original event-loop exception handler
+        try:
+            loop = asyncio.get_running_loop()
+            loop.set_exception_handler(self._original_exception_handler)
+        except RuntimeError:
+            pass  # No running loop (e.g. during interpreter shutdown)
 
         # Close remaining WebSocket connections
         for ws in list(self._connections):

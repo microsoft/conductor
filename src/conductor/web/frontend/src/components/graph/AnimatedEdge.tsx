@@ -5,7 +5,7 @@ import {
   getBezierPath,
   type EdgeProps,
 } from '@xyflow/react';
-import { useWorkflowStore } from '@/stores/workflow-store';
+import { useViewedHighlightedEdges } from '@/hooks/use-viewed-context';
 
 export const AnimatedEdge = memo(function AnimatedEdge({
   id,
@@ -19,7 +19,7 @@ export const AnimatedEdge = memo(function AnimatedEdge({
   target,
   data,
 }: EdgeProps) {
-  const highlightedEdges = useWorkflowStore((s) => s.highlightedEdges);
+  const highlightedEdges = useViewedHighlightedEdges();
 
   const edgeHighlight = useMemo(() => {
     return highlightedEdges.find((e) => e.from === source && e.to === target);

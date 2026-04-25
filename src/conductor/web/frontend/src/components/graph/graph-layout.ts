@@ -116,6 +116,7 @@ export function buildGraphElements(
       let flowNodeType = 'agentNode';
       if (nodeType === 'script') flowNodeType = 'scriptNode';
       else if (nodeType === 'human_gate') flowNodeType = 'gateNode';
+      else if (nodeType === 'workflow') flowNodeType = 'workflowNode';
 
       flowNodes.push({
         id: a.name,
@@ -176,8 +177,10 @@ export function buildGraphElements(
     });
   }
 
-  // Create edges
+  // Create edges — only include edges whose source and target exist as nodes
+  const nodeIds = new Set(flowNodes.map((n) => n.id));
   for (const r of routes) {
+    if (!nodeIds.has(r.from) || !nodeIds.has(r.to)) continue;
     flowEdges.push({
       id: `${r.from}->${r.to}`,
       source: r.from,
