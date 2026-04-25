@@ -315,7 +315,11 @@ class WorkflowEngine:
         self.workflow_path = workflow_path
         self._run_id = run_id
         self._log_file = log_file
-        self.context = WorkflowContext()
+        self.context = WorkflowContext(
+            workflow_dir=str(Path(workflow_path).resolve().parent) if workflow_path else "",
+            workflow_file=str(Path(workflow_path).resolve()) if workflow_path else "",
+            workflow_name=config.workflow.name,
+        )
         self.renderer = TemplateRenderer()
         self.router = Router()
         self.limits = LimitEnforcer(
