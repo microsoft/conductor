@@ -14,6 +14,7 @@ from conductor.config.schema import (
     AgentDef,
     ContextConfig,
     GateOption,
+    InputDef,
     LimitsConfig,
     OutputField,
     ParallelGroup,
@@ -389,6 +390,52 @@ class TestWorkflowEngineContextModes:
         assert det["exit_code"] == 0
         # Route condition used parsed field — planner should have run
         assert "planner" in engine.context.agent_outputs
+
+    @pytest.mark.asyncio
+    async def test_optional_input_defaults_render_cleanly(self) -> None:
+        """Optional inputs without defaults use type-appropriate zero values.
+
+        Ensures optional string inputs render as '' (not 'None'),
+        optional numbers as 0 (not 'None'), etc.
+        """
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="optional-defaults",
+                entry_point="echo",
+                input={
+                    "required_id": InputDef(type="number", required=True),
+                    "optional_msg": InputDef(type="string", required=False),
+                    "optional_count": InputDef(type="number", required=False),
+                    "with_default": InputDef(type="string", required=False, default="hello"),
+                },
+            ),
+            agents=[
+                AgentDef(
+                    name="echo",
+                    type="script",
+                    command="pwsh",
+                    args=[
+                        "-Command",
+                        (
+                            "Write-Output 'msg={{ workflow.input.optional_msg }}"
+                            " count={{ workflow.input.optional_count }}"
+                            " def={{ workflow.input.with_default }}'; exit 0"
+                        ),
+                    ],
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+        )
+
+        provider = CopilotProvider(mock_handler=lambda a, p, c: {})
+        engine = WorkflowEngine(config, provider)
+
+        await engine.run({"required_id": 42})
+
+        stdout = engine.context.agent_outputs["echo"]["stdout"].strip()
+        assert "msg=" in stdout
+        assert "None" not in stdout  # Should never render Python's None
+        assert "def=hello" in stdout  # Explicit default works
 
 
 class TestWorkflowEngineRouting:
