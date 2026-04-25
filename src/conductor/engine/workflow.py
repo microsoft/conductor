@@ -1448,6 +1448,16 @@ class WorkflowEngine:
                                 "stderr": script_output.stderr,
                                 "exit_code": script_output.exit_code,
                             }
+                            # Auto-parse JSON stdout: if stdout is valid JSON
+                            # object, merge its fields into output so they're
+                            # accessible as output.field_name in templates and
+                            # route conditions (like LLM structured outputs).
+                            try:
+                                parsed = json.loads(script_output.stdout)
+                                if isinstance(parsed, dict):
+                                    output_content.update(parsed)
+                            except (json.JSONDecodeError, ValueError):
+                                pass
                             self.context.store(agent.name, output_content)
                             self.limits.record_execution(agent.name)
                             self.limits.check_timeout()
