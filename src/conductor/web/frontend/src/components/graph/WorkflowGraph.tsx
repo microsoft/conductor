@@ -17,6 +17,7 @@ import '@xyflow/react/dist/style.css';
 
 import { useWorkflowStore } from '@/stores/workflow-store';
 import { useViewedGraphData } from '@/hooks/use-viewed-context';
+import { useDeepLink } from '@/hooks/use-deep-link';
 import { buildGraphElements, type GraphNodeData } from './graph-layout';
 import { AgentNode } from './AgentNode';
 import { ScriptNode } from './ScriptNode';
@@ -278,6 +279,7 @@ export function WorkflowGraph() {
           <FitViewButton />
         </Controls>
         <FitViewKeyboardShortcut />
+        <DeepLinkHandler />
       </ReactFlow>
     </div>
   );
@@ -318,5 +320,11 @@ function FitViewKeyboardShortcut() {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [fitView]);
 
+  return null;
+}
+
+/** Applies URL query param deep-links (?agent=X, ?subworkflow=Y) on initial load */
+function DeepLinkHandler() {
+  useDeepLink();
   return null;
 }
