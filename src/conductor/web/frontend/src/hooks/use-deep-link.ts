@@ -1,77 +1,142 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useReactFlow } from '@xyflow/react';
 import { useWorkflowStore } from '@/stores/workflow-store';
+import type { SubworkflowContext } from '@/stores/workflow-store';
+
+/** Parse deep-link params from the current URL. */
+function getDeepLinkParams(): { subworkflowPath: string | null; agent: string | null } {
+  const params = new URLSearchParams(window.location.search);
+  return {
+    subworkflowPath: params.get('subworkflow'),
+    agent: params.get('agent'),
+  };
+}
+
+/** Walk the subworkflow context tree to find a path of indices for the given agent name path. */
+function resolveSubworkflowPath(
+  contexts: SubworkflowContext[],
+  segments: string[],
+): { path: number[]; failedSegment: string | null } {
+  const path: number[] = [];
+  let current = contexts;
+
+  for (const segment of segments) {
+    const idx = current.findIndex((c) => c.parentAgent === segment);
+    if (idx === -1) {
+      return { path, failedSegment: segment };
+    }
+    path.push(idx);
+    current = current[idx]!.children;
+  }
+
+  return { path, failedSegment: null };
+}
+
+export interface DeepLinkError {
+  message: string;
+}
 
 /**
  * Reads `?agent=` and `?subworkflow=` query params on initial load
- * and auto-selects / navigates to the matching node once the graph
- * has been populated with data.
+ * and auto-selects / navigates to the matching node once the workflow
+ * state has been replayed.
  *
  * Subworkflow paths support slash-separated nesting:
  *   ?subworkflow=planning/design  → navigate root→planning→design
  *
+ * Returns an error object if the deep-link target cannot be resolved.
  * Must be rendered inside a <ReactFlow> provider so useReactFlow() works.
  */
-export function useDeepLink() {
+export function useDeepLink(): DeepLinkError | null {
+  const [error, setError] = useState<DeepLinkError | null>(null);
   const applied = useRef(false);
   const { fitView } = useReactFlow();
 
-  const agents = useWorkflowStore((s) => s.agents);
-  const selectNode = useWorkflowStore((s) => s.selectNode);
-  const navigateIntoSubworkflow = useWorkflowStore((s) => s.navigateIntoSubworkflow);
+  const { subworkflowPath, agent } = getDeepLinkParams();
+  const hasParams = !!(subworkflowPath || agent);
 
   useEffect(() => {
-    // Only apply once, and only after agents have loaded
-    if (applied.current || agents.length === 0) return;
+    if (applied.current || !hasParams) return;
 
-    const params = new URLSearchParams(window.location.search);
-    const subworkflowPath = params.get('subworkflow');
-    const agent = params.get('agent');
+    // Subscribe to store changes and apply deep-link when state is ready.
+    // This avoids timing issues with useEffect + zustand selectors.
+    const unsubscribe = useWorkflowStore.subscribe((state) => {
+      if (applied.current) return;
 
-    if (!subworkflowPath && !agent) {
+      // Wait until root agents have been populated (workflow_started processed)
+      if (state.agents.length === 0) return;
+
       applied.current = true;
-      return;
-    }
+      unsubscribe();
 
-    // Navigate into the subworkflow path if requested.
-    // Supports slash-separated paths for nested subworkflows:
-    //   ?subworkflow=planning        → one level deep
-    //   ?subworkflow=planning/design → two levels deep
-    if (subworkflowPath) {
-      const segments = subworkflowPath.split('/').filter(Boolean);
-      for (const segment of segments) {
-        // Each call reads the latest store state via get(), so sequential
-        // calls correctly navigate deeper into the context tree.
-        navigateIntoSubworkflow(segment);
-      }
-      applied.current = true;
+      // 1. Navigate into subworkflow path
+      if (subworkflowPath) {
+        const segments = subworkflowPath.split('/').filter(Boolean);
+        const { path, failedSegment } = resolveSubworkflowPath(
+          state.subworkflowContexts,
+          segments,
+        );
 
-      // If there's also an agent param, select it within the subworkflow.
-      // The navigateIntoSubworkflow calls above are synchronous (zustand set/get),
-      // so the viewed context is already switched when we select the node.
-      if (agent) {
-        // Use a short delay to let React Flow rebuild the graph for the new context
-        setTimeout(() => {
-          selectNode(agent);
-          requestAnimationFrame(() => {
-            fitView({ nodes: [{ id: agent }], padding: 0.5, duration: 400 });
+        if (failedSegment) {
+          const resolved = segments.slice(0, path.length).join('/');
+          setError({
+            message: `Subworkflow "${failedSegment}" not found${resolved ? ` (resolved: ${resolved})` : ''}. It may not have started yet.`,
           });
-        }, 100);
+          return;
+        }
+
+        // Apply the full navigation path at once
+        useWorkflowStore.setState({ viewContextPath: path, selectedNode: null });
       }
-      return;
+
+      // 2. Select agent node
+      if (agent) {
+        // Determine which context to check for the agent
+        const freshState = useWorkflowStore.getState();
+        let agentList: { name: string }[];
+
+        if (freshState.viewContextPath.length === 0) {
+          agentList = freshState.agents;
+        } else {
+          // Walk the context tree to get agents at the target depth
+          let ctx: SubworkflowContext | undefined;
+          let contexts = freshState.subworkflowContexts;
+          for (const idx of freshState.viewContextPath) {
+            ctx = contexts[idx];
+            if (!ctx) break;
+            contexts = ctx.children;
+          }
+          agentList = ctx?.agents ?? [];
+        }
+
+        const agentExists = agentList.some((a) => a.name === agent);
+        if (!agentExists) {
+          const location = subworkflowPath || 'root workflow';
+          setError({
+            message: `Agent "${agent}" not found in ${location}.`,
+          });
+          return;
+        }
+
+        useWorkflowStore.setState({ selectedNode: agent });
+
+        // Center the view on the node after React Flow rebuilds the graph
+        setTimeout(() => {
+          fitView({ nodes: [{ id: agent }], padding: 0.5, duration: 400 });
+        }, 200);
+      }
+    });
+
+    // Also check the current state immediately (late-joiner replay may have
+    // already completed before this effect runs)
+    const currentState = useWorkflowStore.getState();
+    if (currentState.agents.length > 0 && !applied.current) {
+      // Trigger the subscriber with current state
+      useWorkflowStore.setState({});
     }
 
-    // Select the agent node and center the view on it
-    if (agent) {
-      const agentExists = agents.some((a) => a.name === agent);
-      if (agentExists) {
-        selectNode(agent);
-        // Allow React Flow to process the selection, then center on the node
-        requestAnimationFrame(() => {
-          fitView({ nodes: [{ id: agent }], padding: 0.5, duration: 400 });
-        });
-        applied.current = true;
-      }
-    }
-  }, [agents, selectNode, navigateIntoSubworkflow, fitView]);
+    return unsubscribe;
+  }, [hasParams, subworkflowPath, agent, fitView]);
+
+  return error;
 }
