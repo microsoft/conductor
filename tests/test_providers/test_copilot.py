@@ -7,7 +7,7 @@ import pytest
 
 from conductor.config.schema import AgentDef
 from conductor.exceptions import ProviderError
-from conductor.providers.copilot import CopilotProvider, RetryConfig
+from conductor.providers.copilot import CopilotProvider, RetryConfig, SDKResponse
 
 
 def stub_handler(agent: AgentDef, prompt: str, context: dict[str, Any]) -> dict[str, Any]:
@@ -381,6 +381,121 @@ class TestCopilotProviderRetryLogic:
 
         await provider.close()
         assert len(provider.get_retry_history()) == 0
+
+
+class TestPromptSchemaGeneration:
+    """Tests for prompt-facing schema generation."""
+
+    def test_build_prompt_schema_recurses_through_nested_fields(self) -> None:
+        """Nested object properties and array items are preserved in prompt schema."""
+        provider = CopilotProvider(mock_handler=stub_handler)
+        agent = AgentDef(
+            name="planner",
+            model="gpt-4",
+            prompt="Plan the work",
+            output={
+                "plan": {
+                    "type": "object",
+                    "description": "Structured research plan",
+                    "properties": {
+                        "questions": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                        "areas": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "name": {"type": "string"},
+                                    "focus": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                    },
+                                },
+                            },
+                        },
+                        "sources": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                    },
+                },
+                "summary": {
+                    "type": "string",
+                },
+            },
+        )
+
+        schema = provider._build_prompt_schema(agent.output or {})
+
+        assert schema["plan"]["type"] == "object"
+        assert schema["plan"]["properties"]["questions"]["type"] == "array"
+        assert schema["plan"]["properties"]["questions"]["items"]["type"] == "string"
+        assert schema["plan"]["properties"]["areas"]["items"]["properties"]["name"]["type"] == "string"
+        assert (
+            schema["plan"]["properties"]["areas"]["items"]["properties"]["focus"]["items"]["type"]
+            == "string"
+        )
+        assert schema["plan"]["required"] == ["questions", "areas", "sources"]
+        assert schema["summary"]["description"] == "The summary field"
+
+    @pytest.mark.asyncio
+    async def test_execute_appends_nested_schema_to_prompt(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The actual prompt sent to Copilot includes nested schema details."""
+        provider = CopilotProvider(retry_config=RetryConfig(max_attempts=1))
+        agent = AgentDef(
+            name="planner",
+            model="gpt-4",
+            prompt="Plan the work",
+            output={
+                "plan": {
+                    "type": "object",
+                    "properties": {
+                        "questions": {"type": "array"},
+                        "areas": {"type": "array"},
+                        "sources": {"type": "array"},
+                    },
+                },
+                "summary": {"type": "string"},
+            },
+        )
+
+        class _FakeSession:
+            session_id = "session-123"
+
+            async def disconnect(self) -> None:
+                return None
+
+        class _FakeClient:
+            async def create_session(self, **kwargs: Any) -> _FakeSession:
+                return _FakeSession()
+
+        captured_prompt: dict[str, str] = {}
+
+        async def _noop() -> None:
+            return None
+
+        async def _fake_send_and_wait(*args: Any, **kwargs: Any) -> SDKResponse:
+            captured_prompt["value"] = args[1]
+            return SDKResponse(
+                content='{"plan":{"questions":[],"areas":[],"sources":[]},"summary":"done"}'
+            )
+
+        provider._client = _FakeClient()
+        monkeypatch.setattr(provider, "_ensure_client_started", _noop)
+        monkeypatch.setattr(provider, "_send_and_wait", _fake_send_and_wait)
+
+        await provider.execute(agent=agent, context={}, rendered_prompt="Plan the work")
+
+        prompt = captured_prompt["value"]
+        assert '"plan"' in prompt
+        assert '"properties"' in prompt
+        assert '"questions"' in prompt
+        assert '"areas"' in prompt
+        assert '"sources"' in prompt
+        assert '"required"' in prompt
+        assert "Return ONLY the JSON object, no other text." in prompt
 
 
 class TestRetryConfig:
