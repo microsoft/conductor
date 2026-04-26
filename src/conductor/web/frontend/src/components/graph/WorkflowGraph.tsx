@@ -325,6 +325,22 @@ function FitViewKeyboardShortcut() {
 
 /** Applies URL query param deep-links (?agent=X, ?subworkflow=Y) on initial load */
 function DeepLinkHandler() {
-  useDeepLink();
-  return null;
+  const error = useDeepLink();
+
+  if (!error) return null;
+
+  return (
+    <div className="absolute top-3 left-1/2 -translate-x-1/2 z-20 animate-[banner-in_200ms_ease-out]">
+      <div className="flex items-center gap-2 px-4 py-2 rounded-lg bg-amber-950/90 border border-amber-500/40 shadow-lg shadow-amber-500/10 backdrop-blur-sm max-w-[560px]">
+        <span className="text-xs text-amber-300">⚠</span>
+        <span className="text-[11px] text-amber-400/80">{error.message}</span>
+        <a
+          href={window.location.pathname}
+          className="px-2 py-0.5 rounded text-[10px] font-medium text-amber-300 bg-amber-500/20 hover:bg-amber-500/30 transition-colors flex-shrink-0 ml-1"
+        >
+          Root
+        </a>
+      </div>
+    </div>
+  );
 }
