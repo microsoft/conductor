@@ -18,7 +18,7 @@ from conductor.config.schema import (
     WorkflowDef,
 )
 from conductor.engine.checkpoint import CheckpointManager
-from conductor.engine.workflow import WorkflowEngine
+from conductor.engine.workflow import RunContext, WorkflowEngine
 from conductor.events import WorkflowEventEmitter
 
 
@@ -51,7 +51,10 @@ class TestBuildSystemMetadata:
 
     def test_always_present_fields(self, simple_config: WorkflowConfig) -> None:
         """System metadata includes all required fields."""
-        engine = WorkflowEngine(simple_config, run_id="abc123", log_file="/tmp/test.jsonl")
+        engine = WorkflowEngine(
+            simple_config,
+            run_context=RunContext(run_id="abc123", log_file="/tmp/test.jsonl"),
+        )
         meta = engine._build_system_metadata()
 
         assert meta["pid"] == os.getpid()
@@ -75,7 +78,9 @@ class TestBuildSystemMetadata:
 
     def test_dashboard_fields_when_port_set(self, simple_config: WorkflowConfig) -> None:
         """Dashboard port and URL present when dashboard_port is provided."""
-        engine = WorkflowEngine(simple_config, dashboard_port=8080)
+        engine = WorkflowEngine(
+            simple_config, run_context=RunContext(dashboard_port=8080)
+        )
         meta = engine._build_system_metadata()
 
         assert meta["dashboard_port"] == 8080
@@ -83,7 +88,7 @@ class TestBuildSystemMetadata:
 
     def test_bg_mode_includes_parent_pid(self, simple_config: WorkflowConfig) -> None:
         """Background mode includes parent_pid."""
-        engine = WorkflowEngine(simple_config, bg_mode=True)
+        engine = WorkflowEngine(simple_config, run_context=RunContext(bg_mode=True))
         meta = engine._build_system_metadata()
 
         assert meta["bg_mode"] is True
@@ -113,10 +118,12 @@ class TestSystemMetadataInEvent:
         engine = WorkflowEngine(
             simple_config,
             event_emitter=emitter,
-            run_id="test-run",
-            log_file="/tmp/test.jsonl",
-            dashboard_port=9090,
-            bg_mode=False,
+            run_context=RunContext(
+                run_id="test-run",
+                log_file="/tmp/test.jsonl",
+                dashboard_port=9090,
+                bg_mode=False,
+            ),
         )
 
         # Mock out the actual execution to just emit workflow_started

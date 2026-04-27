@@ -363,6 +363,7 @@ def run(
         display_execution_plan,
         generate_log_path,
         parse_input_flags,
+        parse_metadata_flags,
         run_workflow_async,
     )
 
@@ -390,10 +391,10 @@ def run(
     # Also parse --input.name=value style from sys.argv
     inputs.update(InputCollector.extract_from_args())
 
-    # Parse --metadata key=value flags (separate from inputs)
+    # Parse --metadata key=value flags (no type coercion — values stay as strings)
     cli_metadata: dict[str, str] = {}
     if raw_metadata:
-        cli_metadata.update(parse_input_flags(raw_metadata))
+        cli_metadata.update(parse_metadata_flags(raw_metadata))
 
     # Resolve log file path
     resolved_log_file: Path | None = None

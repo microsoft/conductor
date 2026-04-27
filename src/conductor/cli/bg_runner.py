@@ -112,7 +112,7 @@ def launch_background(
     # Forward metadata
     if metadata:
         for key, value in metadata.items():
-            cmd.extend(["--metadata", f"{key}={value}"])
+            cmd.extend(["--metadata", f"{key}={_serialize_value(value)}"])
 
     if provider_override:
         cmd.extend(["--provider", provider_override])

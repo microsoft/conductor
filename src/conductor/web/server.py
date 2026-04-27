@@ -113,6 +113,11 @@ class WebDashboard:
         # Subscribe to emitter
         self._emitter.subscribe(self._on_event)
 
+    @property
+    def port(self) -> int:
+        """Resolved TCP port the dashboard is listening on."""
+        return self._actual_port if self._actual_port is not None else self._port
+
     def _create_app(self) -> FastAPI:
         """Create the FastAPI application with all routes.
 
@@ -166,11 +171,12 @@ class WebDashboard:
                     data = event.get("data", {})
                     info = {
                         "run_id": data.get("run_id", ""),
-                        "log_file": data.get("log_file", ""),
                         "workflow_name": data.get("name", ""),
                         "started_at": event.get("timestamp", 0),
                         "metadata": data.get("metadata", {}),
-                        "system": data.get("system", {}),
+                        "conductor_version": data.get("system", {}).get(
+                            "conductor_version", ""
+                        ),
                     }
                     break
             return JSONResponse(content=info)

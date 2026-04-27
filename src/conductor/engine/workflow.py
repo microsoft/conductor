@@ -59,6 +59,18 @@ if TYPE_CHECKING:
 
 
 @dataclass
+class RunContext:
+    """Informational metadata about the current CLI run.
+
+    These fields are not used for workflow orchestration — they are passed
+    through to event data and checkpoints for diagnostics and linking.
+    """
+
+    run_id: str = ""
+    log_file: str = ""
+    dashboard_port: int | None = None
+    bg_mode: bool = False
+@dataclass
 class ParallelAgentError:
     """Error information from a failed parallel agent execution.
 
@@ -270,10 +282,7 @@ class WorkflowEngine:
         keyboard_listener: KeyboardListener | None = None,
         web_dashboard: WebDashboard | None = None,
         _subworkflow_depth: int = 0,
-        run_id: str = "",
-        log_file: str = "",
-        dashboard_port: int | None = None,
-        bg_mode: bool = False,
+        run_context: RunContext | None = None,
     ) -> None:
         """Initialize the WorkflowEngine.
 
@@ -312,8 +321,9 @@ class WorkflowEngine:
         self.config = config
         self.skip_gates = skip_gates
         self.workflow_path = workflow_path
-        self._run_id = run_id
-        self._log_file = log_file
+        self._run_context = run_context or RunContext()
+        self._run_id = self._run_context.run_id
+        self._log_file = self._run_context.log_file
         self.context = WorkflowContext()
         self.renderer = TemplateRenderer()
         self.router = Router()
@@ -361,8 +371,8 @@ class WorkflowEngine:
         self._subworkflow_depth = _subworkflow_depth
 
         # System metadata fields (set by CLI, used in workflow_started event)
-        self._dashboard_port = dashboard_port
-        self._bg_mode = bg_mode
+        self._dashboard_port = self._run_context.dashboard_port
+        self._bg_mode = self._run_context.bg_mode
         self._system_metadata: dict[str, Any] = {}
 
     def _build_pricing_overrides(self) -> dict[str, ModelPricing] | None:
@@ -436,12 +446,17 @@ class WorkflowEngine:
         import sys
         from datetime import UTC, datetime
 
+        try:
+            cwd = os.getcwd()
+        except OSError:
+            cwd = "<unavailable>"
+
         system: dict[str, Any] = {
             "pid": os.getpid(),
             "platform": sys.platform,
             "python_version": _platform.python_version(),
             "conductor_version": self._conductor_version(),
-            "cwd": os.getcwd(),
+            "cwd": cwd,
             "started_at": datetime.now(UTC).isoformat(),
             "run_id": self._run_id,
             "log_file": self._log_file,

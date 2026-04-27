@@ -841,6 +841,41 @@ def parse_input_flags(raw_inputs: list[str]) -> dict[str, Any]:
     return inputs
 
 
+def parse_metadata_flags(raw_metadata: list[str]) -> dict[str, str]:
+    """Parse --metadata key=value flags into a dictionary.
+
+    Unlike ``parse_input_flags``, values are kept as raw strings with no
+    type coercion — metadata is opaque key-value data.
+
+    Args:
+        raw_metadata: List of "key=value" strings from CLI.
+
+    Returns:
+        Dictionary of string key-value pairs.
+
+    Raises:
+        typer.BadParameter: If metadata format is invalid.
+    """
+    result: dict[str, str] = {}
+
+    for raw in raw_metadata:
+        if "=" not in raw:
+            raise typer.BadParameter(
+                f"Invalid metadata format: '{raw}'. Expected format: key=value"
+            )
+
+        key, value = raw.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+
+        if not key:
+            raise typer.BadParameter(f"Empty metadata key in: '{raw}'")
+
+        result[key] = value
+
+    return result
+
+
 def coerce_value(value: str) -> Any:
     """Coerce a string value to an appropriate Python type.
 
@@ -1113,6 +1148,8 @@ async def run_workflow_async(
                 # so POST /api/stop can interrupt the running agent mid-execution
                 interrupt_event = asyncio.Event()
 
+            from conductor.engine.workflow import RunContext
+
             engine = WorkflowEngine(
                 config,
                 registry=registry,
@@ -1122,10 +1159,12 @@ async def run_workflow_async(
                 event_emitter=emitter,
                 keyboard_listener=listener,
                 web_dashboard=dashboard,
-                run_id=event_log_subscriber.run_id if event_log_subscriber else "",
-                log_file=str(event_log_subscriber.path) if event_log_subscriber else "",
-                dashboard_port=(dashboard._actual_port if dashboard is not None else None),
-                bg_mode=web_bg or os.environ.get("CONDUCTOR_WEB_BG") == "1",
+                run_context=RunContext(
+                    run_id=event_log_subscriber.run_id if event_log_subscriber else "",
+                    log_file=str(event_log_subscriber.path) if event_log_subscriber else "",
+                    dashboard_port=(dashboard.port if dashboard is not None else None),
+                    bg_mode=web_bg or os.environ.get("CONDUCTOR_WEB_BG") == "1",
+                ),
             )
 
             # Share interrupt_event with dashboard so POST /api/stop can abort agents
