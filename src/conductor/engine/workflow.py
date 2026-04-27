@@ -70,6 +70,8 @@ class RunContext:
     log_file: str = ""
     dashboard_port: int | None = None
     bg_mode: bool = False
+
+
 @dataclass
 class ParallelAgentError:
     """Error information from a failed parallel agent execution.

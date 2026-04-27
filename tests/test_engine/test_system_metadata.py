@@ -78,9 +78,7 @@ class TestBuildSystemMetadata:
 
     def test_dashboard_fields_when_port_set(self, simple_config: WorkflowConfig) -> None:
         """Dashboard port and URL present when dashboard_port is provided."""
-        engine = WorkflowEngine(
-            simple_config, run_context=RunContext(dashboard_port=8080)
-        )
+        engine = WorkflowEngine(simple_config, run_context=RunContext(dashboard_port=8080))
         meta = engine._build_system_metadata()
 
         assert meta["dashboard_port"] == 8080
