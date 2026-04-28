@@ -1455,6 +1455,13 @@ class WorkflowEngine:
                             try:
                                 parsed = json.loads(script_output.stdout)
                                 if isinstance(parsed, dict):
+                                    shadowed = set(parsed.keys()) & set(output_content.keys())
+                                    if shadowed:
+                                        logger.debug(
+                                            "Script '%s' JSON output shadows built-in fields: %s",
+                                            agent.name,
+                                            ", ".join(sorted(shadowed)),
+                                        )
                                     output_content.update(parsed)
                             except (json.JSONDecodeError, ValueError):
                                 pass
