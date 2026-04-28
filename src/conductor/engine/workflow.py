@@ -308,7 +308,11 @@ class WorkflowEngine:
         self.config = config
         self.skip_gates = skip_gates
         self.workflow_path = workflow_path
-        self.context = WorkflowContext()
+        self.context = WorkflowContext(
+            workflow_dir=str(Path(workflow_path).resolve().parent) if workflow_path else "",
+            workflow_file=str(Path(workflow_path).resolve()) if workflow_path else "",
+            workflow_name=config.workflow.name,
+        )
         self.renderer = TemplateRenderer()
         self.router = Router()
         self.limits = LimitEnforcer(
