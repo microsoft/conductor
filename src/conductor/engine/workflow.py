@@ -1719,13 +1719,20 @@ class WorkflowEngine:
     # Type-appropriate zero values for optional inputs with no declared default.
     # Using None causes templates to render "None" instead of empty string,
     # and | default() won't catch None without the boolean=true flag.
+    # Note: mutable types (array, object) return fresh copies via the method below.
     _TYPE_ZERO_VALUES: dict[str, Any] = {
         "string": "",
         "number": 0,
         "boolean": False,
-        "array": [],
-        "object": {},
     }
+
+    def _zero_value_for_type(self, type_name: str) -> Any:
+        """Return a type-appropriate zero value, with fresh copies for mutable types."""
+        if type_name == "array":
+            return []
+        if type_name == "object":
+            return {}
+        return self._TYPE_ZERO_VALUES.get(type_name)
 
     def _apply_input_defaults(self, inputs: dict[str, Any]) -> dict[str, Any]:
         """Apply default values from input schema for missing optional inputs.
@@ -1752,7 +1759,7 @@ class WorkflowEngine:
                 elif not input_def.required:
                     # Optional with no explicit default — use type-appropriate
                     # zero value so templates render cleanly (not "None").
-                    merged[name] = self._TYPE_ZERO_VALUES.get(input_def.type, None)
+                    merged[name] = self._zero_value_for_type(input_def.type)
 
         return merged
 
