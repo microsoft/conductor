@@ -431,6 +431,18 @@ function PromptMarkdown({
           ),
           // Horizontal rule
           hr: () => <hr className="border-[var(--border)] my-2" />,
+          // Tables
+          table: ({ children }) => (
+            <div className="overflow-x-auto my-2">
+              <table className="text-[11px] border-collapse w-full">{children}</table>
+            </div>
+          ),
+          th: ({ children }) => (
+            <th className="border border-[var(--border)] px-2 py-1 text-left bg-[var(--bg)] font-semibold">{children}</th>
+          ),
+          td: ({ children }) => (
+            <td className="border border-[var(--border)] px-2 py-1">{children}</td>
+          ),
         }}
       >
         {text}
