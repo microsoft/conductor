@@ -17,7 +17,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from conductor.exceptions import ProviderError
+from conductor.exceptions import ProviderError, ValidationError
 from conductor.providers.base import AgentOutput, AgentProvider, EventCallback
 
 if TYPE_CHECKING:
@@ -187,6 +187,7 @@ class CopilotProvider(AgentProvider):
         self._idle_recovery_config = idle_recovery_config or IdleRecoveryConfig()
         self._temperature = temperature
         self._default_max_agent_iterations = max_agent_iterations
+        self._max_schema_depth = 10  # Max nesting depth for recursive schema building
         self._session_ids: dict[str, str] = {}
         self._resume_session_ids: dict[str, str] = {}
         self._interrupted_session: Any = None
@@ -1076,10 +1077,17 @@ class CopilotProvider(AgentProvider):
             f"than the raw JSON object."
         )
 
-    def _build_prompt_schema(self, schema: dict[str, OutputField]) -> dict[str, Any]:
+    def _build_prompt_schema(
+        self, schema: dict[str, OutputField], depth: int = 0
+    ) -> dict[str, Any]:
         """Build a prompt-facing schema description from OutputField definitions."""
+        if depth > self._max_schema_depth:
+            raise ValidationError(
+                f"Schema nesting depth exceeds maximum of {self._max_schema_depth} levels",
+                suggestion="Simplify your output schema to reduce nesting depth",
+            )
         return {
-            field_name: self._build_prompt_field_schema(field_name, field_def)
+            field_name: self._build_prompt_field_schema(field_name, field_def, depth=depth)
             for field_name, field_def in schema.items()
         }
 
@@ -1087,6 +1095,7 @@ class CopilotProvider(AgentProvider):
         self,
         field_name: str,
         field_def: OutputField,
+        depth: int = 0,
     ) -> dict[str, Any]:
         """Build a prompt-facing schema description for a named field."""
         schema: dict[str, Any] = {
@@ -1095,16 +1104,23 @@ class CopilotProvider(AgentProvider):
         }
 
         if field_def.type == "object" and field_def.properties:
-            schema["properties"] = self._build_prompt_schema(field_def.properties)
+            schema["properties"] = self._build_prompt_schema(
+                field_def.properties, depth=depth + 1
+            )
             schema["required"] = list(field_def.properties.keys())
 
         if field_def.type == "array" and field_def.items:
-            schema["items"] = self._build_prompt_item_schema(field_def.items)
+            schema["items"] = self._build_prompt_item_schema(field_def.items, depth=depth + 1)
 
         return schema
 
-    def _build_prompt_item_schema(self, field_def: OutputField) -> dict[str, Any]:
+    def _build_prompt_item_schema(self, field_def: OutputField, depth: int = 0) -> dict[str, Any]:
         """Build a prompt-facing schema description for an array item."""
+        if depth > self._max_schema_depth:
+            raise ValidationError(
+                f"Schema nesting depth exceeds maximum of {self._max_schema_depth} levels",
+                suggestion="Simplify your output schema to reduce nesting depth",
+            )
         schema: dict[str, Any] = {
             "type": field_def.type,
         }
@@ -1113,11 +1129,13 @@ class CopilotProvider(AgentProvider):
             schema["description"] = field_def.description
 
         if field_def.type == "object" and field_def.properties:
-            schema["properties"] = self._build_prompt_schema(field_def.properties)
+            schema["properties"] = self._build_prompt_schema(
+                field_def.properties, depth=depth + 1
+            )
             schema["required"] = list(field_def.properties.keys())
 
         if field_def.type == "array" and field_def.items:
-            schema["items"] = self._build_prompt_item_schema(field_def.items)
+            schema["items"] = self._build_prompt_item_schema(field_def.items, depth=depth + 1)
 
         return schema
 
