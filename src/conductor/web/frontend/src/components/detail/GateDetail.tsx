@@ -2,7 +2,6 @@ import { useState, useEffect } from 'react';
 import ReactMarkdown from 'react-markdown';
 import { Check, Loader2, Send, FileText } from 'lucide-react';
 import { MetadataGrid } from './MetadataGrid';
-import { FileViewer } from './FileViewer';
 import type { NodeData } from '@/stores/workflow-store';
 import { useWorkflowStore } from '@/stores/workflow-store';
 
@@ -18,7 +17,6 @@ export function GateDetail({ node }: GateDetailProps) {
   const [promptForValue, setPromptForValue] = useState('');
   const [pendingPromptFor, setPendingPromptFor] = useState<string | null>(null);
   const [isSending, setIsSending] = useState(false);
-  const [viewingFile, setViewingFile] = useState<string | null>(null);
 
   const isWaiting = node.status === 'waiting';
   const isCompleted = node.status === 'completed';
@@ -310,15 +308,10 @@ export function GateDetail({ node }: GateDetailProps) {
 
           {node.prompt && (
             <div className="border-l-2 border-[var(--border)] pl-3 py-0.5">
-              <PromptMarkdown text={node.prompt} muted={true} onFileClick={setViewingFile} />
+              <PromptMarkdown text={node.prompt} muted={true} />
             </div>
           )}
         </>
-      )}
-
-      {/* File viewer modal */}
-      {viewingFile && (
-        <FileViewer filePath={viewingFile} onClose={() => setViewingFile(null)} />
       )}
     </div>
   );
@@ -339,11 +332,9 @@ function isRelativeFileLink(href: string | undefined): href is string {
 function PromptMarkdown({
   text,
   muted,
-  onFileClick,
 }: {
   text: string;
   muted: boolean;
-  onFileClick?: (path: string) => void;
 }) {
   const textColor = muted ? 'text-[var(--text-muted)]' : 'text-[var(--text)]';
 
@@ -398,18 +389,19 @@ function PromptMarkdown({
             <strong className="font-semibold">{children}</strong>
           ),
           em: ({ children }) => <em className="italic">{children}</em>,
-          // Links — intercept relative file links
+          // Links — open relative file links in VSCode
           a: ({ href, children }) => {
-            if (onFileClick && isRelativeFileLink(href)) {
+            if (isRelativeFileLink(href)) {
+              const vscodeUrl = `vscode://file/${href}`;
               return (
-                <button
-                  onClick={(e) => { e.preventDefault(); onFileClick(href); }}
-                  className="inline-flex items-center gap-0.5 text-blue-400 hover:text-blue-300 underline underline-offset-2 cursor-pointer"
-                  title={`Open ${href}`}
+                <a
+                  href={vscodeUrl}
+                  className="inline-flex items-center gap-0.5 text-blue-400 hover:text-blue-300 underline underline-offset-2"
+                  title={`Open ${href} in VSCode`}
                 >
                   <FileText className="w-3 h-3 inline flex-shrink-0" />
                   {children}
-                </button>
+                </a>
               );
             }
             return (
