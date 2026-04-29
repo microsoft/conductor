@@ -83,7 +83,7 @@ export function GateDetail({ node }: GateDetailProps) {
           {/* Prompt callout */}
           {node.prompt && (
             <div className="border-l-2 border-amber-500/50 pl-3 py-0.5">
-              <PromptMarkdown text={node.prompt} muted={false} onFileClick={setViewingFile} />
+              <PromptMarkdown text={node.prompt} muted={false} />
             </div>
           )}
 
@@ -233,7 +233,7 @@ export function GateDetail({ node }: GateDetailProps) {
           {/* Prompt (dimmed, for context) */}
           {node.prompt && (
             <div className="border-l-2 border-[var(--border)] pl-3 py-0.5">
-              <PromptMarkdown text={node.prompt} muted={true} onFileClick={setViewingFile} />
+              <PromptMarkdown text={node.prompt} muted={true} />
             </div>
           )}
 

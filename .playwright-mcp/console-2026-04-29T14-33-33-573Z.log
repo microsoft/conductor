@@ -1,0 +1,13 @@
+[     456ms] [ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://localhost:62488/api/replay/info:0
+[     606ms] ReferenceError: setViewingFile is not defined
+    at o6 (http://localhost:62488/assets/index-Cw5H3QvN.js:316:15812)
+    at kf (http://localhost:62488/assets/index-Cw5H3QvN.js:48:48583)
+    at Pf (http://localhost:62488/assets/index-Cw5H3QvN.js:48:71449)
+    at q0 (http://localhost:62488/assets/index-Cw5H3QvN.js:48:81840)
+    at my (http://localhost:62488/assets/index-Cw5H3QvN.js:48:117699)
+    at GE (http://localhost:62488/assets/index-Cw5H3QvN.js:48:116739)
+    at pd (http://localhost:62488/assets/index-Cw5H3QvN.js:48:116569)
+    at uy (http://localhost:62488/assets/index-Cw5H3QvN.js:48:113342)
+    at zy (http://localhost:62488/assets/index-Cw5H3QvN.js:48:125343)
+    at Qa (http://localhost:62488/assets/index-Cw5H3QvN.js:48:123891)
+[     605ms] [WARNING] WebSocket connection to 'ws://localhost:62488/ws' failed: WebSocket is closed before the connection is established. @ http://localhost:62488/assets/index-Cw5H3QvN.js:315
