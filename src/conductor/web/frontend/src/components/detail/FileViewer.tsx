@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import { X, FileText, Loader2, AlertTriangle } from 'lucide-react';
 
 interface FileViewerProps {
@@ -119,6 +120,7 @@ export function FileViewer({ filePath, onClose }: FileViewerProps) {
 function MarkdownContent({ content }: { content: string }) {
   return (
     <ReactMarkdown
+      remarkPlugins={[remarkGfm]}
       components={{
         h1: ({ children }) => <h1 className="text-base font-bold mb-3 mt-2 text-[var(--text)]">{children}</h1>,
         h2: ({ children }) => <h2 className="text-sm font-bold mb-2 mt-3 text-[var(--text)]">{children}</h2>,

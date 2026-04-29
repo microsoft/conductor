@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import { Check, Loader2, Send, FileText } from 'lucide-react';
 import { MetadataGrid } from './MetadataGrid';
 import { FileViewer } from './FileViewer';
@@ -350,6 +351,7 @@ function PromptMarkdown({
   return (
     <div className={`gate-markdown text-xs leading-relaxed ${textColor}`}>
       <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
         components={{
           // Headings
           h1: ({ children }) => (
