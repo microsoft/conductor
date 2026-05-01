@@ -201,8 +201,8 @@ class TestWorkflowInParallelGroup:
 class TestWorkflowInForEach:
     """Tests for workflow agents in for_each groups."""
 
-    def test_workflow_in_for_each_raises(self) -> None:
-        """Test that workflow step in for_each inline agent raises ConfigurationError."""
+    def test_workflow_in_for_each_validates(self) -> None:
+        """Test that workflow step in for_each inline agent validates successfully."""
         config = WorkflowConfig(
             workflow=WorkflowDef(
                 name="test",
@@ -227,8 +227,9 @@ class TestWorkflowInForEach:
                 ),
             ],
         )
-        with pytest.raises(ConfigurationError, match="Workflow steps cannot be used in for_each"):
-            validate_workflow_config(config)
+        # Should not raise — workflow agents are now allowed in for_each
+        warnings = validate_workflow_config(config)
+        assert isinstance(warnings, list)
 
 
 class TestWorkflowWorkflowConfig:

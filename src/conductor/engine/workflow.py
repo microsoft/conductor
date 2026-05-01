@@ -575,6 +575,14 @@ class WorkflowEngine:
                 suggestion=("Check for circular sub-workflow references or reduce nesting depth."),
             )
 
+        # Per-agent depth limit (stricter than global MAX_SUBWORKFLOW_DEPTH)
+        if agent.max_depth is not None and self._subworkflow_depth >= agent.max_depth:
+            raise ExecutionError(
+                f"Agent '{agent.name}' max_depth ({agent.max_depth}) exceeded "
+                f"at depth {self._subworkflow_depth}.",
+                suggestion="Increase max_depth or restructure to reduce nesting.",
+            )
+
         assert agent.workflow is not None  # noqa: S101
 
         # Resolve sub-workflow path relative to parent workflow file
@@ -589,15 +597,6 @@ class WorkflowEngine:
             raise ExecutionError(
                 f"Sub-workflow file not found: {sub_path} (referenced by agent '{agent.name}')",
                 suggestion="Check that the 'workflow' path is correct and the file exists.",
-            )
-
-        # Detect circular references via file path
-        current_path = Path(self.workflow_path).resolve() if self.workflow_path else None
-        if current_path is not None and sub_path == current_path:
-            raise ExecutionError(
-                f"Circular sub-workflow reference: agent '{agent.name}' "
-                f"references its own workflow file '{agent.workflow}'.",
-                suggestion="A workflow cannot reference itself as a sub-workflow.",
             )
 
         try:
@@ -633,6 +632,80 @@ class WorkflowEngine:
             )
 
         # Create child engine inheriting provider/registry but with deeper depth
+        child_engine = WorkflowEngine(
+            config=sub_config,
+            provider=self._single_provider,
+            registry=self._registry,
+            skip_gates=self.skip_gates,
+            workflow_path=sub_path,
+            interrupt_event=self._interrupt_event,
+            event_emitter=self._event_emitter,
+            keyboard_listener=self._keyboard_listener,
+            web_dashboard=self._web_dashboard,
+            _subworkflow_depth=self._subworkflow_depth + 1,
+        )
+
+        return await child_engine.run(sub_inputs)
+
+    async def _execute_subworkflow_with_inputs(
+        self,
+        agent: AgentDef,
+        sub_inputs: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Execute a sub-workflow with pre-built inputs.
+
+        Like _execute_subworkflow but accepts explicit inputs instead of
+        extracting them from context. Used by for_each groups where
+        input_mapping has already been rendered with loop variables.
+
+        Args:
+            agent: Workflow agent definition with ``workflow`` path.
+            sub_inputs: Pre-built input dict for the sub-workflow.
+
+        Returns:
+            The sub-workflow's final output dict.
+        """
+        from conductor.config.loader import load_config
+
+        if self._subworkflow_depth >= MAX_SUBWORKFLOW_DEPTH:
+            raise ExecutionError(
+                f"Sub-workflow depth limit exceeded ({MAX_SUBWORKFLOW_DEPTH}). "
+                f"Agent '{agent.name}' cannot invoke sub-workflow '{agent.workflow}'.",
+                suggestion="Check for circular sub-workflow references or reduce nesting depth.",
+            )
+
+        # Per-agent depth limit (stricter than global MAX_SUBWORKFLOW_DEPTH)
+        if agent.max_depth is not None and self._subworkflow_depth >= agent.max_depth:
+            raise ExecutionError(
+                f"Agent '{agent.name}' max_depth ({agent.max_depth}) exceeded "
+                f"at depth {self._subworkflow_depth}.",
+                suggestion="Increase max_depth or restructure to reduce nesting.",
+            )
+
+        assert agent.workflow is not None  # noqa: S101
+
+        if self.workflow_path is not None:
+            base_dir = Path(self.workflow_path).resolve().parent
+        else:
+            base_dir = Path.cwd()
+
+        sub_path = (base_dir / agent.workflow).resolve()
+
+        if not sub_path.exists():
+            raise ExecutionError(
+                f"Sub-workflow file not found: {sub_path} (referenced by agent '{agent.name}')",
+                suggestion="Check that the 'workflow' path is correct and the file exists.",
+            )
+
+        try:
+            sub_config = load_config(sub_path)
+        except Exception as exc:
+            raise ExecutionError(
+                f"Failed to load sub-workflow '{sub_path}' "
+                f"(referenced by agent '{agent.name}'): {exc}",
+                suggestion="Check the sub-workflow YAML for syntax or validation errors.",
+            ) from exc
+
         child_engine = WorkflowEngine(
             config=sub_config,
             provider=self._single_provider,
@@ -2674,7 +2747,52 @@ class WorkflowEngine:
                     key if for_each_group.key_by else None,
                 )
 
-                # Execute agent with injected context (get executor for multi-provider)
+                # Execute agent — sub-workflow or regular
+                if for_each_group.agent.type == "workflow":
+                    # Build sub-workflow inputs from input_mapping with loop vars
+                    if for_each_group.agent.input_mapping:
+                        renderer = TemplateRenderer()
+                        sub_inputs: dict[str, Any] = {}
+                        for k, tmpl in for_each_group.agent.input_mapping.items():
+                            rendered = renderer.render(tmpl, agent_context)
+                            try:
+                                sub_inputs[k] = json.loads(rendered)
+                            except (json.JSONDecodeError, ValueError):
+                                sub_inputs[k] = rendered
+                    else:
+                        wf_ctx = agent_context.get("workflow", {})
+                        sub_inputs = (
+                            dict(wf_ctx.get("input", {})) if isinstance(wf_ctx, dict) else {}
+                        )
+
+                    # Execute sub-workflow
+                    self._emit(
+                        "subworkflow_started",
+                        {
+                            "agent_name": for_each_group.name,
+                            "item_key": key,
+                            "workflow": for_each_group.agent.workflow,
+                        },
+                    )
+                    output_content = await self._execute_subworkflow_with_inputs(
+                        for_each_group.agent, sub_inputs
+                    )
+                    _item_elapsed = _time.time() - _item_start
+
+                    self._emit(
+                        "for_each_item_completed",
+                        {
+                            "group_name": for_each_group.name,
+                            "item_key": key,
+                            "elapsed": _item_elapsed,
+                            "tokens": 0,
+                            "cost_usd": 0.0,
+                            "output": output_content,
+                        },
+                    )
+                    return (key, output_content)
+
+                # Regular agent execution
                 executor = await self._get_executor_for_agent(for_each_group.agent)
 
                 # Item-scoped event callback that tags all streaming events with item_key
