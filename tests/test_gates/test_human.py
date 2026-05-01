@@ -287,12 +287,15 @@ class TestHumanGateHandlerInteractive:
         ):
             await handler.handle_gate(human_gate_agent, context)
 
-            # Verify Panel was called with rendered content
+            # Verify Panel was called with rendered content wrapped in RichMarkdown
             mock_panel.assert_called()
             panel_args = mock_panel.call_args
-            # First positional arg should be the rendered prompt
+            # First positional arg should be a RichMarkdown instance
             rendered_prompt = panel_args[0][0]
-            assert "Generated content here" in rendered_prompt
+            from rich.markdown import Markdown as RichMarkdown
+
+            assert isinstance(rendered_prompt, RichMarkdown)
+            assert "Generated content here" in rendered_prompt.markup
 
 
 class TestHumanGateHandlerAutoSelect:
@@ -544,3 +547,59 @@ class TestMaxIterationsHandlerInteractive:
             panel_args = mock_panel.call_args
             panel_content = panel_args[0][0]
             assert "loop" in panel_content.lower()
+
+
+class TestGatePromptMarkdownRendering:
+    """Tests that gate prompts are rendered as Rich Markdown in the terminal."""
+
+    @pytest.mark.asyncio
+    async def test_prompt_wrapped_in_rich_markdown(
+        self,
+        mock_console: MagicMock,
+        sample_options: list[GateOption],
+    ) -> None:
+        """Verify Panel receives a RichMarkdown object, not a bare string."""
+        from rich.markdown import Markdown as RichMarkdown
+
+        agent = AgentDef(
+            name="md_gate",
+            type="human_gate",
+            prompt="## Review\n\n- [plan](./plan.md)\n- **bold** text",
+            options=sample_options,
+        )
+        handler = HumanGateHandler(console=mock_console, skip_gates=False)
+
+        with (
+            patch("conductor.gates.human.Prompt.ask", return_value="1"),
+            patch("conductor.gates.human.Panel") as mock_panel,
+        ):
+            await handler.handle_gate(agent, {})
+
+            mock_panel.assert_called()
+            rendered = mock_panel.call_args[0][0]
+            assert isinstance(rendered, RichMarkdown)
+            # Verify the original markdown text is preserved in the markup
+            assert "## Review" in rendered.markup
+            assert "[plan](./plan.md)" in rendered.markup
+            assert "**bold**" in rendered.markup
+
+    @pytest.mark.asyncio
+    async def test_skip_gates_auto_selects_without_panel(
+        self,
+        mock_console: MagicMock,
+        sample_options: list[GateOption],
+    ) -> None:
+        """Verify that skip_gates mode auto-selects without displaying the Panel."""
+        agent = AgentDef(
+            name="skip_md_gate",
+            type="human_gate",
+            prompt="# Auto-review\nPlain text here.",
+            options=sample_options,
+        )
+        handler = HumanGateHandler(console=mock_console, skip_gates=True)
+
+        result = await handler.handle_gate(agent, {})
+
+        # skip_gates auto-selects the first option
+        assert result.selected_option == sample_options[0]
+        assert result.route == "next_agent"

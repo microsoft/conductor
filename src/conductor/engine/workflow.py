@@ -33,6 +33,7 @@ from conductor.exceptions import (
     TimeoutError as ConductorTimeoutError,
 )
 from conductor.executor.agent import AgentExecutor
+from conductor.executor.linkify import linkify_markdown
 from conductor.executor.script import ScriptExecutor, ScriptOutput
 from conductor.executor.template import TemplateRenderer
 from conductor.gates.human import (
@@ -830,7 +831,8 @@ class WorkflowEngine:
         """
         # If no web dashboard at all, use CLI only.
         if self._web_dashboard is None:
-            return await self.gate_handler.handle_gate(agent, agent_context)
+            gate_base = Path(self.workflow_path).resolve().parent if self.workflow_path else None
+            return await self.gate_handler.handle_gate(agent, agent_context, base_dir=gate_base)
 
         # Race CLI vs web input. We start the web task unconditionally (not only
         # when a client is currently connected), because the human often opens
@@ -838,8 +840,9 @@ class WorkflowEngine:
         # If we bail early when ``has_connections()`` is False, a later click
         # in the dashboard pushes a message to ``_gate_response_queue`` that
         # nobody is awaiting, and the workflow hangs forever.
+        gate_base = Path(self.workflow_path).resolve().parent if self.workflow_path else None
         cli_task = asyncio.create_task(
-            self.gate_handler.handle_gate(agent, agent_context),
+            self.gate_handler.handle_gate(agent, agent_context, base_dir=gate_base),
             name="gate_cli",
         )
         web_task = asyncio.create_task(
@@ -1425,13 +1428,24 @@ class WorkflowEngine:
                                 for o in (agent.options or [])
                             ]
 
+                            # Render prompt and auto-linkify paths/URLs for markdown display
+                            rendered_prompt = self.renderer.render(agent.prompt, agent_context)
+                            gate_base_dir = (
+                                Path(self.workflow_path).resolve().parent
+                                if self.workflow_path
+                                else None
+                            )
+                            rendered_prompt = linkify_markdown(
+                                rendered_prompt, base_dir=gate_base_dir
+                            )
+
                             self._emit(
                                 "gate_presented",
                                 {
                                     "agent_name": agent.name,
                                     "options": [o.value for o in (agent.options or [])],
                                     "option_details": gate_options_data,
-                                    "prompt": self.renderer.render(agent.prompt, agent_context),
+                                    "prompt": rendered_prompt,
                                 },
                             )
 

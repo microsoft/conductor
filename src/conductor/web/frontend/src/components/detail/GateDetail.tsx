@@ -1,7 +1,9 @@
 import { useState, useEffect } from 'react';
 import ReactMarkdown from 'react-markdown';
-import { Check, Loader2, Send } from 'lucide-react';
+import remarkGfm from 'remark-gfm';
+import { Check, Loader2, Send, FileText } from 'lucide-react';
 import { MetadataGrid } from './MetadataGrid';
+import { FileViewer } from './FileViewer';
 import type { NodeData } from '@/stores/workflow-store';
 import { useWorkflowStore } from '@/stores/workflow-store';
 
@@ -17,6 +19,7 @@ export function GateDetail({ node }: GateDetailProps) {
   const [promptForValue, setPromptForValue] = useState('');
   const [pendingPromptFor, setPendingPromptFor] = useState<string | null>(null);
   const [isSending, setIsSending] = useState(false);
+  const [viewingFile, setViewingFile] = useState<string | null>(null);
 
   const isWaiting = node.status === 'waiting';
   const isCompleted = node.status === 'completed';
@@ -83,7 +86,7 @@ export function GateDetail({ node }: GateDetailProps) {
           {/* Prompt callout */}
           {node.prompt && (
             <div className="border-l-2 border-amber-500/50 pl-3 py-0.5">
-              <PromptMarkdown text={node.prompt} muted={false} />
+              <PromptMarkdown text={node.prompt} muted={false} onFileClick={setViewingFile} />
             </div>
           )}
 
@@ -233,7 +236,7 @@ export function GateDetail({ node }: GateDetailProps) {
           {/* Prompt (dimmed, for context) */}
           {node.prompt && (
             <div className="border-l-2 border-[var(--border)] pl-3 py-0.5">
-              <PromptMarkdown text={node.prompt} muted={true} />
+              <PromptMarkdown text={node.prompt} muted={true} onFileClick={setViewingFile} />
             </div>
           )}
 
@@ -308,22 +311,47 @@ export function GateDetail({ node }: GateDetailProps) {
 
           {node.prompt && (
             <div className="border-l-2 border-[var(--border)] pl-3 py-0.5">
-              <PromptMarkdown text={node.prompt} muted={true} />
+              <PromptMarkdown text={node.prompt} muted={true} onFileClick={setViewingFile} />
             </div>
           )}
         </>
+      )}
+
+      {/* File viewer modal */}
+      {viewingFile && (
+        <FileViewer filePath={viewingFile} onClose={() => setViewingFile(null)} />
       )}
     </div>
   );
 }
 
+/** Returns true if the href looks like a relative file path (not a URL, anchor, or scheme). */
+function isRelativeFileLink(href: string | undefined): href is string {
+  if (!href) return false;
+  // Reject URLs with schemes, protocol-relative, anchor-only, absolute paths
+  if (/^[a-z][a-z0-9+.-]*:/i.test(href)) return false;  // http:, mailto:, javascript:, file:, etc.
+  if (href.startsWith('//')) return false;                 // protocol-relative
+  if (href.startsWith('#')) return false;                  // anchor-only
+  if (href.startsWith('/') || href.startsWith('\\')) return false; // absolute
+  return true;
+}
+
 /** Renders prompt text as markdown with dashboard-consistent styling. */
-function PromptMarkdown({ text, muted }: { text: string; muted: boolean }) {
+function PromptMarkdown({
+  text,
+  muted,
+  onFileClick,
+}: {
+  text: string;
+  muted: boolean;
+  onFileClick?: (path: string) => void;
+}) {
   const textColor = muted ? 'text-[var(--text-muted)]' : 'text-[var(--text)]';
 
   return (
     <div className={`gate-markdown text-xs leading-relaxed ${textColor}`}>
       <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
         components={{
           // Headings
           h1: ({ children }) => (
@@ -372,17 +400,31 @@ function PromptMarkdown({ text, muted }: { text: string; muted: boolean }) {
             <strong className="font-semibold">{children}</strong>
           ),
           em: ({ children }) => <em className="italic">{children}</em>,
-          // Links
-          a: ({ href, children }) => (
-            <a
-              href={href}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-blue-400 hover:text-blue-300 underline underline-offset-2"
-            >
-              {children}
-            </a>
-          ),
+          // Links — intercept relative file links
+          a: ({ href, children }) => {
+            if (onFileClick && isRelativeFileLink(href)) {
+              return (
+                <button
+                  onClick={(e) => { e.preventDefault(); onFileClick(href); }}
+                  className="inline-flex items-center gap-0.5 text-blue-400 hover:text-blue-300 underline underline-offset-2 cursor-pointer"
+                  title={`Open ${href}`}
+                >
+                  <FileText className="w-3 h-3 inline flex-shrink-0" />
+                  {children}
+                </button>
+              );
+            }
+            return (
+              <a
+                href={href}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-blue-400 hover:text-blue-300 underline underline-offset-2"
+              >
+                {children}
+              </a>
+            );
+          },
           // Blockquote
           blockquote: ({ children }) => (
             <blockquote className="border-l-2 border-[var(--border)] pl-2.5 my-1.5 opacity-80">
@@ -391,6 +433,18 @@ function PromptMarkdown({ text, muted }: { text: string; muted: boolean }) {
           ),
           // Horizontal rule
           hr: () => <hr className="border-[var(--border)] my-2" />,
+          // Tables
+          table: ({ children }) => (
+            <div className="overflow-x-auto my-2">
+              <table className="text-[11px] border-collapse w-full">{children}</table>
+            </div>
+          ),
+          th: ({ children }) => (
+            <th className="border border-[var(--border)] px-2 py-1 text-left bg-[var(--bg)] font-semibold">{children}</th>
+          ),
+          td: ({ children }) => (
+            <td className="border border-[var(--border)] px-2 py-1">{children}</td>
+          ),
         }}
       >
         {text}
