@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- Pass `streaming=True` to the Copilot SDK's `create_session` to prevent
+  silent truncation of large tool-call arguments. In non-streaming mode
+  the model's per-turn output budget is exhausted mid-JSON for large
+  arguments (e.g., `create` with multi-KB `file_text`), the CLI executes
+  the partial tool call, and the agent loops on the broken call until
+  the wall-clock session limit fires ([#129]).
+
 ## [0.1.10] - 2026-04-30
 
 ### Added
@@ -27,4 +37,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [#99]: https://github.com/microsoft/conductor/pull/99
 [#101]: https://github.com/microsoft/conductor/pull/101
 [#102]: https://github.com/microsoft/conductor/pull/102
+[#129]: https://github.com/microsoft/conductor/pull/129
 [0.1.10]: https://github.com/microsoft/conductor/compare/v0.1.9...v0.1.10
+[Unreleased]: https://github.com/microsoft/conductor/compare/v0.1.10...HEAD
