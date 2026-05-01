@@ -403,6 +403,69 @@ class ClaudeProvider(AgentProvider):
             self._client = None
             logger.debug("Claude provider closed")
 
+    async def execute_dialog_turn(
+        self,
+        system_prompt: str,
+        user_message: str,
+        history: list[dict[str, str]] | None = None,
+        model: str | None = None,
+    ) -> str:
+        """Execute a single dialog turn using the Claude messages API.
+
+        Creates a lightweight message call with the conversation context
+        and returns the agent's response text.
+
+        Args:
+            system_prompt: System prompt providing dialog context.
+            user_message: The latest user message.
+            history: Optional prior conversation history.
+            model: Optional model override. Falls back to provider default.
+
+        Returns:
+            The agent's response text.
+
+        Raises:
+            ProviderError: If the dialog turn fails.
+        """
+        if self._client is None:
+            raise ProviderError(
+                "Claude client not initialized",
+                suggestion="Call validate_connection() first",
+            )
+
+        # Build messages list from history + current message
+        messages: list[dict[str, str]] = []
+        for msg in history or []:
+            messages.append(
+                {
+                    "role": msg["role"],
+                    "content": msg["content"],
+                }
+            )
+        messages.append({"role": "user", "content": user_message})
+
+        try:
+            response = await self._client.messages.create(
+                model=model or self._default_model,
+                max_tokens=4096,
+                system=system_prompt,
+                messages=messages,
+            )
+
+            # Extract text from response
+            text_parts = []
+            for block in response.content:
+                if hasattr(block, "text"):
+                    text_parts.append(block.text)
+
+            return "\n".join(text_parts) if text_parts else ""
+
+        except Exception as exc:
+            raise ProviderError(
+                f"Dialog turn failed: {exc}",
+                is_retryable=False,
+            ) from exc
+
     async def execute(
         self,
         agent: AgentDef,

@@ -36,7 +36,10 @@ export type EventType =
   | 'workflow_failed'
   | 'checkpoint_saved'
   | 'agent_paused'
-  | 'agent_resumed';
+  | 'agent_resumed'
+  | 'dialog_started'
+  | 'dialog_message'
+  | 'dialog_completed';
 
 // --- Workflow lifecycle ---
 
@@ -255,4 +258,28 @@ export interface AgentPausedData {
 
 export interface AgentResumedData {
   agent_name: string;
+}
+
+// --- Dialog events ---
+
+export interface DialogStartedData {
+  dialog_id: string;
+  agent_name: string;
+  opening_question: string;
+}
+
+export interface DialogMessageData {
+  dialog_id: string;
+  agent_name: string;
+  role: 'user' | 'agent';
+  content: string;
+}
+
+export interface DialogCompletedData {
+  dialog_id: string;
+  agent_name: string;
+  turn_count: number;
+  user_dismissed?: boolean;
+  user_declined?: boolean;
+  agent_proposed_continue?: boolean;
 }

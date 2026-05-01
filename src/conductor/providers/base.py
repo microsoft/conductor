@@ -124,6 +124,35 @@ class AgentProvider(ABC):
         """
         ...
 
+    async def execute_dialog_turn(
+        self,
+        system_prompt: str,
+        user_message: str,
+        history: list[dict[str, str]] | None = None,
+        model: str | None = None,
+    ) -> str:
+        """Execute a single dialog turn for agent-user conversation.
+
+        Used by the dialog evaluator and dialog handler for lightweight
+        conversational exchanges. Creates a fresh, short-lived session
+        for each call — not tied to the agent's main execution session.
+
+        Args:
+            system_prompt: System prompt providing dialog context.
+            user_message: The latest user message.
+            history: Optional prior conversation history as a list of
+                ``{"role": "user"|"assistant", "content": "..."}`` dicts.
+            model: Optional model override. If not provided, uses the
+                provider's default model.
+
+        Returns:
+            The agent's response text.
+
+        Raises:
+            ProviderError: If the dialog turn fails.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support dialog turns")
+
     @abstractmethod
     async def validate_connection(self) -> bool:
         """Verify the provider can connect to its backend.

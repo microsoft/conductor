@@ -29,6 +29,9 @@ import type {
   ForEachCompletedData,
   AgentPausedData,
   AgentResumedData,
+  DialogStartedData,
+  DialogMessageData,
+  DialogCompletedData,
 } from '@/types/events';
 
 export interface ActivityEntry {
@@ -111,6 +114,11 @@ export interface NodeData {
   startedAt?: number;
   // Iteration history (snapshots of completed previous iterations)
   iterationHistory?: IterationSnapshot[];
+  // Dialog-specific
+  dialog_id?: string;
+  dialog_messages?: Array<{ role: 'user' | 'agent'; content: string }>;
+  dialog_active?: boolean;
+  dialog_awaiting_response?: boolean;
 }
 
 export interface GroupProgress {
@@ -236,6 +244,12 @@ interface WorkflowState {
   _wsSend: ((data: object) => void) | null;
   setWsSend: (fn: ((data: object) => void) | null) => void;
   sendGateResponse: (agentName: string, selectedValue: string, additionalInput?: Record<string, string>) => void;
+  // Dialog state
+  activeDialog: { agentName: string; dialogId: string } | null;
+  dialogEngaged: boolean;
+  engageDialog: () => void;
+  sendDialogMessage: (agentName: string, dialogId: string, message: string) => void;
+  sendDialogDecline: (agentName: string, dialogId: string) => void;
 }
 
 function ensureNode(nodes: Record<string, NodeData>, name: string, type: NodeType = 'agent'): NodeData {
@@ -317,6 +331,44 @@ export const useWorkflowStore = create<WorkflowState>((set) => ({
         agent_name: agentName,
         selected_value: selectedValue,
         additional_input: additionalInput || {},
+      });
+    }
+  },
+
+  activeDialog: null,
+  dialogEngaged: false,
+
+  engageDialog: () => {
+    set({ dialogEngaged: true });
+  },
+
+  sendDialogMessage: (agentName, dialogId, message) => {
+    const send = useWorkflowStore.getState()._wsSend;
+    if (send) {
+      send({
+        type: 'dialog_message',
+        agent_name: agentName,
+        dialog_id: dialogId,
+        content: message,
+      });
+      // Optimistically mark awaiting response
+      set((state) => {
+        const nodes = { ...state.nodes };
+        if (nodes[agentName]) {
+          nodes[agentName] = { ...nodes[agentName]!, dialog_awaiting_response: true };
+        }
+        return { nodes };
+      });
+    }
+  },
+
+  sendDialogDecline: (agentName, dialogId) => {
+    const send = useWorkflowStore.getState()._wsSend;
+    if (send) {
+      send({
+        type: 'dialog_decline',
+        agent_name: agentName,
+        dialog_id: dialogId,
       });
     }
   },
@@ -995,6 +1047,39 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     replaceNode(state.nodes, data.agent_name);
     state.isPaused = false;
   },
+
+  dialog_started: (state, _data) => {
+    const data = _data as unknown as DialogStartedData;
+    const nd = ensureNode(state.nodes, data.agent_name);
+    nd.dialog_id = data.dialog_id;
+    nd.dialog_messages = [];
+    nd.dialog_active = true;
+    nd.dialog_awaiting_response = false;
+    state.activeDialog = { agentName: data.agent_name, dialogId: data.dialog_id };
+    state.dialogEngaged = false;
+    replaceNode(state.nodes, data.agent_name);
+  },
+
+  dialog_message: (state, _data) => {
+    const data = _data as unknown as DialogMessageData;
+    const nd = ensureNode(state.nodes, data.agent_name);
+    if (!nd.dialog_messages) nd.dialog_messages = [];
+    nd.dialog_messages.push({ role: data.role, content: data.content });
+    if (data.role === 'agent') {
+      nd.dialog_awaiting_response = false;
+    }
+    replaceNode(state.nodes, data.agent_name);
+  },
+
+  dialog_completed: (state, _data) => {
+    const data = _data as unknown as DialogCompletedData;
+    const nd = ensureNode(state.nodes, data.agent_name);
+    nd.dialog_active = false;
+    nd.dialog_awaiting_response = false;
+    state.activeDialog = null;
+    state.dialogEngaged = false;
+    replaceNode(state.nodes, data.agent_name);
+  },
 };
 
 // --- Build log entries from events ---
@@ -1073,6 +1158,12 @@ function buildLogEntry(event: WorkflowEvent): LogEntry | null {
 
     case 'agent_resumed':
       return { timestamp: ts, level: 'info', source: String(d.agent_name), message: 'Agent resumed — re-executing' };
+
+    case 'dialog_started':
+      return { timestamp: ts, level: 'warning', source: String(d.agent_name), message: 'Dialog started — waiting for user…' };
+
+    case 'dialog_completed':
+      return { timestamp: ts, level: 'success', source: String(d.agent_name), message: `Dialog completed (${d.turn_count || 0} messages)` };
 
     // Skip high-frequency streaming events from the log
     default:

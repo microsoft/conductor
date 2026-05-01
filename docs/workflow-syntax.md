@@ -196,6 +196,42 @@ prompt: |
 
 **Restrictions** — workflow steps cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, `command`, or `options`. Workflow steps also cannot be used inside `parallel` groups or `for_each` groups.
 
+### Dialog Mode
+
+Dialog mode allows agents to conditionally pause after execution and enter a free-form conversation with the user. An LLM evaluator examines the agent's output against user-defined criteria and decides whether to initiate a dialog.
+
+```yaml
+agents:
+  - name: researcher
+    prompt: "Research the given topic thoroughly"
+    dialog:
+      trigger_prompt: |
+        Enter dialog if the agent expresses uncertainty about
+        the user's intent, encounters ambiguous requirements,
+        or needs clarification before proceeding.
+    routes:
+      - to: writer
+```
+
+When triggered, the user is presented with a choice:
+1. **Discuss** — engage in a multi-turn conversation with the agent
+2. **Do your best and continue** — skip the dialog and let the agent proceed
+
+After the conversation, the agent re-executes with the dialog transcript as additional context, producing a refined output.
+
+**Configuration:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `dialog.trigger_prompt` | string | Yes | Criteria for the LLM evaluator to decide when dialog is needed |
+
+**Behavior notes:**
+- Dialog is supported on regular `agent` type only (not `human_gate`, `script`, or `workflow`)
+- In web dashboard mode, the dialog temporarily replaces the graph area with a chat interface
+- When `--skip-gates` is set (e.g., CI/automation), dialogs are automatically skipped
+- The evaluator prompt should describe *when* to trigger dialog, not *what* to ask — the evaluator generates the opening question from the agent's output context
+- After dialog, the agent sees the full conversation transcript and produces updated output
+
 ## Parallel Groups
 
 Parallel groups execute multiple agents concurrently for improved performance.
