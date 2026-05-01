@@ -365,6 +365,17 @@ class WorkflowEngine:
         # Web dashboard for bidirectional gate input
         self._web_dashboard = web_dashboard
 
+        # Dialog mode support
+        from conductor.engine.dialog_evaluator import DialogEvaluator
+        from conductor.gates.dialog import DialogHandler
+
+        self._dialog_evaluator = DialogEvaluator()
+        self._dialog_handler = DialogHandler(
+            skip_dialogs=skip_gates,
+            emitter=event_emitter,
+            web_dashboard=web_dashboard,
+        )
+
         # Checkpoint tracking
         self._current_agent_name: str | None = None
         self._last_checkpoint_path: Path | None = None
@@ -1143,6 +1154,95 @@ class WorkflowEngine:
         new_guidance_section = self.context.get_guidance_prompt_section()
         return await executor.execute(agent, agent_context, guidance_section=new_guidance_section)
 
+    async def _handle_dialog(
+        self,
+        agent: AgentDef,
+        output: AgentOutput,
+        agent_context: dict[str, Any],
+        executor: AgentExecutor,
+    ) -> AgentOutput:
+        """Handle dialog mode evaluation and conversation for an agent.
+
+        Runs the dialog evaluator against the agent's output. If dialog is
+        triggered, presents the user with a choice to engage or skip, then
+        manages the conversation. After dialog, re-executes the agent with
+        the dialog transcript as additional guidance so the agent can refine
+        its output.
+
+        Args:
+            agent: The agent with dialog config.
+            output: The agent's current output.
+            agent_context: The context used for agent execution.
+            executor: The executor for the agent.
+
+        Returns:
+            The original output if dialog was not triggered or declined,
+            or an updated output after re-execution with dialog context.
+        """
+        provider = executor.provider
+
+        # Suspend keyboard listener for interactive dialog
+        if self._keyboard_listener is not None:
+            await self._keyboard_listener.suspend()
+
+        try:
+            evaluation = await self._dialog_evaluator.evaluate(agent, output.content, provider)
+
+            if not evaluation.trigger:
+                logger.debug("Dialog not triggered for '%s': %s", agent.name, evaluation.reason)
+                return output
+
+            logger.info("Dialog triggered for '%s': %s", agent.name, evaluation.reason)
+
+            dialog_result = await self._dialog_handler.handle_dialog(
+                agent=agent,
+                agent_output=output.content,
+                opening_question=evaluation.question,
+                provider=provider,
+                base_dir=self.workflow_path.parent if self.workflow_path else None,
+            )
+
+            # If user declined or no meaningful dialog occurred, keep original output
+            if dialog_result.user_declined or not dialog_result.messages:
+                return output
+
+            # Build dialog transcript for re-execution guidance
+            transcript_parts = []
+            for msg in dialog_result.messages:
+                label = "User" if msg.role == "user" else "Agent"
+                transcript_parts.append(f"{label}: {msg.content}")
+            transcript = "\n".join(transcript_parts)
+
+            dialog_guidance = (
+                f"\n\n--- DIALOG WITH USER ---\n"
+                f"The following conversation occurred after your initial output. "
+                f"Use this context to refine your response:\n\n"
+                f"{transcript}\n"
+                f"--- END DIALOG ---\n\n"
+                f"Now produce your final output incorporating the dialog above."
+            )
+
+            # Re-execute with dialog context
+            guidance_section = self.context.get_guidance_prompt_section() or ""
+            guidance_section += dialog_guidance
+
+            new_output = await executor.execute(
+                agent, agent_context, guidance_section=guidance_section
+            )
+            return new_output
+
+        except Exception:
+            logger.warning(
+                "Dialog handling failed for '%s', using original output",
+                agent.name,
+                exc_info=True,
+            )
+            return output
+        finally:
+            # Resume keyboard listener
+            if self._keyboard_listener is not None:
+                await self._keyboard_listener.resume()
+
     async def _execute_loop(self, current_agent_name: str) -> dict[str, Any]:
         """Core execution loop shared by :meth:`run` and :meth:`resume`.
 
@@ -1703,6 +1803,16 @@ class WorkflowEngine:
                                 guidance_section,
                                 executor,
                                 _agent_start,
+                            )
+                            _agent_elapsed = _time.time() - _agent_start
+
+                        # Dialog mode: evaluate whether agent should enter dialog
+                        if agent.dialog and not output.partial:
+                            output = await self._handle_dialog(
+                                agent,
+                                output,
+                                agent_context,
+                                executor,
                             )
                             _agent_elapsed = _time.time() - _agent_start
 

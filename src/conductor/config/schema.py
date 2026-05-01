@@ -387,6 +387,33 @@ class RetryPolicy(BaseModel):
     """
 
 
+class DialogConfig(BaseModel):
+    """Configuration for agent dialog mode.
+
+    When present on an agent, enables the agent to conditionally pause
+    after execution and enter a free-form conversation with the user.
+
+    An evaluator LLM call examines the agent's output against the
+    user-defined trigger_prompt criteria and decides whether to pause
+    and start a conversation.
+
+    Example YAML::
+
+        dialog:
+          trigger_prompt: |
+            Enter dialog if the agent expresses uncertainty about
+            the user's intent or needs clarification on requirements.
+    """
+
+    trigger_prompt: str
+    """User-defined criteria for when to enter dialog mode.
+
+    This prompt is wrapped in a system message and evaluated against
+    the agent's output. The evaluator decides whether to pause and
+    start a conversation with the user.
+    """
+
+
 class AgentDef(BaseModel):
     """Definition for a single agent in the workflow."""
 
@@ -531,6 +558,24 @@ class AgentDef(BaseModel):
             - timeout
     """
 
+    dialog: DialogConfig | None = None
+    """Optional dialog mode configuration.
+
+    When set, enables this agent to conditionally pause after execution
+    and enter a free-form conversation with the user. A lightweight
+    evaluator LLM call uses the trigger_prompt to decide whether dialog
+    should be triggered based on the agent's output.
+
+    Only applies to provider-backed agents (type='agent' or None).
+
+    Example YAML::
+
+        dialog:
+          trigger_prompt: |
+            Enter dialog if the agent is uncertain about the user's
+            intent or needs clarification on ambiguous requirements.
+    """
+
     @field_validator("timeout")
     @classmethod
     def validate_timeout(cls, v: int | None) -> int | None:
@@ -549,6 +594,8 @@ class AgentDef(BaseModel):
                 raise ValueError("human_gate agents require 'prompt'")
             if self.input_mapping is not None:
                 raise ValueError("human_gate agents cannot have 'input_mapping'")
+            if self.dialog is not None:
+                raise ValueError("human_gate agents cannot have 'dialog'")
         elif self.type == "script":
             if not self.command:
                 raise ValueError("script agents require 'command'")
@@ -577,6 +624,8 @@ class AgentDef(BaseModel):
                 raise ValueError("script agents cannot have 'retry'")
             if self.input_mapping is not None:
                 raise ValueError("script agents cannot have 'input_mapping'")
+            if self.dialog is not None:
+                raise ValueError("script agents cannot have 'dialog'")
         elif self.type == "workflow":
             if not self.workflow:
                 raise ValueError("workflow agents require 'workflow' path")
@@ -600,6 +649,8 @@ class AgentDef(BaseModel):
                 raise ValueError("workflow agents cannot have 'max_agent_iterations'")
             if self.retry is not None:
                 raise ValueError("workflow agents cannot have 'retry'")
+            if self.dialog is not None:
+                raise ValueError("workflow agents cannot have 'dialog'")
         else:
             # Regular agent or human_gate — input_mapping is not valid
             if self.input_mapping is not None:

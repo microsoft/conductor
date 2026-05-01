@@ -1,0 +1,77 @@
+# Dialog Mode Example
+#
+# This example demonstrates the dialog mode feature, where an agent
+# can conditionally pause and have a conversation with the user.
+#
+# The researcher agent has a dialog trigger that fires when the agent
+# encounters ambiguity or needs clarification. When triggered, the
+# user can choose to discuss or let the agent proceed on its own.
+#
+# Usage:
+#   conductor run examples/dialog-mode.yaml --input topic="quantum computing"
+#   conductor run examples/dialog-mode.yaml --web --input topic="quantum computing"
+
+workflow:
+  name: dialog-mode
+  description: Research workflow with agent-initiated dialog
+  version: "1.0.0"
+  entry_point: researcher
+
+  runtime:
+    provider: copilot
+
+  input:
+    topic:
+      type: string
+      required: true
+      description: The topic to research
+
+agents:
+  - name: researcher
+    description: Researches the topic and may ask for user clarification
+    prompt: |
+      Research the following topic and provide a comprehensive summary:
+
+      Topic: {{ workflow.input.topic }}
+
+      If the topic is broad, pick a specific angle and explain your choice.
+      If anything is ambiguous, note what assumptions you're making.
+    output:
+      summary:
+        type: string
+        description: Research summary
+      key_findings:
+        type: string
+        description: Bullet-pointed key findings
+      assumptions:
+        type: string
+        description: Any assumptions made during research
+    dialog:
+      trigger_prompt: |
+        Trigger dialog if the agent:
+        - Expresses significant uncertainty about the scope or angle
+        - Makes assumptions that could lead the research in the wrong direction
+        - Encounters multiple valid interpretations of the topic
+        Do NOT trigger for minor uncertainties that the agent can resolve on its own.
+    routes:
+      - to: writer
+
+  - name: writer
+    description: Writes a polished article from the research
+    prompt: |
+      Write a clear, engaging article based on this research:
+
+      Summary: {{ researcher.output.summary }}
+      Key Findings: {{ researcher.output.key_findings }}
+
+      Keep the tone informative but accessible.
+    output:
+      article:
+        type: string
+        description: The final article
+    routes:
+      - to: $end
+
+output:
+  article: "{{ writer.output.article }}"
+  research_assumptions: "{{ researcher.output.assumptions }}"

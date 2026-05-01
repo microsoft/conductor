@@ -1709,6 +1709,97 @@ class CopilotProvider(AgentProvider):
                 is_retryable=False,
             ) from e
 
+    async def execute_dialog_turn(
+        self,
+        system_prompt: str,
+        user_message: str,
+        history: list[dict[str, str]] | None = None,
+        model: str | None = None,
+    ) -> str:
+        """Execute a single dialog turn using a lightweight Copilot session.
+
+        Creates a fresh session for the dialog, sends the conversation
+        context, and returns the agent's response. The session is destroyed
+        after the turn completes.
+
+        Args:
+            system_prompt: System prompt providing dialog context.
+            user_message: The latest user message.
+            history: Optional prior conversation history.
+            model: Optional model override. Falls back to provider default.
+
+        Returns:
+            The agent's response text.
+
+        Raises:
+            ProviderError: If the dialog turn fails.
+        """
+        await self._ensure_client_started()
+
+        # Build the full prompt from history + current message
+        # System prompt is passed via create_session's system_message parameter
+        # to replace the SDK's default identity instructions.
+        parts = []
+        for msg in history or []:
+            role_label = "User" if msg["role"] == "user" else "Assistant"
+            parts.append(f"{role_label}: {msg['content']}")
+        parts.append(f"User: {user_message}")
+        full_prompt = "\n\n".join(parts)
+
+        session = None
+        try:
+            session = await self._client.create_session(
+                model=model or self._default_model,
+                on_permission_request=self._default_permission_handler,
+                system_message={"mode": "replace", "content": system_prompt},
+            )
+
+            response_content = ""
+            done = asyncio.Event()
+            error_message: str | None = None
+
+            def on_event(event: Any) -> None:
+                nonlocal response_content, error_message
+                event_type = event.type.value if hasattr(event.type, "value") else str(event.type)
+                if event_type == "assistant.message":
+                    response_content = event.data.content
+                elif event_type == "session.idle":
+                    done.set()
+                elif event_type in ("error", "session.error"):
+                    error_message = getattr(event.data, "message", str(event.data))
+                    done.set()
+
+            session.on(on_event)
+            await session.send(full_prompt)
+
+            try:
+                await asyncio.wait_for(done.wait(), timeout=120.0)
+            except TimeoutError as exc:
+                raise ProviderError(
+                    "Dialog turn timed out after 120s",
+                    is_retryable=False,
+                ) from exc
+
+            if error_message:
+                raise ProviderError(
+                    f"Dialog turn error: {error_message}",
+                    is_retryable=False,
+                )
+
+            return response_content
+
+        except ProviderError:
+            raise
+        except Exception as exc:
+            raise ProviderError(
+                f"Dialog turn failed: {exc}",
+                is_retryable=False,
+            ) from exc
+        finally:
+            if session is not None:
+                with contextlib.suppress(Exception):
+                    await session.destroy()
+
     async def close(self) -> None:
         """Close Copilot SDK client.
 
