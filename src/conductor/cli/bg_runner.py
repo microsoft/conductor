@@ -62,6 +62,7 @@ def launch_background(
     log_file: Path | None = None,
     no_interactive: bool = True,
     web_port: int = 0,
+    metadata: dict[str, str] | None = None,
 ) -> str:
     """Fork a detached child process running the workflow with a web dashboard.
 
@@ -77,6 +78,7 @@ def launch_background(
         log_file: Optional log file path.
         no_interactive: Whether to disable interactive mode (always True for bg).
         web_port: Desired port (0 = auto-select).
+        metadata: Optional CLI metadata key=value pairs.
 
     Returns:
         The dashboard URL (e.g. ``http://127.0.0.1:8080``).
@@ -106,6 +108,11 @@ def launch_background(
     # Forward inputs
     for key, value in inputs.items():
         cmd.extend(["--input", f"{key}={_serialize_value(value)}"])
+
+    # Forward metadata
+    if metadata:
+        for key, value in metadata.items():
+            cmd.extend(["--metadata", f"{key}={_serialize_value(value)}"])
 
     if provider_override:
         cmd.extend(["--provider", provider_override])

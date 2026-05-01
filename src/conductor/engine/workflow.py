@@ -59,6 +59,20 @@ if TYPE_CHECKING:
 
 
 @dataclass
+class RunContext:
+    """Informational metadata about the current CLI run.
+
+    These fields are not used for workflow orchestration — they are passed
+    through to event data and checkpoints for diagnostics and linking.
+    """
+
+    run_id: str = ""
+    log_file: str = ""
+    dashboard_port: int | None = None
+    bg_mode: bool = False
+
+
+@dataclass
 class ParallelAgentError:
     """Error information from a failed parallel agent execution.
 
@@ -270,6 +284,7 @@ class WorkflowEngine:
         keyboard_listener: KeyboardListener | None = None,
         web_dashboard: WebDashboard | None = None,
         _subworkflow_depth: int = 0,
+        run_context: RunContext | None = None,
     ) -> None:
         """Initialize the WorkflowEngine.
 
@@ -308,6 +323,9 @@ class WorkflowEngine:
         self.config = config
         self.skip_gates = skip_gates
         self.workflow_path = workflow_path
+        self._run_context = run_context or RunContext()
+        self._run_id = self._run_context.run_id
+        self._log_file = self._run_context.log_file
         self.context = WorkflowContext()
         self.renderer = TemplateRenderer()
         self.router = Router()
@@ -353,6 +371,11 @@ class WorkflowEngine:
 
         # Sub-workflow depth tracking
         self._subworkflow_depth = _subworkflow_depth
+
+        # System metadata fields (set by CLI, used in workflow_started event)
+        self._dashboard_port = self._run_context.dashboard_port
+        self._bg_mode = self._run_context.bg_mode
+        self._system_metadata: dict[str, Any] = {}
 
     def _build_pricing_overrides(self) -> dict[str, ModelPricing] | None:
         """Build pricing overrides from workflow cost configuration.
@@ -410,6 +433,48 @@ class WorkflowEngine:
             return __version__
         except Exception:
             return "unknown"
+
+    def _build_system_metadata(self) -> dict[str, Any]:
+        """Build system metadata dict for the workflow_started event.
+
+        Captures runtime diagnostics that would be lost if the process crashes:
+        PID, platform, Python version, working directory, etc.
+
+        Returns:
+            Dict with system metadata fields.
+        """
+        import os
+        import platform as _platform
+        import sys
+        from datetime import UTC, datetime
+
+        try:
+            cwd = os.getcwd()
+        except OSError:
+            cwd = "<unavailable>"
+
+        system: dict[str, Any] = {
+            "pid": os.getpid(),
+            "platform": sys.platform,
+            "python_version": _platform.python_version(),
+            "conductor_version": self._conductor_version(),
+            "cwd": cwd,
+            "started_at": datetime.now(UTC).isoformat(),
+            "run_id": self._run_id,
+            "log_file": self._log_file,
+            "bg_mode": self._bg_mode,
+        }
+
+        # Conditional fields — only when dashboard is active
+        if self._dashboard_port is not None:
+            system["dashboard_port"] = self._dashboard_port
+            system["dashboard_url"] = f"http://127.0.0.1:{self._dashboard_port}"
+
+        # Parent PID is useful in --web-bg to trace back to the forking CLI process
+        if self._bg_mode:
+            system["parent_pid"] = os.getppid()
+
+        return system
 
     def _make_event_callback(self, agent_name: str) -> Any:
         """Create an event callback for an agent that forwards to the emitter.
@@ -694,6 +759,7 @@ class WorkflowEngine:
             error=error,
             inputs=self.context.workflow_inputs,
             copilot_session_ids=copilot_session_ids,
+            system_metadata=self._system_metadata,
         )
         self._last_checkpoint_path = checkpoint_path
         if checkpoint_path is not None:
@@ -1078,6 +1144,7 @@ class WorkflowEngine:
         try:
             async with self.limits.timeout_context():
                 # Emit workflow_started before the execution loop
+                self._system_metadata = self._build_system_metadata()
                 self._emit(
                     "workflow_started",
                     {
@@ -1134,6 +1201,10 @@ class WorkflowEngine:
                             for r in f.routes
                         ],
                         **self._yaml_source_field(),
+                        "metadata": self.config.workflow.metadata,
+                        "system": self._system_metadata,
+                        "run_id": self._run_id,
+                        "log_file": self._log_file,
                     },
                 )
 

@@ -738,6 +738,13 @@ class WorkflowDef(BaseModel):
     hooks: HooksConfig | None = None
     """Lifecycle event hooks."""
 
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    """Arbitrary key-value metadata for external tooling (dashboards, trackers, etc.).
+
+    Included verbatim in the ``workflow_started`` event so downstream
+    consumers can use it for enrichment without parsing the YAML source.
+    """
+
 
 class WorkflowConfig(BaseModel):
     """Complete workflow configuration file."""
