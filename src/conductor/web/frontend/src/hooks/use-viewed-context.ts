@@ -85,6 +85,7 @@ export function useViewedGraphData() {
         groupProgress: rootProgress,
         entryPoint: rootEntry,
         subworkflowContexts: subContexts,
+        parentAgent: null as string | null,
       };
     }
     const ctx = resolveCtx(subContexts, viewPath);
@@ -98,6 +99,7 @@ export function useViewedGraphData() {
         groupProgress: rootProgress,
         entryPoint: rootEntry,
         subworkflowContexts: subContexts,
+        parentAgent: null as string | null,
       };
     }
     return {
@@ -109,6 +111,7 @@ export function useViewedGraphData() {
       groupProgress: ctx.groupProgress,
       entryPoint: ctx.entryPoint,
       subworkflowContexts: ctx.children,
+      parentAgent: ctx.parentAgent,
     };
   }, [viewPath, rootAgents, rootRoutes, rootParallel, rootForEach, rootNodes, rootProgress, rootEntry, subContexts]);
 }
