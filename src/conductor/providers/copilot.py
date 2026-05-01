@@ -520,11 +520,24 @@ class CopilotProvider(AgentProvider):
             )
 
         try:
-            # Build session kwargs for the SDK
+            # Build session kwargs for the SDK.
+            #
+            # ``streaming=True`` is required: in non-streaming mode the model
+            # must emit its entire turn (text + tool_use blocks + arguments)
+            # under a single per-turn output budget. For agents that issue
+            # large tool-call arguments (e.g., ``create`` with multi-KB
+            # ``file_text``), that budget is exhausted mid-JSON and the CLI
+            # silently executes the partial tool call (e.g. ``{"path": "..."}``
+            # with ``file_text`` missing). The model sees the tool succeed
+            # with no content, retries the same broken call, and loops until
+            # the wall-clock session limit fires. The interactive ``copilot``
+            # CLI defaults to streaming, which is why the same model + tool
+            # combination works there but not via the SDK without this flag.
             session_kwargs: dict[str, Any] = {
                 "model": model,
                 "on_permission_request": self._default_permission_handler,
                 "working_directory": os.getcwd(),
+                "streaming": True,
             }
 
             # Note: Copilot SDK >=0.2.0 does not support temperature as a
