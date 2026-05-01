@@ -9,6 +9,7 @@ export interface GraphNodeData {
   status: string;
   groupName?: string;
   progress?: GroupProgress;
+  parentAgent?: string;
   [key: string]: unknown;
 }
 
@@ -27,6 +28,7 @@ export function buildGraphElements(
   nodes: Record<string, NodeData>,
   groupProgress: Record<string, GroupProgress>,
   entryPoint: string | null,
+  parentAgent?: string | null,
 ): { nodes: Node<GraphNodeData>[]; edges: Edge[] } {
   const flowNodes: Node<GraphNodeData>[] = [];
   const flowEdges: Edge[] = [];
@@ -140,14 +142,16 @@ export function buildGraphElements(
 
   if (hasEnd) {
     const nd = nodes['$end'];
+    const isSubworkflow = !!parentAgent;
     flowNodes.push({
       id: '$end',
-      type: 'endNode',
+      type: isSubworkflow ? 'egressNode' : 'endNode',
       position: { x: 0, y: 0 },
       data: {
         label: '$end',
-        type: 'end',
+        type: isSubworkflow ? 'egress' : 'end',
         status: nd?.status || 'pending',
+        ...(isSubworkflow ? { parentAgent } : {}),
       },
     });
   }
@@ -155,14 +159,16 @@ export function buildGraphElements(
   // Always add $start node if we have an entry point
   if (entryPoint) {
     const nd = nodes['$start'];
+    const isSubworkflow = !!parentAgent;
     flowNodes.push({
       id: '$start',
-      type: 'startNode',
+      type: isSubworkflow ? 'ingressNode' : 'startNode',
       position: { x: 0, y: 0 },
       data: {
         label: '$start',
-        type: 'start',
+        type: isSubworkflow ? 'ingress' : 'start',
         status: nd?.status || 'pending',
+        ...(isSubworkflow ? { parentAgent } : {}),
       },
     });
 

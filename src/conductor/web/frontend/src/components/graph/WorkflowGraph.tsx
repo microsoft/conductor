@@ -26,6 +26,8 @@ import { GroupNode } from './GroupNode';
 import { WorkflowNode } from './WorkflowNode';
 import { EndNode } from './EndNode';
 import { StartNode } from './StartNode';
+import { IngressNode } from './IngressNode';
+import { EgressNode } from './EgressNode';
 import { AnimatedEdge } from './AnimatedEdge';
 import { WorkflowErrorBanner, WorkflowSuccessBanner } from '@/components/layout/ErrorBanner';
 import { NODE_STATUS_HEX } from '@/lib/constants';
@@ -40,6 +42,8 @@ const nodeTypes: NodeTypes = {
   workflowNode: WorkflowNode,
   endNode: EndNode,
   startNode: StartNode,
+  ingressNode: IngressNode,
+  egressNode: EgressNode,
 };
 
 const edgeTypes: EdgeTypes = {
@@ -83,7 +87,7 @@ export function WorkflowGraph() {
   const navigateIntoSubworkflow = useWorkflowStore((s) => s.navigateIntoSubworkflow);
 
   // Get the data for the currently viewed context
-  const { agents, routes, parallelGroups, forEachGroups, nodes: storeNodes, groupProgress, entryPoint, subworkflowContexts } = viewCtx;
+  const { agents, routes, parallelGroups, forEachGroups, nodes: storeNodes, groupProgress, entryPoint, subworkflowContexts, parentAgent } = viewCtx;
 
   const [flowNodes, setFlowNodes, onNodesChange] = useNodesState<Node<GraphNodeData>>([]);
   const [flowEdges, setFlowEdges, onEdgesChange] = useEdgesState<Edge>([]);
@@ -115,11 +119,11 @@ export function WorkflowGraph() {
     graphBuilt.current = true;
 
     const { nodes, edges } = buildGraphElements(
-      agents, routes, parallelGroups, forEachGroups, storeNodes, groupProgress, entryPoint
+      agents, routes, parallelGroups, forEachGroups, storeNodes, groupProgress, entryPoint, parentAgent
     );
     setFlowNodes(nodes);
     setFlowEdges(edges);
-  }, [agents, routes, parallelGroups, forEachGroups, storeNodes, groupProgress, entryPoint, setFlowNodes, setFlowEdges, viewPathKey]);
+  }, [agents, routes, parallelGroups, forEachGroups, storeNodes, groupProgress, entryPoint, setFlowNodes, setFlowEdges, viewPathKey, parentAgent]);
 
   // Update node data when store nodes change (status, progress, etc.)
   useEffect(() => {
