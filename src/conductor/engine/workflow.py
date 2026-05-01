@@ -831,9 +831,7 @@ class WorkflowEngine:
         """
         # If no web dashboard at all, use CLI only.
         if self._web_dashboard is None:
-            gate_base = (
-                Path(self.workflow_path).resolve().parent if self.workflow_path else None
-            )
+            gate_base = Path(self.workflow_path).resolve().parent if self.workflow_path else None
             return await self.gate_handler.handle_gate(agent, agent_context, base_dir=gate_base)
 
         # Race CLI vs web input. We start the web task unconditionally (not only
