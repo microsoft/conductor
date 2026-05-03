@@ -17,11 +17,11 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from conductor.exceptions import ProviderError
+from conductor.exceptions import ProviderError, ValidationError
 from conductor.providers.base import AgentOutput, AgentProvider, EventCallback
 
 if TYPE_CHECKING:
-    from conductor.config.schema import AgentDef
+    from conductor.config.schema import AgentDef, OutputField
 
 logger = logging.getLogger(__name__)
 
@@ -187,6 +187,7 @@ class CopilotProvider(AgentProvider):
         self._idle_recovery_config = idle_recovery_config or IdleRecoveryConfig()
         self._temperature = temperature
         self._default_max_agent_iterations = max_agent_iterations
+        self._max_schema_depth = 10  # Max nesting depth for recursive schema building
         self._session_ids: dict[str, str] = {}
         self._resume_session_ids: dict[str, str] = {}
         self._interrupted_session: Any = None
@@ -505,13 +506,7 @@ class CopilotProvider(AgentProvider):
         # Build schema description for output schema (used in prompt and recovery)
         schema_for_prompt: dict[str, Any] | None = None
         if agent.output:
-            schema_for_prompt = {
-                name: {
-                    "type": field.type,
-                    "description": field.description or f"The {name} field",
-                }
-                for name, field in agent.output.items()
-            }
+            schema_for_prompt = self._build_prompt_schema(agent.output)
             schema_desc = json.dumps(schema_for_prompt, indent=2)
             full_prompt += (
                 f"\n\n**IMPORTANT: You MUST respond with a JSON object matching this schema:**\n"
@@ -1081,6 +1076,68 @@ class CopilotProvider(AgentProvider):
             f"Do NOT include markdown code blocks, explanatory text, or anything other "
             f"than the raw JSON object."
         )
+
+    def _build_prompt_schema(
+        self, schema: dict[str, OutputField], depth: int = 0
+    ) -> dict[str, Any]:
+        """Build a prompt-facing schema description from OutputField definitions."""
+        if depth > self._max_schema_depth:
+            raise ValidationError(
+                f"Schema nesting depth exceeds maximum of {self._max_schema_depth} levels",
+                suggestion="Simplify your output schema to reduce nesting depth",
+            )
+        return {
+            field_name: self._build_prompt_field_schema(field_name, field_def, depth=depth)
+            for field_name, field_def in schema.items()
+        }
+
+    def _build_prompt_field_schema(
+        self,
+        field_name: str,
+        field_def: OutputField,
+        depth: int = 0,
+    ) -> dict[str, Any]:
+        """Build a prompt-facing schema description for a named field."""
+        schema: dict[str, Any] = {
+            "type": field_def.type,
+            "description": field_def.description or f"The {field_name} field",
+        }
+
+        if field_def.type == "object" and field_def.properties:
+            schema["properties"] = self._build_prompt_schema(
+                field_def.properties, depth=depth + 1
+            )
+            schema["required"] = list(field_def.properties.keys())
+
+        if field_def.type == "array" and field_def.items:
+            schema["items"] = self._build_prompt_item_schema(field_def.items, depth=depth + 1)
+
+        return schema
+
+    def _build_prompt_item_schema(self, field_def: OutputField, depth: int = 0) -> dict[str, Any]:
+        """Build a prompt-facing schema description for an array item."""
+        if depth > self._max_schema_depth:
+            raise ValidationError(
+                f"Schema nesting depth exceeds maximum of {self._max_schema_depth} levels",
+                suggestion="Simplify your output schema to reduce nesting depth",
+            )
+        schema: dict[str, Any] = {
+            "type": field_def.type,
+        }
+
+        if field_def.description:
+            schema["description"] = field_def.description
+
+        if field_def.type == "object" and field_def.properties:
+            schema["properties"] = self._build_prompt_schema(
+                field_def.properties, depth=depth + 1
+            )
+            schema["required"] = list(field_def.properties.keys())
+
+        if field_def.type == "array" and field_def.items:
+            schema["items"] = self._build_prompt_item_schema(field_def.items, depth=depth + 1)
+
+        return schema
 
     def _log_event_verbose(self, event_type: str, event: Any, full_mode: bool) -> None:
         """Log SDK events in verbose mode for progress visibility.
