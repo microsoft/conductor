@@ -407,7 +407,7 @@ Original plan: {{ planner.output.plan }}""",
 
         # Verify output
         assert result["summary"] == "All tasks completed successfully"
-        assert result["success"] == "True"  # Boolean rendered as string
+        assert result["success"] is True
 
     def test_routing_from_parallel_group_based_on_results(self) -> None:
         """Test routing decisions based on parallel group outputs."""
