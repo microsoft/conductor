@@ -152,6 +152,13 @@ export interface SubworkflowContext {
   parentAgent: string;
   /** Iteration number (for repeated subworkflow calls) */
   iteration: number;
+  /**
+   * Stable slot identifier for this context within its parent's children.
+   * For sequential sub-workflow agents this is the agent name.
+   * For for_each iterations it is `f"{group.name}[{key}]"`.
+   * Used to disambiguate concurrent for_each iterations of the same group.
+   */
+  slotKey: string;
   /** The .yaml file reference */
   workflowFile: string;
   /** Resolved workflow name (from inner workflow_started) */
@@ -285,7 +292,7 @@ interface WorkflowState {
   // Breadcrumb navigation actions
   navigateToContext: (path: number[]) => void;
   navigateUp: () => void;
-  navigateIntoSubworkflow: (agentName: string, iteration?: number) => void;
+  navigateIntoSubworkflow: (slotKey: string) => void;
 
   // Computed: get the currently viewed context's data
   getViewedContext: () => {
@@ -350,10 +357,11 @@ function addForEachItemActivity(nodes: Record<string, NodeData>, groupName: stri
 // Subworkflow context helpers
 // ---------------------------------------------------------------------------
 
-function createSubworkflowContext(parentAgent: string, iteration: number, workflowFile: string): SubworkflowContext {
+function createSubworkflowContext(parentAgent: string, iteration: number, workflowFile: string, slotKey?: string): SubworkflowContext {
   return {
     parentAgent,
     iteration,
+    slotKey: slotKey ?? parentAgent,
     workflowFile,
     workflowName: '',
     status: 'pending',
@@ -387,11 +395,48 @@ function resolveContext(contexts: SubworkflowContext[], path: number[]): Subwork
   return ctx ?? null;
 }
 
-/** Find a child context by parent agent name and iteration within a context's children. */
-function findChildContext(contexts: SubworkflowContext[], agentName: string, iteration?: number): { ctx: SubworkflowContext; index: number } | null {
+/**
+ * Walk the subworkflow context tree by slot keys, returning the index path
+ * (numeric, for use with resolveContext) and the resolved context.
+ *
+ * Returns null if any segment cannot be matched.
+ */
+function resolveSlotPath(
+  contexts: SubworkflowContext[],
+  slotPath: string[],
+): { indexPath: number[]; ctx: SubworkflowContext | null } | null {
+  if (slotPath.length === 0) {
+    return { indexPath: [], ctx: null };
+  }
+  const indexPath: number[] = [];
+  let current = contexts;
+  let ctx: SubworkflowContext | null = null;
+  for (const slot of slotPath) {
+    // Match newest matching slot (handles re-runs / iteration loops).
+    let foundIdx = -1;
+    for (let i = current.length - 1; i >= 0; i--) {
+      if (current[i]!.slotKey === slot) {
+        foundIdx = i;
+        break;
+      }
+    }
+    if (foundIdx === -1) return null;
+    indexPath.push(foundIdx);
+    ctx = current[foundIdx]!;
+    current = ctx.children;
+  }
+  return { indexPath, ctx };
+}
+
+/** Find a child context by slot key within a context's children. */
+function findChildContext(
+  contexts: SubworkflowContext[],
+  slotKey: string,
+): { ctx: SubworkflowContext; index: number } | null {
+  // Iterate newest-first so that re-runs of the same slot pick the latest.
   for (let i = contexts.length - 1; i >= 0; i--) {
     const c = contexts[i]!;
-    if (c.parentAgent === agentName && (iteration == null || c.iteration === iteration)) {
+    if (c.slotKey === slotKey) {
       return { ctx: c, index: i };
     }
   }
@@ -645,7 +690,7 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
     }));
   },
 
-  navigateIntoSubworkflow: (agentName: string, iteration?: number) => {
+  navigateIntoSubworkflow: (slotKey: string) => {
     const state = get();
     // Determine which context list to search in
     const viewPath = state.viewContextPath;
@@ -657,7 +702,7 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
       if (!parent) return;
       contexts = parent.children;
     }
-    const found = findChildContext(contexts, agentName, iteration);
+    const found = findChildContext(contexts, slotKey);
     if (found) {
       set({ viewContextPath: [...viewPath, found.index], selectedNode: null });
     }
@@ -717,7 +762,10 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
       const idx = state.viewContextPath[i]!;
       const ctx = contexts[idx];
       if (!ctx) break;
-      crumbs.push({ label: ctx.workflowName || ctx.workflowFile || ctx.parentAgent, path: state.viewContextPath.slice(0, i + 1) });
+      // Prefer the slot key (e.g. "plan_children_group[2]") so concurrent
+      // for_each iterations are distinguishable; fall back to workflow name.
+      const label = ctx.slotKey || ctx.workflowName || ctx.workflowFile || ctx.parentAgent;
+      crumbs.push({ label, path: state.viewContextPath.slice(0, i + 1) });
       contexts = ctx.children;
     }
     return crumbs;
@@ -728,8 +776,19 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
 
 type MutableState = WorkflowState;
 
-/** Get the nodes/groupProgress/routes/highlightedEdges for the context that should receive the event. */
-function activeTarget(state: MutableState): {
+/** Get the nodes/groupProgress/routes/highlightedEdges for the context that should receive the event.
+ *
+ * When the event payload carries an explicit `subworkflow_path` (auto-stamped
+ * by sub-workflow engines), that path is used to resolve the owning context —
+ * essential for routing per-iteration agent events under concurrent
+ * for-each-of-workflow execution, where a single shared `activeContextPath`
+ * cannot represent the multiple in-flight sibling contexts. Falls back to
+ * `activeContextPath` for legacy events and root-engine events.
+ */
+function activeTarget(
+  state: MutableState,
+  data?: Record<string, unknown>,
+): {
   nodes: Record<string, NodeData>;
   groupProgress: Record<string, GroupProgress>;
   routes: RouteEdge[];
@@ -738,19 +797,24 @@ function activeTarget(state: MutableState): {
   addTokens: (tokens: number) => void;
   incrCompleted: () => void;
 } {
-  if (state.activeContextPath.length > 0) {
-    const ctx = resolveContext(state.subworkflowContexts, state.activeContextPath);
-    if (ctx) {
-      return {
-        nodes: ctx.nodes,
-        groupProgress: ctx.groupProgress,
-        routes: ctx.routes,
-        highlightedEdges: ctx.highlightedEdges,
-        addCost: (cost: number) => { ctx.totalCost += cost; state.totalCost += cost; },
-        addTokens: (tokens: number) => { ctx.totalTokens += tokens; state.totalTokens += tokens; },
-        incrCompleted: () => { ctx.agentsCompleted++; state.agentsCompleted++; },
-      };
-    }
+  let ctx: SubworkflowContext | null = null;
+  const subPath = data?.subworkflow_path;
+  if (Array.isArray(subPath) && subPath.length > 0) {
+    ctx = resolveSlotPath(state.subworkflowContexts, subPath as string[])?.ctx ?? null;
+  } else if (state.activeContextPath.length > 0) {
+    ctx = resolveContext(state.subworkflowContexts, state.activeContextPath);
+  }
+  if (ctx) {
+    const ctxRef = ctx;
+    return {
+      nodes: ctxRef.nodes,
+      groupProgress: ctxRef.groupProgress,
+      routes: ctxRef.routes,
+      highlightedEdges: ctxRef.highlightedEdges,
+      addCost: (cost: number) => { ctxRef.totalCost += cost; state.totalCost += cost; },
+      addTokens: (tokens: number) => { ctxRef.totalTokens += tokens; state.totalTokens += tokens; },
+      incrCompleted: () => { ctxRef.agentsCompleted++; state.agentsCompleted++; },
+    };
   }
   return {
     nodes: state.nodes,
@@ -854,7 +918,7 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
 
   agent_started: (state, _data, timestamp) => {
     const data = _data as unknown as AgentStartedData;
-    const t = activeTarget(state);
+    const t = activeTarget(state, _data);
     const nd = ensureNode(t.nodes, data.agent_name);
 
     // Snapshot previous iteration before clearing
@@ -892,7 +956,7 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
 
   agent_completed: (state, _data) => {
     const data = _data as unknown as AgentCompletedData;
-    const t = activeTarget(state);
+    const t = activeTarget(state, _data);
     const nd = ensureNode(t.nodes, data.agent_name);
     nd.status = 'completed';
     t.incrCompleted();
@@ -916,7 +980,7 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
 
   agent_failed: (state, _data) => {
     const data = _data as unknown as AgentFailedData;
-    const t = activeTarget(state);
+    const t = activeTarget(state, _data);
     const nd = ensureNode(t.nodes, data.agent_name);
     nd.status = 'failed';
     nd.elapsed = data.elapsed;
@@ -933,7 +997,7 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
   agent_prompt_rendered: (state, _data) => {
     const data = _data as unknown as AgentPromptRenderedData;
     const itemKey = (_data as Record<string, unknown>).item_key as string | undefined;
-    const t = activeTarget(state);
+    const t = activeTarget(state, _data);
     const nd = ensureNode(t.nodes, data.agent_name);
     nd.prompt = data.rendered_prompt;
     nd.context_keys = data.context_keys;
@@ -954,7 +1018,7 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
   agent_reasoning: (state, _data) => {
     const data = _data as unknown as AgentReasoningData;
     const itemKey = (_data as Record<string, unknown>).item_key as string | undefined;
-    const t = activeTarget(state);
+    const t = activeTarget(state, _data);
     const entry: ActivityEntry = { type: 'reasoning', icon: '💭', label: 'thinking', text: data.content };
     addActivity(t.nodes, data.agent_name, entry);
     if (itemKey) addForEachItemActivity(t.nodes, data.agent_name, itemKey, entry);
@@ -964,7 +1028,7 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
   agent_tool_start: (state, _data) => {
     const data = _data as unknown as AgentToolStartData;
     const itemKey = (_data as Record<string, unknown>).item_key as string | undefined;
-    const t = activeTarget(state);
+    const t = activeTarget(state, _data);
     const entry: ActivityEntry = { type: 'tool-start', icon: '🔧', label: 'tool', text: data.tool_name, detail: data.arguments || null };
     addActivity(t.nodes, data.agent_name, entry);
     if (itemKey) addForEachItemActivity(t.nodes, data.agent_name, itemKey, entry);
@@ -974,7 +1038,7 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
   agent_tool_complete: (state, _data) => {
     const data = _data as unknown as AgentToolCompleteData;
     const itemKey = (_data as Record<string, unknown>).item_key as string | undefined;
-    const t = activeTarget(state);
+    const t = activeTarget(state, _data);
     const entry: ActivityEntry = { type: 'tool-complete', icon: '✓', label: 'result', text: data.tool_name || 'done', detail: data.result || null };
     addActivity(t.nodes, data.agent_name, entry);
     if (itemKey) addForEachItemActivity(t.nodes, data.agent_name, itemKey, entry);
@@ -984,7 +1048,7 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
   agent_turn_start: (state, _data) => {
     const data = _data as unknown as AgentTurnStartData;
     const itemKey = (_data as Record<string, unknown>).item_key as string | undefined;
-    const t = activeTarget(state);
+    const t = activeTarget(state, _data);
     const entry: ActivityEntry = { type: 'turn', icon: '⏳', label: 'turn', text: `Turn ${data.turn ?? '?'}` };
     addActivity(t.nodes, data.agent_name, entry);
     if (itemKey) addForEachItemActivity(t.nodes, data.agent_name, itemKey, entry);
@@ -993,7 +1057,7 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
 
   agent_message: (state, _data) => {
     const data = _data as unknown as AgentMessageData;
-    const t = activeTarget(state);
+    const t = activeTarget(state, _data);
     const nd = ensureNode(t.nodes, data.agent_name);
     nd.latest_message = data.content;
     replaceNode(t.nodes, data.agent_name);
@@ -1001,7 +1065,7 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
 
   script_started: (state, _data, timestamp) => {
     const data = _data as { agent_name: string };
-    const t = activeTarget(state);
+    const t = activeTarget(state, _data);
     const nd = ensureNode(t.nodes, data.agent_name);
     nd.status = 'running';
     nd.startedAt = timestamp ?? Date.now() / 1000;
@@ -1010,7 +1074,7 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
 
   script_completed: (state, _data) => {
     const data = _data as unknown as ScriptCompletedData;
-    const t = activeTarget(state);
+    const t = activeTarget(state, _data);
     const nd = ensureNode(t.nodes, data.agent_name);
     nd.status = 'completed';
     t.incrCompleted();
@@ -1023,7 +1087,7 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
 
   script_failed: (state, _data) => {
     const data = _data as unknown as ScriptFailedData;
-    const t = activeTarget(state);
+    const t = activeTarget(state, _data);
     const nd = ensureNode(t.nodes, data.agent_name);
     nd.status = 'failed';
     nd.elapsed = data.elapsed;
@@ -1034,7 +1098,7 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
 
   gate_presented: (state, _data) => {
     const data = _data as unknown as GatePresentedData;
-    const t = activeTarget(state);
+    const t = activeTarget(state, _data);
     const nd = ensureNode(t.nodes, data.agent_name);
     nd.status = 'waiting';
     nd.options = data.options;
@@ -1045,7 +1109,7 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
 
   gate_resolved: (state, _data) => {
     const data = _data as unknown as GateResolvedData;
-    const t = activeTarget(state);
+    const t = activeTarget(state, _data);
     const nd = ensureNode(t.nodes, data.agent_name);
     nd.status = 'completed';
     t.incrCompleted();
@@ -1057,13 +1121,13 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
 
   route_taken: (state, _data) => {
     const data = _data as unknown as RouteTakenData;
-    const t = activeTarget(state);
+    const t = activeTarget(state, _data);
     t.highlightedEdges.push({ from: data.from_agent, to: data.to_agent, state: 'taken' });
   },
 
   parallel_started: (state, _data) => {
     const data = _data as unknown as ParallelStartedData;
-    const t = activeTarget(state);
+    const t = activeTarget(state, _data);
     const nd = ensureNode(t.nodes, data.group_name, 'parallel_group');
     nd.status = 'running';
     if (t.groupProgress[data.group_name]) {
@@ -1076,7 +1140,7 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
 
   parallel_agent_completed: (state, _data) => {
     const data = _data as unknown as ParallelAgentCompletedData;
-    const t = activeTarget(state);
+    const t = activeTarget(state, _data);
     if (t.groupProgress[data.group_name]) {
       t.groupProgress[data.group_name]!.completed++;
     }
@@ -1099,7 +1163,7 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
 
   parallel_agent_failed: (state, _data) => {
     const data = _data as unknown as ParallelAgentFailedData;
-    const t = activeTarget(state);
+    const t = activeTarget(state, _data);
     if (t.groupProgress[data.group_name]) {
       t.groupProgress[data.group_name]!.failed++;
     }
@@ -1114,7 +1178,7 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
 
   parallel_completed: (state, _data) => {
     const data = _data as unknown as ParallelCompletedData;
-    const t = activeTarget(state);
+    const t = activeTarget(state, _data);
     t.incrCompleted();
     const nd = ensureNode(t.nodes, data.group_name, 'parallel_group');
     nd.status = data.failure_count === 0 ? 'completed' : 'failed';
@@ -1123,7 +1187,7 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
 
   for_each_started: (state, _data) => {
     const data = _data as unknown as ForEachStartedData;
-    const t = activeTarget(state);
+    const t = activeTarget(state, _data);
     const nd = ensureNode(t.nodes, data.group_name, 'for_each_group');
     nd.status = 'running';
     nd.for_each_items = [];
@@ -1137,7 +1201,7 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
 
   for_each_item_started: (state, _data) => {
     const data = _data as unknown as ForEachItemStartedData;
-    const t = activeTarget(state);
+    const t = activeTarget(state, _data);
     const nd = ensureNode(t.nodes, data.group_name, 'for_each_group');
     if (!nd.for_each_items) nd.for_each_items = [];
     nd.for_each_items.push({
@@ -1151,7 +1215,7 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
 
   for_each_item_completed: (state, _data) => {
     const data = _data as unknown as ForEachItemCompletedData;
-    const t = activeTarget(state);
+    const t = activeTarget(state, _data);
     if (t.groupProgress[data.group_name]) {
       t.groupProgress[data.group_name]!.completed++;
     }
@@ -1172,7 +1236,7 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
 
   for_each_item_failed: (state, _data) => {
     const data = _data as unknown as ForEachItemFailedData;
-    const t = activeTarget(state);
+    const t = activeTarget(state, _data);
     if (t.groupProgress[data.group_name]) {
       t.groupProgress[data.group_name]!.failed++;
     }
@@ -1192,7 +1256,7 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
 
   for_each_completed: (state, _data) => {
     const data = _data as unknown as ForEachCompletedData;
-    const t = activeTarget(state);
+    const t = activeTarget(state, _data);
     t.incrCompleted();
     const nd = ensureNode(t.nodes, data.group_name, 'for_each_group');
     nd.status = (data.failure_count ?? 0) === 0 ? 'completed' : 'failed';
@@ -1220,24 +1284,29 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
       }
       state.highlightedEdges = [];
     } else {
-      // Child workflow completed — update its context
-      const ctx = resolveContext(state.subworkflowContexts, state.activeContextPath);
+      // Child workflow completed — locate via subworkflow_path (engine-supplied
+      // when running concurrently) so we don't depend on activeContextPath,
+      // which under concurrency may have been advanced past us by another
+      // sibling start.
+      const data = _data as { output?: unknown; subworkflow_path?: string[] };
+      const ctx = data.subworkflow_path
+        ? resolveSlotPath(state.subworkflowContexts, data.subworkflow_path)?.ctx
+        : resolveContext(state.subworkflowContexts, state.activeContextPath);
       if (ctx) {
-        const data = _data as { output?: unknown };
         ctx.status = 'completed';
         ctx.workflowOutput = data.output ?? null;
         if (ctx.nodes['$end']) ctx.nodes['$end']!.status = 'completed';
         if (ctx.nodes['$start']) ctx.nodes['$start']!.status = 'completed';
         ctx.highlightedEdges = [];
       }
-      // Pop the active context path back to parent
-      state.activeContextPath = state.activeContextPath.slice(0, -1);
+      // activeContextPath restoration is handled by the subsequent
+      // subworkflow_completed event (which carries parent_path).
     }
   },
 
   workflow_failed: (state, _data) => {
     state.wfDepth = Math.max(0, state.wfDepth - 1);
-    const data = _data as { agent_name?: string; error_type?: string; message?: string; elapsed_seconds?: number; timeout_seconds?: number; current_agent?: string };
+    const data = _data as { agent_name?: string; error_type?: string; message?: string; elapsed_seconds?: number; timeout_seconds?: number; current_agent?: string; subworkflow_path?: string[] };
     if (state.wfDepth === 0) {
       // Root workflow failed
       state.workflowStatus = 'failed';
@@ -1258,13 +1327,14 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
         replaceNode(state.nodes, '$start');
       }
     } else {
-      // Child workflow failed — update its context
-      const ctx = resolveContext(state.subworkflowContexts, state.activeContextPath);
+      const ctx = data.subworkflow_path
+        ? resolveSlotPath(state.subworkflowContexts, data.subworkflow_path)?.ctx
+        : resolveContext(state.subworkflowContexts, state.activeContextPath);
       if (ctx) {
         ctx.status = 'failed';
         ctx.workflowFailure = { error_type: data.error_type, message: data.message };
       }
-      state.activeContextPath = state.activeContextPath.slice(0, -1);
+      // activeContextPath restoration is handled by subworkflow_failed.
     }
   },
 
@@ -1272,35 +1342,64 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
 
   subworkflow_started: (state, _data) => {
     const data = _data as unknown as SubworkflowStartedData;
-    // Create a new child context and push it onto the active path
-    const ctx = createSubworkflowContext(data.agent_name, data.iteration ?? 1, data.workflow);
+    // Slot key disambiguates concurrent for_each iterations of the same
+    // group. Engines emit it explicitly; older engines fall back to
+    // composing it here from agent_name + item_key.
+    const slotKey =
+      data.slot_key ??
+      (data.item_key != null ? `${data.agent_name}[${data.item_key}]` : data.agent_name);
 
-    // Determine where to insert the child context
-    if (state.activeContextPath.length === 0) {
-      // Child of root
-      state.subworkflowContexts.push(ctx);
-      state.activeContextPath = [state.subworkflowContexts.length - 1];
+    const ctx = createSubworkflowContext(
+      data.agent_name,
+      data.iteration ?? 1,
+      data.workflow,
+      slotKey,
+    );
+
+    // Resolve parent strictly from engine-supplied parent_path when present,
+    // else fall back to the legacy "current activeContextPath is parent"
+    // heuristic (correct only for serial sub-workflows).
+    let parentIndexPath: number[];
+    if (data.parent_path !== undefined) {
+      const resolved = resolveSlotPath(state.subworkflowContexts, data.parent_path);
+      if (!resolved) return; // out-of-order arrival; tolerate
+      parentIndexPath = resolved.indexPath;
     } else {
-      // Child of another subworkflow
-      const parent = resolveContext(state.subworkflowContexts, state.activeContextPath);
-      if (parent) {
-        parent.children.push(ctx);
-        state.activeContextPath = [...state.activeContextPath, parent.children.length - 1];
-      }
+      parentIndexPath = state.activeContextPath;
     }
 
-    // Mark the parent agent node as running (in the parent's context)
-    // The parent context is one level up from activeContextPath
-    const parentPath = state.activeContextPath.slice(0, -1);
-    if (parentPath.length === 0) {
-      // Parent is root
+    // Capture sticky-follow intent BEFORE mutating activeContextPath.
+    const wasAtLiveEdge =
+      state.viewContextPath.length === state.activeContextPath.length &&
+      state.viewContextPath.every((v, i) => v === state.activeContextPath[i]);
+
+    let newActivePath: number[];
+    if (parentIndexPath.length === 0) {
+      state.subworkflowContexts.push(ctx);
+      newActivePath = [state.subworkflowContexts.length - 1];
+    } else {
+      const parent = resolveContext(state.subworkflowContexts, parentIndexPath);
+      if (!parent) return;
+      parent.children.push(ctx);
+      newActivePath = [...parentIndexPath, parent.children.length - 1];
+    }
+    state.activeContextPath = newActivePath;
+    if (wasAtLiveEdge) {
+      // Advance the user's view along with the engine — they were following
+      // the live edge, so a new gate inside this child should be reachable.
+      state.viewContextPath = newActivePath;
+    }
+
+    // Mark the parent-side agent node as running so the graph reflects that
+    // a sub-workflow is in flight.
+    if (parentIndexPath.length === 0) {
       const nd = state.nodes[data.agent_name];
       if (nd) {
         nd.status = 'running';
         replaceNode(state.nodes, data.agent_name);
       }
     } else {
-      const parentCtx = resolveContext(state.subworkflowContexts, parentPath);
+      const parentCtx = resolveContext(state.subworkflowContexts, parentIndexPath);
       if (parentCtx) {
         const nd = parentCtx.nodes[data.agent_name];
         if (nd) {
@@ -1313,28 +1412,70 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
 
   subworkflow_completed: (state, _data) => {
     const data = _data as unknown as SubworkflowCompletedData;
-    // Update the parent agent node status in the parent context
-    const t = activeTarget(state);
-    const nd = t.nodes[data.agent_name];
-    if (nd) {
-      nd.status = 'completed';
-      nd.elapsed = data.elapsed;
-      t.incrCompleted();
-      replaceNode(t.nodes, data.agent_name);
+    // Resolve the parent context (the one that owns the agent node) by
+    // engine-supplied parent_path so concurrent completions land correctly.
+    let parentIndexPath: number[];
+    if (data.parent_path !== undefined) {
+      const resolved = resolveSlotPath(state.subworkflowContexts, data.parent_path);
+      parentIndexPath = resolved?.indexPath ?? [];
+    } else {
+      parentIndexPath = state.activeContextPath;
     }
+
+    const targetNodes =
+      parentIndexPath.length === 0
+        ? state.nodes
+        : resolveContext(state.subworkflowContexts, parentIndexPath)?.nodes;
+    if (targetNodes) {
+      const nd = targetNodes[data.agent_name];
+      if (nd) {
+        // for_each-of-workflow emits one subworkflow_completed per iteration
+        // but the parent agent node is the group, completed by for_each_completed.
+        // Avoid double-incrementing or overwriting the group's status here.
+        if (data.item_key == null) {
+          nd.status = 'completed';
+          nd.elapsed = data.elapsed;
+          if (parentIndexPath.length === 0) {
+            state.agentsCompleted++;
+          } else {
+            const parentCtx = resolveContext(state.subworkflowContexts, parentIndexPath);
+            if (parentCtx) parentCtx.agentsCompleted++;
+          }
+        }
+        replaceNode(targetNodes, data.agent_name);
+      }
+    }
+
+    // Restore activeContextPath to the parent so the next root-level events
+    // route correctly.
+    state.activeContextPath = parentIndexPath;
   },
 
   subworkflow_failed: (state, _data) => {
     const data = _data as unknown as SubworkflowFailedData;
-    const t = activeTarget(state);
-    const nd = t.nodes[data.agent_name];
-    if (nd) {
-      nd.status = 'failed';
-      nd.elapsed = data.elapsed;
-      nd.error_type = data.error_type;
-      nd.error_message = data.message;
-      replaceNode(t.nodes, data.agent_name);
+    let parentIndexPath: number[];
+    if (data.parent_path !== undefined) {
+      const resolved = resolveSlotPath(state.subworkflowContexts, data.parent_path);
+      parentIndexPath = resolved?.indexPath ?? [];
+    } else {
+      parentIndexPath = state.activeContextPath;
     }
+
+    const targetNodes =
+      parentIndexPath.length === 0
+        ? state.nodes
+        : resolveContext(state.subworkflowContexts, parentIndexPath)?.nodes;
+    if (targetNodes) {
+      const nd = targetNodes[data.agent_name];
+      if (nd && data.item_key == null) {
+        nd.status = 'failed';
+        nd.elapsed = data.elapsed;
+        nd.error_type = data.error_type;
+        nd.error_message = data.message;
+        replaceNode(targetNodes, data.agent_name);
+      }
+    }
+    state.activeContextPath = parentIndexPath;
   },
 
   checkpoint_saved: (state, _data) => {

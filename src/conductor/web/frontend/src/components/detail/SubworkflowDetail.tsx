@@ -47,9 +47,9 @@ export function SubworkflowDetail({ node }: SubworkflowDetailProps) {
           <div className="space-y-1">
             {subContexts.map((ctx, idx) => (
               <SubworkflowRunRow
-                key={`${ctx.parentAgent}-${ctx.iteration}-${idx}`}
+                key={`${ctx.slotKey}-${ctx.iteration}-${idx}`}
                 ctx={ctx}
-                onClick={() => navigateIntoSubworkflow(node.name, ctx.iteration)}
+                onClick={() => navigateIntoSubworkflow(ctx.slotKey)}
               />
             ))}
           </div>
