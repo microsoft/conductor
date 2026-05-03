@@ -432,7 +432,8 @@ class TestPromptSchemaGeneration:
         assert schema["plan"]["type"] == "object"
         assert schema["plan"]["properties"]["questions"]["type"] == "array"
         assert schema["plan"]["properties"]["questions"]["items"]["type"] == "string"
-        assert schema["plan"]["properties"]["areas"]["items"]["properties"]["name"]["type"] == "string"
+        areas_props = schema["plan"]["properties"]["areas"]["items"]["properties"]
+        assert areas_props["name"]["type"] == "string"
         assert (
             schema["plan"]["properties"]["areas"]["items"]["properties"]["focus"]["items"]["type"]
             == "string"
@@ -441,7 +442,9 @@ class TestPromptSchemaGeneration:
         assert schema["summary"]["description"] == "The summary field"
 
     @pytest.mark.asyncio
-    async def test_execute_appends_nested_schema_to_prompt(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_execute_appends_nested_schema_to_prompt(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """The actual prompt sent to Copilot includes nested schema details."""
         provider = CopilotProvider(retry_config=RetryConfig(max_attempts=1))
         agent = AgentDef(
