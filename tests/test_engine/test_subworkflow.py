@@ -940,3 +940,103 @@ class TestSubWorkflowInputMapping:
         # Parent's "setup" agent should NOT appear in child's context
         assert len(child_contexts) == 1
         assert "setup" not in child_contexts[0]
+
+
+class TestSubWorkflowDashboardPath:
+    """Tests for engine-driven parent_path / slot_key on for_each-of-workflow events.
+
+    These keep concurrent for_each-of-workflow iterations addressable in the
+    web dashboard without depending on a single shared activeContextPath.
+    """
+
+    @pytest.mark.asyncio
+    async def test_for_each_subworkflow_emits_distinct_slot_keys(
+        self, tmp_workflow_dir: Path
+    ) -> None:
+        """For-each iterations each get a unique bracketed slot_key."""
+        _write_yaml(
+            tmp_workflow_dir / "sub.yaml",
+            """\
+            workflow:
+              name: sub-workflow
+              entry_point: inner
+              runtime:
+                provider: copilot
+              limits:
+                max_iterations: 5
+            agents:
+              - name: inner
+                prompt: "inner {{ workflow.input.item }}"
+                routes:
+                  - to: "$end"
+            output:
+              result: "{{ workflow.input.item }}"
+            """,
+        )
+
+        parent_path = tmp_workflow_dir / "parent.yaml"
+        parent_path.write_text("dummy", encoding="utf-8")
+
+        from conductor.config.schema import ForEachDef, OutputField
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="parent",
+                entry_point="finder",
+                runtime=RuntimeConfig(provider="copilot"),
+                limits=LimitsConfig(max_iterations=20),
+            ),
+            agents=[
+                AgentDef(
+                    name="finder",
+                    prompt="find",
+                    output={"items": OutputField(type="array")},
+                    routes=[RouteDef(to="batch")],
+                ),
+            ],
+            for_each=[
+                ForEachDef(
+                    name="batch",
+                    type="for_each",
+                    source="finder.output.items",
+                    **{"as": "item"},
+                    max_concurrent=1,
+                    agent=AgentDef(
+                        name="runner",
+                        type="workflow",
+                        workflow="sub.yaml",
+                        input_mapping={"item": "{{ item }}"},
+                    ),
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"done": "1"},
+        )
+
+        events: list[tuple[str, dict]] = []
+        emitter = MagicMock()
+        emitter.emit.side_effect = lambda ev: events.append((ev.type, dict(ev.data)))
+
+        def _handler(agent, prompt, context):
+            if agent.name == "finder":
+                return {"items": ["a", "b", "c"]}
+            return {"result": "ok"}
+
+        provider = CopilotProvider(mock_handler=_handler)
+        engine = WorkflowEngine(config, provider, workflow_path=parent_path, event_emitter=emitter)
+        await engine.run({})
+
+        started = [d for t, d in events if t == "subworkflow_started"]
+        assert len(started) == 3, f"expected 3 iterations, got {len(started)}"
+        slot_keys = sorted(d["slot_key"] for d in started)
+        assert slot_keys == ["batch[0]", "batch[1]", "batch[2]"]
+        for d in started:
+            assert d["parent_path"] == []
+            assert d["agent_name"] == "batch"
+            assert d.get("iteration") in (1, 2, 3)
+            assert d.get("item_key") in ("0", "1", "2")
+
+        completed = [d for t, d in events if t == "subworkflow_completed"]
+        assert len(completed) == 3
+        completed_slots = sorted(d["slot_key"] for d in completed)
+        assert completed_slots == ["batch[0]", "batch[1]", "batch[2]"]
