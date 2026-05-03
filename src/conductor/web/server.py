@@ -113,6 +113,11 @@ class WebDashboard:
         # Subscribe to emitter
         self._emitter.subscribe(self._on_event)
 
+    @property
+    def port(self) -> int:
+        """Resolved TCP port the dashboard is listening on."""
+        return self._actual_port if self._actual_port is not None else self._port
+
     def _create_app(self) -> FastAPI:
         """Create the FastAPI application with all routes.
 
@@ -155,6 +160,24 @@ class WebDashboard:
         @app.get("/api/state")
         async def get_state() -> JSONResponse:
             return JSONResponse(content=self._event_history)
+
+        @app.get("/api/info")
+        async def get_info() -> JSONResponse:
+            """Return run identity for dashboard linking."""
+            # Extract from first workflow_started event
+            info: dict[str, Any] = {}
+            for event in self._event_history:
+                if event.get("type") == "workflow_started":
+                    data = event.get("data", {})
+                    info = {
+                        "run_id": data.get("run_id", ""),
+                        "workflow_name": data.get("name", ""),
+                        "started_at": event.get("timestamp", 0),
+                        "metadata": data.get("metadata", {}),
+                        "conductor_version": data.get("system", {}).get("conductor_version", ""),
+                    }
+                    break
+            return JSONResponse(content=info)
 
         @app.get("/api/logs")
         async def download_logs() -> JSONResponse:

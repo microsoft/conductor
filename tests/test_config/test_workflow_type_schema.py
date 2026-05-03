@@ -284,3 +284,58 @@ class TestWorkflowWorkflowConfig:
         # Should not raise
         warnings = validate_workflow_config(config)
         assert isinstance(warnings, list)
+
+
+class TestInputMapping:
+    """Tests for input_mapping on workflow agents."""
+
+    def test_valid_input_mapping(self) -> None:
+        """Test that input_mapping is accepted on workflow agents."""
+        agent = AgentDef(
+            name="sub_wf",
+            type="workflow",
+            workflow="./sub.yaml",
+            input_mapping={
+                "work_item_id": "{{ intake.output.epic_id }}",
+                "title": "{{ intake.output.epic_title }}",
+            },
+        )
+        assert agent.input_mapping is not None
+        assert len(agent.input_mapping) == 2
+
+    def test_workflow_without_input_mapping(self) -> None:
+        """Test that workflow agents work without input_mapping (backward compat)."""
+        agent = AgentDef(name="sub_wf", type="workflow", workflow="./sub.yaml")
+        assert agent.input_mapping is None
+
+    def test_input_mapping_on_regular_agent_raises(self) -> None:
+        """Test that input_mapping on a regular agent raises ValidationError."""
+        with pytest.raises(ValidationError, match="input_mapping"):
+            AgentDef(
+                name="regular",
+                prompt="do something",
+                input_mapping={"key": "{{ value }}"},
+            )
+
+    def test_input_mapping_on_human_gate_raises(self) -> None:
+        """Test that input_mapping on a human_gate raises ValidationError."""
+        with pytest.raises(ValidationError, match="input_mapping"):
+            AgentDef(
+                name="gate",
+                type="human_gate",
+                prompt="Choose",
+                options=[
+                    GateOption(label="Yes", value="yes", route="next"),
+                ],
+                input_mapping={"key": "{{ value }}"},
+            )
+
+    def test_input_mapping_on_script_raises(self) -> None:
+        """Test that input_mapping on a script agent raises ValidationError."""
+        with pytest.raises(ValidationError, match="input_mapping"):
+            AgentDef(
+                name="script",
+                type="script",
+                command="echo hi",
+                input_mapping={"key": "{{ value }}"},
+            )

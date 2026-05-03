@@ -475,6 +475,24 @@ class AgentDef(BaseModel):
         workflow: ./research-pipeline.yaml
     """
 
+    input_mapping: dict[str, str] | None = None
+    """Optional mapping of sub-workflow input names to Jinja2 expressions.
+
+    Each key is a sub-workflow input parameter name. Each value is a Jinja2
+    template expression evaluated against the parent workflow's context.
+
+    When present, the rendered values are passed as the sub-workflow's inputs
+    instead of forwarding the parent's workflow.input.* values.
+
+    Only valid for type='workflow' agents.
+
+    Example::
+
+        input_mapping:
+          work_item_id: "{{ task_manager.output.current_issue_id }}"
+          title: "{{ task_manager.output.current_issue_title }}"
+    """
+
     max_session_seconds: float | None = Field(None, ge=1.0)
     """Maximum wall-clock duration for this agent's session in seconds.
 
@@ -529,6 +547,8 @@ class AgentDef(BaseModel):
                 raise ValueError("human_gate agents require 'options'")
             if not self.prompt:
                 raise ValueError("human_gate agents require 'prompt'")
+            if self.input_mapping is not None:
+                raise ValueError("human_gate agents cannot have 'input_mapping'")
         elif self.type == "script":
             if not self.command:
                 raise ValueError("script agents require 'command'")
@@ -555,6 +575,8 @@ class AgentDef(BaseModel):
                 raise ValueError("script agents cannot have 'max_agent_iterations'")
             if self.retry is not None:
                 raise ValueError("script agents cannot have 'retry'")
+            if self.input_mapping is not None:
+                raise ValueError("script agents cannot have 'input_mapping'")
         elif self.type == "workflow":
             if not self.workflow:
                 raise ValueError("workflow agents require 'workflow' path")
@@ -578,6 +600,13 @@ class AgentDef(BaseModel):
                 raise ValueError("workflow agents cannot have 'max_agent_iterations'")
             if self.retry is not None:
                 raise ValueError("workflow agents cannot have 'retry'")
+        else:
+            # Regular agent or human_gate — input_mapping is not valid
+            if self.input_mapping is not None:
+                raise ValueError(
+                    f"'{self.type or 'agent'}' agents cannot have 'input_mapping' "
+                    "(only workflow agents support input_mapping)"
+                )
         return self
 
 
@@ -737,6 +766,13 @@ class WorkflowDef(BaseModel):
 
     hooks: HooksConfig | None = None
     """Lifecycle event hooks."""
+
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    """Arbitrary key-value metadata for external tooling (dashboards, trackers, etc.).
+
+    Included verbatim in the ``workflow_started`` event so downstream
+    consumers can use it for enrichment without parsing the YAML source.
+    """
 
 
 class WorkflowConfig(BaseModel):
