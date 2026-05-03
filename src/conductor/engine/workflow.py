@@ -652,6 +652,7 @@ class WorkflowEngine:
         self,
         agent: AgentDef,
         sub_inputs: dict[str, Any],
+        slot_key: str | None = None,
     ) -> dict[str, Any]:
         """Execute a sub-workflow with pre-built inputs.
 
@@ -662,6 +663,11 @@ class WorkflowEngine:
         Args:
             agent: Workflow agent definition with ``workflow`` path.
             sub_inputs: Pre-built input dict for the sub-workflow.
+            slot_key: Identity of this sub-workflow run within the parent's
+                slot-key path. For for_each iterations this is typically
+                ``"<group>[<key>]"`` so concurrent iterations get distinct
+                identities for dashboard routing. When ``None``, falls back
+                to ``agent.name`` (matches sequential sub-workflow behavior).
 
         Returns:
             The sub-workflow's final output dict.
@@ -708,18 +714,29 @@ class WorkflowEngine:
                 suggestion="Check the sub-workflow YAML for syntax or validation errors.",
             ) from exc
 
-        child_engine = WorkflowEngine(
-            config=sub_config,
-            provider=self._single_provider,
-            registry=self._registry,
-            skip_gates=self.skip_gates,
-            workflow_path=sub_path,
-            interrupt_event=self._interrupt_event,
-            event_emitter=self._event_emitter,
-            keyboard_listener=self._keyboard_listener,
-            web_dashboard=self._web_dashboard,
-            _subworkflow_depth=self._subworkflow_depth + 1,
-        )
+        child_engine_kwargs: dict[str, Any] = {
+            "config": sub_config,
+            "provider": self._single_provider,
+            "registry": self._registry,
+            "skip_gates": self.skip_gates,
+            "workflow_path": sub_path,
+            "interrupt_event": self._interrupt_event,
+            "event_emitter": self._event_emitter,
+            "keyboard_listener": self._keyboard_listener,
+            "web_dashboard": self._web_dashboard,
+            "_subworkflow_depth": self._subworkflow_depth + 1,
+        }
+        # Thread the dashboard context path into the child engine when the
+        # field exists on this engine (added by the breadcrumb-navigation PR).
+        # Conditional so this code is forward-compatible with the
+        # `_dashboard_context_path` kwarg landing in a separate PR.
+        dashboard_path = getattr(self, "_dashboard_context_path", None)
+        if dashboard_path is not None:
+            child_engine_kwargs["_dashboard_context_path"] = [
+                *dashboard_path,
+                slot_key or agent.name,
+            ]
+        child_engine = WorkflowEngine(**child_engine_kwargs)
 
         return await child_engine.run(sub_inputs)
 
@@ -2767,19 +2784,57 @@ class WorkflowEngine:
                             dict(wf_ctx.get("input", {})) if isinstance(wf_ctx, dict) else {}
                         )
 
-                    # Execute sub-workflow
+                    # Execute sub-workflow per-iteration. Build a unique slot
+                    # key so concurrent iterations get distinct dashboard
+                    # contexts (instead of stacking under one shared path).
+                    iteration_slot_key = f"{for_each_group.name}[{key}]"
                     self._emit(
                         "subworkflow_started",
                         {
                             "agent_name": for_each_group.name,
                             "item_key": key,
+                            "iteration": index + 1,
                             "workflow": for_each_group.agent.workflow,
+                            "parent_path": list(getattr(self, "_dashboard_context_path", [])),
+                            "slot_key": iteration_slot_key,
                         },
                     )
-                    output_content = await self._execute_subworkflow_with_inputs(
-                        for_each_group.agent, sub_inputs
-                    )
+                    try:
+                        output_content = await self._execute_subworkflow_with_inputs(
+                            for_each_group.agent,
+                            sub_inputs,
+                            slot_key=iteration_slot_key,
+                        )
+                    except Exception as exc:
+                        _item_elapsed = _time.time() - _item_start
+                        self._emit(
+                            "subworkflow_failed",
+                            {
+                                "agent_name": for_each_group.name,
+                                "item_key": key,
+                                "iteration": index + 1,
+                                "elapsed": _item_elapsed,
+                                "error_type": type(exc).__name__,
+                                "message": str(exc),
+                                "parent_path": list(getattr(self, "_dashboard_context_path", [])),
+                                "slot_key": iteration_slot_key,
+                            },
+                        )
+                        raise
                     _item_elapsed = _time.time() - _item_start
+
+                    self._emit(
+                        "subworkflow_completed",
+                        {
+                            "agent_name": for_each_group.name,
+                            "item_key": key,
+                            "iteration": index + 1,
+                            "elapsed": _item_elapsed,
+                            "output": output_content,
+                            "parent_path": list(getattr(self, "_dashboard_context_path", [])),
+                            "slot_key": iteration_slot_key,
+                        },
+                    )
 
                     self._emit(
                         "for_each_item_completed",
