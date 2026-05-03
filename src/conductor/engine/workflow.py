@@ -3018,6 +3018,12 @@ class WorkflowEngine:
     def _maybe_parse_json(value: str) -> Any:
         """Attempt to parse a string as JSON.
 
+        Also coerces Python literal string forms ("True", "False", "None") that
+        commonly arise from Jinja expressions like ``{{ a == b }}`` rendering a
+        Python ``bool`` via ``str()``. Without this, those values survive as
+        truthy non-empty strings downstream and silently misbehave in route
+        ``when:`` clauses.
+
         Args:
             value: The string to parse.
 
@@ -3025,6 +3031,14 @@ class WorkflowEngine:
             Parsed JSON value if successful, original string otherwise.
         """
         stripped = value.strip()
+        # Python literal forms produced by str(bool) / str(None) — common from
+        # Jinja expressions in workflow output templates.
+        if stripped == "True":
+            return True
+        if stripped == "False":
+            return False
+        if stripped == "None":
+            return None
         if stripped.startswith(("{", "[", '"')) or stripped in ("true", "false", "null"):
             try:
                 return json.loads(stripped)

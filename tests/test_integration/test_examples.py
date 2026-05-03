@@ -211,7 +211,7 @@ class TestParallelExamples:
         assert "approval_decision" in result
         assert result["approval_decision"] == "approved"
         assert "syntax_passed" in result
-        assert result["syntax_passed"] == "True"  # Templates return strings
+        assert result["syntax_passed"] is True
 
 
 class TestExampleWorkflowsValidity:
