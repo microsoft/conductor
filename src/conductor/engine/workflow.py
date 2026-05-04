@@ -1463,7 +1463,7 @@ class WorkflowEngine:
                                             ", ".join(sorted(shadowed)),
                                         )
                                     output_content.update(parsed)
-                            except (json.JSONDecodeError, ValueError):
+                            except json.JSONDecodeError:
                                 pass
                             self.context.store(agent.name, output_content)
                             self.limits.record_execution(agent.name)
