@@ -21,7 +21,7 @@ from conductor.engine.context import WorkflowContext
 from conductor.engine.limits import LimitEnforcer
 from conductor.engine.pricing import ModelPricing
 from conductor.engine.router import Router, RouteResult
-from conductor.engine.usage import UsageTracker
+from conductor.engine.usage import UsageTracker, WorkflowUsage
 from conductor.events import WorkflowEvent, WorkflowEventEmitter
 from conductor.exceptions import (
     ConductorError,
@@ -286,6 +286,7 @@ class WorkflowEngine:
         web_dashboard: WebDashboard | None = None,
         _subworkflow_depth: int = 0,
         run_context: RunContext | None = None,
+        _dashboard_context_path: list[str] | None = None,
     ) -> None:
         """Initialize the WorkflowEngine.
 
@@ -315,6 +316,13 @@ class WorkflowEngine:
             _subworkflow_depth: Current nesting depth for sub-workflow composition.
                 Used internally to enforce MAX_SUBWORKFLOW_DEPTH. Callers should
                 not set this directly.
+            _dashboard_context_path: Slot-key path identifying this engine's
+                position in the recursive sub-workflow tree. Root engine = ``[]``.
+                Sub-workflow engines spawned via ``_execute_subworkflow`` get
+                ``[*parent_path, slot_key]``. Used by ``_emit`` to auto-stamp
+                ``subworkflow_path`` on outgoing events so the dashboard can
+                route per-context state under concurrency. Callers should not
+                set this directly.
 
         Note:
             If both provider and registry are provided, registry takes precedence.
@@ -327,7 +335,11 @@ class WorkflowEngine:
         self._run_context = run_context or RunContext()
         self._run_id = self._run_context.run_id
         self._log_file = self._run_context.log_file
-        self.context = WorkflowContext()
+        self.context = WorkflowContext(
+            workflow_dir=str(Path(workflow_path).resolve().parent) if workflow_path else "",
+            workflow_file=str(Path(workflow_path).resolve()) if workflow_path else "",
+            workflow_name=config.workflow.name,
+        )
         self.renderer = TemplateRenderer()
         self.router = Router()
         self.limits = LimitEnforcer(
@@ -378,6 +390,13 @@ class WorkflowEngine:
         self._bg_mode = self._run_context.bg_mode
         self._system_metadata: dict[str, Any] = {}
 
+        # Recursive sub-workflow context path for dashboard routing.
+        # Root engine = []. Child engines spawned via _execute_subworkflow get
+        # [*parent_path, slot_key]. _emit auto-stamps non-empty paths onto
+        # outgoing events so the frontend can resolve the owning context
+        # without inferring parentage from activeContextPath.
+        self._dashboard_context_path: list[str] = list(_dashboard_context_path or [])
+
     def _build_pricing_overrides(self) -> dict[str, ModelPricing] | None:
         """Build pricing overrides from workflow cost configuration.
 
@@ -413,6 +432,11 @@ class WorkflowEngine:
         """
         if self._event_emitter is None:
             return
+        # Auto-stamp subworkflow_path on every event from sub-engines so the
+        # dashboard can route per-context state under concurrency. Root engine
+        # has an empty path and emits no stamp (preserving legacy event shape).
+        if self._dashboard_context_path and "subworkflow_path" not in data:
+            data = {**data, "subworkflow_path": list(self._dashboard_context_path)}
         event = WorkflowEvent(type=event_type, timestamp=_time.time(), data=data)
         self._event_emitter.emit(event)
 
@@ -545,10 +569,57 @@ class WorkflowEngine:
             operation_name=f"script '{agent.name}'",
         )
 
+    def _build_subworkflow_inputs(
+        self,
+        agent: AgentDef,
+        context: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Build sub-workflow inputs from an agent's input_mapping or defaults.
+
+        Renders each input_mapping expression against the provided context and
+        attempts JSON parsing for type coercion (so ``"5"`` becomes ``int(5)``
+        and ``"[1,2]"`` becomes a list). Falls back to the raw rendered string
+        if JSON parsing fails.
+
+        When no input_mapping is defined, forwards the parent's workflow.input
+        values as-is.
+
+        Args:
+            agent: Agent definition with optional ``input_mapping``.
+            context: Template rendering context (agent outputs, workflow vars, loop vars).
+
+        Returns:
+            Dict of sub-workflow input values.
+        """
+        if agent.input_mapping is not None:
+            renderer = TemplateRenderer()
+            sub_inputs: dict[str, Any] = {}
+            for key, template_expr in agent.input_mapping.items():
+                try:
+                    rendered = renderer.render(template_expr, context)
+                except Exception as e:
+                    raise ExecutionError(
+                        f"Failed to render input_mapping key '{key}' for agent '{agent.name}': {e}",
+                        suggestion=f"Check that the expression '{template_expr}' "
+                        "references valid context variables.",
+                    ) from e
+                # Attempt JSON parse for type coercion (int, list, dict, bool, null).
+                # Falls back to raw string if the value isn't valid JSON.
+                try:
+                    sub_inputs[key] = json.loads(rendered)
+                except (json.JSONDecodeError, ValueError):
+                    sub_inputs[key] = rendered
+            return sub_inputs
+        else:
+            # Default: forward parent's workflow.input.* values
+            workflow_ctx = context.get("workflow", {})
+            return dict(workflow_ctx.get("input", {})) if isinstance(workflow_ctx, dict) else {}
+
     async def _execute_subworkflow(
         self,
         agent: AgentDef,
         context: dict[str, Any],
+        slot_key: str | None = None,
     ) -> dict[str, Any]:
         """Execute a sub-workflow as a black-box step.
 
@@ -559,6 +630,11 @@ class WorkflowEngine:
         Args:
             agent: Workflow agent definition with ``workflow`` path.
             context: Workflow context for template rendering (used as sub-workflow input).
+            slot_key: Identity of this sub-workflow run within the parent's
+                slot-key path. Defaults to ``agent.name`` for the sequential
+                path; for_each/parallel paths supply per-iteration keys
+                (e.g. ``"<group>[<key>]"``) so concurrent runs get distinct
+                identities.
 
         Returns:
             The sub-workflow's final output dict.
@@ -574,6 +650,14 @@ class WorkflowEngine:
                 f"Sub-workflow depth limit exceeded ({MAX_SUBWORKFLOW_DEPTH}). "
                 f"Agent '{agent.name}' cannot invoke sub-workflow '{agent.workflow}'.",
                 suggestion=("Check for circular sub-workflow references or reduce nesting depth."),
+            )
+
+        # Per-agent depth limit (stricter than global MAX_SUBWORKFLOW_DEPTH)
+        if agent.max_depth is not None and self._subworkflow_depth >= agent.max_depth:
+            raise ExecutionError(
+                f"Agent '{agent.name}' max_depth ({agent.max_depth}) exceeded "
+                f"at depth {self._subworkflow_depth}.",
+                suggestion="Increase max_depth or restructure to reduce nesting.",
             )
 
         assert agent.workflow is not None  # noqa: S101
@@ -592,15 +676,6 @@ class WorkflowEngine:
                 suggestion="Check that the 'workflow' path is correct and the file exists.",
             )
 
-        # Detect circular references via file path
-        current_path = Path(self.workflow_path).resolve() if self.workflow_path else None
-        if current_path is not None and sub_path == current_path:
-            raise ExecutionError(
-                f"Circular sub-workflow reference: agent '{agent.name}' "
-                f"references its own workflow file '{agent.workflow}'.",
-                suggestion="A workflow cannot reference itself as a sub-workflow.",
-            )
-
         try:
             sub_config = load_config(sub_path)
         except Exception as exc:
@@ -611,27 +686,7 @@ class WorkflowEngine:
             ) from exc
 
         # Build sub-workflow inputs from the parent context
-        sub_inputs: dict[str, Any]
-        if agent.input_mapping is not None:
-            # Dynamic inputs: render each Jinja2 expression against parent context
-            renderer = TemplateRenderer()
-            sub_inputs = {}
-            for key, template_expr in agent.input_mapping.items():
-                try:
-                    rendered = renderer.render(template_expr, context)
-                except Exception as e:
-                    raise ExecutionError(
-                        f"Failed to render input_mapping key '{key}' for agent '{agent.name}': {e}",
-                        suggestion=f"Check that the expression '{template_expr}' "
-                        "references valid context variables.",
-                    ) from e
-                sub_inputs[key] = rendered
-        else:
-            # Default: forward parent's workflow.input.* values
-            workflow_ctx = context.get("workflow", {})
-            sub_inputs = (
-                dict(workflow_ctx.get("input", {})) if isinstance(workflow_ctx, dict) else {}
-            )
+        sub_inputs = self._build_subworkflow_inputs(agent, context)
 
         # Create child engine inheriting provider/registry but with deeper depth
         child_engine = WorkflowEngine(
@@ -645,20 +700,165 @@ class WorkflowEngine:
             keyboard_listener=self._keyboard_listener,
             web_dashboard=self._web_dashboard,
             _subworkflow_depth=self._subworkflow_depth + 1,
+            _dashboard_context_path=[
+                *self._dashboard_context_path,
+                slot_key or agent.name,
+            ],
         )
 
         return await child_engine.run(sub_inputs)
 
-    def _get_context_window_for_agent(self, agent: AgentDef) -> int | None:
-        """Return the context window size for an agent's model."""
-        from conductor.engine.pricing import get_pricing
+    async def _execute_subworkflow_with_inputs(
+        self,
+        agent: AgentDef,
+        sub_inputs: dict[str, Any],
+        slot_key: str | None = None,
+    ) -> tuple[dict[str, Any], WorkflowUsage]:
+        """Execute a sub-workflow with pre-built inputs.
 
-        model = agent.model
-        if not model:
+        Like _execute_subworkflow but accepts explicit inputs instead of
+        extracting them from context. Used by for_each groups where
+        input_mapping has already been rendered with loop variables.
+
+        Args:
+            agent: Workflow agent definition with ``workflow`` path.
+            sub_inputs: Pre-built input dict for the sub-workflow.
+            slot_key: Identity of this sub-workflow run within the parent's
+                slot-key path. For for_each iterations this is typically
+                ``"<group>[<key>]"`` so concurrent iterations get distinct
+                identities for dashboard routing. When ``None``, falls back
+                to ``agent.name`` (matches sequential sub-workflow behavior).
+
+        Returns:
+            Tuple of (output dict, child workflow usage summary).
+        """
+        from conductor.config.loader import load_config
+
+        if self._subworkflow_depth >= MAX_SUBWORKFLOW_DEPTH:
+            raise ExecutionError(
+                f"Sub-workflow depth limit exceeded ({MAX_SUBWORKFLOW_DEPTH}). "
+                f"Agent '{agent.name}' cannot invoke sub-workflow '{agent.workflow}'.",
+                suggestion="Check for circular sub-workflow references or reduce nesting depth.",
+            )
+
+        # Per-agent depth limit (stricter than global MAX_SUBWORKFLOW_DEPTH)
+        if agent.max_depth is not None and self._subworkflow_depth >= agent.max_depth:
+            raise ExecutionError(
+                f"Agent '{agent.name}' max_depth ({agent.max_depth}) exceeded "
+                f"at depth {self._subworkflow_depth}.",
+                suggestion="Increase max_depth or restructure to reduce nesting.",
+            )
+
+        assert agent.workflow is not None  # noqa: S101
+
+        if self.workflow_path is not None:
+            base_dir = Path(self.workflow_path).resolve().parent
+        else:
+            base_dir = Path.cwd()
+
+        sub_path = (base_dir / agent.workflow).resolve()
+
+        if not sub_path.exists():
+            raise ExecutionError(
+                f"Sub-workflow file not found: {sub_path} (referenced by agent '{agent.name}')",
+                suggestion="Check that the 'workflow' path is correct and the file exists.",
+            )
+
+        try:
+            sub_config = load_config(sub_path)
+        except Exception as exc:
+            raise ExecutionError(
+                f"Failed to load sub-workflow '{sub_path}' "
+                f"(referenced by agent '{agent.name}'): {exc}",
+                suggestion="Check the sub-workflow YAML for syntax or validation errors.",
+            ) from exc
+
+        child_engine_kwargs: dict[str, Any] = {
+            "config": sub_config,
+            "provider": self._single_provider,
+            "registry": self._registry,
+            "skip_gates": self.skip_gates,
+            "workflow_path": sub_path,
+            "interrupt_event": self._interrupt_event,
+            "event_emitter": self._event_emitter,
+            "keyboard_listener": self._keyboard_listener,
+            "web_dashboard": self._web_dashboard,
+            "_subworkflow_depth": self._subworkflow_depth + 1,
+        }
+        # Thread the dashboard context path into the child engine when the
+        # field exists on this engine (added by the breadcrumb-navigation PR).
+        # Conditional so this code is forward-compatible with the
+        # `_dashboard_context_path` kwarg landing in a separate PR.
+        dashboard_path = getattr(self, "_dashboard_context_path", None)
+        if dashboard_path is not None:
+            child_engine_kwargs["_dashboard_context_path"] = [
+                *dashboard_path,
+                slot_key or agent.name,
+            ]
+        child_engine = WorkflowEngine(**child_engine_kwargs)
+
+        output = await child_engine.run(sub_inputs)
+        usage = child_engine.usage_tracker.get_summary()
+        return output, usage
+
+    async def _get_provider_for_agent(self, agent: AgentDef) -> AgentProvider | None:
+        """Resolve the provider that will (or did) execute ``agent``.
+
+        Mirrors the executor-resolution logic in ``_get_executor_for_agent``
+        so context-window metadata lookups go through the same provider that
+        handles execution. Returns ``None`` only when no provider can be
+        determined (e.g. transient registry failures); callers must treat
+        ``None`` as "metadata unavailable".
+        """
+        if self._registry is not None:
+            try:
+                return await self._registry.get_provider(agent)
+            except Exception as e:
+                logger.debug("Provider lookup via registry failed for %s: %s", agent.name, e)
+                return None
+        return self._single_provider
+
+    async def _get_context_window_for_agent(
+        self, agent: AgentDef, output: AgentOutput | None = None
+    ) -> int | None:
+        """Return the SDK-reported max prompt tokens for an agent.
+
+        Tries each candidate model in priority order — the model the SDK
+        actually used (``output.model``), the agent's configured model, the
+        workflow's runtime default — and returns the first non-``None``
+        result. This is a real fallback chain: if ``output.model`` is an
+        SDK-specific variant the provider doesn't know about, the lookup
+        retries with ``agent.model`` before giving up.
+
+        Returns ``None`` when no candidate resolves, no provider can be
+        reached, or the provider's metadata call fails — context-window
+        metadata is best-effort and must never break workflow execution.
+        """
+        provider = await self._get_provider_for_agent(agent)
+        if provider is None:
             return None
-
-        pricing = get_pricing(model)
-        return pricing.context_window if pricing else None
+        candidates: list[str] = []
+        if output is not None and output.model:
+            candidates.append(output.model)
+        if agent.model and agent.model not in candidates:
+            candidates.append(agent.model)
+        default = self.config.workflow.runtime.default_model
+        if default and default not in candidates:
+            candidates.append(default)
+        for model in candidates:
+            try:
+                value = await provider.get_max_prompt_tokens(model)
+            except Exception as e:
+                logger.debug(
+                    "get_max_prompt_tokens(%r) raised on provider for agent %s: %s",
+                    model,
+                    agent.name,
+                    e,
+                )
+                continue
+            if value is not None:
+                return value
+        return None
 
     async def run(self, inputs: dict[str, Any]) -> dict[str, Any]:
         """Execute the workflow from entry_point to $end.
@@ -728,10 +928,22 @@ class WorkflowEngine:
         Used by the CLI resume path to inject context reconstructed from
         a checkpoint file.
 
+        Workflow metadata (``workflow_dir``, ``workflow_file``, ``workflow_name``)
+        is repopulated from the engine's ``workflow_path`` and ``config`` rather
+        than the restored context. Restored contexts come from
+        ``WorkflowContext.from_dict()``, which intentionally omits absolute path
+        metadata to keep checkpoint files portable across machines and
+        relocatable when workflows move. The engine, which knows the current
+        path, is the source of truth.
+
         Args:
             context: A WorkflowContext restored via ``WorkflowContext.from_dict()``.
         """
         self.context = context
+        if self.workflow_path is not None:
+            self.context.workflow_dir = str(Path(self.workflow_path).resolve().parent)
+            self.context.workflow_file = str(Path(self.workflow_path).resolve())
+        self.context.workflow_name = self.config.workflow.name
 
     def set_limits(self, limits: LimitEnforcer) -> None:
         """Replace the engine's limit enforcer with a restored one.
@@ -936,10 +1148,11 @@ class WorkflowEngine:
 
         # In web mode, the interrupt was already handled at the provider level
         # (partial output → _handle_web_pause). Consume the stale flag silently.
-        # We check for dashboard presence only (not has_connections) because in
-        # --web/--web-bg mode the CLI interactive handler is never appropriate,
-        # even if clients are transiently disconnected.
+        # EXCEPTION: in subworkflows (depth > 0), propagate the interrupt so it
+        # unwinds the child engine back to the parent, stopping the workflow.
         if self._web_dashboard is not None:
+            if self._subworkflow_depth > 0:
+                raise InterruptError(agent_name=current_agent_name)
             return None
 
         # Build output preview from last stored output
@@ -1043,6 +1256,32 @@ class WorkflowEngine:
         disconnect_task = asyncio.create_task(disconnect_event.wait())
         tasks = {resume_task, kill_task, disconnect_task}
 
+        # In subworkflows, also watch the interrupt_event so that a second
+        # Stop click while paused will stop the workflow without requiring
+        # the user to first Resume then wait for the next between-agent check.
+        #
+        # INTENTIONAL ROOT-vs-SUBWORKFLOW ASYMMETRY:
+        # At root depth, we deliberately do NOT subscribe to interrupt_event
+        # here — pause is exited only by Resume or Kill. Inside a sub-workflow
+        # we DO subscribe so a single Stop click cleanly unwinds the child
+        # engine back to the parent (Stop-during-pause is otherwise a no-op
+        # because the partial-output handler owns the only between-agent
+        # interrupt check, and the sub-engine is currently sitting in this
+        # pause loop instead of stepping through its main loop).
+        #
+        # Pre-clearing interrupt_event below means a Stop click that lands
+        # *between* clear() and the asyncio.create_task() below is silently
+        # discarded — but a Stop click that lands during the wait is honored.
+        # That window is tiny (microseconds), and the alternative (not
+        # clearing) would carry a stale Stop signal from a prior pause cycle
+        # into this one. We accept the narrow race in favor of correctness
+        # across cycles. See PR #113 review thread for the discussion.
+        stop_task = None
+        if self._subworkflow_depth > 0 and self._interrupt_event is not None:
+            self._interrupt_event.clear()
+            stop_task = asyncio.create_task(self._interrupt_event.wait())
+            tasks.add(stop_task)
+
         # If any event was set between clear() and task creation, the task
         # will already be done — no need to wait, but we still fall through
         # to the normal done/pending handling below.
@@ -1064,6 +1303,12 @@ class WorkflowEngine:
             raise
 
         if kill_task in done:
+            raise InterruptError(agent_name=agent_name)
+
+        # Stop-while-paused in a subworkflow: treat as interrupt
+        if stop_task is not None and stop_task in done:
+            if self._interrupt_event is not None:
+                self._interrupt_event.clear()
             raise InterruptError(agent_name=agent_name)
 
         if disconnect_task in done:
@@ -1405,7 +1650,9 @@ class WorkflowEngine:
                                 "agent_name": agent.name,
                                 "iteration": agent_execution_count,
                                 "agent_type": agent.type or "agent",
-                                "context_window_max": self._get_context_window_for_agent(agent),
+                                "context_window_max": await self._get_context_window_for_agent(
+                                    agent
+                                ),
                             },
                         )
 
@@ -1499,6 +1746,7 @@ class WorkflowEngine:
                                 agent.name,
                                 agent.input,
                                 mode=self.config.workflow.context.mode,
+                                agent_type=agent.type,
                             )
                             _script_start = _time.time()
 
@@ -1549,6 +1797,23 @@ class WorkflowEngine:
                                 "stderr": script_output.stderr,
                                 "exit_code": script_output.exit_code,
                             }
+                            # Auto-parse JSON stdout: if stdout is valid JSON
+                            # object, merge its fields into output so they're
+                            # accessible as output.field_name in templates and
+                            # route conditions (like LLM structured outputs).
+                            try:
+                                parsed = json.loads(script_output.stdout)
+                                if isinstance(parsed, dict):
+                                    shadowed = set(parsed.keys()) & set(output_content.keys())
+                                    if shadowed:
+                                        logger.debug(
+                                            "Script '%s' JSON output shadows built-in fields: %s",
+                                            agent.name,
+                                            ", ".join(sorted(shadowed)),
+                                        )
+                                    output_content.update(parsed)
+                            except json.JSONDecodeError:
+                                pass
                             self.context.store(agent.name, output_content)
                             self.limits.record_execution(agent.name)
                             self.limits.check_timeout()
@@ -1591,6 +1856,7 @@ class WorkflowEngine:
                                 agent.name,
                                 agent.input,
                                 mode=self.config.workflow.context.mode,
+                                agent_type=agent.type,
                             )
                             _sub_start = _time.time()
 
@@ -1604,6 +1870,8 @@ class WorkflowEngine:
                                     "agent_name": agent.name,
                                     "iteration": sub_execution_count,
                                     "workflow": agent.workflow,
+                                    "parent_path": list(self._dashboard_context_path),
+                                    "slot_key": agent.name,
                                 },
                             )
 
@@ -1618,6 +1886,8 @@ class WorkflowEngine:
                                         "elapsed": _sub_elapsed,
                                         "error_type": type(exc).__name__,
                                         "message": str(exc),
+                                        "parent_path": list(self._dashboard_context_path),
+                                        "slot_key": agent.name,
                                     },
                                 )
                                 raise
@@ -1629,6 +1899,8 @@ class WorkflowEngine:
                                     "agent_name": agent.name,
                                     "elapsed": _sub_elapsed,
                                     "output": sub_output,
+                                    "parent_path": list(self._dashboard_context_path),
+                                    "slot_key": agent.name,
                                 },
                             )
 
@@ -1674,6 +1946,7 @@ class WorkflowEngine:
                             agent.name,
                             agent.input,
                             mode=self.config.workflow.context.mode,
+                            agent_type=agent.type,
                         )
 
                         # Execute agent (get executor for multi-provider support)
@@ -1740,7 +2013,9 @@ class WorkflowEngine:
                                 "output": output.content,
                                 "output_keys": output_keys,
                                 "context_window_used": output.input_tokens,
-                                "context_window_max": self._get_context_window_for_agent(agent),
+                                "context_window_max": await self._get_context_window_for_agent(
+                                    agent, output
+                                ),
                             },
                         )
 
@@ -1817,11 +2092,32 @@ class WorkflowEngine:
             self._save_checkpoint_on_failure(e)
             raise
 
+    # Type-appropriate zero values for optional inputs with no declared default.
+    # Using None causes templates to render "None" instead of empty string,
+    # and | default() won't catch None without the boolean=true flag.
+    # Note: mutable types (array, object) return fresh copies via the method below.
+    _TYPE_ZERO_VALUES: dict[str, Any] = {
+        "string": "",
+        "number": 0,
+        "boolean": False,
+    }
+
+    def _zero_value_for_type(self, type_name: str) -> Any:
+        """Return a type-appropriate zero value, with fresh copies for mutable types."""
+        if type_name == "array":
+            return []
+        if type_name == "object":
+            return {}
+        return self._TYPE_ZERO_VALUES.get(type_name)
+
     def _apply_input_defaults(self, inputs: dict[str, Any]) -> dict[str, Any]:
         """Apply default values from input schema for missing optional inputs.
 
         This ensures all defined inputs are present in the context, either
-        with provided values or their schema defaults (None if no default).
+        with provided values or their schema defaults. Optional inputs
+        without an explicit default get a type-appropriate zero value
+        (empty string, 0, false, [], {}) so they render cleanly in
+        templates without requiring ``| default()`` guards.
 
         Args:
             inputs: The input values provided at runtime.
@@ -1837,8 +2133,9 @@ class WorkflowEngine:
                 if input_def.default is not None:
                     merged[name] = input_def.default
                 elif not input_def.required:
-                    # Optional with no default - set to None so templates can check it
-                    merged[name] = None
+                    # Optional with no explicit default — use type-appropriate
+                    # zero value so templates render cleanly (not "None").
+                    merged[name] = self._zero_value_for_type(input_def.type)
 
         return merged
 
@@ -2343,6 +2640,7 @@ class WorkflowEngine:
                     agent.name,
                     agent.input,
                     mode=self.config.workflow.context.mode,
+                    agent_type=agent.type,
                 )
 
                 # Execute agent (get executor for multi-provider support)
@@ -2368,7 +2666,9 @@ class WorkflowEngine:
                         "tokens": output.tokens_used,
                         "cost_usd": usage.cost_usd,
                         "context_window_used": output.input_tokens,
-                        "context_window_max": self._get_context_window_for_agent(agent),
+                        "context_window_max": await self._get_context_window_for_agent(
+                            agent, output
+                        ),
                     },
                 )
 
@@ -2677,6 +2977,7 @@ class WorkflowEngine:
                     for_each_group.agent.name,
                     for_each_group.agent.input,
                     mode=self.config.workflow.context.mode,
+                    agent_type=for_each_group.agent.type,
                 )
 
                 # Inject loop variables into context
@@ -2688,7 +2989,78 @@ class WorkflowEngine:
                     key if for_each_group.key_by else None,
                 )
 
-                # Execute agent with injected context (get executor for multi-provider)
+                # Execute agent — sub-workflow or regular
+                if for_each_group.agent.type == "workflow":
+                    # Build sub-workflow inputs using shared helper (consistent
+                    # JSON-parse-with-fallback across all sub-workflow paths)
+                    sub_inputs = self._build_subworkflow_inputs(for_each_group.agent, agent_context)
+
+                    # Execute sub-workflow per-iteration. Build a unique slot
+                    # key so concurrent iterations get distinct dashboard
+                    # contexts (instead of stacking under one shared path).
+                    iteration_slot_key = f"{for_each_group.name}[{key}]"
+                    self._emit(
+                        "subworkflow_started",
+                        {
+                            "agent_name": for_each_group.name,
+                            "item_key": key,
+                            "iteration": index + 1,
+                            "workflow": for_each_group.agent.workflow,
+                            "parent_path": list(getattr(self, "_dashboard_context_path", [])),
+                            "slot_key": iteration_slot_key,
+                        },
+                    )
+                    try:
+                        output_content, child_usage = await self._execute_subworkflow_with_inputs(
+                            for_each_group.agent,
+                            sub_inputs,
+                            slot_key=iteration_slot_key,
+                        )
+                    except Exception as exc:
+                        _item_elapsed = _time.time() - _item_start
+                        self._emit(
+                            "subworkflow_failed",
+                            {
+                                "agent_name": for_each_group.name,
+                                "item_key": key,
+                                "iteration": index + 1,
+                                "elapsed": _item_elapsed,
+                                "error_type": type(exc).__name__,
+                                "message": str(exc),
+                                "parent_path": list(getattr(self, "_dashboard_context_path", [])),
+                                "slot_key": iteration_slot_key,
+                            },
+                        )
+                        raise
+                    _item_elapsed = _time.time() - _item_start
+
+                    self._emit(
+                        "subworkflow_completed",
+                        {
+                            "agent_name": for_each_group.name,
+                            "item_key": key,
+                            "iteration": index + 1,
+                            "elapsed": _item_elapsed,
+                            "output": output_content,
+                            "parent_path": list(getattr(self, "_dashboard_context_path", [])),
+                            "slot_key": iteration_slot_key,
+                        },
+                    )
+
+                    self._emit(
+                        "for_each_item_completed",
+                        {
+                            "group_name": for_each_group.name,
+                            "item_key": key,
+                            "elapsed": _item_elapsed,
+                            "tokens": child_usage.total_tokens,
+                            "cost_usd": child_usage.total_cost_usd or 0.0,
+                            "output": output_content,
+                        },
+                    )
+                    return (key, output_content)
+
+                # Regular agent execution
                 executor = await self._get_executor_for_agent(for_each_group.agent)
 
                 # Item-scoped event callback that tags all streaming events with item_key
@@ -3032,6 +3404,12 @@ class WorkflowEngine:
     def _maybe_parse_json(value: str) -> Any:
         """Attempt to parse a string as JSON.
 
+        Also coerces Python literal string forms ("True", "False", "None") that
+        commonly arise from Jinja expressions like ``{{ a == b }}`` rendering a
+        Python ``bool`` via ``str()``. Without this, those values survive as
+        truthy non-empty strings downstream and silently misbehave in route
+        ``when:`` clauses.
+
         Args:
             value: The string to parse.
 
@@ -3039,6 +3417,14 @@ class WorkflowEngine:
             Parsed JSON value if successful, original string otherwise.
         """
         stripped = value.strip()
+        # Python literal forms produced by str(bool) / str(None) — common from
+        # Jinja expressions in workflow output templates.
+        if stripped == "True":
+            return True
+        if stripped == "False":
+            return False
+        if stripped == "None":
+            return None
         if stripped.startswith(("{", "[", '"')) or stripped in ("true", "false", "null"):
             try:
                 return json.loads(stripped)

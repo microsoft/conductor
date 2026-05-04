@@ -32,6 +32,9 @@ export type EventType =
   | 'for_each_item_completed'
   | 'for_each_item_failed'
   | 'for_each_completed'
+  | 'subworkflow_started'
+  | 'subworkflow_completed'
+  | 'subworkflow_failed'
   | 'workflow_completed'
   | 'workflow_failed'
   | 'checkpoint_saved'
@@ -52,12 +55,16 @@ export interface WorkflowStartedData {
 export interface WorkflowCompletedData {
   elapsed?: number;
   output?: unknown;
+  /** Slot-key path of the completing engine (present only at depth > 0). */
+  subworkflow_path?: string[];
 }
 
 export interface WorkflowFailedData {
   agent_name?: string;
   error_type?: string;
   message?: string;
+  /** Slot-key path of the failing engine (present only at depth > 0). */
+  subworkflow_path?: string[];
 }
 
 // --- Agent lifecycle ---
@@ -255,4 +262,37 @@ export interface AgentPausedData {
 
 export interface AgentResumedData {
   agent_name: string;
+}
+
+// --- Subworkflow lifecycle ---
+
+export interface SubworkflowStartedData {
+  agent_name: string;
+  iteration?: number;
+  workflow: string;
+  /** Slot-key path of the parent context in the recursive sub-workflow tree. */
+  parent_path?: string[];
+  /** Slot identifier for this child context (e.g. "agent_name" or "group[2]"). */
+  slot_key?: string;
+  /** for_each item key (when this start was emitted by a for_each iteration). */
+  item_key?: string;
+}
+
+export interface SubworkflowCompletedData {
+  agent_name: string;
+  elapsed?: number;
+  output?: unknown;
+  parent_path?: string[];
+  slot_key?: string;
+  item_key?: string;
+}
+
+export interface SubworkflowFailedData {
+  agent_name: string;
+  elapsed?: number;
+  error_type?: string;
+  message?: string;
+  parent_path?: string[];
+  slot_key?: string;
+  item_key?: string;
 }

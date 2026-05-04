@@ -30,6 +30,9 @@ class TestWorkflowContextBasic:
         assert ctx.agent_outputs == {}
         assert ctx.current_iteration == 0
         assert ctx.execution_history == []
+        assert ctx.workflow_dir == ""
+        assert ctx.workflow_file == ""
+        assert ctx.workflow_name == ""
 
     def test_set_workflow_inputs(self) -> None:
         """Test setting workflow inputs."""
@@ -151,6 +154,50 @@ class TestWorkflowContextLastOnlyMode:
         assert "context" in agent_ctx
 
 
+class TestWorkflowContextMetadata:
+    """Tests for workflow metadata (dir, file, name) in context."""
+
+    def test_workflow_dir_file_name_in_accumulate_context(self) -> None:
+        """Test workflow.dir, workflow.file, workflow.name available in accumulate mode."""
+        ctx = WorkflowContext(
+            workflow_dir="/home/user/workflows",
+            workflow_file="/home/user/workflows/main.yaml",
+            workflow_name="my-workflow",
+        )
+        ctx.set_workflow_inputs({"key": "val"})
+
+        agent_ctx = ctx.build_for_agent("agent", [], mode="accumulate")
+
+        assert agent_ctx["workflow"]["dir"] == "/home/user/workflows"
+        assert agent_ctx["workflow"]["file"] == "/home/user/workflows/main.yaml"
+        assert agent_ctx["workflow"]["name"] == "my-workflow"
+        assert agent_ctx["workflow"]["input"] == {"key": "val"}
+
+    def test_workflow_metadata_in_explicit_mode(self) -> None:
+        """Test workflow.dir/file/name available in explicit mode (not filtered)."""
+        ctx = WorkflowContext(
+            workflow_dir="/registry/twig",
+            workflow_file="/registry/twig/sdlc.yaml",
+            workflow_name="twig-sdlc",
+        )
+
+        agent_ctx = ctx.build_for_agent("agent", [], mode="explicit")
+
+        assert agent_ctx["workflow"]["dir"] == "/registry/twig"
+        assert agent_ctx["workflow"]["file"] == "/registry/twig/sdlc.yaml"
+        assert agent_ctx["workflow"]["name"] == "twig-sdlc"
+
+    def test_empty_metadata_omitted(self) -> None:
+        """Test that empty workflow metadata fields are not included."""
+        ctx = WorkflowContext()
+
+        agent_ctx = ctx.build_for_agent("agent", [], mode="accumulate")
+
+        assert "dir" not in agent_ctx["workflow"]
+        assert "file" not in agent_ctx["workflow"]
+        assert "name" not in agent_ctx["workflow"]
+
+
 class TestWorkflowContextExplicitMode:
     """Tests for explicit context mode."""
 
@@ -218,6 +265,92 @@ class TestWorkflowContextExplicitMode:
                 ["workflow.input.missing"],
                 mode="explicit",
             )
+
+    def test_explicit_mode_local_render_script_gets_full_workflow_input(self) -> None:
+        """Local-render agents (script) see all workflow.input in explicit mode.
+
+        ``workflow.input`` is the workflow's external interface — present for
+        the lifetime of the run — so script templates can reference any
+        workflow input without declaring it in ``input:``.
+        """
+        ctx = WorkflowContext()
+        ctx.set_workflow_inputs({"a": 1, "b": 2, "c": 3})
+
+        agent_ctx = ctx.build_for_agent(
+            "detector",
+            [],  # no declared inputs
+            mode="explicit",
+            agent_type="script",
+        )
+
+        assert agent_ctx["workflow"]["input"] == {"a": 1, "b": 2, "c": 3}
+
+    def test_explicit_mode_local_render_workflow_gets_full_workflow_input(self) -> None:
+        """Local-render agents (sub-workflow) see all workflow.input in explicit mode."""
+        ctx = WorkflowContext()
+        ctx.set_workflow_inputs({"a": 1, "b": 2})
+
+        agent_ctx = ctx.build_for_agent(
+            "child",
+            [],
+            mode="explicit",
+            agent_type="workflow",
+        )
+
+        assert agent_ctx["workflow"]["input"] == {"a": 1, "b": 2}
+
+    def test_explicit_mode_local_render_does_not_leak_agent_outputs(self) -> None:
+        """Local-render carve-out is scoped to workflow.input, not agent outputs.
+
+        Per-step outputs remain explicitly declared even for script /
+        sub-workflow agents — broadening to outputs is an intentional
+        non-goal of the local-render carve-out.
+        """
+        ctx = WorkflowContext()
+        ctx.set_workflow_inputs({"a": 1})
+        ctx.store("planner", {"plan": "do stuff"})
+
+        agent_ctx = ctx.build_for_agent(
+            "detector",
+            [],
+            mode="explicit",
+            agent_type="script",
+        )
+
+        assert "planner" not in agent_ctx
+        assert agent_ctx["workflow"]["input"] == {"a": 1}
+
+    def test_explicit_mode_llm_agent_unchanged(self) -> None:
+        """LLM agents (default agent_type) keep filtered workflow.input in explicit mode.
+
+        Regression guard: the local-render carve-out must not affect prompt
+        budgeting for LLM agents.
+        """
+        ctx = WorkflowContext()
+        ctx.set_workflow_inputs({"a": 1, "b": 2})
+
+        agent_ctx = ctx.build_for_agent(
+            "llm",
+            [],
+            mode="explicit",
+            # agent_type omitted → defaults to None → no carve-out
+        )
+
+        assert agent_ctx["workflow"]["input"] == {}
+
+    def test_explicit_mode_human_gate_unchanged(self) -> None:
+        """human_gate is not a local-render type for the workflow.input carve-out."""
+        ctx = WorkflowContext()
+        ctx.set_workflow_inputs({"a": 1})
+
+        agent_ctx = ctx.build_for_agent(
+            "gate",
+            [],
+            mode="explicit",
+            agent_type="human_gate",
+        )
+
+        assert agent_ctx["workflow"]["input"] == {}
 
 
 class TestWorkflowContextOptionalDeps:

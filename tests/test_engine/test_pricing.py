@@ -112,6 +112,71 @@ class TestGetPricing:
             assert model in DEFAULT_PRICING, f"Expected {model} in DEFAULT_PRICING"
 
 
+class TestFuzzyMatchWarnings:
+    """Tests for the fuzzy-match warning behavior (#137)."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_warned(self) -> None:
+        """Clear the per-process warning de-dupe set between tests."""
+        from conductor.engine.pricing import _FUZZY_MATCH_WARNED
+
+        _FUZZY_MATCH_WARNED.clear()
+
+    def test_exact_match_does_not_warn(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level("WARNING", logger="conductor.engine.pricing"):
+            get_pricing("gpt-4o")
+        assert caplog.records == []
+
+    def test_override_match_does_not_warn(self, caplog: pytest.LogCaptureFixture) -> None:
+        overrides = {"my-model": ModelPricing(input_per_mtok=1.0, output_per_mtok=2.0)}
+        with caplog.at_level("WARNING", logger="conductor.engine.pricing"):
+            get_pricing("my-model", overrides=overrides)
+        assert caplog.records == []
+
+    def test_unknown_model_does_not_warn(self, caplog: pytest.LogCaptureFixture) -> None:
+        # Names with no matching prefix return None and should not warn.
+        with caplog.at_level("WARNING", logger="conductor.engine.pricing"):
+            result = get_pricing("totally-unknown-xyz")
+        assert result is None
+        assert caplog.records == []
+
+    def test_cross_family_name_returns_none_no_warn(self, caplog: pytest.LogCaptureFixture) -> None:
+        # Repro from #137: these names share a textual prefix with claude-opus-4
+        # but are different model families. The delimiter check should reject
+        # the match entirely (returning None and degrading gracefully) rather
+        # than silently inheriting claude-opus-4's pricing/context-window.
+        with caplog.at_level("WARNING", logger="conductor.engine.pricing"):
+            assert get_pricing("claude-opus-4.7") is None
+            assert get_pricing("claude-opus-4.7-high") is None
+            assert get_pricing("claude-opus-4.7-xhigh") is None
+            assert get_pricing("claude-opus-4.7-1m-internal") is None
+        assert caplog.records == []
+
+    def test_versioned_suffix_match_warns(self, caplog: pytest.LogCaptureFixture) -> None:
+        # Real versioned name (date suffix) should still match and warn.
+        with caplog.at_level("WARNING", logger="conductor.engine.pricing"):
+            pricing = get_pricing("claude-sonnet-4-20250514")
+        assert pricing is not None
+        assert len(caplog.records) == 1
+        msg = caplog.records[0].getMessage()
+        assert "claude-sonnet-4-20250514" in msg
+        assert "versioned-suffix" in msg
+        assert "claude-sonnet-4" in msg
+
+    def test_warning_emitted_only_once_per_model(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level("WARNING", logger="conductor.engine.pricing"):
+            get_pricing("claude-sonnet-4-20250514")
+            get_pricing("claude-sonnet-4-20250514")
+            get_pricing("claude-sonnet-4-20250514")
+        assert len(caplog.records) == 1
+
+    def test_different_models_each_warn_once(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level("WARNING", logger="conductor.engine.pricing"):
+            get_pricing("claude-sonnet-4-20250514")
+            get_pricing("claude-3-5-sonnet-latest")
+        assert len(caplog.records) == 2
+
+
 class TestCalculateCost:
     """Tests for the calculate_cost function."""
 

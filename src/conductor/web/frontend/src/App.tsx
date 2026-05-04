@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import { Header } from '@/components/layout/Header';
+import { BreadcrumbBar } from '@/components/layout/BreadcrumbBar';
 import { StatusBar } from '@/components/layout/StatusBar';
 import { ReplayBar } from '@/components/layout/ReplayBar';
 import { ResizableLayout } from '@/components/layout/ResizableLayout';
@@ -55,6 +56,7 @@ export default function App() {
     <div className="h-full flex flex-col bg-[var(--bg)]">
       {isReplayMode ? <ReplayMode /> : <LiveMode />}
       <Header />
+      <BreadcrumbBar />
       <ResizableLayout />
       {replayMode ? <ReplayBar /> : <StatusBar />}
     </div>

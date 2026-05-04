@@ -30,7 +30,7 @@ from pydantic import BaseModel
 
 from conductor.exceptions import ProviderError, ValidationError
 from conductor.executor.output import validate_output
-from conductor.providers.base import AgentOutput, AgentProvider, EventCallback
+from conductor.providers.base import AgentOutput, AgentProvider, EventCallback, match_model_id
 
 if TYPE_CHECKING:
     from conductor.config.schema import AgentDef, OutputField
@@ -39,13 +39,14 @@ if TYPE_CHECKING:
 # Try to import the Anthropic SDK
 try:
     import anthropic
-    from anthropic import AsyncAnthropic
+    from anthropic import AnthropicError, AsyncAnthropic
 
     ANTHROPIC_SDK_AVAILABLE = True
 except ImportError:
     ANTHROPIC_SDK_AVAILABLE = False
     AsyncAnthropic = None  # type: ignore[misc, assignment]
     anthropic = None  # type: ignore[assignment]
+    AnthropicError = Exception  # type: ignore[misc, assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -178,6 +179,13 @@ class ClaudeProvider(AgentProvider):
         self._mcp_servers_config = mcp_servers
         self._mcp_manager: MCPManager | None = None
 
+        # Cache of model_id -> max_input_tokens populated lazily on first
+        # get_max_prompt_tokens() call. Guarded by an asyncio.Lock to avoid
+        # racing concurrent first-callers and emitting duplicate models.list()
+        # requests.
+        self._max_input_cache: dict[str, int | None] | None = None
+        self._max_input_cache_lock = asyncio.Lock()
+
         # Initialize the client (sync initialization)
         self._initialize_client()
 
@@ -288,7 +296,8 @@ class ClaudeProvider(AgentProvider):
     async def _log_available_models(self) -> None:
         """List and log available models, warn if default model is unavailable.
 
-        Consolidated from the former _verify_available_models method.
+        Also seeds ``_max_input_cache`` so the first call to
+        :meth:`get_max_prompt_tokens` doesn't pay for an extra round-trip.
         """
         if self._client is None:
             return
@@ -297,20 +306,73 @@ class ClaudeProvider(AgentProvider):
             # Call client.models.list() to get available models (async)
             logger.debug("Discovering available Claude models via client.models.list()...")
             models_page = await self._client.models.list()
-            available_models = [model.id for model in models_page.data]
-
-            logger.info(f"Available Claude models: {', '.join(available_models)}")
-
-            # Warn if default model not in list
-            if self._default_model not in available_models:
-                logger.warning(
-                    f"Requested model '{self._default_model}' is not in the list of "
-                    f"available models. API calls may fail. Available: {available_models}"
-                )
-            else:
-                logger.debug(f"Default model '{self._default_model}' verified in available models")
-        except Exception as e:
+        except (TimeoutError, AnthropicError, OSError) as e:
             logger.warning(f"Could not list available models (discovery failed): {e}")
+            return
+
+        available_models = [model.id for model in models_page.data]
+        logger.info(f"Available Claude models: {', '.join(available_models)}")
+
+        # Warn if default model not in list (after stripping aliases like -latest).
+        if match_model_id(self._default_model, available_models) is None:
+            logger.warning(
+                f"Requested model '{self._default_model}' is not in the list of "
+                f"available models. API calls may fail. Available: {available_models}"
+            )
+        else:
+            logger.debug(f"Default model '{self._default_model}' verified in available models")
+
+        # Seed the metadata cache so get_max_prompt_tokens() is a pure lookup.
+        self._install_max_input_cache(models_page.data)
+
+    def _install_max_input_cache(self, models_data: list[Any]) -> None:
+        """Replace ``_max_input_cache`` with a fresh mapping of id -> max_input."""
+        self._max_input_cache = {
+            info.id: getattr(info, "max_input_tokens", None) for info in models_data
+        }
+
+    async def get_max_prompt_tokens(self, model: str) -> int | None:
+        """Return the Anthropic SDK's ``max_input_tokens`` for ``model``.
+
+        On first call, populates a per-instance cache by enumerating
+        ``client.models.list()``; subsequent calls are dictionary lookups.
+        ``validate_connection()`` already populates the cache, so callers
+        that go through normal connection setup never pay for an extra
+        round-trip.
+
+        Resolves aliases (``-latest``, dated suffixes, base/versioned name
+        mismatches) via :func:`match_model_id`. Returns ``None`` when the
+        SDK is unavailable, the model can't be resolved, or the listing
+        call fails — context-window metadata must never block workflow
+        execution.
+
+        Note: the value reflects the API's *default* input window. Claude
+        models with a 1M-context beta require an explicit beta header,
+        which Conductor does not set today; for those models the API still
+        reports the default window.
+        """
+        if not ANTHROPIC_SDK_AVAILABLE or self._client is None:
+            return None
+
+        if self._max_input_cache is None:
+            # Fetch outside the lock so concurrent callers don't all queue
+            # behind a slow round-trip; the lock only guards the install.
+            try:
+                page = await self._client.models.list()
+            except (TimeoutError, AnthropicError, OSError) as e:
+                # Don't cache the failure — let the next call retry.
+                logger.debug("Failed to list Anthropic models: %s", e)
+                return None
+            async with self._max_input_cache_lock:
+                if self._max_input_cache is None:
+                    self._install_max_input_cache(page.data)
+
+        # The block above either returned early on failure or installed the
+        # cache, so it's guaranteed non-None here.
+        cache = self._max_input_cache
+        assert cache is not None
+        matched_id = match_model_id(model, cache.keys())
+        return cache.get(matched_id) if matched_id is not None else None
 
     async def _ensure_mcp_connected(self) -> None:
         """Connect to MCP servers if configured.
@@ -398,10 +460,17 @@ class ClaudeProvider(AgentProvider):
             logger.debug("MCP manager closed")
 
         if self._client is not None:
-            # AsyncAnthropic uses httpx AsyncClient internally which should be closed
-            await self._client.close()
+            # Drop the client reference *before* awaiting close() so any
+            # in-flight get_max_prompt_tokens() observes None on its next
+            # access and skips the SDK call. Already-issued requests will
+            # error and be swallowed by the metadata path's narrow except.
+            client = self._client
             self._client = None
+            await client.close()
             logger.debug("Claude provider closed")
+
+        # Drop cached metadata so a re-initialized provider re-fetches.
+        self._max_input_cache = None
 
     async def execute(
         self,

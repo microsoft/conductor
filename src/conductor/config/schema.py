@@ -493,6 +493,18 @@ class AgentDef(BaseModel):
           title: "{{ task_manager.output.current_issue_title }}"
     """
 
+    max_depth: int | None = Field(None, ge=1, le=10)
+    """Per-agent sub-workflow depth limit.
+
+    Overrides the global MAX_SUBWORKFLOW_DEPTH (10) with a tighter bound.
+    Only valid for type='workflow' agents. Useful for self-referential
+    workflows to set an explicit recursion limit.
+
+    Example::
+
+        max_depth: 3  # Allow at most 3 levels of recursion
+    """
+
     max_session_seconds: float | None = Field(None, ge=1.0)
     """Maximum wall-clock duration for this agent's session in seconds.
 
@@ -549,6 +561,8 @@ class AgentDef(BaseModel):
                 raise ValueError("human_gate agents require 'prompt'")
             if self.input_mapping is not None:
                 raise ValueError("human_gate agents cannot have 'input_mapping'")
+            if self.max_depth is not None:
+                raise ValueError("human_gate agents cannot have 'max_depth'")
         elif self.type == "script":
             if not self.command:
                 raise ValueError("script agents require 'command'")
@@ -577,6 +591,8 @@ class AgentDef(BaseModel):
                 raise ValueError("script agents cannot have 'retry'")
             if self.input_mapping is not None:
                 raise ValueError("script agents cannot have 'input_mapping'")
+            if self.max_depth is not None:
+                raise ValueError("script agents cannot have 'max_depth'")
         elif self.type == "workflow":
             if not self.workflow:
                 raise ValueError("workflow agents require 'workflow' path")
@@ -606,6 +622,11 @@ class AgentDef(BaseModel):
                 raise ValueError(
                     f"'{self.type or 'agent'}' agents cannot have 'input_mapping' "
                     "(only workflow agents support input_mapping)"
+                )
+            if self.max_depth is not None:
+                raise ValueError(
+                    f"'{self.type or 'agent'}' agents cannot have 'max_depth' "
+                    "(only workflow agents support max_depth)"
                 )
         return self
 
