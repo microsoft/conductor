@@ -1256,6 +1256,23 @@ class WorkflowEngine:
         # In subworkflows, also watch the interrupt_event so that a second
         # Stop click while paused will stop the workflow without requiring
         # the user to first Resume then wait for the next between-agent check.
+        #
+        # INTENTIONAL ROOT-vs-SUBWORKFLOW ASYMMETRY:
+        # At root depth, we deliberately do NOT subscribe to interrupt_event
+        # here — pause is exited only by Resume or Kill. Inside a sub-workflow
+        # we DO subscribe so a single Stop click cleanly unwinds the child
+        # engine back to the parent (Stop-during-pause is otherwise a no-op
+        # because the partial-output handler owns the only between-agent
+        # interrupt check, and the sub-engine is currently sitting in this
+        # pause loop instead of stepping through its main loop).
+        #
+        # Pre-clearing interrupt_event below means a Stop click that lands
+        # *between* clear() and the asyncio.create_task() below is silently
+        # discarded — but a Stop click that lands during the wait is honored.
+        # That window is tiny (microseconds), and the alternative (not
+        # clearing) would carry a stale Stop signal from a prior pause cycle
+        # into this one. We accept the narrow race in favor of correctness
+        # across cycles. See PR #113 review thread for the discussion.
         stop_task = None
         if self._subworkflow_depth > 0 and self._interrupt_event is not None:
             self._interrupt_event.clear()
