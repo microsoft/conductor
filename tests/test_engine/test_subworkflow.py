@@ -268,10 +268,29 @@ class TestSubWorkflowErrors:
             await engine.run({})
 
     @pytest.mark.asyncio
-    async def test_self_referencing_workflow(self, tmp_workflow_dir: Path) -> None:
-        """Test that a workflow referencing itself raises ExecutionError."""
+    async def test_self_referencing_workflow_hits_depth_limit(self, tmp_workflow_dir: Path) -> None:
+        """Test that a self-referencing workflow is allowed but bounded by depth limit."""
+        # Write a real self-referencing workflow YAML
         parent_path = tmp_workflow_dir / "parent.yaml"
-        parent_path.write_text("dummy", encoding="utf-8")
+        _write_yaml(
+            parent_path,
+            """\
+            workflow:
+              name: self-ref
+              entry_point: sub_wf
+              runtime:
+                provider: copilot
+              limits:
+                max_iterations: 50
+            agents:
+              - name: sub_wf
+                type: workflow
+                workflow: parent.yaml
+                routes:
+                  - to: "$end"
+            output: {}
+            """,
+        )
 
         config = WorkflowConfig(
             workflow=WorkflowDef(
@@ -294,7 +313,58 @@ class TestSubWorkflowErrors:
         mock_provider = MagicMock()
         engine = WorkflowEngine(config, mock_provider, workflow_path=parent_path)
 
-        with pytest.raises(ExecutionError, match="Circular sub-workflow reference"):
+        # Self-reference is now allowed but will hit depth limit
+        with pytest.raises(ExecutionError, match="depth limit exceeded"):
+            await engine.run({})
+
+    @pytest.mark.asyncio
+    async def test_max_depth_per_agent(self, tmp_workflow_dir: Path) -> None:
+        """Test that per-agent max_depth is enforced before global limit."""
+        parent_path = tmp_workflow_dir / "parent.yaml"
+        _write_yaml(
+            parent_path,
+            """\
+            workflow:
+              name: self-ref
+              entry_point: sub_wf
+              runtime:
+                provider: copilot
+              limits:
+                max_iterations: 50
+            agents:
+              - name: sub_wf
+                type: workflow
+                workflow: parent.yaml
+                max_depth: 2
+                routes:
+                  - to: "$end"
+            output: {}
+            """,
+        )
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="parent",
+                entry_point="sub_wf",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="sub_wf",
+                    type="workflow",
+                    workflow="parent.yaml",
+                    max_depth=2,
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+        )
+
+        mock_provider = MagicMock()
+        engine = WorkflowEngine(config, mock_provider, workflow_path=parent_path)
+
+        with pytest.raises(ExecutionError, match="max_depth.*exceeded"):
             await engine.run({})
 
 
@@ -525,3 +595,519 @@ class TestSubWorkflowIterationCounting:
         await engine.run({})
 
         assert engine.limits.current_iteration == 1
+
+
+class TestSubWorkflowInputMapping:
+    """Tests for input_mapping on sub-workflow agents."""
+
+    @pytest.mark.asyncio
+    async def test_input_mapping_renders_expressions(self, tmp_workflow_dir: Path) -> None:
+        """Test that input_mapping Jinja2 expressions are rendered and passed as strings."""
+        _write_yaml(
+            tmp_workflow_dir / "sub.yaml",
+            """\
+            workflow:
+              name: sub-wf
+              entry_point: inner
+              runtime:
+                provider: copilot
+              input:
+                item_id:
+                  type: string
+                  required: true
+                title:
+                  type: string
+                  required: true
+              limits:
+                max_iterations: 5
+            agents:
+              - name: inner
+                prompt: "Work on {{ workflow.input.item_id }}: {{ workflow.input.title }}"
+                routes:
+                  - to: "$end"
+            output:
+              result: "{{ inner.output.result }}"
+            """,
+        )
+
+        parent_path = tmp_workflow_dir / "parent.yaml"
+        parent_path.write_text("dummy", encoding="utf-8")
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="parent",
+                entry_point="setup",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="setup",
+                    prompt="Setup",
+                    routes=[RouteDef(to="sub_wf")],
+                ),
+                AgentDef(
+                    name="sub_wf",
+                    type="workflow",
+                    workflow="sub.yaml",
+                    input_mapping={
+                        "item_id": "{{ setup.output.id }}",
+                        "title": "{{ setup.output.name }}",
+                    },
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"result": "{{ sub_wf.output.result }}"},
+        )
+
+        received_prompts: list[str] = []
+
+        def mock_handler(agent, prompt, context):
+            received_prompts.append(prompt)
+            if agent.name == "setup":
+                return {"id": "42", "name": "Fix the bug"}
+            return {"result": "done"}
+
+        provider = CopilotProvider(mock_handler=mock_handler)
+        engine = WorkflowEngine(config, provider, workflow_path=parent_path)
+        result = await engine.run({})
+
+        assert result["result"] == "done"
+        # The inner agent should have received the mapped values
+        assert any("42" in p and "Fix the bug" in p for p in received_prompts)
+
+    @pytest.mark.asyncio
+    async def test_input_mapping_values_are_strings(self, tmp_workflow_dir: Path) -> None:
+        """Test that input_mapping passes values as strings (no json.loads coercion).
+
+        The rendered template values are always strings when entering the child
+        workflow. Output template rendering may coerce them further, so we verify
+        via the prompt the child agent actually receives.
+        """
+        _write_yaml(
+            tmp_workflow_dir / "sub.yaml",
+            """\
+            workflow:
+              name: sub-wf
+              entry_point: inner
+              runtime:
+                provider: copilot
+              input:
+                count:
+                  type: string
+                  required: true
+                flag:
+                  type: string
+                  required: true
+              limits:
+                max_iterations: 5
+            agents:
+              - name: inner
+                prompt: "Count={{ workflow.input.count }} Flag={{ workflow.input.flag }}"
+                routes:
+                  - to: "$end"
+            output:
+              result: "{{ inner.output.result }}"
+            """,
+        )
+
+        parent_path = tmp_workflow_dir / "parent.yaml"
+        parent_path.write_text("dummy", encoding="utf-8")
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="parent",
+                entry_point="setup",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="setup",
+                    prompt="Setup",
+                    routes=[RouteDef(to="sub_wf")],
+                ),
+                AgentDef(
+                    name="sub_wf",
+                    type="workflow",
+                    workflow="sub.yaml",
+                    input_mapping={
+                        "count": "{{ setup.output.num }}",
+                        "flag": "{{ setup.output.active }}",
+                    },
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"result": "{{ sub_wf.output.result }}"},
+        )
+
+        received_prompts: list[str] = []
+
+        def mock_handler(agent, prompt, context):
+            received_prompts.append(prompt)
+            if agent.name == "setup":
+                return {"num": "42", "active": "true"}
+            return {"result": "ok"}
+
+        provider = CopilotProvider(mock_handler=mock_handler)
+        engine = WorkflowEngine(config, provider, workflow_path=parent_path)
+        await engine.run({})
+
+        # The child's inner agent should see JSON-parsed values rendered into the prompt.
+        # json.loads("42") -> int 42, json.loads("true") -> bool True (Python repr)
+        inner_prompt = [p for p in received_prompts if "Count=" in p][0]
+        assert "Count=42" in inner_prompt
+        assert "Flag=True" in inner_prompt
+
+    @pytest.mark.asyncio
+    async def test_no_input_mapping_forwards_parent_inputs(self, tmp_workflow_dir: Path) -> None:
+        """Test backward compat: no input_mapping forwards parent workflow.input.*."""
+        _write_yaml(
+            tmp_workflow_dir / "sub.yaml",
+            """\
+            workflow:
+              name: sub-wf
+              entry_point: inner
+              runtime:
+                provider: copilot
+              input:
+                topic:
+                  type: string
+                  required: false
+                  default: "default"
+              limits:
+                max_iterations: 5
+            agents:
+              - name: inner
+                prompt: "Work on {{ workflow.input.topic }}"
+                routes:
+                  - to: "$end"
+            output:
+              topic: "{{ workflow.input.topic }}"
+            """,
+        )
+
+        parent_path = tmp_workflow_dir / "parent.yaml"
+        parent_path.write_text("dummy", encoding="utf-8")
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="parent",
+                entry_point="sub_wf",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="sub_wf",
+                    type="workflow",
+                    workflow="sub.yaml",
+                    # No input_mapping — should forward parent's workflow.input.*
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"topic": "{{ sub_wf.output.topic }}"},
+        )
+
+        def mock_handler(agent, prompt, context):
+            return {"result": "ok"}
+
+        provider = CopilotProvider(mock_handler=mock_handler)
+        engine = WorkflowEngine(config, provider, workflow_path=parent_path)
+        result = await engine.run({"topic": "Python"})
+
+        # Parent's workflow.input.topic should be forwarded to child
+        assert result["topic"] == "Python"
+
+    @pytest.mark.asyncio
+    async def test_empty_input_mapping_passes_nothing(self, tmp_workflow_dir: Path) -> None:
+        """Test that input_mapping: {} means 'pass no inputs' (not default forwarding)."""
+        _write_yaml(
+            tmp_workflow_dir / "sub.yaml",
+            """\
+            workflow:
+              name: sub-wf
+              entry_point: inner
+              runtime:
+                provider: copilot
+              input:
+                topic:
+                  type: string
+                  required: false
+                  default: "fallback"
+              limits:
+                max_iterations: 5
+            agents:
+              - name: inner
+                prompt: "Work on {{ workflow.input.topic }}"
+                routes:
+                  - to: "$end"
+            output:
+              topic: "{{ workflow.input.topic }}"
+            """,
+        )
+
+        parent_path = tmp_workflow_dir / "parent.yaml"
+        parent_path.write_text("dummy", encoding="utf-8")
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="parent",
+                entry_point="sub_wf",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="sub_wf",
+                    type="workflow",
+                    workflow="sub.yaml",
+                    input_mapping={},  # Explicitly empty — pass nothing
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"topic": "{{ sub_wf.output.topic }}"},
+        )
+
+        def mock_handler(agent, prompt, context):
+            return {"result": "ok"}
+
+        provider = CopilotProvider(mock_handler=mock_handler)
+        engine = WorkflowEngine(config, provider, workflow_path=parent_path)
+        result = await engine.run({"topic": "Python"})
+
+        # Empty input_mapping = no inputs passed, child should use its default
+        assert result["topic"] == "fallback"
+
+    @pytest.mark.asyncio
+    async def test_input_mapping_error_includes_key_name(self, tmp_workflow_dir: Path) -> None:
+        """Test that template errors include the failing key name."""
+        _write_yaml(
+            tmp_workflow_dir / "sub.yaml",
+            """\
+            workflow:
+              name: sub-wf
+              entry_point: inner
+              runtime:
+                provider: copilot
+              input:
+                value:
+                  type: string
+                  required: true
+              limits:
+                max_iterations: 5
+            agents:
+              - name: inner
+                prompt: "Use {{ workflow.input.value }}"
+                routes:
+                  - to: "$end"
+            output:
+              result: "done"
+            """,
+        )
+
+        parent_path = tmp_workflow_dir / "parent.yaml"
+        parent_path.write_text("dummy", encoding="utf-8")
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="parent",
+                entry_point="sub_wf",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="sub_wf",
+                    type="workflow",
+                    workflow="sub.yaml",
+                    input_mapping={
+                        "value": "{{ nonexistent_agent.output.missing }}",
+                    },
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+        )
+
+        mock_provider = MagicMock()
+        engine = WorkflowEngine(config, mock_provider, workflow_path=parent_path)
+
+        with pytest.raises(ExecutionError, match="input_mapping key 'value'"):
+            await engine.run({})
+
+    @pytest.mark.asyncio
+    async def test_no_parent_context_leaks_to_child(self, tmp_workflow_dir: Path) -> None:
+        """Test that parent agent outputs are NOT injected into child context."""
+        _write_yaml(
+            tmp_workflow_dir / "sub.yaml",
+            """\
+            workflow:
+              name: sub-wf
+              entry_point: inner
+              runtime:
+                provider: copilot
+              input:
+                data:
+                  type: string
+                  required: true
+              limits:
+                max_iterations: 5
+            agents:
+              - name: inner
+                prompt: "Use {{ workflow.input.data }}"
+                routes:
+                  - to: "$end"
+            output:
+              result: "{{ inner.output.result }}"
+            """,
+        )
+
+        parent_path = tmp_workflow_dir / "parent.yaml"
+        parent_path.write_text("dummy", encoding="utf-8")
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="parent",
+                entry_point="setup",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="setup",
+                    prompt="Setup",
+                    routes=[RouteDef(to="sub_wf")],
+                ),
+                AgentDef(
+                    name="sub_wf",
+                    type="workflow",
+                    workflow="sub.yaml",
+                    input_mapping={"data": "{{ setup.output.value }}"},
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"result": "{{ sub_wf.output.result }}"},
+        )
+
+        child_contexts: list[dict] = []
+
+        def mock_handler(agent, prompt, context):
+            if agent.name == "setup":
+                return {"value": "hello"}
+            # Capture what the child's inner agent can see
+            child_contexts.append(dict(context))
+            return {"result": "done"}
+
+        provider = CopilotProvider(mock_handler=mock_handler)
+        engine = WorkflowEngine(config, provider, workflow_path=parent_path)
+        await engine.run({})
+
+        # Parent's "setup" agent should NOT appear in child's context
+        assert len(child_contexts) == 1
+        assert "setup" not in child_contexts[0]
+
+
+class TestSubWorkflowDashboardPath:
+    """Tests for engine-driven parent_path / slot_key on for_each-of-workflow events.
+
+    These keep concurrent for_each-of-workflow iterations addressable in the
+    web dashboard without depending on a single shared activeContextPath.
+    """
+
+    @pytest.mark.asyncio
+    async def test_for_each_subworkflow_emits_distinct_slot_keys(
+        self, tmp_workflow_dir: Path
+    ) -> None:
+        """For-each iterations each get a unique bracketed slot_key."""
+        _write_yaml(
+            tmp_workflow_dir / "sub.yaml",
+            """\
+            workflow:
+              name: sub-workflow
+              entry_point: inner
+              runtime:
+                provider: copilot
+              limits:
+                max_iterations: 5
+            agents:
+              - name: inner
+                prompt: "inner {{ workflow.input.item }}"
+                routes:
+                  - to: "$end"
+            output:
+              result: "{{ workflow.input.item }}"
+            """,
+        )
+
+        parent_path = tmp_workflow_dir / "parent.yaml"
+        parent_path.write_text("dummy", encoding="utf-8")
+
+        from conductor.config.schema import ForEachDef, OutputField
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="parent",
+                entry_point="finder",
+                runtime=RuntimeConfig(provider="copilot"),
+                limits=LimitsConfig(max_iterations=20),
+            ),
+            agents=[
+                AgentDef(
+                    name="finder",
+                    prompt="find",
+                    output={"items": OutputField(type="array")},
+                    routes=[RouteDef(to="batch")],
+                ),
+            ],
+            for_each=[
+                ForEachDef(
+                    name="batch",
+                    type="for_each",
+                    source="finder.output.items",
+                    **{"as": "item"},
+                    max_concurrent=1,
+                    agent=AgentDef(
+                        name="runner",
+                        type="workflow",
+                        workflow="sub.yaml",
+                        input_mapping={"item": "{{ item }}"},
+                    ),
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"done": "1"},
+        )
+
+        events: list[tuple[str, dict]] = []
+        emitter = MagicMock()
+        emitter.emit.side_effect = lambda ev: events.append((ev.type, dict(ev.data)))
+
+        def _handler(agent, prompt, context):
+            if agent.name == "finder":
+                return {"items": ["a", "b", "c"]}
+            return {"result": "ok"}
+
+        provider = CopilotProvider(mock_handler=_handler)
+        engine = WorkflowEngine(config, provider, workflow_path=parent_path, event_emitter=emitter)
+        await engine.run({})
+
+        started = [d for t, d in events if t == "subworkflow_started"]
+        assert len(started) == 3, f"expected 3 iterations, got {len(started)}"
+        slot_keys = sorted(d["slot_key"] for d in started)
+        assert slot_keys == ["batch[0]", "batch[1]", "batch[2]"]
+        for d in started:
+            assert d["parent_path"] == []
+            assert d["agent_name"] == "batch"
+            assert d.get("iteration") in (1, 2, 3)
+            assert d.get("item_key") in ("0", "1", "2")
+
+        completed = [d for t, d in events if t == "subworkflow_completed"]
+        assert len(completed) == 3
+        completed_slots = sorted(d["slot_key"] for d in completed)
+        assert completed_slots == ["batch[0]", "batch[1]", "batch[2]"]

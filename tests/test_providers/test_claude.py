@@ -2302,3 +2302,140 @@ class TestClaudeProviderRetryLogic:
         # Verify retry-after header was used (delay should be 5.0)
         assert len(provider._retry_history) == 1
         assert provider._retry_history[0]["delay"] == 5.0
+
+
+@patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+@patch("conductor.providers.claude.AsyncAnthropic")
+class TestClaudeGetMaxPromptTokens:
+    """Tests for ClaudeProvider.get_max_prompt_tokens."""
+
+    @pytest.mark.asyncio
+    async def test_returns_max_input_tokens_for_known_model(
+        self, mock_anthropic_class: Mock
+    ) -> None:
+        mock_client = Mock()
+        mock_client.models.list = AsyncMock(
+            return_value=Mock(
+                data=[
+                    Mock(id="claude-sonnet-4-5", max_input_tokens=200_000),
+                    Mock(id="claude-opus-4-5", max_input_tokens=200_000),
+                ]
+            )
+        )
+        mock_anthropic_class.return_value = mock_client
+
+        provider = ClaudeProvider()
+        assert await provider.get_max_prompt_tokens("claude-sonnet-4-5") == 200_000
+
+    @pytest.mark.asyncio
+    async def test_returns_none_for_unknown_model(self, mock_anthropic_class: Mock) -> None:
+        mock_client = Mock()
+        mock_client.models.list = AsyncMock(return_value=Mock(data=[]))
+        mock_anthropic_class.return_value = mock_client
+
+        provider = ClaudeProvider()
+        assert await provider.get_max_prompt_tokens("unknown-x") is None
+
+    @pytest.mark.asyncio
+    async def test_sdk_failure_returns_none_and_does_not_cache(
+        self, mock_anthropic_class: Mock
+    ) -> None:
+        """An SDK exception is swallowed and not cached, so a later call retries."""
+        from anthropic import APIConnectionError
+
+        # APIConnectionError requires a request kwarg; build a minimal one.
+        err = APIConnectionError(request=Mock())
+
+        mock_client = Mock()
+        # First call raises, second call succeeds — proves the failure isn't
+        # cached as "no metadata" forever.
+        mock_client.models.list = AsyncMock(
+            side_effect=[
+                err,
+                Mock(data=[Mock(id="claude-sonnet-4-5", max_input_tokens=200_000)]),
+            ]
+        )
+        mock_anthropic_class.return_value = mock_client
+
+        provider = ClaudeProvider()
+        assert await provider.get_max_prompt_tokens("claude-sonnet-4-5") is None
+        assert await provider.get_max_prompt_tokens("claude-sonnet-4-5") == 200_000
+        assert mock_client.models.list.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_unexpected_exception_propagates(self, mock_anthropic_class: Mock) -> None:
+        """Non-SDK exceptions (programming errors) are not swallowed by the
+        provider — they bubble up so the engine's outer safety net handles them."""
+        mock_client = Mock()
+        mock_client.models.list = AsyncMock(side_effect=RuntimeError("bug"))
+        mock_anthropic_class.return_value = mock_client
+
+        provider = ClaudeProvider()
+        with pytest.raises(RuntimeError):
+            await provider.get_max_prompt_tokens("claude-sonnet-4-5")
+
+    @pytest.mark.asyncio
+    async def test_alias_resolves_via_match_model_id(self, mock_anthropic_class: Mock) -> None:
+        """``-latest`` and dated suffix aliases resolve to the SDK's listed ID."""
+        mock_client = Mock()
+        mock_client.models.list = AsyncMock(
+            return_value=Mock(
+                data=[
+                    Mock(id="claude-3-5-sonnet-20241022", max_input_tokens=200_000),
+                ]
+            )
+        )
+        mock_anthropic_class.return_value = mock_client
+
+        provider = ClaudeProvider()
+        # `-latest` strips to base, then prefix-matches the dated SDK ID.
+        assert await provider.get_max_prompt_tokens("claude-3-5-sonnet-latest") == 200_000
+        # The base name (no dated suffix) also matches the dated SDK ID.
+        assert await provider.get_max_prompt_tokens("claude-3-5-sonnet") == 200_000
+
+    @pytest.mark.asyncio
+    async def test_caches_after_first_call(self, mock_anthropic_class: Mock) -> None:
+        """Second call must hit the cache, not the SDK."""
+        mock_client = Mock()
+        mock_client.models.list = AsyncMock(
+            return_value=Mock(data=[Mock(id="claude-sonnet-4-5", max_input_tokens=200_000)])
+        )
+        mock_anthropic_class.return_value = mock_client
+
+        provider = ClaudeProvider()
+        await provider.get_max_prompt_tokens("claude-sonnet-4-5")
+        await provider.get_max_prompt_tokens("claude-sonnet-4-5")
+        await provider.get_max_prompt_tokens("anything-else")
+
+        assert mock_client.models.list.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_validate_connection_seeds_cache(self, mock_anthropic_class: Mock) -> None:
+        """``validate_connection()`` populates the cache so the first
+        ``get_max_prompt_tokens()`` call is a pure dict lookup."""
+        mock_client = Mock()
+        mock_client.models.list = AsyncMock(
+            return_value=Mock(data=[Mock(id="claude-sonnet-4-5", max_input_tokens=200_000)])
+        )
+        mock_anthropic_class.return_value = mock_client
+
+        provider = ClaudeProvider()
+        assert await provider.validate_connection() is True
+        # validate_connection itself called list (once for the API check, then
+        # _log_available_models reuses the response). Reset the counter to
+        # prove get_max_prompt_tokens doesn't add another call.
+        before = mock_client.models.list.await_count
+        assert await provider.get_max_prompt_tokens("claude-sonnet-4-5") == 200_000
+        assert mock_client.models.list.await_count == before
+
+    @pytest.mark.asyncio
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", False)
+    async def test_returns_none_when_sdk_unavailable(self, mock_anthropic_class: Mock) -> None:
+        # Need a workaround: ANTHROPIC_SDK_AVAILABLE is False so __init__
+        # raises. Build an instance bypassing the init guard by patching
+        # only at call time.
+        with patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True):
+            provider = ClaudeProvider()
+
+        with patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", False):
+            assert await provider.get_max_prompt_tokens("claude-sonnet-4-5") is None
