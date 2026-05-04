@@ -1669,6 +1669,7 @@ class WorkflowEngine:
                                 agent.name,
                                 agent.input,
                                 mode=self.config.workflow.context.mode,
+                                agent_type=agent.type,
                             )
                             _script_start = _time.time()
 
@@ -1719,6 +1720,23 @@ class WorkflowEngine:
                                 "stderr": script_output.stderr,
                                 "exit_code": script_output.exit_code,
                             }
+                            # Auto-parse JSON stdout: if stdout is valid JSON
+                            # object, merge its fields into output so they're
+                            # accessible as output.field_name in templates and
+                            # route conditions (like LLM structured outputs).
+                            try:
+                                parsed = json.loads(script_output.stdout)
+                                if isinstance(parsed, dict):
+                                    shadowed = set(parsed.keys()) & set(output_content.keys())
+                                    if shadowed:
+                                        logger.debug(
+                                            "Script '%s' JSON output shadows built-in fields: %s",
+                                            agent.name,
+                                            ", ".join(sorted(shadowed)),
+                                        )
+                                    output_content.update(parsed)
+                            except json.JSONDecodeError:
+                                pass
                             self.context.store(agent.name, output_content)
                             self.limits.record_execution(agent.name)
                             self.limits.check_timeout()
@@ -1761,6 +1779,7 @@ class WorkflowEngine:
                                 agent.name,
                                 agent.input,
                                 mode=self.config.workflow.context.mode,
+                                agent_type=agent.type,
                             )
                             _sub_start = _time.time()
 
@@ -1844,6 +1863,7 @@ class WorkflowEngine:
                             agent.name,
                             agent.input,
                             mode=self.config.workflow.context.mode,
+                            agent_type=agent.type,
                         )
 
                         # Execute agent (get executor for multi-provider support)
@@ -1989,11 +2009,32 @@ class WorkflowEngine:
             self._save_checkpoint_on_failure(e)
             raise
 
+    # Type-appropriate zero values for optional inputs with no declared default.
+    # Using None causes templates to render "None" instead of empty string,
+    # and | default() won't catch None without the boolean=true flag.
+    # Note: mutable types (array, object) return fresh copies via the method below.
+    _TYPE_ZERO_VALUES: dict[str, Any] = {
+        "string": "",
+        "number": 0,
+        "boolean": False,
+    }
+
+    def _zero_value_for_type(self, type_name: str) -> Any:
+        """Return a type-appropriate zero value, with fresh copies for mutable types."""
+        if type_name == "array":
+            return []
+        if type_name == "object":
+            return {}
+        return self._TYPE_ZERO_VALUES.get(type_name)
+
     def _apply_input_defaults(self, inputs: dict[str, Any]) -> dict[str, Any]:
         """Apply default values from input schema for missing optional inputs.
 
         This ensures all defined inputs are present in the context, either
-        with provided values or their schema defaults (None if no default).
+        with provided values or their schema defaults. Optional inputs
+        without an explicit default get a type-appropriate zero value
+        (empty string, 0, false, [], {}) so they render cleanly in
+        templates without requiring ``| default()`` guards.
 
         Args:
             inputs: The input values provided at runtime.
@@ -2009,8 +2050,9 @@ class WorkflowEngine:
                 if input_def.default is not None:
                     merged[name] = input_def.default
                 elif not input_def.required:
-                    # Optional with no default - set to None so templates can check it
-                    merged[name] = None
+                    # Optional with no explicit default — use type-appropriate
+                    # zero value so templates render cleanly (not "None").
+                    merged[name] = self._zero_value_for_type(input_def.type)
 
         return merged
 
@@ -2515,6 +2557,7 @@ class WorkflowEngine:
                     agent.name,
                     agent.input,
                     mode=self.config.workflow.context.mode,
+                    agent_type=agent.type,
                 )
 
                 # Execute agent (get executor for multi-provider support)
@@ -2851,6 +2894,7 @@ class WorkflowEngine:
                     for_each_group.agent.name,
                     for_each_group.agent.input,
                     mode=self.config.workflow.context.mode,
+                    agent_type=for_each_group.agent.type,
                 )
 
                 # Inject loop variables into context

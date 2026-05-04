@@ -470,3 +470,132 @@ class TestScriptInParallelRejected:
 
         with pytest.raises(ConfigurationError, match="script step"):
             validate_workflow_config(config)
+
+
+class TestScriptJsonStdout:
+    """Tests for auto-parsing script stdout as JSON into output fields.
+
+    See PR #122. When a script's stdout is a valid JSON object, parsed fields
+    are merged into output_content alongside stdout/stderr/exit_code so they
+    are accessible as `output.field_name` in templates and route conditions
+    (matching LLM structured-output behavior).
+    """
+
+    @staticmethod
+    def _single_script_config(args: list[str]) -> WorkflowConfig:
+        """Build a minimal single-script workflow config."""
+        return WorkflowConfig(
+            workflow=WorkflowDef(
+                name="json-script",
+                entry_point="detector",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="detector",
+                    type="script",
+                    command=sys.executable,
+                    args=args,
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+        )
+
+    @pytest.mark.asyncio
+    async def test_json_object_parsed_with_field_routing(self) -> None:
+        """Happy path: JSON object stdout is parsed and fields drive routing."""
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="json-script",
+                entry_point="detector",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="detector",
+                    type="script",
+                    command=sys.executable,
+                    args=[
+                        "-c",
+                        "import json;"
+                        ' print(json.dumps({"plan_exists": True, "route": "planning"}))',
+                    ],
+                    routes=[
+                        RouteDef(to="planner", when="route == 'planning'"),
+                        RouteDef(to="$end"),
+                    ],
+                ),
+                AgentDef(
+                    name="planner",
+                    type="script",
+                    command=sys.executable,
+                    args=["-c", "print('done')"],
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+        )
+
+        engine = WorkflowEngine(config, MagicMock())
+        await engine.run({})
+
+        det = engine.context.agent_outputs["detector"]
+        assert det["plan_exists"] is True
+        assert det["route"] == "planning"
+        # Backward compat: built-in fields still present
+        assert "stdout" in det
+        assert det["exit_code"] == 0
+        # Routing reached planner via parsed field
+        assert "planner" in engine.context.agent_outputs
+
+    @pytest.mark.asyncio
+    async def test_non_json_stdout_preserved_no_extra_fields(self) -> None:
+        """Non-JSON stdout: output.stdout preserved, no extra fields, no exception."""
+        config = self._single_script_config(args=["-c", "print('hello world')"])
+        engine = WorkflowEngine(config, MagicMock())
+        await engine.run({})
+
+        out = engine.context.agent_outputs["detector"]
+        assert "hello world" in out["stdout"]
+        assert set(out.keys()) == {"stdout", "stderr", "exit_code"}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "stdout_payload",
+        ["[1, 2, 3]", "42", '"a string"', "true"],
+        ids=["array", "int", "string", "bool"],
+    )
+    async def test_json_non_object_ignored(self, stdout_payload: str) -> None:
+        """JSON arrays/scalars are not merged (only dict objects are)."""
+        config = self._single_script_config(args=["-c", f"print({stdout_payload!r})"])
+        engine = WorkflowEngine(config, MagicMock())
+        await engine.run({})
+
+        out = engine.context.agent_outputs["detector"]
+        assert set(out.keys()) == {"stdout", "stderr", "exit_code"}
+
+    @pytest.mark.asyncio
+    async def test_json_field_shadows_builtin(self) -> None:
+        """Parsed JSON value wins over built-in field of the same name (PR #122 contract)."""
+        config = self._single_script_config(
+            args=["-c", 'import json; print(json.dumps({"exit_code": "ok"}))'],
+        )
+        engine = WorkflowEngine(config, MagicMock())
+        await engine.run({})
+
+        out = engine.context.agent_outputs["detector"]
+        assert out["exit_code"] == "ok"
+
+    @pytest.mark.asyncio
+    async def test_empty_stdout_no_crash(self) -> None:
+        """Empty stdout: doesn't crash, no extra fields merged."""
+        config = self._single_script_config(args=["-c", "pass"])
+        engine = WorkflowEngine(config, MagicMock())
+        await engine.run({})
+
+        out = engine.context.agent_outputs["detector"]
+        assert set(out.keys()) == {"stdout", "stderr", "exit_code"}
+        assert out["stdout"] == ""
