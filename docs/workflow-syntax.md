@@ -484,6 +484,28 @@ agents:
 
 **Note**: Tool implementation depends on your provider. See provider documentation for available tools.
 
+### MCP Servers
+
+Tools are typically provided by [MCP servers](mcp-tools.md) configured in the `workflow.runtime.mcp_servers` section. MCP tools are automatically made available to agents and can be filtered using the `tools` field above.
+
+```yaml
+workflow:
+  runtime:
+    mcp_servers:
+      web-search:
+        command: npx
+        args: ["-y", "open-websearch@latest"]
+        tools: ["*"]
+
+agents:
+  - name: researcher
+    tools:
+      - web-search__search    # Use specific MCP tool (server__tool format)
+    prompt: "Research the topic"
+```
+
+For full MCP configuration details, see the [MCP Tools guide](mcp-tools.md).
+
 ## External File References
 
 The `!file` YAML tag lets you reference external files from any YAML field value. The file content is transparently inlined during loading, keeping workflow files concise and enabling reuse of prompts, schemas, and configuration across workflows.

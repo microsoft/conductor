@@ -274,16 +274,18 @@ agents:
 ### Tool Support (MCP)
 
 **Copilot**:
-- ✅ Full MCP support
+- ✅ Full MCP support (stdio, http, sse)
 - Web search, code execution, file ops
 - Workflow-level and agent-level tools
 
 **Claude**:
-- ❌ Not available in Phase 1
-- Deferred to Phase 2
-- Research needed for compatibility
+- ✅ MCP support for stdio servers
+- Uses Conductor's built-in MCPManager
+- HTTP/SSE servers not supported
 
-**Winner**: Copilot (until Claude Phase 2+)
+**Winner**: Copilot (broader transport support)
+
+See the [MCP Tools guide](../mcp-tools.md) for details.
 
 ## Migration Path
 

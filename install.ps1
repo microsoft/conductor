@@ -138,6 +138,24 @@ try {
     }
 
     Write-Ok "Conductor $tagName installed"
+
+    # --- Ensure uv's tool bin directory is on the persistent user PATH ---
+    # `uv tool install` only modifies the *current* process PATH. New terminals,
+    # sub-processes, CI agents, and IDE extensions inherit PATH from the user
+    # registry (HKCU\Environment\Path) and won't find `conductor` unless we run
+    # `uv tool update-shell`, which writes the bin dir to the registry. See #115.
+    Write-Info "Ensuring conductor is on PATH for new shells…"
+    try {
+        & uv tool update-shell 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            Write-Ok "PATH updated (restart your terminal to pick up the change)"
+        } else {
+            Write-Info "Could not update user PATH automatically. Run 'uv tool update-shell' manually."
+        }
+    } catch {
+        Write-Info "Could not update user PATH automatically. Run 'uv tool update-shell' manually."
+    }
+
     Write-Host ""
     Write-Host "  Run 'conductor --help' to get started."
     Write-Host "  Run 'conductor update' to check for future updates."

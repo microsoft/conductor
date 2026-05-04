@@ -480,3 +480,105 @@ parallel:
 """
         config = load_config_string(yaml_content)
         assert config.agents[0].routes[0].to == "pg"
+
+
+class TestMetadataLoading:
+    """Tests for workflow metadata loading from YAML."""
+
+    def test_metadata_from_yaml(self) -> None:
+        """Test that metadata is loaded from YAML workflow section."""
+        yaml_content = """
+workflow:
+  name: test-wf
+  entry_point: agent1
+  metadata:
+    tracker: ado
+    project_url: https://dev.azure.com/org/Project
+    work_item_id_agent: intake
+    work_item_id_field: epic_id
+
+agents:
+  - name: agent1
+    model: gpt-4
+    prompt: "Hello"
+    routes:
+      - to: $end
+"""
+        config = load_config_string(yaml_content)
+        assert config.workflow.metadata == {
+            "tracker": "ado",
+            "project_url": "https://dev.azure.com/org/Project",
+            "work_item_id_agent": "intake",
+            "work_item_id_field": "epic_id",
+        }
+
+    def test_no_metadata_in_yaml(self) -> None:
+        """Test that omitting metadata from YAML gives empty dict."""
+        yaml_content = """
+workflow:
+  name: test-wf
+  entry_point: agent1
+
+agents:
+  - name: agent1
+    model: gpt-4
+    prompt: "Hello"
+    routes:
+      - to: $end
+"""
+        config = load_config_string(yaml_content)
+        assert config.workflow.metadata == {}
+
+    def test_metadata_with_nested_values(self) -> None:
+        """Test that metadata supports nested dicts and lists."""
+        yaml_content = """
+workflow:
+  name: test-wf
+  entry_point: agent1
+  metadata:
+    tracker: jira
+    config:
+      base_url: https://jira.example.com
+      project_key: PROJ
+    labels:
+      - backend
+      - infra
+
+agents:
+  - name: agent1
+    model: gpt-4
+    prompt: "Hello"
+    routes:
+      - to: $end
+"""
+        config = load_config_string(yaml_content)
+        assert config.workflow.metadata["tracker"] == "jira"
+        assert config.workflow.metadata["config"]["base_url"] == "https://jira.example.com"
+        assert config.workflow.metadata["labels"] == ["backend", "infra"]
+
+    def test_metadata_independent_from_input(self) -> None:
+        """Test that metadata and input are completely separate namespaces."""
+        yaml_content = """
+workflow:
+  name: test-wf
+  entry_point: agent1
+  input:
+    question:
+      type: string
+      description: User question
+  metadata:
+    tracker: github
+    repo: owner/repo
+
+agents:
+  - name: agent1
+    model: gpt-4
+    prompt: "{{ workflow.input.question }}"
+    routes:
+      - to: $end
+"""
+        config = load_config_string(yaml_content)
+        assert "question" in config.workflow.input
+        assert "question" not in config.workflow.metadata
+        assert "tracker" in config.workflow.metadata
+        assert "tracker" not in config.workflow.input

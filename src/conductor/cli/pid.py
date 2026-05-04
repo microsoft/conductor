@@ -38,13 +38,21 @@ def pid_dir() -> Path:
     return d
 
 
-def write_pid_file(pid: int, port: int, workflow_path: str | Path) -> Path:
+def write_pid_file(
+    pid: int,
+    port: int,
+    workflow_path: str | Path,
+    run_id: str = "",
+    log_file: str = "",
+) -> Path:
     """Write a PID file for a background workflow process.
 
     Args:
         pid: Process ID of the background child.
         port: TCP port the web dashboard is listening on.
         workflow_path: Path to the workflow YAML file.
+        run_id: Unique run identifier (from event log subscriber).
+        log_file: Path to the JSONL event log file.
 
     Returns:
         Path to the created PID file.
@@ -58,6 +66,8 @@ def write_pid_file(pid: int, port: int, workflow_path: str | Path) -> Path:
         "port": port,
         "workflow": str(workflow_path),
         "started_at": datetime.now(UTC).isoformat(),
+        "run_id": run_id,
+        "log_file": log_file,
     }
 
     filepath.write_text(json.dumps(data, indent=2))

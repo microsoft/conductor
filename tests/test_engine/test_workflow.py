@@ -554,6 +554,118 @@ class TestWorkflowEngineOutputTemplates:
 
         assert result["total"] == 42
 
+    @pytest.mark.asyncio
+    async def test_output_template_python_bool_literals(self) -> None:
+        """Python str(bool) outputs ('True'/'False') from Jinja expressions
+        coerce to native bool, not truthy non-empty strings.
+
+        Without this, ``{{ a == b }}`` in a workflow ``output:`` block renders
+        ``"True"`` / ``"False"`` and downstream ``when:`` clauses comparing to
+        ``true`` / ``false`` silently misbehave (the strings are truthy).
+        """
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="bool-output",
+                entry_point="agent1",
+            ),
+            agents=[
+                AgentDef(
+                    name="agent1",
+                    model="gpt-4",
+                    prompt="x",
+                    output={
+                        "left": OutputField(type="string"),
+                        "right": OutputField(type="string"),
+                    },
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={
+                "matched": "{{ agent1.output.left == agent1.output.right }}",
+                "differs": "{{ agent1.output.left != agent1.output.right }}",
+            },
+        )
+
+        def mock_handler(agent, prompt, context):
+            return {"left": "abc", "right": "abc"}
+
+        provider = CopilotProvider(mock_handler=mock_handler)
+        engine = WorkflowEngine(config, provider)
+
+        result = await engine.run({})
+
+        assert result["matched"] is True
+        assert result["differs"] is False
+
+    @pytest.mark.asyncio
+    async def test_output_template_python_none_literal(self) -> None:
+        """Python str(None) ('None') from Jinja coerces to native None."""
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="none-output",
+                entry_point="agent1",
+            ),
+            agents=[
+                AgentDef(
+                    name="agent1",
+                    model="gpt-4",
+                    prompt="x",
+                    output={"thing": OutputField(type="string")},
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={
+                # Jinja's `none` value renders as the string "None" via str(None).
+                "missing": "{{ none }}",
+            },
+        )
+
+        def mock_handler(agent, prompt, context):
+            return {"thing": "value"}
+
+        provider = CopilotProvider(mock_handler=mock_handler)
+        engine = WorkflowEngine(config, provider)
+
+        result = await engine.run({})
+
+        assert result["missing"] is None
+
+    @pytest.mark.asyncio
+    async def test_output_template_lowercase_json_literals_still_work(self) -> None:
+        """Regression: lowercase JSON literals 'true'/'false'/'null' remain coerced."""
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="json-literals-output",
+                entry_point="agent1",
+            ),
+            agents=[
+                AgentDef(
+                    name="agent1",
+                    model="gpt-4",
+                    prompt="x",
+                    output={"v": OutputField(type="string")},
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={
+                "t": "true",
+                "f": "false",
+                "n": "null",
+            },
+        )
+
+        def mock_handler(agent, prompt, context):
+            return {"v": "x"}
+
+        provider = CopilotProvider(mock_handler=mock_handler)
+        engine = WorkflowEngine(config, provider)
+
+        result = await engine.run({})
+
+        assert result["t"] is True
+        assert result["f"] is False
+        assert result["n"] is None
+
 
 class TestWorkflowEngineLoopBack:
     """Tests for loop-back routing patterns."""

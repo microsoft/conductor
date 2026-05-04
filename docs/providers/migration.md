@@ -108,39 +108,35 @@ workflow:
 **Key changes**:
 - `max_tokens` now controls output length (different from Copilot's context trimming)
 
-### Step 5: Remove Copilot-Specific Features
+### Step 5: Adjust MCP Server Configuration
 
-**MCP Servers** (tools) are not supported in Claude Phase 1:
+The Claude provider supports `stdio` MCP servers. If your workflow uses `http` or `sse` servers, those must be removed or replaced with `stdio` equivalents when migrating to Claude.
 
 ```yaml
-# Before (Copilot)
+# Copilot — all transport types work
 workflow:
   runtime:
     mcp_servers:
       web-search:
-        command: npx
+        command: npx                      # stdio — works with both providers
         args: ["-y", "open-websearch@latest"]
         tools: ["*"]
+      remote-api:
+        type: http                        # http — Copilot only
+        url: https://mcp.example.com
 
-# After (Claude) - Remove this section
+# Claude — keep stdio servers, remove http/sse
 workflow:
   runtime:
-    # mcp_servers not supported in Phase 1
+    mcp_servers:
+      web-search:
+        command: npx                      # stdio — works with Claude
+        args: ["-y", "open-websearch@latest"]
+        tools: ["*"]
+      # remote-api removed (http not supported by Claude)
 ```
 
-**Agent tools** must also be removed:
-
-```yaml
-# Before (Copilot)
-agents:
-  - name: researcher
-    tools: [web_search, code_exec]
-
-# After (Claude)
-agents:
-  - name: researcher
-    # Remove tools field
-```
+See the [MCP Tools guide](../mcp-tools.md) for full provider support details.
 
 ### Complete Example
 
@@ -175,12 +171,16 @@ workflow:
     default_model: claude-sonnet-4.5
     temperature: 0.7
     max_tokens: 4096
-    # Remove mcp_servers
+    mcp_servers:
+      web-search:
+        command: npx                      # stdio servers work with Claude
+        args: ["-y", "open-websearch@latest"]
+        tools: ["*"]
 
 agents:
   - name: researcher
     model: claude-sonnet-4.5
-    # Remove tools
+    tools: [web_search]                   # agent tools work with Claude
     prompt: "Research {{ topic }}"
 ```
 
@@ -325,20 +325,19 @@ agents:
 2. Use Haiku models (3-5x faster)
 3. Break workflows into smaller agents
 
-### 6. Tool Calling (Not Available)
+### 6. Tool Calling
 
-**Copilot**: Full MCP tool support
-**Claude**: Phase 1 does NOT support tools/MCP
+**Copilot**: Full MCP tool support (stdio, http, sse)
+**Claude**: MCP tool support for stdio servers only
 
 **Impact**:
-- No web search, code execution, file operations
-- Cannot use external APIs via tools
-- Agents are isolated (no external data)
+- HTTP/SSE MCP servers are not available with Claude
+- stdio-based MCP servers (the most common type) work with both providers
 
-**Workarounds**:
-1. Pre-fetch data and pass as workflow input
-2. Split tool-dependent workflows into separate steps
-3. Wait for Phase 2 (tools support planned)
+**Migration notes**:
+1. Keep stdio MCP servers — they work with Claude
+2. Replace http/sse servers with stdio equivalents if available
+3. See the [MCP Tools guide](../mcp-tools.md) for details
 
 ## Testing Strategy
 
@@ -485,13 +484,14 @@ runtime:
   max_tokens: 8192
 ```
 
-### Pitfall 5: Expecting Tools to Work
+### Pitfall 5: HTTP/SSE MCP Servers Not Working
 
-**Error**: Workflow doesn't error but produces wrong results (no tool calls)
+**Error**: MCP server warning in logs, tools not available
 
-**Solution**: Remove tools from Phase 1 workflows:
+**Solution**: The Claude provider only supports `stdio` MCP servers. Replace `http`/`sse` servers with `stdio` equivalents:
 ```yaml
-# Remove mcp_servers and agent tools fields
+# Replace http/sse servers with stdio equivalents
+# See docs/mcp-tools.md for details
 ```
 
 ### Pitfall 6: Expecting Streaming
@@ -584,8 +584,8 @@ Use this checklist for each workflow:
 - [ ] Set `ANTHROPIC_API_KEY` environment variable
 - [ ] Map model names (GPT → Claude)
 - [ ] Understand `max_tokens` meaning change (context → output length)
-- [ ] Remove `mcp_servers` section
-- [ ] Remove agent `tools` fields
+- [ ] Remove `http`/`sse` MCP servers (Claude supports `stdio` only)
+- [ ] Keep `stdio` MCP servers and agent `tools` fields
 
 ### Testing
 - [ ] Validate YAML syntax

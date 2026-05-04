@@ -157,6 +157,19 @@ main() {
         -c "${tmpdir}/constraints.txt"
 
     success "Conductor ${tag_name} installed"
+
+    # Ensure uv's tool bin directory is on PATH for new shells. `uv tool install`
+    # only modifies the current process PATH; new terminals, sub-processes, CI
+    # agents, and IDE extensions inherit PATH from shell rc files. Running
+    # `uv tool update-shell` adds the bin dir to ~/.bashrc, ~/.zshrc, etc.
+    # (idempotent). See #115.
+    info "Ensuring conductor is on PATH for new shells…"
+    if uv tool update-shell >/dev/null 2>&1; then
+        success "PATH updated (restart your shell to pick up the change)"
+    else
+        info "Could not update shell PATH automatically. Run 'uv tool update-shell' manually."
+    fi
+
     printf '\n  Run \033[1mconductor --help\033[0m to get started.\n'
     printf '  Run \033[1mconductor update\033[0m to check for future updates.\n\n'
 }
