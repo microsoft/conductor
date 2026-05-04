@@ -12,99 +12,122 @@ function getDeepLinkParams(): { subworkflowPath: string | null; agent: string | 
   };
 }
 
-type SegmentFailure =
-  | { reason: 'not_found'; segment: string }
-  | { reason: 'ambiguous'; segment: string; candidates: string[] };
-
-interface ResolveResult {
-  path: number[];
-  failure: SegmentFailure | null;
-}
-
-/** Regex for positional index notation: `agent_name#N` (0-based). */
-const POSITIONAL_RE = /^(.+)#(\d+)$/;
-
 /**
- * Walk the subworkflow context tree to resolve a deep-link path.
+ * Walk the subworkflow context tree to find a path of indices for the given
+ * URL segments.
  *
- * Each segment is matched against sibling contexts in priority order:
- *   1. Exact `slotKey` match — e.g. `plan_child[item-0]`
- *   2. Positional `name#N` — 0-based index among siblings sharing `parentAgent`
- *      e.g. `plan_child#0` → first iteration of plan_child
- *   3. Bare agent name — matches if **exactly one** sibling has that `parentAgent`;
- *      ambiguous when multiple siblings share the name.
+ * Each segment is matched against `slotKey` first, then `parentAgent` as a
+ * fallback. This lets new URLs encode for_each iteration slot keys
+ * (e.g. `plan_children_group[item-7]`) and round-trip into the right
+ * concurrent iteration, while old URLs keyed by agent name (and old
+ * conductor builds where `slotKey` defaults to `parentAgent`) keep working.
  *
- * This lets external integrations deep-link into for_each iterations without
- * knowing the exact `item_key` values emitted by the engine.
+ * For ambiguous parentAgent matches (e.g. multiple iterations of the same
+ * group), the newest matching context wins — same precedence the engine
+ * uses when resolving live events.
  */
 function resolveSubworkflowPath(
   contexts: SubworkflowContext[],
   segments: string[],
-): ResolveResult {
+): { path: number[]; failedSegment: string | null } {
   const path: number[] = [];
   let current = contexts;
 
   for (const segment of segments) {
-    const idx = matchSegment(current, segment);
-    if (typeof idx === 'number') {
-      path.push(idx);
-      current = current[idx]!.children;
-      continue;
+    let idx = -1;
+    // Pass 1: exact slotKey match (newest-first for re-runs / iteration loops)
+    for (let i = current.length - 1; i >= 0; i--) {
+      if (current[i]!.slotKey === segment) {
+        idx = i;
+        break;
+      }
     }
-    // idx is a SegmentFailure
-    return { path, failure: idx };
+    // Pass 2: legacy parentAgent fallback (newest-first)
+    if (idx === -1) {
+      for (let i = current.length - 1; i >= 0; i--) {
+        if (current[i]!.parentAgent === segment) {
+          idx = i;
+          break;
+        }
+      }
+    }
+    if (idx === -1) {
+      return { path, failedSegment: segment };
+    }
+    path.push(idx);
+    current = current[idx]!.children;
   }
 
-  return { path, failure: null };
+  return { path, failedSegment: null };
+}
+
+interface AgentMatch {
+  path: number[];
+  ctx: SubworkflowContext;
 }
 
 /**
- * Match a single path segment against a list of sibling contexts.
- * Returns the matched index, or a SegmentFailure describing why it failed.
+ * Walk the entire subworkflow tree and collect every context whose `agents[]`
+ * contains an entry matching `agentName`.
+ *
+ * Used for agent-only deep-links (?agent=foo, no ?subworkflow=) so that an
+ * agent which lives inside a sub-workflow / for_each iteration is reachable
+ * without the caller needing to construct the full slot path. External
+ * notification feeds typically only know the agent name reliably.
  */
-function matchSegment(
+function findAgentMatches(
   contexts: SubworkflowContext[],
-  segment: string,
-): number | SegmentFailure {
-  // 1. Exact slotKey match (newest first for re-run tolerance)
-  for (let i = contexts.length - 1; i >= 0; i--) {
-    if (contexts[i]!.slotKey === segment) return i;
-  }
-
-  // 2. Positional notation: agent_name#N
-  const posMatch = POSITIONAL_RE.exec(segment);
-  if (posMatch) {
-    const baseName = posMatch[1]!;
-    const ordinal = parseInt(posMatch[2]!, 10);
-    const siblings = contexts
-      .map((c, i) => ({ ctx: c, index: i }))
-      .filter(({ ctx }) => ctx.parentAgent === baseName);
-    if (siblings.length === 0) {
-      return { reason: 'not_found', segment };
+  agentName: string,
+  basePath: number[] = [],
+): AgentMatch[] {
+  const matches: AgentMatch[] = [];
+  for (let i = 0; i < contexts.length; i++) {
+    const ctx = contexts[i]!;
+    const path = [...basePath, i];
+    if (ctx.agents.some((a) => a.name === agentName)) {
+      matches.push({ path, ctx });
     }
-    if (ordinal >= siblings.length) {
-      return {
-        reason: 'not_found',
-        segment,
-      };
+    if (ctx.children.length > 0) {
+      matches.push(...findAgentMatches(ctx.children, agentName, path));
     }
-    return siblings[ordinal]!.index;
   }
+  return matches;
+}
 
-  // 3. Bare agent name — unique parentAgent match only
-  const agentMatches = contexts
-    .map((c, i) => ({ ctx: c, index: i }))
-    .filter(({ ctx }) => ctx.parentAgent === segment);
+/**
+ * Pick the most relevant match among many candidates: running contexts beat
+ * non-running, then deeper paths beat shallower (more specific iteration
+ * wins over a parent that contains it), then newest-by-creation-order wins.
+ * Mirrors the engine's "live edge" preference for live event routing.
+ */
+function pickBestAgentMatch(matches: AgentMatch[]): AgentMatch | null {
+  if (matches.length === 0) return null;
+  return [...matches].sort((a, b) => {
+    const aRunning = a.ctx.status === 'running' ? 1 : 0;
+    const bRunning = b.ctx.status === 'running' ? 1 : 0;
+    if (aRunning !== bRunning) return bRunning - aRunning;
+    if (a.path.length !== b.path.length) return b.path.length - a.path.length;
+    // Same depth, same status: lexicographically-larger path = newer
+    for (let i = 0; i < a.path.length; i++) {
+      const ai = a.path[i]!;
+      const bi = b.path[i]!;
+      if (ai !== bi) return bi - ai;
+    }
+    return 0;
+  })[0]!;
+}
 
-  if (agentMatches.length === 1) {
-    return agentMatches[0]!.index;
+/** Render a slot-key path for human-readable error messages. */
+function describeLocation(contexts: SubworkflowContext[], path: number[]): string {
+  const segments: string[] = [];
+  let current = contexts;
+  for (const idx of path) {
+    const ctx = current[idx];
+    if (!ctx) break;
+    segments.push(ctx.slotKey || ctx.parentAgent || `[${idx}]`);
+    current = ctx.children;
   }
-  if (agentMatches.length > 1) {
-    const candidates = agentMatches.map(({ ctx }) => ctx.slotKey);
-    return { reason: 'ambiguous', segment, candidates };
-  }
-
-  return { reason: 'not_found', segment };
+  return segments.join('/');
 }
 
 export interface DeepLinkError {
@@ -116,24 +139,20 @@ export interface DeepLinkError {
  * and auto-selects / navigates to the matching node once the workflow
  * state has been replayed.
  *
- * ### Subworkflow path notation
+ * Subworkflow paths support slash-separated nesting. Each segment matches
+ * the child context's `slotKey` first, then falls back to `parentAgent`:
+ *   ?subworkflow=planning/design                    → root→planning→design
+ *   ?subworkflow=plan_children_group[item-7]/build  → into a specific
+ *                                                     for_each iteration
  *
- * Paths are slash-separated:
- *   `?subworkflow=segment1/segment2`
- *
- * Each segment is matched in priority order:
- *   1. **Exact slotKey** — `plan_child[item-0]`
- *      Matches the engine-emitted `slot_key` verbatim.
- *   2. **Positional index** — `plan_child#0` (0-based)
- *      Matches the Nth iteration among siblings sharing that `parentAgent`.
- *      Useful when the caller doesn't know the `item_key` values.
- *   3. **Bare agent name** — `plan_child`
- *      Matches if exactly one sibling has that parentAgent (including when
- *      its slotKey has bracket notation). Fails as ambiguous when multiple
- *      for_each iterations exist — use exact slotKey or positional notation.
+ * Agent-only links (?agent=foo, no ?subworkflow=) search transitively:
+ * root agents first, then every sub-workflow context. If the agent is
+ * found in exactly one place, we navigate there. If it's found in many
+ * places (e.g. the same agent ran in every for_each iteration), the
+ * running > deepest > newest match wins.
  *
  * Returns an error object if the deep-link target cannot be resolved.
- * Must be rendered inside a `<ReactFlow>` provider so `useReactFlow()` works.
+ * Must be rendered inside a <ReactFlow> provider so useReactFlow() works.
  */
 export function useDeepLink(): DeepLinkError | null {
   const [error, setError] = useState<DeepLinkError | null>(null);
@@ -146,96 +165,185 @@ export function useDeepLink(): DeepLinkError | null {
   useEffect(() => {
     if (applied.current || !hasParams) return;
 
-    // Subscribe to store changes and apply deep-link when state is ready.
-    // This avoids timing issues with useEffect + zustand selectors.
-    const unsubscribe = useWorkflowStore.subscribe((state) => {
+    let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+    let hardTimeout: ReturnType<typeof setTimeout> | null = null;
+    let unsubscribe: (() => void) | null = null;
+
+    const apply = () => {
       if (applied.current) return;
-
-      // Wait until root agents have been populated (workflow_started processed)
-      if (state.agents.length === 0) return;
-
       applied.current = true;
-      unsubscribe();
+      if (debounceTimer) clearTimeout(debounceTimer);
+      if (hardTimeout) clearTimeout(hardTimeout);
+      if (unsubscribe) unsubscribe();
 
-      // 1. Navigate into subworkflow path (or reset to root for agent-only links)
-      if (subworkflowPath) {
-        const segments = subworkflowPath.split('/').filter(Boolean);
-        const { path, failure } = resolveSubworkflowPath(
-          state.subworkflowContexts,
-          segments,
-        );
-
-        if (failure) {
-          const resolved = segments.slice(0, path.length).join('/');
-          const prefix = resolved ? ` (resolved: ${resolved})` : '';
-          let message: string;
-          if (failure.reason === 'ambiguous') {
-            const alts = failure.candidates
-              .map((c, i) => `"${c}" or "${failure.segment}#${i}"`)
-              .join(', ');
-            message = `"${failure.segment}" is ambiguous${prefix} — multiple iterations exist. Use: ${alts}`;
-          } else {
-            message = `Subworkflow "${failure.segment}" not found${prefix}. It may not have started yet. Use exact slotKey or positional notation (e.g. agent#0).`;
-          }
-          setError({ message });
-          return;
-        }
-
-        // Apply the full navigation path at once
-        useWorkflowStore.setState({ viewContextPath: path, selectedNode: null });
-      } else if (agent) {
-        // Agent-only deep-link: pin to root so sticky-follow doesn't drag
-        // the view into a stale subworkflow/for_each iteration during replay.
-        useWorkflowStore.setState({ viewContextPath: [], selectedNode: null });
+      const state = useWorkflowStore.getState();
+      if (state.agents.length === 0) {
+        setError({ message: 'Workflow state did not load.' });
+        return;
       }
 
-      // 2. Select agent node
-      if (agent) {
-        // Determine which context to check for the agent
-        const freshState = useWorkflowStore.getState();
-        let agentList: { name: string }[];
-
-        if (freshState.viewContextPath.length === 0) {
-          agentList = freshState.agents;
-        } else {
-          // Walk the context tree to get agents at the target depth
-          let ctx: SubworkflowContext | undefined;
-          let contexts = freshState.subworkflowContexts;
-          for (const idx of freshState.viewContextPath) {
-            ctx = contexts[idx];
-            if (!ctx) break;
-            contexts = ctx.children;
-          }
-          agentList = ctx?.agents ?? [];
-        }
-
-        const agentExists = agentList.some((a) => a.name === agent);
-        if (!agentExists) {
-          const location = subworkflowPath || 'root workflow';
+      // Resolve subworkflow path (if provided)
+      let resolvedPath: number[] = [];
+      if (subworkflowPath) {
+        const segments = subworkflowPath.split('/').filter(Boolean);
+        const result = resolveSubworkflowPath(state.subworkflowContexts, segments);
+        if (result.failedSegment) {
+          const resolved = segments.slice(0, result.path.length).join('/');
           setError({
-            message: `Agent "${agent}" not found in ${location}.`,
+            message: `Subworkflow "${result.failedSegment}" not found${resolved ? ` (resolved: ${resolved})` : ''}. It may not have started yet.`,
           });
           return;
         }
+        resolvedPath = result.path;
+      }
 
-        useWorkflowStore.setState({ selectedNode: agent });
+      // Resolve agent (if provided)
+      if (agent) {
+        const agentsAtTarget =
+          resolvedPath.length === 0
+            ? state.agents
+            : (() => {
+                let ctx: SubworkflowContext | undefined;
+                let contexts = state.subworkflowContexts;
+                for (const idx of resolvedPath) {
+                  ctx = contexts[idx];
+                  if (!ctx) break;
+                  contexts = ctx.children;
+                }
+                return ctx?.agents ?? [];
+              })();
+
+        if (agentsAtTarget.some((a) => a.name === agent)) {
+          // Agent is at the requested (or root) location
+          useWorkflowStore.setState({
+            viewContextPath: resolvedPath,
+            selectedNode: agent,
+          });
+        } else {
+          // Not at the requested location. Search transitively.
+          const matches = findAgentMatches(state.subworkflowContexts, agent);
+
+          if (matches.length === 0) {
+            const where = subworkflowPath || 'root workflow';
+            // Even on failure, honour any explicit subworkflow nav, otherwise
+            // pin to root so sticky-follow doesn't strand the user inside a
+            // stale for_each iteration during replay.
+            useWorkflowStore.setState({
+              viewContextPath: resolvedPath,
+              selectedNode: null,
+            });
+            setError({
+              message: `Agent "${agent}" not found in ${where}.`,
+            });
+            return;
+          }
+
+          if (subworkflowPath) {
+            // User asked for a specific path, agent isn't there but is
+            // elsewhere — surface the discovered locations so the next
+            // click is obvious.
+            const locations = matches
+              .slice(0, 5)
+              .map((m) => describeLocation(state.subworkflowContexts, m.path))
+              .join(', ');
+            const more = matches.length > 5 ? `, and ${matches.length - 5} more` : '';
+            useWorkflowStore.setState({
+              viewContextPath: resolvedPath,
+              selectedNode: null,
+            });
+            setError({
+              message: `Agent "${agent}" not found in ${subworkflowPath}. Found in: ${locations}${more}`,
+            });
+            return;
+          }
+
+          // Agent-only link: pick the best transitive match and navigate there.
+          const best = pickBestAgentMatch(matches)!;
+          useWorkflowStore.setState({
+            viewContextPath: best.path,
+            selectedNode: agent,
+          });
+        }
 
         // Center the view on the node after React Flow rebuilds the graph
         setTimeout(() => {
           fitView({ nodes: [{ id: agent }], padding: 0.5, duration: 400 });
         }, 200);
+      } else if (subworkflowPath) {
+        // Subworkflow nav only, no agent
+        useWorkflowStore.setState({
+          viewContextPath: resolvedPath,
+          selectedNode: null,
+        });
       }
-    });
+    };
 
-    // Also check the current state immediately (late-joiner replay may have
-    // already completed before this effect runs)
-    const currentState = useWorkflowStore.getState();
-    if (currentState.agents.length > 0 && !applied.current) {
-      // Trigger the subscriber with current state
-      useWorkflowStore.setState({});
-    }
+    /**
+     * Decide whether the current state is "ready enough" to apply the deep
+     * link, or if we should keep waiting for more replayed events. Returns
+     * true when the resolution is unambiguous (agent at requested location,
+     * or workflow has finished so no more contexts are coming).
+     */
+    const isResolved = (): boolean => {
+      const state = useWorkflowStore.getState();
+      if (state.agents.length === 0) return false;
 
-    return unsubscribe;
+      // If the workflow has ended, we have all the state we'll ever get.
+      if (state.workflowStatus !== 'running' && state.workflowStatus !== 'pending') {
+        return true;
+      }
+
+      // For explicit subworkflow paths, wait until the path resolves.
+      if (subworkflowPath) {
+        const segments = subworkflowPath.split('/').filter(Boolean);
+        const { failedSegment } = resolveSubworkflowPath(
+          state.subworkflowContexts,
+          segments,
+        );
+        if (failedSegment) return false;
+      }
+
+      // For agent-only links, wait until the agent appears somewhere.
+      if (agent && !subworkflowPath) {
+        const rootHas = state.agents.some((a) => a.name === agent);
+        if (!rootHas && findAgentMatches(state.subworkflowContexts, agent).length === 0) {
+          return false;
+        }
+      }
+
+      return true;
+    };
+
+    // Each time the store changes, debounce 200ms then check if we can apply.
+    // The debounce gives the WS replay burst a chance to finish dispatching.
+    const scheduleCheck = () => {
+      if (debounceTimer) clearTimeout(debounceTimer);
+      debounceTimer = setTimeout(() => {
+        if (applied.current) return;
+        if (isResolved()) apply();
+      }, 200);
+    };
+
+    unsubscribe = useWorkflowStore.subscribe(scheduleCheck);
+
+    // Hard cap: if 5 seconds pass and we still haven't applied (e.g. live
+    // workflow that never reaches a terminal state and the agent never
+    // appeared), fall through with whatever state we have so the user gets
+    // a deterministic error instead of a hung UI.
+    hardTimeout = setTimeout(() => {
+      if (applied.current) return;
+      apply();
+    }, 5000);
+
+    // Kick off an initial check in case state was already loaded before
+    // this effect attached.
+    scheduleCheck();
+
+    return () => {
+      if (debounceTimer) clearTimeout(debounceTimer);
+      if (hardTimeout) clearTimeout(hardTimeout);
+      if (unsubscribe) unsubscribe();
+    };
   }, [hasParams, subworkflowPath, agent, fitView]);
 
   return error;
