@@ -1425,7 +1425,13 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     let parentIndexPath: number[];
     if (data.parent_path !== undefined) {
       const resolved = resolveSlotPath(state.subworkflowContexts, data.parent_path);
-      parentIndexPath = resolved?.indexPath ?? [];
+      // Mirror subworkflow_started: bail on resolution miss instead of
+      // silently falling back to root. A null result here means the event
+      // arrived before its sibling subworkflow_started or the path is
+      // inconsistent. Falling back to [] would stamp 'completed' on a
+      // same-named root agent and corrupt activeContextPath below.
+      if (!resolved) return;
+      parentIndexPath = resolved.indexPath;
     } else {
       parentIndexPath = state.activeContextPath;
     }
@@ -1464,7 +1470,11 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     let parentIndexPath: number[];
     if (data.parent_path !== undefined) {
       const resolved = resolveSlotPath(state.subworkflowContexts, data.parent_path);
-      parentIndexPath = resolved?.indexPath ?? [];
+      // See subworkflow_completed: bail on resolution miss to avoid
+      // stamping 'failed' on an unrelated root node and clobbering
+      // activeContextPath.
+      if (!resolved) return;
+      parentIndexPath = resolved.indexPath;
     } else {
       parentIndexPath = state.activeContextPath;
     }
