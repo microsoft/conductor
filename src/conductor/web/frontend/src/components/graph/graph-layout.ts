@@ -183,14 +183,26 @@ export function buildGraphElements(
     });
   }
 
-  // Create edges — only include edges whose source and target exist as nodes
+  // Create edges — only include edges whose source and target exist as nodes.
+  // Remap child nodes inside groups to the parent group node so edges
+  // connect at the group boundary (children use relative positioning).
   const nodeIds = new Set(flowNodes.map((n) => n.id));
+  const childToParent = new Map<string, string>();
+  for (const node of flowNodes) {
+    if (node.parentId) childToParent.set(node.id, node.parentId);
+  }
+
   for (const r of routes) {
-    if (!nodeIds.has(r.from) || !nodeIds.has(r.to)) continue;
+    const from = childToParent.get(r.from) ?? r.from;
+    const to = childToParent.get(r.to) ?? r.to;
+    if (!nodeIds.has(from) || !nodeIds.has(to)) continue;
+    // Skip self-loops created by remapping (e.g. group member → group member)
+    if (from === to) continue;
+    const edgeId = `${from}->${to}${r.when ? `[${r.when}]` : ''}`;
     flowEdges.push({
-      id: `${r.from}->${r.to}`,
-      source: r.from,
-      target: r.to,
+      id: edgeId,
+      source: from,
+      target: to,
       type: 'animatedEdge',
       data: { when: r.when },
       animated: false,
