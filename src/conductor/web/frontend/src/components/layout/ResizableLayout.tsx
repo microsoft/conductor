@@ -3,9 +3,12 @@ import { WorkflowGraph } from '@/components/graph/WorkflowGraph';
 import { DetailPanel } from '@/components/detail/DetailPanel';
 import { OutputPane } from '@/components/layout/OutputPane';
 import { useWorkflowStore } from '@/stores/workflow-store';
+import { DialogOverlay } from '@/components/detail/DialogOverlay';
 
 export function ResizableLayout() {
   const selectedNode = useWorkflowStore((s) => s.selectedNode);
+  const activeDialog = useWorkflowStore((s) => s.activeDialog);
+  const dialogEngaged = useWorkflowStore((s) => s.dialogEngaged);
 
   return (
     <PanelGroup direction="vertical" className="flex-1 overflow-hidden">
@@ -13,7 +16,7 @@ export function ResizableLayout() {
       <Panel defaultSize={70} minSize={30}>
         <PanelGroup direction="horizontal" className="h-full">
           <Panel defaultSize={selectedNode ? 65 : 100} minSize={40}>
-            <WorkflowGraph />
+            {activeDialog && dialogEngaged ? <DialogOverlay /> : <WorkflowGraph />}
           </Panel>
           {selectedNode && (
             <>

@@ -13,6 +13,7 @@ from conductor.config.loader import (
 from conductor.config.schema import (
     AgentDef,
     ContextConfig,
+    DialogConfig,
     GateOption,
     HooksConfig,
     InputDef,
@@ -34,6 +35,7 @@ __all__ = [
     # Schema models
     "AgentDef",
     "ContextConfig",
+    "DialogConfig",
     "GateOption",
     "HooksConfig",
     "InputDef",
