@@ -657,9 +657,7 @@ class WorkflowEngine:
                 yaml_instructions=sub_config.workflow.instructions,
             )
             if sub_preamble:
-                child_preamble = (
-                    child_preamble + sub_preamble if child_preamble else sub_preamble
-                )
+                child_preamble = child_preamble + sub_preamble if child_preamble else sub_preamble
 
         # Create child engine inheriting provider/registry but with deeper depth
         child_engine = WorkflowEngine(
