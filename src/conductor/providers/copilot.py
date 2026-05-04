@@ -1104,9 +1104,7 @@ class CopilotProvider(AgentProvider):
         }
 
         if field_def.type == "object" and field_def.properties:
-            schema["properties"] = self._build_prompt_schema(
-                field_def.properties, depth=depth + 1
-            )
+            schema["properties"] = self._build_prompt_schema(field_def.properties, depth=depth + 1)
             schema["required"] = list(field_def.properties.keys())
 
         if field_def.type == "array" and field_def.items:
@@ -1129,9 +1127,7 @@ class CopilotProvider(AgentProvider):
             schema["description"] = field_def.description
 
         if field_def.type == "object" and field_def.properties:
-            schema["properties"] = self._build_prompt_schema(
-                field_def.properties, depth=depth + 1
-            )
+            schema["properties"] = self._build_prompt_schema(field_def.properties, depth=depth + 1)
             schema["required"] = list(field_def.properties.keys())
 
         if field_def.type == "array" and field_def.items:
