@@ -873,8 +873,16 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
       }
       state.agentsTotal = agentNames.size;
     } else {
-      // Child workflow — populate the active child context
-      const ctx = resolveContext(state.subworkflowContexts, state.activeContextPath);
+      // Child workflow — populate the owning child context. Locate it via
+      // the engine-supplied subworkflow_path (slot-key path) when present,
+      // because under concurrent for_each iterations the global
+      // activeContextPath may have been advanced past us by a sibling
+      // start, which would otherwise scramble whose routes/agents land
+      // in which ctx.
+      const subPath = (_data as Record<string, unknown>).subworkflow_path;
+      const ctx = Array.isArray(subPath) && subPath.length > 0
+        ? resolveSlotPath(state.subworkflowContexts, subPath as string[])?.ctx ?? null
+        : resolveContext(state.subworkflowContexts, state.activeContextPath);
       if (ctx) {
         ctx.workflowName = data.name || '';
         ctx.status = 'running';
