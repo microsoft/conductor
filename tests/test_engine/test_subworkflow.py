@@ -268,10 +268,29 @@ class TestSubWorkflowErrors:
             await engine.run({})
 
     @pytest.mark.asyncio
-    async def test_self_referencing_workflow(self, tmp_workflow_dir: Path) -> None:
-        """Test that a workflow referencing itself raises ExecutionError."""
+    async def test_self_referencing_workflow_hits_depth_limit(self, tmp_workflow_dir: Path) -> None:
+        """Test that a self-referencing workflow is allowed but bounded by depth limit."""
+        # Write a real self-referencing workflow YAML
         parent_path = tmp_workflow_dir / "parent.yaml"
-        parent_path.write_text("dummy", encoding="utf-8")
+        _write_yaml(
+            parent_path,
+            """\
+            workflow:
+              name: self-ref
+              entry_point: sub_wf
+              runtime:
+                provider: copilot
+              limits:
+                max_iterations: 50
+            agents:
+              - name: sub_wf
+                type: workflow
+                workflow: parent.yaml
+                routes:
+                  - to: "$end"
+            output: {}
+            """,
+        )
 
         config = WorkflowConfig(
             workflow=WorkflowDef(
@@ -294,7 +313,58 @@ class TestSubWorkflowErrors:
         mock_provider = MagicMock()
         engine = WorkflowEngine(config, mock_provider, workflow_path=parent_path)
 
-        with pytest.raises(ExecutionError, match="Circular sub-workflow reference"):
+        # Self-reference is now allowed but will hit depth limit
+        with pytest.raises(ExecutionError, match="depth limit exceeded"):
+            await engine.run({})
+
+    @pytest.mark.asyncio
+    async def test_max_depth_per_agent(self, tmp_workflow_dir: Path) -> None:
+        """Test that per-agent max_depth is enforced before global limit."""
+        parent_path = tmp_workflow_dir / "parent.yaml"
+        _write_yaml(
+            parent_path,
+            """\
+            workflow:
+              name: self-ref
+              entry_point: sub_wf
+              runtime:
+                provider: copilot
+              limits:
+                max_iterations: 50
+            agents:
+              - name: sub_wf
+                type: workflow
+                workflow: parent.yaml
+                max_depth: 2
+                routes:
+                  - to: "$end"
+            output: {}
+            """,
+        )
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="parent",
+                entry_point="sub_wf",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="sub_wf",
+                    type="workflow",
+                    workflow="parent.yaml",
+                    max_depth=2,
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+        )
+
+        mock_provider = MagicMock()
+        engine = WorkflowEngine(config, mock_provider, workflow_path=parent_path)
+
+        with pytest.raises(ExecutionError, match="max_depth.*exceeded"):
             await engine.run({})
 
 
@@ -685,10 +755,11 @@ class TestSubWorkflowInputMapping:
         engine = WorkflowEngine(config, provider, workflow_path=parent_path)
         await engine.run({})
 
-        # The child's inner agent should see the string values rendered into the prompt
+        # The child's inner agent should see JSON-parsed values rendered into the prompt.
+        # json.loads("42") -> int 42, json.loads("true") -> bool True (Python repr)
         inner_prompt = [p for p in received_prompts if "Count=" in p][0]
         assert "Count=42" in inner_prompt
-        assert "Flag=true" in inner_prompt
+        assert "Flag=True" in inner_prompt
 
     @pytest.mark.asyncio
     async def test_no_input_mapping_forwards_parent_inputs(self, tmp_workflow_dir: Path) -> None:

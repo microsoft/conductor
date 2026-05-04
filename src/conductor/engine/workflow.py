@@ -21,7 +21,7 @@ from conductor.engine.context import WorkflowContext
 from conductor.engine.limits import LimitEnforcer
 from conductor.engine.pricing import ModelPricing
 from conductor.engine.router import Router, RouteResult
-from conductor.engine.usage import UsageTracker
+from conductor.engine.usage import UsageTracker, WorkflowUsage
 from conductor.events import WorkflowEvent, WorkflowEventEmitter
 from conductor.exceptions import (
     ConductorError,
@@ -544,6 +544,52 @@ class WorkflowEngine:
             operation_name=f"script '{agent.name}'",
         )
 
+    def _build_subworkflow_inputs(
+        self,
+        agent: AgentDef,
+        context: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Build sub-workflow inputs from an agent's input_mapping or defaults.
+
+        Renders each input_mapping expression against the provided context and
+        attempts JSON parsing for type coercion (so ``"5"`` becomes ``int(5)``
+        and ``"[1,2]"`` becomes a list). Falls back to the raw rendered string
+        if JSON parsing fails.
+
+        When no input_mapping is defined, forwards the parent's workflow.input
+        values as-is.
+
+        Args:
+            agent: Agent definition with optional ``input_mapping``.
+            context: Template rendering context (agent outputs, workflow vars, loop vars).
+
+        Returns:
+            Dict of sub-workflow input values.
+        """
+        if agent.input_mapping is not None:
+            renderer = TemplateRenderer()
+            sub_inputs: dict[str, Any] = {}
+            for key, template_expr in agent.input_mapping.items():
+                try:
+                    rendered = renderer.render(template_expr, context)
+                except Exception as e:
+                    raise ExecutionError(
+                        f"Failed to render input_mapping key '{key}' for agent '{agent.name}': {e}",
+                        suggestion=f"Check that the expression '{template_expr}' "
+                        "references valid context variables.",
+                    ) from e
+                # Attempt JSON parse for type coercion (int, list, dict, bool, null).
+                # Falls back to raw string if the value isn't valid JSON.
+                try:
+                    sub_inputs[key] = json.loads(rendered)
+                except (json.JSONDecodeError, ValueError):
+                    sub_inputs[key] = rendered
+            return sub_inputs
+        else:
+            # Default: forward parent's workflow.input.* values
+            workflow_ctx = context.get("workflow", {})
+            return dict(workflow_ctx.get("input", {})) if isinstance(workflow_ctx, dict) else {}
+
     async def _execute_subworkflow(
         self,
         agent: AgentDef,
@@ -575,6 +621,14 @@ class WorkflowEngine:
                 suggestion=("Check for circular sub-workflow references or reduce nesting depth."),
             )
 
+        # Per-agent depth limit (stricter than global MAX_SUBWORKFLOW_DEPTH)
+        if agent.max_depth is not None and self._subworkflow_depth >= agent.max_depth:
+            raise ExecutionError(
+                f"Agent '{agent.name}' max_depth ({agent.max_depth}) exceeded "
+                f"at depth {self._subworkflow_depth}.",
+                suggestion="Increase max_depth or restructure to reduce nesting.",
+            )
+
         assert agent.workflow is not None  # noqa: S101
 
         # Resolve sub-workflow path relative to parent workflow file
@@ -591,15 +645,6 @@ class WorkflowEngine:
                 suggestion="Check that the 'workflow' path is correct and the file exists.",
             )
 
-        # Detect circular references via file path
-        current_path = Path(self.workflow_path).resolve() if self.workflow_path else None
-        if current_path is not None and sub_path == current_path:
-            raise ExecutionError(
-                f"Circular sub-workflow reference: agent '{agent.name}' "
-                f"references its own workflow file '{agent.workflow}'.",
-                suggestion="A workflow cannot reference itself as a sub-workflow.",
-            )
-
         try:
             sub_config = load_config(sub_path)
         except Exception as exc:
@@ -610,27 +655,7 @@ class WorkflowEngine:
             ) from exc
 
         # Build sub-workflow inputs from the parent context
-        sub_inputs: dict[str, Any]
-        if agent.input_mapping is not None:
-            # Dynamic inputs: render each Jinja2 expression against parent context
-            renderer = TemplateRenderer()
-            sub_inputs = {}
-            for key, template_expr in agent.input_mapping.items():
-                try:
-                    rendered = renderer.render(template_expr, context)
-                except Exception as e:
-                    raise ExecutionError(
-                        f"Failed to render input_mapping key '{key}' for agent '{agent.name}': {e}",
-                        suggestion=f"Check that the expression '{template_expr}' "
-                        "references valid context variables.",
-                    ) from e
-                sub_inputs[key] = rendered
-        else:
-            # Default: forward parent's workflow.input.* values
-            workflow_ctx = context.get("workflow", {})
-            sub_inputs = (
-                dict(workflow_ctx.get("input", {})) if isinstance(workflow_ctx, dict) else {}
-            )
+        sub_inputs = self._build_subworkflow_inputs(agent, context)
 
         # Create child engine inheriting provider/registry but with deeper depth
         child_engine = WorkflowEngine(
@@ -653,7 +678,7 @@ class WorkflowEngine:
         agent: AgentDef,
         sub_inputs: dict[str, Any],
         slot_key: str | None = None,
-    ) -> dict[str, Any]:
+    ) -> tuple[dict[str, Any], WorkflowUsage]:
         """Execute a sub-workflow with pre-built inputs.
 
         Like _execute_subworkflow but accepts explicit inputs instead of
@@ -670,7 +695,7 @@ class WorkflowEngine:
                 to ``agent.name`` (matches sequential sub-workflow behavior).
 
         Returns:
-            The sub-workflow's final output dict.
+            Tuple of (output dict, child workflow usage summary).
         """
         from conductor.config.loader import load_config
 
@@ -679,6 +704,14 @@ class WorkflowEngine:
                 f"Sub-workflow depth limit exceeded ({MAX_SUBWORKFLOW_DEPTH}). "
                 f"Agent '{agent.name}' cannot invoke sub-workflow '{agent.workflow}'.",
                 suggestion="Check for circular sub-workflow references or reduce nesting depth.",
+            )
+
+        # Per-agent depth limit (stricter than global MAX_SUBWORKFLOW_DEPTH)
+        if agent.max_depth is not None and self._subworkflow_depth >= agent.max_depth:
+            raise ExecutionError(
+                f"Agent '{agent.name}' max_depth ({agent.max_depth}) exceeded "
+                f"at depth {self._subworkflow_depth}.",
+                suggestion="Increase max_depth or restructure to reduce nesting.",
             )
 
         assert agent.workflow is not None  # noqa: S101
@@ -694,15 +727,6 @@ class WorkflowEngine:
             raise ExecutionError(
                 f"Sub-workflow file not found: {sub_path} (referenced by agent '{agent.name}')",
                 suggestion="Check that the 'workflow' path is correct and the file exists.",
-            )
-
-        # Detect circular references via file path
-        current_path = Path(self.workflow_path).resolve() if self.workflow_path else None
-        if current_path is not None and sub_path == current_path:
-            raise ExecutionError(
-                f"Circular sub-workflow reference: agent '{agent.name}' "
-                f"references its own workflow file '{agent.workflow}'.",
-                suggestion="A workflow cannot reference itself as a sub-workflow.",
             )
 
         try:
@@ -738,7 +762,9 @@ class WorkflowEngine:
             ]
         child_engine = WorkflowEngine(**child_engine_kwargs)
 
-        return await child_engine.run(sub_inputs)
+        output = await child_engine.run(sub_inputs)
+        usage = child_engine.usage_tracker.get_summary()
+        return output, usage
 
     def _get_context_window_for_agent(self, agent: AgentDef) -> int | None:
         """Return the context window size for an agent's model."""
@@ -2768,21 +2794,9 @@ class WorkflowEngine:
 
                 # Execute agent — sub-workflow or regular
                 if for_each_group.agent.type == "workflow":
-                    # Build sub-workflow inputs from input_mapping with loop vars
-                    if for_each_group.agent.input_mapping:
-                        renderer = TemplateRenderer()
-                        sub_inputs: dict[str, Any] = {}
-                        for k, tmpl in for_each_group.agent.input_mapping.items():
-                            rendered = renderer.render(tmpl, agent_context)
-                            try:
-                                sub_inputs[k] = json.loads(rendered)
-                            except (json.JSONDecodeError, ValueError):
-                                sub_inputs[k] = rendered
-                    else:
-                        wf_ctx = agent_context.get("workflow", {})
-                        sub_inputs = (
-                            dict(wf_ctx.get("input", {})) if isinstance(wf_ctx, dict) else {}
-                        )
+                    # Build sub-workflow inputs using shared helper (consistent
+                    # JSON-parse-with-fallback across all sub-workflow paths)
+                    sub_inputs = self._build_subworkflow_inputs(for_each_group.agent, agent_context)
 
                     # Execute sub-workflow per-iteration. Build a unique slot
                     # key so concurrent iterations get distinct dashboard
@@ -2800,7 +2814,7 @@ class WorkflowEngine:
                         },
                     )
                     try:
-                        output_content = await self._execute_subworkflow_with_inputs(
+                        output_content, child_usage = await self._execute_subworkflow_with_inputs(
                             for_each_group.agent,
                             sub_inputs,
                             slot_key=iteration_slot_key,
@@ -2842,8 +2856,8 @@ class WorkflowEngine:
                             "group_name": for_each_group.name,
                             "item_key": key,
                             "elapsed": _item_elapsed,
-                            "tokens": 0,
-                            "cost_usd": 0.0,
+                            "tokens": child_usage.total_tokens,
+                            "cost_usd": child_usage.total_cost_usd or 0.0,
                             "output": output_content,
                         },
                     )
