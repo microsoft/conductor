@@ -16,6 +16,7 @@ from conductor.config.schema import (
     AgentDef,
     ContextConfig,
     GateOption,
+    InputDef,
     LimitsConfig,
     OutputField,
     ParallelGroup,
@@ -337,6 +338,98 @@ class TestWorkflowEngineContextModes:
 
         # Script should have rendered the template successfully
         assert engine.context.agent_outputs["detector"]["stdout"].strip() == "42"
+
+
+class TestApplyInputDefaults:
+    """Tests for `_apply_input_defaults` / `_zero_value_for_type`.
+
+    Optional inputs without an explicit ``default:`` must resolve to a
+    type-appropriate zero value (not ``None``) so templates render cleanly
+    without requiring ``| default()`` guards.
+    """
+
+    @staticmethod
+    def _engine_with_input(name: str, input_def: InputDef) -> WorkflowEngine:
+        """Build a minimal engine whose only declared input is `input_def`."""
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="defaults-probe",
+                entry_point="noop",
+                input={name: input_def},
+            ),
+            agents=[
+                AgentDef(
+                    name="noop",
+                    model="gpt-4",
+                    prompt="noop",
+                    output={"result": OutputField(type="string")},
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+        )
+        return WorkflowEngine(config, CopilotProvider(mock_handler=lambda a, p, c: {}))
+
+    @pytest.mark.parametrize(
+        ("type_name", "expected_zero"),
+        [
+            ("string", ""),
+            ("number", 0),
+            ("boolean", False),
+            ("array", []),
+            ("object", {}),
+        ],
+    )
+    def test_optional_input_with_no_default_gets_type_zero(
+        self, type_name: str, expected_zero: object
+    ) -> None:
+        """Every InputDef.type resolves to its type-appropriate zero, not None."""
+        engine = self._engine_with_input("opt", InputDef(type=type_name, required=False))
+
+        merged = engine._apply_input_defaults({})
+
+        assert "opt" in merged
+        assert merged["opt"] == expected_zero
+        assert merged["opt"] is not None
+
+    def test_explicit_default_is_honored_over_zero(self) -> None:
+        """A declared ``default:`` wins; the zero-value path must not override it."""
+        engine = self._engine_with_input(
+            "with_default", InputDef(type="string", required=False, default="hello")
+        )
+
+        merged = engine._apply_input_defaults({})
+
+        assert merged["with_default"] == "hello"
+
+    def test_provided_value_passes_through_unchanged(self) -> None:
+        """Caller-provided values are never overwritten by defaults."""
+        engine = self._engine_with_input("opt", InputDef(type="string", required=False))
+
+        merged = engine._apply_input_defaults({"opt": "explicit"})
+
+        assert merged["opt"] == "explicit"
+
+    def test_required_input_is_left_alone_when_missing(self) -> None:
+        """Missing required inputs are not silently filled — let validation flag them."""
+        engine = self._engine_with_input("must_have", InputDef(type="string", required=True))
+
+        merged = engine._apply_input_defaults({})
+
+        assert "must_have" not in merged
+
+    @pytest.mark.parametrize("type_name", ["array", "object"])
+    def test_zero_value_for_mutable_type_returns_fresh_instance(self, type_name: str) -> None:
+        """Mutable zeros must not be shared — guards against the classic
+        shared-mutable-default bug if someone later "optimizes" the lookup
+        into a single cached instance.
+        """
+        engine = self._engine_with_input("opt", InputDef(type=type_name, required=False))
+
+        first = engine._zero_value_for_type(type_name)
+        second = engine._zero_value_for_type(type_name)
+
+        assert first == second
+        assert first is not second
 
 
 class TestWorkflowEngineRouting:
