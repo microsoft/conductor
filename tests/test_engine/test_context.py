@@ -219,6 +219,92 @@ class TestWorkflowContextExplicitMode:
                 mode="explicit",
             )
 
+    def test_explicit_mode_local_render_script_gets_full_workflow_input(self) -> None:
+        """Local-render agents (script) see all workflow.input in explicit mode.
+
+        ``workflow.input`` is the workflow's external interface — present for
+        the lifetime of the run — so script templates can reference any
+        workflow input without declaring it in ``input:``.
+        """
+        ctx = WorkflowContext()
+        ctx.set_workflow_inputs({"a": 1, "b": 2, "c": 3})
+
+        agent_ctx = ctx.build_for_agent(
+            "detector",
+            [],  # no declared inputs
+            mode="explicit",
+            agent_type="script",
+        )
+
+        assert agent_ctx["workflow"]["input"] == {"a": 1, "b": 2, "c": 3}
+
+    def test_explicit_mode_local_render_workflow_gets_full_workflow_input(self) -> None:
+        """Local-render agents (sub-workflow) see all workflow.input in explicit mode."""
+        ctx = WorkflowContext()
+        ctx.set_workflow_inputs({"a": 1, "b": 2})
+
+        agent_ctx = ctx.build_for_agent(
+            "child",
+            [],
+            mode="explicit",
+            agent_type="workflow",
+        )
+
+        assert agent_ctx["workflow"]["input"] == {"a": 1, "b": 2}
+
+    def test_explicit_mode_local_render_does_not_leak_agent_outputs(self) -> None:
+        """Local-render carve-out is scoped to workflow.input, not agent outputs.
+
+        Per-step outputs remain explicitly declared even for script /
+        sub-workflow agents — broadening to outputs is an intentional
+        non-goal of the local-render carve-out.
+        """
+        ctx = WorkflowContext()
+        ctx.set_workflow_inputs({"a": 1})
+        ctx.store("planner", {"plan": "do stuff"})
+
+        agent_ctx = ctx.build_for_agent(
+            "detector",
+            [],
+            mode="explicit",
+            agent_type="script",
+        )
+
+        assert "planner" not in agent_ctx
+        assert agent_ctx["workflow"]["input"] == {"a": 1}
+
+    def test_explicit_mode_llm_agent_unchanged(self) -> None:
+        """LLM agents (default agent_type) keep filtered workflow.input in explicit mode.
+
+        Regression guard: the local-render carve-out must not affect prompt
+        budgeting for LLM agents.
+        """
+        ctx = WorkflowContext()
+        ctx.set_workflow_inputs({"a": 1, "b": 2})
+
+        agent_ctx = ctx.build_for_agent(
+            "llm",
+            [],
+            mode="explicit",
+            # agent_type omitted → defaults to None → no carve-out
+        )
+
+        assert agent_ctx["workflow"]["input"] == {}
+
+    def test_explicit_mode_human_gate_unchanged(self) -> None:
+        """human_gate is not a local-render type for the workflow.input carve-out."""
+        ctx = WorkflowContext()
+        ctx.set_workflow_inputs({"a": 1})
+
+        agent_ctx = ctx.build_for_agent(
+            "gate",
+            [],
+            mode="explicit",
+            agent_type="human_gate",
+        )
+
+        assert agent_ctx["workflow"]["input"] == {}
+
 
 class TestWorkflowContextOptionalDeps:
     """Tests for optional dependencies with ? suffix."""

@@ -1398,13 +1398,7 @@ class WorkflowEngine:
                                 agent.name,
                                 agent.input,
                                 mode=self.config.workflow.context.mode,
-                            )
-                            # Script args are rendered locally (no LLM cost), so
-                            # workflow inputs must always be available for template
-                            # resolution — even in explicit mode where they'd
-                            # otherwise be filtered out.
-                            agent_context.setdefault("workflow", {})["input"] = (
-                                self.context.workflow_inputs.copy()
+                                agent_type=agent.type,
                             )
                             _script_start = _time.time()
 
@@ -1497,12 +1491,7 @@ class WorkflowEngine:
                                 agent.name,
                                 agent.input,
                                 mode=self.config.workflow.context.mode,
-                            )
-                            # input_mapping templates are rendered locally (no LLM
-                            # cost), so workflow inputs must always be available —
-                            # even in explicit mode.
-                            agent_context.setdefault("workflow", {})["input"] = (
-                                self.context.workflow_inputs.copy()
+                                agent_type=agent.type,
                             )
                             _sub_start = _time.time()
 
@@ -1586,6 +1575,7 @@ class WorkflowEngine:
                             agent.name,
                             agent.input,
                             mode=self.config.workflow.context.mode,
+                            agent_type=agent.type,
                         )
 
                         # Execute agent (get executor for multi-provider support)
@@ -2255,6 +2245,7 @@ class WorkflowEngine:
                     agent.name,
                     agent.input,
                     mode=self.config.workflow.context.mode,
+                    agent_type=agent.type,
                 )
 
                 # Execute agent (get executor for multi-provider support)
@@ -2589,6 +2580,7 @@ class WorkflowEngine:
                     for_each_group.agent.name,
                     for_each_group.agent.input,
                     mode=self.config.workflow.context.mode,
+                    agent_type=for_each_group.agent.type,
                 )
 
                 # Inject loop variables into context

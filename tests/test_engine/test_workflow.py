@@ -8,6 +8,8 @@ Tests cover:
 - Error handling
 """
 
+import sys
+
 import pytest
 
 from conductor.config.schema import (
@@ -300,11 +302,12 @@ class TestWorkflowEngineContextModes:
 
     @pytest.mark.asyncio
     async def test_explicit_mode_script_gets_workflow_inputs(self) -> None:
-        """Regression: script agents in explicit mode must see workflow.input.
+        """Regression: script agents in explicit mode see workflow.input.
 
-        In explicit mode, workflow.input was empty {} for script agents that
-        didn't declare inputs. Script args are rendered locally (no LLM cost),
-        so workflow inputs must always be available for template resolution.
+        ``workflow.input`` is the workflow's external interface — set once at
+        startup and present for the lifetime of the run. For local-render
+        agent types (``script``, ``workflow``) it is always available, even
+        in explicit mode where prior agent outputs remain explicitly declared.
         """
         config = WorkflowConfig(
             workflow=WorkflowDef(
@@ -316,10 +319,10 @@ class TestWorkflowEngineContextModes:
                 AgentDef(
                     name="detector",
                     type="script",
-                    command="pwsh",
+                    command=sys.executable,
                     args=[
-                        "-Command",
-                        "Write-Output '{{ workflow.input.work_item_id }}'; exit 0",
+                        "-c",
+                        "print('{{ workflow.input.work_item_id }}')",
                     ],
                     # No input: list — should still see workflow.input
                     routes=[RouteDef(to="$end")],

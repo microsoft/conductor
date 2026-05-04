@@ -16,6 +16,14 @@ if TYPE_CHECKING:
 # Average characters per token (conservative estimate)
 CHARS_PER_TOKEN = 4
 
+# Agent types whose templates are rendered locally (not sent to an LLM).
+# For these, ``workflow.input`` is always made available regardless of context
+# mode, because workflow inputs are the workflow's external interface — set
+# once at startup and present for the lifetime of the run. Per-step agent
+# outputs remain explicitly declared in ``input:`` for traceability, even for
+# local renders.
+_LOCAL_RENDER_AGENT_TYPES = frozenset({"script", "workflow"})
+
 
 def estimate_tokens(text: str) -> int:
     """Estimate the number of tokens in a text string.
@@ -142,6 +150,7 @@ class WorkflowContext:
         agent_name: str,
         inputs: list[str],
         mode: str = "accumulate",
+        agent_type: str | None = None,
     ) -> dict[str, Any]:
         """Build context dict for a specific agent based on its input declarations.
 
@@ -154,6 +163,12 @@ class WorkflowContext:
             agent_name: Name of the agent needing context.
             inputs: List of input references (e.g., ['workflow.input.goal', 'planner.output']).
             mode: Context mode - accumulate, last_only, or explicit.
+            agent_type: The agent's ``type`` field (e.g., ``"agent"``, ``"script"``,
+                ``"workflow"``, ``"human_gate"``). When the type is in
+                ``_LOCAL_RENDER_AGENT_TYPES``, ``workflow.input`` is always
+                populated even in explicit mode — see the constant's docstring
+                for rationale. Outputs from prior agents remain governed by
+                ``mode`` regardless of agent type.
 
         Returns:
             Dict with 'workflow', agent outputs, and 'context' metadata.
@@ -164,8 +179,13 @@ class WorkflowContext:
         # For explicit mode, start with empty workflow inputs
         # For other modes, include all workflow inputs
         if mode == "explicit":
+            # Local-render agents (script, sub-workflow) always see the full
+            # workflow.input — see _LOCAL_RENDER_AGENT_TYPES for rationale.
+            initial_workflow_inputs: dict[str, Any] = (
+                self.workflow_inputs.copy() if agent_type in _LOCAL_RENDER_AGENT_TYPES else {}
+            )
             ctx: dict[str, Any] = {
-                "workflow": {"input": {}},
+                "workflow": {"input": initial_workflow_inputs},
                 "context": {
                     "iteration": self.current_iteration,
                     "history": self.execution_history.copy(),
