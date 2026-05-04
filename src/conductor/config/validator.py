@@ -720,6 +720,14 @@ def _collect_template_strings(
     if agent.working_dir:
         templates.append((f"agent '{agent.name}' working_dir", agent.working_dir))
 
+    # input_mapping is on AgentDef in main (added by #109 closing #101) but may not
+    # exist on the schema in branches that haven't merged that yet. getattr keeps
+    # this forward-compatible without coupling validate semantics to schema timing.
+    input_mapping: dict[str, str] | None = getattr(agent, "input_mapping", None)
+    if input_mapping:
+        for key, expr in input_mapping.items():
+            templates.append((f"agent '{agent.name}' input_mapping.{key}", expr))
+
     return templates
 
 

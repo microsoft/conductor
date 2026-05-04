@@ -19,6 +19,7 @@ from conductor.config.schema import (
 )
 from conductor.config.validator import (
     INPUT_REF_PATTERN,
+    _collect_template_strings,
     _extract_template_refs,
     validate_workflow_config,
 )
@@ -1072,3 +1073,62 @@ class TestExamplesRegression:
                 failures.append(f"{path.name}: {type(e).__name__}: {e}")
 
         assert not failures, "examples failed validation:\n  " + "\n  ".join(failures)
+
+
+class TestInputMappingTemplateCollection:
+    """Coverage for input_mapping template collection.
+
+    The input_mapping field was added to AgentDef by PR #109 (closing #101). On
+    branches that have merged that schema change, _collect_template_strings
+    should pick up its templates so stale-ref scanning catches them. The helper
+    uses getattr so this stays a no-op on branches that haven't merged it yet,
+    and these tests use a duck-typed object to exercise the path regardless.
+    """
+
+    @staticmethod
+    def _make_agent_like(
+        name: str,
+        prompt: str | None,
+        input_mapping: dict[str, str] | None,
+    ) -> object:
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            name=name,
+            prompt=prompt,
+            system_prompt=None,
+            command=None,
+            args=[],
+            working_dir=None,
+            input_mapping=input_mapping,
+        )
+
+    def test_collects_input_mapping_templates(self) -> None:
+        agent = self._make_agent_like(
+            name="caller",
+            prompt="Call sub-workflow",
+            input_mapping={
+                "topic": "{{ workflow.input.topic }}",
+                "research": "{{ researcher.output.findings }}",
+            },
+        )
+        templates = _collect_template_strings(agent)  # type: ignore[arg-type]
+        labels = {label for label, _ in templates}
+        assert "agent 'caller' input_mapping.topic" in labels
+        assert "agent 'caller' input_mapping.research" in labels
+
+    def test_no_input_mapping_collects_nothing_extra(self) -> None:
+        agent = self._make_agent_like(name="caller", prompt="Simple", input_mapping=None)
+        templates = _collect_template_strings(agent)  # type: ignore[arg-type]
+        labels = {label for label, _ in templates}
+        assert not any("input_mapping" in label for label in labels)
+
+    def test_extractor_catches_stale_ref_in_input_mapping(self) -> None:
+        # Simulates: when this PR merges with main's AgentDef.input_mapping,
+        # a stale agent reference inside an input_mapping expression is caught
+        # by _extract_template_refs the same as any other template field.
+        agent_refs, input_refs = _extract_template_refs(
+            "{{ old_agent.output.findings }}"
+        )
+        assert "old_agent" in agent_refs
+        assert not input_refs
