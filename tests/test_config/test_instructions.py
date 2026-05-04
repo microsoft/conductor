@@ -290,6 +290,32 @@ class TestBuildInstructionsPreamble:
 
 
 # ---------------------------------------------------------------------------
+# Wrap / unwrap roundtrip
+# ---------------------------------------------------------------------------
+
+
+class TestWrapUnwrapPreamble:
+    """Tests for _wrap_preamble and _unwrap_preamble roundtrip."""
+
+    def test_roundtrip(self) -> None:
+        from conductor.config.instructions import _unwrap_preamble, _wrap_preamble
+
+        inner = "Follow PEP 8.\n\n---\n\nUse pytest for tests."
+        wrapped = _wrap_preamble(inner)
+        assert "<workspace_instructions>" in wrapped
+        assert "</workspace_instructions>" in wrapped
+        unwrapped = _unwrap_preamble(wrapped)
+        assert unwrapped == inner
+
+    def test_unwrap_passthrough(self) -> None:
+        """Unwrapping a string without tags returns it stripped."""
+        from conductor.config.instructions import _unwrap_preamble
+
+        result = _unwrap_preamble("plain text")
+        assert result == "plain text"
+
+
+# ---------------------------------------------------------------------------
 # AgentExecutor integration
 # ---------------------------------------------------------------------------
 
@@ -472,9 +498,14 @@ class TestSubWorkflowInstructionMerging:
 
     @pytest.mark.asyncio
     async def test_subworkflow_merges_own_instructions(self, tmp_path: Path) -> None:
-        """Sub-workflow with its own instructions field should merge with parent preamble."""
+        """Sub-workflow with its own instructions field should merge with parent preamble.
+
+        The merged result should contain a single <workspace_instructions> block,
+        not nested tags.
+        """
         import textwrap
 
+        from conductor.config.instructions import _wrap_preamble
         from conductor.config.schema import (
             AgentDef,
             ContextConfig,
@@ -539,19 +570,27 @@ class TestSubWorkflowInstructionMerging:
             prompts_seen.append(prompt)
             return {"result": "done"}
 
+        # Pass a properly wrapped preamble (as build_instructions_preamble would produce)
+        parent_preamble = _wrap_preamble("PARENT_CONTENT")
+
         provider = CopilotProvider(mock_handler=mock_handler)
         engine = WorkflowEngine(
             config,
             provider,
             workflow_path=parent_path,
-            instructions_preamble="PARENT_PREAMBLE\n\n",
+            instructions_preamble=parent_preamble,
         )
         await engine.run({})
 
-        # Inner agent should see both parent preamble and sub instruction
+        # Inner agent should see both parent and sub instruction content
         assert len(prompts_seen) == 1
-        assert "PARENT_PREAMBLE" in prompts_seen[0]
-        assert "SUB_INSTRUCTION" in prompts_seen[0]
+        prompt = prompts_seen[0]
+        assert "PARENT_CONTENT" in prompt
+        assert "SUB_INSTRUCTION" in prompt
+
+        # Critically: only ONE set of <workspace_instructions> tags (not nested)
+        assert prompt.count("<workspace_instructions>") == 1
+        assert prompt.count("</workspace_instructions>") == 1
 
 
 # ---------------------------------------------------------------------------

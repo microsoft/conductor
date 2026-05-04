@@ -130,13 +130,18 @@ def load_instruction_files(paths: list[Path]) -> str:
     return combined
 
 
-def build_instructions_preamble(
+def build_inner_instructions(
     *,
     auto_discover_dir: Path | None = None,
     yaml_instructions: list[str] | None = None,
     cli_instruction_paths: list[str] | None = None,
 ) -> str | None:
-    """Combine all instruction sources into a single preamble string.
+    """Combine all instruction sources into raw (unwrapped) content.
+
+    This returns the inner text without ``<workspace_instructions>`` tags.
+    Use :func:`build_instructions_preamble` for the fully wrapped version,
+    or call this directly when merging multiple instruction sources before
+    wrapping once at the outermost layer (e.g. sub-workflow merging).
 
     Sources are combined in this order:
     1. Auto-discovered workspace files (if ``auto_discover_dir`` is provided)
@@ -151,8 +156,7 @@ def build_instructions_preamble(
         cli_instruction_paths: File paths provided via ``--instructions`` CLI flag.
 
     Returns:
-        Combined preamble string to prepend to agent prompts, or None if no
-        instructions were found from any source.
+        Combined raw instruction text, or None if no instructions were found.
     """
     parts: list[str] = []
 
@@ -192,13 +196,89 @@ def build_instructions_preamble(
     if not parts:
         return None
 
-    preamble = "\n\n---\n\n".join(parts)
+    return "\n\n---\n\n".join(parts)
 
+
+def _wrap_preamble(inner: str) -> str:
+    """Wrap raw instruction content in workspace_instructions tags."""
     return (
         "<workspace_instructions>\n"
         "The following workspace instructions describe the conventions, patterns, "
         "and practices for the repository you are working in. Follow them when "
         "writing code, reviewing changes, or designing solutions.\n\n"
-        f"{preamble}\n"
+        f"{inner}\n"
         "</workspace_instructions>\n\n"
     )
+
+
+_OPEN_TAG = "<workspace_instructions>\n"
+_CLOSE_TAG = "\n</workspace_instructions>\n\n"
+
+# The preamble header text inserted after the opening tag
+_HEADER = (
+    "The following workspace instructions describe the conventions, patterns, "
+    "and practices for the repository you are working in. Follow them when "
+    "writing code, reviewing changes, or designing solutions.\n\n"
+)
+
+
+def _unwrap_preamble(preamble: str) -> str:
+    """Extract inner content from a wrapped preamble string.
+
+    Strips the ``<workspace_instructions>`` tags and header text,
+    returning only the raw instruction content.
+
+    Args:
+        preamble: A preamble string produced by :func:`_wrap_preamble`.
+
+    Returns:
+        The inner instruction content without wrapper tags.
+    """
+    inner = preamble
+    if inner.startswith(_OPEN_TAG):
+        inner = inner[len(_OPEN_TAG) :]
+    if inner.startswith(_HEADER):
+        inner = inner[len(_HEADER) :]
+    if inner.endswith(_CLOSE_TAG):
+        inner = inner[: -len(_CLOSE_TAG)]
+    elif inner.endswith("</workspace_instructions>\n\n"):
+        inner = inner[: -len("</workspace_instructions>\n\n")]
+    return inner.strip()
+
+
+def build_instructions_preamble(
+    *,
+    auto_discover_dir: Path | None = None,
+    yaml_instructions: list[str] | None = None,
+    cli_instruction_paths: list[str] | None = None,
+) -> str | None:
+    """Combine all instruction sources into a single wrapped preamble string.
+
+    Sources are combined in this order:
+    1. Auto-discovered workspace files (if ``auto_discover_dir`` is provided)
+    2. Workflow YAML ``instructions`` field entries
+    3. CLI ``--instructions`` file paths
+
+    The combined content is wrapped in ``<workspace_instructions>`` tags.
+    Use :func:`build_inner_instructions` to get the unwrapped content
+    (e.g. for merging with a parent preamble before wrapping once).
+
+    Args:
+        auto_discover_dir: Directory to start auto-discovery from (typically CWD).
+            If None, auto-discovery is skipped.
+        yaml_instructions: Instruction entries from the workflow YAML ``instructions``
+            field. Each entry can be inline text or content already loaded via ``!file``.
+        cli_instruction_paths: File paths provided via ``--instructions`` CLI flag.
+
+    Returns:
+        Combined preamble string to prepend to agent prompts, or None if no
+        instructions were found from any source.
+    """
+    inner = build_inner_instructions(
+        auto_discover_dir=auto_discover_dir,
+        yaml_instructions=yaml_instructions,
+        cli_instruction_paths=cli_instruction_paths,
+    )
+    if inner is None:
+        return None
+    return _wrap_preamble(inner)

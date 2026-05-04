@@ -704,7 +704,8 @@ class WorkflowEngine:
         sub_inputs = self._build_subworkflow_inputs(agent, context)
 
         # Merge instructions preamble: parent preamble + sub-workflow's own instructions.
-        # Uses inner (unwrapped) content to avoid nested <workspace_instructions> tags.
+        # Uses inner (unwrapped) content to avoid nested <workspace_instructions> tags,
+        # then wraps once at the outermost layer.
         child_preamble = self._instructions_preamble
         if sub_config.workflow.instructions:
             from conductor.config.instructions import (
@@ -718,6 +719,7 @@ class WorkflowEngine:
             )
             if sub_inner:
                 if child_preamble:
+                    # Parent preamble is already wrapped — unwrap, merge, re-wrap
                     parent_inner = _unwrap_preamble(child_preamble)
                     child_preamble = _wrap_preamble(parent_inner + "\n\n---\n\n" + sub_inner)
                 else:
