@@ -380,3 +380,238 @@ class TestAgentExecutorInstructionsPreamble:
         agent = AgentDef(name="test", prompt="Hello {{ name }}")
         result = executor.render_prompt(agent, {"name": "World"})
         assert result == "Hello World"
+
+
+# ---------------------------------------------------------------------------
+# Sub-workflow instruction merging
+# ---------------------------------------------------------------------------
+
+
+class TestSubWorkflowInstructionMerging:
+    """Tests for sub-workflow instruction preamble merging in WorkflowEngine."""
+
+    @pytest.mark.asyncio
+    async def test_subworkflow_inherits_parent_preamble(self, tmp_path: Path) -> None:
+        """Sub-workflow should inherit the parent's instructions preamble."""
+        import textwrap
+
+        from conductor.config.schema import (
+            AgentDef,
+            ContextConfig,
+            LimitsConfig,
+            RouteDef,
+            RuntimeConfig,
+            WorkflowConfig,
+            WorkflowDef,
+        )
+        from conductor.engine.workflow import WorkflowEngine
+        from conductor.providers.copilot import CopilotProvider
+
+        # Create sub-workflow YAML (no instructions of its own)
+        sub_yaml = tmp_path / "sub.yaml"
+        sub_yaml.write_text(
+            textwrap.dedent("""\
+            workflow:
+              name: sub
+              entry_point: inner
+              runtime:
+                provider: copilot
+              limits:
+                max_iterations: 5
+            agents:
+              - name: inner
+                prompt: "Do inner work"
+                routes:
+                  - to: "$end"
+            output:
+              result: "{{ inner.output.result }}"
+            """),
+            encoding="utf-8",
+        )
+
+        parent_path = tmp_path / "parent.yaml"
+        parent_path.write_text("dummy", encoding="utf-8")
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="parent",
+                entry_point="step",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="step",
+                    type="workflow",
+                    workflow="sub.yaml",
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"result": "{{ step.output.result }}"},
+        )
+
+        prompts_seen: list[str] = []
+
+        def mock_handler(agent, prompt, context):
+            prompts_seen.append(prompt)
+            return {"result": "done"}
+
+        provider = CopilotProvider(mock_handler=mock_handler)
+        engine = WorkflowEngine(
+            config,
+            provider,
+            workflow_path=parent_path,
+            instructions_preamble="PARENT_PREAMBLE\n\n",
+        )
+        await engine.run({})
+
+        # The inner agent's prompt should include the parent preamble
+        assert len(prompts_seen) == 1
+        assert "PARENT_PREAMBLE" in prompts_seen[0]
+
+    @pytest.mark.asyncio
+    async def test_subworkflow_merges_own_instructions(self, tmp_path: Path) -> None:
+        """Sub-workflow with its own instructions field should merge with parent preamble."""
+        import textwrap
+
+        from conductor.config.schema import (
+            AgentDef,
+            ContextConfig,
+            LimitsConfig,
+            RouteDef,
+            RuntimeConfig,
+            WorkflowConfig,
+            WorkflowDef,
+        )
+        from conductor.engine.workflow import WorkflowEngine
+        from conductor.providers.copilot import CopilotProvider
+
+        # Create sub-workflow YAML with its own instructions
+        sub_yaml = tmp_path / "sub.yaml"
+        sub_yaml.write_text(
+            textwrap.dedent("""\
+            workflow:
+              name: sub
+              entry_point: inner
+              runtime:
+                provider: copilot
+              limits:
+                max_iterations: 5
+              instructions:
+                - "SUB_INSTRUCTION"
+            agents:
+              - name: inner
+                prompt: "Do inner work"
+                routes:
+                  - to: "$end"
+            output:
+              result: "{{ inner.output.result }}"
+            """),
+            encoding="utf-8",
+        )
+
+        parent_path = tmp_path / "parent.yaml"
+        parent_path.write_text("dummy", encoding="utf-8")
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="parent",
+                entry_point="step",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="step",
+                    type="workflow",
+                    workflow="sub.yaml",
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"result": "{{ step.output.result }}"},
+        )
+
+        prompts_seen: list[str] = []
+
+        def mock_handler(agent, prompt, context):
+            prompts_seen.append(prompt)
+            return {"result": "done"}
+
+        provider = CopilotProvider(mock_handler=mock_handler)
+        engine = WorkflowEngine(
+            config,
+            provider,
+            workflow_path=parent_path,
+            instructions_preamble="PARENT_PREAMBLE\n\n",
+        )
+        await engine.run({})
+
+        # Inner agent should see both parent preamble and sub instruction
+        assert len(prompts_seen) == 1
+        assert "PARENT_PREAMBLE" in prompts_seen[0]
+        assert "SUB_INSTRUCTION" in prompts_seen[0]
+
+
+# ---------------------------------------------------------------------------
+# bg_runner flag forwarding
+# ---------------------------------------------------------------------------
+
+
+class TestBgRunnerInstructionFlags:
+    """Tests for --workspace-instructions and --instructions forwarding in bg_runner."""
+
+    def test_workspace_instructions_flag_forwarded(self) -> None:
+        """--workspace-instructions should appear in the subprocess command."""
+        import contextlib
+        from unittest.mock import patch
+
+        from conductor.cli.bg_runner import launch_background
+
+        with (
+            patch("conductor.cli.bg_runner.subprocess.Popen") as mock_popen,
+            patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+        ):
+            mock_popen.return_value.pid = 12345
+
+            with contextlib.suppress(Exception):
+                launch_background(
+                    workflow_path=Path("test.yaml"),
+                    inputs={},
+                    workspace_instructions=True,
+                    web_port=9999,
+                )
+
+            if mock_popen.called:
+                cmd = mock_popen.call_args[0][0]
+                assert "--workspace-instructions" in cmd
+
+    def test_cli_instructions_forwarded(self) -> None:
+        """--instructions paths should appear in the subprocess command."""
+        import contextlib
+        from unittest.mock import patch
+
+        from conductor.cli.bg_runner import launch_background
+
+        with (
+            patch("conductor.cli.bg_runner.subprocess.Popen") as mock_popen,
+            patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+        ):
+            mock_popen.return_value.pid = 12345
+
+            with contextlib.suppress(Exception):
+                launch_background(
+                    workflow_path=Path("test.yaml"),
+                    inputs={},
+                    cli_instructions=["AGENTS.md", "CLAUDE.md"],
+                    web_port=9999,
+                )
+
+            if mock_popen.called:
+                cmd = mock_popen.call_args[0][0]
+                # Should have --instructions AGENTS.md --instructions CLAUDE.md
+                instr_indices = [i for i, x in enumerate(cmd) if x == "--instructions"]
+                assert len(instr_indices) == 2
+                assert cmd[instr_indices[0] + 1] == "AGENTS.md"
+                assert cmd[instr_indices[1] + 1] == "CLAUDE.md"
