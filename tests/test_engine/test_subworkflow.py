@@ -755,10 +755,11 @@ class TestSubWorkflowInputMapping:
         engine = WorkflowEngine(config, provider, workflow_path=parent_path)
         await engine.run({})
 
-        # The child's inner agent should see the string values rendered into the prompt
+        # The child's inner agent should see JSON-parsed values rendered into the prompt.
+        # json.loads("42") -> int 42, json.loads("true") -> bool True (Python repr)
         inner_prompt = [p for p in received_prompts if "Count=" in p][0]
         assert "Count=42" in inner_prompt
-        assert "Flag=true" in inner_prompt
+        assert "Flag=True" in inner_prompt
 
     @pytest.mark.asyncio
     async def test_no_input_mapping_forwards_parent_inputs(self, tmp_workflow_dir: Path) -> None:
