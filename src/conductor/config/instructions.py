@@ -111,9 +111,7 @@ def load_instruction_files(paths: list[Path]) -> str:
         try:
             content = path.read_text(encoding="utf-8").strip()
             if content:
-                sections.append(
-                    f"# Instructions from: {path.name}\n\n{content}"
-                )
+                sections.append(f"# Instructions from: {path.name}\n\n{content}")
                 logger.debug("Loaded instruction file: %s (%d bytes)", path, len(content))
         except (OSError, UnicodeDecodeError) as e:
             logger.warning("Failed to read instruction file %s: %s", path, e)
@@ -165,9 +163,7 @@ def build_instructions_preamble(
             content = load_instruction_files(discovered)
             if content:
                 parts.append(content)
-            logger.info(
-                "Auto-discovered %d workspace instruction file(s)", len(discovered)
-            )
+            logger.info("Auto-discovered %d workspace instruction file(s)", len(discovered))
 
     # 2. Workflow YAML instructions field
     if yaml_instructions:
@@ -187,9 +183,7 @@ def build_instructions_preamble(
             else:
                 missing.append(path_str)
         if missing:
-            raise FileNotFoundError(
-                f"Instruction file(s) not found: {', '.join(missing)}"
-            )
+            raise FileNotFoundError(f"Instruction file(s) not found: {', '.join(missing)}")
         if cli_paths:
             content = load_instruction_files(cli_paths)
             if content:

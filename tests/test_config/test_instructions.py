@@ -222,9 +222,7 @@ class TestBuildInstructionsPreamble:
         assert "PEP 8" in result
 
     def test_yaml_instructions_skip_empty(self) -> None:
-        result = build_instructions_preamble(
-            yaml_instructions=["content", "  ", ""]
-        )
+        result = build_instructions_preamble(yaml_instructions=["content", "  ", ""])
         assert result is not None
         assert "content" in result
 
@@ -232,17 +230,13 @@ class TestBuildInstructionsPreamble:
         f = tmp_path / "custom.md"
         f.write_text("custom instructions")
 
-        result = build_instructions_preamble(
-            cli_instruction_paths=[str(f)]
-        )
+        result = build_instructions_preamble(cli_instruction_paths=[str(f)])
         assert result is not None
         assert "custom instructions" in result
 
     def test_cli_missing_file_raises(self, tmp_path: Path) -> None:
         with pytest.raises(FileNotFoundError, match="not found"):
-            build_instructions_preamble(
-                cli_instruction_paths=[str(tmp_path / "missing.md")]
-            )
+            build_instructions_preamble(cli_instruction_paths=[str(tmp_path / "missing.md")])
 
     def test_combines_all_sources(self, tmp_path: Path) -> None:
         (tmp_path / ".git").mkdir()
@@ -316,11 +310,7 @@ class TestAgentExecutorInstructionsPreamble:
             return_value=AgentOutput(content={"result": "ok"}, raw_response='{"result":"ok"}')
         )
 
-        preamble = (
-            "<workspace_instructions>\n"
-            "Follow PEP 8\n"
-            "</workspace_instructions>\n\n"
-        )
+        preamble = "<workspace_instructions>\nFollow PEP 8\n</workspace_instructions>\n\n"
         executor = AgentExecutor(
             provider,
             instructions_preamble=preamble,
