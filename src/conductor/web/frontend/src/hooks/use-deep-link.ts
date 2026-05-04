@@ -157,7 +157,7 @@ export function useDeepLink(): DeepLinkError | null {
       applied.current = true;
       unsubscribe();
 
-      // 1. Navigate into subworkflow path
+      // 1. Navigate into subworkflow path (or reset to root for agent-only links)
       if (subworkflowPath) {
         const segments = subworkflowPath.split('/').filter(Boolean);
         const { path, failure } = resolveSubworkflowPath(
@@ -183,6 +183,10 @@ export function useDeepLink(): DeepLinkError | null {
 
         // Apply the full navigation path at once
         useWorkflowStore.setState({ viewContextPath: path, selectedNode: null });
+      } else if (agent) {
+        // Agent-only deep-link: pin to root so sticky-follow doesn't drag
+        // the view into a stale subworkflow/for_each iteration during replay.
+        useWorkflowStore.setState({ viewContextPath: [], selectedNode: null });
       }
 
       // 2. Select agent node
