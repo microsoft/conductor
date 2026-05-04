@@ -268,10 +268,29 @@ class TestSubWorkflowErrors:
             await engine.run({})
 
     @pytest.mark.asyncio
-    async def test_self_referencing_workflow(self, tmp_workflow_dir: Path) -> None:
-        """Test that a workflow referencing itself raises ExecutionError."""
+    async def test_self_referencing_workflow_hits_depth_limit(self, tmp_workflow_dir: Path) -> None:
+        """Test that a self-referencing workflow is allowed but bounded by depth limit."""
+        # Write a real self-referencing workflow YAML
         parent_path = tmp_workflow_dir / "parent.yaml"
-        parent_path.write_text("dummy", encoding="utf-8")
+        _write_yaml(
+            parent_path,
+            """\
+            workflow:
+              name: self-ref
+              entry_point: sub_wf
+              runtime:
+                provider: copilot
+              limits:
+                max_iterations: 50
+            agents:
+              - name: sub_wf
+                type: workflow
+                workflow: parent.yaml
+                routes:
+                  - to: "$end"
+            output: {}
+            """,
+        )
 
         config = WorkflowConfig(
             workflow=WorkflowDef(
@@ -294,7 +313,58 @@ class TestSubWorkflowErrors:
         mock_provider = MagicMock()
         engine = WorkflowEngine(config, mock_provider, workflow_path=parent_path)
 
-        with pytest.raises(ExecutionError, match="Circular sub-workflow reference"):
+        # Self-reference is now allowed but will hit depth limit
+        with pytest.raises(ExecutionError, match="depth limit exceeded"):
+            await engine.run({})
+
+    @pytest.mark.asyncio
+    async def test_max_depth_per_agent(self, tmp_workflow_dir: Path) -> None:
+        """Test that per-agent max_depth is enforced before global limit."""
+        parent_path = tmp_workflow_dir / "parent.yaml"
+        _write_yaml(
+            parent_path,
+            """\
+            workflow:
+              name: self-ref
+              entry_point: sub_wf
+              runtime:
+                provider: copilot
+              limits:
+                max_iterations: 50
+            agents:
+              - name: sub_wf
+                type: workflow
+                workflow: parent.yaml
+                max_depth: 2
+                routes:
+                  - to: "$end"
+            output: {}
+            """,
+        )
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="parent",
+                entry_point="sub_wf",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="sub_wf",
+                    type="workflow",
+                    workflow="parent.yaml",
+                    max_depth=2,
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+        )
+
+        mock_provider = MagicMock()
+        engine = WorkflowEngine(config, mock_provider, workflow_path=parent_path)
+
+        with pytest.raises(ExecutionError, match="max_depth.*exceeded"):
             await engine.run({})
 
 
@@ -685,10 +755,11 @@ class TestSubWorkflowInputMapping:
         engine = WorkflowEngine(config, provider, workflow_path=parent_path)
         await engine.run({})
 
-        # The child's inner agent should see the string values rendered into the prompt
+        # The child's inner agent should see JSON-parsed values rendered into the prompt.
+        # json.loads("42") -> int 42, json.loads("true") -> bool True (Python repr)
         inner_prompt = [p for p in received_prompts if "Count=" in p][0]
         assert "Count=42" in inner_prompt
-        assert "Flag=true" in inner_prompt
+        assert "Flag=True" in inner_prompt
 
     @pytest.mark.asyncio
     async def test_no_input_mapping_forwards_parent_inputs(self, tmp_workflow_dir: Path) -> None:
@@ -940,3 +1011,460 @@ class TestSubWorkflowInputMapping:
         # Parent's "setup" agent should NOT appear in child's context
         assert len(child_contexts) == 1
         assert "setup" not in child_contexts[0]
+
+
+class TestSubWorkflowDashboardPath:
+    """Tests for engine-driven parent_path / slot_key on dashboard events.
+
+    These keep concurrent for_each-of-workflow iterations addressable in the
+    web dashboard without depending on a single shared activeContextPath.
+    """
+
+    @pytest.mark.asyncio
+    async def test_for_each_subworkflow_emits_distinct_slot_keys(
+        self, tmp_workflow_dir: Path
+    ) -> None:
+        """For-each iterations each get a unique bracketed slot_key."""
+        _write_yaml(
+            tmp_workflow_dir / "sub.yaml",
+            """\
+            workflow:
+              name: sub-workflow
+              entry_point: inner
+              runtime:
+                provider: copilot
+              limits:
+                max_iterations: 5
+            agents:
+              - name: inner
+                prompt: "inner {{ workflow.input.item }}"
+                routes:
+                  - to: "$end"
+            output:
+              result: "{{ workflow.input.item }}"
+            """,
+        )
+
+        parent_path = tmp_workflow_dir / "parent.yaml"
+        parent_path.write_text("dummy", encoding="utf-8")
+
+        from conductor.config.schema import ForEachDef, OutputField
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="parent",
+                entry_point="finder",
+                runtime=RuntimeConfig(provider="copilot"),
+                limits=LimitsConfig(max_iterations=20),
+            ),
+            agents=[
+                AgentDef(
+                    name="finder",
+                    prompt="find",
+                    output={"items": OutputField(type="array")},
+                    routes=[RouteDef(to="batch")],
+                ),
+            ],
+            for_each=[
+                ForEachDef(
+                    name="batch",
+                    type="for_each",
+                    source="finder.output.items",
+                    **{"as": "item"},
+                    max_concurrent=1,
+                    agent=AgentDef(
+                        name="runner",
+                        type="workflow",
+                        workflow="sub.yaml",
+                        input_mapping={"item": "{{ item }}"},
+                    ),
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"done": "1"},
+        )
+
+        events: list[tuple[str, dict]] = []
+        emitter = MagicMock()
+        emitter.emit.side_effect = lambda ev: events.append((ev.type, dict(ev.data)))
+
+        def _handler(agent, prompt, context):
+            if agent.name == "finder":
+                return {"items": ["a", "b", "c"]}
+            return {"result": "ok"}
+
+        provider = CopilotProvider(mock_handler=_handler)
+        engine = WorkflowEngine(config, provider, workflow_path=parent_path, event_emitter=emitter)
+        await engine.run({})
+
+        started = [d for t, d in events if t == "subworkflow_started"]
+        assert len(started) == 3, f"expected 3 iterations, got {len(started)}"
+        slot_keys = sorted(d["slot_key"] for d in started)
+        assert slot_keys == ["batch[0]", "batch[1]", "batch[2]"]
+        for d in started:
+            assert d["parent_path"] == []
+            assert d["agent_name"] == "batch"
+            assert d.get("iteration") in (1, 2, 3)
+            assert d.get("item_key") in ("0", "1", "2")
+
+        completed = [d for t, d in events if t == "subworkflow_completed"]
+        assert len(completed) == 3
+        completed_slots = sorted(d["slot_key"] for d in completed)
+        assert completed_slots == ["batch[0]", "batch[1]", "batch[2]"]
+
+    @pytest.mark.asyncio
+    async def test_sequential_subworkflow_emits_parent_path_and_slot_key(
+        self, tmp_workflow_dir: Path
+    ) -> None:
+        """Sequential sub-workflow emits parent_path=[] and slot_key=agent.name."""
+        _write_yaml(
+            tmp_workflow_dir / "sub.yaml",
+            """\
+            workflow:
+              name: sub
+              entry_point: inner
+              runtime:
+                provider: copilot
+              limits:
+                max_iterations: 5
+            agents:
+              - name: inner
+                prompt: "inner"
+                routes:
+                  - to: "$end"
+            output:
+              result: "done"
+            """,
+        )
+
+        parent_path = tmp_workflow_dir / "parent.yaml"
+        parent_path.write_text("dummy", encoding="utf-8")
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="parent",
+                entry_point="research",
+                runtime=RuntimeConfig(provider="copilot"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="research",
+                    type="workflow",
+                    workflow="sub.yaml",
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"result": "{{ research.output.result }}"},
+        )
+
+        events: list[tuple[str, dict]] = []
+        emitter = MagicMock()
+        emitter.emit.side_effect = lambda ev: events.append((ev.type, dict(ev.data)))
+
+        provider = CopilotProvider(mock_handler=lambda agent, prompt, context: {"result": "ok"})
+        engine = WorkflowEngine(config, provider, workflow_path=parent_path, event_emitter=emitter)
+        await engine.run({})
+
+        started = [d for t, d in events if t == "subworkflow_started"]
+        completed = [d for t, d in events if t == "subworkflow_completed"]
+        assert len(started) == 1, f"expected 1 subworkflow_started, got {len(started)}"
+        assert started[0]["agent_name"] == "research"
+        assert started[0]["parent_path"] == []
+        assert started[0]["slot_key"] == "research"
+        assert len(completed) == 1
+        assert completed[0]["parent_path"] == []
+        assert completed[0]["slot_key"] == "research"
+
+        # The child engine auto-stamps subworkflow_path on every event it emits
+        # so the dashboard can route per-context state correctly.
+        child_workflow_completed = [
+            d
+            for t, d in events
+            if t == "workflow_completed" and d.get("subworkflow_path") == ["research"]
+        ]
+        assert len(child_workflow_completed) == 1
+
+    @pytest.mark.asyncio
+    async def test_subworkflow_failed_event_carries_parent_path_and_slot_key(
+        self, tmp_workflow_dir: Path
+    ) -> None:
+        """When a sub-workflow raises, subworkflow_failed carries dashboard fields.
+
+        The success path is asserted in
+        ``test_sequential_subworkflow_emits_parent_path_and_slot_key`` —
+        this complements it by exercising the exception branch in
+        ``WorkflowEngine`` (which emits subworkflow_failed before re-raising).
+        """
+        _write_yaml(
+            tmp_workflow_dir / "sub.yaml",
+            """\
+            workflow:
+              name: sub-broken
+              entry_point: inner
+              runtime:
+                provider: copilot
+              limits:
+                max_iterations: 5
+            agents:
+              - name: inner
+                prompt: "inner"
+                routes:
+                  - to: nonexistent_target
+            output:
+              result: "{{ inner.output.result }}"
+            """,
+        )
+
+        parent_path = tmp_workflow_dir / "parent.yaml"
+        parent_path.write_text("dummy", encoding="utf-8")
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="parent",
+                entry_point="research",
+                runtime=RuntimeConfig(provider="copilot"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="research",
+                    type="workflow",
+                    workflow="sub.yaml",
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"result": "{{ research.output.result }}"},
+        )
+
+        events: list[tuple[str, dict]] = []
+        emitter = MagicMock()
+        emitter.emit.side_effect = lambda ev: events.append((ev.type, dict(ev.data)))
+
+        provider = CopilotProvider(mock_handler=lambda agent, prompt, context: {"result": "ok"})
+        engine = WorkflowEngine(config, provider, workflow_path=parent_path, event_emitter=emitter)
+
+        with pytest.raises(ExecutionError):
+            await engine.run({})
+
+        failed = [d for t, d in events if t == "subworkflow_failed"]
+        assert len(failed) == 1, f"expected 1 subworkflow_failed event, got {len(failed)}"
+        assert failed[0]["agent_name"] == "research"
+        assert failed[0]["parent_path"] == []
+        assert failed[0]["slot_key"] == "research"
+        assert "error_type" in failed[0]
+        assert "message" in failed[0]
+
+    @pytest.mark.asyncio
+    async def test_nested_subworkflow_path_accumulates(self, tmp_workflow_dir: Path) -> None:
+        """At depth >= 2, subworkflow_path on auto-stamped events chains correctly.
+
+        Parent -> mid (workflow) -> leaf (workflow). Events emitted by the
+        leaf engine must carry subworkflow_path = ["mid", "leaf"], proving
+        ``_dashboard_context_path`` accumulates across nesting levels.
+        """
+        _write_yaml(
+            tmp_workflow_dir / "leaf.yaml",
+            """\
+            workflow:
+              name: leaf
+              entry_point: leaf_inner
+              runtime:
+                provider: copilot
+              limits:
+                max_iterations: 5
+            agents:
+              - name: leaf_inner
+                prompt: "leaf"
+                routes:
+                  - to: "$end"
+            output:
+              result: "leaf_done"
+            """,
+        )
+        _write_yaml(
+            tmp_workflow_dir / "mid.yaml",
+            """\
+            workflow:
+              name: mid
+              entry_point: leaf
+              runtime:
+                provider: copilot
+              limits:
+                max_iterations: 5
+            agents:
+              - name: leaf
+                type: workflow
+                workflow: leaf.yaml
+                routes:
+                  - to: "$end"
+            output:
+              result: "{{ leaf.output.result }}"
+            """,
+        )
+
+        parent_path = tmp_workflow_dir / "parent.yaml"
+        parent_path.write_text("dummy", encoding="utf-8")
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="parent",
+                entry_point="mid",
+                runtime=RuntimeConfig(provider="copilot"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="mid",
+                    type="workflow",
+                    workflow="mid.yaml",
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"result": "{{ mid.output.result }}"},
+        )
+
+        events: list[tuple[str, dict]] = []
+        emitter = MagicMock()
+        emitter.emit.side_effect = lambda ev: events.append((ev.type, dict(ev.data)))
+
+        provider = CopilotProvider(mock_handler=lambda a, p, c: {"result": "ok"})
+        engine = WorkflowEngine(config, provider, workflow_path=parent_path, event_emitter=emitter)
+        await engine.run({})
+
+        # Events from the leaf engine must carry the full slot-key chain.
+        leaf_workflow_completed = [
+            d
+            for t, d in events
+            if t == "workflow_completed" and d.get("subworkflow_path") == ["mid", "leaf"]
+        ]
+        assert len(leaf_workflow_completed) == 1, (
+            "expected workflow_completed from depth-2 engine carrying "
+            "subworkflow_path=['mid', 'leaf']"
+        )
+
+        # Mid engine emits its own workflow_completed at depth 1.
+        mid_workflow_completed = [
+            d
+            for t, d in events
+            if t == "workflow_completed" and d.get("subworkflow_path") == ["mid"]
+        ]
+        assert len(mid_workflow_completed) == 1
+
+        # Root engine's workflow_completed has no subworkflow_path stamp.
+        root_workflow_completed = [
+            d for t, d in events if t == "workflow_completed" and "subworkflow_path" not in d
+        ]
+        assert len(root_workflow_completed) == 1
+
+        # Nested subworkflow_started carries parent_path = ["mid"].
+        nested_started = [
+            d for t, d in events if t == "subworkflow_started" and d.get("parent_path") == ["mid"]
+        ]
+        assert len(nested_started) == 1
+        assert nested_started[0]["agent_name"] == "leaf"
+        assert nested_started[0]["slot_key"] == "leaf"
+
+    @pytest.mark.asyncio
+    async def test_concurrent_for_each_subworkflow_emits_distinct_slot_keys(
+        self, tmp_workflow_dir: Path
+    ) -> None:
+        """For-each iterations get distinct slot_keys even with max_concurrent > 1.
+
+        The existing ``test_for_each_subworkflow_emits_distinct_slot_keys``
+        runs with max_concurrent=1 (sequential). This variant uses
+        max_concurrent=3 so iterations actually overlap, proving that
+        slot_key uniqueness is not an artifact of serial execution.
+        """
+        _write_yaml(
+            tmp_workflow_dir / "sub.yaml",
+            """\
+            workflow:
+              name: sub-workflow
+              entry_point: inner
+              runtime:
+                provider: copilot
+              limits:
+                max_iterations: 5
+            agents:
+              - name: inner
+                prompt: "inner {{ workflow.input.item }}"
+                routes:
+                  - to: "$end"
+            output:
+              result: "{{ workflow.input.item }}"
+            """,
+        )
+
+        parent_path = tmp_workflow_dir / "parent.yaml"
+        parent_path.write_text("dummy", encoding="utf-8")
+
+        from conductor.config.schema import ForEachDef, OutputField
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="parent",
+                entry_point="finder",
+                runtime=RuntimeConfig(provider="copilot"),
+                limits=LimitsConfig(max_iterations=20),
+            ),
+            agents=[
+                AgentDef(
+                    name="finder",
+                    prompt="find",
+                    output={"items": OutputField(type="array")},
+                    routes=[RouteDef(to="batch")],
+                ),
+            ],
+            for_each=[
+                ForEachDef(
+                    name="batch",
+                    type="for_each",
+                    source="finder.output.items",
+                    **{"as": "item"},
+                    max_concurrent=3,
+                    agent=AgentDef(
+                        name="runner",
+                        type="workflow",
+                        workflow="sub.yaml",
+                        input_mapping={"item": "{{ item }}"},
+                    ),
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"done": "1"},
+        )
+
+        events: list[tuple[str, dict]] = []
+        emitter = MagicMock()
+        emitter.emit.side_effect = lambda ev: events.append((ev.type, dict(ev.data)))
+
+        def _handler(agent, prompt, context):
+            if agent.name == "finder":
+                return {"items": ["x", "y", "z"]}
+            return {"result": "ok"}
+
+        provider = CopilotProvider(mock_handler=_handler)
+        engine = WorkflowEngine(config, provider, workflow_path=parent_path, event_emitter=emitter)
+        await engine.run({})
+
+        started = [d for t, d in events if t == "subworkflow_started"]
+        assert len(started) == 3
+        slot_keys = {d["slot_key"] for d in started}
+        assert slot_keys == {"batch[0]", "batch[1]", "batch[2]"}, (
+            "concurrent iterations must each get a distinct slot_key"
+        )
+
+        # Each iteration's child engine must auto-stamp its own slot key
+        # on outgoing events (this is what keeps concurrent dashboard
+        # contexts isolated under for_each-of-workflow).
+        child_completed_paths = {
+            tuple(d["subworkflow_path"])
+            for t, d in events
+            if t == "workflow_completed" and "subworkflow_path" in d
+        }
+        assert child_completed_paths == {
+            ("batch[0]",),
+            ("batch[1]",),
+            ("batch[2]",),
+        }

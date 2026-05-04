@@ -938,3 +938,166 @@ class TestPartialOutputHandling:
         event = asyncio.Event()
         result2 = await provider.execute(agent, {}, "prompt", interrupt_signal=event)
         assert result2.content == {"result": "mock"}
+
+
+class TestCheckInterruptSubworkflow:
+    """Tests for _check_interrupt behavior at subworkflow depth > 0.
+
+    At root depth, a between-agent interrupt in web mode is silently
+    consumed (the partial-output handler does the real pausing). In
+    subworkflows the interrupt MUST propagate so the child engine
+    unwinds back to the parent — otherwise Stop is a no-op while a
+    sub-workflow runs.
+    """
+
+    @pytest.mark.asyncio
+    async def test_check_interrupt_raises_in_subworkflow(
+        self, two_agent_config: WorkflowConfig
+    ) -> None:
+        """Sub-engine raises InterruptError when interrupt is set in web mode."""
+        from types import SimpleNamespace
+
+        event = asyncio.Event()
+        event.set()
+
+        # Truthy stand-in: _check_interrupt only checks ``is not None``.
+        web_dashboard = SimpleNamespace()
+
+        provider = CopilotProvider(mock_handler=lambda a, p, c: {})
+        engine = WorkflowEngine(
+            two_agent_config,
+            provider,
+            interrupt_event=event,
+            web_dashboard=web_dashboard,  # type: ignore[arg-type]
+            _subworkflow_depth=1,
+        )
+
+        with pytest.raises(InterruptError) as exc_info:
+            await engine._check_interrupt("inner_agent")
+
+        assert exc_info.value.agent_name == "inner_agent"
+        # Event should have been cleared even though we raised.
+        assert not event.is_set()
+
+    @pytest.mark.asyncio
+    async def test_check_interrupt_consumed_silently_at_root(
+        self, two_agent_config: WorkflowConfig
+    ) -> None:
+        """Root-depth web mode consumes the flag silently (regression guard)."""
+        from types import SimpleNamespace
+
+        event = asyncio.Event()
+        event.set()
+        web_dashboard = SimpleNamespace()
+
+        provider = CopilotProvider(mock_handler=lambda a, p, c: {})
+        engine = WorkflowEngine(
+            two_agent_config,
+            provider,
+            interrupt_event=event,
+            web_dashboard=web_dashboard,  # type: ignore[arg-type]
+            _subworkflow_depth=0,
+        )
+
+        # Returns None (no interrupt result) and clears the flag without raising.
+        result = await engine._check_interrupt("planner")
+        assert result is None
+        assert not event.is_set()
+
+
+class TestHandleWebPauseSubworkflow:
+    """Tests for _handle_web_pause behavior at subworkflow depth > 0.
+
+    A second Stop click while a sub-workflow agent is paused must be
+    able to abort the workflow without requiring the user to first
+    Resume and wait for the next between-agent check.
+    """
+
+    def _make_dashboard(self) -> object:
+        """Build a minimal stand-in for WebDashboard's pause-time surface."""
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            has_connections=lambda: True,
+            resume_event=asyncio.Event(),
+            kill_event=asyncio.Event(),
+            disconnect_event=asyncio.Event(),
+        )
+
+    @pytest.mark.asyncio
+    async def test_handle_web_pause_stop_event_in_subworkflow(
+        self, two_agent_config: WorkflowConfig
+    ) -> None:
+        """Sub-engine pause unblocks on interrupt_event with InterruptError."""
+        from conductor.providers.base import AgentOutput
+
+        interrupt_event = asyncio.Event()
+        web_dashboard = self._make_dashboard()
+
+        provider = CopilotProvider(mock_handler=lambda a, p, c: {})
+        engine = WorkflowEngine(
+            two_agent_config,
+            provider,
+            interrupt_event=interrupt_event,
+            web_dashboard=web_dashboard,  # type: ignore[arg-type]
+            _subworkflow_depth=1,
+        )
+
+        partial = AgentOutput(content={"plan": "partial"}, raw_response="x", partial=True)
+
+        async def trigger_stop() -> None:
+            # Give _handle_web_pause a moment to set up its wait tasks
+            # before we set the interrupt event.
+            await asyncio.sleep(0.05)
+            interrupt_event.set()
+
+        with pytest.raises(InterruptError) as exc_info:
+            await asyncio.gather(
+                engine._handle_web_pause("planner", partial),
+                trigger_stop(),
+            )
+        assert exc_info.value.agent_name == "planner"
+        # interrupt_event should be cleared after consumption so subsequent
+        # checks don't trip on a stale flag.
+        assert not interrupt_event.is_set()
+
+    @pytest.mark.asyncio
+    async def test_handle_web_pause_root_ignores_interrupt_event(
+        self, two_agent_config: WorkflowConfig
+    ) -> None:
+        """Root-depth pause does NOT subscribe to interrupt_event.
+
+        At root, Stop-while-paused is intentionally not honored — only
+        Kill works. This documents the asymmetry with subworkflow
+        behavior; see workflow.py:_handle_web_pause.
+        """
+        from conductor.providers.base import AgentOutput
+
+        interrupt_event = asyncio.Event()
+        web_dashboard = self._make_dashboard()
+
+        provider = CopilotProvider(mock_handler=lambda a, p, c: {})
+        engine = WorkflowEngine(
+            two_agent_config,
+            provider,
+            interrupt_event=interrupt_event,
+            web_dashboard=web_dashboard,  # type: ignore[arg-type]
+            _subworkflow_depth=0,
+        )
+
+        partial = AgentOutput(content={"plan": "partial"}, raw_response="x", partial=True)
+
+        async def signal_then_resume() -> None:
+            await asyncio.sleep(0.05)
+            # Setting the interrupt event should NOT unpause the root engine.
+            interrupt_event.set()
+            await asyncio.sleep(0.05)
+            # Resume is the only way out at root depth.
+            web_dashboard.resume_event.set()
+
+        result, _ = await asyncio.gather(
+            engine._handle_web_pause("planner", partial),
+            signal_then_resume(),
+        )
+        # Resume returned True; no InterruptError raised.
+        assert result is True

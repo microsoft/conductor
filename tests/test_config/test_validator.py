@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from conductor.config.schema import (
     AgentDef,
+    ContextConfig,
     ForEachDef,
     GateOption,
     InputDef,
@@ -14,7 +17,12 @@ from conductor.config.schema import (
     WorkflowConfig,
     WorkflowDef,
 )
-from conductor.config.validator import validate_workflow_config
+from conductor.config.validator import (
+    INPUT_REF_PATTERN,
+    _collect_template_strings,
+    _extract_template_refs,
+    validate_workflow_config,
+)
 from conductor.exceptions import ConfigurationError
 
 
@@ -605,3 +613,520 @@ class TestOutputPathCoverage:
         )
         warnings = validate_workflow_config(config)
         assert not warnings
+
+
+def _agent_with_prompt(name: str, prompt: str, **kwargs: object) -> AgentDef:
+    """Tiny helper: AgentDef with model defaulted, routes terminating at $end."""
+    routes = kwargs.pop("routes", [RouteDef(to="$end")])
+    model = kwargs.pop("model", "gpt-4")
+    return AgentDef(name=name, model=model, prompt=prompt, routes=routes, **kwargs)  # type: ignore[arg-type]
+
+
+class TestExtractTemplateRefs:
+    """Unit tests for the Jinja2-AST-based reference extractor."""
+
+    def test_simple_agent_output_ref(self) -> None:
+        agents, inputs = _extract_template_refs("{{ writer.output.text }}")
+        assert agents == {"writer"}
+        assert inputs == set()
+
+    def test_simple_workflow_input_ref(self) -> None:
+        agents, inputs = _extract_template_refs("Hello {{ workflow.input.name }}")
+        assert agents == set()
+        assert inputs == {"name"}
+
+    def test_outputs_plural_ref(self) -> None:
+        agents, _ = _extract_template_refs("{{ pg.outputs.member.field }}")
+        assert agents == {"pg"}
+
+    def test_errors_ref(self) -> None:
+        agents, _ = _extract_template_refs("{% if pg.errors %}fail{% endif %}")
+        assert agents == {"pg"}
+
+    def test_bare_output_ref(self) -> None:
+        agents, _ = _extract_template_refs("{{ writer.output }}")
+        assert agents == {"writer"}
+
+    def test_for_loop_variable_excluded(self) -> None:
+        """Loop-bound vars must not be reported as agent refs (false-positive #1)."""
+        agents, _ = _extract_template_refs(
+            "{% for r in researcher.outputs %}{{ r.output.text }}{% endfor %}"
+        )
+        # Only the iterable name; the loop variable `r` is scope-bound.
+        assert agents == {"researcher"}
+
+    def test_string_literal_excluded(self) -> None:
+        """Names inside string literals must not be reported (false-positive #2)."""
+        agents, _ = _extract_template_refs(
+            '{{ x | replace("foo.output", "y") | replace("bar.outputs", "z") }}'
+        )
+        assert agents == set()
+
+    def test_set_binding_excluded(self) -> None:
+        agents, _ = _extract_template_refs("{% set x = 1 %}{{ x.output }}")
+        assert agents == set()
+
+    def test_built_in_namespaces_excluded(self) -> None:
+        for builtin in ("workflow", "context", "item", "loop"):
+            agents, _ = _extract_template_refs("{{ " + builtin + ".output.x }}")
+            assert agents == set(), f"{builtin} leaked through"
+
+    def test_unrelated_attrs_ignored(self) -> None:
+        agents, inputs = _extract_template_refs("{{ writer.metadata.author }}")
+        assert agents == set()
+        assert inputs == set()
+
+    def test_no_template_tags(self) -> None:
+        assert _extract_template_refs("just plain text") == (set(), set())
+        assert _extract_template_refs("") == (set(), set())
+
+    def test_malformed_template_returns_empty(self) -> None:
+        # Don't raise — render-time validation will surface the precise error.
+        assert _extract_template_refs("{{ unterminated") == (set(), set())
+
+    def test_multiple_refs_in_one_template(self) -> None:
+        agents, inputs = _extract_template_refs(
+            "{{ a.output }}/{{ b.outputs.x }}/{{ workflow.input.foo }}/{{ workflow.input.bar }}"
+        )
+        assert agents == {"a", "b"}
+        assert inputs == {"foo", "bar"}
+
+
+class TestInputRefPatternExtensions:
+    """Test the extended INPUT_REF_PATTERN shapes added in this PR."""
+
+    @pytest.mark.parametrize(
+        "ref,expected_parallel",
+        [
+            ("group.errors", "group"),
+            ("group.errors.member", "group"),
+            ("group.errors.member.field", "group"),
+            ("group.outputs", "group"),
+            ("group.outputs.member", "group"),
+            ("group.outputs.member.field", "group"),
+            ("group.errors?", "group"),
+            ("group.outputs?", "group"),
+        ],
+    )
+    def test_pattern_accepts_new_shapes(self, ref: str, expected_parallel: str) -> None:
+        match = INPUT_REF_PATTERN.match(ref)
+        assert match is not None, f"{ref!r} should match INPUT_REF_PATTERN"
+        assert match.group("parallel") == expected_parallel
+
+    @pytest.mark.parametrize(
+        "ref",
+        [
+            "agent.output",
+            "agent.output.field",
+            "agent.output?",
+            "agent.output.field?",
+            "workflow.input.param",
+            "workflow.input.param?",
+        ],
+    )
+    def test_pattern_still_accepts_legacy_shapes(self, ref: str) -> None:
+        assert INPUT_REF_PATTERN.match(ref) is not None
+
+    @pytest.mark.parametrize(
+        "ref",
+        [
+            "workflow.input",  # bare workflow.input no longer accepted
+            "agent",
+            "agent.foo",
+            "group.bogus",
+        ],
+    )
+    def test_pattern_rejects_invalid_shapes(self, ref: str) -> None:
+        assert INPUT_REF_PATTERN.match(ref) is None
+
+
+class TestTemplateReferenceValidation:
+    """End-to-end tests for stale-reference detection in agent templates."""
+
+    def test_stale_agent_ref_in_prompt_errors(self) -> None:
+        config = WorkflowConfig(
+            workflow=WorkflowDef(name="t", entry_point="writer"),
+            agents=[
+                _agent_with_prompt("writer", "Based on {{ old_name.output.findings }}, write."),
+            ],
+        )
+        with pytest.raises(ConfigurationError, match="unknown agent 'old_name'"):
+            validate_workflow_config(config)
+
+    def test_stale_agent_ref_in_system_prompt_errors(self) -> None:
+        config = WorkflowConfig(
+            workflow=WorkflowDef(name="t", entry_point="writer"),
+            agents=[
+                _agent_with_prompt(
+                    "writer",
+                    "ok",
+                    system_prompt="Use {{ ghost.output }}",
+                ),
+            ],
+        )
+        with pytest.raises(ConfigurationError, match="system_prompt.*unknown agent 'ghost'"):
+            validate_workflow_config(config)
+
+    def test_stale_agent_ref_in_script_args_errors(self) -> None:
+        config = WorkflowConfig(
+            workflow=WorkflowDef(name="t", entry_point="step"),
+            agents=[
+                AgentDef(
+                    name="step",
+                    type="script",
+                    command="echo",
+                    args=["{{ ghost.output.value }}"],
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+        )
+        with pytest.raises(ConfigurationError, match=r"args\[0\].*unknown agent 'ghost'"):
+            validate_workflow_config(config)
+
+    def test_stale_agent_ref_in_command_errors(self) -> None:
+        config = WorkflowConfig(
+            workflow=WorkflowDef(name="t", entry_point="step"),
+            agents=[
+                AgentDef(
+                    name="step",
+                    type="script",
+                    command="run-{{ ghost.output }}",
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+        )
+        with pytest.raises(ConfigurationError, match="command.*unknown agent 'ghost'"):
+            validate_workflow_config(config)
+
+    def test_stale_agent_ref_in_working_dir_errors(self) -> None:
+        config = WorkflowConfig(
+            workflow=WorkflowDef(name="t", entry_point="step"),
+            agents=[
+                AgentDef(
+                    name="step",
+                    type="script",
+                    command="echo",
+                    working_dir="/tmp/{{ ghost.output }}",
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+        )
+        with pytest.raises(ConfigurationError, match="working_dir.*unknown agent 'ghost'"):
+            validate_workflow_config(config)
+
+    def test_unknown_workflow_input_errors(self) -> None:
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="t",
+                entry_point="writer",
+                input={"topic": InputDef(type="string")},
+            ),
+            agents=[
+                _agent_with_prompt("writer", "Write about {{ workflow.input.nonexistent }}"),
+            ],
+        )
+        with pytest.raises(ConfigurationError, match="unknown workflow input 'nonexistent'"):
+            validate_workflow_config(config)
+
+    def test_workflow_input_unchecked_when_no_input_block(self) -> None:
+        """Workflows without an input: block may use workflow.input freely."""
+        config = WorkflowConfig(
+            workflow=WorkflowDef(name="t", entry_point="writer"),
+            agents=[
+                _agent_with_prompt("writer", "{{ workflow.input.anything }}"),
+            ],
+        )
+        # Should not raise — this is the documented escape hatch.
+        validate_workflow_config(config)
+
+    def test_for_loop_variable_does_not_error(self) -> None:
+        """Regression test: false-positive #1 from PR review."""
+        config = WorkflowConfig(
+            workflow=WorkflowDef(name="t", entry_point="aggregator"),
+            agents=[
+                AgentDef(name="r1", model="gpt-4", prompt="Research"),
+                AgentDef(name="r2", model="gpt-4", prompt="Research"),
+                _agent_with_prompt(
+                    "aggregator",
+                    "{% for r in pg.outputs %}- {{ r.output.text }}{% endfor %}",
+                ),
+            ],
+            parallel=[
+                ParallelGroup(
+                    name="pg",
+                    agents=["r1", "r2"],
+                    routes=[RouteDef(to="aggregator")],
+                ),
+            ],
+        )
+        # No raise: `r` is a loop variable, not a stale agent name.
+        validate_workflow_config(config)
+
+    def test_string_literal_does_not_error(self) -> None:
+        """Regression test: false-positive #2 from PR review."""
+        config = WorkflowConfig(
+            workflow=WorkflowDef(name="t", entry_point="writer"),
+            agents=[
+                _agent_with_prompt("writer", '{{ "x" | replace("foo.output", "y") }}'),
+            ],
+        )
+        validate_workflow_config(config)
+
+    def test_for_each_inline_agent_template_scanned(self) -> None:
+        """For-each groups have inline agents whose templates must also be checked."""
+        config = WorkflowConfig(
+            workflow=WorkflowDef(name="t", entry_point="analyzers"),
+            agents=[],
+            for_each=[
+                ForEachDef(
+                    name="analyzers",
+                    type="for_each",
+                    source="workflow.input.items",
+                    **{"as": "item"},
+                    agent=AgentDef(
+                        name="analyzer",
+                        model="gpt-4",
+                        prompt="Analyze {{ ghost.output.x }}",
+                    ),
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+        )
+        with pytest.raises(ConfigurationError, match="unknown agent 'ghost'"):
+            validate_workflow_config(config)
+
+    def test_for_each_inline_agent_loop_var_does_not_error(self) -> None:
+        """`item`, `_index`, `_key` are built-ins and must not error inside fe agents."""
+        config = WorkflowConfig(
+            workflow=WorkflowDef(name="t", entry_point="analyzers"),
+            agents=[],
+            for_each=[
+                ForEachDef(
+                    name="analyzers",
+                    type="for_each",
+                    source="workflow.input.items",
+                    **{"as": "item"},
+                    agent=AgentDef(
+                        name="analyzer",
+                        model="gpt-4",
+                        prompt="Analyze {{ item }} index={{ _index }}",
+                    ),
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+        )
+        validate_workflow_config(config)
+
+    def test_for_each_group_accepted_in_input_references(self) -> None:
+        """For-each group names should be valid in agent input: lists."""
+        config = WorkflowConfig(
+            workflow=WorkflowDef(name="t", entry_point="analyzers"),
+            agents=[
+                _agent_with_prompt(
+                    "summarizer",
+                    "{{ analyzers.outputs }}",
+                    input=["analyzers.outputs"],
+                ),
+            ],
+            for_each=[
+                ForEachDef(
+                    name="analyzers",
+                    type="for_each",
+                    source="workflow.input.items",
+                    **{"as": "item"},
+                    agent=AgentDef(name="a", model="gpt-4", prompt="{{ item }}"),
+                    routes=[RouteDef(to="summarizer")],
+                ),
+            ],
+        )
+        validate_workflow_config(config)
+
+
+class TestExplicitModeWarnings:
+    """Tests for explicit-context-mode advisory warnings."""
+
+    def test_undeclared_agent_ref_in_explicit_mode_warns(self) -> None:
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="t",
+                entry_point="writer",
+                context=ContextConfig(mode="explicit"),
+            ),
+            agents=[
+                _agent_with_prompt("research", "do work", routes=[RouteDef(to="writer")]),
+                _agent_with_prompt(
+                    "writer",
+                    "Use {{ research.output.findings }}",
+                    # Notably absent: input=["research.output"]
+                ),
+            ],
+        )
+        warnings = validate_workflow_config(config)
+        assert any("research.output" in w and "explicit" in w and "writer" in w for w in warnings)
+
+    def test_undeclared_workflow_input_ref_in_explicit_mode_warns(self) -> None:
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="t",
+                entry_point="writer",
+                context=ContextConfig(mode="explicit"),
+                input={"topic": InputDef(type="string")},
+            ),
+            agents=[
+                _agent_with_prompt(
+                    "writer",
+                    "About {{ workflow.input.topic }}",
+                    # Notably absent: input=["workflow.input.topic"]
+                ),
+            ],
+        )
+        warnings = validate_workflow_config(config)
+        assert any("workflow.input.topic" in w and "explicit" in w for w in warnings)
+
+    def test_declared_input_in_explicit_mode_no_warning(self) -> None:
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="t",
+                entry_point="writer",
+                context=ContextConfig(mode="explicit"),
+                input={"topic": InputDef(type="string")},
+            ),
+            agents=[
+                _agent_with_prompt(
+                    "writer",
+                    "About {{ workflow.input.topic }}",
+                    input=["workflow.input.topic"],
+                ),
+            ],
+        )
+        warnings = validate_workflow_config(config)
+        # Should have no explicit-mode advisories.
+        assert not any("explicit context mode" in w for w in warnings)
+
+    def test_script_agents_skipped_in_explicit_mode(self) -> None:
+        """Script and workflow agents don't carry input declarations the same way."""
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="t",
+                entry_point="step",
+                context=ContextConfig(mode="explicit"),
+                input={"topic": InputDef(type="string")},
+            ),
+            agents=[
+                AgentDef(
+                    name="step",
+                    type="script",
+                    command="echo",
+                    args=["{{ workflow.input.topic }}"],
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+        )
+        warnings = validate_workflow_config(config)
+        assert not any("explicit context mode" in w for w in warnings)
+
+
+class TestOutputTemplateValidation:
+    """Tests for unknown references in workflow `output:` templates."""
+
+    def test_unknown_agent_in_output_errors(self) -> None:
+        config = WorkflowConfig(
+            workflow=WorkflowDef(name="t", entry_point="writer"),
+            agents=[_agent_with_prompt("writer", "ok")],
+            output={"summary": "{{ ghost.output }}"},
+        )
+        with pytest.raises(ConfigurationError, match=r"output 'summary'.*unknown agent 'ghost'"):
+            validate_workflow_config(config)
+
+    def test_unknown_workflow_input_in_output_errors(self) -> None:
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="t",
+                entry_point="writer",
+                input={"topic": InputDef(type="string")},
+            ),
+            agents=[_agent_with_prompt("writer", "ok")],
+            output={"echo": "{{ workflow.input.bogus }}"},
+        )
+        with pytest.raises(
+            ConfigurationError, match=r"output 'echo'.*unknown workflow input 'bogus'"
+        ):
+            validate_workflow_config(config)
+
+
+class TestExamplesRegression:
+    """Every example workflow under examples/ must still validate."""
+
+    def test_all_bundled_examples_validate(self) -> None:
+        from conductor.config.loader import load_config
+
+        examples_dir = Path(__file__).resolve().parents[2] / "examples"
+        yaml_files = sorted(examples_dir.glob("*.yaml"))
+        assert yaml_files, "no example workflows found — fixture path wrong?"
+
+        failures: list[str] = []
+        for path in yaml_files:
+            try:
+                config = load_config(path)
+                validate_workflow_config(config, workflow_path=path)
+            except Exception as e:  # pragma: no cover - report on failure only
+                failures.append(f"{path.name}: {type(e).__name__}: {e}")
+
+        assert not failures, "examples failed validation:\n  " + "\n  ".join(failures)
+
+
+class TestInputMappingTemplateCollection:
+    """Coverage for input_mapping template collection.
+
+    The input_mapping field was added to AgentDef by PR #109 (closing #101). On
+    branches that have merged that schema change, _collect_template_strings
+    should pick up its templates so stale-ref scanning catches them. The helper
+    uses getattr so this stays a no-op on branches that haven't merged it yet,
+    and these tests use a duck-typed object to exercise the path regardless.
+    """
+
+    @staticmethod
+    def _make_agent_like(
+        name: str,
+        prompt: str | None,
+        input_mapping: dict[str, str] | None,
+    ) -> object:
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            name=name,
+            prompt=prompt,
+            system_prompt=None,
+            command=None,
+            args=[],
+            working_dir=None,
+            input_mapping=input_mapping,
+        )
+
+    def test_collects_input_mapping_templates(self) -> None:
+        agent = self._make_agent_like(
+            name="caller",
+            prompt="Call sub-workflow",
+            input_mapping={
+                "topic": "{{ workflow.input.topic }}",
+                "research": "{{ researcher.output.findings }}",
+            },
+        )
+        templates = _collect_template_strings(agent)  # type: ignore[arg-type]
+        labels = {label for label, _ in templates}
+        assert "agent 'caller' input_mapping.topic" in labels
+        assert "agent 'caller' input_mapping.research" in labels
+
+    def test_no_input_mapping_collects_nothing_extra(self) -> None:
+        agent = self._make_agent_like(name="caller", prompt="Simple", input_mapping=None)
+        templates = _collect_template_strings(agent)  # type: ignore[arg-type]
+        labels = {label for label, _ in templates}
+        assert not any("input_mapping" in label for label in labels)
+
+    def test_extractor_catches_stale_ref_in_input_mapping(self) -> None:
+        # Simulates: when this PR merges with main's AgentDef.input_mapping,
+        # a stale agent reference inside an input_mapping expression is caught
+        # by _extract_template_refs the same as any other template field.
+        agent_refs, input_refs = _extract_template_refs("{{ old_agent.output.findings }}")
+        assert "old_agent" in agent_refs
+        assert not input_refs

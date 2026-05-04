@@ -247,3 +247,151 @@ output: {}
         assert is_valid is False
         assert config is None
         assert "Validation Failed" in output.getvalue()
+
+
+class TestSemanticValidationIntegration:
+    """Integration tests for the new semantic-validation wiring in the CLI."""
+
+    def _write(self, path: Path, content: str) -> None:
+        path.write_text(content, encoding="utf-8")
+
+    def test_stale_agent_ref_fails_validation(self, tmp_path: Path) -> None:
+        from conductor.cli.validate import validate_workflow
+
+        workflow_file = tmp_path / "stale.yaml"
+        self._write(
+            workflow_file,
+            """
+workflow:
+  name: stale-ref
+  entry_point: writer
+agents:
+  - name: writer
+    model: gpt-4
+    prompt: "Use {{ ghost.output.value }}"
+    routes:
+      - to: $end
+""",
+        )
+        is_valid, config = validate_workflow(workflow_file)
+        assert is_valid is False
+        assert config is None
+
+    def test_unknown_workflow_input_fails_validation(self, tmp_path: Path) -> None:
+        from conductor.cli.validate import validate_workflow
+
+        workflow_file = tmp_path / "bad_input.yaml"
+        self._write(
+            workflow_file,
+            """
+workflow:
+  name: bad-input
+  entry_point: writer
+  input:
+    topic: { type: string }
+agents:
+  - name: writer
+    model: gpt-4
+    prompt: "Write about {{ workflow.input.nonexistent }}"
+    routes:
+      - to: $end
+""",
+        )
+        is_valid, config = validate_workflow(workflow_file)
+        assert is_valid is False
+        assert config is None
+
+    def test_explicit_mode_warning_renders(self, tmp_path: Path) -> None:
+        """Warnings should be displayed but validation should still pass."""
+        from io import StringIO
+
+        from rich.console import Console
+
+        from conductor.cli.validate import validate_workflow
+
+        workflow_file = tmp_path / "warn.yaml"
+        self._write(
+            workflow_file,
+            """
+workflow:
+  name: warn
+  entry_point: writer
+  context:
+    mode: explicit
+  input:
+    topic: { type: string }
+agents:
+  - name: writer
+    model: gpt-4
+    prompt: "About {{ workflow.input.topic }}"
+    routes:
+      - to: $end
+""",
+        )
+
+        output = StringIO()
+        console = Console(file=output, force_terminal=False, width=200)
+
+        is_valid, config = validate_workflow(workflow_file, console=console)
+        assert is_valid is True
+        assert config is not None
+        out = output.getvalue()
+        # Warning should mention the undeclared input and explicit mode.
+        assert "workflow.input.topic" in out
+        assert "explicit" in out
+
+    def test_for_loop_var_does_not_block_validation(self, tmp_path: Path) -> None:
+        """Regression test: false-positive #1 should not cause CLI failure."""
+        from conductor.cli.validate import validate_workflow
+
+        workflow_file = tmp_path / "loopvar.yaml"
+        self._write(
+            workflow_file,
+            """
+workflow:
+  name: loopvar
+  entry_point: pg
+agents:
+  - name: r1
+    model: gpt-4
+    prompt: "Research"
+  - name: r2
+    model: gpt-4
+    prompt: "Research"
+  - name: aggregator
+    model: gpt-4
+    prompt: |
+      {% for r in pg.outputs %}- {{ r.output.text }}{% endfor %}
+    routes:
+      - to: $end
+parallel:
+  - name: pg
+    agents: [r1, r2]
+    routes:
+      - to: aggregator
+""",
+        )
+        is_valid, _ = validate_workflow(workflow_file)
+        assert is_valid is True
+
+    def test_validate_command_exits_nonzero_on_stale_ref(self, tmp_path: Path) -> None:
+        """The CLI command (not just the function) must propagate failure."""
+        workflow_file = tmp_path / "stale.yaml"
+        self._write(
+            workflow_file,
+            """
+workflow:
+  name: stale
+  entry_point: writer
+agents:
+  - name: writer
+    model: gpt-4
+    prompt: "Use {{ ghost.output }}"
+    routes:
+      - to: $end
+""",
+        )
+        result = runner.invoke(app, ["validate", str(workflow_file)])
+        assert result.exit_code != 0
+        assert "Validation Failed" in result.output
+        assert "ghost" in result.output
