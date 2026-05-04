@@ -499,6 +499,132 @@ class TestServerStartupFailure:
             await dashboard.start()
 
 
+class TestProactorShutdownRace:
+    """Tests for the proactor accept-loop race guard (Python 3.14+ Windows).
+
+    The proactor event loop can raise AssertionError when a new connection
+    is accepted after Server.close() sets _sockets = None during shutdown.
+    The dashboard guards against this with both a custom exception handler
+    and a guarded serve wrapper.
+    """
+
+    def test_is_proactor_shutdown_race_true_during_shutdown(self) -> None:
+        """_is_proactor_shutdown_race returns True when server is shutting down."""
+        _, dashboard = _make_dashboard()
+        dashboard._server = MagicMock()
+        dashboard._server.should_exit = True
+
+        context = {"exception": AssertionError()}
+        assert dashboard._is_proactor_shutdown_race(context) is True
+
+    def test_is_proactor_shutdown_race_false_when_not_shutting_down(self) -> None:
+        """_is_proactor_shutdown_race returns False when server is running."""
+        _, dashboard = _make_dashboard()
+        dashboard._server = MagicMock()
+        dashboard._server.should_exit = False
+
+        context = {"exception": AssertionError()}
+        assert dashboard._is_proactor_shutdown_race(context) is False
+
+    def test_is_proactor_shutdown_race_false_for_non_assertion(self) -> None:
+        """_is_proactor_shutdown_race returns False for non-AssertionError."""
+        _, dashboard = _make_dashboard()
+        dashboard._server = MagicMock()
+        dashboard._server.should_exit = True
+
+        context = {"exception": RuntimeError("something else")}
+        assert dashboard._is_proactor_shutdown_race(context) is False
+
+    def test_is_proactor_shutdown_race_false_without_server(self) -> None:
+        """_is_proactor_shutdown_race returns False when no server exists."""
+        _, dashboard = _make_dashboard()
+        dashboard._server = None
+
+        context = {"exception": AssertionError()}
+        assert dashboard._is_proactor_shutdown_race(context) is False
+
+    def test_loop_exception_handler_suppresses_race(self) -> None:
+        """Custom exception handler suppresses the proactor race silently."""
+        _, dashboard = _make_dashboard()
+        dashboard._server = MagicMock()
+        dashboard._server.should_exit = True
+
+        loop = MagicMock()
+        context = {"exception": AssertionError(), "message": "test"}
+
+        # Should not raise or call default handler
+        dashboard._loop_exception_handler(loop, context)
+        loop.default_exception_handler.assert_not_called()
+
+    def test_loop_exception_handler_delegates_other_errors(self) -> None:
+        """Custom exception handler delegates non-race errors to the default."""
+        _, dashboard = _make_dashboard()
+        dashboard._server = MagicMock()
+        dashboard._server.should_exit = False
+        dashboard._original_exception_handler = None
+
+        loop = MagicMock()
+        context = {"exception": RuntimeError("real error"), "message": "boom"}
+
+        dashboard._loop_exception_handler(loop, context)
+        loop.default_exception_handler.assert_called_once_with(context)
+
+    def test_loop_exception_handler_delegates_to_original(self) -> None:
+        """Custom exception handler delegates to original handler if set."""
+        _, dashboard = _make_dashboard()
+        dashboard._server = MagicMock()
+        dashboard._server.should_exit = False
+        original = MagicMock()
+        dashboard._original_exception_handler = original
+
+        loop = MagicMock()
+        context = {"exception": ValueError("other"), "message": "test"}
+
+        dashboard._loop_exception_handler(loop, context)
+        original.assert_called_once_with(loop, context)
+        loop.default_exception_handler.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_guarded_serve_suppresses_assertion_during_shutdown(self) -> None:
+        """_guarded_serve swallows AssertionError when server is shutting down."""
+        from unittest.mock import patch
+
+        _, dashboard = _make_dashboard()
+
+        async def _assert_serve(self: object) -> None:
+            raise AssertionError("self._sockets is not None")
+
+        import uvicorn
+
+        with patch.object(uvicorn.Server, "serve", _assert_serve):
+            dashboard._server = uvicorn.Server(
+                uvicorn.Config(app=dashboard._app, host="127.0.0.1", port=0)
+            )
+            dashboard._server.should_exit = True
+            # Should not raise
+            await dashboard._guarded_serve()
+
+    @pytest.mark.asyncio
+    async def test_guarded_serve_reraises_assertion_when_running(self) -> None:
+        """_guarded_serve re-raises AssertionError when server is NOT shutting down."""
+        from unittest.mock import patch
+
+        _, dashboard = _make_dashboard()
+
+        async def _assert_serve(self: object) -> None:
+            raise AssertionError("unexpected assertion")
+
+        import uvicorn
+
+        with patch.object(uvicorn.Server, "serve", _assert_serve):
+            dashboard._server = uvicorn.Server(
+                uvicorn.Config(app=dashboard._app, host="127.0.0.1", port=0)
+            )
+            dashboard._server.should_exit = False
+            with pytest.raises(AssertionError, match="unexpected assertion"):
+                await dashboard._guarded_serve()
+
+
 class TestWaitForGateResponse:
     """Tests for WebDashboard.wait_for_gate_response stale-message handling."""
 

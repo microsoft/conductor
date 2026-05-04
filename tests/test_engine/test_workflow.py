@@ -8,12 +8,15 @@ Tests cover:
 - Error handling
 """
 
+import sys
+
 import pytest
 
 from conductor.config.schema import (
     AgentDef,
     ContextConfig,
     GateOption,
+    InputDef,
     LimitsConfig,
     OutputField,
     ParallelGroup,
@@ -196,6 +199,39 @@ class TestWorkflowEngineBasic:
         assert received_contexts[1][0] == "executor"
         assert received_contexts[1][1]["planner"]["output"]["plan"] == "the plan"
 
+    def test_engine_populates_workflow_metadata(
+        self, tmp_path, simple_workflow_config: WorkflowConfig
+    ) -> None:
+        """``WorkflowEngine.__init__`` wires ``workflow_path`` into context fields.
+
+        Guards against a regression where someone refactors ``__init__`` and
+        reverts to a bare ``WorkflowContext()``, silently dropping
+        ``workflow.dir``/``workflow.file``/``workflow.name`` from templates.
+        """
+        wf_file = tmp_path / "wf.yaml"
+        wf_file.write_text("name: test\n")
+
+        engine = WorkflowEngine(simple_workflow_config, workflow_path=wf_file)
+
+        assert engine.context.workflow_dir == str(tmp_path.resolve())
+        assert engine.context.workflow_file == str(wf_file.resolve())
+        assert engine.context.workflow_name == simple_workflow_config.workflow.name
+
+    def test_engine_workflow_metadata_empty_without_path(
+        self, simple_workflow_config: WorkflowConfig
+    ) -> None:
+        """Without ``workflow_path``, path-derived fields stay empty.
+
+        Empty strings are omitted from the rendered context (see
+        ``WorkflowContext.build_for_agent``), so this preserves the existing
+        no-pollution behaviour for path-less engines (e.g., test fixtures).
+        """
+        engine = WorkflowEngine(simple_workflow_config)
+
+        assert engine.context.workflow_dir == ""
+        assert engine.context.workflow_file == ""
+        assert engine.context.workflow_name == simple_workflow_config.workflow.name
+
 
 class TestWorkflowEngineContextModes:
     """Tests for different context accumulation modes."""
@@ -297,6 +333,136 @@ class TestWorkflowEngineContextModes:
         assert "agent1" in agent2_context
         # Workflow.input.goal should not be in agent2's context since it's not in input list
         assert "other" not in agent2_context.get("workflow", {}).get("input", {})
+
+    @pytest.mark.asyncio
+    async def test_explicit_mode_script_gets_workflow_inputs(self) -> None:
+        """Regression: script agents in explicit mode see workflow.input.
+
+        ``workflow.input`` is the workflow's external interface — set once at
+        startup and present for the lifetime of the run. For local-render
+        agent types (``script``, ``workflow``) it is always available, even
+        in explicit mode where prior agent outputs remain explicitly declared.
+        """
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="explicit-script",
+                entry_point="detector",
+                context=ContextConfig(mode="explicit"),
+            ),
+            agents=[
+                AgentDef(
+                    name="detector",
+                    type="script",
+                    command=sys.executable,
+                    args=[
+                        "-c",
+                        "print('{{ workflow.input.work_item_id }}')",
+                    ],
+                    # No input: list — should still see workflow.input
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+        )
+
+        provider = CopilotProvider(mock_handler=lambda a, p, c: {})
+        engine = WorkflowEngine(config, provider)
+
+        await engine.run({"work_item_id": 42})
+
+        # Script should have rendered the template successfully
+        assert engine.context.agent_outputs["detector"]["stdout"].strip() == "42"
+
+
+class TestApplyInputDefaults:
+    """Tests for `_apply_input_defaults` / `_zero_value_for_type`.
+
+    Optional inputs without an explicit ``default:`` must resolve to a
+    type-appropriate zero value (not ``None``) so templates render cleanly
+    without requiring ``| default()`` guards.
+    """
+
+    @staticmethod
+    def _engine_with_input(name: str, input_def: InputDef) -> WorkflowEngine:
+        """Build a minimal engine whose only declared input is `input_def`."""
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="defaults-probe",
+                entry_point="noop",
+                input={name: input_def},
+            ),
+            agents=[
+                AgentDef(
+                    name="noop",
+                    model="gpt-4",
+                    prompt="noop",
+                    output={"result": OutputField(type="string")},
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+        )
+        return WorkflowEngine(config, CopilotProvider(mock_handler=lambda a, p, c: {}))
+
+    @pytest.mark.parametrize(
+        ("type_name", "expected_zero"),
+        [
+            ("string", ""),
+            ("number", 0),
+            ("boolean", False),
+            ("array", []),
+            ("object", {}),
+        ],
+    )
+    def test_optional_input_with_no_default_gets_type_zero(
+        self, type_name: str, expected_zero: object
+    ) -> None:
+        """Every InputDef.type resolves to its type-appropriate zero, not None."""
+        engine = self._engine_with_input("opt", InputDef(type=type_name, required=False))
+
+        merged = engine._apply_input_defaults({})
+
+        assert "opt" in merged
+        assert merged["opt"] == expected_zero
+        assert merged["opt"] is not None
+
+    def test_explicit_default_is_honored_over_zero(self) -> None:
+        """A declared ``default:`` wins; the zero-value path must not override it."""
+        engine = self._engine_with_input(
+            "with_default", InputDef(type="string", required=False, default="hello")
+        )
+
+        merged = engine._apply_input_defaults({})
+
+        assert merged["with_default"] == "hello"
+
+    def test_provided_value_passes_through_unchanged(self) -> None:
+        """Caller-provided values are never overwritten by defaults."""
+        engine = self._engine_with_input("opt", InputDef(type="string", required=False))
+
+        merged = engine._apply_input_defaults({"opt": "explicit"})
+
+        assert merged["opt"] == "explicit"
+
+    def test_required_input_is_left_alone_when_missing(self) -> None:
+        """Missing required inputs are not silently filled — let validation flag them."""
+        engine = self._engine_with_input("must_have", InputDef(type="string", required=True))
+
+        merged = engine._apply_input_defaults({})
+
+        assert "must_have" not in merged
+
+    @pytest.mark.parametrize("type_name", ["array", "object"])
+    def test_zero_value_for_mutable_type_returns_fresh_instance(self, type_name: str) -> None:
+        """Mutable zeros must not be shared — guards against the classic
+        shared-mutable-default bug if someone later "optimizes" the lookup
+        into a single cached instance.
+        """
+        engine = self._engine_with_input("opt", InputDef(type=type_name, required=False))
+
+        first = engine._zero_value_for_type(type_name)
+        second = engine._zero_value_for_type(type_name)
+
+        assert first == second
+        assert first is not second
 
 
 class TestWorkflowEngineRouting:
@@ -553,6 +719,118 @@ class TestWorkflowEngineOutputTemplates:
         result = await engine.run({})
 
         assert result["total"] == 42
+
+    @pytest.mark.asyncio
+    async def test_output_template_python_bool_literals(self) -> None:
+        """Python str(bool) outputs ('True'/'False') from Jinja expressions
+        coerce to native bool, not truthy non-empty strings.
+
+        Without this, ``{{ a == b }}`` in a workflow ``output:`` block renders
+        ``"True"`` / ``"False"`` and downstream ``when:`` clauses comparing to
+        ``true`` / ``false`` silently misbehave (the strings are truthy).
+        """
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="bool-output",
+                entry_point="agent1",
+            ),
+            agents=[
+                AgentDef(
+                    name="agent1",
+                    model="gpt-4",
+                    prompt="x",
+                    output={
+                        "left": OutputField(type="string"),
+                        "right": OutputField(type="string"),
+                    },
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={
+                "matched": "{{ agent1.output.left == agent1.output.right }}",
+                "differs": "{{ agent1.output.left != agent1.output.right }}",
+            },
+        )
+
+        def mock_handler(agent, prompt, context):
+            return {"left": "abc", "right": "abc"}
+
+        provider = CopilotProvider(mock_handler=mock_handler)
+        engine = WorkflowEngine(config, provider)
+
+        result = await engine.run({})
+
+        assert result["matched"] is True
+        assert result["differs"] is False
+
+    @pytest.mark.asyncio
+    async def test_output_template_python_none_literal(self) -> None:
+        """Python str(None) ('None') from Jinja coerces to native None."""
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="none-output",
+                entry_point="agent1",
+            ),
+            agents=[
+                AgentDef(
+                    name="agent1",
+                    model="gpt-4",
+                    prompt="x",
+                    output={"thing": OutputField(type="string")},
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={
+                # Jinja's `none` value renders as the string "None" via str(None).
+                "missing": "{{ none }}",
+            },
+        )
+
+        def mock_handler(agent, prompt, context):
+            return {"thing": "value"}
+
+        provider = CopilotProvider(mock_handler=mock_handler)
+        engine = WorkflowEngine(config, provider)
+
+        result = await engine.run({})
+
+        assert result["missing"] is None
+
+    @pytest.mark.asyncio
+    async def test_output_template_lowercase_json_literals_still_work(self) -> None:
+        """Regression: lowercase JSON literals 'true'/'false'/'null' remain coerced."""
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="json-literals-output",
+                entry_point="agent1",
+            ),
+            agents=[
+                AgentDef(
+                    name="agent1",
+                    model="gpt-4",
+                    prompt="x",
+                    output={"v": OutputField(type="string")},
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={
+                "t": "true",
+                "f": "false",
+                "n": "null",
+            },
+        )
+
+        def mock_handler(agent, prompt, context):
+            return {"v": "x"}
+
+        provider = CopilotProvider(mock_handler=mock_handler)
+        engine = WorkflowEngine(config, provider)
+
+        result = await engine.run({})
+
+        assert result["t"] is True
+        assert result["f"] is False
+        assert result["n"] is None
 
 
 class TestWorkflowEngineLoopBack:
