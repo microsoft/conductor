@@ -283,6 +283,7 @@ export function WorkflowGraph() {
           <FitViewButton />
         </Controls>
         <FitViewKeyboardShortcut />
+        <FitViewOnContextSwitch viewPathKey={viewPathKey} />
         <DeepLinkHandler />
       </ReactFlow>
     </div>
@@ -323,6 +324,21 @@ function FitViewKeyboardShortcut() {
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [fitView]);
+
+  return null;
+}
+
+/** Auto-fit viewport when navigating between workflow contexts */
+function FitViewOnContextSwitch({ viewPathKey }: { viewPathKey: string }) {
+  const { fitView } = useReactFlow();
+  const prevKey = useRef(viewPathKey);
+
+  useEffect(() => {
+    if (prevKey.current !== viewPathKey) {
+      prevKey.current = viewPathKey;
+      setTimeout(() => fitView({ padding: 0.2, duration: 300 }), 50);
+    }
+  }, [viewPathKey, fitView]);
 
   return null;
 }
