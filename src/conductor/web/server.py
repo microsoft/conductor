@@ -405,24 +405,25 @@ class WebDashboard:
         Returns True only when all of:
         - The exception is ``AssertionError``
         - The uvicorn server is in shutdown state (``should_exit`` is set)
-        - The traceback (if available) originates from asyncio internals
+        - The traceback is present and the deepest frame originates from
+          asyncio internals
         """
         exc = context.get("exception")
         if not isinstance(exc, AssertionError):
             return False
         if self._server is None or not getattr(self._server, "should_exit", False):
             return False
-        # Extra safety: check traceback originates from asyncio, not user code
+        # Require an asyncio traceback frame so unrelated AssertionErrors
+        # raised during shutdown (e.g., from a workflow callback finishing
+        # late) propagate to the default handler instead of being silently
+        # swallowed. Issue #145 (I3).
         import traceback as tb_mod
 
         tb = exc.__traceback__
-        if tb is not None:
-            frames = tb_mod.extract_tb(tb)
-            if frames and "asyncio" in frames[-1].filename:
-                return True
-        # If no traceback but server is shutting down, still suppress —
-        # the only known source of AssertionError during shutdown is this race.
-        return True
+        if tb is None:
+            return False
+        frames = tb_mod.extract_tb(tb)
+        return bool(frames) and "asyncio" in frames[-1].filename
 
     def _loop_exception_handler(
         self, loop: asyncio.AbstractEventLoop, context: dict[str, Any]

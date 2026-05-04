@@ -1141,6 +1141,12 @@ class WorkflowEngine:
         if self._interrupt_event is None or not self._interrupt_event.is_set():
             return None
 
+        # Clearing here is safe because is_set() above is the only consumer
+        # within this method; the unwind path raised below does NOT re-check
+        # the event before reaching the parent engine. If a future change
+        # adds a between-agent recheck after the InterruptError catch, this
+        # clear must move to AFTER the raise to preserve interrupt visibility.
+        # Issue #145 (S2).
         self._interrupt_event.clear()
 
         # In web mode, the interrupt was already handled at the provider level
