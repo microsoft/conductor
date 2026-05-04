@@ -243,9 +243,11 @@ def _try_linkify_path(token: str, base_dir: Path | None) -> str | None:
     # If base_dir is provided, verify file exists
     if base_dir is not None:
         try:
+            resolved_base = base_dir.resolve()
             candidate = (base_dir / stripped).resolve()
-            # Security: must be within base_dir
-            if not str(candidate).startswith(str(base_dir.resolve())):
+            # Security: must be within base_dir (path-aware containment, not
+            # string-prefix — `/foo/bar` must not match `/foo/barbaz/...`).
+            if not candidate.is_relative_to(resolved_base):
                 return None
             if not candidate.is_file():
                 return None

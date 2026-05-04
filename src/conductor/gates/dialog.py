@@ -75,6 +75,26 @@ DISMISS_KEYWORDS = frozenset(
     }
 )
 
+# Marker the agent appends to signal it's ready to continue. Treated as a
+# terminal control token (must be at the end of the response) to prevent
+# false positives if the agent quotes the marker mid-response.
+_READY_MARKER = "[READY_TO_CONTINUE]"
+
+
+def _extract_ready_marker(response: str) -> tuple[bool, str]:
+    """Return ``(proposed, cleaned)`` for an agent response.
+
+    ``proposed`` is True only when the marker appears at the very end of the
+    (right-stripped) response. ``cleaned`` is the response with the trailing
+    marker removed. This avoids both false positives from mid-response
+    mentions and the user-injection vector where a user pastes the marker.
+    """
+    stripped = response.rstrip()
+    if stripped.endswith(_READY_MARKER):
+        cleaned = stripped[: -len(_READY_MARKER)].rstrip()
+        return True, cleaned
+    return False, response
+
 
 @dataclass
 class DialogMessage:
@@ -278,6 +298,9 @@ class DialogHandler:
                     model=agent.model,
                 )
             except Exception:
+                # Roll back the user turn so the next attempt doesn't leave two
+                # consecutive user messages in the provider context.
+                history.pop()
                 logger.warning(
                     "Dialog turn failed for agent '%s'",
                     agent.name,
@@ -289,21 +312,22 @@ class DialogHandler:
                 continue
 
             history.append({"role": "assistant", "content": agent_response})
-            result.messages.append(DialogMessage(role="agent", content=agent_response))
+            ready_proposed, clean_response = _extract_ready_marker(agent_response)
+            stored_response = clean_response if ready_proposed else agent_response
+            result.messages.append(DialogMessage(role="agent", content=stored_response))
             self._emit_event(
                 "dialog_message",
                 {
                     "dialog_id": dialog_id,
                     "agent_name": agent.name,
                     "role": "agent",
-                    "content": agent_response,
+                    "content": stored_response,
                 },
             )
 
-            # Check if agent proposed completion
-            if "[READY_TO_CONTINUE]" in agent_response:
+            # Check if agent proposed completion (terminal marker only)
+            if ready_proposed:
                 result.agent_proposed_continue = True
-                clean_response = agent_response.replace("[READY_TO_CONTINUE]", "").strip()
                 self._display_agent_message(clean_response)
                 self._display_continue_proposal()
 
@@ -437,6 +461,9 @@ class DialogHandler:
                     model=agent.model,
                 )
             except Exception:
+                # Roll back the user turn so the next attempt doesn't leave two
+                # consecutive user messages in the provider context.
+                history.pop()
                 logger.warning(
                     "Dialog turn failed for agent '%s'",
                     agent.name,
@@ -474,12 +501,13 @@ class DialogHandler:
                 continue
 
             history.append({"role": "assistant", "content": agent_response})
-            result.messages.append(DialogMessage(role="agent", content=agent_response))
+            ready_proposed, clean_response = _extract_ready_marker(agent_response)
+            stored_response = clean_response if ready_proposed else agent_response
+            result.messages.append(DialogMessage(role="agent", content=stored_response))
 
-            # Check if agent proposed completion
-            if "[READY_TO_CONTINUE]" in agent_response:
+            # Check if agent proposed completion (terminal marker only)
+            if ready_proposed:
                 result.agent_proposed_continue = True
-                clean_response = agent_response.replace("[READY_TO_CONTINUE]", "").strip()
                 self._emit_event(
                     "dialog_message",
                     {
@@ -497,9 +525,10 @@ class DialogHandler:
                 approval = msg.get("content", "")
                 if approval.lower() in ("yes", "y", ""):
                     break
-                # User wants to keep chatting
+                # User wants to keep chatting — treat approval as the next user
+                # turn. The loop top will append it to provider history exactly
+                # once; we only update the transcript / UI here.
                 user_input = approval
-                history.append({"role": "user", "content": approval})
                 result.messages.append(DialogMessage(role="user", content=approval))
                 self._emit_event(
                     "dialog_message",
@@ -518,7 +547,7 @@ class DialogHandler:
                     "dialog_id": dialog_id,
                     "agent_name": agent.name,
                     "role": "agent",
-                    "content": agent_response,
+                    "content": stored_response,
                 },
             )
 

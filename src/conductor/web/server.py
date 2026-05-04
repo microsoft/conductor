@@ -347,7 +347,9 @@ class WebDashboard:
         """Wait for a dialog message or decline from the web client.
 
         Blocks until a ``dialog_message`` or ``dialog_decline`` message is
-        received via WebSocket that matches the given agent name.
+        received via WebSocket that matches both the given agent name and
+        dialog id. Messages from a stale or different dialog are dropped so
+        a re-entered dialog can't be confused with the previous one.
 
         Args:
             agent_name: The name of the agent in dialog mode.
@@ -360,12 +362,15 @@ class WebDashboard:
         """
         while True:
             msg = await self._dialog_response_queue.get()
-            if msg.get("agent_name") == agent_name:
+            if msg.get("agent_name") == agent_name and msg.get("dialog_id") == dialog_id:
                 return msg
             logger.warning(
-                "Discarding stale dialog message for agent %r while waiting on %r",
+                "Discarding stale dialog message for agent %r / dialog %r "
+                "while waiting on agent %r / dialog %r",
                 msg.get("agent_name"),
+                msg.get("dialog_id"),
                 agent_name,
+                dialog_id,
             )
 
     # ------------------------------------------------------------------

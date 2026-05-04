@@ -2302,3 +2302,119 @@ class TestClaudeProviderRetryLogic:
         # Verify retry-after header was used (delay should be 5.0)
         assert len(provider._retry_history) == 1
         assert provider._retry_history[0]["delay"] == 5.0
+
+
+class TestClaudeExecuteDialogTurn:
+    """Tests for Claude provider dialog-turn API (provider parity with Copilot)."""
+
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    @pytest.mark.asyncio
+    async def test_dialog_turn_empty_history_sends_only_current_message(
+        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
+    ) -> None:
+        """Empty history -> messages list contains only the current user message."""
+        mock_anthropic_module.__version__ = "0.77.0"
+        mock_client = Mock()
+        mock_client.models.list = AsyncMock(return_value=Mock(data=[]))
+        mock_text_block = Mock()
+        mock_text_block.text = "the reply"
+        mock_response = Mock()
+        mock_response.content = [mock_text_block]
+        mock_client.messages.create = AsyncMock(return_value=mock_response)
+        mock_anthropic_class.return_value = mock_client
+
+        provider = ClaudeProvider()
+        result = await provider.execute_dialog_turn(
+            system_prompt="be a helpful assistant",
+            user_message="hello",
+            history=[],
+        )
+
+        assert result == "the reply"
+        kwargs = mock_client.messages.create.call_args.kwargs
+        assert kwargs["system"] == "be a helpful assistant"
+        assert kwargs["messages"] == [{"role": "user", "content": "hello"}]
+
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    @pytest.mark.asyncio
+    async def test_dialog_turn_multi_turn_history_preserved_in_order(
+        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
+    ) -> None:
+        """Multi-turn history is appended in order, with current message last."""
+        mock_anthropic_module.__version__ = "0.77.0"
+        mock_client = Mock()
+        mock_client.models.list = AsyncMock(return_value=Mock(data=[]))
+        mock_response = Mock()
+        mock_response.content = [Mock(text="ack")]
+        mock_client.messages.create = AsyncMock(return_value=mock_response)
+        mock_anthropic_class.return_value = mock_client
+
+        provider = ClaudeProvider()
+        await provider.execute_dialog_turn(
+            system_prompt="sys",
+            user_message="third user msg",
+            history=[
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "second"},
+            ],
+        )
+
+        kwargs = mock_client.messages.create.call_args.kwargs
+        assert kwargs["messages"] == [
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "second"},
+            {"role": "user", "content": "third user msg"},
+        ]
+
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    @pytest.mark.asyncio
+    async def test_dialog_turn_model_override_used(
+        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
+    ) -> None:
+        """model arg overrides the provider default."""
+        mock_anthropic_module.__version__ = "0.77.0"
+        mock_client = Mock()
+        mock_client.models.list = AsyncMock(return_value=Mock(data=[]))
+        mock_response = Mock()
+        mock_response.content = [Mock(text="x")]
+        mock_client.messages.create = AsyncMock(return_value=mock_response)
+        mock_anthropic_class.return_value = mock_client
+
+        provider = ClaudeProvider()
+        await provider.execute_dialog_turn(
+            system_prompt="sys",
+            user_message="hi",
+            history=None,
+            model="claude-3-opus-20240229",
+        )
+
+        kwargs = mock_client.messages.create.call_args.kwargs
+        assert kwargs["model"] == "claude-3-opus-20240229"
+
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    @pytest.mark.asyncio
+    async def test_dialog_turn_error_wrapped_as_provider_error(
+        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
+    ) -> None:
+        """SDK errors propagate as ProviderError, not bare exceptions."""
+        mock_anthropic_module.__version__ = "0.77.0"
+        mock_client = Mock()
+        mock_client.models.list = AsyncMock(return_value=Mock(data=[]))
+        mock_client.messages.create = AsyncMock(side_effect=RuntimeError("api down"))
+        mock_anthropic_class.return_value = mock_client
+
+        provider = ClaudeProvider()
+        with pytest.raises(ProviderError, match="api down"):
+            await provider.execute_dialog_turn(
+                system_prompt="sys",
+                user_message="hi",
+                history=[],
+            )

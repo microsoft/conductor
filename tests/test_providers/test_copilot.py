@@ -577,3 +577,153 @@ class TestFixPipeBlockingMode:
         # early — it proceeded past the guard and attempted the import.
         with contextlib.suppress(ModuleNotFoundError):
             provider._fix_pipe_blocking_mode()
+
+
+class TestCopilotExecuteDialogTurn:
+    """Tests for Copilot provider dialog-turn API (provider parity with Claude).
+
+    The Copilot SDK is session-based and event-driven, so we mock create_session
+    and synthesize the assistant.message + session.idle events that real sessions
+    emit.
+    """
+
+    @staticmethod
+    def _build_event(event_type: str, content: str = "", message: str = "") -> Any:
+        """Build a fake SDK event with .type.value, .data.content, .data.message."""
+        from unittest.mock import Mock as _Mock
+
+        ev = _Mock()
+        ev.type = _Mock()
+        ev.type.value = event_type
+        ev.data = _Mock()
+        ev.data.content = content
+        ev.data.message = message
+        return ev
+
+    async def _make_provider_with_session(
+        self,
+        captured: dict[str, Any],
+        response_text: str = "an answer",
+    ) -> CopilotProvider:
+        """Build a provider whose create_session returns a session that, on send,
+        invokes its event handler with assistant.message + session.idle.
+        """
+        from unittest.mock import AsyncMock as _AsyncMock
+
+        provider = CopilotProvider(mock_handler=stub_handler)
+        # Force the started state without invoking the real SDK
+        provider._started = True
+
+        session = _AsyncMock()
+        captured_callback: dict[str, Any] = {}
+
+        def on_event(callback: Any) -> None:
+            captured_callback["cb"] = callback
+
+        session.on = on_event
+
+        async def send(prompt: str) -> None:
+            captured["sent_prompt"] = prompt
+            cb = captured_callback["cb"]
+            cb(self._build_event("assistant.message", response_text))
+            cb(self._build_event("session.idle"))
+
+        session.send = send
+        session.destroy = _AsyncMock()
+
+        async def create_session(**kwargs: Any) -> Any:
+            captured["create_session_kwargs"] = kwargs
+            return session
+
+        client = _AsyncMock()
+        client.create_session = create_session
+        provider._client = client
+        return provider
+
+    @pytest.mark.asyncio
+    async def test_dialog_turn_empty_history_sends_only_current_message(self) -> None:
+        captured: dict[str, Any] = {}
+        provider = await self._make_provider_with_session(captured, response_text="reply")
+
+        result = await provider.execute_dialog_turn(
+            system_prompt="be helpful",
+            user_message="hello",
+            history=[],
+        )
+
+        assert result == "reply"
+        # System prompt is sent via create_session, not embedded in the prompt body
+        assert captured["create_session_kwargs"]["system_message"] == {
+            "mode": "replace",
+            "content": "be helpful",
+        }
+        # With empty history, the prompt is just the current user message line.
+        assert captured["sent_prompt"] == "User: hello"
+
+    @pytest.mark.asyncio
+    async def test_dialog_turn_multi_turn_history_serialized_in_order(self) -> None:
+        captured: dict[str, Any] = {}
+        provider = await self._make_provider_with_session(captured)
+
+        await provider.execute_dialog_turn(
+            system_prompt="sys",
+            user_message="third",
+            history=[
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "second"},
+            ],
+        )
+
+        # History serialized as User:/Assistant: blocks separated by blank lines,
+        # with the current message appended last as a User: block.
+        assert captured["sent_prompt"] == ("User: first\n\nAssistant: second\n\nUser: third")
+
+    @pytest.mark.asyncio
+    async def test_dialog_turn_model_override_used(self) -> None:
+        captured: dict[str, Any] = {}
+        provider = await self._make_provider_with_session(captured)
+
+        await provider.execute_dialog_turn(
+            system_prompt="sys",
+            user_message="hi",
+            history=None,
+            model="claude-sonnet-4.5",
+        )
+
+        assert captured["create_session_kwargs"]["model"] == "claude-sonnet-4.5"
+
+    @pytest.mark.asyncio
+    async def test_dialog_turn_session_error_wrapped_as_provider_error(self) -> None:
+        from unittest.mock import AsyncMock as _AsyncMock
+
+        provider = CopilotProvider(mock_handler=stub_handler)
+        provider._started = True
+
+        session = _AsyncMock()
+        captured_callback: dict[str, Any] = {}
+
+        def on_event(callback: Any) -> None:
+            captured_callback["cb"] = callback
+
+        session.on = on_event
+
+        async def send(prompt: str) -> None:
+            cb = captured_callback["cb"]
+            cb(self._build_event("session.error", message="internal failure"))
+
+        session.send = send
+        session.destroy = _AsyncMock()
+
+        async def create_session(**kwargs: Any) -> Any:
+            return session
+
+        client = _AsyncMock()
+        client.create_session = create_session
+        provider._client = client
+
+        with pytest.raises(ProviderError, match="Dialog turn error"):
+            await provider.execute_dialog_turn(
+                system_prompt="sys",
+                user_message="hi",
+                history=[],
+            )

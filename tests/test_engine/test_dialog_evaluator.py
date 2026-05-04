@@ -60,6 +60,61 @@ class TestDialogEvaluatorParsing:
         assert result.reason == ""
         assert result.question == ""
 
+    def test_parse_unterminated_code_fence_keeps_last_line(self) -> None:
+        """Unterminated ```json fences must not slice off the last JSON line."""
+        # No closing ``` — the previous parser dropped the last line and failed.
+        response = '```json\n{"trigger": true, "reason": "ok"}'
+        result = self.evaluator._parse_evaluation(response)
+        assert result.trigger is True
+        assert result.reason == "ok"
+
+    def test_parse_terminated_code_fence_strips_both(self) -> None:
+        """Closing fence must still be stripped when present."""
+        response = '```\n{"trigger": false, "reason": "clear"}\n```'
+        result = self.evaluator._parse_evaluation(response)
+        assert result.trigger is False
+        assert result.reason == "clear"
+
+
+class TestEvaluatorTruncation:
+    """Tests for the agent-output truncation marker."""
+
+    def test_truncate_below_limit_unchanged(self) -> None:
+        from conductor.engine.dialog_evaluator import _truncate_for_evaluator
+
+        text = "abc"
+        assert _truncate_for_evaluator(text, limit=10) == "abc"
+
+    def test_truncate_above_limit_appends_marker(self) -> None:
+        from conductor.engine.dialog_evaluator import _truncate_for_evaluator
+
+        text = "x" * 6000
+        result = _truncate_for_evaluator(text, limit=4000)
+        assert result.endswith("…[truncated]")
+        assert len(result) <= 4000
+
+    @pytest.mark.asyncio
+    async def test_evaluate_truncates_large_output(self) -> None:
+        """Large agent outputs should reach the evaluator with a marker."""
+        evaluator = DialogEvaluator()
+        agent = AgentDef(
+            name="test",
+            prompt="test",
+            dialog=DialogConfig(trigger_prompt="Enter dialog if uncertain"),
+        )
+        provider = MagicMock()
+        provider.execute_dialog_turn = AsyncMock(
+            return_value='{"trigger": false, "reason": "clear"}'
+        )
+
+        # 5000+ char output to force truncation
+        big_output = {"text": "x" * 5500}
+        await evaluator.evaluate(agent, big_output, provider)
+
+        call_args = provider.execute_dialog_turn.call_args
+        user_message = call_args.kwargs["user_message"]
+        assert "…[truncated]" in user_message
+
 
 class TestDialogEvaluatorEvaluate:
     """Tests for the full evaluate() method."""

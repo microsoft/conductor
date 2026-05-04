@@ -16,6 +16,11 @@ function isRelativeFileLink(href: string | undefined): href is string {
   if (href.startsWith('//')) return false;
   if (href.startsWith('#')) return false;
   if (href.startsWith('/') || href.startsWith('\\')) return false;
+  // Defense in depth: reject parent-traversal segments and Windows drive letters.
+  // Server-side validation is still required by the eventual /api/open-file endpoint;
+  // this is only a client-side first cut so the surface is minimized when it lands.
+  if (/(^|[/\\])\.\.([/\\]|$)/.test(href)) return false;
+  if (/^[a-zA-Z]:[/\\]/.test(href)) return false;
   return true;
 }
 

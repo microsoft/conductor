@@ -45,6 +45,23 @@ Agent output:
 {agent_output}
 """
 
+# Sentinel marker appended when the agent output is truncated to fit the
+# evaluator prompt. Lets the evaluator LLM know it has partial data so it
+# can either still trigger or ask for clarification rather than failing silently.
+_TRUNCATION_MARKER = "\n…[truncated]"
+
+
+def _truncate_for_evaluator(text: str, limit: int) -> str:
+    """Truncate ``text`` to ``limit`` chars, appending a marker if cut.
+
+    The marker is part of the budget — we leave headroom so the evaluator
+    sees ``…[truncated]`` rather than a half-token at the boundary.
+    """
+    if len(text) <= limit:
+        return text
+    headroom = len(_TRUNCATION_MARKER)
+    return text[: max(0, limit - headroom)] + _TRUNCATION_MARKER
+
 
 @dataclass
 class DialogEvaluation:
@@ -115,7 +132,7 @@ class DialogEvaluator:
         )
         user_prompt = EVALUATOR_USER_PROMPT.format(
             agent_name=agent.name,
-            agent_output=output_str[:4000],  # Truncate to avoid excessive tokens
+            agent_output=_truncate_for_evaluator(output_str, limit=4000),
         )
 
         try:
@@ -148,10 +165,14 @@ class DialogEvaluator:
         """
         try:
             text = response.strip()
-            # Handle markdown code blocks
+            # Handle markdown code blocks. The LLM may omit the closing fence,
+            # in which case we must NOT swallow the last line of valid JSON.
             if text.startswith("```"):
-                lines = text.split("\n")
-                text = "\n".join(lines[1:-1]) if len(lines) > 2 else text
+                lines = text.splitlines()
+                if len(lines) > 1 and lines[-1].strip().startswith("```"):
+                    text = "\n".join(lines[1:-1])
+                elif len(lines) > 1:
+                    text = "\n".join(lines[1:])
 
             data = json.loads(text)
             return DialogEvaluation(

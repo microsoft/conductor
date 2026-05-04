@@ -351,14 +351,11 @@ export const useWorkflowStore = create<WorkflowState>((set) => ({
         dialog_id: dialogId,
         content: message,
       });
-      // Optimistically mark awaiting response
-      set((state) => {
-        const nodes = { ...state.nodes };
-        if (nodes[agentName]) {
-          nodes[agentName] = { ...nodes[agentName]!, dialog_awaiting_response: true };
-        }
-        return { nodes };
-      });
+      // No optimistic update — the server echoes the user message back as a
+      // `dialog_message` event with role='user', and the handler below flips
+      // `dialog_awaiting_response` accordingly. Keeps state transitions in one
+      // place and avoids a race where the agent reply arrives before the
+      // optimistic set commits.
     }
   },
 
@@ -406,6 +403,8 @@ export const useWorkflowStore = create<WorkflowState>((set) => ({
         activityLog: [],
         workflowOutput: null,
         workflowFailedAgent: null,
+        activeDialog: null,
+        dialogEngaged: false,
       };
       for (const event of events) {
         const handler = eventHandlers[event.type];
@@ -451,6 +450,8 @@ export const useWorkflowStore = create<WorkflowState>((set) => ({
         activityLog: [],
         workflowOutput: null,
         workflowFailedAgent: null,
+        activeDialog: null,
+        dialogEngaged: false,
       };
       for (const event of events) {
         const handler = eventHandlers[event.type];
@@ -492,6 +493,8 @@ export const useWorkflowStore = create<WorkflowState>((set) => ({
         forEachGroups: [],
         isPaused: false,
         lastEventTime: null,
+        activeDialog: null,
+        dialogEngaged: false,
       };
       for (const event of events) {
         const handler = eventHandlers[event.type];
@@ -1065,7 +1068,12 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     const nd = ensureNode(state.nodes, data.agent_name);
     if (!nd.dialog_messages) nd.dialog_messages = [];
     nd.dialog_messages.push({ role: data.role, content: data.content });
-    if (data.role === 'agent') {
+    // A user message means we're now waiting on the agent; an agent message
+    // means we're not. Centralizing the flag here (instead of optimistically
+    // toggling it in `sendDialogMessage`) keeps the state machine single-sourced.
+    if (data.role === 'user') {
+      nd.dialog_awaiting_response = true;
+    } else if (data.role === 'agent') {
       nd.dialog_awaiting_response = false;
     }
     replaceNode(state.nodes, data.agent_name);
