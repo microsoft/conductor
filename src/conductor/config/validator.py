@@ -11,30 +11,62 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import jinja2
+from jinja2 import Environment, meta, nodes
+
 from conductor.exceptions import ConfigurationError
 
 if TYPE_CHECKING:
     from conductor.config.schema import AgentDef, WorkflowConfig
 
 
-# Matches agent/group name references in output templates.
-# Catches {{ name.output.field }}, {{ group.outputs.member }}, and {% if name.output %}.
-# Note: this is intentionally broader than the agent_ref_pattern in _validate_output_references
-# (which only matches {{ }} blocks with .output singular). This pattern also matches {% %} blocks
-# and .outputs plural for path coverage analysis.
-_OUTPUT_REF_PATTERN = re.compile(r"(?:\{\{|\{%)[^}%]*?(\w+)\.outputs?\b")
+# Shared Jinja2 environment used purely for AST parsing of template strings.
+# We never render with this env; we only ask it to produce an AST so we can
+# walk Getattr chains and find undeclared variables. Using Jinja2's own parser
+# (rather than regex) gives us scope-aware tracking — `{% for x in y %}`,
+# `{% set x = ... %}`, macro params — and string-literal awareness for free.
+#
+# `meta.find_undeclared_variables` runs Jinja2's compiler over the AST, which
+# fails on unknown filters/tests (e.g. conductor's `| json` filter is registered
+# at render time on a different env). We don't want validation to choke on that,
+# so we install tolerant `filters`/`tests` mappings that pretend every name is
+# defined and return identity. Render-time validation will surface real errors.
 
-# Matches agent/workflow template references in Jinja2 expressions:
-#   {{ agent_name.output.field }}
-#   {{ agent_name.output }}
-#   {% if agent_name.output.field %}
-# Excludes built-in namespaces: workflow, context, item, _index, _key
-_TEMPLATE_REF_PATTERN = re.compile(r"(?:\{\{|\{%)[^}%]*?\b(\w+)\.(?:output|outputs)\b")
 
-# Matches workflow.input.X references in templates
-_WORKFLOW_INPUT_REF_PATTERN = re.compile(r"(?:\{\{|\{%)[^}%]*?\bworkflow\.input\.(\w+)\b")
+def _identity_filter(value: object, *_args: object, **_kwargs: object) -> object:
+    return value
+
+
+class _TolerantNameMap(dict):
+    """A dict that pretends every key exists, returning an identity function.
+
+    Used for Jinja2 ``Environment.filters`` / ``Environment.tests`` during
+    validation so that workflow-specific filters (registered only at render
+    time) don't cause the AST walk to raise ``TemplateAssertionError``.
+    """
+
+    def __contains__(self, key: object) -> bool:
+        return True
+
+    def __getitem__(self, key: str) -> object:
+        try:
+            return dict.__getitem__(self, key)
+        except KeyError:
+            return _identity_filter
+
+    def get(self, key: str, default: object = None) -> object:
+        return dict.get(self, key, _identity_filter)
+
+
+_JINJA_ENV = Environment(autoescape=False)
+_JINJA_ENV.filters = _TolerantNameMap(_JINJA_ENV.filters)
+_JINJA_ENV.tests = _TolerantNameMap(_JINJA_ENV.tests)
 
 _BUILTIN_NAMES = frozenset({"workflow", "context", "item", "_index", "_key", "loop"})
+
+# Attribute names that mark a Getattr chain as an "output reference":
+#   agent.output.field, group.outputs.member, group.errors.member
+_OUTPUT_ATTRS = frozenset({"output", "outputs", "errors"})
 
 # DFS path cap: larger workflows may get partial coverage analysis
 _MAX_ENUMERATED_PATHS = 100
@@ -523,21 +555,82 @@ def _enumerate_paths_to_end(
     return paths
 
 
+def _extract_template_refs(template: str) -> tuple[set[str], set[str]]:
+    """Extract agent/group and workflow-input references from a Jinja2 template.
+
+    Uses Jinja2's own parser, so:
+      - Loop variables are excluded: ``{% for x in y %}{{ x.output }}{% endfor %}``
+        does not produce a spurious reference to ``x``.
+      - ``{% set x = ... %}`` bindings and macro parameters are excluded.
+      - String literals are excluded: ``{{ x | replace("foo.output", "y") }}``
+        does not produce a reference to ``foo``.
+
+    A name is reported as an output reference when it appears as the root of a
+    Getattr chain whose first attribute is one of ``output``/``outputs``/``errors``
+    (e.g. ``agent.output.field``, ``group.outputs.member``, ``group.errors``).
+
+    A name is reported as a workflow-input reference when the chain matches
+    ``workflow.input.<name>``.
+
+    Built-in namespaces (``workflow``, ``context``, ``item``, ``_index``, ``_key``,
+    ``loop``) and any name bound by a Jinja2 scope are filtered out.
+
+    Args:
+        template: A Jinja2 template string (may contain no template tags).
+
+    Returns:
+        Tuple of ``(agent_refs, workflow_input_refs)``. Both sets are empty when
+        the template has no recognizable references or contains a syntax error
+        we cannot parse — semantic validation should not fail on malformed
+        templates; render-time will raise the precise error.
+    """
+    if not template or ("{{" not in template and "{%" not in template):
+        return set(), set()
+
+    try:
+        ast = _JINJA_ENV.parse(template)
+    except jinja2.TemplateSyntaxError:
+        return set(), set()
+
+    undeclared = meta.find_undeclared_variables(ast)
+    agent_refs: set[str] = set()
+    input_refs: set[str] = set()
+
+    for node in ast.find_all(nodes.Getattr):
+        # Walk down the Getattr chain to its root Name, collecting attributes.
+        attrs: list[str] = []
+        cur: nodes.Node = node
+        while isinstance(cur, nodes.Getattr):
+            attrs.insert(0, cur.attr)
+            cur = cur.node
+        if not isinstance(cur, nodes.Name):
+            continue
+        # Skip names bound by an enclosing scope (loop var, macro param, set).
+        if cur.name not in undeclared:
+            continue
+
+        root = cur.name
+        if root == "workflow" and len(attrs) >= 2 and attrs[0] == "input":
+            input_refs.add(attrs[1])
+        elif attrs and attrs[0] in _OUTPUT_ATTRS and root not in _BUILTIN_NAMES:
+            agent_refs.add(root)
+
+    return agent_refs, input_refs
+
+
 def _extract_output_template_refs(output: dict[str, str]) -> set[str]:
-    """Extract agent/group names referenced in output templates.
+    """Extract agent/group names referenced across all workflow output templates.
 
     Args:
         output: Dict of output field names to template expressions.
 
     Returns:
-        Set of referenced agent/group names (excluding 'workflow' and 'context').
+        Set of referenced agent/group names.
     """
     refs: set[str] = set()
     for template in output.values():
-        for match in _OUTPUT_REF_PATTERN.finditer(template):
-            name = match.group(1)
-            if name not in ("workflow", "context"):
-                refs.add(name)
+        agents, _ = _extract_template_refs(template)
+        refs.update(agents)
     return refs
 
 
@@ -614,7 +707,6 @@ def _collect_template_strings(
     Returns:
         List of (source_label, template_string) tuples for error reporting.
     """
-
     templates: list[tuple[str, str]] = []
 
     if agent.prompt:
@@ -625,46 +717,38 @@ def _collect_template_strings(
         templates.append((f"agent '{agent.name}' command", agent.command))
     for i, arg in enumerate(agent.args):
         templates.append((f"agent '{agent.name}' args[{i}]", arg))
-    input_mapping: dict[str, str] | None = getattr(agent, "input_mapping", None)
-    if input_mapping:
-        for key, expr in input_mapping.items():
-            templates.append((f"agent '{agent.name}' input_mapping.{key}", expr))
     if agent.working_dir:
         templates.append((f"agent '{agent.name}' working_dir", agent.working_dir))
 
     return templates
 
 
-def _resolve_prompt_file(agent_name: str, prompt: str, workflow_path: Path | None) -> str | None:
-    """If a prompt looks like it came from a !file tag, try to load the file content.
-
-    The !file tag is already resolved during YAML loading, so the prompt field
-    contains the file content. This function is for scanning prompts that may
-    have been loaded from files for additional template references.
-
-    Returns the prompt as-is (it's already resolved by the loader).
-    """
-    return prompt if prompt else None
-
-
 def _validate_template_references(
     config: WorkflowConfig,
     workflow_path: Path | None = None,
 ) -> tuple[list[str], list[str]]:
-    """Validate Jinja2 template references across all agents.
+    """Validate Jinja2 template references across all agents and workflow output.
 
     Checks that:
-    - {{ X.output.Y }} references use valid agent names
-    - {{ workflow.input.X }} references use declared input names
-    - In explicit mode, agents reference only declared inputs
+    - ``{{ X.output.Y }}`` (and ``X.outputs``/``X.errors``) references resolve to a
+      known agent, parallel group, or for-each group.
+    - ``{{ workflow.input.X }}`` references resolve to a declared workflow input.
+    - In explicit context mode, agents only reference inputs they have declared
+      in their ``input:`` list (warning, not error).
+
+    Uses Jinja2's AST so loop variables, ``{% set %}`` bindings, macro params, and
+    string literals do not produce false positives.
 
     Args:
         config: The WorkflowConfig to validate.
-        workflow_path: Optional path to the workflow file (for !file resolution).
+        workflow_path: Optional path to the workflow file (currently unused;
+            reserved for future ``!file`` cross-file scanning).
 
     Returns:
         Tuple of (error messages, warning messages).
     """
+    del workflow_path  # reserved for future cross-file resolution
+
     errors: list[str] = []
     warnings: list[str] = []
 
@@ -675,45 +759,37 @@ def _validate_template_references(
     workflow_input_names = set(config.workflow.input.keys())
     is_explicit = config.workflow.context.mode == "explicit"
 
-    # Collect all agents including for-each inline agents
+    # Collect all agents including for-each inline agents.
     all_agents: list[tuple[AgentDef, set[str]]] = []
     for agent in config.agents:
         all_agents.append((agent, all_names))
     for fe in config.for_each:
-        # For-each inline agents can reference the parent's agents
         all_agents.append((fe.agent, all_names))
 
     for agent, valid_names in all_agents:
         templates = _collect_template_strings(agent)
 
-        # Extract declared input references for explicit mode checks
+        # Extract declared input references for explicit-mode advisory checks.
         declared_agents: set[str] = set()
         declared_workflow_inputs: set[str] = set()
-        has_full_workflow_input = False
         for ref in agent.input:
             match = INPUT_REF_PATTERN.match(ref.rstrip("?"))
-            if match:
-                ref_agent = match.group("agent")
-                if ref_agent:
-                    declared_agents.add(ref_agent)
-                ref_parallel = match.group("parallel")
-                if ref_parallel:
-                    declared_agents.add(ref_parallel)
-                ref_input = match.group("input")
-                if ref_input:
-                    declared_workflow_inputs.add(ref_input)
-            # Check for bare "workflow.input" (all inputs)
-            clean_ref = ref.rstrip("?")
-            if clean_ref == "workflow.input":
-                has_full_workflow_input = True
+            if not match:
+                continue
+            ref_agent = match.group("agent")
+            if ref_agent:
+                declared_agents.add(ref_agent)
+            ref_parallel = match.group("parallel")
+            if ref_parallel:
+                declared_agents.add(ref_parallel)
+            ref_input = match.group("input")
+            if ref_input:
+                declared_workflow_inputs.add(ref_input)
 
         for source, template in templates:
-            # Check agent/group output references
-            for match in _TEMPLATE_REF_PATTERN.finditer(template):
-                ref_name = match.group(1)
-                if ref_name in _BUILTIN_NAMES:
-                    continue
+            agent_refs, input_refs = _extract_template_refs(template)
 
+            for ref_name in agent_refs:
                 if ref_name not in valid_names:
                     errors.append(
                         f"{source} references unknown agent '{ref_name}'. "
@@ -724,19 +800,16 @@ def _validate_template_references(
                     and agent.type not in ("script", "workflow")
                     and ref_name not in declared_agents
                 ):
-                    # In explicit mode, LLM agents should declare their inputs
                     warnings.append(
                         f"{source} references '{ref_name}.output' but "
                         f"agent '{agent.name}' does not declare '{ref_name}.output' "
                         f"in its input: list (explicit context mode)"
                     )
 
-            # Check workflow.input references
-            for match in _WORKFLOW_INPUT_REF_PATTERN.finditer(template):
-                input_name = match.group(1)
+            for input_name in input_refs:
                 if workflow_input_names and input_name not in workflow_input_names:
                     # Only error when inputs ARE declared — workflows without
-                    # input: blocks may use workflow.input conditionally
+                    # input: blocks may use workflow.input conditionally.
                     errors.append(
                         f"{source} references unknown workflow input '{input_name}'. "
                         f"Declared inputs: {', '.join(sorted(workflow_input_names))}"
@@ -744,7 +817,6 @@ def _validate_template_references(
                 elif (
                     is_explicit
                     and agent.type not in ("script", "workflow")
-                    and not has_full_workflow_input
                     and input_name not in declared_workflow_inputs
                 ):
                     warnings.append(
@@ -754,18 +826,17 @@ def _validate_template_references(
                         f"(explicit context mode)"
                     )
 
-    # Check workflow output templates
+    # Check workflow output templates.
     if config.output:
         for field, template in config.output.items():
-            for match in _TEMPLATE_REF_PATTERN.finditer(template):
-                ref_name = match.group(1)
-                if ref_name not in _BUILTIN_NAMES and ref_name not in all_names:
+            agent_refs, input_refs = _extract_template_refs(template)
+            for ref_name in agent_refs:
+                if ref_name not in all_names:
                     errors.append(
                         f"Workflow output '{field}' references unknown agent '{ref_name}'"
                     )
-            for match in _WORKFLOW_INPUT_REF_PATTERN.finditer(template):
-                input_name = match.group(1)
-                if input_name not in workflow_input_names:
+            for input_name in input_refs:
+                if workflow_input_names and input_name not in workflow_input_names:
                     errors.append(
                         f"Workflow output '{field}' references unknown "
                         f"workflow input '{input_name}'"
