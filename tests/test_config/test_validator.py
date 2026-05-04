@@ -1127,8 +1127,6 @@ class TestInputMappingTemplateCollection:
         # Simulates: when this PR merges with main's AgentDef.input_mapping,
         # a stale agent reference inside an input_mapping expression is caught
         # by _extract_template_refs the same as any other template field.
-        agent_refs, input_refs = _extract_template_refs(
-            "{{ old_agent.output.findings }}"
-        )
+        agent_refs, input_refs = _extract_template_refs("{{ old_agent.output.findings }}")
         assert "old_agent" in agent_refs
         assert not input_refs
