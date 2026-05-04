@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.10...HEAD)
 
+### Added
+- `metadata` dict on workflow definitions, settable statically in YAML or
+  dynamically via `--metadata` / `-m` CLI flags. Merged metadata is
+  included in the `workflow_started` event for downstream consumers
+  ([#107](https://github.com/microsoft/conductor/pull/107)).
+- `input_mapping` field on `type: workflow` agents, enabling Jinja2-templated
+  per-call inputs to sub-workflows evaluated against the parent context.
+  When omitted, the parent's `workflow.input.*` is forwarded as before
+  ([#109](https://github.com/microsoft/conductor/pull/109)).
+
 ### Fixed
 - Pass `streaming=True` to the Copilot SDK's `create_session` to prevent
   silent truncation of large tool-call arguments. In non-streaming mode
