@@ -6,7 +6,38 @@ and functions to calculate costs based on token usage.
 
 from __future__ import annotations
 
+import logging
+import re
 from dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
+
+# Track models that have already triggered a fuzzy-match warning so we only log
+# once per process per unknown model name. See #137.
+_FUZZY_MATCH_WARNED: set[str] = set()
+
+
+def _warn_fuzzy_match(requested: str, matched_key: str, strategy: str) -> None:
+    """Emit a one-time warning when ``get_pricing`` falls back to a non-exact match.
+
+    Args:
+        requested: The model name the caller asked for.
+        matched_key: The key in ``DEFAULT_PRICING`` that was returned.
+        strategy: How the match was made (e.g. ``"longest-prefix"``,
+            ``"suffix-strip"``, ``"suffix-strip+longest-prefix"``).
+    """
+    if requested in _FUZZY_MATCH_WARNED:
+        return
+    _FUZZY_MATCH_WARNED.add(requested)
+    logger.warning(
+        "Pricing for model %r resolved via %s fallback to %r. "
+        "Cost and context_window metadata may be inaccurate. "
+        "Add %r to DEFAULT_PRICING or pass an override to silence this warning.",
+        requested,
+        strategy,
+        matched_key,
+        requested,
+    )
 
 
 @dataclass(frozen=True)
@@ -244,21 +275,23 @@ def get_pricing(
     sorted_keys = sorted(DEFAULT_PRICING.keys(), key=lambda k: len(k), reverse=True)
     for known_model in sorted_keys:
         if model.startswith(known_model):
+            _warn_fuzzy_match(model, known_model, "longest-prefix")
             return DEFAULT_PRICING[known_model]
 
     # Try removing date suffix patterns for common formats
     # e.g., "claude-3-5-sonnet-20241022" -> "claude-3-5-sonnet"
     # e.g., "claude-3-5-sonnet-latest" -> "claude-3-5-sonnet"
-    import re
 
     # Remove common suffixes like -20241022, -latest, -preview
     simplified = re.sub(r"-(\d{8}|latest|preview)$", "", model)
     if simplified in DEFAULT_PRICING:
+        _warn_fuzzy_match(model, simplified, "suffix-strip")
         return DEFAULT_PRICING[simplified]
 
     # Try matching simplified version against known models
     for known_model in sorted_keys:
         if simplified.startswith(known_model):
+            _warn_fuzzy_match(model, known_model, "suffix-strip+longest-prefix")
             return DEFAULT_PRICING[known_model]
 
     return None
