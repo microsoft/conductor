@@ -299,51 +299,97 @@ class TestWorkflowEngineContextModes:
         # Workflow.input.goal should not be in agent2's context since it's not in input list
         assert "other" not in agent2_context.get("workflow", {}).get("input", {})
 
-    @pytest.mark.asyncio
-    async def test_optional_input_defaults_render_cleanly(self) -> None:
-        """Optional inputs without defaults use type-appropriate zero values.
 
-        Ensures optional string inputs render as '' (not 'None'),
-        optional numbers as 0 (not 'None'), etc.
-        """
+class TestApplyInputDefaults:
+    """Tests for `_apply_input_defaults` / `_zero_value_for_type`.
+
+    Optional inputs without an explicit ``default:`` must resolve to a
+    type-appropriate zero value (not ``None``) so templates render cleanly
+    without requiring ``| default()`` guards.
+    """
+
+    @staticmethod
+    def _engine_with_input(name: str, input_def: InputDef) -> WorkflowEngine:
+        """Build a minimal engine whose only declared input is `input_def`."""
         config = WorkflowConfig(
             workflow=WorkflowDef(
-                name="optional-defaults",
-                entry_point="echo",
-                input={
-                    "required_id": InputDef(type="number", required=True),
-                    "optional_msg": InputDef(type="string", required=False),
-                    "optional_count": InputDef(type="number", required=False),
-                    "with_default": InputDef(type="string", required=False, default="hello"),
-                },
+                name="defaults-probe",
+                entry_point="noop",
+                input={name: input_def},
             ),
             agents=[
                 AgentDef(
-                    name="echo",
-                    type="script",
-                    command="pwsh",
-                    args=[
-                        "-Command",
-                        (
-                            "Write-Output 'msg={{ workflow.input.optional_msg }}"
-                            " count={{ workflow.input.optional_count }}"
-                            " def={{ workflow.input.with_default }}'; exit 0"
-                        ),
-                    ],
+                    name="noop",
+                    model="gpt-4",
+                    prompt="noop",
+                    output={"result": OutputField(type="string")},
                     routes=[RouteDef(to="$end")],
                 ),
             ],
         )
+        return WorkflowEngine(config, CopilotProvider(mock_handler=lambda a, p, c: {}))
 
-        provider = CopilotProvider(mock_handler=lambda a, p, c: {})
-        engine = WorkflowEngine(config, provider)
+    @pytest.mark.parametrize(
+        ("type_name", "expected_zero"),
+        [
+            ("string", ""),
+            ("number", 0),
+            ("boolean", False),
+            ("array", []),
+            ("object", {}),
+        ],
+    )
+    def test_optional_input_with_no_default_gets_type_zero(
+        self, type_name: str, expected_zero: object
+    ) -> None:
+        """Every InputDef.type resolves to its type-appropriate zero, not None."""
+        engine = self._engine_with_input("opt", InputDef(type=type_name, required=False))
 
-        await engine.run({"required_id": 42})
+        merged = engine._apply_input_defaults({})
 
-        stdout = engine.context.agent_outputs["echo"]["stdout"].strip()
-        assert "msg=" in stdout
-        assert "None" not in stdout  # Should never render Python's None
-        assert "def=hello" in stdout  # Explicit default works
+        assert "opt" in merged
+        assert merged["opt"] == expected_zero
+        assert merged["opt"] is not None
+
+    def test_explicit_default_is_honored_over_zero(self) -> None:
+        """A declared ``default:`` wins; the zero-value path must not override it."""
+        engine = self._engine_with_input(
+            "with_default", InputDef(type="string", required=False, default="hello")
+        )
+
+        merged = engine._apply_input_defaults({})
+
+        assert merged["with_default"] == "hello"
+
+    def test_provided_value_passes_through_unchanged(self) -> None:
+        """Caller-provided values are never overwritten by defaults."""
+        engine = self._engine_with_input("opt", InputDef(type="string", required=False))
+
+        merged = engine._apply_input_defaults({"opt": "explicit"})
+
+        assert merged["opt"] == "explicit"
+
+    def test_required_input_is_left_alone_when_missing(self) -> None:
+        """Missing required inputs are not silently filled — let validation flag them."""
+        engine = self._engine_with_input("must_have", InputDef(type="string", required=True))
+
+        merged = engine._apply_input_defaults({})
+
+        assert "must_have" not in merged
+
+    @pytest.mark.parametrize("type_name", ["array", "object"])
+    def test_zero_value_for_mutable_type_returns_fresh_instance(self, type_name: str) -> None:
+        """Mutable zeros must not be shared — guards against the classic
+        shared-mutable-default bug if someone later "optimizes" the lookup
+        into a single cached instance.
+        """
+        engine = self._engine_with_input("opt", InputDef(type=type_name, required=False))
+
+        first = engine._zero_value_for_type(type_name)
+        second = engine._zero_value_for_type(type_name)
+
+        assert first == second
+        assert first is not second
 
 
 class TestWorkflowEngineRouting:
