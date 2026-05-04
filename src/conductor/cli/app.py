@@ -306,6 +306,24 @@ def run(
             ),
         ),
     ] = False,
+    workspace_instructions: Annotated[
+        bool,
+        typer.Option(
+            "--workspace-instructions",
+            help=(
+                "Auto-discover workspace instruction files "
+                "(AGENTS.md, CLAUDE.md, .github/copilot-instructions.md) "
+                "and prepend them to all agent prompts."
+            ),
+        ),
+    ] = False,
+    raw_instructions: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--instructions",
+            help="Path to instruction file(s) to prepend to all agent prompts. Can be repeated.",
+        ),
+    ] = None,
 ) -> None:
     """Run a workflow from a YAML file.
 
@@ -329,6 +347,8 @@ def run(
         conductor run workflow.yaml --web
         conductor run workflow.yaml --web --web-port 8080
         conductor run workflow.yaml --web-bg
+        conductor run workflow.yaml --workspace-instructions
+        conductor run workflow.yaml --instructions AGENTS.md
     """
     import asyncio
     import json
@@ -418,6 +438,8 @@ def run(
                 no_interactive=True,  # Always non-interactive in background
                 web_port=web_port,
                 metadata=cli_metadata,
+                workspace_instructions=workspace_instructions,
+                cli_instructions=raw_instructions,
             )
             console.print(f"[bold cyan]Dashboard:[/bold cyan] {url}")
             console.print(
@@ -443,6 +465,8 @@ def run(
                 web_port=web_port,
                 web_bg=web_bg,
                 metadata=cli_metadata,
+                workspace_instructions=workspace_instructions,
+                cli_instructions=raw_instructions,
             )
         )
 

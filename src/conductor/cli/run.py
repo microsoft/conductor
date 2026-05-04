@@ -1026,6 +1026,8 @@ async def run_workflow_async(
     web_port: int = 0,
     web_bg: bool = False,
     metadata: dict[str, str] | None = None,
+    workspace_instructions: bool = False,
+    cli_instructions: list[str] | None = None,
 ) -> dict[str, Any]:
     """Execute a workflow asynchronously.
 
@@ -1040,6 +1042,8 @@ async def run_workflow_async(
         web_port: Port for the web dashboard (0 = auto-select).
         web_bg: If True, auto-shutdown dashboard after workflow + client disconnect.
         metadata: Optional CLI metadata to merge on top of YAML-declared metadata.
+        workspace_instructions: If True, auto-discover workspace instruction files.
+        cli_instructions: Optional list of instruction file paths from CLI.
 
     Returns:
         The workflow output as a dictionary.
@@ -1118,6 +1122,22 @@ async def run_workflow_async(
             verbose_log(f"Provider override: {provider_override}", style="yellow")
             config.workflow.runtime.provider = provider_override  # type: ignore[assignment]
 
+        # Build workspace instructions preamble
+        instructions_preamble: str | None = None
+        if workspace_instructions or cli_instructions or config.workflow.instructions:
+            from conductor.config.instructions import build_instructions_preamble
+
+            instructions_preamble = build_instructions_preamble(
+                auto_discover_dir=Path.cwd() if workspace_instructions else None,
+                yaml_instructions=config.workflow.instructions or None,
+                cli_instruction_paths=cli_instructions,
+            )
+            if instructions_preamble:
+                verbose_log(
+                    f"Workspace instructions loaded ({len(instructions_preamble)} chars)",
+                    style="cyan",
+                )
+
         # Convert MCP servers from workflow config to SDK format
         mcp_servers = await _build_mcp_servers(config)
 
@@ -1159,6 +1179,7 @@ async def run_workflow_async(
                 event_emitter=emitter,
                 keyboard_listener=listener,
                 web_dashboard=dashboard,
+                instructions_preamble=instructions_preamble,
                 run_context=RunContext(
                     run_id=event_log_subscriber.run_id if event_log_subscriber else "",
                     log_file=str(event_log_subscriber.path) if event_log_subscriber else "",
@@ -1583,6 +1604,7 @@ async def resume_workflow_async(
                 workflow_path=resolved_workflow_path,
                 interrupt_event=interrupt_event,
                 keyboard_listener=listener,
+                instructions_preamble=cp.instructions_preamble,
             )
             engine.set_context(restored_context)
             engine.set_limits(restored_limits)

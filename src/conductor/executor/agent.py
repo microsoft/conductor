@@ -97,15 +97,19 @@ class AgentExecutor:
         self,
         provider: AgentProvider,
         workflow_tools: list[str] | None = None,
+        instructions_preamble: str | None = None,
     ) -> None:
         """Initialize the AgentExecutor.
 
         Args:
             provider: The agent provider to use for execution.
             workflow_tools: Tools defined at workflow level. Defaults to empty list.
+            instructions_preamble: Optional workspace instructions text to prepend
+                to every agent's rendered prompt.
         """
         self.provider = provider
         self.workflow_tools = workflow_tools or []
+        self.instructions_preamble = instructions_preamble
         self.renderer = TemplateRenderer()
 
     async def execute(
@@ -152,6 +156,10 @@ class AgentExecutor:
 
         # Render prompt with context
         rendered_prompt = self.renderer.render(agent.prompt, context)
+
+        # Prepend workspace instructions preamble if available
+        if self.instructions_preamble:
+            rendered_prompt = self.instructions_preamble + rendered_prompt
 
         # Append user guidance section if provided
         if guidance_section:
@@ -222,7 +230,7 @@ class AgentExecutor:
         return output
 
     def render_prompt(self, agent: AgentDef, context: dict[str, Any]) -> str:
-        """Render an agent's prompt template.
+        """Render an agent's prompt template including workspace instructions.
 
         This is useful for debugging or dry-run mode.
 
@@ -231,9 +239,12 @@ class AgentExecutor:
             context: Context for prompt rendering.
 
         Returns:
-            Rendered prompt string.
+            Rendered prompt string with workspace instructions prepended if configured.
 
         Raises:
             TemplateError: If prompt rendering fails.
         """
-        return self.renderer.render(agent.prompt, context)
+        rendered = self.renderer.render(agent.prompt, context)
+        if self.instructions_preamble:
+            rendered = self.instructions_preamble + rendered
+        return rendered
