@@ -774,6 +774,28 @@ class WorkflowDef(BaseModel):
     consumers can use it for enrichment without parsing the YAML source.
     """
 
+    instructions: list[str] = Field(default_factory=list)
+    """Workspace instruction file contents or inline text.
+
+    Each entry can be:
+    - A ``!file`` tag reference (resolved by the YAML loader)
+    - Inline text included as-is
+
+    Instructions from all entries are concatenated and prepended to every
+    agent's prompt as workspace context. Use this for self-contained
+    workflows where the YAML lives alongside the code.
+
+    For workflows distributed as skills (where the YAML lives far from
+    the target repo), use the ``--workspace-instructions`` CLI flag
+    instead for automatic discovery.
+
+    Example::
+
+        instructions:
+          - !file ../AGENTS.md
+          - "Always respond in English."
+    """
+
 
 class WorkflowConfig(BaseModel):
     """Complete workflow configuration file."""
