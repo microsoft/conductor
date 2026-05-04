@@ -342,3 +342,52 @@ class TestContextWindowResolutionOrder:
         assert collector.first("agent_started").data["context_window_max"] == 128000
         # agent_completed has output.model — uses that
         assert collector.first("agent_completed").data["context_window_max"] == 400000
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_agent_model_when_output_model_unknown(self) -> None:
+        """If output.model is an SDK-unknown variant (e.g. a reasoning-effort
+        tier the provider doesn't list), the chain retries with agent.model
+        rather than returning None."""
+        emitter, collector = _make_emitter_and_collector()
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="test-fallback",
+                entry_point="a1",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="a1",
+                    model="claude-opus-4.7",
+                    prompt="Hello",
+                    output={"answer": OutputField(type="string")},
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"answer": "{{ a1.output.answer }}"},
+        )
+
+        provider = CopilotProvider(mock_handler=lambda a, p, c: {"answer": "hi"})
+
+        # Provider only knows the base name, not the reasoning-effort variant.
+        async def fake_get_max_prompt_tokens(model: str) -> int | None:
+            return {"claude-opus-4.7": 200_000}.get(model)
+
+        provider.get_max_prompt_tokens = fake_get_max_prompt_tokens  # type: ignore[method-assign]
+
+        original_execute = provider.execute
+
+        async def execute_with_variant_model(*args, **kwargs):  # type: ignore[no-untyped-def]
+            output = await original_execute(*args, **kwargs)
+            output.model = "claude-opus-4.7-xhigh"  # SDK doesn't know this name
+            return output
+
+        provider.execute = execute_with_variant_model  # type: ignore[method-assign]
+
+        engine = WorkflowEngine(config, provider, event_emitter=emitter)
+        await engine.run({})
+
+        # output.model returned None; chain fell back to agent.model.
+        assert collector.first("agent_completed").data["context_window_max"] == 200_000

@@ -1,6 +1,6 @@
 """Unit tests for the AgentProvider ABC and AgentOutput dataclass."""
 
-from conductor.providers.base import AgentOutput
+from conductor.providers.base import AgentOutput, match_model_id
 
 
 class TestAgentOutput:
@@ -67,3 +67,54 @@ class TestAgentOutput:
         assert output.content["analysis"]["score"] == 8.5
         assert output.content["analysis"]["issues"] == ["minor", "cosmetic"]
         assert output.content["analysis"]["approved"] is True
+
+
+class TestMatchModelId:
+    """Unit tests for the alias-aware model ID matcher."""
+
+    def test_exact_match(self) -> None:
+        assert match_model_id("gpt-4o", ["gpt-4o", "gpt-4.1"]) == "gpt-4o"
+
+    def test_returns_none_when_no_known_ids(self) -> None:
+        assert match_model_id("gpt-4o", []) is None
+
+    def test_returns_none_for_unrelated_name(self) -> None:
+        assert match_model_id("totally-different", ["gpt-4o"]) is None
+
+    def test_versioned_suffix_matches_base(self) -> None:
+        # Requested name has a dated suffix; SDK lists the base name.
+        assert (
+            match_model_id("claude-3-5-sonnet-20241022", ["claude-3-5-sonnet"])
+            == "claude-3-5-sonnet"
+        )
+
+    def test_base_matches_versioned_sdk_id(self) -> None:
+        # Requested name is the base; SDK lists a dated/aliased variant.
+        assert (
+            match_model_id("claude-3-5-sonnet", ["claude-3-5-sonnet-20241022"])
+            == "claude-3-5-sonnet-20241022"
+        )
+
+    def test_latest_alias_strips_and_matches(self) -> None:
+        assert (
+            match_model_id("claude-3-5-sonnet-latest", ["claude-3-5-sonnet-20241022"])
+            == "claude-3-5-sonnet-20241022"
+        )
+
+    def test_preview_alias_strips_and_matches(self) -> None:
+        assert match_model_id("gemini-3.1-pro-preview", ["gemini-3.1-pro"]) == "gemini-3.1-pro"
+
+    def test_longest_match_wins(self) -> None:
+        # "o1-mini-20240101" must match "o1-mini" (longer), not "o1".
+        assert match_model_id("o1-mini-20240101", ["o1", "o1-mini"]) == "o1-mini"
+
+    def test_boundary_check_prevents_cross_family_match(self) -> None:
+        # "claude-opus-4.7" must NOT match "claude-opus-4" (different family).
+        # No valid match -> None.
+        assert match_model_id("claude-opus-4.7", ["claude-opus-4"]) is None
+
+    def test_boundary_check_prevents_cross_family_with_suffix(self) -> None:
+        assert match_model_id("claude-opus-4.7-high", ["claude-opus-4"]) is None
+
+    def test_unknown_after_suffix_strip_returns_none(self) -> None:
+        assert match_model_id("totally-different-latest", ["gpt-4o"]) is None

@@ -788,33 +788,42 @@ class WorkflowEngine:
     ) -> int | None:
         """Return the SDK-reported max prompt tokens for an agent.
 
-        Resolves the model in priority order: the model the SDK actually used
-        (``output.model``), then the agent's configured model, then the
-        workflow's runtime default. Returns ``None`` when no model can be
-        resolved, no provider can be reached, or the provider's metadata call
-        fails — context-window metadata is best-effort and must never break
-        workflow execution.
+        Tries each candidate model in priority order — the model the SDK
+        actually used (``output.model``), the agent's configured model, the
+        workflow's runtime default — and returns the first non-``None``
+        result. This is a real fallback chain: if ``output.model`` is an
+        SDK-specific variant the provider doesn't know about, the lookup
+        retries with ``agent.model`` before giving up.
+
+        Returns ``None`` when no candidate resolves, no provider can be
+        reached, or the provider's metadata call fails — context-window
+        metadata is best-effort and must never break workflow execution.
         """
-        model = (
-            (output.model if output is not None else None)
-            or agent.model
-            or self.config.workflow.runtime.default_model
-        )
-        if not model:
-            return None
         provider = await self._get_provider_for_agent(agent)
         if provider is None:
             return None
-        try:
-            return await provider.get_max_prompt_tokens(model)
-        except Exception as e:
-            logger.debug(
-                "get_max_prompt_tokens(%r) raised on provider for agent %s: %s",
-                model,
-                agent.name,
-                e,
-            )
-            return None
+        candidates: list[str] = []
+        if output is not None and output.model:
+            candidates.append(output.model)
+        if agent.model and agent.model not in candidates:
+            candidates.append(agent.model)
+        default = self.config.workflow.runtime.default_model
+        if default and default not in candidates:
+            candidates.append(default)
+        for model in candidates:
+            try:
+                value = await provider.get_max_prompt_tokens(model)
+            except Exception as e:
+                logger.debug(
+                    "get_max_prompt_tokens(%r) raised on provider for agent %s: %s",
+                    model,
+                    agent.name,
+                    e,
+                )
+                continue
+            if value is not None:
+                return value
+        return None
 
     async def run(self, inputs: dict[str, Any]) -> dict[str, Any]:
         """Execute the workflow from entry_point to $end.

@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from conductor.exceptions import ProviderError, ValidationError
-from conductor.providers.base import AgentOutput, AgentProvider, EventCallback
+from conductor.providers.base import AgentOutput, AgentProvider, EventCallback, match_model_id
 
 if TYPE_CHECKING:
     from conductor.config.schema import AgentDef, OutputField
@@ -1778,25 +1778,30 @@ class CopilotProvider(AgentProvider):
     async def get_max_prompt_tokens(self, model: str) -> int | None:
         """Return the Copilot SDK's ``max_prompt_tokens`` for ``model``.
 
-        Queries ``client.list_models()`` (cached internally by the SDK) and
-        returns ``capabilities.limits.max_prompt_tokens`` for the matching
-        model. Returns ``None`` in mock-handler mode, when the SDK is
-        unavailable, when the model is unknown, or when any SDK call fails —
-        context-window metadata must never block workflow execution.
+        Queries ``client.list_models()`` (cached internally by the SDK),
+        resolves any aliases (e.g. ``-latest``, dated suffixes, base-name
+        vs versioned-name) via :func:`match_model_id`, and returns
+        ``capabilities.limits.max_prompt_tokens`` for the matched entry.
+
+        Returns ``None`` in mock-handler mode, when the SDK is unavailable,
+        when no match is found, or when the SDK call fails — context-window
+        metadata must never block workflow execution.
         """
         if self._mock_handler is not None or not COPILOT_SDK_AVAILABLE:
             return None
         try:
             await self._ensure_client_started()
             models = await self._client.list_models()
-        except Exception as e:
+        except (TimeoutError, ProviderError, OSError, RuntimeError) as e:
             logger.debug("Failed to list Copilot models for %r: %s", model, e)
             return None
-        for info in models:
-            if info.id == model:
-                limits = getattr(info.capabilities, "limits", None)
-                return getattr(limits, "max_prompt_tokens", None) if limits else None
-        return None
+        by_id = {info.id: info for info in models}
+        matched_id = match_model_id(model, by_id.keys())
+        if matched_id is None:
+            return None
+        info = by_id[matched_id]
+        limits = getattr(info.capabilities, "limits", None)
+        return getattr(limits, "max_prompt_tokens", None)
 
     def get_session_ids(self) -> dict[str, str]:
         """Get tracked session IDs for all executed agents.

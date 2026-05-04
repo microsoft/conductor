@@ -7,8 +7,9 @@ all provider implementations must use to ensure a consistent interface.
 from __future__ import annotations
 
 import asyncio
+import re
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -18,6 +19,46 @@ if TYPE_CHECKING:
 # Type alias for event callbacks that receive structured SDK events.
 # Callback signature: (event_type: str, data: dict[str, Any]) -> None
 EventCallback = Callable[[str, dict[str, Any]], None]
+
+
+# Suffixes that providers may strip when matching aliased model names against
+# their SDK's canonical IDs (e.g. "claude-3-5-sonnet-latest" -> base name).
+_VERSION_SUFFIX_RE = re.compile(r"-(\d{8}|latest|preview)$")
+
+
+def match_model_id(requested: str, known_ids: Iterable[str]) -> str | None:
+    """Find the canonical SDK ID matching a possibly aliased model name.
+
+    Match strategies, in order:
+
+    1. Exact match.
+    2. Boundary prefix match (longest first), in either direction. Handles
+       both ``"claude-3-5-sonnet-20241022"`` for requested
+       ``"claude-3-5-sonnet"`` *and* the reverse, where the SDK lists a
+       dated ID and the user specified the base name.
+    3. Suffix-strip (``-YYYYMMDD``, ``-latest``, ``-preview``) on the
+       requested name, then re-try strategies 1 and 2.
+
+    Returns the matching SDK ID, or ``None`` if no strategy succeeds.
+    """
+    ids = [str(i) for i in known_ids]
+    if not ids:
+        return None
+    if requested in ids:
+        return requested
+    sorted_ids = sorted(ids, key=lambda s: len(s), reverse=True)
+    for known in sorted_ids:
+        if requested.startswith(known + "-") or known.startswith(requested + "-"):
+            return known
+    simplified = _VERSION_SUFFIX_RE.sub("", requested)
+    if simplified == requested:
+        return None
+    if simplified in ids:
+        return simplified
+    for known in sorted_ids:
+        if simplified.startswith(known + "-") or known.startswith(simplified + "-"):
+            return known
+    return None
 
 
 @dataclass
