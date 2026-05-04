@@ -91,6 +91,8 @@ class CheckpointData:
     limits: dict[str, Any]
     copilot_session_ids: dict[str, str] = field(default_factory=dict)
     file_path: Path = field(default_factory=lambda: Path())
+    instructions_preamble: str | None = None
+    """Workspace instructions preamble that was active during the original run."""
 
 
 class CheckpointManager:
@@ -137,6 +139,7 @@ class CheckpointManager:
         inputs: dict[str, Any],
         copilot_session_ids: dict[str, str] | None = None,
         system_metadata: dict[str, Any] | None = None,
+        instructions_preamble: str | None = None,
     ) -> Path | None:
         """Serialize workflow state to a checkpoint file.
 
@@ -155,6 +158,7 @@ class CheckpointManager:
             inputs: Workflow inputs.
             copilot_session_ids: Optional mapping of agent names to session IDs.
             system_metadata: Optional system metadata captured at workflow start.
+            instructions_preamble: Optional workspace instructions preamble to persist.
 
         Returns:
             Path to the saved checkpoint file, or ``None`` if saving failed.
@@ -196,6 +200,7 @@ class CheckpointManager:
                 "limits": _make_json_serializable(limits.to_dict()),
                 "copilot_session_ids": copilot_session_ids or {},
                 "system": system_metadata or {},
+                "instructions_preamble": instructions_preamble,
             }
 
             # Serialize to JSON
@@ -311,6 +316,7 @@ class CheckpointManager:
             limits=data["limits"],
             copilot_session_ids=data.get("copilot_session_ids", {}),
             file_path=checkpoint_path,
+            instructions_preamble=data.get("instructions_preamble"),
         )
 
     @staticmethod

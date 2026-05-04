@@ -63,6 +63,8 @@ def launch_background(
     no_interactive: bool = True,
     web_port: int = 0,
     metadata: dict[str, str] | None = None,
+    workspace_instructions: bool = False,
+    cli_instructions: list[str] | None = None,
 ) -> str:
     """Fork a detached child process running the workflow with a web dashboard.
 
@@ -79,6 +81,8 @@ def launch_background(
         no_interactive: Whether to disable interactive mode (always True for bg).
         web_port: Desired port (0 = auto-select).
         metadata: Optional CLI metadata key=value pairs.
+        workspace_instructions: Whether to auto-discover workspace instruction files.
+        cli_instructions: Optional list of instruction file paths.
 
     Returns:
         The dashboard URL (e.g. ``http://127.0.0.1:8080``).
@@ -122,6 +126,13 @@ def launch_background(
 
     if log_file:
         cmd.extend(["--log-file", str(log_file)])
+
+    if workspace_instructions:
+        cmd.append("--workspace-instructions")
+
+    if cli_instructions:
+        for instr_path in cli_instructions:
+            cmd.extend(["--instructions", instr_path])
 
     # Launch detached child
     kwargs: dict[str, Any] = {
