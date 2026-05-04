@@ -196,6 +196,39 @@ class TestWorkflowEngineBasic:
         assert received_contexts[1][0] == "executor"
         assert received_contexts[1][1]["planner"]["output"]["plan"] == "the plan"
 
+    def test_engine_populates_workflow_metadata(
+        self, tmp_path, simple_workflow_config: WorkflowConfig
+    ) -> None:
+        """``WorkflowEngine.__init__`` wires ``workflow_path`` into context fields.
+
+        Guards against a regression where someone refactors ``__init__`` and
+        reverts to a bare ``WorkflowContext()``, silently dropping
+        ``workflow.dir``/``workflow.file``/``workflow.name`` from templates.
+        """
+        wf_file = tmp_path / "wf.yaml"
+        wf_file.write_text("name: test\n")
+
+        engine = WorkflowEngine(simple_workflow_config, workflow_path=wf_file)
+
+        assert engine.context.workflow_dir == str(tmp_path.resolve())
+        assert engine.context.workflow_file == str(wf_file.resolve())
+        assert engine.context.workflow_name == simple_workflow_config.workflow.name
+
+    def test_engine_workflow_metadata_empty_without_path(
+        self, simple_workflow_config: WorkflowConfig
+    ) -> None:
+        """Without ``workflow_path``, path-derived fields stay empty.
+
+        Empty strings are omitted from the rendered context (see
+        ``WorkflowContext.build_for_agent``), so this preserves the existing
+        no-pollution behaviour for path-less engines (e.g., test fixtures).
+        """
+        engine = WorkflowEngine(simple_workflow_config)
+
+        assert engine.context.workflow_dir == ""
+        assert engine.context.workflow_file == ""
+        assert engine.context.workflow_name == simple_workflow_config.workflow.name
+
 
 class TestWorkflowEngineContextModes:
     """Tests for different context accumulation modes."""

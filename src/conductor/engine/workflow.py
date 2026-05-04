@@ -650,10 +650,22 @@ class WorkflowEngine:
         Used by the CLI resume path to inject context reconstructed from
         a checkpoint file.
 
+        Workflow metadata (``workflow_dir``, ``workflow_file``, ``workflow_name``)
+        is repopulated from the engine's ``workflow_path`` and ``config`` rather
+        than the restored context. Restored contexts come from
+        ``WorkflowContext.from_dict()``, which intentionally omits absolute path
+        metadata to keep checkpoint files portable across machines and
+        relocatable when workflows move. The engine, which knows the current
+        path, is the source of truth.
+
         Args:
             context: A WorkflowContext restored via ``WorkflowContext.from_dict()``.
         """
         self.context = context
+        if self.workflow_path is not None:
+            self.context.workflow_dir = str(Path(self.workflow_path).resolve().parent)
+            self.context.workflow_file = str(Path(self.workflow_path).resolve())
+        self.context.workflow_name = self.config.workflow.name
 
     def set_limits(self, limits: LimitEnforcer) -> None:
         """Replace the engine's limit enforcer with a restored one.
