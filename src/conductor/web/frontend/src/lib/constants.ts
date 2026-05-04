@@ -1,5 +1,5 @@
 export type NodeStatus = 'pending' | 'running' | 'completed' | 'failed' | 'paused' | 'idle' | 'waiting';
-export type NodeType = 'agent' | 'script' | 'human_gate' | 'parallel_group' | 'for_each_group' | 'start' | 'end';
+export type NodeType = 'agent' | 'script' | 'human_gate' | 'parallel_group' | 'for_each_group' | 'workflow' | 'start' | 'end' | 'ingress' | 'egress';
 
 export const NODE_STATUS_HEX: Record<string, string> = {
   pending: '#6b7280',

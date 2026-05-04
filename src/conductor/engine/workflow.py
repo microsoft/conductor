@@ -285,6 +285,7 @@ class WorkflowEngine:
         web_dashboard: WebDashboard | None = None,
         _subworkflow_depth: int = 0,
         run_context: RunContext | None = None,
+        _dashboard_context_path: list[str] | None = None,
     ) -> None:
         """Initialize the WorkflowEngine.
 
@@ -314,6 +315,13 @@ class WorkflowEngine:
             _subworkflow_depth: Current nesting depth for sub-workflow composition.
                 Used internally to enforce MAX_SUBWORKFLOW_DEPTH. Callers should
                 not set this directly.
+            _dashboard_context_path: Slot-key path identifying this engine's
+                position in the recursive sub-workflow tree. Root engine = ``[]``.
+                Sub-workflow engines spawned via ``_execute_subworkflow`` get
+                ``[*parent_path, slot_key]``. Used by ``_emit`` to auto-stamp
+                ``subworkflow_path`` on outgoing events so the dashboard can
+                route per-context state under concurrency. Callers should not
+                set this directly.
 
         Note:
             If both provider and registry are provided, registry takes precedence.
@@ -377,6 +385,13 @@ class WorkflowEngine:
         self._bg_mode = self._run_context.bg_mode
         self._system_metadata: dict[str, Any] = {}
 
+        # Recursive sub-workflow context path for dashboard routing.
+        # Root engine = []. Child engines spawned via _execute_subworkflow get
+        # [*parent_path, slot_key]. _emit auto-stamps non-empty paths onto
+        # outgoing events so the frontend can resolve the owning context
+        # without inferring parentage from activeContextPath.
+        self._dashboard_context_path: list[str] = list(_dashboard_context_path or [])
+
     def _build_pricing_overrides(self) -> dict[str, ModelPricing] | None:
         """Build pricing overrides from workflow cost configuration.
 
@@ -412,6 +427,11 @@ class WorkflowEngine:
         """
         if self._event_emitter is None:
             return
+        # Auto-stamp subworkflow_path on every event from sub-engines so the
+        # dashboard can route per-context state under concurrency. Root engine
+        # has an empty path and emits no stamp (preserving legacy event shape).
+        if self._dashboard_context_path and "subworkflow_path" not in data:
+            data = {**data, "subworkflow_path": list(self._dashboard_context_path)}
         event = WorkflowEvent(type=event_type, timestamp=_time.time(), data=data)
         self._event_emitter.emit(event)
 
@@ -548,6 +568,7 @@ class WorkflowEngine:
         self,
         agent: AgentDef,
         context: dict[str, Any],
+        slot_key: str | None = None,
     ) -> dict[str, Any]:
         """Execute a sub-workflow as a black-box step.
 
@@ -558,6 +579,11 @@ class WorkflowEngine:
         Args:
             agent: Workflow agent definition with ``workflow`` path.
             context: Workflow context for template rendering (used as sub-workflow input).
+            slot_key: Identity of this sub-workflow run within the parent's
+                slot-key path. Defaults to ``agent.name`` for the sequential
+                path; for_each/parallel paths supply per-iteration keys
+                (e.g. ``"<group>[<key>]"``) so concurrent runs get distinct
+                identities.
 
         Returns:
             The sub-workflow's final output dict.
@@ -644,6 +670,10 @@ class WorkflowEngine:
             keyboard_listener=self._keyboard_listener,
             web_dashboard=self._web_dashboard,
             _subworkflow_depth=self._subworkflow_depth + 1,
+            _dashboard_context_path=[
+                *self._dashboard_context_path,
+                slot_key or agent.name,
+            ],
         )
 
         return await child_engine.run(sub_inputs)
@@ -933,10 +963,11 @@ class WorkflowEngine:
 
         # In web mode, the interrupt was already handled at the provider level
         # (partial output → _handle_web_pause). Consume the stale flag silently.
-        # We check for dashboard presence only (not has_connections) because in
-        # --web/--web-bg mode the CLI interactive handler is never appropriate,
-        # even if clients are transiently disconnected.
+        # EXCEPTION: in subworkflows (depth > 0), propagate the interrupt so it
+        # unwinds the child engine back to the parent, stopping the workflow.
         if self._web_dashboard is not None:
+            if self._subworkflow_depth > 0:
+                raise InterruptError(agent_name=current_agent_name)
             return None
 
         # Build output preview from last stored output
@@ -1040,6 +1071,15 @@ class WorkflowEngine:
         disconnect_task = asyncio.create_task(disconnect_event.wait())
         tasks = {resume_task, kill_task, disconnect_task}
 
+        # In subworkflows, also watch the interrupt_event so that a second
+        # Stop click while paused will stop the workflow without requiring
+        # the user to first Resume then wait for the next between-agent check.
+        stop_task = None
+        if self._subworkflow_depth > 0 and self._interrupt_event is not None:
+            self._interrupt_event.clear()
+            stop_task = asyncio.create_task(self._interrupt_event.wait())
+            tasks.add(stop_task)
+
         # If any event was set between clear() and task creation, the task
         # will already be done — no need to wait, but we still fall through
         # to the normal done/pending handling below.
@@ -1061,6 +1101,12 @@ class WorkflowEngine:
             raise
 
         if kill_task in done:
+            raise InterruptError(agent_name=agent_name)
+
+        # Stop-while-paused in a subworkflow: treat as interrupt
+        if stop_task is not None and stop_task in done:
+            if self._interrupt_event is not None:
+                self._interrupt_event.clear()
             raise InterruptError(agent_name=agent_name)
 
         if disconnect_task in done:
@@ -1590,6 +1636,8 @@ class WorkflowEngine:
                                     "agent_name": agent.name,
                                     "iteration": sub_execution_count,
                                     "workflow": agent.workflow,
+                                    "parent_path": list(self._dashboard_context_path),
+                                    "slot_key": agent.name,
                                 },
                             )
 
@@ -1604,6 +1652,8 @@ class WorkflowEngine:
                                         "elapsed": _sub_elapsed,
                                         "error_type": type(exc).__name__,
                                         "message": str(exc),
+                                        "parent_path": list(self._dashboard_context_path),
+                                        "slot_key": agent.name,
                                     },
                                 )
                                 raise
@@ -1615,6 +1665,8 @@ class WorkflowEngine:
                                     "agent_name": agent.name,
                                     "elapsed": _sub_elapsed,
                                     "output": sub_output,
+                                    "parent_path": list(self._dashboard_context_path),
+                                    "slot_key": agent.name,
                                 },
                             )
 

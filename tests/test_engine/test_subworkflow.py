@@ -940,3 +940,84 @@ class TestSubWorkflowInputMapping:
         # Parent's "setup" agent should NOT appear in child's context
         assert len(child_contexts) == 1
         assert "setup" not in child_contexts[0]
+
+
+class TestSubWorkflowDashboardPath:
+    """Tests for engine-driven parent_path / slot_key on dashboard events.
+
+    These keep concurrent for_each-of-workflow iterations addressable in the
+    web dashboard without depending on a single shared activeContextPath.
+    """
+
+    @pytest.mark.asyncio
+    async def test_sequential_subworkflow_emits_parent_path_and_slot_key(
+        self, tmp_workflow_dir: Path
+    ) -> None:
+        """Sequential sub-workflow emits parent_path=[] and slot_key=agent.name."""
+        _write_yaml(
+            tmp_workflow_dir / "sub.yaml",
+            """\
+            workflow:
+              name: sub-workflow
+              entry_point: inner
+              runtime:
+                provider: copilot
+              limits:
+                max_iterations: 5
+            agents:
+              - name: inner
+                prompt: "inner"
+                routes:
+                  - to: "$end"
+            output:
+              result: "done"
+            """,
+        )
+
+        parent_path = tmp_workflow_dir / "parent.yaml"
+        parent_path.write_text("dummy", encoding="utf-8")
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="parent",
+                entry_point="research",
+                runtime=RuntimeConfig(provider="copilot"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="research",
+                    type="workflow",
+                    workflow="sub.yaml",
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"result": "{{ research.output.result }}"},
+        )
+
+        events: list[tuple[str, dict]] = []
+        emitter = MagicMock()
+        emitter.emit.side_effect = lambda ev: events.append((ev.type, dict(ev.data)))
+
+        provider = CopilotProvider(mock_handler=lambda agent, prompt, context: {"result": "ok"})
+        engine = WorkflowEngine(config, provider, workflow_path=parent_path, event_emitter=emitter)
+        await engine.run({})
+
+        started = [d for t, d in events if t == "subworkflow_started"]
+        completed = [d for t, d in events if t == "subworkflow_completed"]
+        assert len(started) == 1, f"expected 1 subworkflow_started, got {len(started)}"
+        assert started[0]["agent_name"] == "research"
+        assert started[0]["parent_path"] == []
+        assert started[0]["slot_key"] == "research"
+        assert len(completed) == 1
+        assert completed[0]["parent_path"] == []
+        assert completed[0]["slot_key"] == "research"
+
+        # The child engine auto-stamps subworkflow_path on every event it emits
+        # so the dashboard can route per-context state correctly.
+        child_workflow_completed = [
+            d
+            for t, d in events
+            if t == "workflow_completed" and d.get("subworkflow_path") == ["research"]
+        ]
+        assert len(child_workflow_completed) == 1

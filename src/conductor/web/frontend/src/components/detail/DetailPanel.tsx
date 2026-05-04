@@ -1,15 +1,17 @@
 import { useEffect, useState } from 'react';
 import { X } from 'lucide-react';
 import { useWorkflowStore } from '@/stores/workflow-store';
+import { useViewedNodes } from '@/hooks/use-viewed-context';
 import { AgentDetail } from './AgentDetail';
 import { ScriptDetail } from './ScriptDetail';
 import { GateDetail } from './GateDetail';
 import { GroupDetail } from './GroupDetail';
+import { SubworkflowDetail } from './SubworkflowDetail';
 import { cn } from '@/lib/utils';
 
 export function DetailPanel() {
   const selectedNode = useWorkflowStore((s) => s.selectedNode);
-  const nodes = useWorkflowStore((s) => s.nodes);
+  const viewedNodes = useViewedNodes();
   const selectNode = useWorkflowStore((s) => s.selectNode);
 
   // Slide-in animation state
@@ -20,7 +22,7 @@ export function DetailPanel() {
     return () => setMounted(false);
   }, [selectedNode]);
 
-  const node = selectedNode ? nodes[selectedNode] : null;
+  const node = selectedNode ? viewedNodes[selectedNode] : null;
 
   if (!selectedNode || !node) {
     return (
@@ -44,6 +46,8 @@ export function DetailPanel() {
       case 'parallel_group':
       case 'for_each_group':
         return GroupDetail;
+      case 'workflow':
+        return SubworkflowDetail;
       default:
         return AgentDetail;
     }

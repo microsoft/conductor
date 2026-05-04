@@ -16,13 +16,18 @@ import {
 import '@xyflow/react/dist/style.css';
 
 import { useWorkflowStore } from '@/stores/workflow-store';
+import { useViewedGraphData } from '@/hooks/use-viewed-context';
+import { useDeepLink } from '@/hooks/use-deep-link';
 import { buildGraphElements, type GraphNodeData } from './graph-layout';
 import { AgentNode } from './AgentNode';
 import { ScriptNode } from './ScriptNode';
 import { GateNode } from './GateNode';
 import { GroupNode } from './GroupNode';
+import { WorkflowNode } from './WorkflowNode';
 import { EndNode } from './EndNode';
 import { StartNode } from './StartNode';
+import { IngressNode } from './IngressNode';
+import { EgressNode } from './EgressNode';
 import { AnimatedEdge } from './AnimatedEdge';
 import { WorkflowErrorBanner, WorkflowSuccessBanner } from '@/components/layout/ErrorBanner';
 import { NODE_STATUS_HEX } from '@/lib/constants';
@@ -34,8 +39,11 @@ const nodeTypes: NodeTypes = {
   scriptNode: ScriptNode,
   gateNode: GateNode,
   groupNode: GroupNode,
+  workflowNode: WorkflowNode,
   endNode: EndNode,
   startNode: StartNode,
+  ingressNode: IngressNode,
+  egressNode: EgressNode,
 };
 
 const edgeTypes: EdgeTypes = {
@@ -69,36 +77,53 @@ function EdgeMarkers() {
 }
 
 export function WorkflowGraph() {
-  const agents = useWorkflowStore((s) => s.agents);
-  const routes = useWorkflowStore((s) => s.routes);
-  const parallelGroups = useWorkflowStore((s) => s.parallelGroups);
-  const forEachGroups = useWorkflowStore((s) => s.forEachGroups);
-  const storeNodes = useWorkflowStore((s) => s.nodes);
-  const groupProgress = useWorkflowStore((s) => s.groupProgress);
+  const viewCtx = useViewedGraphData();
+  const viewContextPath = useWorkflowStore((s) => s.viewContextPath);
   const selectNode = useWorkflowStore((s) => s.selectNode);
   const selectedNode = useWorkflowStore((s) => s.selectedNode);
   const workflowStatus = useWorkflowStore((s) => s.workflowStatus);
-  const entryPoint = useWorkflowStore((s) => s.entryPoint);
   const wsStatus = useWorkflowStore((s) => s.wsStatus);
   const workflowFailedAgent = useWorkflowStore((s) => s.workflowFailedAgent);
+  const navigateIntoSubworkflow = useWorkflowStore((s) => s.navigateIntoSubworkflow);
+
+  // Get the data for the currently viewed context
+  const { agents, routes, parallelGroups, forEachGroups, nodes: storeNodes, groupProgress, entryPoint, subworkflowContexts, parentAgent } = viewCtx;
 
   const [flowNodes, setFlowNodes, onNodesChange] = useNodesState<Node<GraphNodeData>>([]);
   const [flowEdges, setFlowEdges, onEdgesChange] = useEdgesState<Edge>([]);
 
   const graphBuilt = useRef(false);
+  const prevViewPath = useRef<string>('');
 
-  // Build graph when agents first appear
+  // Rebuild graph when context changes (breadcrumb navigation) or when agents first appear
+  const viewPathKey = JSON.stringify(viewContextPath);
   useEffect(() => {
-    if (agents.length === 0) return;
+    if (agents.length === 0) {
+      // Clear stale graph elements when navigated to an empty context
+      if (prevViewPath.current !== viewPathKey) {
+        graphBuilt.current = false;
+        prevViewPath.current = viewPathKey;
+        setFlowNodes([]);
+        setFlowEdges([]);
+      }
+      return;
+    }
+
+    // Force rebuild on context switch
+    if (prevViewPath.current !== viewPathKey) {
+      graphBuilt.current = false;
+      prevViewPath.current = viewPathKey;
+    }
+
     if (graphBuilt.current) return;
     graphBuilt.current = true;
 
     const { nodes, edges } = buildGraphElements(
-      agents, routes, parallelGroups, forEachGroups, storeNodes, groupProgress, entryPoint
+      agents, routes, parallelGroups, forEachGroups, storeNodes, groupProgress, entryPoint, parentAgent
     );
     setFlowNodes(nodes);
     setFlowEdges(edges);
-  }, [agents, routes, parallelGroups, forEachGroups, storeNodes, groupProgress, entryPoint, setFlowNodes, setFlowEdges]);
+  }, [agents, routes, parallelGroups, forEachGroups, storeNodes, groupProgress, entryPoint, setFlowNodes, setFlowEdges, viewPathKey, parentAgent]);
 
   // Update node data when store nodes change (status, progress, etc.)
   useEffect(() => {
@@ -152,6 +177,18 @@ export function WorkflowGraph() {
       selectNode(node.id);
     },
     [selectNode],
+  );
+
+  // Double-click on workflow agent nodes to navigate into subworkflow
+  const onNodeDoubleClick = useCallback(
+    (_: React.MouseEvent, node: Node) => {
+      // Check if this node has a subworkflow context
+      const hasSubworkflow = subworkflowContexts.some((c) => c.parentAgent === node.id);
+      if (hasSubworkflow) {
+        navigateIntoSubworkflow(node.id);
+      }
+    },
+    [subworkflowContexts, navigateIntoSubworkflow],
   );
 
   const onPaneClick = useCallback(() => {
@@ -220,6 +257,7 @@ export function WorkflowGraph() {
         onNodesChange={onNodesChange}
         onEdgesChange={onEdgesChange}
         onNodeClick={onNodeClick}
+        onNodeDoubleClick={onNodeDoubleClick}
         onPaneClick={onPaneClick}
         nodeTypes={nodeTypes}
         edgeTypes={edgeTypes}
@@ -245,6 +283,7 @@ export function WorkflowGraph() {
           <FitViewButton />
         </Controls>
         <FitViewKeyboardShortcut />
+        <DeepLinkHandler />
       </ReactFlow>
     </div>
   );
@@ -286,4 +325,26 @@ function FitViewKeyboardShortcut() {
   }, [fitView]);
 
   return null;
+}
+
+/** Applies URL query param deep-links (?agent=X, ?subworkflow=Y) on initial load */
+function DeepLinkHandler() {
+  const error = useDeepLink();
+
+  if (!error) return null;
+
+  return (
+    <div className="absolute top-3 left-1/2 -translate-x-1/2 z-20 animate-[banner-in_200ms_ease-out]">
+      <div className="flex items-center gap-2 px-4 py-2 rounded-lg bg-amber-950/90 border border-amber-500/40 shadow-lg shadow-amber-500/10 backdrop-blur-sm max-w-[560px]">
+        <span className="text-xs text-amber-300">⚠</span>
+        <span className="text-[11px] text-amber-400/80">{error.message}</span>
+        <a
+          href={window.location.pathname}
+          className="px-2 py-0.5 rounded text-[10px] font-medium text-amber-300 bg-amber-500/20 hover:bg-amber-500/30 transition-colors flex-shrink-0 ml-1"
+        >
+          Root
+        </a>
+      </div>
+    </div>
+  );
 }
