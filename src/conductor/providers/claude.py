@@ -178,6 +178,13 @@ class ClaudeProvider(AgentProvider):
         self._mcp_servers_config = mcp_servers
         self._mcp_manager: MCPManager | None = None
 
+        # Cache of model_id -> max_input_tokens populated lazily on first
+        # get_max_prompt_tokens() call. Guarded by an asyncio.Lock to avoid
+        # racing concurrent first-callers and emitting duplicate models.list()
+        # requests.
+        self._max_input_cache: dict[str, int | None] | None = None
+        self._max_input_cache_lock = asyncio.Lock()
+
         # Initialize the client (sync initialization)
         self._initialize_client()
 
@@ -311,6 +318,36 @@ class ClaudeProvider(AgentProvider):
                 logger.debug(f"Default model '{self._default_model}' verified in available models")
         except Exception as e:
             logger.warning(f"Could not list available models (discovery failed): {e}")
+
+    async def get_max_prompt_tokens(self, model: str) -> int | None:
+        """Return the Anthropic SDK's ``max_input_tokens`` for ``model``.
+
+        Lazily populates a per-instance cache on first call by enumerating
+        ``client.models.list()``. Subsequent calls are dictionary lookups.
+        Returns ``None`` if the SDK is unavailable, the client failed to
+        initialize, the model isn't listed, or the listing call raises —
+        context-window metadata must never block workflow execution.
+
+        Note: the value reflects the API's *default* input window. Claude
+        models with a 1M-context beta require an explicit beta header, which
+        Conductor does not set today; for those models the API still reports
+        the default window.
+        """
+        if not ANTHROPIC_SDK_AVAILABLE or self._client is None:
+            return None
+        async with self._max_input_cache_lock:
+            if self._max_input_cache is None:
+                cache: dict[str, int | None] = {}
+                try:
+                    page = await self._client.models.list()
+                except Exception as e:
+                    logger.debug("Failed to list Anthropic models: %s", e)
+                    self._max_input_cache = cache  # cache the empty result
+                    return None
+                for info in page.data:
+                    cache[info.id] = getattr(info, "max_input_tokens", None)
+                self._max_input_cache = cache
+        return self._max_input_cache.get(model)
 
     async def _ensure_mcp_connected(self) -> None:
         """Connect to MCP servers if configured.

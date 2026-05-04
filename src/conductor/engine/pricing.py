@@ -30,7 +30,7 @@ def _warn_fuzzy_match(requested: str, matched_key: str, strategy: str) -> None:
     _FUZZY_MATCH_WARNED.add(requested)
     logger.warning(
         "Pricing for model %r resolved via %s fallback to %r. "
-        "Cost and context_window metadata may be inaccurate. "
+        "Cost calculation may be inaccurate. "
         "Add %r to DEFAULT_PRICING or pass an override to silence this warning.",
         requested,
         strategy,
@@ -41,66 +41,59 @@ def _warn_fuzzy_match(requested: str, matched_key: str, strategy: str) -> None:
 
 @dataclass(frozen=True)
 class ModelPricing:
-    """Pricing and metadata per model.
+    """Pricing per model.
 
     Attributes:
         input_per_mtok: Cost per million input tokens (USD).
         output_per_mtok: Cost per million output tokens (USD).
         cache_read_per_mtok: Cost per million cache read tokens (USD).
         cache_write_per_mtok: Cost per million cache write tokens (USD).
-        context_window: Context window size in tokens, or None if unknown.
     """
 
     input_per_mtok: float
     output_per_mtok: float
     cache_read_per_mtok: float = 0.0
     cache_write_per_mtok: float = 0.0
-    context_window: int | None = None
 
 
-# Default model table (pricing + context window metadata)
-# Sources: OpenAI pricing page, Anthropic pricing page, provider docs
+# Default model table (pricing only).
+# Context-window metadata is sourced from each provider's SDK at runtime via
+# ``AgentProvider.get_max_prompt_tokens()`` — see ``providers/base.py``.
+# Sources: OpenAI pricing page, Anthropic pricing page, provider docs.
 DEFAULT_PRICING: dict[str, ModelPricing] = {
     # OpenAI / Copilot models
-    "gpt-4-turbo": ModelPricing(
-        input_per_mtok=10.00, output_per_mtok=30.00, context_window=128_000
-    ),
-    "gpt-4o": ModelPricing(input_per_mtok=2.50, output_per_mtok=10.00, context_window=128_000),
-    "gpt-4o-mini": ModelPricing(input_per_mtok=0.15, output_per_mtok=0.60, context_window=128_000),
-    "gpt-4.1": ModelPricing(input_per_mtok=2.00, output_per_mtok=8.00, context_window=1_047_576),
-    "gpt-4.1-mini": ModelPricing(
-        input_per_mtok=0.15, output_per_mtok=0.60, context_window=1_047_576
-    ),
-    "gpt-4": ModelPricing(input_per_mtok=30.00, output_per_mtok=60.00, context_window=8_192),
-    "gpt-3.5-turbo": ModelPricing(input_per_mtok=0.50, output_per_mtok=1.50, context_window=16_385),
-    "gpt-5.2": ModelPricing(input_per_mtok=2.00, output_per_mtok=8.00, context_window=400_000),
-    "gpt-5.1": ModelPricing(input_per_mtok=2.00, output_per_mtok=8.00, context_window=400_000),
+    "gpt-4-turbo": ModelPricing(input_per_mtok=10.00, output_per_mtok=30.00),
+    "gpt-4o": ModelPricing(input_per_mtok=2.50, output_per_mtok=10.00),
+    "gpt-4o-mini": ModelPricing(input_per_mtok=0.15, output_per_mtok=0.60),
+    "gpt-4.1": ModelPricing(input_per_mtok=2.00, output_per_mtok=8.00),
+    "gpt-4.1-mini": ModelPricing(input_per_mtok=0.15, output_per_mtok=0.60),
+    "gpt-4": ModelPricing(input_per_mtok=30.00, output_per_mtok=60.00),
+    "gpt-3.5-turbo": ModelPricing(input_per_mtok=0.50, output_per_mtok=1.50),
+    "gpt-5.2": ModelPricing(input_per_mtok=2.00, output_per_mtok=8.00),
+    "gpt-5.1": ModelPricing(input_per_mtok=2.00, output_per_mtok=8.00),
     # O-series
-    "o1": ModelPricing(input_per_mtok=15.00, output_per_mtok=60.00, context_window=200_000),
-    "o1-mini": ModelPricing(input_per_mtok=3.00, output_per_mtok=12.00, context_window=128_000),
-    "o1-preview": ModelPricing(input_per_mtok=15.00, output_per_mtok=60.00, context_window=128_000),
-    "o3-mini": ModelPricing(input_per_mtok=1.10, output_per_mtok=4.40, context_window=200_000),
+    "o1": ModelPricing(input_per_mtok=15.00, output_per_mtok=60.00),
+    "o1-mini": ModelPricing(input_per_mtok=3.00, output_per_mtok=12.00),
+    "o1-preview": ModelPricing(input_per_mtok=15.00, output_per_mtok=60.00),
+    "o3-mini": ModelPricing(input_per_mtok=1.10, output_per_mtok=4.40),
     # Claude 4.5 Series (newest)
     "claude-opus-4-5": ModelPricing(
         input_per_mtok=5.00,
         output_per_mtok=25.00,
         cache_read_per_mtok=0.50,
         cache_write_per_mtok=6.25,
-        context_window=200_000,
     ),
     "claude-sonnet-4-5": ModelPricing(
         input_per_mtok=3.00,
         output_per_mtok=15.00,
         cache_read_per_mtok=0.30,
         cache_write_per_mtok=3.75,
-        context_window=200_000,
     ),
     "claude-haiku-4-5": ModelPricing(
         input_per_mtok=1.00,
         output_per_mtok=5.00,
         cache_read_per_mtok=0.10,
         cache_write_per_mtok=1.25,
-        context_window=200_000,
     ),
     # Short aliases for Claude 4.5 Series (used in workflow files)
     "opus-4.5": ModelPricing(
@@ -108,21 +101,18 @@ DEFAULT_PRICING: dict[str, ModelPricing] = {
         output_per_mtok=25.00,
         cache_read_per_mtok=0.50,
         cache_write_per_mtok=6.25,
-        context_window=200_000,
     ),
     "sonnet-4.5": ModelPricing(
         input_per_mtok=3.00,
         output_per_mtok=15.00,
         cache_read_per_mtok=0.30,
         cache_write_per_mtok=3.75,
-        context_window=200_000,
     ),
     "haiku-4.5": ModelPricing(
         input_per_mtok=1.00,
         output_per_mtok=5.00,
         cache_read_per_mtok=0.10,
         cache_write_per_mtok=1.25,
-        context_window=200_000,
     ),
     # Claude 4.6 Series
     "claude-opus-4.6": ModelPricing(
@@ -130,21 +120,18 @@ DEFAULT_PRICING: dict[str, ModelPricing] = {
         output_per_mtok=25.00,
         cache_read_per_mtok=0.50,
         cache_write_per_mtok=6.25,
-        context_window=1_000_000,
     ),
     "claude-opus-4.6-1m": ModelPricing(
         input_per_mtok=5.00,
         output_per_mtok=25.00,
         cache_read_per_mtok=0.50,
         cache_write_per_mtok=6.25,
-        context_window=1_000_000,
     ),
     "claude-sonnet-4.6": ModelPricing(
         input_per_mtok=3.00,
         output_per_mtok=15.00,
         cache_read_per_mtok=0.30,
         cache_write_per_mtok=3.75,
-        context_window=1_000_000,
     ),
     # Claude 4 Series
     "claude-opus-4": ModelPricing(
@@ -152,21 +139,18 @@ DEFAULT_PRICING: dict[str, ModelPricing] = {
         output_per_mtok=75.00,
         cache_read_per_mtok=1.50,
         cache_write_per_mtok=18.75,
-        context_window=200_000,
     ),
     "claude-sonnet-4": ModelPricing(
         input_per_mtok=3.00,
         output_per_mtok=15.00,
         cache_read_per_mtok=0.30,
         cache_write_per_mtok=3.75,
-        context_window=200_000,
     ),
     "claude-haiku-4": ModelPricing(
         input_per_mtok=0.25,
         output_per_mtok=1.25,
         cache_read_per_mtok=0.03,
         cache_write_per_mtok=0.30,
-        context_window=200_000,
     ),
     # Claude 3.x Series
     "claude-3-7-sonnet": ModelPricing(
@@ -174,69 +158,59 @@ DEFAULT_PRICING: dict[str, ModelPricing] = {
         output_per_mtok=15.00,
         cache_read_per_mtok=0.30,
         cache_write_per_mtok=3.75,
-        context_window=200_000,
     ),
     "claude-3.7-sonnet": ModelPricing(
         input_per_mtok=3.00,
         output_per_mtok=15.00,
         cache_read_per_mtok=0.30,
         cache_write_per_mtok=3.75,
-        context_window=200_000,
     ),
     "claude-3-5-sonnet": ModelPricing(
         input_per_mtok=3.00,
         output_per_mtok=15.00,
         cache_read_per_mtok=0.30,
         cache_write_per_mtok=3.75,
-        context_window=200_000,
     ),
     "claude-3.5-sonnet": ModelPricing(
         input_per_mtok=3.00,
         output_per_mtok=15.00,
         cache_read_per_mtok=0.30,
         cache_write_per_mtok=3.75,
-        context_window=200_000,
     ),
     "claude-3-5-haiku": ModelPricing(
         input_per_mtok=0.80,
         output_per_mtok=4.00,
         cache_read_per_mtok=0.08,
         cache_write_per_mtok=1.00,
-        context_window=200_000,
     ),
     "claude-3.5-haiku": ModelPricing(
         input_per_mtok=0.80,
         output_per_mtok=4.00,
         cache_read_per_mtok=0.08,
         cache_write_per_mtok=1.00,
-        context_window=200_000,
     ),
     "claude-3-opus": ModelPricing(
         input_per_mtok=15.00,
         output_per_mtok=75.00,
         cache_read_per_mtok=1.50,
         cache_write_per_mtok=18.75,
-        context_window=200_000,
     ),
     "claude-3-sonnet": ModelPricing(
         input_per_mtok=3.00,
         output_per_mtok=15.00,
         cache_read_per_mtok=0.30,
         cache_write_per_mtok=3.75,
-        context_window=200_000,
     ),
     "claude-3-haiku": ModelPricing(
         input_per_mtok=0.25,
         output_per_mtok=1.25,
         cache_read_per_mtok=0.03,
         cache_write_per_mtok=0.30,
-        context_window=200_000,
     ),
     # Gemini
     "gemini-3.1-pro-preview": ModelPricing(
         input_per_mtok=1.25,
         output_per_mtok=5.00,
-        context_window=1_000_000,
     ),
 }
 

@@ -695,3 +695,68 @@ class TestFixPipeBlockingMode:
         # early — it proceeded past the guard and attempted the import.
         with contextlib.suppress(ModuleNotFoundError):
             provider._fix_pipe_blocking_mode()
+
+
+class TestGetMaxPromptTokens:
+    """Tests for CopilotProvider.get_max_prompt_tokens."""
+
+    @pytest.mark.asyncio
+    async def test_mock_handler_mode_returns_none(self) -> None:
+        """Mock-handler mode has no SDK to query — must return None."""
+        provider = CopilotProvider(mock_handler=stub_handler)
+        assert await provider.get_max_prompt_tokens("gpt-4o") is None
+
+    @pytest.mark.asyncio
+    async def test_returns_max_prompt_tokens_for_known_model(self) -> None:
+        """Looks up the matching model and returns its max_prompt_tokens."""
+
+        class _Limits:
+            max_prompt_tokens = 128000
+
+        class _Caps:
+            limits = _Limits()
+
+        class _Model:
+            id = "gpt-4o"
+            capabilities = _Caps()
+
+        class _FakeClient:
+            async def list_models(self) -> list[Any]:
+                return [_Model()]
+
+        provider = CopilotProvider(mock_handler=stub_handler)
+        provider._mock_handler = None  # disable mock-handler short-circuit
+        provider._client = _FakeClient()
+        # Skip _ensure_client_started by marking as already-started.
+        provider._started = True
+
+        result = await provider.get_max_prompt_tokens("gpt-4o")
+        assert result == 128000
+
+    @pytest.mark.asyncio
+    async def test_returns_none_for_unknown_model(self) -> None:
+        class _FakeClient:
+            async def list_models(self) -> list[Any]:
+                return []
+
+        provider = CopilotProvider(mock_handler=stub_handler)
+        provider._mock_handler = None
+        provider._client = _FakeClient()
+        provider._started = True
+
+        assert await provider.get_max_prompt_tokens("anything") is None
+
+    @pytest.mark.asyncio
+    async def test_sdk_failure_returns_none(self) -> None:
+        """An exception from the SDK must not propagate; metadata is best-effort."""
+
+        class _BoomClient:
+            async def list_models(self) -> list[Any]:
+                raise RuntimeError("network down")
+
+        provider = CopilotProvider(mock_handler=stub_handler)
+        provider._mock_handler = None
+        provider._client = _BoomClient()
+        provider._started = True
+
+        assert await provider.get_max_prompt_tokens("gpt-4o") is None

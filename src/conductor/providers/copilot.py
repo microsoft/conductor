@@ -1775,6 +1775,29 @@ class CopilotProvider(AgentProvider):
         self._call_history.clear()
         self._retry_history.clear()
 
+    async def get_max_prompt_tokens(self, model: str) -> int | None:
+        """Return the Copilot SDK's ``max_prompt_tokens`` for ``model``.
+
+        Queries ``client.list_models()`` (cached internally by the SDK) and
+        returns ``capabilities.limits.max_prompt_tokens`` for the matching
+        model. Returns ``None`` in mock-handler mode, when the SDK is
+        unavailable, when the model is unknown, or when any SDK call fails —
+        context-window metadata must never block workflow execution.
+        """
+        if self._mock_handler is not None or not COPILOT_SDK_AVAILABLE:
+            return None
+        try:
+            await self._ensure_client_started()
+            models = await self._client.list_models()
+        except Exception as e:
+            logger.debug("Failed to list Copilot models for %r: %s", model, e)
+            return None
+        for info in models:
+            if info.id == model:
+                limits = getattr(info.capabilities, "limits", None)
+                return getattr(limits, "max_prompt_tokens", None) if limits else None
+        return None
+
     def get_session_ids(self) -> dict[str, str]:
         """Get tracked session IDs for all executed agents.
 

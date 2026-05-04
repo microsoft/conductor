@@ -144,3 +144,33 @@ class AgentProvider(ABC):
         such as HTTP clients or session state.
         """
         ...
+
+    async def get_max_prompt_tokens(self, model: str) -> int | None:
+        """Return the SDK-reported maximum input (prompt) tokens for ``model``.
+
+        This is the authoritative cap on prompt size enforced by the underlying
+        SDK or backend (e.g. the Copilot ``max_prompt_tokens`` field, or the
+        Anthropic ``max_input_tokens`` field). It is typically lower than the
+        model's theoretical context window — for example, the Copilot SDK
+        currently caps most GPT-5 variants at 128K despite a 400K model max.
+
+        Implementations should:
+
+        * Query their SDK's model-listing endpoint (cached after the first call).
+        * Return ``None`` when the model is unknown to the provider, when the
+          SDK call fails, or when no metadata is available.
+        * Never raise — context-window metadata is best-effort and must not
+          interrupt workflow execution.
+
+        The default implementation returns ``None``, which causes the
+        dashboard's context-window bar to be hidden and any future enforcement
+        to be skipped — both safe degradations.
+
+        Args:
+            model: The model identifier as it would be sent to the SDK
+                (e.g. ``"gpt-5.2"``, ``"claude-sonnet-4-5-20250929"``).
+
+        Returns:
+            The maximum prompt (input) tokens the SDK will accept, or ``None``.
+        """
+        return None

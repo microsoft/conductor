@@ -2302,3 +2302,74 @@ class TestClaudeProviderRetryLogic:
         # Verify retry-after header was used (delay should be 5.0)
         assert len(provider._retry_history) == 1
         assert provider._retry_history[0]["delay"] == 5.0
+
+
+@patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+@patch("conductor.providers.claude.AsyncAnthropic")
+class TestClaudeGetMaxPromptTokens:
+    """Tests for ClaudeProvider.get_max_prompt_tokens."""
+
+    @pytest.mark.asyncio
+    async def test_returns_max_input_tokens_for_known_model(
+        self, mock_anthropic_class: Mock
+    ) -> None:
+        mock_client = Mock()
+        mock_client.models.list = AsyncMock(
+            return_value=Mock(
+                data=[
+                    Mock(id="claude-sonnet-4-5", max_input_tokens=200_000),
+                    Mock(id="claude-opus-4-5", max_input_tokens=200_000),
+                ]
+            )
+        )
+        mock_anthropic_class.return_value = mock_client
+
+        provider = ClaudeProvider()
+        assert await provider.get_max_prompt_tokens("claude-sonnet-4-5") == 200_000
+
+    @pytest.mark.asyncio
+    async def test_returns_none_for_unknown_model(self, mock_anthropic_class: Mock) -> None:
+        mock_client = Mock()
+        mock_client.models.list = AsyncMock(return_value=Mock(data=[]))
+        mock_anthropic_class.return_value = mock_client
+
+        provider = ClaudeProvider()
+        assert await provider.get_max_prompt_tokens("unknown-x") is None
+
+    @pytest.mark.asyncio
+    async def test_sdk_failure_returns_none(self, mock_anthropic_class: Mock) -> None:
+        """An exception from models.list() must not propagate."""
+        mock_client = Mock()
+        mock_client.models.list = AsyncMock(side_effect=RuntimeError("network down"))
+        mock_anthropic_class.return_value = mock_client
+
+        provider = ClaudeProvider()
+        assert await provider.get_max_prompt_tokens("claude-sonnet-4-5") is None
+
+    @pytest.mark.asyncio
+    async def test_caches_after_first_call(self, mock_anthropic_class: Mock) -> None:
+        """Second call must hit the cache, not the SDK."""
+        mock_client = Mock()
+        mock_client.models.list = AsyncMock(
+            return_value=Mock(data=[Mock(id="claude-sonnet-4-5", max_input_tokens=200_000)])
+        )
+        mock_anthropic_class.return_value = mock_client
+
+        provider = ClaudeProvider()
+        await provider.get_max_prompt_tokens("claude-sonnet-4-5")
+        await provider.get_max_prompt_tokens("claude-sonnet-4-5")
+        await provider.get_max_prompt_tokens("anything-else")
+
+        assert mock_client.models.list.await_count == 1
+
+    @pytest.mark.asyncio
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", False)
+    async def test_returns_none_when_sdk_unavailable(self, mock_anthropic_class: Mock) -> None:
+        # Need a workaround: ANTHROPIC_SDK_AVAILABLE is False so __init__
+        # raises. Build an instance bypassing the init guard by patching
+        # only at call time.
+        with patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True):
+            provider = ClaudeProvider()
+
+        with patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", False):
+            assert await provider.get_max_prompt_tokens("claude-sonnet-4-5") is None
