@@ -25,8 +25,46 @@ http://localhost:{port}[?subworkflow={path}][&agent={name}]
 
 ## Subworkflow Path
 
-The `subworkflow` parameter is a `/`-separated path of **parent agent names**
-that invoke each sub-workflow, starting from the root workflow.
+The `subworkflow` parameter is a `/`-separated path of segments, starting from
+the root workflow. Each segment is matched against sibling subworkflow contexts
+in priority order:
+
+### 1. Exact slot key
+
+Matches the engine-emitted `slot_key` verbatim. For sequential subworkflows the
+slot key equals the agent name. For `for_each` iterations the slot key includes
+the item key in brackets, e.g. `plan_child[item-0]`.
+
+```
+?subworkflow=plan_child[item-0]/design
+```
+
+### 2. Positional index (`agent#N`, 0-based)
+
+Matches the Nth iteration among siblings sharing that `parentAgent`. Useful when
+the caller doesn't know the exact `item_key` values emitted by the engine.
+
+```
+# First for_each iteration of plan_child
+?subworkflow=plan_child%230
+
+# Third iteration, then into its "design" child
+?subworkflow=plan_child%232/design
+```
+
+> **Note:** `#` must be percent-encoded as `%23` in URLs.
+
+### 3. Bare agent name
+
+Matches if **exactly one** sibling has that `parentAgent`. Works for sequential
+(non-`for_each`) subworkflows and single-iteration `for_each` groups. Returns an
+**ambiguous** error when multiple iterations exist — the error message lists the
+valid exact slot keys and positional alternatives.
+
+```
+# Works when there is only one "planning" subworkflow
+?subworkflow=planning
+```
 
 Given this workflow nesting:
 
@@ -38,17 +76,23 @@ root
 │   └── design      (workflow agent → design.yaml)
 │       ├── reviewer   (agent)
 │       └── writer     (agent)
+├── plan_child      (for_each workflow agent → child.yaml)
+│   ├── plan_child[item-0]   (iteration 0)
+│   └── plan_child[item-1]   (iteration 1)
 └── close_out       (agent)
 ```
 
-| URL                                          | Result                                    |
-|----------------------------------------------|-------------------------------------------|
-| `?subworkflow=planning`                      | View planning.yaml's graph                |
-| `?subworkflow=planning/design`               | View design.yaml's graph                  |
-| `?subworkflow=planning/design&agent=reviewer` | View design.yaml, select reviewer node    |
+| URL                                                    | Result                                    |
+|--------------------------------------------------------|-------------------------------------------|
+| `?subworkflow=planning`                                | View planning.yaml's graph                |
+| `?subworkflow=planning/design`                         | View design.yaml's graph                  |
+| `?subworkflow=planning/design&agent=reviewer`          | View design.yaml, select reviewer node    |
+| `?subworkflow=plan_child[item-0]`                      | View child.yaml iteration 0               |
+| `?subworkflow=plan_child%230`                          | Same — positional (0-based)               |
+| `?subworkflow=plan_child%231`                          | View child.yaml iteration 1               |
 
-Each path segment must match the `name` of the workflow-type agent in its
-parent workflow — this is the same value shown in the breadcrumb bar.
+Each path segment is matched using the priority rules above (exact slot key →
+positional → bare name).
 
 ## Agent Selection
 
@@ -94,9 +138,10 @@ to navigate to the correct context first:
 
 | Scenario                              | Behavior                                        |
 |---------------------------------------|--------------------------------------------------|
-| Unknown subworkflow path segment      | Navigation stops at the last valid level          |
-| Unknown agent name                    | No node selected, graph shows default view        |
-| Subworkflow hasn't started yet        | Navigation fails silently (no context exists)     |
+| Unknown subworkflow path segment      | Error banner with "not found" + notation hint     |
+| Ambiguous bare name (multiple for_each iterations) | Error banner listing valid alternatives |
+| Unknown agent name                    | No node selected, error banner displayed          |
+| Subworkflow hasn't started yet        | Navigation fails with "not found" error           |
 | Page refresh                          | Deep-link re-applied from URL (full state replay) |
 | Combined with breadcrumb navigation   | User can freely navigate after deep-link applies  |
 
@@ -117,4 +162,13 @@ http://localhost:49123?subworkflow=planning/design
 
 # Drill into subworkflow and select an agent within it
 http://localhost:49123?subworkflow=planning/design&agent=reviewer
+
+# for_each iteration by exact slot key
+http://localhost:49123?subworkflow=plan_child[item-0]
+
+# for_each iteration by positional index (# → %23 in URL)
+http://localhost:49123?subworkflow=plan_child%230
+
+# Nested: for_each iteration, then into a child subworkflow
+http://localhost:49123?subworkflow=plan_child%230/design&agent=writer
 ```
