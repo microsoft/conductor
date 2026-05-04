@@ -1,27 +1,12 @@
 import { useState, useRef, useEffect } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { Send, MessageCircle, FileText } from 'lucide-react';
+import { Send, MessageCircle } from 'lucide-react';
 import { useWorkflowStore } from '@/stores/workflow-store';
 import type { NodeData } from '@/stores/workflow-store';
 
 interface DialogDetailProps {
   node: NodeData;
-}
-
-/** Returns true if the href looks like a relative file path (not a URL, anchor, or scheme). */
-function isRelativeFileLink(href: string | undefined): href is string {
-  if (!href) return false;
-  if (/^[a-z][a-z0-9+.-]*:/i.test(href)) return false;
-  if (href.startsWith('//')) return false;
-  if (href.startsWith('#')) return false;
-  if (href.startsWith('/') || href.startsWith('\\')) return false;
-  // Defense in depth: reject parent-traversal segments and Windows drive letters.
-  // Server-side validation is still required by the eventual /api/open-file endpoint;
-  // this is only a client-side first cut so the surface is minimized when it lands.
-  if (/(^|[/\\])\.\.([/\\]|$)/.test(href)) return false;
-  if (/^[a-zA-Z]:[/\\]/.test(href)) return false;
-  return true;
 }
 
 function DialogMarkdown({ text }: { text: string }) {
@@ -59,39 +44,16 @@ function DialogMarkdown({ text }: { text: string }) {
           ),
           strong: ({ children }) => <strong className="font-semibold">{children}</strong>,
           em: ({ children }) => <em className="italic">{children}</em>,
-          a: ({ href, children }) => {
-            if (isRelativeFileLink(href)) {
-              const handleOpenInEditor = (e: React.MouseEvent) => {
-                e.preventDefault();
-                fetch('/api/open-file', {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ path: href }),
-                });
-              };
-              return (
-                <a
-                  href="#"
-                  onClick={handleOpenInEditor}
-                  className="inline-flex items-center gap-0.5 text-blue-400 hover:text-blue-300 underline underline-offset-2"
-                  title={`Open ${href} in default editor`}
-                >
-                  <FileText className="w-3 h-3 inline flex-shrink-0" />
-                  {children}
-                </a>
-              );
-            }
-            return (
-              <a
-                href={href}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="text-blue-400 hover:text-blue-300 underline underline-offset-2"
-              >
-                {children}
-              </a>
-            );
-          },
+          a: ({ href, children }) => (
+            <a
+              href={href}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-blue-400 hover:text-blue-300 underline underline-offset-2"
+            >
+              {children}
+            </a>
+          ),
           blockquote: ({ children }) => (
             <blockquote className="border-l-2 border-[var(--border)] pl-2.5 my-1.5 opacity-80">
               {children}
