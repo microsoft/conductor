@@ -7,7 +7,6 @@ and functions to calculate costs based on token usage.
 from __future__ import annotations
 
 import logging
-import re
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
@@ -248,10 +247,16 @@ def get_pricing(
 ) -> ModelPricing | None:
     """Get pricing for a model.
 
-    Checks user-provided overrides first, then falls back to
-    the default pricing table. Supports fuzzy matching for
-    versioned model names (e.g., "claude-sonnet-4-20250514"
-    matches "claude-sonnet-4").
+    Checks user-provided overrides first, then falls back to the default
+    pricing table. Supports a narrow form of fuzzy matching for versioned
+    model names — the requested name must equal a known key, or extend it
+    with a ``-`` delimiter (e.g. ``claude-sonnet-4-20250514`` matches
+    ``claude-sonnet-4``). Names that share a textual prefix without the
+    delimiter (e.g. ``claude-opus-4.7-high`` against ``claude-opus-4``)
+    are *not* matched and will return ``None``, so callers don't silently
+    inherit metadata from a sibling model family.
+
+    Non-exact matches log a one-time warning per requested name (see #137).
 
     Args:
         model: The model name to look up.
@@ -260,38 +265,22 @@ def get_pricing(
     Returns:
         ModelPricing if found, None otherwise.
     """
-    # Check overrides first
+    # Check overrides first (treated as user intent — never warn).
     if overrides and model in overrides:
         return overrides[model]
 
-    # Try exact match
+    # Exact match.
     if model in DEFAULT_PRICING:
         return DEFAULT_PRICING[model]
 
-    # Try fuzzy matching for versioned model names
-    # e.g., "claude-sonnet-4-20250514" -> "claude-sonnet-4"
-    # e.g., "gpt-4o-2024-08-06" -> "gpt-4o"
-    # Sort keys longest-first so "o1-mini" matches before "o1"
+    # Versioned-name match: requested name must extend a known key with a
+    # `-` delimiter. Sort keys longest-first so e.g. `o1-mini` matches before
+    # `o1`. The delimiter check prevents cross-family bleed like
+    # `claude-opus-4.7-high` matching `claude-opus-4` (#137).
     sorted_keys = sorted(DEFAULT_PRICING.keys(), key=lambda k: len(k), reverse=True)
     for known_model in sorted_keys:
-        if model.startswith(known_model):
-            _warn_fuzzy_match(model, known_model, "longest-prefix")
-            return DEFAULT_PRICING[known_model]
-
-    # Try removing date suffix patterns for common formats
-    # e.g., "claude-3-5-sonnet-20241022" -> "claude-3-5-sonnet"
-    # e.g., "claude-3-5-sonnet-latest" -> "claude-3-5-sonnet"
-
-    # Remove common suffixes like -20241022, -latest, -preview
-    simplified = re.sub(r"-(\d{8}|latest|preview)$", "", model)
-    if simplified in DEFAULT_PRICING:
-        _warn_fuzzy_match(model, simplified, "suffix-strip")
-        return DEFAULT_PRICING[simplified]
-
-    # Try matching simplified version against known models
-    for known_model in sorted_keys:
-        if simplified.startswith(known_model):
-            _warn_fuzzy_match(model, known_model, "suffix-strip+longest-prefix")
+        if model.startswith(known_model + "-"):
+            _warn_fuzzy_match(model, known_model, "versioned-suffix")
             return DEFAULT_PRICING[known_model]
 
     return None
