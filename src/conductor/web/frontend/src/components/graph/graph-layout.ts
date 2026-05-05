@@ -238,10 +238,7 @@ export function buildGraphElements(
   // back-edge to Dagre in REVERSED direction so the layout reflects the
   // true forward DAG, while we still render the edge in its original
   // direction.
-  const startNode = flowNodes.find((n) => n.id === '$start');
-  const backEdgeIds = startNode
-    ? findBackEdges(flowNodes, flowEdges, startNode.id)
-    : new Set<string>();
+  const backEdgeIds = findBackEdges(flowNodes, flowEdges, '$start');
 
   // Apply dagre layout to top-level nodes only (non-children)
   applyDagreLayout(flowNodes, flowEdges, backEdgeIds);
@@ -255,8 +252,9 @@ export function buildGraphElements(
  * stack when we visit u→v). Operates on top-level node IDs only, since edges
  * have already been remapped from group children to group parents.
  *
- * Traversal order is stable (insertion order of edges, sorted target IDs as
- * tiebreaker) so layout is deterministic across renders.
+ * Traversal order is deterministic: outgoing edges are visited in sorted
+ * target-ID order, and unreachable subgraphs are entered in sorted source-ID
+ * order, so layout is stable across renders.
  */
 function findBackEdges(
   flowNodes: Node<GraphNodeData>[],
@@ -297,8 +295,7 @@ function findBackEdges(
 
   // Also DFS from any unvisited nodes that have outgoing edges, so back-edges
   // in unreachable subgraphs are still classified deterministically.
-  const remainingSources = [...adj.keys()].filter((id) => !visited.has(id)).sort();
-  for (const id of remainingSources) {
+  for (const id of [...adj.keys()].sort()) {
     if (!visited.has(id)) dfs(id);
   }
 

@@ -1627,7 +1627,6 @@ class WorkflowEngine:
                             for a in self.config.agents
                             if a.type == "human_gate" and a.options
                             for o in a.options
-                            if o.route
                         ]
                         + [
                             {
