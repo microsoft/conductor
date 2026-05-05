@@ -108,6 +108,7 @@ try {
     # --- Install (with retry for Windows Defender file locking) ---
     $maxRetries = 3
     $installed = $false
+    $lastOutput = $null
     for ($attempt = 1; $attempt -le $maxRetries; $attempt++) {
         if ($attempt -eq 1) {
             Write-Info "Installing Conductor $tagName…"
@@ -121,6 +122,7 @@ try {
         } catch {
             # PowerShell treats native stderr as errors when ErrorActionPreference=Stop
         }
+        $lastOutput = $output
         if ($LASTEXITCODE -eq 0) {
             $installed = $true
             break
@@ -129,10 +131,19 @@ try {
 
     if (-not $installed) {
         Write-Host ""
-        Write-Info "Install failed after $maxRetries attempts. This is often caused by"
-        Write-Info "Windows Defender scanning files during install. Try:"
-        Write-Info "  1. Add a Defender exclusion: Add-MpExclusion -Path `"$env:LOCALAPPDATA\uv`""
-        Write-Info "  2. Re-run this installer"
+        Write-Host "  ── uv tool install output ──" -ForegroundColor Yellow
+        if ($lastOutput) {
+            $lastOutput | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
+        } else {
+            Write-Host "  (no output captured)" -ForegroundColor DarkGray
+        }
+        Write-Host ""
+        Write-Info "Install failed after $maxRetries attempts."
+        Write-Info "If the output above mentions a locked file or 'access is denied',"
+        Write-Info "Windows Defender may be scanning the install directory. Try adding"
+        Write-Info "an exclusion (run PowerShell as Administrator):"
+        Write-Info "  Add-MpPreference -ExclusionPath `"$env:LOCALAPPDATA\uv`""
+        Write-Info "Then re-run this installer."
         Write-Host ""
         Write-Err "uv tool install failed"
     }
