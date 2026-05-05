@@ -2555,3 +2555,611 @@ class TestClaudeGetMaxPromptTokens:
 
         with patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", False):
             assert await provider.get_max_prompt_tokens("claude-sonnet-4-5") is None
+
+
+class TestClaudeReasoningEffort:
+    """Tests for extended-thinking / reasoning effort plumbing."""
+
+    @staticmethod
+    def _build_provider(
+        mock_anthropic_module: Mock,
+        mock_anthropic_class: Mock,
+        *,
+        default_reasoning_effort: str | None = None,
+        temperature: float | None = None,
+    ) -> tuple[ClaudeProvider, Mock]:
+        mock_anthropic_module.__version__ = "0.77.0"
+        mock_client = Mock()
+        mock_client.models.list = AsyncMock(return_value=Mock(data=[]))
+
+        text_block = Mock()
+        text_block.type = "text"
+        text_block.text = "ok"
+
+        response = Mock()
+        response.content = [text_block]
+        response.usage = Mock(input_tokens=1, output_tokens=1)
+
+        mock_client.messages.create = AsyncMock(return_value=response)
+        mock_anthropic_class.return_value = mock_client
+
+        provider = ClaudeProvider(
+            temperature=temperature,
+            default_reasoning_effort=default_reasoning_effort,  # type: ignore[arg-type]
+        )
+        return provider, mock_client
+
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    @pytest.mark.asyncio
+    async def test_thinking_kwarg_forwarded_with_correct_shape(
+        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
+    ) -> None:
+        from conductor.config.schema import ReasoningConfig
+
+        provider, mock_client = self._build_provider(mock_anthropic_module, mock_anthropic_class)
+        agent = AgentDef(
+            name="t",
+            prompt="p",
+            model="claude-opus-4-20250514",
+            reasoning=ReasoningConfig(effort="medium"),
+        )
+        await provider.execute(agent=agent, context={}, rendered_prompt="p")
+
+        kwargs = mock_client.messages.create.call_args[1]
+        assert kwargs["thinking"] == {"type": "enabled", "budget_tokens": 8192}
+
+    @pytest.mark.parametrize(
+        "effort,expected",
+        [("low", 2048), ("medium", 8192), ("high", 16384), ("xhigh", 32768)],
+    )
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    @pytest.mark.asyncio
+    async def test_effort_to_budget_mapping(
+        self,
+        mock_anthropic_module: Mock,
+        mock_anthropic_class: Mock,
+        effort: str,
+        expected: int,
+    ) -> None:
+        from conductor.config.schema import ReasoningConfig
+
+        provider, mock_client = self._build_provider(mock_anthropic_module, mock_anthropic_class)
+        agent = AgentDef(
+            name="t",
+            prompt="p",
+            model="claude-sonnet-4-20250514",
+            reasoning=ReasoningConfig(effort=effort),  # type: ignore[arg-type]
+        )
+        await provider.execute(agent=agent, context={}, rendered_prompt="p")
+
+        kwargs = mock_client.messages.create.call_args[1]
+        assert kwargs["thinking"]["budget_tokens"] == expected
+        assert kwargs["thinking"]["type"] == "enabled"
+
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    @pytest.mark.asyncio
+    async def test_temperature_coerced_to_one_when_thinking_enabled(
+        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
+    ) -> None:
+        from conductor.config.schema import ReasoningConfig
+
+        provider, mock_client = self._build_provider(
+            mock_anthropic_module, mock_anthropic_class, temperature=0.3
+        )
+        agent = AgentDef(
+            name="t",
+            prompt="p",
+            model="claude-opus-4-20250514",
+            reasoning=ReasoningConfig(effort="low"),
+        )
+        await provider.execute(agent=agent, context={}, rendered_prompt="p")
+
+        kwargs = mock_client.messages.create.call_args[1]
+        assert kwargs["temperature"] == 1.0
+        # User-configured temperature is preserved on the provider itself.
+        assert provider._default_temperature == 0.3
+
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    @pytest.mark.asyncio
+    async def test_max_tokens_bumped_above_budget(
+        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
+    ) -> None:
+        from conductor.config.schema import ReasoningConfig
+
+        provider, mock_client = self._build_provider(mock_anthropic_module, mock_anthropic_class)
+        # Default max_tokens=8192. xhigh budget=32768. Effective must be
+        # >= 32768 + 4096 = 36864.
+        agent = AgentDef(
+            name="t",
+            prompt="p",
+            model="claude-opus-4-20250514",
+            reasoning=ReasoningConfig(effort="xhigh"),
+        )
+        await provider.execute(agent=agent, context={}, rendered_prompt="p")
+
+        kwargs = mock_client.messages.create.call_args[1]
+        assert kwargs["max_tokens"] >= 32768 + 4096
+        assert kwargs["max_tokens"] > kwargs["thinking"]["budget_tokens"]
+
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    @pytest.mark.asyncio
+    async def test_validation_error_on_non_thinking_model(
+        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
+    ) -> None:
+        from conductor.config.schema import ReasoningConfig
+
+        provider, _ = self._build_provider(mock_anthropic_module, mock_anthropic_class)
+        agent = AgentDef(
+            name="t",
+            prompt="p",
+            model="claude-3-5-sonnet-latest",
+            reasoning=ReasoningConfig(effort="medium"),
+        )
+        with pytest.raises(ValidationError, match="extended thinking"):
+            await provider.execute(agent=agent, context={}, rendered_prompt="p")
+
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    @pytest.mark.asyncio
+    async def test_no_validation_error_on_thinking_model(
+        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
+    ) -> None:
+        from conductor.config.schema import ReasoningConfig
+
+        provider, mock_client = self._build_provider(mock_anthropic_module, mock_anthropic_class)
+        agent = AgentDef(
+            name="t",
+            prompt="p",
+            model="claude-opus-4-20250514",
+            reasoning=ReasoningConfig(effort="high"),
+        )
+        # Should not raise.
+        await provider.execute(agent=agent, context={}, rendered_prompt="p")
+        assert "thinking" in mock_client.messages.create.call_args[1]
+
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    @pytest.mark.asyncio
+    async def test_runtime_default_used_when_agent_unset(
+        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
+    ) -> None:
+        provider, mock_client = self._build_provider(
+            mock_anthropic_module,
+            mock_anthropic_class,
+            default_reasoning_effort="low",
+        )
+        agent = AgentDef(
+            name="t",
+            prompt="p",
+            model="claude-sonnet-4-20250514",
+            # No per-agent reasoning configured.
+        )
+        await provider.execute(agent=agent, context={}, rendered_prompt="p")
+
+        kwargs = mock_client.messages.create.call_args[1]
+        assert kwargs["thinking"]["budget_tokens"] == 2048
+
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    @pytest.mark.asyncio
+    async def test_per_agent_reasoning_overrides_runtime_default(
+        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
+    ) -> None:
+        from conductor.config.schema import ReasoningConfig
+
+        provider, mock_client = self._build_provider(
+            mock_anthropic_module,
+            mock_anthropic_class,
+            default_reasoning_effort="low",
+        )
+        agent = AgentDef(
+            name="t",
+            prompt="p",
+            model="claude-sonnet-4-20250514",
+            reasoning=ReasoningConfig(effort="high"),
+        )
+        await provider.execute(agent=agent, context={}, rendered_prompt="p")
+
+        kwargs = mock_client.messages.create.call_args[1]
+        assert kwargs["thinking"]["budget_tokens"] == 16384
+
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    @pytest.mark.asyncio
+    async def test_thinking_blocks_emit_agent_reasoning_event(
+        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
+    ) -> None:
+        from conductor.config.schema import ReasoningConfig
+
+        mock_anthropic_module.__version__ = "0.77.0"
+        mock_client = Mock()
+        mock_client.models.list = AsyncMock(return_value=Mock(data=[]))
+
+        thinking_block = Mock(spec=["type", "thinking"])
+        thinking_block.type = "thinking"
+        thinking_block.thinking = "Let me reason step by step..."
+
+        text_block = Mock(spec=["type", "text"])
+        text_block.type = "text"
+        text_block.text = "Final answer"
+
+        response = Mock()
+        response.content = [thinking_block, text_block]
+        response.usage = Mock(input_tokens=10, output_tokens=20)
+
+        mock_client.messages.create = AsyncMock(return_value=response)
+        mock_anthropic_class.return_value = mock_client
+
+        provider = ClaudeProvider()
+        agent = AgentDef(
+            name="t",
+            prompt="p",
+            model="claude-opus-4-20250514",
+            reasoning=ReasoningConfig(effort="medium"),
+        )
+
+        events: list[tuple[str, dict]] = []
+
+        def cb(event_type: str, data: dict) -> None:
+            events.append((event_type, data))
+
+        await provider.execute(agent=agent, context={}, rendered_prompt="p", event_callback=cb)
+
+        reasoning_events = [e for e in events if e[0] == "agent_reasoning"]
+        assert len(reasoning_events) == 1
+        assert reasoning_events[0][1]["content"] == "Let me reason step by step..."
+
+        message_events = [e for e in events if e[0] == "agent_message"]
+        assert len(message_events) == 1
+        assert message_events[0][1]["content"] == "Final answer"
+
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    @pytest.mark.asyncio
+    async def test_no_thinking_kwarg_when_reasoning_unset(
+        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
+    ) -> None:
+        provider, mock_client = self._build_provider(mock_anthropic_module, mock_anthropic_class)
+        agent = AgentDef(
+            name="t",
+            prompt="p",
+            model="claude-opus-4-20250514",
+            # No reasoning config and no runtime default.
+        )
+        await provider.execute(agent=agent, context={}, rendered_prompt="p")
+
+        kwargs = mock_client.messages.create.call_args[1]
+        assert "thinking" not in kwargs
+
+
+class TestClaudeReasoningEffortRegressions:
+    """Regression tests for fixes applied on feat/reasoning-effort.
+
+    Covers:
+    - Fix #1: thinking / redacted_thinking blocks must be echoed back in the
+      assistant message replay across agentic-loop iterations, otherwise the
+      Anthropic API rejects iteration 2+ with a 400 when reasoning + tool_use
+      are combined.
+    - Fix #3: ``execute_dialog_turn`` raises ``ValidationError`` (not
+      ``ProviderError``) for non-thinking models when
+      ``default_reasoning_effort`` is configured.
+    - Fix #5 / coverage: ``thinking`` kwarg is forwarded through the
+      parse-recovery path (not just the bare agentic-loop path).
+    """
+
+    @staticmethod
+    def _build_provider_with_responses(
+        mock_anthropic_module: Mock,
+        mock_anthropic_class: Mock,
+        responses: list[Mock],
+    ) -> tuple[ClaudeProvider, Mock]:
+        """Build a ClaudeProvider whose messages.create returns ``responses`` in order."""
+        mock_anthropic_module.__version__ = "0.77.0"
+        mock_client = Mock()
+        mock_client.models.list = AsyncMock(return_value=Mock(data=[]))
+        mock_client.messages.create = AsyncMock(side_effect=responses)
+        mock_anthropic_class.return_value = mock_client
+
+        provider = ClaudeProvider()
+        return provider, mock_client
+
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    @pytest.mark.asyncio
+    async def test_thinking_block_preserved_in_agentic_loop_replay(
+        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
+    ) -> None:
+        """Regression for Fix #1 (CRITICAL).
+
+        When a Claude response combines a ``thinking`` block with a ``tool_use``
+        block, the next iteration of the agentic loop must replay BOTH blocks
+        in the assistant message, in original order, with the thinking block
+        serialized as ``{"type": "thinking", "thinking": ..., "signature": ...}``.
+        Dropping the thinking block (or its signature) causes the Anthropic API
+        to reject the next request with a 400.
+
+        Also asserts ``thinking`` kwarg is forwarded on EVERY API call within
+        the loop — not only the first.
+        """
+        from conductor.config.schema import ReasoningConfig
+
+        # Iteration 1: thinking + tool_use → triggers MCP tool execution.
+        thinking_block = Mock(spec=["type", "thinking", "signature"])
+        thinking_block.type = "thinking"
+        thinking_block.thinking = "Let me consider what tool to call..."
+        thinking_block.signature = "sig-abc123"
+
+        tool_use_block = Mock(spec=["type", "id", "name", "input"])
+        tool_use_block.type = "tool_use"
+        tool_use_block.id = "toolu_01"
+        tool_use_block.name = "search"
+        tool_use_block.input = {"query": "weather"}
+
+        response_iter1 = Mock()
+        response_iter1.content = [thinking_block, tool_use_block]
+        response_iter1.usage = Mock(input_tokens=10, output_tokens=20)
+
+        # Iteration 2: text only → loop terminates.
+        text_block = Mock(spec=["type", "text"])
+        text_block.type = "text"
+        text_block.text = "It is sunny."
+
+        response_iter2 = Mock()
+        response_iter2.content = [text_block]
+        response_iter2.usage = Mock(input_tokens=15, output_tokens=5)
+
+        provider, mock_client = self._build_provider_with_responses(
+            mock_anthropic_module, mock_anthropic_class, [response_iter1, response_iter2]
+        )
+
+        # Stub MCP manager so the tool_use is actually executed and the loop
+        # advances to iteration 2 (without an MCP manager the loop bails out).
+        mock_mcp = Mock()
+        mock_mcp.has_servers = Mock(return_value=False)  # don't add tools to the request
+        mock_mcp.call_tool = AsyncMock(return_value="sunny")
+        provider._mcp_manager = mock_mcp
+
+        agent = AgentDef(
+            name="t",
+            prompt="p",
+            model="claude-opus-4-20250514",
+            reasoning=ReasoningConfig(effort="medium"),
+        )
+        await provider.execute(agent=agent, context={}, rendered_prompt="p")
+
+        # Both API calls must have happened.
+        assert mock_client.messages.create.await_count == 2
+
+        # Thinking kwarg present on BOTH calls (not just the first).
+        first_kwargs = mock_client.messages.create.call_args_list[0].kwargs
+        second_kwargs = mock_client.messages.create.call_args_list[1].kwargs
+        expected_thinking = {"type": "enabled", "budget_tokens": 8192}
+        assert first_kwargs["thinking"] == expected_thinking
+        assert second_kwargs["thinking"] == expected_thinking
+
+        # The second call's messages must echo the assistant turn with both
+        # blocks serialized in original order.
+        replayed_messages = second_kwargs["messages"]
+        assistant_turns = [m for m in replayed_messages if m["role"] == "assistant"]
+        assert len(assistant_turns) == 1, "Exactly one assistant replay expected"
+        assistant_content = assistant_turns[0]["content"]
+
+        assert assistant_content == [
+            {
+                "type": "thinking",
+                "thinking": "Let me consider what tool to call...",
+                "signature": "sig-abc123",
+            },
+            {
+                "type": "tool_use",
+                "id": "toolu_01",
+                "name": "search",
+                "input": {"query": "weather"},
+            },
+        ]
+
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    @pytest.mark.asyncio
+    async def test_redacted_thinking_block_preserved_in_agentic_loop_replay(
+        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
+    ) -> None:
+        """Regression for Fix #1: ``redacted_thinking`` blocks (no signature, has ``data``)
+        must also be echoed in the assistant replay as
+        ``{"type": "redacted_thinking", "data": ...}``.
+        """
+        from conductor.config.schema import ReasoningConfig
+
+        redacted_block = Mock(spec=["type", "data"])
+        redacted_block.type = "redacted_thinking"
+        redacted_block.data = "REDACTED_PAYLOAD"
+
+        tool_use_block = Mock(spec=["type", "id", "name", "input"])
+        tool_use_block.type = "tool_use"
+        tool_use_block.id = "toolu_02"
+        tool_use_block.name = "search"
+        tool_use_block.input = {"q": "x"}
+
+        response_iter1 = Mock()
+        response_iter1.content = [redacted_block, tool_use_block]
+        response_iter1.usage = Mock(input_tokens=5, output_tokens=5)
+
+        text_block = Mock(spec=["type", "text"])
+        text_block.type = "text"
+        text_block.text = "done"
+        response_iter2 = Mock()
+        response_iter2.content = [text_block]
+        response_iter2.usage = Mock(input_tokens=1, output_tokens=1)
+
+        provider, mock_client = self._build_provider_with_responses(
+            mock_anthropic_module, mock_anthropic_class, [response_iter1, response_iter2]
+        )
+
+        mock_mcp = Mock()
+        mock_mcp.has_servers = Mock(return_value=False)
+        mock_mcp.call_tool = AsyncMock(return_value="ok")
+        provider._mcp_manager = mock_mcp
+
+        agent = AgentDef(
+            name="t",
+            prompt="p",
+            model="claude-opus-4-20250514",
+            reasoning=ReasoningConfig(effort="low"),
+        )
+        await provider.execute(agent=agent, context={}, rendered_prompt="p")
+
+        assert mock_client.messages.create.await_count == 2
+        replayed_messages = mock_client.messages.create.call_args_list[1].kwargs["messages"]
+        assistant_turns = [m for m in replayed_messages if m["role"] == "assistant"]
+        assert assistant_turns[0]["content"] == [
+            {"type": "redacted_thinking", "data": "REDACTED_PAYLOAD"},
+            {
+                "type": "tool_use",
+                "id": "toolu_02",
+                "name": "search",
+                "input": {"q": "x"},
+            },
+        ]
+
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    @pytest.mark.asyncio
+    async def test_dialog_turn_raises_validation_error_for_non_thinking_model(
+        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
+    ) -> None:
+        """Regression for Fix #3.
+
+        ``execute_dialog_turn`` must raise ``ValidationError`` (not silently
+        drop the reasoning request, and not wrap it as ``ProviderError``)
+        when ``default_reasoning_effort`` is set but the resolved model does
+        not support extended thinking. Mirrors ``_resolve_thinking_for_agent``.
+        """
+        mock_anthropic_module.__version__ = "0.77.0"
+        mock_client = Mock()
+        mock_client.models.list = AsyncMock(return_value=Mock(data=[]))
+        # messages.create should NOT be called — the validation must trip
+        # first. Setting it as AsyncMock guards against silent fallthrough.
+        mock_client.messages.create = AsyncMock(return_value=Mock(content=[]))
+        mock_anthropic_class.return_value = mock_client
+
+        provider = ClaudeProvider(default_reasoning_effort="high")  # type: ignore[arg-type]
+
+        with pytest.raises(ValidationError, match="extended thinking"):
+            await provider.execute_dialog_turn(
+                system_prompt="sys",
+                user_message="hi",
+                model="claude-3-5-sonnet-latest",
+            )
+
+        # And ensure no API call was made (no silent dropping of reasoning).
+        mock_client.messages.create.assert_not_awaited()
+
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    @pytest.mark.asyncio
+    async def test_dialog_turn_succeeds_for_thinking_model_with_default_effort(
+        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
+    ) -> None:
+        """Companion to Fix #3: the same ``default_reasoning_effort`` setting
+        must work on a thinking-capable model and forward the ``thinking``
+        kwarg with the correct budget.
+        """
+        mock_anthropic_module.__version__ = "0.77.0"
+        mock_client = Mock()
+        mock_client.models.list = AsyncMock(return_value=Mock(data=[]))
+
+        text_block = Mock(spec=["type", "text"])
+        text_block.type = "text"
+        text_block.text = "hello"
+        response = Mock()
+        response.content = [text_block]
+        mock_client.messages.create = AsyncMock(return_value=response)
+        mock_anthropic_class.return_value = mock_client
+
+        provider = ClaudeProvider(default_reasoning_effort="medium")  # type: ignore[arg-type]
+
+        result = await provider.execute_dialog_turn(
+            system_prompt="sys",
+            user_message="hi",
+            model="claude-opus-4-20250514",
+        )
+
+        assert result == "hello"
+        kwargs = mock_client.messages.create.call_args.kwargs
+        assert kwargs["thinking"] == {"type": "enabled", "budget_tokens": 8192}
+        # max_tokens must accommodate the thinking budget.
+        assert kwargs["max_tokens"] >= 8192 + 4096
+
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    @pytest.mark.asyncio
+    async def test_thinking_kwarg_forwarded_through_parse_recovery_path(
+        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
+    ) -> None:
+        """Regression for Fix #5 / coverage gap.
+
+        Agents with an ``output:`` schema route through
+        ``_execute_with_parse_recovery`` rather than the bare ``_execute_api_call``
+        path. Verify that ``thinking`` is forwarded on that path so reasoning
+        is not silently dropped for structured-output agents.
+        """
+        from conductor.config.schema import ReasoningConfig
+
+        # emit_output tool_use → parse-recovery happy path (no recovery needed,
+        # but still goes through _execute_with_parse_recovery).
+        emit_block = Mock(spec=["type", "name", "input", "id"])
+        emit_block.type = "tool_use"
+        emit_block.name = "emit_output"
+        emit_block.id = "toolu_emit"
+        emit_block.input = {"answer": "42"}
+
+        response = Mock()
+        response.content = [emit_block]
+        response.usage = Mock(input_tokens=5, output_tokens=5)
+
+        provider, mock_client = self._build_provider_with_responses(
+            mock_anthropic_module, mock_anthropic_class, [response]
+        )
+
+        agent = AgentDef(
+            name="t",
+            prompt="p",
+            model="claude-opus-4-20250514",
+            reasoning=ReasoningConfig(effort="high"),
+            output={"answer": OutputField(type="string")},
+        )
+        result = await provider.execute(agent=agent, context={}, rendered_prompt="p")
+
+        assert result.content == {"answer": "42"}
+        kwargs = mock_client.messages.create.call_args.kwargs
+        assert kwargs["thinking"] == {"type": "enabled", "budget_tokens": 16384}
+        # temperature must be coerced to 1.0 when thinking is enabled.
+        assert kwargs["temperature"] == 1.0
+
+    # TODO: cover _execute_api_call interrupt-race branch (interrupt_signal set
+    # mid-call) — requires racing asyncio.Event with the mocked API call and is
+    # exercised indirectly today via the agentic-loop tests above.
+    # TODO: cover _request_partial_output path with thinking forwarded — this
+    # is a fourth messages.create site reachable only via mid-agent interrupt
+    # and partial-output flow; mocking complexity is prohibitive for a unit
+    # test (would need a full asyncio interrupt fixture).

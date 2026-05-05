@@ -937,3 +937,305 @@ class TestGetMaxPromptTokens:
         provider = self._provider_with_list_models(list_models)
         assert await provider.get_max_prompt_tokens("claude-3-5-sonnet-latest") == 200_000
         assert await provider.get_max_prompt_tokens("claude-3-5-sonnet-20241022") == 200_000
+
+
+class TestReasoningEffort:
+    """Tests for reasoning_effort plumbing into create_session."""
+
+    @staticmethod
+    def _make_model(model_id: str, supported: list[str] | None) -> Any:
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            id=model_id,
+            capabilities=SimpleNamespace(
+                limits=SimpleNamespace(max_prompt_tokens=128_000),
+                supported_reasoning_efforts=supported,
+            ),
+        )
+
+    @staticmethod
+    async def _build_provider(
+        captured: dict[str, Any],
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        default_reasoning_effort: str | None = None,
+        list_models_impl: Any = None,
+    ) -> CopilotProvider:
+        """Build a provider with a fake client that captures create_session kwargs.
+
+        The provider is in real-SDK mode (``_mock_handler`` set to ``None``)
+        so the validation + plumbing path is exercised end to end.
+        """
+
+        class _FakeSession:
+            session_id = "session-xyz"
+
+            async def disconnect(self) -> None:
+                return None
+
+        class _FakeClient:
+            async def create_session(self, **kwargs: Any) -> _FakeSession:
+                captured["create_session_kwargs"] = kwargs
+                return _FakeSession()
+
+            async def list_models(self) -> list[Any]:
+                if list_models_impl is None:
+                    return []
+                return await list_models_impl()
+
+        provider = CopilotProvider(
+            mock_handler=stub_handler,
+            default_reasoning_effort=default_reasoning_effort,
+        )
+        provider._mock_handler = None
+        provider._client = _FakeClient()
+        provider._started = True
+
+        async def _noop() -> None:
+            return None
+
+        async def _fake_send_and_wait(*args: Any, **kwargs: Any) -> SDKResponse:
+            return SDKResponse(content='{"ok":true}')
+
+        monkeypatch.setattr(provider, "_ensure_client_started", _noop)
+        monkeypatch.setattr(provider, "_send_and_wait", _fake_send_and_wait)
+        return provider
+
+    @pytest.mark.asyncio
+    async def test_per_agent_effort_forwarded_to_create_session(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from conductor.config.schema import ReasoningConfig
+
+        captured: dict[str, Any] = {}
+        provider = await self._build_provider(captured, monkeypatch)
+        agent = AgentDef(
+            name="planner",
+            model="gpt-4o",
+            prompt="Plan",
+            reasoning=ReasoningConfig(effort="high"),
+        )
+        await provider.execute(agent=agent, context={}, rendered_prompt="Plan")
+        assert captured["create_session_kwargs"]["reasoning_effort"] == "high"
+
+    @pytest.mark.asyncio
+    async def test_runtime_default_used_when_agent_has_none(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        captured: dict[str, Any] = {}
+        provider = await self._build_provider(
+            captured, monkeypatch, default_reasoning_effort="medium"
+        )
+        agent = AgentDef(name="planner", model="gpt-4o", prompt="Plan")
+        await provider.execute(agent=agent, context={}, rendered_prompt="Plan")
+        assert captured["create_session_kwargs"]["reasoning_effort"] == "medium"
+
+    @pytest.mark.asyncio
+    async def test_per_agent_effort_overrides_runtime_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from conductor.config.schema import ReasoningConfig
+
+        captured: dict[str, Any] = {}
+        provider = await self._build_provider(captured, monkeypatch, default_reasoning_effort="low")
+        agent = AgentDef(
+            name="planner",
+            model="gpt-4o",
+            prompt="Plan",
+            reasoning=ReasoningConfig(effort="xhigh"),
+        )
+        await provider.execute(agent=agent, context={}, rendered_prompt="Plan")
+        assert captured["create_session_kwargs"]["reasoning_effort"] == "xhigh"
+
+    @pytest.mark.asyncio
+    async def test_no_effort_set_means_key_absent(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured: dict[str, Any] = {}
+        provider = await self._build_provider(captured, monkeypatch)
+        agent = AgentDef(name="planner", model="gpt-4o", prompt="Plan")
+        await provider.execute(agent=agent, context={}, rendered_prompt="Plan")
+        assert "reasoning_effort" not in captured["create_session_kwargs"]
+
+    @pytest.mark.asyncio
+    async def test_validation_error_when_model_does_not_support_effort(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from conductor.config.schema import ReasoningConfig
+        from conductor.exceptions import ValidationError
+
+        async def list_models() -> list[Any]:
+            return [self._make_model("gpt-4o", supported=["low", "medium"])]
+
+        captured: dict[str, Any] = {}
+        provider = await self._build_provider(captured, monkeypatch, list_models_impl=list_models)
+        agent = AgentDef(
+            name="planner",
+            model="gpt-4o",
+            prompt="Plan",
+            reasoning=ReasoningConfig(effort="xhigh"),
+        )
+        with pytest.raises(ValidationError, match="does not support reasoning_effort"):
+            await provider.execute(agent=agent, context={}, rendered_prompt="Plan")
+
+    @pytest.mark.asyncio
+    async def test_validation_skipped_in_mock_handler_mode(self) -> None:
+        """Mock-handler mode must skip capability validation entirely."""
+        provider = CopilotProvider(mock_handler=stub_handler)
+        # Even an obviously bogus effort value is accepted because the SDK
+        # path is short-circuited by the mock handler.
+        await provider._validate_reasoning_effort_for_model("gpt-4o", "xhigh")
+
+    @pytest.mark.asyncio
+    async def test_supported_efforts_none_allows_any_effort(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When the SDK reports no capability metadata, validation is permissive."""
+        from conductor.config.schema import ReasoningConfig
+
+        async def list_models() -> list[Any]:
+            return [self._make_model("gpt-4o", supported=None)]
+
+        captured: dict[str, Any] = {}
+        provider = await self._build_provider(captured, monkeypatch, list_models_impl=list_models)
+        agent = AgentDef(
+            name="planner",
+            model="gpt-4o",
+            prompt="Plan",
+            reasoning=ReasoningConfig(effort="xhigh"),
+        )
+        await provider.execute(agent=agent, context={}, rendered_prompt="Plan")
+        assert captured["create_session_kwargs"]["reasoning_effort"] == "xhigh"
+
+    @pytest.mark.asyncio
+    async def test_validation_error_not_retried_in_execute_with_retry(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression: ValidationError from capability check must escape unwrapped
+        from _execute_with_retry after a single attempt — no retry, no sleep,
+        and not re-wrapped as ProviderError.
+        """
+        from conductor.config.schema import ReasoningConfig
+        from conductor.exceptions import ValidationError
+
+        list_models_calls = 0
+
+        async def list_models() -> list[Any]:
+            nonlocal list_models_calls
+            list_models_calls += 1
+            return [self._make_model("gpt-4o", supported=["low", "medium"])]
+
+        sleep_calls: list[float] = []
+
+        async def fake_sleep(delay: float) -> None:
+            sleep_calls.append(delay)
+
+        monkeypatch.setattr("conductor.providers.copilot.asyncio.sleep", fake_sleep)
+
+        captured: dict[str, Any] = {}
+        provider = await self._build_provider(captured, monkeypatch, list_models_impl=list_models)
+        # Force a multi-attempt retry config so a successful retry-suppression
+        # is unambiguous (a ProviderError-wrapped path would loop 3 times).
+        provider._retry_config = RetryConfig(max_attempts=3, base_delay=0.0, max_delay=0.0)
+
+        agent = AgentDef(
+            name="planner",
+            model="gpt-4o",
+            prompt="Plan",
+            reasoning=ReasoningConfig(effort="high"),
+        )
+
+        with pytest.raises(ValidationError, match="does not support reasoning_effort"):
+            await provider.execute(agent=agent, context={}, rendered_prompt="Plan")
+
+        # Capability check ran exactly once — no retry of the SDK call.
+        assert list_models_calls == 1
+        # _retry_history is only appended on the ProviderError/Exception
+        # branches; the ValidationError branch must skip it entirely.
+        assert provider.get_retry_history() == []
+        # No backoff sleep was scheduled.
+        assert sleep_calls == []
+
+    @pytest.mark.asyncio
+    async def test_validation_error_from_dialog_turn_escapes_unwrapped(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression: ValidationError from execute_dialog_turn must propagate
+        unwrapped (not re-wrapped as ProviderError by the broad except clause).
+        """
+        from unittest.mock import AsyncMock as _AsyncMock
+
+        from conductor.exceptions import ValidationError
+
+        provider = CopilotProvider(
+            mock_handler=stub_handler,
+            default_reasoning_effort="xhigh",
+        )
+        provider._mock_handler = None
+        provider._started = True
+
+        async def list_models() -> list[Any]:
+            return [self._make_model("gpt-4o", supported=["low", "medium"])]
+
+        # create_session must NOT be reached when validation fails.
+        create_session_called = False
+
+        async def create_session(**kwargs: Any) -> Any:
+            nonlocal create_session_called
+            create_session_called = True
+            raise AssertionError("create_session should not be called when validation fails")
+
+        client = _AsyncMock()
+        client.create_session = create_session
+        client.list_models = list_models
+        provider._client = client
+
+        async def _noop() -> None:
+            return None
+
+        monkeypatch.setattr(provider, "_ensure_client_started", _noop)
+
+        with pytest.raises(ValidationError) as exc_info:
+            await provider.execute_dialog_turn(
+                system_prompt="be helpful",
+                user_message="hi",
+                history=[],
+                model="gpt-4o",
+            )
+
+        # Original typed error preserved (not stringified into ProviderError).
+        assert "does not support reasoning_effort" in str(exc_info.value)
+        assert exc_info.value.suggestion is not None
+        assert not create_session_called
+
+    @pytest.mark.asyncio
+    async def test_retryable_provider_error_is_still_retried(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Guard against an over-broad fix: non-validation ProviderError must
+        still trigger the retry loop up to max_attempts.
+        """
+        call_count = 0
+
+        def mock_handler(agent: AgentDef, prompt: str, context: dict[str, Any]) -> dict[str, Any]:
+            nonlocal call_count
+            call_count += 1
+            raise ProviderError("transient backend error", status_code=500)
+
+        sleep_calls: list[float] = []
+
+        async def fake_sleep(delay: float) -> None:
+            sleep_calls.append(delay)
+
+        monkeypatch.setattr("conductor.providers.copilot.asyncio.sleep", fake_sleep)
+
+        retry_config = RetryConfig(max_attempts=3, base_delay=0.0, max_delay=0.0, jitter=0.0)
+        provider = CopilotProvider(mock_handler=mock_handler, retry_config=retry_config)
+        agent = AgentDef(name="planner", model="gpt-4o", prompt="Plan")
+
+        with pytest.raises(ProviderError):
+            await provider.execute(agent=agent, context={}, rendered_prompt="Plan")
+
+        assert call_count == 3
+        assert len(provider.get_retry_history()) == 3
+        # Two backoff sleeps between three attempts.
+        assert len(sleep_calls) == 2

@@ -72,6 +72,23 @@ conductor run examples/design-review.yaml --input requirement="Build a REST API"
 conductor run examples/design-review.yaml --input requirement="Build a REST API" --skip-gates
 ```
 
+## Reasoning Effort
+
+### reasoning-effort.yaml
+
+A two-stage workflow that demonstrates configuring model reasoning / extended-thinking effort. Demonstrates:
+- Workflow-wide default via `runtime.default_reasoning_effort`
+- Per-agent override via `reasoning.effort` (wins over the default)
+- Conditional routing on a structured boolean output
+- The unified field translates to each provider's native API: `reasoning_effort` on the Copilot session, or extended `thinking` budget on Claude
+
+```bash
+conductor run examples/reasoning-effort.yaml \
+  --input topic="how the Raft consensus algorithm handles leader election"
+```
+
+See [Reasoning Effort](../docs/configuration.md#reasoning-effort) for the per-provider translation, supported models, and validation rules.
+
 ## Multi-Agent Workflows
 
 ### research-assistant.yaml

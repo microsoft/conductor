@@ -19,6 +19,7 @@ workflow:
     timeout: 600                 # Per-request timeout in seconds (optional)
     max_agent_iterations: 50     # Max tool-use roundtrips per agent (1-500, optional)
     max_session_seconds: 120     # Wall-clock timeout per agent session (optional)
+    default_reasoning_effort: medium  # Workflow-wide reasoning effort: low, medium, high, xhigh (optional)
 
   input:                         # Define workflow inputs
     param_name:
@@ -76,9 +77,40 @@ agents:
     max_agent_iterations: 100    # Override workflow default for this agent (optional)
     max_session_seconds: 60      # Wall-clock timeout for this agent (optional)
 
+    reasoning:                   # Override runtime.default_reasoning_effort (optional)
+      effort: high               # low, medium, high, or xhigh
+
     routes:                      # Where to go next
       - to: next_agent
 ```
+
+### Reasoning Effort
+
+`reasoning.effort` (per-agent) and `runtime.default_reasoning_effort` (workflow-wide) accept `low`, `medium`, `high`, or `xhigh`. Per-agent overrides the runtime default. The provider translates the unified value to its native API:
+
+- **Copilot**: forwarded as `reasoning_effort` on the session. Validated against the model's advertised `supported_reasoning_efforts`; raises `ValidationError` for unsupported combinations (skipped in mock-handler mode or when capability metadata is absent).
+- **Claude**: enables extended thinking via `thinking={"type": "enabled", "budget_tokens": N}` with mapping `low=2048`, `medium=8192`, `high=16384`, `xhigh=32768`. Auto-coerces `temperature` to `1.0` (logged at INFO) and bumps `max_tokens` to fit `budget + 4096` (capped at 64000, logged at INFO when clamped). Only valid on thinking-capable models (`claude-3-7-*`, `claude-opus-4*`, `claude-sonnet-4*`, `claude-haiku-4*`); raises `ValidationError` otherwise.
+
+Both providers surface reasoning content via `agent_reasoning` events visible in the dashboard, JSONL logs, and the console at `-vv`. Not allowed on `script`, `human_gate`, or `workflow` agent types.
+
+```yaml
+runtime:
+  provider: claude
+  default_model: claude-opus-4-20250514
+  default_reasoning_effort: medium    # workflow-wide default
+
+agents:
+  - name: explainer
+    prompt: "Explain this algorithm."
+    # inherits 'medium'
+
+  - name: architect
+    reasoning:
+      effort: high                    # override
+    prompt: "Design the system architecture."
+```
+
+See `examples/reasoning-effort.yaml` for a complete example.
 
 ## Routing Patterns
 

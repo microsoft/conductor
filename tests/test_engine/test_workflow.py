@@ -2330,3 +2330,179 @@ class TestExtractKeyFromItem:
         key = workflow_engine._extract_key_from_item(item, "missing", fallback_index=42)
         assert key == "42"
         assert isinstance(key, str)
+
+
+class _RecordingReasoningProvider:
+    """Minimal AgentProvider that records the resolved reasoning effort per agent.
+
+    Mirrors what real providers (Copilot/Claude) do: it stores
+    ``default_reasoning_effort`` on init and calls
+    :func:`conductor.providers.reasoning.resolve_reasoning_effort` on each
+    ``execute()`` so we can verify the full plumbing path end-to-end.
+    """
+
+    def __init__(self, default_reasoning_effort=None):
+        from conductor.providers.base import AgentProvider
+
+        assert isinstance(self, object)
+        self._default_reasoning_effort = default_reasoning_effort
+        self.resolved_efforts: dict[str, str | None] = {}
+        # Sanity: ensure the protocol the engine expects is satisfied via duck typing.
+        _ = AgentProvider
+
+    async def execute(
+        self,
+        agent,
+        context,
+        rendered_prompt,
+        tools=None,
+        interrupt_signal=None,
+        event_callback=None,
+    ):
+        from conductor.providers.base import AgentOutput
+        from conductor.providers.reasoning import resolve_reasoning_effort
+
+        effort = resolve_reasoning_effort(agent, self._default_reasoning_effort)
+        self.resolved_efforts[agent.name] = effort
+
+        content: dict[str, object] = {}
+        if agent.output:
+            for field_name in agent.output:
+                content[field_name] = f"{agent.name}:{effort}"
+        return AgentOutput(content=content, raw_response=None, model=agent.model)
+
+    async def validate_connection(self) -> bool:
+        return True
+
+    async def close(self) -> None:
+        return None
+
+    async def get_max_prompt_tokens(self, model: str):
+        return None
+
+
+class TestReasoningEffortPlumbing:
+    """End-to-end plumbing for ``runtime.default_reasoning_effort`` and
+    per-agent ``reasoning.effort`` overrides.
+    """
+
+    @pytest.mark.asyncio
+    async def test_runtime_default_and_per_agent_override_reach_provider(self) -> None:
+        """Agents inherit the runtime default; per-agent ``reasoning`` overrides it."""
+        from conductor.config.schema import ReasoningConfig
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="reasoning-effort-plumbing",
+                entry_point="inheritor",
+                runtime=RuntimeConfig(provider="copilot", default_reasoning_effort="medium"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="inheritor",
+                    model="gpt-4",
+                    prompt="Inherit the runtime default",
+                    output={"answer": OutputField(type="string")},
+                    routes=[RouteDef(to="overrider")],
+                ),
+                AgentDef(
+                    name="overrider",
+                    model="gpt-4",
+                    prompt="Override with high",
+                    reasoning=ReasoningConfig(effort="high"),
+                    output={"answer": OutputField(type="string")},
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={
+                "inheritor": "{{ inheritor.output.answer }}",
+                "overrider": "{{ overrider.output.answer }}",
+            },
+        )
+
+        provider = _RecordingReasoningProvider(default_reasoning_effort="medium")
+        engine = WorkflowEngine(config, provider)
+
+        result = await engine.run({})
+
+        assert provider.resolved_efforts == {
+            "inheritor": "medium",
+            "overrider": "high",
+        }
+        # The recording provider encodes the effort into the output, confirming
+        # the engine actually consumed the value the provider produced.
+        assert result["inheritor"] == "inheritor:medium"
+        assert result["overrider"] == "overrider:high"
+
+    @pytest.mark.asyncio
+    async def test_no_runtime_default_and_no_agent_reasoning_resolves_to_none(self) -> None:
+        """When neither side sets reasoning, the resolver returns ``None``."""
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="reasoning-effort-unset",
+                entry_point="solo",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="solo",
+                    model="gpt-4",
+                    prompt="No reasoning configured",
+                    output={"answer": OutputField(type="string")},
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"answer": "{{ solo.output.answer }}"},
+        )
+
+        provider = _RecordingReasoningProvider(default_reasoning_effort=None)
+        engine = WorkflowEngine(config, provider)
+
+        await engine.run({})
+
+        assert provider.resolved_efforts == {"solo": None}
+
+
+class TestProviderFactoryReasoningEffortWiring:
+    """``ProviderFactory.create_provider`` must forward
+    ``default_reasoning_effort`` from the ``RuntimeConfig`` to the concrete
+    provider's ``_default_reasoning_effort`` attribute.
+    """
+
+    @pytest.mark.asyncio
+    async def test_factory_forwards_to_copilot(self) -> None:
+        from conductor.providers.copilot import CopilotProvider as _CopilotProvider
+        from conductor.providers.factory import ProviderFactory
+
+        runtime = RuntimeConfig(provider="copilot", default_reasoning_effort="high")
+        provider = await ProviderFactory.create_provider(runtime, validate=False)
+        try:
+            assert isinstance(provider, _CopilotProvider)
+            assert provider._default_reasoning_effort == "high"
+        finally:
+            await provider.close()
+
+    @pytest.mark.asyncio
+    async def test_factory_forwards_to_claude(self) -> None:
+        from conductor.providers.claude import (
+            ANTHROPIC_SDK_AVAILABLE,
+        )
+        from conductor.providers.claude import (
+            ClaudeProvider as _ClaudeProvider,
+        )
+        from conductor.providers.factory import ProviderFactory
+
+        if not ANTHROPIC_SDK_AVAILABLE:
+            pytest.skip("anthropic SDK not installed")
+
+        runtime = RuntimeConfig(provider="claude", default_reasoning_effort="high")
+        provider = await ProviderFactory.create_provider(runtime, validate=False)
+        try:
+            assert isinstance(provider, _ClaudeProvider)
+            assert provider._default_reasoning_effort == "high"
+        finally:
+            await provider.close()

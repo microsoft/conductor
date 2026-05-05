@@ -100,7 +100,7 @@ For runtime config, context modes, limits, and cost tracking, see [references/au
 | `context.mode` | How agents share data (accumulate, last_only, explicit) |
 | `limits` | Safety bounds (max_iterations up to 500, timeout_seconds) |
 | `cost` | Token usage and cost tracking configuration |
-| `runtime` | Provider, model, temperature, max_tokens, MCP servers |
+| `runtime` | Provider, model, temperature, max_tokens, reasoning effort, MCP servers |
 | `--web` | Real-time web dashboard with DAG graph, live streaming, in-browser human gates |
 | `checkpoint` | Auto-saved on failure; resume with `conductor resume` |
 | `registry` | Named workflow sources (GitHub repo or local dir) for sharing workflows |

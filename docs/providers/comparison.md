@@ -12,6 +12,7 @@ This guide helps you choose between GitHub Copilot and Anthropic Claude provider
 | **Model Selection** | GPT-5.2, o1 | Haiku, Sonnet, Opus | Tie |
 | **Streaming** | Yes | No (Phase 1) | Copilot |
 | **Tool Support** | Yes (MCP, all types) | Yes (MCP, stdio only) | Copilot |
+| **Reasoning / Extended Thinking** | Yes (`reasoning_effort` on session) | Yes (extended `thinking` budget) | Tie |
 | **Speed** | Fast | Fast | Tie |
 | **Output Quality** | Excellent | Excellent | Tie |
 | **Cost Predictability** | High (flat rate) | Variable (usage-based) | Copilot |
@@ -241,6 +242,31 @@ agents:
 **Winner**: Copilot (broader transport support)
 
 See the [MCP Tools guide](../mcp-tools.md) for details.
+
+### Reasoning / Extended Thinking
+
+Both providers expose a unified [`reasoning.effort`](../configuration.md#reasoning-effort)
+field (`low` | `medium` | `high` | `xhigh`) at workflow scope
+(`runtime.default_reasoning_effort`) or per agent (`reasoning.effort`).
+Conductor translates the value to each provider's native API:
+
+**Copilot**:
+- Forwarded as `reasoning_effort` on `CopilotClient.create_session`
+- Validated against the model's advertised `supported_reasoning_efforts`
+
+**Claude**:
+- Translated to `messages.create(thinking={"type": "enabled", "budget_tokens": N})`
+- Effort → budget: low=2048, medium=8192, high=16384, xhigh=32768 tokens
+- Restricted to thinking-capable models (`claude-3-7-*`, `claude-opus-4*`,
+  `claude-sonnet-4*`, `claude-haiku-4*`)
+- Auto-coerces `temperature=1.0` and bumps `max_tokens` to fit the budget
+
+Reasoning content from either provider surfaces as `agent_reasoning` events
+in the dashboard, JSONL log, and `-vv` console output.
+
+**Winner**: Tie (both support it; pick the provider on other grounds)
+
+See [`examples/reasoning-effort.yaml`](../../examples/reasoning-effort.yaml).
 
 ## Migration Path
 

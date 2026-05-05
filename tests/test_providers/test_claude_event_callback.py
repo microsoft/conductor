@@ -63,6 +63,7 @@ def _make_provider_with_mcp() -> ClaudeProvider:
     provider._max_schema_depth = 10
     provider._default_max_agent_iterations = 50
     provider._default_max_session_seconds = None
+    provider._default_reasoning_effort = None
 
     mock_mcp_manager = MagicMock()
     mock_mcp_manager.has_servers.return_value = True
@@ -89,6 +90,7 @@ def _make_bare_provider() -> ClaudeProvider:
     provider._max_schema_depth = 10
     provider._default_max_agent_iterations = 50
     provider._default_max_session_seconds = None
+    provider._default_reasoning_effort = None
     return provider
 
 
@@ -547,6 +549,7 @@ class TestEventCallbackThreading:
         agent.model = None
         agent.max_agent_iterations = None
         agent.max_session_seconds = None
+        agent.reasoning = None
 
         await provider._execute_with_retry(
             agent=agent,

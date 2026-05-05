@@ -121,6 +121,7 @@ make validate-examples    # validate all examples
 - **Failure modes** for parallel/for-each: `fail_fast`, `continue_on_error`, `all_or_nothing`
 - **Route evaluation**: First matching `when` condition wins; no `when` = always matches
 - **Tool resolution**: `null` = all workflow tools, `[]` = none, `[list]` = subset
+- **Reasoning effort**: `runtime.default_reasoning_effort` sets a workflow-wide default; per-agent `reasoning.effort` overrides it. Allowed values: `low`, `medium`, `high`, `xhigh`. Each provider translates the unified value to its native API (Copilot: `reasoning_effort` on the session, validated against the model's `supported_reasoning_efforts`; Claude: extended thinking with budget mapping low=2048, medium=8192, high=16384, xhigh=32768 tokens, with `temperature` coerced to 1.0 and `max_tokens` bumped to fit the budget). See `examples/reasoning-effort.yaml`.
 
 ## Tests Structure
 
@@ -158,5 +159,6 @@ All providers (`copilot.py`, `claude.py`) must maintain feature parity. Any chan
 - **Output contract**: Same `AgentOutput` structure with consistent field population (model, tokens, input_tokens, output_tokens, content)
 - **Tool execution**: Same MCP tool calling interface and result handling
 - **Session management**: Same lifecycle (`validate_connection()`, `execute()`, `close()`)
+- **Reasoning effort**: All providers must accept the unified `reasoning.effort` field (`low` | `medium` | `high` | `xhigh`), translate it to the native API (Copilot `reasoning_effort` on the session; Claude extended `thinking` budget), validate that the selected model supports the requested effort, and raise `ValidationError` with a clear message when it does not. Any reasoning/thinking content the model returns must be surfaced via `agent_reasoning` events so the dashboard, JSONL logger, and console subscriber render it consistently.
 
 When modifying any provider, check all other providers for the same change. The dashboard, JSONL logger, console subscriber, and workflow engine all depend on consistent behavior across providers.

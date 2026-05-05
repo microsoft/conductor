@@ -19,6 +19,7 @@ Conductor provides the patterns that work: evaluator-optimizer loops for iterati
 - **Sub-workflow composition** - Reusable sub-workflows with templated `input_mapping`, usable inside `for_each` groups for dynamic fan-out
 - **Script steps** - Run shell commands and route on exit code or parsed JSON stdout
 - **Dialog mode** - Agents can pause for multi-turn conversation when uncertain
+- **Reasoning effort** - Unified `reasoning.effort` (low/medium/high/xhigh) per agent or workflow-wide, translated to each provider's native API
 - **Workspace instructions** - Auto-discover and inject `AGENTS.md` / `CLAUDE.md` / `.github/copilot-instructions.md` into every agent's prompt
 - **Conditional routing** - Route between agents based on output conditions
 - **Human-in-the-loop** - Pause for human decisions with Markdown-rendered prompts and clickable file links
@@ -231,8 +232,9 @@ conductor registry add official myorg/conductor-workflows --default
 conductor registry list official
 
 # Run a workflow from the registry
-conductor run qa-bot                    # latest from default registry
-conductor run qa-bot@official@1.2.3    # specific version
+conductor run qa-bot                       # latest from default registry
+conductor run 'qa-bot@official#v1.2.3'     # specific tag (quote the #)
+conductor run 'qa-bot@official#main'       # branch HEAD (re-resolved on fetch)
 ```
 
 See [docs/design/registry.md](docs/design/registry.md) for the full design.

@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any
 
 from conductor.exceptions import ProviderError, ValidationError
 from conductor.providers.base import AgentOutput, AgentProvider, EventCallback, match_model_id
+from conductor.providers.reasoning import ReasoningEffort, resolve_reasoning_effort
 
 if TYPE_CHECKING:
     from conductor.config.schema import AgentDef, OutputField
@@ -157,6 +158,7 @@ class CopilotProvider(AgentProvider):
         idle_recovery_config: IdleRecoveryConfig | None = None,
         temperature: float | None = None,
         max_agent_iterations: int | None = None,
+        default_reasoning_effort: ReasoningEffort | None = None,
     ) -> None:
         """Initialize the Copilot provider.
 
@@ -174,6 +176,10 @@ class CopilotProvider(AgentProvider):
             temperature: Default temperature for generation (0.0-1.0). Optional.
             max_agent_iterations: Maximum tool-use iterations per agent execution.
                 None means no iteration limit (only wall-clock timeout applies).
+            default_reasoning_effort: Workflow-wide default ``reasoning_effort``
+                applied to ``create_session`` when an agent does not specify
+                its own ``reasoning.effort``. One of ``low``, ``medium``,
+                ``high``, ``xhigh``, or ``None`` to send no value.
         """
         self._client: Any = None  # Will hold Copilot SDK client
         self._mock_handler = mock_handler
@@ -187,6 +193,7 @@ class CopilotProvider(AgentProvider):
         self._idle_recovery_config = idle_recovery_config or IdleRecoveryConfig()
         self._temperature = temperature
         self._default_max_agent_iterations = max_agent_iterations
+        self._default_reasoning_effort = default_reasoning_effort
         self._max_schema_depth = 10  # Max nesting depth for recursive schema building
         self._session_ids: dict[str, str] = {}
         self._resume_session_ids: dict[str, str] = {}
@@ -412,6 +419,11 @@ class CopilotProvider(AgentProvider):
 
                 await asyncio.sleep(delay)
 
+            except ValidationError:
+                # Configuration / capability errors are deterministic and
+                # never recoverable by retrying. Surface them unwrapped so
+                # the workflow engine can present the original message.
+                raise
             except Exception as e:
                 # Wrap unexpected errors as retryable
                 last_error = e
@@ -548,6 +560,20 @@ class CopilotProvider(AgentProvider):
             # Add MCP servers if configured
             if self._mcp_servers:
                 session_kwargs["mcp_servers"] = self._mcp_servers
+
+            # Resolve reasoning effort: per-agent override wins over runtime default.
+            # When set, validate against the model's advertised capabilities
+            # before forwarding to the SDK.
+            effort = resolve_reasoning_effort(agent, self._default_reasoning_effort)
+            if effort is not None:
+                await self._validate_reasoning_effort_for_model(model, effort)
+                session_kwargs["reasoning_effort"] = effort
+                logger.debug(
+                    "Setting reasoning_effort=%s for agent %r (model=%s)",
+                    effort,
+                    agent.name,
+                    model,
+                )
 
             # Attempt to resume a previous session if one exists for this agent
             session: Any = None
@@ -715,6 +741,10 @@ class CopilotProvider(AgentProvider):
                     await session.disconnect()
 
         except ProviderError:
+            raise
+        except ValidationError:
+            # Configuration errors (e.g. unsupported reasoning_effort) are
+            # deterministic; surface unwrapped so retries don't mask them.
             raise
         except Exception as e:
             raise ProviderError(
@@ -1814,11 +1844,25 @@ class CopilotProvider(AgentProvider):
 
         session = None
         try:
-            session = await self._client.create_session(
-                model=model or self._default_model,
-                on_permission_request=self._default_permission_handler,
-                system_message={"mode": "replace", "content": system_prompt},
-            )
+            dialog_kwargs: dict[str, Any] = {
+                "model": model or self._default_model,
+                "on_permission_request": self._default_permission_handler,
+                "system_message": {"mode": "replace", "content": system_prompt},
+            }
+
+            # Dialog turns honor the workflow-wide default reasoning effort
+            # only — there's no agent-scoped override at this layer.
+            effort = self._default_reasoning_effort
+            if effort is not None:
+                await self._validate_reasoning_effort_for_model(dialog_kwargs["model"], effort)
+                dialog_kwargs["reasoning_effort"] = effort
+                logger.debug(
+                    "Setting reasoning_effort=%s for dialog turn (model=%s)",
+                    effort,
+                    dialog_kwargs["model"],
+                )
+
+            session = await self._client.create_session(**dialog_kwargs)
 
             response_content = ""
             done = asyncio.Event()
@@ -1855,6 +1899,8 @@ class CopilotProvider(AgentProvider):
             return response_content
 
         except ProviderError:
+            raise
+        except ValidationError:
             raise
         except Exception as exc:
             raise ProviderError(
@@ -1906,6 +1952,54 @@ class CopilotProvider(AgentProvider):
         info = by_id[matched_id]
         limits = getattr(info.capabilities, "limits", None)
         return getattr(limits, "max_prompt_tokens", None)
+
+    async def _validate_reasoning_effort_for_model(
+        self, model: str, effort: ReasoningEffort
+    ) -> None:
+        """Validate ``effort`` against the model's advertised capabilities.
+
+        Looks up the model via ``client.list_models()`` (resolving aliases via
+        :func:`match_model_id`) and inspects
+        ``capabilities.supported_reasoning_efforts``. When that list is
+        present and ``effort`` is not in it, raises :class:`ValidationError`.
+
+        When the field is missing/``None`` (capability unknown), or when the
+        model can't be matched, or when listing fails, validation is skipped
+        — capability metadata must never block a workflow that the SDK might
+        otherwise accept.
+
+        Skipped entirely in mock-handler mode and when the SDK is not
+        installed.
+        """
+        if self._mock_handler is not None or not COPILOT_SDK_AVAILABLE:
+            return
+        try:
+            await self._ensure_client_started()
+            models = await self._client.list_models()
+        except (TimeoutError, ProviderError, OSError, RuntimeError) as e:
+            logger.debug(
+                "Failed to list Copilot models for reasoning_effort validation of %r: %s",
+                model,
+                e,
+            )
+            return
+        by_id = {info.id: info for info in models}
+        matched_id = match_model_id(model, by_id.keys())
+        if matched_id is None:
+            return
+        info = by_id[matched_id]
+        supported = getattr(info.capabilities, "supported_reasoning_efforts", None)
+        if supported is None:
+            return
+        if effort not in supported:
+            raise ValidationError(
+                f"Model {model!r} does not support reasoning_effort={effort!r}; "
+                f"supported values: {sorted(supported)}",
+                suggestion=(
+                    "Choose an effort listed in the model's capabilities, "
+                    "or pick a different model."
+                ),
+            )
 
     def get_session_ids(self) -> dict[str, str]:
         """Get tracked session IDs for all executed agents.

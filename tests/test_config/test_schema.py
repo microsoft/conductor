@@ -14,6 +14,7 @@ from conductor.config.schema import (
     InputDef,
     LimitsConfig,
     OutputField,
+    ReasoningConfig,
     RouteDef,
     RuntimeConfig,
     WorkflowConfig,
@@ -1273,3 +1274,125 @@ class TestWorkflowConfigWithForEach:
                 ],
             )
         assert "nested for-each groups are not allowed" in str(exc_info.value).lower()
+
+
+class TestAgentDefReasoning:
+    """Tests for the reasoning field on AgentDef."""
+
+    @pytest.mark.parametrize("effort", ["low", "medium", "high", "xhigh"])
+    def test_accepts_valid_effort(self, effort: str) -> None:
+        """Test that AgentDef accepts each valid effort level."""
+        agent = AgentDef(name="a", model="gpt-4", prompt="test", reasoning={"effort": effort})
+        assert agent.reasoning is not None
+        assert agent.reasoning.effort == effort
+
+    @pytest.mark.parametrize("effort", ["none", "max", 42])
+    def test_rejects_invalid_effort(self, effort: object) -> None:
+        """Test that invalid effort values raise ValidationError."""
+        with pytest.raises(ValidationError):
+            AgentDef(
+                name="a",
+                model="gpt-4",
+                prompt="test",
+                reasoning={"effort": effort},  # type: ignore[arg-type]
+            )
+
+    def test_reasoning_defaults_to_none(self) -> None:
+        """Test that reasoning defaults to None when omitted."""
+        agent = AgentDef(name="x", model="gpt-4", prompt="test")
+        assert agent.reasoning is None
+
+    def test_explicit_reasoning_none_is_valid(self) -> None:
+        """Test that explicitly passing reasoning=None is valid."""
+        agent = AgentDef(name="x", model="gpt-4", prompt="test", reasoning=None)
+        assert agent.reasoning is None
+
+    def test_reasoning_accepts_reasoning_config_instance(self) -> None:
+        """Test that a ReasoningConfig instance is accepted."""
+        agent = AgentDef(
+            name="a",
+            model="gpt-4",
+            prompt="test",
+            reasoning=ReasoningConfig(effort="high"),
+        )
+        assert agent.reasoning is not None
+        assert agent.reasoning.effort == "high"
+
+    def test_default_agent_type_accepts_reasoning(self) -> None:
+        """Test that default (None) agent type accepts reasoning."""
+        agent = AgentDef(name="a", model="gpt-4", prompt="test", reasoning={"effort": "medium"})
+        assert agent.type is None
+        assert agent.reasoning is not None
+        assert agent.reasoning.effort == "medium"
+
+    def test_explicit_agent_type_accepts_reasoning(self) -> None:
+        """Test that type='agent' accepts reasoning."""
+        agent = AgentDef(
+            name="a",
+            type="agent",
+            model="gpt-4",
+            prompt="test",
+            reasoning={"effort": "low"},
+        )
+        assert agent.reasoning is not None
+        assert agent.reasoning.effort == "low"
+
+    def test_human_gate_with_reasoning_raises(self) -> None:
+        """Test that human_gate agents cannot have reasoning."""
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(
+                name="gate1",
+                type="human_gate",
+                prompt="Choose:",
+                options=[GateOption(label="Ok", value="ok", route="next")],
+                reasoning={"effort": "low"},
+            )
+        assert "human_gate agents cannot have 'reasoning'" in str(exc_info.value)
+
+    def test_script_with_reasoning_raises(self) -> None:
+        """Test that script agents cannot have reasoning."""
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(
+                name="s",
+                type="script",
+                command="echo hello",
+                reasoning={"effort": "high"},
+            )
+        assert "script agents cannot have 'reasoning'" in str(exc_info.value)
+
+    def test_workflow_with_reasoning_raises(self) -> None:
+        """Test that workflow agents cannot have reasoning."""
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(
+                name="w",
+                type="workflow",
+                workflow="./sub.yaml",
+                reasoning={"effort": "medium"},
+            )
+        assert "workflow agents cannot have 'reasoning'" in str(exc_info.value)
+
+
+class TestRuntimeConfigDefaultReasoningEffort:
+    """Tests for default_reasoning_effort on RuntimeConfig."""
+
+    def test_default_is_none(self) -> None:
+        """Test that default_reasoning_effort defaults to None."""
+        config = RuntimeConfig()
+        assert config.default_reasoning_effort is None
+
+    def test_explicit_none_is_valid(self) -> None:
+        """Test that explicitly passing None is valid."""
+        config = RuntimeConfig(default_reasoning_effort=None)
+        assert config.default_reasoning_effort is None
+
+    @pytest.mark.parametrize("effort", ["low", "medium", "high", "xhigh"])
+    def test_accepts_valid_effort(self, effort: str) -> None:
+        """Test that each valid effort level is accepted."""
+        config = RuntimeConfig(default_reasoning_effort=effort)  # type: ignore[arg-type]
+        assert config.default_reasoning_effort == effort
+
+    @pytest.mark.parametrize("effort", ["none", "max", "extreme", 42, ""])
+    def test_rejects_invalid_effort(self, effort: object) -> None:
+        """Test that invalid effort values raise ValidationError."""
+        with pytest.raises(ValidationError):
+            RuntimeConfig(default_reasoning_effort=effort)  # type: ignore[arg-type]

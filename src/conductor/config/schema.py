@@ -10,6 +10,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from conductor.providers.reasoning import ReasoningEffort
+
 
 class InputDef(BaseModel):
     """Definition for a workflow input parameter."""
@@ -414,6 +416,31 @@ class DialogConfig(BaseModel):
     """
 
 
+class ReasoningConfig(BaseModel):
+    """Configuration for model reasoning / extended thinking effort.
+
+    When present on an agent (or as a runtime default), enables the
+    provider's reasoning capability:
+
+    - **Copilot SDK** sets ``reasoning_effort`` on the session.
+    - **Anthropic SDK** enables extended thinking with a budget mapped from
+      the effort level (low=2k, medium=8k, high=16k, xhigh=32k tokens).
+
+    Validation happens at execute time. Claude rejects models that don't
+    match the supported prefix list; Copilot consults the SDK's advertised
+    ``supported_reasoning_efforts`` (when available) and otherwise allows
+    the request through to the SDK.
+
+    Example YAML::
+
+        reasoning:
+          effort: high
+    """
+
+    effort: ReasoningEffort
+    """Reasoning effort level applied to the agent's model calls."""
+
+
 class AgentDef(BaseModel):
     """Definition for a single agent in the workflow."""
 
@@ -588,6 +615,25 @@ class AgentDef(BaseModel):
             intent or needs clarification on ambiguous requirements.
     """
 
+    reasoning: ReasoningConfig | None = None
+    """Optional reasoning / extended-thinking effort for this agent.
+
+    When set, the provider configures its reasoning capability:
+
+    - Copilot: passes ``reasoning_effort`` to ``create_session``.
+    - Claude: enables ``thinking`` with a budget mapped from the effort
+      level (low=2k, medium=8k, high=16k, xhigh=32k tokens).
+
+    Falls back to ``runtime.default_reasoning_effort`` when unset.
+
+    Only applies to provider-backed agents (type='agent' or None).
+
+    Example YAML::
+
+        reasoning:
+          effort: high
+    """
+
     @field_validator("timeout")
     @classmethod
     def validate_timeout(cls, v: int | None) -> int | None:
@@ -610,6 +656,8 @@ class AgentDef(BaseModel):
                 raise ValueError("human_gate agents cannot have 'dialog'")
             if self.max_depth is not None:
                 raise ValueError("human_gate agents cannot have 'max_depth'")
+            if self.reasoning is not None:
+                raise ValueError("human_gate agents cannot have 'reasoning'")
         elif self.type == "script":
             if not self.command:
                 raise ValueError("script agents require 'command'")
@@ -642,6 +690,8 @@ class AgentDef(BaseModel):
                 raise ValueError("script agents cannot have 'dialog'")
             if self.max_depth is not None:
                 raise ValueError("script agents cannot have 'max_depth'")
+            if self.reasoning is not None:
+                raise ValueError("script agents cannot have 'reasoning'")
         elif self.type == "workflow":
             if not self.workflow:
                 raise ValueError("workflow agents require 'workflow' path")
@@ -679,6 +729,8 @@ class AgentDef(BaseModel):
                     f"'{self.type or 'agent'}' agents cannot have 'max_depth' "
                     "(only workflow agents support max_depth)"
                 )
+        if self.type == "workflow" and self.reasoning is not None:
+            raise ValueError("workflow agents cannot have 'reasoning'")
         return self
 
 
@@ -803,6 +855,21 @@ class RuntimeConfig(BaseModel):
 
     Default is None, which uses the provider's built-in default
     (Claude: 50, Copilot: unlimited).
+    """
+
+    default_reasoning_effort: ReasoningEffort | None = None
+    """Workflow-wide default reasoning effort applied to provider-backed agents.
+
+    Each agent may override with its own ``reasoning.effort``. Providers
+    translate this into their native parameter:
+
+    - Copilot: ``reasoning_effort`` on ``create_session``
+    - Claude: ``thinking`` with budget mapped from effort level
+
+    Validation happens at execute time. Claude rejects models that don't
+    match the supported prefix list; Copilot consults the SDK's advertised
+    ``supported_reasoning_efforts`` (when available) and otherwise allows
+    the request through to the SDK.
     """
 
 

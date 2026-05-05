@@ -43,6 +43,18 @@ workflow:
     on_error: "{{ template }}"      # Optional: Expression evaluated on error
 
   context_mode: accumulate          # accumulate | snapshot | minimal (default: accumulate)
+
+  runtime:
+    provider: copilot               # copilot | claude
+    default_model: gpt-5.2
+    temperature: 0.7
+    max_tokens: 4096
+    default_reasoning_effort: medium  # Optional: low | medium | high | xhigh
+                                      # Workflow-wide default for reasoning /
+                                      # extended-thinking effort. Inherited by
+                                      # every provider-backed agent unless it
+                                      # declares its own `reasoning.effort`.
+                                      # See docs/configuration.md#reasoning-effort.
 ```
 
 **Workflow metadata** is included verbatim in the `workflow_started` event and lets downstream consumers (dashboards, queue runners, observability tools) adapt without parsing the YAML. CLI `--metadata key=value` flags merge on top of YAML metadata (CLI wins on conflicts).
@@ -84,7 +96,14 @@ agents:
     
     tools:                          # Optional: Agent-specific tools
       - tool_name
-    
+
+    reasoning:                      # Optional: per-agent reasoning override
+      effort: high                  # low | medium | high | xhigh
+                                    # Overrides runtime.default_reasoning_effort.
+                                    # Only valid on type=agent (rejected on
+                                    # script, human_gate, workflow).
+                                    # See docs/configuration.md#reasoning-effort.
+
     routes:                         # Optional: Routing logic
       - to: next_agent              # Agent name or $end
         when: "{{ condition }}"     # Optional: Route condition

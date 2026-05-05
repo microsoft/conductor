@@ -12,6 +12,7 @@ from conductor.exceptions import ProviderError
 from conductor.providers.base import AgentProvider
 from conductor.providers.claude import ANTHROPIC_SDK_AVAILABLE, ClaudeProvider
 from conductor.providers.copilot import CopilotProvider, IdleRecoveryConfig
+from conductor.providers.reasoning import ReasoningEffort
 
 
 async def create_provider(
@@ -24,6 +25,7 @@ async def create_provider(
     timeout: float | None = None,
     max_session_seconds: float | None = None,
     max_agent_iterations: int | None = None,
+    default_reasoning_effort: ReasoningEffort | None = None,
 ) -> AgentProvider:
     """Factory function to create the appropriate provider.
 
@@ -44,6 +46,9 @@ async def create_provider(
         timeout: Request timeout in seconds.
         max_session_seconds: Maximum wall-clock duration for agent sessions.
         max_agent_iterations: Maximum tool-use iterations per agent execution.
+        default_reasoning_effort: Workflow-wide default reasoning effort
+            (``low`` / ``medium`` / ``high`` / ``xhigh``) applied when an agent
+            does not specify its own ``reasoning.effort``.
 
     Returns:
         Configured AgentProvider instance.
@@ -69,6 +74,7 @@ async def create_provider(
                 temperature=temperature,
                 idle_recovery_config=idle_recovery_config,
                 max_agent_iterations=max_agent_iterations,
+                default_reasoning_effort=default_reasoning_effort,
             )
         case "openai-agents":
             raise ProviderError(
@@ -89,6 +95,7 @@ async def create_provider(
                 mcp_servers=mcp_servers,
                 max_agent_iterations=max_agent_iterations,
                 max_session_seconds=max_session_seconds,
+                default_reasoning_effort=default_reasoning_effort,
             )
         case _:
             raise ProviderError(
@@ -140,6 +147,7 @@ class ProviderFactory:
         timeout = getattr(runtime_config, "timeout", None)
         max_session_seconds = getattr(runtime_config, "max_session_seconds", None)
         max_agent_iterations = getattr(runtime_config, "max_agent_iterations", None)
+        default_reasoning_effort = getattr(runtime_config, "default_reasoning_effort", None)
 
         return await create_provider(
             provider_type=provider_type,
@@ -150,4 +158,5 @@ class ProviderFactory:
             timeout=timeout,
             max_session_seconds=max_session_seconds,
             max_agent_iterations=max_agent_iterations,
+            default_reasoning_effort=default_reasoning_effort,
         )

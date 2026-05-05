@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.11...HEAD)
 
+### Added
+- Unified `reasoning.effort` configuration for per-agent and workflow-wide
+  control of model reasoning / extended-thinking effort. Set
+  `runtime.default_reasoning_effort` (`low` | `medium` | `high` | `xhigh`) for a
+  workflow-wide default, or override per agent with a `reasoning.effort` block.
+  Translates to `reasoning_effort` on the Copilot session and to extended
+  `thinking` budget on Claude (low=2048, medium=8192, high=16384, xhigh=32768
+  tokens, with `temperature` coerced to 1.0 and `max_tokens` bumped to fit).
+  Validates against each model's supported efforts/capabilities and surfaces
+  thinking content via `agent_reasoning` events. See
+  [`examples/reasoning-effort.yaml`](examples/reasoning-effort.yaml).
+
 ## [0.1.11](https://github.com/microsoft/conductor/compare/v0.1.10...v0.1.11) - 2026-05-04
 
 ### Added

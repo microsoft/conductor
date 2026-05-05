@@ -34,6 +34,7 @@ workflow:
     timeout: float                  # Per-request timeout in seconds (optional, default: 600)
     max_agent_iterations: integer   # Max tool-use roundtrips per agent (1-500, optional)
     max_session_seconds: float      # Wall-clock timeout per agent session in seconds (optional)
+    default_reasoning_effort: string # Workflow-wide reasoning/thinking effort: low, medium, high, xhigh (optional)
     mcp_servers:                    # MCP server configurations
       <server_name>:
         type: string                # "stdio" (default), "http", or "sse"
@@ -130,6 +131,11 @@ agents:
     max_agent_iterations: integer   # Max tool-use roundtrips for this agent (1-500, optional)
     max_session_seconds: float      # Wall-clock timeout for this agent session (optional)
 
+    # Per-agent reasoning effort (overrides runtime.default_reasoning_effort)
+    # Not allowed for script, human_gate, or workflow agent types.
+    reasoning:
+      effort: string                # low, medium, high, or xhigh
+
     # Per-agent retry policy (optional, not allowed for script agents)
     retry:
       max_attempts: integer         # Max attempts including first (1-10, default: 1 = no retry)
@@ -146,7 +152,16 @@ agents:
     timeout: integer                # Per-script timeout in seconds
 ```
 
-**Script agent restrictions:** Cannot have `prompt`, `provider`, `model`, `tools`, `output`, `system_prompt`, `options`, `retry`. Output is always `{stdout, stderr, exit_code}`.
+**Script agent restrictions:** Cannot have `prompt`, `provider`, `model`, `tools`, `output`, `system_prompt`, `options`, `retry`, `reasoning`. Output is always `{stdout, stderr, exit_code}`.
+
+**Reasoning effort:** `reasoning.effort` (and `runtime.default_reasoning_effort`) accepts `low`, `medium`, `high`, or `xhigh`. Per-agent value overrides the runtime default. Each provider translates the unified value to its native API:
+
+- **Copilot**: forwards `reasoning_effort` to the session. Validated against the model's advertised `supported_reasoning_efforts` (when available); raises `ValidationError` for unsupported combinations.
+- **Claude**: enables extended thinking via `thinking={"type":"enabled","budget_tokens":N}` with mapping low=2048, medium=8192, high=16384, xhigh=32768. Auto-coerces `temperature=1.0` (Anthropic API requirement) and bumps `max_tokens` to fit `budget+4096` (capped at 64000). Only valid on thinking-capable models (Claude 3.7+, Opus/Sonnet/Haiku 4.x); raises `ValidationError` otherwise.
+
+Both providers continue to surface reasoning content via `agent_reasoning` events visible in the dashboard, JSONL logs, and console at `-vv`.
+
+Forbidden on agent types: `script`, `human_gate`, `workflow`.
 
 ## Script Agent Schema
 
