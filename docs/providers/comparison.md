@@ -6,7 +6,7 @@ This guide helps you choose between GitHub Copilot and Anthropic Claude provider
 
 | Feature | Copilot | Claude | Winner |
 |---------|---------|--------|--------|
-| **Context Window** | 8K-128K | 200K (all models) | Claude |
+| **Context Window** | per-model (SDK-reported) | per-model (SDK-reported) | Tie |
 | **Pricing Model** | Subscription ($10-39/mo) | Pay-per-token | Depends |
 | **Setup** | GitHub auth | API key | Copilot (easier) |
 | **Model Selection** | GPT-5.2, o1 | Haiku, Sonnet, Opus | Tie |

@@ -16,12 +16,15 @@ Conductor provides the patterns that work: evaluator-optimizer loops for iterati
 - **YAML-based workflows** - Define multi-agent workflows in readable YAML
 - **Multiple providers** - GitHub Copilot or Anthropic Claude with seamless switching
 - **Parallel execution** - Run agents concurrently (static groups or dynamic for-each)
-- **Script steps** - Run shell commands and route on exit code without an AI agent
+- **Sub-workflow composition** - Reusable sub-workflows with templated `input_mapping`, usable inside `for_each` groups for dynamic fan-out
+- **Script steps** - Run shell commands and route on exit code or parsed JSON stdout
+- **Dialog mode** - Agents can pause for multi-turn conversation when uncertain
+- **Workspace instructions** - Auto-discover and inject `AGENTS.md` / `CLAUDE.md` / `.github/copilot-instructions.md` into every agent's prompt
 - **Conditional routing** - Route between agents based on output conditions
-- **Human-in-the-loop** - Pause for human decisions with Rich terminal UI
+- **Human-in-the-loop** - Pause for human decisions with Markdown-rendered prompts and clickable file links
 - **Safety limits** - Max iterations and timeout enforcement
-- **[Web dashboard](#web-dashboard)** - Real-time workflow visualization with interactive DAG graph, live streaming, and in-browser human gates
-- **Validation** - Validate workflows before execution
+- **[Web dashboard](#web-dashboard)** - Real-time workflow visualization with interactive DAG graph, breadcrumb navigation into sub-workflows, live streaming, and in-browser human gates
+- **Validation** - Catches stale template references, missing inputs, and undeclared dependencies before runtime
 
 ## Installation
 
@@ -189,6 +192,9 @@ conductor run <workflow.yaml> [OPTIONS]
 | Option | Description |
 |--------|-------------|
 | `-i, --input NAME=VALUE` | Workflow input (repeatable) |
+| `-m, --metadata KEY=VALUE` | Workflow metadata (repeatable; surfaced in `workflow_started`) |
+| `--workspace-instructions` | Auto-discover `AGENTS.md` / `CLAUDE.md` / `.github/copilot-instructions.md` and prepend to every agent prompt |
+| `--instructions PATH` | Explicit instructions file (repeatable) |
 | `-p, --provider PROVIDER` | Override provider |
 | `--dry-run` | Preview execution plan |
 | `--skip-gates` | Auto-select at human gates |

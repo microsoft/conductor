@@ -23,6 +23,9 @@ conductor run <workflow.yaml> [OPTIONS]
 |--------|-------|-------------|
 | `--input NAME=VALUE` | `-i` | Workflow input (repeatable) |
 | `--input.NAME=VALUE` | | Alternative input syntax |
+| `--metadata KEY=VALUE` | `-m` | Workflow metadata (repeatable). Merged on top of YAML `metadata:` and surfaced in the `workflow_started` event. |
+| `--workspace-instructions` | | Auto-discover convention files (`AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md`) by walking from CWD up to the git root. Concatenated and prepended to every agent's prompt. |
+| `--instructions PATH` | | Explicit path to an instructions file (repeatable). Combines with auto-discovered files when both flags are used. |
 | `--provider PROVIDER` | `-p` | Override provider (copilot, claude) |
 | `--dry-run` | | Show execution plan without running |
 | `--skip-gates` | | Auto-select first option at human gates |
@@ -107,6 +110,19 @@ conductor run workflow.yaml --skip-gates
 conductor run workflow.yaml --silent --log-file auto --skip-gates --input question="Automated test"
 ```
 
+#### Metadata and Instructions
+
+```bash
+# Inject runtime metadata (visible in the workflow_started event)
+conductor run twig-sdlc.yaml --metadata work_item_id=1814 --metadata env=staging
+
+# Auto-discover and inject AGENTS.md / CLAUDE.md / copilot-instructions.md
+conductor run workflow.yaml --workspace-instructions
+
+# Combine auto-discovery with an explicit extra file
+conductor run workflow.yaml --workspace-instructions --instructions ./style-guide.md
+```
+
 #### Complex Inputs
 
 ```bash
@@ -160,7 +176,7 @@ conductor stop --all
 
 ## `conductor validate`
 
-Validate a workflow file without executing it. Checks YAML syntax, schema compliance, and cross-references (agent names, routes, parallel groups).
+Validate a workflow file without executing it. Checks YAML syntax, schema compliance, cross-references (agent names, routes, parallel groups), and Jinja2 template references throughout the workflow.
 
 ```bash
 conductor validate <workflow.yaml>
@@ -181,6 +197,7 @@ for f in examples/*.yaml; do conductor validate "$f"; done
 
 ### Validation Checks
 
+**Errors** (validation fails):
 - YAML syntax errors
 - Schema compliance (required fields, types)
 - Agent name references in routes
@@ -188,6 +205,12 @@ for f in examples/*.yaml; do conductor validate "$f"; done
 - For-each source references
 - Circular dependency detection
 - Input/output schema validation
+- **Stale agent references in templates** — `{{ old_agent.output.field }}` where `old_agent` doesn't exist
+- **Missing workflow input references** — `{{ workflow.input.x }}` where `x` isn't declared in `input:`
+- Stale references checked across `prompt`, `system_prompt`, `command`, `args`, `working_dir`, `input_mapping`, parallel-group inputs, and workflow `output:` templates
+
+**Warnings** (validation passes with notes):
+- **Undeclared dependencies in explicit mode** — agent prompt references `{{ a.output.val }}` but doesn't declare `a.output` in its `input:` list
 
 ## `conductor registry`
 

@@ -23,6 +23,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Self-referential sub-workflows are now allowed; depth is bounded by the
   global `MAX_SUBWORKFLOW_DEPTH` plus an optional per-agent `max_depth`
   field on `AgentDef` ([#111](https://github.com/microsoft/conductor/pull/111)).
+- `workflow.dir`, `workflow.file`, and `workflow.name` template variables are
+  now available in all agent contexts (regardless of context mode). Lets
+  registry-hosted workflows reference co-located scripts and assets without
+  depending on the caller's working directory
+  ([#121](https://github.com/microsoft/conductor/pull/121)).
+- Script agent stdout that is valid JSON is auto-parsed and merged into
+  the agent's output dict alongside `stdout`, `stderr`, and `exit_code`,
+  enabling field-based `when:` route conditions instead of opaque exit-code
+  matching ([#122](https://github.com/microsoft/conductor/pull/122)).
+- `conductor validate` now performs semantic validation in addition to
+  YAML schema checks, catching stale agent references, missing workflow
+  inputs, and undeclared explicit-mode dependencies before runtime in
+  `prompt`, `system_prompt`, `command`, `args`, `working_dir`,
+  `input_mapping`, parallel-group inputs, and workflow `output:`
+  templates ([#125](https://github.com/microsoft/conductor/pull/125)).
+- Web dashboard: breadcrumb navigation, double-click dive-in to
+  sub-workflow graphs, isolated subworkflow contexts (no node-status
+  bleed across repeated runs), and reliable Stop button during
+  subworkflows ([#113](https://github.com/microsoft/conductor/pull/113),
+  follow-up fixes in [#146](https://github.com/microsoft/conductor/pull/146)).
+- Dialog mode for agents: multi-turn conversational interactions
+  driven by a `dialog` gate with conditional transitions, full
+  Copilot and Claude provider support, and dedicated dashboard UI
+  (`DialogDetail`, `DialogEngagementPrompt`, `DialogOverlay`)
+  ([#130](https://github.com/microsoft/conductor/pull/130)).
+- Markdown rendering and auto-linkification in human gate prompts.
+  Gate prompts render through Rich Markdown in the terminal and as
+  GitHub-Flavored Markdown in the dashboard. Bare file paths and URLs
+  in gate prompts are converted to clickable links; relative paths
+  open a sandboxed `FileViewer` modal served via a path-traversal-safe
+  `GET /api/files/{path}` endpoint
+  ([#131](https://github.com/microsoft/conductor/pull/131)).
+- Workspace instructions support: `--workspace-instructions` and
+  `--instructions` CLI flags plus a YAML-level `instructions:` field on
+  the workflow. Auto-discovers `AGENTS.md`, `CLAUDE.md`, and
+  `.github/copilot-instructions.md` by walking from CWD to the git root,
+  prepends them to every agent's prompt, inherits into sub-workflows,
+  and persists in checkpoints
+  ([#141](https://github.com/microsoft/conductor/pull/141)).
 
 ### Changed
 - The dashboard's "context window remaining" bar now sources
@@ -62,6 +101,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `install.sh` so `conductor` is available on PATH in new shells, CI
   agents, and IDE extensions after a fresh install
   ([#142](https://github.com/microsoft/conductor/pull/142)).
+- In explicit context mode, `workflow.input` is now always available to
+  `script` and `type: workflow` agent templates regardless of the agent's
+  declared `input:` list. The explicit-mode contract still applies to LLM
+  agents (no undeclared inputs in prompts to control token cost)
+  ([#119](https://github.com/microsoft/conductor/pull/119)).
+- Optional workflow inputs without an explicit `default:` now resolve to
+  type-appropriate zero values (`""`, `0`, `false`, `[]`, `{}`) instead of
+  Python `None`, so templates like
+  `{{ workflow.input.optional | default("fallback") }}` render the fallback
+  rather than the literal string `"None"`
+  ([#123](https://github.com/microsoft/conductor/pull/123)).
 
 ## [0.1.10](https://github.com/microsoft/conductor/compare/v0.1.9...v0.1.10) - 2026-04-30
 
