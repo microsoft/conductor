@@ -626,6 +626,50 @@ class TestVerboseLogging:
         finally:
             verbose_mode.reset(token)
 
+    def test_verbose_log_agent_timeout(self) -> None:
+        """Test verbose_log_agent_timeout function."""
+        from io import StringIO
+
+        from rich.console import Console
+
+        from conductor.cli.run import verbose_log_agent_timeout
+
+        output = StringIO()
+        token = verbose_mode.set(True)
+        try:
+            with patch(
+                "conductor.cli.run._verbose_console",
+                Console(file=output, force_terminal=True, no_color=True),
+            ):
+                verbose_log_agent_timeout("slow_agent", 15.3, 10.0)
+                output_text = output.getvalue()
+                assert "slow_agent" in output_text
+                assert "15.3" in output_text
+                assert "10" in output_text
+                assert "timed out" in output_text
+        finally:
+            verbose_mode.reset(token)
+
+    def test_verbose_log_agent_timeout_not_verbose(self) -> None:
+        """Test verbose_log_agent_timeout is a no-op when not verbose."""
+        from io import StringIO
+
+        from rich.console import Console
+
+        from conductor.cli.run import verbose_log_agent_timeout
+
+        output = StringIO()
+        token = verbose_mode.set(False)
+        try:
+            with patch(
+                "conductor.cli.run._verbose_console",
+                Console(file=output, force_terminal=True, no_color=True),
+            ):
+                verbose_log_agent_timeout("slow_agent", 15.3, 10.0)
+                assert output.getvalue() == ""
+        finally:
+            verbose_mode.reset(token)
+
     def test_verbose_log_parallel_summary_success(self) -> None:
         """Test verbose_log_parallel_summary for successful execution."""
         from io import StringIO
@@ -1224,6 +1268,27 @@ class TestFileLoggingDualWrite:
         finally:
             verbose_mode.reset(token)
 
+    def test_agent_timeout_writes_to_file(self, tmp_path: Path) -> None:
+        """Test that verbose_log_agent_timeout writes to file."""
+        from conductor.cli.run import (
+            close_file_logging,
+            init_file_logging,
+            verbose_log_agent_timeout,
+        )
+
+        log_path = tmp_path / "test.log"
+        token = verbose_mode.set(False)
+        try:
+            init_file_logging(log_path)
+            verbose_log_agent_timeout("slow_agent", 15.3, 10.0)
+            close_file_logging()
+
+            content = log_path.read_text(encoding="utf-8")
+            assert "slow_agent" in content
+            assert "timed out" in content
+        finally:
+            verbose_mode.reset(token)
+
     def test_parallel_summary_writes_to_file(self, tmp_path: Path) -> None:
         """Test that verbose_log_parallel_summary writes to file."""
         from conductor.cli.run import (
@@ -1645,3 +1710,42 @@ output:
         finally:
             full_mode.reset(token_full)
             verbose_mode.reset(token_verbose)
+
+
+class TestConsoleEventSubscriberAgentTimeout:
+    """Test ConsoleEventSubscriber handling of agent_timeout event."""
+
+    def test_agent_timeout_event_triggers_log(self) -> None:
+        """ConsoleEventSubscriber dispatches agent_timeout to verbose_log_agent_timeout."""
+        import time
+        from io import StringIO
+
+        from rich.console import Console
+
+        from conductor.cli.run import ConsoleEventSubscriber
+        from conductor.events import WorkflowEvent
+
+        subscriber = ConsoleEventSubscriber()
+
+        output = StringIO()
+        token = verbose_mode.set(True)
+        try:
+            with patch(
+                "conductor.cli.run._verbose_console",
+                Console(file=output, force_terminal=True, no_color=True),
+            ):
+                event = WorkflowEvent(
+                    type="agent_timeout",
+                    timestamp=time.time(),
+                    data={
+                        "agent_name": "slow_researcher",
+                        "elapsed": 120.5,
+                        "timeout_seconds": 120.0,
+                    },
+                )
+                subscriber.on_event(event)
+                output_text = output.getvalue()
+                assert "slow_researcher" in output_text
+                assert "timed out" in output_text
+        finally:
+            verbose_mode.reset(token)
