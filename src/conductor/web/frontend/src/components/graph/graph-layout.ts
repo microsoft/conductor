@@ -192,13 +192,34 @@ export function buildGraphElements(
     if (node.parentId) childToParent.set(node.id, node.parentId);
   }
 
+  // Dedupe edges by (from, to). YAML route lists frequently combine a
+  // conditional route with a catch-all to the same target (e.g. an "if X
+  // then $end" plus a bare "to: $end" fallback). The engine evaluates
+  // routes in order and the first match wins, so multiple entries between
+  // the same pair represent ONE visual transition, not parallel edges.
+  // Without deduping, dagre lays them as two overlapping/diverging edges
+  // which render as phantom strands going off-canvas.
+  // When collapsing routes with different `when` conditions, the label is
+  // cleared to avoid implying only one condition applies.
+  const seenPairs = new Map<string, { when: string | undefined; idx: number }>();
   for (const r of routes) {
     const from = childToParent.get(r.from) ?? r.from;
     const to = childToParent.get(r.to) ?? r.to;
     if (!nodeIds.has(from) || !nodeIds.has(to)) continue;
     // Skip self-loops created by remapping (e.g. group member → group member)
     if (from === to) continue;
-    const edgeId = `${from}->${to}${r.when ? `[${r.when}]` : ''}`;
+    const pairKey = `${from}->${to}`;
+    const existing = seenPairs.get(pairKey);
+    if (existing) {
+      // Multiple distinct conditions collapse — drop the label.
+      if (existing.when !== r.when) {
+        flowEdges[existing.idx]!.data = { when: undefined };
+      }
+      continue;
+    }
+    const idx = flowEdges.length;
+    seenPairs.set(pairKey, { when: r.when, idx });
+    const edgeId = `${pairKey}${r.when ? `[${r.when}]` : ''}`;
     flowEdges.push({
       id: edgeId,
       source: from,

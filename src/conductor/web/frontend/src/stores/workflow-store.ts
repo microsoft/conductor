@@ -413,6 +413,12 @@ function resolveContext(contexts: SubworkflowContext[], path: number[]): Subwork
  * Walk the subworkflow context tree by slot keys, returning the index path
  * (numeric, for use with resolveContext) and the resolved context.
  *
+ * For each slot, matches the newest matching context to support re-runs /
+ * iteration loops where the same slot key appears multiple times. Note the
+ * consequence: older iterations of the same slot become unreachable via this
+ * path resolver — late-arriving events targeting them must use the index
+ * path captured at the time the iteration was active. Issue #145 (S3).
+ *
  * Returns null if any segment cannot be matched.
  */
 function resolveSlotPath(

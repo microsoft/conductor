@@ -524,24 +524,25 @@ class WebDashboard:
         Returns True only when all of:
         - The exception is ``AssertionError``
         - The uvicorn server is in shutdown state (``should_exit`` is set)
-        - The traceback (if available) originates from asyncio internals
+        - The traceback is present and the deepest frame originates from
+          asyncio internals
         """
         exc = context.get("exception")
         if not isinstance(exc, AssertionError):
             return False
         if self._server is None or not getattr(self._server, "should_exit", False):
             return False
-        # Extra safety: check traceback originates from asyncio, not user code
+        # Require an asyncio traceback frame so unrelated AssertionErrors
+        # raised during shutdown (e.g., from a workflow callback finishing
+        # late) propagate to the default handler instead of being silently
+        # swallowed. Issue #145 (I3).
         import traceback as tb_mod
 
         tb = exc.__traceback__
-        if tb is not None:
-            frames = tb_mod.extract_tb(tb)
-            if frames and "asyncio" in frames[-1].filename:
-                return True
-        # If no traceback but server is shutting down, still suppress —
-        # the only known source of AssertionError during shutdown is this race.
-        return True
+        if tb is None:
+            return False
+        frames = tb_mod.extract_tb(tb)
+        return bool(frames) and "asyncio" in frames[-1].filename
 
     def _loop_exception_handler(
         self, loop: asyncio.AbstractEventLoop, context: dict[str, Any]
@@ -564,12 +565,14 @@ class WebDashboard:
 
         If ``serve()`` itself raises ``AssertionError`` during shutdown
         (rather than the exception surfacing through a callback), this
-        wrapper suppresses it.
+        wrapper applies the same asyncio-frame gate used in
+        ``_loop_exception_handler`` to avoid swallowing unrelated errors.
         """
         try:
             await self._server.serve()
-        except AssertionError:
-            if self._server is not None and getattr(self._server, "should_exit", False):
+        except AssertionError as exc:
+            ctx: dict[str, Any] = {"exception": exc}
+            if self._is_proactor_shutdown_race(ctx):
                 logger.debug(
                     "Suppressed proactor accept-loop AssertionError during server shutdown"
                 )

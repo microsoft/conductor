@@ -12,8 +12,9 @@ from __future__ import annotations
 
 import asyncio
 import time
+import traceback
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from starlette.testclient import TestClient
@@ -502,6 +503,19 @@ class TestServerStartupFailure:
             await dashboard.start()
 
 
+def _make_exc_with_asyncio_traceback() -> AssertionError:
+    """Construct an AssertionError that carries a real (non-empty) traceback.
+
+    Combined with patching ``traceback.extract_tb`` in the relevant test, this
+    simulates the proactor accept-loop race where the AssertionError surfaces
+    from inside asyncio internals.
+    """
+    try:
+        raise AssertionError("simulated proactor race")
+    except AssertionError as e:
+        return e
+
+
 class TestProactorShutdownRace:
     """Tests for the proactor accept-loop race guard (Python 3.14+ Windows).
 
@@ -512,13 +526,47 @@ class TestProactorShutdownRace:
     """
 
     def test_is_proactor_shutdown_race_true_during_shutdown(self) -> None:
-        """_is_proactor_shutdown_race returns True when server is shutting down."""
+        """Returns True for AssertionError raised from asyncio internals during shutdown."""
         _, dashboard = _make_dashboard()
         dashboard._server = MagicMock()
         dashboard._server.should_exit = True
 
+        exc = _make_exc_with_asyncio_traceback()
+        context = {"exception": exc}
+        # Simulate the deepest traceback frame originating in asyncio internals.
+        fake_frame = traceback.FrameSummary(
+            filename="/usr/lib/python3.14/asyncio/base_events.py",
+            lineno=1,
+            name="_attach",
+        )
+        with patch("traceback.extract_tb", return_value=[fake_frame]):
+            assert dashboard._is_proactor_shutdown_race(context) is True
+
+    def test_is_proactor_shutdown_race_false_for_non_asyncio_traceback(self) -> None:
+        """Returns False when the traceback is NOT from asyncio (issue #145 I3)."""
+        _, dashboard = _make_dashboard()
+        dashboard._server = MagicMock()
+        dashboard._server.should_exit = True
+
+        # An AssertionError raised by user/workflow code during shutdown
+        # has no asyncio frame and must NOT be silently swallowed.
+        try:
+            raise AssertionError("user-code assertion")
+        except AssertionError as e:
+            exc = e
+        context = {"exception": exc}
+        assert dashboard._is_proactor_shutdown_race(context) is False
+
+    def test_is_proactor_shutdown_race_false_without_traceback(self) -> None:
+        """Returns False when traceback is absent (issue #145 I3)."""
+        _, dashboard = _make_dashboard()
+        dashboard._server = MagicMock()
+        dashboard._server.should_exit = True
+
+        # An AssertionError without a traceback cannot be classified as the
+        # known race; the gate must fail closed.
         context = {"exception": AssertionError()}
-        assert dashboard._is_proactor_shutdown_race(context) is True
+        assert dashboard._is_proactor_shutdown_race(context) is False
 
     def test_is_proactor_shutdown_race_false_when_not_shutting_down(self) -> None:
         """_is_proactor_shutdown_race returns False when server is running."""
@@ -553,10 +601,16 @@ class TestProactorShutdownRace:
         dashboard._server.should_exit = True
 
         loop = MagicMock()
-        context = {"exception": AssertionError(), "message": "test"}
+        exc = _make_exc_with_asyncio_traceback()
+        context = {"exception": exc, "message": "test"}
 
-        # Should not raise or call default handler
-        dashboard._loop_exception_handler(loop, context)
+        fake_frame = traceback.FrameSummary(
+            filename="/usr/lib/python3.14/asyncio/base_events.py",
+            lineno=1,
+            name="_attach",
+        )
+        with patch("traceback.extract_tb", return_value=[fake_frame]):
+            dashboard._loop_exception_handler(loop, context)
         loop.default_exception_handler.assert_not_called()
 
     def test_loop_exception_handler_delegates_other_errors(self) -> None:
@@ -589,7 +643,8 @@ class TestProactorShutdownRace:
 
     @pytest.mark.asyncio
     async def test_guarded_serve_suppresses_assertion_during_shutdown(self) -> None:
-        """_guarded_serve swallows AssertionError when server is shutting down."""
+        """_guarded_serve swallows AssertionError when the asyncio-frame gate passes."""
+        import traceback as tb_mod
         from unittest.mock import patch
 
         _, dashboard = _make_dashboard()
@@ -599,12 +654,20 @@ class TestProactorShutdownRace:
 
         import uvicorn
 
-        with patch.object(uvicorn.Server, "serve", _assert_serve):
+        fake_frame = tb_mod.FrameSummary(
+            filename="/usr/lib/python3.14/asyncio/base_events.py",
+            lineno=1,
+            name="_attach",
+        )
+        with (
+            patch.object(uvicorn.Server, "serve", _assert_serve),
+            patch("traceback.extract_tb", return_value=[fake_frame]),
+        ):
             dashboard._server = uvicorn.Server(
                 uvicorn.Config(app=dashboard._app, host="127.0.0.1", port=0)
             )
             dashboard._server.should_exit = True
-            # Should not raise
+            # Should not raise — asyncio frame gate passes
             await dashboard._guarded_serve()
 
     @pytest.mark.asyncio
@@ -625,6 +688,36 @@ class TestProactorShutdownRace:
             )
             dashboard._server.should_exit = False
             with pytest.raises(AssertionError, match="unexpected assertion"):
+                await dashboard._guarded_serve()
+
+    @pytest.mark.asyncio
+    async def test_guarded_serve_reraises_non_asyncio_assertion_during_shutdown(self) -> None:
+        """_guarded_serve re-raises AssertionError from non-asyncio code even during shutdown."""
+        import traceback as tb_mod
+        from unittest.mock import patch
+
+        _, dashboard = _make_dashboard()
+
+        async def _assert_serve(self: object) -> None:
+            raise AssertionError("workflow callback assertion")
+
+        import uvicorn
+
+        # Traceback from user code, not asyncio internals
+        fake_frame = tb_mod.FrameSummary(
+            filename="/app/src/conductor/engine/workflow.py",
+            lineno=42,
+            name="execute",
+        )
+        with (
+            patch.object(uvicorn.Server, "serve", _assert_serve),
+            patch("traceback.extract_tb", return_value=[fake_frame]),
+        ):
+            dashboard._server = uvicorn.Server(
+                uvicorn.Config(app=dashboard._app, host="127.0.0.1", port=0)
+            )
+            dashboard._server.should_exit = True
+            with pytest.raises(AssertionError, match="workflow callback assertion"):
                 await dashboard._guarded_serve()
 
 
