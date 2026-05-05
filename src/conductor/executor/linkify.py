@@ -41,9 +41,11 @@ LINKABLE_EXTENSIONS = frozenset(
         ".sh",
         ".bat",
         ".ps1",
-        ".plan.md",
     }
 )
+
+# Pre-computed tuple for fast str.endswith() checks (no Python-level loop).
+_LINKABLE_SUFFIXES = tuple(LINKABLE_EXTENSIONS)
 
 # ---------------------------------------------------------------------------
 # Regex patterns
@@ -62,16 +64,6 @@ _EXISTING_LINK_RE = re.compile(r"\[[^\]]*\]\([^)]*\)|\[[^\]]*\]\[[^\]]*\]")
 _URL_RE = re.compile(
     r"(?<![(\[])"  # not preceded by ( or [
     r"https?://[^\s)<>\]\[\"'`]+"
-)
-
-# Bare file path: contains at least one /, ends with a known extension.
-# Must start at a word boundary or line start.  Avoids matching inside
-# URLs (already handled) by requiring no scheme prefix.
-_FILE_PATH_RE = re.compile(
-    r"(?<![a-zA-Z0-9_/\\])"  # not preceded by path-like chars (avoids partial matches)
-    r"(?!https?://)"  # not a URL
-    r"(?:[a-zA-Z0-9_.][a-zA-Z0-9_./-]*[a-zA-Z0-9_]"  # path chars with at least one /
-    r")"
 )
 
 # ---------------------------------------------------------------------------
@@ -255,11 +247,9 @@ def _try_linkify_path(token: str, base_dir: Path | None) -> str | None:
             return None
 
     # Build markdown link with forward slashes (for dashboard API)
-    link_target = normalized
-    return f"{prefix}[{stripped}]({link_target}){suffix}"
+    return f"{prefix}[{stripped}]({normalized}){suffix}"
 
 
 def _has_linkable_extension(path: str) -> bool:
     """Check if a path ends with a known linkable extension."""
-    lower = path.lower()
-    return any(lower.endswith(ext) for ext in LINKABLE_EXTENSIONS)
+    return path.lower().endswith(_LINKABLE_SUFFIXES)

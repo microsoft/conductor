@@ -104,6 +104,42 @@ agents:
         when: "{{ approval_gate.choice == 'reject' }}"
 ```
 
+#### Markdown in Gate Prompts
+
+Gate prompts support full **Markdown formatting**. In the terminal, prompts are rendered with Rich Markdown (headings, bold, lists, code blocks). In the web dashboard, prompts render as styled HTML with interactive features:
+
+- **Headings, bold, lists, code blocks** — all standard Markdown syntax is rendered
+- **Tables** — GitHub Flavored Markdown (GFM) pipe tables are supported
+- **File links** — relative file paths in the prompt (e.g., `./src/plan.md`) are auto-detected and rendered as clickable links that open in VS Code
+- **URLs** — bare `http://` and `https://` URLs are auto-linked
+
+```yaml
+agents:
+  - name: review_gate
+    type: human_gate
+    description: "Review the generated plan"
+    prompt: |
+      ## Review Required
+
+      The planner produced the following artifacts:
+
+      | File | Purpose |
+      |------|---------|
+      | ./output/plan.md | Implementation plan |
+      | ./output/timeline.md | Delivery timeline |
+
+      Please review the files above and choose how to proceed.
+      See also: https://wiki.example.com/review-guidelines
+
+    options:
+      - name: approve
+        description: "Looks good — proceed"
+      - name: revise
+        description: "Needs changes"
+```
+
+The auto-linkify processor is Markdown-aware: it skips fenced code blocks, inline code spans, and existing markdown links. File paths are validated against the workflow root directory (path traversal is blocked).
+
 ### Script Steps
 
 Script steps run shell commands as workflow steps, capturing stdout, stderr, and exit code. Use them to integrate shell scripts, run tests, or invoke external tools without an AI agent.

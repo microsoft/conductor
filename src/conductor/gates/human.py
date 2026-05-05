@@ -11,13 +11,17 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from rich.console import Console
+from rich.markdown import Markdown as RichMarkdown
 from rich.panel import Panel
 from rich.prompt import IntPrompt, Prompt
 
 from conductor.exceptions import HumanGateError
+from conductor.executor.linkify import linkify_markdown
 from conductor.executor.template import TemplateRenderer
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from conductor.config.schema import AgentDef, GateOption
 
 
@@ -72,6 +76,7 @@ class HumanGateHandler:
         self,
         agent: AgentDef,
         context: dict[str, Any],
+        base_dir: Path | None = None,
     ) -> GateResult:
         """Handle a human gate interaction.
 
@@ -81,6 +86,8 @@ class HumanGateHandler:
         Args:
             agent: The human_gate agent definition.
             context: Current workflow context for template rendering.
+            base_dir: Optional directory for resolving relative file paths
+                in the rendered prompt into clickable markdown links.
 
         Returns:
             GateResult with selected option, route, and any additional input.
@@ -94,8 +101,9 @@ class HumanGateHandler:
                 suggestion="Add 'options' list to the human_gate agent",
             )
 
-        # Render the prompt with context
+        # Render the prompt with context and auto-linkify paths/URLs
         prompt_text = self.renderer.render(agent.prompt, context)
+        prompt_text = linkify_markdown(prompt_text, base_dir=base_dir)
 
         # If skip_gates is enabled, auto-select first option
         if self.skip_gates:
@@ -131,11 +139,11 @@ class HumanGateHandler:
         Returns:
             The selected GateOption.
         """
-        # Display the prompt in a styled panel
+        # Display the prompt in a styled panel (render as Markdown for rich formatting)
         self.console.print()
         self.console.print(
             Panel(
-                prompt_text,
+                RichMarkdown(prompt_text),
                 title="[bold cyan]Decision Required[/bold cyan]",
                 border_style="cyan",
             )
