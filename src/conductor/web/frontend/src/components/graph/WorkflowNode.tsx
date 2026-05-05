@@ -4,7 +4,7 @@ import { Layers, ChevronRight } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { NODE_STATUS_HEX } from '@/lib/constants';
 import { useWorkflowStore } from '@/stores/workflow-store';
-import { useViewedNodes, useViewedSubworkflowContexts } from '@/hooks/use-viewed-context';
+import { useViewedSubworkflowContexts } from '@/hooks/use-viewed-context';
 import { NodeTooltip } from './NodeTooltip';
 import type { GraphNodeData } from './graph-layout';
 import type { NodeStatus } from '@/lib/constants';

@@ -196,9 +196,9 @@ export function WorkflowGraph() {
   }, [selectNode]);
 
   // Minimap node color
-  const minimapNodeColor = useCallback((node: Node) => {
+  const minimapNodeColor = useCallback((node: Node): string => {
     const status = ((node.data as GraphNodeData)?.status || 'pending') as NodeStatus;
-    return NODE_STATUS_HEX[status] || NODE_STATUS_HEX.pending;
+    return NODE_STATUS_HEX[status] ?? NODE_STATUS_HEX.pending ?? '#6b7280';
   }, []);
 
   // Update selected state on nodes

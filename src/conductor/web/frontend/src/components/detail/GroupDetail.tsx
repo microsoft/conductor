@@ -104,9 +104,9 @@ export function GroupDetail({ node }: GroupDetailProps) {
 }
 
 const ITEM_STATUS_COLORS: Record<ForEachItemData['status'], string> = {
-  running: NODE_STATUS_HEX.running,
-  completed: NODE_STATUS_HEX.completed,
-  failed: NODE_STATUS_HEX.failed,
+  running: NODE_STATUS_HEX.running!,
+  completed: NODE_STATUS_HEX.completed!,
+  failed: NODE_STATUS_HEX.failed!,
 };
 
 function ForEachItemRow({ groupName, item }: { groupName: string; item: ForEachItemData }) {

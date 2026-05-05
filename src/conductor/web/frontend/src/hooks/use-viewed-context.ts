@@ -7,7 +7,7 @@
  */
 import { useMemo } from 'react';
 import { useWorkflowStore } from '@/stores/workflow-store';
-import type { NodeData, GroupProgress, HighlightedEdge, SubworkflowContext, WorkflowAgent, RouteEdge, ParallelGroup, ForEachGroup } from '@/stores/workflow-store';
+import type { NodeData, GroupProgress, HighlightedEdge, SubworkflowContext } from '@/stores/workflow-store';
 
 /** Resolve a SubworkflowContext from a path of indices. */
 function resolveCtx(contexts: SubworkflowContext[], path: number[]): SubworkflowContext | null {

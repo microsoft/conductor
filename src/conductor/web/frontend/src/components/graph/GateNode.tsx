@@ -3,7 +3,6 @@ import { Handle, Position, type NodeProps } from '@xyflow/react';
 import { ShieldCheck } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { NODE_STATUS_HEX } from '@/lib/constants';
-import { useWorkflowStore } from '@/stores/workflow-store';
 import { useViewedNodes } from '@/hooks/use-viewed-context';
 import { NodeTooltip } from './NodeTooltip';
 import type { GraphNodeData } from './graph-layout';

@@ -78,6 +78,9 @@ class WebDashboard:
         # Gate response channel (web client → engine)
         self._gate_response_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
 
+        # Dialog response channel (web client → engine)
+        self._dialog_response_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
         # Auto-shutdown support (--web-bg)
         self._bg_event = asyncio.Event()
         self._grace_task: asyncio.Task[None] | None = None
@@ -235,6 +238,11 @@ class WebDashboard:
                         msg = json.loads(raw)
                         if isinstance(msg, dict) and msg.get("type") == "gate_response":
                             self._gate_response_queue.put_nowait(msg)
+                        elif isinstance(msg, dict) and msg.get("type") in (
+                            "dialog_message",
+                            "dialog_decline",
+                        ):
+                            self._dialog_response_queue.put_nowait(msg)
                     except (json.JSONDecodeError, TypeError):
                         pass  # Ignore non-JSON messages (keep-alive pings)
             except WebSocketDisconnect:
@@ -334,6 +342,36 @@ class WebDashboard:
                 "Discarding stale gate_response for agent %r while waiting on %r",
                 msg.get("agent_name"),
                 agent_name,
+            )
+
+    async def wait_for_dialog_message(self, agent_name: str, dialog_id: str) -> dict[str, Any]:
+        """Wait for a dialog message or decline from the web client.
+
+        Blocks until a ``dialog_message`` or ``dialog_decline`` message is
+        received via WebSocket that matches both the given agent name and
+        dialog id. Messages from a stale or different dialog are dropped so
+        a re-entered dialog can't be confused with the previous one.
+
+        Args:
+            agent_name: The name of the agent in dialog mode.
+            dialog_id: The dialog session identifier.
+
+        Returns:
+            The dialog response payload dict with keys ``type``
+            (``dialog_message`` or ``dialog_decline``) and optionally
+            ``content``.
+        """
+        while True:
+            msg = await self._dialog_response_queue.get()
+            if msg.get("agent_name") == agent_name and msg.get("dialog_id") == dialog_id:
+                return msg
+            logger.warning(
+                "Discarding stale dialog message for agent %r / dialog %r "
+                "while waiting on agent %r / dialog %r",
+                msg.get("agent_name"),
+                msg.get("dialog_id"),
+                agent_name,
+                dialog_id,
             )
 
     # ------------------------------------------------------------------
