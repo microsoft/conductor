@@ -24,7 +24,7 @@ import json
 import logging
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -32,6 +32,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from conductor.events import WorkflowEvent, WorkflowEventEmitter
+from conductor.executor.linkify import LINKABLE_EXTENSIONS
 
 logger = logging.getLogger(__name__)
 
@@ -40,32 +41,7 @@ _STATIC_DIR = Path(__file__).parent / "static"
 # Grace period (seconds) before auto-shutdown in --web-bg mode
 _BG_GRACE_SECONDS = 30
 
-# File API: allowed text extensions and max file size
-_FILE_ALLOWED_EXTENSIONS = frozenset(
-    {
-        ".md",
-        ".txt",
-        ".yaml",
-        ".yml",
-        ".json",
-        ".log",
-        ".py",
-        ".ts",
-        ".js",
-        ".tsx",
-        ".jsx",
-        ".css",
-        ".html",
-        ".toml",
-        ".cfg",
-        ".ini",
-        ".csv",
-        ".xml",
-        ".sh",
-        ".bat",
-        ".ps1",
-    }
-)
+# File API: max file size (extension allowlist is LINKABLE_EXTENSIONS from linkify)
 _FILE_MAX_SIZE = 1 * 1024 * 1024  # 1 MB
 
 
@@ -107,6 +83,9 @@ class WebDashboard:
 
         # Gate response channel (web client → engine)
         self._gate_response_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+        # Dialog response channel (web client → engine)
+        self._dialog_response_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
 
         # Auto-shutdown support (--web-bg)
         self._bg_event = asyncio.Event()
@@ -266,9 +245,9 @@ class WebDashboard:
 
             # Reject absolute, drive-qualified, UNC, and scheme-prefixed paths
             if (
-                file_path.startswith(("/", "\\"))
-                or "://" in file_path
-                or (len(file_path) >= 2 and file_path[1] == ":")
+                "://" in file_path
+                or PurePosixPath(file_path).is_absolute()
+                or PureWindowsPath(file_path).is_absolute()
             ):
                 return JSONResponse(
                     {"error": "Absolute paths are not allowed"},
@@ -290,7 +269,7 @@ class WebDashboard:
                 )
 
             # Extension allowlist
-            if target.suffix.lower() not in _FILE_ALLOWED_EXTENSIONS:
+            if target.suffix.lower() not in LINKABLE_EXTENSIONS:
                 return JSONResponse(
                     {"error": f"File type '{target.suffix}' is not supported"},
                     status_code=403,
@@ -340,6 +319,11 @@ class WebDashboard:
                         msg = json.loads(raw)
                         if isinstance(msg, dict) and msg.get("type") == "gate_response":
                             self._gate_response_queue.put_nowait(msg)
+                        elif isinstance(msg, dict) and msg.get("type") in (
+                            "dialog_message",
+                            "dialog_decline",
+                        ):
+                            self._dialog_response_queue.put_nowait(msg)
                     except (json.JSONDecodeError, TypeError):
                         pass  # Ignore non-JSON messages (keep-alive pings)
             except WebSocketDisconnect:
@@ -439,6 +423,36 @@ class WebDashboard:
                 "Discarding stale gate_response for agent %r while waiting on %r",
                 msg.get("agent_name"),
                 agent_name,
+            )
+
+    async def wait_for_dialog_message(self, agent_name: str, dialog_id: str) -> dict[str, Any]:
+        """Wait for a dialog message or decline from the web client.
+
+        Blocks until a ``dialog_message`` or ``dialog_decline`` message is
+        received via WebSocket that matches both the given agent name and
+        dialog id. Messages from a stale or different dialog are dropped so
+        a re-entered dialog can't be confused with the previous one.
+
+        Args:
+            agent_name: The name of the agent in dialog mode.
+            dialog_id: The dialog session identifier.
+
+        Returns:
+            The dialog response payload dict with keys ``type``
+            (``dialog_message`` or ``dialog_decline``) and optionally
+            ``content``.
+        """
+        while True:
+            msg = await self._dialog_response_queue.get()
+            if msg.get("agent_name") == agent_name and msg.get("dialog_id") == dialog_id:
+                return msg
+            logger.warning(
+                "Discarding stale dialog message for agent %r / dialog %r "
+                "while waiting on agent %r / dialog %r",
+                msg.get("agent_name"),
+                msg.get("dialog_id"),
+                agent_name,
+                dialog_id,
             )
 
     # ------------------------------------------------------------------

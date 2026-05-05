@@ -1,0 +1,60 @@
+# Dialog Mode Test — guaranteed to trigger dialog
+#
+# This workflow asks an agent to analyze a codebase question,
+# but the agent will express uncertainty about scope/approach,
+# triggering a dialog with the user.
+#
+# Usage:
+#   conductor run examples/dialog-test.yaml --input question="How should I refactor the error handling?"
+
+workflow:
+  name: dialog-test
+  description: Quick test to exercise dialog mode
+  entry_point: analyst
+
+  runtime:
+    provider: copilot
+
+  input:
+    question:
+      type: string
+      required: true
+      description: A code analysis question — the agent will seek clarification
+
+agents:
+  - name: analyst
+    description: An agent that analyzes code but needs clarification on scope
+    model: claude-haiku-4.5
+    prompt: |
+      The user asked: {{ workflow.input.question }}
+
+      You MUST respond as though this question is too broad to answer well.
+      Identify at least 3 different ways you could approach or scope this
+      analysis, explain why each leads to very different recommendations,
+      and state clearly that you need the user to narrow the scope before
+      you can give a useful answer. Express strong uncertainty about which
+      approach the user wants.
+    output:
+      approaches:
+        type: string
+        description: The possible approaches or scopes you identified
+      chosen_approach:
+        type: string
+        description: Which approach you went with (after dialog)
+      analysis:
+        type: string
+        description: Your analysis based on the chosen approach
+    dialog:
+      trigger_prompt: |
+        ALWAYS trigger dialog. The agent's output will contain
+        uncertainty and multiple possible approaches — this is by design.
+        Trigger if the output mentions any ambiguity, multiple
+        approaches, uncertainty, or inability to proceed.
+        In practice: always return trigger=true for this agent.
+    routes:
+      - to: $end
+
+output:
+  approaches: "{{ analyst.output.approaches }}"
+  chosen: "{{ analyst.output.chosen_approach }}"
+  analysis: "{{ analyst.output.analysis }}"
