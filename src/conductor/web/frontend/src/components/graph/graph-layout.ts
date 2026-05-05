@@ -199,7 +199,9 @@ export function buildGraphElements(
   // the same pair represent ONE visual transition, not parallel edges.
   // Without deduping, dagre lays them as two overlapping/diverging edges
   // which render as phantom strands going off-canvas.
-  const seenPairs = new Set<string>();
+  // When collapsing routes with different `when` conditions, the label is
+  // cleared to avoid implying only one condition applies.
+  const seenPairs = new Map<string, { when: string | undefined; idx: number }>();
   for (const r of routes) {
     const from = childToParent.get(r.from) ?? r.from;
     const to = childToParent.get(r.to) ?? r.to;
@@ -207,8 +209,16 @@ export function buildGraphElements(
     // Skip self-loops created by remapping (e.g. group member → group member)
     if (from === to) continue;
     const pairKey = `${from}->${to}`;
-    if (seenPairs.has(pairKey)) continue;
-    seenPairs.add(pairKey);
+    const existing = seenPairs.get(pairKey);
+    if (existing) {
+      // Multiple distinct conditions collapse — drop the label.
+      if (existing.when !== r.when) {
+        flowEdges[existing.idx]!.data = { when: undefined };
+      }
+      continue;
+    }
+    const idx = flowEdges.length;
+    seenPairs.set(pairKey, { when: r.when, idx });
     const edgeId = `${pairKey}${r.when ? `[${r.when}]` : ''}`;
     flowEdges.push({
       id: edgeId,

@@ -640,7 +640,8 @@ class TestProactorShutdownRace:
 
     @pytest.mark.asyncio
     async def test_guarded_serve_suppresses_assertion_during_shutdown(self) -> None:
-        """_guarded_serve swallows AssertionError when server is shutting down."""
+        """_guarded_serve swallows AssertionError when the asyncio-frame gate passes."""
+        import traceback as tb_mod
         from unittest.mock import patch
 
         _, dashboard = _make_dashboard()
@@ -650,12 +651,20 @@ class TestProactorShutdownRace:
 
         import uvicorn
 
-        with patch.object(uvicorn.Server, "serve", _assert_serve):
+        fake_frame = tb_mod.FrameSummary(
+            filename="/usr/lib/python3.14/asyncio/base_events.py",
+            lineno=1,
+            name="_attach",
+        )
+        with (
+            patch.object(uvicorn.Server, "serve", _assert_serve),
+            patch("traceback.extract_tb", return_value=[fake_frame]),
+        ):
             dashboard._server = uvicorn.Server(
                 uvicorn.Config(app=dashboard._app, host="127.0.0.1", port=0)
             )
             dashboard._server.should_exit = True
-            # Should not raise
+            # Should not raise — asyncio frame gate passes
             await dashboard._guarded_serve()
 
     @pytest.mark.asyncio
@@ -676,6 +685,36 @@ class TestProactorShutdownRace:
             )
             dashboard._server.should_exit = False
             with pytest.raises(AssertionError, match="unexpected assertion"):
+                await dashboard._guarded_serve()
+
+    @pytest.mark.asyncio
+    async def test_guarded_serve_reraises_non_asyncio_assertion_during_shutdown(self) -> None:
+        """_guarded_serve re-raises AssertionError from non-asyncio code even during shutdown."""
+        import traceback as tb_mod
+        from unittest.mock import patch
+
+        _, dashboard = _make_dashboard()
+
+        async def _assert_serve(self: object) -> None:
+            raise AssertionError("workflow callback assertion")
+
+        import uvicorn
+
+        # Traceback from user code, not asyncio internals
+        fake_frame = tb_mod.FrameSummary(
+            filename="/app/src/conductor/engine/workflow.py",
+            lineno=42,
+            name="execute",
+        )
+        with (
+            patch.object(uvicorn.Server, "serve", _assert_serve),
+            patch("traceback.extract_tb", return_value=[fake_frame]),
+        ):
+            dashboard._server = uvicorn.Server(
+                uvicorn.Config(app=dashboard._app, host="127.0.0.1", port=0)
+            )
+            dashboard._server.should_exit = True
+            with pytest.raises(AssertionError, match="workflow callback assertion"):
                 await dashboard._guarded_serve()
 
 

@@ -446,12 +446,14 @@ class WebDashboard:
 
         If ``serve()`` itself raises ``AssertionError`` during shutdown
         (rather than the exception surfacing through a callback), this
-        wrapper suppresses it.
+        wrapper applies the same asyncio-frame gate used in
+        ``_loop_exception_handler`` to avoid swallowing unrelated errors.
         """
         try:
             await self._server.serve()
-        except AssertionError:
-            if self._server is not None and getattr(self._server, "should_exit", False):
+        except AssertionError as exc:
+            ctx: dict[str, Any] = {"exception": exc}
+            if self._is_proactor_shutdown_race(ctx):
                 logger.debug(
                     "Suppressed proactor accept-loop AssertionError during server shutdown"
                 )
