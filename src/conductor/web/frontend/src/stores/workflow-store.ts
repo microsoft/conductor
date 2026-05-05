@@ -839,12 +839,15 @@ type MutableState = WorkflowState;
 
 /** Get the nodes/groupProgress/routes/highlightedEdges for the context that should receive the event.
  *
- * When the event payload carries an explicit `subworkflow_path` (auto-stamped
- * by sub-workflow engines), that path is used to resolve the owning context —
- * essential for routing per-iteration agent events under concurrent
- * for-each-of-workflow execution, where a single shared `activeContextPath`
- * cannot represent the multiple in-flight sibling contexts. Falls back to
- * `activeContextPath` for legacy events and root-engine events.
+ * Routing is keyed strictly off the engine-supplied `subworkflow_path` stamp:
+ * sub-workflow engines tag every event with their depth-aware path, the root
+ * engine emits no stamp, and we resolve accordingly. This avoids conflating
+ * "where did this event originate" (engine state) with "where is the user
+ * looking" (UI state) — earlier versions fell back to `activeContextPath`
+ * for unstamped events, which incorrectly routed parent-level events such
+ * as `for_each_item_started` into whichever sub-workflow the user (or a
+ * prior `subworkflow_started` event) had advanced the cursor into,
+ * silently dropping iterations from the parent's for-each panel.
  */
 function activeTarget(
   state: MutableState,
@@ -862,8 +865,6 @@ function activeTarget(
   const subPath = data?.subworkflow_path;
   if (Array.isArray(subPath) && subPath.length > 0) {
     ctx = resolveSlotPath(state.subworkflowContexts, subPath as string[])?.ctx ?? null;
-  } else if (state.activeContextPath.length > 0) {
-    ctx = resolveContext(state.subworkflowContexts, state.activeContextPath);
   }
   if (ctx) {
     const ctxRef = ctx;
@@ -1438,9 +1439,17 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     }
 
     // Capture sticky-follow intent BEFORE mutating activeContextPath.
-    const wasAtLiveEdge =
-      state.viewContextPath.length === state.activeContextPath.length &&
-      state.viewContextPath.every((v, i) => v === state.activeContextPath[i]);
+    //
+    // Disabled: previously, when the user's view was at the engine's live
+    // edge (typical at first launch, when both paths are []), starting a
+    // sub-workflow would auto-advance ``viewContextPath`` into the new
+    // child. That made the dashboard land inside an iteration on first
+    // open and follow whichever sub-workflow most recently started during
+    // a for_each fan-out. Engine progress and user view are now decoupled:
+    // ``activeContextPath`` still tracks the engine's cursor (used to
+    // resolve ``parent_path`` for older engines that don't stamp it), but
+    // the user's view stays where it is until they navigate explicitly.
+    const wasAtLiveEdge = false;
 
     let newActivePath: number[];
     if (parentIndexPath.length === 0) {
