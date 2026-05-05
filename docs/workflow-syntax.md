@@ -23,11 +23,20 @@ workflow:
   name: string                      # Required: Unique workflow identifier
   description: string               # Optional: Human-readable description
   entry_point: string               # Required: Name of first agent to execute
-  
+
+  metadata:                         # Optional: free-form key/value metadata
+    tracker: ado                    # surfaced in the workflow_started event
+    project_url: https://...        # CLI --metadata / -m can add or override
+
+  instructions:                     # Optional: extra instruction files (paths)
+    - ./docs/conventions.md         # prepended to every agent prompt
+    - ./AGENTS.md                   # also auto-discoverable via
+                                    # --workspace-instructions (see CLI ref)
+
   limits:
     max_iterations: 10              # Default: 10, max: 500
     timeout_seconds: 600            # Optional: Maximum wall-clock time (seconds)
-  
+
   hooks:
     on_start: "{{ template }}"      # Optional: Expression evaluated on start
     on_complete: "{{ template }}"   # Optional: Expression evaluated on success
@@ -35,6 +44,10 @@ workflow:
 
   context_mode: accumulate          # accumulate | snapshot | minimal (default: accumulate)
 ```
+
+**Workflow metadata** is included verbatim in the `workflow_started` event and lets downstream consumers (dashboards, queue runners, observability tools) adapt without parsing the YAML. CLI `--metadata key=value` flags merge on top of YAML metadata (CLI wins on conflicts).
+
+**Instructions files** are loaded once and prepended to every agent's rendered prompt. They are inherited by sub-workflows and persisted in checkpoints so resume continues to use the same instructions. Use the YAML `instructions:` list for workflow-pinned context, or pass `--workspace-instructions` on the CLI to auto-discover `AGENTS.md`, `CLAUDE.md`, and `.github/copilot-instructions.md` by walking from CWD up to the git root.
 
 ### Context Modes
 
@@ -172,6 +185,25 @@ agents:
 | `stderr` | string | Captured standard error |
 | `exit_code` | integer | Process exit code (0 = success) |
 
+**JSON stdout auto-parsing** — if `stdout` is valid JSON _and_ the parsed value is an object, its fields are merged into the agent's output dict alongside `stdout`/`stderr`/`exit_code`. This lets you route on parsed fields directly instead of opaque exit codes:
+
+```yaml
+# Script writes to stdout: {"route": "planning", "issue_count": 3}
+agents:
+  - name: detector
+    type: script
+    command: pwsh
+    args: ["-File", "{{ workflow.dir }}/scripts/detect.ps1"]
+    routes:
+      - to: planner
+        when: "route == 'planning'"          # parsed field
+      - to: scaler
+        when: "issue_count > 100"            # parsed field
+      - to: $end
+```
+
+JSON arrays and scalars are ignored (only objects merge). Non-JSON stdout is unchanged. Parsed fields shadow `stdout`/`stderr`/`exit_code` if a script outputs those as JSON keys.
+
 Access in downstream agents:
 
 ```yaml
@@ -207,6 +239,12 @@ agents:
     workflow: ./research-pipeline.yaml   # Required: path to sub-workflow YAML
     input:                               # Optional: explicit input declarations
       - workflow.input.topic
+    input_mapping:                       # Optional: per-call inputs to the sub-workflow
+      topic: "{{ workflow.input.topic }}"
+      depth: "{{ research_planner.output.depth }}"
+    max_depth: 3                         # Optional: per-agent recursion cap
+                                         #   (additionally bounded by global
+                                         #   MAX_SUBWORKFLOW_DEPTH = 10)
     output:                              # Optional: output schema for validation
       findings:
         type: string
@@ -219,8 +257,9 @@ agents:
 - The `workflow` path is resolved relative to the parent workflow file
 - Sub-workflow inherits the parent's provider configuration
 - Sub-workflow output is stored in context and accessible via `{{ agent_name.output.field }}`
-- Recursive composition is supported (sub-workflows can reference other sub-workflows) with a depth limit of 10
-- Circular references (a workflow referencing itself) are detected and rejected
+- Recursive composition is supported (sub-workflows can reference other sub-workflows) with a global depth limit of `MAX_SUBWORKFLOW_DEPTH = 10`
+- Self-referential sub-workflows (a workflow referencing itself) are allowed; depth is bounded by the global cap and the optional per-agent `max_depth` field
+- `input_mapping` keys are sub-workflow input names; each value is a Jinja2 expression evaluated against the parent's context. When `input_mapping` is omitted, the parent's `workflow.input.*` is forwarded to the sub-workflow as before
 
 **Access sub-workflow output in downstream agents:**
 
@@ -230,7 +269,24 @@ prompt: |
   {{ deep_research.output.findings }}
 ```
 
-**Restrictions** — workflow steps cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, `command`, or `options`. Workflow steps also cannot be used inside `parallel` groups or `for_each` groups.
+**Sub-workflows in `for_each` groups** — `type: workflow` agents can be used inside `for_each` groups to fan out one sub-workflow run per item in the source array. Each iteration receives its own `input_mapping` evaluated against the loop variable, and emits its own `subworkflow_started` / `subworkflow_completed` events:
+
+```yaml
+parallel:
+  - name: plan_issues
+    for_each:
+      source: epic_planner.output.issues
+      as: issue
+    max_concurrent: 1
+    agent:
+      type: workflow
+      workflow: ./plan-and-review.yaml
+      input_mapping:
+        work_item_id: "{{ issue.id }}"
+        title: "{{ issue.title }}"
+```
+
+**Restrictions** — workflow steps cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, `command`, or `options`.
 
 ### Dialog Mode
 
@@ -474,6 +530,41 @@ input:
 ```
 
 Access in agents: `{{ workflow.input.question }}`
+
+**Optional inputs without an explicit `default`** resolve to type-appropriate zero values rather than `None`, so templates render cleanly:
+
+| Input `type` | Zero value |
+|---|---|
+| `string` | `""` |
+| `number` | `0` |
+| `boolean` | `false` |
+| `array` | `[]` |
+| `object` | `{}` |
+
+This means `{{ workflow.input.optional_msg | default("fallback") }}` correctly renders `"fallback"` when `optional_msg` is omitted, instead of the literal string `"None"`.
+
+### Workflow Metadata Variables
+
+In addition to `workflow.input.*`, every agent has access to:
+
+| Variable | Description |
+|---|---|
+| `workflow.name` | Workflow name from the YAML |
+| `workflow.description` | Workflow description from the YAML |
+| `workflow.dir` | Absolute path to the directory containing the workflow YAML |
+| `workflow.file` | Absolute path to the workflow YAML file |
+
+These are available in **all** context modes (they're metadata, not inputs). `workflow.dir` is particularly useful for registry-hosted workflows that need to reference co-located scripts or assets without depending on the caller's working directory:
+
+```yaml
+agents:
+  - name: detector
+    type: script
+    command: pwsh
+    args:
+      - "-File"
+      - "{{ workflow.dir }}/scripts/detect-state.ps1"
+```
 
 ### Workflow Outputs
 
@@ -774,7 +865,7 @@ workflow:
 ### Available Hook Contexts
 
 **`on_start`**:
-- `workflow.name`, `workflow.description`
+- `workflow.name`, `workflow.description`, `workflow.dir`, `workflow.file`
 - `workflow.input.*` (all input values)
 
 **`on_complete`**:

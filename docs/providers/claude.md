@@ -97,7 +97,7 @@ echo '.env' >> .gitignore
 
 ## Model Selection
 
-Claude offers multiple model tiers optimized for different use cases. All models support a 200K token context window.
+Claude offers multiple model tiers optimized for different use cases. All current Claude models default to a 200K-token context window; the dashboard's "context remaining" bar sources this value from the Anthropic SDK at runtime, so it always reflects the actual cap your account has access to (rather than a hand-maintained number that can drift). Beta context modes such as Claude's 1M-token window are not enabled by default in conductor today.
 
 ### Available Models
 
