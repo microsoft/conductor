@@ -567,6 +567,29 @@ class AgentDef(BaseModel):
         max_depth: 3  # Allow at most 3 levels of recursion
     """
 
+    timeout_seconds: float | None = Field(None, ge=1.0)
+    """Hard wall-clock timeout for this agent's execution in seconds.
+
+    When set, the engine wraps the entire agent execution in
+    ``asyncio.wait_for()``. If exceeded, raises ``AgentTimeoutError``
+    which is handled by existing error semantics (``fail_fast``,
+    ``continue_on_error``).
+
+    The effective timeout is ``min(timeout_seconds, remaining_workflow_timeout)``
+    so agent timeouts never exceed the workflow-level limit.
+
+    Only applies to provider-backed agents (not script, human_gate,
+    or workflow types). This is a hard cancellation — unlike
+    ``max_session_seconds`` which checks between provider iterations.
+
+    Note: Agent-level timeouts are non-retryable. The retry policy
+    operates inside the provider and is cancelled along with the agent.
+
+    Example::
+
+        timeout_seconds: 120  # Cancel agent after 2 minutes
+    """
+
     max_session_seconds: float | None = Field(None, ge=1.0)
     """Maximum wall-clock duration for this agent's session in seconds.
 
@@ -666,6 +689,8 @@ class AgentDef(BaseModel):
                 raise ValueError("human_gate agents cannot have 'max_depth'")
             if self.reasoning is not None:
                 raise ValueError("human_gate agents cannot have 'reasoning'")
+            if self.timeout_seconds is not None:
+                raise ValueError("human_gate agents cannot have 'timeout_seconds'")
         elif self.type == "script":
             if not self.command:
                 raise ValueError("script agents require 'command'")
@@ -700,6 +725,11 @@ class AgentDef(BaseModel):
                 raise ValueError("script agents cannot have 'max_depth'")
             if self.reasoning is not None:
                 raise ValueError("script agents cannot have 'reasoning'")
+            if self.timeout_seconds is not None:
+                raise ValueError(
+                    "script agents cannot have 'timeout_seconds' "
+                    "(use 'timeout' for script-specific timeouts)"
+                )
         elif self.type == "workflow":
             if not self.workflow:
                 raise ValueError("workflow agents require 'workflow' path")
@@ -725,6 +755,8 @@ class AgentDef(BaseModel):
                 raise ValueError("workflow agents cannot have 'retry'")
             if self.dialog is not None:
                 raise ValueError("workflow agents cannot have 'dialog'")
+            if self.timeout_seconds is not None:
+                raise ValueError("workflow agents cannot have 'timeout_seconds'")
         else:
             # Regular agent or human_gate — input_mapping is not valid
             if self.input_mapping is not None:

@@ -419,6 +419,38 @@ def verbose_log_parallel_agent_failed(
         _file_console.print(error_msg)
 
 
+def verbose_log_agent_timeout(
+    agent_name: str,
+    elapsed: float,
+    timeout_seconds: float,
+) -> None:
+    """Log agent timeout.
+
+    Args:
+        agent_name: Name of the agent that timed out.
+        elapsed: Elapsed time in seconds.
+        timeout_seconds: Configured timeout limit.
+    """
+    from rich.text import Text
+
+    from conductor.cli.app import is_verbose
+
+    should_console = is_verbose()
+    should_file = _file_console is not None
+    if not should_console and not should_file:
+        return
+
+    text = Text()
+    text.append("  ⏱ ", style="yellow")
+    text.append(agent_name, style="yellow bold")
+    text.append(f"  timed out after {elapsed:.1f}s (limit: {timeout_seconds:.0f}s)", style="dim")
+
+    if should_console:
+        _verbose_console.print(text)
+    if _file_console is not None:
+        _file_console.print(text)
+
+
 def verbose_log_parallel_summary(
     group_name: str,
     success_count: int,
@@ -663,6 +695,13 @@ class ConsoleEventSubscriber:
                 cost_usd=d.get("cost_usd"),
                 input_tokens=d.get("input_tokens"),
                 output_tokens=d.get("output_tokens"),
+            )
+
+        elif t == "agent_timeout":
+            verbose_log_agent_timeout(
+                d.get("agent_name", "?"),
+                d.get("elapsed", 0.0),
+                d.get("timeout_seconds", 0.0),
             )
 
         elif t == "route_taken":

@@ -24,6 +24,7 @@ from conductor.engine.router import Router, RouteResult
 from conductor.engine.usage import UsageTracker, WorkflowUsage
 from conductor.events import WorkflowEvent, WorkflowEventEmitter
 from conductor.exceptions import (
+    AgentTimeoutError,
     ConductorError,
     ExecutionError,
     InterruptError,
@@ -601,6 +602,60 @@ class WorkflowEngine:
             self.script_executor.execute(agent, context),
             operation_name=f"script '{agent.name}'",
         )
+
+    async def _execute_with_agent_timeout(
+        self,
+        agent: AgentDef,
+        coro: Any,
+    ) -> Any:
+        """Wrap an agent execution coroutine with the agent's timeout_seconds.
+
+        If the agent has ``timeout_seconds`` configured, this wraps the coroutine
+        in ``asyncio.wait_for()`` with an effective timeout that is the minimum of
+        the agent's timeout and any remaining workflow-level timeout.
+
+        When the remaining workflow timeout is stricter, the coroutine runs
+        without the agent timeout wrapper so the existing workflow timeout
+        path handles the error with correct attribution.
+
+        On timeout, emits an ``agent_timeout`` event and raises ``AgentTimeoutError``.
+
+        Args:
+            agent: Agent definition with optional ``timeout_seconds``.
+            coro: The coroutine to execute (typically ``executor.execute(...)``).
+
+        Returns:
+            Result of the coroutine.
+
+        Raises:
+            AgentTimeoutError: If the agent exceeds its timeout_seconds.
+        """
+        if agent.timeout_seconds is None:
+            return await coro
+
+        # If workflow remaining timeout is stricter, let it own the error
+        remaining = self.limits.get_remaining_timeout()
+        if remaining is not None and remaining <= agent.timeout_seconds:
+            return await coro
+
+        start = _time.monotonic()
+        try:
+            return await asyncio.wait_for(coro, timeout=agent.timeout_seconds)
+        except TimeoutError:
+            elapsed = _time.monotonic() - start
+            self._emit(
+                "agent_timeout",
+                {
+                    "agent_name": agent.name,
+                    "elapsed": elapsed,
+                    "timeout_seconds": agent.timeout_seconds,
+                },
+            )
+            raise AgentTimeoutError(
+                agent_name=agent.name,
+                elapsed_seconds=elapsed,
+                timeout_seconds=agent.timeout_seconds,
+            ) from None
 
     def _build_subworkflow_inputs(
         self,
@@ -2138,12 +2193,15 @@ class WorkflowEngine:
                         executor = await self._get_executor_for_agent(agent)
                         guidance_section = self.context.get_guidance_prompt_section()
                         event_callback = self._make_event_callback(agent.name)
-                        output = await executor.execute(
+                        output = await self._execute_with_agent_timeout(
                             agent,
-                            agent_context,
-                            guidance_section=guidance_section,
-                            interrupt_signal=self._interrupt_event,
-                            event_callback=event_callback,
+                            executor.execute(
+                                agent,
+                                agent_context,
+                                guidance_section=guidance_section,
+                                interrupt_signal=self._interrupt_event,
+                                event_callback=event_callback,
+                            ),
                         )
                         _agent_elapsed = _time.time() - _agent_start
 
@@ -2925,10 +2983,13 @@ class WorkflowEngine:
                 # Execute agent (get executor for multi-provider support)
                 executor = await self._get_executor_for_agent(agent)
                 event_callback = self._make_event_callback(agent.name)
-                output = await executor.execute(
+                output = await self._execute_with_agent_timeout(
                     agent,
-                    agent_context,
-                    event_callback=event_callback,
+                    executor.execute(
+                        agent,
+                        agent_context,
+                        event_callback=event_callback,
+                    ),
                 )
                 _agent_elapsed = _time.time() - _agent_start
 
@@ -3348,10 +3409,13 @@ class WorkflowEngine:
                     self._emit(event_type, data_with_agent)
 
                 event_callback = _item_callback if self._event_emitter else None
-                output = await executor.execute(
+                output = await self._execute_with_agent_timeout(
                     for_each_group.agent,
-                    agent_context,
-                    event_callback=event_callback,
+                    executor.execute(
+                        for_each_group.agent,
+                        agent_context,
+                        event_callback=event_callback,
+                    ),
                 )
                 _item_elapsed = _time.time() - _item_start
 
