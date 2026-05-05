@@ -230,13 +230,86 @@ export function buildGraphElements(
     });
   }
 
+  // Classify edges as forward or back-edges using a DFS from $start.
+  // Back-edges are loop-back routes (e.g. plan_reviewer → planner when
+  // approved=false). Feeding them to Dagre as-is causes it to greedily
+  // reverse arbitrary edges to break cycles, which scrambles the ranking
+  // and produces disjointed layouts. Pre-classifying lets us pass each
+  // back-edge to Dagre in REVERSED direction so the layout reflects the
+  // true forward DAG, while we still render the edge in its original
+  // direction.
+  const startNode = flowNodes.find((n) => n.id === '$start');
+  const backEdgeIds = startNode
+    ? findBackEdges(flowNodes, flowEdges, startNode.id)
+    : new Set<string>();
+
   // Apply dagre layout to top-level nodes only (non-children)
-  applyDagreLayout(flowNodes, flowEdges);
+  applyDagreLayout(flowNodes, flowEdges, backEdgeIds);
 
   return { nodes: flowNodes, edges: flowEdges };
 }
 
-function applyDagreLayout(flowNodes: Node<GraphNodeData>[], flowEdges: Edge[]): void {
+/**
+ * Identify back-edges via DFS from the entry node. An edge u→v is a back-edge
+ * iff v is an ancestor of u in the DFS tree (i.e. v is currently on the DFS
+ * stack when we visit u→v). Operates on top-level node IDs only, since edges
+ * have already been remapped from group children to group parents.
+ *
+ * Traversal order is stable (insertion order of edges, sorted target IDs as
+ * tiebreaker) so layout is deterministic across renders.
+ */
+function findBackEdges(
+  flowNodes: Node<GraphNodeData>[],
+  flowEdges: Edge[],
+  startId: string,
+): Set<string> {
+  const topLevelIds = new Set(flowNodes.filter((n) => !n.parentId).map((n) => n.id));
+
+  // Build adjacency from top-level edges. Sort targets for stability.
+  const adj = new Map<string, { target: string; edgeId: string }[]>();
+  for (const e of flowEdges) {
+    if (!topLevelIds.has(e.source) || !topLevelIds.has(e.target)) continue;
+    if (!adj.has(e.source)) adj.set(e.source, []);
+    adj.get(e.source)!.push({ target: e.target, edgeId: e.id });
+  }
+  for (const list of adj.values()) {
+    list.sort((a, b) => (a.target < b.target ? -1 : a.target > b.target ? 1 : 0));
+  }
+
+  const backEdges = new Set<string>();
+  const onStack = new Set<string>();
+  const visited = new Set<string>();
+
+  const dfs = (node: string): void => {
+    visited.add(node);
+    onStack.add(node);
+    for (const { target, edgeId } of adj.get(node) ?? []) {
+      if (onStack.has(target)) {
+        backEdges.add(edgeId);
+      } else if (!visited.has(target)) {
+        dfs(target);
+      }
+    }
+    onStack.delete(node);
+  };
+
+  if (topLevelIds.has(startId)) dfs(startId);
+
+  // Also DFS from any unvisited nodes that have outgoing edges, so back-edges
+  // in unreachable subgraphs are still classified deterministically.
+  const remainingSources = [...adj.keys()].filter((id) => !visited.has(id)).sort();
+  for (const id of remainingSources) {
+    if (!visited.has(id)) dfs(id);
+  }
+
+  return backEdges;
+}
+
+function applyDagreLayout(
+  flowNodes: Node<GraphNodeData>[],
+  flowEdges: Edge[],
+  backEdgeIds: Set<string>,
+): void {
   // Use a NON-compound dagre graph — compound mode causes crashes
   // when edges cross compound boundaries
   const g = new dagre.graphlib.Graph();
@@ -253,10 +326,14 @@ function applyDagreLayout(flowNodes: Node<GraphNodeData>[], flowEdges: Edge[]): 
     g.setNode(node.id, { width: w, height: h });
   }
 
-  // Add edges (dagre needs valid source/target nodes)
+  // Add edges (dagre needs valid source/target nodes). Back-edges are passed
+  // in REVERSED direction so dagre ranks the underlying DAG correctly; the
+  // visible flowEdges entries keep their original direction.
   for (const edge of flowEdges) {
-    // Only add edge if both source and target are in dagre graph
-    if (g.hasNode(edge.source) && g.hasNode(edge.target)) {
+    if (!g.hasNode(edge.source) || !g.hasNode(edge.target)) continue;
+    if (backEdgeIds.has(edge.id)) {
+      g.setEdge(edge.target, edge.source);
+    } else {
       g.setEdge(edge.source, edge.target);
     }
   }
