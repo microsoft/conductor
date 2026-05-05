@@ -19,6 +19,7 @@ from conductor.registry.config import (
     load_config,
     remove_registry,
 )
+from conductor.registry.errors import RegistryError
 from conductor.registry.resolver import resolve_ref
 
 runner = CliRunner()
@@ -48,8 +49,8 @@ def _create_local_registry(
     Args:
         root: Parent directory (e.g. tmp_path).
         workflows: Mapping of workflow-name → dict with keys
-            ``description``, ``path``, ``versions``, and ``content``
-            (the YAML text of the workflow file).
+            ``description``, ``path``, and ``content`` (the YAML text of the
+            workflow file).
         sibling_files: Optional mapping of workflow-name → dict of
             filename → content for extra files alongside the workflow.
 
@@ -61,21 +62,17 @@ def _create_local_registry(
     registry_dir = root / "registry"
     registry_dir.mkdir(parents=True, exist_ok=True)
 
-    # Build index.yaml
     index_data: dict = {"workflows": {}}
     for name, info in workflows.items():
         index_data["workflows"][name] = {
             "description": info.get("description", ""),
             "path": info["path"],
-            "versions": info.get("versions", []),
         }
 
-        # Write the workflow file
         wf_path = registry_dir / info["path"]
         wf_path.parent.mkdir(parents=True, exist_ok=True)
         wf_path.write_text(info["content"])
 
-        # Write sibling files
         if sibling_files and name in sibling_files:
             for fname, fcontent in sibling_files[name].items():
                 (wf_path.parent / fname).write_text(fcontent)
@@ -117,25 +114,22 @@ class TestFullLocalFlow:
                 "hello": {
                     "description": "A greeting workflow",
                     "path": "hello/workflow.yaml",
-                    "versions": ["1.0.0"],
                     "content": _SIMPLE_WORKFLOW,
                 },
             },
         )
 
-        # Add registry
         add_registry("my-reg", str(reg_dir), registry_type=RegistryType.path, set_default=True)
 
-        # Resolve with explicit registry and version
-        ref = resolve_ref("hello@my-reg@1.0.0")
+        # Path registries don't accept refs — use the bare name with explicit registry.
+        ref = resolve_ref("hello@my-reg")
         assert ref.kind == "registry"
         assert ref.workflow == "hello"
         assert ref.registry_name == "my-reg"
-        assert ref.version == "1.0.0"
+        assert ref.ref is None
         assert ref.registry_entry is not None
 
-        # Fetch
-        cached_path = fetch_workflow("my-reg", ref.registry_entry, "hello", version="1.0.0")
+        cached_path = fetch_workflow("my-reg", ref.registry_entry, "hello")
         assert cached_path.exists()
         assert cached_path.name == "workflow.yaml"
         assert "test-workflow" in cached_path.read_text()
@@ -158,7 +152,6 @@ class TestDefaultRegistryFlow:
                 "greeter": {
                     "description": "Greet someone",
                     "path": "greeter.yaml",
-                    "versions": ["0.1.0"],
                     "content": _SIMPLE_WORKFLOW,
                 },
             },
@@ -166,52 +159,44 @@ class TestDefaultRegistryFlow:
 
         add_registry("default-reg", str(reg_dir), registry_type=RegistryType.path, set_default=True)
 
-        # Resolve without @registry — should use default
         ref = resolve_ref("greeter")
         assert ref.kind == "registry"
         assert ref.registry_name == "default-reg"
         assert ref.workflow == "greeter"
 
-        # Fetch and verify
-        cached = fetch_workflow("default-reg", ref.registry_entry, "greeter", version="0.1.0")
+        cached = fetch_workflow("default-reg", ref.registry_entry, "greeter")
         assert cached.exists()
         assert "test-workflow" in cached.read_text()
 
 
 # ---------------------------------------------------------------------------
-# Latest version resolution
+# Path registries reject refs
 # ---------------------------------------------------------------------------
 
 
-class TestLatestVersionResolution:
-    """When no version is specified, the last version in the list is used."""
+class TestPathRegistryRefs:
+    """Path registries do not support refs and raise on non-empty refs."""
 
-    def test_resolves_latest_version(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_fetch_with_ref_raises(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         _setup_home(tmp_path, monkeypatch)
 
         reg_dir = _create_local_registry(
             tmp_path,
             {
-                "multi-ver": {
-                    "description": "Has multiple versions",
-                    "path": "multi-ver.yaml",
-                    "versions": ["1.0.0", "1.1.0", "2.0.0"],
+                "wf": {
+                    "description": "",
+                    "path": "wf.yaml",
                     "content": _SIMPLE_WORKFLOW,
                 },
             },
         )
 
-        add_registry("ver-reg", str(reg_dir), registry_type=RegistryType.path, set_default=True)
-
-        # Fetch without version — should resolve to 2.0.0 (last in list)
-        ref = resolve_ref("multi-ver")
+        add_registry("p-reg", str(reg_dir), registry_type=RegistryType.path, set_default=True)
+        ref = resolve_ref("wf")
         assert ref.registry_entry is not None
 
-        cached = fetch_workflow("ver-reg", ref.registry_entry, "multi-ver")
-        assert cached.exists()
-
-        # Path registries return source path directly (version is ignored)
-        assert str(cached).startswith(str(reg_dir))
+        with pytest.raises(RegistryError, match="Path registries do not support refs"):
+            fetch_workflow("p-reg", ref.registry_entry, "wf", ref="v1.0.0")
 
 
 # ---------------------------------------------------------------------------
@@ -233,7 +218,6 @@ class TestCacheReuse:
                 "cached-wf": {
                     "description": "Cached workflow",
                     "path": "cached-wf.yaml",
-                    "versions": ["1.0.0"],
                     "content": _SIMPLE_WORKFLOW,
                 },
             },
@@ -243,15 +227,12 @@ class TestCacheReuse:
         ref = resolve_ref("cached-wf")
         assert ref.registry_entry is not None
 
-        # First fetch
-        path1 = fetch_workflow("cache-reg", ref.registry_entry, "cached-wf", version="1.0.0")
-
-        # Second fetch — should return the same source path
-        path2 = fetch_workflow("cache-reg", ref.registry_entry, "cached-wf", version="1.0.0")
+        path1 = fetch_workflow("cache-reg", ref.registry_entry, "cached-wf")
+        path2 = fetch_workflow("cache-reg", ref.registry_entry, "cached-wf")
 
         assert path1 == path2
         assert path1.exists()
-        # Path registries don't use cache — returns source directly
+        # Path registries don't use cache — returns source directly.
         assert str(path1).startswith(str(reg_dir))
 
 
@@ -261,9 +242,9 @@ class TestCacheReuse:
 
 
 class TestSiblingFiles:
-    """Sibling files in the workflow directory are also cached."""
+    """Sibling files in the workflow directory are present alongside the workflow."""
 
-    def test_siblings_copied_to_cache(
+    def test_siblings_alongside_workflow(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _setup_home(tmp_path, monkeypatch)
@@ -274,7 +255,6 @@ class TestSiblingFiles:
                 "with-siblings": {
                     "description": "Has extra files",
                     "path": "with-siblings/workflow.yaml",
-                    "versions": ["1.0.0"],
                     "content": _SIMPLE_WORKFLOW,
                 },
             },
@@ -290,10 +270,9 @@ class TestSiblingFiles:
         ref = resolve_ref("with-siblings")
         assert ref.registry_entry is not None
 
-        cached = fetch_workflow("sib-reg", ref.registry_entry, "with-siblings", version="1.0.0")
+        cached = fetch_workflow("sib-reg", ref.registry_entry, "with-siblings")
         cache_dir = cached.parent
 
-        # Siblings should be in the same directory as the workflow
         assert (cache_dir / "prompt.txt").exists()
         assert (cache_dir / "prompt.txt").read_text() == "You are a helpful assistant."
         assert (cache_dir / "schema.json").exists()
@@ -314,44 +293,37 @@ class TestCLIRoundTrip:
         self._tmp_path = tmp_path
 
     def test_full_cli_lifecycle(self) -> None:
-        # Create a local registry on disk
         reg_dir = _create_local_registry(
             self._tmp_path,
             {
                 "demo": {
                     "description": "Demo workflow",
                     "path": "demo.yaml",
-                    "versions": ["1.0"],
                     "content": _SIMPLE_WORKFLOW,
                 },
             },
         )
 
-        # Add registry with --default
         result = runner.invoke(
             app, ["registry", "add", "test-reg", str(reg_dir), "--type", "path", "--default"]
         )
         assert result.exit_code == 0, result.output
         assert "added" in result.output
 
-        # List registries — should show test-reg
         result = runner.invoke(app, ["registry", "list"])
         assert result.exit_code == 0, result.output
         assert "test-reg" in result.output
-        assert "✓" in result.output  # default marker
+        assert "✓" in result.output
 
-        # List workflows in test-reg
         result = runner.invoke(app, ["registry", "list", "test-reg"])
         assert result.exit_code == 0, result.output
         assert "demo" in result.output
         assert "Demo workflow" in result.output
 
-        # Remove registry
         result = runner.invoke(app, ["registry", "remove", "test-reg"])
         assert result.exit_code == 0, result.output
         assert "removed" in result.output
 
-        # List again — should be empty
         result = runner.invoke(app, ["registry", "list"])
         assert result.exit_code == 0, result.output
         assert "No registries configured" in result.output
@@ -364,7 +336,6 @@ class TestCLIRoundTrip:
                 "wf-a": {
                     "description": "A",
                     "path": "a.yaml",
-                    "versions": ["1.0"],
                     "content": _SIMPLE_WORKFLOW,
                 },
             },
@@ -375,7 +346,6 @@ class TestCLIRoundTrip:
                 "wf-b": {
                     "description": "B",
                     "path": "b.yaml",
-                    "versions": ["2.0"],
                     "content": _SIMPLE_WORKFLOW,
                 },
             },
@@ -402,7 +372,6 @@ class TestCLIRoundTrip:
                 "auto": {
                     "description": "Auto-resolved",
                     "path": "auto.yaml",
-                    "versions": ["1.0"],
                     "content": _SIMPLE_WORKFLOW,
                 },
             },
@@ -411,11 +380,9 @@ class TestCLIRoundTrip:
         runner.invoke(app, ["registry", "add", "def-reg", str(reg_dir), "--type", "path"])
         runner.invoke(app, ["registry", "set-default", "def-reg"])
 
-        # Verify config
         config = load_config()
         assert config.default == "def-reg"
 
-        # Resolve bare name (no @)
         ref = resolve_ref("auto")
         assert ref.kind == "registry"
         assert ref.registry_name == "def-reg"
@@ -441,7 +408,6 @@ class TestEdgeCases:
                 "wf": {
                     "description": "",
                     "path": "wf.yaml",
-                    "versions": ["1.0"],
                     "content": _SIMPLE_WORKFLOW,
                 },
             },

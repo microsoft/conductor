@@ -10,19 +10,21 @@ so that local edits are reflected immediately.
 
 Cache layout::
 
-    <base>/cache/registries/<registry>/<workflow>/<version>/
+    <base>/cache/registries/<registry>/<workflow>/<sha[:12]>/
 """
 
 from __future__ import annotations
 
 import os
 import shutil
+import tempfile
 from pathlib import Path
 
 from conductor.registry.config import RegistryEntry, RegistryType
 from conductor.registry.errors import RegistryError
 from conductor.registry.github import fetch_file, list_directory, parse_github_source
-from conductor.registry.index import load_index, resolve_latest
+from conductor.registry.index import load_index
+from conductor.registry.version_resolver import materialize_to_sha, resolve_ref
 
 # fetch_file returns bytes; list_directory returns filenames (not full paths)
 
@@ -45,32 +47,33 @@ def get_cache_base() -> Path:
 def get_cached_workflow_path(
     registry_name: str,
     workflow_name: str,
-    version: str,
+    sha: str,
 ) -> Path | None:
     """Return the cached workflow YAML path if it exists, else ``None``.
 
     Looks for the workflow at::
 
-        <cache_base>/<registry_name>/<workflow_name>/<version>/
+        <cache_base>/<registry_name>/<workflow_name>/<sha[:12]>/
 
     The filename is derived from a glob of ``*.yaml`` / ``*.yml`` files in the
-    version directory.  Returns the first YAML file found (there should be
-    exactly one workflow file per cached version directory).
+    SHA directory.  Returns the first YAML file found (there should be
+    exactly one workflow file per cached SHA directory).
 
     Args:
         registry_name: Name of the registry.
         workflow_name: Name of the workflow.
-        version: Resolved version string.
+        sha: Full immutable commit SHA. The first 12 chars are used as the
+            on-disk directory name.
 
     Returns:
         ``Path`` to the cached workflow YAML, or ``None`` when not cached.
     """
-    version_dir = get_cache_base() / registry_name / workflow_name / version
-    if not version_dir.is_dir():
+    sha_dir = get_cache_base() / registry_name / workflow_name / sha[:12]
+    if not sha_dir.is_dir():
         return None
 
     for ext in ("*.yaml", "*.yml"):
-        matches = list(version_dir.glob(ext))
+        matches = list(sha_dir.glob(ext))
         if matches:
             return matches[0]
     return None
@@ -85,31 +88,30 @@ def fetch_workflow(
     registry_name: str,
     registry_entry: RegistryEntry,
     workflow_name: str,
-    version: str | None = None,
+    ref: str | None = None,
 ) -> Path:
     """Fetch a workflow from a registry and cache it locally.
 
-    Steps:
+    For **path** registries, reads directly from the source directory (no
+    caching). The ``ref`` argument must be ``None`` — :func:`resolve_ref`
+    raises if a ref is provided for a path registry.
 
-    1. Load the registry index.
-    2. Resolve version (if ``None``, resolve ``latest``).
-    3. Check cache — return cached path if explicit version already present.
-    4. Fetch the workflow file **and** sibling files in the same directory.
-    5. Write everything to the cache directory.
-    6. Return the ``Path`` to the cached workflow YAML.
+    For **github** registries:
 
-    For **GitHub** registries files are fetched at the git tag matching the
-    version via :func:`~conductor.registry.github.fetch_file` and siblings
-    are enumerated with :func:`~conductor.registry.github.list_directory`.
-
-    For **path** registries files are copied from the source directory to
-    guarantee a stable snapshot even when the source changes.
+    1. Resolve ``ref`` (or "latest") to a concrete git ref name.
+    2. Materialize that ref to an immutable commit SHA.
+    3. Return the cached workflow path if already present.
+    4. Otherwise, load the registry index **at that SHA** (so the index and
+       workflow file are guaranteed to come from the same commit), look up
+       the workflow path, fetch the workflow + sibling files into a temp
+       directory, and atomically rename it into the cache.
 
     Args:
         registry_name: Configured registry name.
         registry_entry: The registry definition (type + source).
         workflow_name: Workflow key as listed in the registry index.
-        version: Explicit version string, or ``None`` for ``latest``.
+        ref: Explicit git ref (tag, branch, or SHA), or ``None`` for the
+            registry's default (latest tag, falling back to default branch).
 
     Returns:
         Path to the cached workflow YAML file.
@@ -117,19 +119,19 @@ def fetch_workflow(
     Raises:
         RegistryError: On fetch failure, missing workflow, or I/O errors.
     """
-    # 1. Load the index
-    index = load_index(registry_entry)
-
-    # 2. Look up workflow metadata from the index
-    if workflow_name not in index.workflows:
-        raise RegistryError(
-            f"Workflow '{workflow_name}' not found in registry '{registry_name}'",
-            suggestion=f"Run 'conductor registry list {registry_name}' to see available workflows.",
-        )
-    workflow_info = index.workflows[workflow_name]
-
-    # 3. For path registries, read directly from source (no caching, no versioning)
+    # Path registries: read directly from source. resolve_ref raises if a
+    # ref was supplied, propagating a clear error to the caller.
     if registry_entry.type == RegistryType.path:
+        resolve_ref(registry_entry, ref)
+        index = load_index(registry_entry)
+        if workflow_name not in index.workflows:
+            raise RegistryError(
+                f"Workflow '{workflow_name}' not found in registry '{registry_name}'",
+                suggestion=(
+                    f"Run 'conductor registry list {registry_name}' to see available workflows."
+                ),
+            )
+        workflow_info = index.workflows[workflow_name]
         source_path = Path(registry_entry.source) / workflow_info.path
         if not source_path.exists():
             raise RegistryError(
@@ -139,33 +141,49 @@ def fetch_workflow(
             )
         return source_path
 
-    # 4. For GitHub registries, resolve version
-    if version is None:
-        version = resolve_latest(index, workflow_name)
+    # GitHub registry: resolve ref → SHA, then check cache.
+    resolved_ref = resolve_ref(registry_entry, ref)
+    sha = materialize_to_sha(registry_entry, resolved_ref)
 
-    # 5. Check cache (explicit versions are immutable)
-    cached = get_cached_workflow_path(registry_name, workflow_name, version)
+    cached = get_cached_workflow_path(registry_name, workflow_name, sha)
     if cached is not None:
         return cached
 
-    # 6. Prepare cache directory
-    version_dir = get_cache_base() / registry_name / workflow_name / version
-    version_dir.mkdir(parents=True, exist_ok=True)
-
-    # 7. Fetch from GitHub
-    try:
-        _fetch_github(registry_entry, workflow_info.path, version, version_dir)
-    except RegistryError:
-        raise
-    except Exception as exc:
+    # Load the index pinned to the SHA so the workflow path comes from the
+    # exact commit we're about to fetch.
+    index = load_index(registry_entry, ref=sha)
+    if workflow_name not in index.workflows:
         raise RegistryError(
-            f"Failed to fetch workflow '{workflow_name}' from registry '{registry_name}': {exc}",
-            suggestion="Check your network connection and registry configuration.",
-        ) from exc
+            f"Workflow '{workflow_name}' not found in registry '{registry_name}'",
+            suggestion=f"Run 'conductor registry list {registry_name}' to see available workflows.",
+        )
+    workflow_info = index.workflows[workflow_name]
 
-    # 8. Return the cached workflow path
+    # Atomically write to cache: fetch into a tmp dir under the workflow
+    # parent (so the rename is intra-filesystem), then os.replace().
+    parent = get_cache_base() / registry_name / workflow_name
+    parent.mkdir(parents=True, exist_ok=True)
+    final_dir = parent / sha[:12]
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix=".tmp-", dir=parent))
+    try:
+        _fetch_github(registry_entry, workflow_info.path, sha, tmp_dir)
+        try:
+            os.replace(tmp_dir, final_dir)
+        except OSError:
+            # Likely a race: another process populated final_dir first. If it
+            # exists, drop our tmp work and use the cached entry. Otherwise
+            # re-raise.
+            if final_dir.exists():
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+            else:
+                raise
+    except Exception:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise
+
     workflow_filename = Path(workflow_info.path).name
-    result = version_dir / workflow_filename
+    result = final_dir / workflow_filename
     if not result.exists():
         raise RegistryError(
             f"Workflow file '{workflow_filename}' not found in cache after fetch",
@@ -182,7 +200,7 @@ def fetch_workflow(
 def _fetch_github(
     registry_entry: RegistryEntry,
     workflow_path: str,
-    version: str,
+    sha: str,
     dest_dir: Path,
 ) -> None:
     """Fetch a workflow and its sibling files from a GitHub registry.
@@ -190,7 +208,7 @@ def _fetch_github(
     Args:
         registry_entry: Registry entry with ``source`` as ``owner/repo``.
         workflow_path: Relative path to the workflow YAML in the repo.
-        version: Git ref (tag) to fetch at.
+        sha: Immutable commit SHA to fetch at.
         dest_dir: Local directory to write files into.
     """
     owner, repo = parse_github_source(registry_entry.source)
@@ -199,12 +217,12 @@ def _fetch_github(
     workflow_filename = workflow_p.name
 
     # Fetch the workflow file itself (returns bytes)
-    content = fetch_file(owner, repo, workflow_path, ref=version)
+    content = fetch_file(owner, repo, workflow_path, ref=sha)
     (dest_dir / workflow_filename).write_bytes(content)
 
     # Fetch sibling files — list_directory returns filenames (not full paths)
     try:
-        sibling_names = list_directory(owner, repo, parent_dir, ref=version)
+        sibling_names = list_directory(owner, repo, parent_dir, ref=sha)
     except Exception:
         # If listing fails, we already have the workflow file
         return
@@ -214,7 +232,7 @@ def _fetch_github(
             continue  # already fetched
         sibling_repo_path = f"{parent_dir}/{name}" if parent_dir != "." else name
         try:
-            sibling_content = fetch_file(owner, repo, sibling_repo_path, ref=version)
+            sibling_content = fetch_file(owner, repo, sibling_repo_path, ref=sha)
             (dest_dir / name).write_bytes(sibling_content)
         except Exception:
             # Best-effort for siblings — don't fail the whole fetch

@@ -1,14 +1,14 @@
 """Workflow reference resolution.
 
-Parses user-supplied workflow references (e.g. ``qa-bot@team@1.2.3``) and
+Parses user-supplied workflow references (e.g. ``qa-bot@team#v1.2.3``) and
 determines whether an argument is a local file path or a registry reference.
 
 Resolution rules (in order):
 1. If the argument exists as a file on disk, treat it as a local path.
 2. If it looks like a file path (has path separators or YAML extension), treat
    it as a local path — even if the file doesn't exist yet.
-3. Otherwise parse as a registry reference using ``name[@registry][@version]``
-   syntax.
+3. Otherwise parse as a registry reference using ``<workflow>[@<registry>][#<ref>]``
+   syntax, where ``<ref>`` is a git tag, branch, or commit SHA.
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ class ResolvedRef:
     # For registry refs
     workflow: str | None = None
     registry_name: str | None = None
-    version: str | None = None  # None means "latest"
+    ref: str | None = None  # Git tag / branch / SHA. None means "latest"
     registry_entry: RegistryEntry | None = None
 
 
@@ -45,7 +45,10 @@ def resolve_ref(ref: str) -> ResolvedRef:
     If *ref* is an existing file path or looks like a file path (contains path
     separators or has a ``.yaml``/``.yml`` extension), a **file** ref is
     returned.  Otherwise *ref* is parsed as a registry reference using
-    ``name[@registry][@version]`` syntax.
+    ``<workflow>[@<registry>][#<ref>]`` syntax, where ``@`` introduces an
+    optional registry name and ``#`` introduces an optional git ref (tag,
+    branch, or commit SHA). An empty registry segment (``name@#ref``) selects
+    the configured default registry.
 
     Args:
         ref: The raw reference string from the CLI.
@@ -54,8 +57,8 @@ def resolve_ref(ref: str) -> ResolvedRef:
         A :class:`ResolvedRef` describing the resolved target.
 
     Raises:
-        RegistryError: If the reference requires a default registry but none is
-            configured, or if the named registry does not exist.
+        RegistryError: If the reference is malformed, requires a default
+            registry but none is configured, or names an unknown registry.
     """
     if _looks_like_file_path(ref):
         return ResolvedRef(kind="file", path=Path(ref))
@@ -82,17 +85,50 @@ def _looks_like_file_path(ref: str) -> bool:
     return path.exists() and path.is_file()
 
 
-def _parse_registry_ref(ref: str) -> ResolvedRef:
-    """Parse *ref* as ``name[@registry][@version]`` and resolve against config.
+def _parse_registry_ref(raw: str) -> ResolvedRef:
+    """Parse *raw* as ``<workflow>[@<registry>][#<ref>]`` and resolve against config.
 
     Raises:
-        RegistryError: On missing default registry or unknown registry name.
+        RegistryError: On malformed syntax, missing default registry, or
+            unknown registry name.
     """
-    parts = ref.split("@", maxsplit=2)
+    # Split on '#' first — the right side (if any) is the git ref.
+    hash_parts = raw.split("#")
+    if len(hash_parts) > 2:
+        raise RegistryError(
+            "Workflow ref may contain at most one '#'",
+            suggestion="Use '<workflow>[@<registry>][#<ref>]' (e.g. qa-bot@team#v1.0.0).",
+        )
 
-    workflow = parts[0]
-    raw_registry: str | None = parts[1] if len(parts) >= 2 else None
-    version: str | None = parts[2] if len(parts) >= 3 else None
+    left = hash_parts[0]
+    git_ref: str | None
+    if len(hash_parts) == 2:
+        git_ref = hash_parts[1]
+        if git_ref == "":
+            raise RegistryError(
+                "Ref cannot be empty after '#'",
+                suggestion="Provide a tag, branch, or commit SHA after '#' (e.g. qa-bot#v1.0.0).",
+            )
+    else:
+        git_ref = None
+
+    # Split the left side on '@' — at most one '@' is allowed.
+    at_parts = left.split("@")
+    if len(at_parts) > 2:
+        raise RegistryError(
+            "Workflow ref may contain at most one '@' "
+            "(use '#' for refs, e.g. name@registry#v1.0.0)",
+            suggestion="Use '<workflow>[@<registry>][#<ref>]' syntax.",
+        )
+
+    workflow = at_parts[0]
+    if workflow == "":
+        raise RegistryError(
+            "Workflow name is required",
+            suggestion="Provide a workflow name (e.g. qa-bot, qa-bot@team#v1.0.0).",
+        )
+
+    raw_registry: str | None = at_parts[1] if len(at_parts) == 2 else None
 
     config = load_config()
 
@@ -124,6 +160,6 @@ def _parse_registry_ref(ref: str) -> ResolvedRef:
         kind="registry",
         workflow=workflow,
         registry_name=registry_name,
-        version=version,
+        ref=git_ref,
         registry_entry=config.registries[registry_name],
     )

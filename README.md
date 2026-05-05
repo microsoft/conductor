@@ -231,8 +231,9 @@ conductor registry add official myorg/conductor-workflows --default
 conductor registry list official
 
 # Run a workflow from the registry
-conductor run qa-bot                    # latest from default registry
-conductor run qa-bot@official@1.2.3    # specific version
+conductor run qa-bot                       # latest from default registry
+conductor run 'qa-bot@official#v1.2.3'     # specific tag (quote the #)
+conductor run 'qa-bot@official#main'       # branch HEAD (re-resolved on fetch)
 ```
 
 See [docs/design/registry.md](docs/design/registry.md) for the full design.

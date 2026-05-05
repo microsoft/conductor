@@ -97,22 +97,26 @@ class TestListWorkflows:
 
         mock_index = RegistryIndex(
             workflows={
-                "qa-bot": WorkflowInfo(
-                    description="QA helper", path="qa/bot.yaml", versions=["1.0", "1.1"]
-                ),
-                "summarizer": WorkflowInfo(
-                    description="Summarize docs", path="summarizer.yaml", versions=["2.0"]
-                ),
+                "qa-bot": WorkflowInfo(description="QA helper", path="qa/bot.yaml"),
+                "summarizer": WorkflowInfo(description="Summarize docs", path="summarizer.yaml"),
             }
         )
 
-        with patch("conductor.cli.registry.load_index", return_value=mock_index):
+        with (
+            patch("conductor.cli.registry.load_index", return_value=mock_index),
+            patch(
+                "conductor.cli.registry.list_tags",
+                return_value=["v2.0.0", "v1.5.0", "v1.4.0", "v1.3.0", "v1.2.0", "v1.1.0"],
+            ),
+        ):
             result = runner.invoke(app, ["registry", "list", "team"])
 
         assert result.exit_code == 0
         assert "qa-bot" in result.output
         assert "summarizer" in result.output
-        assert "1.0" in result.output
+        assert "Latest tags:" in result.output
+        assert "v2.0.0" in result.output
+        assert "..." in result.output  # >5 tags → truncation indicator
 
     def test_list_workflows_unknown_registry(self) -> None:
         result = runner.invoke(app, ["registry", "list", "nope"])
@@ -182,13 +186,14 @@ class TestShow:
 
         mock_index = RegistryIndex(
             workflows={
-                "qa-bot": WorkflowInfo(
-                    description="QA helper", path="qa/bot.yaml", versions=["1.0", "1.1"]
-                ),
+                "qa-bot": WorkflowInfo(description="QA helper", path="qa/bot.yaml"),
             }
         )
 
-        with patch("conductor.cli.registry.load_index", return_value=mock_index):
+        with (
+            patch("conductor.cli.registry.load_index", return_value=mock_index),
+            patch("conductor.cli.registry.list_tags", return_value=["v1.0.0"]),
+        ):
             result = runner.invoke(app, ["registry", "show", "team"])
 
         assert result.exit_code == 0
@@ -196,6 +201,8 @@ class TestShow:
         assert "acme/workflows" in result.output
         assert "qa-bot" in result.output
         assert "QA helper" in result.output
+        assert "Latest tags:" in result.output
+        assert "v1.0.0" in result.output
         assert "conductor show" in result.output
 
     def test_show_unknown_registry(self) -> None:

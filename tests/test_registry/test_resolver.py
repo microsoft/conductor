@@ -50,7 +50,7 @@ class TestResolvedRef:
         assert ref.path == Path("my.yaml")
         assert ref.workflow is None
         assert ref.registry_name is None
-        assert ref.version is None
+        assert ref.ref is None
         assert ref.registry_entry is None
 
     def test_registry_ref_fields(self) -> None:
@@ -59,13 +59,13 @@ class TestResolvedRef:
             kind="registry",
             workflow="qa-bot",
             registry_name="team",
-            version="1.2.3",
+            ref="v1.2.3",
             registry_entry=entry,
         )
         assert ref.kind == "registry"
         assert ref.workflow == "qa-bot"
         assert ref.registry_name == "team"
-        assert ref.version == "1.2.3"
+        assert ref.ref == "v1.2.3"
         assert ref.registry_entry is entry
 
     def test_frozen(self) -> None:
@@ -107,7 +107,7 @@ class TestLooksLikeFilePath:
 
 
 class TestResolveRefFile:
-    def test_existing_file_on_disk(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_existing_file_on_disk(self, tmp_path: Path) -> None:
         f = tmp_path / "workflow"
         f.write_text("content")
         ref = resolve_ref(str(f))
@@ -115,19 +115,24 @@ class TestResolveRefFile:
         assert ref.path == Path(str(f))
 
     def test_yaml_extension_nonexistent(self) -> None:
-        ref = resolve_ref("nonexistent.yaml")
+        ref = resolve_ref("foo.yaml")
         assert ref.kind == "file"
-        assert ref.path == Path("nonexistent.yaml")
+        assert ref.path == Path("foo.yaml")
 
     def test_yml_extension_nonexistent(self) -> None:
-        ref = resolve_ref("nonexistent.yml")
+        ref = resolve_ref("foo.yml")
         assert ref.kind == "file"
-        assert ref.path == Path("nonexistent.yml")
+        assert ref.path == Path("foo.yml")
 
-    def test_path_with_slash(self) -> None:
-        ref = resolve_ref("./my-workflow.yaml")
+    def test_relative_path_with_slash(self) -> None:
+        ref = resolve_ref("./foo.yml")
         assert ref.kind == "file"
-        assert ref.path == Path("./my-workflow.yaml")
+        assert ref.path == Path("./foo.yml")
+
+    def test_absolute_path(self) -> None:
+        ref = resolve_ref("/abs/path.yaml")
+        assert ref.kind == "file"
+        assert ref.path == Path("/abs/path.yaml")
 
     def test_path_with_backslash(self) -> None:
         ref = resolve_ref("dir\\workflow")
@@ -136,12 +141,12 @@ class TestResolveRefFile:
 
 
 # ---------------------------------------------------------------------------
-# resolve_ref — registry references
+# resolve_ref — registry references (positive cases)
 # ---------------------------------------------------------------------------
 
 
 class TestResolveRefRegistry:
-    def test_name_only_uses_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_bare_name_uses_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
         config = _make_config(default="team")
         _patch_config(monkeypatch, config)
 
@@ -149,55 +154,161 @@ class TestResolveRefRegistry:
         assert ref.kind == "registry"
         assert ref.workflow == "qa-bot"
         assert ref.registry_name == "team"
-        assert ref.version is None
+        assert ref.ref is None
         assert ref.registry_entry == config.registries["team"]
+
+    def test_name_with_tag_ref(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        config = _make_config(default="team")
+        _patch_config(monkeypatch, config)
+
+        ref = resolve_ref("qa-bot#v1.2.3")
+        assert ref.kind == "registry"
+        assert ref.workflow == "qa-bot"
+        assert ref.registry_name == "team"
+        assert ref.ref == "v1.2.3"
+
+    def test_name_with_branch_ref(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        config = _make_config(default="team")
+        _patch_config(monkeypatch, config)
+
+        ref = resolve_ref("qa-bot#main")
+        assert ref.kind == "registry"
+        assert ref.workflow == "qa-bot"
+        assert ref.registry_name == "team"
+        assert ref.ref == "main"
+
+    def test_name_with_commit_sha_ref(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        config = _make_config(default="team")
+        _patch_config(monkeypatch, config)
+
+        ref = resolve_ref("qa-bot#abc1234")
+        assert ref.ref == "abc1234"
 
     def test_name_at_registry(self, monkeypatch: pytest.MonkeyPatch) -> None:
         config = _make_config(default="team")
         _patch_config(monkeypatch, config)
 
-        ref = resolve_ref("qa-bot@local")
-        assert ref.kind == "registry"
-        assert ref.workflow == "qa-bot"
-        assert ref.registry_name == "local"
-        assert ref.version is None
-        assert ref.registry_entry == config.registries["local"]
-
-    def test_name_at_registry_at_version(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        config = _make_config(default="team")
-        _patch_config(monkeypatch, config)
-
-        ref = resolve_ref("qa-bot@team@1.2.3")
+        ref = resolve_ref("qa-bot@team")
         assert ref.kind == "registry"
         assert ref.workflow == "qa-bot"
         assert ref.registry_name == "team"
-        assert ref.version == "1.2.3"
+        assert ref.ref is None
+        assert ref.registry_entry == config.registries["team"]
 
-    def test_name_at_empty_at_version_uses_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        config = _make_config(default="team")
+    def test_name_at_registry_with_ref(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        config = _make_config(default="local")
         _patch_config(monkeypatch, config)
 
-        ref = resolve_ref("qa-bot@@1.2.3")
+        ref = resolve_ref("qa-bot@team#v1.2.3")
         assert ref.kind == "registry"
         assert ref.workflow == "qa-bot"
         assert ref.registry_name == "team"
-        assert ref.version == "1.2.3"
+        assert ref.ref == "v1.2.3"
+        assert ref.registry_entry == config.registries["team"]
 
-    def test_missing_default_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_empty_registry_with_ref_uses_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        config = _make_config(default="team")
+        _patch_config(monkeypatch, config)
+
+        ref = resolve_ref("qa-bot@#v1")
+        assert ref.kind == "registry"
+        assert ref.workflow == "qa-bot"
+        assert ref.registry_name == "team"
+        assert ref.ref == "v1"
+
+    def test_registry_entry_populated(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        config = _make_config(default="team")
+        _patch_config(monkeypatch, config)
+
+        ref = resolve_ref("qa-bot@team#v2.0.0")
+        assert ref.registry_entry is not None
+        assert ref.registry_entry.type == RegistryType.github
+        assert ref.registry_entry.source == "acme/workflows"
+
+
+# ---------------------------------------------------------------------------
+# resolve_ref — registry references (negative cases)
+# ---------------------------------------------------------------------------
+
+
+class TestResolveRefRegistryErrors:
+    def test_empty_ref_after_hash(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        config = _make_config(default="team")
+        _patch_config(monkeypatch, config)
+
+        with pytest.raises(RegistryError, match="Ref cannot be empty"):
+            resolve_ref("qa-bot#")
+
+    def test_double_hash(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        config = _make_config(default="team")
+        _patch_config(monkeypatch, config)
+
+        with pytest.raises(RegistryError, match="at most one '#'"):
+            resolve_ref("qa-bot##v1")
+
+    def test_multiple_hashes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        config = _make_config(default="team")
+        _patch_config(monkeypatch, config)
+
+        with pytest.raises(RegistryError, match="at most one '#'"):
+            resolve_ref("qa-bot#v1#v2")
+
+    def test_double_at(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        config = _make_config(default="team")
+        _patch_config(monkeypatch, config)
+
+        with pytest.raises(RegistryError, match="at most one '@'"):
+            resolve_ref("qa-bot@@v1")
+
+    def test_multiple_ats(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        config = _make_config(default="team")
+        _patch_config(monkeypatch, config)
+
+        with pytest.raises(RegistryError, match="at most one '@'"):
+            resolve_ref("qa-bot@a@b")
+
+    def test_empty_workflow_with_registry_and_ref(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        config = _make_config(default="team")
+        _patch_config(monkeypatch, config)
+
+        with pytest.raises(RegistryError, match="Workflow name is required"):
+            resolve_ref("@team#v1")
+
+    def test_empty_workflow_with_ref_only(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        config = _make_config(default="team")
+        _patch_config(monkeypatch, config)
+
+        with pytest.raises(RegistryError, match="Workflow name is required"):
+            resolve_ref("#v1")
+
+    def test_empty_workflow_with_registry_only(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        config = _make_config(default="team")
+        _patch_config(monkeypatch, config)
+
+        with pytest.raises(RegistryError, match="Workflow name is required"):
+            resolve_ref("@team")
+
+    def test_just_hash(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        config = _make_config(default="team")
+        _patch_config(monkeypatch, config)
+
+        # "#" splits into ["", ""], so empty-ref check fires first.
+        with pytest.raises(RegistryError, match="Ref cannot be empty"):
+            resolve_ref("#")
+
+    def test_no_default_registry_configured(self, monkeypatch: pytest.MonkeyPatch) -> None:
         config = _make_config(default=None)
         _patch_config(monkeypatch, config)
 
         with pytest.raises(RegistryError, match="No default registry configured"):
             resolve_ref("qa-bot")
 
-    def test_missing_default_with_empty_registry_raises(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_no_default_with_empty_registry_segment(self, monkeypatch: pytest.MonkeyPatch) -> None:
         config = _make_config(default=None)
         _patch_config(monkeypatch, config)
 
         with pytest.raises(RegistryError, match="No default registry configured"):
-            resolve_ref("qa-bot@@1.0.0")
+            resolve_ref("qa-bot@#v1.0.0")
 
     def test_unknown_registry_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
         config = _make_config(default="team")
@@ -206,11 +317,9 @@ class TestResolveRefRegistry:
         with pytest.raises(RegistryError, match="Registry 'nope' not found"):
             resolve_ref("qa-bot@nope")
 
-    def test_registry_entry_populated(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_unknown_registry_with_ref_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
         config = _make_config(default="team")
         _patch_config(monkeypatch, config)
 
-        ref = resolve_ref("qa-bot@team@2.0.0")
-        assert ref.registry_entry is not None
-        assert ref.registry_entry.type == RegistryType.github
-        assert ref.registry_entry.source == "acme/workflows"
+        with pytest.raises(RegistryError, match="Registry 'nope' not found"):
+            resolve_ref("qa-bot@nope#v1.0.0")

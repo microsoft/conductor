@@ -19,7 +19,11 @@ from conductor.registry.config import (
     save_config,
 )
 from conductor.registry.errors import RegistryError
+from conductor.registry.github import list_tags, parse_github_source
 from conductor.registry.index import load_index
+from conductor.registry.version_resolver import _sort_tags
+
+_MAX_DISPLAY_TAGS = 5
 
 registry_app = typer.Typer(
     name="registry",
@@ -83,14 +87,42 @@ def _list_registry_workflows(name: str) -> None:
     table = Table(title=f"Workflows in '{name}'")
     table.add_column("Name", style="cyan")
     table.add_column("Description")
-    table.add_column("Versions", style="green")
 
     for wf_name, info in index.workflows.items():
-        versions = ", ".join(info.versions) if info.versions else "-"
-        table.add_row(wf_name, info.description or "-", versions)
+        table.add_row(wf_name, info.description or "-")
 
     output_console.print(table)
+
+    tags_line = _format_latest_tags(entry)
+    if tags_line is not None:
+        output_console.print(f"\nLatest tags: {tags_line}")
+
     output_console.print("\n[dim]Use 'conductor show <workflow>' to see inputs and details.[/dim]")
+
+
+def _format_latest_tags(entry: RegistryEntry) -> str | None:
+    """Return a formatted "Latest tags" string for a registry, or None for path registries.
+
+    For github registries, fetches tags via the API and returns up to
+    ``_MAX_DISPLAY_TAGS`` newest tags (semver-sorted). Returns "(unavailable)"
+    on any fetch failure and "(no tags)" if the repo has none.
+    """
+    if entry.type != RegistryType.github:
+        return None
+
+    try:
+        owner, repo = parse_github_source(entry.source)
+        tags = list_tags(owner, repo)
+    except Exception:
+        return "(unavailable)"
+
+    if not tags:
+        return "(no tags)"
+
+    sorted_tags = _sort_tags(tags)
+    display = sorted_tags[:_MAX_DISPLAY_TAGS]
+    suffix = ", ..." if len(sorted_tags) > _MAX_DISPLAY_TAGS else ""
+    return ", ".join(display) + suffix
 
 
 @registry_app.command()
@@ -154,14 +186,28 @@ def set_default(
         raise typer.Exit(code=1) from None
 
 
-@registry_app.command()
+@registry_app.command(
+    help=(
+        "Refresh registry index and clear cached workflows.\n\n"
+        "Re-fetches the latest index from each configured registry and clears "
+        "locally-cached workflow files. Index fetches always bypass GitHub's CDN "
+        "cache (via SHA-based URLs), so this primarily clears cached workflow "
+        "contents pinned to mutable refs (branches)."
+    ),
+)
 def update(
     name: Annotated[
         str | None,
         typer.Argument(help="Registry to update (all if omitted)."),
     ] = None,
 ) -> None:
-    """Refresh registry index and clear cached workflows."""
+    """Refresh registry index and clear cached workflows.
+
+    Re-fetches the latest index from each configured registry and clears
+    locally-cached workflow files. Index fetches always bypass GitHub's CDN
+    cache (via SHA-based URLs), so this primarily clears cached workflow
+    contents pinned to mutable refs (branches).
+    """
     try:
         config = load_config()
 
@@ -218,11 +264,14 @@ def _show_registry(name: str, entry: RegistryEntry) -> None:
     table = Table(title="Workflows")
     table.add_column("Name", style="cyan")
     table.add_column("Description")
-    table.add_column("Versions", style="green")
 
     for wf_name, info in index.workflows.items():
-        versions = ", ".join(info.versions) if info.versions else "-"
-        table.add_row(wf_name, info.description or "-", versions)
+        table.add_row(wf_name, info.description or "-")
 
     output_console.print(table)
+
+    tags_line = _format_latest_tags(entry)
+    if tags_line is not None:
+        output_console.print(f"\nLatest tags: {tags_line}")
+
     output_console.print("\n[dim]Use 'conductor show <workflow>' to see inputs and details.[/dim]")

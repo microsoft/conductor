@@ -224,12 +224,12 @@ conductor registry <subcommand> [OPTIONS]
 
 | Subcommand | Description |
 |------------|-------------|
-| `list [NAME]` | List registries, or list workflows in a specific registry |
+| `list [NAME]` | List configured registries, or list workflows in a specific registry. For GitHub registries, the per-registry listing also prints a "Latest tags:" footer with up to 5 newest tags. |
 | `add <NAME> <SOURCE>` | Add a new registry (GitHub `owner/repo` or local path) |
 | `remove <NAME>` | Remove a registry |
 | `set-default <NAME>` | Set the default registry |
-| `update [NAME]` | Update cached registry index (all or specific) |
-| `show <NAME>` | Show registry details and status |
+| `update [NAME]` | Refresh the cached index for one or all registries. For GitHub registries, the index is re-fetched via a SHA-pinned raw URL that bypasses Fastly's CDN, so updates always reflect the current state of the registry repo. |
+| `show <NAME>` | Show details for a single configured registry: type, source, default status, and (for GitHub registries) a "Latest tags:" footer listing up to 5 newest tags discovered on the registry repo. Use `list <NAME>` to inspect the workflows it contains. |
 
 ### Options
 
@@ -267,18 +267,33 @@ conductor registry remove local
 
 ### Running Workflows from a Registry
 
-Once a registry is configured, `conductor run` accepts short workflow names:
+Once a registry is configured, `conductor run` accepts short workflow names
+of the form `<workflow>[@<registry>][#<ref>]`. `@` selects the registry;
+`#` selects a git ref (tag, branch, or commit SHA). Quote the reference in
+shell commands so `#` isn't treated as a comment.
 
 ```bash
-# Run from default registry (latest version)
+# Run from default registry (latest tag, or default-branch HEAD if no tags)
 conductor run qa-bot
 
-# Run from a specific registry
+# Run from a specific registry (latest)
 conductor run qa-bot@official
 
-# Run a specific version
-conductor run qa-bot@official@1.2.3
+# Pin a specific tag
+conductor run 'qa-bot@official#v1.2.3'
+
+# Pin the default-branch HEAD or any other branch
+conductor run 'qa-bot@official#main'
+
+# Pin a specific commit SHA
+conductor run 'qa-bot@official#a1b2c3d'
+
+# Pin a tag in the default registry (empty registry segment)
+conductor run 'qa-bot@#v1.2.3'
 ```
+
+Path-type registries do not support `#<ref>` and will reject any reference
+that includes one.
 
 See [design/registry.md](./design/registry.md) for the full design.
 

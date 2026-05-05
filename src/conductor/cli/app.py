@@ -370,7 +370,7 @@ def run(
                 registry_name=ref.registry_name,
                 registry_entry=ref.registry_entry,
                 workflow_name=ref.workflow,
-                version=ref.version,
+                ref=ref.ref,
             )
     except RegistryError as e:
         print_error(e)
@@ -518,7 +518,7 @@ def validate(
                 registry_name=ref.registry_name,
                 registry_entry=ref.registry_entry,
                 workflow_name=ref.workflow,
-                version=ref.version,
+                ref=ref.ref,
             )
     except RegistryError as e:
         print_error(e)
@@ -577,7 +577,7 @@ def show(
                 registry_name=ref.registry_name,
                 registry_entry=ref.registry_entry,
                 workflow_name=ref.workflow,
-                version=ref.version,
+                ref=ref.ref,
             )
     except RegistryError as e:
         print_error(e)
@@ -600,8 +600,8 @@ def show(
 
     if ref.kind == "registry":
         output_console.print(f"[bold]Registry:[/bold]    {ref.registry_name}")
-        if ref.version:
-            output_console.print(f"[bold]Version:[/bold]     {ref.version}")
+        if ref.ref:
+            output_console.print(f"[bold]Version:[/bold]     {ref.ref}")
 
     from rich.table import Table
 
@@ -773,7 +773,7 @@ def resume(
                     registry_name=ref.registry_name,
                     registry_entry=ref.registry_entry,
                     workflow_name=ref.workflow,
-                    version=ref.version,
+                    ref=ref.ref,
                 )
         except RegistryError as e:
             print_error(e)

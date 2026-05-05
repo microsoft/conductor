@@ -16,7 +16,6 @@ from conductor.registry.index import (
     WorkflowInfo,
     get_workflow_info,
     load_index,
-    resolve_latest,
 )
 
 # ---------------------------------------------------------------------------
@@ -28,12 +27,10 @@ _SAMPLE_INDEX: dict = {
         "qa-bot": {
             "description": "Simple Q&A workflow",
             "path": "workflows/qa-bot.yaml",
-            "versions": ["1.0.0", "1.1.0", "2.0.0"],
         },
         "code-review": {
             "description": "Multi-agent code review",
             "path": "workflows/code-review.yaml",
-            "versions": ["0.3.0"],
         },
     }
 }
@@ -81,7 +78,6 @@ class TestLoadPathIndex:
         assert "code-review" in idx.workflows
         assert idx.workflows["qa-bot"].description == "Simple Q&A workflow"
         assert idx.workflows["qa-bot"].path == "workflows/qa-bot.yaml"
-        assert idx.workflows["qa-bot"].versions == ["1.0.0", "1.1.0", "2.0.0"]
 
     def test_load_json_fallback(self, tmp_path: Path) -> None:
         """index.json is loaded when index.yaml does not exist."""
@@ -89,7 +85,7 @@ class TestLoadPathIndex:
         idx = load_index(_path_entry(str(tmp_path)))
 
         assert "qa-bot" in idx.workflows
-        assert idx.workflows["code-review"].versions == ["0.3.0"]
+        assert idx.workflows["code-review"].path == "workflows/code-review.yaml"
 
     def test_yaml_preferred_over_json(self, tmp_path: Path) -> None:
         """index.yaml takes priority when both files exist."""
@@ -168,9 +164,17 @@ class TestLoadGitHubIndex:
     """Tests for loading index from GitHub registries."""
 
     @patch("conductor.registry.github.fetch_file_text")
+    @patch("conductor.registry.github.resolve_ref_to_sha", return_value="abc123def456")
+    @patch("conductor.registry.github.get_default_branch", return_value="main")
     @patch("conductor.registry.github.parse_github_source", return_value=("myorg", "myrepo"))
-    def test_fetch_yaml_main(self, _mock_parse: MagicMock, mock_fetch: MagicMock) -> None:
-        """Fetches index.yaml from main branch."""
+    def test_fetch_yaml_default_branch(
+        self,
+        _mock_parse: MagicMock,
+        mock_default_branch: MagicMock,
+        mock_resolve: MagicMock,
+        mock_fetch: MagicMock,
+    ) -> None:
+        """Without a ref, queries the default branch and resolves to a SHA."""
         yaml = YAML(typ="safe")
         from io import StringIO
 
@@ -183,109 +187,158 @@ class TestLoadGitHubIndex:
         idx = load_index(_github_entry("myorg/myrepo"))
         assert "qa-bot" in idx.workflows
 
-        mock_fetch.assert_called_once_with("myorg", "myrepo", "index.yaml", ref="main")
+        mock_default_branch.assert_called_once_with("myorg", "myrepo")
+        mock_resolve.assert_called_once_with("myorg", "myrepo", "main")
+        mock_fetch.assert_called_once_with("myorg", "myrepo", "index.yaml", ref="abc123def456")
 
     @patch("conductor.registry.github.fetch_file_text")
+    @patch("conductor.registry.github.resolve_ref_to_sha", return_value="deadbeef00000")
+    @patch("conductor.registry.github.get_default_branch", return_value="trunk")
     @patch("conductor.registry.github.parse_github_source", return_value=("myorg", "myrepo"))
-    def test_fallback_to_master(self, _mock_parse: MagicMock, mock_fetch: MagicMock) -> None:
-        """Falls back to master branch when main raises RegistryError."""
+    def test_latest_ref_uses_default_branch(
+        self,
+        _mock_parse: MagicMock,
+        mock_default_branch: MagicMock,
+        mock_resolve: MagicMock,
+        mock_fetch: MagicMock,
+    ) -> None:
+        """Passing ref='latest' is equivalent to no ref — uses default branch."""
+        json_text = json.dumps(_SAMPLE_INDEX)
+        # yaml fails, json succeeds
+        mock_fetch.side_effect = [RegistryError("not found"), json_text]
+
+        idx = load_index(_github_entry("myorg/myrepo"), ref="latest")
+        assert "qa-bot" in idx.workflows
+
+        mock_default_branch.assert_called_once_with("myorg", "myrepo")
+        mock_resolve.assert_called_once_with("myorg", "myrepo", "trunk")
+
+    @patch("conductor.registry.github.fetch_file_text")
+    @patch("conductor.registry.github.resolve_ref_to_sha", return_value="tagsha9876543")
+    @patch("conductor.registry.github.get_default_branch")
+    @patch("conductor.registry.github.parse_github_source", return_value=("myorg", "myrepo"))
+    def test_explicit_ref_passes_through(
+        self,
+        _mock_parse: MagicMock,
+        mock_default_branch: MagicMock,
+        mock_resolve: MagicMock,
+        mock_fetch: MagicMock,
+    ) -> None:
+        """Explicit ref is resolved directly without consulting default branch."""
         yaml = YAML(typ="safe")
         from io import StringIO
 
         stream = StringIO()
         yaml.dump(_SAMPLE_INDEX, stream)
-        yaml_text = stream.getvalue()
+        mock_fetch.return_value = stream.getvalue()
 
-        # main raises error, master succeeds
-        mock_fetch.side_effect = [
-            RegistryError("not found"),
-            yaml_text,
-        ]
+        idx = load_index(_github_entry("myorg/myrepo"), ref="v1.2.3")
+        assert "qa-bot" in idx.workflows
+
+        # Default branch should NOT be queried for an explicit ref
+        mock_default_branch.assert_not_called()
+        mock_resolve.assert_called_once_with("myorg", "myrepo", "v1.2.3")
+        # Resolved SHA — not the original ref — must be passed to fetch_file_text
+        mock_fetch.assert_called_once_with("myorg", "myrepo", "index.yaml", ref="tagsha9876543")
+
+    @patch("conductor.registry.github.fetch_file_text")
+    @patch("conductor.registry.github.resolve_ref_to_sha", return_value="sha1234567890")
+    @patch("conductor.registry.github.get_default_branch", return_value="main")
+    @patch("conductor.registry.github.parse_github_source", return_value=("myorg", "myrepo"))
+    def test_fallback_to_json(
+        self,
+        _mock_parse: MagicMock,
+        _mock_default_branch: MagicMock,
+        _mock_resolve: MagicMock,
+        mock_fetch: MagicMock,
+    ) -> None:
+        """Falls back to index.json when index.yaml is not found at the SHA."""
+        json_text = json.dumps(_SAMPLE_INDEX)
+        mock_fetch.side_effect = [RegistryError("not found"), json_text]
 
         idx = load_index(_github_entry("myorg/myrepo"))
         assert "qa-bot" in idx.workflows
         assert mock_fetch.call_count == 2
+        # Both attempts use the resolved SHA
+        for call in mock_fetch.call_args_list:
+            assert call.kwargs["ref"] == "sha1234567890"
 
     @patch("conductor.registry.github.fetch_file_text")
+    @patch("conductor.registry.github.resolve_ref_to_sha", return_value="sha1234567890")
+    @patch("conductor.registry.github.get_default_branch", return_value="main")
     @patch("conductor.registry.github.parse_github_source", return_value=("myorg", "myrepo"))
-    def test_fallback_to_json(self, _mock_parse: MagicMock, mock_fetch: MagicMock) -> None:
-        """Falls back to index.json when index.yaml not found on any branch."""
-        json_text = json.dumps(_SAMPLE_INDEX)
-
-        # yaml on main → error, yaml on master → error, json on main → success
-        mock_fetch.side_effect = [
-            RegistryError("not found"),
-            RegistryError("not found"),
-            json_text,
-        ]
-
-        idx = load_index(_github_entry("myorg/myrepo"))
-        assert "qa-bot" in idx.workflows
-        assert mock_fetch.call_count == 3
-
-    @patch("conductor.registry.github.fetch_file_text")
-    @patch("conductor.registry.github.parse_github_source", return_value=("myorg", "myrepo"))
-    def test_all_404_raises(self, _mock_parse: MagicMock, mock_fetch: MagicMock) -> None:
-        """RegistryError when all fetch attempts fail."""
+    def test_all_404_raises(
+        self,
+        _mock_parse: MagicMock,
+        _mock_default_branch: MagicMock,
+        _mock_resolve: MagicMock,
+        mock_fetch: MagicMock,
+    ) -> None:
+        """RegistryError when neither index file is found at the SHA."""
         mock_fetch.side_effect = RegistryError("not found")
 
         with pytest.raises(RegistryError, match="No index.yaml or index.json"):
             load_index(_github_entry("myorg/myrepo"))
 
-        # yaml(main, master) + json(main, master) = 4 attempts
-        assert mock_fetch.call_count == 4
+        # Only one attempt per filename — no branch fallback any more
+        assert mock_fetch.call_count == 2
 
     @patch("conductor.registry.github.fetch_file_text")
+    @patch("conductor.registry.github.resolve_ref_to_sha", return_value="sha1234567890")
+    @patch("conductor.registry.github.get_default_branch", return_value="main")
     @patch("conductor.registry.github.parse_github_source", return_value=("myorg", "myrepo"))
-    def test_network_error_raises(self, _mock_parse: MagicMock, mock_fetch: MagicMock) -> None:
+    def test_network_error_raises(
+        self,
+        _mock_parse: MagicMock,
+        _mock_default_branch: MagicMock,
+        _mock_resolve: MagicMock,
+        mock_fetch: MagicMock,
+    ) -> None:
         """RegistryError on network failure propagates."""
         mock_fetch.side_effect = RegistryError("Failed to fetch: connection refused")
 
         with pytest.raises(RegistryError, match="No index.yaml or index.json"):
             load_index(_github_entry("myorg/myrepo"))
 
+    @patch("conductor.registry.github.resolve_ref_to_sha")
+    @patch("conductor.registry.github.get_default_branch")
+    @patch("conductor.registry.github.parse_github_source", return_value=("myorg", "myrepo"))
+    def test_resolve_ref_failure_propagates(
+        self,
+        _mock_parse: MagicMock,
+        _mock_default_branch: MagicMock,
+        mock_resolve: MagicMock,
+    ) -> None:
+        """If ref cannot be resolved to a SHA, the error propagates."""
+        mock_resolve.side_effect = RegistryError("ref not found")
+
+        with pytest.raises(RegistryError, match="ref not found"):
+            load_index(_github_entry("myorg/myrepo"), ref="nonexistent")
+
 
 # ---------------------------------------------------------------------------
-# Tests: resolve_latest
+# Tests: legacy schema compatibility
 # ---------------------------------------------------------------------------
 
 
-class TestResolveLatest:
-    """Tests for resolve_latest."""
+class TestLegacySchema:
+    """Tests for back-compat with older index schemas."""
 
-    def test_returns_last_version(self) -> None:
-        """Returns the last version in the list."""
-        idx = RegistryIndex(
-            workflows={
-                "wf": WorkflowInfo(path="w.yaml", versions=["1.0.0", "1.1.0", "2.0.0"]),
+    def test_index_with_legacy_versions_field_is_ignored(self) -> None:
+        """Indexes that still include a legacy 'versions' field parse without error."""
+        legacy = {
+            "workflows": {
+                "wf": {
+                    "description": "legacy entry",
+                    "path": "workflows/wf.yaml",
+                    "versions": ["1.0.0"],
+                }
             }
-        )
-        assert resolve_latest(idx, "wf") == "2.0.0"
-
-    def test_single_version(self) -> None:
-        """Works with a single version."""
-        idx = RegistryIndex(
-            workflows={
-                "wf": WorkflowInfo(path="w.yaml", versions=["0.1.0"]),
-            }
-        )
-        assert resolve_latest(idx, "wf") == "0.1.0"
-
-    def test_no_versions_raises(self) -> None:
-        """RegistryError when the workflow has no versions."""
-        idx = RegistryIndex(
-            workflows={
-                "wf": WorkflowInfo(path="w.yaml", versions=[]),
-            }
-        )
-        with pytest.raises(RegistryError, match="no versions"):
-            resolve_latest(idx, "wf")
-
-    def test_workflow_not_found_raises(self) -> None:
-        """RegistryError when the workflow doesn't exist."""
-        idx = RegistryIndex(workflows={})
-        with pytest.raises(RegistryError, match="not found"):
-            resolve_latest(idx, "nope")
+        }
+        idx = RegistryIndex.model_validate(legacy)
+        assert "wf" in idx.workflows
+        assert idx.workflows["wf"].path == "workflows/wf.yaml"
+        assert not hasattr(idx.workflows["wf"], "versions")
 
 
 # ---------------------------------------------------------------------------
@@ -298,13 +351,12 @@ class TestGetWorkflowInfo:
 
     def test_found(self) -> None:
         """Returns WorkflowInfo for an existing workflow."""
-        info = WorkflowInfo(description="My workflow", path="workflows/my.yaml", versions=["1.0.0"])
+        info = WorkflowInfo(description="My workflow", path="workflows/my.yaml")
         idx = RegistryIndex(workflows={"my-wf": info})
 
         result = get_workflow_info(idx, "my-wf")
         assert result.description == "My workflow"
         assert result.path == "workflows/my.yaml"
-        assert result.versions == ["1.0.0"]
 
     def test_not_found_raises(self) -> None:
         """RegistryError when the workflow is not in the index."""

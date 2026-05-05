@@ -119,12 +119,15 @@ def fetch_file_text(owner: str, repo: str, path: str, ref: str = "main") -> str:
     return fetch_file(owner, repo, path, ref).decode("utf-8")
 
 
+_MAX_TAGS = 1000
+
+
 def list_tags(owner: str, repo: str) -> list[str]:
     """List all git tags for a repository, newest first.
 
     Uses GET /repos/{owner}/{repo}/tags from the GitHub REST API.
-    Returns just the tag names as strings.
-    No pagination in v1 — returns first page (up to 100).
+    Follows ``Link: <...>; rel="next"`` headers to paginate, capping at
+    ``_MAX_TAGS`` (1000) tags total to prevent runaway loops.
 
     Args:
         owner: Repository owner.
@@ -136,18 +139,92 @@ def list_tags(owner: str, repo: str) -> list[str]:
     Raises:
         RegistryError: If the API request fails.
     """
-    url = f"{GITHUB_API_BASE}/repos/{owner}/{repo}/tags"
+    url: str | None = f"{GITHUB_API_BASE}/repos/{owner}/{repo}/tags?per_page=100"
+    tags: list[str] = []
+    while url is not None and len(tags) < _MAX_TAGS:
+        try:
+            response = httpx.get(
+                url,
+                headers=_build_headers(api=True),
+                timeout=DEFAULT_TIMEOUT,
+                follow_redirects=True,
+            )
+        except httpx.TimeoutException as exc:
+            raise RegistryError(f"Timeout listing tags for {owner}/{repo}") from exc
+        except httpx.HTTPError as exc:
+            raise RegistryError(f"HTTP error listing tags for {owner}/{repo}: {exc}") from exc
+
+        _raise_for_status(response, context=f"Listing tags for {owner}/{repo}")
+        tags.extend(tag["name"] for tag in response.json())
+
+        next_link = response.links.get("next")
+        url = next_link["url"] if next_link else None
+
+    return tags[:_MAX_TAGS]
+
+
+def get_default_branch(owner: str, repo: str) -> str:
+    """Get the default branch name for a GitHub repository.
+
+    Uses GET /repos/{owner}/{repo} from the GitHub REST API and returns
+    the ``default_branch`` field.
+
+    Args:
+        owner: Repository owner.
+        repo: Repository name.
+
+    Returns:
+        Default branch name (e.g. "main" or "master").
+
+    Raises:
+        RegistryError: If the request fails or the repo is not found.
+    """
+    url = f"{GITHUB_API_BASE}/repos/{owner}/{repo}"
     try:
         response = httpx.get(
             url, headers=_build_headers(api=True), timeout=DEFAULT_TIMEOUT, follow_redirects=True
         )
     except httpx.TimeoutException as exc:
-        raise RegistryError(f"Timeout listing tags for {owner}/{repo}") from exc
+        raise RegistryError(f"Timeout fetching default branch for {owner}/{repo}") from exc
     except httpx.HTTPError as exc:
-        raise RegistryError(f"HTTP error listing tags for {owner}/{repo}: {exc}") from exc
+        raise RegistryError(
+            f"HTTP error fetching default branch for {owner}/{repo}: {exc}"
+        ) from exc
 
-    _raise_for_status(response, context=f"Listing tags for {owner}/{repo}")
-    return [tag["name"] for tag in response.json()]
+    _raise_for_status(response, context=f"Fetching default branch for {owner}/{repo}")
+    return response.json()["default_branch"]
+
+
+def resolve_ref_to_sha(owner: str, repo: str, ref: str) -> str:
+    """Resolve a git ref (branch, tag, or short SHA) to a full commit SHA.
+
+    Uses GET /repos/{owner}/{repo}/commits/{ref} which accepts any kind of
+    ref — branch names, tag names, or full/short SHAs — and returns the
+    commit metadata. We return the full ``sha`` field.
+
+    Args:
+        owner: Repository owner.
+        repo: Repository name.
+        ref: A branch name, tag name, or commit SHA (full or short).
+
+    Returns:
+        The full 40-character commit SHA.
+
+    Raises:
+        RegistryError: If the ref cannot be resolved or request fails.
+    """
+    url = f"{GITHUB_API_BASE}/repos/{owner}/{repo}/commits/{ref}"
+    try:
+        response = httpx.get(
+            url, headers=_build_headers(api=True), timeout=DEFAULT_TIMEOUT, follow_redirects=True
+        )
+    except httpx.TimeoutException as exc:
+        raise RegistryError(f"Timeout resolving ref {ref} for {owner}/{repo}") from exc
+    except httpx.HTTPError as exc:
+        raise RegistryError(f"HTTP error resolving ref {ref} for {owner}/{repo}: {exc}") from exc
+
+    _raise_for_status(response, context=f"Resolving ref {ref} for {owner}/{repo}")
+    return response.json()["sha"]
 
 
 def list_directory(owner: str, repo: str, path: str, ref: str = "main") -> list[str]:
