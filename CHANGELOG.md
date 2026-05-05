@@ -5,7 +5,9 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.10...HEAD)
+## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.11...HEAD)
+
+## [0.1.11](https://github.com/microsoft/conductor/compare/v0.1.10...v0.1.11) - 2026-05-04
 
 ### Added
 - `metadata` dict on workflow definitions, settable statically in YAML or
@@ -112,6 +114,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `{{ workflow.input.optional | default("fallback") }}` render the fallback
   rather than the literal string `"None"`
   ([#123](https://github.com/microsoft/conductor/pull/123)).
+- Web dashboard: events without an engine-supplied `subworkflow_path`
+  stamp (e.g., `for_each_item_started` for a parent for_each over
+  `type: workflow` agents) now route strictly to the root context
+  instead of falling back to the user's currently-viewed path. This
+  fixes two related symptoms: dashboards opened during a run with
+  sub-workflows no longer auto-land inside an iteration, and a parent
+  for_each panel now displays every iteration rather than silently
+  dropping the middle ones into a sibling sub-workflow's context
+  ([#148](https://github.com/microsoft/conductor/pull/148)).
 
 ## [0.1.10](https://github.com/microsoft/conductor/compare/v0.1.9...v0.1.10) - 2026-04-30
 
