@@ -22,6 +22,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from datetime import UTC, datetime
@@ -39,6 +40,10 @@ _API_URL = "https://api.github.com/repos/microsoft/conductor/releases/latest"
 _FETCH_TIMEOUT_SECONDS = 2
 _REPO_GIT_URL = "https://github.com/microsoft/conductor.git"
 _RELEASE_DL_URL = "https://github.com/microsoft/conductor/releases/download"
+
+# Retry settings for `uv tool install` — mirrors install.ps1
+_INSTALL_MAX_ATTEMPTS = 3
+_INSTALL_RETRY_DELAY_SECONDS = 2
 
 
 # ---------------------------------------------------------------------------
@@ -291,7 +296,7 @@ def _get_conductor_exe() -> Path | None:
     return Path(which) if which else None
 
 
-def run_update(console: Console) -> None:
+def run_update(console: Console, force: bool = False) -> None:
     """Fetch the latest version and self-upgrade via ``uv tool install``.
 
     This always bypasses the cache and fetches from the network.  On success
@@ -300,8 +305,13 @@ def run_update(console: Console) -> None:
     The upgrade pins transitive dependencies using a constraints file
     published with each GitHub Release, verified via SHA-256 checksum.
 
+    Other running Conductor processes (especially on Windows) can hold file
+    locks that cause ``uv tool install`` to fail. Unless ``force=True``, this
+    function detects those processes up front and asks the user to stop them.
+
     Args:
         console: Rich console for output.
+        force: If True, skip the running-process check.
     """
     console.print("[bold]Checking for updates…[/bold]")
 
@@ -317,6 +327,27 @@ def run_update(console: Console) -> None:
         console.print(f"[green]Already up to date[/green] (v{current}).")
         return
 
+    # Pre-flight: detect other running conductor processes that could hold
+    # file locks during the install. On Windows this is the most common cause
+    # of "Access is denied" failures from `uv tool install --force`.
+    if not force:
+        running = _find_running_conductor_processes()
+        if running:
+            console.print(
+                f"[bold yellow]Warning:[/bold yellow] {len(running)} other Conductor "
+                f"process{'es are' if len(running) > 1 else ' is'} running:"
+            )
+            for proc in running:
+                console.print(f"  • PID {proc['pid']}: {proc['cmd']}")
+            console.print(
+                "\nRunning processes can hold file locks that cause the upgrade to fail "
+                "(especially on Windows).\n"
+                "Stop them first (e.g. [bold]conductor stop --all[/bold] for background "
+                "dashboards), then re-run [bold]conductor update[/bold].\n"
+                "To upgrade anyway, re-run with [bold]conductor update --force[/bold]."
+            )
+            return
+
     console.print(f"Upgrading Conductor: v{current} → v{version}")
 
     install_url = f"git+{_REPO_GIT_URL}@{tag_name}"
@@ -328,35 +359,57 @@ def run_update(console: Console) -> None:
     if constraints_path:
         cmd.extend(["-c", str(constraints_path)])
 
-    # On Windows, rename our exe out of the way so uv can write the new one.
+    # On Windows, rename our exe(s) out of the way so uv can write the new one.
     # Windows locks running executables but allows renaming them.
     renamed_exes: list[tuple[Path, Path]] = []
     if sys.platform == "win32":
         renamed_exes = _rename_windows_exes()
 
+    success = False
+    last_proc: subprocess.CompletedProcess[str] | None = None
+
     try:
         # Set PYTHONUTF8=1 so child Python processes use UTF-8 encoding
         # instead of the system default (cp1252 on Windows).
         env = {**os.environ, "PYTHONUTF8": "1"}
-        proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", env=env)  # noqa: S603
 
-        if proc.returncode == 0:
-            console.print(f"[green]Successfully upgraded to v{version}[/green]")
-            cache_path = get_cache_path()
-            cache_path.unlink(missing_ok=True)
-        elif sys.platform == "win32" and "Failed to install entrypoint" in (proc.stderr or ""):
-            # On Windows, uv may fail to copy the entrypoint because the running
-            # executable is locked.  The package itself was installed successfully.
-            console.print(f"[green]Successfully upgraded to v{version}[/green]")
-            console.print(
-                "[dim]Note: restart your terminal for the update to take full effect.[/dim]"
+        # Retry to absorb transient Windows Defender / file-lock failures,
+        # mirroring install.ps1's behavior.
+        for attempt in range(1, _INSTALL_MAX_ATTEMPTS + 1):
+            if attempt > 1:
+                console.print(
+                    f"[dim]Retrying install (attempt {attempt}/{_INSTALL_MAX_ATTEMPTS})…[/dim]"
+                )
+                time.sleep(_INSTALL_RETRY_DELAY_SECONDS)
+
+            proc = subprocess.run(  # noqa: S603
+                cmd, capture_output=True, text=True, encoding="utf-8", env=env
             )
+            last_proc = proc
+
+            if proc.returncode == 0:
+                success = True
+                break
+            if sys.platform == "win32" and "Failed to install entrypoint" in (proc.stderr or ""):
+                # On Windows, uv may fail to copy the entrypoint because the running
+                # executable is locked.  The package itself was installed successfully.
+                success = True
+                break
+
+        if success and last_proc is not None:
+            console.print(f"[green]Successfully upgraded to v{version}[/green]")
+            if (
+                sys.platform == "win32"
+                and last_proc.returncode != 0
+                and "Failed to install entrypoint" in (last_proc.stderr or "")
+            ):
+                console.print(
+                    "[dim]Note: restart your terminal for the update to take full effect.[/dim]"
+                )
             cache_path = get_cache_path()
             cache_path.unlink(missing_ok=True)
         else:
-            console.print(f"[bold red]Upgrade failed[/bold red] (exit code {proc.returncode})")
-            if proc.stderr:
-                console.print(f"[dim]{proc.stderr.strip()}[/dim]")
+            _report_install_failure(console, last_proc)
             # On Windows, restore the original exe(s) if uv failed
             for orig, backup in renamed_exes:
                 if backup.exists() and not orig.exists():
@@ -370,15 +423,175 @@ def run_update(console: Console) -> None:
                 constraints_path.parent.rmdir()
 
 
+def _report_install_failure(
+    console: Console, proc: subprocess.CompletedProcess[str] | None
+) -> None:
+    """Print a detailed failure report including full uv stdout and stderr.
+
+    Surfaces both streams (not just stderr, which was the previous behavior)
+    and on Windows points users at the most common remediations: closing
+    other Conductor processes and adding a Defender exclusion.
+
+    Args:
+        console: Rich console for output.
+        proc: The completed subprocess from the final ``uv tool install``
+            attempt, or ``None`` if no attempt completed.
+    """
+    if proc is None:
+        console.print("[bold red]Upgrade failed[/bold red] — no install attempt completed.")
+        return
+
+    console.print(
+        f"[bold red]Upgrade failed[/bold red] (exit code {proc.returncode}) "
+        f"after {_INSTALL_MAX_ATTEMPTS} attempts."
+    )
+    console.print("\n[bold]── uv tool install output ──[/bold]")
+    if proc.stdout:
+        console.print(f"[dim]{proc.stdout.rstrip()}[/dim]")
+    if proc.stderr:
+        console.print(f"[dim]{proc.stderr.rstrip()}[/dim]")
+    if not proc.stdout and not proc.stderr:
+        console.print("[dim](no output captured)[/dim]")
+
+    if sys.platform == "win32":
+        stderr_lower = (proc.stderr or "").lower()
+        if any(s in stderr_lower for s in ("access is denied", "being used by another", "locked")):
+            console.print(
+                "\n[yellow]Looks like a file-lock issue.[/yellow] Stop any running Conductor "
+                "processes (foreground runs, background dashboards via "
+                "[bold]conductor stop --all[/bold], and any spawned IDE workers) and try again."
+            )
+        console.print(
+            "\nIf the install repeatedly fails with 'Access is denied', Windows Defender "
+            "may be scanning the install directory. Add an exclusion (run PowerShell as "
+            "Administrator):"
+        )
+        console.print(r"  [bold]Add-MpPreference -ExclusionPath \"$env:LOCALAPPDATA\uv\"[/bold]")
+
+
+def _find_running_conductor_processes() -> list[dict]:
+    """Return a list of other running Conductor processes (excluding self).
+
+    Cross-platform: uses ``tasklist`` on Windows and ``ps`` elsewhere.
+    Each entry is ``{"pid": int, "cmd": str}``. The current process is
+    always excluded.
+
+    Returns:
+        A list of dicts, one per detected Conductor process other than the
+        current one. Empty list on detection error or when none are found.
+    """
+    self_pid = os.getpid()
+    results: list[dict] = []
+
+    try:
+        if sys.platform == "win32":
+            # /v gives full command line in the WindowTitle column on some
+            # locales but is unreliable; use wmic-like parsing of /fo csv.
+            proc = subprocess.run(  # noqa: S603, S607
+                ["tasklist", "/fo", "csv", "/nh"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if proc.returncode != 0:
+                return []
+            for line in proc.stdout.splitlines():
+                # CSV: "Image Name","PID","Session Name","Session#","Mem Usage"
+                parts = [p.strip().strip('"') for p in line.split(",")]
+                if len(parts) < 2:
+                    continue
+                image, pid_str = parts[0], parts[1]
+                if "conductor" not in image.lower():
+                    continue
+                try:
+                    pid = int(pid_str)
+                except ValueError:
+                    continue
+                if pid == self_pid:
+                    continue
+                results.append({"pid": pid, "cmd": image})
+        else:
+            proc = subprocess.run(  # noqa: S603, S607
+                ["ps", "-axo", "pid=,command="],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if proc.returncode != 0:
+                return []
+            for line in proc.stdout.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                pid_str, _, cmd = line.partition(" ")
+                cmd = cmd.strip()
+                try:
+                    pid = int(pid_str)
+                except ValueError:
+                    continue
+                if pid == self_pid:
+                    continue
+                # Match the conductor entrypoint script or any process whose
+                # command line invokes it. Avoid matching this module's own
+                # name in unrelated paths.
+                if not _looks_like_conductor_process(cmd):
+                    continue
+                results.append({"pid": pid, "cmd": cmd[:120]})
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+
+    return results
+
+
+def _looks_like_conductor_process(cmd: str) -> bool:
+    """Return True if *cmd* (a process command line) looks like a Conductor invocation.
+
+    Matches the ``conductor`` entrypoint, ``python -m conductor``, and the
+    ``uv tool run conductor`` form. Avoids false positives on unrelated paths
+    that happen to contain the substring ``conductor``.
+
+    Args:
+        cmd: The full command line of a process as reported by ``ps``.
+
+    Returns:
+        True when the command line is most likely a Conductor process.
+    """
+    lower = cmd.lower()
+    tokens = lower.split()
+    if not tokens:
+        return False
+    # Direct entrypoint: ".../bin/conductor ..." or ".../conductor.exe ..."
+    first = Path(tokens[0]).name
+    if first in {"conductor", "conductor.exe"}:
+        return True
+    # python -m conductor / python -m conductor.cli.app
+    if "python" in first and "-m" in tokens:
+        try:
+            mod = tokens[tokens.index("-m") + 1]
+        except IndexError:
+            return False
+        return mod.startswith("conductor")
+    # uv tool run conductor / uv run conductor
+    return first.startswith("uv") and "conductor" in tokens
+
+
 def _rename_windows_exes() -> list[tuple[Path, Path]]:
     """Rename conductor executables on Windows so ``uv`` can overwrite them.
 
     Windows locks running executables, preventing overwrite.  Renaming is
     still allowed, so we move them out of the way before ``uv tool install``.
 
-    We target both the executable found on ``PATH`` (the one currently running)
-    and the standard ``uv`` entrypoint location at ``~/.local/bin``, deduplicating
-    by resolved path.
+    We target every known location uv may have placed an entrypoint in:
+
+    1. The executable found on ``PATH`` (the one currently running)
+    2. ``~/.local/bin/conductor.exe`` — uv's standard user bin dir
+    3. ``%LOCALAPPDATA%/uv/tools/conductor-cli/Scripts/conductor.exe`` —
+       per-user uv tool venv (the most common cause of failed self-upgrades
+       when the running process holds locks on files inside it)
+    4. ``%APPDATA%/uv/tools/conductor-cli/Scripts/conductor.exe`` — alt path
+       on some uv versions
+
+    Deduplicates by resolved path (case-insensitive on Windows).
 
     Returns:
         A list of ``(original_path, backup_path)`` tuples for later restoration.
@@ -393,8 +606,16 @@ def _rename_windows_exes() -> list[tuple[Path, Path]]:
         candidates.append(exe_from_which)
 
     # 2. The standard uv entrypoint location
-    uv_bin_exe = Path.home() / ".local" / "bin" / "conductor.exe"
-    candidates.append(uv_bin_exe)
+    candidates.append(Path.home() / ".local" / "bin" / "conductor.exe")
+
+    # 3 & 4. The uv tool venv Scripts dirs (LOCALAPPDATA and APPDATA)
+    for env_var in ("LOCALAPPDATA", "APPDATA"):
+        base = os.environ.get(env_var)
+        if not base:
+            continue
+        candidates.append(
+            Path(base) / "uv" / "tools" / "conductor-cli" / "Scripts" / "conductor.exe"
+        )
 
     for exe_path in candidates:
         if not exe_path.exists():
