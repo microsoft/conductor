@@ -1620,6 +1620,16 @@ class WorkflowEngine:
                         ]
                         + [
                             {
+                                "from": a.name,
+                                "to": o.route,
+                                "when": f"selection == '{o.value}'",
+                            }
+                            for a in self.config.agents
+                            if a.type == "human_gate" and a.options
+                            for o in a.options
+                        ]
+                        + [
+                            {
                                 "from": p.name,
                                 "to": r.to,
                                 "when": r.when,
