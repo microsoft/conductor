@@ -109,6 +109,7 @@ try {
     $maxRetries = 3
     $installed = $false
     $lastOutput = $null
+    $lastExitCode = $null
     for ($attempt = 1; $attempt -le $maxRetries; $attempt++) {
         if ($attempt -eq 1) {
             Write-Info "Installing Conductor $tagName…"
@@ -116,14 +117,25 @@ try {
             Write-Info "Retrying install (attempt $attempt/$maxRetries)…"
             Start-Sleep -Seconds 2
         }
-        $output = $null
-        try {
-            $output = & uv tool install --force "git+https://github.com/$Repo.git@$tagName" -c $constraintsFile 2>&1
-        } catch {
-            # PowerShell treats native stderr as errors when ErrorActionPreference=Stop
-        }
-        $lastOutput = $output
-        if ($LASTEXITCODE -eq 0) {
+
+        # Run uv via temp files so we capture stdout AND stderr regardless of
+        # PowerShell's $ErrorActionPreference behavior on native stderr.
+        # Previous approach (`& uv ... 2>&1` inside try/catch with Stop) lost
+        # the output when PS threw before the assignment completed, leaving
+        # the user with "(no output captured)" and no way to diagnose.
+        $stdoutFile = Join-Path $tmpDir "uv-stdout-$attempt.log"
+        $stderrFile = Join-Path $tmpDir "uv-stderr-$attempt.log"
+        $proc = Start-Process -FilePath 'uv' `
+            -ArgumentList @('tool', 'install', '--force', "git+https://github.com/$Repo.git@$tagName", '-c', $constraintsFile) `
+            -NoNewWindow -Wait -PassThru `
+            -RedirectStandardOutput $stdoutFile `
+            -RedirectStandardError $stderrFile
+
+        $stdout = if (Test-Path $stdoutFile) { Get-Content $stdoutFile -Raw } else { '' }
+        $stderr = if (Test-Path $stderrFile) { Get-Content $stderrFile -Raw } else { '' }
+        $lastOutput = (@($stdout, $stderr) | Where-Object { $_ } | Out-String).Trim()
+        $lastExitCode = $proc.ExitCode
+        if ($lastExitCode -eq 0) {
             $installed = $true
             break
         }
@@ -131,11 +143,11 @@ try {
 
     if (-not $installed) {
         Write-Host ""
-        Write-Host "  ── uv tool install output ──" -ForegroundColor Yellow
+        Write-Host "  ── uv tool install output (exit code $lastExitCode) ──" -ForegroundColor Yellow
         if ($lastOutput) {
-            $lastOutput | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
+            $lastOutput -split "`r?`n" | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
         } else {
-            Write-Host "  (no output captured)" -ForegroundColor DarkGray
+            Write-Host "  (no output captured — run 'uv tool install --force `"git+https://github.com/$Repo.git@$tagName`"' manually to see the error)" -ForegroundColor DarkGray
         }
         Write-Host ""
         Write-Info "Install failed after $maxRetries attempts."
