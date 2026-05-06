@@ -405,6 +405,12 @@ class TestCheckForUpdateHint:
 class TestRunUpdate:
     """Tests for ``run_update`` with mocked subprocess."""
 
+    @pytest.fixture(autouse=True)
+    def _mock_pre_flight(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Skip the running-process check and instant-sleep retry delays."""
+        monkeypatch.setattr("conductor.cli.update._find_running_conductor_processes", lambda: [])
+        monkeypatch.setattr("conductor.cli.update.time.sleep", lambda _s: None)
+
     def test_successful_upgrade(self, cache_dir: Path) -> None:
         """Successful upgrade prints before/after and clears cache."""
         # Pre-populate cache to verify it's deleted
@@ -468,12 +474,14 @@ class TestRunUpdate:
                 "conductor.cli.update.fetch_latest_version",
                 return_value=("99.0.0", "v99.0.0", "https://example.com"),
             ),
-            patch("conductor.cli.update.subprocess.run", return_value=mock_proc),
+            patch("conductor.cli.update.subprocess.run", return_value=mock_proc) as mock_run,
         ):
             run_update(c)
 
         output = buf.getvalue()
         assert "Upgrade failed" in output
+        # Retry loop runs all attempts before giving up
+        assert mock_run.call_count == 3
 
     def test_network_failure(self, cache_dir: Path) -> None:
         """When fetch fails, should print an error."""
@@ -667,6 +675,94 @@ class TestRunUpdate:
 
         # Cache should be cleared on partial success
         assert not cache_file.exists()
+
+    def test_aborts_when_other_conductor_running(self, cache_dir: Path) -> None:
+        """When other conductor processes are detected, abort with guidance."""
+        c, buf = _make_console(is_terminal=True)
+        with (
+            patch(
+                "conductor.cli.update.fetch_latest_version",
+                return_value=("99.0.0", "v99.0.0", "https://example.com"),
+            ),
+            patch(
+                "conductor.cli.update._find_running_conductor_processes",
+                return_value=[{"pid": 1234, "cmd": "/usr/local/bin/conductor run foo.yaml"}],
+            ),
+            patch("conductor.cli.update.subprocess.run") as mock_run,
+        ):
+            run_update(c)
+
+        output = buf.getvalue()
+        assert "1234" in output
+        assert "conductor stop --all" in output
+        assert "--force" in output
+        # Install must NOT have been attempted
+        mock_run.assert_not_called()
+
+    def test_force_skips_pre_flight(self, cache_dir: Path) -> None:
+        """``force=True`` proceeds with the install even when processes are running."""
+        c, buf = _make_console(is_terminal=True)
+        mock_proc = MagicMock()
+        mock_proc.returncode = 0
+        mock_proc.stderr = ""
+
+        with (
+            patch(
+                "conductor.cli.update.fetch_latest_version",
+                return_value=("99.0.0", "v99.0.0", "https://example.com"),
+            ),
+            patch(
+                "conductor.cli.update._find_running_conductor_processes",
+                return_value=[{"pid": 1234, "cmd": "conductor"}],
+            ),
+            patch("conductor.cli.update.subprocess.run", return_value=mock_proc) as mock_run,
+        ):
+            run_update(c, force=True)
+
+        output = buf.getvalue()
+        assert "Successfully upgraded" in output
+        mock_run.assert_called_once()
+
+    def test_retry_succeeds_on_second_attempt(self, cache_dir: Path) -> None:
+        """A transient failure on attempt 1 followed by success on attempt 2 reports success."""
+        c, buf = _make_console(is_terminal=True)
+        fail = MagicMock(returncode=1, stderr="transient")
+        ok = MagicMock(returncode=0, stderr="")
+
+        with (
+            patch(
+                "conductor.cli.update.fetch_latest_version",
+                return_value=("99.0.0", "v99.0.0", "https://example.com"),
+            ),
+            patch("conductor.cli.update.subprocess.run", side_effect=[fail, ok]) as mock_run,
+        ):
+            run_update(c)
+
+        output = buf.getvalue()
+        assert "Successfully upgraded" in output
+        assert "Upgrade failed" not in output
+        assert mock_run.call_count == 2
+
+    def test_failure_surfaces_stdout_and_stderr(self, cache_dir: Path) -> None:
+        """Failure report shows both stdout and stderr from uv."""
+        c, buf = _make_console(is_terminal=True)
+        mock_proc = MagicMock()
+        mock_proc.returncode = 1
+        mock_proc.stdout = "uv-stdout-line"
+        mock_proc.stderr = "uv-stderr-line"
+
+        with (
+            patch(
+                "conductor.cli.update.fetch_latest_version",
+                return_value=("99.0.0", "v99.0.0", "https://example.com"),
+            ),
+            patch("conductor.cli.update.subprocess.run", return_value=mock_proc),
+        ):
+            run_update(c)
+
+        output = buf.getvalue()
+        assert "uv-stdout-line" in output
+        assert "uv-stderr-line" in output
 
 
 # ===================================================================
