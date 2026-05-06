@@ -30,6 +30,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ([#151](https://github.com/microsoft/conductor/pull/151)).
 
 ### Fixed
+- `conductor update` reliability on Windows. Adds a pre-flight check for
+  other running Conductor processes (which hold file locks on
+  `%LOCALAPPDATA%\uv\tools\conductor-cli\` and cause `uv tool install
+  --force` to fail with "Access is denied"), retries the install up to 3
+  times to absorb transient Windows Defender failures, surfaces full uv
+  stdout AND stderr on failure with Defender-exclusion guidance, broadens
+  the Windows entrypoint rename to cover the uv tool venv `Scripts/`
+  directory in `%LOCALAPPDATA%` and `%APPDATA%`, and adds a new
+  `conductor update --force` flag to skip the pre-flight check
+  ([#155](https://github.com/microsoft/conductor/pull/155)).
 - Dashboard layout for workflows with `human_gate` options or multiple
   loop-back routes (e.g. revision loops). The `workflow_started` event now
   emits routes from `human_gate` `options[].route` so gate edges aren't
