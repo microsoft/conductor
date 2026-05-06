@@ -180,6 +180,139 @@ def launch_background(
     return f"http://127.0.0.1:{web_port}"
 
 
+def launch_background_resume(
+    *,
+    workflow_path: Path | None,
+    checkpoint_path: Path | None,
+    provider_override: str | None = None,
+    skip_gates: bool = False,
+    log_file: Path | None = None,
+    web_port: int = 0,
+    metadata: dict[str, str] | None = None,
+) -> str:
+    """Fork a detached child process resuming the workflow with a web dashboard.
+
+    The child executes ``conductor resume <workflow|--from path> --web ...``
+    with all the caller-supplied options. The parent waits briefly for the
+    web server to become reachable, then returns the dashboard URL.
+
+    Either ``workflow_path`` or ``checkpoint_path`` (or both) must be
+    provided — at least one is required by the resume command.
+
+    Args:
+        workflow_path: Optional path to the workflow YAML file. Used to find
+            the latest checkpoint when ``checkpoint_path`` is not given.
+        checkpoint_path: Optional explicit path to a checkpoint file.
+        provider_override: Optional provider name override.
+        skip_gates: Whether to auto-select first option at human gates.
+        log_file: Optional log file path.
+        web_port: Desired port (0 = auto-select).
+        metadata: Optional CLI metadata key=value pairs.
+
+    Returns:
+        The dashboard URL (e.g. ``http://127.0.0.1:8080``).
+
+    Raises:
+        ValueError: If neither ``workflow_path`` nor ``checkpoint_path`` is
+            provided.
+        RuntimeError: If the child process fails to start or the server
+            doesn't become reachable within the timeout.
+    """
+    if workflow_path is None and checkpoint_path is None:
+        raise ValueError(
+            "launch_background_resume requires either workflow_path or checkpoint_path"
+        )
+
+    # Resolve port early so we know what URL to return
+    if web_port == 0:
+        web_port = _find_free_port()
+
+    # Build the subprocess command
+    cmd: list[str] = [
+        sys.executable,
+        "-m",
+        "conductor",
+        "--silent",  # suppress CLI output in the background process
+        "resume",
+    ]
+
+    if workflow_path is not None:
+        cmd.append(str(workflow_path))
+
+    if checkpoint_path is not None:
+        cmd.extend(["--from", str(checkpoint_path)])
+
+    cmd.extend(
+        [
+            "--web",
+            "--web-port",
+            str(web_port),
+            "--no-interactive",
+        ]
+    )
+
+    # Forward metadata
+    if metadata:
+        for key, value in metadata.items():
+            cmd.extend(["--metadata", f"{key}={_serialize_value(value)}"])
+
+    if provider_override:
+        cmd.extend(["--provider", provider_override])
+
+    if skip_gates:
+        cmd.append("--skip-gates")
+
+    if log_file:
+        cmd.extend(["--log-file", str(log_file)])
+
+    # Launch detached child
+    kwargs: dict[str, Any] = {
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "stdin": subprocess.DEVNULL,
+    }
+
+    if sys.platform != "win32":
+        kwargs["start_new_session"] = True
+    else:
+        # Windows: CREATE_NEW_PROCESS_GROUP for detachment
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+
+    # Set environment variables to signal bg mode to the child
+    env = os.environ.copy()
+    env["CONDUCTOR_WEB_BG"] = "1"
+    env["CONDUCTOR_WEB_PORT"] = str(web_port)
+    kwargs["env"] = env
+
+    try:
+        proc = subprocess.Popen(cmd, **kwargs)  # noqa: S603
+    except Exception as exc:
+        raise RuntimeError(f"Failed to start background process: {exc}") from exc
+
+    # Wait for the web server to start
+    if not _wait_for_server(web_port, timeout=15.0):
+        retcode = proc.poll()
+        if retcode is not None:
+            raise RuntimeError(
+                f"Background process exited immediately with code {retcode}. "
+                f"Check logs or run without --web-bg for details."
+            )
+        raise RuntimeError(
+            f"Dashboard did not start within 15 seconds on port {web_port}. "
+            f"The background process (PID {proc.pid}) may still be starting."
+        )
+
+    # Write PID file so `conductor stop` can find this process
+    from conductor.cli.pid import write_pid_file
+
+    # Use workflow_path if available, otherwise checkpoint_path stem-derived
+    pid_workflow_ref = workflow_path if workflow_path is not None else checkpoint_path
+    assert pid_workflow_ref is not None  # noqa: S101  # checked above
+    write_pid_file(proc.pid, web_port, pid_workflow_ref)
+
+    return f"http://127.0.0.1:{web_port}"
+
+
 def _serialize_value(value: Any) -> str:
     """Serialize a value for passing as a CLI --input argument.
 

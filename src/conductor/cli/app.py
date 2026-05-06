@@ -688,6 +688,25 @@ def resume(
             help="Path to a specific checkpoint file to resume from.",
         ),
     ] = None,
+    provider: Annotated[
+        str | None,
+        typer.Option(
+            "--provider",
+            "-p",
+            help="Override the provider specified in the workflow (e.g., 'copilot').",
+        ),
+    ] = None,
+    raw_metadata: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--metadata",
+            "-m",
+            help=(
+                "Workflow metadata in key=value format. "
+                "Merged on top of YAML metadata. Can be repeated."
+            ),
+        ),
+    ] = None,
     skip_gates: Annotated[
         bool,
         typer.Option(
@@ -713,6 +732,31 @@ def resume(
             help="Disable interactive interrupt capability (Esc to pause).",
         ),
     ] = False,
+    web: Annotated[
+        bool,
+        typer.Option(
+            "--web",
+            help="Start a real-time web dashboard for workflow visualization.",
+        ),
+    ] = False,
+    web_port: Annotated[
+        int,
+        typer.Option(
+            "--web-port",
+            help="Port for the web dashboard (0 = auto-select).",
+        ),
+    ] = 0,
+    web_bg: Annotated[
+        bool,
+        typer.Option(
+            "--web-bg",
+            help=(
+                "Run resumed workflow + dashboard in a background process. "
+                "Prints the dashboard URL and exits immediately. "
+                "Does not require --web."
+            ),
+        ),
+    ] = False,
 ) -> None:
     """Resume a workflow from a checkpoint after failure.
 
@@ -723,6 +767,11 @@ def resume(
     Either provide a workflow file (to find the latest checkpoint) or
     use --from to specify a checkpoint file directly.
 
+    Note: when running with --web or --web-bg, the dashboard only shows
+    events from the resumed agent forward. Agent runs that completed
+    before the checkpoint were emitted in the original process and are
+    not replayed.
+
     \b
     Examples:
         conductor resume workflow.yaml
@@ -730,11 +779,20 @@ def resume(
         conductor resume workflow.yaml --skip-gates
         conductor resume workflow.yaml --log-file auto
         conductor resume workflow.yaml --no-interactive
+        conductor resume workflow.yaml --provider copilot
+        conductor resume workflow.yaml --metadata tracker=ado -m work_item_id=1814
+        conductor resume workflow.yaml --web
+        conductor resume workflow.yaml --web --web-port 8080
+        conductor resume workflow.yaml --web-bg
     """
     import asyncio
     import json
 
-    from conductor.cli.run import generate_log_path, resume_workflow_async
+    from conductor.cli.run import (
+        generate_log_path,
+        parse_metadata_flags,
+        resume_workflow_async,
+    )
 
     # Validate arguments
     if workflow is None and from_checkpoint is None:
@@ -747,6 +805,10 @@ def resume(
             "or conductor resume --from <checkpoint.json>[/dim]"
         )
         raise typer.Exit(code=1)
+
+    # Validate mutually exclusive flags
+    if web and web_bg:
+        raise typer.BadParameter("--web and --web-bg are mutually exclusive")
 
     # Resolve workflow ref if provided
     resolved_workflow: Path | None = None
@@ -789,6 +851,11 @@ def resume(
             )
             raise typer.Exit(code=1)
 
+    # Parse --metadata key=value flags (no type coercion)
+    cli_metadata: dict[str, str] = {}
+    if raw_metadata:
+        cli_metadata.update(parse_metadata_flags(raw_metadata))
+
     # Resolve log file path
     resolved_log_file: Path | None = None
     if log_file is not None:
@@ -798,14 +865,43 @@ def resume(
         else:
             resolved_log_file = Path(log_file)
 
+    # Handle --web-bg: fork a background process and exit immediately
+    if web_bg:
+        from conductor.cli.bg_runner import launch_background_resume
+
+        try:
+            url = launch_background_resume(
+                workflow_path=resolved_workflow,
+                checkpoint_path=resolved_checkpoint,
+                provider_override=provider,
+                skip_gates=skip_gates,
+                log_file=resolved_log_file,
+                web_port=web_port,
+                metadata=cli_metadata,
+            )
+            console.print(f"[bold cyan]Dashboard:[/bold cyan] {url}")
+            console.print(
+                "[dim]Resumed workflow running in background. Dashboard auto-shuts down after "
+                "workflow completes and all clients disconnect.[/dim]"
+            )
+        except Exception as e:
+            print_error(e)
+            raise typer.Exit(code=1) from None
+        return
+
     try:
         result = asyncio.run(
             resume_workflow_async(
                 workflow_path=resolved_workflow,
                 checkpoint_path=resolved_checkpoint,
+                provider_override=provider,
                 skip_gates=skip_gates,
                 log_file=resolved_log_file,
                 no_interactive=no_interactive,
+                web=web,
+                web_port=web_port,
+                web_bg=web_bg,
+                metadata=cli_metadata,
             )
         )
 

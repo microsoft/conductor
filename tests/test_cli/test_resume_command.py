@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from typer.testing import CliRunner
@@ -214,6 +214,216 @@ class TestResumeCommand:
             result = runner.invoke(app, ["resume", "--from", str(cp_path)])
 
         assert result.exit_code == 1
+
+    def test_resume_with_provider_override(self, tmp_path: Path) -> None:
+        """Test resume passes --provider through as provider_override."""
+        wf_path = _write_workflow(tmp_path)
+
+        with patch(
+            "conductor.cli.run.resume_workflow_async", new_callable=AsyncMock
+        ) as mock_resume:
+            mock_resume.return_value = {"result": "ok"}
+            runner.invoke(app, ["resume", str(wf_path), "--provider", "claude"])
+
+        call_kwargs = mock_resume.call_args
+        assert call_kwargs[1]["provider_override"] == "claude"
+
+    def test_resume_with_metadata(self, tmp_path: Path) -> None:
+        """Test resume parses --metadata flags into a dict."""
+        wf_path = _write_workflow(tmp_path)
+
+        with patch(
+            "conductor.cli.run.resume_workflow_async", new_callable=AsyncMock
+        ) as mock_resume:
+            mock_resume.return_value = {"result": "ok"}
+            runner.invoke(
+                app,
+                [
+                    "resume",
+                    str(wf_path),
+                    "--metadata",
+                    "tracker=ado",
+                    "-m",
+                    "work_item_id=1814",
+                ],
+            )
+
+        call_kwargs = mock_resume.call_args
+        assert call_kwargs[1]["metadata"] == {
+            "tracker": "ado",
+            "work_item_id": "1814",
+        }
+
+    def test_resume_invalid_metadata_format(self, tmp_path: Path) -> None:
+        """Test resume rejects malformed --metadata values."""
+        wf_path = _write_workflow(tmp_path)
+
+        result = runner.invoke(app, ["resume", str(wf_path), "--metadata", "no_equals"])
+        assert result.exit_code != 0
+
+    def test_resume_with_web(self, tmp_path: Path) -> None:
+        """Test resume passes --web and --web-port through."""
+        wf_path = _write_workflow(tmp_path)
+
+        with patch(
+            "conductor.cli.run.resume_workflow_async", new_callable=AsyncMock
+        ) as mock_resume:
+            mock_resume.return_value = {"result": "ok"}
+            runner.invoke(app, ["resume", str(wf_path), "--web", "--web-port", "9091"])
+
+        call_kwargs = mock_resume.call_args
+        assert call_kwargs[1]["web"] is True
+        assert call_kwargs[1]["web_port"] == 9091
+        assert call_kwargs[1]["web_bg"] is False
+
+    def test_resume_web_and_web_bg_mutually_exclusive(self, tmp_path: Path) -> None:
+        """Test that --web and --web-bg cannot be combined."""
+        wf_path = _write_workflow(tmp_path)
+
+        result = runner.invoke(app, ["resume", str(wf_path), "--web", "--web-bg"])
+        assert result.exit_code != 0
+        assert "mutually exclusive" in result.output.lower()
+
+    def test_resume_web_bg_invokes_launch_background_resume(self, tmp_path: Path) -> None:
+        """Test that --web-bg dispatches to launch_background_resume."""
+        wf_path = _write_workflow(tmp_path)
+
+        with patch("conductor.cli.bg_runner.launch_background_resume") as mock_launch:
+            mock_launch.return_value = "http://127.0.0.1:9092"
+            result = runner.invoke(
+                app,
+                [
+                    "resume",
+                    str(wf_path),
+                    "--web-bg",
+                    "--web-port",
+                    "9092",
+                    "--provider",
+                    "copilot",
+                    "-m",
+                    "tracker=ado",
+                    "--skip-gates",
+                ],
+            )
+
+        assert result.exit_code == 0
+        assert "http://127.0.0.1:9092" in result.output
+        assert mock_launch.called
+        kwargs = mock_launch.call_args[1]
+        assert kwargs["workflow_path"] == wf_path.resolve()
+        assert kwargs["checkpoint_path"] is None
+        assert kwargs["provider_override"] == "copilot"
+        assert kwargs["skip_gates"] is True
+        assert kwargs["web_port"] == 9092
+        assert kwargs["metadata"] == {"tracker": "ado"}
+
+    def test_resume_web_bg_with_from_checkpoint(self, tmp_path: Path) -> None:
+        """Test --web-bg forwards --from checkpoint path."""
+        wf_path = _write_workflow(tmp_path)
+        cp_path = _write_checkpoint(tmp_path, wf_path)
+
+        with patch("conductor.cli.bg_runner.launch_background_resume") as mock_launch:
+            mock_launch.return_value = "http://127.0.0.1:9093"
+            result = runner.invoke(app, ["resume", "--from", str(cp_path), "--web-bg"])
+
+        assert result.exit_code == 0
+        kwargs = mock_launch.call_args[1]
+        assert kwargs["workflow_path"] is None
+        assert kwargs["checkpoint_path"] == cp_path.resolve()
+
+
+# ---------------------------------------------------------------------------
+# launch_background_resume tests
+# ---------------------------------------------------------------------------
+
+
+class TestLaunchBackgroundResume:
+    """Tests for the launch_background_resume helper in bg_runner.py."""
+
+    def test_requires_workflow_or_checkpoint(self) -> None:
+        """Test that launch_background_resume raises when both args are None."""
+        from conductor.cli.bg_runner import launch_background_resume
+
+        with pytest.raises(ValueError, match="workflow_path or checkpoint_path"):
+            launch_background_resume(workflow_path=None, checkpoint_path=None)
+
+    def test_builds_resume_subcommand_with_workflow(self, tmp_path: Path) -> None:
+        """Test the subprocess command starts with `conductor resume <workflow>`."""
+        from conductor.cli import bg_runner
+
+        wf_path = tmp_path / "wf.yaml"
+        wf_path.write_text("workflow: {name: x, entry_point: a}\nagents: []\n")
+
+        captured: dict[str, list[str]] = {}
+
+        def _fake_popen(cmd: list[str], **kwargs: object) -> MagicMock:  # type: ignore[no-untyped-def]
+            captured["cmd"] = cmd
+            proc = MagicMock()
+            proc.pid = 12345
+            proc.poll.return_value = None
+            return proc
+
+        with (
+            patch("conductor.cli.bg_runner.subprocess.Popen", side_effect=_fake_popen),
+            patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch("conductor.cli.pid.write_pid_file"),
+        ):
+            url = bg_runner.launch_background_resume(
+                workflow_path=wf_path,
+                checkpoint_path=None,
+                provider_override="copilot",
+                skip_gates=True,
+                metadata={"tracker": "ado"},
+                web_port=9099,
+            )
+
+        assert url == "http://127.0.0.1:9099"
+        cmd = captured["cmd"]
+        # `--silent` is global and must precede the subcommand
+        assert "--silent" in cmd
+        assert cmd.index("resume") > cmd.index("--silent")
+        assert str(wf_path) in cmd
+        assert "--web" in cmd
+        assert "--web-port" in cmd
+        assert "9099" in cmd
+        assert "--no-interactive" in cmd
+        assert "--provider" in cmd and "copilot" in cmd
+        assert "--skip-gates" in cmd
+        assert "--metadata" in cmd
+        assert "tracker=ado" in cmd
+
+    def test_builds_resume_subcommand_with_from_checkpoint(self, tmp_path: Path) -> None:
+        """Test --from is forwarded when checkpoint_path is given without workflow_path."""
+        from conductor.cli import bg_runner
+
+        cp_path = tmp_path / "cp.json"
+        cp_path.write_text("{}")
+
+        captured: dict[str, list[str]] = {}
+
+        def _fake_popen(cmd: list[str], **kwargs: object) -> MagicMock:  # type: ignore[no-untyped-def]
+            captured["cmd"] = cmd
+            proc = MagicMock()
+            proc.pid = 12345
+            proc.poll.return_value = None
+            return proc
+
+        with (
+            patch("conductor.cli.bg_runner.subprocess.Popen", side_effect=_fake_popen),
+            patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch("conductor.cli.pid.write_pid_file"),
+        ):
+            bg_runner.launch_background_resume(
+                workflow_path=None,
+                checkpoint_path=cp_path,
+                web_port=9100,
+            )
+
+        cmd = captured["cmd"]
+        assert "resume" in cmd
+        assert "--from" in cmd
+        from_idx = cmd.index("--from")
+        assert cmd[from_idx + 1] == str(cp_path)
 
 
 # ---------------------------------------------------------------------------

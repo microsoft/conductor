@@ -47,7 +47,11 @@ uv run conductor stop --all            # stop all background workflows
 uv run conductor update                # check for and install latest version
 
 # Resume a failed workflow from checkpoint
-uv run conductor resume workflow.yaml  # resume from latest checkpoint
+uv run conductor resume workflow.yaml                  # resume from latest checkpoint
+uv run conductor resume workflow.yaml --web            # resume with dashboard
+uv run conductor resume workflow.yaml --web-bg         # resume with background dashboard
+uv run conductor resume workflow.yaml --provider copilot
+uv run conductor resume workflow.yaml -m tracker=ado
 uv run conductor checkpoints           # list available checkpoints
 
 # Validate a workflow
@@ -162,3 +166,31 @@ All providers (`copilot.py`, `claude.py`) must maintain feature parity. Any chan
 - **Reasoning effort**: All providers must accept the unified `reasoning.effort` field (`low` | `medium` | `high` | `xhigh`), translate it to the native API (Copilot `reasoning_effort` on the session; Claude extended `thinking` budget), validate that the selected model supports the requested effort, and raise `ValidationError` with a clear message when it does not. Any reasoning/thinking content the model returns must be surfaced via `agent_reasoning` events so the dashboard, JSONL logger, and console subscriber render it consistently.
 
 When modifying any provider, check all other providers for the same change. The dashboard, JSONL logger, console subscriber, and workflow engine all depend on consistent behavior across providers.
+
+### Run / Resume Parity
+
+The `run` and `resume` commands must accept the same flags wherever a flag is meaningful for a resumed run. When adding a new flag to `run`, add it to `resume` too unless there's a specific reason it cannot apply.
+
+Flags that **must** be mirrored on both:
+
+- `--provider` / `-p` — runtime provider override
+- `--metadata` / `-m` — CLI metadata merged on top of YAML metadata
+- `--skip-gates` — auto-select first option at human gates
+- `--log-file` / `-l` — debug log file path (`auto` or explicit)
+- `--no-interactive` — disable Esc-to-pause keyboard listener
+- `--web` — start the real-time web dashboard
+- `--web-port` — dashboard port (0 = auto-select)
+- `--web-bg` — fork a detached process running the workflow + dashboard
+
+Flags intentionally **not** mirrored on `resume` (and why):
+
+- `--input` / `-i` — workflow inputs are restored from the checkpoint context; supplying them at resume would conflict.
+- `--workspace-instructions`, `--instructions` — the `instructions_preamble` is persisted in the checkpoint and restored verbatim; re-supplying would be ambiguous.
+- `--dry-run` — resume executes from a saved point and is incompatible with planning-only output.
+
+Implementation parity rules:
+
+- The async helpers (`run_workflow_async` and `resume_workflow_async` in `cli/run.py`) must wire up the same event emitter, JSONL event log subscriber, console event subscriber, and `WebDashboard` lifecycle.
+- The `WorkflowEngine` constructor receives the same kwargs in both paths (`event_emitter`, `web_dashboard`, `run_context`, `interrupt_event`, `keyboard_listener`, `instructions_preamble`).
+- Background-process forking lives in `cli/bg_runner.py`. `run --web-bg` calls `launch_background()` and `resume --web-bg` calls `launch_background_resume()`. Both must forward equivalent options and write a PID file via `cli/pid.py`.
+- Note: on resume, the dashboard only shows events from the resumed agent forward — events from agents that completed before the checkpoint were emitted in the original process and are not replayed.
