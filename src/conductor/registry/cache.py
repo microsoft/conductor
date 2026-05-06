@@ -118,6 +118,9 @@ def fetch_workflow(
 
     Raises:
         RegistryError: On fetch failure, missing workflow, or I/O errors.
+            Failures fetching sibling files in the same directory are
+            silently swallowed (best-effort) — only the workflow file
+            itself must succeed.
     """
     # Path registries: read directly from source. resolve_ref raises if a
     # ref was supplied, propagating a clear error to the caller.
@@ -262,3 +265,43 @@ def clear_cache(registry_name: str | None = None) -> None:
     else:
         if base.exists():
             shutil.rmtree(base)
+
+
+def prune_temp_dirs(registry_name: str | None = None) -> int:
+    """Remove orphaned ``.tmp-*`` directories under the cache.
+
+    The atomic write pattern in :func:`fetch_workflow` creates ``.tmp-XXXX``
+    directories alongside each workflow's SHA directory. If a process is
+    killed mid-write, these orphans never get cleaned up. This helper walks
+    the cache and removes any directory whose name starts with ``.tmp-``.
+
+    Args:
+        registry_name: If provided, only that registry's cache is scanned.
+            Otherwise all registries under the cache base are scanned.
+
+    Returns:
+        Count of directories successfully removed.
+    """
+    base = get_cache_base()
+    if not base.is_dir():
+        return 0
+
+    if registry_name is not None:
+        registry_roots = [base / registry_name]
+    else:
+        registry_roots = [p for p in base.iterdir() if p.is_dir()]
+
+    removed = 0
+    for reg_root in registry_roots:
+        if not reg_root.is_dir():
+            continue
+        # Layout: <reg>/<workflow>/<sha-or-.tmp-*>/
+        for workflow_dir in reg_root.iterdir():
+            if not workflow_dir.is_dir():
+                continue
+            for child in workflow_dir.iterdir():
+                if child.is_dir() and child.name.startswith(".tmp-"):
+                    shutil.rmtree(child, ignore_errors=True)
+                    if not child.exists():
+                        removed += 1
+    return removed

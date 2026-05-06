@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from packaging.version import InvalidVersion, Version
+
 from conductor.registry.config import RegistryEntry, RegistryType
 from conductor.registry.errors import RegistryError
 from conductor.registry.github import (
@@ -40,7 +42,7 @@ def resolve_ref(entry: RegistryEntry, requested: str | None) -> str:
         owner, repo = parse_github_source(entry.source)
         tags = list_tags(owner, repo)
         if tags:
-            return _sort_tags(tags)[0]
+            return sort_tags(tags)[0]
         return get_default_branch(owner, repo)
 
     return requested
@@ -59,19 +61,13 @@ def materialize_to_sha(entry: RegistryEntry, ref: str) -> str:
     return resolve_ref_to_sha(owner, repo, ref)
 
 
-def _sort_tags(tags: list[str]) -> list[str]:
+def sort_tags(tags: list[str]) -> list[str]:
     """Sort tags newest-first, preferring semver order for parseable tags.
 
     Tags that parse as PEP 440 / semver (after stripping a leading ``v``) are
     placed first in descending version order. Unparseable tags follow in
     their original input order (which is GitHub's newest-commit-first).
     """
-    try:
-        from packaging.version import InvalidVersion, Version
-    except ImportError:
-        # packaging not available — fall back to input order.
-        return list(tags)
-
     parseable: list[tuple[Version, str]] = []
     unparseable: list[str] = []
     for tag in tags:

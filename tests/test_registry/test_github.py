@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 import httpx
 import pytest
 
-from conductor.registry.errors import RegistryError
+from conductor.registry.errors import RegistryError, RegistryNotFoundError
 from conductor.registry.github import (
     fetch_file,
     fetch_file_text,
@@ -55,6 +55,14 @@ class TestFetchFile:
         mock_get.return_value = _mock_response(status_code=404)
 
         with pytest.raises(RegistryError, match="not found"):
+            fetch_file("owner", "repo", "missing.txt")
+
+    @patch("conductor.registry.github.httpx.get")
+    def test_404_raises_registry_not_found_error(self, mock_get: MagicMock) -> None:
+        """404 specifically raises RegistryNotFoundError (subclass of RegistryError)."""
+        mock_get.return_value = _mock_response(status_code=404)
+
+        with pytest.raises(RegistryNotFoundError, match="not found"):
             fetch_file("owner", "repo", "missing.txt")
 
     @patch("conductor.registry.github.httpx.get")

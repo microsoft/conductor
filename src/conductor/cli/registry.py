@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from typing import Annotated
 
+import httpx
 import typer
 from rich.console import Console
 from rich.table import Table
 
-from conductor.registry.cache import clear_cache
+from conductor.registry.cache import clear_cache, prune_temp_dirs
 from conductor.registry.config import (
     RegistryEntry,
     RegistryType,
@@ -21,7 +22,7 @@ from conductor.registry.config import (
 from conductor.registry.errors import RegistryError
 from conductor.registry.github import list_tags, parse_github_source
 from conductor.registry.index import load_index
-from conductor.registry.version_resolver import _sort_tags
+from conductor.registry.version_resolver import sort_tags
 
 _MAX_DISPLAY_TAGS = 5
 
@@ -104,8 +105,10 @@ def _format_latest_tags(entry: RegistryEntry) -> str | None:
     """Return a formatted "Latest tags" string for a registry, or None for path registries.
 
     For github registries, fetches tags via the API and returns up to
-    ``_MAX_DISPLAY_TAGS`` newest tags (semver-sorted). Returns "(unavailable)"
-    on any fetch failure and "(no tags)" if the repo has none.
+    ``_MAX_DISPLAY_TAGS`` newest tags (semver-sorted). Returns
+    ``"(unavailable: <reason>)"`` on a fetch failure (surfacing the
+    underlying ``RegistryError`` message or the HTTP exception class name)
+    and ``"(no tags)"`` if the repo has none.
     """
     if entry.type != RegistryType.github:
         return None
@@ -113,13 +116,15 @@ def _format_latest_tags(entry: RegistryEntry) -> str | None:
     try:
         owner, repo = parse_github_source(entry.source)
         tags = list_tags(owner, repo)
-    except Exception:
-        return "(unavailable)"
+    except RegistryError as error:
+        return f"(unavailable: {error})"
+    except httpx.HTTPError as error:
+        return f"(unavailable: {type(error).__name__})"
 
     if not tags:
         return "(no tags)"
 
-    sorted_tags = _sort_tags(tags)
+    sorted_tags = sort_tags(tags)
     display = sorted_tags[:_MAX_DISPLAY_TAGS]
     suffix = ", ..." if len(sorted_tags) > _MAX_DISPLAY_TAGS else ""
     return ", ".join(display) + suffix
@@ -192,7 +197,8 @@ def set_default(
         "Re-fetches the latest index from each configured registry and clears "
         "locally-cached workflow files. Index fetches always bypass GitHub's CDN "
         "cache (via SHA-based URLs), so this primarily clears cached workflow "
-        "contents pinned to mutable refs (branches)."
+        "contents pinned to mutable refs (branches). Also prunes orphaned "
+        "'.tmp-*' directories left behind by interrupted fetches."
     ),
 )
 def update(
@@ -206,7 +212,8 @@ def update(
     Re-fetches the latest index from each configured registry and clears
     locally-cached workflow files. Index fetches always bypass GitHub's CDN
     cache (via SHA-based URLs), so this primarily clears cached workflow
-    contents pinned to mutable refs (branches).
+    contents pinned to mutable refs (branches). Additionally prunes any
+    orphaned ``.tmp-*`` directories left behind by interrupted fetches.
     """
     try:
         config = load_config()
@@ -218,6 +225,9 @@ def update(
                     suggestion="Run 'conductor registry list' to see available registries.",
                 )
             clear_cache(name)
+            pruned = prune_temp_dirs(name)
+            if pruned > 0:
+                output_console.print(f"Pruned {pruned} stale .tmp-* directories.")
             load_index(config.registries[name])
             output_console.print(f"Registry '{name}' updated.")
         else:
@@ -225,6 +235,9 @@ def update(
                 output_console.print("No registries configured.")
                 return
             clear_cache()
+            pruned = prune_temp_dirs()
+            if pruned > 0:
+                output_console.print(f"Pruned {pruned} stale .tmp-* directories.")
             for reg_name, entry in config.registries.items():
                 load_index(entry)
                 output_console.print(f"Registry '{reg_name}' updated.")

@@ -13,6 +13,7 @@ from conductor.registry.cache import (
     fetch_workflow,
     get_cache_base,
     get_cached_workflow_path,
+    prune_temp_dirs,
 )
 from conductor.registry.config import RegistryEntry, RegistryType
 from conductor.registry.errors import RegistryError
@@ -556,3 +557,70 @@ class TestClearCache:
         # Should not raise
         clear_cache(registry_name="does-not-exist")
         clear_cache()
+
+
+# ---------------------------------------------------------------------------
+# prune_temp_dirs
+# ---------------------------------------------------------------------------
+
+
+class TestPruneTempDirs:
+    def test_prune_temp_dirs_removes_orphans(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        home = _setup_conductor_home(tmp_path, monkeypatch)
+        cache_base = home / "cache" / "registries"
+
+        # Real SHA dir alongside an orphan .tmp-* dir.
+        real = cache_base / "reg-a" / "wf" / _SHA_DIR
+        orphan = cache_base / "reg-a" / "wf" / ".tmp-abc"
+        real.mkdir(parents=True)
+        orphan.mkdir(parents=True)
+        (orphan / "junk.yaml").write_text("x", encoding="utf-8")
+
+        removed = prune_temp_dirs()
+
+        assert removed == 1
+        assert not orphan.exists()
+        assert real.exists()
+
+    def test_prune_temp_dirs_scoped_to_registry(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        home = _setup_conductor_home(tmp_path, monkeypatch)
+        cache_base = home / "cache" / "registries"
+
+        orphan_a = cache_base / "reg-a" / "wf" / ".tmp-aaa"
+        orphan_b = cache_base / "reg-b" / "wf" / ".tmp-bbb"
+        orphan_a.mkdir(parents=True)
+        orphan_b.mkdir(parents=True)
+
+        removed = prune_temp_dirs("reg-a")
+
+        assert removed == 1
+        assert not orphan_a.exists()
+        assert orphan_b.exists()
+
+    def test_prune_temp_dirs_returns_count(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        home = _setup_conductor_home(tmp_path, monkeypatch)
+        cache_base = home / "cache" / "registries"
+
+        for n in range(3):
+            (cache_base / "reg-a" / "wf" / f".tmp-{n}").mkdir(parents=True)
+        (cache_base / "reg-b" / "other-wf" / ".tmp-xyz").mkdir(parents=True)
+        # Real dirs - should not be counted.
+        (cache_base / "reg-a" / "wf" / _SHA_DIR).mkdir(parents=True)
+
+        removed = prune_temp_dirs()
+
+        assert removed == 4
+
+    def test_prune_temp_dirs_missing_base_returns_zero(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _setup_conductor_home(tmp_path, monkeypatch)
+        # No cache dir at all
+        assert prune_temp_dirs() == 0
+        assert prune_temp_dirs("reg-a") == 0

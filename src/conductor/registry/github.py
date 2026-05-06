@@ -10,7 +10,7 @@ import subprocess
 
 import httpx
 
-from conductor.registry.errors import RegistryError
+from conductor.registry.errors import RegistryError, RegistryNotFoundError
 
 GITHUB_RAW_BASE = "https://raw.githubusercontent.com"
 GITHUB_API_BASE = "https://api.github.com"
@@ -59,7 +59,7 @@ def _raise_for_status(response: httpx.Response, *, context: str) -> None:
         return
     status = response.status_code
     if status == 404:
-        raise RegistryError(
+        raise RegistryNotFoundError(
             f"{context}: not found (404). Check that the repository exists and the ref is valid.",
             suggestion="If this is a private repo, ensure 'gh auth login' has been run.",
         )
@@ -123,7 +123,7 @@ _MAX_TAGS = 1000
 
 
 def list_tags(owner: str, repo: str) -> list[str]:
-    """List all git tags for a repository, newest first.
+    """List all git tags for a repository in GitHub's commit-date order.
 
     Uses GET /repos/{owner}/{repo}/tags from the GitHub REST API.
     Follows ``Link: <...>; rel="next"`` headers to paginate, capping at
@@ -134,7 +134,9 @@ def list_tags(owner: str, repo: str) -> list[str]:
         repo: Repository name.
 
     Returns:
-        List of tag name strings, newest first.
+        List of tag name strings in GitHub's commit-date order (newest commit
+        first). For semver ordering of these tags, use
+        :func:`conductor.registry.version_resolver.sort_tags`.
 
     Raises:
         RegistryError: If the API request fails.

@@ -8,9 +8,9 @@ from conductor.registry import version_resolver
 from conductor.registry.config import RegistryEntry, RegistryType
 from conductor.registry.errors import RegistryError
 from conductor.registry.version_resolver import (
-    _sort_tags,
     materialize_to_sha,
     resolve_ref,
+    sort_tags,
 )
 
 
@@ -95,25 +95,25 @@ def test_resolve_ref_github_tag_returned_verbatim(monkeypatch: pytest.MonkeyPatc
 
 
 # ---------------------------------------------------------------------------
-# _sort_tags
+# sort_tags
 # ---------------------------------------------------------------------------
 
 
 def test_sort_tags_v_prefix() -> None:
-    assert _sort_tags(["v1.0.0", "v2.0.0", "v1.1.0"]) == ["v2.0.0", "v1.1.0", "v1.0.0"]
+    assert sort_tags(["v1.0.0", "v2.0.0", "v1.1.0"]) == ["v2.0.0", "v1.1.0", "v1.0.0"]
 
 
 def test_sort_tags_prereleases() -> None:
-    assert _sort_tags(["1.0.0", "1.0.0-rc1", "0.9.0"]) == ["1.0.0", "1.0.0-rc1", "0.9.0"]
+    assert sort_tags(["1.0.0", "1.0.0-rc1", "0.9.0"]) == ["1.0.0", "1.0.0-rc1", "0.9.0"]
 
 
 def test_sort_tags_mixed_parseable_and_not() -> None:
-    result = _sort_tags(["v1.0.0", "release-2024", "v2.0.0", "experimental"])
+    result = sort_tags(["v1.0.0", "release-2024", "v2.0.0", "experimental"])
     assert result == ["v2.0.0", "v1.0.0", "release-2024", "experimental"]
 
 
 def test_sort_tags_empty() -> None:
-    assert _sort_tags([]) == []
+    assert sort_tags([]) == []
 
 
 # ---------------------------------------------------------------------------

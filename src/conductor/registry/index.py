@@ -13,7 +13,7 @@ from pydantic import BaseModel
 from ruamel.yaml import YAML, YAMLError
 
 from conductor.registry.config import RegistryEntry, RegistryType
-from conductor.registry.errors import RegistryError
+from conductor.registry.errors import RegistryError, RegistryNotFoundError
 
 _INDEX_FILENAMES = ("index.yaml", "index.json")
 
@@ -201,13 +201,13 @@ def _load_github_index(source: str, ref: str | None) -> RegistryIndex:
     for filename in _INDEX_FILENAMES:
         try:
             text = fetch_file_text(owner, repo, filename, ref=sha)
-        except RegistryError:
+        except RegistryNotFoundError:
             continue
 
         return _parse_github_response(text, filename, f"{source}/{sha}/{filename}")
 
     tried_label = ref if ref is not None else "default branch"
-    raise RegistryError(
+    raise RegistryNotFoundError(
         f"No index.yaml or index.json found in GitHub repo '{source}' "
         f"at ref '{tried_label}' (resolved to {sha})",
         suggestion="Ensure the repository contains an index.yaml or index.json at this ref.",

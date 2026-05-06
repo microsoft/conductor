@@ -10,7 +10,7 @@ import pytest
 from ruamel.yaml import YAML
 
 from conductor.registry.config import RegistryEntry, RegistryType
-from conductor.registry.errors import RegistryError
+from conductor.registry.errors import RegistryError, RegistryNotFoundError
 from conductor.registry.index import (
     RegistryIndex,
     WorkflowInfo,
@@ -205,7 +205,7 @@ class TestLoadGitHubIndex:
         """Passing ref='latest' is equivalent to no ref — uses default branch."""
         json_text = json.dumps(_SAMPLE_INDEX)
         # yaml fails, json succeeds
-        mock_fetch.side_effect = [RegistryError("not found"), json_text]
+        mock_fetch.side_effect = [RegistryNotFoundError("not found"), json_text]
 
         idx = load_index(_github_entry("myorg/myrepo"), ref="latest")
         assert "qa-bot" in idx.workflows
@@ -254,7 +254,7 @@ class TestLoadGitHubIndex:
     ) -> None:
         """Falls back to index.json when index.yaml is not found at the SHA."""
         json_text = json.dumps(_SAMPLE_INDEX)
-        mock_fetch.side_effect = [RegistryError("not found"), json_text]
+        mock_fetch.side_effect = [RegistryNotFoundError("not found"), json_text]
 
         idx = load_index(_github_entry("myorg/myrepo"))
         assert "qa-bot" in idx.workflows
@@ -274,10 +274,10 @@ class TestLoadGitHubIndex:
         _mock_resolve: MagicMock,
         mock_fetch: MagicMock,
     ) -> None:
-        """RegistryError when neither index file is found at the SHA."""
-        mock_fetch.side_effect = RegistryError("not found")
+        """RegistryNotFoundError when neither index file is found at the SHA."""
+        mock_fetch.side_effect = RegistryNotFoundError("not found")
 
-        with pytest.raises(RegistryError, match="No index.yaml or index.json"):
+        with pytest.raises(RegistryNotFoundError, match="No index.yaml or index.json"):
             load_index(_github_entry("myorg/myrepo"))
 
         # Only one attempt per filename — no branch fallback any more
@@ -294,10 +294,10 @@ class TestLoadGitHubIndex:
         _mock_resolve: MagicMock,
         mock_fetch: MagicMock,
     ) -> None:
-        """RegistryError on network failure propagates."""
+        """RegistryError on network failure propagates immediately, not collapsed to 'no index'."""
         mock_fetch.side_effect = RegistryError("Failed to fetch: connection refused")
 
-        with pytest.raises(RegistryError, match="No index.yaml or index.json"):
+        with pytest.raises(RegistryError, match="connection refused"):
             load_index(_github_entry("myorg/myrepo"))
 
     @patch("conductor.registry.github.resolve_ref_to_sha")
@@ -314,6 +314,93 @@ class TestLoadGitHubIndex:
 
         with pytest.raises(RegistryError, match="ref not found"):
             load_index(_github_entry("myorg/myrepo"), ref="nonexistent")
+
+    @patch("conductor.registry.github.fetch_file_text")
+    @patch("conductor.registry.github.resolve_ref_to_sha", return_value="sha1234567890")
+    @patch("conductor.registry.github.get_default_branch", return_value="main")
+    @patch("conductor.registry.github.parse_github_source", return_value=("myorg", "myrepo"))
+    def test_load_index_propagates_auth_error(
+        self,
+        _mock_parse: MagicMock,
+        _mock_default_branch: MagicMock,
+        _mock_resolve: MagicMock,
+        mock_fetch: MagicMock,
+    ) -> None:
+        """A non-404 RegistryError (e.g. HTTP 403 auth/rate-limit) on the first
+        filename propagates immediately rather than being swallowed and reported
+        as 'no index file found'."""
+        mock_fetch.side_effect = RegistryError(
+            "Fetching myorg/myrepo/index.yaml at ref sha1234567890: HTTP 403. "
+            "GitHub API rate limit may be exceeded. Try again later."
+        )
+
+        with pytest.raises(RegistryError, match="HTTP 403") as exc_info:
+            load_index(_github_entry("myorg/myrepo"))
+
+        assert "No index.yaml or index.json" not in str(exc_info.value)
+        # Only the first filename should be tried — the loop must NOT fall through
+        assert mock_fetch.call_count == 1
+
+    @patch("conductor.registry.github.fetch_file_text")
+    @patch("conductor.registry.github.resolve_ref_to_sha", return_value="sha1234567890")
+    @patch("conductor.registry.github.get_default_branch", return_value="main")
+    @patch("conductor.registry.github.parse_github_source", return_value=("myorg", "myrepo"))
+    def test_load_index_propagates_rate_limit(
+        self,
+        _mock_parse: MagicMock,
+        _mock_default_branch: MagicMock,
+        _mock_resolve: MagicMock,
+        mock_fetch: MagicMock,
+    ) -> None:
+        """An HTTP 429 rate-limit error propagates immediately."""
+        mock_fetch.side_effect = RegistryError(
+            "Fetching myorg/myrepo/index.yaml at ref sha1234567890: HTTP 429. "
+            "GitHub API rate limit may be exceeded. Try again later."
+        )
+
+        with pytest.raises(RegistryError, match="HTTP 429") as exc_info:
+            load_index(_github_entry("myorg/myrepo"))
+
+        assert "No index.yaml or index.json" not in str(exc_info.value)
+        assert mock_fetch.call_count == 1
+
+    @patch("conductor.registry.github.fetch_file_text")
+    @patch("conductor.registry.github.resolve_ref_to_sha", return_value="sha1234567890")
+    @patch("conductor.registry.github.get_default_branch", return_value="main")
+    @patch("conductor.registry.github.parse_github_source", return_value=("myorg", "myrepo"))
+    def test_load_index_falls_back_yaml_to_json_on_404(
+        self,
+        _mock_parse: MagicMock,
+        _mock_default_branch: MagicMock,
+        _mock_resolve: MagicMock,
+        mock_fetch: MagicMock,
+    ) -> None:
+        """A 404 (RegistryNotFoundError) on index.yaml falls through to index.json."""
+        json_text = json.dumps(_SAMPLE_INDEX)
+        mock_fetch.side_effect = [RegistryNotFoundError("not found"), json_text]
+
+        idx = load_index(_github_entry("myorg/myrepo"))
+        assert "qa-bot" in idx.workflows
+        assert mock_fetch.call_count == 2
+
+    @patch("conductor.registry.github.fetch_file_text")
+    @patch("conductor.registry.github.resolve_ref_to_sha", return_value="sha1234567890")
+    @patch("conductor.registry.github.get_default_branch", return_value="main")
+    @patch("conductor.registry.github.parse_github_source", return_value=("myorg", "myrepo"))
+    def test_load_index_404_for_both_raises_not_found(
+        self,
+        _mock_parse: MagicMock,
+        _mock_default_branch: MagicMock,
+        _mock_resolve: MagicMock,
+        mock_fetch: MagicMock,
+    ) -> None:
+        """When both yaml and json 404, the final error is a RegistryNotFoundError."""
+        mock_fetch.side_effect = RegistryNotFoundError("not found")
+
+        with pytest.raises(RegistryNotFoundError, match="No index.yaml or index.json"):
+            load_index(_github_entry("myorg/myrepo"))
+
+        assert mock_fetch.call_count == 2
 
 
 # ---------------------------------------------------------------------------
