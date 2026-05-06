@@ -469,18 +469,114 @@ def _report_install_failure(
         console.print(r"  [bold]Add-MpPreference -ExclusionPath \"$env:LOCALAPPDATA\uv\"[/bold]")
 
 
+def _get_self_and_ancestor_pids() -> set[int]:
+    """Return the PID of the current process and all of its ancestors.
+
+    On Windows the ``conductor.exe`` shim that launched the Python
+    interpreter is a *separate* process. Excluding only ``os.getpid()``
+    would still surface that shim as another running Conductor process
+    during ``conductor update``. Walking the full ancestor chain prevents
+    those false positives.
+
+    The walk is best-effort: any failure (missing tool, parse error,
+    timeout, permission denied) returns whatever PIDs were collected so
+    far, never raises. The current PID and its direct parent are always
+    included via the ``os`` module so the result is never empty.
+
+    Returns:
+        A set of PIDs to treat as "self" when scanning for other running
+        Conductor processes.
+    """
+    pids: set[int] = {os.getpid()}
+    with contextlib.suppress(OSError):
+        pids.add(os.getppid())
+
+    parent_map = _build_parent_pid_map()
+    if not parent_map:
+        return pids
+
+    # Walk up from the current PID until we hit a missing entry or a
+    # cycle (defensive: PID reuse can theoretically create one).
+    cursor = os.getpid()
+    seen: set[int] = set()
+    while cursor in parent_map and cursor not in seen:
+        seen.add(cursor)
+        ppid = parent_map[cursor]
+        if ppid <= 0:
+            break
+        pids.add(ppid)
+        cursor = ppid
+
+    return pids
+
+
+def _build_parent_pid_map() -> dict[int, int]:
+    """Return a mapping of ``pid -> parent_pid`` for all running processes.
+
+    Uses ``wmic`` on Windows and ``ps`` elsewhere. Returns an empty dict
+    on any failure so callers can fall back gracefully.
+    """
+    try:
+        if sys.platform == "win32":
+            proc = subprocess.run(  # noqa: S603, S607
+                ["wmic", "process", "get", "ProcessId,ParentProcessId", "/format:csv"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if proc.returncode != 0:
+                return {}
+            mapping: dict[int, int] = {}
+            # CSV header is "Node,ParentProcessId,ProcessId" — we don't
+            # rely on column position; instead we look for the first two
+            # integer columns on each line.
+            for line in proc.stdout.splitlines():
+                parts = [p.strip() for p in line.split(",")]
+                ints = [int(p) for p in parts if p.isdigit()]
+                if len(ints) >= 2:
+                    ppid_val, pid_val = ints[0], ints[1]
+                    mapping[pid_val] = ppid_val
+            return mapping
+        proc = subprocess.run(  # noqa: S603, S607
+            ["ps", "-axo", "pid=,ppid="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if proc.returncode != 0:
+            return {}
+        mapping = {}
+        for line in proc.stdout.splitlines():
+            tokens = line.split()
+            if len(tokens) < 2:
+                continue
+            try:
+                pid_val = int(tokens[0])
+                ppid_val = int(tokens[1])
+            except ValueError:
+                continue
+            mapping[pid_val] = ppid_val
+        return mapping
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+
+
 def _find_running_conductor_processes() -> list[dict]:
     """Return a list of other running Conductor processes (excluding self).
 
     Cross-platform: uses ``tasklist`` on Windows and ``ps`` elsewhere.
-    Each entry is ``{"pid": int, "cmd": str}``. The current process is
-    always excluded.
+    Each entry is ``{"pid": int, "cmd": str}``. The current process and its
+    ancestor chain are always excluded — on Windows the ``conductor.exe``
+    shim that launched the Python interpreter is a separate process from
+    the running Python, so excluding only ``os.getpid()`` would still
+    surface our own shim as a "running Conductor process".
 
     Returns:
         A list of dicts, one per detected Conductor process other than the
-        current one. Empty list on detection error or when none are found.
+        current one (and its ancestors). Empty list on detection error or
+        when none are found.
     """
-    self_pid = os.getpid()
+    excluded_pids = _get_self_and_ancestor_pids()
     results: list[dict] = []
 
     try:
@@ -507,7 +603,7 @@ def _find_running_conductor_processes() -> list[dict]:
                     pid = int(pid_str)
                 except ValueError:
                     continue
-                if pid == self_pid:
+                if pid in excluded_pids:
                     continue
                 results.append({"pid": pid, "cmd": image})
         else:
@@ -529,7 +625,7 @@ def _find_running_conductor_processes() -> list[dict]:
                     pid = int(pid_str)
                 except ValueError:
                     continue
-                if pid == self_pid:
+                if pid in excluded_pids:
                     continue
                 # Match the conductor entrypoint script or any process whose
                 # command line invokes it. Avoid matching this module's own

@@ -849,3 +849,112 @@ class TestUpdateHintCLI:
         ):
             runner.invoke(app, ["validate", "--help"])
         mock_hint.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Tests: ancestor PID exclusion in _find_running_conductor_processes
+# ---------------------------------------------------------------------------
+
+
+class TestAncestorPidExclusion:
+    """Verify that the current process and its ancestors are not flagged."""
+
+    def test_self_pid_in_excluded_set(self) -> None:
+        """``os.getpid()`` is always excluded."""
+        import os
+
+        from conductor.cli.update import _get_self_and_ancestor_pids
+
+        assert os.getpid() in _get_self_and_ancestor_pids()
+
+    def test_parent_pid_in_excluded_set(self) -> None:
+        """``os.getppid()`` is always excluded so the launching shim is ignored."""
+        import os
+
+        from conductor.cli.update import _get_self_and_ancestor_pids
+
+        assert os.getppid() in _get_self_and_ancestor_pids()
+
+    def test_ancestor_chain_excluded_via_parent_map(self) -> None:
+        """When a parent map is available, the full ancestor chain is excluded."""
+        import os
+
+        from conductor.cli.update import _get_self_and_ancestor_pids
+
+        my_pid = os.getpid()
+        # Fabricated ancestor chain: my_pid -> 100 -> 200 -> 0
+        fake_map = {my_pid: 100, 100: 200, 200: 0}
+        with patch("conductor.cli.update._build_parent_pid_map", return_value=fake_map):
+            pids = _get_self_and_ancestor_pids()
+        assert my_pid in pids
+        assert 100 in pids
+        assert 200 in pids
+        # PPID 0 is the chain terminator and is not added.
+        assert 0 not in pids
+
+    def test_parent_map_failure_falls_back_to_getpid_and_getppid(self) -> None:
+        """When the parent map cannot be built we still exclude self and direct parent."""
+        import os
+
+        from conductor.cli.update import _get_self_and_ancestor_pids
+
+        with patch("conductor.cli.update._build_parent_pid_map", return_value={}):
+            pids = _get_self_and_ancestor_pids()
+        assert os.getpid() in pids
+        assert os.getppid() in pids
+
+    def test_cycle_in_parent_map_terminates_walk(self) -> None:
+        """A cycle in the parent map does not cause infinite recursion."""
+        import os
+
+        from conductor.cli.update import _get_self_and_ancestor_pids
+
+        my_pid = os.getpid()
+        # Cyclic chain my_pid -> 100 -> my_pid
+        fake_map = {my_pid: 100, 100: my_pid}
+        with patch("conductor.cli.update._build_parent_pid_map", return_value=fake_map):
+            pids = _get_self_and_ancestor_pids()
+        # Walk added 100 then stopped before re-adding my_pid.
+        assert 100 in pids
+        assert my_pid in pids
+
+    def test_find_running_excludes_ancestor(self) -> None:
+        """Conductor shim listed in ``ps`` but in our ancestor chain is filtered out."""
+        import os
+        import sys
+
+        from conductor.cli.update import _find_running_conductor_processes
+
+        ancestor_pid = 99999
+        other_pid = 88888
+
+        # ps output containing both ancestor and an unrelated conductor proc.
+        if sys.platform == "win32":
+            mock_stdout = (
+                f'"conductor.exe","{ancestor_pid}","Console","1","12 K"\n'
+                f'"conductor.exe","{other_pid}","Console","1","12 K"\n'
+            )
+            cmd_match = ["tasklist"]
+        else:
+            mock_stdout = (
+                f"{ancestor_pid} /usr/local/bin/conductor run wf.yaml\n"
+                f"{other_pid} /usr/local/bin/conductor run other.yaml\n"
+            )
+            cmd_match = ["ps"]
+
+        from subprocess import CompletedProcess
+
+        completed = CompletedProcess(args=cmd_match, returncode=0, stdout=mock_stdout, stderr="")
+
+        with (
+            patch(
+                "conductor.cli.update._get_self_and_ancestor_pids",
+                return_value={os.getpid(), ancestor_pid},
+            ),
+            patch("conductor.cli.update.subprocess.run", return_value=completed),
+        ):
+            running = _find_running_conductor_processes()
+
+        pids = {p["pid"] for p in running}
+        assert ancestor_pid not in pids, "ancestor (own shim) should be filtered"
+        assert other_pid in pids, "unrelated conductor proc should be reported"
