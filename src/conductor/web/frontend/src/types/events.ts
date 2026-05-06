@@ -328,27 +328,63 @@ export interface SubworkflowFailedData {
 
 // --- Iteration limit gate ---
 
-export interface IterationLimitReachedData {
-  /** Agent name (when triggered before a single agent execution). */
-  agent_name?: string;
-  /** Parallel group name (when triggered before a parallel group). */
-  group_name?: string;
-  /** Number of agents in the parallel group. */
-  agent_count?: number;
+/**
+ * Discriminated target for iteration-limit events: the Python engine emits
+ * either ``agent_name`` (single-agent gate) or ``group_name`` + ``agent_count``
+ * (parallel-group gate) — never both. Modeling them as a union prevents the
+ * "neither/both" illegal states that an independently-optional pair would admit.
+ */
+export type IterationLimitTarget =
+  | {
+      /** Agent name (when triggered before a single agent execution). */
+      agent_name: string;
+      group_name?: never;
+      agent_count?: never;
+    }
+  | {
+      /** Parallel group name (when triggered before a parallel group). */
+      group_name: string;
+      /** Number of agents in the parallel group. */
+      agent_count: number;
+      agent_name?: never;
+    };
+
+export type IterationLimitReachedData = IterationLimitTarget & {
   current_iteration: number;
   max_iterations: number;
-  /** Last few agents executed, oldest to newest. */
+  /** Last up to 5 agents executed, oldest to newest. */
   agent_history: string[];
-  /** Heuristic flag: true when the recent history is stuck on one agent. */
-  possible_loop?: boolean;
-  /** When true, the workflow will auto-stop without prompting. */
-  skip_gates?: boolean;
-}
+  /**
+   * Heuristic: ``true`` when the last 3 entries of ``agent_history`` are all
+   * the same agent (and history has at least 3 entries). Useful for flagging
+   * stuck review loops.
+   */
+  possible_loop: boolean;
+  /**
+   * When ``true``, the workflow will auto-stop without prompting the user
+   * (``--skip-gates``). Subscribers should render the gate as auto-closing
+   * rather than awaiting console input.
+   */
+  skip_gates: boolean;
+};
 
-export interface IterationLimitResolvedData {
-  agent_name?: string;
-  group_name?: string;
-  /** True when the user chose to continue with more iterations. */
+export type IterationLimitResolvedData = (
+  | { agent_name: string; group_name?: never }
+  | { group_name: string; agent_name?: never }
+) & {
+  /**
+   * ``true`` when the gate was resolved by continuing (user prompt or, in
+   * ``--skip-gates`` mode, the auto-decision); ``false`` when the workflow
+   * stopped at the gate.
+   */
   continue_execution: boolean;
+  /** Additional iterations granted; ``0`` when not continuing. */
   additional_iterations: number;
-}
+  /**
+   * ``true`` when the gate was resolved by an unexpected exception
+   * (e.g. ``EOFError`` on non-TTY, ``KeyboardInterrupt``) rather than by a
+   * user or auto decision. The dashboard can use this to distinguish a
+   * crash-driven stop from a deliberate one.
+   */
+  aborted?: boolean;
+};

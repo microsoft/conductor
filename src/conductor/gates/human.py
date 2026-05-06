@@ -377,5 +377,9 @@ class MaxIterationsHandler:
 
             value = await asyncio.to_thread(_ask_int)
             return max(0, value)  # Ensure non-negative
-        except (ValueError, KeyboardInterrupt):
+        except (ValueError, KeyboardInterrupt, EOFError):
+            # EOFError fires when stdin is not a TTY (CI, ``< /dev/null``,
+            # containers without an attached terminal). Treat it as
+            # "stop" — same as the user typing 0 — so the dashboard's
+            # iteration_limit_resolved event still fires (issue #134).
             return 0

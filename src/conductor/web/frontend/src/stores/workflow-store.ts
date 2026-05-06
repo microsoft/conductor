@@ -271,15 +271,7 @@ interface WorkflowState {
   lastEventTime: number | null;
   isPaused: boolean;
   /** Set when the engine is blocked on a max-iterations gate (issue #134). */
-  iterationLimitGate: {
-    agent_name?: string;
-    group_name?: string;
-    current_iteration: number;
-    max_iterations: number;
-    agent_history: string[];
-    possible_loop?: boolean;
-    skip_gates?: boolean;
-  } | null;
+  iterationLimitGate: IterationLimitReachedData | null;
 
   // --- Subworkflow depth tracking ---
   /** Current nesting depth: 0 = root workflow events are active */
@@ -1357,6 +1349,9 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
       const data = _data as { output?: unknown };
       state.workflowStatus = 'completed';
       state.isPaused = false;
+      // Clear any iteration-limit gate that wasn't paired with a resolved
+      // event (defense-in-depth — see issue #134).
+      state.iterationLimitGate = null;
       state.workflowOutput = data.output ?? null;
       if (state.nodes['$end']) {
         state.nodes['$end']!.status = 'completed';
@@ -1395,6 +1390,9 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
       // Root workflow failed
       state.workflowStatus = 'failed';
       state.isPaused = false;
+      // Clear any lingering iteration-limit gate so the StatusBar doesn't
+      // keep an orphan banner around (defense-in-depth — see issue #134).
+      state.iterationLimitGate = null;
       state.workflowFailedAgent = data.agent_name || null;
       if (data.agent_name && state.nodes[data.agent_name]) {
         state.nodes[data.agent_name]!.status = 'failed';
@@ -1617,15 +1615,9 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
 
   iteration_limit_reached: (state, _data) => {
     const data = _data as unknown as IterationLimitReachedData;
-    state.iterationLimitGate = {
-      agent_name: data.agent_name,
-      group_name: data.group_name,
-      current_iteration: data.current_iteration,
-      max_iterations: data.max_iterations,
-      agent_history: data.agent_history ?? [],
-      possible_loop: data.possible_loop,
-      skip_gates: data.skip_gates,
-    };
+    // Reuse the event payload directly so the slice always tracks the
+    // canonical shape (no inline type drift — see types/events.ts).
+    state.iterationLimitGate = data;
     const target = data.agent_name ?? data.group_name;
     if (target) {
       const nd = ensureNode(state.nodes, target);
@@ -1638,6 +1630,11 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
         }`,
       });
       replaceNode(state.nodes, target);
+    } else if (typeof console !== 'undefined') {
+      console.warn(
+        '[workflow-store] iteration_limit_reached event missing both agent_name and group_name',
+        data,
+      );
     }
   },
 
@@ -1651,11 +1648,18 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
         type: 'iteration_limit_resolved',
         icon: data.continue_execution ? '▶' : '■',
         label: 'Iteration limit',
-        text: data.continue_execution
-          ? `Continuing with ${data.additional_iterations} more iteration(s)`
-          : 'Stopping workflow',
+        text: data.aborted
+          ? 'Gate aborted unexpectedly — stopping workflow'
+          : data.continue_execution
+            ? `Continuing with ${data.additional_iterations} more iteration(s)`
+            : 'Stopping workflow',
       });
       replaceNode(state.nodes, target);
+    } else if (typeof console !== 'undefined') {
+      console.warn(
+        '[workflow-store] iteration_limit_resolved event missing both agent_name and group_name',
+        data,
+      );
     }
   },
 
