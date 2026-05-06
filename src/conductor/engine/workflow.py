@@ -641,7 +641,7 @@ class WorkflowEngine:
         start = _time.monotonic()
         try:
             return await asyncio.wait_for(coro, timeout=agent.timeout_seconds)
-        except TimeoutError:
+        except TimeoutError as e:
             elapsed = _time.monotonic() - start
             self._emit(
                 "agent_timeout",
@@ -655,7 +655,7 @@ class WorkflowEngine:
                 agent_name=agent.name,
                 elapsed_seconds=elapsed,
                 timeout_seconds=agent.timeout_seconds,
-            ) from None
+            ) from e
 
     def _build_subworkflow_inputs(
         self,

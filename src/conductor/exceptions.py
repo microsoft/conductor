@@ -450,8 +450,10 @@ class AgentTimeoutError(TimeoutError):
     is raised when an agent's ``timeout_seconds`` configuration causes a hard
     cancellation via ``asyncio.wait_for()``.
 
-    Attributes:
-        agent_name: Name of the agent that timed out.
+    The timed-out agent name is available via ``current_agent`` (inherited
+    from ``TimeoutError``) and ``agent_name`` (inherited from
+    ``ExecutionError``). Both are set to the same value for consistency
+    with consumers that check either attribute.
     """
 
     def __init__(
@@ -477,8 +479,8 @@ class AgentTimeoutError(TimeoutError):
             current_agent=agent_name,
             suggestion=suggestion,
         )
-        # Set after super().__init__() because ExecutionError.__init__
-        # defaults agent_name to None and would overwrite an earlier assignment.
+        # ExecutionError.__init__ defaults agent_name to None — set it here
+        # so both .agent_name and .current_agent resolve to the same value.
         self.agent_name = agent_name
 
 

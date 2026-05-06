@@ -582,6 +582,12 @@ class AgentDef(BaseModel):
     or workflow types). This is a hard cancellation — unlike
     ``max_session_seconds`` which checks between provider iterations.
 
+    Because this is a hard cancellation, in-flight provider sessions,
+    MCP tool calls, and HTTP connections receive ``CancelledError``
+    mid-flight and may not get a clean shutdown. External state (e.g.,
+    partially-written files, open MCP tool handles) may be left
+    inconsistent.
+
     Note: Agent-level timeouts are non-retryable. The retry policy
     operates inside the provider and is cancelled along with the agent.
 

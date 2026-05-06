@@ -18,6 +18,7 @@ import pytest
 from conductor.config.schema import (
     AgentDef,
     ContextConfig,
+    ForEachDef,
     GateOption,
     LimitsConfig,
     OutputField,
@@ -383,7 +384,7 @@ class TestAgentTimeoutIntegration:
         provider = CopilotProvider(mock_handler=lambda a, p, c: {"answer": "42"})
         engine = WorkflowEngine(config, provider)
         result = await engine.run({"question": "test"})
-        assert result["answer"] == 42 or result["answer"] == "42"
+        assert result["answer"] == 42
 
 
 # ---------------------------------------------------------------------------
@@ -573,3 +574,168 @@ class TestAgentTimeoutError:
         )
         assert "timeout_seconds" in err.suggestion
         assert "researcher" in err.suggestion
+
+
+# ---------------------------------------------------------------------------
+# For-each group timeout tests
+# ---------------------------------------------------------------------------
+
+
+class TestAgentTimeoutForEach:
+    """Agent timeout behavior in for-each groups."""
+
+    @pytest.mark.asyncio
+    async def test_timeout_in_for_each_continue_on_error(self) -> None:
+        """Timed-out agent in continue_on_error for-each group allows others to succeed."""
+        emitter, collector = _make_emitter_and_collector()
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="for-each-timeout",
+                entry_point="finder",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=50),
+            ),
+            agents=[
+                AgentDef(
+                    name="finder",
+                    model="gpt-4",
+                    prompt="Find items",
+                    output={"items": OutputField(type="array")},
+                    routes=[RouteDef(to="processors")],
+                ),
+            ],
+            for_each=[
+                ForEachDef.model_validate(
+                    {
+                        "name": "processors",
+                        "type": "for_each",
+                        "source": "finder.output.items",
+                        "as": "item",
+                        "max_concurrent": 2,
+                        "failure_mode": "continue_on_error",
+                        "agent": {
+                            "name": "processor",
+                            "model": "gpt-4",
+                            "prompt": "Process: {{ item }}",
+                            "timeout_seconds": 1.0,
+                            "output": {"result": {"type": "string"}},
+                        },
+                        "routes": [{"to": "$end"}],
+                    }
+                ),
+            ],
+            output={"result": "done"},
+        )
+
+        call_count = 0
+
+        def mock_handler(agent, prompt, context):
+            nonlocal call_count
+            if agent.name == "finder":
+                return {"items": ["item1", "item2", "item3"]}
+            return {"result": "processed"}
+
+        provider = CopilotProvider(mock_handler=mock_handler)
+        engine = WorkflowEngine(config, provider, event_emitter=emitter)
+
+        original_get_executor = engine._get_executor_for_agent
+
+        async def patched_get_executor(agent):
+            executor = await original_get_executor(agent)
+            if agent.name == "processor":
+                original_exec = executor.execute
+
+                async def slow_exec(*args, **kwargs):
+                    nonlocal call_count
+                    call_count += 1
+                    # Make every other item slow
+                    if call_count % 2 == 0:
+                        await asyncio.sleep(10)
+                    return await original_exec(*args, **kwargs)
+
+                executor.execute = slow_exec
+            return executor
+
+        with patch.object(engine, "_get_executor_for_agent", side_effect=patched_get_executor):
+            result = await engine.run({})
+
+        # Workflow should complete (continue_on_error)
+        assert result is not None
+        # At least one agent_timeout should have been emitted
+        assert "agent_timeout" in collector.types()
+
+    @pytest.mark.asyncio
+    async def test_timeout_in_for_each_fail_fast(self) -> None:
+        """Timed-out agent in fail_fast for-each group fails the group."""
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="for-each-timeout-fail",
+                entry_point="finder",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=50),
+            ),
+            agents=[
+                AgentDef(
+                    name="finder",
+                    model="gpt-4",
+                    prompt="Find items",
+                    output={"items": OutputField(type="array")},
+                    routes=[RouteDef(to="processors")],
+                ),
+            ],
+            for_each=[
+                ForEachDef.model_validate(
+                    {
+                        "name": "processors",
+                        "type": "for_each",
+                        "source": "finder.output.items",
+                        "as": "item",
+                        "max_concurrent": 1,
+                        "failure_mode": "fail_fast",
+                        "agent": {
+                            "name": "processor",
+                            "model": "gpt-4",
+                            "prompt": "Process: {{ item }}",
+                            "timeout_seconds": 1.0,
+                            "output": {"result": {"type": "string"}},
+                        },
+                        "routes": [{"to": "$end"}],
+                    }
+                ),
+            ],
+            output={"result": "done"},
+        )
+
+        def mock_handler(agent, prompt, context):
+            if agent.name == "finder":
+                return {"items": ["item1"]}
+            return {"result": "processed"}
+
+        provider = CopilotProvider(mock_handler=mock_handler)
+        engine = WorkflowEngine(config, provider)
+
+        original_get_executor = engine._get_executor_for_agent
+
+        async def patched_get_executor(agent):
+            executor = await original_get_executor(agent)
+            if agent.name == "processor":
+                original_exec = executor.execute
+
+                async def slow_exec(*args, **kwargs):
+                    await asyncio.sleep(10)
+                    return await original_exec(*args, **kwargs)
+
+                executor.execute = slow_exec
+            return executor
+
+        with (
+            patch.object(engine, "_get_executor_for_agent", side_effect=patched_get_executor),
+            pytest.raises(Exception) as exc_info,
+        ):
+            await engine.run({})
+
+        error_str = str(exc_info.value)
+        assert "timeout" in error_str.lower() or "processor" in error_str
