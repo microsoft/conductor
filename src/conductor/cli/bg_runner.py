@@ -1,8 +1,9 @@
 """Background runner for ``--web-bg`` mode.
 
-When ``conductor run --web-bg`` is used, this module forks a detached child
-process that runs the workflow with ``--web`` enabled, then the parent process
-prints the dashboard URL and exits immediately.
+When ``conductor run --web-bg`` or ``conductor resume --web-bg`` is used, this
+module forks a detached child process that runs the workflow with ``--web``
+enabled, then the parent process prints the dashboard URL and exits
+immediately.
 
 The child process is fully detached (new session on Unix, new process group on
 Windows) so it outlives the parent. It auto-shuts down after the workflow
@@ -12,6 +13,7 @@ completes and all WebSocket clients disconnect (the existing ``--web`` +
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import socket
@@ -51,6 +53,73 @@ def _wait_for_server(port: int, timeout: float = 15.0) -> bool:
         except OSError:
             time.sleep(0.2)
     return False
+
+
+def _terminate_child(proc: subprocess.Popen[Any]) -> None:
+    """Best-effort terminate a still-running child process.
+
+    Used to avoid orphaned background workflows when post-launch validation
+    (server reachability, PID file write) fails. Any errors raised while
+    terminating are swallowed so the original failure surfaces to the caller.
+
+    Args:
+        proc: The subprocess.Popen handle to terminate.
+    """
+    if proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            with contextlib.suppress(Exception):
+                proc.wait(timeout=2.0)
+    except Exception:  # noqa: BLE001 - cleanup must not raise
+        pass
+
+
+def _finalize_background_launch(
+    proc: subprocess.Popen[Any],
+    web_port: int,
+    pid_workflow_ref: Path,
+) -> None:
+    """Wait for the dashboard to come up and write the PID file.
+
+    On any failure (server didn't start, child died early, PID write raised),
+    the still-running child is terminated to avoid orphaned processes holding
+    the dashboard port without a discoverable PID file.
+
+    Args:
+        proc: The detached child process.
+        web_port: The TCP port the child should be listening on.
+        pid_workflow_ref: Path used to derive the PID file name and recorded
+            inside it for ``conductor stop`` to display.
+
+    Raises:
+        RuntimeError: If the child died early, the dashboard didn't start
+            within the timeout, or the PID file could not be written.
+    """
+    if not _wait_for_server(web_port, timeout=15.0):
+        retcode = proc.poll()
+        if retcode is not None:
+            raise RuntimeError(
+                f"Background process exited immediately with code {retcode}. "
+                f"Check logs or run without --web-bg for details."
+            )
+        _terminate_child(proc)
+        raise RuntimeError(
+            f"Dashboard did not start within 15 seconds on port {web_port}. "
+            f"The background process was terminated."
+        )
+
+    from conductor.cli.pid import write_pid_file
+
+    try:
+        write_pid_file(proc.pid, web_port, pid_workflow_ref)
+    except Exception as exc:
+        _terminate_child(proc)
+        raise RuntimeError(f"Failed to write PID file for background process: {exc}") from exc
 
 
 def launch_background(
@@ -158,24 +227,7 @@ def launch_background(
     except Exception as exc:
         raise RuntimeError(f"Failed to start background process: {exc}") from exc
 
-    # Wait for the web server to start
-    if not _wait_for_server(web_port, timeout=15.0):
-        # Check if the process already died
-        retcode = proc.poll()
-        if retcode is not None:
-            raise RuntimeError(
-                f"Background process exited immediately with code {retcode}. "
-                f"Check logs or run without --web-bg for details."
-            )
-        raise RuntimeError(
-            f"Dashboard did not start within 15 seconds on port {web_port}. "
-            f"The background process (PID {proc.pid}) may still be starting."
-        )
-
-    # Write PID file so `conductor stop` can find this process
-    from conductor.cli.pid import write_pid_file
-
-    write_pid_file(proc.pid, web_port, workflow_path)
+    _finalize_background_launch(proc, web_port, workflow_path)
 
     return f"http://127.0.0.1:{web_port}"
 
@@ -193,8 +245,9 @@ def launch_background_resume(
     """Fork a detached child process resuming the workflow with a web dashboard.
 
     The child executes ``conductor resume <workflow|--from path> --web ...``
-    with all the caller-supplied options. The parent waits briefly for the
-    web server to become reachable, then returns the dashboard URL.
+    with all the caller-supplied options. ``--no-interactive`` is always
+    appended since the detached child has no TTY. The parent waits briefly
+    for the web server to become reachable, then returns the dashboard URL.
 
     Either ``workflow_path`` or ``checkpoint_path`` (or both) must be
     provided — at least one is required by the resume command.
@@ -289,26 +342,16 @@ def launch_background_resume(
     except Exception as exc:
         raise RuntimeError(f"Failed to start background process: {exc}") from exc
 
-    # Wait for the web server to start
-    if not _wait_for_server(web_port, timeout=15.0):
-        retcode = proc.poll()
-        if retcode is not None:
-            raise RuntimeError(
-                f"Background process exited immediately with code {retcode}. "
-                f"Check logs or run without --web-bg for details."
-            )
-        raise RuntimeError(
-            f"Dashboard did not start within 15 seconds on port {web_port}. "
-            f"The background process (PID {proc.pid}) may still be starting."
+    # Use workflow_path if available, otherwise fall back to checkpoint_path
+    # for the PID file name and recorded reference.
+    pid_workflow_ref = workflow_path if workflow_path is not None else checkpoint_path
+    if pid_workflow_ref is None:  # pragma: no cover - guarded above
+        _terminate_child(proc)
+        raise ValueError(
+            "launch_background_resume requires either workflow_path or checkpoint_path"
         )
 
-    # Write PID file so `conductor stop` can find this process
-    from conductor.cli.pid import write_pid_file
-
-    # Use workflow_path if available, otherwise checkpoint_path stem-derived
-    pid_workflow_ref = workflow_path if workflow_path is not None else checkpoint_path
-    assert pid_workflow_ref is not None  # noqa: S101  # checked above
-    write_pid_file(proc.pid, web_port, pid_workflow_ref)
+    _finalize_background_launch(proc, web_port, pid_workflow_ref)
 
     return f"http://127.0.0.1:{web_port}"
 

@@ -1043,10 +1043,14 @@ async def _execute_with_stop_signal(
         return_when=asyncio.FIRST_COMPLETED,
     )
 
+    # Cancel any losing task and drain it. Use ``gather(return_exceptions=True)``
+    # so a non-CancelledError stored on the losing task (e.g. dashboard.stop
+    # raised, or engine raised right as the kill button fired) does not abort
+    # the cleanup loop and leak an un-awaited task.
     for task in pending:
         task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
 
     if engine_task in done:
         return engine_task.result()

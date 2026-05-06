@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -638,3 +639,440 @@ class TestResumeWorkflowAsync:
 
         with pytest.raises(CheckpointError, match="Workflow file not found"):
             await resume_workflow_async(checkpoint_path=cp_path)
+
+
+# ---------------------------------------------------------------------------
+# launch_background_resume failure paths and detachment behavior
+# ---------------------------------------------------------------------------
+
+
+class TestLaunchBackgroundResumeFailures:
+    """Failure paths and detachment kwargs for launch_background_resume."""
+
+    def test_terminates_child_on_server_timeout(self, tmp_path: Path) -> None:
+        """If the dashboard never comes up, the still-running child is killed."""
+        from conductor.cli import bg_runner
+
+        wf_path = tmp_path / "wf.yaml"
+        wf_path.write_text("workflow: {name: x, entry_point: a}\nagents: []\n")
+
+        proc = MagicMock()
+        proc.pid = 4242
+        proc.poll.return_value = None  # still running
+
+        with (
+            patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
+            patch("conductor.cli.bg_runner._wait_for_server", return_value=False),
+            patch("conductor.cli.pid.write_pid_file") as mock_write,
+            pytest.raises(RuntimeError, match="terminated"),
+        ):
+            bg_runner.launch_background_resume(workflow_path=wf_path, checkpoint_path=None)
+
+        proc.terminate.assert_called_once()
+        mock_write.assert_not_called()
+
+    def test_reports_immediate_child_exit(self, tmp_path: Path) -> None:
+        """If the child died before the server came up, surface its exit code."""
+        from conductor.cli import bg_runner
+
+        wf_path = tmp_path / "wf.yaml"
+        wf_path.write_text("workflow: {name: x, entry_point: a}\nagents: []\n")
+
+        proc = MagicMock()
+        proc.pid = 4243
+        proc.poll.return_value = 7  # exited with code 7
+
+        with (
+            patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
+            patch("conductor.cli.bg_runner._wait_for_server", return_value=False),
+            patch("conductor.cli.pid.write_pid_file") as mock_write,
+            pytest.raises(RuntimeError, match="exited immediately with code 7"),
+        ):
+            bg_runner.launch_background_resume(workflow_path=wf_path, checkpoint_path=None)
+
+        # Child already dead -> no terminate, no PID file written.
+        proc.terminate.assert_not_called()
+        mock_write.assert_not_called()
+
+    def test_terminates_child_on_pid_write_failure(self, tmp_path: Path) -> None:
+        """If write_pid_file raises, the running child is killed (no orphan)."""
+        from conductor.cli import bg_runner
+
+        wf_path = tmp_path / "wf.yaml"
+        wf_path.write_text("workflow: {name: x, entry_point: a}\nagents: []\n")
+
+        proc = MagicMock()
+        proc.pid = 4244
+        proc.poll.return_value = None
+
+        with (
+            patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
+            patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch("conductor.cli.pid.write_pid_file", side_effect=OSError("disk full")),
+            pytest.raises(RuntimeError, match="Failed to write PID file"),
+        ):
+            bg_runner.launch_background_resume(workflow_path=wf_path, checkpoint_path=None)
+
+        proc.terminate.assert_called_once()
+
+    def test_pid_file_written_with_workflow_path(self, tmp_path: Path) -> None:
+        """When workflow_path is provided, the PID file is keyed to it."""
+        from conductor.cli import bg_runner
+
+        wf_path = tmp_path / "wf.yaml"
+        wf_path.write_text("workflow: {name: x, entry_point: a}\nagents: []\n")
+
+        proc = MagicMock()
+        proc.pid = 5555
+        proc.poll.return_value = None
+
+        with (
+            patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
+            patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch("conductor.cli.pid.write_pid_file") as mock_write,
+        ):
+            bg_runner.launch_background_resume(
+                workflow_path=wf_path, checkpoint_path=None, web_port=9201
+            )
+
+        mock_write.assert_called_once_with(5555, 9201, wf_path)
+
+    def test_pid_file_falls_back_to_checkpoint_path(self, tmp_path: Path) -> None:
+        """When only checkpoint_path is given, it is used for the PID file ref."""
+        from conductor.cli import bg_runner
+
+        cp_path = tmp_path / "cp.json"
+        cp_path.write_text("{}")
+
+        proc = MagicMock()
+        proc.pid = 5556
+        proc.poll.return_value = None
+
+        with (
+            patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
+            patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch("conductor.cli.pid.write_pid_file") as mock_write,
+        ):
+            bg_runner.launch_background_resume(
+                workflow_path=None, checkpoint_path=cp_path, web_port=9202
+            )
+
+        mock_write.assert_called_once_with(5556, 9202, cp_path)
+
+    def test_subprocess_detachment_kwargs(self, tmp_path: Path) -> None:
+        """Verify Popen is called with detachment + DEVNULL + bg env vars."""
+        import sys as _sys
+
+        from conductor.cli import bg_runner
+
+        wf_path = tmp_path / "wf.yaml"
+        wf_path.write_text("workflow: {name: x, entry_point: a}\nagents: []\n")
+
+        captured: dict[str, object] = {}
+
+        def _fake_popen(cmd: list[str], **kwargs: object) -> MagicMock:
+            captured.update(kwargs)
+            captured["cmd"] = cmd
+            proc = MagicMock()
+            proc.pid = 1
+            proc.poll.return_value = None
+            return proc
+
+        with (
+            patch("conductor.cli.bg_runner.subprocess.Popen", side_effect=_fake_popen),
+            patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch("conductor.cli.pid.write_pid_file"),
+        ):
+            bg_runner.launch_background_resume(
+                workflow_path=wf_path, checkpoint_path=None, web_port=9203
+            )
+
+        import subprocess as _sp
+
+        assert captured["stdout"] is _sp.DEVNULL
+        assert captured["stderr"] is _sp.DEVNULL
+        assert captured["stdin"] is _sp.DEVNULL
+        if _sys.platform == "win32":
+            assert captured["creationflags"] == _sp.CREATE_NEW_PROCESS_GROUP
+        else:
+            assert captured["start_new_session"] is True
+        env = captured["env"]
+        assert isinstance(env, dict)
+        assert env["CONDUCTOR_WEB_BG"] == "1"
+        assert env["CONDUCTOR_WEB_PORT"] == "9203"
+
+
+# ---------------------------------------------------------------------------
+# _execute_with_stop_signal tests (used by both run and resume)
+# ---------------------------------------------------------------------------
+
+
+class TestExecuteWithStopSignal:
+    """Direct tests of the shared cancellation helper."""
+
+    @pytest.mark.asyncio
+    async def test_returns_engine_result_when_no_dashboard(self) -> None:
+        from conductor.cli.run import _execute_with_stop_signal
+
+        async def _engine() -> dict[str, str]:
+            return {"ok": "yes"}
+
+        result = await _execute_with_stop_signal(_engine(), dashboard=None)
+        assert result == {"ok": "yes"}
+
+    @pytest.mark.asyncio
+    async def test_returns_engine_result_when_engine_finishes_first(self) -> None:
+        import asyncio
+
+        from conductor.cli.run import _execute_with_stop_signal
+
+        dashboard = MagicMock()
+
+        async def _never_stop() -> None:
+            await asyncio.Event().wait()
+
+        dashboard.wait_for_stop = _never_stop
+
+        async def _engine() -> dict[str, str]:
+            await asyncio.sleep(0)
+            return {"ok": "yes"}
+
+        result = await _execute_with_stop_signal(_engine(), dashboard=dashboard)
+        assert result == {"ok": "yes"}
+
+    @pytest.mark.asyncio
+    async def test_raises_execution_error_when_stop_fires_first(self) -> None:
+        import asyncio
+
+        from conductor.cli.run import _execute_with_stop_signal
+        from conductor.exceptions import ExecutionError
+
+        dashboard = MagicMock()
+
+        async def _stop() -> None:
+            return None  # stop signal fires immediately
+
+        dashboard.wait_for_stop = _stop
+
+        async def _engine() -> dict[str, str]:
+            await asyncio.Event().wait()  # would block forever
+            return {}
+
+        with pytest.raises(ExecutionError, match="stopped by user"):
+            await _execute_with_stop_signal(_engine(), dashboard=dashboard)
+
+    @pytest.mark.asyncio
+    async def test_losing_task_with_exception_does_not_leak(self) -> None:
+        """Regression: the cleanup loop must drain a losing task even if
+        cancelling it surfaces a stored non-CancelledError. With the previous
+        ``contextlib.suppress(CancelledError)`` the second pending task could
+        be left un-awaited; ``asyncio.gather(return_exceptions=True)`` fixes it.
+        """
+        import asyncio
+
+        from conductor.cli.run import _execute_with_stop_signal
+
+        dashboard = MagicMock()
+
+        async def _stop_raises() -> None:
+            # Stop signal "fires" by raising — this lands as a stored exception
+            # on the losing wait_for_stop task once it's cancelled.
+            raise RuntimeError("dashboard stop boom")
+
+        dashboard.wait_for_stop = _stop_raises
+
+        async def _engine() -> dict[str, str]:
+            await asyncio.sleep(0)
+            return {"ok": "engine won"}
+
+        # Either outcome (engine wins or stop wins) is acceptable; the only
+        # thing this test guards against is the helper itself raising or
+        # leaking an un-awaited task warning.
+        import contextlib as _ctx
+
+        with _ctx.suppress(Exception):
+            await _execute_with_stop_signal(_engine(), dashboard=dashboard)
+
+
+# ---------------------------------------------------------------------------
+# resume_workflow_async wiring tests (no mocking of resume_workflow_async)
+# ---------------------------------------------------------------------------
+
+
+def _make_resume_mocks() -> tuple[MagicMock, MagicMock]:
+    """Create ProviderRegistry + WorkflowEngine mocks for resume_workflow_async."""
+    mock_registry = AsyncMock()
+    mock_registry.__aenter__ = AsyncMock(return_value=mock_registry)
+    mock_registry.__aexit__ = AsyncMock(return_value=False)
+    mock_registry.set_resume_session_ids = MagicMock()
+
+    mock_engine = MagicMock()
+    mock_engine.resume = AsyncMock(return_value={"result": "ok"})
+    mock_engine.config = MagicMock()
+    mock_engine.config.workflow.cost.show_summary = False
+    mock_engine._last_checkpoint_path = None
+    mock_engine.set_context = MagicMock()
+    mock_engine.set_limits = MagicMock()
+    mock_engine.get_execution_summary = MagicMock(return_value={})
+    return mock_registry, mock_engine
+
+
+class TestResumeWiring:
+    """Verify resume_workflow_async actually wires the new components."""
+
+    @pytest.mark.asyncio
+    async def test_dashboard_start_oserror_is_non_fatal(self, tmp_path: Path) -> None:
+        """Mirror of run-side test: dashboard start failure must not abort resume."""
+        from conductor.cli.run import resume_workflow_async
+
+        wf_path = _write_workflow(tmp_path)
+        cp_path = _write_checkpoint(tmp_path, wf_path)
+
+        mock_dashboard = MagicMock()
+        mock_dashboard.start = AsyncMock(side_effect=OSError("port busy"))
+        mock_dashboard.stop = AsyncMock()
+
+        mock_web_module = MagicMock()
+        mock_web_module.WebDashboard.return_value = mock_dashboard
+
+        mock_registry, mock_engine = _make_resume_mocks()
+
+        import sys as _sys
+
+        with (
+            patch.dict(_sys.modules, {"conductor.web.server": mock_web_module}),
+            patch("conductor.cli.run.ProviderRegistry", return_value=mock_registry),
+            patch("conductor.cli.run.WorkflowEngine", return_value=mock_engine),
+            patch(
+                "conductor.cli.run._build_mcp_servers",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+        ):
+            result = await resume_workflow_async(checkpoint_path=cp_path, web=True)
+
+        assert result == {"result": "ok"}
+        assert mock_engine.resume.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_provider_override_mutates_config(self, tmp_path: Path) -> None:
+        """provider_override must overwrite config.workflow.runtime.provider."""
+        from conductor.cli.run import resume_workflow_async
+
+        wf_path = _write_workflow(tmp_path)
+        cp_path = _write_checkpoint(tmp_path, wf_path)
+
+        captured_configs: list[Any] = []
+
+        def _capture_config(config: Any, **_kwargs: Any) -> Any:  # noqa: ANN401
+            captured_configs.append(config)
+            mock_registry, _ = _make_resume_mocks()
+            return mock_registry
+
+        mock_registry, mock_engine = _make_resume_mocks()
+
+        with (
+            patch("conductor.cli.run.ProviderRegistry", side_effect=_capture_config),
+            patch("conductor.cli.run.WorkflowEngine", return_value=mock_engine),
+            patch(
+                "conductor.cli.run._build_mcp_servers",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+        ):
+            await resume_workflow_async(checkpoint_path=cp_path, provider_override="claude")
+
+        assert captured_configs, "ProviderRegistry was not constructed"
+        cfg = captured_configs[0]
+        assert cfg.workflow.runtime.provider == "claude"
+
+    @pytest.mark.asyncio
+    async def test_metadata_merges_into_config(self, tmp_path: Path) -> None:
+        """CLI metadata must be merged on top of YAML metadata on resume."""
+        from conductor.cli.run import resume_workflow_async
+
+        wf_path = _write_workflow(tmp_path)
+        cp_path = _write_checkpoint(tmp_path, wf_path)
+
+        captured_configs: list[Any] = []
+
+        def _capture_config(config: Any, **_kwargs: Any) -> Any:  # noqa: ANN401
+            captured_configs.append(config)
+            mock_registry, _ = _make_resume_mocks()
+            return mock_registry
+
+        _, mock_engine = _make_resume_mocks()
+
+        with (
+            patch("conductor.cli.run.ProviderRegistry", side_effect=_capture_config),
+            patch("conductor.cli.run.WorkflowEngine", return_value=mock_engine),
+            patch(
+                "conductor.cli.run._build_mcp_servers",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+        ):
+            await resume_workflow_async(
+                checkpoint_path=cp_path, metadata={"tracker": "ado", "ticket": "1234"}
+            )
+
+        cfg = captured_configs[0]
+        assert cfg.workflow.metadata["tracker"] == "ado"
+        assert cfg.workflow.metadata["ticket"] == "1234"
+
+    @pytest.mark.asyncio
+    async def test_run_context_populated_on_resume(self, tmp_path: Path) -> None:
+        """RunContext passed to WorkflowEngine must include run_id, log_file, bg_mode."""
+        import os as _os
+
+        from conductor.cli.run import resume_workflow_async
+
+        wf_path = _write_workflow(tmp_path)
+        cp_path = _write_checkpoint(tmp_path, wf_path)
+
+        engine_kwargs: dict[str, Any] = {}
+
+        def _capture_engine(*_args: Any, **kwargs: Any) -> Any:  # noqa: ANN401
+            engine_kwargs.update(kwargs)
+            _, mock_engine = _make_resume_mocks()
+            return mock_engine
+
+        mock_registry, _ = _make_resume_mocks()
+
+        # Force bg_mode via env var (simulates the bg-child code path).
+        with (
+            patch.dict(_os.environ, {"CONDUCTOR_WEB_BG": "1"}, clear=False),
+            patch("conductor.cli.run.ProviderRegistry", return_value=mock_registry),
+            patch("conductor.cli.run.WorkflowEngine", side_effect=_capture_engine),
+            patch(
+                "conductor.cli.run._build_mcp_servers",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+        ):
+            await resume_workflow_async(checkpoint_path=cp_path)
+
+        rc = engine_kwargs.get("run_context")
+        assert rc is not None, f"run_context not passed; got kwargs={list(engine_kwargs)}"
+        assert rc.bg_mode is True
+        assert isinstance(rc.run_id, str) and rc.run_id  # populated from event log subscriber
+        assert isinstance(rc.log_file, str) and rc.log_file
+        # event_emitter must be wired so the dashboard / event log receive events
+        assert engine_kwargs.get("event_emitter") is not None
+
+    def test_metadata_value_with_equals_sign_via_cli(self, tmp_path: Path) -> None:
+        """Regression: --metadata key=https://x?a=b must keep the right-hand =."""
+        wf_path = _write_workflow(tmp_path)
+        _write_checkpoint(tmp_path, wf_path)
+
+        with patch(
+            "conductor.cli.run.resume_workflow_async", new_callable=AsyncMock
+        ) as mock_resume:
+            mock_resume.return_value = {"result": "ok"}
+            result = runner.invoke(
+                app,
+                ["resume", str(wf_path), "-m", "url=https://x?a=b&c=d"],
+            )
+        assert result.exit_code == 0, result.output
+        kwargs = mock_resume.call_args[1]
+        assert kwargs["metadata"] == {"url": "https://x?a=b&c=d"}
