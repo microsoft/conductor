@@ -5,7 +5,9 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.11...HEAD)
+## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.12...HEAD)
+
+## [0.1.12](https://github.com/microsoft/conductor/compare/v0.1.11...v0.1.12) - 2026-05-05
 
 ### Added
 - Unified `reasoning.effort` configuration for per-agent and workflow-wide
@@ -17,7 +19,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tokens, with `temperature` coerced to 1.0 and `max_tokens` bumped to fit).
   Validates against each model's supported efforts/capabilities and surfaces
   thinking content via `agent_reasoning` events. See
-  [`examples/reasoning-effort.yaml`](examples/reasoning-effort.yaml).
+  [`examples/reasoning-effort.yaml`](examples/reasoning-effort.yaml)
+  ([#152](https://github.com/microsoft/conductor/pull/152)).
+- Tag-based versioning for the workflow registry. Versions are now
+  auto-discovered from git tags instead of being explicitly listed in
+  `registry.yaml`, and refs accept any tag, branch, or SHA via the new
+  `workflow#ref` syntax (e.g. `sdd/plan#v3.0.0`, `sdd/plan#main`,
+  `sdd/plan#abc1234`). Stale CDN content is bypassed via cache-busting
+  query parameters so registry updates are visible immediately
+  ([#151](https://github.com/microsoft/conductor/pull/151)).
+
+### Fixed
+- `conductor update` reliability on Windows. Adds a pre-flight check for
+  other running Conductor processes (which hold file locks on
+  `%LOCALAPPDATA%\uv\tools\conductor-cli\` and cause `uv tool install
+  --force` to fail with "Access is denied"), retries the install up to 3
+  times to absorb transient Windows Defender failures, surfaces full uv
+  stdout AND stderr on failure with Defender-exclusion guidance, broadens
+  the Windows entrypoint rename to cover the uv tool venv `Scripts/`
+  directory in `%LOCALAPPDATA%` and `%APPDATA%`, and adds a new
+  `conductor update --force` flag to skip the pre-flight check
+  ([#155](https://github.com/microsoft/conductor/pull/155)).
+- Dashboard layout for workflows with `human_gate` options or multiple
+  loop-back routes (e.g. revision loops). The `workflow_started` event now
+  emits routes from `human_gate` `options[].route` so gate edges aren't
+  silently dropped, and the frontend pre-classifies back-edges via DFS from
+  `$start` and feeds them to Dagre in reversed direction so cycles no
+  longer scramble rank assignment. Workflows like `sdd/plan-v3.yaml` now
+  render as a coherent top-to-bottom DAG instead of disconnected columns
+  with long diagonal edges
+  ([#153](https://github.com/microsoft/conductor/pull/153)).
+- Windows install failures now surface useful diagnostics. `install.ps1`
+  prints captured `uv` stdout/stderr on failure instead of swallowing it,
+  and uses the correct Microsoft Defender cmdlet so the install path is
+  exclusion-friendly ([#149](https://github.com/microsoft/conductor/pull/149)).
 
 ## [0.1.11](https://github.com/microsoft/conductor/compare/v0.1.10...v0.1.11) - 2026-05-04
 
