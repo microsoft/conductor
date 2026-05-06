@@ -1073,20 +1073,30 @@ def _print_running_list(entries: list[dict], con: Console) -> None:
 
 
 @app.command()
-def update() -> None:
+def update(
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Skip the running-process check and attempt the upgrade anyway.",
+    ),
+) -> None:
     """Check for and install the latest version of Conductor.
 
     Fetches the latest release from GitHub and upgrades using
     ``uv tool install --locked --force git+https://github.com/microsoft/conductor.git@v{version}``.
 
+    Detects other running Conductor processes (especially important on Windows
+    where they hold file locks) and aborts unless ``--force`` is passed.
+
     \b
     Examples:
         conductor update
+        conductor update --force
     """
     from conductor.cli.update import run_update
 
     try:
-        run_update(console)
+        run_update(console, force=force)
     except Exception as e:
         print_error(e)
         raise typer.Exit(code=1) from None
