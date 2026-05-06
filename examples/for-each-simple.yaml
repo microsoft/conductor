@@ -29,12 +29,12 @@ workflow:
   limits:
     max_iterations: 20
 
-# Optional input: if provided, items are used directly; otherwise generated
-input:
-  items:
-    type: string
-    required: false
-    description: JSON array of items to process (e.g. '["apple", "banana"]')
+  # Optional input: if provided, items are used directly; otherwise generated
+  input:
+    items:
+      type: string
+      required: false
+      description: JSON array of items to process (e.g. '["apple", "banana"]')
 
 # For-each group definition
 for_each:

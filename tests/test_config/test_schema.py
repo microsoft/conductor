@@ -1396,3 +1396,91 @@ class TestRuntimeConfigDefaultReasoningEffort:
         """Test that invalid effort values raise ValidationError."""
         with pytest.raises(ValidationError):
             RuntimeConfig(default_reasoning_effort=effort)  # type: ignore[arg-type]
+
+
+class TestExtraFieldsForbidden:
+    """Tests that workflow models reject unknown fields.
+
+    Regression tests for https://github.com/microsoft/conductor/issues/140 —
+    misnesting `parallel:` or `for_each:` inside an `agents:` item used to
+    silently drop the field, leaving a wrapper agent with no model/prompt
+    that failed obscurely at the provider.
+    """
+
+    def test_agentdef_misnested_parallel_rejected(self) -> None:
+        """An `agents:` item with a nested `parallel:` field is rejected."""
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef.model_validate(
+                {
+                    "name": "review_group",
+                    "parallel": ["technical_reviewer", "readability_reviewer"],
+                    "failure_mode": "fail_fast",
+                    "routes": [{"to": "$end"}],
+                }
+            )
+        errors = exc_info.value.errors()
+        # The unknown field must be reported by Pydantic's extra_forbidden
+        assert any(
+            err["type"] == "extra_forbidden" and "parallel" in err["loc"] for err in errors
+        ), f"Expected extra_forbidden error for 'parallel', got: {errors}"
+
+    def test_agentdef_misnested_for_each_rejected(self) -> None:
+        """An `agents:` item with a nested `for_each:` field is rejected."""
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef.model_validate(
+                {
+                    "name": "fanout",
+                    "for_each": [{"name": "x", "type": "for_each"}],
+                }
+            )
+        errors = exc_info.value.errors()
+        assert any(
+            err["type"] == "extra_forbidden" and "for_each" in err["loc"] for err in errors
+        ), f"Expected extra_forbidden error for 'for_each', got: {errors}"
+
+    def test_agentdef_typo_field_rejected(self) -> None:
+        """A typo'd field on an agent is rejected (e.g., `prmpt` instead of `prompt`)."""
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef.model_validate(
+                {
+                    "name": "answerer",
+                    "model": "claude-haiku-4.5",
+                    "prmpt": "Answer the question.",
+                }
+            )
+        errors = exc_info.value.errors()
+        assert any(err["type"] == "extra_forbidden" and "prmpt" in err["loc"] for err in errors), (
+            f"Expected extra_forbidden error for 'prmpt', got: {errors}"
+        )
+
+    def test_parallel_group_extra_field_rejected(self) -> None:
+        """An unknown field on a ParallelGroup is rejected."""
+        with pytest.raises(ValidationError) as exc_info:
+            from conductor.config.schema import ParallelGroup
+
+            ParallelGroup.model_validate(
+                {
+                    "name": "g",
+                    "agents": ["a", "b"],
+                    "fail_fast": True,  # typo: actually `failure_mode`
+                }
+            )
+        errors = exc_info.value.errors()
+        assert any(err["type"] == "extra_forbidden" for err in errors)
+
+    def test_workflow_config_top_level_extra_field_rejected(self) -> None:
+        """An unknown top-level workflow field is rejected (catches `agent:` typo etc.)."""
+        from conductor.config.schema import ParallelGroup  # noqa: F401
+
+        with pytest.raises(ValidationError) as exc_info:
+            WorkflowConfig.model_validate(
+                {
+                    "workflow": {"name": "x", "version": "1", "entry_point": "a"},
+                    "agents": [{"name": "a", "model": "m", "prompt": "p"}],
+                    "agnts": [],  # typo
+                }
+            )
+        errors = exc_info.value.errors()
+        assert any(err["type"] == "extra_forbidden" and "agnts" in err["loc"] for err in errors), (
+            f"Expected extra_forbidden error for 'agnts', got: {errors}"
+        )

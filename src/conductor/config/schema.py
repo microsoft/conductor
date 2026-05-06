@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from conductor.providers.reasoning import ReasoningEffort
 
@@ -109,6 +109,8 @@ class RouteDef(BaseModel):
 class ParallelGroup(BaseModel):
     """Definition for a parallel agent execution group."""
 
+    model_config = ConfigDict(extra="forbid")
+
     name: str
     """Unique identifier for this parallel group."""
 
@@ -159,6 +161,8 @@ class ForEachDef(BaseModel):
                 success: { type: boolean }
         ```
     """
+
+    model_config = ConfigDict(extra="forbid")
 
     name: str
     """Unique identifier for this for-each group."""
@@ -443,6 +447,8 @@ class ReasoningConfig(BaseModel):
 
 class AgentDef(BaseModel):
     """Definition for a single agent in the workflow."""
+
+    model_config = ConfigDict(extra="forbid")
 
     name: str
     """Unique identifier for this agent."""
@@ -938,6 +944,8 @@ class WorkflowDef(BaseModel):
 
 class WorkflowConfig(BaseModel):
     """Complete workflow configuration file."""
+
+    model_config = ConfigDict(extra="forbid")
 
     workflow: WorkflowDef
     """Workflow-level settings."""
