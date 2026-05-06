@@ -5,7 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.13...HEAD)
+## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.14...HEAD)
+
+## [0.1.14](https://github.com/microsoft/conductor/compare/v0.1.13...v0.1.14) - 2026-05-06
+
+### Fixed
+- `conductor update` no longer reports its own launching shim as another
+  running Conductor process. On Windows the `conductor.exe` shim is a
+  separate process from the Python interpreter that runs the update
+  command, so excluding only `os.getpid()` caused a false "1 other
+  Conductor process is running" warning. The check now walks the full
+  ancestor PID chain (via `wmic` on Windows, `ps` elsewhere) and excludes
+  every process along the way, falling back to `{getpid(), getppid()}`
+  if the parent map cannot be built.
+  [#164](https://github.com/microsoft/conductor/pull/164)
 
 ## [0.1.13](https://github.com/microsoft/conductor/compare/v0.1.12...v0.1.13) - 2026-05-06
 
