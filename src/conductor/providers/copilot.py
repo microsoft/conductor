@@ -18,6 +18,10 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from conductor.exceptions import ProviderError, ValidationError
+from conductor.providers._event_format import (
+    extract_tool_result_text,
+    format_tool_arguments,
+)
 from conductor.providers.base import AgentOutput, AgentProvider, EventCallback, match_model_id
 from conductor.providers.reasoning import ReasoningEffort, resolve_reasoning_effort
 
@@ -1219,8 +1223,7 @@ class CopilotProvider(AgentProvider):
             if full_mode:
                 args = getattr(event.data, "arguments", None) or getattr(event.data, "args", None)
                 if args:
-                    args_str = str(args)
-                    args_preview = args_str[:200] + "..." if len(args_str) > 200 else args_str
+                    args_preview = format_tool_arguments(args, max_length=200) or ""
                     arg_text = Text()
                     arg_text.append("    │     ", style="dim")
                     arg_text.append("args: ", style="dim italic")
@@ -1241,11 +1244,7 @@ class CopilotProvider(AgentProvider):
             if full_mode:
                 result = getattr(event.data, "result", None) or getattr(event.data, "output", None)
                 if result:
-                    result_str = str(result)
-                    if len(result_str) > 200:
-                        result_preview = result_str[:200] + "..."
-                    else:
-                        result_preview = result_str
+                    result_preview = extract_tool_result_text(result, max_length=200) or ""
                     result_text = Text()
                     result_text.append("    │     ", style="dim")
                     result_text.append("result: ", style="dim italic")
@@ -1327,7 +1326,7 @@ class CopilotProvider(AgentProvider):
                     "agent_tool_start",
                     {
                         "tool_name": str(tool_name),
-                        "arguments": str(arguments)[:500] if arguments else None,
+                        "arguments": format_tool_arguments(arguments),
                     },
                 )
 
@@ -1340,7 +1339,7 @@ class CopilotProvider(AgentProvider):
                     "agent_tool_complete",
                     {
                         "tool_name": str(tool_name) if tool_name else None,
-                        "result": str(result)[:500] if result else None,
+                        "result": extract_tool_result_text(result),
                     },
                 )
 

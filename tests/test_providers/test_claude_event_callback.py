@@ -392,7 +392,9 @@ class TestAgentToolEvents:
 
         start_events = [(t, d) for t, d in events if t == "agent_tool_start"]
         assert len(start_events) == 1
-        assert len(start_events[0][1]["arguments"]) <= 500
+        # Truncated to 500 chars + a single-char "…" ellipsis when long.
+        assert len(start_events[0][1]["arguments"]) <= 501
+        assert start_events[0][1]["arguments"].endswith("…")
 
     @pytest.mark.asyncio
     async def test_tool_result_truncated(self) -> None:
@@ -422,7 +424,9 @@ class TestAgentToolEvents:
 
         complete_events = [(t, d) for t, d in events if t == "agent_tool_complete"]
         assert len(complete_events) == 1
-        assert len(complete_events[0][1]["result"]) <= 500
+        # Truncated to 500 chars + a single-char "…" ellipsis when long.
+        assert len(complete_events[0][1]["result"]) <= 501
+        assert complete_events[0][1]["result"].endswith("…")
 
 
 # ---------------------------------------------------------------------------

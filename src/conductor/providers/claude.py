@@ -30,6 +30,10 @@ from pydantic import BaseModel
 
 from conductor.exceptions import ProviderError, ValidationError
 from conductor.executor.output import validate_output
+from conductor.providers._event_format import (
+    extract_tool_result_text,
+    format_tool_arguments,
+)
 from conductor.providers.base import AgentOutput, AgentProvider, EventCallback, match_model_id
 from conductor.providers.reasoning import (
     ReasoningEffort,
@@ -1539,7 +1543,7 @@ class ClaudeProvider(AgentProvider):
                 if event_callback:
                     try:
                         arguments = (
-                            str(dict(tool_use.input))[:500]
+                            format_tool_arguments(dict(tool_use.input))
                             if hasattr(tool_use, "input") and tool_use.input
                             else None
                         )
@@ -1570,7 +1574,7 @@ class ClaudeProvider(AgentProvider):
                                 "agent_tool_complete",
                                 {
                                     "tool_name": tool_use.name,
-                                    "result": str(result)[:500] if result else None,
+                                    "result": extract_tool_result_text(result),
                                 },
                             )
                         except Exception:
