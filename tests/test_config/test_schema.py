@@ -1484,3 +1484,41 @@ class TestExtraFieldsForbidden:
         assert any(err["type"] == "extra_forbidden" and "agnts" in err["loc"] for err in errors), (
             f"Expected extra_forbidden error for 'agnts', got: {errors}"
         )
+
+    def test_workflowdef_typo_field_rejected(self) -> None:
+        """A typo'd field on the `workflow:` block is rejected.
+
+        Without `extra="forbid"` on WorkflowDef, typos like `entery_point:` or
+        `limts:` are silently dropped, leaving the user's intent ignored.
+        """
+        with pytest.raises(ValidationError) as exc_info:
+            WorkflowDef.model_validate(
+                {
+                    "name": "demo",
+                    "entry_point": "a",
+                    "entery_point": "b",  # typo
+                }
+            )
+        errors = exc_info.value.errors()
+        assert any(
+            err["type"] == "extra_forbidden" and "entery_point" in err["loc"] for err in errors
+        ), f"Expected extra_forbidden error for 'entery_point', got: {errors}"
+
+    def test_routedef_typo_when_rejected(self) -> None:
+        """A typo'd `when:` on a route is rejected.
+
+        Without `extra="forbid"` on RouteDef, `whn:` was silently dropped and
+        `route.when` defaulted to `None`, turning a conditional route into an
+        unconditional one — a workflow-semantics bug nearly impossible to debug.
+        """
+        with pytest.raises(ValidationError) as exc_info:
+            RouteDef.model_validate(
+                {
+                    "to": "next_agent",
+                    "whn": "output.score > 5",  # typo for `when`
+                }
+            )
+        errors = exc_info.value.errors()
+        assert any(err["type"] == "extra_forbidden" and "whn" in err["loc"] for err in errors), (
+            f"Expected extra_forbidden error for 'whn', got: {errors}"
+        )

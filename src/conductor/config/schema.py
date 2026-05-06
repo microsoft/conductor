@@ -88,6 +88,8 @@ class OutputField(BaseModel):
 class RouteDef(BaseModel):
     """Definition for a routing rule."""
 
+    model_config = ConfigDict(extra="forbid")
+
     to: str
     """Target agent name, '$end', or human gate name."""
 
@@ -881,6 +883,8 @@ class RuntimeConfig(BaseModel):
 
 class WorkflowDef(BaseModel):
     """Top-level workflow configuration."""
+
+    model_config = ConfigDict(extra="forbid")
 
     name: str
     """Unique workflow identifier."""
