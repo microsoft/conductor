@@ -5,7 +5,71 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.12...HEAD)
+## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.13...HEAD)
+
+## [0.1.13](https://github.com/microsoft/conductor/compare/v0.1.12...v0.1.13) - 2026-05-06
+
+### Added
+- `conductor resume` is now at flag parity with `conductor run`. New flags:
+  `--provider` / `-p` (runtime provider override), `--metadata` / `-m` (CLI
+  metadata merged on top of YAML metadata), `--web` (real-time dashboard for
+  the resumed run), `--web-port`, and `--web-bg` (fork a detached resume +
+  dashboard process). `--web` and `--web-bg` are mutually exclusive, matching
+  `run`. The dashboard only shows events from the resumed agent forward —
+  agent runs that completed before the checkpoint were emitted in the original
+  process and are not replayed. `--input`, `--workspace-instructions`,
+  `--instructions`, and `--dry-run` are intentionally not mirrored
+  ([#158](https://github.com/microsoft/conductor/pull/158)).
+- Reasoning effort (`low` / `medium` / `high` / `xhigh`) is now displayed in
+  the web dashboard under each agent's metadata, right after `Model`. Effective
+  value is per-agent `reasoning.effort` if set, otherwise
+  `runtime.default_reasoning_effort`, otherwise omitted. Backed by a new
+  `reasoning_effort` field on the `workflow_started` event payload, so older
+  event log JSONL files replay gracefully (the row simply doesn't render)
+  ([#160](https://github.com/microsoft/conductor/pull/160)).
+- New `iteration_limit_reached` and `iteration_limit_resolved` events are
+  emitted when a workflow hits its `max_iterations` cap. Previously the
+  console showed an interactive `IntPrompt` while the web dashboard went
+  silently dark; the dashboard now renders the prompt state and the chosen
+  resolution. The `iteration_limit_reached` payload includes a `possible_loop`
+  heuristic flag (set when the last 3 history entries are the same agent) so
+  subscribers can call out stuck review loops
+  ([#162](https://github.com/microsoft/conductor/pull/162)).
+
+### Changed
+- Workflow registry references now resolve `latest` (and bare `name@registry`
+  refs) to the **default branch HEAD** instead of the newest git tag.
+  Previously, the moment a registry repo got its first tag, bare references
+  silently froze at that tag and stopped picking up commits to `main`. Tags
+  remain first-class — pin explicitly via `workflow#v1.2.3` for releases. Also
+  saves one GitHub API call on the hot path of bare-name fetches
+  ([#157](https://github.com/microsoft/conductor/pull/157)).
+
+### Fixed
+- Schema validation now rejects unknown fields on `AgentDef`, `ParallelGroup`,
+  `ForEachDef`, and `WorkflowConfig` instead of silently dropping them.
+  Misnesting `parallel:` or `for_each:` inside an `agents:` item — or typos
+  like `prmpt:` — used to fall through to a runtime
+  `Model "gpt-4o" is not available` error three layers downstream. They now
+  fail at parse time with a clear Pydantic error pointing at the offending
+  location. `conductor validate` also gained "Parallel Groups" and "For-each
+  Groups" rows in its summary table so missing groups are immediately visible
+  ([#159](https://github.com/microsoft/conductor/pull/159)).
+- Tool arguments and results are now pretty-printed in dashboard / JSONL /
+  verbose-console events. Copilot tool results no longer leak the full
+  `Result(content=..., contents=None, detailed_content=..., kind=None)` repr
+  with literal `\\n` escapes and doubled `\\\\` Windows paths, and tool
+  arguments render as JSON (`{"k": "v"}`) instead of Python dict repr
+  (`{'k': 'v'}`). Both providers share a new
+  `src/conductor/providers/_event_format.py` helper for parity
+  ([#161](https://github.com/microsoft/conductor/pull/161)).
+- `install.ps1` on Windows now captures full `uv tool install` stdout AND
+  stderr via `Start-Process -RedirectStandardOutput -RedirectStandardError`
+  to temp files. Previously, with `$ErrorActionPreference = 'Stop'`,
+  PowerShell treated uv's stderr as a terminating error and threw before
+  the assignment completed, so install failures showed `(no output captured)`
+  with no way to diagnose them
+  ([#156](https://github.com/microsoft/conductor/pull/156)).
 
 ## [0.1.12](https://github.com/microsoft/conductor/compare/v0.1.11...v0.1.12) - 2026-05-05
 
