@@ -44,7 +44,7 @@ uv run conductor stop --port 8080      # stop specific port
 uv run conductor stop --all            # stop all background workflows
 
 # Update conductor
-uv run conductor update                # check for and install latest version
+uv run conductor update                # check for updates and print the install-script command
 
 # Resume a failed workflow from checkpoint
 uv run conductor resume workflow.yaml                  # resume from latest checkpoint
@@ -68,7 +68,7 @@ make validate-examples    # validate all examples
   - `run.py` - Workflow execution command with verbose logging helpers
   - `bg_runner.py` - Background process forking for `--web-bg` mode
   - `pid.py` - PID file utilities for tracking/stopping background processes
-  - `update.py` - Update check, version comparison, and self-upgrade via `uv tool install`
+  - `update.py` - Update check and version comparison. Upgrades are delegated to the install script (`install.ps1`/`install.sh`); in-process self-upgrade was removed because on Windows the running Python interpreter sits inside the venv `uv tool install --force` is trying to recreate, which fails with "Access is denied". `conductor update` now prints the OS-appropriate install-script one-liner.
 
 - **config/**: YAML loading and Pydantic schema validation
   - `schema.py` - Pydantic models for all workflow YAML structures (WorkflowConfig, AgentDef, ParallelGroup, ForEachDef, etc.)

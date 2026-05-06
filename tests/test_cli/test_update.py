@@ -398,371 +398,79 @@ class TestCheckForUpdateHint:
 
 
 # ===================================================================
-# E2-T8: run_update
+# E2-T8: run_update (now: instructs the user to run the install script)
 # ===================================================================
 
 
 class TestRunUpdate:
-    """Tests for ``run_update`` with mocked subprocess."""
-
-    @pytest.fixture(autouse=True)
-    def _mock_pre_flight(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Skip the running-process check and instant-sleep retry delays."""
-        monkeypatch.setattr("conductor.cli.update._find_running_conductor_processes", lambda: [])
-        monkeypatch.setattr("conductor.cli.update.time.sleep", lambda _s: None)
-
-    def test_successful_upgrade(self, cache_dir: Path) -> None:
-        """Successful upgrade prints before/after and clears cache."""
-        # Pre-populate cache to verify it's deleted
-        cache_file = cache_dir / "update-check.json"
-        cache_file.write_text("{}")
-
-        c, buf = _make_console(is_terminal=True)
-        mock_proc = MagicMock()
-        mock_proc.returncode = 0
-        mock_proc.stderr = ""
-
-        with (
-            patch(
-                "conductor.cli.update.fetch_latest_version",
-                return_value=("99.0.0", "v99.0.0", "https://example.com"),
-            ),
-            patch("conductor.cli.update.subprocess.run", return_value=mock_proc) as mock_run,
-        ):
-            run_update(c)
-
-        output = buf.getvalue()
-        assert "99.0.0" in output
-        assert "Successfully upgraded" in output
-
-        # Verify subprocess was called with the correct command
-        args = mock_run.call_args[0][0]
-        assert args[0] == "uv"
-        assert "--force" in args
-        assert any("@v99.0.0" in a for a in args)
-
-        # Cache should be deleted
-        assert not cache_file.exists()
+    """Tests for `run_update` after the move to install-script-only upgrades."""
 
     def test_already_up_to_date(self, cache_dir: Path) -> None:
-        """When local == remote, should say 'already up to date'."""
-        import conductor
-
-        c, buf = _make_console(is_terminal=True)
-        with patch(
-            "conductor.cli.update.fetch_latest_version",
-            return_value=(
-                conductor.__version__,
-                f"v{conductor.__version__}",
-                "https://example.com",
-            ),
-        ):
-            run_update(c)
-
-        output = buf.getvalue()
-        assert "Already up to date" in output
-
-    def test_upgrade_failure(self, cache_dir: Path) -> None:
-        """Failed subprocess should report the error."""
-        c, buf = _make_console(is_terminal=True)
-        mock_proc = MagicMock()
-        mock_proc.returncode = 1
-        mock_proc.stderr = "some error output"
-
+        c, buf = _make_console()
         with (
             patch(
                 "conductor.cli.update.fetch_latest_version",
-                return_value=("99.0.0", "v99.0.0", "https://example.com"),
+                return_value=("0.1.0", "v0.1.0", "https://example/release"),
             ),
-            patch("conductor.cli.update.subprocess.run", return_value=mock_proc) as mock_run,
+            patch("conductor.cli.update.__version__", "0.1.0"),
         ):
             run_update(c)
-
         output = buf.getvalue()
-        assert "Upgrade failed" in output
-        # Retry loop runs all attempts before giving up
-        assert mock_run.call_count == 3
+        assert "up to date" in output.lower()
+        assert get_cache_path().exists()
 
-    def test_network_failure(self, cache_dir: Path) -> None:
-        """When fetch fails, should print an error."""
-        c, buf = _make_console(is_terminal=True)
+    def test_newer_available_prints_install_command(self, cache_dir: Path) -> None:
+        c, buf = _make_console()
+        with (
+            patch(
+                "conductor.cli.update.fetch_latest_version",
+                return_value=("99.0.0", "v99.0.0", "https://example/release"),
+            ),
+            patch("conductor.cli.update.__version__", "0.1.0"),
+        ):
+            run_update(c)
+        output = buf.getvalue()
+        assert "99.0.0" in output
+        import sys as _sys
+
+        if _sys.platform == "win32":
+            assert "install.ps1" in output
+            assert "iex" in output
+        else:
+            assert "install.sh" in output
+            assert "curl" in output
+
+    def test_no_subprocess_install_attempt(self, cache_dir: Path) -> None:
+        c, _buf = _make_console()
+        with (
+            patch(
+                "conductor.cli.update.fetch_latest_version",
+                return_value=("99.0.0", "v99.0.0", "https://example/release"),
+            ),
+            patch("conductor.cli.update.__version__", "0.1.0"),
+            patch("subprocess.run") as mock_run,
+            patch("subprocess.Popen") as mock_popen,
+        ):
+            run_update(c)
+        assert mock_run.call_count == 0
+        assert mock_popen.call_count == 0
+
+    def test_fetch_failure_prints_error(self, cache_dir: Path) -> None:
+        c, buf = _make_console()
         with patch("conductor.cli.update.fetch_latest_version", return_value=None):
             run_update(c)
+        assert "could not reach github" in buf.getvalue().lower()
 
-        output = buf.getvalue()
-        assert "Could not reach GitHub" in output
-
-    def test_command_includes_tag_name(self, cache_dir: Path) -> None:
-        """The subprocess command must include ``@{tag_name}``."""
-        c, buf = _make_console(is_terminal=True)
-        mock_proc = MagicMock()
-        mock_proc.returncode = 0
-        mock_proc.stderr = ""
-
+    def test_force_kwarg_accepted_for_back_compat(self, cache_dir: Path) -> None:
+        c, _buf = _make_console()
         with (
             patch(
                 "conductor.cli.update.fetch_latest_version",
-                return_value=("2.0.0", "v2.0.0", "https://example.com"),
+                return_value=("99.0.0", "v99.0.0", "https://example/"),
             ),
-            patch("conductor.cli.update.subprocess.run", return_value=mock_proc) as mock_run,
-        ):
-            run_update(c)
-
-        args = mock_run.call_args[0][0]
-        install_arg = [a for a in args if a.startswith("git+")]
-        assert len(install_arg) == 1
-        assert install_arg[0].endswith("@v2.0.0")
-
-    def test_windows_renames_exe_before_install(self, cache_dir: Path, tmp_path: Path) -> None:
-        """On Windows, ``run_update`` renames the exe to ``.exe.old`` before calling ``uv``."""
-        # Create a fake conductor.exe
-        fake_exe = tmp_path / "conductor.exe"
-        fake_exe.write_text("fake")
-
-        cache_file = cache_dir / "update-check.json"
-        cache_file.write_text("{}")
-
-        c, buf = _make_console(is_terminal=True)
-        mock_proc = MagicMock()
-        mock_proc.returncode = 0
-        mock_proc.stderr = ""
-
-        with (
-            patch(
-                "conductor.cli.update.fetch_latest_version",
-                return_value=("99.0.0", "v99.0.0", "https://example.com"),
-            ),
-            patch("conductor.cli.update.sys.platform", "win32"),
-            patch("conductor.cli.update._get_conductor_exe", return_value=fake_exe),
-            patch("conductor.cli.update.subprocess.run", return_value=mock_proc) as mock_run,
-        ):
-            run_update(c)
-
-        # The exe should have been renamed to .exe.old
-        old_exe = tmp_path / "conductor.exe.old"
-        assert old_exe.exists()
-
-        # subprocess.run must be called (not Popen)
-        mock_run.assert_called_once()
-
-        # Output should say successful (synchronous path)
-        output = buf.getvalue()
-        assert "Successfully upgraded" in output
-
-        # Cache should be cleared
-        assert not cache_file.exists()
-
-    def test_windows_restores_exe_on_failure(self, cache_dir: Path, tmp_path: Path) -> None:
-        """On Windows, if ``uv`` fails and doesn't write a new exe, the old one is restored."""
-        # Create a fake conductor.exe
-        fake_exe = tmp_path / "conductor.exe"
-        fake_exe.write_text("fake")
-
-        c, buf = _make_console(is_terminal=True)
-        mock_proc = MagicMock()
-        mock_proc.returncode = 1
-        mock_proc.stderr = "install failed"
-
-        with (
-            patch(
-                "conductor.cli.update.fetch_latest_version",
-                return_value=("99.0.0", "v99.0.0", "https://example.com"),
-            ),
-            patch("conductor.cli.update.sys.platform", "win32"),
-            patch("conductor.cli.update._get_conductor_exe", return_value=fake_exe),
-            patch("conductor.cli.update.subprocess.run", return_value=mock_proc),
-        ):
-            run_update(c)
-
-        # The .old file should have been renamed back to .exe since uv didn't write a new one
-        assert fake_exe.exists()
-        old_exe = tmp_path / "conductor.exe.old"
-        assert not old_exe.exists()
-
-        # Output should report failure
-        output = buf.getvalue()
-        assert "Upgrade failed" in output
-
-    def test_windows_cleans_up_previous_old_exe(self, cache_dir: Path, tmp_path: Path) -> None:
-        """On Windows, a leftover ``.exe.old`` from a previous update is deleted first."""
-        # Create a fake conductor.exe and a pre-existing .old file
-        fake_exe = tmp_path / "conductor.exe"
-        fake_exe.write_text("new-fake")
-        old_leftover = tmp_path / "conductor.exe.old"
-        old_leftover.write_text("stale-old")
-
-        c, buf = _make_console(is_terminal=True)
-        mock_proc = MagicMock()
-        mock_proc.returncode = 0
-        mock_proc.stderr = ""
-
-        with (
-            patch(
-                "conductor.cli.update.fetch_latest_version",
-                return_value=("99.0.0", "v99.0.0", "https://example.com"),
-            ),
-            patch("conductor.cli.update.sys.platform", "win32"),
-            patch("conductor.cli.update._get_conductor_exe", return_value=fake_exe),
-            patch("conductor.cli.update.subprocess.run", return_value=mock_proc),
-        ):
-            run_update(c)
-
-        # The old leftover should be gone, replaced by the newly renamed exe
-        old_exe = tmp_path / "conductor.exe.old"
-        assert old_exe.exists()
-        # The content should be "new-fake" (current exe), not "stale-old"
-        assert old_exe.read_text() == "new-fake"
-
-    def test_unix_skips_rename(self, cache_dir: Path) -> None:
-        """On non-Windows platforms, ``_get_conductor_exe`` is not called."""
-        c, buf = _make_console(is_terminal=True)
-        mock_proc = MagicMock()
-        mock_proc.returncode = 0
-        mock_proc.stderr = ""
-
-        with (
-            patch(
-                "conductor.cli.update.fetch_latest_version",
-                return_value=("99.0.0", "v99.0.0", "https://example.com"),
-            ),
-            patch("conductor.cli.update.sys.platform", "linux"),
-            patch("conductor.cli.update.subprocess.run", return_value=mock_proc) as mock_run,
-            patch("conductor.cli.update._get_conductor_exe") as mock_get_exe,
-        ):
-            run_update(c)
-
-        # _get_conductor_exe must NOT be called on Linux
-        mock_get_exe.assert_not_called()
-
-        # subprocess.run must be called
-        mock_run.assert_called_once()
-
-        # Output should mention successful upgrade
-        output = buf.getvalue()
-        assert "Successfully upgraded" in output
-
-    def test_windows_entrypoint_failure_reports_success(
-        self, cache_dir: Path, tmp_path: Path
-    ) -> None:
-        """On Windows, if uv installs the package but fails to copy the entrypoint,
-        report success with a restart note instead of failure."""
-        fake_exe = tmp_path / "conductor.exe"
-        fake_exe.write_text("fake")
-
-        cache_file = cache_dir / "update-check.json"
-        cache_file.write_text("{}")
-
-        c, buf = _make_console(is_terminal=True)
-        mock_proc = MagicMock()
-        mock_proc.returncode = 2
-        mock_proc.stderr = "error: Failed to install entrypoint\n  Caused by: failed to copy file"
-
-        with (
-            patch(
-                "conductor.cli.update.fetch_latest_version",
-                return_value=("99.0.0", "v99.0.0", "https://example.com"),
-            ),
-            patch("conductor.cli.update.sys.platform", "win32"),
-            patch("conductor.cli.update._get_conductor_exe", return_value=fake_exe),
-            patch("conductor.cli.update.subprocess.run", return_value=mock_proc),
-        ):
-            run_update(c)
-
-        output = buf.getvalue()
-        assert "Successfully upgraded" in output
-        assert "restart your terminal" in output
-        assert "Upgrade failed" not in output
-
-        # Cache should be cleared on partial success
-        assert not cache_file.exists()
-
-    def test_aborts_when_other_conductor_running(self, cache_dir: Path) -> None:
-        """When other conductor processes are detected, abort with guidance."""
-        c, buf = _make_console(is_terminal=True)
-        with (
-            patch(
-                "conductor.cli.update.fetch_latest_version",
-                return_value=("99.0.0", "v99.0.0", "https://example.com"),
-            ),
-            patch(
-                "conductor.cli.update._find_running_conductor_processes",
-                return_value=[{"pid": 1234, "cmd": "/usr/local/bin/conductor run foo.yaml"}],
-            ),
-            patch("conductor.cli.update.subprocess.run") as mock_run,
-        ):
-            run_update(c)
-
-        output = buf.getvalue()
-        assert "1234" in output
-        assert "conductor stop --all" in output
-        assert "--force" in output
-        # Install must NOT have been attempted
-        mock_run.assert_not_called()
-
-    def test_force_skips_pre_flight(self, cache_dir: Path) -> None:
-        """``force=True`` proceeds with the install even when processes are running."""
-        c, buf = _make_console(is_terminal=True)
-        mock_proc = MagicMock()
-        mock_proc.returncode = 0
-        mock_proc.stderr = ""
-
-        with (
-            patch(
-                "conductor.cli.update.fetch_latest_version",
-                return_value=("99.0.0", "v99.0.0", "https://example.com"),
-            ),
-            patch(
-                "conductor.cli.update._find_running_conductor_processes",
-                return_value=[{"pid": 1234, "cmd": "conductor"}],
-            ),
-            patch("conductor.cli.update.subprocess.run", return_value=mock_proc) as mock_run,
+            patch("conductor.cli.update.__version__", "0.1.0"),
         ):
             run_update(c, force=True)
-
-        output = buf.getvalue()
-        assert "Successfully upgraded" in output
-        mock_run.assert_called_once()
-
-    def test_retry_succeeds_on_second_attempt(self, cache_dir: Path) -> None:
-        """A transient failure on attempt 1 followed by success on attempt 2 reports success."""
-        c, buf = _make_console(is_terminal=True)
-        fail = MagicMock(returncode=1, stderr="transient")
-        ok = MagicMock(returncode=0, stderr="")
-
-        with (
-            patch(
-                "conductor.cli.update.fetch_latest_version",
-                return_value=("99.0.0", "v99.0.0", "https://example.com"),
-            ),
-            patch("conductor.cli.update.subprocess.run", side_effect=[fail, ok]) as mock_run,
-        ):
-            run_update(c)
-
-        output = buf.getvalue()
-        assert "Successfully upgraded" in output
-        assert "Upgrade failed" not in output
-        assert mock_run.call_count == 2
-
-    def test_failure_surfaces_stdout_and_stderr(self, cache_dir: Path) -> None:
-        """Failure report shows both stdout and stderr from uv."""
-        c, buf = _make_console(is_terminal=True)
-        mock_proc = MagicMock()
-        mock_proc.returncode = 1
-        mock_proc.stdout = "uv-stdout-line"
-        mock_proc.stderr = "uv-stderr-line"
-
-        with (
-            patch(
-                "conductor.cli.update.fetch_latest_version",
-                return_value=("99.0.0", "v99.0.0", "https://example.com"),
-            ),
-            patch("conductor.cli.update.subprocess.run", return_value=mock_proc),
-        ):
-            run_update(c)
-
-        output = buf.getvalue()
-        assert "uv-stdout-line" in output
-        assert "uv-stderr-line" in output
 
 
 # ===================================================================
@@ -849,112 +557,3 @@ class TestUpdateHintCLI:
         ):
             runner.invoke(app, ["validate", "--help"])
         mock_hint.assert_not_called()
-
-
-# ---------------------------------------------------------------------------
-# Tests: ancestor PID exclusion in _find_running_conductor_processes
-# ---------------------------------------------------------------------------
-
-
-class TestAncestorPidExclusion:
-    """Verify that the current process and its ancestors are not flagged."""
-
-    def test_self_pid_in_excluded_set(self) -> None:
-        """``os.getpid()`` is always excluded."""
-        import os
-
-        from conductor.cli.update import _get_self_and_ancestor_pids
-
-        assert os.getpid() in _get_self_and_ancestor_pids()
-
-    def test_parent_pid_in_excluded_set(self) -> None:
-        """``os.getppid()`` is always excluded so the launching shim is ignored."""
-        import os
-
-        from conductor.cli.update import _get_self_and_ancestor_pids
-
-        assert os.getppid() in _get_self_and_ancestor_pids()
-
-    def test_ancestor_chain_excluded_via_parent_map(self) -> None:
-        """When a parent map is available, the full ancestor chain is excluded."""
-        import os
-
-        from conductor.cli.update import _get_self_and_ancestor_pids
-
-        my_pid = os.getpid()
-        # Fabricated ancestor chain: my_pid -> 100 -> 200 -> 0
-        fake_map = {my_pid: 100, 100: 200, 200: 0}
-        with patch("conductor.cli.update._build_parent_pid_map", return_value=fake_map):
-            pids = _get_self_and_ancestor_pids()
-        assert my_pid in pids
-        assert 100 in pids
-        assert 200 in pids
-        # PPID 0 is the chain terminator and is not added.
-        assert 0 not in pids
-
-    def test_parent_map_failure_falls_back_to_getpid_and_getppid(self) -> None:
-        """When the parent map cannot be built we still exclude self and direct parent."""
-        import os
-
-        from conductor.cli.update import _get_self_and_ancestor_pids
-
-        with patch("conductor.cli.update._build_parent_pid_map", return_value={}):
-            pids = _get_self_and_ancestor_pids()
-        assert os.getpid() in pids
-        assert os.getppid() in pids
-
-    def test_cycle_in_parent_map_terminates_walk(self) -> None:
-        """A cycle in the parent map does not cause infinite recursion."""
-        import os
-
-        from conductor.cli.update import _get_self_and_ancestor_pids
-
-        my_pid = os.getpid()
-        # Cyclic chain my_pid -> 100 -> my_pid
-        fake_map = {my_pid: 100, 100: my_pid}
-        with patch("conductor.cli.update._build_parent_pid_map", return_value=fake_map):
-            pids = _get_self_and_ancestor_pids()
-        # Walk added 100 then stopped before re-adding my_pid.
-        assert 100 in pids
-        assert my_pid in pids
-
-    def test_find_running_excludes_ancestor(self) -> None:
-        """Conductor shim listed in ``ps`` but in our ancestor chain is filtered out."""
-        import os
-        import sys
-
-        from conductor.cli.update import _find_running_conductor_processes
-
-        ancestor_pid = 99999
-        other_pid = 88888
-
-        # ps output containing both ancestor and an unrelated conductor proc.
-        if sys.platform == "win32":
-            mock_stdout = (
-                f'"conductor.exe","{ancestor_pid}","Console","1","12 K"\n'
-                f'"conductor.exe","{other_pid}","Console","1","12 K"\n'
-            )
-            cmd_match = ["tasklist"]
-        else:
-            mock_stdout = (
-                f"{ancestor_pid} /usr/local/bin/conductor run wf.yaml\n"
-                f"{other_pid} /usr/local/bin/conductor run other.yaml\n"
-            )
-            cmd_match = ["ps"]
-
-        from subprocess import CompletedProcess
-
-        completed = CompletedProcess(args=cmd_match, returncode=0, stdout=mock_stdout, stderr="")
-
-        with (
-            patch(
-                "conductor.cli.update._get_self_and_ancestor_pids",
-                return_value={os.getpid(), ancestor_pid},
-            ),
-            patch("conductor.cli.update.subprocess.run", return_value=completed),
-        ):
-            running = _find_running_conductor_processes()
-
-        pids = {p["pid"] for p in running}
-        assert ancestor_pid not in pids, "ancestor (own shim) should be filtered"
-        assert other_pid in pids, "unrelated conductor proc should be reported"

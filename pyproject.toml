@@ -89,4 +89,5 @@ testpaths = ["tests"]
 markers = [
     "performance: marks tests as performance tests (deselect with '-m \"not performance\"')",
     "real_api: marks tests that make real API calls to external services (deselect with '-m \"not real_api\"')",
+    "install_scripts: marks tests that exercise install.ps1/install.sh end-to-end (slow; opt-in via '-m install_scripts')",
 ]

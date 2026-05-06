@@ -13,16 +13,9 @@ so they never block the CLI.
 
 from __future__ import annotations
 
-import contextlib
-import hashlib
 import json
 import logging
-import os
-import shutil
-import subprocess
 import sys
-import tempfile
-import time
 import urllib.error
 import urllib.request
 from datetime import UTC, datetime
@@ -280,39 +273,40 @@ def _print_hint(console: Console, remote_version: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Self-upgrade
+# Upgrade instructions (formerly self-upgrade)
 # ---------------------------------------------------------------------------
 
 
-def _get_conductor_exe() -> Path | None:
-    """Return the path to the ``conductor`` executable, or ``None`` if not found.
+def _install_command() -> str:
+    """Return the OS-appropriate one-line install/upgrade command.
 
-    Uses :func:`shutil.which` to locate the executable on ``$PATH``.
-
-    Returns:
-        A :class:`Path` to the executable, or ``None``.
+    The install script is the single, canonical upgrade path. ``conductor
+    update`` no longer attempts to self-upgrade in-process because on
+    Windows the running ``python.exe`` lives inside the venv that
+    ``uv tool install --force`` is trying to delete, which makes the
+    operation fundamentally impossible from within the running process.
     """
-    which = shutil.which("conductor")
-    return Path(which) if which else None
+    if sys.platform == "win32":
+        return "irm https://aka.ms/conductor/install.ps1 | iex"
+    return "curl -sSfL https://aka.ms/conductor/install.sh | sh"
 
 
 def run_update(console: Console, force: bool = False) -> None:
-    """Fetch the latest version and self-upgrade via ``uv tool install``.
+    """Check for a newer release and tell the user how to install it.
 
-    This always bypasses the cache and fetches from the network.  On success
-    the cache file is deleted so the next invocation will re-check cleanly.
-
-    The upgrade pins transitive dependencies using a constraints file
-    published with each GitHub Release, verified via SHA-256 checksum.
-
-    Other running Conductor processes (especially on Windows) can hold file
-    locks that cause ``uv tool install`` to fail. Unless ``force=True``, this
-    function detects those processes up front and asks the user to stop them.
+    This used to perform the upgrade in-process via ``uv tool install``, but
+    that repeatedly hit ``Access is denied`` on Windows because the running
+    Python interpreter (and its loaded DLLs) sit inside the venv that uv
+    tries to recreate. The install script runs from a non-conductor shell
+    and therefore does not hold those locks.
 
     Args:
         console: Rich console for output.
-        force: If True, skip the running-process check.
+        force: Accepted for backward compatibility; currently unused
+            (the install script handles its own safety checks).
     """
+    del force  # accepted for backward compatibility; ignored
+
     console.print("[bold]Checking for updates…[/bold]")
 
     result = fetch_latest_version()
@@ -320,474 +314,24 @@ def run_update(console: Console, force: bool = False) -> None:
         console.print("[bold red]Error:[/bold red] Could not reach GitHub to check for updates.")
         return
 
-    version, tag_name, _url = result
+    version, _tag_name, _url = result
     current = __version__
 
     if not is_newer(version, current):
         console.print(f"[green]Already up to date[/green] (v{current}).")
+        # Refresh the cache so the hint stops nagging.
+        write_cache(version, _tag_name, _url)
         return
 
-    # Pre-flight: detect other running conductor processes that could hold
-    # file locks during the install. On Windows this is the most common cause
-    # of "Access is denied" failures from `uv tool install --force`.
-    if not force:
-        running = _find_running_conductor_processes()
-        if running:
-            console.print(
-                f"[bold yellow]Warning:[/bold yellow] {len(running)} other Conductor "
-                f"process{'es are' if len(running) > 1 else ' is'} running:"
-            )
-            for proc in running:
-                console.print(f"  • PID {proc['pid']}: {proc['cmd']}")
-            console.print(
-                "\nRunning processes can hold file locks that cause the upgrade to fail "
-                "(especially on Windows).\n"
-                "Stop them first (e.g. [bold]conductor stop --all[/bold] for background "
-                "dashboards), then re-run [bold]conductor update[/bold].\n"
-                "To upgrade anyway, re-run with [bold]conductor update --force[/bold]."
-            )
-            return
-
-    console.print(f"Upgrading Conductor: v{current} → v{version}")
-
-    install_url = f"git+{_REPO_GIT_URL}@{tag_name}"
-
-    # Download constraints file and verify checksum
-    constraints_path = _download_constraints(tag_name, console)
-
-    cmd = ["uv", "tool", "install", "--force", install_url]
-    if constraints_path:
-        cmd.extend(["-c", str(constraints_path)])
-
-    # On Windows, rename our exe(s) out of the way so uv can write the new one.
-    # Windows locks running executables but allows renaming them.
-    renamed_exes: list[tuple[Path, Path]] = []
-    if sys.platform == "win32":
-        renamed_exes = _rename_windows_exes()
-
-    success = False
-    last_proc: subprocess.CompletedProcess[str] | None = None
-
-    try:
-        # Set PYTHONUTF8=1 so child Python processes use UTF-8 encoding
-        # instead of the system default (cp1252 on Windows).
-        env = {**os.environ, "PYTHONUTF8": "1"}
-
-        # Retry to absorb transient Windows Defender / file-lock failures,
-        # mirroring install.ps1's behavior.
-        for attempt in range(1, _INSTALL_MAX_ATTEMPTS + 1):
-            if attempt > 1:
-                console.print(
-                    f"[dim]Retrying install (attempt {attempt}/{_INSTALL_MAX_ATTEMPTS})…[/dim]"
-                )
-                time.sleep(_INSTALL_RETRY_DELAY_SECONDS)
-
-            proc = subprocess.run(  # noqa: S603
-                cmd, capture_output=True, text=True, encoding="utf-8", env=env
-            )
-            last_proc = proc
-
-            if proc.returncode == 0:
-                success = True
-                break
-            if sys.platform == "win32" and "Failed to install entrypoint" in (proc.stderr or ""):
-                # On Windows, uv may fail to copy the entrypoint because the running
-                # executable is locked.  The package itself was installed successfully.
-                success = True
-                break
-
-        if success and last_proc is not None:
-            console.print(f"[green]Successfully upgraded to v{version}[/green]")
-            if (
-                sys.platform == "win32"
-                and last_proc.returncode != 0
-                and "Failed to install entrypoint" in (last_proc.stderr or "")
-            ):
-                console.print(
-                    "[dim]Note: restart your terminal for the update to take full effect.[/dim]"
-                )
-            cache_path = get_cache_path()
-            cache_path.unlink(missing_ok=True)
-        else:
-            _report_install_failure(console, last_proc)
-            # On Windows, restore the original exe(s) if uv failed
-            for orig, backup in renamed_exes:
-                if backup.exists() and not orig.exists():
-                    with contextlib.suppress(OSError):
-                        backup.rename(orig)
-    finally:
-        # Clean up temp constraints file
-        if constraints_path:
-            with contextlib.suppress(OSError):
-                constraints_path.unlink()
-                constraints_path.parent.rmdir()
-
-
-def _report_install_failure(
-    console: Console, proc: subprocess.CompletedProcess[str] | None
-) -> None:
-    """Print a detailed failure report including full uv stdout and stderr.
-
-    Surfaces both streams (not just stderr, which was the previous behavior)
-    and on Windows points users at the most common remediations: closing
-    other Conductor processes and adding a Defender exclusion.
-
-    Args:
-        console: Rich console for output.
-        proc: The completed subprocess from the final ``uv tool install``
-            attempt, or ``None`` if no attempt completed.
-    """
-    if proc is None:
-        console.print("[bold red]Upgrade failed[/bold red] — no install attempt completed.")
-        return
-
+    cmd = _install_command()
+    console.print(f"[bold]Conductor v{version}[/bold] is available (you have v{current}).")
+    console.print()
+    console.print("To upgrade, run this in a [bold]new shell[/bold] (not inside conductor):")
+    console.print()
+    console.print(f"  [bold cyan]{cmd}[/bold cyan]")
+    console.print()
     console.print(
-        f"[bold red]Upgrade failed[/bold red] (exit code {proc.returncode}) "
-        f"after {_INSTALL_MAX_ATTEMPTS} attempts."
+        "[dim]The install script handles file-lock safety, retries, and "
+        "post-install verification. It is the single supported upgrade path "
+        "on all platforms.[/dim]"
     )
-    console.print("\n[bold]── uv tool install output ──[/bold]")
-    if proc.stdout:
-        console.print(f"[dim]{proc.stdout.rstrip()}[/dim]")
-    if proc.stderr:
-        console.print(f"[dim]{proc.stderr.rstrip()}[/dim]")
-    if not proc.stdout and not proc.stderr:
-        console.print("[dim](no output captured)[/dim]")
-
-    if sys.platform == "win32":
-        stderr_lower = (proc.stderr or "").lower()
-        if any(s in stderr_lower for s in ("access is denied", "being used by another", "locked")):
-            console.print(
-                "\n[yellow]Looks like a file-lock issue.[/yellow] Stop any running Conductor "
-                "processes (foreground runs, background dashboards via "
-                "[bold]conductor stop --all[/bold], and any spawned IDE workers) and try again."
-            )
-        console.print(
-            "\nIf the install repeatedly fails with 'Access is denied', Windows Defender "
-            "may be scanning the install directory. Add an exclusion (run PowerShell as "
-            "Administrator):"
-        )
-        console.print(r"  [bold]Add-MpPreference -ExclusionPath \"$env:LOCALAPPDATA\uv\"[/bold]")
-
-
-def _get_self_and_ancestor_pids() -> set[int]:
-    """Return the PID of the current process and all of its ancestors.
-
-    On Windows the ``conductor.exe`` shim that launched the Python
-    interpreter is a *separate* process. Excluding only ``os.getpid()``
-    would still surface that shim as another running Conductor process
-    during ``conductor update``. Walking the full ancestor chain prevents
-    those false positives.
-
-    The walk is best-effort: any failure (missing tool, parse error,
-    timeout, permission denied) returns whatever PIDs were collected so
-    far, never raises. The current PID and its direct parent are always
-    included via the ``os`` module so the result is never empty.
-
-    Returns:
-        A set of PIDs to treat as "self" when scanning for other running
-        Conductor processes.
-    """
-    pids: set[int] = {os.getpid()}
-    with contextlib.suppress(OSError):
-        pids.add(os.getppid())
-
-    parent_map = _build_parent_pid_map()
-    if not parent_map:
-        return pids
-
-    # Walk up from the current PID until we hit a missing entry or a
-    # cycle (defensive: PID reuse can theoretically create one).
-    cursor = os.getpid()
-    seen: set[int] = set()
-    while cursor in parent_map and cursor not in seen:
-        seen.add(cursor)
-        ppid = parent_map[cursor]
-        if ppid <= 0:
-            break
-        pids.add(ppid)
-        cursor = ppid
-
-    return pids
-
-
-def _build_parent_pid_map() -> dict[int, int]:
-    """Return a mapping of ``pid -> parent_pid`` for all running processes.
-
-    Uses ``wmic`` on Windows and ``ps`` elsewhere. Returns an empty dict
-    on any failure so callers can fall back gracefully.
-    """
-    try:
-        if sys.platform == "win32":
-            proc = subprocess.run(  # noqa: S603, S607
-                ["wmic", "process", "get", "ProcessId,ParentProcessId", "/format:csv"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            if proc.returncode != 0:
-                return {}
-            mapping: dict[int, int] = {}
-            # CSV header is "Node,ParentProcessId,ProcessId" — we don't
-            # rely on column position; instead we look for the first two
-            # integer columns on each line.
-            for line in proc.stdout.splitlines():
-                parts = [p.strip() for p in line.split(",")]
-                ints = [int(p) for p in parts if p.isdigit()]
-                if len(ints) >= 2:
-                    ppid_val, pid_val = ints[0], ints[1]
-                    mapping[pid_val] = ppid_val
-            return mapping
-        proc = subprocess.run(  # noqa: S603, S607
-            ["ps", "-axo", "pid=,ppid="],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if proc.returncode != 0:
-            return {}
-        mapping = {}
-        for line in proc.stdout.splitlines():
-            tokens = line.split()
-            if len(tokens) < 2:
-                continue
-            try:
-                pid_val = int(tokens[0])
-                ppid_val = int(tokens[1])
-            except ValueError:
-                continue
-            mapping[pid_val] = ppid_val
-        return mapping
-    except (OSError, subprocess.TimeoutExpired):
-        return {}
-
-
-def _find_running_conductor_processes() -> list[dict]:
-    """Return a list of other running Conductor processes (excluding self).
-
-    Cross-platform: uses ``tasklist`` on Windows and ``ps`` elsewhere.
-    Each entry is ``{"pid": int, "cmd": str}``. The current process and its
-    ancestor chain are always excluded — on Windows the ``conductor.exe``
-    shim that launched the Python interpreter is a separate process from
-    the running Python, so excluding only ``os.getpid()`` would still
-    surface our own shim as a "running Conductor process".
-
-    Returns:
-        A list of dicts, one per detected Conductor process other than the
-        current one (and its ancestors). Empty list on detection error or
-        when none are found.
-    """
-    excluded_pids = _get_self_and_ancestor_pids()
-    results: list[dict] = []
-
-    try:
-        if sys.platform == "win32":
-            # /v gives full command line in the WindowTitle column on some
-            # locales but is unreliable; use wmic-like parsing of /fo csv.
-            proc = subprocess.run(  # noqa: S603, S607
-                ["tasklist", "/fo", "csv", "/nh"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            if proc.returncode != 0:
-                return []
-            for line in proc.stdout.splitlines():
-                # CSV: "Image Name","PID","Session Name","Session#","Mem Usage"
-                parts = [p.strip().strip('"') for p in line.split(",")]
-                if len(parts) < 2:
-                    continue
-                image, pid_str = parts[0], parts[1]
-                if "conductor" not in image.lower():
-                    continue
-                try:
-                    pid = int(pid_str)
-                except ValueError:
-                    continue
-                if pid in excluded_pids:
-                    continue
-                results.append({"pid": pid, "cmd": image})
-        else:
-            proc = subprocess.run(  # noqa: S603, S607
-                ["ps", "-axo", "pid=,command="],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            if proc.returncode != 0:
-                return []
-            for line in proc.stdout.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                pid_str, _, cmd = line.partition(" ")
-                cmd = cmd.strip()
-                try:
-                    pid = int(pid_str)
-                except ValueError:
-                    continue
-                if pid in excluded_pids:
-                    continue
-                # Match the conductor entrypoint script or any process whose
-                # command line invokes it. Avoid matching this module's own
-                # name in unrelated paths.
-                if not _looks_like_conductor_process(cmd):
-                    continue
-                results.append({"pid": pid, "cmd": cmd[:120]})
-    except (OSError, subprocess.TimeoutExpired):
-        return []
-
-    return results
-
-
-def _looks_like_conductor_process(cmd: str) -> bool:
-    """Return True if *cmd* (a process command line) looks like a Conductor invocation.
-
-    Matches the ``conductor`` entrypoint, ``python -m conductor``, and the
-    ``uv tool run conductor`` form. Avoids false positives on unrelated paths
-    that happen to contain the substring ``conductor``.
-
-    Args:
-        cmd: The full command line of a process as reported by ``ps``.
-
-    Returns:
-        True when the command line is most likely a Conductor process.
-    """
-    lower = cmd.lower()
-    tokens = lower.split()
-    if not tokens:
-        return False
-    # Direct entrypoint: ".../bin/conductor ..." or ".../conductor.exe ..."
-    first = Path(tokens[0]).name
-    if first in {"conductor", "conductor.exe"}:
-        return True
-    # python -m conductor / python -m conductor.cli.app
-    if "python" in first and "-m" in tokens:
-        try:
-            mod = tokens[tokens.index("-m") + 1]
-        except IndexError:
-            return False
-        return mod.startswith("conductor")
-    # uv tool run conductor / uv run conductor
-    return first.startswith("uv") and "conductor" in tokens
-
-
-def _rename_windows_exes() -> list[tuple[Path, Path]]:
-    """Rename conductor executables on Windows so ``uv`` can overwrite them.
-
-    Windows locks running executables, preventing overwrite.  Renaming is
-    still allowed, so we move them out of the way before ``uv tool install``.
-
-    We target every known location uv may have placed an entrypoint in:
-
-    1. The executable found on ``PATH`` (the one currently running)
-    2. ``~/.local/bin/conductor.exe`` — uv's standard user bin dir
-    3. ``%LOCALAPPDATA%/uv/tools/conductor-cli/Scripts/conductor.exe`` —
-       per-user uv tool venv (the most common cause of failed self-upgrades
-       when the running process holds locks on files inside it)
-    4. ``%APPDATA%/uv/tools/conductor-cli/Scripts/conductor.exe`` — alt path
-       on some uv versions
-
-    Deduplicates by resolved path (case-insensitive on Windows).
-
-    Returns:
-        A list of ``(original_path, backup_path)`` tuples for later restoration.
-    """
-    renamed: list[tuple[Path, Path]] = []
-    seen: set[str] = set()
-    candidates: list[Path] = []
-
-    # 1. The exe on PATH (the one currently running)
-    exe_from_which = _get_conductor_exe()
-    if exe_from_which:
-        candidates.append(exe_from_which)
-
-    # 2. The standard uv entrypoint location
-    candidates.append(Path.home() / ".local" / "bin" / "conductor.exe")
-
-    # 3 & 4. The uv tool venv Scripts dirs (LOCALAPPDATA and APPDATA)
-    for env_var in ("LOCALAPPDATA", "APPDATA"):
-        base = os.environ.get(env_var)
-        if not base:
-            continue
-        candidates.append(
-            Path(base) / "uv" / "tools" / "conductor-cli" / "Scripts" / "conductor.exe"
-        )
-
-    for exe_path in candidates:
-        if not exe_path.exists():
-            continue
-
-        # Deduplicate by resolved path (case-insensitive on Windows)
-        try:
-            key = str(exe_path.resolve()).lower()
-        except OSError:
-            continue
-        if key in seen:
-            continue
-        seen.add(key)
-
-        old_path = exe_path.with_suffix(".exe.old")
-        try:
-            # replace() overwrites an existing .old file, unlike rename() which
-            # fails on Windows when the destination already exists (e.g. from a
-            # previous interrupted update).
-            exe_path.replace(old_path)
-            renamed.append((exe_path, old_path))
-        except OSError:
-            pass  # rename failed; proceed, uv will report the error
-
-    return renamed
-
-
-def _download_constraints(tag_name: str, console: Console) -> Path | None:
-    """Download and verify the constraints file for a release.
-
-    Args:
-        tag_name: The release tag (e.g. ``v0.3.0``).
-        console: Rich console for status output.
-
-    Returns:
-        Path to the downloaded constraints file, or ``None`` if unavailable.
-    """
-    constraints_url = f"{_RELEASE_DL_URL}/{tag_name}/constraints.txt"
-    checksum_url = f"{_RELEASE_DL_URL}/{tag_name}/constraints.txt.sha256"
-
-    tmpdir = Path(tempfile.mkdtemp(prefix="conductor-update-"))
-    constraints_path = tmpdir / "constraints.txt"
-
-    try:
-        # Download constraints file
-        req = urllib.request.Request(constraints_url)
-        with urllib.request.urlopen(req, timeout=10) as resp:  # noqa: S310
-            constraints_path.write_bytes(resp.read())
-
-        # Download checksum
-        req = urllib.request.Request(checksum_url)
-        with urllib.request.urlopen(req, timeout=10) as resp:  # noqa: S310
-            checksum_content = resp.read().decode().strip()
-        expected_hash = checksum_content.split()[0]
-
-        # Verify
-        actual_hash = hashlib.sha256(constraints_path.read_bytes()).hexdigest()
-        if actual_hash != expected_hash:
-            console.print(
-                "[bold red]Error:[/bold red] Constraints file checksum mismatch — "
-                "skipping constraints."
-            )
-            with contextlib.suppress(OSError):
-                constraints_path.unlink()
-                tmpdir.rmdir()
-            return None
-
-        console.print("[dim]Constraints verified ✓[/dim]")
-        return constraints_path
-
-    except Exception:  # noqa: BLE001
-        logger.debug("Failed to download constraints file", exc_info=True)
-        console.print(
-            "[dim]Constraints file not available for this release, installing without.[/dim]"
-        )
-        with contextlib.suppress(OSError):
-            constraints_path.unlink()
-            tmpdir.rmdir()
-        return None

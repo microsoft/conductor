@@ -45,9 +45,25 @@ The installer checks for [uv](https://docs.astral.sh/uv/) (installs it if missin
 
 ### Updating
 
+`conductor update` checks for a newer release and tells you the one-line command to upgrade. Upgrades happen via the install script — the same script you used to install — because in-process self-upgrade is unreliable on Windows (the running Python interpreter sits inside the venv that needs replacing).
+
 ```bash
 conductor update
 ```
+
+To upgrade, run the install script in a **new shell** (not from inside a running `conductor` process):
+
+**macOS / Linux:**
+```bash
+curl -sSfL https://aka.ms/conductor/install.sh | sh
+```
+
+**Windows (PowerShell):**
+```powershell
+irm https://aka.ms/conductor/install.ps1 | iex
+```
+
+The install script handles file-lock safety (process detection, stale-file cleanup, and on Windows a rename-fallback when the venv directory can't be removed), retries with backoff, and verifies the installed version after install. If your shell ever gets into a bad state from a failed update, re-running the install script is always the right next step.
 
 ### Manual Install
 
