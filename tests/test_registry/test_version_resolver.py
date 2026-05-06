@@ -48,38 +48,28 @@ def test_resolve_ref_path_with_ref_raises() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_resolve_ref_github_none_picks_newest_tag(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        version_resolver, "list_tags", lambda owner, repo: ["v1.0.0", "v2.0.0", "v1.1.0"]
-    )
-    monkeypatch.setattr(
-        version_resolver,
-        "get_default_branch",
-        lambda owner, repo: pytest.fail("should not be called"),
-    )
-    assert resolve_ref(_gh_entry(), None) == "v2.0.0"
+def test_resolve_ref_github_none_returns_default_branch(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(version_resolver, "get_default_branch", lambda owner, repo: "main")
+    assert resolve_ref(_gh_entry(), None) == "main"
 
 
 def test_resolve_ref_github_latest_same_as_none(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        version_resolver, "list_tags", lambda owner, repo: ["v1.0.0", "v2.0.0", "v1.1.0"]
-    )
-    assert resolve_ref(_gh_entry(), "latest") == "v2.0.0"
-    assert resolve_ref(_gh_entry(), "LATEST") == "v2.0.0"
+    monkeypatch.setattr(version_resolver, "get_default_branch", lambda owner, repo: "trunk")
+    assert resolve_ref(_gh_entry(), "latest") == "trunk"
+    assert resolve_ref(_gh_entry(), "LATEST") == "trunk"
 
 
-def test_resolve_ref_github_no_tags_returns_default_branch(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(version_resolver, "list_tags", lambda owner, repo: [])
+def test_resolve_ref_github_does_not_query_tags(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Default-branch resolution must not require a tag listing API call."""
     monkeypatch.setattr(version_resolver, "get_default_branch", lambda owner, repo: "main")
+    # If resolve_ref ever imports list_tags again, this test will surface it.
     assert resolve_ref(_gh_entry(), None) == "main"
 
 
 def test_resolve_ref_github_branch_returned_verbatim(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         version_resolver,
-        "list_tags",
+        "get_default_branch",
         lambda owner, repo: pytest.fail("should not be called"),
     )
     assert resolve_ref(_gh_entry(), "main") == "main"
@@ -88,7 +78,7 @@ def test_resolve_ref_github_branch_returned_verbatim(monkeypatch: pytest.MonkeyP
 def test_resolve_ref_github_tag_returned_verbatim(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         version_resolver,
-        "list_tags",
+        "get_default_branch",
         lambda owner, repo: pytest.fail("should not be called"),
     )
     assert resolve_ref(_gh_entry(), "v1.0.0") == "v1.0.0"

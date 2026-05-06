@@ -105,9 +105,9 @@ Resolution rules, in order:
 3. Missing `@<registry>` → use the configured default registry.
 4. An empty registry between `@` and `#` (e.g. `name@#ref`) is allowed and
    means "use the default registry at this ref".
-5. Missing `#<ref>` → use `latest`. `latest` resolves to the newest
-   semver-sorted git tag (with a leading `v` stripped for parsing). If the
-   registry repo has no tags, `latest` falls back to the default branch HEAD.
+5. Missing `#<ref>` → use `latest`. `latest` resolves to the **default
+   branch HEAD** of the registry repo (re-resolved to a fresh commit SHA
+   on every fetch). To pin to a release, use `#<tag>` explicitly.
 6. An empty ref after `#` (e.g. `name@reg#`) is a hard error.
 7. Multiple `@` or multiple `#` in a single reference are hard errors.
 8. Path-type registries do not support `#<ref>`. Passing
@@ -154,12 +154,13 @@ auto-discover YAML files in a registry — the maintainer curates the index.
 Versioning is automatic and tag-driven for GitHub registries:
 
 - **Auto-discovery**: available versions are the registry repo's git tags,
-  fetched on demand via the GitHub API. Maintainers do not list versions in
-  `index.yaml`.
-- **`latest` resolution**: `latest` resolves to the newest semver-sorted tag
-  (a leading `v` is stripped before parsing, so `v1.2.3` and `1.2.3` sort
-  identically). If the repo has no tags, `latest` falls back to the
-  default-branch HEAD.
+  fetched on demand via the GitHub API for display in `registry list`/`show`.
+  Maintainers do not list versions in `index.yaml`.
+- **`latest` resolution**: `latest` (the default when no `#<ref>` is given)
+  always resolves to the **default branch HEAD** of the registry repo.
+  This means a bare `name@registry` reference always picks up the newest
+  commit on the default branch — typical for development workflows.
+  To pin to a tagged release, use an explicit ref: `name@registry#v1.2.3`.
 - **Flexible refs**: any tag, branch, or commit SHA can be pinned via
   `#<ref>`. Branch refs are re-resolved to their current commit SHA at
   fetch time, so a branch ref always refers to the latest commit on that
@@ -288,7 +289,7 @@ file of the same name.
 | Decision                                  | Choice                                                  | Why                                                                                                  |
 | ----------------------------------------- | ------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
 | Named registries vs always-inline source  | Named, configured once                                  | Mirrors npm/cargo. Short refs in `run` commands. Default registry makes the common case zero-config. |
-| Versioning                                | Auto-discovered from git tags; pin any tag/branch/SHA via `#ref` | Reproducibility without forcing maintainers to maintain a parallel version list. `latest` follows newest semver tag, falling back to default-branch HEAD. Branches and SHAs are first-class refs. |
+| Versioning                                | Default branch HEAD when unpinned; pin any tag/branch/SHA via `#ref` | Bare names always follow the default branch (typical dev workflow). Tagged releases are opt-in via explicit `#<tag>`. Avoids the surprise of `latest` skipping past commits because a tag exists. Branches and SHAs are first-class refs. |
 | Local-registry layout                     | Directory + `index.yaml`                                | Consistent with GitHub registries. Maintainer controls what's exposed. Local registries do not support refs.                                                                                |
 | Caching strategy                          | Local cache keyed by resolved commit SHA, atomic writes | Avoids per-run network. SHA-based keys make branch refs self-invalidate on a fresh fetch. SHA-pinned raw URLs bypass the CDN, so no `--force` flag is needed.                              |
 | Reference syntax                          | `name@registry#ref`                                     | Visually unambiguous: `@` selects the registry, `#` selects a git ref (tag, branch, or SHA). Both segments are independently optional.                                                       |

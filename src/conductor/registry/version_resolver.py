@@ -8,7 +8,6 @@ from conductor.registry.config import RegistryEntry, RegistryType
 from conductor.registry.errors import RegistryError
 from conductor.registry.github import (
     get_default_branch,
-    list_tags,
     parse_github_source,
     resolve_ref_to_sha,
 )
@@ -21,11 +20,14 @@ def resolve_ref(entry: RegistryEntry, requested: str | None) -> str:
     (path registries do not support refs).
 
     For github registries:
-      * If ``requested`` is None or "latest", returns the newest tag
-        (semver-sorted when possible). If no tags exist, returns the default
-        branch name.
-      * Otherwise returns ``requested`` verbatim — this allows pinning to any
-        tag, branch, or commit SHA.
+      * If ``requested`` is None or "latest", returns the default branch
+        name. The caller will materialize this to the current commit SHA,
+        so users always pick up the newest commit on the default branch.
+      * Otherwise returns ``requested`` verbatim — this allows pinning to
+        any tag, branch, or commit SHA.
+
+    Tags are no longer auto-selected as "latest"; users who want a specific
+    release should pin explicitly with ``#<tag>``.
     """
     if entry.type == RegistryType.path:
         if requested is not None and requested != "":
@@ -40,9 +42,6 @@ def resolve_ref(entry: RegistryEntry, requested: str | None) -> str:
 
     if requested is None or requested.lower() == "latest":
         owner, repo = parse_github_source(entry.source)
-        tags = list_tags(owner, repo)
-        if tags:
-            return sort_tags(tags)[0]
         return get_default_branch(owner, repo)
 
     return requested

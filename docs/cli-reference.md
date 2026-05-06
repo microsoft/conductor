@@ -273,7 +273,7 @@ of the form `<workflow>[@<registry>][#<ref>]`. `@` selects the registry;
 shell commands so `#` isn't treated as a comment.
 
 ```bash
-# Run from default registry (latest tag, or default-branch HEAD if no tags)
+# Run from default registry (default-branch HEAD)
 conductor run qa-bot
 
 # Run from a specific registry (latest)
