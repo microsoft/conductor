@@ -13,6 +13,7 @@ export function StatusBar() {
   const wsStatus = useWorkflowStore((s) => s.wsStatus);
   const workflowFailure = useWorkflowStore((s) => s.workflowFailure);
   const lastEventTime = useWorkflowStore((s) => s.lastEventTime);
+  const iterationLimitGate = useWorkflowStore((s) => s.iterationLimitGate);
   const elapsed = useElapsedTimer();
 
   // "Last activity X ago" — ticks every second while running
@@ -33,6 +34,11 @@ export function StatusBar() {
   const isFailed = workflowStatus === 'failed';
 
   const statusText = (() => {
+    if (iterationLimitGate && workflowStatus === 'running') {
+      const target = iterationLimitGate.agent_name ?? iterationLimitGate.group_name ?? 'workflow';
+      const auto = iterationLimitGate.skip_gates ? ' — auto-stopping' : ' — awaiting console input';
+      return `Iteration limit reached: ${target} ${iterationLimitGate.current_iteration}/${iterationLimitGate.max_iterations}${auto}`;
+    }
     switch (workflowStatus) {
       case 'pending':
         return 'Waiting for workflow\u2026';
@@ -56,12 +62,15 @@ export function StatusBar() {
     }
   })();
 
-  const statusDotColor = {
-    pending: 'bg-[var(--pending)]',
-    running: 'bg-[var(--running)] animate-pulse',
-    completed: 'bg-[var(--completed)]',
-    failed: 'bg-[var(--failed)]',
-  }[workflowStatus];
+  const isAwaitingIterationGate = iterationLimitGate != null && workflowStatus === 'running';
+  const statusDotColor = isAwaitingIterationGate
+    ? 'bg-[var(--waiting)] animate-pulse'
+    : ({
+        pending: 'bg-[var(--pending)]',
+        running: 'bg-[var(--running)] animate-pulse',
+        completed: 'bg-[var(--completed)]',
+        failed: 'bg-[var(--failed)]',
+      }[workflowStatus]);
 
   const wsIndicator = (() => {
     switch (wsStatus) {
@@ -102,11 +111,21 @@ export function StatusBar() {
         'flex items-center gap-4 px-4 py-1.5 border-t text-xs flex-shrink-0 transition-colors duration-300',
         isFailed
           ? 'bg-red-950/50 border-red-500/30'
-          : 'bg-[var(--surface)] border-[var(--border)]',
+          : isAwaitingIterationGate
+            ? 'bg-amber-950/30 border-amber-500/30'
+            : 'bg-[var(--surface)] border-[var(--border)]',
       )}
     >
       <span className={cn('w-2 h-2 rounded-full flex-shrink-0', statusDotColor)} />
-      <span className={cn(isFailed ? 'text-red-300' : 'text-[var(--text)]')}>
+      <span
+        className={cn(
+          isFailed
+            ? 'text-red-300'
+            : isAwaitingIterationGate
+              ? 'text-amber-200'
+              : 'text-[var(--text)]',
+        )}
+      >
         {statusText}
       </span>
       {agentsTotal > 0 && (

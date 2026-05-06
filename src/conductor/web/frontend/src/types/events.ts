@@ -42,7 +42,9 @@ export type EventType =
   | 'agent_resumed'
   | 'dialog_started'
   | 'dialog_message'
-  | 'dialog_completed';
+  | 'dialog_completed'
+  | 'iteration_limit_reached'
+  | 'iteration_limit_resolved';
 
 // --- Workflow lifecycle ---
 
@@ -322,4 +324,31 @@ export interface SubworkflowFailedData {
   parent_path?: string[];
   slot_key?: string;
   item_key?: string;
+}
+
+// --- Iteration limit gate ---
+
+export interface IterationLimitReachedData {
+  /** Agent name (when triggered before a single agent execution). */
+  agent_name?: string;
+  /** Parallel group name (when triggered before a parallel group). */
+  group_name?: string;
+  /** Number of agents in the parallel group. */
+  agent_count?: number;
+  current_iteration: number;
+  max_iterations: number;
+  /** Last few agents executed, oldest to newest. */
+  agent_history: string[];
+  /** Heuristic flag: true when the recent history is stuck on one agent. */
+  possible_loop?: boolean;
+  /** When true, the workflow will auto-stop without prompting. */
+  skip_gates?: boolean;
+}
+
+export interface IterationLimitResolvedData {
+  agent_name?: string;
+  group_name?: string;
+  /** True when the user chose to continue with more iterations. */
+  continue_execution: boolean;
+  additional_iterations: number;
 }
