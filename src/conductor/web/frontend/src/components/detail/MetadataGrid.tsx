@@ -27,6 +27,7 @@ export function MetadataGrid({ items }: MetadataGridProps) {
 export function buildAgentMetadata(nd: {
   elapsed?: number;
   model?: string;
+  reasoning_effort?: string;
   tokens?: number;
   input_tokens?: number;
   output_tokens?: number;
@@ -41,6 +42,7 @@ export function buildAgentMetadata(nd: {
 
   if (nd.elapsed != null) items.push({ label: 'Elapsed', value: formatElapsed(nd.elapsed) });
   if (nd.model) items.push({ label: 'Model', value: nd.model });
+  if (nd.reasoning_effort) items.push({ label: 'Reasoning', value: nd.reasoning_effort });
   if (nd.tokens != null) items.push({ label: 'Tokens', value: formatTokens(nd.tokens) });
   if (nd.input_tokens != null && nd.output_tokens != null) {
     items.push({ label: 'In / Out', value: `${formatTokens(nd.input_tokens)} / ${formatTokens(nd.output_tokens)}` });

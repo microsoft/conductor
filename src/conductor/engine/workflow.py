@@ -1582,6 +1582,7 @@ class WorkflowEngine:
             async with self.limits.timeout_context():
                 # Emit workflow_started before the execution loop
                 self._system_metadata = self._build_system_metadata()
+                default_effort = self.config.workflow.runtime.default_reasoning_effort
                 self._emit(
                     "workflow_started",
                     {
@@ -1593,6 +1594,11 @@ class WorkflowEngine:
                                 "name": a.name,
                                 "type": a.type or "agent",
                                 "model": a.model,
+                                "reasoning_effort": (
+                                    a.reasoning.effort
+                                    if a.reasoning is not None
+                                    else default_effort
+                                ),
                             }
                             for a in self.config.agents
                         ],

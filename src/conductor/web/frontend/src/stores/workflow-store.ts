@@ -53,6 +53,7 @@ export interface IterationSnapshot {
   output?: unknown;
   elapsed?: number;
   model?: string;
+  reasoning_effort?: string;
   tokens?: number;
   input_tokens?: number;
   output_tokens?: number;
@@ -82,6 +83,7 @@ export interface NodeData {
   type: NodeType;
   elapsed?: number;
   model?: string;
+  reasoning_effort?: string;
   // Context window tracking
   context_pct?: number;
   context_window_used?: number;
@@ -142,6 +144,7 @@ export interface WorkflowAgent {
   name: string;
   type?: string;
   model?: string;
+  reasoning_effort?: string | null;
 }
 
 export interface ParallelGroup {
@@ -936,6 +939,7 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
           const nodeType = (a.type || 'agent') as NodeType;
           ensureNode(state.nodes, a.name, nodeType);
           if (a.model) state.nodes[a.name]!.model = a.model;
+          if (a.reasoning_effort) state.nodes[a.name]!.reasoning_effort = a.reasoning_effort;
           agentNames.add(a.name);
         }
       }
@@ -983,6 +987,7 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
             const nodeType = (a.type || 'agent') as NodeType;
             ensureNode(ctx.nodes, a.name, nodeType);
             if (a.model) ctx.nodes[a.name]!.model = a.model;
+            if (a.reasoning_effort) ctx.nodes[a.name]!.reasoning_effort = a.reasoning_effort;
             agentNames.add(a.name);
           }
         }
@@ -1006,6 +1011,7 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
         output: nd.output,
         elapsed: nd.elapsed,
         model: nd.model,
+        reasoning_effort: nd.reasoning_effort,
         tokens: nd.tokens,
         input_tokens: nd.input_tokens,
         output_tokens: nd.output_tokens,
