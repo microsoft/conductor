@@ -980,3 +980,114 @@ class TestLoadInstructionFilesBom:
         result = load_instruction_files([f])
         assert "\ufeff" not in result
         assert "Agent rules." in result
+
+
+# ---------------------------------------------------------------------------
+# Coverage: _parse_frontmatter exception path
+# ---------------------------------------------------------------------------
+
+
+class TestParseFrontmatterExceptions:
+    """Locks the exception path of _parse_frontmatter (OSError on read)."""
+
+    def test_unreadable_file_returns_none(self, tmp_path: Path) -> None:
+        """When ``path.read_text`` raises (e.g., file is actually a directory),
+        the parser returns None and logs at DEBUG; never raises."""
+        from conductor.config.instructions import _parse_frontmatter
+
+        # Pass a directory path — read_text will raise an OSError (PermissionError
+        # on Windows, IsADirectoryError on POSIX). Both subclass OSError.
+        d = tmp_path / "not_a_file"
+        d.mkdir()
+        assert _parse_frontmatter(d) is None
+
+
+# ---------------------------------------------------------------------------
+# Coverage: non-recursive ConventionDirectory branch
+# ---------------------------------------------------------------------------
+
+
+class TestConventionDirectoryNonRecursive:
+    """Locks the ``recursive=False`` branch of _walk_directory_convention.
+
+    No production convention currently uses ``recursive=False``, but the
+    polymorphic shape supports it (e.g. for hypothetical Cline-style flat
+    directories like ``.clinerules/*.md``). These tests pin the behaviour
+    without waiting for a future convention to add it.
+    """
+
+    def test_non_recursive_skips_subdirectory_files(self, tmp_path: Path) -> None:
+        """With ``recursive=False``, files in subdirectories are NOT discovered."""
+        from conductor.config.instructions import (
+            ConventionDirectory,
+            _walk_directory_convention,
+        )
+
+        base = tmp_path / "rules"
+        base.mkdir()
+        (base / "top.md").write_text("top-level rule", encoding="utf-8")
+        sub = base / "lang"
+        sub.mkdir()
+        (sub / "csharp.md").write_text("nested rule", encoding="utf-8")
+
+        conv = ConventionDirectory(path="rules", pattern="*.md", recursive=False)
+        results = dict(_walk_directory_convention(base, conv))
+
+        assert "top.md" in results
+        assert "csharp.md" not in results
+        # Recursion suppressed — nested file path is not yielded
+        assert not any("lang" in k for k in results)
+
+    def test_non_recursive_applies_pattern(self, tmp_path: Path) -> None:
+        """Pattern filter applies in the non-recursive branch."""
+        from conductor.config.instructions import (
+            ConventionDirectory,
+            _walk_directory_convention,
+        )
+
+        base = tmp_path / "rules"
+        base.mkdir()
+        (base / "match.md").write_text("md", encoding="utf-8")
+        (base / "skip.txt").write_text("txt", encoding="utf-8")
+
+        conv = ConventionDirectory(path="rules", pattern="*.md", recursive=False)
+        results = dict(_walk_directory_convention(base, conv))
+
+        assert "match.md" in results
+        assert "skip.txt" not in results
+
+    def test_non_recursive_applies_include_file_predicate(self, tmp_path: Path) -> None:
+        """``include_file`` predicate applies in the non-recursive branch."""
+        from conductor.config.instructions import (
+            ConventionDirectory,
+            _walk_directory_convention,
+        )
+
+        base = tmp_path / "rules"
+        base.mkdir()
+        (base / "include.md").write_text("INCLUDE", encoding="utf-8")
+        (base / "skip.md").write_text("SKIP", encoding="utf-8")
+
+        conv = ConventionDirectory(
+            path="rules",
+            pattern="*.md",
+            recursive=False,
+            include_file=lambda p: "INCLUDE" in p.read_text(encoding="utf-8"),
+        )
+        results = dict(_walk_directory_convention(base, conv))
+
+        assert "include.md" in results
+        assert "skip.md" not in results
+
+    def test_non_recursive_missing_directory_yields_nothing(self, tmp_path: Path) -> None:
+        """If the convention directory does not exist, the walker logs at DEBUG
+        and yields nothing — never raises."""
+        from conductor.config.instructions import (
+            ConventionDirectory,
+            _walk_directory_convention,
+        )
+
+        missing = tmp_path / "does_not_exist"
+        conv = ConventionDirectory(path="rules", pattern="*.md", recursive=False)
+        # No exception; empty iterator
+        assert list(_walk_directory_convention(missing, conv)) == []
