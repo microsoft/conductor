@@ -1091,3 +1091,35 @@ class TestConventionDirectoryNonRecursive:
         conv = ConventionDirectory(path="rules", pattern="*.md", recursive=False)
         # No exception; empty iterator
         assert list(_walk_directory_convention(missing, conv)) == []
+
+    def test_non_recursive_skips_entries_whose_is_file_raises(self, tmp_path: Path) -> None:
+        """Defensive: ``entry.is_file()`` can raise OSError for broken symlinks
+        or permission errors. The walker swallows that exception and skips
+        the entry rather than crashing the whole discovery."""
+        from unittest.mock import patch
+
+        from conductor.config.instructions import (
+            ConventionDirectory,
+            _walk_directory_convention,
+        )
+
+        base = tmp_path / "rules"
+        base.mkdir()
+        (base / "good.md").write_text("ok", encoding="utf-8")
+        (base / "broken.md").write_text("ok", encoding="utf-8")
+
+        conv = ConventionDirectory(path="rules", pattern="*.md", recursive=False)
+
+        # Make is_file() raise OSError for the "broken" entry only
+        original_is_file = os.DirEntry.is_file
+
+        def patched_is_file(self, *, follow_symlinks=True):
+            if self.name == "broken.md":
+                raise OSError("simulated broken symlink")
+            return original_is_file(self, follow_symlinks=follow_symlinks)
+
+        with patch.object(os.DirEntry, "is_file", patched_is_file):
+            results = dict(_walk_directory_convention(base, conv))
+
+        assert "good.md" in results
+        assert "broken.md" not in results
