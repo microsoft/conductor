@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 import pytest
@@ -654,3 +655,328 @@ class TestBgRunnerInstructionFlags:
                 assert len(instr_indices) == 2
                 assert cmd[instr_indices[0] + 1] == "AGENTS.md"
                 assert cmd[instr_indices[1] + 1] == "CLAUDE.md"
+
+
+# ---------------------------------------------------------------------------
+# Directory-convention discovery: .github/instructions/*.instructions.md
+# ---------------------------------------------------------------------------
+
+
+def _write_with_frontmatter(
+    path: Path,
+    *,
+    apply_to: str | None = "**",
+    body: str = "Coding rules.",
+    description: str | None = None,
+    no_frontmatter: bool = False,
+    raw: str | None = None,
+    encoding: str = "utf-8",
+) -> None:
+    """Helper: write a `.instructions.md` file with the given frontmatter setup.
+
+    * ``raw`` — write bytes/string verbatim (overrides everything)
+    * ``no_frontmatter`` — write ``body`` without any ``---`` block
+    * ``apply_to=None`` — emit a frontmatter block with no ``applyTo`` key
+    * ``apply_to="<glob>"`` — emit a frontmatter block with that ``applyTo`` value
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if raw is not None:
+        path.write_text(raw, encoding=encoding)
+        return
+    if no_frontmatter:
+        path.write_text(body, encoding=encoding)
+        return
+    lines = ["---"]
+    if description is not None:
+        lines.append(f"description: '{description}'")
+    if apply_to is not None:
+        lines.append(f"applyTo: '{apply_to}'")
+    lines.append("---")
+    lines.append(body)
+    path.write_text("\n".join(lines) + "\n", encoding=encoding)
+
+
+class TestDiscoverGithubInstructionsDir:
+    """Tests for `.github/instructions/*.instructions.md` directory discovery."""
+
+    def test_discovers_always_on_file(self, tmp_path: Path) -> None:
+        (tmp_path / ".git").mkdir()
+        f = tmp_path / ".github" / "instructions" / "style.instructions.md"
+        _write_with_frontmatter(f, apply_to="**", body="Use four-space indents.")
+        result = discover_workspace_instructions(tmp_path)
+        assert any(p.name == "style.instructions.md" for p in result)
+
+    def test_skips_scoped_file(self, tmp_path: Path) -> None:
+        """`applyTo: '<other glob>'` is scoped per the docs and SHOULD NOT be loaded."""
+        (tmp_path / ".git").mkdir()
+        f = tmp_path / ".github" / "instructions" / "ts-only.instructions.md"
+        _write_with_frontmatter(f, apply_to="**/*.ts", body="TS rules.")
+        result = discover_workspace_instructions(tmp_path)
+        assert not any(p.name == "ts-only.instructions.md" for p in result)
+
+    def test_skips_no_frontmatter(self, tmp_path: Path) -> None:
+        """Files without any frontmatter are 'manual-attach' per the docs → SKIP."""
+        (tmp_path / ".git").mkdir()
+        f = tmp_path / ".github" / "instructions" / "plain.instructions.md"
+        _write_with_frontmatter(f, no_frontmatter=True, body="Plain markdown.")
+        result = discover_workspace_instructions(tmp_path)
+        assert not any(p.name == "plain.instructions.md" for p in result)
+
+    def test_skips_no_apply_to(self, tmp_path: Path) -> None:
+        """Frontmatter present but no `applyTo` key → manual-attach default → SKIP."""
+        (tmp_path / ".git").mkdir()
+        f = tmp_path / ".github" / "instructions" / "desc-only.instructions.md"
+        _write_with_frontmatter(f, apply_to=None, description="Just description")
+        result = discover_workspace_instructions(tmp_path)
+        assert not any(p.name == "desc-only.instructions.md" for p in result)
+
+    def test_recursive_subdirs(self, tmp_path: Path) -> None:
+        """Files in nested subdirectories are discovered (recursive=True default)."""
+        (tmp_path / ".git").mkdir()
+        f = tmp_path / ".github" / "instructions" / "lang" / "csharp.instructions.md"
+        _write_with_frontmatter(f, apply_to="**", body="C# rules.")
+        result = discover_workspace_instructions(tmp_path)
+        assert any(p.parent.name == "lang" and p.name == "csharp.instructions.md" for p in result)
+
+    def test_closest_wins_per_relative_path(self, tmp_path: Path) -> None:
+        """When the same relative path exists at multiple levels, closest wins."""
+        (tmp_path / ".git").mkdir()
+        # root-level instructions
+        _write_with_frontmatter(
+            tmp_path / ".github" / "instructions" / "lang" / "csharp.instructions.md",
+            apply_to="**",
+            body="ROOT_CSHARP",
+        )
+        _write_with_frontmatter(
+            tmp_path / ".github" / "instructions" / "style.instructions.md",
+            apply_to="**",
+            body="ROOT_STYLE",
+        )
+        # subproject-level overrides csharp only
+        sub = tmp_path / "subproject"
+        sub.mkdir()
+        _write_with_frontmatter(
+            sub / ".github" / "instructions" / "lang" / "csharp.instructions.md",
+            apply_to="**",
+            body="SUB_CSHARP",
+        )
+
+        result = discover_workspace_instructions(sub)
+        # Build a {rel-path-within-dir: file} map for easier assertion
+        by_rel = {}
+        for p in result:
+            # Find the .github/instructions ancestor
+            parts = p.parts
+            try:
+                idx = parts.index("instructions")
+            except ValueError:
+                continue
+            if idx >= 1 and parts[idx - 1] == ".github":
+                rel = "/".join(parts[idx + 1 :])
+                by_rel[rel] = p
+
+        # Subproject's csharp wins; root's style is loaded since no override
+        assert (
+            by_rel["lang/csharp.instructions.md"]
+            .read_text(encoding="utf-8")
+            .endswith("SUB_CSHARP\n")
+        )
+        assert by_rel["style.instructions.md"].read_text(encoding="utf-8").endswith("ROOT_STYLE\n")
+
+    def test_root_only_file_loads_when_subproject_missing(self, tmp_path: Path) -> None:
+        """When the subproject has no `.github/instructions/`, root's files load."""
+        (tmp_path / ".git").mkdir()
+        _write_with_frontmatter(
+            tmp_path / ".github" / "instructions" / "global.instructions.md",
+            apply_to="**",
+        )
+        sub = tmp_path / "subproject"
+        sub.mkdir()
+        result = discover_workspace_instructions(sub)
+        assert any(p.name == "global.instructions.md" for p in result)
+
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="Symlink creation requires elevation on Windows",
+    )
+    def test_symlinked_directory_not_traversed(self, tmp_path: Path) -> None:
+        """Symlinked directories inside `.github/instructions/` are NOT traversed.
+
+        Prevents symlink loops and out-of-tree expansion. Symlinked instruction
+        FILES are still treated as regular files (different policy)."""
+        (tmp_path / ".git").mkdir()
+        instr_dir = tmp_path / ".github" / "instructions"
+        instr_dir.mkdir(parents=True)
+        # Real file directly under the convention dir
+        _write_with_frontmatter(instr_dir / "real.instructions.md", apply_to="**")
+        # Out-of-tree directory containing a tempting file
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        _write_with_frontmatter(outside / "leak.instructions.md", apply_to="**")
+        # Symlink the outside dir into the convention dir
+        os.symlink(outside, instr_dir / "outside_link", target_is_directory=True)
+
+        result = discover_workspace_instructions(tmp_path)
+        names = [p.name for p in result]
+        assert "real.instructions.md" in names
+        assert "leak.instructions.md" not in names
+
+    def test_directory_and_file_conventions_coexist(self, tmp_path: Path) -> None:
+        """File conventions (AGENTS.md) and directory conventions both load."""
+        (tmp_path / ".git").mkdir()
+        (tmp_path / "AGENTS.md").write_text("agents content")
+        _write_with_frontmatter(
+            tmp_path / ".github" / "instructions" / "style.instructions.md",
+            apply_to="**",
+        )
+        result = discover_workspace_instructions(tmp_path)
+        names = [p.name for p in result]
+        assert "AGENTS.md" in names
+        assert "style.instructions.md" in names
+        # File conventions appear first (declaration order in CONVENTIONS).
+        assert names.index("AGENTS.md") < names.index("style.instructions.md")
+
+    def test_pattern_must_match(self, tmp_path: Path) -> None:
+        """Files in `.github/instructions/` that don't match the `*.instructions.md`
+        pattern are NOT picked up (e.g. plain `.md`)."""
+        (tmp_path / ".git").mkdir()
+        # Wrong extension: .md, not .instructions.md
+        _write_with_frontmatter(
+            tmp_path / ".github" / "instructions" / "foo.md",
+            apply_to="**",
+            body="should not load",
+        )
+        result = discover_workspace_instructions(tmp_path)
+        assert not any(p.name == "foo.md" for p in result)
+
+
+# ---------------------------------------------------------------------------
+# Frontmatter robustness: edge cases for `_is_always_on_instructions_file`
+# ---------------------------------------------------------------------------
+
+
+class TestFrontmatterRobustness:
+    """Edge cases for the YAML frontmatter parser used by the directory convention."""
+
+    def test_crlf_line_endings(self, tmp_path: Path) -> None:
+        """Windows-authored files with CRLF are still parsed correctly."""
+        (tmp_path / ".git").mkdir()
+        f = tmp_path / ".github" / "instructions" / "win.instructions.md"
+        f.parent.mkdir(parents=True)
+        f.write_bytes(b"---\r\napplyTo: '**'\r\n---\r\nWindows file.\r\n")
+        result = discover_workspace_instructions(tmp_path)
+        assert any(p.name == "win.instructions.md" for p in result)
+
+    def test_utf8_bom_handling(self, tmp_path: Path) -> None:
+        """A leading UTF-8 BOM does not break frontmatter parsing."""
+        (tmp_path / ".git").mkdir()
+        f = tmp_path / ".github" / "instructions" / "bom.instructions.md"
+        f.parent.mkdir(parents=True)
+        # BOM (\xef\xbb\xbf) followed by frontmatter
+        f.write_bytes(b"\xef\xbb\xbf---\napplyTo: '**'\n---\nBOM file.\n")
+        result = discover_workspace_instructions(tmp_path)
+        assert any(p.name == "bom.instructions.md" for p in result)
+
+    def test_malformed_yaml_skipped_with_warning(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Malformed YAML in frontmatter logs a warning and skips, not crashes."""
+        (tmp_path / ".git").mkdir()
+        f = tmp_path / ".github" / "instructions" / "bad.instructions.md"
+        f.parent.mkdir(parents=True)
+        # Invalid YAML: unclosed quote
+        f.write_text("---\napplyTo: '**\n---\nBody.\n", encoding="utf-8")
+        with caplog.at_level(logging.WARNING):
+            result = discover_workspace_instructions(tmp_path)
+        assert not any(p.name == "bad.instructions.md" for p in result)
+        assert "Failed to parse frontmatter" in caplog.text
+
+    def test_non_dict_yaml_skipped(self, tmp_path: Path) -> None:
+        """Frontmatter that parses to a non-dict (list/scalar/empty) is skipped safely."""
+        (tmp_path / ".git").mkdir()
+        # Frontmatter that parses to a YAML list (not a dict)
+        list_fm = tmp_path / ".github" / "instructions" / "list.instructions.md"
+        list_fm.parent.mkdir(parents=True)
+        list_fm.write_text("---\n- a\n- b\n---\nBody.\n", encoding="utf-8")
+        # Frontmatter that parses to an empty doc
+        empty_fm = tmp_path / ".github" / "instructions" / "empty.instructions.md"
+        empty_fm.write_text("---\n\n---\nBody.\n", encoding="utf-8")
+        # Frontmatter that parses to a scalar
+        scalar_fm = tmp_path / ".github" / "instructions" / "scalar.instructions.md"
+        scalar_fm.write_text("---\nhello\n---\nBody.\n", encoding="utf-8")
+
+        result = discover_workspace_instructions(tmp_path)
+        names = [p.name for p in result]
+        assert "list.instructions.md" not in names
+        assert "empty.instructions.md" not in names
+        assert "scalar.instructions.md" not in names
+
+    def test_closing_delimiter_at_eof(self, tmp_path: Path) -> None:
+        """Frontmatter with closing `---` at EOF (no trailing newline) parses correctly.
+
+        Some authors do not end files with a trailing newline. The tolerant
+        regex handles both `\\Z` and `\\r?\\n` after the closing delimiter.
+        """
+        (tmp_path / ".git").mkdir()
+        f = tmp_path / ".github" / "instructions" / "eof.instructions.md"
+        f.parent.mkdir(parents=True)
+        # No body, no trailing newline
+        f.write_text("---\napplyTo: '**'\n---", encoding="utf-8")
+        result = discover_workspace_instructions(tmp_path)
+        assert any(p.name == "eof.instructions.md" for p in result)
+
+
+# ---------------------------------------------------------------------------
+# Backward compatibility: CONVENTION_FILES alias
+# ---------------------------------------------------------------------------
+
+
+class TestBackwardCompat:
+    """Locks the public-import contract for downstream consumers of
+    ``CONVENTION_FILES`` predating the polymorphic refactor."""
+
+    def test_convention_files_remains_importable(self) -> None:
+        """`CONVENTION_FILES` was module-public before the refactor and must
+        keep working for any downstream code that imports it directly."""
+        from conductor.config.instructions import CONVENTION_FILES
+
+        assert CONVENTION_FILES == [
+            "AGENTS.md",
+            ".github/copilot-instructions.md",
+            "CLAUDE.md",
+        ]
+
+    def test_convention_files_projects_from_conventions(self) -> None:
+        """`CONVENTION_FILES` must reflect every `ConventionFile` entry in
+        `CONVENTIONS`, in the same order — so adding a new file convention
+        automatically updates the alias."""
+        from conductor.config.instructions import (
+            CONVENTION_FILES,
+            CONVENTIONS,
+            ConventionFile,
+        )
+
+        expected = [c.path for c in CONVENTIONS if isinstance(c, ConventionFile)]
+        assert expected == CONVENTION_FILES
+
+
+# ---------------------------------------------------------------------------
+# UTF-8 BOM handling in load_instruction_files
+# ---------------------------------------------------------------------------
+
+
+class TestLoadInstructionFilesBom:
+    """Locks BOM handling in the reader path (not just the frontmatter parser)."""
+
+    def test_bom_stripped_from_loaded_content(self, tmp_path: Path) -> None:
+        """A BOM-authored instruction file must not leak `\\ufeff` into the
+        prompt content emitted by `load_instruction_files()`.
+        """
+        from conductor.config.instructions import load_instruction_files
+
+        f = tmp_path / "AGENTS.md"
+        # BOM (\xef\xbb\xbf) followed by content
+        f.write_bytes(b"\xef\xbb\xbfAgent rules.\n")
+        result = load_instruction_files([f])
+        assert "\ufeff" not in result
+        assert "Agent rules." in result

@@ -311,9 +311,12 @@ def run(
         typer.Option(
             "--workspace-instructions",
             help=(
-                "Auto-discover workspace instruction files "
-                "(AGENTS.md, CLAUDE.md, .github/copilot-instructions.md) "
-                "and prepend them to all agent prompts."
+                "Auto-discover workspace instruction files and prepend them to "
+                "all agent prompts. Discovers AGENTS.md, CLAUDE.md, "
+                ".github/copilot-instructions.md, and "
+                ".github/instructions/**/*.instructions.md (recursive; only "
+                "files marked 'applyTo: \"**\"' in YAML frontmatter are "
+                "included)."
             ),
         ),
     ] = False,
