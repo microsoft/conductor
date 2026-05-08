@@ -554,13 +554,13 @@ class TestRunUpdateApply:
         else:
             assert "replacing" in output or "installer" in output
 
-    @pytest.mark.skipif(sys.platform != "win32", reason="Windows-specific spawn path")
     def test_spawn_installer_windows_uses_new_console_and_exits(self, cache_dir: Path) -> None:
         """On Windows, the installer is spawned with CREATE_NEW_CONSOLE and we exit 0."""
         from conductor.cli.update import _spawn_installer_and_exit
 
         c, _buf = _make_console()
         with (
+            patch("conductor.cli.update.sys.platform", "win32"),
             patch("subprocess.Popen") as mock_popen,
             pytest.raises(SystemExit) as excinfo,
         ):
@@ -571,6 +571,10 @@ class TestRunUpdateApply:
         # Must spawn detached from the current console.
         create_new_console = getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010)
         assert kwargs.get("creationflags", 0) & create_new_console
+        # Must also request job breakaway so the installer survives in
+        # CI runners and terminal hosts that kill all job members on close.
+        create_breakaway = getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000)
+        assert kwargs.get("creationflags", 0) & create_breakaway
         # Must pass AUTO_STOP so the safety check doesn't trip on our
         # about-to-die conductor process.
         assert kwargs.get("env", {}).get("CONDUCTOR_INSTALL_AUTO_STOP") == "1"
@@ -578,13 +582,57 @@ class TestRunUpdateApply:
         cmd_args = mock_popen.call_args.args[0]
         assert any("install.ps1" in str(a) for a in cmd_args)
 
-    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX-specific exec path")
+    def test_spawn_installer_windows_falls_back_when_breakaway_denied(
+        self, cache_dir: Path
+    ) -> None:
+        """If the parent's job forbids breakaway, retry without that flag."""
+        from conductor.cli.update import _spawn_installer_and_exit
+
+        c, _buf = _make_console()
+        # First call (with breakaway) raises ERROR_ACCESS_DENIED;
+        # second call (CREATE_NEW_CONSOLE only) succeeds.
+        access_denied = OSError(5, "Access is denied")
+        with (
+            patch("conductor.cli.update.sys.platform", "win32"),
+            patch("subprocess.Popen", side_effect=[access_denied, MagicMock()]) as mock_popen,
+            pytest.raises(SystemExit) as excinfo,
+        ):
+            _spawn_installer_and_exit(c)
+        assert excinfo.value.code == 0
+        # Two attempts: with breakaway, then without.
+        assert mock_popen.call_count == 2
+        first_flags = mock_popen.call_args_list[0].kwargs.get("creationflags", 0)
+        second_flags = mock_popen.call_args_list[1].kwargs.get("creationflags", 0)
+        create_breakaway = getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000)
+        create_new_console = getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010)
+        assert first_flags & create_breakaway
+        assert not (second_flags & create_breakaway)
+        assert second_flags & create_new_console
+
+    def test_spawn_installer_windows_aborts_when_all_attempts_fail(self, cache_dir: Path) -> None:
+        """If both spawn attempts fail, surface the last error and exit 1."""
+        from conductor.cli.update import _spawn_installer_and_exit
+
+        c, buf = _make_console()
+        with (
+            patch("conductor.cli.update.sys.platform", "win32"),
+            patch("subprocess.Popen", side_effect=OSError(5, "Access is denied")),
+            pytest.raises(SystemExit) as excinfo,
+        ):
+            _spawn_installer_and_exit(c)
+        assert excinfo.value.code == 1
+        # User-facing fallback hint must reference the manual install command.
+        assert "install.ps1" in buf.getvalue() or "install.sh" in buf.getvalue()
+
     def test_spawn_installer_posix_execs_sh(self, cache_dir: Path) -> None:
         """On POSIX, the installer replaces the current process via execvpe."""
         from conductor.cli.update import _spawn_installer_and_exit
 
         c, _buf = _make_console()
-        with patch("os.execvpe") as mock_exec:
+        with (
+            patch("conductor.cli.update.sys.platform", "linux"),
+            patch("os.execvpe") as mock_exec,
+        ):
             _spawn_installer_and_exit(c)
         mock_exec.assert_called_once()
         program, argv, env = mock_exec.call_args.args

@@ -333,22 +333,45 @@ def _spawn_installer_and_exit(console: Console) -> None:
             "-Command",
             ps_command,
         ]
-        # CREATE_NEW_CONSOLE = 0x00000010. Falls back to the literal value if
-        # the constant is missing (older Python).
+        # CREATE_NEW_CONSOLE gives the installer its own visible console
+        # window so the user can watch progress. CREATE_BREAKAWAY_FROM_JOB
+        # detaches the installer from any job object the parent is in,
+        # which matters in CI runners (GitHub Actions, Azure Pipelines)
+        # and some terminal hosts that kill all job members on close —
+        # without it the installer can be terminated mid-upgrade.
+        # Both fall back to literal Win32 values if Python lacks them.
         create_new_console = getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010)
-        try:
-            subprocess.Popen(
-                cmd,
-                creationflags=create_new_console,
-                close_fds=True,
-                env=env,
-            )
-        except OSError as e:
-            console.print(f"[bold red]Could not spawn installer:[/bold red] {e}")
+        create_breakaway = getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000)
+
+        # Prefer breakaway, but the parent's job may forbid it
+        # (JOB_OBJECT_LIMIT_BREAKAWAY_OK not set), in which case
+        # CreateProcess returns ERROR_ACCESS_DENIED. Fall back to
+        # plain CREATE_NEW_CONSOLE so we still spawn something.
+        flag_attempts = (create_new_console | create_breakaway, create_new_console)
+        spawned = False
+        last_error: OSError | None = None
+        for flags in flag_attempts:
+            try:
+                subprocess.Popen(
+                    cmd,
+                    creationflags=flags,
+                    close_fds=True,
+                    env=env,
+                )
+                spawned = True
+                break
+            except OSError as e:
+                last_error = e
+                continue
+
+        if not spawned:
+            assert last_error is not None
+            console.print(f"[bold red]Could not spawn installer:[/bold red] {last_error}")
             console.print(
                 f"Run this manually in a new shell:  [bold cyan]{_install_command()}[/bold cyan]"
             )
             raise SystemExit(1) from None
+
         console.print(
             "[green]Installer launched in a new console window.[/green] "
             "This conductor process will now exit so file locks release. "
