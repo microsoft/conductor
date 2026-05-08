@@ -417,7 +417,7 @@ class TestRunUpdate:
             run_update(c)
         output = buf.getvalue()
         assert "up to date" in output.lower()
-        assert get_cache_path().exists()
+        assert (cache_dir / "update-check.json").exists()
 
     def test_newer_available_prints_install_command(self, cache_dir: Path) -> None:
         c, buf = _make_console()
