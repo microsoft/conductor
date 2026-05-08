@@ -6,11 +6,15 @@ Covers:
 - ``fetch_latest_version()`` with mocked network responses
 - ``check_for_update_hint()`` with TTY/verbosity/subcommand guards
 - ``run_update()`` with mocked subprocess execution
+- ``run_update(apply=True)`` spawn-and-exit handoff to the install script
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
+import subprocess
+import sys
 from datetime import UTC, datetime, timedelta
 from io import StringIO
 from pathlib import Path
@@ -473,6 +477,122 @@ class TestRunUpdate:
             run_update(c, force=True)
 
 
+class TestRunUpdateApply:
+    """Tests for ``run_update(apply=True)`` — spawn-and-exit behavior."""
+
+    @pytest.fixture()
+    def newer_release(self, cache_dir: Path):
+        with (
+            patch(
+                "conductor.cli.update.fetch_latest_version",
+                return_value=("99.0.0", "v99.0.0", "https://example/release"),
+            ),
+            patch("conductor.cli.update.__version__", "0.1.0"),
+        ):
+            yield
+
+    def test_apply_does_not_print_paste_command(self, newer_release) -> None:
+        """With --apply we should hand off to the installer, not print a manual command."""
+        c, buf = _make_console()
+        with (
+            patch("conductor.cli.update._spawn_installer_and_exit") as mock_spawn,
+        ):
+            run_update(c, apply=True)
+        mock_spawn.assert_called_once()
+        output = buf.getvalue()
+        # The paste-this-into-a-new-shell hint should not be shown.
+        assert "new shell" not in output.lower()
+
+    def test_apply_skipped_when_already_up_to_date(self, cache_dir: Path) -> None:
+        """If we're already on the latest version, --apply should be a no-op."""
+        c, _buf = _make_console()
+        with (
+            patch(
+                "conductor.cli.update.fetch_latest_version",
+                return_value=("0.1.0", "v0.1.0", "https://example/"),
+            ),
+            patch("conductor.cli.update.__version__", "0.1.0"),
+            patch("conductor.cli.update._spawn_installer_and_exit") as mock_spawn,
+        ):
+            run_update(c, apply=True)
+        mock_spawn.assert_not_called()
+
+    def test_apply_skipped_when_fetch_fails(self, cache_dir: Path) -> None:
+        """If we can't reach GitHub, --apply must not blindly run the installer."""
+        c, _buf = _make_console()
+        with (
+            patch("conductor.cli.update.fetch_latest_version", return_value=None),
+            patch("conductor.cli.update._spawn_installer_and_exit") as mock_spawn,
+        ):
+            run_update(c, apply=True)
+        mock_spawn.assert_not_called()
+
+    def test_apply_mentions_new_console_or_replace_in_output(self, newer_release) -> None:
+        """The handoff message should describe what is about to happen."""
+        c, buf = _make_console()
+
+        # Make _spawn_installer_and_exit do its real Rich printing but
+        # short-circuit before the actual subprocess call.
+        def fake_spawn(console):
+            if sys.platform == "win32":
+                console.print(
+                    "Installer launched in a new console window. "
+                    "This conductor process will now exit so file locks release."
+                )
+                raise SystemExit(0)
+            console.print("Replacing conductor with installer…")
+
+        with (
+            patch("conductor.cli.update._spawn_installer_and_exit", side_effect=fake_spawn),
+            contextlib.suppress(SystemExit),
+        ):
+            run_update(c, apply=True)
+        output = buf.getvalue().lower()
+        if sys.platform == "win32":
+            assert "new console" in output or "exit" in output
+        else:
+            assert "replacing" in output or "installer" in output
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="Windows-specific spawn path")
+    def test_spawn_installer_windows_uses_new_console_and_exits(self, cache_dir: Path) -> None:
+        """On Windows, the installer is spawned with CREATE_NEW_CONSOLE and we exit 0."""
+        from conductor.cli.update import _spawn_installer_and_exit
+
+        c, _buf = _make_console()
+        with (
+            patch("subprocess.Popen") as mock_popen,
+            pytest.raises(SystemExit) as excinfo,
+        ):
+            _spawn_installer_and_exit(c)
+        assert excinfo.value.code == 0
+        mock_popen.assert_called_once()
+        kwargs = mock_popen.call_args.kwargs
+        # Must spawn detached from the current console.
+        create_new_console = getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010)
+        assert kwargs.get("creationflags", 0) & create_new_console
+        # Must pass AUTO_STOP so the safety check doesn't trip on our
+        # about-to-die conductor process.
+        assert kwargs.get("env", {}).get("CONDUCTOR_INSTALL_AUTO_STOP") == "1"
+        # And the command must actually be the install one-liner.
+        cmd_args = mock_popen.call_args.args[0]
+        assert any("install.ps1" in str(a) for a in cmd_args)
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX-specific exec path")
+    def test_spawn_installer_posix_execs_sh(self, cache_dir: Path) -> None:
+        """On POSIX, the installer replaces the current process via execvpe."""
+        from conductor.cli.update import _spawn_installer_and_exit
+
+        c, _buf = _make_console()
+        with patch("os.execvpe") as mock_exec:
+            _spawn_installer_and_exit(c)
+        mock_exec.assert_called_once()
+        program, argv, env = mock_exec.call_args.args
+        assert program == "sh"
+        assert argv[0] == "sh" and argv[1] == "-c"
+        assert "install.sh" in argv[2]
+        assert env.get("CONDUCTOR_INSTALL_AUTO_STOP") == "1"
+
+
 # ===================================================================
 # E3-T3: CLI-level tests
 # ===================================================================
@@ -489,6 +609,21 @@ class TestUpdateCommand:
             result = runner.invoke(app, ["update"])
         assert result.exit_code == 0
         mock_run.assert_called_once()
+
+    def test_update_apply_flag_passes_through(self, cache_dir: Path) -> None:
+        """``conductor update --apply`` must forward ``apply=True``."""
+        with patch("conductor.cli.update.run_update") as mock_run:
+            result = runner.invoke(app, ["update", "--apply"])
+        assert result.exit_code == 0
+        mock_run.assert_called_once()
+        kwargs = mock_run.call_args.kwargs
+        assert kwargs.get("apply") is True
+
+    def test_update_apply_flag_visible_in_help(self) -> None:
+        """``--apply`` should be discoverable from ``conductor update --help``."""
+        result = runner.invoke(app, ["update", "--help"])
+        assert result.exit_code == 0
+        assert "--apply" in result.output
 
     def test_update_command_visible_in_help(self) -> None:
         """``update`` should appear in ``conductor --help``."""

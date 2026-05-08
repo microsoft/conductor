@@ -1173,26 +1173,34 @@ def update(
     force: bool = typer.Option(
         False,
         "--force",
-        help="Skip the running-process check and attempt the upgrade anyway.",
+        help="Accepted for backward compatibility; currently a no-op.",
+    ),
+    apply: bool = typer.Option(
+        False,
+        "--apply",
+        help=(
+            "Launch the install script automatically. Conductor will exit so "
+            "file locks release; on Windows the installer opens in a new "
+            "console window."
+        ),
     ),
 ) -> None:
     """Check for and install the latest version of Conductor.
 
-    Fetches the latest release from GitHub and upgrades using
-    ``uv tool install --locked --force git+https://github.com/microsoft/conductor.git@v{version}``.
-
-    Detects other running Conductor processes (especially important on Windows
-    where they hold file locks) and aborts unless ``--force`` is passed.
+    By default, prints the OS-appropriate one-liner you can paste into a
+    fresh shell. With ``--apply``, spawns the install script as a fully
+    detached process and exits the current ``conductor`` so its file locks
+    release — required for upgrade-while-running to succeed on Windows.
 
     \b
     Examples:
-        conductor update
-        conductor update --force
+        conductor update           # check + print install command
+        conductor update --apply   # check + launch installer, then exit
     """
     from conductor.cli.update import run_update
 
     try:
-        run_update(console, force=force)
+        run_update(console, force=force, apply=apply)
     except Exception as e:
         print_error(e)
         raise typer.Exit(code=1) from None

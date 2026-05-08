@@ -4,7 +4,9 @@ This module provides:
 - Cache-based update checking against the GitHub Releases API
 - Semantic version comparison (including pre-release detection)
 - A one-line Rich hint when a newer version is available
-- A ``run_update()`` function that self-upgrades via ``uv tool install``
+- A ``run_update()`` function that prints the install-script command, or with
+  ``apply=True`` spawns the install script as a fully detached process and
+  exits the current ``conductor`` so it releases its file locks
 
 The cache file lives at ``~/.conductor/update-check.json`` and is refreshed
 every 24 hours.  Network requests use a 2-second timeout and fail silently
@@ -15,6 +17,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -33,6 +37,11 @@ _API_URL = "https://api.github.com/repos/microsoft/conductor/releases/latest"
 _FETCH_TIMEOUT_SECONDS = 2
 _REPO_GIT_URL = "https://github.com/microsoft/conductor.git"
 _RELEASE_DL_URL = "https://github.com/microsoft/conductor/releases/download"
+
+# Install-script entry points. Kept as module-level constants so a future
+# redirect change is a one-line edit.
+_INSTALL_PS1_URL = "https://aka.ms/conductor/install.ps1"
+_INSTALL_SH_URL = "https://aka.ms/conductor/install.sh"
 
 # Retry settings for `uv tool install` — mirrors install.ps1
 _INSTALL_MAX_ATTEMPTS = 3
@@ -287,23 +296,100 @@ def _install_command() -> str:
     operation fundamentally impossible from within the running process.
     """
     if sys.platform == "win32":
-        return "irm https://aka.ms/conductor/install.ps1 | iex"
-    return "curl -sSfL https://aka.ms/conductor/install.sh | sh"
+        return f"irm {_INSTALL_PS1_URL} | iex"
+    return f"curl -sSfL {_INSTALL_SH_URL} | sh"
 
 
-def run_update(console: Console, force: bool = False) -> None:
-    """Check for a newer release and tell the user how to install it.
+def _spawn_installer_and_exit(console: Console) -> None:
+    """Spawn the install script detached from this process, then exit.
 
-    This used to perform the upgrade in-process via ``uv tool install``, but
-    that repeatedly hit ``Access is denied`` on Windows because the running
-    Python interpreter (and its loaded DLLs) sit inside the venv that uv
-    tries to recreate. The install script runs from a non-conductor shell
-    and therefore does not hold those locks.
+    The current ``conductor`` process holds locks on the venv that the
+    install script needs to recreate. Spawning the installer and exiting
+    immediately gives the OS a chance to release those locks before
+    ``uv tool install`` tries to delete the directory.
+
+    On Windows the installer runs in a *new console window* (so the user
+    can watch progress) and the current process exits with code 0.
+
+    On POSIX the current process is replaced via :func:`os.execvp` so the
+    installer inherits this terminal directly.
+
+    The installer is invoked with ``CONDUCTOR_INSTALL_AUTO_STOP=1`` so any
+    leftover conductor processes (including the brief race window during
+    our exit) are reaped without blocking on a prompt.
+
+    This function does not return; it raises ``SystemExit`` (Windows) or
+    replaces the process (POSIX).
+    """
+    env = {**os.environ, "CONDUCTOR_INSTALL_AUTO_STOP": "1"}
+
+    if sys.platform == "win32":
+        ps_command = f"irm {_INSTALL_PS1_URL} | iex"
+        cmd = [
+            "powershell.exe",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            ps_command,
+        ]
+        # CREATE_NEW_CONSOLE = 0x00000010. Falls back to the literal value if
+        # the constant is missing (older Python).
+        create_new_console = getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010)
+        try:
+            subprocess.Popen(
+                cmd,
+                creationflags=create_new_console,
+                close_fds=True,
+                env=env,
+            )
+        except OSError as e:
+            console.print(f"[bold red]Could not spawn installer:[/bold red] {e}")
+            console.print(
+                f"Run this manually in a new shell:  [bold cyan]{_install_command()}[/bold cyan]"
+            )
+            raise SystemExit(1) from None
+        console.print(
+            "[green]Installer launched in a new console window.[/green] "
+            "This conductor process will now exit so file locks release. "
+            "Watch the new window for progress."
+        )
+        # Exit immediately so the venv we live in becomes deletable.
+        raise SystemExit(0)
+
+    # POSIX: no file-lock issue. Replace ourselves with the install script
+    # so its output streams directly to this terminal.
+    sh_command = f"curl -sSfL {_INSTALL_SH_URL} | sh"
+    console.print(
+        "[green]Replacing conductor with installer…[/green] (install script output follows)"
+    )
+    # os.execvpe replaces the current process image, so we need to flush
+    # any buffered Rich output first.
+    console.file.flush()
+    try:
+        os.execvpe("sh", ["sh", "-c", sh_command], env)
+    except OSError as e:
+        console.print(f"[bold red]Could not exec installer:[/bold red] {e}")
+        console.print(f"Run this manually:  [bold cyan]{_install_command()}[/bold cyan]")
+        raise SystemExit(1) from None
+
+
+def run_update(console: Console, force: bool = False, apply: bool = False) -> None:
+    """Check for a newer release and either print or run the install command.
+
+    By default, this prints the OS-appropriate install-script one-liner so
+    the user can paste it into a fresh shell. With ``apply=True`` the script
+    is spawned as a fully detached process and the current ``conductor``
+    process exits immediately so its file locks release — this avoids the
+    "Access is denied" failure that in-process self-upgrade hits on Windows.
 
     Args:
         console: Rich console for output.
         force: Accepted for backward compatibility; currently unused
             (the install script handles its own safety checks).
+        apply: If True, spawn the installer and exit instead of printing
+            the command. The installer runs in a new console window on
+            Windows and replaces the current process on POSIX.
     """
     del force  # accepted for backward compatibility; ignored
 
@@ -323,13 +409,23 @@ def run_update(console: Console, force: bool = False) -> None:
         write_cache(version, _tag_name, _url)
         return
 
-    cmd = _install_command()
     console.print(f"[bold]Conductor v{version}[/bold] is available (you have v{current}).")
     console.print()
+
+    if apply:
+        # Hand off to the installer and exit; this call does not return.
+        _spawn_installer_and_exit(console)
+        return  # pragma: no cover - _spawn_installer_and_exit never returns
+
+    cmd = _install_command()
     console.print("To upgrade, run this in a [bold]new shell[/bold] (not inside conductor):")
     console.print()
     console.print(f"  [bold cyan]{cmd}[/bold cyan]")
     console.print()
+    console.print(
+        "[dim]Or re-run with [bold]--apply[/bold] to launch the installer "
+        "automatically (conductor will exit so file locks release).[/dim]"
+    )
     console.print(
         "[dim]The install script handles file-lock safety, retries, and "
         "post-install verification. It is the single supported upgrade path "

@@ -63,6 +63,14 @@ curl -sSfL https://aka.ms/conductor/install.sh | sh
 irm https://aka.ms/conductor/install.ps1 | iex
 ```
 
+Or skip the copy-paste with `--apply`:
+
+```bash
+conductor update --apply
+```
+
+`--apply` launches the install script automatically — on Windows it opens in a new console window so you can watch progress; on macOS/Linux it replaces the current process. Either way, the running `conductor` exits before the installer touches the venv, so file locks release cleanly.
+
 The install script handles file-lock safety (process detection, stale-file cleanup, and on Windows a rename-fallback when the venv directory can't be removed), retries with backoff, and verifies the installed version after install. If your shell ever gets into a bad state from a failed update, re-running the install script is always the right next step.
 
 ### Manual Install
