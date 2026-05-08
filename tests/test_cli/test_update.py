@@ -21,6 +21,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+import typer
 from rich.console import Console
 from typer.testing import CliRunner
 
@@ -620,10 +621,18 @@ class TestUpdateCommand:
         assert kwargs.get("apply") is True
 
     def test_update_apply_flag_visible_in_help(self) -> None:
-        """``--apply`` should be discoverable from ``conductor update --help``."""
-        result = runner.invoke(app, ["update", "--help"])
-        assert result.exit_code == 0
-        assert "--apply" in result.output
+        """``--apply`` should be a registered option on ``conductor update``.
+
+        We don't check the ``--help`` rendering directly because Rich's
+        narrow-terminal output in CI wraps the option name column in ways
+        that break naive substring search; introspecting the click command
+        is robust to that.
+        """
+        # Find the click command Typer registered for ``update``.
+        click_app = typer.main.get_command(app)
+        update_cmd = click_app.commands["update"]
+        param_names = {opt for p in update_cmd.params for opt in getattr(p, "opts", [])}
+        assert "--apply" in param_names
 
     def test_update_command_visible_in_help(self) -> None:
         """``update`` should appear in ``conductor --help``."""
