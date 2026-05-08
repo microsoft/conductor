@@ -176,7 +176,7 @@ def run_install_script(
     sandbox: Sandbox,
     *,
     source: Path | str,
-    yes: bool = True,
+    auto_stop: bool = True,
     force: bool = False,
     extra_env: dict | None = None,
     timeout: int = 600,
@@ -184,7 +184,8 @@ def run_install_script(
     """Drive install.ps1 (Windows) or install.sh (POSIX) against the sandbox.
 
     Always passes the source via ``--source`` / ``-Source`` and runs in
-    ``--yes`` mode unless overridden.
+    ``--auto-stop`` mode unless overridden so any conductor process the test
+    leaves behind gets reaped automatically.
     """
     extra_env = dict(extra_env or {})
     # Optional belt-and-braces: tests can opt-out of `uv tool update-shell`
@@ -204,14 +205,14 @@ def run_install_script(
             "-Source",
             str(source),
         ]
-        if yes:
-            cmd.append("-Yes")
+        if auto_stop:
+            cmd.append("-AutoStop")
         if force:
             cmd.append("-Force")
     else:
         cmd = ["sh", str(INSTALL_SH), "--source", str(source)]
-        if yes:
-            cmd.append("--yes")
+        if auto_stop:
+            cmd.append("--auto-stop")
         if force:
             cmd.append("--force")
 

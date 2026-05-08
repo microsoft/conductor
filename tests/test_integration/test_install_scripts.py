@@ -157,16 +157,15 @@ def test_upgrade_with_running_process_uses_rename_fallback(
     assert version == "0.0.2", f"expected 0.0.2, got {version!r}\n{result.combined}"
 
 
-def test_running_process_safety_check_aborts_without_force(
-    sandbox: Sandbox, wheels: WheelPair
-) -> None:
-    """Without ``-Force``, the script must abort when conductor.exe is running.
+def test_running_process_auto_stop_kills_and_continues(sandbox: Sandbox, wheels: WheelPair) -> None:
+    """``--auto-stop`` must stop other conductor processes and proceed.
 
     Spawns the real ``conductor.exe`` (not python.exe) so it shows up under
     ``Get-CimInstance Win32_Process -Filter "Name = 'conductor.exe'"``.
     Uses ``conductor run`` with a workflow containing an unconditional human
-    gate so the process hangs on stdin; with ``-Yes`` the install script
-    detects the running process, kills it, and proceeds.
+    gate so the process hangs on stdin; with ``--auto-stop`` (and no
+    ``--force``) the install script detects the running process, stops it,
+    and proceeds to a successful install.
     """
     if not IS_WINDOWS:
         pytest.skip("running-process detection only wired for Windows in this test")
@@ -195,9 +194,10 @@ def test_running_process_safety_check_aborts_without_force(
     )
     try:
         time.sleep(3.0)  # let it boot and reach the gate
-        # With -Yes (and no -Force), the install script kills the running
-        # conductor and proceeds. Verify the install ultimately succeeds.
-        result = run_install_script(sandbox, source=wheels.new, force=False, yes=True)
+        # With --auto-stop (and no --force), the install script kills the
+        # running conductor and proceeds. Verify the install ultimately
+        # succeeds.
+        result = run_install_script(sandbox, source=wheels.new, force=False, auto_stop=True)
     finally:
         _kill(proc)
 

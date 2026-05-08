@@ -12,10 +12,12 @@
 #   --source <path-or-url>    OR   $CONDUCTOR_INSTALL_SOURCE
 #       Install from this source (wheel path, directory, or git+ URL) instead
 #       of the latest GitHub release. Skips constraints download.
-#   --yes                     OR   $CONDUCTOR_INSTALL_YES=1
-#       Non-interactive mode.
+#   --auto-stop               OR   $CONDUCTOR_INSTALL_AUTO_STOP=1
+#       If other conductor processes are running, stop them and continue
+#       without prompting. Without this flag, the script prompts when a TTY
+#       is available, or aborts when running non-interactively.
 #   --force                   OR   $CONDUCTOR_INSTALL_FORCE=1
-#       Skip the running-process check.
+#       Skip the running-process check entirely.
 
 set -eu
 
@@ -28,14 +30,14 @@ GITHUB_DL="https://github.com/${REPO}/releases/download"
 # ---------------------------------------------------------------------------
 
 SOURCE="${CONDUCTOR_INSTALL_SOURCE:-}"
-YES="${CONDUCTOR_INSTALL_YES:-0}"
+AUTO_STOP="${CONDUCTOR_INSTALL_AUTO_STOP:-0}"
 FORCE_FLAG="${CONDUCTOR_INSTALL_FORCE:-0}"
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --source)        SOURCE="$2"; shift 2 ;;
         --source=*)      SOURCE="${1#--source=}"; shift ;;
-        --yes|-y)        YES=1; shift ;;
+        --auto-stop)     AUTO_STOP=1; shift ;;
         --force)         FORCE_FLAG=1; shift ;;
         *) shift ;;
     esac
@@ -240,17 +242,35 @@ main() {
                 printf '    • %s\n' "$line"
             done
             printf '\n  These can hold file locks that may cause the upgrade to fail.\n'
-            printf "  Stop them ('conductor stop --all' for background dashboards)\n"
-            printf "  or re-run with --force to skip this check.\n\n"
-            if [ "$YES" != "1" ]; then
-                printf '  Continue anyway? [y/N] '
+            printf "  Stop them ('conductor stop --all' for background dashboards),\n"
+            printf "  re-run with --auto-stop to stop them automatically,\n"
+            printf "  or re-run with --force to skip this check entirely.\n\n"
+
+            should_stop=0
+            if [ "$AUTO_STOP" = "1" ]; then
+                should_stop=1
+            elif [ ! -t 0 ] || [ ! -r /dev/tty ]; then
+                # No TTY (curl | sh from a script, CI pipe, etc.) — refuse to guess.
+                error "Aborted (other Conductor processes running; re-run with --auto-stop to stop them, or --force to skip the check)."
+            else
+                printf '  Stop them now and continue? [y/N] '
                 read -r ans </dev/tty || ans=''
                 case "$ans" in
-                    y|Y|yes|YES) ;;
+                    y|Y|yes|YES) should_stop=1 ;;
                     *) error "Aborted." ;;
                 esac
-            else
-                error "Aborted (other Conductor processes running; re-run with --force to override)."
+            fi
+
+            if [ "$should_stop" = "1" ]; then
+                printf '%s\n' "$running" | while IFS= read -r line; do
+                    pid=$(printf '%s' "$line" | awk '{print $1}')
+                    if kill "$pid" 2>/dev/null; then
+                        success "Stopped PID ${pid}"
+                    else
+                        warn "Could not stop PID ${pid}"
+                    fi
+                done
+                sleep 1
             fi
         fi
     fi

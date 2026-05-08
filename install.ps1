@@ -8,7 +8,8 @@
 #   4. Installs Conductor via uv tool install with pinned dependencies
 #
 # Robustness features for upgrade-over-existing-install:
-#   - Detects other running conductor processes and aborts unless -Yes
+#   - Detects other running conductor processes; with -AutoStop kills them and
+#     continues, otherwise prompts (or aborts if no TTY)
 #   - Sweeps stale *.exe.old files left by previous failed updates
 #   - Retries with backoff (2s, 5s, 10s) to absorb Defender / file-lock blips
 #   - Rename-fallback: if uv can't remove the Scripts dir because of locks,
@@ -19,16 +20,17 @@
 #   -Source <path-or-url>     OR   $env:CONDUCTOR_INSTALL_SOURCE
 #       Install from this source (wheel path, directory, or git+ URL) instead
 #       of the latest GitHub release. Skips constraints download.
-#   -Yes                      OR   $env:CONDUCTOR_INSTALL_YES = '1'
-#       Non-interactive mode. Don't prompt; abort on any safety-check failure
-#       (use --Force to ignore safety checks).
+#   -AutoStop                 OR   $env:CONDUCTOR_INSTALL_AUTO_STOP = '1'
+#       If other conductor.exe processes are running, stop them and continue
+#       without prompting. Without this flag, the script prompts when a TTY is
+#       available, or aborts when running non-interactively.
 #   -Force                    OR   $env:CONDUCTOR_INSTALL_FORCE = '1'
-#       Skip the running-process check.
+#       Skip the running-process check entirely.
 
 [CmdletBinding()]
 param(
     [string]$Source,
-    [switch]$Yes,
+    [switch]$AutoStop,
     [switch]$Force
 )
 
@@ -39,9 +41,9 @@ $GitHubApi = "https://api.github.com/repos/$Repo/releases/latest"
 $GitHubDL  = "https://github.com/$Repo/releases/download"
 
 # Env-var fallbacks so the script works under `irm | iex` (no real params)
-if (-not $Source -and $env:CONDUCTOR_INSTALL_SOURCE) { $Source = $env:CONDUCTOR_INSTALL_SOURCE }
-if (-not $Yes    -and $env:CONDUCTOR_INSTALL_YES   -eq '1') { $Yes   = $true }
-if (-not $Force  -and $env:CONDUCTOR_INSTALL_FORCE -eq '1') { $Force = $true }
+if (-not $Source   -and $env:CONDUCTOR_INSTALL_SOURCE)               { $Source   = $env:CONDUCTOR_INSTALL_SOURCE }
+if (-not $AutoStop -and $env:CONDUCTOR_INSTALL_AUTO_STOP -eq '1')    { $AutoStop = $true }
+if (-not $Force    -and $env:CONDUCTOR_INSTALL_FORCE     -eq '1')    { $Force    = $true }
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -100,9 +102,9 @@ function Get-RunningConductorProcesses {
         foreach ($p in $procs) {
             if ($excluded.ContainsKey([int]$p.ProcessId)) { continue }
             $results += [pscustomobject]@{
-                Pid  = [int]$p.ProcessId
-                Name = $p.Name
-                Path = $p.ExecutablePath
+                ProcessId = [int]$p.ProcessId
+                Name      = $p.Name
+                Path      = $p.ExecutablePath
             }
         }
     } catch { }
@@ -280,29 +282,40 @@ if (-not $Force) {
         Write-Warn "Other Conductor processes are running:"
         foreach ($r in $running) {
             $pathOrName = if ($r.Path) { $r.Path } else { $r.Name }
-            Write-Host ("    • PID {0}: {1}" -f $r.Pid, $pathOrName)
+            Write-Host ("    • PID {0}: {1}" -f $r.ProcessId, $pathOrName)
         }
         Write-Host ""
         Write-Host "  These can hold file locks that cause the upgrade to fail."
         Write-Host "  Stop them (e.g. 'conductor stop --all' for background dashboards),"
-        Write-Host "  or re-run with -Force to skip this check."
+        Write-Host "  re-run with -AutoStop to stop them automatically,"
+        Write-Host "  or re-run with -Force to skip this check entirely."
         Write-Host ""
-        if (-not $Yes) {
+
+        $shouldStop = $false
+        if ($AutoStop) {
+            $shouldStop = $true
+        } elseif ([Console]::IsInputRedirected -or -not $Host.UI.RawUI) {
+            # No TTY (irm | iex from a script, CI pipe, etc.) — refuse to guess.
+            Write-Err "Aborted (other Conductor processes running; re-run with -AutoStop to stop them, or -Force to skip the check)."
+        } else {
             $resp = Read-Host "  Stop them now and continue? [y/N]"
-            if ($resp -notmatch '^(y|yes)$') {
+            if ($resp -match '^(y|yes)$') {
+                $shouldStop = $true
+            } else {
                 Write-Err "Aborted."
             }
+        }
+
+        if ($shouldStop) {
             foreach ($r in $running) {
                 try {
-                    Stop-Process -Id $r.Pid -Force -ErrorAction Stop
-                    Write-Ok "Stopped PID $($r.Pid)"
+                    Stop-Process -Id $r.ProcessId -Force -ErrorAction Stop
+                    Write-Ok "Stopped PID $($r.ProcessId)"
                 } catch {
-                    Write-Warn "Could not stop PID $($r.Pid): $($_.Exception.Message)"
+                    Write-Warn "Could not stop PID $($r.ProcessId): $($_.Exception.Message)"
                 }
             }
             Start-Sleep -Seconds 1
-        } else {
-            Write-Err "Aborted (other Conductor processes running; re-run with -Force to override)."
         }
     }
 }
