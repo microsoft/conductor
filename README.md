@@ -73,6 +73,8 @@ conductor update --apply
 
 The install script handles file-lock safety (process detection, stale-file cleanup, and on Windows a rename-fallback when the venv directory can't be removed), retries with backoff, and verifies the installed version after install. If your shell ever gets into a bad state from a failed update, re-running the install script is always the right next step.
 
+Conductor periodically checks GitHub for newer releases (cached for 24 hours under `~/.conductor/update-check.json`) and prints a one-line hint when one is available. To silence the hint permanently — for example when you manage upgrades through a package manager or company-mirrored install — set `CONDUCTOR_NO_UPDATE_CHECK=1` in your shell environment. The check is also skipped automatically for non-TTY invocations, `--silent` mode, the `update` subcommand, and `--help` / `--version`.
+
 ### Manual Install
 
 ```bash

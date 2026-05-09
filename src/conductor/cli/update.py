@@ -208,6 +208,10 @@ def fetch_latest_version() -> tuple[str, str, str] | None:
 # ---------------------------------------------------------------------------
 
 
+_DISABLE_ENV_VAR = "CONDUCTOR_NO_UPDATE_CHECK"
+_HINT_SKIP_FLAGS = frozenset({"--help", "-h", "--version", "-v"})
+
+
 def check_for_update_hint(console: Console) -> None:
     """Print a one-line update hint if a newer version is available.
 
@@ -215,6 +219,13 @@ def check_for_update_hint(console: Console) -> None:
     - stderr is not a TTY
     - The CLI is in ``SILENT`` mode
     - The invoked subcommand is ``update``
+    - ``--help`` / ``-h`` / ``--version`` / ``-v`` was passed (these
+      already produce focused output the user came for; a hint would be
+      noise)
+    - The ``CONDUCTOR_NO_UPDATE_CHECK`` environment variable is set to a
+      truthy value (``1``, ``true``, ``yes``, case-insensitive). Useful
+      for users who manage upgrades through a package manager and want
+      to silence the nudge permanently.
 
     Cache is read first; if the cache is stale or missing, a network fetch
     is performed and the result is cached.
@@ -222,6 +233,10 @@ def check_for_update_hint(console: Console) -> None:
     Args:
         console: The Rich console (stderr) used for output.
     """
+    # Guard: explicit opt-out via env var
+    if _update_check_disabled():
+        return
+
     # Guard: non-TTY
     if not console.is_terminal:
         return
@@ -232,8 +247,8 @@ def check_for_update_hint(console: Console) -> None:
     if console_verbosity.get() == ConsoleVerbosity.SILENT:
         return
 
-    # Guard: 'update' subcommand
-    if _is_update_subcommand():
+    # Guard: 'update' subcommand or --help/--version
+    if _is_update_subcommand() or _is_help_or_version_invocation():
         return
 
     # Try cache first
@@ -256,6 +271,12 @@ def check_for_update_hint(console: Console) -> None:
         _print_hint(console, version)
 
 
+def _update_check_disabled() -> bool:
+    """Return ``True`` if the user opted out of update checks via env var."""
+    val = os.environ.get(_DISABLE_ENV_VAR, "").strip().lower()
+    return val in {"1", "true", "yes"}
+
+
 def _is_update_subcommand() -> bool:
     """Return ``True`` if the CLI was invoked with the ``update`` subcommand."""
     args = sys.argv[1:]
@@ -264,6 +285,15 @@ def _is_update_subcommand() -> bool:
         if not arg.startswith("-"):
             return arg == "update"
     return False
+
+
+def _is_help_or_version_invocation() -> bool:
+    """Return ``True`` if any ``--help`` / ``--version`` style flag is present.
+
+    These invocations already produce the focused output the user requested;
+    sneaking an upgrade hint above (or below) it would obscure the answer.
+    """
+    return any(arg in _HINT_SKIP_FLAGS for arg in sys.argv[1:])
 
 
 def _print_hint(console: Console, remote_version: str) -> None:
@@ -276,7 +306,8 @@ def _print_hint(console: Console, remote_version: str) -> None:
     console.print(
         f"💡 Conductor v{remote_version} available "
         f"(you have v{__version__}). "
-        f"Run [bold]'conductor update'[/bold] to upgrade.",
+        f"Run [bold]'conductor update'[/bold] to see how, "
+        f"or [bold]'conductor update --apply'[/bold] to upgrade in one step.",
         style="yellow",
     )
 

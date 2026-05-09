@@ -69,7 +69,7 @@ make validate-examples    # validate all examples
   - `run.py` - Workflow execution command with verbose logging helpers
   - `bg_runner.py` - Background process forking for `--web-bg` mode
   - `pid.py` - PID file utilities for tracking/stopping background processes
-  - `update.py` - Update check and version comparison. Upgrades are delegated to the install script (`install.ps1`/`install.sh`); in-process self-upgrade was removed because on Windows the running Python interpreter sits inside the venv `uv tool install --force` is trying to recreate, which fails with "Access is denied". `conductor update` prints the OS-appropriate install-script one-liner; `conductor update --apply` spawns the installer detached (Windows: new console window; POSIX: `os.execvpe` replace) and exits the current process so file locks release.
+  - `update.py` - Update check and version comparison. Upgrades are delegated to the install script (`install.ps1`/`install.sh`); in-process self-upgrade was removed because on Windows the running Python interpreter sits inside the venv `uv tool install --force` is trying to recreate, which fails with "Access is denied". `conductor update` prints the OS-appropriate install-script one-liner; `conductor update --apply` spawns the installer detached (Windows: new console window; POSIX: `os.execvpe` replace) and exits the current process so file locks release. The startup hint is suppressed by `CONDUCTOR_NO_UPDATE_CHECK=1`, `--silent`, `--help`/`--version`, and the `update` subcommand itself.
 
 - **config/**: YAML loading and Pydantic schema validation
   - `schema.py` - Pydantic models for all workflow YAML structures (WorkflowConfig, AgentDef, ParallelGroup, ForEachDef, etc.)

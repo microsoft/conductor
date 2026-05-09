@@ -401,6 +401,125 @@ class TestCheckForUpdateHint:
         output = buf.getvalue()
         assert "99.0.0" in output
 
+    def test_hint_mentions_apply_for_one_step_upgrade(self, cache_dir: Path) -> None:
+        """The hint should advertise both `update` and `update --apply`."""
+        now = datetime.now(UTC)
+        (cache_dir / "update-check.json").write_text(
+            json.dumps(
+                {
+                    "version": "99.0.0",
+                    "tag_name": "v99.0.0",
+                    "url": "https://example.com",
+                    "checked_at": now.isoformat(),
+                }
+            )
+        )
+
+        c, buf = _make_console(is_terminal=True)
+        with (
+            patch("conductor.cli.update.sys.argv", ["conductor", "run", "wf.yaml"]),
+            patch("conductor.cli.app.console_verbosity") as mock_cv,
+        ):
+            from conductor.cli.app import ConsoleVerbosity
+
+            mock_cv.get.return_value = ConsoleVerbosity.FULL
+            check_for_update_hint(c)
+
+        output = buf.getvalue()
+        assert "conductor update" in output
+        assert "--apply" in output
+
+    @pytest.mark.parametrize("flag", ["--help", "-h", "--version", "-v"])
+    def test_help_or_version_flag_skips_hint(self, cache_dir: Path, flag: str) -> None:
+        """The hint must not pollute --help / --version output."""
+        now = datetime.now(UTC)
+        (cache_dir / "update-check.json").write_text(
+            json.dumps(
+                {
+                    "version": "99.0.0",
+                    "tag_name": "v99.0.0",
+                    "url": "https://example.com",
+                    "checked_at": now.isoformat(),
+                }
+            )
+        )
+
+        c, buf = _make_console(is_terminal=True)
+        with (
+            patch("conductor.cli.update.sys.argv", ["conductor", flag]),
+            patch("conductor.cli.app.console_verbosity") as mock_cv,
+        ):
+            from conductor.cli.app import ConsoleVerbosity
+
+            mock_cv.get.return_value = ConsoleVerbosity.FULL
+            check_for_update_hint(c)
+
+        assert buf.getvalue() == ""
+
+    @pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "Yes"])
+    def test_env_var_disables_hint(
+        self, cache_dir: Path, monkeypatch: pytest.MonkeyPatch, value: str
+    ) -> None:
+        """``CONDUCTOR_NO_UPDATE_CHECK`` permanently silences the hint."""
+        now = datetime.now(UTC)
+        (cache_dir / "update-check.json").write_text(
+            json.dumps(
+                {
+                    "version": "99.0.0",
+                    "tag_name": "v99.0.0",
+                    "url": "https://example.com",
+                    "checked_at": now.isoformat(),
+                }
+            )
+        )
+
+        monkeypatch.setenv("CONDUCTOR_NO_UPDATE_CHECK", value)
+        c, buf = _make_console(is_terminal=True)
+        with (
+            patch("conductor.cli.update.sys.argv", ["conductor", "run", "wf.yaml"]),
+            patch("conductor.cli.app.console_verbosity") as mock_cv,
+            patch("conductor.cli.update.fetch_latest_version") as mock_fetch,
+        ):
+            from conductor.cli.app import ConsoleVerbosity
+
+            mock_cv.get.return_value = ConsoleVerbosity.FULL
+            check_for_update_hint(c)
+
+        assert buf.getvalue() == ""
+        # Critically: the env var should also short-circuit BEFORE the
+        # network fetch, so users who opt out don't pay any latency cost.
+        mock_fetch.assert_not_called()
+
+    @pytest.mark.parametrize("value", ["", "0", "false", "no", "anything-else"])
+    def test_env_var_falsy_value_does_not_disable_hint(
+        self, cache_dir: Path, monkeypatch: pytest.MonkeyPatch, value: str
+    ) -> None:
+        """Non-truthy env values must NOT disable the hint (avoid surprise opt-outs)."""
+        now = datetime.now(UTC)
+        (cache_dir / "update-check.json").write_text(
+            json.dumps(
+                {
+                    "version": "99.0.0",
+                    "tag_name": "v99.0.0",
+                    "url": "https://example.com",
+                    "checked_at": now.isoformat(),
+                }
+            )
+        )
+
+        monkeypatch.setenv("CONDUCTOR_NO_UPDATE_CHECK", value)
+        c, buf = _make_console(is_terminal=True)
+        with (
+            patch("conductor.cli.update.sys.argv", ["conductor", "run", "wf.yaml"]),
+            patch("conductor.cli.app.console_verbosity") as mock_cv,
+        ):
+            from conductor.cli.app import ConsoleVerbosity
+
+            mock_cv.get.return_value = ConsoleVerbosity.FULL
+            check_for_update_hint(c)
+
+        assert "99.0.0" in buf.getvalue()
+
 
 # ===================================================================
 # E2-T8: run_update (now: instructs the user to run the install script)
