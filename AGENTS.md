@@ -69,11 +69,13 @@ make validate-examples    # validate all examples
   - `bg_runner.py` - Background process forking for `--web-bg` mode
   - `pid.py` - PID file utilities for tracking/stopping background processes
   - `update.py` - Update check, version comparison, and self-upgrade via `uv tool install`
+  - `pricing.py` - `conductor pricing path` subcommand: print where conductor reads user-level pricing from
 
 - **config/**: YAML loading and Pydantic schema validation
   - `schema.py` - Pydantic models for all workflow YAML structures (WorkflowConfig, AgentDef, ParallelGroup, ForEachDef, etc.)
   - `loader.py` - YAML parsing with environment variable resolution (${VAR:-default}) and `!file` tag support
   - `validator.py` - Cross-reference validation (agent names, routes, parallel groups)
+  - `user_pricing.py` - Loads optional machine-wide pricing overrides from `~/.conductor/pricing.yaml` (path overridable via `CONDUCTOR_PRICING_FILE`); missing file is silent, malformed file is a hard error
 
 - **engine/**: Workflow execution orchestration
   - `workflow.py` - Main `WorkflowEngine` class that orchestrates agent execution, parallel groups, for-each groups, and routing

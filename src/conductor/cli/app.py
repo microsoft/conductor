@@ -36,9 +36,11 @@ app = typer.Typer(
 )
 
 # Register subcommand groups
+from conductor.cli.pricing import pricing_app  # noqa: E402
 from conductor.cli.registry import registry_app  # noqa: E402
 
 app.add_typer(registry_app)
+app.add_typer(pricing_app)
 
 # Rich console for formatted output
 console = Console(stderr=True)
