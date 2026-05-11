@@ -24,6 +24,7 @@ import time
 import pytest
 
 from .install_scripts_helpers import (
+    INSTALL_PS1,
     IS_WINDOWS,
     InstallResult,
     Sandbox,
@@ -203,3 +204,69 @@ def test_running_process_auto_stop_kills_and_continues(sandbox: Sandbox, wheels:
 
     _assert_install_ok(result, "0.0.2")
     assert get_installed_version(sandbox) == "0.0.2", result.combined
+
+
+@pytest.mark.skipif(not IS_WINDOWS, reason="PowerShell required to test irm | iex parse path")
+def test_install_ps1_parses_via_iex_pipeline() -> None:
+    """``install.ps1`` must parse cleanly when delivered via ``irm | iex``.
+
+    The README install command is::
+
+        irm https://aka.ms/conductor/install.ps1 | iex
+
+    ``Invoke-RestMethod`` returns the body as a single string. If the file
+    starts with a UTF-8 BOM (``EF BB BF``), the BOM survives as ``U+FEFF``
+    at index 0 and PowerShell's in-memory parser (``Invoke-Expression`` /
+    ``[ScriptBlock]::Create``) chokes on the first real token after the
+    comment header, producing::
+
+        Unexpected attribute 'CmdletBinding'.
+
+    The existing tests in this module all use ``powershell.exe -File
+    install.ps1``, which loads the script via PowerShell's *file* loader
+    and handles the BOM differently from the in-memory ``iex`` parser —
+    so they don't catch the BOM regression. This test does, by reading
+    the script bytes ourselves (mirroring what ``irm`` does) and feeding
+    them to ``[ScriptBlock]::Create``, which is what ``iex`` uses
+    internally to parse the input. It does **not** execute the script,
+    so it's safe and fast.
+    """
+    # Use a here-string that interpolates the script path; ``[ScriptBlock]::Create``
+    # is the same parse path ``Invoke-Expression`` takes internally and will
+    # surface the BOM-induced parse error if one regresses.
+    # Escape any ``'`` in the path per PowerShell single-quoted-string rules
+    # (a single quote is doubled) so paths containing one don't break the
+    # generated -Command snippet.
+    escaped_path = str(INSTALL_PS1).replace("'", "''")
+    ps_script = (
+        "$ErrorActionPreference = 'Stop'; "
+        f"$content = [System.IO.File]::ReadAllText('{escaped_path}'); "
+        "try { "
+        "  [void][ScriptBlock]::Create($content); "
+        "  Write-Output 'PARSE_OK' "
+        "} catch { "
+        '  Write-Error "PARSE_FAIL: $_"; '
+        "  exit 1 "
+        "}"
+    )
+    proc = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            ps_script,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert proc.returncode == 0 and "PARSE_OK" in proc.stdout, (
+        "install.ps1 failed to parse via the `irm | iex` code path "
+        "(`[ScriptBlock]::Create`). This usually means the file has a "
+        "leading UTF-8 BOM (EF BB BF) that breaks `irm <url> | iex`. "
+        f"\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+    )

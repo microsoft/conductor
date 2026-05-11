@@ -1,4 +1,4 @@
-﻿# Conductor installer for Windows (PowerShell)
+# Conductor installer for Windows (PowerShell)
 # Usage: irm https://aka.ms/conductor/install.ps1 | iex
 #
 # This script:
