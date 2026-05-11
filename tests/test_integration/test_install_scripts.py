@@ -19,7 +19,10 @@ parity sanity check.
 from __future__ import annotations
 
 import subprocess
+import sys
+import textwrap
 import time
+from pathlib import Path
 
 import pytest
 
@@ -50,23 +53,94 @@ def _assert_install_ok(result: InstallResult, version: str) -> None:
     )
 
 
-def _spawn_long_running_conductor(sandbox: Sandbox) -> subprocess.Popen:
-    """Spawn a long-running process inside the sandbox venv that locks files.
+def _spawn_file_locker(sandbox: Sandbox, ready_file: Path) -> subprocess.Popen:
+    """Open a file inside the sandbox's ``Scripts/`` dir with a deletion lock.
 
-    Importing ``conductor`` loads the package and its DLLs, so the venv's
-    ``python.exe`` plus its loaded ``python3xx.dll`` are locked for the
-    lifetime of the process — exactly the scenario that fails in production.
+    Spawns a small child process (the test runner's own Python) that uses
+    Win32 ``CreateFileW`` to open ``Scripts/python.exe`` with
+    ``FILE_SHARE_READ`` only — crucially **no** ``FILE_SHARE_DELETE``. Any
+    attempt by ``uv tool install --force`` to delete the file then fails with
+    ``ERROR_SHARING_VIOLATION`` ("used by another process"), which matches
+    one of ``Test-LockError``'s needles in ``install.ps1`` and triggers the
+    rename-fallback path the test is named for.
 
-    Uses ``-I`` (isolated mode) so the source tree at the repo cwd is not
-    accidentally picked up over the installed package.
+    This is more reliable than spawning the seeded venv's ``python.exe`` and
+    importing ``conductor``: in many uv installs that ``python.exe`` is just
+    a ~241 KB launcher whose real interpreter and ``python3xx.dll`` live
+    under ``%APPDATA%/uv/python/...``, so nothing inside ``Scripts/`` ends
+    up locked and the fallback never fires (see issue #174).
+
+    The child writes ``ready_file`` once the lock is held, then sleeps; the
+    caller polls ``ready_file`` to know when it's safe to invoke the
+    install script.
     """
-    code = "import conductor; import time; time.sleep(120)"
+    target = str(sandbox.python_exe)
+    code = textwrap.dedent(
+        f"""
+        import ctypes
+        import ctypes.wintypes
+        import sys
+        import time
+        from pathlib import Path
+
+        target = {target!r}
+        ready = Path({str(ready_file)!r})
+
+        GENERIC_READ = 0x80000000
+        FILE_SHARE_READ = 0x00000001
+        OPEN_EXISTING = 3
+        INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel32.CreateFileW.restype = ctypes.c_void_p
+        kernel32.CreateFileW.argtypes = (
+            ctypes.wintypes.LPCWSTR,
+            ctypes.wintypes.DWORD,
+            ctypes.wintypes.DWORD,
+            ctypes.c_void_p,
+            ctypes.wintypes.DWORD,
+            ctypes.wintypes.DWORD,
+            ctypes.c_void_p,
+        )
+
+        h = kernel32.CreateFileW(
+            target, GENERIC_READ, FILE_SHARE_READ, None, OPEN_EXISTING, 0, None
+        )
+        if not h or h == INVALID_HANDLE_VALUE:
+            err = ctypes.get_last_error()
+            sys.stderr.write(f'CreateFileW({{target!r}}) failed: WinError {{err}}\\n')
+            sys.exit(1)
+
+        ready.write_text('locked')
+        # Sleep well past the test's timeout; the parent kills us when done.
+        time.sleep(300)
+        """
+    ).strip()
     return subprocess.Popen(
-        [str(sandbox.python_exe), "-I", "-c", code],
+        [sys.executable, "-I", "-c", code],
         env=sandbox.env(),
         cwd=str(sandbox.root),
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+
+def _wait_for_lock(proc: subprocess.Popen, ready_file: Path, timeout: float = 10.0) -> None:
+    """Poll until the locker subprocess signals ready, or fail fast on its death."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if ready_file.exists():
+            return
+        if proc.poll() is not None:
+            out, err = proc.communicate(timeout=5)
+            raise AssertionError(
+                f"file-locker subprocess exited early (code {proc.returncode}):\n"
+                f"--- stdout ---\n{out}\n--- stderr ---\n{err}\n"
+            )
+        time.sleep(0.05)
+    raise AssertionError(
+        f"file-locker subprocess did not become ready within {timeout}s (ready_file={ready_file})"
     )
 
 
@@ -129,32 +203,57 @@ def test_upgrade_clears_stale_old_files(sandbox: Sandbox, wheels: WheelPair) -> 
 def test_upgrade_with_running_process_uses_rename_fallback(
     sandbox: Sandbox, wheels: WheelPair
 ) -> None:
-    """Upgrade while a venv-internal process holds file locks.
+    """Upgrade while a process holds a deletion lock on a file in ``Scripts/``.
 
-    Spawns a child Python from the seeded venv that imports ``conductor`` and
-    sleeps. This locks ``python.exe`` and ``python3xx.dll`` inside the
-    sandbox's ``Scripts`` dir — exactly the situation that breaks
-    ``conductor update`` in production. Must succeed via the rename-fallback.
+    Holds an open Win32 handle on ``Scripts/python.exe`` with
+    ``FILE_SHARE_READ`` only (no ``FILE_SHARE_DELETE``) so ``uv tool install
+    --force`` cannot remove the file on its first attempt. ``install.ps1``
+    must detect the lock-error string and take the rename-fallback path
+    (``Move-ConductorToolDirAside``), then the retried install must succeed.
 
-    Uses ``-Force`` to skip the running-process safety check (the running
-    process is intentional for this test) so the script actually attempts
-    the install.
+    Beyond the install succeeding, this test asserts the fallback path
+    actually ran by checking for both diagnostic messages in the log:
+
+    * ``"Install blocked by a file lock"`` — emitted right before the rename
+    * ``"Moved existing install to"`` — emitted after the rename succeeds
+
+    Without those assertions (see issue #174) this test passes whenever
+    ``uv tool install --force`` happens to succeed on the first attempt,
+    silently masking regressions in ``Test-LockError`` or
+    ``Move-ConductorToolDirAside``.
+
+    Uses ``-Force`` to skip the running-process safety check (the locker
+    isn't a ``conductor.exe`` process so it wouldn't trip that check anyway,
+    but ``-Force`` keeps this test independent of that path).
     """
     seed_install(sandbox, wheels.old)
-    proc = _spawn_long_running_conductor(sandbox)
+    assert sandbox.python_exe.exists(), (
+        f"seeded venv missing expected python.exe at {sandbox.python_exe}"
+    )
+    ready_file = sandbox.root / ".lock-ready"
+    proc = _spawn_file_locker(sandbox, ready_file)
     try:
-        # Give it time to fully load the DLLs
-        time.sleep(2.0)
+        _wait_for_lock(proc, ready_file)
         result = run_install_script(sandbox, source=wheels.new, force=True)
     finally:
         _kill(proc)
 
     _assert_install_ok(result, "0.0.2")
     # After fallback, the freshly installed conductor should report 0.0.2.
-    # Note: the running child process still holds the OLD venv (now renamed
-    # aside), but a fresh invocation hits the new venv.
+    # Note: the locked python.exe is now under conductor-cli.old-<ts>/, but
+    # a fresh invocation hits the new venv.
     version = get_installed_version(sandbox)
     assert version == "0.0.2", f"expected 0.0.2, got {version!r}\n{result.combined}"
+
+    # Assert the rename-fallback actually ran — these are the load-bearing
+    # checks for this test (see issue #174).
+    assert "Install blocked by a file lock" in result.combined, (
+        "rename-fallback path did not trigger; install succeeded on the first "
+        f"attempt without the lock being detected:\n{result.combined}"
+    )
+    assert "Moved existing install to" in result.combined, (
+        f"Move-ConductorToolDirAside did not log the renamed-aside path:\n{result.combined}"
+    )
 
 
 def test_running_process_auto_stop_kills_and_continues(sandbox: Sandbox, wheels: WheelPair) -> None:
