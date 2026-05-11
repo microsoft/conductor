@@ -18,6 +18,7 @@ parity sanity check.
 
 from __future__ import annotations
 
+import contextlib
 import subprocess
 import sys
 import textwrap
@@ -54,24 +55,52 @@ def _assert_install_ok(result: InstallResult, version: str) -> None:
 
 
 def _spawn_file_locker(sandbox: Sandbox, ready_file: Path) -> subprocess.Popen:
-    """Open a file inside the sandbox's ``Scripts/`` dir with a deletion lock.
+    """Hold ``Scripts/python.exe`` open so its directory cannot be cleanly removed.
 
     Spawns a small child process (the test runner's own Python) that uses
-    Win32 ``CreateFileW`` to open ``Scripts/python.exe`` with
-    ``FILE_SHARE_READ`` only — crucially **no** ``FILE_SHARE_DELETE``. Any
-    attempt by ``uv tool install --force`` to delete the file then fails with
-    ``ERROR_SHARING_VIOLATION`` ("used by another process"), which matches
-    one of ``Test-LockError``'s needles in ``install.ps1`` and triggers the
-    rename-fallback path the test is named for.
+    Win32 ``CreateFileW`` to open ``Scripts/python.exe`` with **full share
+    modes** (``FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE``).
+    The handle stays alive for 300 s; the parent kills it in ``finally``.
 
-    This is more reliable than spawning the seeded venv's ``python.exe`` and
-    importing ``conductor``: in many uv installs that ``python.exe`` is just
-    a ~241 KB launcher whose real interpreter and ``python3xx.dll`` live
-    under ``%APPDATA%/uv/python/...``, so nothing inside ``Scripts/`` ends
-    up locked and the fallback never fires (see issue #174).
+    Why full share modes (and not the stricter ``FILE_SHARE_READ`` only)
+    that an earlier draft used: this test must trigger the rename-fallback
+    in ``install.ps1`` (``Move-ConductorToolDirAside``), which needs to be
+    able to rename the ``conductor-cli`` directory aside *while a child
+    file is still locked*. On NTFS, a parent directory can only be renamed
+    when every open child handle was opened with ``FILE_SHARE_DELETE`` —
+    the same rule the Windows image loader follows. The earlier draft
+    (without ``FILE_SHARE_DELETE``) was strict enough to trigger
+    ``Test-LockError`` but ALSO blocked the rename, so the fallback fired
+    but couldn't succeed and the test failed in CI.
 
-    The child writes ``ready_file`` once the lock is held, then sleeps; the
-    caller polls ``ready_file`` to know when it's safe to invoke the
+    What still creates a lock with full sharing: ``uv tool install --force``
+    opens each file in ``Scripts/`` with DELETE access and marks it for
+    delete via ``FILE_DISPOSITION_INFO``. Because this child still holds
+    an open handle, the file enters "delete-pending" state — it remains
+    listed in the directory until the last handle closes. Subsequent
+    ``RemoveDirectory(Scripts/)`` then fails with
+    ``ERROR_DIR_NOT_EMPTY``, which uv surfaces as
+    ``"failed to remove directory ..."`` — matching one of
+    ``Test-LockError``'s needles in ``install.ps1`` and triggering the
+    rename-fallback. The rename then succeeds because the child handle
+    permits ``FILE_SHARE_DELETE``.
+
+    This faithfully mimics the production scenario the fallback was
+    designed for: a running ``conductor.exe`` whose Windows image section
+    pins ``Scripts/`` files (image loader uses full share modes — same
+    semantics as this child).
+
+    Why a child process and not in-process: in many uv installs the
+    seeded ``Scripts/python.exe`` is a ~241 KB launcher whose real
+    interpreter lives under ``%APPDATA%/uv/python/...`` (see issue #174),
+    so a previous attempt that ran ``python.exe -c "import conductor"``
+    didn't actually lock anything in ``Scripts/``. Using ``sys.executable``
+    (the test runner's Python) plus an explicit ``CreateFileW`` sidesteps
+    that pitfall — Windows enforces share modes per file regardless of
+    which process opened the handle.
+
+    The child writes ``ready_file`` once the handle is open, then sleeps;
+    the caller polls ``ready_file`` to know when it's safe to invoke the
     install script.
     """
     target = str(sandbox.python_exe)
@@ -88,6 +117,8 @@ def _spawn_file_locker(sandbox: Sandbox, ready_file: Path) -> subprocess.Popen:
 
         GENERIC_READ = 0x80000000
         FILE_SHARE_READ = 0x00000001
+        FILE_SHARE_WRITE = 0x00000002
+        FILE_SHARE_DELETE = 0x00000004
         OPEN_EXISTING = 3
         INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 
@@ -103,8 +134,11 @@ def _spawn_file_locker(sandbox: Sandbox, ready_file: Path) -> subprocess.Popen:
             ctypes.c_void_p,
         )
 
+        share_mode = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+        # NOTE: must read get_last_error() immediately after CreateFileW;
+        # any intervening ctypes foreign-function call would clobber it.
         h = kernel32.CreateFileW(
-            target, GENERIC_READ, FILE_SHARE_READ, None, OPEN_EXISTING, 0, None
+            target, GENERIC_READ, share_mode, None, OPEN_EXISTING, 0, None
         )
         if not h or h == INVALID_HANDLE_VALUE:
             err = ctypes.get_last_error()
@@ -126,30 +160,62 @@ def _spawn_file_locker(sandbox: Sandbox, ready_file: Path) -> subprocess.Popen:
     )
 
 
+def _drain_subprocess_output(proc: subprocess.Popen) -> tuple[str, str]:
+    """Best-effort read of an exited (or about-to-be-killed) subprocess's pipes."""
+    try:
+        out, err = proc.communicate(timeout=5)
+    except (subprocess.TimeoutExpired, ValueError, OSError) as exc:
+        out = err = f"<unavailable: {exc!r}>"
+    return out or "", err or ""
+
+
 def _wait_for_lock(proc: subprocess.Popen, ready_file: Path, timeout: float = 10.0) -> None:
-    """Poll until the locker subprocess signals ready, or fail fast on its death."""
+    """Poll until the locker subprocess signals ready, or fail fast on its death.
+
+    On early subprocess exit, raises ``AssertionError`` including the child's
+    captured stdout/stderr (typically a ``CreateFileW failed: WinError ...``
+    line) so the failure is immediately diagnosable in CI.
+
+    On timeout, kills the still-running subprocess and includes whatever
+    was captured before the kill — this catches "child stuck after
+    CreateFileW returned but before write_text" cases (e.g. AV interference).
+    """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if ready_file.exists():
             return
         if proc.poll() is not None:
-            out, err = proc.communicate(timeout=5)
+            out, err = _drain_subprocess_output(proc)
             raise AssertionError(
                 f"file-locker subprocess exited early (code {proc.returncode}):\n"
                 f"--- stdout ---\n{out}\n--- stderr ---\n{err}\n"
             )
         time.sleep(0.05)
+    # Timeout — kill the child so we can read its pipes.
+    with contextlib.suppress(OSError):
+        proc.kill()
+    out, err = _drain_subprocess_output(proc)
     raise AssertionError(
-        f"file-locker subprocess did not become ready within {timeout}s (ready_file={ready_file})"
+        f"file-locker subprocess did not become ready within {timeout}s "
+        f"(ready_file={ready_file}, exited={proc.poll() is not None}):\n"
+        f"--- stdout ---\n{out}\n--- stderr ---\n{err}\n"
     )
 
 
 def _kill(proc: subprocess.Popen) -> None:
+    """Best-effort kill + reap. Surfaces leaks to stderr instead of swallowing."""
     try:
         proc.kill()
+    except OSError as exc:
+        print(f"WARNING: kill(pid={proc.pid}) failed: {exc!r}", file=sys.stderr)
+    try:
         proc.wait(timeout=10)
-    except Exception:
-        pass
+    except subprocess.TimeoutExpired:
+        print(
+            f"WARNING: subprocess pid={proc.pid} did not exit within 10s after kill; "
+            f"may leak a file handle into pytest tmp_path teardown",
+            file=sys.stderr,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -203,13 +269,20 @@ def test_upgrade_clears_stale_old_files(sandbox: Sandbox, wheels: WheelPair) -> 
 def test_upgrade_with_running_process_uses_rename_fallback(
     sandbox: Sandbox, wheels: WheelPair
 ) -> None:
-    """Upgrade while a process holds a deletion lock on a file in ``Scripts/``.
+    """Upgrade while a child process holds an open handle on a file in ``Scripts/``.
 
-    Holds an open Win32 handle on ``Scripts/python.exe`` with
-    ``FILE_SHARE_READ`` only (no ``FILE_SHARE_DELETE``) so ``uv tool install
-    --force`` cannot remove the file on its first attempt. ``install.ps1``
-    must detect the lock-error string and take the rename-fallback path
-    (``Move-ConductorToolDirAside``), then the retried install must succeed.
+    Uses ``_spawn_file_locker`` to keep ``Scripts/python.exe`` open with full
+    share modes. ``uv tool install --force`` can mark the file for delete
+    (it enters delete-pending state) but the directory removal then fails
+    with ``ERROR_DIR_NOT_EMPTY`` — uv surfaces this as
+    ``"failed to remove directory ..."``, which matches a ``Test-LockError``
+    needle in ``install.ps1`` and triggers ``Move-ConductorToolDirAside``.
+    The rename succeeds because the locker grants ``FILE_SHARE_DELETE``,
+    and the retried install succeeds in a fresh ``conductor-cli`` directory.
+
+    See ``_spawn_file_locker``'s docstring for why full share modes (vs. a
+    stricter ``FILE_SHARE_READ``-only handle) are required: stricter
+    sharing also blocks the parent rename, which would defeat the test.
 
     Beyond the install succeeding, this test asserts the fallback path
     actually ran by checking for both diagnostic messages in the log:
