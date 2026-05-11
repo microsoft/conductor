@@ -18,7 +18,8 @@ parity sanity check.
 
 from __future__ import annotations
 
-import contextlib
+import os
+import shutil
 import subprocess
 import sys
 import textwrap
@@ -54,152 +55,108 @@ def _assert_install_ok(result: InstallResult, version: str) -> None:
     )
 
 
-def _spawn_file_locker(sandbox: Sandbox, ready_file: Path) -> subprocess.Popen:
-    """Hold ``Scripts/python.exe`` open so its directory cannot be cleanly removed.
+def _install_uv_shim(sandbox: Sandbox) -> tuple[Path, dict[str, str]]:
+    """Install a ``uv`` shim that fakes a lock-error on the first install.
 
-    Spawns a small child process (the test runner's own Python) that uses
-    Win32 ``CreateFileW`` to open ``Scripts/python.exe`` with **full share
-    modes** (``FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE``).
-    The handle stays alive for 300 s; the parent kills it in ``finally``.
+    Returns ``(shim_dir, extra_env)``. Callers must:
 
-    Why full share modes (and not the stricter ``FILE_SHARE_READ`` only)
-    that an earlier draft used: this test must trigger the rename-fallback
-    in ``install.ps1`` (``Move-ConductorToolDirAside``), which needs to be
-    able to rename the ``conductor-cli`` directory aside *while a child
-    file is still locked*. On NTFS, a parent directory can only be renamed
-    when every open child handle was opened with ``FILE_SHARE_DELETE`` —
-    the same rule the Windows image loader follows. The earlier draft
-    (without ``FILE_SHARE_DELETE``) was strict enough to trigger
-    ``Test-LockError`` but ALSO blocked the rename, so the fallback fired
-    but couldn't succeed and the test failed in CI.
+    * Prepend ``shim_dir`` to ``PATH`` for the ``install.ps1`` invocation,
+      so PowerShell resolves bare ``uv`` to the shim's ``uv.bat`` first.
+    * Merge ``extra_env`` into the install script's environment so the
+      shim can find the real ``uv`` and persist its attempt counter.
 
-    What still creates a lock with full sharing: ``uv tool install --force``
-    opens each file in ``Scripts/`` with DELETE access and marks it for
-    delete via ``FILE_DISPOSITION_INFO``. Because this child still holds
-    an open handle, the file enters "delete-pending" state — it remains
-    listed in the directory until the last handle closes. Subsequent
-    ``RemoveDirectory(Scripts/)`` then fails with
-    ``ERROR_DIR_NOT_EMPTY``, which uv surfaces as
-    ``"failed to remove directory ..."`` — matching one of
-    ``Test-LockError``'s needles in ``install.ps1`` and triggering the
-    rename-fallback. The rename then succeeds because the child handle
-    permits ``FILE_SHARE_DELETE``.
+    The shim intercepts ``uv tool install --force ...`` calls. On the
+    first such call, it writes a canned lock-error to stderr (matching
+    two of ``Test-LockError``'s needles) and exits non-zero. On all
+    subsequent calls — and on every other ``uv`` subcommand
+    (``tool dir``, ``tool update-shell``, etc.) — it ``exec``s the real
+    ``uv`` unchanged. The result: ``install.ps1``'s first
+    ``Invoke-UvInstall`` returns the canned lock-error, ``Test-LockError``
+    matches, ``Move-ConductorToolDirAside`` runs (no real lock — succeeds),
+    and the retried install hits the real ``uv`` (succeeds).
 
-    This faithfully mimics the production scenario the fallback was
-    designed for: a running ``conductor.exe`` whose Windows image section
-    pins ``Scripts/`` files (image loader uses full share modes — same
-    semantics as this child).
+    Why this approach (Option B from issue #174): an earlier draft used a
+    real Win32 file-handle lock, but no share-mode combination satisfies
+    both required invariants. ``FILE_SHARE_READ``-only triggers
+    ``Test-LockError`` but blocks the parent-directory rename (NTFS
+    requires ``FILE_SHARE_DELETE`` on every open child handle for
+    ``MoveFileExW`` on the parent to succeed). Adding ``FILE_SHARE_DELETE``
+    lets uv's POSIX-semantics unlink (Rust ≥ 1.66 uses
+    ``FILE_DISPOSITION_FLAG_POSIX_SEMANTICS``) immediately remove the
+    file from the directory listing, so the lock never surfaces. See the
+    PR description for #177 for the full investigation.
 
-    Why a child process and not in-process: in many uv installs the
-    seeded ``Scripts/python.exe`` is a ~241 KB launcher whose real
-    interpreter lives under ``%APPDATA%/uv/python/...`` (see issue #174),
-    so a previous attempt that ran ``python.exe -c "import conductor"``
-    didn't actually lock anything in ``Scripts/``. Using ``sys.executable``
-    (the test runner's Python) plus an explicit ``CreateFileW`` sidesteps
-    that pitfall — Windows enforces share modes per file regardless of
-    which process opened the handle.
-
-    The child writes ``ready_file`` once the handle is open, then sleeps;
-    the caller polls ``ready_file`` to know when it's safe to invoke the
-    install script.
+    The shim approach trades fidelity-to-real-Windows-locks for a
+    deterministic test of the install.ps1 control flow — which is the
+    actually load-bearing invariant the test should protect.
     """
-    target = str(sandbox.python_exe)
-    code = textwrap.dedent(
-        f"""
-        import ctypes
-        import ctypes.wintypes
-        import sys
-        import time
-        from pathlib import Path
+    real_uv = shutil.which("uv")
+    if not real_uv:
+        raise RuntimeError("could not locate `uv` on PATH for shim setup")
 
-        target = {target!r}
-        ready = Path({str(ready_file)!r})
+    shim_dir = sandbox.root / "uv-shim"
+    shim_dir.mkdir()
+    state_file = sandbox.root / ".uv-shim-state"
 
-        GENERIC_READ = 0x80000000
-        FILE_SHARE_READ = 0x00000001
-        FILE_SHARE_WRITE = 0x00000002
-        FILE_SHARE_DELETE = 0x00000004
-        OPEN_EXISTING = 3
-        INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+    shim_py = shim_dir / "uv-shim.py"
+    shim_py.write_text(
+        textwrap.dedent(
+            """
+            import os
+            import subprocess
+            import sys
+            from pathlib import Path
 
-        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
-        kernel32.CreateFileW.restype = ctypes.c_void_p
-        kernel32.CreateFileW.argtypes = (
-            ctypes.wintypes.LPCWSTR,
-            ctypes.wintypes.DWORD,
-            ctypes.wintypes.DWORD,
-            ctypes.c_void_p,
-            ctypes.wintypes.DWORD,
-            ctypes.wintypes.DWORD,
-            ctypes.c_void_p,
-        )
+            real_uv = os.environ['CONDUCTOR_TEST_REAL_UV']
+            state = Path(os.environ['CONDUCTOR_TEST_SHIM_STATE'])
 
-        share_mode = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
-        # NOTE: must read get_last_error() immediately after CreateFileW;
-        # any intervening ctypes foreign-function call would clobber it.
-        h = kernel32.CreateFileW(
-            target, GENERIC_READ, share_mode, None, OPEN_EXISTING, 0, None
-        )
-        if not h or h == INVALID_HANDLE_VALUE:
-            err = ctypes.get_last_error()
-            sys.stderr.write(f'CreateFileW({{target!r}}) failed: WinError {{err}}\\n')
-            sys.exit(1)
-
-        ready.write_text('locked')
-        # Sleep well past the test's timeout; the parent kills us when done.
-        time.sleep(300)
-        """
-    ).strip()
-    return subprocess.Popen(
-        [sys.executable, "-I", "-c", code],
-        env=sandbox.env(),
-        cwd=str(sandbox.root),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-
-
-def _drain_subprocess_output(proc: subprocess.Popen) -> tuple[str, str]:
-    """Best-effort read of an exited (or about-to-be-killed) subprocess's pipes."""
-    try:
-        out, err = proc.communicate(timeout=5)
-    except (subprocess.TimeoutExpired, ValueError, OSError) as exc:
-        out = err = f"<unavailable: {exc!r}>"
-    return out or "", err or ""
-
-
-def _wait_for_lock(proc: subprocess.Popen, ready_file: Path, timeout: float = 10.0) -> None:
-    """Poll until the locker subprocess signals ready, or fail fast on its death.
-
-    On early subprocess exit, raises ``AssertionError`` including the child's
-    captured stdout/stderr (typically a ``CreateFileW failed: WinError ...``
-    line) so the failure is immediately diagnosable in CI.
-
-    On timeout, kills the still-running subprocess and includes whatever
-    was captured before the kill — this catches "child stuck after
-    CreateFileW returned but before write_text" cases (e.g. AV interference).
-    """
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if ready_file.exists():
-            return
-        if proc.poll() is not None:
-            out, err = _drain_subprocess_output(proc)
-            raise AssertionError(
-                f"file-locker subprocess exited early (code {proc.returncode}):\n"
-                f"--- stdout ---\n{out}\n--- stderr ---\n{err}\n"
+            args = sys.argv[1:]
+            is_install_force = (
+                len(args) >= 3
+                and args[0] == 'tool'
+                and args[1] == 'install'
+                and '--force' in args[2:]
             )
-        time.sleep(0.05)
-    # Timeout — kill the child so we can read its pipes.
-    with contextlib.suppress(OSError):
-        proc.kill()
-    out, err = _drain_subprocess_output(proc)
-    raise AssertionError(
-        f"file-locker subprocess did not become ready within {timeout}s "
-        f"(ready_file={ready_file}, exited={proc.poll() is not None}):\n"
-        f"--- stdout ---\n{out}\n--- stderr ---\n{err}\n"
+
+            if is_install_force:
+                attempt = int(state.read_text().strip()) if state.exists() else 0
+                attempt += 1
+                state.write_text(str(attempt))
+                if attempt == 1:
+                    # Canned message that matches two Test-LockError needles
+                    # in install.ps1 ('failed to remove directory' and
+                    # 'used by another process'). Modeled after a real uv
+                    # error from CI run #25672191042.
+                    sys.stderr.write(
+                        'error: failed to remove directory '
+                        '`C:\\\\fake\\\\conductor-cli\\\\Scripts`: '
+                        'The process cannot access the file because it is '
+                        'being used by another process. (os error 32)\\n'
+                    )
+                    sys.stderr.flush()
+                    sys.exit(2)
+
+            # Defer to the real uv with the same args, cwd, env, and stdio.
+            sys.exit(subprocess.run([real_uv, *args]).returncode)
+            """
+        ).strip(),
+        encoding="utf-8",
     )
+
+    # uv.bat: PowerShell's bare-command resolution finds .bat via PATHEXT.
+    # Use the test runner's sys.executable (absolute path) so the shim
+    # doesn't depend on `python` being on PATH inside install.ps1's env.
+    shim_bat = shim_dir / "uv.bat"
+    shim_bat.write_text(
+        f'@echo off\r\n"{sys.executable}" "{shim_py}" %*\r\n',
+        encoding="utf-8",
+    )
+
+    extra_env = {
+        "CONDUCTOR_TEST_REAL_UV": real_uv,
+        "CONDUCTOR_TEST_SHIM_STATE": str(state_file),
+    }
+    return shim_dir, extra_env
 
 
 def _kill(proc: subprocess.Popen) -> None:
@@ -265,67 +222,64 @@ def test_upgrade_clears_stale_old_files(sandbox: Sandbox, wheels: WheelPair) -> 
     assert not stale.exists(), f"stale .old file survived install:\n{result.combined}"
 
 
-@pytest.mark.skipif(not IS_WINDOWS, reason="file-lock fallback is Windows-specific")
+@pytest.mark.skipif(not IS_WINDOWS, reason="install.ps1 rename-fallback is Windows-specific")
 def test_upgrade_with_running_process_uses_rename_fallback(
     sandbox: Sandbox, wheels: WheelPair
 ) -> None:
-    """Upgrade while a child process holds an open handle on a file in ``Scripts/``.
+    """Verify the install.ps1 rename-fallback control flow end-to-end.
 
-    Uses ``_spawn_file_locker`` to keep ``Scripts/python.exe`` open with full
-    share modes. ``uv tool install --force`` can mark the file for delete
-    (it enters delete-pending state) but the directory removal then fails
-    with ``ERROR_DIR_NOT_EMPTY`` — uv surfaces this as
-    ``"failed to remove directory ..."``, which matches a ``Test-LockError``
-    needle in ``install.ps1`` and triggers ``Move-ConductorToolDirAside``.
-    The rename succeeds because the locker grants ``FILE_SHARE_DELETE``,
-    and the retried install succeeds in a fresh ``conductor-cli`` directory.
+    Installs a ``uv`` shim (see ``_install_uv_shim``) that intercepts the
+    first ``uv tool install --force`` call and returns a canned lock-error
+    matching ``Test-LockError``'s needles. ``install.ps1`` must then:
 
-    See ``_spawn_file_locker``'s docstring for why full share modes (vs. a
-    stricter ``FILE_SHARE_READ``-only handle) are required: stricter
-    sharing also blocks the parent rename, which would defeat the test.
+    1. Detect the lock error and log ``"Install blocked by a file lock"``.
+    2. Call ``Move-ConductorToolDirAside`` and log
+       ``"Moved existing install to <path>"`` once the rename succeeds.
+    3. Retry ``uv tool install --force`` — which now hits the real ``uv``
+       (the shim only fakes attempt #1) and installs into a fresh
+       ``conductor-cli`` directory.
+    4. Report success and verify the new version responds.
 
-    Beyond the install succeeding, this test asserts the fallback path
-    actually ran by checking for both diagnostic messages in the log:
+    All three assertions below are load-bearing — see issue #174 for what
+    happens when they're missing (the test passes whenever ``uv tool
+    install --force`` happens to succeed on the first attempt, silently
+    masking regressions in ``Test-LockError`` or
+    ``Move-ConductorToolDirAside``).
 
-    * ``"Install blocked by a file lock"`` — emitted right before the rename
-    * ``"Moved existing install to"`` — emitted after the rename succeeds
-
-    Without those assertions (see issue #174) this test passes whenever
-    ``uv tool install --force`` happens to succeed on the first attempt,
-    silently masking regressions in ``Test-LockError`` or
-    ``Move-ConductorToolDirAside``.
-
-    Uses ``-Force`` to skip the running-process safety check (the locker
-    isn't a ``conductor.exe`` process so it wouldn't trip that check anyway,
-    but ``-Force`` keeps this test independent of that path).
+    Uses ``-Force`` to skip the running-process safety check; the shim
+    deliberately produces only the lock-error diagnostic and isn't a
+    ``conductor.exe`` process so wouldn't trip that check anyway.
     """
     seed_install(sandbox, wheels.old)
     assert sandbox.python_exe.exists(), (
         f"seeded venv missing expected python.exe at {sandbox.python_exe}"
     )
-    ready_file = sandbox.root / ".lock-ready"
-    proc = _spawn_file_locker(sandbox, ready_file)
-    try:
-        _wait_for_lock(proc, ready_file)
-        result = run_install_script(sandbox, source=wheels.new, force=True)
-    finally:
-        _kill(proc)
+
+    shim_dir, shim_env = _install_uv_shim(sandbox)
+    extra_env = {
+        **shim_env,
+        # Prepend shim_dir to PATH so PowerShell's `uv` resolution finds
+        # the shim's uv.bat (via PATHEXT) before the real uv on the runner.
+        "PATH": str(shim_dir) + os.pathsep + os.environ.get("PATH", ""),
+    }
+
+    result = run_install_script(sandbox, source=wheels.new, force=True, extra_env=extra_env)
 
     _assert_install_ok(result, "0.0.2")
-    # After fallback, the freshly installed conductor should report 0.0.2.
-    # Note: the locked python.exe is now under conductor-cli.old-<ts>/, but
-    # a fresh invocation hits the new venv.
     version = get_installed_version(sandbox)
     assert version == "0.0.2", f"expected 0.0.2, got {version!r}\n{result.combined}"
 
-    # Assert the rename-fallback actually ran — these are the load-bearing
-    # checks for this test (see issue #174).
+    # Load-bearing assertions for issue #174 — these prove the fallback
+    # ran end-to-end. Without them, this test would pass even if
+    # Test-LockError or Move-ConductorToolDirAside silently regressed.
     assert "Install blocked by a file lock" in result.combined, (
-        "rename-fallback path did not trigger; install succeeded on the first "
-        f"attempt without the lock being detected:\n{result.combined}"
+        "rename-fallback did not trigger; install.ps1 didn't recognize the "
+        "shim's canned lock-error as a lock-shaped failure. Did "
+        f"Test-LockError's needle list change?\n{result.combined}"
     )
     assert "Moved existing install to" in result.combined, (
-        f"Move-ConductorToolDirAside did not log the renamed-aside path:\n{result.combined}"
+        "Move-ConductorToolDirAside did not log the renamed-aside path; "
+        f"the rename either failed or the success log was removed:\n{result.combined}"
     )
 
 
