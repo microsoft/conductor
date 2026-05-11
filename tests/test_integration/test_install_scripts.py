@@ -22,7 +22,6 @@ import os
 import shutil
 import subprocess
 import sys
-import textwrap
 import time
 from pathlib import Path
 
@@ -55,40 +54,32 @@ def _assert_install_ok(result: InstallResult, version: str) -> None:
     )
 
 
-def _install_uv_shim(sandbox: Sandbox) -> tuple[Path, dict[str, str]]:
+_SHIM_SOURCE = Path(__file__).parent / "_uv_shim.py"
+
+
+def _install_uv_shim(sandbox: Sandbox) -> dict[str, str]:
     """Install a ``uv`` shim that fakes a lock-error on the first install.
 
-    Returns ``(shim_dir, extra_env)``. Callers must:
+    Returns an ``extra_env`` mapping that callers should merge into the
+    ``install.ps1`` invocation's environment. The mapping prepends the
+    shim's directory to ``PATH`` (so PowerShell's bare-``uv`` resolution
+    finds ``uv.bat`` first), captures the real ``uv`` path for the shim
+    to defer to, and points the shim at a per-sandbox state file.
 
-    * Prepend ``shim_dir`` to ``PATH`` for the ``install.ps1`` invocation,
-      so PowerShell resolves bare ``uv`` to the shim's ``uv.bat`` first.
-    * Merge ``extra_env`` into the install script's environment so the
-      shim can find the real ``uv`` and persist its attempt counter.
+    The shim itself lives in ``_uv_shim.py`` next to this file; see that
+    module's docstring for behavior. The shim intercepts only the first
+    ``uv tool install --force`` call and forwards every other ``uv``
+    invocation to the real binary.
 
-    The shim intercepts ``uv tool install --force ...`` calls. On the
-    first such call, it writes a canned lock-error to stderr (matching
-    two of ``Test-LockError``'s needles) and exits non-zero. On all
-    subsequent calls — and on every other ``uv`` subcommand
-    (``tool dir``, ``tool update-shell``, etc.) — it ``exec``s the real
-    ``uv`` unchanged. The result: ``install.ps1``'s first
-    ``Invoke-UvInstall`` returns the canned lock-error, ``Test-LockError``
-    matches, ``Move-ConductorToolDirAside`` runs (no real lock — succeeds),
-    and the retried install hits the real ``uv`` (succeeds).
-
-    Why this approach (Option B from issue #174): an earlier draft used a
-    real Win32 file-handle lock, but no share-mode combination satisfies
-    both required invariants. ``FILE_SHARE_READ``-only triggers
-    ``Test-LockError`` but blocks the parent-directory rename (NTFS
-    requires ``FILE_SHARE_DELETE`` on every open child handle for
-    ``MoveFileExW`` on the parent to succeed). Adding ``FILE_SHARE_DELETE``
-    lets uv's POSIX-semantics unlink (Rust ≥ 1.66 uses
-    ``FILE_DISPOSITION_FLAG_POSIX_SEMANTICS``) immediately remove the
-    file from the directory listing, so the lock never surfaces. See the
-    PR description for #177 for the full investigation.
-
-    The shim approach trades fidelity-to-real-Windows-locks for a
-    deterministic test of the install.ps1 control flow — which is the
-    actually load-bearing invariant the test should protect.
+    Why this approach (Option B from issue #174): no synthetic Win32 file
+    handle can simultaneously trigger ``Test-LockError`` AND let
+    ``Move-ConductorToolDirAside`` succeed against modern uv on Windows.
+    Without ``FILE_SHARE_DELETE``, NTFS blocks the parent-directory
+    rename; with it, Rust ≥ 1.66's POSIX-semantics unlinks bypass the
+    lock entirely. See PR #177 for the full investigation. The shim
+    trades fidelity-to-real-Windows-locks for a deterministic test of
+    install.ps1's control flow — which is the actually load-bearing
+    invariant the test should protect.
     """
     real_uv = shutil.which("uv")
     if not real_uv:
@@ -96,67 +87,22 @@ def _install_uv_shim(sandbox: Sandbox) -> tuple[Path, dict[str, str]]:
 
     shim_dir = sandbox.root / "uv-shim"
     shim_dir.mkdir()
-    state_file = sandbox.root / ".uv-shim-state"
-
-    shim_py = shim_dir / "uv-shim.py"
-    shim_py.write_text(
-        textwrap.dedent(
-            """
-            import os
-            import subprocess
-            import sys
-            from pathlib import Path
-
-            real_uv = os.environ['CONDUCTOR_TEST_REAL_UV']
-            state = Path(os.environ['CONDUCTOR_TEST_SHIM_STATE'])
-
-            args = sys.argv[1:]
-            is_install_force = (
-                len(args) >= 3
-                and args[0] == 'tool'
-                and args[1] == 'install'
-                and '--force' in args[2:]
-            )
-
-            if is_install_force:
-                attempt = int(state.read_text().strip()) if state.exists() else 0
-                attempt += 1
-                state.write_text(str(attempt))
-                if attempt == 1:
-                    # Canned message that matches two Test-LockError needles
-                    # in install.ps1 ('failed to remove directory' and
-                    # 'used by another process'). Modeled after a real uv
-                    # error from CI run #25672191042.
-                    sys.stderr.write(
-                        'error: failed to remove directory '
-                        '`C:\\\\fake\\\\conductor-cli\\\\Scripts`: '
-                        'The process cannot access the file because it is '
-                        'being used by another process. (os error 32)\\n'
-                    )
-                    sys.stderr.flush()
-                    sys.exit(2)
-
-            # Defer to the real uv with the same args, cwd, env, and stdio.
-            sys.exit(subprocess.run([real_uv, *args]).returncode)
-            """
-        ).strip(),
-        encoding="utf-8",
-    )
+    shim_py = shim_dir / "_uv_shim.py"
+    shutil.copy(_SHIM_SOURCE, shim_py)
 
     # uv.bat: PowerShell's bare-command resolution finds .bat via PATHEXT.
     # Use the test runner's sys.executable (absolute path) so the shim
-    # doesn't depend on `python` being on PATH inside install.ps1's env.
-    shim_bat = shim_dir / "uv.bat"
-    shim_bat.write_text(
+    # works regardless of what's on PATH inside install.ps1's env.
+    (shim_dir / "uv.bat").write_text(
         f'@echo off\r\n"{sys.executable}" "{shim_py}" %*\r\n',
         encoding="utf-8",
     )
 
-    extra_env = {
+    return {
+        "PATH": str(shim_dir) + os.pathsep + os.environ.get("PATH", ""),
         "CONDUCTOR_TEST_REAL_UV": real_uv,
-        "CONDUCTOR_TEST_SHIM_STATE": str(state_file),
+        "CONDUCTOR_TEST_SHIM_STATE": str(shim_dir / "state"),
     }
-    return shim_dir, extra_env
 
 
 def _kill(proc: subprocess.Popen) -> None:
@@ -251,19 +197,10 @@ def test_upgrade_with_running_process_uses_rename_fallback(
     ``conductor.exe`` process so wouldn't trip that check anyway.
     """
     seed_install(sandbox, wheels.old)
-    assert sandbox.python_exe.exists(), (
-        f"seeded venv missing expected python.exe at {sandbox.python_exe}"
+
+    result = run_install_script(
+        sandbox, source=wheels.new, force=True, extra_env=_install_uv_shim(sandbox)
     )
-
-    shim_dir, shim_env = _install_uv_shim(sandbox)
-    extra_env = {
-        **shim_env,
-        # Prepend shim_dir to PATH so PowerShell's `uv` resolution finds
-        # the shim's uv.bat (via PATHEXT) before the real uv on the runner.
-        "PATH": str(shim_dir) + os.pathsep + os.environ.get("PATH", ""),
-    }
-
-    result = run_install_script(sandbox, source=wheels.new, force=True, extra_env=extra_env)
 
     _assert_install_ok(result, "0.0.2")
     version = get_installed_version(sandbox)
