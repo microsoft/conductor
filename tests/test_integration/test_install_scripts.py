@@ -44,7 +44,7 @@ pytestmark = pytest.mark.install_scripts
 
 def _assert_install_ok(result: InstallResult, version: str) -> None:
     assert result.returncode == 0, f"install script failed:\n{result.combined}"
-    # The script prints "✓ Verified: conductor v0.0.2 …" or similar; tolerate
+    # The script prints "[OK] Verified: conductor v0.0.2 ..." or similar; tolerate
     # cases where post-install verify fell back to a warning.
     assert "Conductor" in (result.stdout + result.stderr) or "conductor" in (
         result.stdout + result.stderr
