@@ -49,10 +49,10 @@ if (-not $Force    -and $env:CONDUCTOR_INSTALL_FORCE     -eq '1')    { $Force   
 # Helpers
 # ---------------------------------------------------------------------------
 
-function Write-Info { param([string]$Msg) Write-Host "  → $Msg" -ForegroundColor Cyan }
-function Write-Ok   { param([string]$Msg) Write-Host "  ✓ $Msg" -ForegroundColor Green }
+function Write-Info { param([string]$Msg) Write-Host "  -> $Msg" -ForegroundColor Cyan }
+function Write-Ok   { param([string]$Msg) Write-Host "  [OK] $Msg" -ForegroundColor Green }
 function Write-Warn { param([string]$Msg) Write-Host "  ! $Msg" -ForegroundColor Yellow }
-function Write-Err  { param([string]$Msg) Write-Host "  ✗ $Msg" -ForegroundColor Red; exit 1 }
+function Write-Err  { param([string]$Msg) Write-Host "  [X] $Msg" -ForegroundColor Red; exit 1 }
 
 function Get-UvToolsDir {
     # `uv tool dir` returns the canonical tools directory for the current uv install.
@@ -171,7 +171,7 @@ function Move-ConductorToolDirAside {
     $stamp = (Get-Date).ToString('yyyyMMddHHmmssfff')
     $renamed = "$current.old-$stamp"
     try {
-        # On Windows, Move-Item across same volume is a rename — atomic and
+        # On Windows, Move-Item across same volume is a rename -- atomic and
         # works even if files inside are locked, as long as no handles point
         # at the *directory* itself.
         Move-Item -LiteralPath $current -Destination $renamed -Force -ErrorAction Stop
@@ -215,7 +215,7 @@ Write-Host "`nConductor Installer`n" -ForegroundColor White
 # --- uv ---
 $uvCmd = Get-Command uv -ErrorAction SilentlyContinue
 if (-not $uvCmd) {
-    Write-Info "uv not found — installing…"
+    Write-Info "uv not found -- installing..."
     irm https://astral.sh/uv/install.ps1 | iex
     $env:Path = [System.Environment]::GetEnvironmentVariable('Path', 'User') + ';' +
                 [System.Environment]::GetEnvironmentVariable('Path', 'Machine')
@@ -240,7 +240,7 @@ if ($Source) {
     $skipConstraints = $true
     Write-Info "Using local source override: $Source"
 } else {
-    Write-Info "Fetching latest release…"
+    Write-Info "Fetching latest release..."
     $headers = @{ Accept = 'application/vnd.github+json' }
     $release = Invoke-RestMethod -Uri $GitHubApi -Headers $headers
     $tagName = $release.tag_name
@@ -270,7 +270,7 @@ if (-not $Source) {
                 Write-Host ""
                 return
             }
-            Write-Info "Upgrading Conductor: v$currentVersion → $tagName"
+            Write-Info "Upgrading Conductor: v$currentVersion -> $tagName"
         }
     }
 }
@@ -282,7 +282,7 @@ if (-not $Force) {
         Write-Warn "Other Conductor processes are running:"
         foreach ($r in $running) {
             $pathOrName = if ($r.Path) { $r.Path } else { $r.Name }
-            Write-Host ("    • PID {0}: {1}" -f $r.ProcessId, $pathOrName)
+            Write-Host ("    * PID {0}: {1}" -f $r.ProcessId, $pathOrName)
         }
         Write-Host ""
         Write-Host "  These can hold file locks that cause the upgrade to fail."
@@ -295,7 +295,7 @@ if (-not $Force) {
         if ($AutoStop) {
             $shouldStop = $true
         } elseif ([Console]::IsInputRedirected -or -not $Host.UI.RawUI) {
-            # No TTY (irm | iex from a script, CI pipe, etc.) — refuse to guess.
+            # No TTY (irm | iex from a script, CI pipe, etc.) -- refuse to guess.
             Write-Err "Aborted (other Conductor processes running; re-run with -AutoStop to stop them, or -Force to skip the check)."
         } else {
             $resp = Read-Host "  Stop them now and continue? [y/N]"
@@ -341,7 +341,7 @@ $lastStderr      = $null
 try {
     # --- Constraints (skipped for -Source overrides) ---
     if (-not $skipConstraints -and $tagName) {
-        Write-Info "Downloading constraints…"
+        Write-Info "Downloading constraints..."
         $constraintsUrl  = "$GitHubDL/$tagName/constraints.txt"
         $checksumUrl     = "$GitHubDL/$tagName/constraints.txt.sha256"
         $constraintsFile = Join-Path $tmpDir 'constraints.txt'
@@ -350,7 +350,7 @@ try {
             Invoke-WebRequest -Uri $constraintsUrl -OutFile $constraintsFile -UseBasicParsing
             Invoke-WebRequest -Uri $checksumUrl    -OutFile $checksumFile    -UseBasicParsing
 
-            Write-Info "Verifying checksum…"
+            Write-Info "Verifying checksum..."
             $expectedHash = (Get-Content $checksumFile -Raw).Trim().Split(' ')[0]
             $actualHash = (Get-FileHash -Path $constraintsFile -Algorithm SHA256).Hash.ToLower()
             if ($actualHash -ne $expectedHash) {
@@ -365,11 +365,11 @@ try {
 
     # --- Install with retries + rename-fallback ---
     $delays = @(2, 5, 10)
-    Write-Info "Installing Conductor $displayVersion…"
+    Write-Info "Installing Conductor $displayVersion..."
     for ($attempt = 1; $attempt -le ($delays.Count + 1); $attempt++) {
         if ($attempt -gt 1) {
             $sleep = $delays[[Math]::Min($attempt - 2, $delays.Count - 1)]
-            Write-Info "Retrying install (attempt $attempt) after ${sleep}s…"
+            Write-Info "Retrying install (attempt $attempt) after ${sleep}s..."
             Start-Sleep -Seconds $sleep
         }
 
@@ -385,7 +385,7 @@ try {
         # If we hit a directory-lock error and we haven't already renamed
         # aside, try the rename-fallback before the next retry.
         if (-not $renamedAside -and (Test-LockError -Output ($lastStderr + $lastStdout))) {
-            Write-Warn "Install blocked by a file lock; renaming the existing tool dir aside and retrying…"
+            Write-Warn "Install blocked by a file lock; renaming the existing tool dir aside and retrying..."
             $renamedAside = Move-ConductorToolDirAside
             if ($renamedAside) {
                 Write-Ok "Moved existing install to $renamedAside"
@@ -400,7 +400,7 @@ try {
 
     if (-not $installed) {
         Write-Host ""
-        Write-Host "  ── uv tool install output (exit code $lastExitCode) ──" -ForegroundColor Yellow
+        Write-Host "  -- uv tool install output (exit code $lastExitCode) --" -ForegroundColor Yellow
         $combined = (@($lastStdout, $lastStderr) | Where-Object { $_ } | Out-String).Trim()
         if ($combined) {
             $combined -split "`r?`n" | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
@@ -410,11 +410,11 @@ try {
         Write-Host ""
         Write-Info "Install failed."
         Write-Info "If the error mentions 'Access is denied' or 'failed to remove directory':"
-        Write-Info "  • Stop any running Conductor processes (try Task Manager or 'Get-Process conductor')"
-        Write-Info "  • Windows Defender may be scanning the install directory. Try an exclusion:"
+        Write-Info "  * Stop any running Conductor processes (try Task Manager or 'Get-Process conductor')"
+        Write-Info "  * Windows Defender may be scanning the install directory. Try an exclusion:"
         Write-Info "      Add-MpPreference -ExclusionPath `"`$env:LOCALAPPDATA\uv`""
         if ($renamedAside) {
-            Write-Info "  • The previous install was moved to: $renamedAside"
+            Write-Info "  * The previous install was moved to: $renamedAside"
             Write-Info "    You can delete it manually once nothing has it open."
         }
         Write-Host ""
@@ -424,7 +424,7 @@ try {
     Write-Ok "Conductor $displayVersion installed"
 
     # --- Update PATH for new shells ---
-    Write-Info "Ensuring conductor is on PATH for new shells…"
+    Write-Info "Ensuring conductor is on PATH for new shells..."
     try {
         & uv tool update-shell 2>&1 | Out-Null
         if ($LASTEXITCODE -eq 0) {

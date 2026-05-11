@@ -223,24 +223,35 @@ def test_install_ps1_parses_via_iex_pipeline() -> None:
         Unexpected attribute 'CmdletBinding'.
 
     The existing tests in this module all use ``powershell.exe -File
-    install.ps1``, which loads the script via PowerShell's *file* loader
-    and handles the BOM differently from the in-memory ``iex`` parser —
-    so they don't catch the BOM regression. This test does, by reading
-    the script bytes ourselves (mirroring what ``irm`` does) and feeding
-    them to ``[ScriptBlock]::Create``, which is what ``iex`` uses
-    internally to parse the input. It does **not** execute the script,
-    so it's safe and fast.
+    install.ps1``, which uses PowerShell's file loader. The file loader
+    detects the BOM as an encoding sniff and *strips* it from the string
+    before parsing.  ``Invoke-RestMethod``, by contrast, decodes the HTTP
+    body without that special handling, so the U+FEFF survives as a
+    literal character that ``iex`` / ``[ScriptBlock]::Create`` then sees
+    at offset 0.  This test mirrors the ``irm`` path exactly by reading
+    the raw bytes with ``ReadAllBytes`` and decoding via
+    ``Encoding.UTF8.GetString`` (which preserves the BOM in the returned
+    string), then handing the result to ``[ScriptBlock]::Create``, which
+    is what ``Invoke-Expression`` uses internally to parse its input.
+    It does **not** execute the script, so it's safe and fast.
+
+    DO NOT swap ``ReadAllBytes`` + ``UTF8.GetString`` for ``ReadAllText``:
+    the one-arg ``ReadAllText`` overload constructs a ``StreamReader`` with
+    ``detectEncodingFromByteOrderMarks: true``, which silently *consumes*
+    the BOM. That would make this test a tautology and miss the regression.
     """
-    # Use a here-string that interpolates the script path; ``[ScriptBlock]::Create``
-    # is the same parse path ``Invoke-Expression`` takes internally and will
-    # surface the BOM-induced parse error if one regresses.
-    # Escape any ``'`` in the path per PowerShell single-quoted-string rules
-    # (a single quote is doubled) so paths containing one don't break the
-    # generated -Command snippet.
+    # Build the PowerShell snippet via a Python f-string, embedding the
+    # script path inside a PowerShell single-quoted string. Escape any ``'``
+    # in the path per PowerShell single-quoted-string rules (a single
+    # quote is doubled) so paths containing one don't break the snippet.
     escaped_path = str(INSTALL_PS1).replace("'", "''")
     ps_script = (
         "$ErrorActionPreference = 'Stop'; "
-        f"$content = [System.IO.File]::ReadAllText('{escaped_path}'); "
+        # ReadAllBytes + UTF8.GetString preserves a leading BOM as U+FEFF
+        # in the resulting string, exactly as Invoke-RestMethod would.
+        # See the docstring above -- do NOT replace this with ReadAllText.
+        f"$bytes = [System.IO.File]::ReadAllBytes('{escaped_path}'); "
+        "$content = [System.Text.Encoding]::UTF8.GetString($bytes); "
         "try { "
         "  [void][ScriptBlock]::Create($content); "
         "  Write-Output 'PARSE_OK' "
@@ -268,5 +279,53 @@ def test_install_ps1_parses_via_iex_pipeline() -> None:
         "install.ps1 failed to parse via the `irm | iex` code path "
         "(`[ScriptBlock]::Create`). This usually means the file has a "
         "leading UTF-8 BOM (EF BB BF) that breaks `irm <url> | iex`. "
+        f"\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+    )
+
+
+@pytest.mark.skipif(not IS_WINDOWS, reason="PowerShell required to test the test")
+def test_iex_pipeline_test_actually_catches_bom_regression() -> None:
+    """Test-the-test: prepending a UTF-8 BOM must make the parse path fail.
+
+    This proves the harness in :func:`test_install_ps1_parses_via_iex_pipeline`
+    actually catches a regressed BOM.  We read the (BOM-free) install script,
+    prepend a BOM byte sequence in PowerShell, and assert that
+    ``[ScriptBlock]::Create`` rejects the result.  If this test ever starts
+    passing without raising, the parse-path test above has rotted into a
+    tautology and must be re-checked.
+    """
+    escaped_path = str(INSTALL_PS1).replace("'", "''")
+    ps_script = (
+        "$ErrorActionPreference = 'Stop'; "
+        f"$bytes = [System.IO.File]::ReadAllBytes('{escaped_path}'); "
+        "$content = [System.Text.Encoding]::UTF8.GetString($bytes); "
+        # Prepend a literal U+FEFF, simulating a BOM that survived `irm`.
+        "$withBom = [char]0xFEFF + $content; "
+        "try { "
+        "  [void][ScriptBlock]::Create($withBom); "
+        "  Write-Output 'UNEXPECTED_PASS' "
+        "} catch { "
+        "  Write-Output 'EXPECTED_FAIL' "
+        "}"
+    )
+    proc = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            ps_script,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert "EXPECTED_FAIL" in proc.stdout, (
+        "Expected `[ScriptBlock]::Create` to reject install.ps1 when a BOM "
+        "is prepended, but it did not. The parse-path test in this file is "
+        "no longer protecting against the issue #175 regression. "
         f"\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
     )

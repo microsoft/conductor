@@ -1,10 +1,15 @@
 # PowerShell installer must be UTF-8 *without* BOM and use LF line endings.
 # A leading UTF-8 BOM (EF BB BF) survives `Invoke-RestMethod` as a U+FEFF
-# code point and breaks `irm <url> | iex` — which is the documented official
+# code point and breaks `irm <url> | iex` -- which is the documented official
 # install command in the README. See issue #175.
-install.ps1 text eol=lf working-tree-encoding=UTF-8
-
-# POSIX install script: same treatment for consistency.
+#
+# NOTE: This file pins line endings only. Git's `working-tree-encoding`
+# attribute does NOT enforce "no BOM" -- it only controls encoding
+# *conversion* between repo and working tree. The hard guarantee against
+# a regressed BOM is the byte-level test in
+# `tests/test_integration/test_install_script_files.py`. This stanza
+# is documentation + a hint for tools that respect gitattributes.
+install.ps1 text eol=lf
 install.sh text eol=lf
 
 # Shell + Python: always LF
