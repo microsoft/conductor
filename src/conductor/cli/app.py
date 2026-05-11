@@ -6,6 +6,7 @@ This module defines the main Typer app and global options.
 from __future__ import annotations
 
 import contextvars
+import logging
 import os
 from enum import Enum
 from pathlib import Path
@@ -17,6 +18,8 @@ from rich.panel import Panel
 from rich.text import Text
 
 from conductor import __version__
+
+logger = logging.getLogger(__name__)
 
 
 class ConsoleVerbosity(str, Enum):
@@ -1139,6 +1142,20 @@ def _stop_process(entry: dict, con: Console) -> None:
         con.print(
             f"[bold red]Permission denied:[/bold red] could not stop PID {pid}. "
             f"Try running with elevated privileges."
+        )
+    except OSError as exc:
+        # Defensive catch (companion to the fix for issue #166): on Windows,
+        # ``os.kill`` can raise OSError subclasses for edge cases such as the
+        # target not being a console process group leader, or a probe-failing
+        # PID that the "assume alive" fallback in ``_is_process_alive_windows``
+        # let through.  Treating these as "already exited" lets ``conductor
+        # stop`` continue and clean up the PID file rather than crash.
+        logger.warning(
+            "Unexpected OSError stopping PID %s; treating as already exited", pid, exc_info=True
+        )
+        con.print(
+            f"[yellow]Could not signal PID {pid} ({exc}); "
+            f"removing PID file for workflow '{workflow}' anyway.[/yellow]"
         )
 
 

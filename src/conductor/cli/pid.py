@@ -16,16 +16,69 @@ PID files are JSON with the schema::
 
 from __future__ import annotations
 
+import ctypes
 import json
 import logging
 import os
 import sys
+from ctypes import wintypes
 from datetime import UTC, datetime
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 _PID_DIR_NAME = "runs"
+
+
+# --------------------------------------------------------------------------- #
+# Windows process-liveness probing
+#
+# ``os.kill(pid, 0)`` is the standard Unix probe but is unsafe on Windows: per
+# the CPython docs, any signal value other than ``CTRL_C_EVENT`` /
+# ``CTRL_BREAK_EVENT`` routes through ``TerminateProcess`` and may also raise
+# ``OSError`` subclasses that the POSIX-style branches don't anticipate (e.g.
+# ``WinError 11`` / ``ERROR_BAD_FORMAT``, see issue #166).  We use
+# ``OpenProcess`` + ``GetExitCodeProcess`` instead.
+#
+# All ctypes setup is hoisted to module level so it runs once per process,
+# matches the codebase's ``if sys.platform == "win32":`` idiom (see
+# ``cli/app.py``, ``cli/update.py``, ``cli/bg_runner.py``), and gives tests a
+# single ``_kernel32`` symbol to monkey-patch from any platform.
+# --------------------------------------------------------------------------- #
+
+# Process access right that doesn't require administrative privileges.
+# ``PROCESS_QUERY_LIMITED_INFORMATION`` is granted by a more permissive default
+# DACL than ``PROCESS_QUERY_INFORMATION`` and is the minimum right that
+# satisfies ``GetExitCodeProcess``.
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+# Sentinel exit code returned by ``GetExitCodeProcess`` for a process that has
+# not yet exited.  Defined as ``STILL_ACTIVE`` (alias of ``STATUS_PENDING`` =
+# ``0x103``) in the Windows SDK ``WinBase.h``.
+#
+# Known footgun: a process that legitimately exits with status code 259 is
+# indistinguishable from one that is still running.  Microsoft's documented
+# workaround is ``WaitForSingleObject(handle, 0)``.  We accept this ambiguity
+# because conductor child processes do not exit with code 259 in practice; the
+# worst case is a stale PID-file entry that the user can remove manually.
+_STILL_ACTIVE = 259
+# Specific ``OpenProcess`` failure codes we interpret.  Any other failure is
+# treated as "unknown — assume alive" so that a transient OS hiccup doesn't
+# silently delete a still-running workflow's PID file.
+_ERROR_ACCESS_DENIED = 5
+_ERROR_INVALID_PARAMETER = 87
+
+if sys.platform == "win32":
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    _kernel32.OpenProcess.restype = wintypes.HANDLE
+    _kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    _kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    _kernel32.CloseHandle.restype = wintypes.BOOL
+else:
+    # On non-Windows the kernel32 wrapper is unused in production but tests
+    # patch this symbol to exercise the Windows code path on every platform.
+    _kernel32 = None
 
 
 def pid_dir() -> Path:
@@ -186,7 +239,12 @@ def _is_process_alive(pid: int) -> bool:
 
 
 def _is_process_alive_posix(pid: int) -> bool:
-    """POSIX implementation of :func:`_is_process_alive` using ``os.kill``."""
+    """POSIX implementation of :func:`_is_process_alive` using ``os.kill``.
+
+    Catches generic :class:`OSError` and returns True so a transient OS
+    failure doesn't crash ``conductor stop`` or silently drop a live
+    workflow's PID file (regression for issue #166).
+    """
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -195,10 +253,15 @@ def _is_process_alive_posix(pid: int) -> bool:
         # Process exists but we can't signal it — still alive.
         return True
     except OSError:
-        # Unknown error from the OS — err on the side of "still alive" so that
-        # a transient failure doesn't crash ``conductor stop`` or cause us to
-        # silently drop a still-running workflow's PID file.
-        logger.debug("Unexpected OSError checking PID %s; assuming alive", pid, exc_info=True)
+        # Unknown error from the OS — err on the side of "still alive".  We
+        # log at warning so the user can see why a phantom workflow is
+        # appearing in ``conductor stop`` listings.
+        logger.warning(
+            "Unexpected OSError checking PID %s; assuming alive. "
+            "The PID file in ~/.conductor/runs/ may need manual removal.",
+            pid,
+            exc_info=True,
+        )
         return True
     return True
 
@@ -210,53 +273,56 @@ def _is_process_alive_windows(pid: int) -> bool:
     ``GetExitCodeProcess`` rather than ``os.kill(pid, 0)``, which on Windows
     is unsafe (it routes through ``TerminateProcess``) and can raise
     ``OSError`` subclasses such as ``WinError 11`` (``ERROR_BAD_FORMAT``).
+
+    Limitations:
+
+    - Relies on the ``STILL_ACTIVE`` (259) sentinel from ``GetExitCodeProcess``.
+      A process that legitimately exits with status code 259 will be reported
+      as still alive forever.  Microsoft's documented workaround is
+      ``WaitForSingleObject(handle, 0)``; we accept the ambiguity because
+      conductor child processes do not exit with code 259 in practice.
     """
-    import ctypes
-    from ctypes import wintypes
-
-    # Process access right that doesn't require administrative privileges and
-    # is sufficient to call GetExitCodeProcess.
-    process_query_limited_information = 0x1000
-    # Sentinel exit code returned by GetExitCodeProcess for a process that has
-    # not yet exited.  See the Windows SDK ``WinBase.h`` (``STILL_ACTIVE``).
-    still_active = 259
-    # ``OpenProcess`` failure error codes we want to interpret specifically.
-    error_access_denied = 5
-    error_invalid_parameter = 87
-
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[unresolved-attribute]
-    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-    kernel32.OpenProcess.restype = wintypes.HANDLE
-    kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
-    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
-    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-    kernel32.CloseHandle.restype = wintypes.BOOL
-
-    handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+    # In production this function is only reached when ``sys.platform ==
+    # "win32"`` (so ``_kernel32`` is set); in tests the symbol is patched to a
+    # MagicMock.  The assert narrows the type for ty / mypy and provides a
+    # clear failure mode if the function is ever called incorrectly.
+    assert _kernel32 is not None, "_is_process_alive_windows requires _kernel32 to be initialised"
+    handle = _kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
     if not handle:
-        err = ctypes.get_last_error()  # type: ignore[unresolved-attribute]
-        if err == error_access_denied:
-            # Process exists but we lack the rights to query it — treat as alive.
+        err = ctypes.get_last_error()
+        if err == _ERROR_ACCESS_DENIED:
+            # Process exists but we lack the rights to query it — treat as
+            # alive.  This is an expected condition (e.g. cross-session or
+            # higher-integrity targets) so a debug log is sufficient.
+            logger.debug("OpenProcess(PID=%s) denied (ERROR_ACCESS_DENIED); assuming alive", pid)
             return True
-        if err == error_invalid_parameter:
+        if err == _ERROR_INVALID_PARAMETER:
             # No process with that PID exists.
             return False
-        # Any other failure is unexpected. Don't crash; assume still alive so
-        # we don't silently delete a PID file for a process that may be
-        # running.
-        logger.debug("OpenProcess failed for PID %s with error %s; assuming alive", pid, err)
+        # Any other failure is unexpected.  Don't crash; assume still alive
+        # but warn so the user can diagnose phantom workflows.
+        logger.warning(
+            "OpenProcess(PID=%s) failed with WinError %s (%s); assuming alive. "
+            "The PID file in ~/.conductor/runs/ may need manual removal.",
+            pid,
+            err,
+            ctypes.FormatError(err),
+        )
         return True
 
     try:
         exit_code = wintypes.DWORD()
-        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+        if not _kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
             # Couldn't read the exit code — assume alive rather than crash.
-            logger.debug(
-                "GetExitCodeProcess failed for PID %s with error %s; assuming alive",
+            err = ctypes.get_last_error()
+            logger.warning(
+                "GetExitCodeProcess(PID=%s) failed with WinError %s (%s); assuming alive. "
+                "The PID file in ~/.conductor/runs/ may need manual removal.",
                 pid,
-                ctypes.get_last_error(),  # type: ignore[unresolved-attribute]
+                err,
+                ctypes.FormatError(err),
             )
             return True
-        return exit_code.value == still_active
+        return exit_code.value == _STILL_ACTIVE
     finally:
-        kernel32.CloseHandle(handle)
+        _kernel32.CloseHandle(handle)
