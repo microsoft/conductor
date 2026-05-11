@@ -79,6 +79,30 @@ def _kill(proc: subprocess.Popen) -> None:
         pass
 
 
+def _run_pwsh(script: str) -> subprocess.CompletedProcess[str]:
+    """Run a PowerShell snippet via ``powershell.exe -Command`` (Windows-only).
+
+    Sets the standard non-interactive flags so the snippet can't pop a prompt
+    or load a profile. Returns the completed process; callers do their own
+    assertion on returncode/stdout/stderr.
+    """
+    return subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -260,21 +284,7 @@ def test_install_ps1_parses_via_iex_pipeline() -> None:
         "  exit 1 "
         "}"
     )
-    proc = subprocess.run(
-        [
-            "powershell.exe",
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            ps_script,
-        ],
-        capture_output=True,
-        text=True,
-        timeout=60,
-        check=False,
-    )
+    proc = _run_pwsh(ps_script)
     assert proc.returncode == 0 and "PARSE_OK" in proc.stdout, (
         "install.ps1 failed to parse via the `irm | iex` code path "
         "(`[ScriptBlock]::Create`). This usually means the file has a "
@@ -308,21 +318,7 @@ def test_iex_pipeline_test_actually_catches_bom_regression() -> None:
         "  Write-Output 'EXPECTED_FAIL' "
         "}"
     )
-    proc = subprocess.run(
-        [
-            "powershell.exe",
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            ps_script,
-        ],
-        capture_output=True,
-        text=True,
-        timeout=60,
-        check=False,
-    )
+    proc = _run_pwsh(ps_script)
     assert "EXPECTED_FAIL" in proc.stdout, (
         "Expected `[ScriptBlock]::Create` to reject install.ps1 when a BOM "
         "is prepended, but it did not. The parse-path test in this file is "

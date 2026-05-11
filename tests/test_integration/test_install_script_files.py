@@ -92,15 +92,13 @@ def test_install_ps1_is_pure_ascii() -> None:
     ``-`` for box-drawing horizontal.
     """
     data = INSTALL_PS1.read_bytes()
-    non_ascii = [(i, b) for i, b in enumerate(data) if b > 127]
-    if non_ascii:
-        i, b = non_ascii[0]
+    if not data.isascii():
+        first = next(i for i, b in enumerate(data) if b > 127)
         raise AssertionError(
-            f"install.ps1 contains a non-ASCII byte (0x{b:02X}) at offset {i}. "
-            f"Total non-ASCII bytes: {len(non_ascii)}. Replace with ASCII "
-            f"equivalents -- Windows PowerShell 5.1 reads BOM-less files as "
-            f"Windows-1252 and mangles multi-byte UTF-8 into curly quotes "
-            f"that derail the parser."
+            f"install.ps1 contains a non-ASCII byte (0x{data[first]:02X}) at offset {first}. "
+            "Replace with ASCII equivalents -- Windows PowerShell 5.1 reads BOM-less "
+            "files as Windows-1252 and mangles multi-byte UTF-8 into curly quotes "
+            "that derail the parser."
         )
 
 
