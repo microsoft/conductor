@@ -174,10 +174,16 @@ class AgentExecutor:
             rendered_prompt,
         )
 
-        # Render system prompt if present (used by some providers)
-        # Note: System prompt support will be fully utilized in later EPICs
+        # Render system prompt if present and update the agent so that providers
+        # which forward `agent.system_prompt` (e.g., the Copilot provider) see
+        # the rendered text instead of the raw template with unfilled `{{ }}`
+        # placeholders. Without this, agents whose instructions live in
+        # `system_prompt` send unrendered Jinja to the model, which then
+        # correctly reports "the prompt template contains unfilled variables"
+        # and refuses to do useful work.
         if agent.system_prompt:
-            _ = self.renderer.render(agent.system_prompt, context)
+            rendered_system_prompt = self.renderer.render(agent.system_prompt, context)
+            agent = agent.model_copy(update={"system_prompt": rendered_system_prompt})
 
         # Resolve tools for this agent
         resolved_tools = resolve_agent_tools(agent.tools, self.workflow_tools)

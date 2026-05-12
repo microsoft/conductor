@@ -106,6 +106,27 @@ def validate_workflow_config(config: WorkflowConfig) -> list[str]:
             tool_errors = _validate_tool_references(agent.name, agent.tools, set(config.tools))
             errors.extend(tool_errors)
 
+        # Warn when an LLM agent has system_prompt but no (non-empty) prompt.
+        # The Copilot provider concatenates `agent.system_prompt` into the prompt,
+        # but providers that ignore system_prompt entirely (e.g., Claude) would
+        # leave such agents with an empty user message. Even with the executor
+        # rendering system_prompt, omitting `prompt:` is a portability hazard
+        # and almost always indicates the author meant to include a `prompt:`
+        # block alongside the persona/methodology in `system_prompt:`.
+        if (
+            agent.type in (None, "agent")
+            and agent.system_prompt
+            and not (agent.prompt and agent.prompt.strip())
+        ):
+            warnings.append(
+                f"Agent '{agent.name}' defines `system_prompt` but no `prompt` (or only whitespace). "
+                "Some providers (e.g., Claude) ignore `system_prompt` entirely, which would send an "
+                "empty user message to the model. Even with the Copilot provider, the model often "
+                "responds poorly to a missing user prompt. Move the dynamic, must-execute content "
+                "(input references, instructions) into a `prompt:` block; keep the persona and "
+                "static methodology in `system_prompt:`."
+            )
+
     # Validate parallel groups
     if config.parallel:
         parallel_errors = _validate_parallel_groups(config)

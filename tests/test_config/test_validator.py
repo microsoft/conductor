@@ -55,6 +55,51 @@ class TestValidateWorkflowConfig:
         warnings = validate_workflow_config(config)
         assert isinstance(warnings, list)
 
+    def test_warns_on_system_prompt_without_prompt(self) -> None:
+        """Agent with system_prompt but no prompt: should produce a warning.
+
+        The Copilot provider concatenates system_prompt with the user prompt,
+        so a missing prompt means an empty user message — almost always a
+        latent author mistake. Other providers (Claude) ignore system_prompt
+        entirely, so the agent would have no instructions at all.
+        """
+        config = WorkflowConfig(
+            workflow=WorkflowDef(name="test", entry_point="lonely"),
+            agents=[
+                AgentDef(
+                    name="lonely",
+                    model="gpt-4",
+                    system_prompt="You are a helpful assistant.",
+                    # no prompt:
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+        )
+        warnings = validate_workflow_config(config)
+        assert any(
+            "lonely" in w and "system_prompt" in w and "no `prompt`" in w
+            for w in warnings
+        ), f"expected system_prompt-without-prompt warning; got: {warnings!r}"
+
+    def test_no_warning_when_prompt_present_alongside_system_prompt(self) -> None:
+        """Having both system_prompt and prompt is the expected pattern — no warning."""
+        config = WorkflowConfig(
+            workflow=WorkflowDef(name="test", entry_point="ok"),
+            agents=[
+                AgentDef(
+                    name="ok",
+                    model="gpt-4",
+                    system_prompt="You are a helpful assistant.",
+                    prompt="Answer: 42",
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+        )
+        warnings = validate_workflow_config(config)
+        assert not any(
+            "system_prompt" in w and "no `prompt`" in w for w in warnings
+        )
+
 
 class TestRouteValidation:
     """Tests for route target validation."""
