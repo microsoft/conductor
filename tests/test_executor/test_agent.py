@@ -144,9 +144,7 @@ class TestAgentExecutorBasic:
         provider = CopilotProvider(mock_handler=mock_handler)
         executor = AgentExecutor(provider)
 
-        context = {
-            "workflow": {"input": {"topic": "Python", "question": "What is it?"}}
-        }
+        context = {"workflow": {"input": {"topic": "Python", "question": "What is it?"}}}
         await executor.execute(agent_with_system_prompt, context)
 
         assert len(captured_agents) == 1

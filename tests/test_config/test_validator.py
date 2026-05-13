@@ -77,8 +77,7 @@ class TestValidateWorkflowConfig:
         )
         warnings = validate_workflow_config(config)
         assert any(
-            "lonely" in w and "system_prompt" in w and "no `prompt`" in w
-            for w in warnings
+            "lonely" in w and "system_prompt" in w and "no `prompt`" in w for w in warnings
         ), f"expected system_prompt-without-prompt warning; got: {warnings!r}"
 
     def test_no_warning_when_prompt_present_alongside_system_prompt(self) -> None:
@@ -96,9 +95,7 @@ class TestValidateWorkflowConfig:
             ],
         )
         warnings = validate_workflow_config(config)
-        assert not any(
-            "system_prompt" in w and "no `prompt`" in w for w in warnings
-        )
+        assert not any("system_prompt" in w and "no `prompt`" in w for w in warnings)
 
 
 class TestRouteValidation:

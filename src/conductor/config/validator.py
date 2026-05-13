@@ -119,12 +119,14 @@ def validate_workflow_config(config: WorkflowConfig) -> list[str]:
             and not (agent.prompt and agent.prompt.strip())
         ):
             warnings.append(
-                f"Agent '{agent.name}' defines `system_prompt` but no `prompt` (or only whitespace). "
-                "Some providers (e.g., Claude) ignore `system_prompt` entirely, which would send an "
-                "empty user message to the model. Even with the Copilot provider, the model often "
-                "responds poorly to a missing user prompt. Move the dynamic, must-execute content "
-                "(input references, instructions) into a `prompt:` block; keep the persona and "
-                "static methodology in `system_prompt:`."
+                f"Agent '{agent.name}' defines `system_prompt` but no `prompt` "
+                "(or only whitespace). "
+                "Some providers (e.g., Claude) ignore `system_prompt` entirely, "
+                "which would send an empty user message to the model. "
+                "Even with the Copilot provider, the model often responds poorly "
+                "to a missing user prompt. Move the dynamic, must-execute content "
+                "(input references, instructions) into a `prompt:` block; keep the "
+                "persona and static methodology in `system_prompt:`."
             )
 
     # Validate parallel groups
