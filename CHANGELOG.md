@@ -5,7 +5,80 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.14...HEAD)
+## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.15...HEAD)
+
+## [0.1.15](https://github.com/microsoft/conductor/compare/v0.1.14...v0.1.15) - 2026-05-13
+
+### Added
+- Per-agent `timeout_seconds` field for hard wall-clock timeouts on agent
+  execution. Wraps execution in `asyncio.wait_for()` at the engine level so a
+  slow agent no longer blocks the rest of the workflow. Effective timeout is
+  `min(agent.timeout_seconds, remaining_workflow_timeout)` — when the workflow
+  timeout is stricter it owns the error so attribution is never mislabeled.
+  Raises a new `AgentTimeoutError` (subclass of `TimeoutError`) honored by
+  existing `fail_fast` / `continue_on_error` semantics in parallel and
+  for-each groups, and emits an `agent_timeout` event (with elapsed time
+  and limit) for console + dashboard subscribers. Scoped to provider-backed
+  agents; rejected on `script`, `human_gate`, and `workflow` types
+  ([#150](https://github.com/microsoft/conductor/pull/150)).
+- Auto-discovery of `.github/instructions/**/*.instructions.md` workspace
+  conventions, matching GitHub Copilot's documented semantics. Files marked
+  `applyTo: "**"` in their frontmatter are loaded into the workspace preamble
+  alongside `AGENTS.md` / `CLAUDE.md` / `.github/copilot-instructions.md`;
+  scoped (`applyTo: "<glob>"`) and absent-`applyTo` files are skipped per
+  the convention's manual-attach default. The internal
+  `CONVENTION_FILES: list[str]` table is refactored to a polymorphic
+  `CONVENTIONS: list[Convention]` (`ConventionFile | ConventionDirectory`)
+  so adding new conventions (Cursor rules, Cline rules, etc.) becomes one
+  filter function plus one list entry; a `CONVENTION_FILES` module-level
+  alias preserves backward compatibility for downstream imports
+  ([#169](https://github.com/microsoft/conductor/pull/169)).
+
+### Fixed
+- `agent.system_prompt` is now rendered and forwarded to providers. The
+  executor was rendering `agent.system_prompt` only to discard the result
+  (`_ = self.renderer.render(...)`), so providers that forward
+  `system_prompt` — notably the Copilot provider, which concatenates it
+  into the prompt — received the un-rendered Jinja template. Agents whose
+  instructions lived in `system_prompt` sent literal `{{ ... }}` placeholders
+  to the model and got back "the prompt template contains unfilled variables"
+  refusals. Also adds a `conductor validate` warning for agents that define
+  `system_prompt` but no `prompt:` (a portability hazard since the Claude
+  provider drops `system_prompt` entirely, and almost always a missing-`prompt:`
+  typo) ([#179](https://github.com/microsoft/conductor/pull/179)).
+- `conductor update` on Windows no longer attempts an in-process self-upgrade.
+  The previous flow tried to re-install into the same venv the running
+  `python.exe` lives in, producing "Access is denied" failures that earlier
+  mitigations only papered over. `conductor update` now checks for a newer
+  version and prints the OS-appropriate `install.ps1` / `install.sh`
+  one-liner, and the install scripts become the single upgrade path: they
+  detect other running conductor processes (auto-stopping under `-Yes`),
+  sweep stale `*.exe.old` files, retry with backoff (2s / 5s / 10s), and —
+  when uv can't remove the `conductor-cli` tool dir because of file locks —
+  rename the whole dir aside and retry. `install.sh` reaches parity with
+  `--yes` / `--force` / `--source` flags, retry-with-backoff, running-process
+  detection, and a post-install `conductor --version` verify
+  ([#171](https://github.com/microsoft/conductor/pull/171)).
+- `install.ps1` is now stored without a UTF-8 BOM. The documented one-liner
+  `irm https://aka.ms/conductor/install.ps1 | iex` returns the script body
+  as a single string with the BOM surviving as U+FEFF at index 0; PowerShell's
+  in-memory `iex` parser then trips on the `[CmdletBinding()]` attribute with
+  `Unexpected attribute 'CmdletBinding'`. Both fresh installs via `irm | iex`
+  and `conductor update --apply` (which re-runs the same command in a
+  spawned console) now succeed. Direct `powershell.exe -File install.ps1`
+  invocations were unaffected, which is why prior file-based integration
+  tests didn't catch it ([#178](https://github.com/microsoft/conductor/pull/178)).
+- `conductor stop` (including `--all` and `--port`) no longer crashes on
+  Windows when a PID file exists in `~/.conductor/runs/`. The Unix idiom
+  `os.kill(pid, 0)` for liveness probing is *not* a no-op on Windows — any
+  signal other than `CTRL_C_EVENT` / `CTRL_BREAK_EVENT` routes through
+  `TerminateProcess` and can raise `OSError` subclasses outside
+  `ProcessLookupError` / `PermissionError` (e.g. `WinError 11 /
+  ERROR_BAD_FORMAT`), and even "successful" calls would actually terminate
+  the target with exit code 0. `_is_process_alive()` now dispatches to a
+  Windows-specific implementation using `OpenProcess` +
+  `GetExitCodeProcess` for a truly non-destructive liveness check
+  ([#176](https://github.com/microsoft/conductor/pull/176)).
 
 ## [0.1.14](https://github.com/microsoft/conductor/compare/v0.1.13...v0.1.14) - 2026-05-06
 
