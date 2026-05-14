@@ -1,0 +1,17 @@
+{
+  "name": "conductor",
+  "description": "Multi-agent workflow orchestration via YAML. Ships the conductor skill so the assistant can validate, run, debug, and author workflow files for the conductor CLI.",
+  "version": "0.1.15",
+  "author": {
+    "name": "Microsoft"
+  },
+  "homepage": "https://github.com/microsoft/conductor",
+  "repository": "https://github.com/microsoft/conductor",
+  "license": "MIT",
+  "keywords": [
+    "workflow",
+    "orchestration",
+    "multi-agent",
+    "yaml"
+  ]
+}

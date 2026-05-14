@@ -1,0 +1,38 @@
+name: validate-plugin
+
+on:
+  pull_request:
+    paths:
+      - ".claude-plugin/**"
+      - "plugins/**"
+      - "pyproject.toml"
+      - ".github/workflows/validate-plugin.yml"
+  push:
+    branches: [main]
+    paths:
+      - ".claude-plugin/**"
+      - "plugins/**"
+      - "pyproject.toml"
+      - ".github/workflows/validate-plugin.yml"
+
+jobs:
+  validate-json:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate marketplace.json and plugin.json are valid JSON
+        run: |
+          python -c "import json,sys; json.load(open('.claude-plugin/marketplace.json'))"
+          python -c "import json,sys; json.load(open('plugins/conductor/.claude-plugin/plugin.json'))"
+      - name: Verify SKILL.md exists at the expected plugin path
+        run: |
+          test -f plugins/conductor/skills/conductor/SKILL.md
+          echo "OK: plugins/conductor/skills/conductor/SKILL.md is present"
+      - name: Verify plugin.json and pyproject.toml versions match
+        run: |
+          PLUGIN=$(python -c "import json; print(json.load(open('plugins/conductor/.claude-plugin/plugin.json'))['version'])")
+          PYPROJECT=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          if [ "$PLUGIN" != "$PYPROJECT" ]; then
+            echo "Version mismatch: plugin.json=$PLUGIN pyproject.toml=$PYPROJECT"; exit 1
+          fi
+          echo "OK: both at version $PLUGIN"
