@@ -5,7 +5,6 @@ on:
     paths:
       - ".claude-plugin/**"
       - "plugins/**"
-      - ".claude/skills/**"
       - "pyproject.toml"
       - ".github/workflows/validate-plugin.yml"
   push:
@@ -13,7 +12,6 @@ on:
     paths:
       - ".claude-plugin/**"
       - "plugins/**"
-      - ".claude/skills/**"
       - "pyproject.toml"
       - ".github/workflows/validate-plugin.yml"
 
@@ -26,19 +24,10 @@ jobs:
         run: |
           python -c "import json,sys; json.load(open('.claude-plugin/marketplace.json'))"
           python -c "import json,sys; json.load(open('plugins/conductor/.claude-plugin/plugin.json'))"
-      - name: Verify canonical SKILL.md is a real file
+      - name: Verify SKILL.md exists at the expected plugin path
         run: |
           test -f plugins/conductor/skills/conductor/SKILL.md
-          echo "OK: canonical SKILL.md is a real file"
-      - name: Verify .claude/skills/conductor symlink resolves
-        run: |
-          if [ ! -L .claude/skills/conductor ]; then
-            echo "ERROR: .claude/skills/conductor is not a symlink"; exit 1
-          fi
-          if [ ! -f .claude/skills/conductor/SKILL.md ]; then
-            echo "ERROR: .claude/skills/conductor symlink does not resolve to SKILL.md"; exit 1
-          fi
-          echo "OK: .claude/skills/conductor symlink resolves correctly"
+          echo "OK: plugins/conductor/skills/conductor/SKILL.md is present"
       - name: Verify plugin.json and pyproject.toml versions match
         run: |
           PLUGIN=$(python -c "import json; print(json.load(open('plugins/conductor/.claude-plugin/plugin.json'))['version'])")

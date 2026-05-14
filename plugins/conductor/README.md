@@ -3,11 +3,6 @@
 Bundles the **conductor** skill so Claude Code can validate, run, debug, and author
 Conductor multi-agent YAML workflows.
 
-The skill files in this directory are the canonical source. The
-`.claude/skills/conductor` path at the repo root is a symlink to here, so
-local Claude Code dev sessions and the published plugin share a single source
-of truth.
-
 ## What this plugin contains
 
 - `skills/conductor/SKILL.md` — model-invoked skill describing the workflow schema,
@@ -25,6 +20,15 @@ Add the marketplace and install the plugin:
 ```text
 /plugin marketplace add microsoft/conductor
 /plugin install conductor@conductor
+```
+
+## Local development
+
+If you're hacking on the skill from a clone of `microsoft/conductor`, point Claude
+Code at this directory directly:
+
+```bash
+claude --plugin-dir plugins/conductor
 ```
 
 ## Use the underlying CLI

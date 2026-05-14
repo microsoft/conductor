@@ -118,7 +118,7 @@ pip install git+https://github.com/microsoft/conductor.git@v1.0.0
 ### Use the Conductor skill in Claude Code or Copilot CLI
 
 This repo doubles as a single-plugin marketplace that ships the `conductor`
-skill (the same one in `.claude/skills/conductor/`). The skill teaches the
+skill from `plugins/conductor/skills/conductor/`. The skill teaches the
 assistant the workflow YAML schema, CLI commands, and execution model.
 
 **Claude Code:**
