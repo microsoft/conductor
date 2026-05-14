@@ -128,7 +128,7 @@ assistant the workflow YAML schema, CLI commands, and execution model.
 /plugin install conductor@conductor
 ```
 
-**GitHub Copilot CLI** (`gh skill` requires GitHub CLI 2.90+, public preview):
+**GitHub Copilot CLI** (`gh skill` requires GitHub CLI 2.91+, public preview):
 
 ```bash
 gh skill install microsoft/conductor conductor
