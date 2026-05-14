@@ -16,7 +16,8 @@ conductor run <workflow.yaml> [OPTIONS]
 |--------|-------------|
 | `--input`, `-i NAME=VALUE` | Workflow input (repeatable) |
 | `--input.NAME=VALUE` | Alternative input syntax |
-| `--provider`, `-p PROVIDER` | Override provider (copilot, claude) |
+| `--metadata`, `-m KEY=VALUE` | Workflow metadata, merged on top of YAML `metadata:` (repeatable; values stay strings) |
+| `--provider`, `-p PROVIDER` | Override provider (`copilot`, `claude`, `openai-agents`) |
 | `--dry-run` | Show execution plan only |
 | `--skip-gates` | Auto-select first option at human gates |
 | `--web` | Start real-time web dashboard |
@@ -24,6 +25,8 @@ conductor run <workflow.yaml> [OPTIONS]
 | `--web-port PORT` | Port for web dashboard (0 = auto) |
 | `--no-interactive` | Disable Esc-to-interrupt capability |
 | `--log-file`, `-l PATH` | Write full debug output to file (`auto` for auto-generated) |
+| `--workspace-instructions` | Auto-discover `AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md`, and `.github/instructions/**/*.instructions.md` (only files marked `applyTo: "**"`) and prepend them to every agent prompt |
+| `--instructions PATH` | Path to a specific instruction file to prepend (repeatable) |
 
 **Global options** (before the subcommand):
 
@@ -64,6 +67,15 @@ conductor run workflow.yaml --dry-run
 
 # Override provider
 conductor run workflow.yaml -p claude
+
+# Attach metadata (merged on top of YAML metadata; values are strings)
+conductor run workflow.yaml -m tracker=ado -m work_item_id=42
+
+# Auto-discover workspace instructions and prepend to all prompts
+conductor run workflow.yaml --workspace-instructions
+
+# Prepend explicit instruction file(s)
+conductor run workflow.yaml --instructions AGENTS.md --instructions notes.md
 
 # Start real-time web dashboard
 conductor run workflow.yaml --web --input question="Hello"
@@ -106,25 +118,30 @@ conductor stop --all
 
 ### conductor update
 
-Check for and install the latest version of Conductor:
+Check for the latest version of Conductor and (optionally) launch the installer:
 
 ```bash
-conductor update
+conductor update            # Check + print install command
+conductor update --apply    # Check + launch installer (then exit)
 ```
 
 The command:
-1. Fetches the latest release from the GitHub Releases API
-2. Compares the remote version with the locally installed version
-3. If a newer version is available, runs `uv tool install --force git+https://github.com/microsoft/conductor.git@v{version}` to upgrade
-4. Clears the update-check cache on success so the next invocation re-checks cleanly
 
-If already up to date, prints a confirmation message and exits.
+1. Fetches the latest release from the GitHub Releases API.
+2. Compares the remote version with the locally installed version.
+3. **Default:** prints the OS-appropriate `install.sh` / `install.ps1` one-liner you can paste into a fresh shell.
+4. **`--apply`:** spawns the install script as a fully detached process and exits the current `conductor` so file locks release. On Windows the installer opens in a new console window; on POSIX `os.execvpe` replaces the process. This is the only way to upgrade-while-running cleanly on Windows (in-process self-upgrade was removed because the running interpreter sits inside the venv that `uv tool install --force` is trying to recreate).
+5. Clears the update-check cache on success.
 
-**Passive update hints:** On every CLI invocation, Conductor checks for updates (cached 24 hours, 2-second timeout) and prints a one-line hint if a newer version is available. Hints only appear when stderr is a TTY and `--silent` is not set.
+If already up to date, prints a confirmation and exits.
+
+The legacy `--force` flag is accepted as a no-op for backward compatibility.
+
+**Passive update hints:** On every CLI invocation, Conductor checks for updates (cached 24h, 2-second timeout) and prints a one-line hint if a newer version is available. Suppressed when stderr is not a TTY, when `--silent` is set, when the subcommand is `update`, or when `CONDUCTOR_NO_UPDATE_CHECK=1`.
 
 ### conductor resume
 
-Resume a workflow from a checkpoint after failure:
+Resume a workflow from a checkpoint after failure. Run-flag parity: most `run` flags work identically.
 
 ```bash
 conductor resume <workflow.yaml> [OPTIONS]
@@ -134,29 +151,37 @@ conductor resume --from <checkpoint.json> [OPTIONS]
 | Option | Description |
 |--------|-------------|
 | `--from PATH` | Resume from a specific checkpoint file |
+| `--provider`, `-p PROVIDER` | Override provider for the resumed run |
+| `--metadata`, `-m KEY=VALUE` | Workflow metadata, merged on top of YAML metadata (repeatable) |
 | `--skip-gates` | Auto-select first option at human gates |
 | `--log-file`, `-l PATH` | Write debug output to file |
 | `--no-interactive` | Disable Esc-to-interrupt |
+| `--web` | Start real-time web dashboard for the resumed run |
+| `--web-port PORT` | Port for the dashboard (0 = auto) |
+| `--web-bg` | Fork a detached resume + dashboard process and exit |
 
-When a workflow fails, Conductor automatically saves a checkpoint to `$TMPDIR/conductor/checkpoints/`. The checkpoint contains all prior agent outputs and workflow state, enabling seamless resumption from the failed agent.
+`--web` and `--web-bg` are mutually exclusive. The dashboard only shows events from the resumed agent forward — events emitted in the original process before the checkpoint are not replayed.
+
+Intentionally **not** mirrored on `resume`: `--input` / `--workspace-instructions` / `--instructions` (restored from the checkpoint), and `--dry-run` (incompatible with mid-run resumption).
+
+When a workflow fails, Conductor automatically saves a checkpoint to `$TMPDIR/conductor/checkpoints/`. The checkpoint contains all prior agent outputs, the workflow state, and the resolved `instructions_preamble`, enabling seamless resumption from the failed agent.
 
 **Examples:**
 
 ```bash
-# Resume the latest checkpoint for a workflow
-conductor resume workflow.yaml
-
-# Resume from a specific checkpoint file
+conductor resume workflow.yaml                                            # latest checkpoint
 conductor resume --from /tmp/conductor/checkpoints/my-workflow-20260303-153000.json
-
-# Resume with log file
+conductor resume workflow.yaml --provider claude
+conductor resume workflow.yaml --metadata tracker=ado -m work_item_id=42
+conductor resume workflow.yaml --web
+conductor resume workflow.yaml --web-bg
 conductor resume workflow.yaml --log-file auto
 ```
 
 **Behavior:**
-- If the workflow file has changed since the checkpoint was saved, a warning is displayed
+- If the workflow file has changed since the checkpoint was saved, a warning is displayed but resumption proceeds
 - Execution resumes from the exact agent that failed
-- All prior agent outputs are restored from the checkpoint
+- All prior agent outputs and the workspace `instructions_preamble` are restored from the checkpoint
 
 ### conductor checkpoints
 
@@ -186,14 +211,54 @@ Validate without executing:
 conductor validate <workflow.yaml>
 ```
 
-Checks:
+Performs both schema and **semantic** checks:
+
 - YAML syntax
-- Required fields and schema structure
+- Required fields and schema structure (unknown fields on `AgentDef`, `ParallelGroup`, `ForEachDef`, and `WorkflowConfig` are rejected, not silently dropped)
 - Agent references and route targets
-- Route reachability
+- Route reachability and `$end` reachability
 - Template syntax
 - Parallel group agent references
-- For-each source format and reserved names
+- For-each `source` format and reserved names
+- Stale agent references and undeclared explicit-mode dependencies in `prompt`, `system_prompt`, `command`, `args`, `working_dir`, `input_mapping`, parallel-group inputs, and workflow `output:` templates
+- Warning when an agent defines `system_prompt` but no `prompt:` (portability hazard since the Claude provider drops `system_prompt`)
+
+The success summary table includes Parallel Groups and For-each Groups counts.
+
+### conductor show
+
+Show inputs, agents, parallel/for-each groups, and outputs for a workflow without running it. Accepts a local file path or a registry reference.
+
+```bash
+conductor show <workflow.yaml | workflow_ref>
+```
+
+**Examples:**
+
+```bash
+conductor show ./my-workflow.yaml
+conductor show qa-bot
+conductor show qa-bot@my-registry@1.0.0
+```
+
+Prints a sample `conductor run …` command pre-populated with the discovered inputs.
+
+### conductor replay
+
+Replay a recorded workflow run in the dashboard with a timeline scrubber:
+
+```bash
+conductor replay <log_file> [--web-port PORT]
+```
+
+The log file can be:
+- A JSON array downloaded from the dashboard (`GET /api/logs`)
+- A JSONL file written by the `EventLogSubscriber` (e.g. `$TMPDIR/conductor/conductor-<workflow>-<timestamp>.events.jsonl`)
+
+```bash
+conductor replay conductor-logs.json
+conductor replay /tmp/conductor/conductor-my-workflow-20260101-120000.events.jsonl
+```
 
 ### conductor registry
 
@@ -205,8 +270,8 @@ conductor registry <subcommand> [OPTIONS]
 
 | Subcommand | Description |
 |------------|-------------|
-| `list [name]` | List registries, or workflows in a specific registry |
-| `add <name> <source>` | Add a registry (`--type github\|path`, `--default`) |
+| `list [name]` | List registries, or workflows in a specific registry (also shows latest tags) |
+| `add <name> <source>` | Add a registry. Options: `--type github\|path` (default github), `--default` |
 | `remove <name>` | Remove a registry |
 | `set-default <name>` | Set the default registry |
 | `update [name]` | Refresh index and re-resolve latest versions |
@@ -231,9 +296,11 @@ conductor run qa-bot                     # latest from default registry
 conductor run qa-bot@official            # latest from named registry
 conductor run qa-bot@official@1.2.3      # explicit version
 conductor run qa-bot@@1.2.3              # explicit version from default registry
+conductor run sdd/plan#main              # branch/tag/SHA via "#ref" suffix
+conductor run sdd/plan#abc1234           # explicit commit
 ```
 
-Registry workflows are cached locally at `~/.conductor/cache/registries/` and reused on subsequent runs. Explicit versions are immutable; `latest` is re-resolved on `conductor registry update`.
+`latest` (and bare `name@registry` refs without a `#ref`) resolve to the **default branch HEAD**, not the newest tag — pin explicitly with `workflow#v1.2.3` for releases. Registry workflows are cached locally at `~/.conductor/cache/registries/`. Explicit refs are immutable; bare names re-resolve on `conductor registry update`.
 
 ## Execution Flow
 
@@ -487,8 +554,9 @@ If the workflow file has changed since the checkpoint was saved, a warning is di
 ### Override Provider
 
 ```bash
-conductor run workflow.yaml -p claude       # Use Claude for all agents
-conductor run workflow.yaml -p copilot      # Use Copilot (default)
+conductor run workflow.yaml -p claude          # Use Claude for all agents
+conductor run workflow.yaml -p copilot         # Use Copilot (default)
+conductor run workflow.yaml -p openai-agents   # Use OpenAI Agents SDK
 ```
 
 ### Per-Agent Provider Override
@@ -532,7 +600,9 @@ conductor run workflow.yaml --input q="test" | jq '.answer'
 |----------|-------------|
 | `GITHUB_TOKEN` | GitHub Copilot authentication |
 | `ANTHROPIC_API_KEY` | Claude provider API key |
+| `OPENAI_API_KEY` | OpenAI Agents provider API key (when `provider: openai-agents`) |
 | `CONDUCTOR_LOG_LEVEL` | Logging level (DEBUG, INFO, WARNING, ERROR) |
+| `CONDUCTOR_NO_UPDATE_CHECK` | Set to `1` to suppress the passive update-check hint |
 
 Environment variables in YAML configs support `${VAR}` and `${VAR:-default}` interpolation syntax.
 

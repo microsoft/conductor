@@ -29,13 +29,19 @@ conductor run workflow.yaml -s --input question="Hello"  # Silent: JSON result o
 conductor run workflow.yaml --log-file auto               # Log full debug output to file
 conductor run workflow.yaml --web --input q="Hello"       # Real-time web dashboard
 conductor run workflow.yaml --web-bg --input q="Hello"    # Background mode (prints URL, exits)
-conductor validate workflow.yaml                         # Validate only
-conductor registry add official myorg/workflows --default # Add a registry
+conductor run workflow.yaml -m tracker=ado -m work_item=42 # Attach metadata (merged on top of YAML)
+conductor run workflow.yaml --workspace-instructions     # Auto-discover AGENTS.md / CLAUDE.md / etc.
+conductor validate workflow.yaml                         # Validate (schema + semantic checks)
+conductor show workflow.yaml                             # Show inputs, agents, and outputs
+conductor replay events.jsonl                            # Replay a recorded run in the dashboard
+conductor registry add official myorg/workflows --default # Add a registry (--type github|path)
 conductor registry list official                          # List registry workflows
 conductor run qa-bot@official@1.0.0 --input q="Hello"    # Run from registry
 conductor stop                                           # Stop background workflow
-conductor update                                         # Check for and install latest version
+conductor update                                         # Check + print install command
+conductor update --apply                                 # Check + launch installer (then exit)
 conductor resume workflow.yaml                           # Resume from last checkpoint
+conductor resume workflow.yaml --web                     # Resume with dashboard (run-flag parity)
 conductor checkpoints                                    # List available checkpoints
 ```
 
@@ -92,17 +98,25 @@ For runtime config, context modes, limits, and cost tracking, see [references/au
 |---------|-------------|
 | `entry_point` | First agent/group to execute |
 | `routes` | Where agent goes next (`$end` to finish, `self` to loop) |
-| `type: script` | Shell command step (captures stdout, stderr, exit_code) |
+| `type: script` | Shell command step (captures stdout, stderr, exit_code; JSON stdout is auto-merged) |
+| `type: workflow` | Sub-workflow agent — runs another YAML file as a black box (supports `input_mapping`, `max_depth`) |
 | `parallel` | Static parallel groups (fixed agent list) |
-| `for_each` | Dynamic parallel groups (runtime-determined array) |
-| `human_gate` | Pauses for user decision with options |
+| `for_each` | Dynamic parallel groups (runtime-determined array; supports `type: workflow` agents) |
+| `human_gate` | Pauses for user decision with options (Markdown + auto-linkified paths/URLs) |
+| `dialog` | Per-agent trigger for conditional multi-turn conversation with the user |
+| `retry` | Per-agent retry policy for transient `provider_error` / `timeout` failures |
+| `hooks` | Workflow lifecycle expressions: `on_start`, `on_complete`, `on_error` |
+| `metadata` | Arbitrary YAML or `--metadata`/`-m` key-values surfaced in `workflow_started` events |
+| `instructions` | Workflow-level workspace context (inline strings or `!file` includes) prepended to every prompt |
+| `--workspace-instructions` | CLI flag to auto-discover AGENTS.md / CLAUDE.md / `.github/copilot-instructions.md` / `.github/instructions/**/*.instructions.md` (only `applyTo: "**"` files) |
 | `!file` tag | Include external file content in YAML (`prompt: !file prompt.md`) |
 | `context.mode` | How agents share data (accumulate, last_only, explicit) |
 | `limits` | Safety bounds (max_iterations up to 500, timeout_seconds) |
+| `timeout_seconds` (agent) | Hard wall-clock cancellation per agent (provider-backed agents only) |
 | `cost` | Token usage and cost tracking configuration |
-| `runtime` | Provider, model, temperature, max_tokens, reasoning effort, MCP servers |
-| `--web` | Real-time web dashboard with DAG graph, live streaming, in-browser human gates |
-| `checkpoint` | Auto-saved on failure; resume with `conductor resume` |
-| `registry` | Named workflow sources (GitHub repo or local dir) for sharing workflows |
+| `runtime` | Provider (`copilot`, `claude`, `openai-agents`), model, temperature, max_tokens, reasoning effort, MCP servers |
+| `--web` | Real-time web dashboard with DAG graph, live streaming, in-browser human gates, sub-workflow dive-in, replay |
+| `checkpoint` | Auto-saved on failure; resume with `conductor resume` (run-flag parity: `--provider`, `--metadata`, `--web`, `--web-bg`, `--web-port`) |
+| `registry` | Named workflow sources (GitHub repo or local dir); refs accept `name@registry@version` and `workflow#ref` (tag/branch/SHA) |
 
 For pattern examples (linear, loop, conditional, parallel, for-each, human gate) and template syntax, see [references/authoring.md](references/authoring.md).

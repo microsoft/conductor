@@ -12,7 +12,7 @@ workflow:
   entry_point: first_agent       # Required: starting agent, parallel group, or for-each group
 
   runtime:
-    provider: copilot            # copilot (default) or claude
+    provider: copilot            # copilot (default), claude, or openai-agents
     default_model: gpt-5.2       # Default model for agents
     temperature: 0.7             # 0.0-1.0 (optional)
     max_tokens: 4096             # Max output tokens per response (optional)
@@ -42,6 +42,24 @@ workflow:
       custom-model:
         input_per_mtok: 3.0
         output_per_mtok: 15.0
+
+  hooks:                         # Optional lifecycle expressions
+    on_start: "..."              # Evaluated when workflow starts
+    on_complete: "..."           # Evaluated on success
+    on_error: "..."              # Evaluated on failure
+
+  metadata:                      # Optional arbitrary key-values surfaced in workflow_started events
+    tracker: ado
+    work_item_id: 42
+    # Merged with --metadata / -m CLI flags (CLI wins on key collision)
+
+  instructions:                  # Optional workspace context prepended to every agent prompt
+    - !file ../AGENTS.md         # !file include
+    - "Always respond in English."  # Inline string
+    # For workflows distributed via registry, prefer the --workspace-instructions
+    # CLI flag (auto-discovers AGENTS.md / CLAUDE.md / .github/copilot-instructions.md
+    # / .github/instructions/**/*.instructions.md with applyTo: "**") so target-repo
+    # context is loaded at run time instead of being baked into the YAML.
 ```
 
 ## Agent Definition
@@ -75,7 +93,25 @@ agents:
       - web_search
 
     max_agent_iterations: 100    # Override workflow default for this agent (optional)
-    max_session_seconds: 60      # Wall-clock timeout for this agent (optional)
+    max_session_seconds: 60      # Wall-clock timeout for this agent (optional, soft, between iterations)
+    timeout_seconds: 120         # Hard wall-clock cancellation for this agent (provider-backed only).
+                                 # Engine wraps execution in asyncio.wait_for(); raises AgentTimeoutError.
+                                 # Effective limit = min(timeout_seconds, remaining_workflow_timeout).
+                                 # Non-retryable. Forbidden on script/human_gate/workflow types.
+
+    retry:                       # Per-agent retry policy (optional, not allowed on script/human_gate/workflow)
+      max_attempts: 3            # 1-10, default 1 (no retry)
+      backoff: exponential       # exponential (default) or fixed
+      delay_seconds: 2.0         # Base delay (0-300, default 2.0)
+      retry_on:                  # Default: ["provider_error", "timeout"]
+        - provider_error         # API 500s, rate limits
+        - timeout                # Agent-level timeout exceeded
+                                 # Validation errors are never retried.
+
+    dialog:                      # Optional: conditionally pause for free-form conversation (optional)
+      trigger_prompt: |
+        Enter dialog if the agent expresses uncertainty about the user's
+        intent or needs clarification on ambiguous requirements.
 
     reasoning:                   # Override runtime.default_reasoning_effort (optional)
       effort: high               # low, medium, high, or xhigh
@@ -179,12 +215,26 @@ agents:
 
 ### Script Output
 
-Script steps always produce three fields (no custom `output` schema):
+Script steps always produce three fields:
 
 ```jinja2
-{{ script_name.output.stdout }}     # Captured standard output
+{{ script_name.output.stdout }}     # Captured standard output (string)
 {{ script_name.output.stderr }}     # Captured standard error
 {{ script_name.output.exit_code }}  # Process exit code (0 = success)
+```
+
+If `stdout` is **valid JSON**, its top-level keys are auto-merged into the agent's output dict alongside `stdout`/`stderr`/`exit_code`. This enables structured `when:` route conditions instead of opaque exit-code matching:
+
+```yaml
+agents:
+  - name: classify
+    type: script
+    command: python3
+    args: ["classify.py"]                # prints e.g. {"category": "bug", "score": 87}
+    routes:
+      - to: bug_handler
+        when: "category == 'bug'"        # field-based, not exit-code-based
+      - to: triage
 ```
 
 ### Script Routing
@@ -200,8 +250,119 @@ routes:
 
 ### Script Restrictions
 
-Script agents **cannot** have: `prompt`, `provider`, `model`, `tools`, `output`, `system_prompt`, `options`.
+Script agents **cannot** have: `prompt`, `provider`, `model`, `tools`, `output`, `system_prompt`, `options`, `retry`, `reasoning`, `dialog`, `max_session_seconds`, `max_agent_iterations`, `timeout_seconds` (use `timeout:` instead), `input_mapping`, or `max_depth`.
 Command and args support Jinja2 templating for dynamic values.
+
+## Sub-Workflow Agents (`type: workflow`)
+
+Reference an external workflow YAML file as a black-box step. The sub-workflow runs with its own engine and inherits the parent's provider configuration.
+
+```yaml
+agents:
+  - name: deep_research
+    type: workflow
+    workflow: ./research-pipeline.yaml   # Required: path resolved relative to parent YAML
+    input:                               # Optional: explicit input declarations (for explicit context mode)
+      - workflow.input.topic
+    input_mapping:                       # Optional: per-call inputs to the sub-workflow
+      topic: "{{ workflow.input.topic }}"
+      depth: "{{ research_planner.output.depth }}"
+    max_depth: 3                         # Optional per-agent recursion cap
+                                         #   (additionally bounded by global MAX_SUBWORKFLOW_DEPTH = 10)
+    output:                              # Optional output schema for validation
+      findings:
+        type: string
+    routes:
+      - to: synthesizer
+```
+
+**Semantics:**
+
+- `workflow` path is resolved relative to the parent workflow file.
+- Sub-workflow inherits the parent's provider configuration.
+- When `input_mapping` is omitted, the parent's `workflow.input.*` is forwarded as-is.
+- `input_mapping` keys are sub-workflow input names; values are Jinja2 expressions evaluated against the parent's context.
+- Recursive composition is supported with a global `MAX_SUBWORKFLOW_DEPTH = 10`. Self-referential workflows are allowed; bound recursion further with `max_depth`.
+- Each invocation emits `subworkflow_started` / `subworkflow_completed` events. The dashboard supports breadcrumb navigation and double-click dive-in.
+- Sub-workflow output is accessible via `{{ agent_name.output.field }}`.
+
+**Sub-workflows in `for_each` groups** — `type: workflow` agents work inside `for_each` groups for dynamic fan-out, with per-iteration `input_mapping` evaluated against the loop variable:
+
+```yaml
+for_each:
+  - name: plan_issues
+    type: for_each
+    source: epic_planner.output.issues
+    as: issue
+    max_concurrent: 1
+    agent:
+      type: workflow
+      workflow: ./plan-and-review.yaml
+      input_mapping:
+        work_item_id: "{{ issue.id }}"
+        title: "{{ issue.title }}"
+```
+
+**Restrictions** — workflow steps cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, `command`, `options`, `retry`, `reasoning`, `dialog`, `max_session_seconds`, `max_agent_iterations`, or `timeout_seconds`.
+
+## Dialog Mode
+
+Dialog mode lets an agent conditionally pause after execution and enter a free-form conversation with the user. A lightweight evaluator LLM call inspects the agent's output against `trigger_prompt` and decides whether to engage. Both Copilot and Claude providers are supported, and the dashboard provides dedicated UI (`DialogDetail`, `DialogEngagementPrompt`, `DialogOverlay`).
+
+```yaml
+agents:
+  - name: researcher
+    prompt: "Research the given topic thoroughly"
+    dialog:
+      trigger_prompt: |
+        Enter dialog if the agent expresses uncertainty about
+        the user's intent, encounters ambiguous requirements,
+        or needs clarification before proceeding.
+        Do NOT trigger for minor uncertainties the agent can resolve on its own.
+    routes:
+      - to: writer
+```
+
+Only valid on provider-backed agents (not `script`, `human_gate`, or `workflow`). See `examples/dialog-mode.yaml` for a complete example.
+
+## Workflow Metadata and Workspace Instructions
+
+### Metadata
+
+Attach arbitrary key-value metadata to a workflow for downstream tooling (dashboards, work-item trackers, audit logs). Surfaced in the `workflow_started` event payload.
+
+```yaml
+workflow:
+  name: implement
+  metadata:
+    tracker: ado
+    template_version: 3
+```
+
+CLI metadata is merged on top of YAML metadata (CLI wins on key collision; values stay as strings, no type coercion):
+
+```bash
+conductor run workflow.yaml -m work_item_id=1814 -m sprint=Q3
+```
+
+### Workspace Instructions
+
+Prepend workspace context to every agent prompt. Three options:
+
+1. **YAML `instructions:`** — first-class field, persisted in checkpoints, inherited into sub-workflows. Best for self-contained workflows where the YAML lives alongside the code.
+
+   ```yaml
+   workflow:
+     instructions:
+       - !file ../AGENTS.md
+       - "Always respond in English."
+   ```
+
+2. **`--workspace-instructions` CLI flag** — auto-discovers files by walking from CWD to the git root: `AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md`, and `.github/instructions/**/*.instructions.md` (only files with `applyTo: "**"` in YAML frontmatter; scoped or absent-`applyTo` files are skipped per the GitHub Copilot convention). Best for workflows distributed via registry/skills where the YAML lives far from the target repo.
+
+3. **`--instructions PATH` CLI flag** — explicit path to a file (repeatable).
+
+All three sources are concatenated and prepended to every agent's prompt as a workspace preamble.
 
 ## File Includes (`!file` Tag)
 
@@ -461,6 +622,8 @@ tools: ["search", "fetch"]        # Only these tools available
 |----------|-------------|
 | `{{ workflow.input.param }}` | Workflow input |
 | `{{ workflow.name }}` | Workflow name |
+| `{{ workflow.dir }}` | Directory of the workflow YAML file (always available, all context modes) |
+| `{{ workflow.file }}` | Absolute path to the workflow YAML file |
 | `{{ agent_name.output.field }}` | Agent output |
 | `{{ output.field }}` | Current agent output (in routes) |
 | `{{ group.outputs.agent.field }}` | Parallel group output |

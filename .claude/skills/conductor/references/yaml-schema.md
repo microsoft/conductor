@@ -27,7 +27,7 @@ workflow:
 
   # Runtime configuration
   runtime:
-    provider: string                # "copilot" (default) or "claude"
+    provider: string                # "copilot" (default), "claude", or "openai-agents"
     default_model: string           # Default model for all agents
     temperature: float              # 0.0-1.0, controls randomness (optional)
     max_tokens: integer             # Max OUTPUT tokens per response, 1-200000 (optional)
@@ -81,6 +81,18 @@ workflow:
     on_start: string                # Template executed at workflow start
     on_complete: string             # Template executed on success
     on_error: string                # Template executed on failure
+
+  # Arbitrary metadata for downstream tooling (dashboards, work-item trackers)
+  # Surfaced verbatim in the workflow_started event.
+  metadata: {string: any}           # Optional. Merged with --metadata / -m CLI flags (CLI wins).
+
+  # Workspace context prepended to every agent prompt
+  # Each entry is either a !file include or an inline string.
+  # For workflows distributed via registry, prefer the --workspace-instructions
+  # CLI flag for runtime auto-discovery.
+  instructions:
+    - !file ../AGENTS.md
+    - "Always respond in English."
 ```
 
 ## Agent Schema
@@ -129,20 +141,35 @@ agents:
 
     # Agent-level limits (override workflow runtime defaults)
     max_agent_iterations: integer   # Max tool-use roundtrips for this agent (1-500, optional)
-    max_session_seconds: float      # Wall-clock timeout for this agent session (optional)
+    max_session_seconds: float      # Soft wall-clock timeout per session (checked between iterations)
+    timeout_seconds: float          # Hard wall-clock timeout (>=1.0); engine wraps in asyncio.wait_for().
+                                    # Effective limit = min(timeout_seconds, remaining_workflow_timeout).
+                                    # Raises AgentTimeoutError; non-retryable.
+                                    # Forbidden on script (use 'timeout' instead), human_gate, workflow.
 
     # Per-agent reasoning effort (overrides runtime.default_reasoning_effort)
     # Not allowed for script, human_gate, or workflow agent types.
     reasoning:
       effort: string                # low, medium, high, or xhigh
 
-    # Per-agent retry policy (optional, not allowed for script agents)
+    # Per-agent retry policy (optional, not allowed for script, human_gate, or workflow agents)
     retry:
       max_attempts: integer         # Max attempts including first (1-10, default: 1 = no retry)
       backoff: string               # "exponential" (default) or "fixed"
       delay_seconds: float          # Base delay in seconds (0-300, default: 2.0)
-      retry_on:                     # Error categories to retry (default: all)
+      retry_on:                     # Error categories to retry (default: ["provider_error", "timeout"])
         - string                    # "provider_error" (API 500s, rate limits) or "timeout"
+
+    # Conditional dialog mode (optional, only on provider-backed agents)
+    dialog:
+      trigger_prompt: string        # Criteria evaluated against agent output by an LLM gate
+
+    # Sub-workflow fields (type: workflow)
+    workflow: string                # Path to sub-workflow YAML (relative to parent), required
+    input_mapping:                  # Optional Jinja2 expressions per sub-workflow input parameter
+      <param_name>: string          # e.g. "{{ task_manager.output.current_issue_id }}"
+    max_depth: integer              # Optional per-agent recursion cap (1-10).
+                                    # Bounded additionally by global MAX_SUBWORKFLOW_DEPTH = 10.
 
     # Script-only fields (type: script)
     command: string                 # Command to execute (Jinja2 templated)
@@ -152,7 +179,9 @@ agents:
     timeout: integer                # Per-script timeout in seconds
 ```
 
-**Script agent restrictions:** Cannot have `prompt`, `provider`, `model`, `tools`, `output`, `system_prompt`, `options`, `retry`, `reasoning`. Output is always `{stdout, stderr, exit_code}`.
+**Script agent restrictions:** Cannot have `prompt`, `provider`, `model`, `tools`, `output`, `system_prompt`, `options`, `retry`, `reasoning`, `dialog`, `max_session_seconds`, `max_agent_iterations`, `timeout_seconds` (use `timeout`), `input_mapping`, or `max_depth`. Output is always `{stdout, stderr, exit_code}`. If `stdout` is valid JSON, its top-level keys are auto-merged into the output dict.
+
+**Workflow agent restrictions (`type: workflow`):** Cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, `command`, `options`, `retry`, `reasoning`, `dialog`, `max_session_seconds`, `max_agent_iterations`, or `timeout_seconds`. Requires `workflow:` path. Supports `input_mapping` and `max_depth`. Allowed inside `for_each` groups for dynamic fan-out.
 
 **Reasoning effort:** `reasoning.effort` (and `runtime.default_reasoning_effort`) accepts `low`, `medium`, `high`, or `xhigh`. Per-agent value overrides the runtime default. Each provider translates the unified value to its native API:
 
@@ -365,6 +394,8 @@ output:
 {{ workflow.input.param_name }}    # Workflow input
 {{ workflow.name }}                 # Workflow name
 {{ workflow.description }}          # Workflow description
+{{ workflow.dir }}                  # Directory containing the workflow YAML (all context modes)
+{{ workflow.file }}                 # Absolute path to the workflow YAML
 {{ agent_name.output.field }}       # Agent output field
 {{ output.field }}                  # Current agent output (in routes)
 ```
@@ -511,6 +542,7 @@ runtime:
 - `entry_point` must reference a valid agent, parallel group, or for-each group
 - All referenced agents/groups must be defined
 - Input parameter names must be valid identifiers
+- Unknown fields on `WorkflowConfig`, `AgentDef`, `ParallelGroup`, and `ForEachDef` are **rejected** (not silently dropped)
 
 ### Agent Validation
 
