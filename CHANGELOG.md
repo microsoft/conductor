@@ -5,7 +5,56 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.15...HEAD)
+## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.16...HEAD)
+
+## [0.1.16](https://github.com/microsoft/conductor/compare/v0.1.15...v0.1.16) - 2026-05-14
+
+### Added
+- `type: workflow` agents now accept registry references
+  (`workflow[@registry][#ref]`) in the `workflow:` field, not just local file
+  paths. Resolution prefers a local file when one exists relative to the
+  parent workflow directory (preserves backward compatibility for
+  extensionless local refs); otherwise the value is parsed as a registry
+  reference, fetched via the registry cache, and executed from the cached
+  location. `conductor validate` now recursively validates fetched
+  sub-workflows with cycle detection (inode-based identity, so case-variant
+  paths on macOS/Windows collapse correctly) and a depth cap of 10 — when
+  the cap is hit a warning surfaces so users know validation was truncated
+  rather than silently clean. Mutable registry refs (`name@registry#main`,
+  or no `#ref`) may resolve to a different commit on `conductor resume` if
+  the upstream branch has moved; pinned tags or commit SHAs guarantee
+  deterministic resume
+  ([#188](https://github.com/microsoft/conductor/pull/188)).
+- Conductor now ships as a Claude Code plugin marketplace at the repo root.
+  Users can install the conductor skill directly from `microsoft/conductor`
+  with `/plugin marketplace add microsoft/conductor` followed by
+  `/plugin install conductor@conductor`. The plugin ships markdown only
+  (no `bin/`, hooks, MCP servers, or executables), keeping the trust
+  surface minimal. The same `SKILL.md` remains usable via
+  `gh skill install microsoft/conductor conductor` for Copilot CLI users.
+  The previous `.claude/skills/conductor` location was removed — the
+  plugin is now the single home for the skill; for local development on
+  the skill itself, use `claude --plugin-dir plugins/conductor`
+  ([#186](https://github.com/microsoft/conductor/pull/186)).
+
+### Changed
+- The bundled Conductor skill (`SKILL.md` + references) was refreshed to
+  reflect the current CLI, schema, and feature set: `show` / `replay` /
+  `--metadata` / `--workspace-instructions` quick-reference entries; new
+  `type: workflow`, `dialog`, `retry`, `hooks`, `metadata`, `instructions`,
+  `timeout_seconds`, and `openai-agents` provider concepts; corrected
+  `update` behavior (default prints the install-script one-liner,
+  `--apply` launches the installer); `CONDUCTOR_NO_UPDATE_CHECK`;
+  registry `latest = branch HEAD` and `#ref` syntax; sub-workflow agents
+  and dialog mode authoring guidance; script JSON-stdout auto-merge;
+  `workflow.dir` / `workflow.file` template variables; and unknown-fields
+  rejection in schema validation
+  ([#187](https://github.com/microsoft/conductor/pull/187)).
+- README "Why Conductor?" rewritten around three pillars — repeatable
+  execution, deterministic routing, and version-controlled YAML
+  workflows — and now leads with the real differentiator (zero-token
+  orchestration) using concrete use-case examples
+  ([#185](https://github.com/microsoft/conductor/pull/185)).
 
 ## [0.1.15](https://github.com/microsoft/conductor/compare/v0.1.14...v0.1.15) - 2026-05-13
 
