@@ -1,0 +1,39 @@
+name: validate-plugin
+
+on:
+  pull_request:
+    paths:
+      - ".claude-plugin/**"
+      - "plugins/**"
+      - ".claude/skills/**"
+      - ".github/workflows/validate-plugin.yml"
+  push:
+    branches: [main]
+    paths:
+      - ".claude-plugin/**"
+      - "plugins/**"
+      - ".claude/skills/**"
+      - ".github/workflows/validate-plugin.yml"
+
+jobs:
+  validate-json:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate marketplace.json and plugin.json are valid JSON
+        run: |
+          python -c "import json,sys; json.load(open('.claude-plugin/marketplace.json'))"
+          python -c "import json,sys; json.load(open('plugins/conductor/.claude-plugin/plugin.json'))"
+      - name: Verify skill symlink resolves
+        run: |
+          test -f plugins/conductor/skills/conductor/SKILL.md
+          echo "OK: skill symlink resolves to a real SKILL.md"
+      - name: Verify plugin and marketplace versions match
+        run: |
+          MARKET=$(python -c "import json; print(json.load(open('.claude-plugin/marketplace.json'))['plugins'][0]['version'])")
+          PLUGIN=$(python -c "import json; print(json.load(open('plugins/conductor/.claude-plugin/plugin.json'))['version'])")
+          if [ "$MARKET" != "$PLUGIN" ]; then
+            echo "Version mismatch: marketplace=$MARKET plugin=$PLUGIN"
+            exit 1
+          fi
+          echo "OK: both at version $MARKET"

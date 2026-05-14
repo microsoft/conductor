@@ -115,6 +115,28 @@ conductor run workflow.yaml
 pip install git+https://github.com/microsoft/conductor.git@v1.0.0
 ```
 
+### Use the Conductor skill in Claude Code or Copilot CLI
+
+This repo doubles as a single-plugin marketplace that ships the `conductor`
+skill (the same one in `.claude/skills/conductor/`). The skill teaches the
+assistant the workflow YAML schema, CLI commands, and execution model.
+
+**Claude Code:**
+
+```text
+/plugin marketplace add microsoft/conductor
+/plugin install conductor@conductor
+```
+
+**GitHub Copilot CLI** (`gh skill` requires GitHub CLI 2.90+, public preview):
+
+```bash
+gh skill install microsoft/conductor conductor
+```
+
+The plugin ships only markdown — no executables, hooks, or MCP servers — so
+trust verification is straightforward.
+
 ## Quick Start
 
 ### 1. Create a workflow file
