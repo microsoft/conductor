@@ -193,6 +193,14 @@ def validate_workflow_config(
                 "inline agent. Script steps cannot be used in for_each groups."
             )
 
+    # Validate sub-workflow references (local paths and registry refs).
+    # Skipped when workflow_path is not provided — relative paths cannot be
+    # resolved without knowing the file's location.
+    if workflow_path is not None:
+        sub_errors, sub_warnings = _validate_subworkflow_refs(config, workflow_path)
+        errors.extend(sub_errors)
+        warnings.extend(sub_warnings)
+
     # Validate workflow output references
     output_errors = _validate_output_references(
         config.output,
@@ -747,6 +755,156 @@ def _collect_template_strings(
             templates.append((f"agent '{agent.name}' input_mapping.{key}", expr))
 
     return templates
+
+
+# Maximum depth for recursive sub-workflow validation to prevent infinite loops.
+_MAX_SUBWORKFLOW_VALIDATION_DEPTH = 10
+
+
+def _validate_subworkflow_refs(
+    config: WorkflowConfig,
+    workflow_path: Path | None,
+    _visited: frozenset[str] | None = None,
+    _depth: int = 0,
+) -> tuple[list[str], list[str]]:
+    """Validate all ``type: workflow`` agent references in *config*.
+
+    For local paths, checks that the file exists. For registry references,
+    fetches the workflow to the local cache and recursively validates the
+    full composition tree. Cycle detection prevents infinite recursion.
+
+    Args:
+        config: The workflow configuration to validate.
+        workflow_path: Path of the workflow file being validated (used as the
+            base directory for relative sub-workflow paths).
+        _visited: Set of already-visited canonical paths (for cycle detection).
+            Callers should leave this as ``None``; it is threaded through
+            recursive calls.
+        _depth: Current recursion depth (internal).
+
+    Returns:
+        Tuple of (error messages, warning messages).
+    """
+    if _visited is None:
+        _visited = frozenset()
+
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    if _depth >= _MAX_SUBWORKFLOW_VALIDATION_DEPTH:
+        return errors, warnings
+
+    base_dir = workflow_path.resolve().parent if workflow_path is not None else Path.cwd()
+
+    # Collect all (agent_name, workflow_ref, context_label) tuples to validate.
+    candidates: list[tuple[str, str, str]] = []
+    for agent in config.agents:
+        if agent.type == "workflow" and agent.workflow:
+            candidates.append((agent.name, agent.workflow, f"agent '{agent.name}'"))
+    for fe in config.for_each:
+        agent = fe.agent
+        if agent.type == "workflow" and agent.workflow:
+            candidates.append(
+                (agent.name, agent.workflow, f"for_each group '{fe.name}' agent '{agent.name}'")
+            )
+
+    for _agent_name, workflow_ref, label in candidates:
+        sub_path, ref_errors = _resolve_subworkflow_ref_for_validation(
+            workflow_ref, label, base_dir
+        )
+        errors.extend(ref_errors)
+        if sub_path is None:
+            continue
+
+        canonical = str(sub_path)
+        if canonical in _visited:
+            errors.append(
+                f"{label}: circular sub-workflow reference detected "
+                f"('{workflow_ref}' → '{sub_path}' is already in the validation chain)"
+            )
+            continue
+
+        # Recursively validate the sub-workflow.
+        try:
+            from conductor.config.loader import load_config
+
+            sub_config = load_config(sub_path)
+        except Exception as exc:
+            errors.append(f"{label}: failed to load sub-workflow '{sub_path}': {exc}")
+            continue
+
+        try:
+            sub_warnings = validate_workflow_config(
+                sub_config,
+                workflow_path=sub_path,
+            )
+            warnings.extend(f"{label} → sub-workflow '{sub_path.name}': {w}" for w in sub_warnings)
+        except Exception as exc:
+            # validate_workflow_config raises ConfigurationError on failure.
+            errors.append(f"{label}: sub-workflow '{sub_path.name}' failed validation: {exc}")
+
+    return errors, warnings
+
+
+def _resolve_subworkflow_ref_for_validation(
+    workflow_ref: str,
+    label: str,
+    base_dir: Path,
+) -> tuple[Path | None, list[str]]:
+    """Resolve a ``workflow:`` field value to a local path for validation.
+
+    Mirrors the engine's ``_resolve_subworkflow_path`` but is synchronous and
+    returns errors as a list rather than raising.
+
+    Args:
+        workflow_ref: The raw ``workflow:`` field value.
+        label: Human-readable context for error messages.
+        base_dir: Base directory for relative path resolution.
+
+    Returns:
+        Tuple of (resolved path or None on error, list of error strings).
+    """
+    from conductor.registry.errors import RegistryError
+    from conductor.registry.resolver import resolve_ref
+
+    errors: list[str] = []
+
+    # Check for an existing file beside the parent workflow first.
+    candidate = (base_dir / workflow_ref).resolve()
+    if candidate.is_file():
+        return candidate, errors
+
+    try:
+        resolved = resolve_ref(workflow_ref)
+    except RegistryError as exc:
+        errors.append(f"{label}: invalid sub-workflow reference '{workflow_ref}': {exc}")
+        return None, errors
+
+    if resolved.kind == "file":
+        # File-path syntax but file does not exist.
+        errors.append(f"{label}: sub-workflow file not found: '{candidate}'")
+        return None, errors
+
+    # Registry reference: fetch (uses cache; makes network request on first access).
+    from conductor.registry.cache import fetch_workflow
+
+    # registry_name, registry_entry, and workflow are always set when kind == "registry"
+    assert resolved.registry_name is not None  # noqa: S101
+    assert resolved.registry_entry is not None  # noqa: S101
+    assert resolved.workflow is not None  # noqa: S101
+
+    try:
+        sub_path = fetch_workflow(
+            resolved.registry_name,
+            resolved.registry_entry,
+            resolved.workflow,
+            resolved.ref,
+        )
+    except RegistryError as exc:
+        errors.append(f"{label}: failed to fetch registry sub-workflow '{workflow_ref}': {exc}")
+        return None, errors
+
+    return sub_path, errors
 
 
 def _validate_template_references(

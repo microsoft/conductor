@@ -703,6 +703,97 @@ class WorkflowEngine:
             workflow_ctx = context.get("workflow", {})
             return dict(workflow_ctx.get("input", {})) if isinstance(workflow_ctx, dict) else {}
 
+    async def _resolve_subworkflow_path(
+        self,
+        agent_workflow: str,
+        agent_name: str,
+        base_dir: Path,
+    ) -> Path:
+        """Resolve a sub-workflow reference to a local filesystem path.
+
+        Handles both local file paths and registry references
+        (``workflow[@registry][#ref]`` syntax).
+
+        Resolution order:
+        1. If ``agent_workflow`` resolves to an existing file relative to
+           ``base_dir``, return that path immediately. This preserves
+           backward-compatibility for bare names like ``analysis`` that refer
+           to a sibling file without a ``.yaml`` extension.
+        2. Otherwise, parse as a registry reference via
+           :func:`~conductor.registry.resolver.resolve_ref`.
+        3. If the parsed ref is still a file kind (e.g. a path with a
+           ``.yaml`` extension that does not exist), return the resolved
+           path so the caller can emit a clear "file not found" error.
+        4. For registry refs, fetch the workflow (with caching) and return
+           the cached local path.
+
+        Args:
+            agent_workflow: The ``workflow:`` field value from the agent def.
+            agent_name: Name of the containing agent (used in error messages).
+            base_dir: Directory of the parent workflow file used for relative
+                path resolution.
+
+        Returns:
+            Absolute path to the workflow YAML (local or cached registry copy).
+
+        Raises:
+            ExecutionError: If the registry reference is malformed, names an
+                unknown registry, or the registry fetch fails.
+        """
+        from conductor.registry.errors import RegistryError
+        from conductor.registry.resolver import resolve_ref
+
+        # Step 1: check for an existing file relative to base_dir first.
+        # This ensures "analysis" beside the parent workflow is treated as a
+        # local file, not a registry lookup, even though it has no extension.
+        candidate = (base_dir / agent_workflow).resolve()
+        if candidate.is_file():
+            return candidate
+
+        # Step 2: heuristic parse — file-looking path or registry reference?
+        try:
+            resolved = resolve_ref(agent_workflow)
+        except RegistryError as exc:
+            raise ExecutionError(
+                f"Failed to resolve sub-workflow '{agent_workflow}' "
+                f"(referenced by agent '{agent_name}'): {exc}",
+                suggestion=(
+                    "Check the registry reference syntax and ensure the registry "
+                    "is configured (run 'conductor registry list')."
+                ),
+            ) from exc
+
+        if resolved.kind == "file":
+            # Step 3: file-path syntax but file does not exist — return the
+            # candidate path so the caller emits a clear "file not found" error.
+            return candidate
+
+        # Step 4: registry reference — fetch (or return cached) local path.
+        from conductor.registry.cache import fetch_workflow
+
+        # registry_name, registry_entry, and workflow are always set when kind == "registry"
+        assert resolved.registry_name is not None  # noqa: S101
+        assert resolved.registry_entry is not None  # noqa: S101
+        assert resolved.workflow is not None  # noqa: S101
+
+        try:
+            return await asyncio.to_thread(
+                fetch_workflow,
+                resolved.registry_name,
+                resolved.registry_entry,
+                resolved.workflow,
+                resolved.ref,
+            )
+        except RegistryError as exc:
+            raise ExecutionError(
+                f"Failed to fetch registry sub-workflow '{agent_workflow}' "
+                f"(referenced by agent '{agent_name}'): {exc}",
+                suggestion=(
+                    "Check that the registry name and workflow name are correct "
+                    "and the registry is reachable."
+                ),
+            ) from exc
+
     async def _execute_subworkflow(
         self,
         agent: AgentDef,
@@ -756,9 +847,9 @@ class WorkflowEngine:
         else:
             base_dir = Path.cwd()
 
-        sub_path = (base_dir / agent.workflow).resolve()
+        sub_path = await self._resolve_subworkflow_path(agent.workflow, agent.name, base_dir)
 
-        if not sub_path.exists():
+        if not sub_path.is_file():
             raise ExecutionError(
                 f"Sub-workflow file not found: {sub_path} (referenced by agent '{agent.name}')",
                 suggestion="Check that the 'workflow' path is correct and the file exists.",
@@ -867,9 +958,9 @@ class WorkflowEngine:
         else:
             base_dir = Path.cwd()
 
-        sub_path = (base_dir / agent.workflow).resolve()
+        sub_path = await self._resolve_subworkflow_path(agent.workflow, agent.name, base_dir)
 
-        if not sub_path.exists():
+        if not sub_path.is_file():
             raise ExecutionError(
                 f"Sub-workflow file not found: {sub_path} (referenced by agent '{agent.name}')",
                 suggestion="Check that the 'workflow' path is correct and the file exists.",

@@ -1172,3 +1172,235 @@ class TestInputMappingTemplateCollection:
         agent_refs, input_refs = _extract_template_refs("{{ old_agent.output.findings }}")
         assert "old_agent" in agent_refs
         assert not input_refs
+
+
+class TestSubWorkflowRefValidation:
+    """Tests for _validate_subworkflow_refs in validate_workflow_config."""
+
+    def _make_config(self, workflow_ref: str) -> WorkflowConfig:
+        from conductor.config.schema import LimitsConfig, RuntimeConfig
+
+        return WorkflowConfig(
+            workflow=WorkflowDef(
+                name="parent",
+                entry_point="sub_wf",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="sub_wf",
+                    type="workflow",
+                    workflow=workflow_ref,
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+        )
+
+    def test_local_sub_workflow_validates_ok(self, tmp_path: Path) -> None:
+        """Local file sub-workflow passes validation when file exists."""
+        import textwrap
+
+        from conductor.config.validator import validate_workflow_config
+
+        sub = tmp_path / "sub.yaml"
+        sub.write_text(
+            textwrap.dedent("""\
+                workflow:
+                  name: sub
+                  entry_point: step
+                  runtime:
+                    provider: copilot
+                  limits:
+                    max_iterations: 10
+                agents:
+                  - name: step
+                    type: agent
+                    prompt: go
+                    routes:
+                      - to: "$end"
+                output: {}
+            """),
+            encoding="utf-8",
+        )
+        parent = tmp_path / "parent.yaml"
+        parent.write_text("dummy", encoding="utf-8")
+
+        config = self._make_config("./sub.yaml")
+        warnings = validate_workflow_config(config, workflow_path=parent)
+        assert warnings == []
+
+    def test_missing_local_sub_workflow_errors(self, tmp_path: Path) -> None:
+        """Missing local file sub-workflow produces a validation error."""
+        from conductor.config.validator import validate_workflow_config
+        from conductor.exceptions import ConfigurationError
+
+        parent = tmp_path / "parent.yaml"
+        parent.write_text("dummy", encoding="utf-8")
+
+        config = self._make_config("./nonexistent.yaml")
+        with pytest.raises(ConfigurationError, match="sub-workflow file not found"):
+            validate_workflow_config(config, workflow_path=parent)
+
+    def test_malformed_registry_ref_errors(self, tmp_path: Path) -> None:
+        """Malformed registry reference (two '@') produces a validation error."""
+        from conductor.config.validator import validate_workflow_config
+        from conductor.exceptions import ConfigurationError
+
+        parent = tmp_path / "parent.yaml"
+        parent.write_text("dummy", encoding="utf-8")
+
+        config = self._make_config("a@b@c")  # two '@' — malformed
+        with pytest.raises(ConfigurationError, match="invalid sub-workflow reference"):
+            validate_workflow_config(config, workflow_path=parent)
+
+    def test_registry_ref_validates_fetched_workflow(self, tmp_path: Path) -> None:
+        """Registry reference fetches the workflow and validates it recursively."""
+        import textwrap
+        from unittest.mock import patch
+
+        from conductor.config.validator import validate_workflow_config
+        from conductor.registry.config import RegistryEntry, RegistryType
+        from conductor.registry.resolver import ResolvedRef
+
+        cached_sub = tmp_path / "fetched.yaml"
+        cached_sub.write_text(
+            textwrap.dedent("""\
+                workflow:
+                  name: fetched
+                  entry_point: step
+                  runtime:
+                    provider: copilot
+                  limits:
+                    max_iterations: 10
+                agents:
+                  - name: step
+                    type: agent
+                    prompt: go
+                    routes:
+                      - to: "$end"
+                output: {}
+            """),
+            encoding="utf-8",
+        )
+
+        parent = tmp_path / "parent.yaml"
+        parent.write_text("dummy", encoding="utf-8")
+
+        fake_entry = RegistryEntry(type=RegistryType.github, source="https://github.com/x/y")
+        fake_resolved = ResolvedRef(
+            kind="registry",
+            workflow="fetched",
+            registry_name="team-a",
+            ref="v1.0.0",
+            registry_entry=fake_entry,
+        )
+
+        config = self._make_config("fetched@team-a#v1.0.0")
+        with (
+            patch("conductor.registry.resolver.resolve_ref", return_value=fake_resolved),
+            patch("conductor.registry.cache.fetch_workflow", return_value=cached_sub),
+        ):
+            warnings = validate_workflow_config(config, workflow_path=parent)
+
+        assert warnings == []
+
+    def test_registry_fetch_failure_errors(self, tmp_path: Path) -> None:
+        """Registry fetch failure during validation produces a clear error."""
+        from unittest.mock import patch
+
+        from conductor.config.validator import validate_workflow_config
+        from conductor.exceptions import ConfigurationError
+        from conductor.registry.config import RegistryEntry, RegistryType
+        from conductor.registry.errors import RegistryError
+        from conductor.registry.resolver import ResolvedRef
+
+        parent = tmp_path / "parent.yaml"
+        parent.write_text("dummy", encoding="utf-8")
+
+        fake_entry = RegistryEntry(type=RegistryType.github, source="https://github.com/x/y")
+        fake_resolved = ResolvedRef(
+            kind="registry",
+            workflow="missing",
+            registry_name="team-a",
+            ref="v1.0.0",
+            registry_entry=fake_entry,
+        )
+
+        config = self._make_config("missing@team-a#v1.0.0")
+        with (
+            patch("conductor.registry.resolver.resolve_ref", return_value=fake_resolved),
+            patch(
+                "conductor.registry.cache.fetch_workflow",
+                side_effect=RegistryError("workflow not found"),
+            ),
+            pytest.raises(ConfigurationError, match="failed to fetch registry sub-workflow"),
+        ):
+            validate_workflow_config(config, workflow_path=parent)
+
+    def test_for_each_workflow_agent_ref_validated(self, tmp_path: Path) -> None:
+        """Registry ref inside a for_each inline workflow agent is validated."""
+        from unittest.mock import patch
+
+        from conductor.config.schema import ForEachDef, LimitsConfig, RuntimeConfig
+        from conductor.config.validator import validate_workflow_config
+        from conductor.exceptions import ConfigurationError
+        from conductor.registry.config import RegistryEntry, RegistryType
+        from conductor.registry.errors import RegistryError
+        from conductor.registry.resolver import ResolvedRef
+
+        parent = tmp_path / "parent.yaml"
+        parent.write_text("dummy", encoding="utf-8")
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="parent",
+                entry_point="batch",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="loader",
+                    type="agent",
+                    prompt="load items",
+                    routes=[RouteDef(to="batch")],
+                ),
+            ],
+            for_each=[
+                ForEachDef(
+                    name="batch",
+                    type="for_each",
+                    source="loader.output.items",
+                    **{"as": "item"},
+                    agent=AgentDef(
+                        name="worker",
+                        type="workflow",
+                        workflow="missing@team-a#v1.0.0",
+                        routes=[RouteDef(to="$end")],
+                    ),
+                    routes=[RouteDef(to="$end")],
+                )
+            ],
+        )
+
+        fake_entry = RegistryEntry(type=RegistryType.github, source="https://github.com/x/y")
+        fake_resolved = ResolvedRef(
+            kind="registry",
+            workflow="missing",
+            registry_name="team-a",
+            ref="v1.0.0",
+            registry_entry=fake_entry,
+        )
+
+        with (
+            patch("conductor.registry.resolver.resolve_ref", return_value=fake_resolved),
+            patch(
+                "conductor.registry.cache.fetch_workflow",
+                side_effect=RegistryError("workflow not found"),
+            ),
+            pytest.raises(ConfigurationError, match="failed to fetch registry sub-workflow"),
+        ):
+            validate_workflow_config(config, workflow_path=parent)
