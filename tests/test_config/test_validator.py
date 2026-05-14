@@ -1404,3 +1404,84 @@ class TestSubWorkflowRefValidation:
             pytest.raises(ConfigurationError, match="failed to fetch registry sub-workflow"),
         ):
             validate_workflow_config(config, workflow_path=parent)
+
+    def test_circular_subworkflow_ref_detected(self, tmp_path: Path) -> None:
+        """Circular sub-workflow references (A → B → A) are caught during validation.
+
+        Without cycle detection, recursive validation would loop indefinitely.
+        With it, validation produces a clear "circular reference" error.
+        """
+        import textwrap
+
+        from conductor.config.schema import LimitsConfig, RuntimeConfig
+        from conductor.config.validator import validate_workflow_config
+        from conductor.exceptions import ConfigurationError
+
+        # B references A
+        b_yaml = tmp_path / "b.yaml"
+        b_yaml.write_text(
+            textwrap.dedent("""\
+                workflow:
+                  name: b
+                  entry_point: ref_a
+                  runtime:
+                    provider: copilot
+                  limits:
+                    max_iterations: 10
+                agents:
+                  - name: ref_a
+                    type: workflow
+                    workflow: ./a.yaml
+                    routes:
+                      - to: "$end"
+                output: {}
+            """),
+            encoding="utf-8",
+        )
+
+        # A references B
+        a_yaml = tmp_path / "a.yaml"
+        a_yaml.write_text(
+            textwrap.dedent("""\
+                workflow:
+                  name: a
+                  entry_point: ref_b
+                  runtime:
+                    provider: copilot
+                  limits:
+                    max_iterations: 10
+                agents:
+                  - name: ref_b
+                    type: workflow
+                    workflow: ./b.yaml
+                    routes:
+                      - to: "$end"
+                output: {}
+            """),
+            encoding="utf-8",
+        )
+
+        # Parent references A, which kicks off the A → B → A cycle
+        parent = tmp_path / "parent.yaml"
+        parent.write_text("dummy", encoding="utf-8")
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="parent",
+                entry_point="sub_wf",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="sub_wf",
+                    type="workflow",
+                    workflow="./a.yaml",
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+        )
+
+        with pytest.raises(ConfigurationError, match="circular sub-workflow reference"):
+            validate_workflow_config(config, workflow_path=parent)

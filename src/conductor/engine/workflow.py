@@ -727,6 +727,15 @@ class WorkflowEngine:
         4. For registry refs, fetch the workflow (with caching) and return
            the cached local path.
 
+        Note on checkpoint/resume: this helper is called on every
+        sub-workflow execution, including after :meth:`resume`. Pinned
+        registry refs (``name@registry#v1.2.3`` or ``name@registry#<sha>``)
+        always resolve to the same cached path. Mutable refs
+        (``name@registry#main`` or no ``#ref`` defaulting to "latest") may
+        resolve to a different commit on resume if the upstream branch has
+        moved. Use pinned tags or commit SHAs in production workflows when
+        deterministic resume is required.
+
         Args:
             agent_workflow: The ``workflow:`` field value from the agent def.
             agent_name: Name of the containing agent (used in error messages).

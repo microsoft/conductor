@@ -88,6 +88,9 @@ INPUT_REF_PATTERN = re.compile(
 def validate_workflow_config(
     config: WorkflowConfig,
     workflow_path: Path | None = None,
+    *,
+    _visited_subworkflows: frozenset[str] | None = None,
+    _subworkflow_depth: int = 0,
 ) -> list[str]:
     """Perform comprehensive validation of a workflow configuration.
 
@@ -98,6 +101,12 @@ def validate_workflow_config(
     Args:
         config: The WorkflowConfig to validate.
         workflow_path: Optional path to the workflow file (for !file resolution).
+        _visited_subworkflows: Internal — set of canonical sub-workflow paths
+            already on the validation stack, used for cycle detection in
+            recursive sub-workflow validation. External callers should leave
+            this as ``None``.
+        _subworkflow_depth: Internal — current recursion depth for
+            sub-workflow validation. External callers should leave this as 0.
 
     Returns:
         A list of warning messages (non-fatal issues).
@@ -197,7 +206,12 @@ def validate_workflow_config(
     # Skipped when workflow_path is not provided — relative paths cannot be
     # resolved without knowing the file's location.
     if workflow_path is not None:
-        sub_errors, sub_warnings = _validate_subworkflow_refs(config, workflow_path)
+        sub_errors, sub_warnings = _validate_subworkflow_refs(
+            config,
+            workflow_path,
+            _visited=_visited_subworkflows,
+            _depth=_subworkflow_depth,
+        )
         errors.extend(sub_errors)
         warnings.extend(sub_warnings)
 
@@ -834,9 +848,13 @@ def _validate_subworkflow_refs(
             continue
 
         try:
+            # Thread _visited and _depth through validate_workflow_config so
+            # nested sub-workflow validation also gets cycle detection.
             sub_warnings = validate_workflow_config(
                 sub_config,
                 workflow_path=sub_path,
+                _visited_subworkflows=_visited | {canonical},
+                _subworkflow_depth=_depth + 1,
             )
             warnings.extend(f"{label} → sub-workflow '{sub_path.name}': {w}" for w in sub_warnings)
         except Exception as exc:
