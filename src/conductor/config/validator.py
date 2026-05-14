@@ -89,7 +89,7 @@ def validate_workflow_config(
     config: WorkflowConfig,
     workflow_path: Path | None = None,
     *,
-    _visited_subworkflows: frozenset[str] | None = None,
+    _visited_subworkflows: frozenset[tuple[int, int]] | None = None,
     _subworkflow_depth: int = 0,
 ) -> list[str]:
     """Perform comprehensive validation of a workflow configuration.
@@ -101,10 +101,10 @@ def validate_workflow_config(
     Args:
         config: The WorkflowConfig to validate.
         workflow_path: Optional path to the workflow file (for !file resolution).
-        _visited_subworkflows: Internal — set of canonical sub-workflow paths
-            already on the validation stack, used for cycle detection in
-            recursive sub-workflow validation. External callers should leave
-            this as ``None``.
+        _visited_subworkflows: Internal — set of canonical (st_dev, st_ino)
+            tuples for sub-workflow files already on the validation stack,
+            used for cycle detection in recursive sub-workflow validation.
+            External callers should leave this as ``None``.
         _subworkflow_depth: Internal — current recursion depth for
             sub-workflow validation. External callers should leave this as 0.
 
@@ -778,23 +778,29 @@ _MAX_SUBWORKFLOW_VALIDATION_DEPTH = 10
 def _validate_subworkflow_refs(
     config: WorkflowConfig,
     workflow_path: Path | None,
-    _visited: frozenset[str] | None = None,
+    _visited: frozenset[tuple[int, int]] | None = None,
     _depth: int = 0,
 ) -> tuple[list[str], list[str]]:
     """Validate all ``type: workflow`` agent references in *config*.
 
     For local paths, checks that the file exists. For registry references,
     fetches the workflow to the local cache and recursively validates the
-    full composition tree. Cycle detection prevents infinite recursion.
+    full composition tree. Cycle detection uses inode identity so that the
+    same file referenced via different cases (on case-insensitive
+    filesystems like macOS/Windows) or via symlinks resolves to the same
+    canonical key.
 
     Args:
         config: The workflow configuration to validate.
         workflow_path: Path of the workflow file being validated (used as the
             base directory for relative sub-workflow paths).
-        _visited: Set of already-visited canonical paths (for cycle detection).
-            Callers should leave this as ``None``; it is threaded through
-            recursive calls.
-        _depth: Current recursion depth (internal).
+        _visited: Set of already-visited canonical (st_dev, st_ino) tuples
+            for cycle detection. Callers should leave this as ``None``; it is
+            threaded through recursive calls.
+        _depth: Current recursion depth (internal). When the depth reaches
+            :data:`_MAX_SUBWORKFLOW_VALIDATION_DEPTH`, recursion stops and a
+            warning is emitted so callers know the validation tree was
+            truncated.
 
     Returns:
         Tuple of (error messages, warning messages).
@@ -806,6 +812,12 @@ def _validate_subworkflow_refs(
     warnings: list[str] = []
 
     if _depth >= _MAX_SUBWORKFLOW_VALIDATION_DEPTH:
+        warnings.append(
+            f"Sub-workflow validation depth limit "
+            f"({_MAX_SUBWORKFLOW_VALIDATION_DEPTH}) reached; "
+            "deeper sub-workflows were not validated. "
+            "Reduce nesting or check for unintended cycles."
+        )
         return errors, warnings
 
     base_dir = workflow_path.resolve().parent if workflow_path is not None else Path.cwd()
@@ -830,7 +842,19 @@ def _validate_subworkflow_refs(
         if sub_path is None:
             continue
 
-        canonical = str(sub_path)
+        # Use inode identity (st_dev, st_ino) for cycle detection so that the
+        # same file referenced via different cases (case-insensitive
+        # filesystems) or different relative paths resolves to one key.
+        try:
+            stat = sub_path.stat()
+            canonical: tuple[int, int] = (stat.st_dev, stat.st_ino)
+        except OSError as exc:
+            # Should be rare since _resolve_subworkflow_ref_for_validation
+            # already returned a path it considered valid, but stat() can
+            # still fail on some platforms (e.g. permission errors).
+            errors.append(f"{label}: cannot stat sub-workflow file '{sub_path}': {exc}")
+            continue
+
         if canonical in _visited:
             errors.append(
                 f"{label}: circular sub-workflow reference detected "
@@ -857,8 +881,7 @@ def _validate_subworkflow_refs(
                 _subworkflow_depth=_depth + 1,
             )
             warnings.extend(f"{label} → sub-workflow '{sub_path.name}': {w}" for w in sub_warnings)
-        except Exception as exc:
-            # validate_workflow_config raises ConfigurationError on failure.
+        except ConfigurationError as exc:
             errors.append(f"{label}: sub-workflow '{sub_path.name}' failed validation: {exc}")
 
     return errors, warnings

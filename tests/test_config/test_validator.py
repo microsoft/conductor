@@ -1256,13 +1256,18 @@ class TestSubWorkflowRefValidation:
             validate_workflow_config(config, workflow_path=parent)
 
     def test_registry_ref_validates_fetched_workflow(self, tmp_path: Path) -> None:
-        """Registry reference fetches the workflow and validates it recursively."""
+        """Registry reference fetches the workflow and validates it recursively.
+
+        Mocks only the ``RegistriesConfig`` loader and ``fetch_workflow`` so that
+        real ``resolve_ref`` parses ``fetched@team-a#v1.0.0`` end-to-end —
+        verifying that workflow name, registry name, and ref all extract
+        correctly.
+        """
         import textwrap
         from unittest.mock import patch
 
         from conductor.config.validator import validate_workflow_config
-        from conductor.registry.config import RegistryEntry, RegistryType
-        from conductor.registry.resolver import ResolvedRef
+        from conductor.registry.config import RegistriesConfig, RegistryEntry, RegistryType
 
         cached_sub = tmp_path / "fetched.yaml"
         cached_sub.write_text(
@@ -1288,23 +1293,39 @@ class TestSubWorkflowRefValidation:
         parent = tmp_path / "parent.yaml"
         parent.write_text("dummy", encoding="utf-8")
 
-        fake_entry = RegistryEntry(type=RegistryType.github, source="https://github.com/x/y")
-        fake_resolved = ResolvedRef(
-            kind="registry",
-            workflow="fetched",
-            registry_name="team-a",
-            ref="v1.0.0",
-            registry_entry=fake_entry,
+        # Real registry config so resolve_ref can find "team-a"
+        registry_config = RegistriesConfig(
+            registries={
+                "team-a": RegistryEntry(
+                    type=RegistryType.github,
+                    source="https://github.com/example/team-a",
+                ),
+            },
         )
+
+        # Capture fetch_workflow args to verify resolve_ref produced the
+        # right registry name, workflow name, and ref.
+        captured_args: dict[str, object] = {}
+
+        def capture_fetch(registry_name, registry_entry, workflow_name, ref):
+            captured_args["registry_name"] = registry_name
+            captured_args["workflow_name"] = workflow_name
+            captured_args["ref"] = ref
+            return cached_sub
 
         config = self._make_config("fetched@team-a#v1.0.0")
         with (
-            patch("conductor.registry.resolver.resolve_ref", return_value=fake_resolved),
-            patch("conductor.registry.cache.fetch_workflow", return_value=cached_sub),
+            patch("conductor.registry.resolver.load_config", return_value=registry_config),
+            patch("conductor.registry.cache.fetch_workflow", side_effect=capture_fetch),
         ):
             warnings = validate_workflow_config(config, workflow_path=parent)
 
         assert warnings == []
+        assert captured_args == {
+            "registry_name": "team-a",
+            "workflow_name": "fetched",
+            "ref": "v1.0.0",
+        }
 
     def test_registry_fetch_failure_errors(self, tmp_path: Path) -> None:
         """Registry fetch failure during validation produces a clear error."""
@@ -1485,3 +1506,187 @@ class TestSubWorkflowRefValidation:
 
         with pytest.raises(ConfigurationError, match="circular sub-workflow reference"):
             validate_workflow_config(config, workflow_path=parent)
+
+    def test_circular_subworkflow_via_case_variant_path(self, tmp_path: Path) -> None:
+        """Cycle is detected even when references use different case variants.
+
+        On case-insensitive filesystems (macOS, Windows) ``A.yaml`` and
+        ``a.yaml`` are the same file but ``Path.resolve()`` returns different
+        strings. The validator uses inode identity ``(st_dev, st_ino)`` for
+        cycle detection so cases like ``A.yaml → B.yaml → a.yaml`` are caught
+        on the first revisit, regardless of case used in references.
+
+        Skipped on case-sensitive filesystems where the case-variant
+        references are genuinely different files.
+        """
+        import textwrap
+
+        from conductor.config.schema import LimitsConfig, RuntimeConfig
+        from conductor.config.validator import validate_workflow_config
+        from conductor.exceptions import ConfigurationError
+
+        # Detect case-insensitivity by creating a file and checking if its
+        # uppercase variant is found.
+        probe = tmp_path / "_case_probe.yaml"
+        probe.write_text("x", encoding="utf-8")
+        case_insensitive = (tmp_path / "_CASE_PROBE.yaml").exists()
+        probe.unlink()
+
+        if not case_insensitive:
+            pytest.skip("case-insensitive filesystem required (e.g. macOS, Windows)")
+
+        # Write A.yaml that references B.YAML (uppercase)
+        a_yaml = tmp_path / "A.yaml"
+        a_yaml.write_text(
+            textwrap.dedent("""\
+                workflow:
+                  name: a
+                  entry_point: ref_b
+                  runtime:
+                    provider: copilot
+                  limits:
+                    max_iterations: 10
+                agents:
+                  - name: ref_b
+                    type: workflow
+                    workflow: B.YAML
+                    routes:
+                      - to: "$end"
+                output: {}
+            """),
+            encoding="utf-8",
+        )
+        # Write B.yaml that references a.yaml (lowercase) — same file as A.yaml
+        # on a case-insensitive FS, completing the cycle
+        b_yaml = tmp_path / "B.yaml"
+        b_yaml.write_text(
+            textwrap.dedent("""\
+                workflow:
+                  name: b
+                  entry_point: ref_a
+                  runtime:
+                    provider: copilot
+                  limits:
+                    max_iterations: 10
+                agents:
+                  - name: ref_a
+                    type: workflow
+                    workflow: a.yaml
+                    routes:
+                      - to: "$end"
+                output: {}
+            """),
+            encoding="utf-8",
+        )
+
+        parent = tmp_path / "parent.yaml"
+        parent.write_text("dummy", encoding="utf-8")
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="parent",
+                entry_point="sub_wf",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="sub_wf",
+                    type="workflow",
+                    workflow="A.yaml",  # same file as a.yaml on case-insensitive FS
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+        )
+
+        # Without inode-based detection, str(Path.resolve()) differs for
+        # A.yaml vs a.yaml on macOS, so the cycle would still be caught
+        # (just one level later, after both case variants are visited).
+        # Inode-based detection catches it on the first revisit and also
+        # correctly handles symlinks. Either way, the user sees a clear
+        # circular-reference error rather than hitting the depth limit.
+        with pytest.raises(ConfigurationError, match="circular sub-workflow reference"):
+            validate_workflow_config(config, workflow_path=parent)
+
+    def test_validation_depth_limit_emits_warning(self, tmp_path: Path) -> None:
+        """Hitting the recursion depth limit emits a warning, not a silent pass.
+
+        Builds a 12-level deep chain (parent → a0 → a1 → ... → a11) and
+        verifies the validator stops at depth ``_MAX_SUBWORKFLOW_VALIDATION_DEPTH``
+        but emits a warning so the user knows validation was truncated.
+        """
+        import textwrap
+
+        from conductor.config.schema import LimitsConfig, RuntimeConfig
+        from conductor.config.validator import (
+            _MAX_SUBWORKFLOW_VALIDATION_DEPTH,
+            validate_workflow_config,
+        )
+
+        # Build a deep linear chain a0 → a1 → a2 ... → a{N+1}
+        depth = _MAX_SUBWORKFLOW_VALIDATION_DEPTH + 2
+        for i in range(depth):
+            next_ref = f"./a{i + 1}.yaml" if i + 1 < depth else "$end"
+            if next_ref == "$end":
+                # Terminal sub-workflow: just a single agent
+                content = textwrap.dedent(f"""\
+                    workflow:
+                      name: a{i}
+                      entry_point: terminal
+                      runtime:
+                        provider: copilot
+                      limits:
+                        max_iterations: 10
+                    agents:
+                      - name: terminal
+                        type: agent
+                        prompt: done
+                        routes:
+                          - to: "$end"
+                    output: {{}}
+                """)
+            else:
+                content = textwrap.dedent(f"""\
+                    workflow:
+                      name: a{i}
+                      entry_point: nested
+                      runtime:
+                        provider: copilot
+                      limits:
+                        max_iterations: 10
+                    agents:
+                      - name: nested
+                        type: workflow
+                        workflow: {next_ref}
+                        routes:
+                          - to: "$end"
+                    output: {{}}
+                """)
+            (tmp_path / f"a{i}.yaml").write_text(content, encoding="utf-8")
+
+        parent = tmp_path / "parent.yaml"
+        parent.write_text("dummy", encoding="utf-8")
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="parent",
+                entry_point="sub_wf",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="sub_wf",
+                    type="workflow",
+                    workflow="./a0.yaml",
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+        )
+
+        warnings = validate_workflow_config(config, workflow_path=parent)
+        assert any("depth limit" in w for w in warnings), (
+            f"Expected a depth-limit warning, got warnings: {warnings}"
+        )

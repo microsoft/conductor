@@ -1477,10 +1477,16 @@ class TestRegistrySubWorkflowResolution:
     async def test_registry_ref_resolved_and_executed(
         self, tmp_workflow_dir: Path, tmp_path: Path
     ) -> None:
-        """Registry reference fetches workflow and executes it."""
-        from unittest.mock import AsyncMock, patch
+        """Registry reference fetches workflow and executes it.
 
-        # Write a real sub-workflow to a temp cache location
+        Mocks only ``fetch_workflow`` so that the engine's real
+        ``_resolve_subworkflow_path`` runs end-to-end: real ``resolve_ref``
+        parses the ``analysis@team-a#v1.0.0`` syntax, real precedence check
+        confirms no local file shadows it, and the registry branch is taken.
+        """
+        from unittest.mock import patch
+
+        # Write a real cached sub-workflow to a temp location
         cached_sub = tmp_path / "sub.yaml"
         _write_yaml(
             cached_sub,
@@ -1525,21 +1531,32 @@ class TestRegistrySubWorkflowResolution:
             output={"result": "{{ sub_wf.output.result }}"},
         )
 
-        call_count = 0
+        # Set up a real registry config so resolve_ref can find "team-a"
+        from conductor.registry.config import RegistriesConfig, RegistryEntry, RegistryType
+
+        registry_config = RegistriesConfig(
+            registries={
+                "team-a": RegistryEntry(
+                    type=RegistryType.github,
+                    source="https://github.com/example/team-a",
+                ),
+            },
+        )
 
         def mock_handler(agent, prompt, context):
-            nonlocal call_count
-            call_count += 1
             return {"result": "registry-result"}
 
         from conductor.providers.copilot import CopilotProvider
 
         provider = CopilotProvider(mock_handler=mock_handler)
 
-        with patch(
-            "conductor.engine.workflow.WorkflowEngine._resolve_subworkflow_path",
-            new_callable=AsyncMock,
-            return_value=cached_sub,
+        # Patch the registry config loader (used by resolve_ref) and
+        # fetch_workflow (the network boundary). Real resolve_ref parses
+        # the ref string and looks up the registry; real
+        # _resolve_subworkflow_path is exercised end-to-end.
+        with (
+            patch("conductor.registry.resolver.load_config", return_value=registry_config),
+            patch("conductor.registry.cache.fetch_workflow", return_value=cached_sub),
         ):
             engine = WorkflowEngine(config, provider, workflow_path=parent_path)
             result = await engine.run({})
@@ -1655,10 +1672,16 @@ class TestRegistrySubWorkflowResolution:
 
         provider = CopilotProvider(mock_handler=lambda agent, prompt, context: {"result": "local"})
 
-        # No registry mock needed — should resolve purely via local file check
-        engine = WorkflowEngine(config, provider, workflow_path=parent_path)
-        result = await engine.run({})
+        # Patch resolve_ref to verify it is NOT called when a local file
+        # exists — the precedence check must short-circuit before parsing.
+        from unittest.mock import patch
+
+        with patch("conductor.registry.resolver.resolve_ref") as mock_resolve_ref:
+            engine = WorkflowEngine(config, provider, workflow_path=parent_path)
+            result = await engine.run({})
+
         assert result.get("result") == "local"
+        mock_resolve_ref.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_malformed_registry_ref_raises_execution_error(
