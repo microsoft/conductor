@@ -7,9 +7,11 @@ A CLI tool for defining and running multi-agent workflows with the GitHub Copilo
 
 ## Why Conductor?
 
-A single LLM prompt can answer a question, but it can't review its own work, research from multiple angles, or pause for human approval. You need multi-agent workflows—but building them means coding custom solutions, managing state, handling failures, and hoping you don't create infinite loops.
+Conductor makes multi-agent workflows — code review pipelines, research-then-synthesize flows, plan-then-implement loops — **repeatable, deterministic, and version-controlled**. You define your agents, their prompts, and the routing between them in a single YAML file:
 
-Conductor provides the patterns that work: evaluator-optimizer loops for iterative refinement, parallel execution with failure modes, and human-in-the-loop gates. Define them in YAML with built-in safety limits. Version control your workflows like code.
+- **Repeatable** — Same inputs follow the same path through the same agents.
+- **Deterministic** — Routing uses Jinja2 templates and expression evaluation. First matching condition wins. No LLM in the orchestration loop, no tokens spent deciding what runs next.
+- **Source-controlled** — Plain YAML files. Diff workflows in pull requests, version them with your code, run them the same way locally and in CI.
 
 ## Features
 
