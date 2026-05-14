@@ -323,3 +323,92 @@ class TestResolveRefRegistryErrors:
 
         with pytest.raises(RegistryError, match="Registry 'nope' not found"):
             resolve_ref("qa-bot@nope#v1.0.0")
+
+
+# ---------------------------------------------------------------------------
+# Ad-hoc owner/repo refs
+# ---------------------------------------------------------------------------
+
+
+class TestAdhocRef:
+    """Tests for the ad-hoc ``workflow@owner/repo[#ref]`` form."""
+
+    def test_adhoc_with_pinned_tag(self) -> None:
+        """``analysis@acme/workflows#v1.0.0`` parses as adhoc — no config needed."""
+        ref = resolve_ref("analysis@acme/workflows#v1.0.0")
+        assert ref.kind == "adhoc"
+        assert ref.workflow == "analysis"
+        assert ref.adhoc_owner == "acme"
+        assert ref.adhoc_repo == "workflows"
+        assert ref.ref == "v1.0.0"
+        # registry_name preserved as the raw owner/repo string for diagnostics
+        assert ref.registry_name == "acme/workflows"
+        # registry_entry intentionally None — no config lookup happened
+        assert ref.registry_entry is None
+
+    def test_adhoc_with_pinned_branch(self) -> None:
+        ref = resolve_ref("analysis@acme/workflows#main")
+        assert ref.kind == "adhoc"
+        assert ref.adhoc_owner == "acme"
+        assert ref.adhoc_repo == "workflows"
+        assert ref.ref == "main"
+
+    def test_adhoc_without_ref_defaults_to_none(self) -> None:
+        """Omitted ``#ref`` resolves to default branch HEAD at fetch time."""
+        ref = resolve_ref("analysis@acme/workflows")
+        assert ref.kind == "adhoc"
+        assert ref.adhoc_owner == "acme"
+        assert ref.adhoc_repo == "workflows"
+        assert ref.ref is None
+
+    def test_adhoc_with_dashes_and_dots(self) -> None:
+        """Owner/repo names with dashes, dots, underscores are accepted."""
+        ref = resolve_ref("qa.bot_v2@my-org/team.workflows_v2#v1.0.0")
+        assert ref.kind == "adhoc"
+        assert ref.adhoc_owner == "my-org"
+        assert ref.adhoc_repo == "team.workflows_v2"
+        assert ref.workflow == "qa.bot_v2"
+
+    def test_adhoc_does_not_load_config(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """No call to load_config() when the registry slot looks like owner/repo."""
+        called = {"n": 0}
+
+        def fake_load_config() -> RegistriesConfig:
+            called["n"] += 1
+            return _make_config()
+
+        monkeypatch.setattr("conductor.registry.resolver.load_config", fake_load_config)
+        resolve_ref("analysis@acme/workflows#v1.0.0")
+        assert called["n"] == 0, "ad-hoc form must not consult registry config"
+
+    def test_adhoc_too_many_slashes_rejected(self) -> None:
+        """``owner/repo/extra`` is rejected — exactly one slash required."""
+        with pytest.raises(RegistryError, match="Invalid ad-hoc registry source"):
+            resolve_ref("analysis@acme/workflows/extra#v1.0.0")
+
+    def test_adhoc_empty_owner_rejected(self) -> None:
+        with pytest.raises(RegistryError, match="Invalid ad-hoc registry source"):
+            resolve_ref("analysis@/workflows#v1.0.0")
+
+    def test_adhoc_empty_repo_rejected(self) -> None:
+        with pytest.raises(RegistryError, match="Invalid ad-hoc registry source"):
+            resolve_ref("analysis@acme/#v1.0.0")
+
+    def test_named_registry_not_treated_as_adhoc(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Refs without '/' in the registry slot still use named-registry lookup."""
+        config = _make_config()
+        _patch_config(monkeypatch, config)
+        ref = resolve_ref("qa-bot@team#v1.0.0")
+        assert ref.kind == "registry"
+        assert ref.registry_name == "team"
+        assert ref.adhoc_owner is None
+        assert ref.adhoc_repo is None
+
+    def test_adhoc_help_in_unknown_registry_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Unknown named registry error mentions the ad-hoc fallback."""
+        config = _make_config(default="team")
+        _patch_config(monkeypatch, config)
+        with pytest.raises(RegistryError, match="ad-hoc form") as exc_info:
+            resolve_ref("qa-bot@nope#v1.0.0")
+        # The hint should suggest the workflow@owner/repo form.
+        assert "workflow@owner/repo" in str(exc_info.value)

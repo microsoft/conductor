@@ -1616,7 +1616,7 @@ class TestRegistrySubWorkflowResolution:
                 "conductor.registry.cache.fetch_workflow",
                 side_effect=RegistryError("not found"),
             ),
-            pytest.raises(ExecutionError, match="Failed to fetch registry sub-workflow"),
+            pytest.raises(ExecutionError, match="Failed to fetch sub-workflow"),
         ):
             await engine.run({})
 
@@ -1861,3 +1861,126 @@ class TestRegistrySubWorkflowResolution:
             "resume must resolve the registry ref to the same cached path as the original run"
         )
         assert result["result"] == "analysis-complete"
+
+    @pytest.mark.asyncio
+    async def test_adhoc_ref_resolved_and_executed(
+        self, tmp_workflow_dir: Path, tmp_path: Path
+    ) -> None:
+        """Ad-hoc registry reference (owner/repo in registry slot) fetches and executes.
+
+        Sub-workflow agent with `workflow: "analysis@myorg/workflows#v1.0.0"`
+        where the registry slot contains a literal owner/repo path.
+        Mocks only ``fetch_workflow_adhoc`` so the engine's real
+        ``_resolve_subworkflow_path`` and ``resolve_ref`` run end-to-end,
+        exercising the parsing of the adhoc format.
+        """
+        from unittest.mock import patch
+
+        # Write a real cached sub-workflow to a temp location
+        cached_sub = tmp_path / "sub.yaml"
+        _write_yaml(
+            cached_sub,
+            """\
+            workflow:
+              name: sub-from-adhoc
+              entry_point: inner
+              runtime:
+                provider: copilot
+              limits:
+                max_iterations: 10
+            agents:
+              - name: inner
+                type: agent
+                prompt: do it
+                routes:
+                  - to: "$end"
+            output:
+              result: "{{ inner.output.result }}"
+            """,
+        )
+
+        parent_path = tmp_workflow_dir / "parent.yaml"
+        parent_path.write_text("dummy", encoding="utf-8")
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="parent",
+                entry_point="sub_wf",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="sub_wf",
+                    type="workflow",
+                    workflow="analysis@myorg/workflows#v1.0.0",
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"result": "{{ sub_wf.output.result }}"},
+        )
+
+        def mock_handler(agent, prompt, context):
+            return {"result": "adhoc-result"}
+
+        from conductor.providers.copilot import CopilotProvider
+
+        provider = CopilotProvider(mock_handler=mock_handler)
+
+        # Patch fetch_workflow_adhoc so it returns the cached sub-workflow path.
+        # Real resolve_ref parses the ref string and creates an adhoc kind.
+        with patch(
+            "conductor.registry.cache.fetch_workflow_adhoc", return_value=cached_sub
+        ) as mock_adhoc_fetch:
+            engine = WorkflowEngine(config, provider, workflow_path=parent_path)
+            result = await engine.run({})
+
+        assert result.get("result") == "adhoc-result"
+        # Verify fetch_workflow_adhoc was called with the right args
+        mock_adhoc_fetch.assert_called_once()
+        call_kwargs = mock_adhoc_fetch.call_args[1]
+        assert call_kwargs["owner"] == "myorg"
+        assert call_kwargs["repo"] == "workflows"
+        assert call_kwargs["workflow_name"] == "analysis"
+        assert call_kwargs["ref"] == "v1.0.0"
+
+    @pytest.mark.asyncio
+    async def test_adhoc_fetch_failure_raises_execution_error(self, tmp_workflow_dir: Path) -> None:
+        """Ad-hoc registry fetch failure is wrapped in ExecutionError."""
+        from unittest.mock import patch
+
+        from conductor.registry.errors import RegistryError
+
+        parent_path = tmp_workflow_dir / "parent.yaml"
+        parent_path.write_text("dummy", encoding="utf-8")
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="parent",
+                entry_point="sub_wf",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="sub_wf",
+                    type="workflow",
+                    workflow="missing@acme/tools#latest",
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+        )
+
+        mock_provider = MagicMock()
+        engine = WorkflowEngine(config, mock_provider, workflow_path=parent_path)
+
+        with (
+            patch(
+                "conductor.registry.cache.fetch_workflow_adhoc",
+                side_effect=RegistryError("workflow not found in repository"),
+            ),
+            pytest.raises(ExecutionError, match="Failed to fetch sub-workflow"),
+        ):
+            await engine.run({})

@@ -273,7 +273,10 @@ agents:
 
 **Key semantics:**
 
-- The `workflow` path is resolved relative to the parent workflow file
+- The `workflow` field can be:
+  - A local file path: `./research-pipeline.yaml` (resolved relative to the parent)
+  - A configured registry reference: `qa-bot@team#v1.2.3` (see [Workflow Registry](design/registry.md))
+  - An ad-hoc GitHub reference: `analysis@myorg/team-a#main` (owner/repo fetched directly from GitHub)
 - Sub-workflow inherits the parent's provider configuration
 - Sub-workflow output is stored in context and accessible via `{{ agent_name.output.field }}`
 - Recursive composition is supported (sub-workflows can reference other sub-workflows) with a global depth limit of `MAX_SUBWORKFLOW_DEPTH = 10`
@@ -287,6 +290,33 @@ prompt: |
   The research findings were:
   {{ deep_research.output.findings }}
 ```
+
+**Workflow reference types** — the `workflow` field supports three forms:
+
+```yaml
+agents:
+  # Local file path (relative to parent workflow)
+  - name: local_pipeline
+    type: workflow
+    workflow: ./shared/research-pipeline.yaml
+
+  # Configured registry reference
+  - name: registry_pipeline
+    type: workflow
+    workflow: qa-bot@team#v1.2.3
+
+  # Ad-hoc GitHub reference (no registry setup required)
+  - name: adhoc_pipeline
+    type: workflow
+    workflow: analysis@myorg/team-a#main
+    input_mapping:
+      data: "{{ workflow.input.raw_data }}"
+```
+
+The ad-hoc form (`workflow@owner/repo[#ref]`) allows cross-team workflow
+composition without pre-configuring registries. See
+[Ad-hoc References](design/registry.md#ad-hoc-references) in the registry design
+doc for details on caching, authentication, and ref resolution.
 
 **Sub-workflows in `for_each` groups** — `type: workflow` agents can be used inside `for_each` groups to fan out one sub-workflow run per item in the source array. Each iteration receives its own `input_mapping` evaluated against the loop variable, and emits its own `subworkflow_started` / `subworkflow_completed` events:
 

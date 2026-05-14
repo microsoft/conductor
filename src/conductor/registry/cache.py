@@ -11,6 +11,13 @@ so that local edits are reflected immediately.
 Cache layout::
 
     <base>/cache/registries/<registry>/<workflow>/<sha[:12]>/
+
+For ad-hoc references (``workflow@owner/repo#ref``) the registry namespace
+is ``_adhoc/<owner>/<repo>`` so adhoc caches are isolated from named
+registry caches and cannot collide with any user-configured registry name
+(named registries reject names containing ``/``)::
+
+    <base>/cache/registries/_adhoc/<owner>/<repo>/<workflow>/<sha[:12]>/
 """
 
 from __future__ import annotations
@@ -19,6 +26,7 @@ import os
 import shutil
 import tempfile
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from conductor.registry.config import RegistryEntry, RegistryType
 from conductor.registry.errors import RegistryError
@@ -26,7 +34,14 @@ from conductor.registry.github import fetch_file, list_directory, parse_github_s
 from conductor.registry.index import load_index
 from conductor.registry.version_resolver import materialize_to_sha, resolve_ref
 
+if TYPE_CHECKING:
+    from conductor.registry.resolver import ResolvedRef
+
 # fetch_file returns bytes; list_directory returns filenames (not full paths)
+
+# Reserved cache namespace for ad-hoc references. Cannot collide with a
+# named registry because configured registry names cannot contain '/'.
+_ADHOC_NAMESPACE = "_adhoc"
 
 # ---------------------------------------------------------------------------
 # Path helpers
@@ -193,6 +208,106 @@ def fetch_workflow(
             suggestion="The registry index may reference a file that does not exist.",
         )
     return result
+
+
+def fetch_workflow_adhoc(
+    owner: str,
+    repo: str,
+    workflow_name: str,
+    ref: str | None = None,
+) -> Path:
+    """Fetch an ad-hoc workflow from a GitHub repo without registry config.
+
+    Constructs a synthetic ``RegistryEntry`` for ``owner/repo`` and reuses
+    the same fetch + cache pipeline as named registries. Cache entries are
+    namespaced under ``_adhoc/<owner>/<repo>/`` so they're isolated from
+    configured registries.
+
+    Args:
+        owner: GitHub repository owner.
+        repo: GitHub repository name.
+        workflow_name: Workflow key as listed in the repo's ``index.yaml``.
+        ref: Optional git ref (tag, branch, or SHA). ``None`` resolves to
+            the repository's default branch HEAD.
+
+    Returns:
+        Path to the cached workflow YAML file.
+
+    Raises:
+        RegistryError: On fetch failure, missing workflow, or I/O errors.
+    """
+    synthetic_entry = RegistryEntry(
+        type=RegistryType.github,
+        source=f"{owner}/{repo}",
+    )
+    synthetic_registry_name = f"{_ADHOC_NAMESPACE}/{owner}/{repo}"
+    return fetch_workflow(
+        registry_name=synthetic_registry_name,
+        registry_entry=synthetic_entry,
+        workflow_name=workflow_name,
+        ref=ref,
+    )
+
+
+def resolve_and_fetch(resolved: ResolvedRef) -> Path:
+    """Return a local filesystem path for any kind of resolved reference.
+
+    Single dispatcher used by the CLI, engine, and validator so each call
+    site does not need to switch on ``ResolvedRef.kind``. Behavior by kind:
+
+    * ``file``: returns ``resolved.path`` unchanged. Caller is responsible
+      for verifying the path exists.
+    * ``registry``: fetches via :func:`fetch_workflow` (cached under the
+      configured registry name).
+    * ``adhoc``: fetches via :func:`fetch_workflow_adhoc` (cached under the
+      ``_adhoc/<owner>/<repo>`` namespace).
+
+    Args:
+        resolved: A :class:`~conductor.registry.resolver.ResolvedRef` from
+            :func:`~conductor.registry.resolver.resolve_ref`.
+
+    Returns:
+        A local ``Path`` to the workflow YAML file.
+
+    Raises:
+        RegistryError: When a registry/adhoc fetch fails.
+        ValueError: If ``resolved`` has missing required fields for its kind.
+    """
+    if resolved.kind == "file":
+        if resolved.path is None:
+            raise ValueError("ResolvedRef(kind='file') must have a non-None path")
+        return resolved.path
+
+    if resolved.kind == "registry":
+        if (
+            resolved.registry_name is None
+            or resolved.registry_entry is None
+            or resolved.workflow is None
+        ):
+            raise ValueError(
+                "ResolvedRef(kind='registry') must have non-None "
+                "registry_name, registry_entry, and workflow"
+            )
+        return fetch_workflow(
+            registry_name=resolved.registry_name,
+            registry_entry=resolved.registry_entry,
+            workflow_name=resolved.workflow,
+            ref=resolved.ref,
+        )
+
+    if resolved.kind == "adhoc":
+        if resolved.adhoc_owner is None or resolved.adhoc_repo is None or resolved.workflow is None:
+            raise ValueError(
+                "ResolvedRef(kind='adhoc') must have non-None adhoc_owner, adhoc_repo, and workflow"
+            )
+        return fetch_workflow_adhoc(
+            owner=resolved.adhoc_owner,
+            repo=resolved.adhoc_repo,
+            workflow_name=resolved.workflow,
+            ref=resolved.ref,
+        )
+
+    raise ValueError(f"Unknown ResolvedRef kind: {resolved.kind!r}")
 
 
 # ---------------------------------------------------------------------------

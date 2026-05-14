@@ -905,6 +905,7 @@ def _resolve_subworkflow_ref_for_validation(
     Returns:
         Tuple of (resolved path or None on error, list of error strings).
     """
+    from conductor.registry.cache import resolve_and_fetch
     from conductor.registry.errors import RegistryError
     from conductor.registry.resolver import resolve_ref
 
@@ -926,23 +927,12 @@ def _resolve_subworkflow_ref_for_validation(
         errors.append(f"{label}: sub-workflow file not found: '{candidate}'")
         return None, errors
 
-    # Registry reference: fetch (uses cache; makes network request on first access).
-    from conductor.registry.cache import fetch_workflow
-
-    # registry_name, registry_entry, and workflow are always set when kind == "registry"
-    assert resolved.registry_name is not None  # noqa: S101
-    assert resolved.registry_entry is not None  # noqa: S101
-    assert resolved.workflow is not None  # noqa: S101
-
+    # Named registry or ad-hoc reference: fetch (uses cache; makes network
+    # request on first access).
     try:
-        sub_path = fetch_workflow(
-            resolved.registry_name,
-            resolved.registry_entry,
-            resolved.workflow,
-            resolved.ref,
-        )
+        sub_path = resolve_and_fetch(resolved)
     except RegistryError as exc:
-        errors.append(f"{label}: failed to fetch registry sub-workflow '{workflow_ref}': {exc}")
+        errors.append(f"{label}: failed to fetch sub-workflow '{workflow_ref}': {exc}")
         return None, errors
 
     return sub_path, errors

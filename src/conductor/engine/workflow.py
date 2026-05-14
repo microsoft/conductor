@@ -749,6 +749,7 @@ class WorkflowEngine:
             ExecutionError: If the registry reference is malformed, names an
                 unknown registry, or the registry fetch fails.
         """
+        from conductor.registry.cache import resolve_and_fetch
         from conductor.registry.errors import RegistryError
         from conductor.registry.resolver import resolve_ref
 
@@ -759,7 +760,7 @@ class WorkflowEngine:
         if candidate.is_file():
             return candidate
 
-        # Step 2: heuristic parse — file-looking path or registry reference?
+        # Step 2: parse as file-path / named-registry / ad-hoc reference.
         try:
             resolved = resolve_ref(agent_workflow)
         except RegistryError as exc:
@@ -767,8 +768,9 @@ class WorkflowEngine:
                 f"Failed to resolve sub-workflow '{agent_workflow}' "
                 f"(referenced by agent '{agent_name}'): {exc}",
                 suggestion=(
-                    "Check the registry reference syntax and ensure the registry "
-                    "is configured (run 'conductor registry list')."
+                    "Check the registry reference syntax. For named registries, "
+                    "ensure the registry is configured (run 'conductor registry list'). "
+                    "For ad-hoc references, use 'workflow@owner/repo[#ref]'."
                 ),
             ) from exc
 
@@ -777,29 +779,16 @@ class WorkflowEngine:
             # candidate path so the caller emits a clear "file not found" error.
             return candidate
 
-        # Step 4: registry reference — fetch (or return cached) local path.
-        from conductor.registry.cache import fetch_workflow
-
-        # registry_name, registry_entry, and workflow are always set when kind == "registry"
-        assert resolved.registry_name is not None  # noqa: S101
-        assert resolved.registry_entry is not None  # noqa: S101
-        assert resolved.workflow is not None  # noqa: S101
-
+        # Step 4: dispatch to the unified fetcher (handles registry + adhoc).
         try:
-            return await asyncio.to_thread(
-                fetch_workflow,
-                resolved.registry_name,
-                resolved.registry_entry,
-                resolved.workflow,
-                resolved.ref,
-            )
+            return await asyncio.to_thread(resolve_and_fetch, resolved)
         except RegistryError as exc:
             raise ExecutionError(
-                f"Failed to fetch registry sub-workflow '{agent_workflow}' "
+                f"Failed to fetch sub-workflow '{agent_workflow}' "
                 f"(referenced by agent '{agent_name}'): {exc}",
                 suggestion=(
-                    "Check that the registry name and workflow name are correct "
-                    "and the registry is reachable."
+                    "Check that the registry/repo and workflow name are correct "
+                    "and the source is reachable."
                 ),
             ) from exc
 

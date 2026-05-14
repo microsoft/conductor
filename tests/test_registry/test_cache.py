@@ -624,3 +624,224 @@ class TestPruneTempDirs:
         # No cache dir at all
         assert prune_temp_dirs() == 0
         assert prune_temp_dirs("reg-a") == 0
+
+
+# ---------------------------------------------------------------------------
+# Ad-hoc fetch + resolve_and_fetch unifier
+# ---------------------------------------------------------------------------
+
+
+class TestFetchWorkflowAdhoc:
+    """Tests for fetch_workflow_adhoc and the _adhoc cache namespace."""
+
+    @patch("conductor.registry.cache._fetch_github")
+    @patch("conductor.registry.cache.load_index")
+    @patch("conductor.registry.cache.materialize_to_sha")
+    @patch("conductor.registry.cache.resolve_ref")
+    def test_adhoc_fetches_under_adhoc_namespace(
+        self,
+        mock_resolve_ref: object,
+        mock_materialize: object,
+        mock_load_index: object,
+        mock_fetch_github: object,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Ad-hoc fetch caches under <base>/_adhoc/<owner>/<repo>/<wf>/<sha>/."""
+        from conductor.registry.cache import fetch_workflow_adhoc
+
+        home = _setup_conductor_home(tmp_path, monkeypatch)
+        mock_resolve_ref.return_value = "v1.0.0"  # type: ignore[union-attr]
+        mock_materialize.return_value = _FAKE_SHA  # type: ignore[union-attr]
+        mock_load_index.return_value = _make_index()  # type: ignore[union-attr]
+        mock_fetch_github.side_effect = (  # type: ignore[union-attr]
+            lambda entry, path, sha, dest_dir: _write_workflow_file(dest_dir)
+        )
+
+        result = fetch_workflow_adhoc(
+            owner="myorg",
+            repo="workflows",
+            workflow_name="qa-bot",
+            ref="v1.0.0",
+        )
+
+        assert result.exists()
+        assert result.name == "qa-bot.yaml"
+        # Cache directory is namespaced under _adhoc/<owner>/<repo>/
+        expected_dir = (
+            home / "cache" / "registries" / "_adhoc" / "myorg" / "workflows" / "qa-bot" / _SHA_DIR
+        )
+        assert result.parent == expected_dir
+
+    @patch("conductor.registry.cache._fetch_github")
+    @patch("conductor.registry.cache.load_index")
+    @patch("conductor.registry.cache.materialize_to_sha")
+    @patch("conductor.registry.cache.resolve_ref")
+    def test_adhoc_isolated_from_named_registry_cache(
+        self,
+        mock_resolve_ref: object,
+        mock_materialize: object,
+        mock_load_index: object,
+        mock_fetch_github: object,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Same SHA fetched ad-hoc and as named-registry produces distinct caches."""
+        from conductor.registry.cache import fetch_workflow_adhoc
+
+        home = _setup_conductor_home(tmp_path, monkeypatch)
+        mock_resolve_ref.return_value = "v1.0.0"  # type: ignore[union-attr]
+        mock_materialize.return_value = _FAKE_SHA  # type: ignore[union-attr]
+        mock_load_index.return_value = _make_index()  # type: ignore[union-attr]
+        mock_fetch_github.side_effect = (  # type: ignore[union-attr]
+            lambda entry, path, sha, dest_dir: _write_workflow_file(dest_dir)
+        )
+
+        # Fetch via named registry first
+        named_entry = RegistryEntry(type=RegistryType.github, source="myorg/workflows")
+        named_result = fetch_workflow("official", named_entry, "qa-bot", ref="v1.0.0")
+
+        # Fetch the same workflow via ad-hoc
+        adhoc_result = fetch_workflow_adhoc(
+            owner="myorg",
+            repo="workflows",
+            workflow_name="qa-bot",
+            ref="v1.0.0",
+        )
+
+        # Both succeed but live in different cache directories
+        assert named_result.parent != adhoc_result.parent
+        # Sanity: named_result lives under official/, adhoc under _adhoc/myorg/workflows/
+        assert (home / "cache" / "registries" / "official").exists()
+        assert (home / "cache" / "registries" / "_adhoc" / "myorg" / "workflows").exists()
+        # Adhoc cache path includes the _adhoc/ namespace segment; named does not.
+        assert "_adhoc" in adhoc_result.relative_to(home).parts
+        assert "_adhoc" not in named_result.relative_to(home).parts
+
+    @patch("conductor.registry.cache._fetch_github")
+    @patch("conductor.registry.cache.load_index")
+    @patch("conductor.registry.cache.materialize_to_sha")
+    @patch("conductor.registry.cache.resolve_ref")
+    def test_adhoc_cache_hit_skips_fetch(
+        self,
+        mock_resolve_ref: object,
+        mock_materialize: object,
+        mock_load_index: object,
+        mock_fetch_github: object,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Pre-populated ad-hoc cache returns immediately without fetching."""
+        from conductor.registry.cache import fetch_workflow_adhoc
+
+        home = _setup_conductor_home(tmp_path, monkeypatch)
+        mock_resolve_ref.return_value = "v1.0.0"  # type: ignore[union-attr]
+        mock_materialize.return_value = _FAKE_SHA  # type: ignore[union-attr]
+
+        # Pre-populate the ad-hoc cache
+        sha_dir = (
+            home / "cache" / "registries" / "_adhoc" / "myorg" / "workflows" / "qa-bot" / _SHA_DIR
+        )
+        sha_dir.mkdir(parents=True)
+        (sha_dir / "qa-bot.yaml").write_text("name: qa-bot\n", encoding="utf-8")
+
+        result = fetch_workflow_adhoc(
+            owner="myorg",
+            repo="workflows",
+            workflow_name="qa-bot",
+            ref="v1.0.0",
+        )
+
+        assert result.parent == sha_dir
+        mock_fetch_github.assert_not_called()  # type: ignore[union-attr]
+        mock_load_index.assert_not_called()  # type: ignore[union-attr]
+
+
+class TestResolveAndFetch:
+    """Tests for the resolve_and_fetch unifier dispatcher."""
+
+    def test_file_kind_returns_path_unchanged(self, tmp_path: Path) -> None:
+        from conductor.registry.cache import resolve_and_fetch
+        from conductor.registry.resolver import ResolvedRef
+
+        local = tmp_path / "wf.yaml"
+        local.write_text("name: wf\n")
+        ref = ResolvedRef(kind="file", path=local)
+        assert resolve_and_fetch(ref) == local
+
+    def test_file_kind_missing_path_raises(self) -> None:
+        from conductor.registry.cache import resolve_and_fetch
+        from conductor.registry.resolver import ResolvedRef
+
+        ref = ResolvedRef(kind="file", path=None)
+        with pytest.raises(ValueError, match="non-None path"):
+            resolve_and_fetch(ref)
+
+    @patch("conductor.registry.cache.fetch_workflow")
+    def test_registry_kind_dispatches_to_fetch_workflow(
+        self, mock_fetch: object, tmp_path: Path
+    ) -> None:
+        from conductor.registry.cache import resolve_and_fetch
+        from conductor.registry.resolver import ResolvedRef
+
+        entry = RegistryEntry(type=RegistryType.github, source="o/r")
+        ref = ResolvedRef(
+            kind="registry",
+            workflow="qa-bot",
+            registry_name="team",
+            ref="v1.0.0",
+            registry_entry=entry,
+        )
+        expected_path = tmp_path / "result.yaml"
+        mock_fetch.return_value = expected_path  # type: ignore[union-attr]
+
+        result = resolve_and_fetch(ref)
+
+        assert result == expected_path
+        mock_fetch.assert_called_once_with(  # type: ignore[union-attr]
+            registry_name="team",
+            registry_entry=entry,
+            workflow_name="qa-bot",
+            ref="v1.0.0",
+        )
+
+    @patch("conductor.registry.cache.fetch_workflow_adhoc")
+    def test_adhoc_kind_dispatches_to_fetch_workflow_adhoc(
+        self, mock_fetch: object, tmp_path: Path
+    ) -> None:
+        from conductor.registry.cache import resolve_and_fetch
+        from conductor.registry.resolver import ResolvedRef
+
+        ref = ResolvedRef(
+            kind="adhoc",
+            workflow="qa-bot",
+            registry_name="myorg/workflows",
+            ref="v1.0.0",
+            adhoc_owner="myorg",
+            adhoc_repo="workflows",
+        )
+        expected_path = tmp_path / "result.yaml"
+        mock_fetch.return_value = expected_path  # type: ignore[union-attr]
+
+        result = resolve_and_fetch(ref)
+
+        assert result == expected_path
+        mock_fetch.assert_called_once_with(  # type: ignore[union-attr]
+            owner="myorg",
+            repo="workflows",
+            workflow_name="qa-bot",
+            ref="v1.0.0",
+        )
+
+    def test_adhoc_kind_missing_fields_raises(self) -> None:
+        from conductor.registry.cache import resolve_and_fetch
+        from conductor.registry.resolver import ResolvedRef
+
+        ref = ResolvedRef(
+            kind="adhoc",
+            workflow="qa-bot",
+            adhoc_owner=None,  # missing!
+            adhoc_repo="workflows",
+        )
+        with pytest.raises(ValueError, match="adhoc_owner"):
+            resolve_and_fetch(ref)

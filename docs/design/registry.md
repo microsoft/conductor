@@ -298,6 +298,119 @@ file of the same name.
 | SemVer ranges                             | Out of scope v1                                         | Adds resolver complexity for marginal benefit until ecosystems exist.                                |
 | Index format                              | YAML primary, JSON fallback                             | Consistent with workflow files. JSON tolerated for tooling.                                          |
 
+## Ad-hoc references
+
+A **workflow reference without pre-configured registry** allows teams to compose
+workflows across GitHub organizations and repositories without registry setup.
+
+### Motivation
+
+Configured registries are ideal for standard repos (org-wide workflows, team
+templates). But ad-hoc cross-team composition is common: Team C wants to run a
+workflow from Team A's repo in combination with Team B's workflow, without any
+team having to register each other's repos. Ad-hoc references lower friction for
+one-off usage.
+
+### Syntax
+
+```
+workflow@owner/repo[#ref]
+```
+
+If the part after `@` contains `/`, it is treated as a literal `owner/repo`
+GitHub reference (ad-hoc) and fetched directly. Otherwise it is looked up as a
+configured registry name (existing behavior).
+
+Examples:
+
+```
+analysis@myorg/team-a                # default branch HEAD of myorg/team-a
+analysis@myorg/team-a#v1.0.0         # tag v1.0.0 of myorg/team-a
+analysis@myorg/team-a#main           # main branch of myorg/team-a
+analysis@myorg/team-a#abc1234        # specific commit SHA
+```
+
+### Disambiguation rule
+
+At parse time, Conductor disambiguates between ad-hoc and registry references:
+
+- `analysis@team` → registry name `team` (no `/` in the part after `@`)
+- `analysis@myorg/team-a` → ad-hoc reference to `myorg/team-a` (contains `/`)
+
+Registry names are configured by the user and cannot contain `/`, so there is
+no ambiguity. Both forms coexist: configured registries are recommended for
+frequently-used sources, ad-hoc references for occasional cross-team pulls.
+
+### Caching
+
+Ad-hoc workflows are cached at:
+
+```
+~/.conductor/cache/registries/_adhoc/<owner>/<repo>/<workflow>/<sha[:12]>/
+```
+
+This isolates ad-hoc caches from named registries, avoiding collisions when the
+same workflow name exists in different sources.
+
+### Reference resolution
+
+Ad-hoc references follow the same resolution rules as registry references:
+
+- Missing `#<ref>` → use the **default branch HEAD** (re-resolved on each fetch).
+- Explicit `#<tag>` or `#<branch>` → pinned to that tag or the current HEAD of the branch.
+- Explicit `#<sha>` → pinned to an exact commit.
+- Multiple `@` or multiple `#` are hard errors.
+
+### Authentication
+
+Ad-hoc references use the same authentication as named GitHub registries:
+- Public repos work automatically.
+- Private repos use `gh auth token` if available, otherwise fail with a clear error.
+
+### Usage
+
+Ad-hoc references work everywhere registry references work:
+
+```bash
+conductor run 'analysis@myorg/team-a#v1.0.0' --input question="..."
+conductor validate 'analysis@myorg/team-a#main'
+conductor resume 'analysis@myorg/team-a#v1.0.0'
+```
+
+As a sub-workflow (see [Sub-workflows](#sub-workflows) in the workflow syntax guide):
+
+```yaml
+agents:
+  - name: team_a_analysis
+    type: workflow
+    workflow: analysis@myorg/team-a#v1.0.0
+    input_mapping:
+      data: "{{ workflow.input.raw_data }}"
+```
+
+### Example: Cross-team composition
+
+Team C's workflow references Team A's and Team B's workflows without any
+pre-registry setup:
+
+```yaml
+agents:
+  - name: team_a_pipeline
+    type: workflow
+    workflow: qa-bot@teamA/qa-workflows#main
+    input_mapping:
+      question: "{{ workflow.input.query }}"
+
+  - name: team_b_pipeline
+    type: workflow
+    workflow: reviewer@teamB/review-workflows#v2.1.0
+    input_mapping:
+      content: "{{ team_a_pipeline.output.answer }}"
+```
+
+Both workflows are fetched and composed in Team C's workflow without any
+registry configuration.
+
 ## Open questions
 
 - **Sibling fetch scope for GitHub.** Should we fetch only files in the

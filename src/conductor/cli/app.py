@@ -359,25 +359,12 @@ def run(
     import asyncio
     import json
 
-    from conductor.registry.cache import fetch_workflow as fetch_registry_workflow
+    from conductor.registry.cache import resolve_and_fetch
     from conductor.registry.errors import RegistryError
     from conductor.registry.resolver import resolve_ref
 
     try:
-        ref = resolve_ref(workflow)
-        if ref.kind == "file":
-            assert ref.path is not None
-            workflow_path = ref.path
-        else:
-            assert ref.registry_name is not None
-            assert ref.registry_entry is not None
-            assert ref.workflow is not None
-            workflow_path = fetch_registry_workflow(
-                registry_name=ref.registry_name,
-                registry_entry=ref.registry_entry,
-                workflow_name=ref.workflow,
-                ref=ref.ref,
-            )
+        workflow_path = resolve_and_fetch(resolve_ref(workflow))
     except RegistryError as e:
         print_error(e)
         raise typer.Exit(code=1) from None
@@ -507,25 +494,12 @@ def validate(
         conductor validate ./examples/my-workflow.yaml
         conductor validate qa-bot@team@1.0.0
     """
-    from conductor.registry.cache import fetch_workflow as fetch_registry_workflow
+    from conductor.registry.cache import resolve_and_fetch
     from conductor.registry.errors import RegistryError
     from conductor.registry.resolver import resolve_ref
 
     try:
-        ref = resolve_ref(workflow)
-        if ref.kind == "file":
-            assert ref.path is not None
-            workflow_path = ref.path
-        else:
-            assert ref.registry_name is not None
-            assert ref.registry_entry is not None
-            assert ref.workflow is not None
-            workflow_path = fetch_registry_workflow(
-                registry_name=ref.registry_name,
-                registry_entry=ref.registry_entry,
-                workflow_name=ref.workflow,
-                ref=ref.ref,
-            )
+        workflow_path = resolve_and_fetch(resolve_ref(workflow))
     except RegistryError as e:
         print_error(e)
         raise typer.Exit(code=1) from None
@@ -563,7 +537,7 @@ def show(
         conductor show qa-bot
         conductor show qa-bot@my-registry@1.0.0
     """
-    from conductor.registry.cache import fetch_workflow as fetch_registry_workflow
+    from conductor.registry.cache import resolve_and_fetch
     from conductor.registry.errors import RegistryError
     from conductor.registry.resolver import resolve_ref
 
@@ -576,15 +550,7 @@ def show(
                 console.print(f"[bold red]Error:[/bold red] Workflow file not found: {workflow}")
                 raise typer.Exit(code=1)
         else:
-            assert ref.registry_name is not None
-            assert ref.registry_entry is not None
-            assert ref.workflow is not None
-            workflow_path = fetch_registry_workflow(
-                registry_name=ref.registry_name,
-                registry_entry=ref.registry_entry,
-                workflow_name=ref.workflow,
-                ref=ref.ref,
-            )
+            workflow_path = resolve_and_fetch(ref)
     except RegistryError as e:
         print_error(e)
         raise typer.Exit(code=1) from None
@@ -819,7 +785,7 @@ def resume(
     # Resolve workflow ref if provided
     resolved_workflow: Path | None = None
     if workflow is not None:
-        from conductor.registry.cache import fetch_workflow as fetch_registry_workflow
+        from conductor.registry.cache import resolve_and_fetch
         from conductor.registry.errors import RegistryError
         from conductor.registry.resolver import resolve_ref
 
@@ -834,15 +800,7 @@ def resume(
                     )
                     raise typer.Exit(code=1)
             else:
-                assert ref.registry_name is not None
-                assert ref.registry_entry is not None
-                assert ref.workflow is not None
-                resolved_workflow = fetch_registry_workflow(
-                    registry_name=ref.registry_name,
-                    registry_entry=ref.registry_entry,
-                    workflow_name=ref.workflow,
-                    ref=ref.ref,
-                )
+                resolved_workflow = resolve_and_fetch(ref)
         except RegistryError as e:
             print_error(e)
             raise typer.Exit(code=1) from None

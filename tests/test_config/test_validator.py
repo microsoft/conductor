@@ -1356,7 +1356,7 @@ class TestSubWorkflowRefValidation:
                 "conductor.registry.cache.fetch_workflow",
                 side_effect=RegistryError("workflow not found"),
             ),
-            pytest.raises(ConfigurationError, match="failed to fetch registry sub-workflow"),
+            pytest.raises(ConfigurationError, match="failed to fetch sub-workflow"),
         ):
             validate_workflow_config(config, workflow_path=parent)
 
@@ -1422,7 +1422,7 @@ class TestSubWorkflowRefValidation:
                 "conductor.registry.cache.fetch_workflow",
                 side_effect=RegistryError("workflow not found"),
             ),
-            pytest.raises(ConfigurationError, match="failed to fetch registry sub-workflow"),
+            pytest.raises(ConfigurationError, match="failed to fetch sub-workflow"),
         ):
             validate_workflow_config(config, workflow_path=parent)
 
@@ -1690,3 +1690,85 @@ class TestSubWorkflowRefValidation:
         assert any("depth limit" in w for w in warnings), (
             f"Expected a depth-limit warning, got warnings: {warnings}"
         )
+
+    def test_adhoc_ref_validates_fetched_workflow(self, tmp_path: Path) -> None:
+        """Ad-hoc registry reference (owner/repo) validates fetched workflow.
+
+        Uses `_make_config("analysis@myorg/workflows#v1.0.0")` where the
+        registry slot contains a literal owner/repo path. Mocks only
+        ``fetch_workflow_adhoc`` so the validator's real ``resolve_ref``
+        runs end-to-end, exercising the parsing of the adhoc format.
+        """
+        import textwrap
+        from unittest.mock import patch
+
+        from conductor.config.validator import validate_workflow_config
+
+        cached_sub = tmp_path / "fetched.yaml"
+        cached_sub.write_text(
+            textwrap.dedent("""\
+                workflow:
+                  name: analysis
+                  entry_point: step
+                  runtime:
+                    provider: copilot
+                  limits:
+                    max_iterations: 10
+                agents:
+                  - name: step
+                    type: agent
+                    prompt: go
+                    routes:
+                      - to: "$end"
+                output: {}
+            """),
+            encoding="utf-8",
+        )
+
+        parent = tmp_path / "parent.yaml"
+        parent.write_text("dummy", encoding="utf-8")
+
+        # Capture fetch_workflow_adhoc args to verify the right owner/repo/workflow/ref
+        captured_args: dict[str, object] = {}
+
+        def capture_adhoc_fetch(owner, repo, workflow_name, ref):
+            captured_args["owner"] = owner
+            captured_args["repo"] = repo
+            captured_args["workflow_name"] = workflow_name
+            captured_args["ref"] = ref
+            return cached_sub
+
+        config = self._make_config("analysis@myorg/workflows#v1.0.0")
+        with patch(
+            "conductor.registry.cache.fetch_workflow_adhoc",
+            side_effect=capture_adhoc_fetch,
+        ):
+            warnings = validate_workflow_config(config, workflow_path=parent)
+
+        assert warnings == []
+        assert captured_args == {
+            "owner": "myorg",
+            "repo": "workflows",
+            "workflow_name": "analysis",
+            "ref": "v1.0.0",
+        }
+
+    def test_adhoc_fetch_failure_validation_error(self, tmp_path: Path) -> None:
+        """Ad-hoc registry fetch failure during validation produces ConfigurationError."""
+        from unittest.mock import patch
+
+        from conductor.config.validator import validate_workflow_config
+        from conductor.registry.errors import RegistryError
+
+        parent = tmp_path / "parent.yaml"
+        parent.write_text("dummy", encoding="utf-8")
+
+        config = self._make_config("missing@acme/tools#latest")
+        with (
+            patch(
+                "conductor.registry.cache.fetch_workflow_adhoc",
+                side_effect=RegistryError("workflow not found"),
+            ),
+            pytest.raises(ConfigurationError, match="failed to fetch sub-workflow"),
+        ):
+            validate_workflow_config(config, workflow_path=parent)

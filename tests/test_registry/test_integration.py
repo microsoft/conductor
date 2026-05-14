@@ -431,3 +431,111 @@ class TestEdgeCases:
         ref = resolve_ref(str(local_file))
         assert ref.kind == "file"
         assert ref.path == local_file
+
+
+# ---------------------------------------------------------------------------
+# Ad-hoc references (workflow@owner/repo[#ref])
+# ---------------------------------------------------------------------------
+
+
+class TestAdhocRefIntegration:
+    """End-to-end tests for ad-hoc registry references — no pre-installation."""
+
+    def test_resolve_then_fetch_via_resolve_and_fetch(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Real resolve_ref + mocked fetch produces a cached file under _adhoc/."""
+        from unittest.mock import patch
+
+        from conductor.registry.cache import resolve_and_fetch
+
+        home = _setup_home(tmp_path, monkeypatch)
+
+        # Pre-populate a "fetched" workflow in the expected adhoc cache dir.
+        # In the real flow, _fetch_github would write here; we short-circuit
+        # by mocking materialize_to_sha + load_index + _fetch_github.
+        fake_sha = "c" * 40
+        sha_dir = (
+            home
+            / "cache"
+            / "registries"
+            / "_adhoc"
+            / "myorg"
+            / "team-a"
+            / "analysis"
+            / fake_sha[:12]
+        )
+
+        def fake_fetch_github(entry, workflow_path, sha, dest_dir):
+            (dest_dir / "analysis.yaml").write_text(_SIMPLE_WORKFLOW)
+
+        from conductor.registry.index import RegistryIndex, WorkflowInfo
+
+        fake_index = RegistryIndex(
+            workflows={
+                "analysis": WorkflowInfo(description="", path="analysis.yaml"),
+            }
+        )
+
+        with (
+            patch("conductor.registry.cache.materialize_to_sha", return_value=fake_sha),
+            patch("conductor.registry.cache.resolve_ref", return_value="v1.0.0"),
+            patch("conductor.registry.cache.load_index", return_value=fake_index),
+            patch("conductor.registry.cache._fetch_github", side_effect=fake_fetch_github),
+        ):
+            # No registry configured — but ad-hoc form works anyway
+            resolved = resolve_ref("analysis@myorg/team-a#v1.0.0")
+            assert resolved.kind == "adhoc"
+            assert resolved.adhoc_owner == "myorg"
+            assert resolved.adhoc_repo == "team-a"
+
+            cached = resolve_and_fetch(resolved)
+
+        assert cached.exists()
+        assert cached.parent == sha_dir
+        assert "test-workflow" in cached.read_text()
+
+    def test_adhoc_works_with_no_registries_configured(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Ad-hoc resolution does not consult registry config."""
+        _setup_home(tmp_path, monkeypatch)
+        # No add_registry() call — config is empty.
+
+        # Without ad-hoc, this would raise "No default registry configured"
+        # because there's no '/' in the registry slot. With ad-hoc + '/' in
+        # the slot, no config lookup happens.
+        resolved = resolve_ref("analysis@myorg/team-a#v1.0.0")
+        assert resolved.kind == "adhoc"
+        assert resolved.adhoc_owner == "myorg"
+        assert resolved.adhoc_repo == "team-a"
+        assert resolved.workflow == "analysis"
+
+    def test_adhoc_coexists_with_named_registry(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A named registry and ad-hoc refs to a different repo both work."""
+        _setup_home(tmp_path, monkeypatch)
+
+        reg_dir = _create_local_registry(
+            tmp_path,
+            {
+                "named-wf": {
+                    "description": "",
+                    "path": "named.yaml",
+                    "content": _SIMPLE_WORKFLOW,
+                },
+            },
+        )
+        add_registry("team-a", str(reg_dir), registry_type=RegistryType.path, set_default=False)
+
+        # Named ref → registry kind, looks up "team-a" in config
+        named = resolve_ref("named-wf@team-a")
+        assert named.kind == "registry"
+        assert named.registry_name == "team-a"
+
+        # Ad-hoc ref → adhoc kind, no config lookup (note '/' in registry slot)
+        adhoc = resolve_ref("analysis@otherorg/team-a#v1.0.0")
+        assert adhoc.kind == "adhoc"
+        assert adhoc.adhoc_owner == "otherorg"
+        assert adhoc.adhoc_repo == "team-a"
