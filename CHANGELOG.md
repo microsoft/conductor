@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.16...HEAD)
 
+### Fixed
+- Workflows that configure `reasoning.effort` (or workflow-wide
+  `runtime.default_reasoning_effort`) on the Copilot provider were broken
+  for **every named Copilot model** when running against
+  `github-copilot-sdk` 0.3.0. The SDK's `models.list` response includes a
+  `billing` object on every model, but none of them currently ship the
+  `multiplier` field that the SDK's `ModelBilling.from_dict` parser
+  treats as required — so every model in the response triggers
+  `ValueError("Missing required field 'multiplier' in ModelBilling")`,
+  which kills the entire `list_models()` call. The error then leaked
+  through the narrow `except` tuple in
+  `_validate_reasoning_effort_for_model` (and `get_max_prompt_tokens`),
+  poisoned the retry loop, and surfaced as `Dialog turn failed: …` after
+  three wasted attempts. (`get_max_prompt_tokens` was rescued by the
+  engine's outer `except Exception`, so context-window metadata was
+  silently unavailable rather than fatal.)
+  Both metadata methods now catch any `Exception` raised at the SDK
+  boundary and treat the failure as "metadata unavailable" — validation
+  is skipped permissively and the configured `reasoning_effort` is
+  forwarded to `create_session` as before.
+  `asyncio.CancelledError`/`KeyboardInterrupt`/`SystemExit` (all
+  `BaseException` subclasses) still propagate.
+
 ## [0.1.16](https://github.com/microsoft/conductor/compare/v0.1.15...v0.1.16) - 2026-05-14
 
 ### Added
