@@ -905,16 +905,36 @@ def _resolve_subworkflow_ref_for_validation(
     Returns:
         Tuple of (resolved path or None on error, list of error strings).
     """
-    from conductor.registry.cache import resolve_and_fetch
+    from conductor.registry.cache import auto_fetch_relative_workflow, resolve_and_fetch
     from conductor.registry.errors import RegistryError
     from conductor.registry.resolver import resolve_ref
 
     errors: list[str] = []
 
-    # Check for an existing file beside the parent workflow first.
+    # Step 1: check for an existing file beside the parent workflow first.
     candidate = (base_dir / workflow_ref).resolve()
     if candidate.is_file():
         return candidate, errors
+
+    # Step 1b: when the parent workflow lives inside a registry SHA cache,
+    # try to auto-fetch a sibling workflow from the same registry. Mirrors
+    # the engine's ``_resolve_subworkflow_path`` step 1b so that
+    # ``conductor validate`` succeeds for the same cross-workflow refs
+    # (e.g. ``../document-review/workflow.yaml``) that succeed at runtime.
+    # Only attempts when the candidate looks like a file path (has
+    # separators or a YAML extension) AND is not a registry ref
+    # ('@' indicates named or ad-hoc registry syntax handled below).
+    looks_like_file = "@" not in workflow_ref and (
+        "/" in workflow_ref or "\\" in workflow_ref or candidate.suffix.lower() in {".yaml", ".yml"}
+    )
+    if looks_like_file:
+        try:
+            auto_fetched = auto_fetch_relative_workflow(candidate)
+        except RegistryError as exc:
+            errors.append(f"{label}: failed to auto-fetch sub-workflow '{workflow_ref}': {exc}")
+            return None, errors
+        if auto_fetched is not None and auto_fetched.is_file():
+            return auto_fetched, errors
 
     try:
         resolved = resolve_ref(workflow_ref)
