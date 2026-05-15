@@ -202,6 +202,29 @@ class TestAddRegistry:
         loaded = load_config()
         assert "persisted" in loaded.registries
 
+    @pytest.mark.parametrize("name", ["_adhoc", "_meta"])
+    def test_reserved_name_rejected(
+        self, name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Reserved cache namespaces cannot be used as registry names."""
+        _setup_config_home(tmp_path, monkeypatch)
+        with pytest.raises(RegistryError, match="reserved"):
+            add_registry(name, "org/repo")
+
+    @pytest.mark.parametrize("name", ["with/slash", "with\\backslash", "a/b/c"])
+    def test_name_with_separator_rejected(
+        self, name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Path separators in registry names would break cache layout."""
+        _setup_config_home(tmp_path, monkeypatch)
+        with pytest.raises(RegistryError, match=r"must not contain '/'"):
+            add_registry(name, "org/repo")
+
+    def test_empty_name_rejected(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        _setup_config_home(tmp_path, monkeypatch)
+        with pytest.raises(RegistryError, match="cannot be empty"):
+            add_registry("", "org/repo")
+
 
 # ---------------------------------------------------------------------------
 # remove_registry

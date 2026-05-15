@@ -216,27 +216,55 @@ def _load_github_index(source: str, ref: str | None) -> RegistryIndex:
 
 def _parse_github_response(text: str, filename: str, url: str) -> RegistryIndex:
     """Parse the content fetched from GitHub."""
-    if filename.endswith(".yaml"):
+    fmt = "yaml" if filename.endswith(".yaml") else "json"
+    return parse_index_text(text, fmt, url)
+
+
+def parse_index_text(text: str, fmt: str, source_label: str) -> RegistryIndex:
+    """Parse a registry index from in-memory text.
+
+    Used by the cache layer to load a registry index that was previously
+    persisted to disk (``_meta/<sha>/index.yaml``) without re-fetching from
+    the upstream registry.
+
+    Args:
+        text: The full text of the index file.
+        fmt: Either ``"yaml"`` or ``"json"``.
+        source_label: Human-readable identifier of the source for use in
+            error messages (e.g. a file path or URL).
+
+    Returns:
+        The parsed :class:`RegistryIndex`.
+
+    Raises:
+        RegistryError: If parsing fails or the document is not a mapping.
+    """
+    if fmt == "yaml":
         try:
             yaml = YAML(typ="safe")
             data = yaml.load(text)
         except YAMLError as exc:
             raise RegistryError(
-                f"Failed to parse index from {url}: {exc}",
-                suggestion="Check the YAML syntax in the remote index file.",
+                f"Failed to parse index from {source_label}: {exc}",
+                suggestion="Check the YAML syntax in the index file.",
             ) from exc
-    else:
+    elif fmt == "json":
         try:
             data = json.loads(text)
         except json.JSONDecodeError as exc:
             raise RegistryError(
-                f"Failed to parse index from {url}: {exc}",
-                suggestion="Check the JSON syntax in the remote index file.",
+                f"Failed to parse index from {source_label}: {exc}",
+                suggestion="Check the JSON syntax in the index file.",
             ) from exc
+    else:
+        raise RegistryError(
+            f"Unknown index format {fmt!r}",
+            suggestion="Pass 'yaml' or 'json' as the format.",
+        )
 
     if not isinstance(data, dict):
         raise RegistryError(
-            f"Malformed registry index from {url}: expected a mapping at the top level",
+            f"Malformed registry index from {source_label}: expected a mapping at the top level",
             suggestion="Check that the index file matches the expected schema.",
         )
-    return _parse_index_data(data, url)
+    return _parse_index_data(data, source_label)

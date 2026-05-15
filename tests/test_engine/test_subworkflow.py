@@ -1984,3 +1984,149 @@ class TestRegistrySubWorkflowResolution:
             pytest.raises(ExecutionError, match="Failed to fetch sub-workflow"),
         ):
             await engine.run({})
+
+
+class TestCrossWorkflowRegistryRef:
+    """Cross-workflow relative refs between workflows in the same registry.
+
+    These exercise the auto-fetch hook in ``_resolve_subworkflow_path`` that
+    handles refs like ``../document-review/workflow.yaml`` from a parent
+    workflow that lives inside a registry SHA cache directory.
+    """
+
+    @pytest.mark.asyncio
+    async def test_relative_ref_to_sibling_workflow_in_registry_cache(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Reproduces the bug: parent at sdd-plan/plan.yaml refs ../document-review/workflow.yaml.
+
+        With the fixed cache layout, both workflows share a per-SHA root and
+        the relative path resolves correctly. The sub-workflow file is
+        auto-fetched on demand by ``auto_fetch_relative_workflow`` because
+        only the parent was previously cached.
+        """
+        import json
+        from unittest.mock import patch
+
+        from conductor.registry.cache import CACHE_LAYOUT_VERSION
+
+        # Point CONDUCTOR_HOME at a temp dir so the cache lives there.
+        home = tmp_path / "conductor_home"
+        home.mkdir()
+        monkeypatch.setenv("CONDUCTOR_HOME", str(home))
+
+        sha = "a" * 40
+        sha_dir = sha[:12]
+        cache_base = home / "cache" / "registries"
+        official_sha_root = cache_base / "official" / sha_dir
+
+        # Pre-cache the parent workflow (sdd-plan/plan.yaml) only.
+        parent_dir = official_sha_root / "sdd-plan"
+        parent_dir.mkdir(parents=True)
+        parent_path = parent_dir / "plan.yaml"
+        _write_yaml(
+            parent_path,
+            """\
+            workflow:
+              name: sdd-plan
+              entry_point: sub
+              runtime:
+                provider: copilot
+              limits:
+                max_iterations: 10
+            agents:
+              - name: sub
+                type: workflow
+                workflow: ../document-review/workflow.yaml
+                routes:
+                  - to: "$end"
+            output:
+              result: "{{ sub.output.verdict }}"
+            """,
+        )
+
+        # Pre-write source.json + cached index + sentinel for sdd-plan.
+        meta_dir = cache_base / "official" / "_meta" / sha_dir
+        meta_dir.mkdir(parents=True)
+        (meta_dir / "source.json").write_text(
+            json.dumps(
+                {
+                    "cache_layout_version": CACHE_LAYOUT_VERSION,
+                    "registry_type": "github",
+                    "source": "myorg/workflows",
+                    "full_sha": sha,
+                },
+                sort_keys=True,
+                indent=2,
+            )
+        )
+        (meta_dir / "index.yaml").write_text(
+            "workflows:\n"
+            "  sdd-plan:\n    description: ''\n    path: sdd-plan/plan.yaml\n"
+            "  document-review:\n    description: ''\n    path: document-review/workflow.yaml\n"
+        )
+        (meta_dir / "sdd-plan.complete").write_text("")
+
+        # Document-review YAML that the engine will auto-fetch.
+        sub_yaml = textwrap.dedent(
+            """\
+            workflow:
+              name: document-review
+              entry_point: reviewer
+              runtime:
+                provider: copilot
+              limits:
+                max_iterations: 10
+            agents:
+              - name: reviewer
+                type: agent
+                prompt: review the doc
+                routes:
+                  - to: "$end"
+            output:
+              verdict: "{{ reviewer.output.verdict }}"
+            """
+        )
+
+        from conductor.registry.index import RegistryIndex, WorkflowInfo
+
+        index_obj = RegistryIndex(
+            workflows={
+                "sdd-plan": WorkflowInfo(description="", path="sdd-plan/plan.yaml"),
+                "document-review": WorkflowInfo(
+                    description="", path="document-review/workflow.yaml"
+                ),
+            }
+        )
+
+        def fake_fetch_github(entry, workflow_path, sha_arg, dest_dir):
+            target = dest_dir / workflow_path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(sub_yaml)
+
+        def mock_handler(agent, prompt, context):
+            return {"verdict": "approved"}
+
+        provider = CopilotProvider(mock_handler=mock_handler)
+
+        # Load the parent workflow from the cached path and run it.
+        from conductor.config.loader import load_config
+
+        config = load_config(parent_path)
+
+        with (
+            patch("conductor.registry.cache.materialize_to_sha", return_value=sha),
+            patch("conductor.registry.cache.resolve_ref", return_value=sha),
+            patch("conductor.registry.cache.load_index", return_value=index_obj),
+            patch("conductor.registry.cache._fetch_github", side_effect=fake_fetch_github),
+        ):
+            engine = WorkflowEngine(config, provider, workflow_path=parent_path)
+            result = await engine.run({})
+
+        assert result.get("result") == "approved"
+
+        # Verify the sibling was actually auto-fetched into the shared SHA root.
+        sibling = official_sha_root / "document-review" / "workflow.yaml"
+        assert sibling.exists()
+        # And its sentinel was written.
+        assert (meta_dir / "document-review.complete").exists()

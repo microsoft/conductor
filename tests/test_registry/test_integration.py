@@ -454,20 +454,14 @@ class TestAdhocRefIntegration:
         # Pre-populate a "fetched" workflow in the expected adhoc cache dir.
         # In the real flow, _fetch_github would write here; we short-circuit
         # by mocking materialize_to_sha + load_index + _fetch_github.
+        # Adhoc cache layout: <base>/_adhoc/<owner>/<repo>/<sha[:12]>/<repo_path>
         fake_sha = "c" * 40
-        sha_dir = (
-            home
-            / "cache"
-            / "registries"
-            / "_adhoc"
-            / "myorg"
-            / "team-a"
-            / "analysis"
-            / fake_sha[:12]
-        )
+        sha_dir = home / "cache" / "registries" / "_adhoc" / "myorg" / "team-a" / fake_sha[:12]
 
         def fake_fetch_github(entry, workflow_path, sha, dest_dir):
-            (dest_dir / "analysis.yaml").write_text(_SIMPLE_WORKFLOW)
+            target = dest_dir / workflow_path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(_SIMPLE_WORKFLOW)
 
         from conductor.registry.index import RegistryIndex, WorkflowInfo
 

@@ -719,6 +719,14 @@ class WorkflowEngine:
            ``base_dir``, return that path immediately. This preserves
            backward-compatibility for bare names like ``analysis`` that refer
            to a sibling file without a ``.yaml`` extension.
+        1b. If the candidate path looks like a file (has separators or a
+            YAML extension) and the parent workflow lives inside a registry
+            cache, attempt to auto-fetch a sibling workflow from the same
+            registry+SHA via
+            :func:`~conductor.registry.cache.auto_fetch_relative_workflow`.
+            This handles cross-workflow refs like
+            ``../document-review/workflow.yaml`` between workflows in the
+            same registry repo.
         2. Otherwise, parse as a registry reference via
            :func:`~conductor.registry.resolver.resolve_ref`.
         3. If the parsed ref is still a file kind (e.g. a path with a
@@ -749,7 +757,10 @@ class WorkflowEngine:
             ExecutionError: If the registry reference is malformed, names an
                 unknown registry, or the registry fetch fails.
         """
-        from conductor.registry.cache import resolve_and_fetch
+        from conductor.registry.cache import (
+            auto_fetch_relative_workflow,
+            resolve_and_fetch,
+        )
         from conductor.registry.errors import RegistryError
         from conductor.registry.resolver import resolve_ref
 
@@ -759,6 +770,34 @@ class WorkflowEngine:
         candidate = (base_dir / agent_workflow).resolve()
         if candidate.is_file():
             return candidate
+
+        # Step 1b: when the parent workflow lives inside a registry SHA cache,
+        # try to auto-fetch a sibling workflow from the same registry. This
+        # covers cross-workflow refs like ``../document-review/workflow.yaml``
+        # that were broken by the per-workflow cache layout. Only attempts
+        # when the candidate looks like a file path (has separators or a
+        # YAML extension) AND is not a registry ref ('@' present indicates
+        # named or ad-hoc registry syntax; step 2 handles those).
+        looks_like_file = "@" not in agent_workflow and (
+            "/" in agent_workflow
+            or "\\" in agent_workflow
+            or candidate.suffix.lower() in {".yaml", ".yml"}
+        )
+        if looks_like_file:
+            try:
+                auto_fetched = await asyncio.to_thread(auto_fetch_relative_workflow, candidate)
+            except RegistryError as exc:
+                raise ExecutionError(
+                    f"Failed to auto-fetch sub-workflow '{agent_workflow}' "
+                    f"(referenced by agent '{agent_name}'): {exc}",
+                    suggestion=(
+                        "The parent workflow lives in a registry cache, but "
+                        "the sibling workflow could not be fetched. Check "
+                        "that the path matches an entry in the registry index."
+                    ),
+                ) from exc
+            if auto_fetched is not None and auto_fetched.is_file():
+                return auto_fetched
 
         # Step 2: parse as file-path / named-registry / ad-hoc reference.
         try:
