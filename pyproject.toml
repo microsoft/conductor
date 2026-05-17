@@ -1,6 +1,6 @@
 [project]
 name = "conductor-cli"
-version = "0.1.14"
+version = "0.1.16"
 description = "A CLI tool for defining and running multi-agent workflows with the GitHub Copilot SDK"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -89,4 +89,5 @@ testpaths = ["tests"]
 markers = [
     "performance: marks tests as performance tests (deselect with '-m \"not performance\"')",
     "real_api: marks tests that make real API calls to external services (deselect with '-m \"not real_api\"')",
+    "install_scripts: marks tests that exercise install.ps1/install.sh end-to-end (slow; opt-in via '-m install_scripts')",
 ]

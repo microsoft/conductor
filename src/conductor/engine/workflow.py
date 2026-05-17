@@ -733,6 +733,134 @@ class WorkflowEngine:
             workflow_ctx = context.get("workflow", {})
             return dict(workflow_ctx.get("input", {})) if isinstance(workflow_ctx, dict) else {}
 
+    async def _resolve_subworkflow_path(
+        self,
+        agent_workflow: str,
+        agent_name: str,
+        base_dir: Path,
+    ) -> Path:
+        """Resolve a sub-workflow reference to a local filesystem path.
+
+        Handles both local file paths and registry references
+        (``workflow[@registry][#ref]`` syntax).
+
+        Resolution order:
+        1. If ``agent_workflow`` resolves to an existing file relative to
+           ``base_dir``, return that path immediately. This preserves
+           backward-compatibility for bare names like ``analysis`` that refer
+           to a sibling file without a ``.yaml`` extension.
+        1b. If the candidate path looks like a file (has separators or a
+            YAML extension) and the parent workflow lives inside a registry
+            cache, attempt to auto-fetch a sibling workflow from the same
+            registry+SHA via
+            :func:`~conductor.registry.cache.auto_fetch_relative_workflow`.
+            This handles cross-workflow refs like
+            ``../document-review/workflow.yaml`` between workflows in the
+            same registry repo.
+        2. Otherwise, parse as a registry reference via
+           :func:`~conductor.registry.resolver.resolve_ref`.
+        3. If the parsed ref is still a file kind (e.g. a path with a
+           ``.yaml`` extension that does not exist), return the resolved
+           path so the caller can emit a clear "file not found" error.
+        4. For registry refs, fetch the workflow (with caching) and return
+           the cached local path.
+
+        Note on checkpoint/resume: this helper is called on every
+        sub-workflow execution, including after :meth:`resume`. Pinned
+        registry refs (``name@registry#v1.2.3`` or ``name@registry#<sha>``)
+        always resolve to the same cached path. Mutable refs
+        (``name@registry#main`` or no ``#ref`` defaulting to "latest") may
+        resolve to a different commit on resume if the upstream branch has
+        moved. Use pinned tags or commit SHAs in production workflows when
+        deterministic resume is required.
+
+        Args:
+            agent_workflow: The ``workflow:`` field value from the agent def.
+            agent_name: Name of the containing agent (used in error messages).
+            base_dir: Directory of the parent workflow file used for relative
+                path resolution.
+
+        Returns:
+            Absolute path to the workflow YAML (local or cached registry copy).
+
+        Raises:
+            ExecutionError: If the registry reference is malformed, names an
+                unknown registry, or the registry fetch fails.
+        """
+        from conductor.registry.cache import (
+            auto_fetch_relative_workflow,
+            resolve_and_fetch,
+        )
+        from conductor.registry.errors import RegistryError
+        from conductor.registry.resolver import resolve_ref
+
+        # Step 1: check for an existing file relative to base_dir first.
+        # This ensures "analysis" beside the parent workflow is treated as a
+        # local file, not a registry lookup, even though it has no extension.
+        candidate = (base_dir / agent_workflow).resolve()
+        if candidate.is_file():
+            return candidate
+
+        # Step 1b: when the parent workflow lives inside a registry SHA cache,
+        # try to auto-fetch a sibling workflow from the same registry. This
+        # covers cross-workflow refs like ``../document-review/workflow.yaml``
+        # that were broken by the per-workflow cache layout. Only attempts
+        # when the candidate looks like a file path (has separators or a
+        # YAML extension) AND is not a registry ref ('@' present indicates
+        # named or ad-hoc registry syntax; step 2 handles those).
+        looks_like_file = "@" not in agent_workflow and (
+            "/" in agent_workflow
+            or "\\" in agent_workflow
+            or candidate.suffix.lower() in {".yaml", ".yml"}
+        )
+        if looks_like_file:
+            try:
+                auto_fetched = await asyncio.to_thread(auto_fetch_relative_workflow, candidate)
+            except RegistryError as exc:
+                raise ExecutionError(
+                    f"Failed to auto-fetch sub-workflow '{agent_workflow}' "
+                    f"(referenced by agent '{agent_name}'): {exc}",
+                    suggestion=(
+                        "The parent workflow lives in a registry cache, but "
+                        "the sibling workflow could not be fetched. Check "
+                        "that the path matches an entry in the registry index."
+                    ),
+                ) from exc
+            if auto_fetched is not None and auto_fetched.is_file():
+                return auto_fetched
+
+        # Step 2: parse as file-path / named-registry / ad-hoc reference.
+        try:
+            resolved = resolve_ref(agent_workflow)
+        except RegistryError as exc:
+            raise ExecutionError(
+                f"Failed to resolve sub-workflow '{agent_workflow}' "
+                f"(referenced by agent '{agent_name}'): {exc}",
+                suggestion=(
+                    "Check the registry reference syntax. For named registries, "
+                    "ensure the registry is configured (run 'conductor registry list'). "
+                    "For ad-hoc references, use 'workflow@owner/repo[#ref]'."
+                ),
+            ) from exc
+
+        if resolved.kind == "file":
+            # Step 3: file-path syntax but file does not exist — return the
+            # candidate path so the caller emits a clear "file not found" error.
+            return candidate
+
+        # Step 4: dispatch to the unified fetcher (handles registry + adhoc).
+        try:
+            return await asyncio.to_thread(resolve_and_fetch, resolved)
+        except RegistryError as exc:
+            raise ExecutionError(
+                f"Failed to fetch sub-workflow '{agent_workflow}' "
+                f"(referenced by agent '{agent_name}'): {exc}",
+                suggestion=(
+                    "Check that the registry/repo and workflow name are correct "
+                    "and the source is reachable."
+                ),
+            ) from exc
+
     async def _execute_subworkflow(
         self,
         agent: AgentDef,
@@ -786,9 +914,9 @@ class WorkflowEngine:
         else:
             base_dir = Path.cwd()
 
-        sub_path = (base_dir / agent.workflow).resolve()
+        sub_path = await self._resolve_subworkflow_path(agent.workflow, agent.name, base_dir)
 
-        if not sub_path.exists():
+        if not sub_path.is_file():
             raise ExecutionError(
                 f"Sub-workflow file not found: {sub_path} (referenced by agent '{agent.name}')",
                 suggestion="Check that the 'workflow' path is correct and the file exists.",
@@ -897,9 +1025,9 @@ class WorkflowEngine:
         else:
             base_dir = Path.cwd()
 
-        sub_path = (base_dir / agent.workflow).resolve()
+        sub_path = await self._resolve_subworkflow_path(agent.workflow, agent.name, base_dir)
 
-        if not sub_path.exists():
+        if not sub_path.is_file():
             raise ExecutionError(
                 f"Sub-workflow file not found: {sub_path} (referenced by agent '{agent.name}')",
                 suggestion="Check that the 'workflow' path is correct and the file exists.",

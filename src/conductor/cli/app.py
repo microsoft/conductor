@@ -6,6 +6,7 @@ This module defines the main Typer app and global options.
 from __future__ import annotations
 
 import contextvars
+import logging
 import os
 from enum import Enum
 from pathlib import Path
@@ -17,6 +18,8 @@ from rich.panel import Panel
 from rich.text import Text
 
 from conductor import __version__
+
+logger = logging.getLogger(__name__)
 
 
 class ConsoleVerbosity(str, Enum):
@@ -313,9 +316,12 @@ def run(
         typer.Option(
             "--workspace-instructions",
             help=(
-                "Auto-discover workspace instruction files "
-                "(AGENTS.md, CLAUDE.md, .github/copilot-instructions.md) "
-                "and prepend them to all agent prompts."
+                "Auto-discover workspace instruction files and prepend them to "
+                "all agent prompts. Discovers AGENTS.md, CLAUDE.md, "
+                ".github/copilot-instructions.md, and "
+                ".github/instructions/**/*.instructions.md (recursive; only "
+                "files marked 'applyTo: \"**\"' in YAML frontmatter are "
+                "included)."
             ),
         ),
     ] = False,
@@ -355,25 +361,12 @@ def run(
     import asyncio
     import json
 
-    from conductor.registry.cache import fetch_workflow as fetch_registry_workflow
+    from conductor.registry.cache import resolve_and_fetch
     from conductor.registry.errors import RegistryError
     from conductor.registry.resolver import resolve_ref
 
     try:
-        ref = resolve_ref(workflow)
-        if ref.kind == "file":
-            assert ref.path is not None
-            workflow_path = ref.path
-        else:
-            assert ref.registry_name is not None
-            assert ref.registry_entry is not None
-            assert ref.workflow is not None
-            workflow_path = fetch_registry_workflow(
-                registry_name=ref.registry_name,
-                registry_entry=ref.registry_entry,
-                workflow_name=ref.workflow,
-                ref=ref.ref,
-            )
+        workflow_path = resolve_and_fetch(resolve_ref(workflow))
     except RegistryError as e:
         print_error(e)
         raise typer.Exit(code=1) from None
@@ -503,25 +496,12 @@ def validate(
         conductor validate ./examples/my-workflow.yaml
         conductor validate qa-bot@team@1.0.0
     """
-    from conductor.registry.cache import fetch_workflow as fetch_registry_workflow
+    from conductor.registry.cache import resolve_and_fetch
     from conductor.registry.errors import RegistryError
     from conductor.registry.resolver import resolve_ref
 
     try:
-        ref = resolve_ref(workflow)
-        if ref.kind == "file":
-            assert ref.path is not None
-            workflow_path = ref.path
-        else:
-            assert ref.registry_name is not None
-            assert ref.registry_entry is not None
-            assert ref.workflow is not None
-            workflow_path = fetch_registry_workflow(
-                registry_name=ref.registry_name,
-                registry_entry=ref.registry_entry,
-                workflow_name=ref.workflow,
-                ref=ref.ref,
-            )
+        workflow_path = resolve_and_fetch(resolve_ref(workflow))
     except RegistryError as e:
         print_error(e)
         raise typer.Exit(code=1) from None
@@ -559,7 +539,7 @@ def show(
         conductor show qa-bot
         conductor show qa-bot@my-registry@1.0.0
     """
-    from conductor.registry.cache import fetch_workflow as fetch_registry_workflow
+    from conductor.registry.cache import resolve_and_fetch
     from conductor.registry.errors import RegistryError
     from conductor.registry.resolver import resolve_ref
 
@@ -572,15 +552,7 @@ def show(
                 console.print(f"[bold red]Error:[/bold red] Workflow file not found: {workflow}")
                 raise typer.Exit(code=1)
         else:
-            assert ref.registry_name is not None
-            assert ref.registry_entry is not None
-            assert ref.workflow is not None
-            workflow_path = fetch_registry_workflow(
-                registry_name=ref.registry_name,
-                registry_entry=ref.registry_entry,
-                workflow_name=ref.workflow,
-                ref=ref.ref,
-            )
+            workflow_path = resolve_and_fetch(ref)
     except RegistryError as e:
         print_error(e)
         raise typer.Exit(code=1) from None
@@ -815,7 +787,7 @@ def resume(
     # Resolve workflow ref if provided
     resolved_workflow: Path | None = None
     if workflow is not None:
-        from conductor.registry.cache import fetch_workflow as fetch_registry_workflow
+        from conductor.registry.cache import resolve_and_fetch
         from conductor.registry.errors import RegistryError
         from conductor.registry.resolver import resolve_ref
 
@@ -830,15 +802,7 @@ def resume(
                     )
                     raise typer.Exit(code=1)
             else:
-                assert ref.registry_name is not None
-                assert ref.registry_entry is not None
-                assert ref.workflow is not None
-                resolved_workflow = fetch_registry_workflow(
-                    registry_name=ref.registry_name,
-                    registry_entry=ref.registry_entry,
-                    workflow_name=ref.workflow,
-                    ref=ref.ref,
-                )
+                resolved_workflow = resolve_and_fetch(ref)
         except RegistryError as e:
             print_error(e)
             raise typer.Exit(code=1) from None
@@ -1142,6 +1106,20 @@ def _stop_process(entry: dict, con: Console) -> None:
             f"[bold red]Permission denied:[/bold red] could not stop PID {pid}. "
             f"Try running with elevated privileges."
         )
+    except OSError as exc:
+        # Defensive catch (companion to the fix for issue #166): on Windows,
+        # ``os.kill`` can raise OSError subclasses for edge cases such as the
+        # target not being a console process group leader, or a probe-failing
+        # PID that the "assume alive" fallback in ``_is_process_alive_windows``
+        # let through.  Treating these as "already exited" lets ``conductor
+        # stop`` continue and clean up the PID file rather than crash.
+        logger.warning(
+            "Unexpected OSError stopping PID %s; treating as already exited", pid, exc_info=True
+        )
+        con.print(
+            f"[yellow]Could not signal PID {pid} ({exc}); "
+            f"removing PID file for workflow '{workflow}' anyway.[/yellow]"
+        )
 
 
 def _print_running_list(entries: list[dict], con: Console) -> None:
@@ -1175,26 +1153,34 @@ def update(
     force: bool = typer.Option(
         False,
         "--force",
-        help="Skip the running-process check and attempt the upgrade anyway.",
+        help="Accepted for backward compatibility; currently a no-op.",
+    ),
+    apply: bool = typer.Option(
+        False,
+        "--apply",
+        help=(
+            "Launch the install script automatically. Conductor will exit so "
+            "file locks release; on Windows the installer opens in a new "
+            "console window."
+        ),
     ),
 ) -> None:
     """Check for and install the latest version of Conductor.
 
-    Fetches the latest release from GitHub and upgrades using
-    ``uv tool install --locked --force git+https://github.com/microsoft/conductor.git@v{version}``.
-
-    Detects other running Conductor processes (especially important on Windows
-    where they hold file locks) and aborts unless ``--force`` is passed.
+    By default, prints the OS-appropriate one-liner you can paste into a
+    fresh shell. With ``--apply``, spawns the install script as a fully
+    detached process and exits the current ``conductor`` so its file locks
+    release — required for upgrade-while-running to succeed on Windows.
 
     \b
     Examples:
-        conductor update
-        conductor update --force
+        conductor update           # check + print install command
+        conductor update --apply   # check + launch installer, then exit
     """
     from conductor.cli.update import run_update
 
     try:
-        run_update(console, force=force)
+        run_update(console, force=force, apply=apply)
     except Exception as e:
         print_error(e)
         raise typer.Exit(code=1) from None

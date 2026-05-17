@@ -102,7 +102,10 @@ jobs:
         run: uv sync --group dev
 
       - name: Run tests
-        run: uv run pytest -m "not real_api"
+        # Exclude performance tests: they assert wall-clock thresholds (e.g.
+        # config load <100ms) that flake on shared GitHub Actions runners.
+        # ci.yml uses the same filter — see its inline comment for rationale.
+        run: uv run pytest -m "not real_api and not performance"
         env:
           ANTHROPIC_API_KEY: "sk-ant-test-fake-key-for-mocking"
 

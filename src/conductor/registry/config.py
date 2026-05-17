@@ -190,6 +190,8 @@ def add_registry(
     """
     config = load_config()
 
+    _validate_registry_name(name)
+
     if name in config.registries:
         raise RegistryError(
             f"Registry '{name}' already exists",
@@ -204,6 +206,46 @@ def add_registry(
 
     save_config(config)
     return config
+
+
+# Names reserved for cache namespaces — see ``registry/cache.py``. Using
+# these as named-registry names would collide with internal cache
+# directories and break adhoc/auto-fetch detection.
+_RESERVED_REGISTRY_NAMES = frozenset({"_adhoc", "_meta"})
+
+
+def _validate_registry_name(name: str) -> None:
+    """Reject registry names that would conflict with cache namespaces.
+
+    Disallows:
+
+    * Empty names.
+    * Names containing path separators (``/`` or ``\\``) — these segment
+      the on-disk cache directory and could be mistaken for ad-hoc refs.
+    * The reserved names ``_adhoc`` and ``_meta`` used by the cache layer.
+
+    Raises:
+        RegistryError: If *name* is invalid.
+    """
+    if not name:
+        raise RegistryError(
+            "Registry name cannot be empty",
+            suggestion="Provide a non-empty name (e.g. 'team-a').",
+        )
+    if "/" in name or "\\" in name:
+        raise RegistryError(
+            f"Registry name '{name}' must not contain '/' or '\\'",
+            suggestion=(
+                "Use a simple identifier without path separators. "
+                "For ad-hoc references to a GitHub repo, use the "
+                "'workflow@owner/repo[#ref]' syntax in the workflow ref instead."
+            ),
+        )
+    if name in _RESERVED_REGISTRY_NAMES:
+        raise RegistryError(
+            f"Registry name '{name}' is reserved for internal use",
+            suggestion="Choose a different name.",
+        )
 
 
 def remove_registry(name: str) -> RegistriesConfig:

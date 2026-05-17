@@ -63,6 +63,48 @@ class TestValidateWorkflowConfig:
         warnings = validate_workflow_config(config)
         assert isinstance(warnings, list)
 
+    def test_warns_on_system_prompt_without_prompt(self) -> None:
+        """Agent with system_prompt but no prompt: should produce a warning.
+
+        The Copilot provider concatenates system_prompt with the user prompt,
+        so a missing prompt means an empty user message — almost always a
+        latent author mistake. Other providers (Claude) ignore system_prompt
+        entirely, so the agent would have no instructions at all.
+        """
+        config = WorkflowConfig(
+            workflow=WorkflowDef(name="test", entry_point="lonely"),
+            agents=[
+                AgentDef(
+                    name="lonely",
+                    model="gpt-4",
+                    system_prompt="You are a helpful assistant.",
+                    # no prompt:
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+        )
+        warnings = validate_workflow_config(config)
+        assert any(
+            "lonely" in w and "system_prompt" in w and "no `prompt`" in w for w in warnings
+        ), f"expected system_prompt-without-prompt warning; got: {warnings!r}"
+
+    def test_no_warning_when_prompt_present_alongside_system_prompt(self) -> None:
+        """Having both system_prompt and prompt is the expected pattern — no warning."""
+        config = WorkflowConfig(
+            workflow=WorkflowDef(name="test", entry_point="ok"),
+            agents=[
+                AgentDef(
+                    name="ok",
+                    model="gpt-4",
+                    system_prompt="You are a helpful assistant.",
+                    prompt="Answer: 42",
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+        )
+        warnings = validate_workflow_config(config)
+        assert not any("system_prompt" in w and "no `prompt`" in w for w in warnings)
+
 
 class TestRouteValidation:
     """Tests for route target validation."""
@@ -1130,3 +1172,734 @@ class TestInputMappingTemplateCollection:
         agent_refs, input_refs = _extract_template_refs("{{ old_agent.output.findings }}")
         assert "old_agent" in agent_refs
         assert not input_refs
+
+
+class TestSubWorkflowRefValidation:
+    """Tests for _validate_subworkflow_refs in validate_workflow_config."""
+
+    def _make_config(self, workflow_ref: str) -> WorkflowConfig:
+        from conductor.config.schema import LimitsConfig, RuntimeConfig
+
+        return WorkflowConfig(
+            workflow=WorkflowDef(
+                name="parent",
+                entry_point="sub_wf",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="sub_wf",
+                    type="workflow",
+                    workflow=workflow_ref,
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+        )
+
+    def test_local_sub_workflow_validates_ok(self, tmp_path: Path) -> None:
+        """Local file sub-workflow passes validation when file exists."""
+        import textwrap
+
+        from conductor.config.validator import validate_workflow_config
+
+        sub = tmp_path / "sub.yaml"
+        sub.write_text(
+            textwrap.dedent("""\
+                workflow:
+                  name: sub
+                  entry_point: step
+                  runtime:
+                    provider: copilot
+                  limits:
+                    max_iterations: 10
+                agents:
+                  - name: step
+                    type: agent
+                    prompt: go
+                    routes:
+                      - to: "$end"
+                output: {}
+            """),
+            encoding="utf-8",
+        )
+        parent = tmp_path / "parent.yaml"
+        parent.write_text("dummy", encoding="utf-8")
+
+        config = self._make_config("./sub.yaml")
+        warnings = validate_workflow_config(config, workflow_path=parent)
+        assert warnings == []
+
+    def test_missing_local_sub_workflow_errors(self, tmp_path: Path) -> None:
+        """Missing local file sub-workflow produces a validation error."""
+        from conductor.config.validator import validate_workflow_config
+        from conductor.exceptions import ConfigurationError
+
+        parent = tmp_path / "parent.yaml"
+        parent.write_text("dummy", encoding="utf-8")
+
+        config = self._make_config("./nonexistent.yaml")
+        with pytest.raises(ConfigurationError, match="sub-workflow file not found"):
+            validate_workflow_config(config, workflow_path=parent)
+
+    def test_malformed_registry_ref_errors(self, tmp_path: Path) -> None:
+        """Malformed registry reference (two '@') produces a validation error."""
+        from conductor.config.validator import validate_workflow_config
+        from conductor.exceptions import ConfigurationError
+
+        parent = tmp_path / "parent.yaml"
+        parent.write_text("dummy", encoding="utf-8")
+
+        config = self._make_config("a@b@c")  # two '@' — malformed
+        with pytest.raises(ConfigurationError, match="invalid sub-workflow reference"):
+            validate_workflow_config(config, workflow_path=parent)
+
+    def test_registry_ref_validates_fetched_workflow(self, tmp_path: Path) -> None:
+        """Registry reference fetches the workflow and validates it recursively.
+
+        Mocks only the ``RegistriesConfig`` loader and ``fetch_workflow`` so that
+        real ``resolve_ref`` parses ``fetched@team-a#v1.0.0`` end-to-end —
+        verifying that workflow name, registry name, and ref all extract
+        correctly.
+        """
+        import textwrap
+        from unittest.mock import patch
+
+        from conductor.config.validator import validate_workflow_config
+        from conductor.registry.config import RegistriesConfig, RegistryEntry, RegistryType
+
+        cached_sub = tmp_path / "fetched.yaml"
+        cached_sub.write_text(
+            textwrap.dedent("""\
+                workflow:
+                  name: fetched
+                  entry_point: step
+                  runtime:
+                    provider: copilot
+                  limits:
+                    max_iterations: 10
+                agents:
+                  - name: step
+                    type: agent
+                    prompt: go
+                    routes:
+                      - to: "$end"
+                output: {}
+            """),
+            encoding="utf-8",
+        )
+
+        parent = tmp_path / "parent.yaml"
+        parent.write_text("dummy", encoding="utf-8")
+
+        # Real registry config so resolve_ref can find "team-a"
+        registry_config = RegistriesConfig(
+            registries={
+                "team-a": RegistryEntry(
+                    type=RegistryType.github,
+                    source="https://github.com/example/team-a",
+                ),
+            },
+        )
+
+        # Capture fetch_workflow args to verify resolve_ref produced the
+        # right registry name, workflow name, and ref.
+        captured_args: dict[str, object] = {}
+
+        def capture_fetch(registry_name, registry_entry, workflow_name, ref):
+            captured_args["registry_name"] = registry_name
+            captured_args["workflow_name"] = workflow_name
+            captured_args["ref"] = ref
+            return cached_sub
+
+        config = self._make_config("fetched@team-a#v1.0.0")
+        with (
+            patch("conductor.registry.resolver.load_config", return_value=registry_config),
+            patch("conductor.registry.cache.fetch_workflow", side_effect=capture_fetch),
+        ):
+            warnings = validate_workflow_config(config, workflow_path=parent)
+
+        assert warnings == []
+        assert captured_args == {
+            "registry_name": "team-a",
+            "workflow_name": "fetched",
+            "ref": "v1.0.0",
+        }
+
+    def test_registry_fetch_failure_errors(self, tmp_path: Path) -> None:
+        """Registry fetch failure during validation produces a clear error."""
+        from unittest.mock import patch
+
+        from conductor.config.validator import validate_workflow_config
+        from conductor.exceptions import ConfigurationError
+        from conductor.registry.config import RegistryEntry, RegistryType
+        from conductor.registry.errors import RegistryError
+        from conductor.registry.resolver import ResolvedRef
+
+        parent = tmp_path / "parent.yaml"
+        parent.write_text("dummy", encoding="utf-8")
+
+        fake_entry = RegistryEntry(type=RegistryType.github, source="https://github.com/x/y")
+        fake_resolved = ResolvedRef(
+            kind="registry",
+            workflow="missing",
+            registry_name="team-a",
+            ref="v1.0.0",
+            registry_entry=fake_entry,
+        )
+
+        config = self._make_config("missing@team-a#v1.0.0")
+        with (
+            patch("conductor.registry.resolver.resolve_ref", return_value=fake_resolved),
+            patch(
+                "conductor.registry.cache.fetch_workflow",
+                side_effect=RegistryError("workflow not found"),
+            ),
+            pytest.raises(ConfigurationError, match="failed to fetch sub-workflow"),
+        ):
+            validate_workflow_config(config, workflow_path=parent)
+
+    def test_for_each_workflow_agent_ref_validated(self, tmp_path: Path) -> None:
+        """Registry ref inside a for_each inline workflow agent is validated."""
+        from unittest.mock import patch
+
+        from conductor.config.schema import ForEachDef, LimitsConfig, RuntimeConfig
+        from conductor.config.validator import validate_workflow_config
+        from conductor.exceptions import ConfigurationError
+        from conductor.registry.config import RegistryEntry, RegistryType
+        from conductor.registry.errors import RegistryError
+        from conductor.registry.resolver import ResolvedRef
+
+        parent = tmp_path / "parent.yaml"
+        parent.write_text("dummy", encoding="utf-8")
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="parent",
+                entry_point="batch",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="loader",
+                    type="agent",
+                    prompt="load items",
+                    routes=[RouteDef(to="batch")],
+                ),
+            ],
+            for_each=[
+                ForEachDef(
+                    name="batch",
+                    type="for_each",
+                    source="loader.output.items",
+                    **{"as": "item"},
+                    agent=AgentDef(
+                        name="worker",
+                        type="workflow",
+                        workflow="missing@team-a#v1.0.0",
+                        routes=[RouteDef(to="$end")],
+                    ),
+                    routes=[RouteDef(to="$end")],
+                )
+            ],
+        )
+
+        fake_entry = RegistryEntry(type=RegistryType.github, source="https://github.com/x/y")
+        fake_resolved = ResolvedRef(
+            kind="registry",
+            workflow="missing",
+            registry_name="team-a",
+            ref="v1.0.0",
+            registry_entry=fake_entry,
+        )
+
+        with (
+            patch("conductor.registry.resolver.resolve_ref", return_value=fake_resolved),
+            patch(
+                "conductor.registry.cache.fetch_workflow",
+                side_effect=RegistryError("workflow not found"),
+            ),
+            pytest.raises(ConfigurationError, match="failed to fetch sub-workflow"),
+        ):
+            validate_workflow_config(config, workflow_path=parent)
+
+    def test_circular_subworkflow_ref_detected(self, tmp_path: Path) -> None:
+        """Circular sub-workflow references (A → B → A) are caught during validation.
+
+        Without cycle detection, recursive validation would loop indefinitely.
+        With it, validation produces a clear "circular reference" error.
+        """
+        import textwrap
+
+        from conductor.config.schema import LimitsConfig, RuntimeConfig
+        from conductor.config.validator import validate_workflow_config
+        from conductor.exceptions import ConfigurationError
+
+        # B references A
+        b_yaml = tmp_path / "b.yaml"
+        b_yaml.write_text(
+            textwrap.dedent("""\
+                workflow:
+                  name: b
+                  entry_point: ref_a
+                  runtime:
+                    provider: copilot
+                  limits:
+                    max_iterations: 10
+                agents:
+                  - name: ref_a
+                    type: workflow
+                    workflow: ./a.yaml
+                    routes:
+                      - to: "$end"
+                output: {}
+            """),
+            encoding="utf-8",
+        )
+
+        # A references B
+        a_yaml = tmp_path / "a.yaml"
+        a_yaml.write_text(
+            textwrap.dedent("""\
+                workflow:
+                  name: a
+                  entry_point: ref_b
+                  runtime:
+                    provider: copilot
+                  limits:
+                    max_iterations: 10
+                agents:
+                  - name: ref_b
+                    type: workflow
+                    workflow: ./b.yaml
+                    routes:
+                      - to: "$end"
+                output: {}
+            """),
+            encoding="utf-8",
+        )
+
+        # Parent references A, which kicks off the A → B → A cycle
+        parent = tmp_path / "parent.yaml"
+        parent.write_text("dummy", encoding="utf-8")
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="parent",
+                entry_point="sub_wf",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="sub_wf",
+                    type="workflow",
+                    workflow="./a.yaml",
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+        )
+
+        with pytest.raises(ConfigurationError, match="circular sub-workflow reference"):
+            validate_workflow_config(config, workflow_path=parent)
+
+    def test_circular_subworkflow_via_case_variant_path(self, tmp_path: Path) -> None:
+        """Cycle is detected even when references use different case variants.
+
+        On case-insensitive filesystems (macOS, Windows) ``A.yaml`` and
+        ``a.yaml`` are the same file but ``Path.resolve()`` returns different
+        strings. The validator uses inode identity ``(st_dev, st_ino)`` for
+        cycle detection so cases like ``A.yaml → B.yaml → a.yaml`` are caught
+        on the first revisit, regardless of case used in references.
+
+        Skipped on case-sensitive filesystems where the case-variant
+        references are genuinely different files.
+        """
+        import textwrap
+
+        from conductor.config.schema import LimitsConfig, RuntimeConfig
+        from conductor.config.validator import validate_workflow_config
+        from conductor.exceptions import ConfigurationError
+
+        # Detect case-insensitivity by creating a file and checking if its
+        # uppercase variant is found.
+        probe = tmp_path / "_case_probe.yaml"
+        probe.write_text("x", encoding="utf-8")
+        case_insensitive = (tmp_path / "_CASE_PROBE.yaml").exists()
+        probe.unlink()
+
+        if not case_insensitive:
+            pytest.skip("case-insensitive filesystem required (e.g. macOS, Windows)")
+
+        # Write A.yaml that references B.YAML (uppercase)
+        a_yaml = tmp_path / "A.yaml"
+        a_yaml.write_text(
+            textwrap.dedent("""\
+                workflow:
+                  name: a
+                  entry_point: ref_b
+                  runtime:
+                    provider: copilot
+                  limits:
+                    max_iterations: 10
+                agents:
+                  - name: ref_b
+                    type: workflow
+                    workflow: B.YAML
+                    routes:
+                      - to: "$end"
+                output: {}
+            """),
+            encoding="utf-8",
+        )
+        # Write B.yaml that references a.yaml (lowercase) — same file as A.yaml
+        # on a case-insensitive FS, completing the cycle
+        b_yaml = tmp_path / "B.yaml"
+        b_yaml.write_text(
+            textwrap.dedent("""\
+                workflow:
+                  name: b
+                  entry_point: ref_a
+                  runtime:
+                    provider: copilot
+                  limits:
+                    max_iterations: 10
+                agents:
+                  - name: ref_a
+                    type: workflow
+                    workflow: a.yaml
+                    routes:
+                      - to: "$end"
+                output: {}
+            """),
+            encoding="utf-8",
+        )
+
+        parent = tmp_path / "parent.yaml"
+        parent.write_text("dummy", encoding="utf-8")
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="parent",
+                entry_point="sub_wf",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="sub_wf",
+                    type="workflow",
+                    workflow="A.yaml",  # same file as a.yaml on case-insensitive FS
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+        )
+
+        # Without inode-based detection, str(Path.resolve()) differs for
+        # A.yaml vs a.yaml on macOS, so the cycle would still be caught
+        # (just one level later, after both case variants are visited).
+        # Inode-based detection catches it on the first revisit and also
+        # correctly handles symlinks. Either way, the user sees a clear
+        # circular-reference error rather than hitting the depth limit.
+        with pytest.raises(ConfigurationError, match="circular sub-workflow reference"):
+            validate_workflow_config(config, workflow_path=parent)
+
+    def test_validation_depth_limit_emits_warning(self, tmp_path: Path) -> None:
+        """Hitting the recursion depth limit emits a warning, not a silent pass.
+
+        Builds a 12-level deep chain (parent → a0 → a1 → ... → a11) and
+        verifies the validator stops at depth ``_MAX_SUBWORKFLOW_VALIDATION_DEPTH``
+        but emits a warning so the user knows validation was truncated.
+        """
+        import textwrap
+
+        from conductor.config.schema import LimitsConfig, RuntimeConfig
+        from conductor.config.validator import (
+            _MAX_SUBWORKFLOW_VALIDATION_DEPTH,
+            validate_workflow_config,
+        )
+
+        # Build a deep linear chain a0 → a1 → a2 ... → a{N+1}
+        depth = _MAX_SUBWORKFLOW_VALIDATION_DEPTH + 2
+        for i in range(depth):
+            next_ref = f"./a{i + 1}.yaml" if i + 1 < depth else "$end"
+            if next_ref == "$end":
+                # Terminal sub-workflow: just a single agent
+                content = textwrap.dedent(f"""\
+                    workflow:
+                      name: a{i}
+                      entry_point: terminal
+                      runtime:
+                        provider: copilot
+                      limits:
+                        max_iterations: 10
+                    agents:
+                      - name: terminal
+                        type: agent
+                        prompt: done
+                        routes:
+                          - to: "$end"
+                    output: {{}}
+                """)
+            else:
+                content = textwrap.dedent(f"""\
+                    workflow:
+                      name: a{i}
+                      entry_point: nested
+                      runtime:
+                        provider: copilot
+                      limits:
+                        max_iterations: 10
+                    agents:
+                      - name: nested
+                        type: workflow
+                        workflow: {next_ref}
+                        routes:
+                          - to: "$end"
+                    output: {{}}
+                """)
+            (tmp_path / f"a{i}.yaml").write_text(content, encoding="utf-8")
+
+        parent = tmp_path / "parent.yaml"
+        parent.write_text("dummy", encoding="utf-8")
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="parent",
+                entry_point="sub_wf",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="sub_wf",
+                    type="workflow",
+                    workflow="./a0.yaml",
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+        )
+
+        warnings = validate_workflow_config(config, workflow_path=parent)
+        assert any("depth limit" in w for w in warnings), (
+            f"Expected a depth-limit warning, got warnings: {warnings}"
+        )
+
+    def test_adhoc_ref_validates_fetched_workflow(self, tmp_path: Path) -> None:
+        """Ad-hoc registry reference (owner/repo) validates fetched workflow.
+
+        Uses `_make_config("analysis@myorg/workflows#v1.0.0")` where the
+        registry slot contains a literal owner/repo path. Mocks only
+        ``fetch_workflow_adhoc`` so the validator's real ``resolve_ref``
+        runs end-to-end, exercising the parsing of the adhoc format.
+        """
+        import textwrap
+        from unittest.mock import patch
+
+        from conductor.config.validator import validate_workflow_config
+
+        cached_sub = tmp_path / "fetched.yaml"
+        cached_sub.write_text(
+            textwrap.dedent("""\
+                workflow:
+                  name: analysis
+                  entry_point: step
+                  runtime:
+                    provider: copilot
+                  limits:
+                    max_iterations: 10
+                agents:
+                  - name: step
+                    type: agent
+                    prompt: go
+                    routes:
+                      - to: "$end"
+                output: {}
+            """),
+            encoding="utf-8",
+        )
+
+        parent = tmp_path / "parent.yaml"
+        parent.write_text("dummy", encoding="utf-8")
+
+        # Capture fetch_workflow_adhoc args to verify the right owner/repo/workflow/ref
+        captured_args: dict[str, object] = {}
+
+        def capture_adhoc_fetch(owner, repo, workflow_name, ref):
+            captured_args["owner"] = owner
+            captured_args["repo"] = repo
+            captured_args["workflow_name"] = workflow_name
+            captured_args["ref"] = ref
+            return cached_sub
+
+        config = self._make_config("analysis@myorg/workflows#v1.0.0")
+        with patch(
+            "conductor.registry.cache.fetch_workflow_adhoc",
+            side_effect=capture_adhoc_fetch,
+        ):
+            warnings = validate_workflow_config(config, workflow_path=parent)
+
+        assert warnings == []
+        assert captured_args == {
+            "owner": "myorg",
+            "repo": "workflows",
+            "workflow_name": "analysis",
+            "ref": "v1.0.0",
+        }
+
+    def test_adhoc_fetch_failure_validation_error(self, tmp_path: Path) -> None:
+        """Ad-hoc registry fetch failure during validation produces ConfigurationError."""
+        from unittest.mock import patch
+
+        from conductor.config.validator import validate_workflow_config
+        from conductor.registry.errors import RegistryError
+
+        parent = tmp_path / "parent.yaml"
+        parent.write_text("dummy", encoding="utf-8")
+
+        config = self._make_config("missing@acme/tools#latest")
+        with (
+            patch(
+                "conductor.registry.cache.fetch_workflow_adhoc",
+                side_effect=RegistryError("workflow not found"),
+            ),
+            pytest.raises(ConfigurationError, match="failed to fetch sub-workflow"),
+        ):
+            validate_workflow_config(config, workflow_path=parent)
+
+    def test_relative_ref_to_sibling_workflow_in_registry_cache(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Cross-workflow relative refs between workflows in the same registry validate.
+
+        Reproduces the bug where ``conductor validate <registry-workflow>`` for
+        a workflow at ``sdd/plan.yaml`` that references
+        ``../document-review/workflow.yaml`` failed with "sub-workflow file
+        not found", even though ``conductor run`` for the same workflow
+        succeeds via the engine's auto-fetch hook. Validation must mirror
+        the engine and auto-fetch the sibling workflow from the same
+        registry+SHA cache.
+        """
+        import json
+        import textwrap
+        from unittest.mock import patch
+
+        from conductor.config.loader import load_config
+        from conductor.config.validator import validate_workflow_config
+        from conductor.registry.cache import CACHE_LAYOUT_VERSION
+        from conductor.registry.index import RegistryIndex, WorkflowInfo
+
+        # Point CONDUCTOR_HOME at a temp dir so the cache lives there.
+        home = tmp_path / "conductor_home"
+        home.mkdir()
+        monkeypatch.setenv("CONDUCTOR_HOME", str(home))
+
+        sha = "a" * 40
+        sha_dir = sha[:12]
+        cache_base = home / "cache" / "registries"
+        official_sha_root = cache_base / "official" / sha_dir
+
+        # Pre-cache the parent workflow (sdd/plan.yaml) only — the sibling
+        # ``document-review/workflow.yaml`` must be auto-fetched during
+        # validation.
+        parent_dir = official_sha_root / "sdd"
+        parent_dir.mkdir(parents=True)
+        parent_path = parent_dir / "plan.yaml"
+        parent_path.write_text(
+            textwrap.dedent("""\
+                workflow:
+                  name: sdd-plan
+                  entry_point: document_review
+                  runtime:
+                    provider: copilot
+                  limits:
+                    max_iterations: 10
+                agents:
+                  - name: document_review
+                    type: workflow
+                    workflow: ../document-review/workflow.yaml
+                    routes:
+                      - to: "$end"
+                output:
+                  result: "{{ document_review.output.verdict }}"
+            """),
+            encoding="utf-8",
+        )
+
+        # Pre-write source.json + cached index + sentinel for the parent.
+        meta_dir = cache_base / "official" / "_meta" / sha_dir
+        meta_dir.mkdir(parents=True)
+        (meta_dir / "source.json").write_text(
+            json.dumps(
+                {
+                    "cache_layout_version": CACHE_LAYOUT_VERSION,
+                    "registry_type": "github",
+                    "source": "myorg/workflows",
+                    "full_sha": sha,
+                },
+                sort_keys=True,
+                indent=2,
+            )
+        )
+        (meta_dir / "index.yaml").write_text(
+            "workflows:\n"
+            "  sdd-plan:\n    description: ''\n    path: sdd/plan.yaml\n"
+            "  document-review:\n    description: ''\n    path: document-review/workflow.yaml\n"
+        )
+        (meta_dir / "sdd-plan.complete").write_text("")
+
+        sub_yaml = textwrap.dedent(
+            """\
+            workflow:
+              name: document-review
+              entry_point: reviewer
+              runtime:
+                provider: copilot
+              limits:
+                max_iterations: 10
+            agents:
+              - name: reviewer
+                type: agent
+                prompt: review the doc
+                routes:
+                  - to: "$end"
+            output:
+              verdict: "{{ reviewer.output.verdict }}"
+            """
+        )
+
+        index_obj = RegistryIndex(
+            workflows={
+                "sdd-plan": WorkflowInfo(description="", path="sdd/plan.yaml"),
+                "document-review": WorkflowInfo(
+                    description="", path="document-review/workflow.yaml"
+                ),
+            }
+        )
+
+        def fake_fetch_github(entry, workflow_path, sha_arg, dest_dir):
+            target = dest_dir / workflow_path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(sub_yaml)
+
+        config = load_config(parent_path)
+
+        with (
+            patch("conductor.registry.cache.materialize_to_sha", return_value=sha),
+            patch("conductor.registry.cache.resolve_ref", return_value=sha),
+            patch("conductor.registry.cache.load_index", return_value=index_obj),
+            patch("conductor.registry.cache._fetch_github", side_effect=fake_fetch_github),
+        ):
+            # Should succeed without raising — the sibling is auto-fetched.
+            warnings = validate_workflow_config(config, workflow_path=parent_path)
+
+        assert warnings == []
+        # Confirm the sibling was actually auto-fetched into the shared SHA root.
+        sibling = official_sha_root / "document-review" / "workflow.yaml"
+        assert sibling.exists()

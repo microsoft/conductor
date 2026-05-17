@@ -1,14 +1,18 @@
 """Workflow reference resolution.
 
 Parses user-supplied workflow references (e.g. ``qa-bot@team#v1.2.3``) and
-determines whether an argument is a local file path or a registry reference.
+determines whether an argument is a local file path, a configured registry
+reference, or an ad-hoc GitHub registry reference.
 
 Resolution rules (in order):
 1. If the argument exists as a file on disk, treat it as a local path.
 2. If it looks like a file path (has path separators or YAML extension), treat
    it as a local path — even if the file doesn't exist yet.
 3. Otherwise parse as a registry reference using ``<workflow>[@<registry>][#<ref>]``
-   syntax, where ``<ref>`` is a git tag, branch, or commit SHA.
+   syntax. The ``<registry>`` segment can be either:
+   - A configured registry name (looked up in ``~/.conductor/registries.toml``), or
+   - An ``owner/repo`` literal (contains ``/``) that is fetched ad-hoc from
+     GitHub without requiring registry configuration.
 """
 
 from __future__ import annotations
@@ -27,16 +31,20 @@ _YAML_EXTENSIONS = {".yaml", ".yml"}
 class ResolvedRef:
     """A resolved workflow reference."""
 
-    kind: Literal["file", "registry"]
+    kind: Literal["file", "registry", "adhoc"]
 
     # For file refs
     path: Path | None = None
 
-    # For registry refs
+    # For registry refs (and adhoc refs)
     workflow: str | None = None
     registry_name: str | None = None
     ref: str | None = None  # Git tag / branch / SHA. None means "latest"
     registry_entry: RegistryEntry | None = None
+
+    # For adhoc refs only — owner and repo parsed from the right side of '@'
+    adhoc_owner: str | None = None
+    adhoc_repo: str | None = None
 
 
 def resolve_ref(ref: str) -> ResolvedRef:
@@ -49,6 +57,15 @@ def resolve_ref(ref: str) -> ResolvedRef:
     optional registry name and ``#`` introduces an optional git ref (tag,
     branch, or commit SHA). An empty registry segment (``name@#ref``) selects
     the configured default registry.
+
+    The ``<registry>`` segment supports two forms:
+
+    - A configured registry name (e.g. ``qa-bot@team#v1.0.0``) — looked up in
+      ``~/.conductor/registries.toml``.
+    - An ``owner/repo`` literal (e.g. ``qa-bot@acme/workflows#v1.0.0``) —
+      detected by the presence of ``/``. Treated as an **ad-hoc** GitHub
+      reference, fetched and cached without requiring registry
+      pre-configuration. Returns ``kind="adhoc"``.
 
     Args:
         ref: The raw reference string from the CLI.
@@ -74,7 +91,18 @@ def _looks_like_file_path(ref: str) -> bool:
     * The ref exists as a file on disk.
     * The ref contains a path separator (``/`` or ``\\``).
     * The ref ends with ``.yaml`` or ``.yml``.
+
+    Refs containing ``@`` are always treated as registry references (named
+    or ad-hoc), regardless of whether the rest looks like a path. This
+    allows the ad-hoc form ``workflow@owner/repo#ref`` (which contains ``/``
+    in the registry slot) to be parsed correctly rather than being
+    misclassified as a file path.
     """
+    # Registry refs (named or ad-hoc) always contain '@'. Yield to the
+    # registry parser so 'workflow@owner/repo#ref' is not treated as a file.
+    if "@" in ref:
+        return False
+
     if "/" in ref or "\\" in ref:
         return True
 
@@ -86,11 +114,16 @@ def _looks_like_file_path(ref: str) -> bool:
 
 
 def _parse_registry_ref(raw: str) -> ResolvedRef:
-    """Parse *raw* as ``<workflow>[@<registry>][#<ref>]`` and resolve against config.
+    """Parse *raw* as ``<workflow>[@<registry>][#<ref>]`` and resolve.
+
+    The ``<registry>`` segment can be:
+    - A configured registry name → looked up in ``~/.conductor/registries.toml``
+    - An ``owner/repo`` literal (contains ``/``) → ad-hoc GitHub reference,
+      no configuration required
 
     Raises:
         RegistryError: On malformed syntax, missing default registry, or
-            unknown registry name.
+            unknown registry name (named-registry form only).
     """
     # Split on '#' first — the right side (if any) is the git ref.
     hash_parts = raw.split("#")
@@ -130,6 +163,60 @@ def _parse_registry_ref(raw: str) -> ResolvedRef:
 
     raw_registry: str | None = at_parts[1] if len(at_parts) == 2 else None
 
+    # Ad-hoc owner/repo form — detected by '/' in the registry segment.
+    if raw_registry is not None and "/" in raw_registry:
+        return _parse_adhoc_ref(workflow, raw_registry, git_ref)
+
+    # Named-registry form (existing behavior).
+    return _parse_named_registry_ref(workflow, raw_registry, git_ref)
+
+
+def _parse_adhoc_ref(
+    workflow: str,
+    raw_registry: str,
+    git_ref: str | None,
+) -> ResolvedRef:
+    """Parse an ad-hoc ``<workflow>@<owner>/<repo>[#<ref>]`` reference.
+
+    No registry configuration lookup — the ``owner/repo`` literal is used
+    directly to fetch from GitHub.
+
+    Raises:
+        RegistryError: If ``owner/repo`` is malformed (e.g. empty owner or
+            repo, or contains additional path segments).
+    """
+    parts = raw_registry.split("/")
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        raise RegistryError(
+            f"Invalid ad-hoc registry source '{raw_registry}'. "
+            "Expected '<owner>/<repo>' with exactly one '/'.",
+            suggestion=("Use 'workflow@owner/repo[#ref]' (e.g. analysis@acme/workflows#v1.0.0)."),
+        )
+
+    owner, repo = parts
+    return ResolvedRef(
+        kind="adhoc",
+        workflow=workflow,
+        registry_name=raw_registry,
+        ref=git_ref,
+        adhoc_owner=owner,
+        adhoc_repo=repo,
+    )
+
+
+def _parse_named_registry_ref(
+    workflow: str,
+    raw_registry: str | None,
+    git_ref: str | None,
+) -> ResolvedRef:
+    """Parse a named ``<workflow>[@<registry>][#<ref>]`` reference.
+
+    Looks up the registry by name in the user's configuration.
+
+    Raises:
+        RegistryError: If the registry is missing (and no default is
+            configured), or the named registry doesn't exist in config.
+    """
     config = load_config()
 
     # Determine the registry name: empty string or None → use default.
@@ -139,7 +226,9 @@ def _parse_registry_ref(raw: str) -> ResolvedRef:
                 "No default registry configured",
                 suggestion=(
                     "Run 'conductor registry add <name> <source> --default' to "
-                    "configure a default registry."
+                    "configure a default registry, or use the ad-hoc form "
+                    "'workflow@owner/repo[#ref]' to reference a GitHub repo "
+                    "directly."
                 ),
             )
         registry_name = config.default
@@ -152,7 +241,9 @@ def _parse_registry_ref(raw: str) -> ResolvedRef:
             f"Registry '{registry_name}' not found",
             suggestion=(
                 f"Available registries: {available}. "
-                "Run 'conductor registry list' to see all registries."
+                "Run 'conductor registry list' to see all registries, "
+                "or use the ad-hoc form 'workflow@owner/repo[#ref]' "
+                "to reference a GitHub repo directly."
             ),
         )
 

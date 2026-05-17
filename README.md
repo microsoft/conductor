@@ -7,9 +7,11 @@ A CLI tool for defining and running multi-agent workflows with the GitHub Copilo
 
 ## Why Conductor?
 
-A single LLM prompt can answer a question, but it can't review its own work, research from multiple angles, or pause for human approval. You need multi-agent workflows—but building them means coding custom solutions, managing state, handling failures, and hoping you don't create infinite loops.
+Conductor makes multi-agent workflows — code review pipelines, research-then-synthesize flows, plan-then-implement loops — **repeatable, deterministic, and version-controlled**. You define your agents, their prompts, and the routing between them in a single YAML file:
 
-Conductor provides the patterns that work: evaluator-optimizer loops for iterative refinement, parallel execution with failure modes, and human-in-the-loop gates. Define them in YAML with built-in safety limits. Version control your workflows like code.
+- **Repeatable** — Same inputs follow the same path through the same agents.
+- **Deterministic** — Routing uses Jinja2 templates and expression evaluation. First matching condition wins. No LLM in the orchestration loop, no tokens spent deciding what runs next.
+- **Source-controlled** — Plain YAML files. Diff workflows in pull requests, version them with your code, run them the same way locally and in CI.
 
 ## Features
 
@@ -45,9 +47,35 @@ The installer checks for [uv](https://docs.astral.sh/uv/) (installs it if missin
 
 ### Updating
 
+`conductor update` checks for a newer release and tells you the one-line command to upgrade. Upgrades happen via the install script — the same script you used to install — because in-process self-upgrade is unreliable on Windows (the running Python interpreter sits inside the venv that needs replacing).
+
 ```bash
 conductor update
 ```
+
+To upgrade, run the install script in a **new shell** (not from inside a running `conductor` process):
+
+**macOS / Linux:**
+```bash
+curl -sSfL https://aka.ms/conductor/install.sh | sh
+```
+
+**Windows (PowerShell):**
+```powershell
+irm https://aka.ms/conductor/install.ps1 | iex
+```
+
+Or skip the copy-paste with `--apply`:
+
+```bash
+conductor update --apply
+```
+
+`--apply` launches the install script automatically — on Windows it opens in a new console window so you can watch progress; on macOS/Linux it replaces the current process. Either way, the running `conductor` exits before the installer touches the venv, so file locks release cleanly.
+
+The install script handles file-lock safety (process detection, stale-file cleanup, and on Windows a rename-fallback when the venv directory can't be removed), retries with backoff, and verifies the installed version after install. If your shell ever gets into a bad state from a failed update, re-running the install script is always the right next step.
+
+Conductor periodically checks GitHub for newer releases (cached for 24 hours under `~/.conductor/update-check.json`) and prints a one-line hint when one is available. To silence the hint permanently — for example when you manage upgrades through a package manager or company-mirrored install — set `CONDUCTOR_NO_UPDATE_CHECK=1` in your shell environment. The check is also skipped automatically for non-TTY invocations, `--silent` mode, the `update` subcommand, and `--help` / `--version`.
 
 ### Manual Install
 
@@ -86,6 +114,28 @@ conductor run workflow.yaml
 # Install a specific tag or commit
 pip install git+https://github.com/microsoft/conductor.git@v1.0.0
 ```
+
+### Use the Conductor skill in Claude Code or Copilot CLI
+
+This repo doubles as a single-plugin marketplace that ships the `conductor`
+skill from `plugins/conductor/skills/conductor/`. The skill teaches the
+assistant the workflow YAML schema, CLI commands, and execution model.
+
+**Claude Code:**
+
+```text
+/plugin marketplace add microsoft/conductor
+/plugin install conductor@conductor
+```
+
+**GitHub Copilot CLI** (`gh skill` requires GitHub CLI 2.91+, public preview):
+
+```bash
+gh skill install microsoft/conductor conductor
+```
+
+The plugin ships only markdown — no executables, hooks, or MCP servers — so
+trust verification is straightforward.
 
 ## Quick Start
 

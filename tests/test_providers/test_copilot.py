@@ -916,16 +916,23 @@ class TestGetMaxPromptTokens:
         assert await provider.get_max_prompt_tokens("gpt-4o") == 128000
 
     @pytest.mark.asyncio
-    async def test_unexpected_exception_propagates(self) -> None:
-        """Non-SDK exceptions (programming errors) are not swallowed by the
-        provider — they bubble up so the engine's outer safety net handles them."""
+    async def test_value_error_from_sdk_parser_returns_none(self) -> None:
+        """SDK schema-parsing failures (e.g. ``ValueError`` from
+        ``ModelBilling.from_dict`` when the API omits the ``multiplier``
+        field) must be soft-swallowed — context-window metadata must
+        never block workflow execution.
+
+        Regression for github-copilot-sdk 0.3.0, where ``list_models()``
+        eagerly parses every model and a single malformed entry (observed
+        for ``claude-opus-4.7-1m-internal``) raises ``ValueError`` and
+        kills the whole call.
+        """
 
         async def list_models() -> list[Any]:
-            raise ValueError("bug")
+            raise ValueError("Missing required field 'multiplier' in ModelBilling")
 
         provider = self._provider_with_list_models(list_models)
-        with pytest.raises(ValueError):
-            await provider.get_max_prompt_tokens("gpt-4o")
+        assert await provider.get_max_prompt_tokens("gpt-4o") is None
 
     @pytest.mark.asyncio
     async def test_alias_resolves_via_match_model_id(self) -> None:
@@ -1100,6 +1107,37 @@ class TestReasoningEffort:
         agent = AgentDef(
             name="planner",
             model="gpt-4o",
+            prompt="Plan",
+            reasoning=ReasoningConfig(effort="xhigh"),
+        )
+        await provider.execute(agent=agent, context={}, rendered_prompt="Plan")
+        assert captured["create_session_kwargs"]["reasoning_effort"] == "xhigh"
+
+    @pytest.mark.asyncio
+    async def test_value_error_from_sdk_parser_skips_validation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """SDK schema-parsing failures during ``list_models()`` must not block
+        execution — validation is skipped permissively and the configured
+        ``reasoning_effort`` is still forwarded to ``create_session``.
+
+        Regression for github-copilot-sdk 0.3.0: ``ModelBilling.from_dict``
+        raises ``ValueError("Missing required field 'multiplier' in
+        ModelBilling")`` for models like ``claude-opus-4.7-1m-internal``,
+        which previously leaked through the narrow except tuple in
+        ``_validate_reasoning_effort_for_model`` and surfaced as a
+        ``Dialog turn failed: …`` error after exhausting the retry loop.
+        """
+        from conductor.config.schema import ReasoningConfig
+
+        async def list_models() -> list[Any]:
+            raise ValueError("Missing required field 'multiplier' in ModelBilling")
+
+        captured: dict[str, Any] = {}
+        provider = await self._build_provider(captured, monkeypatch, list_models_impl=list_models)
+        agent = AgentDef(
+            name="planner",
+            model="claude-opus-4.7-1m-internal",
             prompt="Plan",
             reasoning=ReasoningConfig(effort="xhigh"),
         )

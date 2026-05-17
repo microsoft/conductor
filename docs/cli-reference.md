@@ -24,7 +24,7 @@ conductor run <workflow.yaml> [OPTIONS]
 | `--input NAME=VALUE` | `-i` | Workflow input (repeatable) |
 | `--input.NAME=VALUE` | | Alternative input syntax |
 | `--metadata KEY=VALUE` | `-m` | Workflow metadata (repeatable). Merged on top of YAML `metadata:` and surfaced in the `workflow_started` event. |
-| `--workspace-instructions` | | Auto-discover convention files (`AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md`) by walking from CWD up to the git root. Concatenated and prepended to every agent's prompt. |
+| `--workspace-instructions` | | Auto-discover convention files (`AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md`, and `.github/instructions/**/*.instructions.md`) by walking from CWD up to the git root. Concatenated and prepended to every agent's prompt. See [Workspace Instructions](#workspace-instructions) below for details on the `.github/instructions/` directory convention. |
 | `--instructions PATH` | | Explicit path to an instructions file (repeatable). Combines with auto-discovered files when both flags are used. |
 | `--provider PROVIDER` | `-p` | Override provider (copilot, claude) |
 | `--dry-run` | | Show execution plan without running |
@@ -116,12 +116,50 @@ conductor run workflow.yaml --silent --log-file auto --skip-gates --input questi
 # Inject runtime metadata (visible in the workflow_started event)
 conductor run twig-sdlc.yaml --metadata work_item_id=1814 --metadata env=staging
 
-# Auto-discover and inject AGENTS.md / CLAUDE.md / copilot-instructions.md
+# Auto-discover and inject convention instruction files (see "Workspace Instructions" below)
 conductor run workflow.yaml --workspace-instructions
 
 # Combine auto-discovery with an explicit extra file
 conductor run workflow.yaml --workspace-instructions --instructions ./style-guide.md
 ```
+
+##### Workspace Instructions
+
+When `--workspace-instructions` is set, conductor walks from the current
+working directory up to the git root and discovers four conventions, in this
+order:
+
+| Convention | Type | Discovery |
+|---|---|---|
+| `AGENTS.md` | File | Closest-to-CWD wins |
+| `.github/copilot-instructions.md` | File | Closest-to-CWD wins |
+| `CLAUDE.md` | File | Closest-to-CWD wins |
+| `.github/instructions/**/*.instructions.md` | Directory (recursive) | Closest-to-CWD wins per relative path within the directory |
+
+The directory convention follows GitHub Copilot's documented format
+([GitHub docs](https://docs.github.com/en/copilot/customizing-copilot/about-customizing-github-copilot-chat-responses),
+[VS Code docs](https://code.visualstudio.com/docs/copilot/customization/custom-instructions)):
+
+- Files must use the double `*.instructions.md` extension.
+- A YAML frontmatter block with `applyTo` controls activation:
+
+  ```markdown
+  ---
+  description: 'Coding conventions for the API layer'
+  applyTo: '**'
+  ---
+  Use four-space indentation.
+  ```
+
+- `applyTo: "**"` → loaded as always-on (matches Copilot's "always applied").
+- `applyTo: "<other glob>"` → **skipped** (the convention scopes these per-file
+  in the chat; conductor has no equivalent per-agent file scoping).
+- `applyTo` absent → **skipped** (the convention says these are manual-attach
+  only, never auto-applied).
+
+This conservative interpretation matches the documented semantics exactly. To
+include unscoped instructions today, use the explicit `--instructions PATH`
+flag.
 
 #### Complex Inputs
 

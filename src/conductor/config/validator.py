@@ -88,6 +88,9 @@ INPUT_REF_PATTERN = re.compile(
 def validate_workflow_config(
     config: WorkflowConfig,
     workflow_path: Path | None = None,
+    *,
+    _visited_subworkflows: frozenset[tuple[int, int]] | None = None,
+    _subworkflow_depth: int = 0,
 ) -> list[str]:
     """Perform comprehensive validation of a workflow configuration.
 
@@ -98,6 +101,12 @@ def validate_workflow_config(
     Args:
         config: The WorkflowConfig to validate.
         workflow_path: Optional path to the workflow file (for !file resolution).
+        _visited_subworkflows: Internal — set of canonical (st_dev, st_ino)
+            tuples for sub-workflow files already on the validation stack,
+            used for cycle detection in recursive sub-workflow validation.
+            External callers should leave this as ``None``.
+        _subworkflow_depth: Internal — current recursion depth for
+            sub-workflow validation. External callers should leave this as 0.
 
     Returns:
         A list of warning messages (non-fatal issues).
@@ -157,6 +166,29 @@ def validate_workflow_config(
             tool_errors = _validate_tool_references(agent.name, agent.tools, set(config.tools))
             errors.extend(tool_errors)
 
+        # Warn when an LLM agent has system_prompt but no (non-empty) prompt.
+        # The Copilot provider concatenates `agent.system_prompt` into the prompt,
+        # but providers that ignore system_prompt entirely (e.g., Claude) would
+        # leave such agents with an empty user message. Even with the executor
+        # rendering system_prompt, omitting `prompt:` is a portability hazard
+        # and almost always indicates the author meant to include a `prompt:`
+        # block alongside the persona/methodology in `system_prompt:`.
+        if (
+            agent.type in (None, "agent")
+            and agent.system_prompt
+            and not (agent.prompt and agent.prompt.strip())
+        ):
+            warnings.append(
+                f"Agent '{agent.name}' defines `system_prompt` but no `prompt` "
+                "(or only whitespace). "
+                "Some providers (e.g., Claude) ignore `system_prompt` entirely, "
+                "which would send an empty user message to the model. "
+                "Even with the Copilot provider, the model often responds poorly "
+                "to a missing user prompt. Move the dynamic, must-execute content "
+                "(input references, instructions) into a `prompt:` block; keep the "
+                "persona and static methodology in `system_prompt:`."
+            )
+
     # Validate parallel groups
     if config.parallel:
         parallel_errors = _validate_parallel_groups(config)
@@ -169,6 +201,19 @@ def validate_workflow_config(
                 f"For-each group '{for_each_group.name}' uses a script step as its "
                 "inline agent. Script steps cannot be used in for_each groups."
             )
+
+    # Validate sub-workflow references (local paths and registry refs).
+    # Skipped when workflow_path is not provided — relative paths cannot be
+    # resolved without knowing the file's location.
+    if workflow_path is not None:
+        sub_errors, sub_warnings = _validate_subworkflow_refs(
+            config,
+            workflow_path,
+            _visited=_visited_subworkflows,
+            _depth=_subworkflow_depth,
+        )
+        errors.extend(sub_errors)
+        warnings.extend(sub_warnings)
 
     # Validate workflow output references
     output_errors = _validate_output_references(
@@ -724,6 +769,193 @@ def _collect_template_strings(
             templates.append((f"agent '{agent.name}' input_mapping.{key}", expr))
 
     return templates
+
+
+# Maximum depth for recursive sub-workflow validation to prevent infinite loops.
+_MAX_SUBWORKFLOW_VALIDATION_DEPTH = 10
+
+
+def _validate_subworkflow_refs(
+    config: WorkflowConfig,
+    workflow_path: Path | None,
+    _visited: frozenset[tuple[int, int]] | None = None,
+    _depth: int = 0,
+) -> tuple[list[str], list[str]]:
+    """Validate all ``type: workflow`` agent references in *config*.
+
+    For local paths, checks that the file exists. For registry references,
+    fetches the workflow to the local cache and recursively validates the
+    full composition tree. Cycle detection uses inode identity so that the
+    same file referenced via different cases (on case-insensitive
+    filesystems like macOS/Windows) or via symlinks resolves to the same
+    canonical key.
+
+    Args:
+        config: The workflow configuration to validate.
+        workflow_path: Path of the workflow file being validated (used as the
+            base directory for relative sub-workflow paths).
+        _visited: Set of already-visited canonical (st_dev, st_ino) tuples
+            for cycle detection. Callers should leave this as ``None``; it is
+            threaded through recursive calls.
+        _depth: Current recursion depth (internal). When the depth reaches
+            :data:`_MAX_SUBWORKFLOW_VALIDATION_DEPTH`, recursion stops and a
+            warning is emitted so callers know the validation tree was
+            truncated.
+
+    Returns:
+        Tuple of (error messages, warning messages).
+    """
+    if _visited is None:
+        _visited = frozenset()
+
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    if _depth >= _MAX_SUBWORKFLOW_VALIDATION_DEPTH:
+        warnings.append(
+            f"Sub-workflow validation depth limit "
+            f"({_MAX_SUBWORKFLOW_VALIDATION_DEPTH}) reached; "
+            "deeper sub-workflows were not validated. "
+            "Reduce nesting or check for unintended cycles."
+        )
+        return errors, warnings
+
+    base_dir = workflow_path.resolve().parent if workflow_path is not None else Path.cwd()
+
+    # Collect all (agent_name, workflow_ref, context_label) tuples to validate.
+    candidates: list[tuple[str, str, str]] = []
+    for agent in config.agents:
+        if agent.type == "workflow" and agent.workflow:
+            candidates.append((agent.name, agent.workflow, f"agent '{agent.name}'"))
+    for fe in config.for_each:
+        agent = fe.agent
+        if agent.type == "workflow" and agent.workflow:
+            candidates.append(
+                (agent.name, agent.workflow, f"for_each group '{fe.name}' agent '{agent.name}'")
+            )
+
+    for _agent_name, workflow_ref, label in candidates:
+        sub_path, ref_errors = _resolve_subworkflow_ref_for_validation(
+            workflow_ref, label, base_dir
+        )
+        errors.extend(ref_errors)
+        if sub_path is None:
+            continue
+
+        # Use inode identity (st_dev, st_ino) for cycle detection so that the
+        # same file referenced via different cases (case-insensitive
+        # filesystems) or different relative paths resolves to one key.
+        try:
+            stat = sub_path.stat()
+            canonical: tuple[int, int] = (stat.st_dev, stat.st_ino)
+        except OSError as exc:
+            # Should be rare since _resolve_subworkflow_ref_for_validation
+            # already returned a path it considered valid, but stat() can
+            # still fail on some platforms (e.g. permission errors).
+            errors.append(f"{label}: cannot stat sub-workflow file '{sub_path}': {exc}")
+            continue
+
+        if canonical in _visited:
+            errors.append(
+                f"{label}: circular sub-workflow reference detected "
+                f"('{workflow_ref}' → '{sub_path}' is already in the validation chain)"
+            )
+            continue
+
+        # Recursively validate the sub-workflow.
+        try:
+            from conductor.config.loader import load_config
+
+            sub_config = load_config(sub_path)
+        except Exception as exc:
+            errors.append(f"{label}: failed to load sub-workflow '{sub_path}': {exc}")
+            continue
+
+        try:
+            # Thread _visited and _depth through validate_workflow_config so
+            # nested sub-workflow validation also gets cycle detection.
+            sub_warnings = validate_workflow_config(
+                sub_config,
+                workflow_path=sub_path,
+                _visited_subworkflows=_visited | {canonical},
+                _subworkflow_depth=_depth + 1,
+            )
+            warnings.extend(f"{label} → sub-workflow '{sub_path.name}': {w}" for w in sub_warnings)
+        except ConfigurationError as exc:
+            errors.append(f"{label}: sub-workflow '{sub_path.name}' failed validation: {exc}")
+
+    return errors, warnings
+
+
+def _resolve_subworkflow_ref_for_validation(
+    workflow_ref: str,
+    label: str,
+    base_dir: Path,
+) -> tuple[Path | None, list[str]]:
+    """Resolve a ``workflow:`` field value to a local path for validation.
+
+    Mirrors the engine's ``_resolve_subworkflow_path`` but is synchronous and
+    returns errors as a list rather than raising.
+
+    Args:
+        workflow_ref: The raw ``workflow:`` field value.
+        label: Human-readable context for error messages.
+        base_dir: Base directory for relative path resolution.
+
+    Returns:
+        Tuple of (resolved path or None on error, list of error strings).
+    """
+    from conductor.registry.cache import auto_fetch_relative_workflow, resolve_and_fetch
+    from conductor.registry.errors import RegistryError
+    from conductor.registry.resolver import resolve_ref
+
+    errors: list[str] = []
+
+    # Step 1: check for an existing file beside the parent workflow first.
+    candidate = (base_dir / workflow_ref).resolve()
+    if candidate.is_file():
+        return candidate, errors
+
+    # Step 1b: when the parent workflow lives inside a registry SHA cache,
+    # try to auto-fetch a sibling workflow from the same registry. Mirrors
+    # the engine's ``_resolve_subworkflow_path`` step 1b so that
+    # ``conductor validate`` succeeds for the same cross-workflow refs
+    # (e.g. ``../document-review/workflow.yaml``) that succeed at runtime.
+    # Only attempts when the candidate looks like a file path (has
+    # separators or a YAML extension) AND is not a registry ref
+    # ('@' indicates named or ad-hoc registry syntax handled below).
+    looks_like_file = "@" not in workflow_ref and (
+        "/" in workflow_ref or "\\" in workflow_ref or candidate.suffix.lower() in {".yaml", ".yml"}
+    )
+    if looks_like_file:
+        try:
+            auto_fetched = auto_fetch_relative_workflow(candidate)
+        except RegistryError as exc:
+            errors.append(f"{label}: failed to auto-fetch sub-workflow '{workflow_ref}': {exc}")
+            return None, errors
+        if auto_fetched is not None and auto_fetched.is_file():
+            return auto_fetched, errors
+
+    try:
+        resolved = resolve_ref(workflow_ref)
+    except RegistryError as exc:
+        errors.append(f"{label}: invalid sub-workflow reference '{workflow_ref}': {exc}")
+        return None, errors
+
+    if resolved.kind == "file":
+        # File-path syntax but file does not exist.
+        errors.append(f"{label}: sub-workflow file not found: '{candidate}'")
+        return None, errors
+
+    # Named registry or ad-hoc reference: fetch (uses cache; makes network
+    # request on first access).
+    try:
+        sub_path = resolve_and_fetch(resolved)
+    except RegistryError as exc:
+        errors.append(f"{label}: failed to fetch sub-workflow '{workflow_ref}': {exc}")
+        return None, errors
+
+    return sub_path, errors
 
 
 def _validate_template_references(

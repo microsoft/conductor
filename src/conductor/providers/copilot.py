@@ -1935,13 +1935,22 @@ class CopilotProvider(AgentProvider):
         Returns ``None`` in mock-handler mode, when the SDK is unavailable,
         when no match is found, or when the SDK call fails — context-window
         metadata must never block workflow execution.
+
+        Catches ``Exception`` (not ``BaseException``) at the SDK boundary so
+        ``asyncio.CancelledError``/``KeyboardInterrupt``/``SystemExit`` still
+        propagate. The broad catch is required because Copilot SDK >=0.3.0
+        eagerly parses every entry in the ``models.list`` response with
+        dataclass ``from_dict`` helpers that raise ``ValueError`` on any
+        missing required field — e.g. ``ModelBilling`` requires ``multiplier``,
+        and certain models (such as ``claude-opus-4.7-1m-internal``) ship a
+        ``billing`` object without one, which kills the entire listing.
         """
         if self._mock_handler is not None or not COPILOT_SDK_AVAILABLE:
             return None
         try:
             await self._ensure_client_started()
             models = await self._client.list_models()
-        except (TimeoutError, ProviderError, OSError, RuntimeError) as e:
+        except Exception as e:
             logger.debug("Failed to list Copilot models for %r: %s", model, e)
             return None
         by_id = {info.id: info for info in models}
@@ -1967,6 +1976,15 @@ class CopilotProvider(AgentProvider):
         — capability metadata must never block a workflow that the SDK might
         otherwise accept.
 
+        Catches ``Exception`` (not ``BaseException``) at the SDK boundary so
+        ``asyncio.CancelledError``/``KeyboardInterrupt``/``SystemExit`` still
+        propagate. The broad catch is required because Copilot SDK >=0.3.0
+        eagerly parses every entry in the ``models.list`` response with
+        dataclass ``from_dict`` helpers that raise ``ValueError`` on any
+        missing required field — e.g. ``ModelBilling`` requires ``multiplier``,
+        and certain models (such as ``claude-opus-4.7-1m-internal``) ship a
+        ``billing`` object without one, which kills the entire listing.
+
         Skipped entirely in mock-handler mode and when the SDK is not
         installed.
         """
@@ -1975,7 +1993,7 @@ class CopilotProvider(AgentProvider):
         try:
             await self._ensure_client_started()
             models = await self._client.list_models()
-        except (TimeoutError, ProviderError, OSError, RuntimeError) as e:
+        except Exception as e:
             logger.debug(
                 "Failed to list Copilot models for reasoning_effort validation of %r: %s",
                 model,
