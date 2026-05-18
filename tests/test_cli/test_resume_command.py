@@ -296,10 +296,17 @@ class TestResumeCommand:
 
     def test_resume_web_bg_invokes_launch_background_resume(self, tmp_path: Path) -> None:
         """Test that --web-bg dispatches to launch_background_resume."""
+        from conductor.cli.bg_runner import BackgroundLaunch
+
         wf_path = _write_workflow(tmp_path)
 
         with patch("conductor.cli.bg_runner.launch_background_resume") as mock_launch:
-            mock_launch.return_value = "http://127.0.0.1:9092"
+            mock_launch.return_value = BackgroundLaunch(
+                url="http://127.0.0.1:9092",
+                stderr_log=tmp_path / "stub-abcdef01.bg.stderr.log",
+                stdout_log=tmp_path / "stub-abcdef01.bg.stdout.log",
+                run_id="abcdef01",
+            )
             result = runner.invoke(
                 app,
                 [
@@ -329,11 +336,18 @@ class TestResumeCommand:
 
     def test_resume_web_bg_with_from_checkpoint(self, tmp_path: Path) -> None:
         """Test --web-bg forwards --from checkpoint path."""
+        from conductor.cli.bg_runner import BackgroundLaunch
+
         wf_path = _write_workflow(tmp_path)
         cp_path = _write_checkpoint(tmp_path, wf_path)
 
         with patch("conductor.cli.bg_runner.launch_background_resume") as mock_launch:
-            mock_launch.return_value = "http://127.0.0.1:9093"
+            mock_launch.return_value = BackgroundLaunch(
+                url="http://127.0.0.1:9093",
+                stderr_log=tmp_path / "stub-abcdef02.bg.stderr.log",
+                stdout_log=tmp_path / "stub-abcdef02.bg.stdout.log",
+                run_id="abcdef02",
+            )
             result = runner.invoke(app, ["resume", "--from", str(cp_path), "--web-bg"])
 
         assert result.exit_code == 0
@@ -378,7 +392,7 @@ class TestLaunchBackgroundResume:
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
             patch("conductor.cli.pid.write_pid_file"),
         ):
-            url = bg_runner.launch_background_resume(
+            launch = bg_runner.launch_background_resume(
                 workflow_path=wf_path,
                 checkpoint_path=None,
                 provider_override="copilot",
@@ -387,7 +401,7 @@ class TestLaunchBackgroundResume:
                 web_port=9099,
             )
 
-        assert url == "http://127.0.0.1:9099"
+        assert launch.url == "http://127.0.0.1:9099"
         cmd = captured["cmd"]
         # ``--silent`` must NOT be injected: console output is already
         # suppressed by Popen ``stdout``/``stderr=DEVNULL``, and ``--silent``
@@ -771,7 +785,12 @@ class TestLaunchBackgroundResumeFailures:
         mock_write.assert_called_once_with(5556, 9202, cp_path)
 
     def test_subprocess_detachment_kwargs(self, tmp_path: Path) -> None:
-        """Verify Popen is called with detachment + DEVNULL + bg env vars."""
+        """Verify Popen is called with detachment + bg env vars + redirected stdout/stderr.
+
+        The child's stdout/stderr must be redirected to log files (NOT
+        ``DEVNULL``) so a silent crash leaves a forensic trail. See
+        issue #116.
+        """
         import sys as _sys
 
         from conductor.cli import bg_runner
@@ -800,9 +819,20 @@ class TestLaunchBackgroundResumeFailures:
 
         import subprocess as _sp
 
-        assert captured["stdout"] is _sp.DEVNULL
-        assert captured["stderr"] is _sp.DEVNULL
+        # stdin stays DEVNULL (detached child has no interactive input)
         assert captured["stdin"] is _sp.DEVNULL
+        # stdout/stderr must be redirected to writable text-mode file objects
+        # so Python tracebacks and faulthandler dumps from the child survive
+        # the parent's exit. DEVNULL is explicitly NOT allowed here.
+        for stream_name in ("stdout", "stderr"):
+            stream = captured[stream_name]
+            assert stream is not _sp.DEVNULL, (
+                f"{stream_name} must not be DEVNULL — issue #116 requires "
+                "capturing the child's output to a log file."
+            )
+            assert hasattr(stream, "write"), f"{stream_name} must be a writable file-like"
+            assert hasattr(stream, "name"), f"{stream_name} must expose a name attribute"
+            assert ".bg." in stream.name and stream.name.endswith(".log")
         if _sys.platform == "win32":
             expected_flags = _sp.CREATE_NEW_PROCESS_GROUP | _sp.CREATE_BREAKAWAY_FROM_JOB
             assert captured["creationflags"] == expected_flags
@@ -812,6 +842,12 @@ class TestLaunchBackgroundResumeFailures:
         assert isinstance(env, dict)
         assert env["CONDUCTOR_WEB_BG"] == "1"
         assert env["CONDUCTOR_WEB_PORT"] == "9203"
+        # New env vars wired by --web-bg so the child's EventLogSubscriber
+        # and workflow_started metadata cross-reference the bg log files.
+        assert env["CONDUCTOR_RUN_ID"]
+        assert len(env["CONDUCTOR_RUN_ID"]) == 8
+        assert env["CONDUCTOR_BG_STDERR_LOG"].endswith(".bg.stderr.log")
+        assert env["CONDUCTOR_BG_STDOUT_LOG"].endswith(".bg.stdout.log")
 
 
 # ---------------------------------------------------------------------------

@@ -1,24 +1,30 @@
-"""Tests for ``bg_runner`` helpers: detachment kwargs and detached spawn.
+"""Tests for ``conductor.cli.bg_runner``.
 
-Covers the Windows job-breakaway fix from issue #195:
+Covers two issues that landed together:
 
-- ``_detachment_kwargs`` returns the right kwargs for POSIX vs Windows.
-- ``_spawn_detached`` happy path requests breakaway on Windows.
-- ``_spawn_detached`` falls back to plain ``CREATE_NEW_PROCESS_GROUP`` and
+- **#195 / Windows job breakaway**: ``_detachment_kwargs`` returns the right
+  kwargs for POSIX vs Windows; ``_spawn_detached`` happy path requests
+  breakaway on Windows, falls back to plain ``CREATE_NEW_PROCESS_GROUP`` and
   prints a stderr warning when the parent's Windows job forbids breakaway
-  (``OSError`` with ``winerror == 5``).
-- Non-breakaway ``OSError`` (e.g. ``winerror == 2``, "file not found")
-  propagates from the first ``Popen`` call without a retry.
-- POSIX paths never retry on ``OSError``.
-- Both ``launch_background`` and ``launch_background_resume`` route their
-  Popen call through ``_spawn_detached`` (i.e., the Windows breakaway flag
-  is set in both run and resume paths).
+  (``OSError`` with ``winerror == 5``); non-breakaway ``OSError`` propagates
+  without retry; POSIX paths never retry on ``OSError``; both
+  ``launch_background`` and ``launch_background_resume`` route their Popen
+  call through ``_spawn_detached``.
+- **#116 / bg diagnostics**: parent-side bookkeeping for the captured
+  stderr/stdout log files — log-file creation, env-var wiring,
+  error-message threading, handle cleanup, and the ``_sanitize_name`` helper
+  used to build the log filename.
+
+Neither group of tests actually spawns a child process. ``subprocess.Popen``
+is patched in every test so nothing leaks into the test runner.
 """
 
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -244,13 +250,13 @@ class TestLaunchBackgroundRoutesThroughSpawnDetached:
             patch.object(bg_runner, "_wait_for_server", return_value=True),
             patch("conductor.cli.pid.write_pid_file"),
         ):
-            url = bg_runner.launch_background(
+            launch = bg_runner.launch_background(
                 workflow_path=wf_path,
                 inputs={"q": "hello"},
                 web_port=9301,
             )
 
-        assert url == "http://127.0.0.1:9301"
+        assert launch.url == "http://127.0.0.1:9301"
         mock_spawn.assert_called_once()
         # _spawn_detached is called positionally: (cmd, env).
         cmd = mock_spawn.call_args.args[0]
@@ -273,13 +279,13 @@ class TestLaunchBackgroundRoutesThroughSpawnDetached:
             patch.object(bg_runner, "_wait_for_server", return_value=True),
             patch("conductor.cli.pid.write_pid_file"),
         ):
-            url = bg_runner.launch_background_resume(
+            launch = bg_runner.launch_background_resume(
                 workflow_path=wf_path,
                 checkpoint_path=None,
                 web_port=9302,
             )
 
-        assert url == "http://127.0.0.1:9302"
+        assert launch.url == "http://127.0.0.1:9302"
         mock_spawn.assert_called_once()
         cmd = mock_spawn.call_args.args[0]
         env = mock_spawn.call_args.args[1]
@@ -353,3 +359,286 @@ class TestCreationFlagConstants:
 
         assert bg_runner._CREATE_NEW_PROCESS_GROUP == subprocess.CREATE_NEW_PROCESS_GROUP
         assert bg_runner._CREATE_BREAKAWAY_FROM_JOB == subprocess.CREATE_BREAKAWAY_FROM_JOB
+
+
+def _write_workflow(tmp_path: Path) -> Path:
+    wf_path = tmp_path / "test-wf.yaml"
+    wf_path.write_text("workflow: {name: x, entry_point: a}\nagents: []\n")
+    return wf_path
+
+
+@pytest.fixture(autouse=True)
+def _clean_bg_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ensure no parent CONDUCTOR_* bg env vars leak between tests."""
+    for key in (
+        "CONDUCTOR_RUN_ID",
+        "CONDUCTOR_BG_STDERR_LOG",
+        "CONDUCTOR_BG_STDOUT_LOG",
+        "CONDUCTOR_WEB_BG",
+        "CONDUCTOR_WEB_PORT",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+
+# ---------------------------------------------------------------------------
+# launch_background diagnostics
+# ---------------------------------------------------------------------------
+
+
+class TestLaunchBackgroundDiagnostics:
+    """Diagnostics-side behaviour of ``launch_background`` (issue #116)."""
+
+    def test_returns_structured_launch_with_log_paths(self, tmp_path: Path) -> None:
+        """``launch_background`` returns a ``BackgroundLaunch`` with both log paths."""
+        from conductor.cli import bg_runner
+
+        wf_path = _write_workflow(tmp_path)
+
+        def _fake_popen(cmd: list[str], **kwargs: Any) -> MagicMock:
+            proc = MagicMock()
+            proc.pid = 1234
+            proc.poll.return_value = None
+            return proc
+
+        with (
+            patch("conductor.cli.bg_runner.subprocess.Popen", side_effect=_fake_popen),
+            patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch("conductor.cli.pid.write_pid_file"),
+        ):
+            launch = bg_runner.launch_background(
+                workflow_path=wf_path,
+                inputs={},
+                web_port=9300,
+            )
+
+        assert launch.url == "http://127.0.0.1:9300"
+        assert launch.stderr_log.name.endswith(".bg.stderr.log")
+        assert launch.stdout_log.name.endswith(".bg.stdout.log")
+        # 8-hex-character run id, suitable for filename embedding.
+        assert re.fullmatch(r"[0-9a-f]{8}", launch.run_id), launch.run_id
+        # Filenames embed the same run id, so events JSONL (which honours
+        # CONDUCTOR_RUN_ID) can be correlated with the bg log files.
+        assert launch.run_id in launch.stderr_log.name
+        assert launch.run_id in launch.stdout_log.name
+        # The log files are siblings of the events JSONL under TMPDIR/conductor/
+        assert launch.stderr_log.parent.name == "conductor"
+        assert launch.stderr_log.parent.parent == Path(tempfile.gettempdir())
+
+    def test_popen_receives_file_handles_not_devnull(self, tmp_path: Path) -> None:
+        """stderr/stdout must NOT be ``DEVNULL`` — that's what causes #116's silent crash."""
+        from conductor.cli import bg_runner
+
+        wf_path = _write_workflow(tmp_path)
+
+        captured: dict[str, Any] = {}
+
+        def _fake_popen(cmd: list[str], **kwargs: Any) -> MagicMock:
+            captured.update(kwargs)
+            proc = MagicMock()
+            proc.pid = 1
+            proc.poll.return_value = None
+            return proc
+
+        with (
+            patch("conductor.cli.bg_runner.subprocess.Popen", side_effect=_fake_popen),
+            patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch("conductor.cli.pid.write_pid_file"),
+        ):
+            bg_runner.launch_background(
+                workflow_path=wf_path,
+                inputs={},
+                web_port=9301,
+            )
+
+        assert captured["stdin"] is subprocess.DEVNULL  # no interactive input
+        for stream_name in ("stdout", "stderr"):
+            stream = captured[stream_name]
+            assert stream is not subprocess.DEVNULL
+            assert hasattr(stream, "write")
+            assert stream.name.endswith(".log")
+
+    def test_parent_handles_closed_after_popen(self, tmp_path: Path) -> None:
+        """Parent-side stdout/stderr file handles are closed after Popen returns.
+
+        The child has its own duplicated OS handles, so the parent's Python
+        file objects can — and should — be released immediately. Leaving
+        them open would leak file descriptors in the parent.
+        """
+        from conductor.cli import bg_runner
+
+        wf_path = _write_workflow(tmp_path)
+
+        captured: dict[str, Any] = {}
+
+        def _fake_popen(cmd: list[str], **kwargs: Any) -> MagicMock:
+            captured["stdout"] = kwargs["stdout"]
+            captured["stderr"] = kwargs["stderr"]
+            proc = MagicMock()
+            proc.pid = 1
+            proc.poll.return_value = None
+            return proc
+
+        with (
+            patch("conductor.cli.bg_runner.subprocess.Popen", side_effect=_fake_popen),
+            patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch("conductor.cli.pid.write_pid_file"),
+        ):
+            bg_runner.launch_background(
+                workflow_path=wf_path,
+                inputs={},
+                web_port=9302,
+            )
+
+        assert captured["stdout"].closed
+        assert captured["stderr"].closed
+
+    def test_parent_handles_closed_on_finalize_failure(self, tmp_path: Path) -> None:
+        """Parent handles are closed even when ``_finalize_background_launch`` raises."""
+        from conductor.cli import bg_runner
+
+        wf_path = _write_workflow(tmp_path)
+
+        captured: dict[str, Any] = {}
+
+        def _fake_popen(cmd: list[str], **kwargs: Any) -> MagicMock:
+            captured["stdout"] = kwargs["stdout"]
+            captured["stderr"] = kwargs["stderr"]
+            proc = MagicMock()
+            proc.pid = 1
+            # Simulate child exited immediately — _finalize raises RuntimeError.
+            proc.poll.return_value = 7
+            return proc
+
+        with (
+            patch("conductor.cli.bg_runner.subprocess.Popen", side_effect=_fake_popen),
+            patch("conductor.cli.bg_runner._wait_for_server", return_value=False),
+            patch("conductor.cli.pid.write_pid_file"),
+            pytest.raises(RuntimeError, match="exited immediately with code 7"),
+        ):
+            bg_runner.launch_background(
+                workflow_path=wf_path,
+                inputs={},
+                web_port=9303,
+            )
+
+        assert captured["stdout"].closed
+        assert captured["stderr"].closed
+
+    def test_env_wires_correlation_vars(self, tmp_path: Path) -> None:
+        """``CONDUCTOR_RUN_ID`` / log paths are passed to the child via env."""
+        from conductor.cli import bg_runner
+
+        wf_path = _write_workflow(tmp_path)
+
+        captured: dict[str, Any] = {}
+
+        def _fake_popen(cmd: list[str], **kwargs: Any) -> MagicMock:
+            captured["env"] = kwargs["env"]
+            proc = MagicMock()
+            proc.pid = 1
+            proc.poll.return_value = None
+            return proc
+
+        with (
+            patch("conductor.cli.bg_runner.subprocess.Popen", side_effect=_fake_popen),
+            patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch("conductor.cli.pid.write_pid_file"),
+        ):
+            launch = bg_runner.launch_background(
+                workflow_path=wf_path,
+                inputs={},
+                web_port=9304,
+            )
+
+        env = captured["env"]
+        assert env["CONDUCTOR_WEB_BG"] == "1"
+        assert env["CONDUCTOR_WEB_PORT"] == "9304"
+        assert env["CONDUCTOR_RUN_ID"] == launch.run_id
+        assert env["CONDUCTOR_BG_STDERR_LOG"] == str(launch.stderr_log)
+        assert env["CONDUCTOR_BG_STDOUT_LOG"] == str(launch.stdout_log)
+
+    def test_early_exit_error_mentions_stderr_log_path(self, tmp_path: Path) -> None:
+        """RuntimeError raised on early child exit includes the stderr log path."""
+        from conductor.cli import bg_runner
+
+        wf_path = _write_workflow(tmp_path)
+
+        def _fake_popen(cmd: list[str], **kwargs: Any) -> MagicMock:
+            proc = MagicMock()
+            proc.pid = 1
+            proc.poll.return_value = 42  # immediate exit code 42
+            return proc
+
+        with (
+            patch("conductor.cli.bg_runner.subprocess.Popen", side_effect=_fake_popen),
+            patch("conductor.cli.bg_runner._wait_for_server", return_value=False),
+            patch("conductor.cli.pid.write_pid_file"),
+            pytest.raises(RuntimeError) as exc_info,
+        ):
+            bg_runner.launch_background(
+                workflow_path=wf_path,
+                inputs={},
+                web_port=9305,
+            )
+
+        # The message must point users at the captured log so they can find
+        # the traceback that previously vanished into DEVNULL.
+        msg = str(exc_info.value)
+        assert "exited immediately with code 42" in msg
+        assert "stderr log" in msg
+        assert ".bg.stderr.log" in msg
+
+    def test_dashboard_timeout_error_mentions_stderr_log_path(self, tmp_path: Path) -> None:
+        """RuntimeError raised on dashboard timeout includes the stderr log path."""
+        from conductor.cli import bg_runner
+
+        wf_path = _write_workflow(tmp_path)
+
+        def _fake_popen(cmd: list[str], **kwargs: Any) -> MagicMock:
+            proc = MagicMock()
+            proc.pid = 1
+            proc.poll.return_value = None  # still running
+            return proc
+
+        with (
+            patch("conductor.cli.bg_runner.subprocess.Popen", side_effect=_fake_popen),
+            patch("conductor.cli.bg_runner._wait_for_server", return_value=False),
+            patch("conductor.cli.bg_runner._terminate_child"),
+            patch("conductor.cli.pid.write_pid_file"),
+            pytest.raises(RuntimeError) as exc_info,
+        ):
+            bg_runner.launch_background(
+                workflow_path=wf_path,
+                inputs={},
+                web_port=9306,
+            )
+
+        msg = str(exc_info.value)
+        assert "Dashboard did not start" in msg
+        assert "stderr log" in msg
+        assert ".bg.stderr.log" in msg
+
+
+# ---------------------------------------------------------------------------
+# Filename sanitisation
+# ---------------------------------------------------------------------------
+
+
+class TestSanitizeName:
+    """The bg log filename is derived from the workflow stem and must be safe."""
+
+    def test_strips_path_separators_and_specials(self) -> None:
+        from conductor.cli.bg_runner import _sanitize_name
+
+        assert _sanitize_name("my/weird:name") == "my-weird-name"
+        # In practice the caller passes ``Path(...).stem`` (e.g. "passwd"),
+        # so leading dots are uncommon — but the sanitizer must still
+        # leave the rest of the name intact if such a stem ever arrives.
+        assert _sanitize_name("../etc/passwd") == "..-etc-passwd"
+        assert _sanitize_name("normal-name.v1") == "normal-name.v1"
+
+    def test_empty_falls_back_to_workflow(self) -> None:
+        from conductor.cli.bg_runner import _sanitize_name
+
+        assert _sanitize_name("") == "workflow"
+        assert _sanitize_name("///") == "workflow"

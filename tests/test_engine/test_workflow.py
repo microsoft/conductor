@@ -8,6 +8,7 @@ Tests cover:
 - Error handling
 """
 
+import asyncio
 import sys
 
 import pytest
@@ -2506,3 +2507,223 @@ class TestProviderFactoryReasoningEffortWiring:
             assert provider._default_reasoning_effort == "high"
         finally:
             await provider.close()
+
+
+# ---------------------------------------------------------------------------
+# Exception-handling arms in _execute_loop (issue #116)
+# ---------------------------------------------------------------------------
+
+
+class TestExecuteLoopExceptionArms:
+    """Tests for the SystemExit / BaseException / CancelledError arms.
+
+    Issue #116 added a final ``except BaseException`` arm so silent
+    startup crashes leave a ``workflow_failed`` event in the JSONL log,
+    plus an explicit ``except asyncio.CancelledError: raise`` arm so a
+    user-initiated dashboard stop is not labelled as a spurious failure.
+    """
+
+    @pytest.mark.asyncio
+    async def test_systemexit_emits_workflow_failed_event(
+        self, simple_workflow_config: WorkflowConfig
+    ) -> None:
+        """A ``SystemExit`` from the provider is captured as ``workflow_failed``.
+
+        Without the ``except BaseException`` arm this exception would
+        propagate past the engine's existing ``except Exception`` arm and
+        the JSONL log would silently end after ``agent_started`` — the
+        exact symptom reported in issue #116.
+        """
+        from conductor.events import WorkflowEvent, WorkflowEventEmitter
+
+        def mock_handler(agent, prompt, context):
+            raise SystemExit("simulated startup crash")
+
+        provider = CopilotProvider(mock_handler=mock_handler)
+
+        events: list[WorkflowEvent] = []
+        emitter = WorkflowEventEmitter()
+        emitter.subscribe(events.append)
+
+        engine = WorkflowEngine(simple_workflow_config, provider, event_emitter=emitter)
+
+        with pytest.raises(SystemExit):
+            await engine.run({"question": "anything"})
+
+        failed_events = [e for e in events if e.type == "workflow_failed"]
+        assert len(failed_events) == 1, (
+            f"expected exactly one workflow_failed event; got {[e.type for e in events]}"
+        )
+        fail = failed_events[0]
+        assert fail.data["error_type"] == "SystemExit"
+        assert fail.data.get("is_base_exception") is True
+        assert "simulated startup crash" in fail.data["message"]
+
+    @pytest.mark.asyncio
+    async def test_regular_exception_does_not_set_is_base_exception_flag(
+        self, simple_workflow_config: WorkflowConfig
+    ) -> None:
+        """A regular ``Exception`` must NOT set ``is_base_exception`` on workflow_failed.
+
+        This is the contract Phase 2 will rely on to tell genuine
+        ``BaseException`` crashes (e.g., ``SystemExit``) apart from regular
+        workflow errors. Without this baseline test, a buggy refactor could
+        set the flag unconditionally and the issue would go unnoticed.
+        """
+        from conductor.events import WorkflowEvent, WorkflowEventEmitter
+
+        def mock_handler(agent, prompt, context):
+            raise RuntimeError("regular failure, not a base exception")
+
+        provider = CopilotProvider(mock_handler=mock_handler)
+
+        events: list[WorkflowEvent] = []
+        emitter = WorkflowEventEmitter()
+        emitter.subscribe(events.append)
+
+        engine = WorkflowEngine(simple_workflow_config, provider, event_emitter=emitter)
+
+        with pytest.raises(Exception):  # noqa: B017 - exception type varies by retry wrapping
+            await engine.run({"question": "anything"})
+
+        failed_events = [e for e in events if e.type == "workflow_failed"]
+        assert failed_events, "expected a workflow_failed event for a regular Exception"
+        # The provider's retry loop may wrap RuntimeError into ProviderError,
+        # so we don't assert on error_type — only on the flag's absence.
+        for ev in failed_events:
+            assert ev.data.get("is_base_exception") is not True, (
+                f"regular Exception must NOT set is_base_exception=True; got: {ev.data}"
+            )
+
+    @pytest.mark.asyncio
+    async def test_cancellederror_via_external_task_cancel(
+        self, simple_workflow_config: WorkflowConfig
+    ) -> None:
+        """External ``task.cancel()`` propagates as ``CancelledError`` with no failure event.
+
+        This exercises the real dashboard-stop / parent-cancellation flow:
+        the engine task is running, external code calls ``task.cancel()``,
+        ``CancelledError`` is injected at the next ``await`` point inside
+        the engine, and it must hit the new ``except asyncio.CancelledError:
+        raise`` arm WITHOUT firing ``workflow_failed``.
+
+        We patch ``AgentExecutor.execute`` to be an async ``sleep`` so the
+        cancellation has a real ``await`` point to fire at — the
+        ``mock_handler`` path on the provider runs synchronously and would
+        not be cancellable from outside.
+        """
+        from unittest.mock import patch
+
+        from conductor.events import WorkflowEvent, WorkflowEventEmitter
+
+        started = asyncio.Event()
+
+        async def slow_execute(*args, **kwargs):
+            started.set()
+            await asyncio.sleep(60.0)  # cancellable await point
+            raise AssertionError("should never get here — the task is cancelled first")
+
+        def mock_handler(agent, prompt, context):  # pragma: no cover - patched out
+            return {"answer": "unused"}
+
+        provider = CopilotProvider(mock_handler=mock_handler)
+
+        events: list[WorkflowEvent] = []
+        emitter = WorkflowEventEmitter()
+        emitter.subscribe(events.append)
+
+        engine = WorkflowEngine(simple_workflow_config, provider, event_emitter=emitter)
+
+        with patch(
+            "conductor.executor.agent.AgentExecutor.execute",
+            side_effect=slow_execute,
+        ):
+            task = asyncio.create_task(engine.run({"question": "anything"}))
+            await started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        failed_events = [e for e in events if e.type == "workflow_failed"]
+        assert failed_events == [], (
+            "External task.cancel() must propagate without emitting workflow_failed; "
+            f"got: {[e.data for e in failed_events]}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_bg_log_paths_in_workflow_started_system_metadata(
+        self,
+        simple_workflow_config: WorkflowConfig,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """When ``bg_mode=True``, ``CONDUCTOR_BG_*_LOG`` env vars surface in system metadata.
+
+        This is the contract the web dashboard relies on to display the
+        captured stderr/stdout log paths to the user (issue #116).
+        """
+        from conductor.engine.workflow import RunContext
+        from conductor.events import WorkflowEvent, WorkflowEventEmitter
+
+        monkeypatch.setenv("CONDUCTOR_BG_STDERR_LOG", "/tmp/conductor-test.bg.stderr.log")
+        monkeypatch.setenv("CONDUCTOR_BG_STDOUT_LOG", "/tmp/conductor-test.bg.stdout.log")
+
+        def mock_handler(agent, prompt, context):
+            return {"answer": "ok"}
+
+        provider = CopilotProvider(mock_handler=mock_handler)
+
+        events: list[WorkflowEvent] = []
+        emitter = WorkflowEventEmitter()
+        emitter.subscribe(events.append)
+
+        engine = WorkflowEngine(
+            simple_workflow_config,
+            provider,
+            event_emitter=emitter,
+            run_context=RunContext(bg_mode=True),
+        )
+
+        await engine.run({"question": "anything"})
+
+        started = [e for e in events if e.type == "workflow_started"]
+        assert started, "expected a workflow_started event"
+        system = started[0].data["system"]
+        assert system["bg_mode"] is True
+        assert system["bg_stderr_log"] == "/tmp/conductor-test.bg.stderr.log"
+        assert system["bg_stdout_log"] == "/tmp/conductor-test.bg.stdout.log"
+
+    @pytest.mark.asyncio
+    async def test_bg_log_paths_omitted_when_bg_mode_false(
+        self,
+        simple_workflow_config: WorkflowConfig,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """When ``bg_mode=False``, ``CONDUCTOR_BG_*_LOG`` env vars are NOT surfaced.
+
+        Non-bg runs don't write to bg log files, so emitting these fields
+        with stale env values from a previous shell session would be
+        misleading. The metadata block is gated on ``bg_mode``.
+        """
+        from conductor.events import WorkflowEvent, WorkflowEventEmitter
+
+        monkeypatch.setenv("CONDUCTOR_BG_STDERR_LOG", "/tmp/stale.log")
+        monkeypatch.setenv("CONDUCTOR_BG_STDOUT_LOG", "/tmp/stale.log")
+
+        def mock_handler(agent, prompt, context):
+            return {"answer": "ok"}
+
+        provider = CopilotProvider(mock_handler=mock_handler)
+
+        events: list[WorkflowEvent] = []
+        emitter = WorkflowEventEmitter()
+        emitter.subscribe(events.append)
+
+        engine = WorkflowEngine(simple_workflow_config, provider, event_emitter=emitter)
+
+        await engine.run({"question": "anything"})
+
+        started = [e for e in events if e.type == "workflow_started"]
+        assert started
+        system = started[0].data["system"]
+        assert "bg_stderr_log" not in system
+        assert "bg_stdout_log" not in system

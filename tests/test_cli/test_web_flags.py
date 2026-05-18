@@ -73,8 +73,17 @@ class TestWebFlagAcceptance:
 
     def test_web_bg_flag_passed(self, workflow_file: Path) -> None:
         """Test --web-bg flag forks a background process (does not call run_workflow_async)."""
+        from pathlib import Path as _Path
+
+        from conductor.cli.bg_runner import BackgroundLaunch
+
         with patch("conductor.cli.bg_runner.launch_background") as mock_launch:
-            mock_launch.return_value = "http://127.0.0.1:9999"
+            mock_launch.return_value = BackgroundLaunch(
+                url="http://127.0.0.1:9999",
+                stderr_log=_Path("/tmp/conductor-test-deadbeef.bg.stderr.log"),
+                stdout_log=_Path("/tmp/conductor-test-deadbeef.bg.stdout.log"),
+                run_id="deadbeef",
+            )
 
             result = runner.invoke(app, ["run", str(workflow_file), "--web-bg"])
 
@@ -160,7 +169,7 @@ class TestLaunchBackgroundSilentFlag:
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
             patch("conductor.cli.pid.write_pid_file"),
         ):
-            url = bg_runner.launch_background(
+            launch = bg_runner.launch_background(
                 workflow_path=wf_path,
                 inputs={"question": "hello"},
                 provider_override="copilot",
@@ -169,7 +178,7 @@ class TestLaunchBackgroundSilentFlag:
                 web_port=9099,
             )
 
-        assert url == "http://127.0.0.1:9099"
+        assert launch.url == "http://127.0.0.1:9099"
         cmd = captured["cmd"]
         # Issue #196: ``--silent`` must NOT be injected — see class docstring.
         assert "--silent" not in cmd

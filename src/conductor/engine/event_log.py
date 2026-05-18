@@ -20,6 +20,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import re
+import secrets
 import tempfile
 import time
 from pathlib import Path
@@ -28,6 +31,13 @@ from typing import Any
 from conductor.events import WorkflowEvent
 
 logger = logging.getLogger(__name__)
+
+# ``CONDUCTOR_RUN_ID`` is set by ``conductor.cli.bg_runner`` when launching a
+# ``--web-bg`` child. We validate it as a short hex string before using it in
+# a filename, both to keep the filename path-safe and to reject accidental
+# injection via the env var. 32 hex characters is the upper bound — enough
+# for any reasonable run-id format including a SHA1 prefix.
+_RUN_ID_PATTERN = re.compile(r"[0-9a-fA-F]{1,32}")
 
 
 def _make_json_safe(obj: Any) -> Any:
@@ -81,9 +91,15 @@ class EventLogSubscriber:
             existing_run_id: The run identifier associated with
                 ``existing_path``. Reused (not regenerated) so log /
                 timeline correlation tools see one continuous run.
-        """
-        import secrets
 
+        When neither ``existing_path`` nor ``existing_run_id`` is
+        provided, the run id is taken from the ``CONDUCTOR_RUN_ID``
+        environment variable when it is set to a short hex string —
+        used by :mod:`conductor.cli.bg_runner` to propagate the
+        parent-chosen run id to the detached child so all artefacts
+        of a single bg run share the same id in their filenames (see
+        issue #116). Otherwise a fresh random id is generated.
+        """
         if (
             existing_path is not None
             and existing_run_id
@@ -105,15 +121,29 @@ class EventLogSubscriber:
                     exc_info=True,
                 )
 
+        # Fall through to a fresh log file. When a parent (e.g.
+        # ``conductor.cli.bg_runner``) launches us with ``CONDUCTOR_RUN_ID``
+        # set, honour it so the parent-created bg stderr/stdout log files
+        # and this child's ``.events.jsonl`` file share a run id in their
+        # filenames and cross-correlate. Fall back to a fresh random id
+        # otherwise. See issue #116.
+        env_run_id = os.environ.get("CONDUCTOR_RUN_ID", "")
+        if env_run_id and _RUN_ID_PATTERN.fullmatch(env_run_id):
+            self._run_id = env_run_id.lower()
+        else:
+            if env_run_id:
+                # Malformed env value — log so a typo in a wrapper script
+                # doesn't silently disable bg log correlation.
+                logger.debug(
+                    "Ignoring malformed CONDUCTOR_RUN_ID=%r; using random id",
+                    env_run_id,
+                )
+            self._run_id = secrets.token_hex(4)
         ts = time.strftime("%Y%m%d-%H%M%S")
-        # Append random suffix to avoid filename collisions
-        # when multiple runs start in the same second
-        self._run_id = secrets.token_hex(4)
-        ts = f"{ts}-{self._run_id}"
         self._path = (
             Path(tempfile.gettempdir())
             / "conductor"
-            / f"conductor-{workflow_name}-{ts}.events.jsonl"
+            / f"conductor-{workflow_name}-{ts}-{self._run_id}.events.jsonl"
         )
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._handle = open(self._path, "w", encoding="utf-8")  # noqa: SIM115
