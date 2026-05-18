@@ -349,6 +349,18 @@ export type IterationLimitTarget =
       agent_name?: never;
     };
 
+/**
+ * Narrowed target used in the ``iteration_limit_response`` payload sent
+ * from the dashboard back to the engine. The engine already knows the
+ * group's ``agent_count`` from the original ``iteration_limit_reached``
+ * event, so the response only needs to identify the target. Modeling
+ * this as a discriminated union prevents accidentally sending both
+ * ``agent_name`` and ``group_name`` (or neither). See issue #198.
+ */
+export type IterationLimitResponseTarget =
+  | { agent_name: string; group_name?: never }
+  | { group_name: string; agent_name?: never };
+
 export type IterationLimitReachedData = IterationLimitTarget & {
   /**
    * Unique id for this gate occurrence. The dashboard must echo this in the

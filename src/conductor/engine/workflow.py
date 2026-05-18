@@ -2906,6 +2906,14 @@ class WorkflowEngine:
             The user's decision. Never ``None`` — abort/cancel paths are
             handled by the calling code's outer ``finally`` block, which
             converts a missing result into ``aborted=True``.
+
+        Raises:
+            asyncio.CancelledError: If the workflow is cancelled while
+                this gate is waiting (e.g. process shutdown, parent task
+                cancelled). The caller's outer ``finally`` detects this
+                via ``result is None`` and emits
+                ``iteration_limit_resolved`` with ``aborted=True`` before
+                the exception propagates.
         """
         handler = self.max_iterations_handler
         current = self.limits.current_iteration
@@ -2950,10 +2958,7 @@ class WorkflowEngine:
             {cli_task, web_task},
             return_when=asyncio.FIRST_COMPLETED,
         )
-        for task in pending:
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await task
+        await self._drain_iteration_limit_losers(pending)
         winner = done.pop()
         return winner.result()
 
@@ -2993,10 +2998,7 @@ class WorkflowEngine:
             stop_task.cancel()
             raise
 
-        for task in pending:
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await task
+        await self._drain_iteration_limit_losers(pending)
 
         if response_task in done:
             msg = response_task.result()
@@ -3004,17 +3006,56 @@ class WorkflowEngine:
             try:
                 additional = max(0, int(raw))
             except (TypeError, ValueError):
+                # Frontend bug or corrupted payload — degrade to stop so the
+                # workflow doesn't hang, but surface the malformed value so
+                # the underlying bug isn't silent (issue #198 review).
+                logger.warning(
+                    "Iteration-limit gate %s received malformed "
+                    "additional_iterations=%r; treating as stop.",
+                    gate_id,
+                    raw,
+                )
                 additional = 0
             return MaxIterationsPromptResult(
                 continue_execution=additional > 0,
                 additional_iterations=additional,
             )
 
-        # stop_task won the race — treat as explicit stop.
+        # stop_task won the race — treat as explicit stop. Log so a
+        # post-mortem can distinguish a dashboard-stop (POST /api/stop or
+        # /api/kill) from the user clicking the modal's Stop button, which
+        # produces the same MaxIterationsPromptResult shape (issue #198
+        # review).
+        logger.info(
+            "Iteration-limit gate %s resolved by dashboard stop signal",
+            gate_id,
+        )
         return MaxIterationsPromptResult(
             continue_execution=False,
             additional_iterations=0,
         )
+
+    @staticmethod
+    async def _drain_iteration_limit_losers(pending: set[asyncio.Task[Any]]) -> None:
+        """Cancel and await the loser tasks of an iteration-limit race.
+
+        ``CancelledError`` is the expected outcome and is swallowed. Any
+        other exception means the loser task hit a real bug — log it with
+        traceback so the underlying defect isn't silent, even though the
+        winner already determined control flow (issue #198 review).
+        """
+        for task in pending:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.warning(
+                    "Iteration-limit %s task raised after cancellation",
+                    task.get_name(),
+                    exc_info=True,
+                )
 
     def _find_agent(self, name: str) -> AgentDef | None:
         """Find agent by name.

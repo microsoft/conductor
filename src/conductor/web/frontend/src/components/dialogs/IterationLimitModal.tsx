@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { AlertTriangle, Play, StopCircle } from 'lucide-react';
 import { useWorkflowStore } from '@/stores/workflow-store';
+import type { IterationLimitResponseTarget } from '@/types/events';
 
 const DEFAULT_ADDITIONAL_ITERATIONS = 10;
 
@@ -10,9 +11,10 @@ const DEFAULT_ADDITIONAL_ITERATIONS = 10;
  *
  * Issue #198: in ``--web-bg`` (and ``--web``) the engine has no CLI prompt
  * to fall through to, so this modal is the only way the user can resolve
- * the gate without killing the process. Dismissing the modal without a
- * choice keeps the workflow paused — the user must explicitly continue
- * or stop.
+ * the gate without killing the process. The modal is intentionally
+ * non-dismissable (no close button, no Escape, no click-outside-to-close)
+ * because accidentally dismissing it would leave the workflow paused with
+ * no way to resume — the user must explicitly continue or stop.
  *
  * Hidden automatically when ``iterationLimitGate`` clears (via the
  * ``iteration_limit_resolved`` event handler in the store) or when
@@ -57,8 +59,8 @@ export function IterationLimitModal() {
   const continueDisabled =
     !canInteract || parsedAdditional == null || parsedAdditional <= 0;
 
-  const buildTarget = () =>
-    gate.agent_name
+  const buildTarget = (): IterationLimitResponseTarget =>
+    gate.agent_name !== undefined
       ? { agent_name: gate.agent_name }
       : { group_name: gate.group_name };
 

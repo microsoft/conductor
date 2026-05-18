@@ -37,6 +37,7 @@ import type {
   SubworkflowFailedData,
   IterationLimitReachedData,
   IterationLimitResolvedData,
+  IterationLimitResponseTarget,
 } from '@/types/events';
 
 export interface ActivityEntry {
@@ -347,9 +348,13 @@ interface WorkflowState {
    * integer to continue with N more iterations. ``gateId`` must match the
    * id from the most recent ``iteration_limit_reached`` event so the engine
    * ignores stale responses.
+   *
+   * ``target`` uses a discriminated union — exactly one of ``agent_name`` or
+   * ``group_name`` must be set, preventing accidental dual-target payloads
+   * that the engine wouldn't know how to interpret.
    */
   sendIterationLimitResponse: (
-    target: { agent_name?: string; group_name?: string },
+    target: IterationLimitResponseTarget,
     gateId: string,
     additionalIterations: number,
   ) => void;
@@ -588,11 +593,17 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
     if (!send) return;
     // Clamp to non-negative integer. 0 means "stop", N>0 means "continue with N more".
     const additional = Math.max(0, Math.floor(Number(additionalIterations) || 0));
+    // ``target`` is a discriminated union — exactly one branch is set, so a
+    // simple `in` narrowing produces the right payload shape without risk of
+    // sending both fields.
+    const targetFields =
+      'agent_name' in target
+        ? { agent_name: target.agent_name }
+        : { group_name: target.group_name };
     send({
       type: 'iteration_limit_response',
       gate_id: gateId,
-      ...(target.agent_name ? { agent_name: target.agent_name } : {}),
-      ...(target.group_name ? { group_name: target.group_name } : {}),
+      ...targetFields,
       additional_iterations: additional,
     });
   },

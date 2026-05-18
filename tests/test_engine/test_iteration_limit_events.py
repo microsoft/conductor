@@ -992,3 +992,67 @@ async def test_web_only_path_clamps_negative_additional_iterations() -> None:
     assert len(resolved) == 1
     assert resolved[0].data["continue_execution"] is False
     assert resolved[0].data["additional_iterations"] == 0
+
+
+@pytest.mark.asyncio
+async def test_web_only_path_used_when_stdin_is_not_a_tty_without_bg_mode() -> None:
+    """Web dashboard + foreground ``--web`` but stdin redirected (``< /dev/null``,
+    docker container, CI) also takes the web-only path — not the race.
+
+    Without this check, a user invoking ``conductor run --web`` with
+    redirected stdin would regress to the original #198 silent-exit
+    pattern because the CLI ``IntPrompt.ask`` would synchronously raise
+    ``EOFError`` and race-win every dashboard click.
+
+    Distinct from ``test_web_only_path_continues_via_dashboard_in_bg_mode``:
+    that test sets ``bg_mode=True``. This test sets ``bg_mode=False`` and
+    patches ``sys.stdin.isatty`` to exercise the second half of the
+    ``cli_usable = not self._bg_mode and sys.stdin.isatty()`` guard.
+    """
+    config = _looper_config(max_iterations=2)
+    provider = CopilotProvider(mock_handler=lambda a, p, c: {"result": "ok"})
+    collector = EventCollector()
+    dashboard = WebDashboardStub()
+
+    def enqueue_on_reached(event: WorkflowEvent) -> None:
+        if event.type == "iteration_limit_reached":
+            dashboard.enqueue_response(
+                gate_id=event.data["gate_id"],
+                additional_iterations=0,
+                agent_name="looper",
+            )
+
+    collector.subscribe(enqueue_on_reached)
+
+    engine = WorkflowEngine(
+        config,
+        provider=provider,
+        event_emitter=collector,
+        skip_gates=False,
+        web_dashboard=dashboard,  # type: ignore[arg-type]
+        run_context=RunContext(bg_mode=False),
+    )
+
+    async def fail_cli(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError(
+            "CLI prompt was invoked even though stdin is not a TTY; "
+            "the engine must wait on the dashboard instead (issue #198)"
+        )
+
+    with (
+        patch("sys.stdin.isatty", return_value=False),
+        patch(
+            "conductor.gates.human.MaxIterationsHandler.handle_limit_reached",
+            side_effect=fail_cli,
+        ),
+        pytest.raises(MaxIterationsError),
+    ):
+        await asyncio.wait_for(engine.run({}), timeout=5.0)
+
+    # Dashboard resolved the gate without any CLI involvement.
+    reached = collector.by_type("iteration_limit_reached")
+    assert dashboard.awaited_gate_ids == [reached[0].data["gate_id"]]
+    resolved = collector.by_type("iteration_limit_resolved")
+    assert len(resolved) == 1
+    assert resolved[0].data["continue_execution"] is False
+    assert resolved[0].data["additional_iterations"] == 0
