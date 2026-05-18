@@ -761,6 +761,98 @@ class TestWaitForGateResponse:
         assert dashboard._gate_response_queue.empty()
 
 
+class TestWaitForIterationLimitResponse:
+    """Tests for WebDashboard.wait_for_iteration_limit_response (issue #198)."""
+
+    @pytest.mark.asyncio
+    async def test_returns_matching_response(self) -> None:
+        """Returns the response whose gate_id matches the awaited gate."""
+        _, dashboard = _make_dashboard()
+        await dashboard._iteration_limit_response_queue.put(
+            {
+                "gate_id": "gate-abc",
+                "agent_name": "researcher",
+                "additional_iterations": 5,
+            }
+        )
+
+        msg = await asyncio.wait_for(
+            dashboard.wait_for_iteration_limit_response("gate-abc"), timeout=1.0
+        )
+
+        assert msg["gate_id"] == "gate-abc"
+        assert msg["additional_iterations"] == 5
+
+    @pytest.mark.asyncio
+    async def test_discards_stale_responses_by_gate_id(self) -> None:
+        """Responses with a non-matching gate_id are dropped, not re-queued.
+
+        The same target (agent or parallel group) can trigger ``iteration_limit_reached``
+        more than once in a run. Without gate_id matching, a stale double-click
+        from the previous gate could resolve the next one with the user's
+        earlier choice. The gate_id guards against this.
+        """
+        _, dashboard = _make_dashboard()
+        await dashboard._iteration_limit_response_queue.put(
+            {
+                "gate_id": "old-gate",
+                "agent_name": "researcher",
+                "additional_iterations": 0,
+            }
+        )
+        await dashboard._iteration_limit_response_queue.put(
+            {
+                "gate_id": "current-gate",
+                "agent_name": "researcher",
+                "additional_iterations": 10,
+            }
+        )
+
+        msg = await asyncio.wait_for(
+            dashboard.wait_for_iteration_limit_response("current-gate"), timeout=1.0
+        )
+
+        assert msg["gate_id"] == "current-gate"
+        assert msg["additional_iterations"] == 10
+        # Stale message was consumed and dropped, not re-queued — otherwise
+        # a busy loop would re-examine it on every subsequent gate.
+        assert dashboard._iteration_limit_response_queue.empty()
+
+    def test_websocket_routes_iteration_limit_response_to_queue(self) -> None:
+        """``iteration_limit_response`` WS messages land in the dedicated queue.
+
+        End-to-end check: a real WebSocket client sending the message
+        type used by the dashboard reaches the queue ``_wait_for_web_iteration_limit``
+        consumes, not the gate-response or dialog queues.
+        """
+        _, dashboard = _make_dashboard()
+        with TestClient(dashboard.app) as client, client.websocket_connect("/ws") as ws:
+            ws.send_json(
+                {
+                    "type": "iteration_limit_response",
+                    "gate_id": "gate-xyz",
+                    "agent_name": "loopy_agent",
+                    "additional_iterations": 3,
+                }
+            )
+
+            # Allow the server's WS receive loop to process the message
+            # before we inspect the queue. A short poll keeps the test
+            # fast while not racing the event loop.
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                if not dashboard._iteration_limit_response_queue.empty():
+                    break
+                time.sleep(0.01)
+
+            assert not dashboard._iteration_limit_response_queue.empty()
+            assert dashboard._gate_response_queue.empty()
+            assert dashboard._dialog_response_queue.empty()
+            msg = dashboard._iteration_limit_response_queue.get_nowait()
+            assert msg["gate_id"] == "gate-xyz"
+            assert msg["additional_iterations"] == 3
+
+
 async def _short_grace(event: asyncio.Event, delay: float) -> None:
     """Helper for testing: short grace period."""
     await asyncio.sleep(delay)

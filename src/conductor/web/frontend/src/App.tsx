@@ -4,6 +4,7 @@ import { BreadcrumbBar } from '@/components/layout/BreadcrumbBar';
 import { StatusBar } from '@/components/layout/StatusBar';
 import { ReplayBar } from '@/components/layout/ReplayBar';
 import { ResizableLayout } from '@/components/layout/ResizableLayout';
+import { IterationLimitModal } from '@/components/dialogs/IterationLimitModal';
 import { useWebSocket } from '@/hooks/use-websocket';
 import { useReplay } from '@/hooks/use-replay';
 import { useWorkflowStore } from '@/stores/workflow-store';
@@ -59,6 +60,7 @@ export default function App() {
       <BreadcrumbBar />
       <ResizableLayout />
       {replayMode ? <ReplayBar /> : <StatusBar />}
+      {!replayMode && <IterationLimitModal />}
     </div>
   );
 }

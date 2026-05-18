@@ -350,6 +350,13 @@ export type IterationLimitTarget =
     };
 
 export type IterationLimitReachedData = IterationLimitTarget & {
+  /**
+   * Unique id for this gate occurrence. The dashboard must echo this in the
+   * ``iteration_limit_response`` payload so a stale or duplicated response
+   * from a previous gate cannot resolve a later gate for the same target.
+   * Issue #198.
+   */
+  gate_id: string;
   current_iteration: number;
   max_iterations: number;
   /** Last up to 5 agents executed, oldest to newest. */
@@ -372,6 +379,8 @@ export type IterationLimitResolvedData = (
   | { agent_name: string; group_name?: never }
   | { group_name: string; agent_name?: never }
 ) & {
+  /** Echo of the gate_id from the corresponding ``iteration_limit_reached``. */
+  gate_id?: string;
   /**
    * ``true`` when the gate was resolved by continuing (user prompt or, in
    * ``--skip-gates`` mode, the auto-decision); ``false`` when the workflow

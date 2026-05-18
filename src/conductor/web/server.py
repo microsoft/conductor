@@ -87,6 +87,12 @@ class WebDashboard:
         # Dialog response channel (web client → engine)
         self._dialog_response_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
 
+        # Iteration-limit response channel (web client → engine). When the
+        # engine reaches ``max_iterations`` and a dashboard is connected, the
+        # user resolves the gate from the modal in the dashboard and the
+        # response is delivered here. See issue #198.
+        self._iteration_limit_response_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
         # Auto-shutdown support (--web-bg)
         self._bg_event = asyncio.Event()
         self._grace_task: asyncio.Task[None] | None = None
@@ -324,6 +330,10 @@ class WebDashboard:
                             "dialog_decline",
                         ):
                             self._dialog_response_queue.put_nowait(msg)
+                        elif (
+                            isinstance(msg, dict) and msg.get("type") == "iteration_limit_response"
+                        ):
+                            self._iteration_limit_response_queue.put_nowait(msg)
                     except (json.JSONDecodeError, TypeError):
                         pass  # Ignore non-JSON messages (keep-alive pings)
             except WebSocketDisconnect:
@@ -453,6 +463,41 @@ class WebDashboard:
                 msg.get("dialog_id"),
                 agent_name,
                 dialog_id,
+            )
+
+    async def wait_for_iteration_limit_response(self, gate_id: str) -> dict[str, Any]:
+        """Wait for an iteration-limit response from a web client.
+
+        Blocks until an ``iteration_limit_response`` message is received via
+        WebSocket whose ``gate_id`` matches the one passed in. Non-matching
+        messages are discarded with a warning — because each
+        ``iteration_limit_reached`` event carries a fresh ``gate_id``, a
+        stale or duplicated click from a previous gate cannot resolve a
+        later gate even when both target the same agent or parallel group.
+
+        Args:
+            gate_id: The unique id emitted with the active
+                ``iteration_limit_reached`` event.
+
+        Returns:
+            The response payload dict with at minimum ``additional_iterations``
+            (an int; ``0`` means stop, ``N > 0`` means continue with N more).
+
+        See:
+            Issue #198 — ``conductor resume --web-bg`` previously exited
+            silently when ``max_iterations`` was reached because the bg
+            child has ``stdin=DEVNULL`` and the CLI prompt fell through
+            to "stop". This channel lets the dashboard resolve the gate
+            without a TTY.
+        """
+        while True:
+            msg = await self._iteration_limit_response_queue.get()
+            if msg.get("gate_id") == gate_id:
+                return msg
+            logger.warning(
+                "Discarding stale iteration_limit_response (gate_id=%r) while waiting on %r",
+                msg.get("gate_id"),
+                gate_id,
             )
 
     # ------------------------------------------------------------------

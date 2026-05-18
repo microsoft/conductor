@@ -11,7 +11,9 @@ import contextlib
 import copy
 import json
 import logging
+import sys
 import time as _time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -2750,10 +2752,12 @@ class WorkflowEngine:
             # blocking on the console prompt — otherwise the workflow appears
             # silently stalled when monitored via --web. See issue #134.
             recent_history = self.limits.execution_history[-5:]
+            gate_id = uuid.uuid4().hex
             self._emit(
                 "iteration_limit_reached",
                 {
                     "agent_name": agent_name,
+                    "gate_id": gate_id,
                     "current_iteration": self.limits.current_iteration,
                     "max_iterations": self.limits.max_iterations,
                     "agent_history": recent_history,
@@ -2772,11 +2776,7 @@ class WorkflowEngine:
             try:
                 await self._suspend_listener()
                 try:
-                    result = await self.max_iterations_handler.handle_limit_reached(
-                        current_iteration=self.limits.current_iteration,
-                        max_iterations=self.limits.max_iterations,
-                        agent_history=self.limits.execution_history,
-                    )
+                    result = await self._resolve_max_iterations_gate(gate_id=gate_id)
                 finally:
                     await self._resume_listener()
             finally:
@@ -2784,6 +2784,7 @@ class WorkflowEngine:
                     "iteration_limit_resolved",
                     {
                         "agent_name": agent_name,
+                        "gate_id": gate_id,
                         "continue_execution": (
                             result.continue_execution if result is not None else False
                         ),
@@ -2829,10 +2830,12 @@ class WorkflowEngine:
             # the cross-group execution list, so the possible_loop heuristic
             # may surface false positives for true parallel patterns.
             recent_history = self.limits.execution_history[-5:]
+            gate_id = uuid.uuid4().hex
             self._emit(
                 "iteration_limit_reached",
                 {
                     "group_name": group_name,
+                    "gate_id": gate_id,
                     "agent_count": agent_count,
                     "current_iteration": self.limits.current_iteration,
                     "max_iterations": self.limits.max_iterations,
@@ -2849,11 +2852,7 @@ class WorkflowEngine:
             try:
                 await self._suspend_listener()
                 try:
-                    result = await self.max_iterations_handler.handle_limit_reached(
-                        current_iteration=self.limits.current_iteration,
-                        max_iterations=self.limits.max_iterations,
-                        agent_history=self.limits.execution_history,
-                    )
+                    result = await self._resolve_max_iterations_gate(gate_id=gate_id)
                 finally:
                     await self._resume_listener()
             finally:
@@ -2861,6 +2860,7 @@ class WorkflowEngine:
                     "iteration_limit_resolved",
                     {
                         "group_name": group_name,
+                        "gate_id": gate_id,
                         "continue_execution": (
                             result.continue_execution if result is not None else False
                         ),
@@ -2877,6 +2877,144 @@ class WorkflowEngine:
                 self.limits.check_parallel_group_iteration(group_name, agent_count)
             else:
                 raise  # Re-raise MaxIterationsError
+
+    async def _resolve_max_iterations_gate(self, *, gate_id: str) -> MaxIterationsPromptResult:
+        """Resolve a max-iterations gate, choosing CLI / web / race per environment.
+
+        Resolution policy (issue #198):
+
+        - ``skip_gates``: handler auto-stops; no UI.
+        - No web dashboard attached: existing CLI prompt path
+          (``EOFError`` → stop when stdin isn't a TTY).
+        - Web dashboard + (bg mode or non-TTY stdin): **web-only** wait. The
+          CLI prompt is deliberately NOT invoked because ``IntPrompt.ask``
+          would synchronously raise ``EOFError`` (stdin=DEVNULL in
+          ``--web-bg``), get coerced to ``0`` (stop), and race-win every
+          dashboard click. That was the original ``--web-bg`` silent-exit
+          bug. Also watches ``stop_event`` so ``POST /api/stop`` can
+          terminate the wait.
+        - Web dashboard + TTY foreground (``--web`` from a real terminal):
+          race the CLI prompt against the web response. Whichever the user
+          completes first wins; the loser is cancelled.
+
+        Args:
+            gate_id: Unique id emitted on the corresponding
+                ``iteration_limit_reached`` event. The web client echoes
+                this back so we ignore stale responses.
+
+        Returns:
+            The user's decision. Never ``None`` — abort/cancel paths are
+            handled by the calling code's outer ``finally`` block, which
+            converts a missing result into ``aborted=True``.
+        """
+        handler = self.max_iterations_handler
+        current = self.limits.current_iteration
+        maxim = self.limits.max_iterations
+        history = self.limits.execution_history
+
+        # 1. skip_gates → handler auto-stops; no UI.
+        if handler.skip_gates:
+            return await handler.handle_limit_reached(
+                current_iteration=current,
+                max_iterations=maxim,
+                agent_history=history,
+            )
+
+        # 2. No web dashboard → existing CLI-only behavior (TTY or EOF→stop).
+        if self._web_dashboard is None:
+            return await handler.handle_limit_reached(
+                current_iteration=current,
+                max_iterations=maxim,
+                agent_history=history,
+            )
+
+        # 3. Web dashboard + bg or non-TTY → web-only wait.
+        cli_usable = not self._bg_mode and sys.stdin.isatty()
+        if not cli_usable:
+            return await self._wait_for_web_iteration_limit(gate_id)
+
+        # 4. Web dashboard + TTY → race CLI vs web.
+        cli_task = asyncio.create_task(
+            handler.handle_limit_reached(
+                current_iteration=current,
+                max_iterations=maxim,
+                agent_history=history,
+            ),
+            name="iter_limit_cli",
+        )
+        web_task = asyncio.create_task(
+            self._wait_for_web_iteration_limit(gate_id),
+            name="iter_limit_web",
+        )
+        done, pending = await asyncio.wait(
+            {cli_task, web_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in pending:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+        winner = done.pop()
+        return winner.result()
+
+    async def _wait_for_web_iteration_limit(self, gate_id: str) -> MaxIterationsPromptResult:
+        """Wait for the dashboard to resolve a max-iterations gate.
+
+        Races the gate response against the dashboard's stop signal so a
+        ``POST /api/stop`` or ``POST /api/kill`` while waiting (e.g. the
+        user closes the dashboard tab and uses ``conductor stop``) doesn't
+        leave the workflow blocked forever.
+
+        Args:
+            gate_id: Unique id of the gate being awaited.
+
+        Returns:
+            ``MaxIterationsPromptResult`` reflecting the user's choice, or
+            a stop result if the dashboard stop signal fires first.
+        """
+        assert self._web_dashboard is not None  # noqa: S101
+
+        response_task = asyncio.create_task(
+            self._web_dashboard.wait_for_iteration_limit_response(gate_id),
+            name="iter_limit_response",
+        )
+        stop_task = asyncio.create_task(
+            self._web_dashboard.wait_for_stop(),
+            name="iter_limit_stop",
+        )
+
+        try:
+            done, pending = await asyncio.wait(
+                {response_task, stop_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        except asyncio.CancelledError:
+            response_task.cancel()
+            stop_task.cancel()
+            raise
+
+        for task in pending:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+
+        if response_task in done:
+            msg = response_task.result()
+            raw = msg.get("additional_iterations", 0)
+            try:
+                additional = max(0, int(raw))
+            except (TypeError, ValueError):
+                additional = 0
+            return MaxIterationsPromptResult(
+                continue_execution=additional > 0,
+                additional_iterations=additional,
+            )
+
+        # stop_task won the race — treat as explicit stop.
+        return MaxIterationsPromptResult(
+            continue_execution=False,
+            additional_iterations=0,
+        )
 
     def _find_agent(self, name: str) -> AgentDef | None:
         """Find agent by name.
