@@ -123,6 +123,71 @@ class TestWebBgMutualExclusion:
         assert result.exit_code != 0
 
 
+class TestLaunchBackgroundSilentFlag:
+    """Regression tests for issue #196 — bg_runner must not pass --silent.
+
+    The child's ``stdout``/``stderr`` are already redirected to ``DEVNULL``, so
+    ``--silent`` adds nothing for the user. Worse, it sets
+    ``verbose_mode=False`` in the child, which gates provider-side SDK event
+    logging that ``--log-file`` would otherwise capture.
+    """
+
+    def test_launch_background_does_not_pass_silent(self, tmp_path: Path) -> None:
+        """``launch_background`` must not inject ``--silent`` into the cmd.
+
+        Asserts both the negative contract (no ``--silent``) and the positive
+        contract (expected flags still present) so that an accidental
+        regression that drops both ``--silent`` *and* another flag would
+        still be caught. Mirrors ``test_builds_resume_subcommand_with_workflow``
+        on the resume side.
+        """
+        from conductor.cli import bg_runner
+
+        wf_path = tmp_path / "wf.yaml"
+        wf_path.write_text("workflow: {name: x, entry_point: a}\nagents: []\n")
+
+        captured: dict[str, list[str]] = {}
+
+        def _fake_popen(cmd: list[str], **_kwargs: object) -> MagicMock:
+            captured["cmd"] = cmd
+            proc = MagicMock()
+            proc.pid = 12345
+            proc.poll.return_value = None
+            return proc
+
+        with (
+            patch("conductor.cli.bg_runner.subprocess.Popen", side_effect=_fake_popen),
+            patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch("conductor.cli.pid.write_pid_file"),
+        ):
+            url = bg_runner.launch_background(
+                workflow_path=wf_path,
+                inputs={"question": "hello"},
+                provider_override="copilot",
+                skip_gates=True,
+                metadata={"tracker": "ado"},
+                web_port=9099,
+            )
+
+        assert url == "http://127.0.0.1:9099"
+        cmd = captured["cmd"]
+        # Issue #196: ``--silent`` must NOT be injected — see class docstring.
+        assert "--silent" not in cmd
+        # Positive contract: expected flags must still be present.
+        assert "run" in cmd
+        assert str(wf_path) in cmd
+        assert "--web" in cmd
+        assert "--web-port" in cmd
+        assert "9099" in cmd
+        assert "--no-interactive" in cmd
+        assert "--input" in cmd
+        assert "question=hello" in cmd
+        assert "--provider" in cmd and "copilot" in cmd
+        assert "--skip-gates" in cmd
+        assert "--metadata" in cmd
+        assert "tracker=ado" in cmd
+
+
 class TestDashboardStartupFailure:
     """Test that dashboard startup failure is non-fatal."""
 

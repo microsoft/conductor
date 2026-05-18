@@ -9,6 +9,13 @@ The child process is fully detached (new session on Unix, new process group on
 Windows) so it outlives the parent. It auto-shuts down after the workflow
 completes and all WebSocket clients disconnect (the existing ``--web`` +
 ``bg=True`` behavior in ``WebDashboard``).
+
+The child's stdout/stderr/stdin are redirected to ``DEVNULL`` in the Popen
+call, not suppressed via ``--silent``. This is a deliberate design choice:
+``--silent`` would also set ``verbose_mode=False``, which gates provider-side
+SDK event logging that ``--log-file`` writes to disk. Relying on DEVNULL
+keeps the file log populated for detached children where the user has no
+other way to observe runtime behavior (see issue #196).
 """
 
 from __future__ import annotations
@@ -164,12 +171,15 @@ def launch_background(
     if web_port == 0:
         web_port = _find_free_port()
 
-    # Build the subprocess command
+    # Build the subprocess command. Console output is already redirected to
+    # DEVNULL via the Popen ``stdout``/``stderr`` kwargs below, so the child
+    # runs at default verbosity. This keeps ``verbose_log()`` and provider
+    # SDK event logging active so ``--log-file`` captures a real trace when
+    # enabled (see issue #196).
     cmd: list[str] = [
         sys.executable,
         "-m",
         "conductor",
-        "--silent",  # suppress CLI output in the background process
         "run",
         str(workflow_path),
         "--web",
@@ -280,12 +290,15 @@ def launch_background_resume(
     if web_port == 0:
         web_port = _find_free_port()
 
-    # Build the subprocess command
+    # Build the subprocess command. Console output is already redirected to
+    # DEVNULL via the Popen ``stdout``/``stderr`` kwargs below, so the child
+    # runs at default verbosity. This keeps ``verbose_log()`` and provider
+    # SDK event logging active so ``--log-file`` captures a real trace when
+    # enabled (see issue #196).
     cmd: list[str] = [
         sys.executable,
         "-m",
         "conductor",
-        "--silent",  # suppress CLI output in the background process
         "resume",
     ]
 

@@ -380,9 +380,11 @@ class TestLaunchBackgroundResume:
 
         assert url == "http://127.0.0.1:9099"
         cmd = captured["cmd"]
-        # `--silent` is global and must precede the subcommand
-        assert "--silent" in cmd
-        assert cmd.index("resume") > cmd.index("--silent")
+        # ``--silent`` must NOT be injected: console output is already
+        # suppressed by Popen ``stdout``/``stderr=DEVNULL``, and ``--silent``
+        # would also gate provider-side verbose logging that ``--log-file``
+        # relies on. See issue #196.
+        assert "--silent" not in cmd
         assert str(wf_path) in cmd
         assert "--web" in cmd
         assert "--web-port" in cmd
