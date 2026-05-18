@@ -647,6 +647,18 @@ class WorkflowEngine:
         """
         self._suppress_workflow_started_emit = True
 
+    def clear_web_dashboard(self) -> None:
+        """Detach the web dashboard from the engine and its dialog handler.
+
+        Used by the CLI resume / run paths when ``dashboard.start()`` fails
+        after the engine has already captured the dashboard reference at
+        construction time. Without this, downstream code (human gates,
+        dialog handlers) would block forever waiting on a WebSocket
+        connection that will never arrive.
+        """
+        self._web_dashboard = None
+        self._dialog_handler.web_dashboard = None
+
     def _make_event_callback(self, agent_name: str) -> Any:
         """Create an event callback for an agent that forwards to the emitter.
 

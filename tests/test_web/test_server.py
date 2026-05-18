@@ -1178,6 +1178,87 @@ class TestReplaySyntheticFromContext:
         for ev in dashboard._event_history:
             assert ev["timestamp"] == 42.0
 
+    def _build_for_each_config(self):
+        """WorkflowConfig with a for-each group ``f`` over a script agent."""
+        from conductor.config.schema import (
+            ForEachDef,
+            RuntimeConfig,
+            WorkflowConfig,
+            WorkflowDef,
+        )
+
+        return WorkflowConfig(
+            workflow=WorkflowDef(
+                name="t",
+                entry_point="f",
+                runtime=RuntimeConfig(provider="copilot", model="gpt-5"),
+            ),
+            agents=[],
+            for_each=[
+                ForEachDef.model_validate(
+                    {
+                        "name": "f",
+                        "type": "for_each",
+                        "source": "workflow.input.items",
+                        "as": "item",
+                        "agent": {"name": "worker", "prompt": "{{ item }}", "routes": []},
+                    }
+                ),
+            ],
+        )
+
+    def test_for_each_uses_count_field_when_present(self) -> None:
+        """Synthetic for-each replay uses the engine's authoritative ``count``."""
+        from conductor.engine.context import WorkflowContext
+
+        emitter, dashboard = _make_dashboard()
+        ctx = WorkflowContext()
+        # Mirror what WorkflowEngine._execute_for_each_group stores:
+        # {"outputs": [...], "errors": {...}, "count": N}.
+        ctx.store("f", {"outputs": [{"a": 1}, {"a": 2}], "errors": {}, "count": 2})
+
+        count = dashboard.replay_synthetic_from_context(ctx, self._build_for_each_config())
+
+        assert count == 2
+        completed = dashboard._event_history[1]["data"]
+        assert completed["item_count"] == 2
+        assert completed["success_count"] == 2
+        assert completed["failure_count"] == 0
+
+    def test_for_each_zero_count_does_not_use_wrapper_dict_length(self) -> None:
+        """Regression test: empty ``outputs`` must not fall through to wrapper dict.
+
+        A naive ``output.get("outputs") or ...`` would treat an empty list as
+        missing and return ``len(output)`` (i.e. the number of keys in the
+        wrapper dict — 3) as the item count.
+        """
+        from conductor.engine.context import WorkflowContext
+
+        emitter, dashboard = _make_dashboard()
+        ctx = WorkflowContext()
+        ctx.store("f", {"outputs": [], "errors": {}, "count": 0})
+
+        count = dashboard.replay_synthetic_from_context(ctx, self._build_for_each_config())
+
+        assert count == 2
+        completed = dashboard._event_history[1]["data"]
+        assert completed["item_count"] == 0
+        assert completed["success_count"] == 0
+
+    def test_for_each_falls_back_to_outputs_length_when_count_missing(self) -> None:
+        """If ``count`` is absent, derive item count from ``len(outputs)``."""
+        from conductor.engine.context import WorkflowContext
+
+        emitter, dashboard = _make_dashboard()
+        ctx = WorkflowContext()
+        ctx.store("f", {"outputs": [{"a": 1}], "errors": {}})
+
+        count = dashboard.replay_synthetic_from_context(ctx, self._build_for_each_config())
+
+        assert count == 2
+        completed = dashboard._event_history[1]["data"]
+        assert completed["item_count"] == 1
+
 
 class TestPrependWorkflowStarted:
     """Tests for WebDashboard.prepend_workflow_started (issue #167)."""

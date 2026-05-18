@@ -380,9 +380,11 @@ class WebDashboard:
     # ------------------------------------------------------------------
 
     # Root-level lifecycle events that must be dropped on replay:
-    # - ``workflow_started`` is re-emitted by the resumed engine with the
-    #   current (possibly modified) config; the stale original would
-    #   double-increment frontend ``wfDepth`` and visualise stale topology.
+    # - ``workflow_started`` is reconstructed from the *current* YAML by
+    #   the CLI (via :meth:`WorkflowEngine.build_workflow_started_data`)
+    #   and prepended to ``_event_history`` *before* replay; replaying
+    #   the stale original here would double-increment frontend
+    #   ``wfDepth`` and visualise stale topology.
     # - ``workflow_completed`` / ``workflow_failed`` from the original run
     #   would make the dashboard appear finished before the resumed agent
     #   starts.
@@ -423,7 +425,7 @@ class WebDashboard:
         orphan nodes from ``agent_started``/``parallel_agent_completed``
         replays that arrive before topology is set up. Must be called
         before :meth:`start` so the seeded event is observed by every
-        client via ``GET /api/state`` and the WebSocket replay loop.
+        client via ``GET /api/state``.
 
         Args:
             data: Event payload (matches ``WorkflowEngine.build_workflow_started_data()``).
@@ -536,7 +538,6 @@ class WebDashboard:
 
         ts = checkpoint_timestamp if checkpoint_timestamp is not None else _time.time()
 
-        # Build name → agent_def lookup for type resolution
         agent_defs = {a.name: a for a in (config.agents or [])}
         parallel_groups = {g.name: g for g in (config.parallel or [])}
         for_each_groups = {g.name: g for g in (config.for_each or [])}
@@ -548,87 +549,17 @@ class WebDashboard:
         for name in execution_history:
             output = agent_outputs.get(name, {})
             if name in parallel_groups:
-                pg = parallel_groups[name]
-                started_type = "parallel_started"
-                completed_type = "parallel_completed"
-                # The frontend renders parallel_completed as failed unless
-                # ``failure_count === 0`` (workflow-store.ts:1266), so always
-                # emit zeros — we can't know the original counts from the
-                # restored context, but assuming success is the closest match
-                # to "the engine kept going past this group".
-                agent_count = len(getattr(pg, "agents", []) or [])
-                started_data: dict[str, Any] = {
-                    "group_name": name,
-                    "agents": list(getattr(pg, "agents", []) or []),
-                    "synthetic": True,
-                }
-                completed_data: dict[str, Any] = {
-                    "group_name": name,
-                    "outputs": output if isinstance(output, dict) else {},
-                    "success_count": agent_count,
-                    "failure_count": 0,
-                    "elapsed": 0.0,
-                    "synthetic": True,
-                }
+                started_type, started_data, completed_type, completed_data = self._synth_parallel(
+                    name, parallel_groups[name], output
+                )
             elif name in for_each_groups:
-                started_type = "for_each_started"
-                completed_type = "for_each_completed"
-                started_data = {"group_name": name, "synthetic": True}
-                item_count = 0
-                if isinstance(output, dict):
-                    candidate = output.get("outputs") or output.get("items") or output
-                    if isinstance(candidate, (list, dict)):
-                        item_count = len(candidate)
-                completed_data = {
-                    "group_name": name,
-                    "outputs": output if isinstance(output, dict) else {},
-                    "item_count": item_count,
-                    "success_count": item_count,
-                    "failure_count": 0,
-                    "elapsed": 0.0,
-                    "synthetic": True,
-                }
+                started_type, started_data, completed_type, completed_data = self._synth_for_each(
+                    name, output
+                )
             else:
-                agent_def = agent_defs.get(name)
-                agent_type = getattr(agent_def, "type", None) or "agent"
-                if agent_type == "script":
-                    started_type = "script_started"
-                    completed_type = "script_completed"
-                    started_data = {
-                        "agent_name": name,
-                        "iteration": 1,
-                        "synthetic": True,
-                    }
-                    completed_data = {
-                        "agent_name": name,
-                        "elapsed": 0.0,
-                        "stdout": output.get("stdout", "") if isinstance(output, dict) else "",
-                        "stderr": output.get("stderr", "") if isinstance(output, dict) else "",
-                        "exit_code": output.get("exit_code", 0) if isinstance(output, dict) else 0,
-                        "synthetic": True,
-                    }
-                else:
-                    started_type = "agent_started"
-                    completed_type = "agent_completed"
-                    started_data = {
-                        "agent_name": name,
-                        "iteration": 1,
-                        "agent_type": agent_type,
-                        "synthetic": True,
-                    }
-                    output_keys = list(output.keys()) if isinstance(output, dict) else []
-                    completed_data = {
-                        "agent_name": name,
-                        "elapsed": 0.0,
-                        "model": "",
-                        "tokens": 0,
-                        "input_tokens": 0,
-                        "output_tokens": 0,
-                        "cost_usd": 0.0,
-                        "output": output,
-                        "output_keys": output_keys,
-                        "synthetic": True,
-                    }
+                started_type, started_data, completed_type, completed_data = (
+                    self._synth_agent_or_script(name, agent_defs.get(name), output)
+                )
 
             self._event_history.append(
                 {"type": started_type, "timestamp": ts, "data": started_data}
@@ -644,6 +575,109 @@ class WebDashboard:
             len(execution_history),
         )
         return count
+
+    @staticmethod
+    def _synth_parallel(
+        name: str, pg: Any, output: Any
+    ) -> tuple[str, dict[str, Any], str, dict[str, Any]]:
+        """Build synthetic (started, completed) event payloads for a parallel group.
+
+        The frontend renders ``parallel_completed`` as failed unless
+        ``failure_count === 0`` (workflow-store.ts:1266), so always emit
+        zeros — we can't know the original counts from the restored
+        context, but assuming success is the closest match to "the engine
+        kept going past this group".
+        """
+        agents = list(getattr(pg, "agents", []) or [])
+        output_dict = output if isinstance(output, dict) else {}
+        started_data: dict[str, Any] = {
+            "group_name": name,
+            "agents": agents,
+            "synthetic": True,
+        }
+        completed_data: dict[str, Any] = {
+            "group_name": name,
+            "outputs": output_dict,
+            "success_count": len(agents),
+            "failure_count": 0,
+            "elapsed": 0.0,
+            "synthetic": True,
+        }
+        return "parallel_started", started_data, "parallel_completed", completed_data
+
+    @staticmethod
+    def _synth_for_each(name: str, output: Any) -> tuple[str, dict[str, Any], str, dict[str, Any]]:
+        """Build synthetic (started, completed) event payloads for a for-each group.
+
+        The engine stores for-each output as
+        ``{"outputs": <list-or-dict>, "errors": {...}, "count": N}`` (see
+        ``WorkflowEngine._execute_for_each_group``). Use the authoritative
+        ``count`` field when present; only fall back to ``len(outputs)``
+        when that field is missing. Naïve ``output.get("outputs") or ...``
+        would treat an empty list as missing and use the wrapper dict's
+        key count (3) as the item count.
+        """
+        output_dict = output if isinstance(output, dict) else {}
+        item_count = 0
+        if isinstance(output_dict.get("count"), int):
+            item_count = output_dict["count"]
+        elif isinstance(output_dict.get("outputs"), (list, dict)):
+            item_count = len(output_dict["outputs"])
+        started_data: dict[str, Any] = {"group_name": name, "synthetic": True}
+        completed_data: dict[str, Any] = {
+            "group_name": name,
+            "outputs": output_dict,
+            "item_count": item_count,
+            "success_count": item_count,
+            "failure_count": 0,
+            "elapsed": 0.0,
+            "synthetic": True,
+        }
+        return "for_each_started", started_data, "for_each_completed", completed_data
+
+    @staticmethod
+    def _synth_agent_or_script(
+        name: str, agent_def: Any, output: Any
+    ) -> tuple[str, dict[str, Any], str, dict[str, Any]]:
+        """Build synthetic (started, completed) event payloads for an agent/script."""
+        agent_type = getattr(agent_def, "type", None) or "agent"
+        output_dict = output if isinstance(output, dict) else {}
+
+        if agent_type == "script":
+            started_data: dict[str, Any] = {
+                "agent_name": name,
+                "iteration": 1,
+                "synthetic": True,
+            }
+            completed_data: dict[str, Any] = {
+                "agent_name": name,
+                "elapsed": 0.0,
+                "stdout": output_dict.get("stdout", ""),
+                "stderr": output_dict.get("stderr", ""),
+                "exit_code": output_dict.get("exit_code", 0),
+                "synthetic": True,
+            }
+            return "script_started", started_data, "script_completed", completed_data
+
+        started_data = {
+            "agent_name": name,
+            "iteration": 1,
+            "agent_type": agent_type,
+            "synthetic": True,
+        }
+        completed_data = {
+            "agent_name": name,
+            "elapsed": 0.0,
+            "model": "",
+            "tokens": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cost_usd": 0.0,
+            "output": output,
+            "output_keys": list(output_dict.keys()),
+            "synthetic": True,
+        }
+        return "agent_started", started_data, "agent_completed", completed_data
 
     # ------------------------------------------------------------------
     # Async broadcaster

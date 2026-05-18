@@ -730,3 +730,26 @@ class TestBuildAndSuppressWorkflowStarted:
         assert "workflow_started" not in captured_types
         # But workflow_completed IS still emitted (only the start is suppressed).
         assert "workflow_completed" in captured_types
+
+    def test_clear_web_dashboard_detaches_from_engine_and_dialog(self) -> None:
+        """`clear_web_dashboard` drops the dashboard from engine + DialogHandler.
+
+        Regression coverage for the ``resume_workflow_async`` post-fix:
+        the engine captures the dashboard at construction time, so if
+        ``dashboard.start()`` later fails, simply setting the CLI's local
+        ``dashboard = None`` leaves dangling references inside the engine
+        that would block on never-arriving WebSocket gate input.
+        """
+        from unittest.mock import MagicMock
+
+        config = _multi_agent_config()
+        fake_dashboard = MagicMock()
+        engine = WorkflowEngine(config, web_dashboard=fake_dashboard)
+
+        assert engine._web_dashboard is fake_dashboard
+        assert engine._dialog_handler.web_dashboard is fake_dashboard
+
+        engine.clear_web_dashboard()
+
+        assert engine._web_dashboard is None
+        assert engine._dialog_handler.web_dashboard is None

@@ -13,6 +13,7 @@ import re
 import sys
 import tempfile
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -1816,11 +1817,8 @@ async def resume_workflow_async(
                 if existing_log_path is not None:
                     replayed = dashboard.replay_events_from_jsonl(existing_log_path)
                 if replayed == 0:
-                    cp_ts: float | None = None
                     try:
-                        from datetime import datetime as _dt
-
-                        cp_ts = _dt.fromisoformat(cp.created_at).timestamp()
+                        cp_ts: float | None = datetime.fromisoformat(cp.created_at).timestamp()
                     except (TypeError, ValueError):
                         cp_ts = None
                     replayed = dashboard.replay_synthetic_from_context(
@@ -1837,6 +1835,11 @@ async def resume_workflow_async(
                         f"[bold yellow]Warning:[/bold yellow] "
                         f"Dashboard failed to start: {e}. Continuing without dashboard."
                     )
+                    # Drop the dashboard everywhere it's been wired up.
+                    # The engine + DialogHandler captured it at construction
+                    # time and would otherwise block waiting on a never-
+                    # running WebSocket for human gates / dialogs.
+                    engine.clear_web_dashboard()
                     dashboard = None
 
             # Share interrupt_event with dashboard so POST /api/stop can abort agents

@@ -398,6 +398,35 @@ class TestLoadCheckpoint:
         with pytest.raises(CheckpointError, match="missing required field"):
             CheckpointManager.load_checkpoint(f)
 
+    def test_loads_legacy_checkpoint_without_run_id_or_event_log_path(self, tmp_path: Path) -> None:
+        """Old checkpoints written before this PR have neither field.
+
+        Backward compatibility: ``load_checkpoint`` must default both
+        fields to ``""`` without raising.
+        """
+        legacy = tmp_path / "legacy.json"
+        legacy.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "workflow_path": "/x.yaml",
+                    "workflow_hash": "sha256:abc",
+                    "created_at": "2026-01-01T00:00:00+00:00",
+                    "failure": {"error_type": "X", "message": "m", "agent": "a", "iteration": 0},
+                    "inputs": {},
+                    "current_agent": "a",
+                    "context": {"workflow_inputs": {}, "agent_outputs": {}},
+                    "limits": {"current_iteration": 0, "max_iterations": 10},
+                    "copilot_session_ids": {},
+                    # No run_id, no event_log_path — pre-PR shape.
+                }
+            )
+        )
+
+        cp = CheckpointManager.load_checkpoint(legacy)
+        assert cp.run_id == ""
+        assert cp.event_log_path == ""
+
 
 # ---------------------------------------------------------------------------
 # CheckpointManager.find_latest_checkpoint tests

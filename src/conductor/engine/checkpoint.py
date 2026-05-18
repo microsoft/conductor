@@ -78,6 +78,17 @@ class CheckpointData:
         limits: Serialized ``LimitEnforcer`` state.
         copilot_session_ids: Mapping of agent names to Copilot session IDs.
         file_path: Path where the checkpoint file is stored.
+        instructions_preamble: Workspace instructions preamble that was
+            active during the original run, or ``None``.
+        run_id: Original run identifier from the ``EventLogSubscriber``.
+            Empty string when the checkpoint was written by a version
+            of Conductor that predated this field.
+        event_log_path: Filesystem path to the original JSONL event log.
+            Used by the CLI resume path to seed the web dashboard with
+            the original timeline and to append further events to the
+            same log. Empty string when the checkpoint was written by a
+            version of Conductor that predated this field or when the
+            log file was unavailable at checkpoint time.
     """
 
     version: int
