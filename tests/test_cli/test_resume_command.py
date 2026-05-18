@@ -795,7 +795,8 @@ class TestLaunchBackgroundResumeFailures:
         assert captured["stderr"] is _sp.DEVNULL
         assert captured["stdin"] is _sp.DEVNULL
         if _sys.platform == "win32":
-            assert captured["creationflags"] == _sp.CREATE_NEW_PROCESS_GROUP
+            expected_flags = _sp.CREATE_NEW_PROCESS_GROUP | _sp.CREATE_BREAKAWAY_FROM_JOB
+            assert captured["creationflags"] == expected_flags
         else:
             assert captured["start_new_session"] is True
         env = captured["env"]
