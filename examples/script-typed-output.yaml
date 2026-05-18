@@ -1,9 +1,11 @@
 # Script Step with Typed Output Schema Example
 #
-# This example demonstrates a script agent that declares an `output:`
-# schema (issue #118). The script writes a JSON object to stdout; conductor
-# parses it and validates it against the declared schema. Downstream agents
-# and route conditions can then reference typed fields by name instead of
+# This example shows a script agent that declares an `output:` schema,
+# enabling typed downstream access to its fields. The script's STDOUT is
+# reserved for a single JSON object (logs belong on STDERR); conductor
+# parses the JSON, merges it onto the {stdout, stderr, exit_code} baseline,
+# and validates the merged dict against the schema. Downstream agents and
+# route conditions can then reference typed fields by name instead of
 # relying on opaque exit codes or raw stdout strings.
 #
 # This workflow:

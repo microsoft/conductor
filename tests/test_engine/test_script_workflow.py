@@ -670,7 +670,7 @@ class TestScriptOutputSchema:
 
     @pytest.mark.asyncio
     async def test_non_json_stdout_raises_validation_error(self) -> None:
-        """Schema declared + non-JSON stdout → ValidationError with stderr guidance."""
+        """Schema declared + non-JSON stdout → ValidationError surfaces parser detail."""
         config = self._config_with_schema(
             args=["-c", "print('not json')"],
             output={"route": OutputField(type="string")},
@@ -680,13 +680,37 @@ class TestScriptOutputSchema:
         with pytest.raises(ValidationError) as exc_info:
             await engine.run({})
 
-        msg = str(exc_info.value)
+        err = exc_info.value
+        msg = str(err)
         assert "detector" in msg
-        assert "not valid JSON" in msg or "JSON" in msg
+        assert "not valid JSON" in msg
+        # The underlying json.JSONDecodeError text is surfaced so users can
+        # see WHY the parse failed (e.g. "Expecting value: line 1 column 1").
+        assert "line 1" in msg or "Expecting" in msg
+        # The suggestion explicitly mentions writing logs to stderr.
+        assert err.suggestion is not None
+        assert "stderr" in err.suggestion.lower()
+
+    @pytest.mark.asyncio
+    async def test_malformed_json_surfaces_parser_detail(self) -> None:
+        """Truncated/malformed JSON: parser error column/position appears in message."""
+        # Truncated object missing the closing brace.
+        config = self._config_with_schema(
+            args=["-c", 'print(\'{"route": "plan\')'],
+            output={"route": OutputField(type="string")},
+        )
+        engine = WorkflowEngine(config, MagicMock())
+
+        with pytest.raises(ValidationError) as exc_info:
+            await engine.run({})
+
+        msg = str(exc_info.value)
+        # Underlying JSONDecodeError text describes the unterminated string.
+        assert "Unterminated" in msg or "delimiter" in msg or "line 1" in msg
 
     @pytest.mark.asyncio
     async def test_empty_stdout_raises_validation_error(self) -> None:
-        """Empty stdout + schema → ValidationError."""
+        """Empty stdout + schema → ValidationError with stderr-for-logs suggestion."""
         config = self._config_with_schema(
             args=["-c", "pass"],
             output={"route": OutputField(type="string")},
@@ -696,9 +720,10 @@ class TestScriptOutputSchema:
         with pytest.raises(ValidationError) as exc_info:
             await engine.run({})
 
-        # The actionable suggestion should mention stderr for logs.
-        msg = str(exc_info.value)
-        assert "detector" in msg
+        err = exc_info.value
+        assert "detector" in str(err)
+        assert err.suggestion is not None
+        assert "stderr" in err.suggestion.lower()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -721,7 +746,7 @@ class TestScriptOutputSchema:
 
     @pytest.mark.asyncio
     async def test_missing_required_field_raises(self) -> None:
-        """JSON missing a declared field → ValidationError."""
+        """JSON missing a declared field → ValidationError mentions script + field."""
         config = self._config_with_schema(
             args=["-c", 'import json; print(json.dumps({"route": "planning"}))'],
             output={
@@ -731,12 +756,21 @@ class TestScriptOutputSchema:
         )
         engine = WorkflowEngine(config, MagicMock())
 
-        with pytest.raises(ValidationError, match="count"):
+        with pytest.raises(ValidationError) as exc_info:
             await engine.run({})
+
+        err = exc_info.value
+        msg = str(err)
+        # Wrapping in workflow.py adds the script name and stdout-JSON suggestion
+        # on top of the generic validate_output() message.
+        assert "detector" in msg
+        assert "count" in msg
+        assert err.suggestion is not None
+        assert "stderr" in err.suggestion.lower()
 
     @pytest.mark.asyncio
     async def test_wrong_field_type_raises(self) -> None:
-        """JSON field has wrong type → ValidationError."""
+        """JSON field has wrong type → ValidationError mentions script + field."""
         config = self._config_with_schema(
             args=[
                 "-c",
@@ -749,12 +783,16 @@ class TestScriptOutputSchema:
         )
         engine = WorkflowEngine(config, MagicMock())
 
-        with pytest.raises(ValidationError, match="route"):
+        with pytest.raises(ValidationError) as exc_info:
             await engine.run({})
+
+        msg = str(exc_info.value)
+        assert "detector" in msg
+        assert "route" in msg
 
     @pytest.mark.asyncio
     async def test_extra_fields_allowed(self) -> None:
-        """Extra JSON fields beyond schema are kept (matches LLM agent behavior)."""
+        """Extra JSON fields beyond schema are kept (parity with LLM agent output handling)."""
         config = self._config_with_schema(
             args=[
                 "-c",

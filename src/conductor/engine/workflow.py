@@ -2216,7 +2216,24 @@ class WorkflowEngine:
                                                 "Arrays and scalars are not accepted."
                                             ),
                                         )
-                                    validate_output(output_content, agent.output)
+                                    try:
+                                        validate_output(output_content, agent.output)
+                                    except ValidationError as schema_exc:
+                                        # validate_output is shared with LLM agents
+                                        # and its error wording is LLM-flavored
+                                        # ("agent returns ..."). Wrap so script
+                                        # users see the script name and the
+                                        # stdout-JSON contract.
+                                        raise ValidationError(
+                                            f"Script '{agent.name}' stdout JSON "
+                                            f"failed schema validation: "
+                                            f"{schema_exc.args[0]}",
+                                            suggestion=(
+                                                "Emit a JSON object to stdout "
+                                                "with the declared fields and "
+                                                "types. Write logs to stderr."
+                                            ),
+                                        ) from schema_exc
                                 except ValidationError as exc:
                                     self._emit(
                                         "script_failed",

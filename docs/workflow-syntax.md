@@ -223,7 +223,7 @@ agents:
 
 JSON arrays and scalars are ignored (only objects merge). Non-JSON stdout is unchanged. Parsed fields shadow `stdout`/`stderr`/`exit_code` if a script outputs those as JSON keys.
 
-**Declared output schema (strict mode)** — script steps can also declare an `output:` schema using the same syntax as LLM agents. When declared, stdout MUST be a valid JSON object that matches the schema, otherwise the workflow fails with a `ValidationError`:
+**Declared output schema (strict mode)** — script steps can also declare an `output:` schema using the same syntax as LLM agents. When declared, conductor enforces a strict contract: stdout must be a single JSON object, the JSON gets merged onto the `{stdout, stderr, exit_code}` baseline, and the **merged dict** is validated against the schema. If any check fails the workflow aborts with a `ValidationError`:
 
 ```yaml
 agents:
@@ -247,11 +247,13 @@ agents:
 
 Strict-mode semantics:
 
-- **stdout must be a JSON object.** Non-JSON, empty stdout, JSON arrays, and JSON scalars all fail validation. Write logs to `stderr` so they don't interfere with the JSON contract.
-- **Missing or wrong-typed fields fail validation.** Extra fields beyond the schema are kept in `output_content` (matching LLM-agent behavior).
-- **Built-in `stdout`/`stderr`/`exit_code` are validated on the merged dict.** Declaring `exit_code: { type: number }` asserts the built-in matches; if the script emits a shadowing JSON key (e.g. `{"exit_code": "ok"}`), the schema validates the shadowed value.
+- **stdout must be a single JSON object.** Non-JSON, empty stdout, JSON arrays, JSON scalars, and JSON followed by additional text (e.g. log lines) all fail validation with the underlying JSON parser error surfaced for diagnostics. Reserve stdout for the JSON payload and write logs to `stderr`.
+- **Missing or wrong-typed fields fail validation.** Extra fields beyond the schema are kept in the output dict (the validator only enforces declared fields — the same loose-extras policy that LLM-agent structured outputs use).
+- **Validation runs on the merged dict, not the raw JSON.** The `stdout`/`stderr`/`exit_code` built-ins are always present in the dict, with parsed JSON keys overlaid on top. Declaring `exit_code: { type: number }` asserts the built-in matches; if the script emits a shadowing JSON key (e.g. `{"exit_code": "ok"}`), the schema validates the shadowed value.
 - **Failure semantics.** On schema-validation failure, the engine emits `script_failed` (not `script_completed`) and aborts the workflow. The failure event carries the captured stdout, stderr, and exit_code so dashboards and logs can show what the script actually wrote.
 - **`output: {}` opts into strict mode with zero required fields** — useful when you want the JSON-object enforcement without listing fields yet.
+
+Note: this is **structural** parity with LLM agents — the script must emit clean JSON to stdout. The JSON-recovery heuristics LLM agents use (extracting JSON from code fences, wrapping non-object payloads) intentionally do not apply to scripts, which are deterministic.
 
 Without a declared `output:` schema, the legacy auto-merge behavior described above still applies.
 

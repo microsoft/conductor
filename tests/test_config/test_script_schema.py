@@ -104,10 +104,11 @@ class TestScriptAgentDef:
             AgentDef(name="bad", type="script", command="echo", tools=["web_search"])
 
     def test_script_with_output_accepted(self) -> None:
-        """Script agents may declare an `output:` schema (issue #118).
+        """Script agents may declare an `output:` schema at config time (issue #118).
 
-        When a schema is declared, the engine validates JSON stdout against
-        it at runtime. The schema declaration itself should construct cleanly.
+        This test only covers the schema-construction path. Runtime validation
+        of the JSON stdout against the schema is exercised in
+        ``tests/test_engine/test_script_workflow.py::TestScriptOutputSchema``.
         """
         agent = AgentDef(
             name="detector",
@@ -125,7 +126,12 @@ class TestScriptAgentDef:
         assert agent.output["issue_count"].type == "number"
 
     def test_script_with_empty_output_accepted(self) -> None:
-        """Empty `output: {}` opts into strict JSON-object mode with zero fields."""
+        """Empty `output: {}` is accepted at config time.
+
+        Runtime behavior (strict JSON-object mode with zero declared fields)
+        is exercised in
+        ``test_engine/test_script_workflow.py::test_empty_schema_requires_json_object``.
+        """
         agent = AgentDef(
             name="probe",
             type="script",
