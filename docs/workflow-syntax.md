@@ -223,6 +223,40 @@ agents:
 
 JSON arrays and scalars are ignored (only objects merge). Non-JSON stdout is unchanged. Parsed fields shadow `stdout`/`stderr`/`exit_code` if a script outputs those as JSON keys.
 
+**Declared output schema (strict mode)** — script steps can also declare an `output:` schema using the same syntax as LLM agents. When declared, conductor enforces a strict contract: stdout must be a single JSON object, the JSON gets merged onto the `{stdout, stderr, exit_code}` baseline, and the **merged dict** is validated against the schema. If any check fails the workflow aborts with a `ValidationError`:
+
+```yaml
+agents:
+  - name: detector
+    type: script
+    command: pwsh
+    args: ["-File", "{{ workflow.dir }}/scripts/detect.ps1"]
+    output:
+      route:
+        type: string
+        description: Which phase to enter next
+      issue_count:
+        type: number
+    routes:
+      - to: planner
+        when: "route == 'planning'"
+      - to: scaler
+        when: "issue_count > 100"
+      - to: $end
+```
+
+Strict-mode semantics:
+
+- **stdout must be a single JSON object.** Non-JSON, empty stdout, JSON arrays, JSON scalars, and JSON followed by additional text (e.g. log lines) all fail validation with the underlying JSON parser error surfaced for diagnostics. Reserve stdout for the JSON payload and write logs to `stderr`.
+- **Missing or wrong-typed fields fail validation.** Extra fields beyond the schema are kept in the output dict (the validator only enforces declared fields — the same loose-extras policy that LLM-agent structured outputs use).
+- **Validation runs on the merged dict, not the raw JSON.** The `stdout`/`stderr`/`exit_code` built-ins are always present in the dict, with parsed JSON keys overlaid on top. Declaring `exit_code: { type: number }` asserts the built-in matches; if the script emits a shadowing JSON key (e.g. `{"exit_code": "ok"}`), the schema validates the shadowed value.
+- **Failure semantics.** On schema-validation failure, the engine emits `script_failed` (not `script_completed`) and aborts the workflow. The failure event carries the captured stdout, stderr, and exit_code so dashboards and logs can show what the script actually wrote.
+- **`output: {}` opts into strict mode with zero required fields** — useful when you want the JSON-object enforcement without listing fields yet.
+
+Note: this is **structural** parity with LLM agents — the script must emit clean JSON to stdout. The JSON-recovery heuristics LLM agents use (extracting JSON from code fences, wrapping non-object payloads) intentionally do not apply to scripts, which are deterministic.
+
+Omit `output:` to keep the lenient auto-merge behavior described above.
+
 Access in downstream agents:
 
 ```yaml
@@ -243,7 +277,7 @@ routes:
   - to: $end
 ```
 
-**Restrictions** — script steps cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, `output` schema, or `options`. Script steps also cannot be used inside `parallel` groups or `for_each` groups.
+**Restrictions** — script steps cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, or `options`. Script steps also cannot be used inside `parallel` groups or `for_each` groups.
 
 **Environment variable note** — values in `env` are passed as-is to the subprocess (they are not rendered as Jinja2 templates). Use `${VAR}` syntax in the workflow YAML loader if you need environment variable substitution in env values.
 
