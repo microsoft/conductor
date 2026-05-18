@@ -25,6 +25,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   appends to the original log, preserving `run_id` across resume
   generations so log/timeline correlation tools see one continuous run
   (#167).
+- `--web-bg` startup crashes on Windows are no longer silent
+  ([#116](https://github.com/microsoft/conductor/issues/116)). Three
+  changes work together to make any crash forensically traceable:
+  - `conductor.cli.bg_runner` now captures the detached child's stdout
+    and stderr to log files in `$TMPDIR/conductor/` (named to match the
+    existing `.events.jsonl` filename) instead of discarding them with
+    `subprocess.DEVNULL`. A Python traceback or `faulthandler` dump from
+    the child now survives the parent's exit. The captured stderr path
+    is printed alongside the dashboard URL and is included in every
+    background-launch failure message so users always know where to
+    look.
+  - `conductor/__init__.py` enables `faulthandler` at import time
+    (writing to `sys.__stderr__`), so a native crash — segfault, abort,
+    fatal Python error — dumps a Python-level stack trace into the
+    captured stderr log.
+  - `WorkflowEngine._execute_loop` now catches `BaseException` (in
+    addition to the existing `KeyboardInterrupt` / `ConductorError` /
+    `Exception` arms) and emits a `workflow_failed` event with
+    `is_base_exception: true` before re-raising. A bare `SystemExit` or
+    other non-`Exception` failure between `agent_started` and
+    `agent_prompt_rendered` now leaves a structured failure event in the
+    JSONL log instead of an unexplained two-event truncation. An
+    explicit `except asyncio.CancelledError: raise` arm sits in front of
+    it so a normal dashboard-stop or parent cancellation is not
+    mis-reported as an unexpected failure.
+  Two new env vars (`CONDUCTOR_RUN_ID`, `CONDUCTOR_BG_STDERR_LOG`,
+  `CONDUCTOR_BG_STDOUT_LOG`) propagate the parent-chosen run id and log
+  paths to the child so the bg log files and the child's events JSONL
+  share an 8-hex run id in their filenames, and `workflow_started`
+  system metadata surfaces both bg log paths to the dashboard. The root
+  cause of the underlying intermittent Windows crash is still pending —
+  this change makes it diagnosable rather than invisible.
+
 - Workflows that configure `reasoning.effort` (or workflow-wide
   `runtime.default_reasoning_effort`) on the Copilot provider were broken
   for **every named Copilot model** when running against

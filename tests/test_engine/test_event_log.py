@@ -96,6 +96,95 @@ class TestEventLogSubscriber:
         )
         sub.close()
 
+    def test_honours_conductor_run_id_env_var(self, tmp_path, monkeypatch):
+        """``CONDUCTOR_RUN_ID`` (set by bg_runner) is used in the filename and run_id.
+
+        This is what cross-correlates the bg ``.bg.stderr.log`` file with
+        the child's ``.events.jsonl`` file. See issue #116.
+        """
+        monkeypatch.setenv("TMPDIR", str(tmp_path))
+        monkeypatch.setenv("CONDUCTOR_RUN_ID", "abcdef01")
+
+        sub = EventLogSubscriber("env-runid-test")
+        try:
+            assert sub.run_id == "abcdef01"
+            assert "abcdef01" in sub.path.name
+        finally:
+            sub.close()
+
+    def test_lowercases_hex_run_id_from_env(self, tmp_path, monkeypatch):
+        """Mixed-case hex run ids are normalised to lowercase for filename consistency."""
+        monkeypatch.setenv("TMPDIR", str(tmp_path))
+        monkeypatch.setenv("CONDUCTOR_RUN_ID", "ABCDEF01")
+
+        sub = EventLogSubscriber("env-runid-case")
+        try:
+            assert sub.run_id == "abcdef01"
+        finally:
+            sub.close()
+
+    def test_rejects_invalid_run_id_env(self, tmp_path, monkeypatch):
+        """Non-hex / overlong env values are rejected; a fresh random id is used.
+
+        This keeps the filename safe from accidental injection via the env
+        var (e.g. path separators, control characters, very long values).
+        """
+        monkeypatch.setenv("TMPDIR", str(tmp_path))
+        monkeypatch.setenv("CONDUCTOR_RUN_ID", "../etc/passwd")
+
+        sub = EventLogSubscriber("env-runid-bad")
+        try:
+            assert sub.run_id != "../etc/passwd"
+            # Falls back to a fresh 8-hex random id.
+            import re
+
+            assert re.fullmatch(r"[0-9a-f]{8}", sub.run_id), sub.run_id
+        finally:
+            sub.close()
+
+    def test_empty_run_id_env_falls_back_to_random(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("TMPDIR", str(tmp_path))
+        monkeypatch.setenv("CONDUCTOR_RUN_ID", "")
+
+        sub = EventLogSubscriber("env-runid-empty")
+        try:
+            import re
+
+            assert re.fullmatch(r"[0-9a-f]{8}", sub.run_id), sub.run_id
+        finally:
+            sub.close()
+
+    def test_accepts_32_char_hex_run_id(self, tmp_path, monkeypatch):
+        """Upper boundary: a 32-char hex string is the longest accepted run id."""
+        monkeypatch.setenv("TMPDIR", str(tmp_path))
+        monkeypatch.setenv("CONDUCTOR_RUN_ID", "a" * 32)
+
+        sub = EventLogSubscriber("env-runid-32")
+        try:
+            assert sub.run_id == "a" * 32
+            assert "a" * 32 in sub.path.name
+        finally:
+            sub.close()
+
+    def test_rejects_33_char_hex_run_id(self, tmp_path, monkeypatch):
+        """One past the upper boundary: 33-char hex is rejected, falls back to random.
+
+        Guards against an accidental relaxation of the regex to ``{1,}``
+        or removal of the upper bound, which would let arbitrary-length
+        env values into the filename.
+        """
+        import re
+
+        monkeypatch.setenv("TMPDIR", str(tmp_path))
+        monkeypatch.setenv("CONDUCTOR_RUN_ID", "a" * 33)
+
+        sub = EventLogSubscriber("env-runid-33")
+        try:
+            assert sub.run_id != "a" * 33
+            assert re.fullmatch(r"[0-9a-f]{8}", sub.run_id), sub.run_id
+        finally:
+            sub.close()
+
     def test_integrates_with_emitter(self, tmp_path, monkeypatch):
         from conductor.events import WorkflowEventEmitter
 

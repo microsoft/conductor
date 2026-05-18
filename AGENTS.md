@@ -67,7 +67,7 @@ make validate-examples    # validate all examples
 - **cli/**: Typer-based CLI with commands `run`, `validate`, `init`, `templates`, `stop`, `update`, `resume`, `checkpoints`
   - `app.py` - Main entry point, defines the Typer application
   - `run.py` - Workflow execution command with verbose logging helpers
-  - `bg_runner.py` - Background process forking for `--web-bg` mode
+  - `bg_runner.py` - Background process forking for `--web-bg` mode. Captures the detached child's stdout/stderr to `$TMPDIR/conductor/conductor-<name>-<ts>-<runid>.bg.{stderr,stdout}.log` so silent crashes (uncaught Python exceptions, `faulthandler` dumps) leave a forensic trail — DEVNULL is **not** used for stdout/stderr. Passes `CONDUCTOR_RUN_ID`, `CONDUCTOR_BG_STDERR_LOG`, and `CONDUCTOR_BG_STDOUT_LOG` to the child via env so the child's `EventLogSubscriber` shares a run id with the bg log files and surfaces both paths in `workflow_started` system metadata. Returns a `BackgroundLaunch` dataclass (`url`, `stderr_log`, `stdout_log`, `run_id`).
   - `pid.py` - PID file utilities for tracking/stopping background processes
   - `update.py` - Update check and version comparison. Upgrades are delegated to the install script (`install.ps1`/`install.sh`); in-process self-upgrade was removed because on Windows the running Python interpreter sits inside the venv `uv tool install --force` is trying to recreate, which fails with "Access is denied". `conductor update` prints the OS-appropriate install-script one-liner; `conductor update --apply` spawns the installer detached (Windows: new console window; POSIX: `os.execvpe` replace) and exits the current process so file locks release. The startup hint is suppressed by `CONDUCTOR_NO_UPDATE_CHECK=1`, `--silent`, `--help`/`--version`, and the `update` subcommand itself.
 
@@ -127,6 +127,28 @@ make validate-examples    # validate all examples
 - **Route evaluation**: First matching `when` condition wins; no `when` = always matches
 - **Tool resolution**: `null` = all workflow tools, `[]` = none, `[list]` = subset
 - **Reasoning effort**: `runtime.default_reasoning_effort` sets a workflow-wide default; per-agent `reasoning.effort` overrides it. Allowed values: `low`, `medium`, `high`, `xhigh`. Each provider translates the unified value to its native API (Copilot: `reasoning_effort` on the session, validated against the model's `supported_reasoning_efforts`; Claude: extended thinking with budget mapping low=2048, medium=8192, high=16384, xhigh=32768 tokens, with `temperature` coerced to 1.0 and `max_tokens` bumped to fit the budget). See `examples/reasoning-effort.yaml`.
+
+### Debugging `--web-bg` failures
+
+When a `conductor run --web-bg` (or `resume --web-bg`) child dies before
+the dashboard becomes reachable, or crashes mid-run, look at:
+
+1. The child's captured stderr log, printed alongside the dashboard URL
+   on a successful launch and included in every `RuntimeError` message
+   on a failed launch. The path is also stamped into the child's
+   `workflow_started` event under `system.bg_stderr_log` and surfaced
+   in the web dashboard.
+2. The matching `.events.jsonl` file in the same directory — same
+   timestamp and 8-hex run id in the filename, so the three artefacts
+   (`.events.jsonl`, `.bg.stderr.log`, `.bg.stdout.log`) sort together.
+3. For an apparent silent crash, search the events JSONL for a
+   `workflow_failed` event; the `is_base_exception` flag tells you
+   whether the failure escaped the engine's normal `Exception` handling
+   (e.g. a `SystemExit` from a misbehaving library).
+
+`faulthandler` is enabled at import time in `conductor/__init__.py`, so
+a native crash also dumps a Python stack trace to the captured stderr
+log. See issue #116.
 
 ## Tests Structure
 

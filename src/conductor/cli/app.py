@@ -422,7 +422,7 @@ def run(
         from conductor.cli.bg_runner import launch_background
 
         try:
-            url = launch_background(
+            launch = launch_background(
                 workflow_path=workflow_path,
                 inputs=inputs,
                 provider_override=provider,
@@ -434,7 +434,8 @@ def run(
                 workspace_instructions=workspace_instructions,
                 cli_instructions=raw_instructions,
             )
-            console.print(f"[bold cyan]Dashboard:[/bold cyan] {url}")
+            console.print(f"[bold cyan]Dashboard:[/bold cyan] {launch.url}")
+            console.print(f"[dim]Child stderr log: {launch.stderr_log}[/dim]")
             console.print(
                 "[dim]Workflow running in background. Dashboard auto-shuts down after "
                 "workflow completes and all clients disconnect.[/dim]"
@@ -834,7 +835,7 @@ def resume(
         from conductor.cli.bg_runner import launch_background_resume
 
         try:
-            url = launch_background_resume(
+            launch = launch_background_resume(
                 workflow_path=resolved_workflow,
                 checkpoint_path=resolved_checkpoint,
                 provider_override=provider,
@@ -843,7 +844,8 @@ def resume(
                 web_port=web_port,
                 metadata=cli_metadata,
             )
-            console.print(f"[bold cyan]Dashboard:[/bold cyan] {url}")
+            console.print(f"[bold cyan]Dashboard:[/bold cyan] {launch.url}")
+            console.print(f"[dim]Child stderr log: {launch.stderr_log}[/dim]")
             console.print(
                 "[dim]Resumed workflow running in background. Dashboard auto-shuts down after "
                 "workflow completes and all clients disconnect.[/dim]"

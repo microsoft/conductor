@@ -537,6 +537,17 @@ class WorkflowEngine:
         # Parent PID is useful in --web-bg to trace back to the forking CLI process
         if self._bg_mode:
             system["parent_pid"] = os.getppid()
+            # Surface the bg child's captured stderr/stdout log paths so a
+            # user looking at the dashboard or replaying the events JSONL
+            # can find the matching console output. Set by
+            # ``conductor.cli.bg_runner`` when launching the child. See
+            # issue #116.
+            bg_stderr_log = os.environ.get("CONDUCTOR_BG_STDERR_LOG")
+            if bg_stderr_log:
+                system["bg_stderr_log"] = bg_stderr_log
+            bg_stdout_log = os.environ.get("CONDUCTOR_BG_STDOUT_LOG")
+            if bg_stdout_log:
+                system["bg_stdout_log"] = bg_stdout_log
 
         return system
 
@@ -2630,6 +2641,69 @@ class WorkflowEngine:
             # Execute on_error hook for unexpected errors
             self._execute_hook("on_error", error=e)
             self._save_checkpoint_on_failure(e)
+            raise
+        except asyncio.CancelledError:
+            # Normal cancellation path (dashboard stop, parent process exit,
+            # outer ``asyncio.wait_for`` timeout). The caller — typically
+            # ``conductor.cli.run._run_with_stop_signal`` — re-frames the
+            # cancellation as a ConductorError and emits the appropriate
+            # event there. Do NOT emit ``workflow_failed`` here, or the
+            # dashboard would show a spurious "CancelledError" failure
+            # whenever a user clicks Stop.
+            #
+            # No checkpoint is saved on cancellation: cancelled workflows
+            # are not resumable from this point — the user explicitly chose
+            # to stop, and the wrapper-issued ConductorError will trigger
+            # checkpoint save through the ``except ConductorError`` arm on
+            # its way out. See issue #116 review.
+            raise
+        except BaseException as e:
+            # Catch-all for exception classes that don't derive from
+            # ``Exception`` (e.g. ``SystemExit`` raised by a misbehaving
+            # library, fatal runtime errors). Without this arm the silent
+            # Windows startup crash (#116) leaves no ``workflow_failed``
+            # event in the JSONL log, making the failure invisible.
+            #
+            # NOTE: we deliberately do NOT invoke ``on_error`` lifecycle
+            # hooks here. Their declared signature accepts ``Exception |
+            # None``, so user-defined hooks may assume ``e.args`` /
+            # ``traceback`` semantics that don't hold for ``SystemExit``,
+            # and surfacing a process-exit signal to them would change
+            # their contract. Users who need hook-like notification for
+            # ``BaseException`` failures should subscribe to the
+            # ``workflow_failed`` event and check ``is_base_exception``.
+            #
+            # The diagnostic side effects below (``_emit``,
+            # ``_save_checkpoint_on_failure``) are wrapped in their own
+            # ``try/except`` blocks: if either of them raised here, the
+            # raised side-effect exception would replace the original
+            # ``BaseException`` on its way out of this handler, masking
+            # the exact crash we're trying to surface. Print a warning to
+            # stderr instead so the diagnostic regression is visible, but
+            # the ``raise`` at the end always re-raises the *original* ``e``.
+            try:
+                self._emit(
+                    "workflow_failed",
+                    {
+                        "error_type": type(e).__name__,
+                        "message": str(e),
+                        "agent_name": self._current_agent_name,
+                        "is_base_exception": True,
+                    },
+                )
+            except Exception as emit_exc:  # noqa: BLE001 - must not mask `e`
+                print(
+                    f"conductor: WARNING: failed to emit workflow_failed for "
+                    f"{type(e).__name__}: {emit_exc}",
+                    file=sys.stderr,
+                )
+            try:
+                self._save_checkpoint_on_failure(e)
+            except Exception as ckpt_exc:  # noqa: BLE001 - must not mask `e`
+                print(
+                    f"conductor: WARNING: checkpoint save raised unexpectedly: {ckpt_exc}",
+                    file=sys.stderr,
+                )
             raise
 
     # Type-appropriate zero values for optional inputs with no declared default.
