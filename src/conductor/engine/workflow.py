@@ -29,12 +29,14 @@ from conductor.exceptions import (
     ExecutionError,
     InterruptError,
     MaxIterationsError,
+    ValidationError,
 )
 from conductor.exceptions import (
     TimeoutError as ConductorTimeoutError,
 )
 from conductor.executor.agent import AgentExecutor
 from conductor.executor.linkify import linkify_markdown
+from conductor.executor.output import validate_output
 from conductor.executor.script import ScriptExecutor, ScriptOutput
 from conductor.executor.template import TemplateRenderer
 from conductor.gates.human import (
@@ -2151,6 +2153,85 @@ class WorkflowEngine:
                                 raise
                             _script_elapsed = _time.time() - _script_start
 
+                            # Build structured output: stdout/stderr/exit_code baseline,
+                            # with parsed JSON object fields (if present) merged on top.
+                            output_content: dict[str, Any] = {
+                                "stdout": script_output.stdout,
+                                "stderr": script_output.stderr,
+                                "exit_code": script_output.exit_code,
+                            }
+                            # Auto-parse JSON stdout: if stdout is a valid JSON
+                            # object, merge its fields into output so they're
+                            # accessible as output.field_name in templates and
+                            # route conditions (matching LLM structured outputs).
+                            # When an output schema is declared (issue #118), the
+                            # parse must succeed AND yield a dict, otherwise we
+                            # raise ValidationError below.
+                            parsed_json: Any = None
+                            json_parse_error: Exception | None = None
+                            try:
+                                parsed_json = json.loads(script_output.stdout)
+                            except json.JSONDecodeError as exc:
+                                json_parse_error = exc
+
+                            if isinstance(parsed_json, dict):
+                                shadowed = set(parsed_json.keys()) & {
+                                    "stdout",
+                                    "stderr",
+                                    "exit_code",
+                                }
+                                if shadowed:
+                                    logger.debug(
+                                        "Script '%s' JSON output shadows built-in fields: %s",
+                                        agent.name,
+                                        ", ".join(sorted(shadowed)),
+                                    )
+                                output_content.update(parsed_json)
+
+                            # Validate against declared output schema (issue #118).
+                            # Use `is not None` so an explicit `output: {}` opts
+                            # into strict JSON-object mode with zero declared fields.
+                            if agent.output is not None:
+                                try:
+                                    if json_parse_error is not None:
+                                        raise ValidationError(
+                                            f"Script '{agent.name}' declares an "
+                                            "output schema but stdout is not valid "
+                                            f"JSON: {json_parse_error}",
+                                            suggestion=(
+                                                "When 'output:' is declared, the "
+                                                "script must write a JSON object "
+                                                "to stdout. Write logs to stderr."
+                                            ),
+                                        )
+                                    if not isinstance(parsed_json, dict):
+                                        type_name = type(parsed_json).__name__
+                                        raise ValidationError(
+                                            f"Script '{agent.name}' declares an "
+                                            "output schema but stdout is a JSON "
+                                            f"{type_name}, not an object",
+                                            suggestion=(
+                                                "Emit a JSON object (e.g. "
+                                                '{"field": value}) to stdout. '
+                                                "Arrays and scalars are not accepted."
+                                            ),
+                                        )
+                                    validate_output(output_content, agent.output)
+                                except ValidationError as exc:
+                                    self._emit(
+                                        "script_failed",
+                                        {
+                                            "agent_name": agent.name,
+                                            "elapsed": _script_elapsed,
+                                            "error_type": type(exc).__name__,
+                                            "message": str(exc),
+                                            "stdout": script_output.stdout,
+                                            "stderr": script_output.stderr,
+                                            "exit_code": script_output.exit_code,
+                                        },
+                                    )
+                                    raise
+
                             self._emit(
                                 "script_completed",
                                 {
@@ -2162,29 +2243,6 @@ class WorkflowEngine:
                                 },
                             )
 
-                            # Store structured output in context
-                            output_content = {
-                                "stdout": script_output.stdout,
-                                "stderr": script_output.stderr,
-                                "exit_code": script_output.exit_code,
-                            }
-                            # Auto-parse JSON stdout: if stdout is valid JSON
-                            # object, merge its fields into output so they're
-                            # accessible as output.field_name in templates and
-                            # route conditions (like LLM structured outputs).
-                            try:
-                                parsed = json.loads(script_output.stdout)
-                                if isinstance(parsed, dict):
-                                    shadowed = set(parsed.keys()) & set(output_content.keys())
-                                    if shadowed:
-                                        logger.debug(
-                                            "Script '%s' JSON output shadows built-in fields: %s",
-                                            agent.name,
-                                            ", ".join(sorted(shadowed)),
-                                        )
-                                    output_content.update(parsed)
-                            except json.JSONDecodeError:
-                                pass
                             self.context.store(agent.name, output_content)
                             self.limits.record_execution(agent.name)
                             self.limits.check_timeout()

@@ -103,15 +103,37 @@ class TestScriptAgentDef:
         with pytest.raises(ValidationError, match="script agents cannot have 'tools'"):
             AgentDef(name="bad", type="script", command="echo", tools=["web_search"])
 
-    def test_script_with_output_raises(self) -> None:
-        """Test that script agent with output schema raises ValidationError."""
-        with pytest.raises(ValidationError, match="script agents cannot have 'output'"):
-            AgentDef(
-                name="bad",
-                type="script",
-                command="echo",
-                output={"result": OutputField(type="string")},
-            )
+    def test_script_with_output_accepted(self) -> None:
+        """Script agents may declare an `output:` schema (issue #118).
+
+        When a schema is declared, the engine validates JSON stdout against
+        it at runtime. The schema declaration itself should construct cleanly.
+        """
+        agent = AgentDef(
+            name="detector",
+            type="script",
+            command="python",
+            args=["-c", "import json; print(json.dumps({'route': 'planning'}))"],
+            output={
+                "route": OutputField(type="string", description="Next phase"),
+                "issue_count": OutputField(type="number"),
+            },
+        )
+        assert agent.output is not None
+        assert "route" in agent.output
+        assert agent.output["route"].type == "string"
+        assert agent.output["issue_count"].type == "number"
+
+    def test_script_with_empty_output_accepted(self) -> None:
+        """Empty `output: {}` opts into strict JSON-object mode with zero fields."""
+        agent = AgentDef(
+            name="probe",
+            type="script",
+            command="echo",
+            args=["{}"],
+            output={},
+        )
+        assert agent.output == {}
 
     def test_script_with_system_prompt_raises(self) -> None:
         """Test that script agent with system_prompt raises ValidationError."""

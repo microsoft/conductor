@@ -223,6 +223,38 @@ agents:
 
 JSON arrays and scalars are ignored (only objects merge). Non-JSON stdout is unchanged. Parsed fields shadow `stdout`/`stderr`/`exit_code` if a script outputs those as JSON keys.
 
+**Declared output schema (strict mode)** — script steps can also declare an `output:` schema using the same syntax as LLM agents. When declared, stdout MUST be a valid JSON object that matches the schema, otherwise the workflow fails with a `ValidationError`:
+
+```yaml
+agents:
+  - name: detector
+    type: script
+    command: pwsh
+    args: ["-File", "{{ workflow.dir }}/scripts/detect.ps1"]
+    output:
+      route:
+        type: string
+        description: Which phase to enter next
+      issue_count:
+        type: number
+    routes:
+      - to: planner
+        when: "route == 'planning'"
+      - to: scaler
+        when: "issue_count > 100"
+      - to: $end
+```
+
+Strict-mode semantics:
+
+- **stdout must be a JSON object.** Non-JSON, empty stdout, JSON arrays, and JSON scalars all fail validation. Write logs to `stderr` so they don't interfere with the JSON contract.
+- **Missing or wrong-typed fields fail validation.** Extra fields beyond the schema are kept in `output_content` (matching LLM-agent behavior).
+- **Built-in `stdout`/`stderr`/`exit_code` are validated on the merged dict.** Declaring `exit_code: { type: number }` asserts the built-in matches; if the script emits a shadowing JSON key (e.g. `{"exit_code": "ok"}`), the schema validates the shadowed value.
+- **Failure semantics.** On schema-validation failure, the engine emits `script_failed` (not `script_completed`) and aborts the workflow. The failure event carries the captured stdout, stderr, and exit_code so dashboards and logs can show what the script actually wrote.
+- **`output: {}` opts into strict mode with zero required fields** — useful when you want the JSON-object enforcement without listing fields yet.
+
+Without a declared `output:` schema, the legacy auto-merge behavior described above still applies.
+
 Access in downstream agents:
 
 ```yaml
@@ -243,7 +275,7 @@ routes:
   - to: $end
 ```
 
-**Restrictions** — script steps cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, `output` schema, or `options`. Script steps also cannot be used inside `parallel` groups or `for_each` groups.
+**Restrictions** — script steps cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, or `options`. Script steps also cannot be used inside `parallel` groups or `for_each` groups.
 
 **Environment variable note** — values in `env` are passed as-is to the subprocess (they are not rendered as Jinja2 templates). Use `${VAR}` syntax in the workflow YAML loader if you need environment variable substitution in env values.
 

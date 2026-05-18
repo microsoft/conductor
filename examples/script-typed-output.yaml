@@ -1,0 +1,94 @@
+# Script Step with Typed Output Schema Example
+#
+# This example demonstrates a script agent that declares an `output:`
+# schema (issue #118). The script writes a JSON object to stdout; conductor
+# parses it and validates it against the declared schema. Downstream agents
+# and route conditions can then reference typed fields by name instead of
+# relying on opaque exit codes or raw stdout strings.
+#
+# This workflow:
+# 1. Runs a deterministic detector script that emits a JSON state object
+# 2. Routes on a declared field (`phase`) instead of an exit code
+# 3. An LLM agent uses the typed fields to summarise the state
+#
+# Usage:
+#   conductor run examples/script-typed-output.yaml
+
+workflow:
+  name: script-typed-output-demo
+  description: Script agent with declared output schema for typed routing
+  version: "1.0.0"
+  entry_point: detect_state
+
+  runtime:
+    provider: copilot
+
+  limits:
+    max_iterations: 10
+
+agents:
+  - name: detect_state
+    type: script
+    description: Detect the current workspace state and emit typed JSON
+    command: python3
+    args:
+      - "-c"
+      - |
+        import json
+        # A real script would inspect files, run tests, query an API, etc.
+        # Here we just emit a fixed object so the example is hermetic.
+        print(json.dumps({
+            "phase": "planning",
+            "issue_count": 3,
+            "has_plan": False,
+        }))
+    output:
+      phase:
+        type: string
+        description: Which phase the workflow should enter next
+      issue_count:
+        type: number
+        description: Number of unresolved issues detected
+      has_plan:
+        type: boolean
+        description: Whether a plan file already exists
+    routes:
+      - to: planner
+        when: "phase == 'planning'"
+      - to: implementer
+        when: "phase == 'implementation'"
+      - to: $end
+
+  - name: planner
+    description: Summarise the detector output and recommend next steps
+    model: claude-haiku-4.5
+    prompt: |
+      The detector script reports:
+
+      - phase: {{ detect_state.output.phase }}
+      - issue_count: {{ detect_state.output.issue_count }}
+      - has_plan: {{ detect_state.output.has_plan }}
+
+      Recommend the next concrete action for the user.
+    output:
+      recommendation:
+        type: string
+        description: Recommended next action
+    routes:
+      - to: $end
+
+  - name: implementer
+    description: Placeholder for the implementation phase
+    model: claude-haiku-4.5
+    prompt: |
+      The detector reports we're in implementation phase with
+      {{ detect_state.output.issue_count }} open issues. Acknowledge briefly.
+    output:
+      acknowledgement:
+        type: string
+    routes:
+      - to: $end
+
+output:
+  next_action: >-
+    {{ planner.output.recommendation | default('') }}{{ implementer.output.acknowledgement | default('') }}

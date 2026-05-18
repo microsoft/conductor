@@ -708,11 +708,6 @@ class AgentDef(BaseModel):
                 raise ValueError("script agents cannot have 'model'")
             if self.tools is not None:
                 raise ValueError("script agents cannot have 'tools'")
-            if self.output:
-                raise ValueError(
-                    "script agents cannot have 'output' schema "
-                    "(output is always stdout/stderr/exit_code)"
-                )
             if self.system_prompt:
                 raise ValueError("script agents cannot have 'system_prompt'")
             if self.options:
