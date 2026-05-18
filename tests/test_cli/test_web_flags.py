@@ -91,6 +91,30 @@ class TestWebFlagAcceptance:
             assert mock_launch.called
             _, kwargs = mock_launch.call_args
             assert kwargs["workflow_path"] == workflow_file
+            assert "http://127.0.0.1:9999" in result.output
+
+    def test_silent_web_bg_suppresses_dashboard_output(self, workflow_file: Path) -> None:
+        """Test --silent suppresses --web-bg parent-process dashboard output."""
+        from pathlib import Path as _Path
+
+        from conductor.cli.bg_runner import BackgroundLaunch
+
+        with patch("conductor.cli.bg_runner.launch_background") as mock_launch:
+            mock_launch.return_value = BackgroundLaunch(
+                url="http://127.0.0.1:9999",
+                stderr_log=_Path("/tmp/conductor-test-deadbeef.bg.stderr.log"),
+                stdout_log=_Path("/tmp/conductor-test-deadbeef.bg.stdout.log"),
+                run_id="deadbeef",
+            )
+
+            result = runner.invoke(app, ["--silent", "run", str(workflow_file), "--web-bg"])
+
+            assert result.exit_code == 0
+            assert mock_launch.called
+            assert "http://127.0.0.1:9999" not in result.output
+            assert "Dashboard" not in result.output
+            assert "Workflow running in background" not in result.output
+            assert "Child stderr log" not in result.output
 
     def test_web_flags_default_values(self, workflow_file: Path) -> None:
         """Test that web flags default to False/0 when not specified."""

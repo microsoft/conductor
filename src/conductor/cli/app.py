@@ -434,12 +434,13 @@ def run(
                 workspace_instructions=workspace_instructions,
                 cli_instructions=raw_instructions,
             )
-            console.print(f"[bold cyan]Dashboard:[/bold cyan] {launch.url}")
-            console.print(f"[dim]Child stderr log: {launch.stderr_log}[/dim]")
-            console.print(
-                "[dim]Workflow running in background. Dashboard auto-shuts down after "
-                "workflow completes and all clients disconnect.[/dim]"
-            )
+            if is_verbose():
+                console.print(f"[bold cyan]Dashboard:[/bold cyan] {launch.url}")
+                console.print(f"[dim]Child stderr log: {launch.stderr_log}[/dim]")
+                console.print(
+                    "[dim]Workflow running in background. Dashboard auto-shuts down after "
+                    "workflow completes and all clients disconnect.[/dim]"
+                )
         except Exception as e:
             print_error(e)
             raise typer.Exit(code=1) from None
@@ -844,12 +845,13 @@ def resume(
                 web_port=web_port,
                 metadata=cli_metadata,
             )
-            console.print(f"[bold cyan]Dashboard:[/bold cyan] {launch.url}")
-            console.print(f"[dim]Child stderr log: {launch.stderr_log}[/dim]")
-            console.print(
-                "[dim]Resumed workflow running in background. Dashboard auto-shuts down after "
-                "workflow completes and all clients disconnect.[/dim]"
-            )
+            if is_verbose():
+                console.print(f"[bold cyan]Dashboard:[/bold cyan] {launch.url}")
+                console.print(f"[dim]Child stderr log: {launch.stderr_log}[/dim]")
+                console.print(
+                    "[dim]Resumed workflow running in background. Dashboard auto-shuts down "
+                    "after workflow completes and all clients disconnect.[/dim]"
+                )
         except Exception as e:
             print_error(e)
             raise typer.Exit(code=1) from None

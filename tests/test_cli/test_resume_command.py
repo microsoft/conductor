@@ -334,6 +334,28 @@ class TestResumeCommand:
         assert kwargs["web_port"] == 9092
         assert kwargs["metadata"] == {"tracker": "ado"}
 
+    def test_silent_resume_web_bg_suppresses_dashboard_output(self, tmp_path: Path) -> None:
+        """Test --silent suppresses resume --web-bg parent-process dashboard output."""
+        from conductor.cli.bg_runner import BackgroundLaunch
+
+        wf_path = _write_workflow(tmp_path)
+
+        with patch("conductor.cli.bg_runner.launch_background_resume") as mock_launch:
+            mock_launch.return_value = BackgroundLaunch(
+                url="http://127.0.0.1:9092",
+                stderr_log=tmp_path / "stub-cafe1234.bg.stderr.log",
+                stdout_log=tmp_path / "stub-cafe1234.bg.stdout.log",
+                run_id="cafe1234",
+            )
+            result = runner.invoke(app, ["--silent", "resume", str(wf_path), "--web-bg"])
+
+        assert result.exit_code == 0
+        assert mock_launch.called
+        assert "http://127.0.0.1:9092" not in result.output
+        assert "Dashboard" not in result.output
+        assert "Resumed workflow running in background" not in result.output
+        assert "Child stderr log" not in result.output
+
     def test_resume_web_bg_with_from_checkpoint(self, tmp_path: Path) -> None:
         """Test --web-bg forwards --from checkpoint path."""
         from conductor.cli.bg_runner import BackgroundLaunch
