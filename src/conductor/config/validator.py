@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import jinja2
 from jinja2 import Environment, meta, nodes
@@ -68,6 +68,16 @@ _BUILTIN_NAMES = frozenset({"workflow", "context", "item", "_index", "_key", "lo
 #   agent.output.field, group.outputs.member, group.errors.member
 _OUTPUT_ATTRS = frozenset({"output", "outputs", "errors"})
 
+# Attribute names that look like fields on an output but are actually built-in
+# dict methods. We avoid emitting field-precision warnings for these because
+# templates like ``{% for k, v in a.output.items() %}`` are valid uses of the
+# whole output object — even though ``items`` lexically resembles a field.
+# Note: the Call-vs-Getattr filter handles the common method-call case more
+# precisely; this set is a belt-and-suspenders fallback for code paths that
+# reference these names without calling them (e.g., assigning the method to a
+# variable, which is rare in practice).
+_DICT_METHOD_NAMES = frozenset({"items", "keys", "values", "get"})
+
 # DFS path cap: larger workflows may get partial coverage analysis
 _MAX_ENUMERATED_PATHS = 100
 
@@ -79,7 +89,7 @@ _MAX_ENUMERATED_PATHS = 100
 INPUT_REF_PATTERN = re.compile(
     r"^(?:"
     r"(?P<agent>[a-zA-Z_][a-zA-Z0-9_]*)\.output(?:\.(?P<field>[a-zA-Z_][a-zA-Z0-9_]*))?|"
-    r"(?P<parallel>[a-zA-Z_][a-zA-Z0-9_]*)\.(?:outputs|errors)(?:\.(?P<pg_agent>[a-zA-Z_][a-zA-Z0-9_]*)(?:\.(?P<pg_field>[a-zA-Z_][a-zA-Z0-9_]*))?)?|"
+    r"(?P<parallel>[a-zA-Z_][a-zA-Z0-9_]*)\.(?P<pg_kind>outputs|errors)(?:\.(?P<pg_agent>[a-zA-Z_][a-zA-Z0-9_]*)(?:\.(?P<pg_field>[a-zA-Z_][a-zA-Z0-9_]*))?)?|"
     r"workflow\.input\.(?P<input>[a-zA-Z_][a-zA-Z0-9_]*)"
     r")(?P<optional>\?)?$"
 )
@@ -595,7 +605,46 @@ def _enumerate_paths_to_end(
     return paths
 
 
-def _extract_template_refs(template: str) -> tuple[set[str], set[str]]:
+class TemplateRefs(NamedTuple):
+    """Structured references extracted from a Jinja2 template.
+
+    Provides both flat root-name sets (preserves the original API contract for
+    "unknown agent/workflow input" checks) and per-reference field detail
+    (enables explicit-mode field-precision warnings).
+
+    Attributes:
+        agent_refs: Root names referenced via ``<name>.output``,
+            ``<name>.outputs``, or ``<name>.errors`` (deduped). Used for
+            unknown-agent checks and undeclared-agent warnings.
+        workflow_inputs: Names referenced via ``workflow.input.<name>``.
+        agent_output_fields: Maps each agent name to the set of fields that
+            were referenced via ``<name>.output.<field>``. The sentinel value
+            ``None`` in the set means "bare ``<name>.output`` was referenced"
+            (i.e., the whole-output object) — this distinguishes
+            ``{{ a.output }}`` from ``{{ a.output.foo }}`` for field-precision
+            analysis. Absence from this dict means no ``<name>.output*`` ref
+            was seen (only ``.outputs`` / ``.errors`` perhaps).
+        group_member_fields: Maps each ``(group, member)`` pair to the set of
+            fields referenced via ``<group>.outputs.<member>.<field>``.
+            ``None`` in the set indicates a bare
+            ``<group>.outputs.<member>`` reference (whole member). The
+            sentinel key ``(group, None)`` means the template referenced
+            ``<group>.outputs`` with no member — all members are referenced
+            implicitly.
+        group_error_refs: Group names referenced via ``<group>.errors``. Kept
+            separate from output refs because the engine's runtime semantics
+            for ``.errors`` always copy the whole errors dict and never field-
+            slice, so field-precision checks must not be applied to them.
+    """
+
+    agent_refs: set[str]
+    workflow_inputs: set[str]
+    agent_output_fields: dict[str, set[str | None]]
+    group_member_fields: dict[tuple[str, str | None], set[str | None]]
+    group_error_refs: set[str]
+
+
+def _extract_template_refs(template: str) -> TemplateRefs:
     """Extract agent/group and workflow-input references from a Jinja2 template.
 
     Uses Jinja2's own parser, so:
@@ -604,6 +653,10 @@ def _extract_template_refs(template: str) -> tuple[set[str], set[str]]:
       - ``{% set x = ... %}`` bindings and macro parameters are excluded.
       - String literals are excluded: ``{{ x | replace("foo.output", "y") }}``
         does not produce a reference to ``foo``.
+      - Method calls on outputs are detected: ``{{ a.output.items() }}`` does
+        not emit a field ref to ``items`` (the ``items`` Getattr is the callee
+        of a Call node and is treated as a method invocation, not a field
+        access).
 
     A name is reported as an output reference when it appears as the root of a
     Getattr chain whose first attribute is one of ``output``/``outputs``/``errors``
@@ -615,28 +668,86 @@ def _extract_template_refs(template: str) -> tuple[set[str], set[str]]:
     Built-in namespaces (``workflow``, ``context``, ``item``, ``_index``, ``_key``,
     ``loop``) and any name bound by a Jinja2 scope are filtered out.
 
+    Limitations (documented intentionally):
+      - Bracket access (``a.output["bar"]``) is not detected. Detecting it
+        would require walking ``Getitem`` nodes with constant string keys.
+      - Dynamic field access (``a.output[var]``) is not detected.
+      - Method-call detection is local to each chain — if a method like
+        ``items`` is referenced without being called, it is still treated as
+        a field for the unknown-agent check, but is filtered from field-
+        precision checks via ``_DICT_METHOD_NAMES`` as a safety net.
+
     Args:
         template: A Jinja2 template string (may contain no template tags).
 
     Returns:
-        Tuple of ``(agent_refs, workflow_input_refs)``. Both sets are empty when
-        the template has no recognizable references or contains a syntax error
-        we cannot parse — semantic validation should not fail on malformed
-        templates; render-time will raise the precise error.
+        A :class:`TemplateRefs` instance with flat and structured reference
+        information. All fields are empty when the template has no
+        recognizable references or contains a syntax error we cannot parse —
+        semantic validation should not fail on malformed templates; render-
+        time will raise the precise error.
     """
+    empty = TemplateRefs(
+        agent_refs=set(),
+        workflow_inputs=set(),
+        agent_output_fields={},
+        group_member_fields={},
+        group_error_refs=set(),
+    )
+
     if not template or ("{{" not in template and "{%" not in template):
-        return set(), set()
+        return empty
 
     try:
         ast = _JINJA_ENV.parse(template)
     except jinja2.TemplateSyntaxError:
-        return set(), set()
+        return empty
 
-    undeclared = meta.find_undeclared_variables(ast)
+    # ``meta.find_undeclared_variables`` runs Jinja2's compiler over the AST
+    # and can raise ``TemplateAssertionError`` for semantic issues that
+    # ``parse()`` accepts (e.g. duplicate ``{% block %}`` names). Validation
+    # should not hard-fail on such templates — render-time will produce the
+    # precise error if the workflow actually runs.
+    try:
+        undeclared = meta.find_undeclared_variables(ast)
+    except jinja2.TemplateAssertionError:
+        return empty
+
+    # Pre-pass: identify Getattr nodes that are the callee of a Call so we can
+    # treat ``a.output.items()`` as a method invocation rather than a field
+    # access. Also identify Getattr nodes that are the ``.node`` of another
+    # Getattr — those are inner links in a chain (e.g. ``a.output`` from
+    # within ``a.output.bar``) and would otherwise emit spurious
+    # whole-output references. Using ``id()`` for identity comparison is safe
+    # within a single AST; we never store these IDs beyond this function.
+    callee_ids: set[int] = set()
+    for call in ast.find_all(nodes.Call):
+        if isinstance(call.node, nodes.Getattr):
+            callee_ids.add(id(call.node))
+    inner_link_ids: set[int] = set()
+    for ga in ast.find_all(nodes.Getattr):
+        if isinstance(ga.node, nodes.Getattr):
+            inner_link_ids.add(id(ga.node))
+
+    # workflow.input.<name> chains; collected directly into the result.
+    workflow_inputs: set[str] = set()
+    # group.errors chains; collected directly into the result.
+    group_error_refs: set[str] = set()
+    # Output / outputs chains, accumulated as the structured maps directly.
+    agent_output_fields: dict[str, set[str | None]] = {}
+    group_member_fields: dict[tuple[str, str | None], set[str | None]] = {}
     agent_refs: set[str] = set()
-    input_refs: set[str] = set()
 
     for node in ast.find_all(nodes.Getattr):
+        is_callee = id(node) in callee_ids
+        is_inner_link = id(node) in inner_link_ids
+        # Only top-level Getattrs are the entry point for a chain. Inner-link
+        # Getattrs are walked transitively when we process their enclosing
+        # outer Getattr (or, if the outer is the callee of a Call, when we
+        # process the callee itself).
+        if is_inner_link and not is_callee:
+            continue
+
         # Walk down the Getattr chain to its root Name, collecting attributes.
         attrs: list[str] = []
         cur: nodes.Node = node
@@ -649,13 +760,58 @@ def _extract_template_refs(template: str) -> tuple[set[str], set[str]]:
         if cur.name not in undeclared:
             continue
 
-        root = cur.name
-        if root == "workflow" and len(attrs) >= 2 and attrs[0] == "input":
-            input_refs.add(attrs[1])
-        elif attrs and attrs[0] in _OUTPUT_ATTRS and root not in _BUILTIN_NAMES:
-            agent_refs.add(root)
+        # If this is a method call (e.g. ``a.output.items()``), the trailing
+        # attribute is the method name, not a field. Trim it so the chain
+        # reduces to the receiver — yielding a whole-output ref rather than
+        # a spurious field ref to the method name.
+        if is_callee and attrs:
+            attrs = attrs[:-1]
+            if not attrs:
+                continue
 
-    return agent_refs, input_refs
+        root = cur.name
+
+        # workflow.input.<name>
+        if root == "workflow" and len(attrs) >= 2 and attrs[0] == "input":
+            workflow_inputs.add(attrs[1])
+            continue
+
+        # Other built-in namespaces and bare names are ignored.
+        if root in _BUILTIN_NAMES or not attrs:
+            continue
+
+        kind = attrs[0]
+        if kind not in _OUTPUT_ATTRS:
+            continue
+
+        # Errors are handled separately and never get field-precision treatment.
+        if kind == "errors":
+            group_error_refs.add(root)
+            agent_refs.add(root)
+            continue
+
+        agent_refs.add(root)
+        if kind == "output":
+            # attrs is ["output"] or ["output", "<field>", ...]
+            field: str | None = attrs[1] if len(attrs) >= 2 else None
+            agent_output_fields.setdefault(root, set()).add(field)
+        else:  # kind == "outputs"
+            # attrs is ["outputs"] or ["outputs", "<member>", ...]
+            if len(attrs) == 1:
+                # Bare group.outputs — record under sentinel member=None.
+                group_member_fields.setdefault((root, None), set()).add(None)
+            else:
+                member = attrs[1]
+                field = attrs[2] if len(attrs) >= 3 else None
+                group_member_fields.setdefault((root, member), set()).add(field)
+
+    return TemplateRefs(
+        agent_refs=agent_refs,
+        workflow_inputs=workflow_inputs,
+        agent_output_fields=agent_output_fields,
+        group_member_fields=group_member_fields,
+        group_error_refs=group_error_refs,
+    )
 
 
 def _extract_output_template_refs(output: dict[str, str]) -> set[str]:
@@ -669,8 +825,7 @@ def _extract_output_template_refs(output: dict[str, str]) -> set[str]:
     """
     refs: set[str] = set()
     for template in output.values():
-        agents, _ = _extract_template_refs(template)
-        refs.update(agents)
+        refs.update(_extract_template_refs(template).agent_refs)
     return refs
 
 
@@ -1004,44 +1159,195 @@ def _validate_template_references(
     for agent, valid_names in all_agents:
         templates = _collect_template_strings(agent)
 
-        # Extract declared input references for explicit-mode advisory checks.
-        declared_agents: set[str] = set()
+        # Extract declared input references for explicit-mode advisory checks,
+        # tracking the namespace (agent ``.output``, group ``.outputs``, group
+        # ``.errors``) separately. The same declaration set cannot suppress
+        # warnings for a different namespace — declaring ``pg.errors`` must
+        # not silence warnings about ``pg.outputs.*`` references and
+        # vice-versa, because the engine only populates the declared
+        # namespace into the agent's ctx (see ``_add_parallel_group_input``).
+        #
+        # Field-precision tracking (Gap A): ``set[str | None]`` values mean:
+        #   - ``None`` in the set => the whole namespace was declared
+        #     (e.g. ``a.output`` or ``g.outputs`` or ``g.outputs.m``). Any
+        #     field/member reference on that root is allowed at runtime.
+        #   - One or more strings => only those specific fields were declared
+        #     (e.g. ``a.output.foo``); referencing a different field will
+        #     fail at runtime.
         declared_workflow_inputs: set[str] = set()
+        declared_agent_output_fields: dict[str, set[str | None]] = {}
+        # Per (group, member) — only populated for ``.outputs`` declarations.
+        # Member is ``None`` for the bare-group form ``g.outputs``.
+        declared_group_output_member_fields: dict[tuple[str, str | None], set[str | None]] = {}
+        # Group names that have ANY ``.outputs`` declaration (whole-group,
+        # whole-member, or specific-field). Used for the "undeclared outputs"
+        # warning so we don't recompute the set per template iteration.
+        declared_groups_with_outputs: set[str] = set()
+        # Set of group names with errors declared. The engine copies the
+        # whole errors dict regardless of ``.member`` or ``.field`` suffixes
+        # (see ``_add_parallel_group_input`` errors branch), so no field-
+        # precision tracking is needed for errors.
+        declared_group_errors: set[str] = set()
         for ref in agent.input:
             match = INPUT_REF_PATTERN.match(ref.rstrip("?"))
             if not match:
                 continue
             ref_agent = match.group("agent")
             if ref_agent:
-                declared_agents.add(ref_agent)
+                field = match.group("field")
+                # field is None for bare ``a.output`` (whole output declared).
+                declared_agent_output_fields.setdefault(ref_agent, set()).add(field)
             ref_parallel = match.group("parallel")
             if ref_parallel:
-                declared_agents.add(ref_parallel)
+                pg_kind = match.group("pg_kind")
+                if pg_kind == "outputs":
+                    pg_agent = match.group("pg_agent")
+                    pg_field = match.group("pg_field")
+                    # pg_agent is None for bare ``g.outputs``;
+                    # pg_field is None for ``g.outputs.member`` (whole member).
+                    declared_group_output_member_fields.setdefault(
+                        (ref_parallel, pg_agent), set()
+                    ).add(pg_field)
+                    declared_groups_with_outputs.add(ref_parallel)
+                else:  # pg_kind == "errors"
+                    declared_group_errors.add(ref_parallel)
             ref_input = match.group("input")
             if ref_input:
                 declared_workflow_inputs.add(ref_input)
 
         for source, template in templates:
-            agent_refs, input_refs = _extract_template_refs(template)
+            refs = _extract_template_refs(template)
 
-            for ref_name in agent_refs:
-                if ref_name not in valid_names:
+            # Explicit-mode exclusions:
+            # - human_gate prompts render with the full accumulated context
+            #   (engine uses ``WorkflowContext.get_for_template()`` which forces
+            #   ``mode="accumulate"``), so they're never subject to
+            #   explicit-mode warnings.
+            # - script and workflow (sub-workflow) agents are excluded only for
+            #   ``workflow.input`` references because the engine's
+            #   ``_LOCAL_RENDER_AGENT_TYPES`` carve-out populates
+            #   ``workflow.input`` for them regardless of context mode.
+            #   Their ``agent.output`` references still require declaration —
+            #   the engine raises ``KeyError`` via ``_add_explicit_input`` if
+            #   an undeclared agent output is accessed.
+            agent_output_warning_allowed = is_explicit and agent.type != "human_gate"
+
+            # --- Agent-output references (``a.output[.field]``) ---
+            for ref_root, ref_fields in refs.agent_output_fields.items():
+                if ref_root not in valid_names:
                     errors.append(
-                        f"{source} references unknown agent '{ref_name}'. "
+                        f"{source} references unknown agent '{ref_root}'. "
                         f"Available: {', '.join(sorted(valid_names))}"
                     )
-                elif (
-                    is_explicit
-                    and agent.type not in ("script", "workflow")
-                    and ref_name not in declared_agents
-                ):
+                    continue
+                if agent_output_warning_allowed and ref_root not in declared_agent_output_fields:
                     warnings.append(
-                        f"{source} references '{ref_name}.output' but "
-                        f"agent '{agent.name}' does not declare '{ref_name}.output' "
+                        f"{source} references '{ref_root}.output' but "
+                        f"agent '{agent.name}' does not declare '{ref_root}.output' "
+                        f"in its input: list (explicit context mode)"
+                    )
+                    continue
+                # Field-precision (Gap A): warn when the template references a
+                # field that wasn't declared. Skip the check entirely when the
+                # declaration was for the whole output (``None`` in set).
+                if not agent_output_warning_allowed:
+                    continue
+                declared_fields = declared_agent_output_fields[ref_root]
+                if None in declared_fields:
+                    continue
+                declared_field_names = sorted(f for f in declared_fields if f)
+                declared_list = ", ".join(f"{ref_root}.output.{f}" for f in declared_field_names)
+                for ref_field in ref_fields:
+                    if ref_field is None:
+                        # Bare ``ref_root.output`` reference but only specific
+                        # fields were declared — at runtime the engine only
+                        # copies the declared fields into ctx, so the
+                        # whole-output access will only see a partial dict.
+                        warnings.append(
+                            f"{source} references the whole '{ref_root}.output' "
+                            f"object but agent '{agent.name}' only declares "
+                            f"specific fields ({', '.join(declared_field_names)}) "
+                            f"in its input: list. Declare '{ref_root}.output' (without "
+                            f"a field) to access the whole output (explicit context mode)"
+                        )
+                        continue
+                    if ref_field in _DICT_METHOD_NAMES:
+                        continue
+                    if ref_field not in declared_fields:
+                        warnings.append(
+                            f"{source} references '{ref_root}.output.{ref_field}' but "
+                            f"agent '{agent.name}' only declares "
+                            f"{declared_list} "
+                            f"in its input: list (explicit context mode)"
+                        )
+
+            # --- Group-output references (``g.outputs[.member[.field]]``) ---
+            # Skip the field-precision check for for-each groups because the
+            # engine's ``_add_parallel_group_input`` copies the whole member
+            # dict for dict-keyed for-each groups regardless of the declared
+            # ``.field`` suffix (see context.py:
+            # ``elif is_for_each_dict or len(remaining_parts) == 2``), so
+            # field-precision warnings would be false positives.
+            for (group, member), ref_fields in refs.group_member_fields.items():
+                if group not in valid_names:
+                    errors.append(
+                        f"{source} references unknown agent '{group}'. "
+                        f"Available: {', '.join(sorted(valid_names))}"
+                    )
+                    continue
+                if agent_output_warning_allowed and group not in declared_groups_with_outputs:
+                    warnings.append(
+                        f"{source} references '{group}.outputs' but "
+                        f"agent '{agent.name}' does not declare '{group}.outputs' "
+                        f"in its input: list (explicit context mode)"
+                    )
+                    continue
+                if not agent_output_warning_allowed:
+                    continue
+                if member is None or group in for_each_names:
+                    continue
+                # Skip if the whole group's outputs are declared (bare
+                # ``g.outputs`` covers all members).
+                if declared_group_output_member_fields.get((group, None)) is not None:
+                    continue
+                declared_fields = declared_group_output_member_fields.get((group, member))
+                if declared_fields is None or None in declared_fields:
+                    # Either the member isn't declared at all (will be
+                    # surfaced by the undeclared warning) or the whole
+                    # member is declared (any field is OK).
+                    continue
+                declared_field_names = sorted(f for f in declared_fields if f)
+                declared_list = ", ".join(
+                    f"{group}.outputs.{member}.{f}" for f in declared_field_names
+                )
+                for ref_field in ref_fields:
+                    if ref_field is None or ref_field in _DICT_METHOD_NAMES:
+                        continue
+                    if ref_field not in declared_fields:
+                        warnings.append(
+                            f"{source} references "
+                            f"'{group}.outputs.{member}.{ref_field}' but "
+                            f"agent '{agent.name}' only declares "
+                            f"{declared_list} "
+                            f"in its input: list (explicit context mode)"
+                        )
+
+            # --- Group-error references (``g.errors``) ---
+            for group in refs.group_error_refs:
+                if group not in valid_names:
+                    errors.append(
+                        f"{source} references unknown agent '{group}'. "
+                        f"Available: {', '.join(sorted(valid_names))}"
+                    )
+                    continue
+                if agent_output_warning_allowed and group not in declared_group_errors:
+                    warnings.append(
+                        f"{source} references '{group}.errors' but "
+                        f"agent '{agent.name}' does not declare '{group}.errors' "
                         f"in its input: list (explicit context mode)"
                     )
 
-            for input_name in input_refs:
+            for input_name in refs.workflow_inputs:
                 if workflow_input_names and input_name not in workflow_input_names:
                     # Only error when inputs ARE declared — workflows without
                     # input: blocks may use workflow.input conditionally.
@@ -1051,7 +1357,7 @@ def _validate_template_references(
                     )
                 elif (
                     is_explicit
-                    and agent.type not in ("script", "workflow")
+                    and agent.type not in ("script", "workflow", "human_gate")
                     and input_name not in declared_workflow_inputs
                 ):
                     warnings.append(
@@ -1064,13 +1370,13 @@ def _validate_template_references(
     # Check workflow output templates.
     if config.output:
         for field, template in config.output.items():
-            agent_refs, input_refs = _extract_template_refs(template)
-            for ref_name in agent_refs:
+            refs = _extract_template_refs(template)
+            for ref_name in refs.agent_refs:
                 if ref_name not in all_names:
                     errors.append(
                         f"Workflow output '{field}' references unknown agent '{ref_name}'"
                     )
-            for input_name in input_refs:
+            for input_name in refs.workflow_inputs:
                 if workflow_input_names and input_name not in workflow_input_names:
                     errors.append(
                         f"Workflow output '{field}' references unknown "
