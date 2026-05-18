@@ -8,6 +8,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.16...HEAD)
 
 ### Fixed
+- `conductor resume … --web` and `--web-bg` no longer open an empty
+  dashboard. Checkpoints now record the original `run_id` and JSONL
+  `event_log_path`. On resume the dashboard's history is seeded BEFORE
+  it accepts clients: the CLI prepends a fresh `workflow_started` event
+  built from the current YAML (so historical events apply to the
+  correct topology), then replays the original JSONL log line-by-line
+  (or, when no log file is available, synthesises minimal
+  `*_started`/`*_completed` pairs from the restored execution history).
+  The resumed engine's own `workflow_started` emit is suppressed so the
+  dashboard sees exactly one root start — no `wfDepth` double-counting.
+  Root-level `workflow_completed` / `workflow_failed` /
+  `checkpoint_saved` events from the original run are filtered out on
+  replay; subworkflow lifecycle events are preserved so the frontend's
+  context tracking stays balanced. The resumed `EventLogSubscriber`
+  appends to the original log, preserving `run_id` across resume
+  generations so log/timeline correlation tools see one continuous run
+  (#167).
 - Workflows that configure `reasoning.effort` (or workflow-wide
   `runtime.default_reasoning_effort`) on the Copilot provider were broken
   for **every named Copilot model** when running against

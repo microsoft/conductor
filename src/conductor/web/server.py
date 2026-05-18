@@ -376,6 +376,276 @@ class WebDashboard:
             self._workflow_completed = True
 
     # ------------------------------------------------------------------
+    # Replay support (used by ``resume_workflow_async``)
+    # ------------------------------------------------------------------
+
+    # Root-level lifecycle events that must be dropped on replay:
+    # - ``workflow_started`` is re-emitted by the resumed engine with the
+    #   current (possibly modified) config; the stale original would
+    #   double-increment frontend ``wfDepth`` and visualise stale topology.
+    # - ``workflow_completed`` / ``workflow_failed`` from the original run
+    #   would make the dashboard appear finished before the resumed agent
+    #   starts.
+    # - ``checkpoint_saved`` from the original run is stale — a fresh one
+    #   will be written if the resumed run also fails.
+    #
+    # Subworkflow-level events of the same types (identified by a
+    # non-empty ``data.subworkflow_path`` set by ``WorkflowEngine._emit``)
+    # are preserved so frontend ``wfDepth`` and per-context state remain
+    # balanced.
+    _REPLAY_ROOT_SKIP_TYPES = frozenset(
+        {
+            "workflow_started",
+            "workflow_completed",
+            "workflow_failed",
+            "checkpoint_saved",
+        }
+    )
+
+    @staticmethod
+    def _is_root_event(event_dict: dict[str, Any]) -> bool:
+        """Return True when *event_dict* came from the root engine.
+
+        Sub-engine events are stamped with a non-empty ``subworkflow_path``
+        list by :meth:`WorkflowEngine._emit`; root events have no such
+        stamp (preserving legacy event shape).
+        """
+        data = event_dict.get("data") or {}
+        sub_path = data.get("subworkflow_path") if isinstance(data, dict) else None
+        return not (isinstance(sub_path, list) and len(sub_path) > 0)
+
+    def prepend_workflow_started(self, data: dict[str, Any]) -> None:
+        """Insert a ``workflow_started`` event at the head of ``_event_history``.
+
+        Used by ``resume_workflow_async`` so the dashboard has correct
+        topology (agents, parallel groups, for-each groups, routes) before
+        any replayed historical events — without it, the frontend creates
+        orphan nodes from ``agent_started``/``parallel_agent_completed``
+        replays that arrive before topology is set up. Must be called
+        before :meth:`start` so the seeded event is observed by every
+        client via ``GET /api/state`` and the WebSocket replay loop.
+
+        Args:
+            data: Event payload (matches ``WorkflowEngine.build_workflow_started_data()``).
+        """
+        if self._serve_task is not None:
+            logger.warning(
+                "prepend_workflow_started called after dashboard.start(); "
+                "already-connected clients may see inconsistent history."
+            )
+        import time as _time
+
+        self._event_history.insert(
+            0, {"type": "workflow_started", "timestamp": _time.time(), "data": data}
+        )
+
+    def replay_events_from_jsonl(self, path: Path) -> int:
+        """Seed the dashboard's history from an existing JSONL event log.
+
+        Used by ``resume_workflow_async`` so the dashboard can display
+        the full timeline of agents that completed before the checkpoint
+        was written.
+
+        Events are appended directly to ``_event_history`` — they are
+        **not** enqueued on ``_queue``. Late-joining clients pick up the
+        historical events via ``GET /api/state`` and the WebSocket
+        replay loop, both of which iterate ``_event_history``. Callers
+        should invoke this method **before** :meth:`start` so the very
+        first ``/api/state`` request returns the populated history.
+
+        Root-level lifecycle events listed in
+        ``_REPLAY_ROOT_SKIP_TYPES`` are filtered out — see the comment
+        on that constant for the rationale.
+
+        Args:
+            path: Path to the original JSONL log file.
+
+        Returns:
+            Number of events appended to ``_event_history``.
+        """
+        if self._serve_task is not None:
+            logger.warning(
+                "replay_events_from_jsonl called after dashboard.start(); "
+                "already-connected clients will not receive the replayed events."
+            )
+        if not path.exists():
+            logger.warning("Replay log path does not exist: %s", path)
+            return 0
+        if not path.is_file():
+            logger.warning("Replay log path is not a regular file: %s", path)
+            return 0
+
+        try:
+            from conductor.web.replay import _load_events
+
+            events = _load_events(path)
+        except (OSError, ValueError) as exc:
+            logger.warning("Failed to load replay log %s: %s", path, exc)
+            return 0
+
+        count = 0
+        for event_dict in events:
+            if not isinstance(event_dict, dict):
+                continue
+            event_type = event_dict.get("type")
+            if (
+                isinstance(event_type, str)
+                and event_type in self._REPLAY_ROOT_SKIP_TYPES
+                and self._is_root_event(event_dict)
+            ):
+                continue
+            self._event_history.append(event_dict)
+            count += 1
+
+        logger.info("Replayed %d events from %s", count, path)
+        return count
+
+    def replay_synthetic_from_context(
+        self,
+        context: Any,
+        config: Any,
+        checkpoint_timestamp: float | None = None,
+    ) -> int:
+        """Seed the dashboard's history from restored workflow context.
+
+        Fallback used when no JSONL event log is available (older
+        checkpoints, deleted log files). Emits minimal
+        ``*_started`` / ``*_completed`` pairs per entry in
+        ``context.execution_history`` so prior nodes at least appear in
+        the DAG with their final outputs.
+
+        Like :meth:`replay_events_from_jsonl`, this method appends
+        directly to ``_event_history`` and should be invoked **before**
+        :meth:`start`.
+
+        Args:
+            context: A ``WorkflowContext`` restored from the checkpoint.
+            config: The workflow ``WorkflowConfig`` for node-type lookup.
+            checkpoint_timestamp: Unix timestamp to use for synthetic
+                event timestamps. Defaults to ``time.time()`` if None.
+
+        Returns:
+            Number of events appended to ``_event_history``.
+        """
+        if self._serve_task is not None:
+            logger.warning(
+                "replay_synthetic_from_context called after dashboard.start(); "
+                "already-connected clients will not receive the replayed events."
+            )
+        import time as _time
+
+        ts = checkpoint_timestamp if checkpoint_timestamp is not None else _time.time()
+
+        # Build name → agent_def lookup for type resolution
+        agent_defs = {a.name: a for a in (config.agents or [])}
+        parallel_groups = {g.name: g for g in (config.parallel or [])}
+        for_each_groups = {g.name: g for g in (config.for_each or [])}
+
+        execution_history = list(getattr(context, "execution_history", []) or [])
+        agent_outputs = getattr(context, "agent_outputs", {}) or {}
+
+        count = 0
+        for name in execution_history:
+            output = agent_outputs.get(name, {})
+            if name in parallel_groups:
+                pg = parallel_groups[name]
+                started_type = "parallel_started"
+                completed_type = "parallel_completed"
+                # The frontend renders parallel_completed as failed unless
+                # ``failure_count === 0`` (workflow-store.ts:1266), so always
+                # emit zeros — we can't know the original counts from the
+                # restored context, but assuming success is the closest match
+                # to "the engine kept going past this group".
+                agent_count = len(getattr(pg, "agents", []) or [])
+                started_data: dict[str, Any] = {
+                    "group_name": name,
+                    "agents": list(getattr(pg, "agents", []) or []),
+                    "synthetic": True,
+                }
+                completed_data: dict[str, Any] = {
+                    "group_name": name,
+                    "outputs": output if isinstance(output, dict) else {},
+                    "success_count": agent_count,
+                    "failure_count": 0,
+                    "elapsed": 0.0,
+                    "synthetic": True,
+                }
+            elif name in for_each_groups:
+                started_type = "for_each_started"
+                completed_type = "for_each_completed"
+                started_data = {"group_name": name, "synthetic": True}
+                item_count = 0
+                if isinstance(output, dict):
+                    candidate = output.get("outputs") or output.get("items") or output
+                    if isinstance(candidate, (list, dict)):
+                        item_count = len(candidate)
+                completed_data = {
+                    "group_name": name,
+                    "outputs": output if isinstance(output, dict) else {},
+                    "item_count": item_count,
+                    "success_count": item_count,
+                    "failure_count": 0,
+                    "elapsed": 0.0,
+                    "synthetic": True,
+                }
+            else:
+                agent_def = agent_defs.get(name)
+                agent_type = getattr(agent_def, "type", None) or "agent"
+                if agent_type == "script":
+                    started_type = "script_started"
+                    completed_type = "script_completed"
+                    started_data = {
+                        "agent_name": name,
+                        "iteration": 1,
+                        "synthetic": True,
+                    }
+                    completed_data = {
+                        "agent_name": name,
+                        "elapsed": 0.0,
+                        "stdout": output.get("stdout", "") if isinstance(output, dict) else "",
+                        "stderr": output.get("stderr", "") if isinstance(output, dict) else "",
+                        "exit_code": output.get("exit_code", 0) if isinstance(output, dict) else 0,
+                        "synthetic": True,
+                    }
+                else:
+                    started_type = "agent_started"
+                    completed_type = "agent_completed"
+                    started_data = {
+                        "agent_name": name,
+                        "iteration": 1,
+                        "agent_type": agent_type,
+                        "synthetic": True,
+                    }
+                    output_keys = list(output.keys()) if isinstance(output, dict) else []
+                    completed_data = {
+                        "agent_name": name,
+                        "elapsed": 0.0,
+                        "model": "",
+                        "tokens": 0,
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "cost_usd": 0.0,
+                        "output": output,
+                        "output_keys": output_keys,
+                        "synthetic": True,
+                    }
+
+            self._event_history.append(
+                {"type": started_type, "timestamp": ts, "data": started_data}
+            )
+            self._event_history.append(
+                {"type": completed_type, "timestamp": ts, "data": completed_data}
+            )
+            count += 2
+
+        logger.info(
+            "Synthesized %d replay events from %d history entries",
+            count,
+            len(execution_history),
+        )
+        return count
+
+    # ------------------------------------------------------------------
     # Async broadcaster
     # ------------------------------------------------------------------
 

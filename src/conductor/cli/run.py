@@ -1583,9 +1583,12 @@ async def resume_workflow_async(
         log_file: Optional path to write full debug output to a file.
         no_interactive: If True, disables the keyboard interrupt listener.
         web: If True, start a real-time web dashboard for the resumed run.
-            Note: the dashboard only shows events from the resumed agent
-            forward; agent runs that completed before the checkpoint are
-            not replayed.
+            The dashboard is seeded with the original timeline by replaying
+            the JSONL event log captured during the previous run (or by
+            synthesising minimal events from the restored ``WorkflowContext``
+            when the log file is unavailable), so previously completed
+            agents remain visible alongside live events from the resumed
+            run.
         web_port: Port for the web dashboard (0 = auto-select).
         web_bg: If True, auto-shutdown dashboard after workflow + client
             disconnect.
@@ -1667,30 +1670,8 @@ async def resume_workflow_async(
             f"Checkpoint created: {cp.created_at} (failed at: {cp.failure.get('agent', 'unknown')})"
         )
 
-        # Start web dashboard now that we have the workflow path
-        if web:
-            from conductor.web.server import WebDashboard
-
-            bg_mode = web_bg or os.environ.get("CONDUCTOR_WEB_BG") == "1"
-            dashboard = WebDashboard(
-                emitter,
-                host="127.0.0.1",
-                port=web_port,
-                bg=bg_mode,
-                workflow_root=resolved_workflow_path.resolve().parent,
-            )
-
-            try:
-                await dashboard.start()
-                _verbose_console.print(f"[bold cyan]Dashboard:[/bold cyan] {dashboard.url}")
-            except Exception as e:
-                _verbose_console.print(
-                    f"[bold yellow]Warning:[/bold yellow] "
-                    f"Dashboard failed to start: {e}. Continuing without dashboard."
-                )
-                dashboard = None
-
-        # Load workflow config
+        # Load workflow config first — needed both to construct the dashboard
+        # (workflow_root) and to seed the synthetic replay fallback.
         config = load_config(resolved_workflow_path)
 
         # Merge CLI metadata on top of YAML-declared metadata (parity with run)
@@ -1701,16 +1682,6 @@ async def resume_workflow_async(
         if provider_override:
             verbose_log(f"Provider override: {provider_override}", style="yellow")
             config.workflow.runtime.provider = provider_override  # type: ignore[assignment]
-
-        # Start JSONL event log subscriber (parity with run)
-        from conductor.engine.event_log import EventLogSubscriber
-
-        event_log_subscriber = EventLogSubscriber(config.workflow.name)
-        emitter.subscribe(event_log_subscriber.on_event)
-
-        # Subscribe console output to the event emitter (parity with run)
-        console_subscriber = ConsoleEventSubscriber()
-        emitter.subscribe(console_subscriber.on_event)
 
         # Verify the current_agent exists in the workflow
         agent_names = {a.name for a in config.agents}
@@ -1733,6 +1704,25 @@ async def resume_workflow_async(
             cp.limits,
             timeout_seconds=config.workflow.limits.timeout_seconds,
         )
+
+        # Construct the web dashboard early (subscribes to the emitter on
+        # construction) but defer ``dashboard.start()`` until after we have
+        # seeded ``_event_history`` with the current-config
+        # ``workflow_started`` event plus the original run's replay. That
+        # way the very first ``GET /api/state`` and the first WebSocket
+        # client both see a fully populated, topology-correct history —
+        # no race window where a client connects mid-replay.
+        if web:
+            from conductor.web.server import WebDashboard
+
+            bg_mode = web_bg or os.environ.get("CONDUCTOR_WEB_BG") == "1"
+            dashboard = WebDashboard(
+                emitter,
+                host="127.0.0.1",
+                port=web_port,
+                bg=bg_mode,
+                workflow_root=resolved_workflow_path.resolve().parent,
+            )
 
         # Build MCP servers config (same as run_workflow_async)
         mcp_servers = await _build_mcp_servers(config)
@@ -1761,6 +1751,33 @@ async def resume_workflow_async(
 
             from conductor.engine.workflow import RunContext
 
+            # Resume-mode log path: append to the original log when available
+            # so a multi-resume session produces one continuous file and
+            # ``run_id`` stays stable across resume generations.
+            existing_log_path: Path | None = None
+            if cp.event_log_path:
+                candidate = Path(cp.event_log_path)
+                if candidate.exists() and candidate.is_file():
+                    existing_log_path = candidate
+
+            # Build the JSONL subscriber BEFORE the engine so RunContext
+            # carries the resolved ``run_id`` and ``log_file`` (used by
+            # the engine to populate the ``workflow_started`` event payload).
+            # When the checkpoint has the original log info, the subscriber
+            # appends to it and reuses run_id; otherwise it generates fresh.
+            from conductor.engine.event_log import EventLogSubscriber
+
+            event_log_subscriber = EventLogSubscriber(
+                config.workflow.name,
+                existing_path=existing_log_path,
+                existing_run_id=cp.run_id or None,
+            )
+            emitter.subscribe(event_log_subscriber.on_event)
+
+            # Subscribe console output to the event emitter (parity with run)
+            console_subscriber = ConsoleEventSubscriber()
+            emitter.subscribe(console_subscriber.on_event)
+
             engine = WorkflowEngine(
                 config,
                 registry=registry,
@@ -1772,14 +1789,55 @@ async def resume_workflow_async(
                 web_dashboard=dashboard,
                 instructions_preamble=cp.instructions_preamble,
                 run_context=RunContext(
-                    run_id=event_log_subscriber.run_id if event_log_subscriber else "",
-                    log_file=str(event_log_subscriber.path) if event_log_subscriber else "",
+                    run_id=event_log_subscriber.run_id,
+                    log_file=str(event_log_subscriber.path),
                     dashboard_port=(dashboard.port if dashboard is not None else None),
                     bg_mode=web_bg or os.environ.get("CONDUCTOR_WEB_BG") == "1",
                 ),
             )
             engine.set_context(restored_context)
             engine.set_limits(restored_limits)
+
+            # Seed the dashboard with the original timeline so previously
+            # completed agents remain visible. Order matters:
+            #   1. Prepend a fresh ``workflow_started`` built from the
+            #      current config so historical events apply to the
+            #      correct topology.
+            #   2. Replay the original JSONL log (root-level lifecycle
+            #      events are filtered to keep frontend ``wfDepth`` balanced).
+            #   3. If no JSONL is available, fall back to synthesised
+            #      events from the restored context.
+            #   4. Suppress the engine's own ``workflow_started`` emit on
+            #      resume — without this the dashboard would see two root
+            #      starts and treat the live run as a child workflow.
+            if dashboard is not None:
+                dashboard.prepend_workflow_started(engine.build_workflow_started_data())
+                replayed = 0
+                if existing_log_path is not None:
+                    replayed = dashboard.replay_events_from_jsonl(existing_log_path)
+                if replayed == 0:
+                    cp_ts: float | None = None
+                    try:
+                        from datetime import datetime as _dt
+
+                        cp_ts = _dt.fromisoformat(cp.created_at).timestamp()
+                    except (TypeError, ValueError):
+                        cp_ts = None
+                    replayed = dashboard.replay_synthetic_from_context(
+                        restored_context, config, checkpoint_timestamp=cp_ts
+                    )
+                verbose_log(f"Seeded dashboard with {replayed} prior event(s)")
+                engine.suppress_workflow_started_emit()
+
+                try:
+                    await dashboard.start()
+                    _verbose_console.print(f"[bold cyan]Dashboard:[/bold cyan] {dashboard.url}")
+                except Exception as e:
+                    _verbose_console.print(
+                        f"[bold yellow]Warning:[/bold yellow] "
+                        f"Dashboard failed to start: {e}. Continuing without dashboard."
+                    )
+                    dashboard = None
 
             # Share interrupt_event with dashboard so POST /api/stop can abort agents
             if dashboard is not None and interrupt_event is not None:

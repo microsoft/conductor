@@ -419,6 +419,11 @@ class WorkflowEngine:
         self._bg_mode = self._run_context.bg_mode
         self._system_metadata: dict[str, Any] = {}
 
+        # When True, ``_execute_loop`` skips its ``workflow_started`` emit.
+        # Set by :meth:`suppress_workflow_started_emit` from the CLI resume
+        # path after it has seeded the dashboard with a synthesized event.
+        self._suppress_workflow_started_emit: bool = False
+
         # Recursive sub-workflow context path for dashboard routing.
         # Root engine = []. Child engines spawned via _execute_subworkflow get
         # [*parent_path, slot_key]. _emit auto-stamps non-empty paths onto
@@ -534,6 +539,113 @@ class WorkflowEngine:
             system["parent_pid"] = os.getppid()
 
         return system
+
+    def build_workflow_started_data(self) -> dict[str, Any]:
+        """Build the ``workflow_started`` event payload from the current config.
+
+        Extracted from :meth:`_execute_loop` so the CLI resume path can
+        synthesise a topology-aware ``workflow_started`` event and prepend
+        it to the dashboard's history before replaying the original run's
+        events. The resumed engine then suppresses its own emit (via
+        :attr:`_suppress_workflow_started_emit`) so the dashboard sees
+        exactly one root ``workflow_started`` with the current YAML topology.
+
+        Returns:
+            Dict matching the shape emitted by the engine at the start of
+            :meth:`_execute_loop`.
+        """
+        # ``_system_metadata`` is normally populated inside ``_execute_loop``
+        # right before the emit. The CLI may call this method before the
+        # loop runs (during resume seeding), so build a snapshot here if it
+        # has not yet been populated.
+        if not self._system_metadata:
+            self._system_metadata = self._build_system_metadata()
+
+        default_effort = self.config.workflow.runtime.default_reasoning_effort
+        return {
+            "name": self.config.workflow.name,
+            "version": self._conductor_version(),
+            "entry_point": self.config.workflow.entry_point,
+            "agents": [
+                {
+                    "name": a.name,
+                    "type": a.type or "agent",
+                    "model": a.model,
+                    "reasoning_effort": (
+                        a.reasoning.effort if a.reasoning is not None else default_effort
+                    ),
+                }
+                for a in self.config.agents
+            ],
+            "parallel_groups": [
+                {
+                    "name": p.name,
+                    "agents": p.agents,
+                }
+                for p in self.config.parallel
+            ],
+            "for_each_groups": [
+                {
+                    "name": f.name,
+                    "source": f.source,
+                }
+                for f in self.config.for_each
+            ],
+            "routes": [
+                {
+                    "from": a.name,
+                    "to": r.to,
+                    "when": r.when,
+                }
+                for a in self.config.agents
+                for r in a.routes
+            ]
+            + [
+                {
+                    "from": a.name,
+                    "to": o.route,
+                    "when": f"selection == '{o.value}'",
+                }
+                for a in self.config.agents
+                if a.type == "human_gate" and a.options
+                for o in a.options
+            ]
+            + [
+                {
+                    "from": p.name,
+                    "to": r.to,
+                    "when": r.when,
+                }
+                for p in self.config.parallel
+                for r in p.routes
+            ]
+            + [
+                {
+                    "from": f.name,
+                    "to": r.to,
+                    "when": r.when,
+                }
+                for f in self.config.for_each
+                for r in f.routes
+            ],
+            **self._yaml_source_field(),
+            "metadata": self.config.workflow.metadata,
+            "system": self._system_metadata,
+            "run_id": self._run_id,
+            "log_file": self._log_file,
+        }
+
+    def suppress_workflow_started_emit(self) -> None:
+        """Tell :meth:`_execute_loop` to skip its ``workflow_started`` emit.
+
+        Used by ``resume_workflow_async`` after it has manually prepended
+        a topology-aware ``workflow_started`` event to the dashboard's
+        history. Without this suppression the engine would emit a second
+        root ``workflow_started`` once it resumed, double-incrementing
+        the frontend's ``wfDepth`` and routing the resumed run's events
+        into a phantom child workflow context.
+        """
+        self._suppress_workflow_started_emit = True
 
     def _make_event_callback(self, agent_name: str) -> Any:
         """Create an event callback for an agent that forwards to the emitter.
@@ -1313,6 +1425,8 @@ class WorkflowEngine:
             copilot_session_ids=copilot_session_ids,
             system_metadata=self._system_metadata,
             instructions_preamble=self._instructions_preamble,
+            run_id=self._run_context.run_id,
+            event_log_path=self._run_context.log_file,
         )
         self._last_checkpoint_path = checkpoint_path
         if checkpoint_path is not None:
@@ -1830,86 +1944,16 @@ class WorkflowEngine:
         """
         try:
             async with self.limits.timeout_context():
-                # Emit workflow_started before the execution loop
+                # Emit workflow_started before the execution loop.
+                # On resume, the CLI seeds the dashboard with a synthesized
+                # workflow_started using the current config and sets
+                # ``_suppress_workflow_started_emit`` so that the engine does
+                # not re-emit one here (a second root-level emit would
+                # double-increment the frontend's ``wfDepth`` and route the
+                # resumed run's events into a phantom child workflow context).
                 self._system_metadata = self._build_system_metadata()
-                default_effort = self.config.workflow.runtime.default_reasoning_effort
-                self._emit(
-                    "workflow_started",
-                    {
-                        "name": self.config.workflow.name,
-                        "version": self._conductor_version(),
-                        "entry_point": self.config.workflow.entry_point,
-                        "agents": [
-                            {
-                                "name": a.name,
-                                "type": a.type or "agent",
-                                "model": a.model,
-                                "reasoning_effort": (
-                                    a.reasoning.effort
-                                    if a.reasoning is not None
-                                    else default_effort
-                                ),
-                            }
-                            for a in self.config.agents
-                        ],
-                        "parallel_groups": [
-                            {
-                                "name": p.name,
-                                "agents": p.agents,
-                            }
-                            for p in self.config.parallel
-                        ],
-                        "for_each_groups": [
-                            {
-                                "name": f.name,
-                                "source": f.source,
-                            }
-                            for f in self.config.for_each
-                        ],
-                        "routes": [
-                            {
-                                "from": a.name,
-                                "to": r.to,
-                                "when": r.when,
-                            }
-                            for a in self.config.agents
-                            for r in a.routes
-                        ]
-                        + [
-                            {
-                                "from": a.name,
-                                "to": o.route,
-                                "when": f"selection == '{o.value}'",
-                            }
-                            for a in self.config.agents
-                            if a.type == "human_gate" and a.options
-                            for o in a.options
-                        ]
-                        + [
-                            {
-                                "from": p.name,
-                                "to": r.to,
-                                "when": r.when,
-                            }
-                            for p in self.config.parallel
-                            for r in p.routes
-                        ]
-                        + [
-                            {
-                                "from": f.name,
-                                "to": r.to,
-                                "when": r.when,
-                            }
-                            for f in self.config.for_each
-                            for r in f.routes
-                        ],
-                        **self._yaml_source_field(),
-                        "metadata": self.config.workflow.metadata,
-                        "system": self._system_metadata,
-                        "run_id": self._run_id,
-                        "log_file": self._log_file,
-                    },
-                )
+                if not self._suppress_workflow_started_emit:
+                    self._emit("workflow_started", self.build_workflow_started_data())
 
                 _workflow_start = _time.time()
 

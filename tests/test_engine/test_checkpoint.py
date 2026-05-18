@@ -275,6 +275,55 @@ class TestSaveCheckpoint:
         data = json.loads(path.read_text())
         assert data["copilot_session_ids"] == {"agent_a": "sid-123"}
 
+    def test_run_id_and_event_log_path_included(self, tmp_path: Path) -> None:
+        """``run_id`` and ``event_log_path`` round-trip through save+load.
+
+        Regression coverage for issue #167: the resume web dashboard needs
+        these fields to replay the original timeline.
+        """
+        wf = _write_workflow(tmp_path)
+        ctx = _make_context()
+        limits = _make_limits()
+        error = RuntimeError("err")
+        log_path = tmp_path / "conductor-x.events.jsonl"
+        log_path.write_text("")
+
+        with patch.object(CheckpointManager, "get_checkpoints_dir", return_value=tmp_path):
+            saved_path = CheckpointManager.save_checkpoint(
+                wf,
+                ctx,
+                limits,
+                "a",
+                error,
+                {},
+                run_id="abc12345",
+                event_log_path=str(log_path),
+            )
+
+        assert saved_path is not None
+        data = json.loads(saved_path.read_text())
+        assert data["run_id"] == "abc12345"
+        assert data["event_log_path"] == str(log_path)
+
+        cp = CheckpointManager.load_checkpoint(saved_path)
+        assert cp.run_id == "abc12345"
+        assert cp.event_log_path == str(log_path)
+
+    def test_run_id_and_event_log_path_default_empty(self, tmp_path: Path) -> None:
+        """Defaults are empty strings when not supplied (backward compat)."""
+        wf = _write_workflow(tmp_path)
+        ctx = _make_context()
+        limits = _make_limits()
+        error = RuntimeError("err")
+
+        with patch.object(CheckpointManager, "get_checkpoints_dir", return_value=tmp_path):
+            saved_path = CheckpointManager.save_checkpoint(wf, ctx, limits, "a", error, {})
+
+        assert saved_path is not None
+        cp = CheckpointManager.load_checkpoint(saved_path)
+        assert cp.run_id == ""
+        assert cp.event_log_path == ""
+
     def test_no_leftover_tmp_file(self, tmp_path: Path) -> None:
         """After a successful save, no .tmp file should remain."""
         wf = _write_workflow(tmp_path)

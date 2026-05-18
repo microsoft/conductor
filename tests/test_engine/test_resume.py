@@ -577,3 +577,156 @@ class TestSetContextAndLimits:
         assert engine.context.workflow_dir == ""
         assert engine.context.workflow_file == ""
         assert engine.context.workflow_name == config.workflow.name
+
+
+# ---------------------------------------------------------------------------
+# run_id / event_log_path persistence (issue #167)
+# ---------------------------------------------------------------------------
+
+
+class TestRunIdAndEventLogPathPersistence:
+    """Verify the engine forwards RunContext.run_id/log_file into checkpoints."""
+
+    @pytest.mark.asyncio
+    async def test_checkpoint_persists_run_id_and_event_log_path(self, tmp_path: Path) -> None:
+        """When a workflow fails, the saved checkpoint records the run_id and
+        log path so resume_workflow_async can replay the original timeline
+        into the web dashboard (issue #167)."""
+        from conductor.engine.workflow import RunContext
+
+        wf_path = _write_workflow(tmp_path)
+        config = _multi_agent_config()
+
+        def mock_handler(agent, prompt, context):
+            raise ProviderError("boom")
+
+        provider = CopilotProvider(mock_handler=mock_handler)
+        log_file = tmp_path / "conductor-test.events.jsonl"
+        log_file.write_text("")  # touch
+        engine = WorkflowEngine(
+            config,
+            provider,
+            workflow_path=wf_path,
+            run_context=RunContext(run_id="r12345", log_file=str(log_file)),
+        )
+
+        with (
+            patch.object(CheckpointManager, "get_checkpoints_dir", return_value=tmp_path),
+            pytest.raises(ProviderError),
+        ):
+            await engine.run({"topic": "AI"})
+
+        cp = CheckpointManager.load_checkpoint(engine._last_checkpoint_path)
+        assert cp.run_id == "r12345"
+        assert cp.event_log_path == str(log_file)
+
+    @pytest.mark.asyncio
+    async def test_checkpoint_defaults_run_id_empty_when_unset(self, tmp_path: Path) -> None:
+        """Without a RunContext, fields default to empty strings (parity with old
+        checkpoints)."""
+        wf_path = _write_workflow(tmp_path)
+        config = _multi_agent_config()
+
+        def mock_handler(agent, prompt, context):
+            raise ProviderError("boom")
+
+        provider = CopilotProvider(mock_handler=mock_handler)
+        engine = WorkflowEngine(config, provider, workflow_path=wf_path)
+
+        with (
+            patch.object(CheckpointManager, "get_checkpoints_dir", return_value=tmp_path),
+            pytest.raises(ProviderError),
+        ):
+            await engine.run({"topic": "AI"})
+
+        cp = CheckpointManager.load_checkpoint(engine._last_checkpoint_path)
+        assert cp.run_id == ""
+        assert cp.event_log_path == ""
+
+
+# ---------------------------------------------------------------------------
+# build_workflow_started_data + suppress_workflow_started_emit (issue #167)
+# ---------------------------------------------------------------------------
+
+
+class TestBuildAndSuppressWorkflowStarted:
+    """Verify the CLI resume path can seed the dashboard with topology."""
+
+    def test_build_workflow_started_data_shape(self) -> None:
+        """The build helper returns a dict matching the engine's emit shape."""
+        config = _multi_agent_config()
+        engine = WorkflowEngine(config)
+
+        data = engine.build_workflow_started_data()
+
+        assert data["name"] == "multi-agent"
+        assert data["entry_point"] == "planner"
+        agent_names = [a["name"] for a in data["agents"]]
+        assert agent_names == ["planner", "researcher", "synthesizer"]
+        # Routes are flattened from agent.routes + human_gate + parallel + for_each
+        assert any(r["from"] == "planner" and r["to"] == "researcher" for r in data["routes"])
+        # Carries metadata, system, run_id, log_file fields
+        assert "metadata" in data
+        assert "system" in data
+        assert "run_id" in data
+        assert "log_file" in data
+
+    @pytest.mark.asyncio
+    async def test_suppress_workflow_started_emit_skips_emit(self, tmp_path: Path) -> None:
+        """When suppressed, engine.resume() does not emit ``workflow_started``."""
+        from conductor.events import WorkflowEvent, WorkflowEventEmitter
+
+        wf_path = _write_workflow(tmp_path)
+        config = _multi_agent_config()
+
+        def mock_handler(agent, prompt, context):
+            return {"plan": "p", "findings": "f", "summary": "s"}[
+                {"planner": "plan", "researcher": "findings", "synthesizer": "summary"}[agent.name]
+            ]
+
+        # ``mock_handler`` returns a string; need to wrap as dict to match
+        # the AgentDef output schema. Simpler: build per-agent stub outputs.
+        def stub_handler(agent, prompt, context):
+            if agent.name == "planner":
+                return {"plan": "p"}
+            if agent.name == "researcher":
+                return {"findings": "f"}
+            return {"summary": "s"}
+
+        emitter = WorkflowEventEmitter()
+        captured_types: list[str] = []
+
+        def capture(event: WorkflowEvent) -> None:
+            captured_types.append(event.type)
+
+        emitter.subscribe(capture)
+
+        provider = CopilotProvider(mock_handler=stub_handler)
+        engine = WorkflowEngine(config, provider, workflow_path=wf_path, event_emitter=emitter)
+
+        # Sanity: without suppression, engine.run() emits workflow_started.
+        with patch.object(CheckpointManager, "get_checkpoints_dir", return_value=tmp_path):
+            await engine.run({"topic": "AI"})
+
+        assert "workflow_started" in captured_types
+        assert "workflow_completed" in captured_types
+
+        # Reset and try resume with suppression.
+        captured_types.clear()
+        engine2 = WorkflowEngine(config, provider, workflow_path=wf_path, event_emitter=emitter)
+        engine2.set_context(WorkflowContext())
+        engine2.set_limits(
+            LimitEnforcer.from_dict(
+                {"current_iteration": 0, "max_iterations": 10, "execution_history": []},
+                timeout_seconds=120,
+            )
+        )
+        engine2.context.set_workflow_inputs({"topic": "AI"})
+        engine2.suppress_workflow_started_emit()
+        with patch.object(CheckpointManager, "get_checkpoints_dir", return_value=tmp_path):
+            await engine2.resume("planner")
+
+        # No workflow_started should have been emitted on resume.
+        assert "workflow_started" not in captured_types
+        # But workflow_completed IS still emitted (only the start is suppressed).
+        assert "workflow_completed" in captured_types

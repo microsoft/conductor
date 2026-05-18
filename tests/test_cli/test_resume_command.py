@@ -67,10 +67,17 @@ def _write_checkpoint(
     error_message: str = "Network error",
     timestamp: str = "20260224-153000",
     workflow_hash: str | None = None,
+    run_id: str = "",
+    event_log_path: str = "",
+    execution_history: list[str] | None = None,
+    agent_outputs: dict[str, Any] | None = None,
 ) -> Path:
     """Write a checkpoint JSON file and return its path."""
     if workflow_hash is None:
         workflow_hash = CheckpointManager.compute_workflow_hash(workflow_path)
+
+    history = execution_history or []
+    outputs = agent_outputs or {}
 
     checkpoint = {
         "version": 1,
@@ -87,16 +94,18 @@ def _write_checkpoint(
         "current_agent": current_agent,
         "context": {
             "workflow_inputs": {"name": "World"},
-            "agent_outputs": {},
-            "current_iteration": 0,
-            "execution_history": [],
+            "agent_outputs": outputs,
+            "current_iteration": len(history),
+            "execution_history": history,
         },
         "limits": {
-            "current_iteration": 0,
+            "current_iteration": len(history),
             "max_iterations": 10,
-            "execution_history": [],
+            "execution_history": history,
         },
         "copilot_session_ids": {},
+        "run_id": run_id,
+        "event_log_path": event_log_path,
     }
 
     workflow_name = workflow_path.stem
@@ -1079,3 +1088,137 @@ class TestResumeWiring:
         assert result.exit_code == 0, result.output
         kwargs = mock_resume.call_args[1]
         assert kwargs["metadata"] == {"url": "https://x?a=b&c=d"}
+
+
+# ---------------------------------------------------------------------------
+# resume_workflow_async dashboard replay (issue #167)
+# ---------------------------------------------------------------------------
+
+
+class TestResumeReplaysIntoDashboard:
+    """Verify resume_workflow_async seeds the web dashboard with prior events."""
+
+    @pytest.mark.asyncio
+    async def test_replays_original_jsonl_when_path_available(self, tmp_path: Path) -> None:
+        """When the checkpoint records an existing event_log_path, the dashboard's
+        history is seeded from that file before the engine resumes."""
+        from conductor.cli.run import resume_workflow_async
+
+        # Create a real JSONL log with some prior events.
+        log_path = tmp_path / "conductor-test.events.jsonl"
+        log_path.write_text(
+            '{"type":"agent_started","timestamp":1.0,"data":{"agent_name":"greeter"}}\n'
+            '{"type":"agent_completed","timestamp":2.0,'
+            '"data":{"agent_name":"greeter","output":{"greeting":"hi"}}}\n'
+        )
+
+        wf_path = _write_workflow(tmp_path)
+        cp_path = _write_checkpoint(
+            tmp_path,
+            wf_path,
+            run_id="abc12345",
+            event_log_path=str(log_path),
+        )
+
+        captured: dict[str, Any] = {}
+
+        # Capture the dashboard so we can inspect its history.
+        from conductor.web.server import WebDashboard as _RealDashboard
+
+        def _capture_dashboard(*args, **kwargs):
+            dash = _RealDashboard(*args, **kwargs)
+            # Skip the post-execution "wait for Ctrl+C" hang.
+            dash.wait_for_clients_disconnect = AsyncMock(return_value=None)
+            captured["dashboard"] = dash
+            return dash
+
+        with (
+            patch("conductor.cli.run.ProviderRegistry") as mock_registry_cls,
+            patch("conductor.cli.run.WorkflowEngine") as mock_engine_cls,
+            patch("conductor.web.server.WebDashboard", side_effect=_capture_dashboard),
+        ):
+            mock_registry = AsyncMock()
+            mock_registry_cls.return_value = mock_registry
+            mock_registry.__aenter__ = AsyncMock(return_value=mock_registry)
+            mock_registry.__aexit__ = AsyncMock(return_value=False)
+
+            mock_engine = MagicMock()
+            mock_engine.resume = AsyncMock(return_value={"result": "ok"})
+            mock_engine.config = MagicMock()
+            mock_engine.config.workflow.cost.show_summary = False
+            mock_engine_cls.return_value = mock_engine
+
+            await resume_workflow_async(
+                checkpoint_path=cp_path,
+                web=True,
+                web_bg=True,  # use wait_for_clients_disconnect (mocked above)
+                web_port=0,
+                no_interactive=True,
+            )
+
+        dashboard = captured["dashboard"]
+        # Resume-mode dashboard history begins with a synthesised
+        # ``workflow_started`` from the current config (so replayed events
+        # apply to correct topology), followed by the replayed events.
+        types = [ev["type"] for ev in dashboard._event_history]
+        assert types[0] == "workflow_started"
+        assert "agent_started" in types
+        assert "agent_completed" in types
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_synthetic_when_log_missing(self, tmp_path: Path) -> None:
+        """If the checkpoint has no event_log_path (or the file is gone), synthetic
+        events are generated from execution_history so the dashboard isn't blank."""
+        from conductor.cli.run import resume_workflow_async
+
+        wf_path = _write_workflow(tmp_path)
+        # No event_log_path; provide execution_history so synthetic emits events.
+        cp_path = _write_checkpoint(
+            tmp_path,
+            wf_path,
+            current_agent="greeter",
+            execution_history=["greeter"],
+            agent_outputs={"greeter": {"greeting": "hi"}},
+        )
+
+        captured: dict[str, Any] = {}
+        from conductor.web.server import WebDashboard as _RealDashboard
+
+        def _capture_dashboard(*args, **kwargs):
+            dash = _RealDashboard(*args, **kwargs)
+            dash.wait_for_clients_disconnect = AsyncMock(return_value=None)
+            captured["dashboard"] = dash
+            return dash
+
+        with (
+            patch("conductor.cli.run.ProviderRegistry") as mock_registry_cls,
+            patch("conductor.cli.run.WorkflowEngine") as mock_engine_cls,
+            patch("conductor.web.server.WebDashboard", side_effect=_capture_dashboard),
+        ):
+            mock_registry = AsyncMock()
+            mock_registry_cls.return_value = mock_registry
+            mock_registry.__aenter__ = AsyncMock(return_value=mock_registry)
+            mock_registry.__aexit__ = AsyncMock(return_value=False)
+
+            mock_engine = MagicMock()
+            mock_engine.resume = AsyncMock(return_value={"result": "ok"})
+            mock_engine.config = MagicMock()
+            mock_engine.config.workflow.cost.show_summary = False
+            mock_engine_cls.return_value = mock_engine
+
+            await resume_workflow_async(
+                checkpoint_path=cp_path,
+                web=True,
+                web_bg=True,
+                web_port=0,
+                no_interactive=True,
+            )
+
+        dashboard = captured["dashboard"]
+        # Resume-mode dashboard history starts with a synthesised
+        # ``workflow_started`` (current topology) so historical events
+        # apply correctly, then the synthesised agent_started/completed.
+        types = [ev["type"] for ev in dashboard._event_history]
+        assert types == ["workflow_started", "agent_started", "agent_completed"]
+        assert dashboard._event_history[2]["data"]["agent_name"] == "greeter"
+        assert dashboard._event_history[2]["data"]["synthetic"] is True
