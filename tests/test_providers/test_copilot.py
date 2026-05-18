@@ -675,6 +675,308 @@ class TestLogParseRecovery:
             error=long_error,
         )
 
+    def test_log_parse_recovery_emits_agent_tag_when_named(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """When ``agent_name`` is provided, the rendered line includes it."""
+        provider = CopilotProvider(mock_handler=stub_handler)
+
+        provider._log_parse_recovery(
+            attempt=1,
+            max_attempts=5,
+            error="boom",
+            agent_name="analyzer[item_a]",
+        )
+
+        captured = capsys.readouterr().err
+        assert "[analyzer[item_a]]" in captured
+        assert "Parse Recovery 1/5" in captured
+        # The tag must precede the recovery icon
+        assert captured.index("[analyzer[item_a]]") < captured.index("🔄")
+
+    def test_log_parse_recovery_omits_tag_when_unnamed(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """When ``agent_name`` is omitted, no attribution tag is emitted."""
+        provider = CopilotProvider(mock_handler=stub_handler)
+
+        provider._log_parse_recovery(attempt=1, max_attempts=5, error="boom")
+
+        captured = capsys.readouterr().err
+        # No bracketed tag preceding the recovery icon
+        assert "[" not in captured.split("Parse Recovery")[0]
+
+
+class TestLogRecoveryAttempt:
+    """Tests for idle recovery attempt logging."""
+
+    def test_emits_agent_tag_when_named(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """When ``agent_name`` is provided, the rendered line includes it."""
+        provider = CopilotProvider(mock_handler=stub_handler)
+
+        provider._log_recovery_attempt(
+            attempt=2,
+            last_event_type="tool.execution_start",
+            last_tool_call="grep",
+            agent_name="analyzer[item_b]",
+        )
+
+        captured = capsys.readouterr().err
+        assert "[analyzer[item_b]]" in captured
+        assert "Idle Recovery" in captured
+        assert "grep" in captured
+        # The tag must precede the warning icon
+        assert captured.index("[analyzer[item_b]]") < captured.index("⚠️")
+
+    def test_omits_tag_when_unnamed(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """No attribution tag emitted when ``agent_name`` is omitted."""
+        provider = CopilotProvider(mock_handler=stub_handler)
+
+        provider._log_recovery_attempt(
+            attempt=1,
+            last_event_type="tool.execution_start",
+            last_tool_call=None,
+        )
+
+        captured = capsys.readouterr().err
+        # No bracketed tag preceding the recovery icon
+        assert "[" not in captured.split("Idle Recovery")[0]
+
+
+class TestLogEventVerbose:
+    """Tests for SDK event verbose logging and agent attribution.
+
+    The Copilot provider renders SDK events (tool calls, reasoning, processing
+    indicators, sub-agent lifecycle) directly to the console via Rich. When
+    concurrent for-each or parallel iterations interleave their output, an
+    optional ``agent_name`` parameter prefixes each line with ``[agent_name]``
+    so consumers can attribute output to a specific iteration.
+    """
+
+    @staticmethod
+    def _event(**fields: Any) -> Any:
+        """Build a fake SDK event with the given ``.data`` attributes."""
+        from types import SimpleNamespace
+
+        return SimpleNamespace(data=SimpleNamespace(**fields))
+
+    def test_tool_execution_start_renders_agent_tag(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        provider = CopilotProvider(mock_handler=stub_handler)
+
+        provider._log_event_verbose(
+            "tool.execution_start",
+            self._event(tool_name="view"),
+            full_mode=False,
+            agent_name="processor[item_a]",
+        )
+
+        out = capsys.readouterr().err
+        assert "[processor[item_a]]" in out
+        assert "view" in out
+        # Tag must appear before the wrench icon (between tree prefix and icon)
+        assert out.index("[processor[item_a]]") < out.index("🔧")
+
+    def test_tool_execution_start_without_agent_tag(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        provider = CopilotProvider(mock_handler=stub_handler)
+
+        provider._log_event_verbose(
+            "tool.execution_start",
+            self._event(tool_name="view"),
+            full_mode=False,
+        )
+
+        out = capsys.readouterr().err
+        assert "view" in out
+        # No magenta agent tag should appear before the icon
+        assert "[processor" not in out
+
+    def test_tool_execution_start_args_line_has_agent_tag(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The ``args:`` continuation line in full mode must also be tagged."""
+        provider = CopilotProvider(mock_handler=stub_handler)
+
+        provider._log_event_verbose(
+            "tool.execution_start",
+            self._event(tool_name="grep", arguments={"pattern": "needle"}),
+            full_mode=True,
+            agent_name="processor[item_c]",
+        )
+
+        out = capsys.readouterr().err
+        # Both the tool name line and the args line should carry the tag
+        assert out.count("[processor[item_c]]") >= 2
+        assert "args:" in out
+        # On the args line, the tag must come before the ``args:`` literal
+        assert out.index("[processor[item_c]]") < out.index("args:")
+
+    def test_tool_execution_complete_renders_agent_tag(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        provider = CopilotProvider(mock_handler=stub_handler)
+
+        provider._log_event_verbose(
+            "tool.execution_complete",
+            self._event(tool_name="view", result="some result"),
+            full_mode=True,
+            agent_name="processor[0]",
+        )
+
+        out = capsys.readouterr().err
+        # Both the completion line and the result line should carry the tag
+        assert out.count("[processor[0]]") >= 2
+        assert "result:" in out
+        # The tag must precede the check-mark icon on the completion line
+        assert out.index("[processor[0]]") < out.index("✓")
+
+    def test_tool_execution_complete_without_agent_tag(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        provider = CopilotProvider(mock_handler=stub_handler)
+
+        provider._log_event_verbose(
+            "tool.execution_complete",
+            self._event(tool_name="view", result="some result"),
+            full_mode=True,
+        )
+
+        out = capsys.readouterr().err
+        assert "view" in out
+        assert "result:" in out
+        assert "[processor" not in out
+
+    def test_reasoning_renders_agent_tag(self, capsys: pytest.CaptureFixture[str]) -> None:
+        provider = CopilotProvider(mock_handler=stub_handler)
+
+        provider._log_event_verbose(
+            "assistant.reasoning",
+            self._event(content="thinking about it"),
+            full_mode=True,
+            agent_name="processor[item_x]",
+        )
+
+        out = capsys.readouterr().err
+        assert "[processor[item_x]]" in out
+        assert "thinking about it" in out
+        # Tag must precede the brain icon
+        assert out.index("[processor[item_x]]") < out.index("💭")
+
+    def test_reasoning_without_agent_tag(self, capsys: pytest.CaptureFixture[str]) -> None:
+        provider = CopilotProvider(mock_handler=stub_handler)
+
+        provider._log_event_verbose(
+            "assistant.reasoning",
+            self._event(content="thinking about it"),
+            full_mode=True,
+        )
+
+        out = capsys.readouterr().err
+        assert "thinking about it" in out
+        assert "[processor" not in out
+
+    def test_subagent_started_does_not_shadow_agent_name(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """``subagent.started`` previously bound a local ``agent_name``. The
+        outer attribution tag must still come from the method parameter, not
+        from the sub-agent name."""
+        provider = CopilotProvider(mock_handler=stub_handler)
+
+        provider._log_event_verbose(
+            "subagent.started",
+            self._event(name="sub_helper"),
+            full_mode=False,
+            agent_name="planner[item_a]",
+        )
+
+        out = capsys.readouterr().err
+        # Outer tag from method parameter
+        assert "[planner[item_a]]" in out
+        # Sub-agent name still rendered as the body of the line
+        assert "sub_helper" in out
+        # Outer tag must precede the robot icon
+        assert out.index("[planner[item_a]]") < out.index("🤖")
+
+    def test_subagent_started_without_agent_tag(self, capsys: pytest.CaptureFixture[str]) -> None:
+        provider = CopilotProvider(mock_handler=stub_handler)
+
+        provider._log_event_verbose(
+            "subagent.started",
+            self._event(name="sub_helper"),
+            full_mode=False,
+        )
+
+        out = capsys.readouterr().err
+        assert "sub_helper" in out
+        # No outer attribution tag — the sub-agent name in the line body
+        # MUST NOT be confused with an attribution tag, so explicitly check
+        # there's no bracketed tag before the robot icon.
+        assert "[planner" not in out
+
+    def test_subagent_completed_does_not_shadow_agent_name(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        provider = CopilotProvider(mock_handler=stub_handler)
+
+        provider._log_event_verbose(
+            "subagent.completed",
+            self._event(name="sub_helper"),
+            full_mode=False,
+            agent_name="planner[item_b]",
+        )
+
+        out = capsys.readouterr().err
+        assert "[planner[item_b]]" in out
+        assert "sub_helper" in out
+        # Outer tag must precede the check-mark icon
+        assert out.index("[planner[item_b]]") < out.index("✓")
+
+    def test_subagent_completed_without_agent_tag(self, capsys: pytest.CaptureFixture[str]) -> None:
+        provider = CopilotProvider(mock_handler=stub_handler)
+
+        provider._log_event_verbose(
+            "subagent.completed",
+            self._event(name="sub_helper"),
+            full_mode=False,
+        )
+
+        out = capsys.readouterr().err
+        assert "sub_helper" in out
+        assert "[planner" not in out
+
+    def test_turn_start_renders_agent_tag(self, capsys: pytest.CaptureFixture[str]) -> None:
+        provider = CopilotProvider(mock_handler=stub_handler)
+
+        provider._log_event_verbose(
+            "assistant.turn_start",
+            self._event(turn_id=3),
+            full_mode=True,
+            agent_name="processor[42]",
+        )
+
+        out = capsys.readouterr().err
+        assert "[processor[42]]" in out
+        assert "Processing" in out
+        # Tag must precede the hourglass icon
+        assert out.index("[processor[42]]") < out.index("⏳")
+
+    def test_turn_start_without_agent_tag(self, capsys: pytest.CaptureFixture[str]) -> None:
+        provider = CopilotProvider(mock_handler=stub_handler)
+
+        provider._log_event_verbose(
+            "assistant.turn_start",
+            self._event(turn_id=3),
+            full_mode=True,
+        )
+
+        out = capsys.readouterr().err
+        assert "Processing" in out
+        assert "[processor" not in out
+
 
 class TestFixPipeBlockingMode:
     """Tests for _fix_pipe_blocking_mode Windows platform guard."""

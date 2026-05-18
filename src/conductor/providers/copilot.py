@@ -635,6 +635,7 @@ class CopilotProvider(AgentProvider):
                     event_callback=event_callback,
                     max_session_seconds=effective_max_session,
                     max_agent_iterations=effective_max_iterations,
+                    agent_name=agent.name,
                 )
                 response_content = sdk_response.content
 
@@ -703,6 +704,7 @@ class CopilotProvider(AgentProvider):
                                 recovery_attempt + 1,
                                 max_recovery,
                                 last_parse_error,
+                                agent_name=agent.name,
                             )
 
                         # Build recovery prompt and send to same session
@@ -714,7 +716,11 @@ class CopilotProvider(AgentProvider):
 
                         # Send recovery prompt and get new response
                         recovery_response = await self._send_and_wait(
-                            session, recovery_prompt, verbose_enabled, full_enabled
+                            session,
+                            recovery_prompt,
+                            verbose_enabled,
+                            full_enabled,
+                            agent_name=agent.name,
                         )
                         response_content = recovery_response.content
 
@@ -767,6 +773,7 @@ class CopilotProvider(AgentProvider):
         event_callback: EventCallback | None = None,
         max_session_seconds: float | None = None,
         max_agent_iterations: int | None = None,
+        agent_name: str | None = None,
     ) -> SDKResponse:
         """Send a prompt to the session and wait for response.
 
@@ -783,6 +790,12 @@ class CopilotProvider(AgentProvider):
                 If None, uses the provider-level IdleRecoveryConfig default.
             max_agent_iterations: Maximum tool-use iterations for this session.
                 None means no iteration limit.
+            agent_name: Optional agent identifier (e.g., ``"processor[item_a]"``)
+                used to tag verbose log output so concurrent parallel/for-each
+                iterations can be distinguished. When ``None``, no tag is
+                emitted. The Copilot provider's ``_execute_sdk_call`` always
+                passes ``agent.name`` here, so sequential agents are also
+                tagged with their plain name.
 
         Returns:
             SDKResponse with content and usage data. If interrupted,
@@ -819,7 +832,8 @@ class CopilotProvider(AgentProvider):
                 ):
                     tn = getattr(event.data, "tool_name", None) or getattr(event.data, "name", "?")
                     tool_info = f" tool={tn}"
-                logger.debug("sdk_event: %s%s", event_type, tool_info)
+                agent_info = f" agent={agent_name}" if agent_name else ""
+                logger.debug("sdk_event:%s %s%s", agent_info, event_type, tool_info)
 
             # Only update the idle clock for events that indicate real agent
             # work. Bookkeeping/lifecycle events are excluded via the
@@ -865,7 +879,7 @@ class CopilotProvider(AgentProvider):
 
             # Verbose logging for intermediate progress
             if verbose_enabled:
-                self._log_event_verbose(event_type, event, full_enabled)
+                self._log_event_verbose(event_type, event, full_enabled, agent_name=agent_name)
 
         session.on(on_event)
 
@@ -889,6 +903,7 @@ class CopilotProvider(AgentProvider):
             tool_iteration_ref=tool_iteration_ref,
             max_agent_iterations=max_agent_iterations,
             interrupt_signal=interrupt_signal,
+            agent_name=agent_name,
         )
         if was_interrupted:
             # Return partial content (don't check error_message for partial)
@@ -965,7 +980,12 @@ class CopilotProvider(AgentProvider):
         except TimeoutError:
             logger.debug("Post-abort wait timed out after 5s")
 
-    async def send_followup(self, session: Any, guidance: str) -> AgentOutput:
+    async def send_followup(
+        self,
+        session: Any,
+        guidance: str,
+        agent_name: str | None = None,
+    ) -> AgentOutput:
         """Send follow-up guidance to an interrupted session.
 
         After a mid-agent interrupt, the session is kept alive so that
@@ -976,6 +996,11 @@ class CopilotProvider(AgentProvider):
         Args:
             session: The Copilot SDK session handle (kept alive after interrupt).
             guidance: User-provided guidance text to send as follow-up.
+            agent_name: Optional agent identifier forwarded to verbose log
+                output for this follow-up turn. Defaults to ``None``. Today
+                interrupts only fire on sequential agents (for-each iterations
+                do not forward ``interrupt_signal`` to the executor), so the
+                tag, when supplied, is the unqualified agent name.
 
         Returns:
             AgentOutput with the follow-up response content.
@@ -987,7 +1012,11 @@ class CopilotProvider(AgentProvider):
 
         try:
             sdk_response = await self._send_and_wait(
-                session, guidance, verbose_enabled, full_enabled
+                session,
+                guidance,
+                verbose_enabled,
+                full_enabled,
+                agent_name=agent_name,
             )
 
             content: dict[str, Any]
@@ -1018,6 +1047,7 @@ class CopilotProvider(AgentProvider):
         attempt: int,
         max_attempts: int,
         error: str,
+        agent_name: str | None = None,
     ) -> None:
         """Log a parse recovery attempt in verbose mode.
 
@@ -1025,6 +1055,8 @@ class CopilotProvider(AgentProvider):
             attempt: Current recovery attempt number (1-based).
             max_attempts: Maximum number of recovery attempts.
             error: The parse error message.
+            agent_name: Optional agent identifier used to attribute the
+                recovery message to a specific concurrent agent.
         """
         from rich.console import Console
         from rich.text import Text
@@ -1033,6 +1065,8 @@ class CopilotProvider(AgentProvider):
 
         text = Text()
         text.append("    ├─ ", style="dim")
+        if agent_name:
+            text.append(f"[{agent_name}] ", style="magenta")
         text.append("🔄 ", style="")
         text.append(f"Parse Recovery {attempt}/{max_attempts}", style="yellow bold")
         text.append(" - ", style="dim")
@@ -1182,7 +1216,13 @@ class CopilotProvider(AgentProvider):
 
         return schema
 
-    def _log_event_verbose(self, event_type: str, event: Any, full_mode: bool) -> None:
+    def _log_event_verbose(
+        self,
+        event_type: str,
+        event: Any,
+        full_mode: bool,
+        agent_name: str | None = None,
+    ) -> None:
         """Log SDK events in verbose mode for progress visibility.
 
         Note: Caller must check is_verbose() before calling - contextvars
@@ -1192,6 +1232,11 @@ class CopilotProvider(AgentProvider):
             event_type: The event type string.
             event: The event object.
             full_mode: If True, show full details (args, results, reasoning).
+            agent_name: Optional agent identifier (e.g.,
+                ``"processor[item_a]"``). When set, every rendered line is
+                tagged with ``[agent_name]`` between the tree prefix and the
+                event icon so concurrent parallel/for-each iterations can be
+                distinguished in interleaved logs.
         """
         from rich.console import Console
         from rich.text import Text
@@ -1205,6 +1250,11 @@ class CopilotProvider(AgentProvider):
             if _file_console is not None:
                 _file_console.print(renderable)
 
+        def _append_tag(text: Text) -> None:
+            """Append the optional [agent_name] tag to a Rich Text line."""
+            if agent_name:
+                text.append(f"[{agent_name}] ", style="magenta")
+
         # Log interesting events with Rich styling
         if event_type == "tool.execution_start":
             tool_name = (
@@ -1215,6 +1265,7 @@ class CopilotProvider(AgentProvider):
 
             text = Text()
             text.append("    ├─ ", style="dim")
+            _append_tag(text)
             text.append("🔧 ", style="")
             text.append(str(tool_name), style="cyan bold")
             _print(text)
@@ -1226,6 +1277,7 @@ class CopilotProvider(AgentProvider):
                     args_preview = format_tool_arguments(args, max_length=200) or ""
                     arg_text = Text()
                     arg_text.append("    │     ", style="dim")
+                    _append_tag(arg_text)
                     arg_text.append("args: ", style="dim italic")
                     arg_text.append(args_preview, style="dim")
                     _print(arg_text)
@@ -1236,6 +1288,7 @@ class CopilotProvider(AgentProvider):
             if tool_name:
                 text = Text()
                 text.append("    │  ", style="dim")
+                _append_tag(text)
                 text.append("✓ ", style="green")
                 text.append(str(tool_name), style="dim")
                 _print(text)
@@ -1247,6 +1300,7 @@ class CopilotProvider(AgentProvider):
                     result_preview = extract_tool_result_text(result, max_length=200) or ""
                     result_text = Text()
                     result_text.append("    │     ", style="dim")
+                    _append_tag(result_text)
                     result_text.append("result: ", style="dim italic")
                     result_text.append(result_preview, style="dim")
                     _print(result_text)
@@ -1263,25 +1317,28 @@ class CopilotProvider(AgentProvider):
                         display_reasoning = reasoning
                     text = Text()
                     text.append("    │  ", style="dim")
+                    _append_tag(text)
                     text.append("💭 ", style="")
                     text.append(display_reasoning.replace("\n", " "), style="italic dim")
                     _print(text)
 
         elif event_type == "subagent.started":
-            agent_name = getattr(event.data, "name", None) or "unknown"
+            subagent_name = getattr(event.data, "name", None) or "unknown"
             text = Text()
             text.append("    ├─ ", style="dim")
+            _append_tag(text)
             text.append("🤖 ", style="")
             text.append("Sub-agent: ", style="dim")
-            text.append(str(agent_name), style="magenta bold")
+            text.append(str(subagent_name), style="magenta bold")
             _print(text)
 
         elif event_type == "subagent.completed":
-            agent_name = getattr(event.data, "name", None) or "unknown"
+            subagent_name = getattr(event.data, "name", None) or "unknown"
             text = Text()
             text.append("    │  ", style="dim")
+            _append_tag(text)
             text.append("✓ ", style="green")
-            text.append(f"Sub-agent done: {agent_name}", style="dim")
+            text.append(f"Sub-agent done: {subagent_name}", style="dim")
             _print(text)
 
         elif event_type == "assistant.turn_start":
@@ -1291,6 +1348,7 @@ class CopilotProvider(AgentProvider):
                 turn_info = f" (turn {turn})" if turn else ""
                 text = Text()
                 text.append("    │  ", style="dim")
+                _append_tag(text)
                 text.append("⏳ ", style="yellow")
                 text.append(f"Processing{turn_info}...", style="dim italic")
                 _print(text)
@@ -1411,6 +1469,7 @@ class CopilotProvider(AgentProvider):
         attempt: int,
         last_event_type: str | None,
         last_tool_call: str | None,
+        agent_name: str | None = None,
     ) -> None:
         """Log a recovery attempt in verbose mode.
 
@@ -1418,6 +1477,8 @@ class CopilotProvider(AgentProvider):
             attempt: Current recovery attempt number (1-based).
             last_event_type: The type of the last event received.
             last_tool_call: The name of the last tool that was executing.
+            agent_name: Optional agent identifier used to attribute the
+                recovery message to a specific concurrent agent.
         """
         from rich.console import Console
         from rich.text import Text
@@ -1426,6 +1487,8 @@ class CopilotProvider(AgentProvider):
 
         text = Text()
         text.append("    ├─ ", style="dim")
+        if agent_name:
+            text.append(f"[{agent_name}] ", style="magenta")
         text.append("⚠️ ", style="yellow")
         text.append(
             f"Idle Recovery {attempt}/{self._idle_recovery_config.max_recovery_attempts}",
@@ -1450,6 +1513,7 @@ class CopilotProvider(AgentProvider):
         tool_iteration_ref: list[int] | None = None,
         max_agent_iterations: int | None = None,
         interrupt_signal: asyncio.Event | None = None,
+        agent_name: str | None = None,
     ) -> bool:
         """Wait for session completion with idle detection, recovery, and optional interrupt.
 
@@ -1474,6 +1538,10 @@ class CopilotProvider(AgentProvider):
                 None means no iteration limit.
             interrupt_signal: Optional event that signals user interrupt/revive.
                 When set, aborts the session and returns True.
+            agent_name: Optional agent identifier forwarded to verbose recovery
+                logging so that idle-recovery messages emitted from concurrent
+                for-each or parallel iterations can be attributed to a specific
+                agent. ``None`` means no attribution tag.
 
         Returns:
             True if interrupted, False if completed normally.
@@ -1617,7 +1685,12 @@ class CopilotProvider(AgentProvider):
 
                 # Log recovery attempt
                 if verbose_enabled:
-                    self._log_recovery_attempt(recovery_attempts, last_event_type, last_tool_call)
+                    self._log_recovery_attempt(
+                        recovery_attempts,
+                        last_event_type,
+                        last_tool_call,
+                        agent_name=agent_name,
+                    )
 
                 # Send recovery message
                 recovery_prompt = self._build_recovery_prompt(last_event_type, last_tool_call)

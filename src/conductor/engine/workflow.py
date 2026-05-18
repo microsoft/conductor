@@ -1652,7 +1652,11 @@ class WorkflowEngine:
         if isinstance(provider, CopilotProvider):
             session = provider.get_interrupted_session()
             if session is not None:
-                return await provider.send_followup(session, interrupt_result.guidance)
+                return await provider.send_followup(
+                    session,
+                    interrupt_result.guidance,
+                    agent_name=agent.name,
+                )
 
         # Fallback: re-execute the agent with guidance appended to prompt
         new_guidance_section = self.context.get_guidance_prompt_section()
@@ -3531,16 +3535,31 @@ class WorkflowEngine:
                 # Regular agent execution
                 executor = await self._get_executor_for_agent(for_each_group.agent)
 
-                # Item-scoped event callback that tags all streaming events with item_key
+                # Qualify the per-iteration agent name so that any verbose
+                # provider-side logging (e.g. CopilotProvider tool/reasoning
+                # lines) can attribute interleaved output to a specific
+                # for-each iteration. The original AgentDef is untouched —
+                # only this iteration's copy carries the qualified name.
+                qualified_agent = for_each_group.agent.model_copy(
+                    update={"name": f"{for_each_group.agent.name}[{key}]"}
+                )
+
+                # Item-scoped event callback that tags all streaming events
+                # with the for-each group name + item_key. Wrapper keys are
+                # placed *after* ``**data`` so they override any qualified
+                # ``agent_name`` the provider may emit (e.g. ``agent_retry``).
+                # This keeps the event contract stable for downstream
+                # consumers (dashboard, JSONL log) — they always see the
+                # for-each group name plus a separate ``item_key``.
                 def _item_callback(event_type: str, data: dict[str, Any]) -> None:
-                    data_with_agent = {"agent_name": for_each_group.name, "item_key": key, **data}
+                    data_with_agent = {**data, "agent_name": for_each_group.name, "item_key": key}
                     self._emit(event_type, data_with_agent)
 
                 event_callback = _item_callback if self._event_emitter else None
                 output = await self._execute_with_agent_timeout(
-                    for_each_group.agent,
+                    qualified_agent,
                     executor.execute(
-                        for_each_group.agent,
+                        qualified_agent,
                         agent_context,
                         event_callback=event_callback,
                     ),
