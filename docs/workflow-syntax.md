@@ -255,7 +255,7 @@ Strict-mode semantics:
 
 Note: this is **structural** parity with LLM agents — the script must emit clean JSON to stdout. The JSON-recovery heuristics LLM agents use (extracting JSON from code fences, wrapping non-object payloads) intentionally do not apply to scripts, which are deterministic.
 
-Without a declared `output:` schema, the legacy auto-merge behavior described above still applies.
+Omit `output:` to keep the lenient auto-merge behavior described above.
 
 Access in downstream agents:
 

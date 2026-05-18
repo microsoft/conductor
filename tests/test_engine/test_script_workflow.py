@@ -644,6 +644,14 @@ class TestScriptOutputSchema:
         emitter.subscribe(events.append)
         return emitter, events
 
+    @staticmethod
+    async def _run_expect_validation_error(config: WorkflowConfig) -> ValidationError:
+        """Run the workflow and assert it raises ValidationError; return the error."""
+        engine = WorkflowEngine(config, MagicMock())
+        with pytest.raises(ValidationError) as exc_info:
+            await engine.run({})
+        return exc_info.value
+
     @pytest.mark.asyncio
     async def test_valid_json_matches_schema(self) -> None:
         """Happy path: stdout JSON matches declared schema → fields available."""
@@ -675,12 +683,9 @@ class TestScriptOutputSchema:
             args=["-c", "print('not json')"],
             output={"route": OutputField(type="string")},
         )
-        engine = WorkflowEngine(config, MagicMock())
 
-        with pytest.raises(ValidationError) as exc_info:
-            await engine.run({})
+        err = await self._run_expect_validation_error(config)
 
-        err = exc_info.value
         msg = str(err)
         assert "detector" in msg
         assert "not valid JSON" in msg
@@ -699,12 +704,10 @@ class TestScriptOutputSchema:
             args=["-c", 'print(\'{"route": "plan\')'],
             output={"route": OutputField(type="string")},
         )
-        engine = WorkflowEngine(config, MagicMock())
 
-        with pytest.raises(ValidationError) as exc_info:
-            await engine.run({})
+        err = await self._run_expect_validation_error(config)
 
-        msg = str(exc_info.value)
+        msg = str(err)
         # Underlying JSONDecodeError text describes the unterminated string.
         assert "Unterminated" in msg or "delimiter" in msg or "line 1" in msg
 
@@ -715,12 +718,9 @@ class TestScriptOutputSchema:
             args=["-c", "pass"],
             output={"route": OutputField(type="string")},
         )
-        engine = WorkflowEngine(config, MagicMock())
 
-        with pytest.raises(ValidationError) as exc_info:
-            await engine.run({})
+        err = await self._run_expect_validation_error(config)
 
-        err = exc_info.value
         assert "detector" in str(err)
         assert err.suggestion is not None
         assert "stderr" in err.suggestion.lower()
@@ -737,12 +737,10 @@ class TestScriptOutputSchema:
             args=["-c", f"print({stdout_payload!r})"],
             output={"route": OutputField(type="string")},
         )
-        engine = WorkflowEngine(config, MagicMock())
 
-        with pytest.raises(ValidationError) as exc_info:
-            await engine.run({})
+        err = await self._run_expect_validation_error(config)
 
-        assert "object" in str(exc_info.value).lower()
+        assert "object" in str(err).lower()
 
     @pytest.mark.asyncio
     async def test_missing_required_field_raises(self) -> None:
@@ -754,12 +752,9 @@ class TestScriptOutputSchema:
                 "count": OutputField(type="number"),
             },
         )
-        engine = WorkflowEngine(config, MagicMock())
 
-        with pytest.raises(ValidationError) as exc_info:
-            await engine.run({})
+        err = await self._run_expect_validation_error(config)
 
-        err = exc_info.value
         msg = str(err)
         # Wrapping in workflow.py adds the script name and stdout-JSON suggestion
         # on top of the generic validate_output() message.
@@ -781,12 +776,10 @@ class TestScriptOutputSchema:
                 "count": OutputField(type="number"),
             },
         )
-        engine = WorkflowEngine(config, MagicMock())
 
-        with pytest.raises(ValidationError) as exc_info:
-            await engine.run({})
+        err = await self._run_expect_validation_error(config)
 
-        msg = str(exc_info.value)
+        msg = str(err)
         assert "detector" in msg
         assert "route" in msg
 

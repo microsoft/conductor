@@ -605,6 +605,65 @@ class WorkflowEngine:
             operation_name=f"script '{agent.name}'",
         )
 
+    def _validate_script_output_schema(
+        self,
+        agent: AgentDef,
+        parsed_json: Any,
+        json_parse_error: Exception | None,
+        output_content: dict[str, Any],
+    ) -> None:
+        """Validate script stdout against the declared output schema (issue #118).
+
+        Validation runs against the merged ``output_content`` dict (with the
+        ``stdout``/``stderr``/``exit_code`` baseline plus parsed-JSON overlay)
+        so shadowed built-ins are checked too. The wrapped error from
+        ``validate_output`` is re-raised with script-oriented wording so the
+        user sees the script name and the stdout-JSON contract instead of the
+        LLM-flavored "Ensure agent returns ..." default.
+
+        Args:
+            agent: The script agent definition. ``agent.output`` must be a dict
+                (callers check ``is not None``).
+            parsed_json: Result of ``json.loads(stdout)``, or ``None`` if
+                parsing failed.
+            json_parse_error: The ``JSONDecodeError`` instance if parsing
+                failed, else ``None``.
+            output_content: The merged dict to validate.
+
+        Raises:
+            ValidationError: If stdout was not valid JSON, was a JSON
+                array/scalar, or failed schema validation.
+        """
+        if json_parse_error is not None:
+            raise ValidationError(
+                f"Script '{agent.name}' declares an output schema but stdout "
+                f"is not valid JSON: {json_parse_error}",
+                suggestion=(
+                    "When 'output:' is declared, the script must write a JSON "
+                    "object to stdout. Write logs to stderr."
+                ),
+            )
+        if not isinstance(parsed_json, dict):
+            raise ValidationError(
+                f"Script '{agent.name}' declares an output schema but stdout "
+                f"is a JSON {type(parsed_json).__name__}, not an object",
+                suggestion=(
+                    'Emit a JSON object (e.g. {"field": value}) to stdout. '
+                    "Arrays and scalars are not accepted."
+                ),
+            )
+        assert agent.output is not None  # guaranteed by callers
+        try:
+            validate_output(output_content, agent.output)
+        except ValidationError as schema_exc:
+            raise ValidationError(
+                f"Script '{agent.name}' stdout JSON failed schema validation: {schema_exc.args[0]}",
+                suggestion=(
+                    "Emit a JSON object to stdout with the declared fields "
+                    "and types. Write logs to stderr."
+                ),
+            ) from schema_exc
+
     async def _execute_with_agent_timeout(
         self,
         agent: AgentDef,
@@ -2153,20 +2212,17 @@ class WorkflowEngine:
                                 raise
                             _script_elapsed = _time.time() - _script_start
 
-                            # Build structured output: stdout/stderr/exit_code baseline,
-                            # with parsed JSON object fields (if present) merged on top.
+                            # Build structured output: stdout/stderr/exit_code
+                            # baseline, with parsed JSON object fields merged
+                            # on top so they're addressable as `output.field`
+                            # in templates and routes (matching LLM structured
+                            # outputs). Strict validation against `agent.output`
+                            # runs below when declared.
                             output_content: dict[str, Any] = {
                                 "stdout": script_output.stdout,
                                 "stderr": script_output.stderr,
                                 "exit_code": script_output.exit_code,
                             }
-                            # Auto-parse JSON stdout: if stdout is a valid JSON
-                            # object, merge its fields into output so they're
-                            # accessible as output.field_name in templates and
-                            # route conditions (matching LLM structured outputs).
-                            # When an output schema is declared (issue #118), the
-                            # parse must succeed AND yield a dict, otherwise we
-                            # raise ValidationError below.
                             parsed_json: Any = None
                             json_parse_error: Exception | None = None
                             try:
@@ -2189,51 +2245,18 @@ class WorkflowEngine:
                                 output_content.update(parsed_json)
 
                             # Validate against declared output schema (issue #118).
-                            # Use `is not None` so an explicit `output: {}` opts
-                            # into strict JSON-object mode with zero declared fields.
+                            # `is not None` so an explicit `output: {}` opts
+                            # into strict JSON-object mode with zero declared
+                            # fields. See `_validate_script_output_schema` for
+                            # the validation rules and wrapping rationale.
                             if agent.output is not None:
                                 try:
-                                    if json_parse_error is not None:
-                                        raise ValidationError(
-                                            f"Script '{agent.name}' declares an "
-                                            "output schema but stdout is not valid "
-                                            f"JSON: {json_parse_error}",
-                                            suggestion=(
-                                                "When 'output:' is declared, the "
-                                                "script must write a JSON object "
-                                                "to stdout. Write logs to stderr."
-                                            ),
-                                        )
-                                    if not isinstance(parsed_json, dict):
-                                        type_name = type(parsed_json).__name__
-                                        raise ValidationError(
-                                            f"Script '{agent.name}' declares an "
-                                            "output schema but stdout is a JSON "
-                                            f"{type_name}, not an object",
-                                            suggestion=(
-                                                "Emit a JSON object (e.g. "
-                                                '{"field": value}) to stdout. '
-                                                "Arrays and scalars are not accepted."
-                                            ),
-                                        )
-                                    try:
-                                        validate_output(output_content, agent.output)
-                                    except ValidationError as schema_exc:
-                                        # validate_output is shared with LLM agents
-                                        # and its error wording is LLM-flavored
-                                        # ("agent returns ..."). Wrap so script
-                                        # users see the script name and the
-                                        # stdout-JSON contract.
-                                        raise ValidationError(
-                                            f"Script '{agent.name}' stdout JSON "
-                                            f"failed schema validation: "
-                                            f"{schema_exc.args[0]}",
-                                            suggestion=(
-                                                "Emit a JSON object to stdout "
-                                                "with the declared fields and "
-                                                "types. Write logs to stderr."
-                                            ),
-                                        ) from schema_exc
+                                    self._validate_script_output_schema(
+                                        agent,
+                                        parsed_json,
+                                        json_parse_error,
+                                        output_content,
+                                    )
                                 except ValidationError as exc:
                                     self._emit(
                                         "script_failed",
