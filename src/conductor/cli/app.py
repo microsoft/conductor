@@ -987,8 +987,9 @@ def replay(
             raise typer.Exit(1) from exc
 
         await dashboard.start()
-        console.print(f"\n[bold green]▶ Replay dashboard:[/] {dashboard.url}\n")
-        console.print("[dim]Press Ctrl+C to exit[/dim]\n")
+        if is_verbose():
+            console.print(f"\n[bold green]▶ Replay dashboard:[/] {dashboard.url}\n")
+            console.print("[dim]Press Ctrl+C to exit[/dim]\n")
 
         try:
             await asyncio.Event().wait()

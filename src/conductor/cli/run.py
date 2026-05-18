@@ -1169,8 +1169,9 @@ async def run_workflow_async(
 
         try:
             await dashboard.start()
-            # Print URL to stderr regardless of --silent/--quiet
-            _verbose_console.print(f"[bold cyan]Dashboard:[/bold cyan] {dashboard.url}")
+            from conductor.cli.app import is_verbose
+            if is_verbose():
+                _verbose_console.print(f"[bold cyan]Dashboard:[/bold cyan] {dashboard.url}")
         except Exception as e:
             _verbose_console.print(
                 f"[bold yellow]Warning:[/bold yellow] "
@@ -1682,7 +1683,9 @@ async def resume_workflow_async(
 
             try:
                 await dashboard.start()
-                _verbose_console.print(f"[bold cyan]Dashboard:[/bold cyan] {dashboard.url}")
+                from conductor.cli.app import is_verbose
+                if is_verbose():
+                    _verbose_console.print(f"[bold cyan]Dashboard:[/bold cyan] {dashboard.url}")
             except Exception as e:
                 _verbose_console.print(
                     f"[bold yellow]Warning:[/bold yellow] "
