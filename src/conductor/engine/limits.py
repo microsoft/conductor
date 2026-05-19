@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from conductor.exceptions import (
+    BudgetExceededError,
     MaxIterationsError,
 )
 from conductor.exceptions import (
@@ -52,6 +53,12 @@ class LimitEnforcer:
     timeout_seconds: int | None = None
     """Maximum wall-clock time for entire workflow. None means unlimited."""
 
+    budget_usd: float | None = None
+    """Maximum cost budget in USD. None means no budget tracking."""
+
+    budget_mode: str = "audit"
+    """Budget enforcement mode: 'audit' (warn only) or 'enforce' (stop)."""
+
     current_iteration: int = 0
     """Current iteration count."""
 
@@ -63,6 +70,9 @@ class LimitEnforcer:
 
     current_agent: str | None = None
     """Currently executing agent name."""
+
+    _budget_exceeded_emitted: bool = field(default=False, repr=False)
+    """Internal flag to emit budget_exceeded event only once."""
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize limit state to a JSON-compatible dict.
@@ -85,17 +95,22 @@ class LimitEnforcer:
         cls,
         data: dict[str, Any],
         timeout_seconds: int | None = None,
+        budget_usd: float | None = None,
+        budget_mode: str = "audit",
     ) -> LimitEnforcer:
         """Reconstruct a LimitEnforcer from a serialized dict.
 
         Uses ``max_iterations`` from the checkpoint (it may have been
         increased by the user) and ``timeout_seconds`` from the current
         workflow config so that the resumed run gets a fresh timeout
-        window.
+        window. ``budget_usd`` and ``budget_mode`` come from the current
+        config so that the resumed run gets a fresh budget window.
 
         Args:
             data: Dict previously produced by ``to_dict()``.
             timeout_seconds: Timeout from the workflow config (fresh window).
+            budget_usd: Budget from the workflow config (fresh window).
+            budget_mode: Budget mode from the workflow config.
 
         Returns:
             A new LimitEnforcer with restored iteration state and a fresh
@@ -104,6 +119,8 @@ class LimitEnforcer:
         enforcer = cls(
             max_iterations=data.get("max_iterations", 10),
             timeout_seconds=timeout_seconds,
+            budget_usd=budget_usd,
+            budget_mode=budget_mode,
         )
         enforcer.current_iteration = data.get("current_iteration", 0)
         enforcer.execution_history = list(data.get("execution_history", []))
@@ -238,6 +255,35 @@ class LimitEnforcer:
                 timeout_seconds=float(self.timeout_seconds),
                 current_agent=self.current_agent,
             )
+
+    def check_budget(self, spent_usd: float) -> tuple[bool, bool]:
+        """Check if the workflow cost budget has been exceeded.
+
+        Returns a tuple indicating whether the budget was exceeded and
+        whether this is the first time the overshoot was detected (so
+        the caller can emit a one-time event).
+
+        In ``enforce`` mode the caller should raise ``BudgetExceededError``
+        after emitting the event. In ``audit`` mode the caller should
+        log a warning and continue.
+
+        Args:
+            spent_usd: Current cumulative cost from UsageTracker.
+
+        Returns:
+            Tuple of (exceeded, first_time). ``exceeded`` is True when
+            ``spent_usd > budget_usd``. ``first_time`` is True only on
+            the first call that detects the overshoot.
+        """
+        if self.budget_usd is None:
+            return (False, False)
+
+        if spent_usd > self.budget_usd:
+            first_time = not self._budget_exceeded_emitted
+            self._budget_exceeded_emitted = True
+            return (True, first_time)
+
+        return (False, False)
 
     def get_elapsed_time(self) -> float:
         """Get the elapsed time since workflow start.

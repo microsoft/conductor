@@ -27,6 +27,7 @@ from conductor.engine.usage import UsageTracker, WorkflowUsage
 from conductor.events import WorkflowEvent, WorkflowEventEmitter
 from conductor.exceptions import (
     AgentTimeoutError,
+    BudgetExceededError,
     ConductorError,
     ExecutionError,
     InterruptError,
@@ -356,6 +357,8 @@ class WorkflowEngine:
         self.limits = LimitEnforcer(
             max_iterations=config.workflow.limits.max_iterations,
             timeout_seconds=config.workflow.limits.timeout_seconds,
+            budget_usd=config.workflow.limits.budget_usd,
+            budget_mode=config.workflow.limits.budget_mode,
         )
         self.gate_handler = HumanGateHandler(skip_gates=skip_gates)
         self.max_iterations_handler = MaxIterationsHandler(skip_gates=skip_gates)
@@ -478,6 +481,58 @@ class WorkflowEngine:
             data = {**data, "subworkflow_path": list(self._dashboard_context_path)}
         event = WorkflowEvent(type=event_type, timestamp=_time.time(), data=data)
         self._event_emitter.emit(event)
+
+    def _check_budget(self) -> None:
+        """Check whether the workflow cost budget has been exceeded.
+
+        Reads current spend from ``usage_tracker``, delegates the
+        threshold check to ``LimitEnforcer.check_budget()``, and acts
+        according to ``budget_mode``:
+
+        - On first overshoot: emit a ``budget_exceeded`` event.
+        - ``enforce`` mode: raise ``BudgetExceededError`` (triggers
+          checkpoint + workflow stop).
+        - ``audit`` mode: log a warning and continue.
+
+        Subsequent overshoots in ``audit`` mode are silent (no repeated
+        events or warnings).
+        """
+        summary = self.usage_tracker.get_summary()
+        spent = summary.total_cost_usd or 0.0
+        exceeded, first_time = self.limits.check_budget(spent)
+
+        if not exceeded:
+            return
+
+        budget = self.limits.budget_usd  # guaranteed non-None when exceeded
+        assert budget is not None  # for type narrowing
+
+        if first_time:
+            self._emit(
+                "budget_exceeded",
+                {
+                    "budget_usd": budget,
+                    "spent_usd": spent,
+                    "budget_mode": self.limits.budget_mode,
+                    "current_agent": self.limits.current_agent,
+                },
+            )
+
+        if self.limits.budget_mode == "enforce":
+            raise BudgetExceededError(
+                f"Workflow exceeded cost budget (${budget:.2f}): "
+                f"spent ${spent:.2f}",
+                budget_usd=budget,
+                spent_usd=spent,
+                current_agent=self.limits.current_agent,
+            )
+
+        if first_time:
+            logger.warning(
+                "Budget exceeded (audit mode): spent $%.4f of $%.2f budget",
+                spent,
+                budget,
+            )
 
     def _yaml_source_field(self) -> dict[str, str]:
         """Return ``{"yaml_source": <text>}`` if the workflow file is readable."""
@@ -2038,8 +2093,9 @@ class WorkflowEngine:
                             for_each_group.name, count=for_each_output.count
                         )
 
-                        # Check timeout after for-each group
+                        # Check timeout and budget after for-each group
                         self.limits.check_timeout()
+                        self._check_budget()
 
                         # Evaluate routes from for-each group
                         route_result = self._evaluate_for_each_routes(
@@ -2109,8 +2165,9 @@ class WorkflowEngine:
                         agent_count = len(parallel_group.agents)
                         self.limits.record_execution(parallel_group.name, count=agent_count)
 
-                        # Check timeout after parallel group
+                        # Check timeout and budget after parallel group
                         self.limits.check_timeout()
+                        self._check_budget()
 
                         # Evaluate routes from parallel group
                         route_result = self._evaluate_parallel_routes(
@@ -2355,6 +2412,7 @@ class WorkflowEngine:
                             self.context.store(agent.name, output_content)
                             self.limits.record_execution(agent.name)
                             self.limits.check_timeout()
+                            self._check_budget()
 
                             route_result = self._evaluate_routes(agent, output_content)
 
@@ -2446,6 +2504,7 @@ class WorkflowEngine:
                             self.context.store(agent.name, sub_output)
                             self.limits.record_execution(agent.name)
                             self.limits.check_timeout()
+                            self._check_budget()
 
                             route_result = self._evaluate_routes(agent, sub_output)
 
@@ -2576,8 +2635,9 @@ class WorkflowEngine:
                         # Record successful execution
                         self.limits.record_execution(agent.name)
 
-                        # Check timeout after each agent
+                        # Check timeout and budget after each agent
                         self.limits.check_timeout()
+                        self._check_budget()
 
                         # Evaluate routes using the Router
                         route_result = self._evaluate_routes(agent, output.content)
@@ -2623,6 +2683,10 @@ class WorkflowEngine:
             if isinstance(e, ConductorTimeoutError):
                 fail_data["elapsed_seconds"] = e.elapsed_seconds
                 fail_data["timeout_seconds"] = e.timeout_seconds
+                fail_data["current_agent"] = e.current_agent
+            elif isinstance(e, BudgetExceededError):
+                fail_data["budget_usd"] = e.budget_usd
+                fail_data["spent_usd"] = e.spent_usd
                 fail_data["current_agent"] = e.current_agent
             self._emit("workflow_failed", fail_data)
             # Execute on_error hook with error information
