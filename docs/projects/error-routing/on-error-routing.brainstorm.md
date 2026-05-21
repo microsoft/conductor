@@ -93,9 +93,13 @@ them and the design adjusts cleanly.
 
 3. **Typed error envelope is the load-bearing primitive.**
    `{conductor_error: true, kind, message, details}` — flat dotted-string
-   kinds, equality match only in v1. Scripts write to a runtime-supplied
-   path (`CONDUCTOR_ERROR_OUT`) and exit 0; agents emit it as their JSON
-   response. The envelope is what makes everything else routable.
+   kinds, equality match only in v1. The script-side contract is
+   language-neutral: conductor sets `$CONDUCTOR_ERROR_OUT` to a path; the
+   script writes the JSON to that path and exits 0. No new bespoke
+   commands required in any engine — three lines in pwsh, bash, python,
+   node, or dotnet. Optional helpers shipped per engine for ergonomics.
+   Agents emit the envelope as their JSON response. Direct prior art:
+   GitHub Actions' `$GITHUB_OUTPUT` env-var-file convention.
 
 4. **Sub-workflow errors propagate by default.** Crossing a `type:
    workflow` boundary accumulates a frame trail; the parent's routes
@@ -184,7 +188,7 @@ pattern is conductor's call.
 
 Conductor recognizes node failure only in narrow runtime senses:
 
-- `script` node: pwsh non-zero exit / unhandled exception
+- `script` node: non-zero exit / unhandled subprocess error (engine-agnostic; conductor spawns subprocesses without knowing the language)
 - `agent` node: LLM response violates `output:` schema
 - Provider transport: rate-limit / timeout (auto-retried 3× —
   `providers/copilot.py:69-91`, `providers/claude.py:90-111`)
@@ -233,6 +237,11 @@ work unchanged.
 - No hierarchical kind matching in v1 (flat string equality).
 - No JSON-schema versioning of kinds in v1 (start flat strings).
 - No `requires:` / preconditions surface — separate brief, parallel work.
+- **No inference of kinds from exit codes, stderr patterns, or any other
+  runtime signal.** Kinds are author-chosen at the failure site
+  (intentional classification). Without intentional authorship, conductor
+  surfaces a synthetic `internal.script_error` / `internal.schema_violation`
+  and that's all anyone can know.
 
 ---
 
@@ -254,47 +263,244 @@ An error is a structured record with three required fields and one optional:
 `kind` is a flat dotted string for v1 (`external.git.drift`,
 `precondition.missing`, `internal.script_error`). Equality match only.
 
-#### How a node raises it
+The envelope is exposed in template scope to downstream nodes as
+`{{ <node>.error }}` (`kind`, `message`, `details`), parallel to the
+existing `{{ <node>.output }}`.
 
-- **`script` nodes** write the envelope to a path the runtime supplies
-  via the env var `CONDUCTOR_ERROR_OUT` and exit `0`. The runtime checks
-  the file after the script returns; if present and parseable as the
-  envelope shape, the node is treated as errored. Exit `0` and no file =
-  success; non-zero exit = legacy unstructured error (kind
-  `internal.script_error`, message = stderr tail).
+#### D1.1 The script-side contract is engine-agnostic
 
-  Rationale for env-var-with-file over stdout sentinel: keeps script
-  stdout free for the existing `output:` capture path; avoids reserving
-  a stdout marker that could collide with author output; file IO is
-  cross-platform clean.
+Conductor's script executor (`executor/script.py`) spawns subprocesses
+via `asyncio.create_subprocess_exec` and doesn't know what language
+they're written in. The error contract follows the same posture: it's a
+file-format + env-var convention that any language can implement in a
+few lines.
 
-- **`agent` nodes** emit the envelope as their JSON response. The runtime
-  detects the `conductor_error: true` discriminator before `output:`
-  schema validation and routes through the error path instead. A helper
-  shape may be added to `output:` schema validation so authors can
-  declare both their happy-path schema and the kinds they may raise.
+**The contract, in full:**
 
-- **`workflow` nodes** raise whatever their child raises (see D4).
+1. Before spawning the script, the runtime generates a unique temp file
+   path and sets `CONDUCTOR_ERROR_OUT=<that path>` in the child's
+   environment. Conductor already passes `env=...` explicitly today
+   (`script.py:98-99`), so this is one added line.
+2. The script may write the envelope JSON to that path and exit `0`.
+3. After the subprocess exits, conductor checks the path:
+   - **File present, parses as envelope** → node is treated as errored
+     with that kind.
+   - **File absent, exit 0** → success (today's behavior).
+   - **File absent, exit non-zero** → synthetic
+     `internal.script_error`, `message` = stderr tail.
 
-A conductor-shipped pwsh helper makes the script side ergonomic:
+That's the entire contract. No language-specific commands, no stdout
+sentinels, no parsing of script output beyond what conductor already
+does (capture stdout/stderr as text).
+
+**Direct prior art.** GitHub Actions uses exactly this pattern for its
+modern workflow commands: `$GITHUB_OUTPUT`, `$GITHUB_STEP_SUMMARY`,
+`$GITHUB_ENV` are all env-var-named file paths the runner sets, and
+actions in any language append to them. GHA explicitly migrated *away*
+from stdout sentinels (`::set-output::`) toward this shape, citing
+stdout pollution, parser fragility, and security. The pattern runs
+identically on Windows and Linux runners — the env var is just a postal
+address; the OS difference (`CreateProcessW` vs. `execve`) is hidden by
+the subprocess layer.
+
+Other relevant prior art surveyed: Azure DevOps Pipelines logging
+commands (stdout sentinel; same caveats as old GHA), RFC 7807 Problem
+Details (JSON-shape inspiration but HTTP-flavored), JSON-RPC error
+object (numeric codes — user-unfriendly), POSIX sysexits.h (only ~15
+codes; no message field), systemd `sd_notify` (Linux-only, socket-
+based), compiler diagnostic JSON formats (per-tool, not a standard).
+None of these fit conductor's shape better than the env-var-file
+convention GHA settled on.
+
+#### D1.2 The same envelope, in every engine
+
+Three to five lines in any language. Nothing is required beyond writing
+the JSON file. Conductor docs ship these side-by-side:
+
+**pwsh**
+```pwsh
+'{"conductor_error":true,"kind":"external.git.drift","message":"SHA mismatch"}' |
+  Set-Content -Encoding utf8 $env:CONDUCTOR_ERROR_OUT
+exit 0
+```
+
+**bash / sh**
+```bash
+cat > "$CONDUCTOR_ERROR_OUT" <<'JSON'
+{"conductor_error":true,"kind":"external.git.drift","message":"SHA mismatch"}
+JSON
+exit 0
+```
+
+**python**
+```python
+import json, os, pathlib
+pathlib.Path(os.environ["CONDUCTOR_ERROR_OUT"]).write_text(json.dumps({
+    "conductor_error": True,
+    "kind": "external.git.drift",
+    "message": "SHA mismatch",
+}))
+```
+
+**node**
+```js
+require("fs").writeFileSync(process.env.CONDUCTOR_ERROR_OUT, JSON.stringify({
+  conductor_error: true, kind: "external.git.drift", message: "SHA mismatch"
+}));
+```
+
+**dotnet / C#**
+```csharp
+File.WriteAllText(
+    Environment.GetEnvironmentVariable("CONDUCTOR_ERROR_OUT")!,
+    JsonSerializer.Serialize(new {
+        conductor_error = true,
+        kind = "external.git.drift",
+        message = "SHA mismatch"
+    }));
+```
+
+#### D1.3 Optional shipped helpers per engine
+
+To remove even that friction for common engines, conductor ships a
+small `helpers/error/` directory with one-file convenience modules.
+None are required; they're sugar over the contract above.
+
+| Engine | Helper file | Surface |
+|---|---|---|
+| pwsh | `Conductor.Error.psm1` | `Write-ConductorError -Kind x.y -Message m [-Details @{...}]` |
+| bash / sh | `conductor-error.sh` | `conductor_error x.y "message" '{"k":"v"}'` (sourced) |
+| python | `conductor_error.py` | `conductor_error.raise_kind("x.y", "message", details={...})` |
+| node | `conductor-error.mjs` | `raiseError({kind: "x.y", message: "m", details: {}})` |
+| dotnet | `ConductorError.cs` | `ConductorError.Raise("x.y", "message", new {...})` |
+
+Each helper is 5–15 lines. They exist to make the common path read
+naturally; authors who don't want them never see them. New engines
+don't need a helper to use the contract — they just write the JSON.
+
+#### D1.4 How agent nodes raise the envelope
+
+Agent nodes emit the envelope as their JSON response. The runtime
+detects the `conductor_error: true` discriminator *before* `output:`
+schema validation and routes through the error path instead. A helper
+shape may be added to `output:` schema validation so authors can declare
+both their happy-path schema and the kinds they may raise (see D1.6
+below).
+
+#### D1.5 How workflow nodes raise the envelope
+
+A `type: workflow` node raises whatever its child raises. The frame
+trail accumulates at the boundary crossing — see D4 for propagation
+semantics.
+
+#### D1.6 Where do kinds come from?
+
+The runtime never *infers* a kind. Inferring from exit codes or stderr
+patterns would be fragile and create an implicit API that any tool
+update could break. Conductor's contract is that classification is
+*intentional, at the failure site:*
+
+| Source | Who picks the kind | Result |
+|---|---|---|
+| Script writes envelope to `$CONDUCTOR_ERROR_OUT` | Script author | `kind` = whatever string the script wrote (runtime trusts verbatim) |
+| Agent emits `{conductor_error: true, kind: "..."}` in JSON | Prompt author | Same — runtime trusts the kind string |
+| Script exits non-zero without writing the envelope | Nobody | `internal.script_error`, `message` = stderr tail. *"Something failed"* — no semantic info. |
+| Agent JSON violates `output:` schema | Nobody | `internal.schema_violation`. Same — pure "something failed." |
+| Provider transport retries exhausted | Conductor | `provider.exhausted` (synthetic, runtime-owned — see D5) |
+| `limits.max_iterations` hit, timeout | Conductor | Halts. Not routable in v1 (runaway signal). |
+
+If a script silently dies, the route author can match on
+`internal.script_error` (or `on_error: true` catch-all) but learns
+nothing about *why*. If the script explicitly raised
+`external.git.drift`, it's because the author wrote a classification
+line at the place they detected the drift. Same contract Python has
+with exceptions: nothing infers `FileNotFoundError` for you — `open()`
+raises it because someone wrote `raise FileNotFoundError(...)` at the
+source.
+
+**How does the route author know what kinds a node raises?** Three
+answers, in order of formality:
+
+1. **Convention / docs.** The script's `--help` or its repo docs lists
+   the kinds it may raise. Workflow author reads, writes routes. Same
+   model as reading a library's exception spec. For polyphony, this
+   lives inside the verb taxonomy already maintained.
+
+2. **Catch-all + iterate.** Author starts with `on_error: true,
+   to: error_gate`, runs the workflow, sees `error.kind` in the gate
+   or event log, splits the catch-all into specific kinds as they
+   emerge. Pragmatic; pairs with `errors.jsonl` being grep-friendly.
+
+3. **Optional `raises:` declaration on the node** (see D1.7).
+
+#### D1.7 Optional `raises:` declaration
+
+Nodes may declare the kinds they intend to raise, for self-doc + lint:
+
+```yaml
+- name: stamp_facets
+  type: script
+  command: pwsh
+  args: [...]
+  raises:                              # OPTIONAL — declared kind contract
+    - external.git.drift
+    - precondition.missing
+  routes:
+    - to: next_node
+    - on_error: external.git.drift     # lint: must be in `raises` or be `*`/true
+      to: drift_recovery
+    - on_error: precondition.missing
+      to: precondition_gate
+```
+
+Two benefits when declared:
+
+- **Lint.** `on_error: <kind>` clauses on the same node's routes must
+  reference a kind in `raises:` (or be a catch-all). Catches typos like
+  `external.git.drft`.
+- **Self-doc.** A workflow author looking at the node sees the contract
+  at the top of the YAML, not by archaeology through the script body.
+
+If a node raises a kind not in its declared `raises:`, the runtime
+treats it as `internal.undeclared_kind` (still routable via catch-all,
+still visible — but flagged as a workflow bug at runtime and in the
+event log). Declaration is purely opt-in; nodes without `raises:` work
+fine, you just don't get the lint or the runtime check.
+
+#### D1.8 Wrapping third-party CLIs
+
+For tools the workflow author doesn't own (`git`, `gh`, `dotnet test`,
+arbitrary vendor CLIs), conductor can't classify failures
+automatically — the tool doesn't know about conductor. The author
+wraps:
+
+```bash
+if ! git fetch origin 2> /tmp/err; then
+  cat > "$CONDUCTOR_ERROR_OUT" <<JSON
+{"conductor_error":true,"kind":"external.git.fetch_failed",
+ "message":"git fetch failed: $(head -1 /tmp/err)",
+ "details":{"remote":"origin","exit":$?}}
+JSON
+  exit 0
+fi
+```
+
+Or in pwsh:
 
 ```pwsh
-function Write-ConductorError {
-  param([Parameter(Mandatory)][string]$Kind,
-        [Parameter(Mandatory)][string]$Message,
-        [hashtable]$Details = @{})
-  $env:CONDUCTOR_ERROR_OUT |
-    Set-Content -Encoding utf8 -Value (ConvertTo-Json @{
-      conductor_error = $true; kind = $Kind
-      message = $Message;      details = $Details
-    } -Depth 8 -Compress)
+$out = & git fetch origin 2>&1
+if ($LASTEXITCODE -ne 0) {
+  Write-ConductorError -Kind external.git.fetch_failed `
+    -Message "git fetch failed: $($out | Select-Object -First 1)" `
+    -Details @{ remote = "origin"; exit = $LASTEXITCODE }
   exit 0
 }
 ```
 
-The envelope is exposed in template scope to downstream nodes as
-`{{ <node>.error }}` (`kind`, `message`, `details`), parallel to the
-existing `{{ <node>.output }}`.
+The wrapping *is* the classification work — there's no way around it.
+Polyphony already wraps things this way (the `{success: bool}` idiom is
+exactly this with a less-standard envelope); this proposal just
+standardizes the shape.
 
 ### D2. `on_error` on `RouteDef`
 
@@ -489,18 +695,23 @@ compatible — existing workflows continue to work unchanged.
 
 ### Phase 1 — Envelope + `on_error` routes + halt-on-unhandled
 
-- Script env-var-with-file mechanism (`CONDUCTOR_ERROR_OUT`)
+- Script `CONDUCTOR_ERROR_OUT` env-var-file contract (language-neutral,
+  per D1.1)
 - Agent JSON `conductor_error: true` discriminator
 - `RouteDef.on_error` field (true / `<kind>` / `[<kind>]`)
+- Optional `raises: [<kind>]` declaration on nodes + lint pass (per D1.7)
 - `{{ <node>.error }}` template scope
 - Unhandled error at root → `errors.jsonl` + `workflow.failed` event +
   distinct exit code
-- pwsh helper shipped (`Write-ConductorError`)
+- Shipped helpers per common engine in `helpers/error/` (pwsh, bash,
+  python, node, dotnet — all optional sugar over the contract)
 
 Acceptance:
 
-1. A pwsh script that calls `Write-ConductorError -Kind x.y -Message m`
-   and exits 0 causes the node to be marked errored.
+1. A script in any language that writes a valid envelope JSON to
+   `$CONDUCTOR_ERROR_OUT` and exits 0 causes the node to be marked
+   errored. Cross-platform tests cover at least pwsh-on-Windows,
+   bash-on-Linux, and python on both.
 2. An LLM agent emitting `{conductor_error: true, kind: "x.y", message: "m"}`
    does the same; `output:` schema validation does not run on the error
    shape.
@@ -515,6 +726,10 @@ Acceptance:
 8. A script that exits non-zero without writing the envelope still
    works, surfacing kind `internal.script_error` with stderr tail as
    `message`.
+9. A node with `raises: [x.y]` and a route `on_error: x.z` fails
+   load-time lint (typo / undeclared kind).
+10. A node with `raises: [x.y]` that actually raises `x.z` at runtime
+    surfaces as `internal.undeclared_kind` and is logged.
 
 ### Phase 2 — Sub-workflow propagation + route actions
 
@@ -576,6 +791,8 @@ current source.
 - `config/schema.py:89` — `RouteDef`; add `on_error: bool | str |
   list[str]` and (Phase 2) `retry`, `halt`, `propagate` action fields
   with exactly-one-of validation.
+- `config/schema.py` (`AgentDef`) — add optional `raises: list[str]`
+  field on nodes for declared kind contract + lint (per D1.7).
 - `config/schema.py:347` — `HooksConfig.on_error` (workflow-level
   lifecycle hook) is *unrelated* and stays; document the distinction so
   authors don't conflate them.
@@ -584,8 +801,9 @@ current source.
   level `retry` action is semantic, not transport, and lives only in
   routes.
 - `config/validator.py` — cross-validate that `on_error: <kind>` values
-  referenced in routes are reachable; that exactly one action exists per
-  route entry.
+  on a node are either in that node's declared `raises:` or are
+  catch-alls; that exactly one action exists per route entry; that
+  reserved-prefix kinds aren't user-declared.
 - `engine/router.py` — split route evaluation into success-bucket and
   error-bucket; first-match within each.
 - `engine/workflow.py:563-676` — sub-workflow invocation; propagation
@@ -598,8 +816,13 @@ current source.
   (see all open decisions below).
 - `executor/agent.py` — detect `conductor_error: true` discriminator
   before `output:` schema validation.
-- `executor/script.py` — set `CONDUCTOR_ERROR_OUT` env var; read file
-  after process exit; coerce to envelope.
+- `executor/script.py:98-105` — runtime allocates a temp file path
+  (`tempfile.mkstemp()` with `delete=False` so Windows file-locking
+  doesn't bite; conductor reads only after subprocess exit so there's
+  no read/write overlap), sets `CONDUCTOR_ERROR_OUT` in the spawned
+  env, reads the file after `await process.communicate()`, deletes it,
+  coerces to envelope. Helpers ship in a new top-level `helpers/error/`
+  directory (per D1.3); not auto-loaded, no PATH manipulation.
 - `providers/copilot.py:69-91, 281-340` and
   `providers/claude.py:90-111, 529-555` — Phase 3 surfaces transport
   exhaustion as `provider.exhausted`; verify both providers handle
@@ -617,8 +840,10 @@ Each phase ships with:
 - **Workflow integration tests** in `tests/test_integration/` using
   minimal multi-node YAMLs that exercise the propagation paths end-to-
   end. At least one case per route action.
-- **At least one cross-platform script test** — confirm the env-var-with-
-  file mechanism works identically on Windows pwsh and Linux pwsh.
+- **Cross-engine script tests** — confirm the `CONDUCTOR_ERROR_OUT`
+  contract works identically across pwsh, bash, and python on at least
+  Windows and Linux. Same workflow YAML, same envelope shape, three
+  language implementations of the writing script.
 - **A regression workflow** that uses the legacy `{success: false}` +
   routes + gate pattern to prove backward compatibility.
 - **A parallel-group test** showing per-node error routes compose under
