@@ -15,6 +15,10 @@ interface TooltipData {
   errorMessage?: string | null;
   iteration?: number | null;
   selectedOption?: string | null;
+  // Terminate-step metadata (issue #219). Populated for `type: terminate`
+  // nodes; rendered as a distinct section below the details grid when set.
+  reason?: string | null;
+  terminationStatus?: 'success' | 'failed' | null;
 }
 
 interface NodeTooltipProps {
@@ -115,7 +119,43 @@ export function NodeTooltip({ data, children }: NodeTooltipProps) {
                   <span className="text-[var(--text)] truncate">{data.selectedOption}</span>
                 </>
               )}
+              {data.terminationStatus && (
+                <>
+                  <span className="text-[var(--text-muted)]">Termination</span>
+                  <span
+                    className={cn(
+                      'font-mono capitalize',
+                      data.terminationStatus === 'success'
+                        ? 'text-[var(--completed)]'
+                        : 'text-[var(--failed)]',
+                    )}
+                  >
+                    {data.terminationStatus}
+                  </span>
+                </>
+              )}
             </div>
+
+            {/* Termination reason (issue #219) — shown for `type: terminate`
+                steps so the rendered reason is visible without opening the
+                node detail panel. */}
+            {data.reason && (
+              <>
+                <div className="h-px bg-[var(--border)]" />
+                <div
+                  className={cn(
+                    'leading-tight break-words',
+                    data.terminationStatus === 'failed'
+                      ? 'text-red-400'
+                      : 'text-[var(--text)]',
+                  )}
+                >
+                  <span className="text-[var(--text-muted)] mr-1">Reason:</span>
+                  {data.reason.slice(0, 160)}
+                  {data.reason.length > 160 ? '...' : ''}
+                </div>
+              </>
+            )}
 
             {/* Error message */}
             {data.errorMessage && (

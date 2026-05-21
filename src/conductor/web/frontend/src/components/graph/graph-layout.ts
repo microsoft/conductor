@@ -121,6 +121,7 @@ export function buildGraphElements(
       else if (nodeType === 'human_gate') flowNodeType = 'gateNode';
       else if (nodeType === 'workflow') flowNodeType = 'workflowNode';
       else if (nodeType === 'wait') flowNodeType = 'waitNode';
+      else if (nodeType === 'terminate') flowNodeType = 'terminateNode';
 
       flowNodes.push({
         id: a.name,

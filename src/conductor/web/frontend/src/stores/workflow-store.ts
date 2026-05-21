@@ -142,6 +142,10 @@ export interface NodeData {
   dialog_messages?: Array<{ role: 'user' | 'agent'; content: string }>;
   dialog_active?: boolean;
   dialog_awaiting_response?: boolean;
+  // Terminate-specific (type: terminate steps; see issue #219)
+  termination_status?: 'success' | 'failed';
+  termination_reason?: string;
+  terminated_by?: string;
 }
 
 export interface GroupProgress {
@@ -254,11 +258,22 @@ interface WorkflowState {
   workflowName: string;
   workflowStatus: WorkflowStatus;
   workflowStartTime: number | null;
-  workflowFailure: { error_type?: string; message?: string; elapsed_seconds?: number; timeout_seconds?: number; current_agent?: string; checkpoint_path?: string } | null;
+  workflowFailure: { error_type?: string; message?: string; elapsed_seconds?: number; timeout_seconds?: number; current_agent?: string; checkpoint_path?: string; termination_reason?: string; terminated_by?: string; is_explicit?: boolean; status?: string } | null;
   workflowFailedAgent: string | null;
   workflowYaml: string | null;
   conductorVersion: string | null;
   entryPoint: string | null;
+
+  // Explicit-termination metadata, populated for both success and failure
+  // terminations (see issue #219). When present, the WorkflowSuccessBanner /
+  // WorkflowErrorBanner can show the structured reason and terminate step
+  // name in addition to the generic completion / failure banners.
+  workflowTermination: {
+    is_explicit: boolean;
+    status: 'success' | 'failed';
+    termination_reason?: string;
+    terminated_by?: string;
+  } | null;
 
   // Graph structure
   agents: WorkflowAgent[];
@@ -518,6 +533,7 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
   workflowStartTime: null,
   workflowFailure: null,
   workflowFailedAgent: null,
+  workflowTermination: null,
   workflowYaml: null,
   conductorVersion: null,
   entryPoint: null,
@@ -656,6 +672,7 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
         activityLog: [],
         workflowOutput: null,
         workflowFailedAgent: null,
+        workflowTermination: null,
         activeDialog: null,
         dialogEngaged: false,
         wfDepth: 0,
@@ -705,6 +722,7 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
         activityLog: [],
         workflowOutput: null,
         workflowFailedAgent: null,
+        workflowTermination: null,
         activeDialog: null,
         dialogEngaged: false,
         wfDepth: 0,
@@ -741,6 +759,7 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
         activityLog: [],
         workflowOutput: null,
         workflowFailedAgent: null,
+        workflowTermination: null,
         workflowStatus: 'pending',
         workflowStartTime: null,
         workflowName: '',
@@ -1110,6 +1129,15 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     }
     if (data.cost_usd) t.addCost(data.cost_usd);
     if (data.tokens) t.addTokens(data.tokens);
+    // Capture terminate-step metadata when present (issue #219). The engine
+    // emits these on agent_completed for `status: success` terminate steps so
+    // the TerminateNode can render the rendered reason in its body.
+    const extra = _data as Record<string, unknown>;
+    if (extra.terminated_by) {
+      nd.termination_status = (extra.status as 'success' | 'failed' | undefined) ?? 'success';
+      nd.termination_reason = extra.termination_reason as string | undefined;
+      nd.terminated_by = extra.terminated_by as string;
+    }
     replaceNode(t.nodes, data.agent_name);
   },
 
@@ -1125,6 +1153,16 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
       if (route.to === data.agent_name) {
         t.highlightedEdges.push({ from: route.from, to: route.to, state: 'failed' });
       }
+    }
+    // Capture terminate-step metadata when present (issue #219). For
+    // `type: terminate status: failed`, the engine emits agent_failed with
+    // the rendered termination fields so the TerminateNode can render the
+    // reason directly without falling back to `error_message`.
+    const extra = _data as Record<string, unknown>;
+    if (extra.terminated_by) {
+      nd.termination_status = (extra.status as 'success' | 'failed' | undefined) ?? 'failed';
+      nd.termination_reason = extra.termination_reason as string | undefined;
+      nd.terminated_by = extra.terminated_by as string;
     }
     replaceNode(t.nodes, data.agent_name);
   },
@@ -1475,13 +1513,27 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     state.wfDepth = Math.max(0, state.wfDepth - 1);
     if (state.wfDepth === 0) {
       // Root workflow completed
-      const data = _data as { output?: unknown };
+      const data = _data as { output?: unknown; is_explicit?: boolean; termination_reason?: string; terminated_by?: string; status?: string };
       state.workflowStatus = 'completed';
       state.isPaused = false;
       // Clear any iteration-limit gate that wasn't paired with a resolved
       // event (defense-in-depth — see issue #134).
       state.iterationLimitGate = null;
       state.workflowOutput = data.output ?? null;
+      // Explicit-termination metadata (issue #219). When the root workflow
+      // ended via `type: terminate status: success`, the engine attaches
+      // these fields; surface them via `workflowTermination` so the success
+      // banner can show the reason and terminate step name.
+      if (data.is_explicit) {
+        state.workflowTermination = {
+          is_explicit: true,
+          status: (data.status as 'success' | 'failed' | undefined) ?? 'success',
+          termination_reason: data.termination_reason,
+          terminated_by: data.terminated_by,
+        };
+      } else {
+        state.workflowTermination = null;
+      }
       if (state.nodes['$end']) {
         state.nodes['$end']!.status = 'completed';
         replaceNode(state.nodes, '$end');
@@ -1514,7 +1566,7 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
 
   workflow_failed: (state, _data) => {
     state.wfDepth = Math.max(0, state.wfDepth - 1);
-    const data = _data as { agent_name?: string; error_type?: string; message?: string; elapsed_seconds?: number; timeout_seconds?: number; current_agent?: string; subworkflow_path?: string[] };
+    const data = _data as { agent_name?: string; error_type?: string; message?: string; elapsed_seconds?: number; timeout_seconds?: number; current_agent?: string; subworkflow_path?: string[]; is_explicit?: boolean; termination_reason?: string; terminated_by?: string; status?: string };
     if (state.wfDepth === 0) {
       // Root workflow failed
       state.workflowStatus = 'failed';
@@ -1532,7 +1584,29 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
           }
         }
       }
-      state.workflowFailure = { error_type: data.error_type, message: data.message, elapsed_seconds: data.elapsed_seconds, timeout_seconds: data.timeout_seconds, current_agent: data.current_agent };
+      state.workflowFailure = {
+        error_type: data.error_type,
+        message: data.message,
+        elapsed_seconds: data.elapsed_seconds,
+        timeout_seconds: data.timeout_seconds,
+        current_agent: data.current_agent,
+        // Issue #219: forward termination metadata so the error banner can
+        // distinguish explicit terminate-step failures from generic crashes.
+        termination_reason: data.termination_reason,
+        terminated_by: data.terminated_by,
+        is_explicit: data.is_explicit,
+        status: data.status,
+      };
+      if (data.is_explicit) {
+        state.workflowTermination = {
+          is_explicit: true,
+          status: (data.status as 'success' | 'failed' | undefined) ?? 'failed',
+          termination_reason: data.termination_reason,
+          terminated_by: data.terminated_by,
+        };
+      } else {
+        state.workflowTermination = null;
+      }
       if (state.nodes['$start']) {
         state.nodes['$start']!.status = 'completed';
         replaceNode(state.nodes, '$start');
