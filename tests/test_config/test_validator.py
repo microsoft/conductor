@@ -143,6 +143,203 @@ class TestRouteValidation:
         validate_workflow_config(config)
 
 
+class TestOnErrorRouteValidation:
+    """Tests for on_error route placement and cross-check against ``raises``."""
+
+    @staticmethod
+    def _wf(*agents: AgentDef, **extra: object) -> WorkflowConfig:
+        return WorkflowConfig(
+            workflow=WorkflowDef(name="t", entry_point=agents[0].name),
+            agents=list(agents),
+            **extra,  # type: ignore[arg-type]
+        )
+
+    def test_on_error_on_plain_agent_is_valid(self) -> None:
+        cfg = self._wf(
+            AgentDef(
+                name="leaf",
+                model="gpt-4",
+                prompt="x",
+                raises=["external.git.fetch_failed"],
+                routes=[
+                    RouteDef(to="handler", on_error="external.git.fetch_failed"),
+                    RouteDef(to="$end"),
+                ],
+            ),
+            AgentDef(name="handler", model="gpt-4", prompt="recover", routes=[RouteDef(to="$end")]),
+        )
+        validate_workflow_config(cfg)  # should not raise
+
+    def test_on_error_on_script_is_valid(self) -> None:
+        cfg = self._wf(
+            AgentDef(
+                name="fetch",
+                type="script",
+                command="git fetch",
+                raises=["external.git.fetch_failed"],
+                routes=[
+                    RouteDef(to="recover", on_error=True),
+                    RouteDef(to="$end"),
+                ],
+            ),
+            AgentDef(name="recover", model="gpt-4", prompt="x", routes=[RouteDef(to="$end")]),
+        )
+        validate_workflow_config(cfg)
+
+    def test_on_error_on_human_gate_is_hard_error(self) -> None:
+        cfg = self._wf(
+            AgentDef(
+                name="gate",
+                type="human_gate",
+                prompt="pick one",
+                options=[GateOption(label="ok", value="ok", route="next")],
+                routes=[RouteDef(to="next", on_error=True)],
+            ),
+            AgentDef(name="next", model="gpt-4", prompt="x", routes=[RouteDef(to="$end")]),
+        )
+        with pytest.raises(ConfigurationError, match="human_gate.*on_error"):
+            validate_workflow_config(cfg)
+
+    def test_on_error_on_workflow_node_is_hard_error(self) -> None:
+        cfg = self._wf(
+            AgentDef(
+                name="sub",
+                type="workflow",
+                workflow="./sub.yaml",
+                routes=[
+                    RouteDef(to="$end"),
+                    RouteDef(to="rescue", on_error="external.x"),
+                ],
+            ),
+            AgentDef(name="rescue", model="gpt-4", prompt="x", routes=[RouteDef(to="$end")]),
+        )
+        with pytest.raises(ConfigurationError, match="workflow.*on_error"):
+            validate_workflow_config(cfg)
+
+    def test_on_error_kind_must_be_dotted(self) -> None:
+        """Schema-level validator rejects malformed kind strings at construction.
+
+        Defensive: the cross-field validator repeats this check so configs
+        built via ``model_construct`` (bypassing Pydantic validation) still
+        get caught.
+        """
+        with pytest.raises(Exception, match="dotted lowercase identifier"):
+            RouteDef(to="rescue", on_error="not_dotted")
+
+    def test_undeclared_kind_in_on_error_is_hard_error(self) -> None:
+        """If raises is set, on_error kinds must be declared (or reserved/catch-all)."""
+        cfg = self._wf(
+            AgentDef(
+                name="leaf",
+                model="gpt-4",
+                prompt="x",
+                raises=["external.git.fetch_failed"],
+                routes=[
+                    RouteDef(to="rescue", on_error="external.api.timeout"),
+                    RouteDef(to="$end"),
+                ],
+            ),
+            AgentDef(name="rescue", model="gpt-4", prompt="x", routes=[RouteDef(to="$end")]),
+        )
+        with pytest.raises(ConfigurationError, match="external.api.timeout"):
+            validate_workflow_config(cfg)
+
+    def test_catch_all_on_error_always_legal_even_with_raises(self) -> None:
+        cfg = self._wf(
+            AgentDef(
+                name="leaf",
+                model="gpt-4",
+                prompt="x",
+                raises=["external.git.fetch_failed"],
+                routes=[
+                    RouteDef(to="rescue", on_error=True),
+                    RouteDef(to="$end"),
+                ],
+            ),
+            AgentDef(name="rescue", model="gpt-4", prompt="x", routes=[RouteDef(to="$end")]),
+        )
+        validate_workflow_config(cfg)
+
+    def test_reserved_allowlist_kind_is_legal_in_on_error(self) -> None:
+        """``internal.schema_violation`` may be matched even though raises forbids it."""
+        cfg = self._wf(
+            AgentDef(
+                name="leaf",
+                model="gpt-4",
+                prompt="x",
+                raises=["external.git.fetch_failed"],
+                routes=[
+                    RouteDef(to="rescue", on_error="internal.schema_violation"),
+                    RouteDef(to="$end"),
+                ],
+            ),
+            AgentDef(name="rescue", model="gpt-4", prompt="x", routes=[RouteDef(to="$end")]),
+        )
+        validate_workflow_config(cfg)
+
+    def test_undeclared_raises_means_anything_goes(self) -> None:
+        """No raises declared = on_error accepts any well-formed kind."""
+        cfg = self._wf(
+            AgentDef(
+                name="leaf",
+                model="gpt-4",
+                prompt="x",
+                routes=[
+                    RouteDef(to="rescue", on_error=["a.b", "c.d"]),
+                    RouteDef(to="$end"),
+                ],
+            ),
+            AgentDef(name="rescue", model="gpt-4", prompt="x", routes=[RouteDef(to="$end")]),
+        )
+        validate_workflow_config(cfg)
+
+    def test_on_error_on_parallel_group_is_hard_error(self) -> None:
+        cfg = WorkflowConfig(
+            workflow=WorkflowDef(name="t", entry_point="group"),
+            agents=[
+                AgentDef(name="a", model="gpt-4", prompt="x"),
+                AgentDef(name="b", model="gpt-4", prompt="x"),
+                AgentDef(name="rescue", model="gpt-4", prompt="x", routes=[RouteDef(to="$end")]),
+            ],
+            parallel=[
+                ParallelGroup(
+                    name="group",
+                    agents=["a", "b"],
+                    routes=[
+                        RouteDef(to="$end"),
+                        RouteDef(to="rescue", on_error=True),
+                    ],
+                )
+            ],
+        )
+        with pytest.raises(ConfigurationError, match="parallel group.*on_error"):
+            validate_workflow_config(cfg)
+
+    def test_on_error_on_for_each_group_is_hard_error(self) -> None:
+        cfg = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="t",
+                entry_point="loop",
+                input={"items": InputDef(type="array")},
+            ),
+            agents=[
+                AgentDef(name="rescue", model="gpt-4", prompt="x", routes=[RouteDef(to="$end")])
+            ],
+            for_each=[
+                ForEachDef(
+                    name="loop",
+                    type="for_each",
+                    source="workflow.input.items",
+                    **{"as": "item"},  # 'as' is a reserved keyword
+                    agent=AgentDef(name="worker", model="gpt-4", prompt="{{ item }}"),
+                    routes=[RouteDef(to="rescue", on_error="x.y")],
+                )
+            ],
+        )
+        with pytest.raises(ConfigurationError, match="for_each group.*on_error"):
+            validate_workflow_config(cfg)
+
+
 class TestHumanGateValidation:
     """Tests for human gate validation."""
 
@@ -718,6 +915,30 @@ class TestExtractTemplateRefs:
         assert refs.agent_refs == set()
         assert refs.workflow_inputs == set()
 
+    def test_singular_error_ref_extracted(self) -> None:
+        """``agent.error[.field]`` populates ``agent_error_refs``."""
+        refs = _extract_template_refs("{{ failing.error.kind }}")
+        # Reflected in both flat agent_refs (for unknown-agent checks)
+        # AND in the dedicated agent_error_refs set (for explicit-mode
+        # undeclared-input warnings on the .error path).
+        assert refs.agent_refs == {"failing"}
+        assert refs.agent_error_refs == {"failing"}
+        # No spurious field-precision tracking for errors.
+        assert refs.agent_output_fields == {}
+
+    def test_bare_error_ref_extracted(self) -> None:
+        refs = _extract_template_refs("{% if failing.error %}boom{% endif %}")
+        assert refs.agent_error_refs == {"failing"}
+
+    def test_error_and_output_can_coexist_for_same_agent(self) -> None:
+        """A template referencing both ``a.output`` and ``a.error`` is legal."""
+        refs = _extract_template_refs(
+            "{{ a.output.text }}{% if a.error %}{{ a.error.kind }}{% endif %}"
+        )
+        assert refs.agent_refs == {"a"}
+        assert refs.agent_error_refs == {"a"}
+        assert refs.agent_output_fields == {"a": {"text"}}
+
     def test_no_template_tags(self) -> None:
         refs = _extract_template_refs("just plain text")
         assert refs.agent_refs == set() and refs.workflow_inputs == set()
@@ -853,6 +1074,25 @@ class TestInputRefPatternExtensions:
     )
     def test_pattern_rejects_invalid_shapes(self, ref: str) -> None:
         assert INPUT_REF_PATTERN.match(ref) is None
+
+    @pytest.mark.parametrize(
+        "ref,expected_agent",
+        [
+            ("failing_node.error", "failing_node"),
+            ("failing_node.error.kind", "failing_node"),
+            ("failing_node.error.message", "failing_node"),
+            ("failing_node.error?", "failing_node"),
+            ("failing_node.error.kind?", "failing_node"),
+        ],
+    )
+    def test_pattern_accepts_agent_error_shapes(self, ref: str, expected_agent: str) -> None:
+        """``agent.error[.field]`` (singular) is the on_error envelope ref."""
+        match = INPUT_REF_PATTERN.match(ref)
+        assert match is not None, f"{ref!r} should match INPUT_REF_PATTERN"
+        assert match.group("error_agent") == expected_agent
+        # And it must not be misclassified as an output / parallel ref.
+        assert match.group("agent") is None
+        assert match.group("parallel") is None
 
 
 class TestTemplateReferenceValidation:

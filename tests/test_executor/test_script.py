@@ -281,3 +281,153 @@ class TestScriptExecutorErrors:
         )
         output = await executor.execute(agent, {})
         assert output.exit_code == 42
+
+
+class TestScriptErrorEnvelope:
+    """Tests for the ``CONDUCTOR_ERROR_OUT`` envelope contract."""
+
+    @pytest.mark.asyncio
+    async def test_no_envelope_when_file_empty(self, executor: ScriptExecutor) -> None:
+        """A script that exits 0 and writes nothing produces no envelope."""
+        agent = AgentDef(
+            name="quiet",
+            type="script",
+            command=sys.executable,
+            args=["-c", "print('ok')"],
+            raises=["external.x"],  # opted in, but didn't raise anything
+        )
+        output = await executor.execute(agent, {})
+        assert output.exit_code == 0
+        assert output.error is None
+
+    @pytest.mark.asyncio
+    async def test_well_formed_envelope_is_surfaced(self, executor: ScriptExecutor) -> None:
+        """A script writes a JSON envelope to ``$CONDUCTOR_ERROR_OUT``."""
+        script = (
+            "import json, os\n"
+            "with open(os.environ['CONDUCTOR_ERROR_OUT'], 'w', encoding='utf-8') as f:\n"
+            "    json.dump({"
+            "'conductor_error': True, "
+            "'kind': 'external.git.fetch_failed', "
+            "'message': 'remote unreachable', "
+            "'details': {'remote': 'origin'}"
+            "}, f)\n"
+        )
+        agent = AgentDef(
+            name="fetch",
+            type="script",
+            command=sys.executable,
+            args=["-c", script],
+            raises=["external.git.fetch_failed"],
+        )
+        output = await executor.execute(agent, {})
+        assert output.error is not None
+        assert output.error["kind"] == "external.git.fetch_failed"
+        assert output.error["message"] == "remote unreachable"
+        assert output.error["details"] == {"remote": "origin"}
+
+    @pytest.mark.asyncio
+    async def test_user_env_cannot_override_envelope_path(self, executor: ScriptExecutor) -> None:
+        """``CONDUCTOR_ERROR_OUT`` in ``agent.env`` is overridden by the executor."""
+        # The script reads $CONDUCTOR_ERROR_OUT and writes there. If the
+        # executor's value wins, the test passes (envelope shows up). If the
+        # user override won, the file would be created in a path the executor
+        # doesn't know about, so output.error stays None.
+        script = (
+            "import json, os\n"
+            "with open(os.environ['CONDUCTOR_ERROR_OUT'], 'w', encoding='utf-8') as f:\n"
+            "    json.dump({"
+            "'conductor_error': True, "
+            "'kind': 'external.x', "
+            "'message': 'm'"
+            "}, f)\n"
+        )
+        agent = AgentDef(
+            name="hijack",
+            type="script",
+            command=sys.executable,
+            args=["-c", script],
+            env={"CONDUCTOR_ERROR_OUT": "/this/path/does/not/exist/should/not/win"},
+            raises=["external.x"],
+        )
+        output = await executor.execute(agent, {})
+        assert output.error is not None
+        assert output.error["kind"] == "external.x"
+
+    @pytest.mark.asyncio
+    async def test_synthesize_script_error_when_opted_in(self, executor: ScriptExecutor) -> None:
+        """Non-zero exit + no envelope + opt-in → synthesized ``internal.script_error``."""
+        agent = AgentDef(
+            name="boom",
+            type="script",
+            command=sys.executable,
+            args=["-c", "import sys; sys.stderr.write('kaboom\\n'); sys.exit(7)"],
+            raises=["external.x"],
+        )
+        output = await executor.execute(agent, {})
+        assert output.exit_code == 7
+        assert output.error is not None
+        assert output.error["kind"] == "internal.script_error"
+        assert output.error["details"]["exit_code"] == 7
+
+    @pytest.mark.asyncio
+    async def test_legacy_nonzero_exit_without_optin_has_no_envelope(
+        self, executor: ScriptExecutor
+    ) -> None:
+        """Legacy workflows that route on ``exit_code`` are not surprised by an envelope."""
+        agent = AgentDef(
+            name="legacy",
+            type="script",
+            command=sys.executable,
+            args=["-c", "import sys; sys.exit(3)"],
+        )
+        output = await executor.execute(agent, {})
+        assert output.exit_code == 3
+        assert output.error is None
+
+    @pytest.mark.asyncio
+    async def test_malformed_envelope_downgraded_to_schema_violation(
+        self, executor: ScriptExecutor
+    ) -> None:
+        """An envelope missing ``kind`` becomes ``internal.schema_violation``."""
+        script = (
+            "import json, os\n"
+            "with open(os.environ['CONDUCTOR_ERROR_OUT'], 'w', encoding='utf-8') as f:\n"
+            "    json.dump({'conductor_error': True, 'message': 'no kind here'}, f)\n"
+        )
+        agent = AgentDef(
+            name="bad",
+            type="script",
+            command=sys.executable,
+            args=["-c", script],
+            raises=["external.x"],
+        )
+        output = await executor.execute(agent, {})
+        assert output.error is not None
+        assert output.error["kind"] == "internal.schema_violation"
+
+    @pytest.mark.asyncio
+    async def test_envelope_temp_file_is_cleaned_up(self, executor: ScriptExecutor) -> None:
+        """The temp file is removed after the script runs (success path)."""
+        # Capture the path the script saw and check it doesn't exist after.
+        capture_path = os.path.join(tempfile.gettempdir(), "conductor-test-capture.txt")
+        script = (
+            "import os\n"
+            f"with open(r'{capture_path}', 'w') as f:\n"
+            "    f.write(os.environ['CONDUCTOR_ERROR_OUT'])\n"
+        )
+        try:
+            agent = AgentDef(
+                name="capture",
+                type="script",
+                command=sys.executable,
+                args=["-c", script],
+            )
+            await executor.execute(agent, {})
+            with open(capture_path) as f:
+                error_path = f.read().strip()
+            assert error_path  # we got a path
+            assert not os.path.exists(error_path), "temp envelope file should be removed"
+        finally:
+            if os.path.exists(capture_path):
+                os.unlink(capture_path)

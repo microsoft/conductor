@@ -1,0 +1,83 @@
+# Error Routing with Helpers
+#
+# Companion to `error-routing.yaml`. Demonstrates the same `on_error`
+# flow but uses the engine-agnostic helper modules shipped under
+# `src/conductor/helpers/error/` instead of hand-writing the envelope.
+#
+# Each helper is ~15 lines of language-native code that:
+#
+#   1. Reads `$CONDUCTOR_ERROR_OUT` from the environment.
+#   2. Writes `{conductor_error: true, kind, message, details?}` to it.
+#   3. Returns — leaving exit-code management to the caller.
+#
+# Nothing here is auto-loaded. Scripts must explicitly source / import
+# the helper they want (PowerShell `Import-Module`, Bash `source`,
+# Python `import`, Node `import`, .NET `using`). Scripts that don't
+# want a helper write the JSON themselves — it's three lines.
+#
+# This example uses the Python and PowerShell helpers because they're
+# the two engines most commonly invoked from conductor on developer
+# machines. Bash, Node, and .NET equivalents follow the same shape.
+#
+# Usage:
+#   conductor run examples/error-routing-helpers.yaml
+
+workflow:
+  name: error-routing-helpers-demo
+  description: |
+    Same typed-error routing as error-routing.yaml, but raising via
+    the per-engine helpers shipped under conductor.helpers.error.
+  entry_point: probe_python
+
+  runtime:
+    provider: copilot
+
+  context:
+    mode: accumulate
+
+  limits:
+    max_iterations: 20
+
+agents:
+  - name: probe_python
+    type: script
+    command: python
+    args:
+      - -c
+      - |
+        import sys
+        # The helper is shipped with the conductor wheel and is
+        # importable when conductor is installed. Adjust the import
+        # path if you're running from a source checkout.
+        from conductor.helpers.error import conductor_error
+
+        conductor_error.raise_kind(
+            "external.git.fetch_failed",
+            "git fetch origin returned 128",
+            details={"remote": "origin", "exit": 128},
+        )
+        sys.exit(0)
+    raises:
+      - external.git.fetch_failed
+    routes:
+      - to: rescue
+        on_error: external.git.fetch_failed
+      - to: $end
+
+  - name: rescue
+    model: gpt-4o-mini
+    prompt: |
+      A git fetch failure was raised via the Python helper.
+        kind:    {{ probe_python.error.kind }}
+        message: {{ probe_python.error.message }}
+        remote:  {{ probe_python.error.details.remote }}
+        exit:    {{ probe_python.error.details.exit }}
+      Suggest a single recovery step.
+    routes:
+      - to: $end
+    output:
+      next_step:
+        type: string
+
+output:
+  next_step: "{{ rescue.output.next_step }}"

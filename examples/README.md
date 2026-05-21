@@ -89,6 +89,42 @@ conductor run examples/reasoning-effort.yaml \
 
 See [Reasoning Effort](../docs/configuration.md#reasoning-effort) for the per-provider translation, supported models, and validation rules.
 
+## Error Routing
+
+### error-routing.yaml
+
+A script-driven probe that emits a typed Conductor error envelope via
+the language-neutral `CONDUCTOR_ERROR_OUT` contract, then routes by
+`on_error: <kind>` instead of a fragile `exit_code` check. Demonstrates:
+
+- Writing `{conductor_error: true, kind, message, details}` from a
+  script and exiting 0
+- Declaring `raises:` on the node so undeclared kinds are normalised
+  to `internal.undeclared_kind` instead of leaking through
+- Routing by `on_error: <kind>` (`external.git.drift` →
+  rescue agent, `external.api.rate_limited` → backoff agent)
+- Reading `{{ probe.error.kind }}`, `{{ probe.error.message }}`,
+  `{{ probe.error.details.* }}` from the routed-to handler
+
+```bash
+conductor run examples/error-routing.yaml --input simulated_failure=drift
+conductor run examples/error-routing.yaml --input simulated_failure=rate_limited
+conductor run examples/error-routing.yaml --input simulated_failure=ok
+```
+
+### error-routing-helpers.yaml
+
+Companion example showing the same routing flow but raising the
+envelope via the shipped Python helper
+(`conductor.helpers.error.conductor_error.raise_kind`). PowerShell,
+Bash, Node, and .NET helpers are all available under
+[`src/conductor/helpers/error/`](../src/conductor/helpers/error/) and
+follow the same shape.
+
+```bash
+conductor run examples/error-routing-helpers.yaml
+```
+
 ## Multi-Agent Workflows
 
 ### research-assistant.yaml

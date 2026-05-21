@@ -980,3 +980,74 @@ output:
         # agent1 should be marked as a loop target
         agent1_step = next(s for s in plan.steps if s.agent_name == "agent1")
         assert agent1_step.is_loop_target is True
+
+
+class TestUnhandledWorkflowErrorExitCode:
+    """Step 10: ``run`` exits 3 (not 1) when an UnhandledWorkflowError escapes."""
+
+    def test_exit_code_3_on_unhandled_workflow_error(self, tmp_path: Path) -> None:
+        """A workflow that halts on an unhandled envelope exits with code 3."""
+        from conductor.exceptions import UnhandledWorkflowError
+
+        workflow_file = tmp_path / "halt.yaml"
+        workflow_file.write_text("""\
+workflow:
+  name: halting
+  entry_point: probe
+
+agents:
+  - name: probe
+    model: gpt-4
+    prompt: "x"
+    routes:
+      - to: $end
+
+output:
+  v: "x"
+""")
+
+        envelope = {
+            "kind": "external.api.timeout",
+            "message": "took too long",
+        }
+        frames = [{"node": "probe", "kind": "external.api.timeout", "iteration": 1}]
+
+        async def _raiser(*_args, **_kwargs):
+            exc = UnhandledWorkflowError(envelope, frames)
+            exc.errors_jsonl_path = tmp_path / "fake-errors.jsonl"  # type: ignore[attr-defined]
+            raise exc
+
+        with patch("conductor.cli.run.run_workflow_async", side_effect=_raiser):
+            result = runner.invoke(app, ["run", str(workflow_file)])
+
+        assert result.exit_code == 3, (
+            f"expected exit code 3 (unhandled typed halt), got {result.exit_code}; "
+            f"output={result.output!r}"
+        )
+
+    def test_generic_exception_still_exits_1(self, tmp_path: Path) -> None:
+        """Regression: a generic failure still maps to exit code 1, not 3."""
+        workflow_file = tmp_path / "boom.yaml"
+        workflow_file.write_text("""\
+workflow:
+  name: boom
+  entry_point: agent1
+
+agents:
+  - name: agent1
+    model: gpt-4
+    prompt: "x"
+    routes:
+      - to: $end
+
+output:
+  v: "x"
+""")
+
+        async def _raiser(*_args, **_kwargs):
+            raise RuntimeError("kaboom")
+
+        with patch("conductor.cli.run.run_workflow_async", side_effect=_raiser):
+            result = runner.invoke(app, ["run", str(workflow_file)])
+
+        assert result.exit_code == 1

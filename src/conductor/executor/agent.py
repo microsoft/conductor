@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from conductor.exceptions import ValidationError
 from conductor.executor.output import parse_json_output, validate_output
@@ -229,9 +229,77 @@ class AgentExecutor:
                     model=output.model,
                 )
 
-        # Validate output against schema (skip for partial output from interrupts)
-        if agent.output and not output.partial:
-            validate_output(output.content, agent.output)
+        # Validate output against schema (skip for partial output from interrupts).
+        #
+        # Before validating, check for the ``conductor_error`` discriminator —
+        # if the agent's structured output says ``conductor_error: true``, the
+        # node has raised a typed error rather than produced a normal result.
+        # We coerce + attach the envelope to ``output.error`` and SKIP schema
+        # validation: the agent's declared output schema doesn't apply to
+        # error envelopes, and forcing it would mask the real failure with a
+        # confusing schema-violation message.
+        #
+        # A schema-violation on a non-error response is itself surfaced as a
+        # synthesized ``internal.schema_violation`` envelope so the engine can
+        # route on it like any other failure.
+        if output.partial:
+            return output
+
+        # Lazy import: ``conductor.engine`` package __init__ pulls in
+        # workflow.py, which imports AgentExecutor — going through the
+        # package here would deadlock. The errors module is a leaf.
+        from conductor.engine.errors import (  # noqa: PLC0415
+            EnvelopeValidationError,
+            coerce_envelope,
+            make_schema_violation,
+        )
+
+        if isinstance(output.content, dict) and output.content.get("conductor_error") is True:
+            try:
+                envelope = coerce_envelope(output.content)
+            except EnvelopeValidationError as exc:
+                # The agent claimed a failure but the envelope is malformed
+                # (missing kind, bad type, etc.). Surface as a schema violation
+                # of the envelope shape itself so the engine still halts cleanly.
+                envelope = make_schema_violation(
+                    node_name=agent.name,
+                    source="agent",
+                    original_message=f"Malformed conductor_error envelope: {exc}",
+                )
+            return AgentOutput(
+                content=output.content,
+                raw_response=output.raw_response,
+                tokens_used=output.tokens_used,
+                input_tokens=output.input_tokens,
+                output_tokens=output.output_tokens,
+                cache_read_tokens=output.cache_read_tokens,
+                cache_write_tokens=output.cache_write_tokens,
+                model=output.model,
+                partial=output.partial,
+                error=cast("dict[str, Any]", envelope),
+            )
+
+        if agent.output:
+            try:
+                validate_output(output.content, agent.output)
+            except ValidationError as exc:
+                envelope = make_schema_violation(
+                    node_name=agent.name,
+                    source="agent",
+                    original_message=str(exc),
+                )
+                return AgentOutput(
+                    content=output.content,
+                    raw_response=output.raw_response,
+                    tokens_used=output.tokens_used,
+                    input_tokens=output.input_tokens,
+                    output_tokens=output.output_tokens,
+                    cache_read_tokens=output.cache_read_tokens,
+                    cache_write_tokens=output.cache_write_tokens,
+                    model=output.model,
+                    partial=output.partial,
+                    error=cast("dict[str, Any]", envelope),
+                )
 
         return output
 

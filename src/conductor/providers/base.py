@@ -106,6 +106,16 @@ class AgentOutput:
     partial: bool = False
     """Whether this output is partial (from a mid-agent interrupt)."""
 
+    error: dict[str, Any] | None = None
+    """Optional structured error envelope (see :mod:`conductor.engine.errors`).
+
+    When set, the agent produced a ``{conductor_error: true, ...}``
+    discriminator (or the engine synthesized one — e.g. for an output
+    schema violation). The engine inspects this field at the agent call
+    site to route on the failure rather than treating the output as
+    success. ``None`` means the agent succeeded.
+    """
+
 
 class AgentProvider(ABC):
     """Abstract base class for SDK providers.

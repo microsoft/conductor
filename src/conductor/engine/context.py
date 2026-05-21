@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
+    from conductor.engine.errors import ErrorEnvelope
     from conductor.providers.base import AgentProvider
 
 # Token estimation constants
@@ -101,6 +102,16 @@ class WorkflowContext:
     agent_outputs: dict[str, dict[str, Any]] = field(default_factory=dict)
     """Outputs from executed agents, keyed by agent name."""
 
+    agent_errors: dict[str, ErrorEnvelope] = field(default_factory=dict)
+    """Error envelopes from failed agents, keyed by agent name.
+
+    Populated by :meth:`store_error`. Phase 1 leaf executors (agent,
+    script) either populate ``agent_outputs`` (success) or
+    ``agent_errors`` (raise), never both — but consumers should treat
+    them as a co-located pair: a node's slot in the rendered context
+    is ``{node: {output?, error?}}``.
+    """
+
     current_iteration: int = 0
     """Current execution iteration count."""
 
@@ -154,6 +165,23 @@ class WorkflowContext:
             output: The structured output from the agent.
         """
         self.agent_outputs[agent_name] = output
+        self.execution_history.append(agent_name)
+        self.current_iteration += 1
+
+    def store_error(self, agent_name: str, envelope: ErrorEnvelope) -> None:
+        """Store an error envelope from a failed agent in context.
+
+        Co-located with :meth:`store` so that the rendered context shape
+        is ``{agent_name: {output?, error?}}``. Phase 1 leaf executors
+        call exactly one of ``store`` / ``store_error`` per node; both
+        bump ``current_iteration`` and append to ``execution_history``
+        because the node ran to a definitive outcome either way.
+
+        Args:
+            agent_name: The name of the agent that raised the envelope.
+            envelope: The error envelope ``{kind, message, details}``.
+        """
+        self.agent_errors[agent_name] = envelope
         self.execution_history.append(agent_name)
         self.current_iteration += 1
 
@@ -240,10 +268,21 @@ class WorkflowContext:
                         # Regular agents wrap output in {"output": ...}
                         ctx[agent] = {"output": output}
 
+                # Surface error envelopes co-located with their node's
+                # slot. Failing nodes never produced an output in Phase 1,
+                # but if both ever coexist, the dict merges cleanly.
+                for agent, envelope in self.agent_errors.items():
+                    slot = ctx.get(agent)
+                    if isinstance(slot, dict):
+                        slot["error"] = envelope
+                    else:
+                        ctx[agent] = {"error": envelope}
+
             elif mode == "last_only" and self.execution_history:
-                # Only the most recent agent's output
+                # Only the most recent agent's output (and/or error)
                 last_agent = self.execution_history[-1]
-                last_output = self.agent_outputs.get(last_agent, {})
+                last_output = self.agent_outputs.get(last_agent)
+                last_error = self.agent_errors.get(last_agent)
 
                 # Check if this is a parallel group output
                 is_parallel_group = (
@@ -254,8 +293,18 @@ class WorkflowContext:
 
                 if is_parallel_group:
                     ctx[last_agent] = last_output
-                else:
-                    ctx[last_agent] = {"output": last_output}
+                elif last_agent in self.agent_outputs:
+                    # Preserve legacy behavior: even an empty output dict
+                    # surfaces as ``{"output": {}}`` so templates that
+                    # reference the last agent don't KeyError.
+                    slot: dict[str, Any] = {
+                        "output": last_output if last_output is not None else {}
+                    }
+                    if last_error is not None:
+                        slot["error"] = last_error
+                    ctx[last_agent] = slot
+                elif last_error is not None:
+                    ctx[last_agent] = {"error": last_error}
 
         return ctx
 
@@ -312,7 +361,7 @@ class WorkflowContext:
                 else:
                     raise KeyError(f"Missing required workflow input: {param_name}")
         else:
-            # Could be agent_name.output or parallel_group.outputs
+            # Could be agent_name.output, agent_name.error, or parallel_group.outputs
             entity_name = parts[0]
 
             if entity_name in self.agent_outputs:
@@ -329,15 +378,27 @@ class WorkflowContext:
                     # Handle parallel group references
                     self._add_parallel_group_input(ctx, entity_name, parts[1:], is_optional)
                 else:
-                    # Handle regular agent references
+                    # Handle regular agent references (output and/or error)
                     self._add_agent_input(ctx, entity_name, parts[1:], is_optional)
+            elif entity_name in self.agent_errors:
+                # Failing-agent-only case: no output stored, only the
+                # envelope. ``agent_name.error[.field]`` is the only
+                # legal subpath here.
+                self._add_agent_input(ctx, entity_name, parts[1:], is_optional)
             elif not is_optional:
                 raise KeyError(f"Missing required agent output: {entity_name}")
 
     def _add_agent_input(
         self, ctx: dict[str, Any], agent_name: str, remaining_parts: list[str], is_optional: bool
     ) -> None:
-        """Add a regular agent output reference to context.
+        """Add a regular agent output or error reference to context.
+
+        Supports both success-path references (``agent.output(.field)?``)
+        and error-path references (``agent.error(.field)?``). Error
+        envelopes are bounded in size and templates often need
+        ``error.details.*`` access, so any ``.error*`` reference copies
+        the whole envelope into ``ctx[agent_name]["error"]`` rather than
+        selecting a single field.
 
         Args:
             ctx: The context dictionary to update.
@@ -348,13 +409,35 @@ class WorkflowContext:
         Raises:
             KeyError: If a required field is missing.
         """
+        # Error-path references: copy the whole envelope. Phase 1 leaf
+        # executors raise XOR succeed, so a node with ``.error`` declared
+        # is typically a failing producer the explicit-mode handler is
+        # consuming.
+        if remaining_parts and remaining_parts[0] == "error":
+            envelope = self.agent_errors.get(agent_name)
+            if envelope is None:
+                if not is_optional:
+                    raise KeyError(f"Missing error envelope from agent '{agent_name}'")
+                return
+            slot = ctx.get(agent_name)
+            if not isinstance(slot, dict):
+                slot = {}
+                ctx[agent_name] = slot
+            slot["error"] = envelope
+            return
+
+        # Success-path references: existing behavior.
+        agent_output = self.agent_outputs.get(agent_name)
+        if agent_output is None:
+            if not is_optional:
+                raise KeyError(f"Missing output from agent '{agent_name}'")
+            return
+
         # Ensure the agent context exists
         if agent_name not in ctx:
             ctx[agent_name] = {"output": {}}
         elif "output" not in ctx[agent_name]:
             ctx[agent_name]["output"] = {}
-
-        agent_output = self.agent_outputs[agent_name]
 
         if not remaining_parts:
             # Just agent_name - copy entire output
@@ -514,6 +597,7 @@ class WorkflowContext:
         return {
             "workflow_inputs": copy.deepcopy(self.workflow_inputs),
             "agent_outputs": copy.deepcopy(self.agent_outputs),
+            "agent_errors": copy.deepcopy(self.agent_errors),
             "current_iteration": self.current_iteration,
             "execution_history": list(self.execution_history),
             "user_guidance": list(self.user_guidance),
@@ -534,6 +618,9 @@ class WorkflowContext:
         ctx = cls()
         ctx.workflow_inputs = copy.deepcopy(data.get("workflow_inputs", {}))
         ctx.agent_outputs = copy.deepcopy(data.get("agent_outputs", {}))
+        # ``agent_errors`` is new in Phase 1 error routing; older
+        # checkpoints simply have no errors to restore.
+        ctx.agent_errors = copy.deepcopy(data.get("agent_errors", {}))
         ctx.current_iteration = data.get("current_iteration", 0)
         ctx.execution_history = list(data.get("execution_history", []))
         ctx.user_guidance = list(data.get("user_guidance", []))
@@ -560,6 +647,18 @@ class WorkflowContext:
             return None
         last_agent = self.execution_history[-1]
         return self.agent_outputs.get(last_agent)
+
+    def get_latest_error(self) -> ErrorEnvelope | None:
+        """Get the error envelope from the most recently executed agent.
+
+        Returns ``None`` if the last node succeeded, was a non-leaf
+        node, or if no nodes have executed. Useful for the halt-on-
+        unhandled path which needs the envelope from the failing leaf.
+        """
+        if not self.execution_history:
+            return None
+        last_agent = self.execution_history[-1]
+        return self.agent_errors.get(last_agent)
 
     def estimate_context_tokens(self) -> int:
         """Estimate the total number of tokens in the current context.

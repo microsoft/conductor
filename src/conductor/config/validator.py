@@ -9,15 +9,16 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import jinja2
 from jinja2 import Environment, meta, nodes
 
+from conductor.error_kinds import KIND_PATTERN, RESERVED_ON_ERROR_ALLOWLIST
 from conductor.exceptions import ConfigurationError
 
 if TYPE_CHECKING:
-    from conductor.config.schema import AgentDef, WorkflowConfig
+    from conductor.config.schema import AgentDef, WorkflowConfig  # noqa: F401
 
 
 # Shared Jinja2 environment used purely for AST parsing of template strings.
@@ -65,8 +66,8 @@ _JINJA_ENV.tests = _TolerantNameMap(_JINJA_ENV.tests)
 _BUILTIN_NAMES = frozenset({"workflow", "context", "item", "_index", "_key", "loop"})
 
 # Attribute names that mark a Getattr chain as an "output reference":
-#   agent.output.field, group.outputs.member, group.errors.member
-_OUTPUT_ATTRS = frozenset({"output", "outputs", "errors"})
+#   agent.output.field, agent.error.field, group.outputs.member, group.errors.member
+_OUTPUT_ATTRS = frozenset({"output", "outputs", "error", "errors"})
 
 # Attribute names that look like fields on an output but are actually built-in
 # dict methods. We avoid emitting field-precision warnings for these because
@@ -83,12 +84,14 @@ _MAX_ENUMERATED_PATHS = 100
 
 # Pattern for input references:
 # - agent.output(.field)?
+# - agent.error(.field)?
 # - parallel_group.outputs.agent(.field)?
 # - workflow.input.param
 # All with optional ? suffix
 INPUT_REF_PATTERN = re.compile(
     r"^(?:"
     r"(?P<agent>[a-zA-Z_][a-zA-Z0-9_]*)\.output(?:\.(?P<field>[a-zA-Z_][a-zA-Z0-9_]*))?|"
+    r"(?P<error_agent>[a-zA-Z_][a-zA-Z0-9_]*)\.error(?:\.(?P<error_field>[a-zA-Z_][a-zA-Z0-9_]*))?|"
     r"(?P<parallel>[a-zA-Z_][a-zA-Z0-9_]*)\.(?P<pg_kind>outputs|errors)(?:\.(?P<pg_agent>[a-zA-Z_][a-zA-Z0-9_]*)(?:\.(?P<pg_field>[a-zA-Z_][a-zA-Z0-9_]*))?)?|"
     r"workflow\.input\.(?P<input>[a-zA-Z_][a-zA-Z0-9_]*)"
     r")(?P<optional>\?)?$"
@@ -145,6 +148,10 @@ def validate_workflow_config(
         # Validate route targets - allow routing to agents and parallel groups
         agent_errors = _validate_agent_routes(agent.name, agent.routes, all_names)
         errors.extend(agent_errors)
+
+        # Validate on_error route placement + cross-check against raises
+        on_error_errors = _validate_on_error_routes(agent)
+        errors.extend(on_error_errors)
 
         # Validate human_gate has options
         if agent.type == "human_gate":
@@ -203,6 +210,10 @@ def validate_workflow_config(
     if config.parallel:
         parallel_errors = _validate_parallel_groups(config)
         errors.extend(parallel_errors)
+        # Phase 1: on_error routes on parallel groups are not supported
+        # (group-level error envelopes are deferred to Phase 2).
+        for pg in config.parallel:
+            errors.extend(_validate_group_routes_no_on_error("parallel group", pg.name, pg.routes))
 
     # Validate for_each groups: reject script steps as inline agents
     for for_each_group in config.for_each:
@@ -211,6 +222,12 @@ def validate_workflow_config(
                 f"For-each group '{for_each_group.name}' uses a script step as its "
                 "inline agent. Script steps cannot be used in for_each groups."
             )
+        # Phase 1: same as parallel — no group-level error envelopes yet.
+        errors.extend(
+            _validate_group_routes_no_on_error(
+                "for_each group", for_each_group.name, for_each_group.routes
+            )
+        )
 
     # Validate sub-workflow references (local paths and registry refs).
     # Skipped when workflow_path is not provided — relative paths cannot be
@@ -279,6 +296,137 @@ def _validate_agent_routes(
     return errors
 
 
+# Node types that DO emit error envelopes in Phase 1 and may therefore
+# carry ``on_error`` routes. Other types (human_gate, workflow,
+# notification) get a hard validator error if they try.
+_LEAF_TYPES_THAT_RAISE: frozenset[str | None] = frozenset({"agent", "script", None})
+
+
+def _validate_on_error_routes(agent: Any) -> list[str]:
+    """Validate ``on_error`` route shape, placement, and cross-check vs ``raises``.
+
+    The schema-level Pydantic validator already enforces the discriminator
+    shape (``bool | str | list[str]``), rejects ``False``, and forbids
+    reserved-prefix kinds in ``raises``. This function adds the
+    cross-cutting checks that need the full :class:`AgentDef` in view:
+
+    1. **Placement**: ``on_error`` routes are only legal on leaf node
+       types that actually raise envelopes in Phase 1 (``agent``,
+       ``script``, or untyped). Routes on ``human_gate`` / ``workflow``
+       /  ``notification`` agents that declare ``on_error`` get a hard
+       error so authors don't ship handlers that never fire.
+    2. **Kind shape**: any string kind in ``on_error`` must look like a
+       dotted lowercase identifier (the same ``KIND_PATTERN`` enforced on
+       ``raises``).
+    3. **Cross-check vs ``raises``**: if ``agent.raises`` is declared,
+       every concrete kind matched by an ``on_error`` route must appear
+       in ``raises`` or in :data:`RESERVED_ON_ERROR_ALLOWLIST` (the
+       runtime-synthesized kinds — ``internal.script_error``,
+       ``internal.schema_violation``, ``internal.undeclared_kind``).
+       Catch-all (``on_error: true``) is always allowed. Routes with no
+       ``on_error`` are unaffected.
+
+    Args:
+        agent: An :class:`~conductor.config.schema.AgentDef`.
+
+    Returns:
+        List of validation error messages (empty if all checks pass).
+    """
+    errors: list[str] = []
+    if not agent.routes:
+        return errors
+
+    # Collect routes with on_error set (the schema-level validator already
+    # filtered out False; None means "success route" and is skipped here).
+    error_routes = [(i, r) for i, r in enumerate(agent.routes) if r.on_error is not None]
+    if not error_routes:
+        return errors
+
+    # 1. Placement check — hard error for unsupported node types.
+    if agent.type not in _LEAF_TYPES_THAT_RAISE:
+        errors.append(
+            f"Agent '{agent.name}' has type '{agent.type}' but declares one or more "
+            f"'on_error' routes. In Phase 1, only 'agent' and 'script' nodes raise "
+            f"error envelopes. Remove the on_error routes or change the agent type."
+        )
+        # Continue with the remaining checks so a misconfigured node
+        # surfaces all of its on_error problems in one validator pass.
+
+    declared = set(agent.raises or [])
+
+    for idx, route in error_routes:
+        kinds = _collect_on_error_kinds(route.on_error)
+        for kind in kinds:
+            # 2. Kind shape — must look like a dotted identifier.
+            if not KIND_PATTERN.match(kind):
+                errors.append(
+                    f"Agent '{agent.name}' route {idx} on_error contains "
+                    f"invalid kind '{kind}'. Kinds must be dotted lowercase "
+                    f"identifiers (e.g., 'external.git.fetch_failed')."
+                )
+                continue
+            # 3. Cross-check vs raises. Only run when ``raises`` is
+            # declared — an undeclared producer accepts any kind in
+            # on_error (the discriminator is the contract).
+            if declared and kind not in declared and kind not in RESERVED_ON_ERROR_ALLOWLIST:
+                allowlist_hint = ", ".join(sorted(RESERVED_ON_ERROR_ALLOWLIST)) or "(none)"
+                errors.append(
+                    f"Agent '{agent.name}' route {idx} on_error references kind "
+                    f"'{kind}' but the agent declares raises={sorted(declared)}. "
+                    f"Add '{kind}' to the agent's raises list or remove the "
+                    f"route. Always-legal reserved kinds: {allowlist_hint}."
+                )
+
+    return errors
+
+
+def _collect_on_error_kinds(on_error: bool | str | list[str]) -> list[str]:
+    """Return the concrete kind strings inside an ``on_error`` matcher.
+
+    ``True`` (catch-all) contributes no concrete kinds and is always
+    legal at the cross-check stage. Strings and lists yield their
+    string contents.
+    """
+    if on_error is True:
+        return []
+    if isinstance(on_error, str):
+        return [on_error]
+    if isinstance(on_error, list):
+        return list(on_error)
+    return []
+
+
+def _validate_group_routes_no_on_error(group_kind: str, group_name: str, routes: list) -> list[str]:
+    """Reject ``on_error`` routes attached to a parallel or for_each group.
+
+    Phase 1 only emits envelopes from leaf agent/script nodes. Group-
+    level error envelopes (where any child failure surfaces as one
+    envelope on the group) are deferred to Phase 2. Until then, an
+    ``on_error`` route on a group is a footgun — it would never fire —
+    so we hard-error rather than silently warn.
+
+    Args:
+        group_kind: Human label for the group type, e.g. ``"parallel group"``.
+        group_name: The group's ``name`` field.
+        routes: The group's routes list.
+
+    Returns:
+        List of validation error messages.
+    """
+    errors: list[str] = []
+    if not routes:
+        return errors
+    for i, route in enumerate(routes):
+        if route.on_error is not None:
+            errors.append(
+                f"{group_kind.capitalize()} '{group_name}' route {i} declares "
+                f"'on_error', but Phase 1 does not emit envelopes from "
+                f"{group_kind}s. Remove the on_error field or wait for Phase 2 "
+                f"group-level error routing."
+            )
+    return errors
+
+
 def _validate_input_references(
     agent_name: str,
     inputs: list[str],
@@ -327,6 +475,21 @@ def _validate_input_references(
             else:
                 errors.append(
                     f"Agent '{agent_name}' references unknown agent '{ref_agent}' in input"
+                )
+
+        # Check if referencing another agent's error envelope
+        ref_error_agent = match.group("error_agent")
+        if ref_error_agent and ref_error_agent not in agent_names:
+            is_optional = match.group("optional") == "?"
+            if is_optional:
+                warnings.append(
+                    f"Agent '{agent_name}' has optional reference to error envelope "
+                    f"from unknown agent '{ref_error_agent}'"
+                )
+            else:
+                errors.append(
+                    f"Agent '{agent_name}' references error envelope from unknown agent "
+                    f"'{ref_error_agent}' in input"
                 )
 
         # Check if referencing parallel/for-each group output
@@ -518,7 +681,7 @@ def _validate_parallel_groups(config: WorkflowConfig) -> list[str]:
                 # Parse input reference to extract agent name
                 match = INPUT_REF_PATTERN.match(input_ref)
                 if match:
-                    ref_agent = match.group("agent")
+                    ref_agent = match.group("agent") or match.group("error_agent")
                     if ref_agent and ref_agent in pg_agents_set and ref_agent != agent_name:
                         errors.append(
                             f"Agent '{agent_name}' in parallel group '{pg.name}' references "
@@ -635,6 +798,12 @@ class TemplateRefs(NamedTuple):
             separate from output refs because the engine's runtime semantics
             for ``.errors`` always copy the whole errors dict and never field-
             slice, so field-precision checks must not be applied to them.
+        agent_error_refs: Agent names referenced via ``<name>.error`` (singular
+            error envelope from a failing leaf node). Kept separate from
+            output refs because envelopes are always copied whole — the
+            runtime never field-slices them — so field-precision checks
+            must not be applied. Used for explicit-mode undeclared-input
+            warnings on ``{{ failing_node.error.kind }}``-style references.
     """
 
     agent_refs: set[str]
@@ -642,6 +811,7 @@ class TemplateRefs(NamedTuple):
     agent_output_fields: dict[str, set[str | None]]
     group_member_fields: dict[tuple[str, str | None], set[str | None]]
     group_error_refs: set[str]
+    agent_error_refs: set[str]
 
 
 def _extract_template_refs(template: str) -> TemplateRefs:
@@ -693,6 +863,7 @@ def _extract_template_refs(template: str) -> TemplateRefs:
         agent_output_fields={},
         group_member_fields={},
         group_error_refs=set(),
+        agent_error_refs=set(),
     )
 
     if not template or ("{{" not in template and "{%" not in template):
@@ -733,6 +904,8 @@ def _extract_template_refs(template: str) -> TemplateRefs:
     workflow_inputs: set[str] = set()
     # group.errors chains; collected directly into the result.
     group_error_refs: set[str] = set()
+    # agent.error chains (singular envelope from a failing leaf).
+    agent_error_refs: set[str] = set()
     # Output / outputs chains, accumulated as the structured maps directly.
     agent_output_fields: dict[str, set[str | None]] = {}
     group_member_fields: dict[tuple[str, str | None], set[str | None]] = {}
@@ -790,6 +963,13 @@ def _extract_template_refs(template: str) -> TemplateRefs:
             agent_refs.add(root)
             continue
 
+        # Singular error envelope on a failing leaf node; whole envelope
+        # is copied into ctx, so no field-precision either.
+        if kind == "error":
+            agent_error_refs.add(root)
+            agent_refs.add(root)
+            continue
+
         agent_refs.add(root)
         if kind == "output":
             # attrs is ["output"] or ["output", "<field>", ...]
@@ -811,6 +991,7 @@ def _extract_template_refs(template: str) -> TemplateRefs:
         agent_output_fields=agent_output_fields,
         group_member_fields=group_member_fields,
         group_error_refs=group_error_refs,
+        agent_error_refs=agent_error_refs,
     )
 
 
@@ -1188,6 +1369,10 @@ def _validate_template_references(
         # (see ``_add_parallel_group_input`` errors branch), so no field-
         # precision tracking is needed for errors.
         declared_group_errors: set[str] = set()
+        # Set of agent names whose error envelope is declared via
+        # ``<agent>.error[.field]``. The engine always copies the whole
+        # envelope, so no field-precision tracking is needed here either.
+        declared_agent_error_refs: set[str] = set()
         for ref in agent.input:
             match = INPUT_REF_PATTERN.match(ref.rstrip("?"))
             if not match:
@@ -1197,6 +1382,9 @@ def _validate_template_references(
                 field = match.group("field")
                 # field is None for bare ``a.output`` (whole output declared).
                 declared_agent_output_fields.setdefault(ref_agent, set()).add(field)
+            ref_error_agent = match.group("error_agent")
+            if ref_error_agent:
+                declared_agent_error_refs.add(ref_error_agent)
             ref_parallel = match.group("parallel")
             if ref_parallel:
                 pg_kind = match.group("pg_kind")
@@ -1344,6 +1532,23 @@ def _validate_template_references(
                     warnings.append(
                         f"{source} references '{group}.errors' but "
                         f"agent '{agent.name}' does not declare '{group}.errors' "
+                        f"in its input: list (explicit context mode)"
+                    )
+
+            # --- Agent-error references (``a.error[.field]``) ---
+            # Mirror of the group-error block. Envelopes are bounded in
+            # size and always copied whole, so no field-precision check.
+            for failing in refs.agent_error_refs:
+                if failing not in valid_names:
+                    errors.append(
+                        f"{source} references unknown agent '{failing}'. "
+                        f"Available: {', '.join(sorted(valid_names))}"
+                    )
+                    continue
+                if agent_output_warning_allowed and failing not in declared_agent_error_refs:
+                    warnings.append(
+                        f"{source} references '{failing}.error' but "
+                        f"agent '{agent.name}' does not declare '{failing}.error' "
                         f"in its input: list (explicit context mode)"
                     )
 

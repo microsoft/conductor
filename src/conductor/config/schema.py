@@ -10,6 +10,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from conductor.error_kinds import KIND_PATTERN, RESERVED_KIND_PREFIXES, is_reserved_prefix
 from conductor.providers.reasoning import ReasoningEffort
 
 
@@ -86,7 +87,19 @@ class OutputField(BaseModel):
 
 
 class RouteDef(BaseModel):
-    """Definition for a routing rule."""
+    """Definition for a routing rule.
+
+    Routes split into two buckets at evaluation time:
+
+    - **Success routes** (``on_error`` is ``None``, the default): matched
+      only when the producing node completed successfully.
+    - **Error routes** (``on_error`` is set): matched only when the
+      producing node raised a typed error envelope.
+
+    Within each bucket, routes are evaluated in declaration order; the
+    first ``when`` to evaluate truthy wins. A route with no ``when``
+    always matches within its bucket.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -99,6 +112,24 @@ class RouteDef(BaseModel):
     output: dict[str, str] | None = None
     """Optional output transformation (template expressions)."""
 
+    on_error: bool | str | list[str] | None = None
+    """Marks this route as an error route and selects which error kinds it matches.
+
+    Accepted forms:
+
+    - ``None`` (default): success route. Matches only when the producing
+      node completed successfully.
+    - ``True``: catch-all error route. Matches any raised kind.
+    - ``str``: matches that single dotted-lowercase kind exactly
+      (e.g. ``external.git.fetch_failed``).
+    - ``list[str]``: matches if the raised kind is any entry in the list.
+
+    ``False`` is rejected: omit the field for a success route.
+
+    The kind format is enforced by :data:`conductor.error_kinds.KIND_PATTERN`.
+    See ``docs/projects/error-routing/on-error-routing.brainstorm.md``.
+    """
+
     @field_validator("to")
     @classmethod
     def validate_target(cls, v: str) -> str:
@@ -106,6 +137,47 @@ class RouteDef(BaseModel):
         if not v:
             raise ValueError("Route target cannot be empty")
         return v
+
+    @field_validator("on_error", mode="before")
+    @classmethod
+    def validate_on_error(cls, v: Any) -> bool | str | list[str] | None:
+        """Validate the on_error discriminator and kind format.
+
+        Runs in ``before`` mode so we see the raw YAML-decoded value
+        and aren't fighting Pydantic's bool/str coercion.
+        """
+        if v is None:
+            return None
+        if isinstance(v, bool):
+            if v is False:
+                raise ValueError(
+                    "on_error: false is not allowed; omit the field for a success route"
+                )
+            return True
+        if isinstance(v, str):
+            if not v:
+                raise ValueError("on_error kind cannot be empty")
+            if not KIND_PATTERN.match(v):
+                raise ValueError(
+                    f"on_error kind '{v}' must be a dotted lowercase identifier "
+                    "(e.g. 'external.git.fetch_failed')"
+                )
+            return v
+        if isinstance(v, list):
+            if not v:
+                raise ValueError("on_error kind list cannot be empty")
+            for entry in v:
+                if not isinstance(entry, str) or not entry:
+                    raise ValueError(
+                        f"on_error kind list entries must be non-empty strings, got {entry!r}"
+                    )
+                if not KIND_PATTERN.match(entry):
+                    raise ValueError(
+                        f"on_error kind '{entry}' must be a dotted lowercase identifier "
+                        "(e.g. 'external.git.fetch_failed')"
+                    )
+            return v
+        raise ValueError(f"on_error must be bool, str, or list[str]; got {type(v).__name__}")
 
 
 class ParallelGroup(BaseModel):
@@ -508,6 +580,30 @@ class AgentDef(BaseModel):
     routes: list[RouteDef] = Field(default_factory=list)
     """Routing rules evaluated in order after execution."""
 
+    raises: list[str] | None = None
+    """Optional declaration of error kinds this node may raise.
+
+    When present, two checks fire:
+
+    1. **Load-time lint** (in :mod:`conductor.config.validator`): every
+       ``on_error`` kind on routes leaving this node must either appear
+       in ``raises``, be in the reserved on_error allowlist, or be a
+       catch-all (``on_error: true``). Typos surface at validate time.
+    2. **Runtime undeclared-kind check**: if the node raises a kind not
+       in this list, the runtime rewrites the envelope's ``kind`` to
+       ``internal.undeclared_kind`` and preserves the original kind
+       under ``details.original_kind``. This makes contract drift
+       routable and visible.
+
+    Entries must match :data:`conductor.error_kinds.KIND_PATTERN` and
+    must NOT use a reserved prefix (``internal.``, ``provider.``,
+    ``subworkflow.``, ``retry.``) — those namespaces are owned by the
+    runtime.
+
+    Strictly optional: existing workflows can adopt ``on_error`` routing
+    without declaring ``raises`` and skip the contract enforcement.
+    """
+
     options: list[GateOption] | None = None
     """Options for human_gate type agents."""
 
@@ -677,6 +773,39 @@ class AgentDef(BaseModel):
         """Ensure timeout is positive if set."""
         if v is not None and v <= 0:
             raise ValueError("timeout must be a positive integer")
+        return v
+
+    @field_validator("raises")
+    @classmethod
+    def validate_raises(cls, v: list[str] | None) -> list[str] | None:
+        """Validate the optional ``raises`` declaration.
+
+        Each entry must match :data:`conductor.error_kinds.KIND_PATTERN`
+        and must NOT use a reserved prefix — those prefixes name
+        runtime-synthesized kinds, not author-classified failures.
+        """
+        if v is None:
+            return None
+        if not v:
+            raise ValueError("raises list cannot be empty; omit the field instead of declaring []")
+        seen: set[str] = set()
+        for kind in v:
+            if not isinstance(kind, str) or not kind:
+                raise ValueError(f"raises entries must be non-empty strings, got {kind!r}")
+            if not KIND_PATTERN.match(kind):
+                raise ValueError(
+                    f"raises kind '{kind}' must be a dotted lowercase identifier "
+                    "(e.g. 'external.git.fetch_failed')"
+                )
+            if is_reserved_prefix(kind):
+                raise ValueError(
+                    f"raises kind '{kind}' uses a reserved prefix; reserved prefixes "
+                    f"({', '.join(RESERVED_KIND_PREFIXES)}) name runtime-synthesized "
+                    "kinds and cannot be declared by workflow authors"
+                )
+            if kind in seen:
+                raise ValueError(f"raises kind '{kind}' is declared more than once")
+            seen.add(kind)
         return v
 
     @model_validator(mode="after")
