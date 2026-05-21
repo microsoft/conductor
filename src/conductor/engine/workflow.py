@@ -20,10 +20,12 @@ from typing import TYPE_CHECKING, Any
 
 from conductor.engine.checkpoint import CheckpointManager
 from conductor.engine.context import WorkflowContext
+from conductor.engine.errors import wrap_undeclared_kind
 from conductor.engine.limits import LimitEnforcer
 from conductor.engine.pricing import ModelPricing
 from conductor.engine.router import Router, RouteResult
 from conductor.engine.usage import UsageTracker, WorkflowUsage
+from conductor.error_kinds import RESERVED_ON_ERROR_ALLOWLIST
 from conductor.events import WorkflowEvent, WorkflowEventEmitter
 from conductor.exceptions import (
     AgentTimeoutError,
@@ -31,6 +33,8 @@ from conductor.exceptions import (
     ExecutionError,
     InterruptError,
     MaxIterationsError,
+    UnhandledNodeError,
+    UnhandledWorkflowError,
     ValidationError,
 )
 from conductor.exceptions import (
@@ -102,6 +106,14 @@ class ParallelAgentError:
     exception_type: str
     message: str
     suggestion: str | None = None
+    envelope: dict[str, Any] | None = None
+    """Typed error envelope when the child raised via the on_error contract.
+
+    Populated when a child agent/script returned an
+    :class:`~conductor.engine.errors.ErrorEnvelope` instead of throwing.
+    Downstream consumers can inspect this to recover the typed kind/details.
+    ``None`` for failures that came through ordinary exception paths.
+    """
 
 
 @dataclass
@@ -147,6 +159,8 @@ class ForEachError:
     exception_type: str
     message: str
     suggestion: str | None = None
+    envelope: dict[str, Any] | None = None
+    """Typed error envelope when the iteration raised via the on_error contract."""
 
 
 @dataclass
@@ -1143,7 +1157,19 @@ class WorkflowEngine:
             instructions_preamble=child_preamble,
         )
 
-        return await child_engine.run(sub_inputs)
+        try:
+            return await child_engine.run(sub_inputs)
+        except UnhandledWorkflowError as exc:
+            # Phase 1 invariant: error envelopes do NOT propagate across
+            # sub-workflow boundaries. The child's halt is surfaced to the
+            # parent as a generic ExecutionError so the parent's success
+            # path treats it like any other sub-workflow failure. Phase 2
+            # will introduce envelope propagation with parent frames.
+            raise ExecutionError(
+                f"sub-workflow '{agent.name}' halted on unhandled error envelope "
+                f"({exc.envelope.get('kind')}): {exc.envelope.get('message')}",
+                agent_name=agent.name,
+            ) from exc
 
     async def _execute_subworkflow_with_inputs(
         self,
@@ -1255,7 +1281,14 @@ class WorkflowEngine:
 
         child_engine = WorkflowEngine(**child_engine_kwargs)
 
-        output = await child_engine.run(sub_inputs)
+        try:
+            output = await child_engine.run(sub_inputs)
+        except UnhandledWorkflowError as exc:
+            raise ExecutionError(
+                f"sub-workflow '{agent.name}' halted on unhandled error envelope "
+                f"({exc.envelope.get('kind')}): {exc.envelope.get('message')}",
+                agent_name=agent.name,
+            ) from exc
         usage = child_engine.usage_tracker.get_summary()
         return output, usage
 
@@ -2313,6 +2346,53 @@ class WorkflowEngine:
                                     )
                                 output_content.update(parsed_json)
 
+                            # Error-bucket: script wrote a CONDUCTOR_ERROR_OUT
+                            # envelope, or the executor synthesized
+                            # internal.script_error. Skip declared-output schema
+                            # validation (the script's "output" contract doesn't
+                            # apply when it raised) and route via the error path.
+                            if script_output.error is not None:
+                                self._emit(
+                                    "script_completed",
+                                    {
+                                        "agent_name": agent.name,
+                                        "elapsed": _script_elapsed,
+                                        "stdout": script_output.stdout,
+                                        "stderr": script_output.stderr,
+                                        "exit_code": script_output.exit_code,
+                                    },
+                                )
+                                self.limits.record_execution(agent.name)
+                                self.limits.check_timeout()
+                                route_result = self._handle_leaf_error(
+                                    agent, script_output.error, output_content
+                                )
+                                self._emit(
+                                    "route_taken",
+                                    {
+                                        "from_agent": agent.name,
+                                        "to_agent": route_result.target,
+                                    },
+                                )
+                                if route_result.target == "$end":
+                                    result = self._build_final_output(route_result.output_transform)
+                                    self._emit(
+                                        "workflow_completed",
+                                        {
+                                            "elapsed": _time.time() - _workflow_start,
+                                            "output": result,
+                                        },
+                                    )
+                                    self._execute_hook("on_complete", result=result)
+                                    return result
+                                current_agent_name = route_result.target
+                                interrupt_result = await self._check_interrupt(current_agent_name)
+                                if interrupt_result is not None:
+                                    current_agent_name = await self._handle_interrupt_result(
+                                        interrupt_result, current_agent_name
+                                    )
+                                continue
+
                             # Validate against declared output schema (issue #118).
                             # `is not None` so an explicit `output: {}` opts
                             # into strict JSON-object mode with zero declared
@@ -2569,6 +2649,43 @@ class WorkflowEngine:
                                 ),
                             },
                         )
+
+                        # Error-bucket: leaf raised a typed envelope. Normalize,
+                        # store via store_error (NOT store), evaluate error
+                        # routes, and let an unhandled envelope propagate as
+                        # UnhandledWorkflowError. The success path below is
+                        # skipped entirely.
+                        if output.error is not None:
+                            self.limits.record_execution(agent.name)
+                            self.limits.check_timeout()
+                            route_result = self._handle_leaf_error(
+                                agent, output.error, output.content
+                            )
+                            self._emit(
+                                "route_taken",
+                                {
+                                    "from_agent": agent.name,
+                                    "to_agent": route_result.target,
+                                },
+                            )
+                            if route_result.target == "$end":
+                                result = self._build_final_output(route_result.output_transform)
+                                self._emit(
+                                    "workflow_completed",
+                                    {
+                                        "elapsed": _time.time() - _workflow_start,
+                                        "output": result,
+                                    },
+                                )
+                                self._execute_hook("on_complete", result=result)
+                                return result
+                            current_agent_name = route_result.target
+                            interrupt_result = await self._check_interrupt(current_agent_name)
+                            if interrupt_result is not None:
+                                current_agent_name = await self._handle_interrupt_result(
+                                    interrupt_result, current_agent_name
+                                )
+                            continue
 
                         # Store output
                         self.context.store(agent.name, output.content)
@@ -3551,6 +3668,21 @@ class WorkflowEngine:
                     },
                 )
 
+                # If the child raised a typed envelope, surface it as a
+                # child failure via the existing exception path so the
+                # group's failure_mode logic handles it uniformly. The
+                # envelope is preserved on the wrapped exception so the
+                # group can record it in its ``errors`` collection.
+                if output.error is not None:
+                    normalized = self._normalize_envelope_for_node(agent, output.error)
+                    exc = ExecutionError(
+                        f"agent '{agent.name}' raised "
+                        f"'{normalized.get('kind')}': {normalized.get('message')}",
+                        agent_name=agent.name,
+                    )
+                    exc._envelope = normalized  # type: ignore[attr-defined]
+                    raise exc
+
                 # Individual parallel agents are counted toward iteration limit
                 # at the parallel group level after all agents complete
                 return (agent.name, output.content)
@@ -3643,6 +3775,7 @@ class WorkflowEngine:
                         exception_type=type(result).__name__,
                         message=str(result),
                         suggestion=getattr(result, "suggestion", None),
+                        envelope=getattr(result, "_envelope", None),
                     )
                 else:
                     # Agent succeeded - store output
@@ -3698,6 +3831,7 @@ class WorkflowEngine:
                         exception_type=type(result).__name__,
                         message=str(result),
                         suggestion=getattr(result, "suggestion", None),
+                        envelope=getattr(result, "_envelope", None),
                     )
                 else:
                     # Agent succeeded - store output
@@ -3990,6 +4124,21 @@ class WorkflowEngine:
                     },
                 )
 
+                # Typed-envelope path mirrors the parallel group: surface
+                # as a child failure via the existing exception channel so
+                # the failure_mode policy handles it uniformly.
+                if output.error is not None:
+                    normalized = self._normalize_envelope_for_node(
+                        for_each_group.agent, output.error
+                    )
+                    exc = ExecutionError(
+                        f"for_each iteration '{key}' raised "
+                        f"'{normalized.get('kind')}': {normalized.get('message')}",
+                        agent_name=for_each_group.agent.name,
+                    )
+                    exc._envelope = normalized  # type: ignore[attr-defined]
+                    raise exc
+
                 return (key, output.content)
             except Exception as e:
                 _item_elapsed = _time.time() - _item_start
@@ -4083,6 +4232,7 @@ class WorkflowEngine:
                             exception_type=type(result).__name__,
                             message=str(result),
                             suggestion=getattr(result, "suggestion", None),
+                            envelope=getattr(result, "_envelope", None),
                         )
                     else:
                         # Item succeeded - store output
@@ -4115,6 +4265,7 @@ class WorkflowEngine:
                             exception_type=type(result).__name__,
                             message=str(result),
                             suggestion=getattr(result, "suggestion", None),
+                            envelope=getattr(result, "_envelope", None),
                         )
                     else:
                         # Item succeeded - store output
@@ -4197,7 +4348,81 @@ class WorkflowEngine:
         result = self._evaluate_routes(agent, output)
         return result.target
 
-    def _evaluate_routes(self, agent: AgentDef, output: dict[str, Any]) -> RouteResult:
+    def _normalize_envelope_for_node(
+        self,
+        agent: AgentDef,
+        envelope: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Apply undeclared-kind normalization to a leaf envelope.
+
+        When a node has declared ``raises:``, any envelope whose ``kind`` is
+        not in that list (and not in the runtime-synthesized
+        :data:`RESERVED_ON_ERROR_ALLOWLIST`) is wrapped into
+        ``internal.undeclared_kind`` with the original kind preserved in
+        ``details.original_kind``. This is the engine's job (not the
+        executor's): the executor is agnostic to the workflow's contract.
+
+        Called once at the leaf node's call site before context storage,
+        route evaluation, and event emission so every downstream observer
+        sees the normalized form.
+        """
+        declared = agent.raises
+        if not declared:
+            return envelope
+        kind = envelope.get("kind")
+        if kind in declared or kind in RESERVED_ON_ERROR_ALLOWLIST:
+            return envelope
+        return dict(wrap_undeclared_kind(envelope, declared=list(declared)))  # type: ignore[arg-type]
+
+    def _handle_leaf_error(
+        self,
+        agent: AgentDef,
+        envelope: dict[str, Any],
+        output_for_route: dict[str, Any],
+    ) -> RouteResult:
+        """Apply normalization, store the envelope, and evaluate error routes.
+
+        Used by both the agent and script call sites after a leaf executor
+        returns an envelope. The returned :class:`RouteResult` is what the
+        caller should drive forward; if no error route matches, this method
+        raises :class:`UnhandledWorkflowError` wrapping the normalized
+        envelope and a single-leaf frame trail.
+
+        Args:
+            agent: The leaf node that raised.
+            envelope: The raw envelope (pre-normalization) from the executor.
+            output_for_route: The leaf node's output content as it would be
+                stored on the success path. The error router sees this as
+                ``current_output`` so templates that reference output fields
+                still work.
+
+        Returns:
+            The :class:`RouteResult` from the matching error route.
+
+        Raises:
+            UnhandledWorkflowError: if no error route at this level matched.
+        """
+        normalized = self._normalize_envelope_for_node(agent, envelope)
+        self.context.store_error(agent.name, normalized)
+
+        try:
+            return self._evaluate_routes(agent, output_for_route, error=normalized)
+        except UnhandledNodeError as exc:
+            frames = [
+                {
+                    "node": agent.name,
+                    "kind": normalized.get("kind"),
+                    "iteration": self.limits.get_agent_execution_count(agent.name),
+                }
+            ]
+            raise UnhandledWorkflowError(normalized, frames=frames) from exc
+
+    def _evaluate_routes(
+        self,
+        agent: AgentDef,
+        output: dict[str, Any],
+        error: dict[str, Any] | None = None,
+    ) -> RouteResult:
         """Evaluate routes using the Router.
 
         Uses the Router to evaluate routing rules and determine the next agent.
@@ -4205,19 +4430,27 @@ class WorkflowEngine:
 
         Args:
             agent: The current agent definition.
-            output: The agent's output content.
+            output: The agent's output content. Pass ``{}`` on the error path
+                (the envelope is the meaningful signal).
+            error: If set, treated as the error envelope and only error-bucket
+                routes (those with ``on_error`` populated) are considered.
+                Empty routes plus a non-None error raises
+                :class:`UnhandledNodeError` rather than silently routing to ``$end``.
 
         Returns:
             RouteResult with target and optional output transform.
         """
         if not agent.routes:
-            # No routes defined - default to $end
+            if error is not None:
+                from conductor.exceptions import UnhandledNodeError  # noqa: PLC0415
+
+                raise UnhandledNodeError(error, node_name=agent.name)
             return RouteResult(target="$end")
 
         # Build context for condition evaluation
         eval_context = self.context.get_for_template()
 
-        return self.router.evaluate(agent.routes, output, eval_context)
+        return self.router.evaluate(agent.routes, output, eval_context, error=error)
 
     def _evaluate_parallel_routes(
         self, parallel_group: ParallelGroup, output: dict[str, Any]
