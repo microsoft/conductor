@@ -21,6 +21,7 @@ import { useDeepLink } from '@/hooks/use-deep-link';
 import { buildGraphElements, type GraphNodeData } from './graph-layout';
 import { AgentNode } from './AgentNode';
 import { ScriptNode } from './ScriptNode';
+import { SetNode } from './SetNode';
 import { GateNode } from './GateNode';
 import { GroupNode } from './GroupNode';
 import { WorkflowNode } from './WorkflowNode';
@@ -37,6 +38,7 @@ import { Loader2, Maximize, Zap } from 'lucide-react';
 const nodeTypes: NodeTypes = {
   agentNode: AgentNode,
   scriptNode: ScriptNode,
+  setNode: SetNode,
   gateNode: GateNode,
   groupNode: GroupNode,
   workflowNode: WorkflowNode,

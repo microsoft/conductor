@@ -4,6 +4,7 @@ import { useWorkflowStore } from '@/stores/workflow-store';
 import { useViewedNodes } from '@/hooks/use-viewed-context';
 import { AgentDetail } from './AgentDetail';
 import { ScriptDetail } from './ScriptDetail';
+import { SetDetail } from './SetDetail';
 import { GateDetail } from './GateDetail';
 import { GroupDetail } from './GroupDetail';
 import { DialogEngagementPrompt } from './DialogEngagementPrompt';
@@ -47,6 +48,8 @@ export function DetailPanel() {
     switch (node.type) {
       case 'script':
         return ScriptDetail;
+      case 'set':
+        return SetDetail;
       case 'human_gate':
         return GateDetail;
       case 'parallel_group':
