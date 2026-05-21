@@ -18,6 +18,7 @@ from rich.panel import Panel
 from rich.text import Text
 
 from conductor import __version__
+from conductor.exceptions import WorkflowTerminated
 
 logger = logging.getLogger(__name__)
 
@@ -468,16 +469,28 @@ def run(
         # Output as JSON to stdout
         output_console.print_json(json.dumps(result))
 
+    except WorkflowTerminated as e:
+        # Explicit `type: terminate` with `status: failed`. Print the
+        # rendered final output so downstream tooling can read it, surface
+        # the reason (and optional suggestion) as a user-facing message,
+        # then exit non-zero. `default=str` keeps the JSON dump robust
+        # against any output value that isn't directly JSON-serialisable —
+        # today everything goes through `_maybe_parse_json` so it round-
+        # trips, but a future custom Jinja filter or output_template
+        # transform could produce a non-trivial Python object that would
+        # otherwise crash the CLI here and lose the termination message.
+        try:
+            output_console.print_json(json.dumps(e.output, default=str))
+        except (TypeError, ValueError) as json_exc:
+            logger.exception("Failed to serialise terminate output")
+            console.print(
+                f"[yellow]Warning:[/yellow] could not serialise terminate output: {json_exc}"
+            )
+        console.print(f"[red]Workflow terminated[/red] at '{e.terminated_by}': {e.reason}")
+        if e.suggestion:
+            console.print(f"[dim]Suggestion: {e.suggestion}[/dim]")
+        raise typer.Exit(code=1) from None
     except Exception as e:
-        from conductor.exceptions import WorkflowTerminated
-
-        if isinstance(e, WorkflowTerminated):
-            # Explicit `type: terminate` with `status: failed`. Print the
-            # rendered final output so downstream tooling can read it, surface
-            # the reason as a user-facing message, then exit non-zero.
-            output_console.print_json(json.dumps(e.output))
-            console.print(f"[red]Workflow terminated[/red] at '{e.terminated_by}': {e.reason}")
-            raise typer.Exit(code=1) from None
         print_error(e)
         raise typer.Exit(code=1) from None
 
@@ -885,13 +898,21 @@ def resume(
         # Output as JSON to stdout
         output_console.print_json(json.dumps(result))
 
+    except WorkflowTerminated as e:
+        # Mirror of the `run` handler — see commentary there for the
+        # `default=str` and `try/except` rationale.
+        try:
+            output_console.print_json(json.dumps(e.output, default=str))
+        except (TypeError, ValueError) as json_exc:
+            logger.exception("Failed to serialise terminate output")
+            console.print(
+                f"[yellow]Warning:[/yellow] could not serialise terminate output: {json_exc}"
+            )
+        console.print(f"[red]Workflow terminated[/red] at '{e.terminated_by}': {e.reason}")
+        if e.suggestion:
+            console.print(f"[dim]Suggestion: {e.suggestion}[/dim]")
+        raise typer.Exit(code=1) from None
     except Exception as e:
-        from conductor.exceptions import WorkflowTerminated
-
-        if isinstance(e, WorkflowTerminated):
-            output_console.print_json(json.dumps(e.output))
-            console.print(f"[red]Workflow terminated[/red] at '{e.terminated_by}': {e.reason}")
-            raise typer.Exit(code=1) from None
         print_error(e)
         raise typer.Exit(code=1) from None
 

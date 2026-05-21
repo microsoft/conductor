@@ -32,6 +32,7 @@ from conductor.exceptions import (
     ExecutionError,
     InterruptError,
     MaxIterationsError,
+    SubworkflowTerminatedError,
     ValidationError,
     WorkflowTerminated,
 )
@@ -1397,6 +1398,17 @@ class WorkflowEngine:
         ``subworkflow_failed`` event fires and the parent's outer error
         handling treats it like any other ``ExecutionError``.
 
+        The child's rendered output dict (from ``output_template:`` or the
+        child workflow's ``output:`` mapping) is preserved on the raised
+        :class:`ExecutionError` as the ``terminated_output`` attribute so
+        debuggers, on_error hooks, and CLI surfaces can inspect what the
+        child intended to emit. The child's reason is also embedded in the
+        exception message for human-readable diagnostics. We deliberately do
+        NOT merge ``terminated_output`` into the parent's context — that
+        would let parent routes accidentally branch on a child's
+        "i was failing" payload (use ``status: success`` + ``output_template``
+        for that pattern).
+
         Successful terminations inside a child propagate normally: the
         child returns its rendered output dict and the parent continues.
 
@@ -1412,7 +1424,14 @@ class WorkflowEngine:
         try:
             return await child_engine.run(sub_inputs)
         except WorkflowTerminated as exc:
-            raise ExecutionError(
+            # Convert to SubworkflowTerminatedError so the parent's outer
+            # handler treats this as a normal sub-workflow failure (parent's
+            # own `workflow_failed` does NOT carry `is_explicit: true`). The
+            # child's rendered output / reason / terminate-step name are
+            # preserved as structured attributes on the wrapper so on_error
+            # hooks, debugging surfaces, and the CLI can inspect them without
+            # walking ``__cause__``.
+            raise SubworkflowTerminatedError(
                 f"Sub-workflow '{agent.workflow}' (agent '{agent.name}') "
                 f"terminated explicitly: {exc.reason}",
                 suggestion=(
@@ -1423,6 +1442,9 @@ class WorkflowEngine:
                     "`output_template:`."
                 ),
                 agent_name=agent.name,
+                terminated_output=exc.output,
+                terminated_reason=exc.reason,
+                terminated_by=exc.terminated_by,
             ) from exc
 
     async def _get_provider_for_agent(self, agent: AgentDef) -> AgentProvider | None:
@@ -2333,8 +2355,11 @@ class WorkflowEngine:
 
                         # Handle terminate steps — explicit workflow exit with a
                         # structured reason and status. Reached via a normal
-                        # route from any upstream agent/group; the engine ends
-                        # the workflow immediately (no routes evaluated after).
+                        # route from any upstream agent/group, OR as the
+                        # workflow's `entry_point` (a workflow whose first step
+                        # is a terminate ends immediately on dispatch). The
+                        # engine ends the workflow on this branch — no routes
+                        # evaluated after.
                         if agent.type == "terminate":
                             terminate_elapsed = _time.time() - _workflow_start
                             agent_context = self.context.build_for_agent(
@@ -2351,8 +2376,8 @@ class WorkflowEngine:
                             )
                             # Store the terminate step's own context entry
                             # BEFORE building the final output so workflow.output
-                            # templates can reference {{ <step>.reason }} /
-                            # {{ <step>.status }} if desired.
+                            # templates can reference {{ <step>.output.reason }}
+                            # / {{ <step>.output.status }} if desired.
                             self.context.store(
                                 agent.name,
                                 {
@@ -2361,14 +2386,38 @@ class WorkflowEngine:
                                     "terminated_by": agent.name,
                                 },
                             )
-                            self.limits.record_execution(agent.name)
+                            # check_timeout before record_execution so a
+                            # workflow that has exhausted its iteration budget
+                            # exactly at this terminate step cannot mask the
+                            # user's explicit termination behind a
+                            # MaxIterationsError from record_execution.
                             self.limits.check_timeout()
+                            self.limits.record_execution(agent.name)
 
                             # Build the final output: prefer output_template
                             # when set (replaces workflow-level output:);
                             # otherwise fall back to the workflow's output:
-                            # mapping rendered as usual.
-                            output = self._build_terminate_output(agent)
+                            # mapping rendered as usual. A template error here
+                            # must surface through `agent_failed` so the
+                            # dashboard / JSONL log records a resolved
+                            # lifecycle for the terminate step rather than
+                            # leaving it visually "in flight".
+                            try:
+                                output = self._build_terminate_output(agent)
+                            except Exception as exc:
+                                self._emit(
+                                    "agent_failed",
+                                    {
+                                        "agent_name": agent.name,
+                                        "elapsed": _time.time()
+                                        - _workflow_start
+                                        - terminate_elapsed,
+                                        "agent_type": "terminate",
+                                        "error_type": type(exc).__name__,
+                                        "message": str(exc),
+                                    },
+                                )
+                                raise
 
                             termination_meta = {
                                 "termination_reason": rendered_reason,

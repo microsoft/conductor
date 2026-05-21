@@ -1652,8 +1652,26 @@ class TestTerminateAgent:
         assert forbidden_field in str(exc_info.value)
 
     @pytest.mark.parametrize("step_type", ["script", "workflow", "human_gate"])
-    def test_terminate_fields_rejected_on_other_step_types(self, step_type: str) -> None:
-        """The terminate-only-fields guard must trip for every non-terminate type."""
+    @pytest.mark.parametrize(
+        "forbidden_field,field_value",
+        [
+            ("status", "success"),
+            ("reason", "halt"),
+            ("output_template", {"k": "{{ a.output }}"}),
+        ],
+    )
+    def test_terminate_fields_rejected_on_other_step_types(
+        self, step_type: str, forbidden_field: str, field_value: object
+    ) -> None:
+        """The terminate-only-fields guard must trip for every non-terminate type
+        and every terminate-exclusive field — not just `status`.
+
+        Earlier iteration of this test only varied ``step_type`` and asserted on
+        ``status``. A bug in ``validate_agent_type`` that, say, rejected only
+        ``status`` on ``script`` agents but silently accepted ``reason`` and
+        ``output_template`` would have slipped through. Cross-product the
+        parametrisation so every (step_type, terminate-field) pair is exercised.
+        """
         payload: dict[str, object] = {"name": "a", "type": step_type}
         if step_type == "script":
             payload["command"] = "echo"
@@ -1662,10 +1680,10 @@ class TestTerminateAgent:
         elif step_type == "human_gate":
             payload["prompt"] = "Pick"
             payload["options"] = [GateOption(value="x", label="X", route="$end")]
-        payload["status"] = "success"
+        payload[forbidden_field] = field_value
         with pytest.raises(ValidationError) as exc_info:
             AgentDef.model_validate(payload)
-        assert "status" in str(exc_info.value)
+        assert forbidden_field in str(exc_info.value)
 
     def test_input_allowed_on_terminate(self) -> None:
         """Terminate steps may declare context inputs to drive Jinja rendering."""

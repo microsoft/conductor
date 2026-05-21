@@ -781,12 +781,21 @@ class AgentDef(BaseModel):
     ``status`` / ``reason``). When omitted, the workflow-level ``output:``
     mapping is rendered as usual.
 
+    Each rendered value is then passed through the engine's JSON-coercion
+    helper before being placed in the final output dict: literal strings
+    ``"true"`` / ``"false"`` become Python booleans, numeric strings become
+    ``int`` / ``float``, and strings that parse as JSON objects/arrays are
+    deserialised. This matches the behaviour of workflow-level ``output:``
+    and route output transforms, but it means the example below produces
+    ``{"aborted": True, "stage": "precheck", ...}`` — not all-string values.
+    Quote with backslashes if you genuinely want the literal text ``"true"``.
+
     Forbidden on all step types other than ``terminate``.
 
     Example YAML::
 
         output_template:
-          aborted: "true"
+          aborted: "true"            # rendered to Python True
           stage: precheck
           reason: "{{ precheck.output.reason }}"
     """

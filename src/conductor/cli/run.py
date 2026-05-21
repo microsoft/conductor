@@ -1345,8 +1345,15 @@ async def run_workflow_async(
 
                 result = await _run_with_stop_signal(engine, inputs, dashboard)
             except WorkflowTerminated:
-                # Explicit `type: terminate status: failed` — no resume hint
-                # because this is an intentional, non-resumable outcome.
+                # Defense-in-depth: `_print_resume_instructions` already early-
+                # returns when no checkpoint was saved, and the engine skips
+                # the on-failure checkpoint save for `WorkflowTerminated` —
+                # so the hint wouldn't print today regardless. Catching the
+                # exception explicitly here makes the intent ("never resume an
+                # explicit termination") visible at the CLI layer, so a future
+                # refactor of either `_print_resume_instructions` or the
+                # engine's checkpoint policy cannot accidentally start
+                # surfacing a misleading "resume?" hint for intentional exits.
                 raise
             except BaseException:
                 _print_resume_instructions(engine)
@@ -1916,8 +1923,13 @@ async def resume_workflow_async(
 
                 result = await _resume_with_stop_signal(engine, cp.current_agent, dashboard)
             except WorkflowTerminated:
-                # Explicit `type: terminate status: failed` — no resume hint
-                # because this is an intentional, non-resumable outcome.
+                # Defense-in-depth: see the matching arm in
+                # `run_workflow_async` for the full rationale. In short,
+                # `_print_resume_instructions` is already a no-op when no
+                # checkpoint was saved (which is the case for an explicit
+                # termination), but pinning that contract at the CLI layer
+                # protects against future drift in either the helper or the
+                # engine's checkpoint policy.
                 raise
             except BaseException:
                 _print_resume_instructions(engine)

@@ -1027,16 +1027,20 @@ def _collect_template_strings(
 
     # Terminate steps: validate `reason` and `output_template` like other
     # Jinja2-rendered fields so bad refs fail at validate-time, not runtime.
-    # `getattr` matches the duck-typed-agent path used by
-    # `TestInputMappingTemplateCollection` (mirrors the `input_mapping`
-    # forward-compatibility shim above).
-    if getattr(agent, "type", None) == "terminate":
-        reason = getattr(agent, "reason", None)
-        if reason:
-            templates.append((f"agent '{agent.name}' reason", reason))
-        output_template: dict[str, str] | None = getattr(agent, "output_template", None)
-        if output_template:
-            for key, expr in output_template.items():
+    # Use a runtime-imported `AgentDef` isinstance check (NOT `getattr`) so a
+    # future rename of `AgentDef.type` / `.reason` / `.output_template`
+    # surfaces as an `AttributeError` here instead of silently skipping
+    # template validation. Duck-typed agent objects (the only callers using
+    # `SimpleNamespace`-style stubs are forward-compat tests like
+    # `TestInputMappingTemplateCollection`) never set `type="terminate"`, so
+    # they don't enter this branch and don't need the `getattr` fallback.
+    from conductor.config.schema import AgentDef as _AgentDef
+
+    if isinstance(agent, _AgentDef) and agent.type == "terminate":
+        if agent.reason is not None:
+            templates.append((f"agent '{agent.name}' reason", agent.reason))
+        if agent.output_template:
+            for key, expr in agent.output_template.items():
                 templates.append((f"agent '{agent.name}' output_template.{key}", expr))
 
     return templates
