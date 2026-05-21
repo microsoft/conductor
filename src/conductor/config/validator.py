@@ -65,8 +65,8 @@ _JINJA_ENV.tests = _TolerantNameMap(_JINJA_ENV.tests)
 _BUILTIN_NAMES = frozenset({"workflow", "context", "item", "_index", "_key", "loop"})
 
 # Attribute names that mark a Getattr chain as an "output reference":
-#   agent.output.field, group.outputs.member, group.errors.member
-_OUTPUT_ATTRS = frozenset({"output", "outputs", "errors"})
+#   agent.output.field, agent.error.field, group.outputs.member, group.errors.member
+_OUTPUT_ATTRS = frozenset({"output", "outputs", "error", "errors"})
 
 # Attribute names that look like fields on an output but are actually built-in
 # dict methods. We avoid emitting field-precision warnings for these because
@@ -83,12 +83,14 @@ _MAX_ENUMERATED_PATHS = 100
 
 # Pattern for input references:
 # - agent.output(.field)?
+# - agent.error(.field)?
 # - parallel_group.outputs.agent(.field)?
 # - workflow.input.param
 # All with optional ? suffix
 INPUT_REF_PATTERN = re.compile(
     r"^(?:"
     r"(?P<agent>[a-zA-Z_][a-zA-Z0-9_]*)\.output(?:\.(?P<field>[a-zA-Z_][a-zA-Z0-9_]*))?|"
+    r"(?P<error_agent>[a-zA-Z_][a-zA-Z0-9_]*)\.error(?:\.(?P<error_field>[a-zA-Z_][a-zA-Z0-9_]*))?|"
     r"(?P<parallel>[a-zA-Z_][a-zA-Z0-9_]*)\.(?P<pg_kind>outputs|errors)(?:\.(?P<pg_agent>[a-zA-Z_][a-zA-Z0-9_]*)(?:\.(?P<pg_field>[a-zA-Z_][a-zA-Z0-9_]*))?)?|"
     r"workflow\.input\.(?P<input>[a-zA-Z_][a-zA-Z0-9_]*)"
     r")(?P<optional>\?)?$"
@@ -329,6 +331,21 @@ def _validate_input_references(
                     f"Agent '{agent_name}' references unknown agent '{ref_agent}' in input"
                 )
 
+        # Check if referencing another agent's error envelope
+        ref_error_agent = match.group("error_agent")
+        if ref_error_agent and ref_error_agent not in agent_names:
+            is_optional = match.group("optional") == "?"
+            if is_optional:
+                warnings.append(
+                    f"Agent '{agent_name}' has optional reference to error envelope "
+                    f"from unknown agent '{ref_error_agent}'"
+                )
+            else:
+                errors.append(
+                    f"Agent '{agent_name}' references error envelope from unknown agent "
+                    f"'{ref_error_agent}' in input"
+                )
+
         # Check if referencing parallel/for-each group output
         ref_parallel = match.group("parallel")
         if ref_parallel and ref_parallel not in group_names:
@@ -518,7 +535,7 @@ def _validate_parallel_groups(config: WorkflowConfig) -> list[str]:
                 # Parse input reference to extract agent name
                 match = INPUT_REF_PATTERN.match(input_ref)
                 if match:
-                    ref_agent = match.group("agent")
+                    ref_agent = match.group("agent") or match.group("error_agent")
                     if ref_agent and ref_agent in pg_agents_set and ref_agent != agent_name:
                         errors.append(
                             f"Agent '{agent_name}' in parallel group '{pg.name}' references "
@@ -635,6 +652,12 @@ class TemplateRefs(NamedTuple):
             separate from output refs because the engine's runtime semantics
             for ``.errors`` always copy the whole errors dict and never field-
             slice, so field-precision checks must not be applied to them.
+        agent_error_refs: Agent names referenced via ``<name>.error`` (singular
+            error envelope from a failing leaf node). Kept separate from
+            output refs because envelopes are always copied whole — the
+            runtime never field-slices them — so field-precision checks
+            must not be applied. Used for explicit-mode undeclared-input
+            warnings on ``{{ failing_node.error.kind }}``-style references.
     """
 
     agent_refs: set[str]
@@ -642,6 +665,7 @@ class TemplateRefs(NamedTuple):
     agent_output_fields: dict[str, set[str | None]]
     group_member_fields: dict[tuple[str, str | None], set[str | None]]
     group_error_refs: set[str]
+    agent_error_refs: set[str]
 
 
 def _extract_template_refs(template: str) -> TemplateRefs:
@@ -693,6 +717,7 @@ def _extract_template_refs(template: str) -> TemplateRefs:
         agent_output_fields={},
         group_member_fields={},
         group_error_refs=set(),
+        agent_error_refs=set(),
     )
 
     if not template or ("{{" not in template and "{%" not in template):
@@ -733,6 +758,8 @@ def _extract_template_refs(template: str) -> TemplateRefs:
     workflow_inputs: set[str] = set()
     # group.errors chains; collected directly into the result.
     group_error_refs: set[str] = set()
+    # agent.error chains (singular envelope from a failing leaf).
+    agent_error_refs: set[str] = set()
     # Output / outputs chains, accumulated as the structured maps directly.
     agent_output_fields: dict[str, set[str | None]] = {}
     group_member_fields: dict[tuple[str, str | None], set[str | None]] = {}
@@ -790,6 +817,13 @@ def _extract_template_refs(template: str) -> TemplateRefs:
             agent_refs.add(root)
             continue
 
+        # Singular error envelope on a failing leaf node; whole envelope
+        # is copied into ctx, so no field-precision either.
+        if kind == "error":
+            agent_error_refs.add(root)
+            agent_refs.add(root)
+            continue
+
         agent_refs.add(root)
         if kind == "output":
             # attrs is ["output"] or ["output", "<field>", ...]
@@ -811,6 +845,7 @@ def _extract_template_refs(template: str) -> TemplateRefs:
         agent_output_fields=agent_output_fields,
         group_member_fields=group_member_fields,
         group_error_refs=group_error_refs,
+        agent_error_refs=agent_error_refs,
     )
 
 
@@ -1188,6 +1223,10 @@ def _validate_template_references(
         # (see ``_add_parallel_group_input`` errors branch), so no field-
         # precision tracking is needed for errors.
         declared_group_errors: set[str] = set()
+        # Set of agent names whose error envelope is declared via
+        # ``<agent>.error[.field]``. The engine always copies the whole
+        # envelope, so no field-precision tracking is needed here either.
+        declared_agent_error_refs: set[str] = set()
         for ref in agent.input:
             match = INPUT_REF_PATTERN.match(ref.rstrip("?"))
             if not match:
@@ -1197,6 +1236,9 @@ def _validate_template_references(
                 field = match.group("field")
                 # field is None for bare ``a.output`` (whole output declared).
                 declared_agent_output_fields.setdefault(ref_agent, set()).add(field)
+            ref_error_agent = match.group("error_agent")
+            if ref_error_agent:
+                declared_agent_error_refs.add(ref_error_agent)
             ref_parallel = match.group("parallel")
             if ref_parallel:
                 pg_kind = match.group("pg_kind")
@@ -1344,6 +1386,23 @@ def _validate_template_references(
                     warnings.append(
                         f"{source} references '{group}.errors' but "
                         f"agent '{agent.name}' does not declare '{group}.errors' "
+                        f"in its input: list (explicit context mode)"
+                    )
+
+            # --- Agent-error references (``a.error[.field]``) ---
+            # Mirror of the group-error block. Envelopes are bounded in
+            # size and always copied whole, so no field-precision check.
+            for failing in refs.agent_error_refs:
+                if failing not in valid_names:
+                    errors.append(
+                        f"{source} references unknown agent '{failing}'. "
+                        f"Available: {', '.join(sorted(valid_names))}"
+                    )
+                    continue
+                if agent_output_warning_allowed and failing not in declared_agent_error_refs:
+                    warnings.append(
+                        f"{source} references '{failing}.error' but "
+                        f"agent '{agent.name}' does not declare '{failing}.error' "
                         f"in its input: list (explicit context mode)"
                     )
 

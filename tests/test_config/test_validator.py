@@ -718,6 +718,30 @@ class TestExtractTemplateRefs:
         assert refs.agent_refs == set()
         assert refs.workflow_inputs == set()
 
+    def test_singular_error_ref_extracted(self) -> None:
+        """``agent.error[.field]`` populates ``agent_error_refs``."""
+        refs = _extract_template_refs("{{ failing.error.kind }}")
+        # Reflected in both flat agent_refs (for unknown-agent checks)
+        # AND in the dedicated agent_error_refs set (for explicit-mode
+        # undeclared-input warnings on the .error path).
+        assert refs.agent_refs == {"failing"}
+        assert refs.agent_error_refs == {"failing"}
+        # No spurious field-precision tracking for errors.
+        assert refs.agent_output_fields == {}
+
+    def test_bare_error_ref_extracted(self) -> None:
+        refs = _extract_template_refs("{% if failing.error %}boom{% endif %}")
+        assert refs.agent_error_refs == {"failing"}
+
+    def test_error_and_output_can_coexist_for_same_agent(self) -> None:
+        """A template referencing both ``a.output`` and ``a.error`` is legal."""
+        refs = _extract_template_refs(
+            "{{ a.output.text }}{% if a.error %}{{ a.error.kind }}{% endif %}"
+        )
+        assert refs.agent_refs == {"a"}
+        assert refs.agent_error_refs == {"a"}
+        assert refs.agent_output_fields == {"a": {"text"}}
+
     def test_no_template_tags(self) -> None:
         refs = _extract_template_refs("just plain text")
         assert refs.agent_refs == set() and refs.workflow_inputs == set()
@@ -853,6 +877,25 @@ class TestInputRefPatternExtensions:
     )
     def test_pattern_rejects_invalid_shapes(self, ref: str) -> None:
         assert INPUT_REF_PATTERN.match(ref) is None
+
+    @pytest.mark.parametrize(
+        "ref,expected_agent",
+        [
+            ("failing_node.error", "failing_node"),
+            ("failing_node.error.kind", "failing_node"),
+            ("failing_node.error.message", "failing_node"),
+            ("failing_node.error?", "failing_node"),
+            ("failing_node.error.kind?", "failing_node"),
+        ],
+    )
+    def test_pattern_accepts_agent_error_shapes(self, ref: str, expected_agent: str) -> None:
+        """``agent.error[.field]`` (singular) is the on_error envelope ref."""
+        match = INPUT_REF_PATTERN.match(ref)
+        assert match is not None, f"{ref!r} should match INPUT_REF_PATTERN"
+        assert match.group("error_agent") == expected_agent
+        # And it must not be misclassified as an output / parallel ref.
+        assert match.group("agent") is None
+        assert match.group("parallel") is None
 
 
 class TestTemplateReferenceValidation:

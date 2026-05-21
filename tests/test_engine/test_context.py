@@ -1265,3 +1265,152 @@ class TestWorkflowContextGuidance:
 
         assert section is not None
         assert section.startswith("\n\n")
+
+
+class TestWorkflowContextStoreError:
+    """Tests for ``store_error`` and the ``.error`` access path."""
+
+    @staticmethod
+    def _envelope(kind: str = "external.git.drift") -> dict[str, object]:
+        return {"kind": kind, "message": "boom", "details": {"branch": "main"}}
+
+    def test_store_error_populates_state(self) -> None:
+        """store_error sets agent_errors, history, iteration counter."""
+        ctx = WorkflowContext()
+        env = self._envelope()
+        ctx.store_error("fetcher", env)
+
+        assert ctx.agent_errors == {"fetcher": env}
+        assert ctx.execution_history == ["fetcher"]
+        assert ctx.current_iteration == 1
+        assert ctx.agent_outputs == {}
+
+    def test_get_latest_error_returns_envelope(self) -> None:
+        ctx = WorkflowContext()
+        env = self._envelope("policy.violation")
+        ctx.store_error("policy_check", env)
+
+        assert ctx.get_latest_error() == env
+        assert ctx.get_latest_output() is None
+
+    def test_get_latest_error_none_when_last_succeeded(self) -> None:
+        ctx = WorkflowContext()
+        ctx.store_error("a", self._envelope())
+        ctx.store("b", {"result": "ok"})
+
+        assert ctx.get_latest_error() is None
+        assert ctx.get_latest_output() == {"result": "ok"}
+
+    def test_accumulate_mode_surfaces_error_envelope(self) -> None:
+        ctx = WorkflowContext()
+        ctx.store("good", {"x": 1})
+        ctx.store_error("bad", self._envelope())
+
+        agent_ctx = ctx.build_for_agent("handler", [], mode="accumulate")
+
+        assert agent_ctx["good"] == {"output": {"x": 1}}
+        assert agent_ctx["bad"] == {"error": self._envelope()}
+
+    def test_last_only_mode_with_failing_last(self) -> None:
+        ctx = WorkflowContext()
+        ctx.store("good", {"x": 1})
+        ctx.store_error("bad", self._envelope())
+
+        agent_ctx = ctx.build_for_agent("handler", [], mode="last_only")
+
+        # Only the last (failing) agent should be present.
+        assert "good" not in agent_ctx
+        assert agent_ctx["bad"] == {"error": self._envelope()}
+
+    def test_last_only_mode_with_successful_last_does_not_surface_old_error(self) -> None:
+        ctx = WorkflowContext()
+        ctx.store_error("bad", self._envelope())
+        ctx.store("good", {"x": 1})
+
+        agent_ctx = ctx.build_for_agent("handler", [], mode="last_only")
+
+        assert "bad" not in agent_ctx
+        assert agent_ctx["good"] == {"output": {"x": 1}}
+
+    def test_explicit_mode_declared_error_ref_copies_envelope(self) -> None:
+        ctx = WorkflowContext()
+        ctx.store_error("bad", self._envelope())
+
+        agent_ctx = ctx.build_for_agent("handler", ["bad.error"], mode="explicit")
+
+        assert agent_ctx["bad"]["error"] == self._envelope()
+
+    def test_explicit_mode_dotted_error_field_copies_whole_envelope(self) -> None:
+        """``agent.error.kind`` declaration copies the whole envelope.
+
+        Envelopes are bounded in size and templates commonly need
+        ``error.details.*`` access, so the runtime never field-slices
+        them — declaring a sub-path is treated like declaring the whole.
+        """
+        ctx = WorkflowContext()
+        env = self._envelope()
+        ctx.store_error("bad", env)
+
+        agent_ctx = ctx.build_for_agent("handler", ["bad.error.kind"], mode="explicit")
+
+        assert agent_ctx["bad"]["error"] == env
+
+    def test_explicit_mode_undeclared_error_ref_raises(self) -> None:
+        ctx = WorkflowContext()
+        ctx.store_error("bad", self._envelope())
+
+        with pytest.raises(KeyError, match="good"):
+            # Failing agent is "bad"; declaring "good.output" doesn't help —
+            # missing required output should raise.
+            ctx.build_for_agent("handler", ["good.output"], mode="explicit")
+
+    def test_explicit_mode_optional_error_ref_tolerates_missing(self) -> None:
+        ctx = WorkflowContext()
+        # No failing agent stored at all.
+        agent_ctx = ctx.build_for_agent("handler", ["missing.error?"], mode="explicit")
+
+        # Optional missing ref should not raise and should not populate.
+        assert "missing" not in agent_ctx
+
+    def test_explicit_mode_output_and_error_coexist(self) -> None:
+        """A handler may need a peer's output plus the failer's envelope."""
+        ctx = WorkflowContext()
+        ctx.store("planner", {"plan": "do x"})
+        ctx.store_error("executor", self._envelope())
+
+        agent_ctx = ctx.build_for_agent(
+            "handler",
+            ["planner.output", "executor.error"],
+            mode="explicit",
+        )
+
+        assert agent_ctx["planner"] == {"output": {"plan": "do x"}}
+        assert agent_ctx["executor"] == {"error": self._envelope()}
+
+    def test_to_dict_round_trips_agent_errors(self) -> None:
+        ctx = WorkflowContext()
+        env = self._envelope()
+        ctx.set_workflow_inputs({"q": "?"})
+        ctx.store("good", {"x": 1})
+        ctx.store_error("bad", env)
+
+        data = ctx.to_dict()
+        restored = WorkflowContext.from_dict(data)
+
+        assert restored.agent_errors == {"bad": env}
+        assert restored.agent_outputs == {"good": {"x": 1}}
+        assert restored.execution_history == ["good", "bad"]
+        assert restored.current_iteration == 2
+
+    def test_from_dict_missing_agent_errors_is_empty(self) -> None:
+        """Older checkpoints without agent_errors restore cleanly."""
+        ctx = WorkflowContext.from_dict(
+            {
+                "workflow_inputs": {},
+                "agent_outputs": {"a": {"x": 1}},
+                "current_iteration": 1,
+                "execution_history": ["a"],
+                "user_guidance": [],
+            }
+        )
+        assert ctx.agent_errors == {}
