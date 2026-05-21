@@ -603,3 +603,84 @@ class RetryableError(ConductorError):
             suggestion = f"All {max_attempts} retry attempts have been exhausted"
 
         super().__init__(message, suggestion)
+
+
+class UnhandledNodeError(ConductorError):
+    """Internal signal raised by the router when a node raises an
+    error envelope and no ``on_error`` route at the same level matches.
+
+    Engine catches this at the per-node dispatch site and re-raises as
+    :class:`UnhandledWorkflowError` (with a frame trail) so workflow-
+    level halt handling can emit ``errors.jsonl`` and map to the
+    distinct CLI exit code.
+
+    This exception is not intended to surface to end users; if you see
+    it in a stack trace, the engine missed a catch.
+    """
+
+    def __init__(
+        self,
+        envelope: dict[str, object],
+        node_name: str,
+    ) -> None:
+        """Initialize an UnhandledNodeError.
+
+        Args:
+            envelope: The :class:`conductor.engine.errors.ErrorEnvelope`
+                that no route handled.
+            node_name: Name of the node that raised the envelope.
+        """
+        self.envelope = envelope
+        self.node_name = node_name
+        super().__init__(
+            f"node '{node_name}' raised '{envelope.get('kind')}' but no on_error "
+            "route at this level matched",
+            suggestion=(
+                "Add an on_error route matching this kind (or `on_error: true` to "
+                "catch any kind) at the same routing level as the node, or remove "
+                "the raise from the node."
+            ),
+        )
+
+
+class UnhandledWorkflowError(ConductorError):
+    """Workflow halted because a node raised an error envelope that no
+    ``on_error`` route handled.
+
+    Carries the original envelope and a frame trail describing where
+    the raise originated. In Phase 1 the trail has a single frame for
+    the failing leaf node; Phase 2 will accumulate frames as envelopes
+    propagate across sub-workflow boundaries.
+
+    Caught at the CLI layer and mapped to a distinct exit code so
+    callers can distinguish "workflow ran and halted on typed error"
+    from generic failures.
+    """
+
+    def __init__(
+        self,
+        envelope: dict[str, object],
+        frames: list[dict[str, object]],
+    ) -> None:
+        """Initialize an UnhandledWorkflowError.
+
+        Args:
+            envelope: The :class:`conductor.engine.errors.ErrorEnvelope`
+                that propagated unhandled to workflow root.
+            frames: Frame trail (innermost first). Phase 1 always has
+                exactly one frame; preserved as a list so the shape is
+                stable across Phase 2 propagation work.
+        """
+        self.envelope = envelope
+        self.frames = frames
+        kind = envelope.get("kind", "<unknown>")
+        message = envelope.get("message", "")
+        node = frames[0].get("node", "<unknown>") if frames else "<unknown>"
+        super().__init__(
+            f"workflow halted: node '{node}' raised '{kind}' with no handling route: {message}",
+            suggestion=(
+                "Add an on_error route at the workflow level that matches this kind "
+                "(or `on_error: true` for a catch-all), or fix the underlying "
+                "condition the node is reporting."
+            ),
+        )
