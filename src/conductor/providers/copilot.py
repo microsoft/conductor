@@ -26,7 +26,7 @@ from conductor.providers.base import AgentOutput, AgentProvider, EventCallback, 
 from conductor.providers.reasoning import ReasoningEffort, resolve_reasoning_effort
 
 if TYPE_CHECKING:
-    from conductor.config.schema import AgentDef, OutputField
+    from conductor.config.schema import AgentDef, OutputField, ProviderSettings
 
 logger = logging.getLogger(__name__)
 
@@ -163,6 +163,7 @@ class CopilotProvider(AgentProvider):
         temperature: float | None = None,
         max_agent_iterations: int | None = None,
         default_reasoning_effort: ReasoningEffort | None = None,
+        provider_settings: ProviderSettings | None = None,
     ) -> None:
         """Initialize the Copilot provider.
 
@@ -184,12 +185,27 @@ class CopilotProvider(AgentProvider):
                 applied to ``create_session`` when an agent does not specify
                 its own ``reasoning.effort``. One of ``low``, ``medium``,
                 ``high``, ``xhigh``, or ``None`` to send no value.
+            provider_settings: Optional structured provider settings from
+                ``runtime.provider``. When ``has_custom_routing()`` is True,
+                the resolved SDK ``ProviderConfig`` is attached to every
+                ``create_session`` call (both agent execution and dialog
+                turns), enabling custom OpenAI-compatible / Azure / Anthropic
+                endpoints. Env-var fallbacks
+                (``COPILOT_PROVIDER_BASE_URL`` → ``OPENAI_BASE_URL``,
+                ``COPILOT_PROVIDER_API_KEY`` → ``OPENAI_API_KEY``,
+                ``COPILOT_PROVIDER_BEARER_TOKEN``) fill missing fields once
+                custom routing is activated; ambient OpenAI env vars never
+                activate custom routing on their own.
         """
         self._client: Any = None  # Will hold Copilot SDK client
         self._mock_handler = mock_handler
         self._call_history: list[dict[str, Any]] = []
         self._retry_config = retry_config or RetryConfig()
         self._retry_history: list[dict[str, Any]] = []  # For testing retries
+        # Track whether the caller actually supplied a default model so the
+        # custom-routing warning can fire reliably without depending on the
+        # value of the sentinel default below.
+        self._default_model_explicit = model is not None
         self._default_model = model or "gpt-4o"
         self._mcp_servers = mcp_servers or {}
         self._started = False
@@ -203,6 +219,8 @@ class CopilotProvider(AgentProvider):
         self._resume_session_ids: dict[str, str] = {}
         self._interrupted_session: Any = None
         self._abort_supported: bool | None = None
+        self._provider_settings = provider_settings
+        self._warn_custom_routing_default_model()
 
     @staticmethod
     def _default_permission_handler(
@@ -219,6 +237,145 @@ class CopilotProvider(AgentProvider):
         """
         logger.debug("auto-approved permission request: %s", request)
         return PermissionHandler.approve_all(request, invocation)
+
+    def _warn_custom_routing_default_model(self) -> None:
+        """Warn if custom routing is active but no default model is set.
+
+        Custom endpoints (Ollama, vLLM, Azure deployments) rarely expose
+        the SDK's built-in default model. Surface this early so users
+        don't get a confusing 404 on the first ``create_session``.
+
+        Uses ``_default_model_explicit`` (captured in ``__init__``) so
+        the heuristic does not depend on the value of the sentinel
+        fallback — a future change to the fallback model name would not
+        break this warning, and a user who deliberately picks the same
+        model name as the fallback does not get a false positive.
+        """
+        settings = self._provider_settings
+        if settings is None or not settings.has_custom_routing():
+            return
+        if not self._default_model_explicit:
+            logger.warning(
+                "Custom Copilot provider routing is active (base_url=%s) but no "
+                "runtime.default_model is set. The SDK fallback %r is unlikely "
+                "to exist on the custom endpoint; configure runtime.default_model.",
+                settings.base_url or "<from env>",
+                self._default_model,
+            )
+
+    def _resolve_sdk_provider_config(self) -> dict[str, Any] | None:
+        """Build the SDK ``ProviderConfig`` dict to forward, or ``None``.
+
+        Returns ``None`` when no structured ``runtime.provider`` was
+        configured, or when the configured object did not activate custom
+        routing (i.e. only ``name`` was set). When custom routing is
+        active, fills missing fields from environment variables in this
+        precedence order:
+
+        - ``base_url``: ``COPILOT_PROVIDER_BASE_URL`` → ``OPENAI_BASE_URL``
+        - ``api_key``: ``COPILOT_PROVIDER_API_KEY`` (only)
+        - ``bearer_token``: ``COPILOT_PROVIDER_BEARER_TOKEN`` (only)
+
+        Ambient ``OPENAI_API_KEY`` is intentionally NOT used as an
+        implicit fallback for ``api_key`` — that would silently send an
+        OpenAI credential to whatever ``base_url`` points at, which is
+        a real credential-leak risk in dev shells. Users who want
+        OpenAI-environment-style behavior should opt in explicitly via
+        ``api_key: ${OPENAI_API_KEY}`` interpolation in YAML.
+
+        ``type`` defaults to ``"openai"`` when ``base_url`` is set but
+        ``type`` is not — OpenAI-compatible endpoints (Ollama, vLLM, LM
+        Studio) are the dominant use case.
+
+        When both ``api_key`` and ``bearer_token`` resolve (from any
+        combination of YAML and env vars), both are forwarded; the
+        Copilot SDK silently prefers ``bearer_token`` and a warning is
+        emitted.
+
+        Raises ``ProviderError`` when custom routing is activated but
+        every routing field resolves to a falsy value (e.g. all
+        intended env vars are unset). Silently returning ``None`` in
+        that case would mask user misconfiguration as default behavior.
+        """
+        settings = self._provider_settings
+        if settings is None or not settings.has_custom_routing():
+            return None
+
+        base_url = (
+            settings.base_url
+            or os.environ.get("COPILOT_PROVIDER_BASE_URL")
+            or os.environ.get("OPENAI_BASE_URL")
+        )
+        api_key = (
+            settings.api_key.get_secret_value()
+            if settings.api_key is not None
+            else os.environ.get("COPILOT_PROVIDER_API_KEY")
+        )
+        bearer_token = (
+            settings.bearer_token.get_secret_value()
+            if settings.bearer_token is not None
+            else os.environ.get("COPILOT_PROVIDER_BEARER_TOKEN")
+        )
+
+        # Operate on the resolved locals so the warning also fires when
+        # one credential comes from YAML and the other from an env var.
+        if api_key and bearer_token:
+            logger.warning(
+                "Both api_key and bearer_token resolved (possibly from different sources, "
+                "YAML and/or env vars); the Copilot SDK silently prefers bearer_token."
+            )
+
+        provider_type: str | None = settings.type
+        if provider_type is None and base_url:
+            provider_type = "openai"
+
+        cfg: dict[str, Any] = {}
+        if provider_type:
+            cfg["type"] = provider_type
+        if settings.wire_api:
+            cfg["wire_api"] = settings.wire_api
+        if base_url:
+            cfg["base_url"] = base_url
+        if api_key:
+            cfg["api_key"] = api_key
+        if bearer_token:
+            cfg["bearer_token"] = bearer_token
+        if settings.headers:
+            cfg["headers"] = dict(settings.headers)
+        # Always emit the azure block when the settings carry one — the
+        # schema validator already requires at least ``api_version`` to
+        # be set, so this never produces an empty sub-dict.
+        if settings.azure is not None:
+            azure_cfg: dict[str, Any] = {}
+            if settings.azure.api_version is not None:
+                azure_cfg["api_version"] = settings.azure.api_version
+            cfg["azure"] = azure_cfg
+
+        if not cfg:
+            raise ProviderError(
+                "runtime.provider opted into custom routing but no usable fields "
+                "resolved. Set base_url / api_key / bearer_token in YAML or via the "
+                "COPILOT_PROVIDER_* environment variables.",
+                suggestion=(
+                    "Check that any ${VAR} interpolations in runtime.provider resolved "
+                    "to non-empty values and that the intended COPILOT_PROVIDER_* env "
+                    "vars are exported in the current shell."
+                ),
+                is_retryable=False,
+            )
+
+        return cfg
+
+    def _apply_provider_config(self, session_kwargs: dict[str, Any]) -> None:
+        """Attach the resolved SDK provider config to ``session_kwargs``.
+
+        Called from every ``create_session`` site (main agent execution and
+        dialog turns) so all sessions for this provider instance hit the
+        same endpoint.
+        """
+        provider_cfg = self._resolve_sdk_provider_config()
+        if provider_cfg is not None:
+            session_kwargs["provider"] = provider_cfg
 
     async def execute(
         self,
@@ -564,6 +721,10 @@ class CopilotProvider(AgentProvider):
             # Add MCP servers if configured
             if self._mcp_servers:
                 session_kwargs["mcp_servers"] = self._mcp_servers
+
+            # Apply custom provider routing (Ollama / vLLM / Azure / etc.)
+            # when runtime.provider opted into it.
+            self._apply_provider_config(session_kwargs)
 
             # Resolve reasoning effort: per-agent override wins over runtime default.
             # When set, validate against the model's advertised capabilities
@@ -1921,6 +2082,10 @@ class CopilotProvider(AgentProvider):
                 "on_permission_request": self._default_permission_handler,
                 "system_message": {"mode": "replace", "content": system_prompt},
             }
+
+            # Honor the same custom provider routing as agent sessions so
+            # dialog turns hit the same endpoint as agent execution.
+            self._apply_provider_config(dialog_kwargs)
 
             # Dialog turns honor the workflow-wide default reasoning effort
             # only — there's no agent-scoped override at this layer.

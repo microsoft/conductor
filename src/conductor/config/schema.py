@@ -8,7 +8,15 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 from conductor.duration import parse_duration
 from conductor.providers.reasoning import ReasoningEffort
@@ -1270,11 +1278,206 @@ class MCPServerDef(BaseModel):
         return self
 
 
+class AzureProviderOptions(BaseModel):
+    """Azure-specific provider options forwarded to the Copilot SDK.
+
+    Mirrors :class:`copilot.session.AzureProviderOptions`. Currently only
+    ``api_version`` is recognized; additional fields the SDK adds in the
+    future can be enumerated here.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    api_version: str | None = None
+    """Azure OpenAI API version (e.g. ``"2024-10-21"``). Optional; the SDK
+    falls back to its own default when unset."""
+
+
+class ProviderSettings(BaseModel):
+    """Structured provider configuration for ``runtime.provider``.
+
+    Supports two YAML shapes via :meth:`RuntimeConfig._coerce_provider`:
+
+    - String shorthand: ``provider: copilot`` (equivalent to
+      ``provider: {name: copilot}``).
+    - Object form: enables routing the Copilot SDK at custom endpoints
+      such as Azure OpenAI, Ollama, vLLM, LM Studio, or any other
+      OpenAI-compatible server. Object fields beyond ``name`` are
+      currently supported only for ``name: copilot``; they are forwarded
+      verbatim to ``copilot.client.create_session(provider=...)``.
+
+    When any field beyond ``name`` is set, the Copilot provider activates
+    "custom routing" mode and fills any missing field from environment
+    variables (see :meth:`has_custom_routing`).
+
+    The model is frozen after construction (``frozen=True``) because
+    custom routing is set-once at config load. This avoids the
+    Pydantic gotcha where ``model_validator(mode="after")``
+    cross-field invariants do not re-fire on per-attribute assignment
+    even with ``validate_assignment=True``.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    name: Literal["copilot", "openai-agents", "claude"] = "copilot"
+    """SDK provider to use for agent execution."""
+
+    type: Literal["openai", "azure", "anthropic"] | None = None
+    """Wire-format dialect for the upstream endpoint. Copilot-only.
+
+    Defaults to ``"openai"`` at activation time when ``base_url`` is set
+    but ``type`` is not.
+    """
+
+    wire_api: Literal["completions", "responses"] | None = None
+    """OpenAI wire API variant. Copilot-only.
+
+    ``"completions"`` for the classic ``/v1/chat/completions`` shape used by
+    Ollama, vLLM, LM Studio, and the legacy OpenAI API. ``"responses"`` for
+    the newer OpenAI Responses API.
+    """
+
+    base_url: str | None = None
+    """Endpoint base URL (e.g. ``http://localhost:11434/v1``)."""
+
+    api_key: SecretStr | None = None
+    """API key for the endpoint. Prefer ``${OPENAI_API_KEY}`` interpolation
+    in YAML so the literal value never lands in ``workflow_started`` events
+    or checkpoints."""
+
+    bearer_token: SecretStr | None = None
+    """Bearer token. Takes precedence over ``api_key`` when both are set.
+    Copilot-only."""
+
+    headers: dict[str, str] | None = None
+    """Extra HTTP headers to send with every request. Copilot-only."""
+
+    azure: AzureProviderOptions | None = None
+    """Azure-specific options (e.g. ``api_version``). Requires
+    ``type: azure``. Copilot-only."""
+
+    @model_validator(mode="after")
+    def _check_field_compatibility(self) -> ProviderSettings:
+        copilot_only_fields = {
+            "type": self.type,
+            "wire_api": self.wire_api,
+            "bearer_token": self.bearer_token,
+            "headers": self.headers,
+            "azure": self.azure,
+        }
+        if self.name != "copilot":
+            extras = sorted(k for k, v in copilot_only_fields.items() if v is not None)
+            if extras:
+                raise ValueError(
+                    f"Provider fields {extras} are only supported when name='copilot'. "
+                    "Structured provider config for other providers is not yet implemented."
+                )
+            if self.base_url is not None or self.api_key is not None:
+                raise ValueError(
+                    f"Structured provider config (base_url/api_key) for name='{self.name}' "
+                    "is not yet implemented; use environment variables for the underlying SDK."
+                )
+
+        if self.azure is not None and self.type != "azure":
+            raise ValueError("'azure' options require type='azure'")
+
+        # Reject empty containers and empty SecretStr — they activate
+        # custom routing via has_custom_routing() but resolve to falsy
+        # values in the resolver and would silently drop the entire
+        # SDK provider kwarg.
+        if self.headers is not None and len(self.headers) == 0:
+            raise ValueError(
+                "'headers' must contain at least one entry; remove the key to omit headers"
+            )
+        for secret_field, value in (("api_key", self.api_key), ("bearer_token", self.bearer_token)):
+            if value is not None and value.get_secret_value() == "":
+                raise ValueError(
+                    f"'{secret_field}' is empty; remove the key or supply a value "
+                    "(typo / unset env interpolation?)"
+                )
+
+        # Positive precondition: structured fields that only make sense
+        # alongside an endpoint must not be the *only* thing set.
+        # ``base_url`` may still come from an env-var fallback, so this
+        # check is intentionally narrow: ``wire_api`` / ``type`` /
+        # ``headers`` / ``azure`` alone (with no other field) is almost
+        # certainly a misconfiguration.
+        if self.base_url is None and self.api_key is None and self.bearer_token is None:
+            anchorless = sorted(
+                k
+                for k in ("type", "wire_api", "headers", "azure")
+                if copilot_only_fields.get(k) is not None
+            )
+            if anchorless:
+                raise ValueError(
+                    f"Provider fields {anchorless} require base_url, api_key, or "
+                    "bearer_token to also be set (in YAML or via environment variables); "
+                    "they cannot stand alone."
+                )
+
+        if self.azure is not None and self.azure.api_version is None:
+            raise ValueError(
+                "'azure' block is empty; either set azure.api_version or remove the block"
+            )
+
+        return self
+
+    def has_custom_routing(self) -> bool:
+        """Return True when YAML explicitly opted into custom routing.
+
+        Custom routing is gated on at least one non-``name`` field being
+        set. We never activate from ambient environment variables alone —
+        that would silently divert default Copilot traffic based on
+        unrelated shell state.
+        """
+        return any(
+            value is not None
+            for value in (
+                self.type,
+                self.wire_api,
+                self.base_url,
+                self.api_key,
+                self.bearer_token,
+                self.headers,
+                self.azure,
+            )
+        )
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, nxt: Any) -> Any:
+        """Collapse to bare string when only ``name`` is set.
+
+        Preserves backward compatibility with the original
+        ``provider: copilot`` YAML/JSON shape: a ``ProviderSettings`` with
+        no custom routing round-trips as the plain string ``"copilot"``,
+        not as ``{"name": "copilot"}``. Once any structured field is set,
+        the full object is emitted.
+        """
+        if not self.has_custom_routing():
+            return self.name
+        return nxt(self)
+
+
 class RuntimeConfig(BaseModel):
     """Provider and runtime configuration."""
 
-    provider: Literal["copilot", "openai-agents", "claude"] = "copilot"
-    """SDK provider to use for agent execution."""
+    model_config = ConfigDict(validate_assignment=True)
+
+    provider: ProviderSettings = Field(default_factory=ProviderSettings)
+    """SDK provider configuration.
+
+    Accepts either a string shorthand (``provider: copilot``) or a
+    structured :class:`ProviderSettings` object. See
+    :class:`ProviderSettings` for the full field reference and custom
+    routing semantics.
+    """
+
+    @field_validator("provider", mode="before")
+    @classmethod
+    def _coerce_provider(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return {"name": value}
+        return value
 
     default_model: str | None = None
     """Default model for agents that don't specify one."""

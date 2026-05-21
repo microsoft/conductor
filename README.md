@@ -232,6 +232,32 @@ Set your API key: `export ANTHROPIC_API_KEY=sk-ant-...`
 
 **See also:** [Claude Documentation](docs/providers/claude.md) | [Provider Comparison](docs/providers/comparison.md) | [Migration Guide](docs/providers/migration.md)
 
+### Using a Local / Custom LLM Endpoint (Ollama, vLLM, Azure OpenAI, ...)
+
+`runtime.provider` also accepts a structured object that routes the
+Copilot SDK at any OpenAI-compatible / Azure / Anthropic-shaped endpoint.
+Useful for local inference (Ollama, vLLM, LM Studio) and managed
+deployments (Azure OpenAI):
+
+```yaml
+workflow:
+  runtime:
+    provider:
+      name: copilot
+      type: openai                          # openai | azure | anthropic
+      wire_api: completions                 # completions | responses
+      base_url: http://localhost:11434/v1
+      api_key: ${OPENAI_API_KEY:-ollama}
+    default_model: llama3.1                 # match your endpoint's model name
+```
+
+The structured form is opt-in: a bare `provider: copilot` keeps the
+default GitHub Copilot routing. See
+[`examples/copilot-local-llm.yaml`](examples/copilot-local-llm.yaml) for
+the full example (including an Azure OpenAI variant) and
+[Configuration Guide → Custom Provider Routing](docs/configuration.md#custom-provider-routing-ollama--vllm--azure-openai)
+for environment-variable fallbacks, security notes, and validator rules.
+
 ## CLI Reference
 
 ### `conductor run`
@@ -303,12 +329,9 @@ See the [`examples/`](./examples/) directory for complete workflows:
 | [design-review.yaml](./examples/design-review.yaml) | Human gate with loop pattern |
 | [script-step.yaml](./examples/script-step.yaml) | Script step with exit_code routing |
 | [set-step.yaml](./examples/set-step.yaml) | Set step deriving named values + boolean-routed branching |
-<<<<<<< HEAD
 | [wait-step.yaml](./examples/wait-step.yaml) | Wait step + script for a polling loop-back pattern |
 | [wait-smoke.yaml](./examples/wait-smoke.yaml) | Minimal wait-only smoke test (no provider required) |
-=======
 | [terminate.yaml](./examples/terminate.yaml) | Explicit `type: terminate` with success and failure paths |
->>>>>>> e04312b (docs(terminate): document type: terminate across user-facing docs (#219))
 
 **More examples and running instructions:** [examples/README.md](./examples/README.md)
 

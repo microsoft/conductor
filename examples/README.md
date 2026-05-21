@@ -174,6 +174,26 @@ Research workflow demonstrating multi-provider patterns. Demonstrates:
 conductor run examples/multi-provider-research.yaml --input topic="Cloud computing"
 ```
 
+### copilot-local-llm.yaml
+
+Routes the Copilot SDK at a local / custom OpenAI-compatible endpoint
+(Ollama, vLLM, LM Studio, Azure OpenAI, etc.) via structured
+`runtime.provider` configuration. Demonstrates:
+- Object form of `runtime.provider` (the bare-string `provider: copilot`
+  shorthand still works)
+- `type` / `wire_api` / `base_url` / `api_key` forwarded to the Copilot
+  SDK's `create_session(provider=…)` parameter
+- Secret hygiene via `${OPENAI_API_KEY:-ollama}` interpolation
+- Azure OpenAI variant in a commented block
+
+```bash
+# Requires Ollama running on http://localhost:11434
+conductor run examples/copilot-local-llm.yaml --input question="What is Python?"
+```
+
+See [Configuration → Custom Provider Routing](../docs/configuration.md#custom-provider-routing-ollama--vllm--azure-openai)
+for env-var fallbacks, validator rules, and the security rationale.
+
 ## Step Types
 
 ### script-step.yaml

@@ -375,7 +375,8 @@ class TestRuntimeConfig:
     def test_default_values(self) -> None:
         """Test default runtime configuration."""
         config = RuntimeConfig()
-        assert config.provider == "copilot"
+        assert config.provider.name == "copilot"
+        assert not config.provider.has_custom_routing()
         assert config.default_model is None
         assert config.temperature is None
         assert config.max_tokens is None
@@ -384,7 +385,7 @@ class TestRuntimeConfig:
     def test_custom_provider(self) -> None:
         """Test custom provider setting."""
         config = RuntimeConfig(provider="openai-agents", default_model="gpt-4")
-        assert config.provider == "openai-agents"
+        assert config.provider.name == "openai-agents"
         assert config.default_model == "gpt-4"
 
     def test_invalid_provider_raises(self) -> None:
@@ -395,7 +396,7 @@ class TestRuntimeConfig:
     def test_claude_provider_with_temperature(self) -> None:
         """Test Claude provider with temperature setting."""
         config = RuntimeConfig(provider="claude", temperature=0.7)
-        assert config.provider == "claude"
+        assert config.provider.name == "claude"
         assert config.temperature == 0.7
 
     def test_temperature_boundary_values(self) -> None:
@@ -463,7 +464,7 @@ class TestRuntimeConfig:
             max_tokens=4096,
             timeout=120.0,
         )
-        assert config.provider == "claude"
+        assert config.provider.name == "claude"
         assert config.default_model == "claude-3-5-sonnet-latest"
         assert config.temperature == 0.7
         assert config.max_tokens == 4096
@@ -588,7 +589,7 @@ class TestWorkflowDef:
         workflow = WorkflowDef(name="test", entry_point="agent1")
         assert workflow.name == "test"
         assert workflow.entry_point == "agent1"
-        assert workflow.runtime.provider == "copilot"
+        assert workflow.runtime.provider.name == "copilot"
 
     def test_full_workflow(self) -> None:
         """Test fully configured workflow definition."""
