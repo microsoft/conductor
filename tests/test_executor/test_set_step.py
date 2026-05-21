@@ -17,7 +17,13 @@ import pytest
 
 from conductor.config.schema import AgentDef
 from conductor.exceptions import ExecutionError, TemplateError
-from conductor.executor.set_step import SetExecutor, _coerce, _to_json_safe
+from conductor.executor.set_step import (
+    SET_VALUE_REPR_MAX,
+    SetExecutor,
+    _coerce,
+    _to_json_safe,
+    render_set_value_repr,
+)
 
 
 @pytest.fixture
@@ -80,13 +86,19 @@ class TestSetExecutorSingleValue:
         out = executor.execute(agent, {})
         assert out.value is None
 
-    def test_string_that_looks_like_yaml_null_kept_as_string(self, executor: SetExecutor) -> None:
-        """``yaml.safe_load`` returns None for empty input but our coercer
-        preserves the rendered string in that case unless the user explicitly
-        wrote a null marker."""
+    def test_empty_render_via_template_returns_empty_string(self, executor: SetExecutor) -> None:
+        """Template rendering to empty hits the not-stripped short-circuit."""
         agent = AgentDef(name="x", type="set", value="{{ '' }}")
         out = executor.execute(agent, {})
         assert out.value == ""
+
+    def test_date_like_render_normalised_to_iso(self, executor: SetExecutor) -> None:
+        """End-to-end auto detection: YAML date → ISO 8601 string after
+        ``_to_json_safe`` runs."""
+        agent = AgentDef(name="x", type="set", value="2024-01-02")
+        out = executor.execute(agent, {})
+        assert out.value == "2024-01-02"
+        assert isinstance(out.value, str)
 
 
 class TestSetExecutorMultiValues:
@@ -127,6 +139,18 @@ class TestSetExecutorMultiValues:
         assert out.value["first"] == "hello-modified"
         # Original `a` is used here — not the rendered `first` from this step.
         assert out.value["second"] == "hello"
+
+    def test_date_like_render_in_multi_normalised_to_iso(self, executor: SetExecutor) -> None:
+        """Per-binding ``_to_json_safe`` also runs for multi-values steps."""
+        agent = AgentDef(
+            name="x",
+            type="set",
+            values={"d": "2024-01-02", "t": "12:30:45"},
+        )
+        out = executor.execute(agent, {})
+        assert out.value == {"d": "2024-01-02", "t": "12:30:45"}
+        assert isinstance(out.value["d"], str)
+        assert isinstance(out.value["t"], str)
 
 
 class TestSetExecutorExplicitOutputType:
@@ -248,8 +272,14 @@ class TestJsonSafeNormalisation:
         v = {"a": [1, _dt.date(2024, 1, 2), {"b": _dt.time(12, 0)}]}
         assert _to_json_safe(v, "label") == {"a": [1, "2024-01-02", {"b": "12:00:00"}]}
 
-    def test_non_string_dict_key_coerced(self) -> None:
-        assert _to_json_safe({1: "x", 2: "y"}, "label") == {"1": "x", "2": "y"}
+    def test_non_string_dict_key_raises(self) -> None:
+        """Non-string dict keys raise instead of being silently coerced.
+
+        Silent coercion would risk collisions like ``{1: "a", "1": "b"}`` →
+        one entry lost; raising keeps the JSON-safe contract honest.
+        """
+        with pytest.raises(ExecutionError, match="not JSON-safe"):
+            _to_json_safe({1: "x", 2: "y"}, "label")
 
     def test_unknown_type_raises(self) -> None:
         class Custom:
@@ -259,15 +289,51 @@ class TestJsonSafeNormalisation:
             _to_json_safe(Custom(), "label")
 
 
+class TestRenderSetValueRepr:
+    """`render_set_value_repr` is shared by the engine emitter and the web
+    server's synthetic-replay branch — keep its truncation contract pinned."""
+
+    def test_short_scalar_unchanged(self) -> None:
+        assert render_set_value_repr("hello") == '"hello"'
+
+    def test_short_dict_serialised(self) -> None:
+        assert render_set_value_repr({"a": 1, "b": True}) == '{"a": 1, "b": true}'
+
+    def test_long_value_truncated_with_marker(self) -> None:
+        big = "x" * (SET_VALUE_REPR_MAX * 2)
+        result = render_set_value_repr(big)
+        assert result.endswith("… [truncated]")
+        # The truncated portion is exactly SET_VALUE_REPR_MAX chars of the
+        # JSON-serialised string (which includes the leading quote).
+        assert len(result) == SET_VALUE_REPR_MAX + len("… [truncated]")
+
+    def test_short_value_no_marker(self) -> None:
+        short = "x" * (SET_VALUE_REPR_MAX - 10)
+        result = render_set_value_repr(short)
+        assert "[truncated]" not in result
+
+
 class TestCoerceDirect:
     """Direct ``_coerce`` coverage for branches not exercised through execute()."""
 
-    def test_auto_yaml_parse_failure_falls_back_to_string(self) -> None:
-        # A string that PyYAML can't parse cleanly — defensive fallback path.
-        result = _coerce("- not balanced\n  : bad", "auto", "label")
-        # We assert it didn't raise; whether YAML recovered or fell back to
-        # string is acceptable as long as we got a value.
-        assert result is not None
+    def test_auto_yaml_parse_failure_falls_back_to_raw_string(self) -> None:
+        """Malformed YAML falls back to the raw rendered string verbatim."""
+        # Unclosed flow mapping — YAML parse error, not recoverable.
+        raw = "{a: 1, b:"
+        result = _coerce(raw, "auto", "label")
+        assert result == raw
+
+    def test_auto_pure_comment_render_kept_as_string(self) -> None:
+        """yaml.safe_load returns None for pure-comment renders; the auto
+        branch should keep the raw string so the user doesn't get a surprise
+        null bind."""
+        raw = "# just a comment"
+        result = _coerce(raw, "auto", "label")
+        assert result == raw
+
+    def test_auto_explicit_null_marker_returns_none(self) -> None:
+        for marker in ("null", "~", "Null", "NULL"):
+            assert _coerce(marker, "auto", "label") is None
 
     def test_date_like_yaml_string_normalised_after_coerce(self) -> None:
         """A date-like string parses to a ``date`` in YAML, then JSON-safe

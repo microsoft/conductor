@@ -162,6 +162,17 @@ export interface ScriptFailedData {
 
 // --- Set step lifecycle (issue #221) ---
 
+/** Effective output-type label used during coercion. Mirrors the schema's
+ * `AgentDef.output_type` enumeration and `SetOutputType` in set_step.py. */
+export type SetOutputType =
+  | 'auto'
+  | 'string'
+  | 'number'
+  | 'integer'
+  | 'boolean'
+  | 'list'
+  | 'dict';
+
 export interface SetStartedData {
   agent_name: string;
   iteration?: number;
@@ -170,8 +181,8 @@ export interface SetStartedData {
 export interface SetCompletedData {
   agent_name: string;
   elapsed?: number;
-  /** Effective output type used for coercion (auto/string/number/...). */
-  output_type?: string;
+  /** Effective output type used for coercion. */
+  output_type?: SetOutputType;
   /** Sorted dict keys for multi-`values:` steps; empty array for scalars. */
   output_keys?: string[];
   /** Short JSON-safe preview of the bound value (truncated to ~512 chars). */

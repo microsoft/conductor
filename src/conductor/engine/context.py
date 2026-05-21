@@ -6,11 +6,16 @@ including inputs, agent outputs, and execution history.
 
 from __future__ import annotations
 
+import copy
+import json
+import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     from conductor.providers.base import AgentProvider
+
+logger = logging.getLogger(__name__)
 
 # Token estimation constants
 # Average characters per token (conservative estimate)
@@ -351,14 +356,12 @@ class WorkflowContext:
         Raises:
             KeyError: If a required field is missing.
         """
-        import copy
-
         agent_output = self.agent_outputs[agent_name]
         is_dict_output = isinstance(agent_output, dict)
 
-        # Ensure the agent context exists. Use a sentinel "output not yet
-        # populated" marker because the stored output may legitimately be
-        # ``None`` (for ``set`` steps that bound a null value).
+        # Initialise ``output`` to an empty dict for dict-shaped outputs (so
+        # subsequent field-writes have somewhere to land) or to ``None`` for
+        # scalar/list outputs (which are assigned whole below).
         if agent_name not in ctx:
             ctx[agent_name] = {"output": {} if is_dict_output else None}
         elif "output" not in ctx[agent_name]:
@@ -380,8 +383,8 @@ class WorkflowContext:
             # is undefined and (when required) must raise.
             field_name = remaining_parts[1]
             if is_dict_output and field_name in agent_output:
-                # Ensure we have a dict to write the field into; replace the
-                # sentinel set above when the stored output is dict-shaped.
+                # Ensure we have a dict to write the field into (the initial
+                # output slot above seeded ``None`` for non-dict outputs).
                 if not isinstance(ctx[agent_name]["output"], dict):
                     ctx[agent_name]["output"] = {}
                 ctx[agent_name]["output"][field_name] = agent_output[field_name]
@@ -706,8 +709,15 @@ class WorkflowContext:
             output = self.agent_outputs[agent_name]
             # Set steps with single value: store scalars/lists, which have
             # no per-field truncation surface; skip them — their token cost
-            # is treated as immutable for this strategy.
+            # is treated as immutable for this strategy. Log so a user
+            # debugging "context still too big" can see why.
             if not isinstance(output, dict):
+                logger.debug(
+                    "context.trim(truncate): skipping non-dict output for '%s' "
+                    "(type=%s); per-field truncation does not apply",
+                    agent_name,
+                    type(output).__name__,
+                )
                 continue
             for key, value in list(output.items()):
                 if isinstance(value, str) and len(value) > 100:
@@ -775,12 +785,21 @@ class WorkflowContext:
                                 summary += f"{key}={value} "
                     else:
                         # Scalar/list/None output (e.g. from a set step with
-                        # single value:). Render a short repr instead of
+                        # single value:). Render a JSON preview instead of
                         # iterating dict items, which would crash.
-                        rendered = repr(output)
+                        try:
+                            rendered = json.dumps(output, default=str, ensure_ascii=False)
+                        except (TypeError, ValueError):
+                            rendered = repr(output)
                         if len(rendered) > 50:
                             rendered = rendered[:50] + "..."
                         summary += rendered
+                        logger.debug(
+                            "context.trim(summarize): rendered non-dict output for '%s' "
+                            "as JSON preview (type=%s)",
+                            agent_name,
+                            type(output).__name__,
+                        )
                     summary_parts.append(summary.strip())
                     del self.agent_outputs[agent_name]
 

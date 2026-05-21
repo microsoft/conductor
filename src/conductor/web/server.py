@@ -660,15 +660,13 @@ class WebDashboard:
             return "script_started", started_data, "script_completed", completed_data
 
         if agent_type == "set":
-            # Mirror the live runtime's set_completed payload shape. The
-            # value_repr is a short JSON preview; the frontend uses it for
-            # the node detail panel and tooltips.
-            try:
-                value_repr = json.dumps(output, default=str, ensure_ascii=False)
-            except (TypeError, ValueError):
-                value_repr = repr(output)
-            if len(value_repr) > 512:
-                value_repr = value_repr[:512] + "… [truncated]"
+            # Mirror the live runtime's set_completed payload shape so
+            # synthetic replays render identically to live runs. Reuse
+            # render_set_value_repr to keep the 512-char truncation marker
+            # in sync with the engine emitter.
+            from conductor.executor.set_step import render_set_value_repr
+
+            declared_type = getattr(agent_def, "output_type", None) or "auto"
             started_data = {
                 "agent_name": name,
                 "iteration": 1,
@@ -677,9 +675,9 @@ class WebDashboard:
             completed_data = {
                 "agent_name": name,
                 "elapsed": 0.0,
-                "output_type": "auto",
+                "output_type": declared_type,
                 "output_keys": sorted(output_dict.keys()) if output_dict else [],
-                "value_repr": value_repr,
+                "value_repr": render_set_value_repr(output),
                 "synthetic": True,
             }
             return "set_started", started_data, "set_completed", completed_data

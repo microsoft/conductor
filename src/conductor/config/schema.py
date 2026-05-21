@@ -560,8 +560,8 @@ class AgentDef(BaseModel):
     ) = None
     """Override type detection for a single-binding 'set' step.
 
-    Only valid with ``value:``. For ``values:``, every binding uses ``auto``
-    detection (per-key typing may be added in a future enhancement).
+    Only valid with ``value:``. For ``values:``, every binding uses
+    ``auto`` detection; per-key ``output_type`` is not supported.
 
     - ``auto`` / unset: render the template and run ``yaml.safe_load`` on the
       result; fall back to the raw string on parse failure. Empty/whitespace-only

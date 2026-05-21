@@ -40,7 +40,11 @@ from conductor.executor.agent import AgentExecutor
 from conductor.executor.linkify import linkify_markdown
 from conductor.executor.output import validate_output
 from conductor.executor.script import ScriptExecutor, ScriptOutput
-from conductor.executor.set_step import SetExecutor
+from conductor.executor.set_step import (
+    SetExecutor,
+    SetOutput,
+    render_set_value_repr,
+)
 from conductor.executor.template import TemplateRenderer
 from conductor.gates.human import (
     GateResult,
@@ -56,27 +60,6 @@ logger = logging.getLogger(__name__)
 # Maximum nesting depth for sub-workflow composition.
 # Prevents runaway recursion when workflows reference each other.
 MAX_SUBWORKFLOW_DEPTH = 10
-
-# Maximum length of the `value_repr` field included in set_completed events.
-# Keeps the dashboard payload bounded for very large list/dict outputs while
-# still giving humans a useful preview of what was bound.
-_SET_VALUE_REPR_MAX = 512
-
-
-def _set_value_repr(value: Any) -> str:
-    """Render a short JSON-safe repr of a set step's stored value.
-
-    Used for the ``value_repr`` field on ``set_completed`` events. Long
-    renders are truncated with an ellipsis marker so dashboard payloads
-    stay bounded.
-    """
-    try:
-        rendered = json.dumps(value, default=str, ensure_ascii=False)
-    except (TypeError, ValueError):
-        rendered = repr(value)
-    if len(rendered) > _SET_VALUE_REPR_MAX:
-        return rendered[:_SET_VALUE_REPR_MAX] + "… [truncated]"
-    return rendered
 
 
 if TYPE_CHECKING:
@@ -764,6 +747,92 @@ class WorkflowEngine:
             self.script_executor.execute(agent, context),
             operation_name=f"script '{agent.name}'",
         )
+
+    async def _run_set_step(self, agent: AgentDef, agent_context: dict[str, Any]) -> SetOutput:
+        """Execute a set step end-to-end with full event + validation parity.
+
+        Shared between the main dispatch loop, parallel groups, and
+        for-each so that:
+
+        - Every set step emits ``set_started`` before execution.
+        - Every set step emits ``set_completed`` on success or ``set_failed``
+          on any exception (template, coercion, schema-on-scalar, or
+          ``validate_output``).
+        - ``output:`` schema validation runs in all three positions, not just
+          the linear main loop. The single-value scalar-with-schema case
+          raises a friendly ``ValidationError`` pointing the user to
+          ``values:`` instead.
+
+        Callers are responsible for storing the returned value into context,
+        recording iteration, evaluating routes (main loop), and emitting any
+        envelope events (``parallel_agent_completed`` /
+        ``for_each_item_completed``).
+        """
+        iteration = self.limits.get_agent_execution_count(agent.name) + 1
+        self._emit(
+            "set_started",
+            {"agent_name": agent.name, "iteration": iteration},
+        )
+
+        start = _time.time()
+        try:
+            set_output = self.set_executor.execute(agent, agent_context)
+        except Exception as exc:
+            elapsed = _time.time() - start
+            self._emit(
+                "set_failed",
+                {
+                    "agent_name": agent.name,
+                    "elapsed": elapsed,
+                    "error_type": type(exc).__name__,
+                    "message": str(exc),
+                },
+            )
+            raise
+        elapsed = _time.time() - start
+
+        # Output schema validation runs even inside parallel/for-each so
+        # `output:` is a real contract regardless of where the step lives.
+        # Only meaningful for dict-shaped outputs — single ``value:`` with a
+        # scalar result raises an explicit error instead of silently passing.
+        if agent.output is not None:
+            try:
+                if not isinstance(set_output.value, dict):
+                    raise ValidationError(
+                        f"Set step '{agent.name}' declares an output schema "
+                        f"but its rendered value is a "
+                        f"{type(set_output.value).__name__}, not a dict",
+                        suggestion=(
+                            "Use 'values:' (multi-binding) to produce a dict, "
+                            "or drop the 'output:' schema for a scalar/list value."
+                        ),
+                    )
+                validate_output(set_output.value, agent.output)
+            except ValidationError as schema_exc:
+                self._emit(
+                    "set_failed",
+                    {
+                        "agent_name": agent.name,
+                        "elapsed": elapsed,
+                        "error_type": type(schema_exc).__name__,
+                        "message": str(schema_exc),
+                    },
+                )
+                raise
+
+        self._emit(
+            "set_completed",
+            {
+                "agent_name": agent.name,
+                "elapsed": elapsed,
+                "output_type": set_output.output_type,
+                "output_keys": (
+                    sorted(set_output.value.keys()) if isinstance(set_output.value, dict) else []
+                ),
+                "value_repr": render_set_value_repr(set_output.value),
+            },
+        )
+        return set_output
 
     def _validate_script_output_schema(
         self,
@@ -2411,7 +2480,8 @@ class WorkflowEngine:
                                 )
                             continue
 
-                        # Handle set steps (issue #221).
+                        # Handle set steps. Pure context transformations:
+                        # render, coerce, validate, emit, route.
                         if agent.type == "set":
                             agent_context = self.context.build_for_agent(
                                 agent.name,
@@ -2419,104 +2489,22 @@ class WorkflowEngine:
                                 mode=self.config.workflow.context.mode,
                                 agent_type=agent.type,
                             )
-                            _set_start = _time.time()
 
-                            set_execution_count = (
-                                self.limits.get_agent_execution_count(agent.name) + 1
-                            )
-
-                            self._emit(
-                                "set_started",
-                                {
-                                    "agent_name": agent.name,
-                                    "iteration": set_execution_count,
-                                },
-                            )
-
-                            try:
-                                set_output = self.set_executor.execute(agent, agent_context)
-                            except Exception as exc:
-                                _set_elapsed = _time.time() - _set_start
-                                self._emit(
-                                    "set_failed",
-                                    {
-                                        "agent_name": agent.name,
-                                        "elapsed": _set_elapsed,
-                                        "error_type": type(exc).__name__,
-                                        "message": str(exc),
-                                    },
-                                )
-                                raise
-                            _set_elapsed = _time.time() - _set_start
-
-                            # Optional output: schema validation. Only meaningful
-                            # for dict-shaped outputs (multi 'values:' is always
-                            # a dict; single 'value:' may be). Raise a friendly
-                            # error if a schema is declared but the rendered
-                            # output isn't a dict.
-                            if agent.output is not None:
-                                if not isinstance(set_output.value, dict):
-                                    schema_err = ValidationError(
-                                        f"Set step '{agent.name}' declares an output schema "
-                                        f"but its rendered value is a "
-                                        f"{type(set_output.value).__name__}, not a dict",
-                                        suggestion=(
-                                            "Use 'values:' (multi-binding) to produce a dict, "
-                                            "or drop the 'output:' schema for a scalar/list value."
-                                        ),
-                                    )
-                                    self._emit(
-                                        "set_failed",
-                                        {
-                                            "agent_name": agent.name,
-                                            "elapsed": _set_elapsed,
-                                            "error_type": type(schema_err).__name__,
-                                            "message": str(schema_err),
-                                        },
-                                    )
-                                    raise schema_err
-                                try:
-                                    validate_output(set_output.value, agent.output)
-                                except ValidationError as schema_exc:
-                                    self._emit(
-                                        "set_failed",
-                                        {
-                                            "agent_name": agent.name,
-                                            "elapsed": _set_elapsed,
-                                            "error_type": type(schema_exc).__name__,
-                                            "message": str(schema_exc),
-                                        },
-                                    )
-                                    raise
-
-                            self._emit(
-                                "set_completed",
-                                {
-                                    "agent_name": agent.name,
-                                    "elapsed": _set_elapsed,
-                                    "output_type": set_output.output_type,
-                                    "output_keys": (
-                                        sorted(set_output.value.keys())
-                                        if isinstance(set_output.value, dict)
-                                        else []
-                                    ),
-                                    "value_repr": _set_value_repr(set_output.value),
-                                },
-                            )
-
+                            set_output = await self._run_set_step(agent, agent_context)
                             self.context.store(agent.name, set_output.value)
                             self.limits.record_execution(agent.name)
                             self.limits.check_timeout()
 
                             # Routes attached to a set step evaluate against
                             # the bound value directly. Dict-shaped outputs
-                            # expose ``{{ output.<key> }}`` and (via simpleeval
-                            # flattening) bare ``<key>`` access; scalar /
-                            # list outputs expose ``{{ output }}`` for Jinja
-                            # ``when:`` expressions. The router wraps
-                            # whatever we pass under the ``output`` key in its
-                            # eval scope, so passing the raw value here gives
-                            # both patterns the right shape.
+                            # expose ``output.<key>`` in Jinja ``when:`` and
+                            # bare ``<key>`` in simpleeval ``when:`` (via the
+                            # router's arithmetic-context flattening). Scalar
+                            # / list outputs expose only ``output``. The
+                            # router wraps whatever we pass under the
+                            # ``output`` key in its eval scope, so passing
+                            # the raw value here gives both patterns the
+                            # right shape.
                             route_result = self._evaluate_routes(agent, set_output.value)
 
                             self._emit(
@@ -3682,9 +3670,12 @@ class WorkflowEngine:
                 # `set` steps are pure context transformations — no provider,
                 # no event_callback, no usage accounting. Validator forbids
                 # same-group dependencies in their templates, so the pre-group
-                # snapshot is the right thing to render against.
+                # snapshot is the right thing to render against. We still
+                # emit set_started/set_completed/set_failed via _run_set_step
+                # so the dashboard renders set nodes consistently with the
+                # linear path.
                 if agent.type == "set":
-                    set_output = self.set_executor.execute(agent, agent_context)
+                    set_output = await self._run_set_step(agent, agent_context)
                     _agent_elapsed = _time.time() - _agent_start
                     self._emit(
                         "parallel_agent_completed",
@@ -4125,9 +4116,12 @@ class WorkflowEngine:
                 # Regular agent execution
                 # `set` steps in for-each are pure context transformations
                 # per item (e.g. building a normalised list of strings). No
-                # provider, no event_callback, no usage accounting.
+                # provider, no event_callback, no usage accounting. We still
+                # emit set_started/set_completed/set_failed via _run_set_step
+                # so the dashboard renders per-item set nodes consistently
+                # with the linear path.
                 if for_each_group.agent.type == "set":
-                    set_output = self.set_executor.execute(for_each_group.agent, agent_context)
+                    set_output = await self._run_set_step(for_each_group.agent, agent_context)
                     _item_elapsed = _time.time() - _item_start
                     self._emit(
                         "for_each_item_completed",

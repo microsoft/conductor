@@ -11,22 +11,29 @@ Outputs:
 
 Type detection (``output_type`` unset / ``auto``):
 1. Render the template with Jinja2.
-2. Parse the rendered string with ``yaml.safe_load``; fall back to the raw
-   string on parse failure or non-JSON-safe types.
+2. Parse the rendered string with ruamel's safe YAML loader (equivalent to
+   ``yaml.safe_load``); fall back to the raw string on parse failure.
 3. Empty / whitespace-only rendered strings become ``""`` (not ``None``).
 
-Type detection results are passed through :func:`_to_json_safe`, which
-converts ``datetime`` / ``date`` / ``time`` to their ISO-8601 string form and
-rejects anything else. This guarantees that checkpoint round-trips and
-event-payload serialisation never silently change the stored type.
+Type detection results are passed through :func:`_to_json_safe`, which:
+- leaves JSON-safe scalars (``None``/``bool``/``int``/``float``/``str``) and
+  recursively-normalised lists/dicts unchanged,
+- converts ``datetime``/``date``/``time`` to their ISO-8601 string form,
+- raises :class:`~conductor.exceptions.ExecutionError` for any other Python
+  type (including non-string dict keys).
+
+This guarantees that checkpoint round-trips and event-payload serialisation
+never silently change the stored type.
 """
 
 from __future__ import annotations
 
 import datetime as _dt
 import io
+import json
+import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from ruamel.yaml import YAML
 from ruamel.yaml.error import YAMLError
@@ -36,6 +43,50 @@ from conductor.executor.template import TemplateRenderer
 
 if TYPE_CHECKING:
     from conductor.config.schema import AgentDef
+
+logger = logging.getLogger(__name__)
+
+
+# Maximum length of the ``value_repr`` field included in ``set_completed``
+# events and the dashboard synthetic-replay branch. Keeps dashboard payloads
+# bounded for very large list/dict outputs while still giving humans a useful
+# preview of what was bound.
+SET_VALUE_REPR_MAX = 512
+
+
+def render_set_value_repr(value: Any) -> str:
+    """Render a short JSON-safe preview of a set step's stored value.
+
+    Shared between the live engine emitter and the web server's synthetic
+    replay branch so the two paths never diverge. Long renders are truncated
+    with an ellipsis marker so payloads stay bounded.
+
+    The ``json.dumps`` call is expected to succeed because set outputs flow
+    through :func:`_to_json_safe` before storage. If it ever fails the value
+    contains a non-JSON-safe Python object that bypassed normalisation —
+    likely a corrupt or hand-edited checkpoint. We log loudly and fall back
+    to ``repr`` so the dashboard still renders something.
+    """
+    try:
+        rendered = json.dumps(value, default=str, ensure_ascii=False)
+    except (TypeError, ValueError):
+        logger.error(
+            "render_set_value_repr: value of type %s is not JSON-safe; "
+            "falling back to repr. This usually indicates a corrupt or "
+            "hand-edited checkpoint.",
+            type(value).__name__,
+            exc_info=True,
+        )
+        rendered = repr(value)
+    if len(rendered) > SET_VALUE_REPR_MAX:
+        return rendered[:SET_VALUE_REPR_MAX] + "… [truncated]"
+    return rendered
+
+
+# Literal alias for the effective output type label. Mirrors the schema's
+# ``AgentDef.output_type`` enumeration so callers (engine event payloads,
+# dashboard, JSONL log) can narrow on the same set of strings.
+SetOutputType = Literal["auto", "string", "number", "integer", "boolean", "list", "dict"]
 
 
 @dataclass
@@ -56,7 +107,7 @@ class SetOutput:
 
     value: Any
     is_multi: bool
-    output_type: str
+    output_type: SetOutputType
 
 
 class SetExecutor:
@@ -77,7 +128,6 @@ class SetExecutor:
     """
 
     def __init__(self) -> None:
-        """Initialize the SetExecutor with a template renderer."""
         self.renderer = TemplateRenderer()
 
     def execute(self, agent: AgentDef, context: dict[str, Any]) -> SetOutput:
@@ -95,11 +145,13 @@ class SetExecutor:
             ExecutionError: If a template renders to a value that cannot be
                 coerced to the requested ``output_type``, or to a non-JSON-safe
                 Python object that we cannot normalize.
-            TemplateError: If a template fails to render (undefined variable,
-                syntax error, etc.) — propagated from the renderer.
+            conductor.exceptions.TemplateError: If a template fails to render
+                (undefined variable, syntax error, etc.) — propagated from the
+                renderer.
         """
-        # Both branches are guaranteed by the schema validator: exactly one of
-        # value / values is non-None.
+        # Both branches are guaranteed by ``AgentDef.validate_agent_type``
+        # (config/schema.py) — exactly one of value / values is non-None
+        # when type == "set".
         if agent.values is not None:
             rendered_bindings: dict[str, Any] = {}
             for key, template in agent.values.items():
@@ -157,10 +209,10 @@ _TRUE_STRINGS = frozenset({"true", "1", "yes", "y", "on"})
 _FALSE_STRINGS = frozenset({"false", "0", "no", "n", "off"})
 
 
-# Shared ruamel.yaml loader. `safe` mode is the documented equivalent of
-# `yaml.safe_load` from PyYAML — no Python-object construction, no arbitrary
-# tag instantiation. We construct it once because YAML() instances are cheap
-# but reusable.
+# Shared ruamel.yaml loader in safe mode — equivalent to PyYAML's
+# ``yaml.safe_load``. Reused across calls; ``YAML()`` instances are stateful
+# enough that it's idiomatic to construct one per loader configuration and
+# reuse it.
 _YAML_LOADER = YAML(typ="safe", pure=True)
 
 
@@ -203,10 +255,21 @@ def _coerce(rendered: str, output_type: str, label: str) -> Any:
         try:
             parsed = _yaml_load(rendered)
         except YAMLError:
+            # Best-effort fallback: a malformed render still binds *something*
+            # (the raw string) so a downstream consumer can flag the issue.
+            # Logged at debug level — verbose users / debug logs surface the
+            # demoted parse without breaking the default UX.
+            logger.debug(
+                "%s: yaml.safe_load failed for auto-detect; binding raw string",
+                label,
+                exc_info=True,
+            )
             return rendered
-        # YAML interprets a bare URL-like string oddly in rare cases; if the
-        # parse result is None and the rendered string isn't an explicit
-        # null marker, keep it as a string (avoids surprise null binds).
+        # ruamel/PyYAML safe_load returns None for inputs that are
+        # syntactically valid but contain no scalar (e.g. pure-comment
+        # renders like "# foo", or whitespace-around-a-directive). When the
+        # rendered string isn't an explicit null marker, prefer the raw
+        # string so users don't get a surprise null bind.
         if parsed is None and stripped not in {"null", "~", "Null", "NULL"}:
             return rendered
         return parsed
@@ -217,8 +280,9 @@ def _coerce(rendered: str, output_type: str, label: str) -> Any:
             return True
         if s in _FALSE_STRINGS:
             return False
+        empty_hint = " (template rendered an empty string)" if not stripped else ""
         raise ExecutionError(
-            f"{label}: cannot coerce {rendered!r} to boolean",
+            f"{label}: cannot coerce {rendered!r} to boolean{empty_hint}",
             suggestion=(
                 "Expected one of: true/false, 1/0, yes/no, y/n, on/off (case-insensitive)."
             ),
@@ -227,7 +291,7 @@ def _coerce(rendered: str, output_type: str, label: str) -> Any:
     if output_type == "integer":
         try:
             return int(stripped)
-        except (TypeError, ValueError) as exc:
+        except ValueError as exc:
             raise ExecutionError(
                 f"{label}: cannot coerce {rendered!r} to integer",
                 suggestion="Render an integer literal (e.g. '42') for output_type: integer.",
@@ -237,11 +301,11 @@ def _coerce(rendered: str, output_type: str, label: str) -> Any:
         # Prefer int for integral renders, fall back to float.
         try:
             return int(stripped)
-        except (TypeError, ValueError):
+        except ValueError:
             pass
         try:
             return float(stripped)
-        except (TypeError, ValueError) as exc:
+        except ValueError as exc:
             raise ExecutionError(
                 f"{label}: cannot coerce {rendered!r} to number",
                 suggestion=(
@@ -314,9 +378,18 @@ def _to_json_safe(value: Any, label: str) -> Any:
         normalised: dict[str, Any] = {}
         for key, sub in value.items():
             if not isinstance(key, str):
-                # JSON object keys must be strings — coerce to string and
-                # surface the conversion so users notice unexpected key types.
-                key = str(key)
+                # Raise rather than silently stringify — matches the rest of
+                # _to_json_safe's "JSON-safe or error" contract. Silently
+                # coercing risks collisions (e.g. {1: "a", "1": "b"} → one
+                # entry lost) and hides input shape bugs from users.
+                raise ExecutionError(
+                    f"{label}: dict key of type {type(key).__name__} ({key!r}) is not JSON-safe",
+                    suggestion=(
+                        "JSON object keys must be strings. Render maps with "
+                        "string keys (e.g. via ``| dictsort`` or explicit "
+                        "string casts in the template)."
+                    ),
+                )
             normalised[key] = _to_json_safe(sub, label)
         return normalised
     raise ExecutionError(

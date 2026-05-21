@@ -108,7 +108,7 @@ export interface NodeData {
   stderr?: string;
   exit_code?: number;
   // Set-step-specific (issue #221)
-  set_output_type?: string;
+  set_output_type?: import('@/types/events').SetOutputType;
   set_output_keys?: string[];
   set_value_repr?: string;
   // Gate-specific

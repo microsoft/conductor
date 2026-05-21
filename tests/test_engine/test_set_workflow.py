@@ -247,6 +247,73 @@ class TestSetInParallelGroup:
         result = await _make_engine(config).run({"a": "alpha", "b": "beta"})
         assert result == {"left": "alpha", "right": "beta"}
 
+    @pytest.mark.asyncio
+    async def test_set_in_parallel_emits_set_events(self) -> None:
+        """Set steps inside a parallel group still emit set_started /
+        set_completed in addition to parallel_agent_completed — keeps the
+        dashboard rendering consistent with the linear path."""
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="set-parallel-events",
+                entry_point="grp",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(name="left", type="set", value="{{ workflow.input.a }}"),
+                AgentDef(name="right", type="set", value="{{ workflow.input.b }}"),
+            ],
+            parallel=[
+                ParallelGroup(
+                    name="grp",
+                    agents=["left", "right"],
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"x": "{{ grp.outputs.left }}"},
+        )
+        engine = _make_engine(config)
+        received = _collect_events(engine)
+        await engine.run({"a": "alpha", "b": "beta"})
+        started = [ev for ev in received if ev.type == "set_started"]
+        completed = [ev for ev in received if ev.type == "set_completed"]
+        assert {ev.data["agent_name"] for ev in started} == {"left", "right"}
+        assert {ev.data["agent_name"] for ev in completed} == {"left", "right"}
+
+    @pytest.mark.asyncio
+    async def test_set_in_parallel_output_schema_enforced(self) -> None:
+        """`output:` schema validation runs for set steps inside parallel
+        groups — same contract as the linear main loop."""
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="set-parallel-schema",
+                entry_point="grp",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(name="ok", type="set", value="x"),
+                AgentDef(
+                    name="bad",
+                    type="set",
+                    value="hello",
+                    output={"ok": OutputField(type="boolean")},
+                ),
+            ],
+            parallel=[
+                ParallelGroup(
+                    name="grp",
+                    agents=["ok", "bad"],
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"x": "{{ grp.outputs.ok }}"},
+        )
+        with pytest.raises(Exception, match="not a dict"):
+            await _make_engine(config).run({})
+
 
 class TestSetInForEach:
     """Set steps inside for-each compute a per-item value."""
@@ -288,6 +355,47 @@ class TestSetInForEach:
         result = await _make_engine(config).run({})
         assert result["all"] == "item-1,item-2,item-3"
 
+    @pytest.mark.asyncio
+    async def test_set_in_for_each_emits_set_events_per_item(self) -> None:
+        """Each for-each iteration of a set step emits its own
+        set_started / set_completed so the dashboard renders per-item state."""
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="set-foreach-events",
+                entry_point="setup",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=20),
+            ),
+            agents=[
+                AgentDef(
+                    name="setup",
+                    type="set",
+                    values={"items": "{{ [1, 2, 3] }}"},
+                    routes=[RouteDef(to="loop")],
+                ),
+            ],
+            for_each=[
+                ForEachDef(
+                    name="loop",
+                    type="for_each",
+                    source="setup.output.items",
+                    **{"as": "item"},
+                    agent=AgentDef(name="binder", type="set", value="item-{{ item }}"),
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"x": "{{ loop.outputs | join(',') }}"},
+        )
+        engine = _make_engine(config)
+        received = _collect_events(engine)
+        await engine.run({})
+        # 1 set_started for the top-level "setup" plus 3 for each iteration.
+        started_for_binder = [
+            ev for ev in received if ev.type == "set_started" and ev.data["agent_name"] == "binder"
+        ]
+        assert len(started_for_binder) == 3
+
 
 class TestSetOutputSchemaValidation:
     """Output schema validation rules for set steps."""
@@ -313,8 +421,12 @@ class TestSetOutputSchemaValidation:
             ],
             output={"x": "{{ bind.output }}"},
         )
+        engine = _make_engine(config)
+        received = _collect_events(engine)
         with pytest.raises(ValidationError, match="not a dict"):
-            await _make_engine(config).run({})
+            await engine.run({})
+        # set_failed must be emitted on the schema-on-scalar path too.
+        assert any(ev.type == "set_failed" for ev in received)
 
     @pytest.mark.asyncio
     async def test_multi_values_with_output_schema_pass(self) -> None:
@@ -361,8 +473,12 @@ class TestSetOutputSchemaValidation:
             ],
             output={"x": "{{ bind.output.ok }}"},
         )
+        engine = _make_engine(config)
+        received = _collect_events(engine)
         with pytest.raises(ValidationError):
-            await _make_engine(config).run({})
+            await engine.run({})
+        # set_failed must be emitted on the validate_output failure path too.
+        assert any(ev.type == "set_failed" for ev in received)
 
 
 class TestSetEvents:
@@ -503,8 +619,13 @@ class TestSetIterationCounting:
             await engine.run({})
 
 
-class TestSetCheckpointRoundtrip:
-    """Context survives serialize/restore with scalar / list / dict set outputs."""
+class TestSetContextSerialization:
+    """Context survives serialize/restore with scalar / list / dict set outputs.
+
+    This covers the context layer directly. The CLI-level resume command
+    test suite (``tests/test_cli/test_resume_command.py``) exercises the
+    full engine resume path through the same serialised shape.
+    """
 
     def test_context_to_from_dict(self) -> None:
         """Direct round-trip via WorkflowContext (no engine restart needed)."""
