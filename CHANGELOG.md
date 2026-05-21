@@ -5,7 +5,68 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.16...HEAD)
+## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.17...HEAD)
+
+## [0.1.17](https://github.com/microsoft/conductor/compare/v0.1.16...v0.1.17) - 2026-05-21
+
+### Added
+- Script agents can now declare an `output:` schema using the same
+  OutputField syntax as LLM agents. When declared, the engine parses
+  stdout as JSON and validates it against the schema before emitting
+  `script_completed`; missing fields, wrong types, non-JSON stdout,
+  empty stdout, and JSON arrays/scalars all raise `ValidationError` and
+  emit `script_failed` (with stdout/stderr/exit_code) instead of
+  completing. Validation runs on the **merged** output dict so declared
+  `stdout` / `stderr` / `exit_code` fields validate the value
+  downstream actually sees (matching the PR #122 shadowing contract).
+  An explicit `output: {}` opts into strict JSON-object mode with zero
+  required fields. Without a declared schema, the legacy best-effort
+  JSON-stdout auto-merge from PR #122 is fully preserved, so this is
+  purely additive. Routing conditions can now reference declared fields
+  (e.g. `when: "phase == 'planning'"`) rather than opaque exit codes
+  ([#206](https://github.com/microsoft/conductor/pull/206),
+  [#118](https://github.com/microsoft/conductor/issues/118)).
+- `conductor validate` now warns on undeclared `agent.output` references
+  and field-level mismatches in `explicit` context mode, closing two
+  follow-up gaps left by PR #125 that still produced the runtime
+  `TemplateError: 'dict object' has no attribute 'X'` from issue #105.
+  The validator now tracks declared fields per agent root (`a.output.foo`
+  vs `a.output.bar`), so a prompt that references an undeclared field on
+  an otherwise-declared agent surfaces a warning instead of a runtime
+  failure; the same logic applies to static parallel groups
+  (`pg.outputs.member.field`). Output-vs-error namespaces are tracked
+  independently so `input: ["pg.errors"]` no longer silently suppresses
+  warnings for `{{ pg.outputs.* }}` references, and the AST walker now
+  filters inner-link `Getattr` nodes (no more spurious whole-output
+  refs from `{{ a.output.bar }}` chains), detects method-call nodes
+  (`{% for k,v in a.output.items() %}` registers as a whole-output ref),
+  and degrades gracefully on `TemplateAssertionError`. For-each groups
+  remain skipped (whole-member copy makes field precision a false
+  positive); `human_gate` is now correctly excluded from `agent.output`
+  warnings since the engine renders gate prompts in accumulate mode
+  ([#208](https://github.com/microsoft/conductor/pull/208), refs #105).
+
+### Changed
+- Copilot provider verbose log lines (tool calls, reasoning, processing
+  indicators, idle/parse recovery) are now prefixed with the originating
+  agent name in parallel and for-each runs, eliminating the
+  un-attributable interleaved output that made the for-each case
+  unreadable (every iteration previously shared the same agent name).
+  An optional `agent_name` parameter is plumbed through
+  `_execute_sdk_call` → `_send_and_wait` → `_log_event_verbose` and
+  rendered as a magenta `[agent_name]` tag between the tree icon and
+  event content (continuation lines tagged too). For-each iterations
+  additionally get a `model_copy()` of the per-iteration agent with
+  `name = f"{name}[{key}]"` so each iteration produces a distinct tag;
+  the original `AgentDef` is untouched and context lookups still use
+  the unqualified name. Static parallel groups are unaffected — each
+  agent already has a unique name. The `_item_callback` merge order is
+  flipped so the wrapper's `agent_name`/`item_key` win over any
+  qualified name the provider emits, preserving the dashboard/JSONL
+  event contract (`agent_name` = for-each group name; `item_key`
+  disambiguates iterations). Backward compatible: `agent_name` defaults
+  to `None` for sequential agents
+  ([#207](https://github.com/microsoft/conductor/pull/207), closes #16).
 
 ### Fixed
 - `conductor resume … --web` and `--web-bg` no longer open an empty
@@ -79,6 +140,112 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   forwarded to `create_session` as before.
   `asyncio.CancelledError`/`KeyboardInterrupt`/`SystemExit` (all
   `BaseException` subclasses) still propagate.
+- `conductor resume --web-bg` (and `--web`) no longer exit silently when
+  a workflow exceeds `max_iterations`. The bg child was forked with
+  `--no-interactive` and `stdin=subprocess.DEVNULL`, so when the engine
+  hit the limit, `IntPrompt.ask` raised `EOFError`, got coerced to `0`
+  (stop), and the workflow ended with no way to recover. The
+  max-iterations gate can now be resolved from the dashboard. New
+  resolution policy: `skip_gates` auto-stops (unchanged); no web
+  dashboard uses the legacy CLI prompt (unchanged); web dashboard +
+  bg/non-TTY stdin uses a **web-only** wait (the CLI prompt is
+  deliberately NOT raced because it would synchronously `EOFError` and
+  win every dashboard click), with `dashboard.wait_for_stop()` racing
+  so `POST /api/stop` can terminate the wait when no dashboard tab is
+  open; web dashboard + TTY foreground races CLI vs web. Each
+  `iteration_limit_reached` payload carries a uuid4 `gate_id` that the
+  dashboard must echo back in `iteration_limit_response`, and the
+  server matches/discards stale responses so a delayed double-click
+  cannot be misapplied to a later gate. `iteration_limit_resolved`
+  includes the same `gate_id` so subscribers can correlate the pair.
+  New top-level `IterationLimitModal` (parallel-group gates can't
+  attach to a per-agent panel) shows iteration count, recent agent
+  history, and number input; it is hidden when `skip_gates` is true
+  and does not close on Escape so the workflow can't be accidentally
+  orphaned ([#202](https://github.com/microsoft/conductor/pull/202),
+  fixes #198).
+- `conductor run --web-bg` and `conductor resume --web-bg` no longer
+  get killed within ~10 seconds when launched from a shell wrapper
+  that runs commands inside a Windows job object with
+  `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` (GitHub Actions runners, VS Code
+  integrated terminal, JetBrains IDE terminals, GitHub Copilot CLI
+  shell tool). The detached child previously inherited the parent's
+  job and died with it; users saw a dashboard URL but the workflow
+  never made progress. The `Popen` call now requests
+  `CREATE_BREAKAWAY_FROM_JOB` in addition to
+  `CREATE_NEW_PROCESS_GROUP` so the child fully detaches. In hardened
+  CI environments that clear `JOB_OBJECT_LIMIT_BREAKAWAY_OK`,
+  `CreateProcess` raises `ERROR_ACCESS_DENIED`; in that case a visible
+  stderr warning is emitted (so the user understands bg mode may not
+  survive shell exit) and the spawn is retried without the breakaway
+  flag. Other `OSError`s propagate unchanged so the existing
+  `RuntimeError` wrapper still surfaces them cleanly. Refactors the
+  two near-identical detachment+Popen blocks in `launch_background`
+  and `launch_background_resume` into a single `_spawn_detached`
+  helper; constants are resolved via `getattr` so the module remains
+  importable on POSIX hosts and tests can patch `sys.platform` to
+  `"win32"` from Linux/macOS
+  ([#200](https://github.com/microsoft/conductor/pull/200)).
+- `conductor run --web-bg --log-file auto` now produces a log file
+  with a real provider-side trace. `bg_runner.launch_background()` /
+  `launch_background_resume()` already redirect the child's
+  stdout/stderr/stdin to `subprocess.DEVNULL`, so silence is enforced
+  at the OS level — but they also passed `--silent` to the child,
+  which flipped `verbose_mode=False` and gated more than console
+  prints (the Copilot provider's `_log_event_verbose()`,
+  `_log_parse_recovery()`, and `_log_recovery_attempt()` all became
+  no-ops, dropping events from the log file too). Both synthesized
+  commands now omit `--silent`; console output still goes to DEVNULL
+  via the Popen kwargs. Side benefit: the synthesized command is now
+  reproducible by hand without learning that `--silent` was being
+  injected behind the scenes
+  ([#199](https://github.com/microsoft/conductor/pull/199),
+  [#196](https://github.com/microsoft/conductor/issues/196)).
+- `--web-bg` and other `--silent` invocations no longer leak the
+  dashboard URL banner to stdout. Several `console.print` /
+  `typer.echo` calls in `cli/run.py` were unconditionally writing the
+  bg-launch URL, stderr log path, and `conductor stop` hint even with
+  `--silent` / `is_verbose() == False`. Remaining unguarded URL prints
+  are now gated behind `is_verbose()` so `--silent` is honored end to
+  end ([#203](https://github.com/microsoft/conductor/pull/203),
+  [#211](https://github.com/microsoft/conductor/pull/211)).
+- `conductor validate <registry-workflow>` now succeeds for workflows
+  that `conductor run` already executed successfully. The validator's
+  `_resolve_subworkflow_ref_for_validation` was missing the step that
+  the engine's `_resolve_subworkflow_path` already had: when a parent
+  workflow lives inside a registry SHA cache and references a sibling
+  via a relative path (e.g. `../document-review/workflow.yaml`), the
+  engine auto-fetches the sibling from the same registry+SHA cache via
+  `auto_fetch_relative_workflow`. The validator only checked the
+  filesystem and reported "sub-workflow file not found". Validation and
+  execution now agree on which refs are resolvable
+  ([#197](https://github.com/microsoft/conductor/pull/197)).
+- Registry cache now mirrors the source repository layout so
+  repo-relative references between workflows in the same registry repo
+  resolve correctly. Previously each workflow was isolated under
+  `<base>/<registry>/<workflow_name>/<sha[:12]>/<filename>`, so
+  `sdd-plan/plan.yaml` referencing `../document-review/workflow.yaml`
+  resolved to a path that never existed in the cache and forced manual
+  workarounds. The cache now stores workflows from the same
+  registry+SHA under a shared per-SHA root
+  (`<base>/<registry>/<sha[:12]>/<repo_path>`); metadata lives in a
+  sibling `_meta/<sha[:12]>/` tree so it can never collide with real
+  repo paths (e.g. a repo's own `.conductor/` directory). Per-workflow
+  readiness sentinels are written **last** so readers never observe a
+  partially populated workflow; per-file `os.replace()` stays
+  intra-filesystem for atomic promotion; `_safe_repo_path()` rejects
+  `..`, absolute paths, NUL bytes, and empty paths from any
+  index/sibling entry; `_resolve_within()` adds defense-in-depth that
+  resolved targets stay under the SHA root; `source.json` carries
+  `cache_layout_version`, `registry_type`, `source`, and `full_sha` so
+  cache hits require all four to match (stale metadata triggers
+  re-fetch); the registry index is cached on disk so cache hits avoid
+  a network round-trip. Sub-workflow refs from the same registry are
+  auto-fetched when not yet present (gated to file-path-looking
+  candidates with no `@`). `add_registry()` now rejects names
+  containing `/`, `\`, the empty string, or the reserved `_adhoc` /
+  `_meta` namespaces
+  ([#194](https://github.com/microsoft/conductor/pull/194)).
 
 ## [0.1.16](https://github.com/microsoft/conductor/compare/v0.1.15...v0.1.16) - 2026-05-14
 
