@@ -34,24 +34,41 @@ if TYPE_CHECKING:
 # Verbose console for logging (stderr).
 #
 # This subclass enforces the global --silent contract ("No progress output.
-# Only JSON result on stdout.") at the source: every ``_verbose_console.print``
-# call in this module becomes a no-op when ``is_verbose()`` is False, so
+# Only JSON result on stdout.") at the source: every ``.print()`` call on a
+# ``_SilentAwareConsole`` becomes a no-op when ``is_verbose()`` is False, so
 # individual call sites do not each have to remember to gate themselves
 # (see issue #209, follow-up to #203/#211). File logging is unaffected —
 # ``_file_console`` is a separate Console wired up by ``init_file_logging``.
+#
+# Scope: only ``.print()`` is gated. Other Rich ``Console`` output methods
+# (``.log()``, ``.rule()``, ``.status()``, ``.print_json()``, etc.) would
+# silently bypass ``--silent`` if used on this instance. All current call
+# sites in this module use only ``.print``; if you introduce a new one,
+# either route it through ``.print`` or extend this subclass.
 class _SilentAwareConsole(Console):
-    """``Console`` that honors ``--silent`` at the print level."""
+    """``Console`` that honors ``--silent`` at the print level.
+
+    The instance is locked to ``stderr=True`` to preserve the contract that
+    ``--silent`` runs emit JSON on stdout with nothing else; routing gated
+    output to stdout would corrupt that channel.
+    """
+
+    def __init__(self, **kwargs: Any) -> None:
+        # Lock stderr=True; everything else (highlight, width, etc.) is
+        # caller-tunable.
+        kwargs.pop("stderr", None)
+        super().__init__(stderr=True, **kwargs)
 
     def print(self, *args: Any, **kwargs: Any) -> None:
         # Lazy import to avoid the cli.run -> cli.app import cycle at module
-        # load time, and to pick up the current ContextVar value per-call.
+        # load time.
         from conductor.cli.app import is_verbose
 
         if is_verbose():
             super().print(*args, **kwargs)
 
 
-_verbose_console = _SilentAwareConsole(stderr=True, highlight=False)
+_verbose_console = _SilentAwareConsole(highlight=False)
 
 # File console for file logging (None when not active)
 _file_console: Console | None = None
