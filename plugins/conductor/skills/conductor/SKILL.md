@@ -102,6 +102,7 @@ For runtime config, context modes, limits, and cost tracking, see [references/au
 | `type: set` | Pure-context step that evaluates Jinja2 expressions and binds typed values (no LLM, no subprocess); supports single `value:` and multi `values:` |
 | `type: wait` | Pause via `asyncio.sleep` (cross-platform); duration accepts `Ns/Nm/Nh/Nms` or Jinja2; composes with route loop-backs for polling |
 | `type: workflow` | Sub-workflow agent — runs another YAML file as a black box (supports `input_mapping`, `max_depth`) |
+| `type: terminate` | Explicit terminal step with `status` (`success`/`failed`), Jinja `reason`, optional `output_template` — controls CLI exit code, dashboard state, and emits `is_explicit: true` in `workflow_completed`/`workflow_failed` |
 | `parallel` | Static parallel groups (fixed agent list) |
 | `for_each` | Dynamic parallel groups (runtime-determined array; supports `type: workflow` agents) |
 | `human_gate` | Pauses for user decision with options (Markdown + auto-linkified paths/URLs) |

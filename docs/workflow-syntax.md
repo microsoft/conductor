@@ -75,7 +75,7 @@ Agents are defined in the `agents` list. Each agent represents a unit of work.
 agents:
   - name: string                    # Required: Unique agent identifier
     description: string             # Optional: Purpose description
-    type: agent                     # agent | human_gate | script | workflow | wait (default: agent)
+    type: agent                     # agent | human_gate | script | workflow | wait | terminate (default: agent)
     model: string                   # Optional: Model identifier (e.g., 'claude-sonnet-4.5')
     
     prompt: |                       # Required for type=agent: Agent instructions
@@ -521,6 +521,58 @@ parallel:
 ```
 
 **Restrictions** — workflow steps cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, `command`, or `options`.
+
+### Terminate Steps
+
+Terminate steps end the workflow with an explicit `status` (`success` or `failed`) and a structured `reason`. Reaching a terminate step ends execution immediately — no routes are evaluated after — and produces a CLI exit code, dashboard state, and event payload that downstream tooling can distinguish from a generic crash.
+
+```yaml
+agents:
+  - name: precheck
+    type: script
+    command: bash
+    args: ["-c", "echo '{\"action\":\"abort\",\"reason\":\"unsafe input\"}'"]
+    output:
+      action:  { type: string }
+      reason:  { type: string }
+    routes:
+      - when: "action == 'abort'"
+        to: abort_unsafe
+      - when: "action == 'noop'"
+        to: noop_exit
+      - to: main_pipeline
+
+  # Soft success — workflow ends cleanly, exit 0, dashboard ✅.
+  - name: noop_exit
+    type: terminate
+    status: success
+    reason: "Document already up to date; no edits needed."
+
+  # Hard failure with reason — workflow ends, exit 1, dashboard ❌.
+  - name: abort_unsafe
+    type: terminate
+    status: failed
+    reason: "{{ precheck.output.reason }}"
+    output_template:                  # optional; replaces workflow.output
+      aborted: "true"                 # rendered then JSON-coerced to True
+      stage: precheck
+      reason: "{{ precheck.output.reason }}"
+```
+
+**Behaviour**
+
+| `status` | CLI exit code | Dashboard | Event | Resumable? |
+|----------|---------------|-----------|-------|------------|
+| `success` | `0` | ✅ | `workflow_completed { termination_reason, terminated_by, is_explicit: true, status: "success" }` | n/a (clean exit) |
+| `failed`  | `1` | ❌ | `workflow_failed { error_type: "WorkflowTerminated", termination_reason, terminated_by, is_explicit: true, status: "failed", output }` | **No** — explicit terminations skip the on-failure checkpoint |
+
+**Final output** — when `output_template:` is set, it *replaces* the workflow-level `output:` mapping for this termination path. Each rendered value is passed through the same JSON-coercion helper used elsewhere in the engine, so `"true"` becomes `True`, `"42"` becomes `42`, and JSON literals are parsed. When `output_template:` is omitted, the workflow-level `output:` is rendered as on any other terminal path.
+
+**Restrictions** — terminate steps cannot have `routes`, `tools`, `output`, `prompt`, `model`, `provider`, `system_prompt`, `command`, `args`, `env`, `working_dir`, `timeout`, `timeout_seconds`, `max_session_seconds`, `max_agent_iterations`, `max_depth`, `retry`, `dialog`, `reasoning`, `workflow`, `input_mapping`, or `options`. They cannot appear as members of a parallel group or as a `for_each` inline agent — route to them from those groups' `routes:` instead.
+
+**Sub-workflow boundary** — a `status: failed` terminate inside a sub-workflow is downgraded to a `SubworkflowTerminatedError` (subclass of `ExecutionError`) at the parent boundary so the parent treats it as a normal sub-workflow failure (its own `workflow_failed` does NOT inherit `is_explicit: true`). The child's rendered output, reason, and terminate step name are preserved on the wrapper as `terminated_output`, `terminated_reason`, and `terminated_by` for `on_error` hooks and debugging surfaces. A `status: success` terminate inside a sub-workflow returns its rendered output cleanly and the parent continues with its next routes.
+
+See [`examples/terminate.yaml`](../examples/terminate.yaml) for a complete worked example with all three paths.
 
 ### Dialog Mode
 

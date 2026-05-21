@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.17...HEAD)
 
 ### Added
+<<<<<<< HEAD
 - New `type: wait` workflow step that pauses execution for a parsed
   duration via in-process `asyncio.sleep`. Cross-platform — no shell
   `sleep` dependency. Use for rate-limit cooldowns, polling intervals,
@@ -34,6 +35,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   route loop-back
   ([#224](https://github.com/microsoft/conductor/pull/224),
   closes [#218](https://github.com/microsoft/conductor/issues/218)).
+=======
+- New `type: terminate` workflow step that explicitly ends the workflow with
+  a structured `status` (`success` | `failed`) and Jinja2-rendered `reason`,
+  plus an optional `output_template` (`dict[str, str]`) that replaces the
+  workflow-level `output:` mapping for that termination path. Reaching a
+  terminate step ends the workflow immediately (no routes evaluated after).
+  `status: success` returns the rendered output cleanly (CLI exit 0,
+  dashboard ✅, emits `workflow_completed { termination_reason, terminated_by,
+  is_explicit: true, status: "success" }`); `status: failed` raises a new
+  `WorkflowTerminated` exception (`ExecutionError` subclass), gives the CLI a
+  non-zero exit code while still printing the rendered output JSON to stdout
+  for downstream tooling, and intentionally **skips** the on-failure
+  checkpoint save because explicit termination is not a resumable transient
+  failure. Inside a sub-workflow, a failed terminate is downgraded at the
+  parent boundary to a new `SubworkflowTerminatedError` (also an
+  `ExecutionError`) preserving the child's rendered `terminated_output` /
+  `terminated_reason` / `terminated_by` as structured attributes, so the
+  parent treats it as a normal sub-workflow failure (its own
+  `workflow_failed` does NOT inherit `is_explicit: true`) while debugging
+  surfaces can still inspect what the child intended to emit. Schema
+  validation rejects `routes`, `tools`, `output`, `prompt`, `model`,
+  `provider`, and the other agent-only fields on terminate steps, and
+  conversely rejects `status` / `reason` / `output_template` on every other
+  step type so authors who forget `type: terminate` get a clear error
+  instead of silently dropped fields. Terminate cannot be used as a
+  parallel-group member or as a `for_each` inline agent — route to one
+  from those groups' `routes:` instead. The example workflow lives at
+  `examples/terminate.yaml`
+  ([#219](https://github.com/microsoft/conductor/issues/219)).
+>>>>>>> e04312b (docs(terminate): document type: terminate across user-facing docs (#219))
 
 ## [0.1.17](https://github.com/microsoft/conductor/compare/v0.1.16...v0.1.17) - 2026-05-21
 

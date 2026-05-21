@@ -453,7 +453,36 @@ class ReasoningConfig(BaseModel):
 
 
 class AgentDef(BaseModel):
-    """Definition for a single agent in the workflow."""
+    """Definition for a single agent in the workflow.
+
+    A single Pydantic model covers all step kinds. The ``type`` field
+    discriminates between them:
+
+    - ``agent`` (default): LLM-backed agent. Requires ``prompt``; supports
+      ``model``, ``provider``, ``tools``, ``output``, ``reasoning``, ``retry``,
+      ``dialog``, and ``timeout_seconds``.
+    - ``human_gate``: Pause for user decision. Requires ``prompt`` and
+      ``options``.
+    - ``script``: Shell command step. Requires ``command``; supports
+      ``args``, ``env``, ``working_dir``, ``timeout``. Output is always
+      ``{stdout, stderr, exit_code}`` with parsed-JSON keys merged on top
+      when ``stdout`` is valid JSON.
+    - ``workflow``: Sub-workflow black-box step. Requires ``workflow:``
+      (path or registry reference); supports ``input_mapping`` and
+      ``max_depth``.
+    - ``terminate``: Explicit terminal step. Requires ``status`` (``success``
+      | ``failed``) and ``reason``; supports optional ``output_template``.
+      Reaching one ends the workflow immediately (no routes evaluated
+      after) and surfaces in the CLI exit code / dashboard / event log as
+      a distinct, intentional outcome — distinguishable from a generic
+      crash via ``is_explicit: true`` on the emitted lifecycle event.
+
+    Per-type field forbidden-lists are enforced in
+    :meth:`validate_agent_type`. Cross-cutting structural rules (e.g.,
+    terminate steps cannot appear as parallel-group members or as a
+    for_each inline agent) are enforced in
+    :func:`conductor.config.validator.validate_workflow_config`.
+    """
 
     model_config = ConfigDict(extra="forbid")
 

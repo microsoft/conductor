@@ -21,6 +21,7 @@ Conductor makes multi-agent workflows — code review pipelines, research-then-s
 - **Sub-workflow composition** - Reusable sub-workflows with templated `input_mapping`, usable inside `for_each` groups for dynamic fan-out
 - **Script steps** - Run shell commands and route on exit code or parsed JSON stdout
 - **Set steps** - Bind one or more Jinja2-evaluated values into the context (no LLM, no subprocess) for derived flags, computed defaults, and constants reused by many later prompts
+- **Terminate steps** - Explicit terminal step with `status` (`success`/`failed`) and structured `reason` — distinguishable from the default `$end` path in CLI exit codes, dashboard state, and event logs
 - **Dialog mode** - Agents can pause for multi-turn conversation when uncertain
 - **Reasoning effort** - Unified `reasoning.effort` (low/medium/high/xhigh) per agent or workflow-wide, translated to each provider's native API
 - **Workspace instructions** - Auto-discover and inject `AGENTS.md` / `CLAUDE.md` / `.github/copilot-instructions.md` into every agent's prompt
@@ -302,8 +303,12 @@ See the [`examples/`](./examples/) directory for complete workflows:
 | [design-review.yaml](./examples/design-review.yaml) | Human gate with loop pattern |
 | [script-step.yaml](./examples/script-step.yaml) | Script step with exit_code routing |
 | [set-step.yaml](./examples/set-step.yaml) | Set step deriving named values + boolean-routed branching |
+<<<<<<< HEAD
 | [wait-step.yaml](./examples/wait-step.yaml) | Wait step + script for a polling loop-back pattern |
 | [wait-smoke.yaml](./examples/wait-smoke.yaml) | Minimal wait-only smoke test (no provider required) |
+=======
+| [terminate.yaml](./examples/terminate.yaml) | Explicit `type: terminate` with success and failure paths |
+>>>>>>> e04312b (docs(terminate): document type: terminate across user-facing docs (#219))
 
 **More examples and running instructions:** [examples/README.md](./examples/README.md)
 

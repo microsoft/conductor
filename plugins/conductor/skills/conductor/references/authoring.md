@@ -67,7 +67,7 @@ workflow:
 ```yaml
 agents:
   - name: my_agent               # Required: unique identifier
-    type: agent                  # agent (default), human_gate, script, workflow, or wait
+    type: agent                  # agent (default), human_gate, script, workflow, wait, or terminate
     description: What it does
     model: gpt-5.2               # Override workflow default
     provider: claude             # Optional: per-agent provider override
@@ -451,6 +451,45 @@ for_each:
 ```
 
 **Restrictions** — workflow steps cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, `command`, `options`, `retry`, `reasoning`, `dialog`, `max_session_seconds`, `max_agent_iterations`, or `timeout_seconds`.
+
+## Terminate Steps (`type: terminate`)
+
+End the workflow with an explicit, structured outcome — distinguishable from a generic crash in CLI exit codes, dashboard state, and event logs. Real workflows have multiple legitimate end states beyond "the last agent finished": early success ("the document is already up to date"), soft abort ("no matching issues found"), hard failure with reason ("upstream service returned unprocessable data"), pre-condition not met ("this PR is from a fork"). With only `$end`, all of these collapse into "workflow completed" downstream. Terminate steps surface the distinction.
+
+```yaml
+agents:
+  - name: precheck
+    prompt: "Is the input safe to process? Return JSON: {safe: bool, reason: string}"
+    output:
+      safe:   { type: boolean }
+      reason: { type: string }
+    routes:
+      - when: "not precheck.output.safe"
+        to: abort_unsafe
+      - to: main_pipeline
+
+  - name: abort_unsafe
+    type: terminate
+    status: failed                     # success | failed (required)
+    reason: "{{ precheck.output.reason }}"   # required; Jinja2-templated
+    output_template:                   # optional; replaces workflow-level output:
+      aborted: "true"                  # rendered then JSON-coerced ("true" -> True)
+      stage: precheck
+      reason: "{{ precheck.output.reason }}"
+```
+
+**Semantics:**
+
+- Reaching a terminate step ends the workflow immediately — no routes evaluated after.
+- `status: success` → engine returns the rendered output, CLI exits `0`, dashboard ✅, emits `workflow_completed { termination_reason, terminated_by, is_explicit: true, status: "success" }`. Runs the `on_complete` hook.
+- `status: failed` → engine raises `WorkflowTerminated` (subclass of `ExecutionError`), CLI exits `1` (and still prints the rendered output JSON to stdout for downstream tooling), dashboard ❌, emits `workflow_failed { error_type: "WorkflowTerminated", termination_reason, terminated_by, is_explicit: true, status: "failed", output }`. Runs the `on_error` hook. **Intentionally not resumable** — the engine skips the on-failure checkpoint because the author explicitly chose this outcome.
+- `output_template:` is a `dict[str, str]` where each value is a Jinja2 expression. The rendered values are passed through the engine's JSON-coercion helper, so `"true"` becomes `True`, `"42"` becomes `42`, and JSON literals (`'{"k":"v"}'`) are parsed. When omitted, the workflow-level `output:` mapping is rendered as on any other terminal path.
+- **Sub-workflow boundary** — a `status: failed` terminate inside a child sub-workflow is downgraded to `SubworkflowTerminatedError` (also an `ExecutionError`) at the parent boundary. The parent treats it as a normal sub-workflow failure (its own `workflow_failed` does NOT inherit `is_explicit: true`). The child's rendered output, reason, and terminate-step name are preserved as `terminated_output` / `terminated_reason` / `terminated_by` attributes on the wrapper for `on_error` hooks and debugging surfaces. A `status: success` child terminate returns its rendered output cleanly and the parent continues with its next routes.
+- **Branching on a child's termination** — if the parent's routes need to react to a child's outcome, the child should use `status: success` plus an `output_template:` carrying the relevant fields. Failed terminate is an error from the parent's perspective; parent `routes:` are only evaluated after successful steps.
+
+**Restrictions** — terminate steps cannot have `routes`, `tools`, `output`, `prompt`, `model`, `provider`, `system_prompt`, `command`, `args`, `env`, `working_dir`, `timeout`, `timeout_seconds`, `max_session_seconds`, `max_agent_iterations`, `max_depth`, `retry`, `dialog`, `reasoning`, `workflow`, `input_mapping`, or `options`. Cannot appear as a parallel-group member or as a `for_each` inline agent — route to them from those groups' `routes:` instead. Conversely, regular agents cannot have `status`, `reason`, or `output_template` — those fields are rejected at schema validation to catch authors who forgot to add `type: terminate`.
+
+See `examples/terminate.yaml` for a complete example demonstrating success, failure, and pass-through paths.
 
 ## Dialog Mode
 

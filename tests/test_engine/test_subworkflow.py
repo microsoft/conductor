@@ -2321,9 +2321,7 @@ class TestSubWorkflowTerminate:
         # outer ConductorError handler picks it up via the same code path as
         # any other sub-workflow failure, but the distinct class name makes
         # the cause visible to event consumers.
-        assert all(
-            e.data.get("error_type") == "SubworkflowTerminatedError" for e in outer
-        ), (
+        assert all(e.data.get("error_type") == "SubworkflowTerminatedError" for e in outer), (
             f"parent error_type should be SubworkflowTerminatedError; got: "
             f"{[e.data.get('error_type') for e in outer]}"
         )

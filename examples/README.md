@@ -94,6 +94,30 @@ conductor run examples/design-review.yaml --input requirement="Build a REST API"
 conductor run examples/design-review.yaml --input requirement="Build a REST API" --skip-gates
 ```
 
+## Explicit Termination
+
+### terminate.yaml
+
+A workflow with multiple legitimate end states beyond "the last agent finished," using `type: terminate` steps to surface each outcome distinctly. Demonstrates:
+
+- `status: success` — early-exit when there's nothing to do (CLI exit 0, dashboard ✅)
+- `status: failed` — refuse-to-run on unsafe input (CLI exit 1, dashboard ❌, emits `workflow_failed` with `is_explicit: true` and `error_type: WorkflowTerminated`)
+- Pass-through normal pipeline for the "do the work" path
+- Optional `output_template:` that replaces the workflow-level `output:` for a termination path
+
+```bash
+# Success path — soft no-op, exit 0
+conductor run examples/terminate.yaml --input document_state=current
+
+# Failure path — hard refusal, exit 1 with structured reason
+conductor run examples/terminate.yaml --input document_state=unsafe
+
+# Normal pipeline (no terminate hit)
+conductor run examples/terminate.yaml --input document_state=stale
+```
+
+CI / dashboard / notification tooling can read `is_explicit: true` from the JSONL event log to distinguish an intentional termination from a generic crash.
+
 ## Reasoning Effort
 
 ### reasoning-effort.yaml
