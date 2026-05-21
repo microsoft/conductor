@@ -1,0 +1,139 @@
+# Error Routing Workflow
+#
+# This example demonstrates Phase 1 of typed `on_error` routing
+# (issue #227). It shows how a `type: script` node can write a typed
+# error envelope to $CONDUCTOR_ERROR_OUT and have the engine pick a
+# matching route by `on_error: <kind>` instead of falling through to a
+# generic exit_code branch.
+#
+# The shape of the contract is intentionally simple:
+#
+#   1. Conductor sets CONDUCTOR_ERROR_OUT to a per-invocation temp file
+#      path in the script's environment.
+#   2. The script writes
+#      `{"conductor_error": true, "kind": "<dotted>", "message": "..."}`
+#      to that path and exits 0.
+#   3. Conductor reads the file, treats the node as raised, and
+#      evaluates routes by matching `on_error` against the envelope's
+#      `kind`. The first matching route wins (same rule as `when:`).
+#
+# A node that declares `raises:` is opting in to typed errors — at
+# runtime, any kind not in the declared list is rewritten to
+# `internal.undeclared_kind` (with the original kind preserved under
+# `details.original_kind`) so authors who care about the contract get
+# loud feedback when a script "lies".
+#
+# Usage:
+#   conductor run examples/error-routing.yaml
+#
+# Try toggling the `simulated_failure` workflow input between
+# "drift", "rate_limited", and "ok" to see different route arms fire.
+
+workflow:
+  name: error-routing-demo
+  description: |
+    Demonstrates typed on_error routing: a probe step either succeeds
+    or writes a typed envelope, and downstream agents react based on
+    the kind without using fragile exit_code checks.
+  entry_point: probe
+
+  input:
+    simulated_failure:
+      type: string
+      description: One of "ok", "drift", "rate_limited"
+      default: drift
+
+  runtime:
+    provider: copilot
+
+  context:
+    mode: accumulate
+
+  limits:
+    max_iterations: 20
+
+agents:
+  - name: probe
+    type: script
+    command: python
+    args:
+      - -c
+      - |
+        import json, os, sys
+        mode = os.environ.get("MODE", "ok")
+        if mode == "ok":
+            print(json.dumps({"sha": "abc123"}))
+            sys.exit(0)
+        envelope = {
+            "ok": {},
+            "drift": {
+                "conductor_error": True,
+                "kind": "external.git.drift",
+                "message": "remote SHA does not match expected",
+                "details": {"expected": "abc123", "actual": "def456"},
+            },
+            "rate_limited": {
+                "conductor_error": True,
+                "kind": "external.api.rate_limited",
+                "message": "GitHub returned 429",
+                "details": {"retry_after_s": 30},
+            },
+        }[mode]
+        with open(os.environ["CONDUCTOR_ERROR_OUT"], "w") as f:
+            json.dump(envelope, f)
+        sys.exit(0)
+    env:
+      MODE: "{{ workflow.input.simulated_failure }}"
+    raises:
+      - external.git.drift
+      - external.api.rate_limited
+    routes:
+      - to: rescue_drift
+        on_error: external.git.drift
+      - to: backoff_and_retry
+        on_error: external.api.rate_limited
+      - to: continue_happy
+    output:
+      sha:
+        type: string
+
+  - name: continue_happy
+    model: gpt-4o-mini
+    prompt: |
+      The git probe reported sha={{ probe.output.sha }}. Acknowledge.
+    routes:
+      - to: $end
+    output:
+      acknowledgment:
+        type: string
+
+  - name: rescue_drift
+    model: gpt-4o-mini
+    prompt: |
+      A git drift was detected.
+        kind:    {{ probe.error.kind }}
+        message: {{ probe.error.message }}
+        details: {{ probe.error.details }}
+      Recommend a recovery plan in two sentences.
+    routes:
+      - to: $end
+    output:
+      recovery_plan:
+        type: string
+
+  - name: backoff_and_retry
+    model: gpt-4o-mini
+    prompt: |
+      A rate-limit hit was detected.
+        retry_after_s: {{ probe.error.details.retry_after_s }}
+      Describe a sensible backoff strategy in one sentence.
+    routes:
+      - to: $end
+    output:
+      strategy:
+        type: string
+
+output:
+  acknowledgment: "{{ continue_happy.output.acknowledgment | default('') }}"
+  recovery_plan: "{{ rescue_drift.output.recovery_plan | default('') }}"
+  strategy: "{{ backoff_and_retry.output.strategy | default('') }}"
