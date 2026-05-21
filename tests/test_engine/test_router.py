@@ -431,3 +431,174 @@ class TestRouterEdgeCases:
 
         result = router.evaluate(routes, {"value": ""}, {})
         assert result.target == "empty"
+
+
+class TestRouterErrorBucket:
+    """Tests for on_error routing.
+
+    Routes split into a success bucket (``on_error is None``) and an
+    error bucket (``on_error`` set). Only the bucket matching the
+    presence/absence of an envelope competes.
+    """
+
+    @staticmethod
+    def _envelope(kind: str, message: str = "boom") -> dict[str, object]:
+        """Build a minimal ErrorEnvelope-shaped dict for tests."""
+        return {"kind": kind, "message": message, "details": {}}
+
+    def test_error_path_success_routes_skipped(self) -> None:
+        """Success routes never match when an envelope is provided."""
+        router = Router()
+        routes = [
+            RouteDef(to="should_not_match"),  # success catch-all
+            RouteDef(to="handler", on_error=True),
+        ]
+
+        result = router.evaluate(routes, {}, {}, error=self._envelope("any.kind"))
+        assert result.target == "handler"
+
+    def test_success_path_error_routes_skipped(self) -> None:
+        """Error routes never match on the success path."""
+        router = Router()
+        routes = [
+            RouteDef(to="error_handler", on_error=True),
+            RouteDef(to="next"),  # success catch-all
+        ]
+
+        result = router.evaluate(routes, {"ok": True}, {})
+        assert result.target == "next"
+
+    def test_on_error_true_catches_any_kind(self) -> None:
+        """``on_error: true`` matches any envelope kind."""
+        router = Router()
+        routes = [RouteDef(to="catch_all", on_error=True)]
+
+        result = router.evaluate(routes, {}, {}, error=self._envelope("external.git.drift"))
+        assert result.target == "catch_all"
+
+    def test_on_error_string_exact_match(self) -> None:
+        """A string ``on_error`` matches only the exact kind."""
+        router = Router()
+        routes = [
+            RouteDef(to="git_handler", on_error="external.git.drift"),
+            RouteDef(to="fallback", on_error=True),
+        ]
+
+        result = router.evaluate(routes, {}, {}, error=self._envelope("external.git.drift"))
+        assert result.target == "git_handler"
+
+        result = router.evaluate(routes, {}, {}, error=self._envelope("external.api.timeout"))
+        assert result.target == "fallback"
+
+    def test_on_error_list_membership(self) -> None:
+        """A list ``on_error`` matches if the kind appears in the list."""
+        router = Router()
+        routes = [
+            RouteDef(
+                to="external_handler",
+                on_error=["external.git.drift", "external.api.timeout"],
+            ),
+            RouteDef(to="fallback", on_error=True),
+        ]
+
+        result = router.evaluate(routes, {}, {}, error=self._envelope("external.api.timeout"))
+        assert result.target == "external_handler"
+
+        result = router.evaluate(routes, {}, {}, error=self._envelope("policy.violation"))
+        assert result.target == "fallback"
+
+    def test_error_route_when_clause_applies(self) -> None:
+        """``when:`` still applies in the error bucket."""
+        router = Router()
+        routes = [
+            RouteDef(
+                to="retry",
+                on_error=True,
+                when="{{ error.details.retryable }}",
+            ),
+            RouteDef(to="give_up", on_error=True),
+        ]
+
+        retryable = {"kind": "external.x", "message": "m", "details": {"retryable": True}}
+        not_retryable = {"kind": "external.x", "message": "m", "details": {"retryable": False}}
+
+        assert router.evaluate(routes, {}, {}, error=retryable).target == "retry"
+        assert router.evaluate(routes, {}, {}, error=not_retryable).target == "give_up"
+
+    def test_error_eval_context_exposes_kind_via_jinja(self) -> None:
+        """Templates on error routes can reference ``error.kind`` etc."""
+        router = Router()
+        routes = [
+            RouteDef(
+                to="match",
+                on_error=True,
+                when="{{ error.kind == 'policy.violation' }}",
+            ),
+            RouteDef(to="other", on_error=True),
+        ]
+
+        result = router.evaluate(routes, {}, {}, error=self._envelope("policy.violation"))
+        assert result.target == "match"
+
+    def test_error_route_output_transform_sees_error(self) -> None:
+        """``output:`` on an error route renders against the envelope."""
+        router = Router()
+        routes = [
+            RouteDef(
+                to="reporter",
+                on_error=True,
+                output={"failed_kind": "{{ error.kind }}"},
+            )
+        ]
+
+        result = router.evaluate(routes, {}, {}, error=self._envelope("external.git.drift"))
+        assert result.output_transform == {"failed_kind": "external.git.drift"}
+
+    def test_no_matching_error_route_raises_unhandled_node_error(self) -> None:
+        """An envelope with no matching error route raises UnhandledNodeError."""
+        from conductor.exceptions import UnhandledNodeError
+
+        router = Router()
+        routes = [
+            RouteDef(to="git", on_error="external.git.drift"),
+            RouteDef(to="next"),  # success catch-all — must NOT swallow errors
+        ]
+
+        envelope = self._envelope("policy.violation")
+        with pytest.raises(UnhandledNodeError) as exc_info:
+            router.evaluate(routes, {}, {}, error=envelope)
+
+        # The envelope is preserved on the exception so the engine can
+        # wrap it in UnhandledWorkflowError.
+        assert exc_info.value.envelope["kind"] == "policy.violation"
+
+    def test_first_matching_error_route_wins(self) -> None:
+        """Order matters within the error bucket."""
+        router = Router()
+        routes = [
+            RouteDef(to="first", on_error=True),
+            RouteDef(to="second", on_error=True),
+        ]
+
+        result = router.evaluate(routes, {}, {}, error=self._envelope("any.thing"))
+        assert result.target == "first"
+
+    def test_success_no_match_still_raises_value_error(self) -> None:
+        """Backwards-compat: success-path exhaustion still raises ValueError."""
+        router = Router()
+        # Only an error route, no success catch-all.
+        routes = [RouteDef(to="handler", on_error=True)]
+
+        with pytest.raises(ValueError, match="No matching route found"):
+            router.evaluate(routes, {"x": 1}, {})
+
+    def test_simpleeval_can_reference_flattened_error_fields(self) -> None:
+        """simpleeval flattening exposes ``error.kind`` as ``kind``/``error_kind``."""
+        router = Router()
+        routes = [
+            RouteDef(to="git", on_error=True, when="kind == 'external.git.drift'"),
+            RouteDef(to="other", on_error=True),
+        ]
+
+        result = router.evaluate(routes, {}, {}, error=self._envelope("external.git.drift"))
+        assert result.target == "git"
