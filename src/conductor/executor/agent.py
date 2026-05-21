@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from conductor.exceptions import ValidationError
 from conductor.executor.output import parse_json_output, validate_output
@@ -276,7 +276,7 @@ class AgentExecutor:
                 cache_write_tokens=output.cache_write_tokens,
                 model=output.model,
                 partial=output.partial,
-                error=dict(envelope),
+                error=cast("dict[str, Any]", envelope),
             )
 
         if agent.output:
@@ -298,7 +298,7 @@ class AgentExecutor:
                     cache_write_tokens=output.cache_write_tokens,
                     model=output.model,
                     partial=output.partial,
-                    error=dict(envelope),
+                    error=cast("dict[str, Any]", envelope),
                 )
 
         return output

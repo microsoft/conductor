@@ -16,7 +16,7 @@ import time as _time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from conductor.engine.checkpoint import CheckpointManager
 from conductor.engine.context import WorkflowContext
@@ -4478,7 +4478,7 @@ class WorkflowEngine:
             UnhandledWorkflowError: if no error route at this level matched.
         """
         normalized = self._normalize_envelope_for_node(agent, envelope)
-        self.context.store_error(agent.name, normalized)
+        self.context.store_error(agent.name, cast("Any", normalized))
 
         try:
             return self._evaluate_routes(agent, output_for_route, error=normalized)
@@ -4525,7 +4525,7 @@ class WorkflowEngine:
         # Build context for condition evaluation
         eval_context = self.context.get_for_template()
 
-        return self.router.evaluate(agent.routes, output, eval_context, error=error)
+        return self.router.evaluate(agent.routes, output, eval_context, error=cast("Any", error))
 
     def _evaluate_parallel_routes(
         self, parallel_group: ParallelGroup, output: dict[str, Any]

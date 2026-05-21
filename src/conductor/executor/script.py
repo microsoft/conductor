@@ -12,7 +12,7 @@ import json
 import os
 import tempfile
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from conductor.exceptions import ExecutionError
 from conductor.executor.template import TemplateRenderer
@@ -239,16 +239,16 @@ def _read_error_envelope(path: str, node_name: str) -> dict[str, Any] | None:
             source="script",
             original_message=f"CONDUCTOR_ERROR_OUT file is not valid JSON: {exc}",
         )
-        return dict(envelope)
+        return cast("dict[str, Any]", envelope)
     try:
-        return dict(coerce_envelope(parsed))
+        return cast("dict[str, Any]", coerce_envelope(parsed))
     except EnvelopeValidationError as exc:
         envelope = make_schema_violation(
             node_name=node_name,
             source="script",
             original_message=f"Malformed envelope in CONDUCTOR_ERROR_OUT: {exc}",
         )
-        return dict(envelope)
+        return cast("dict[str, Any]", envelope)
 
 
 def _synthesize_script_error(*, exit_code: int, stderr_tail: str, command: str) -> dict[str, Any]:
@@ -257,4 +257,7 @@ def _synthesize_script_error(*, exit_code: int, stderr_tail: str, command: str) 
 
     # Truncate stderr so we don't drag megabytes of compiler noise into the envelope.
     tail = stderr_tail[-2000:] if len(stderr_tail) > 2000 else stderr_tail
-    return dict(make_script_error(exit_code=exit_code, stderr_tail=tail, command=command))
+    return cast(
+        "dict[str, Any]",
+        make_script_error(exit_code=exit_code, stderr_tail=tail, command=command),
+    )
