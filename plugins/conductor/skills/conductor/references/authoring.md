@@ -253,6 +253,88 @@ routes:
 Script agents **cannot** have: `prompt`, `provider`, `model`, `tools`, `output`, `system_prompt`, `options`, `retry`, `reasoning`, `dialog`, `max_session_seconds`, `max_agent_iterations`, `timeout_seconds` (use `timeout:` instead), `input_mapping`, or `max_depth`.
 Command and args support Jinja2 templating for dynamic values.
 
+## Set Steps
+
+Set steps evaluate one or more Jinja2 expressions and bind the typed results into context. No LLM call, no subprocess, no I/O — these are pure context transformations. Use them when you'd otherwise duplicate a Jinja expression across many prompts, run `echo`-only script steps, or burn a model call on something deterministic.
+
+```yaml
+agents:
+  # Single binding: output is the typed scalar / list / dict.
+  - name: compute_slug
+    type: set
+    value: "{{ workflow.input.org }}/{{ workflow.input.repo }}"
+    routes:
+      - to: derive_flags
+
+  # Multi-binding: output is a dict, accessible as step.output.<key>.
+  - name: derive_flags
+    type: set
+    values:
+      is_breaking: "{{ research.output.severity in ['high', 'critical'] }}"
+      target_branch: "{{ workflow.input.branch or 'main' }}"
+      effective_model: "{{ workflow.input.model or 'claude-sonnet-4-5' }}"
+    routes:
+      - to: breaking_path
+        when: "{{ output.is_breaking }}"
+      - to: safe_path
+```
+
+Exactly one of `value:` / `values:` must be present.
+
+### Type Detection
+
+Default (auto) detection uses safe YAML loading: booleans, numbers, lists, and dicts become native Python types; date-like strings are converted to ISO 8601 to stay JSON-safe; parse failures fall back to the raw string; empty renders become `""` (not `None`). Override with `output_type:` on a single `value:` to force `string`, `number`, `integer`, `boolean`, `list`, or `dict`. Per-key typing on `values:` is not supported — chain steps if you need it.
+
+### Multi-Binding Ordering
+
+Every binding in a single `values:` step renders against the *original* pre-step context. Later bindings cannot reference earlier ones in the same step. Chain multiple set steps for ordered dependencies:
+
+```yaml
+- name: step_a
+  type: set
+  value: "{{ workflow.input.x | upper }}"
+- name: step_b
+  type: set
+  value: "{{ step_a.output }}-suffix"
+```
+
+### Routing on Set Output
+
+Routes attached to a set step see the bound value directly. Dict outputs expose `{{ output.<key> }}` (Jinja2) and bare `<key>` (simpleeval); scalar / list outputs expose only `{{ output }}`:
+
+```yaml
+# Multi-values: route on a derived dict field.
+- name: derive_flags
+  type: set
+  values:
+    is_breaking: "{{ severity == 'high' }}"
+  routes:
+    - to: hot_path
+      when: "{{ output.is_breaking }}"
+    - to: safe_path
+
+# Single-value: route on the scalar itself.
+- name: flag
+  type: set
+  value: "{{ workflow.input.severity == 'high' }}"
+  routes:
+    - to: hi
+      when: "{{ output }}"
+    - to: lo
+```
+
+### Set Step Composition
+
+- Inside `parallel` groups: each member publishes its bound value to context. Templates cannot reference sibling group members (validator-enforced).
+- Inside `for_each` as the inline agent: one bound value per item, accessible via `loop.outputs`.
+- Output `value:` / `values:` chain naturally — a multi-binding step that publishes `items` can drive a downstream `for_each` whose `source:` is `step.output.items`.
+
+### Set Step Restrictions
+
+Set agents **cannot** have: `prompt`, `provider`, `model`, `tools`, `system_prompt`, `command`, `args`, `env`, `working_dir`, `timeout`, `workflow`, `options`, `input_mapping`, `max_depth`, `retry`, `dialog`, `reasoning`, `timeout_seconds`, `max_session_seconds`, or `max_agent_iterations`. They count toward `limits.max_iterations` like any other step.
+
+`output:` schema validation is permitted only when the rendered output is a dict (always for `values:`, sometimes for `value:`). A single-`value:` step with a declared schema that produces a scalar raises a `ValidationError` pointing to `values:`.
+
 ## Sub-Workflow Agents (`type: workflow`)
 
 Reference an external workflow YAML file as a black-box step. The sub-workflow runs with its own engine and inherits the parent's provider configuration.

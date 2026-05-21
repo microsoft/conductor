@@ -177,9 +177,18 @@ agents:
     env: {string: string}           # Extra environment variables
     working_dir: string             # Working directory (Jinja2 templated)
     timeout: integer                # Per-script timeout in seconds
+
+    # Set-only fields (type: set) — exactly one of value: / values: required
+    value: string                   # Single Jinja2 expression (typed result)
+    values:                         # Multi-binding: each key gets its own typed result
+      <key>: string
+    output_type: string             # auto|string|number|integer|boolean|list|dict
+                                    # (single value: only; per-key typing on values: not supported)
 ```
 
 **Script agent restrictions:** Cannot have `prompt`, `provider`, `model`, `tools`, `output`, `system_prompt`, `options`, `retry`, `reasoning`, `dialog`, `max_session_seconds`, `max_agent_iterations`, `timeout_seconds` (use `timeout`), `input_mapping`, or `max_depth`. Output is always `{stdout, stderr, exit_code}`. If `stdout` is valid JSON, its top-level keys are auto-merged into the output dict.
+
+**Set agent restrictions:** Cannot have `prompt`, `provider`, `model`, `tools`, `system_prompt`, `options`, `command`, `args`, `env`, `working_dir`, `timeout`, `workflow`, `input_mapping`, `max_depth`, `retry`, `dialog`, `reasoning`, `timeout_seconds`, `max_session_seconds`, or `max_agent_iterations`. Requires exactly one of `value:` or `values:`. `output_type:` is forbidden with `values:` (per-key typing not yet supported). `output:` schema validation is permitted only when the rendered output is a dict (always for `values:`, sometimes for `value:`); a scalar with a declared schema raises `ValidationError`. Set agents are allowed inside `parallel` groups and as `for_each` inline agents, and count toward `limits.max_iterations` like any other step.
 
 **Workflow agent restrictions (`type: workflow`):** Cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, `command`, `options`, `retry`, `reasoning`, `dialog`, `max_session_seconds`, `max_agent_iterations`, or `timeout_seconds`. Requires `workflow:` path. Supports `input_mapping` and `max_depth`. Allowed inside `for_each` groups for dynamic fan-out.
 
@@ -221,6 +230,80 @@ Script agents always produce:
 {{ script_name.output.stderr }}     # Captured standard error
 {{ script_name.output.exit_code }}  # Process exit code (0 = success)
 ```
+
+## Set Agent Schema
+
+Set agents evaluate Jinja2 expressions and bind typed values into the workflow context — no LLM call, no subprocess:
+
+```yaml
+agents:
+  # Single binding form — output is the typed scalar / list / dict.
+  - name: string
+    type: set                       # Required
+    description: string             # Optional
+    value: string                   # Required (when not using values:): Jinja2 expression
+    output_type: string             # Optional: auto|string|number|integer|boolean|list|dict
+    input: [string]                 # Optional: context dependencies
+    routes:                         # Optional: routing rules
+      - to: string
+
+  # Multi-binding form — output is a dict, each key gets its own typed result.
+  - name: string
+    type: set
+    values:                         # Required (when not using value:): named bindings
+      <key>: string                 # Jinja2 expression per key
+    input: [string]
+    routes:
+      - to: string
+        when: string                # e.g. "{{ output.<key> }}" (Jinja2) or "<key>" (simpleeval)
+```
+
+Exactly one of `value:` or `values:` must be present. `output_type:` only applies to single `value:`.
+
+### Set Output
+
+```jinja2
+# Single value:
+{{ step.output }}                  # The typed scalar / list / dict directly
+
+# Multi values:
+{{ step.output.is_breaking }}      # Each declared key
+{{ step.output.target_branch }}
+```
+
+### Type Detection (auto)
+
+Default (`output_type` unset or `auto`) uses safe YAML loading (equivalent to `yaml.safe_load`):
+
+- Booleans, numbers, lists, dicts → native Python types
+- Parse failures and pure-comment renders → raw string
+- Empty / whitespace-only renders → `""` (not `None`)
+- `datetime` / `date` / `time` (e.g. from `"2024-01-02"`) → ISO 8601 string (keeps checkpoints JSON-safe)
+- Any other non-JSON-safe Python value → `ExecutionError`
+
+### Routing on Set Output
+
+Routes attached to a set step evaluate against the bound value directly:
+
+```yaml
+# Dict-shaped output → access fields via Jinja2 or simpleeval flattening.
+routes:
+  - to: hot_path
+    when: "{{ output.is_breaking }}"     # Jinja2
+  - to: hot_path
+    when: "is_breaking"                  # simpleeval (flattened)
+
+# Scalar output → use {{ output }}.
+routes:
+  - to: hot_path
+    when: "{{ output }}"
+```
+
+### Set Step Composition
+
+- Allowed inside `parallel` groups (each member publishes to context). Templates cannot reference sibling group members — the validator catches this at config time.
+- Allowed as the inline agent of a `for_each` group (one bound value per item).
+- Each invocation emits `set_started` / `set_completed` / `set_failed` events with `output_type`, `output_keys`, and a 512-char-truncated `value_repr`.
 
 ## File Includes (`!file` Tag)
 

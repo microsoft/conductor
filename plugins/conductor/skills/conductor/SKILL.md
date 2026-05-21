@@ -99,6 +99,7 @@ For runtime config, context modes, limits, and cost tracking, see [references/au
 | `entry_point` | First agent/group to execute |
 | `routes` | Where agent goes next (`$end` to finish, `self` to loop) |
 | `type: script` | Shell command step (captures stdout, stderr, exit_code; JSON stdout is auto-merged) |
+| `type: set` | Pure-context step that evaluates Jinja2 expressions and binds typed values (no LLM, no subprocess); supports single `value:` and multi `values:` |
 | `type: workflow` | Sub-workflow agent — runs another YAML file as a black box (supports `input_mapping`, `max_depth`) |
 | `parallel` | Static parallel groups (fixed agent list) |
 | `for_each` | Dynamic parallel groups (runtime-determined array; supports `type: workflow` agents) |

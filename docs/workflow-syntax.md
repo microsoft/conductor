@@ -281,6 +281,93 @@ routes:
 
 **Environment variable note** — values in `env` are passed as-is to the subprocess (they are not rendered as Jinja2 templates). Use `${VAR}` syntax in the workflow YAML loader if you need environment variable substitution in env values.
 
+### Set Steps
+
+Set steps evaluate one or more Jinja2 expressions and bind the typed results into the workflow context. No LLM call, no subprocess, no I/O — they're pure context transformations. Use them to combine inputs, derive flags from prior outputs, compute defaults, or normalise a value once for many downstream prompts to share.
+
+```yaml
+agents:
+  # Single binding — output is the typed scalar / list / dict.
+  - name: compute_slug
+    type: set
+    value: "{{ workflow.input.org }}/{{ workflow.input.repo }}"
+    # accessible as: compute_slug.output  (a string)
+    routes:
+      - to: derive_flags
+
+  # Multi-binding — output is a dict, accessible as step.output.<key>.
+  - name: derive_flags
+    type: set
+    values:
+      is_breaking: "{{ research.output.severity in ['high', 'critical'] }}"
+      target_branch: "{{ workflow.input.branch or 'main' }}"
+      effective_model: "{{ workflow.input.model or 'claude-sonnet-4-5' }}"
+    routes:
+      - to: breaking_path
+        when: "{{ output.is_breaking }}"
+      - to: safe_path
+```
+
+Exactly one of `value:` or `values:` must be present.
+
+**Type detection** — by default, the rendered string is parsed with safe YAML (equivalent to `yaml.safe_load`); booleans, numbers, lists, and dicts are returned as native types. Parse failures and pure-comment renders fall back to the raw string. Empty / whitespace-only renders become `""`, not `None`. `yaml.safe_load` produces `datetime`/`date`/`time` objects from strings like `"2024-01-02"`; these are converted to their ISO 8601 string form so checkpoint round-trips and dashboard payloads stay JSON-safe. Any other non-JSON-safe Python value raises `ExecutionError`.
+
+**Explicit `output_type:`** (single `value:` only) forces a specific coercion:
+
+| Value | Behaviour |
+|-------|-----------|
+| `auto` (default) | YAML safe-load with the rules above |
+| `string` | Keep the raw rendered string verbatim |
+| `number` | Try `int` then `float`; raise on failure |
+| `integer` | `int`; raise on failure |
+| `boolean` | Case-insensitive `true`/`false`/`1`/`0`/`yes`/`no`/`y`/`n`/`on`/`off` |
+| `list` | Parse via YAML; assert the result is a list |
+| `dict` | Parse via YAML; assert the result is a dict |
+
+Per-key typing on multi `values:` is not supported.
+
+**Multi-binding ordering** — every binding in a single `values:` step renders against the *original* pre-step context. Later bindings cannot reference earlier ones in the same step. If you need ordered dependencies, chain multiple set steps:
+
+```yaml
+- name: step_a
+  type: set
+  value: "{{ workflow.input.x | upper }}"
+- name: step_b
+  type: set
+  value: "{{ step_a.output }}-suffix"
+```
+
+**Routing on set output** — routes attached to a set step evaluate against the bound value directly. Dict outputs expose `{{ output.<key> }}` (Jinja2) and bare `<key>` (simpleeval); scalar / list outputs expose only `{{ output }}`:
+
+```yaml
+# Multi-values step — route on a derived dict field.
+- name: derive_flags
+  type: set
+  values:
+    is_breaking: "{{ severity == 'high' }}"
+  routes:
+    - to: breaking_path
+      when: "{{ output.is_breaking }}"
+    - to: safe_path
+
+# Single-value step — route on the scalar itself.
+- name: flag
+  type: set
+  value: "{{ workflow.input.severity == 'high' }}"
+  routes:
+    - to: hi
+      when: "{{ output }}"
+    - to: lo
+```
+
+**Optional output schema** — set steps support the same `output:` schema as LLM and script agents, but only when the rendered value is a dict (which is always the case for multi `values:`, and may be the case for single `value:`). If a single-`value:` step declares `output:` but produces a scalar / list, the engine raises a friendly `ValidationError` pointing to `values:` as the intended shape.
+
+**Composition** — set steps are allowed inside `parallel` groups (each member publishes its bound value to context) and as the inline agent of a `for_each` group (one bound value per item). Inside a parallel group, set templates cannot reference sibling group members (the validator catches this at config time, since the engine renders against a pre-group snapshot).
+
+**Restrictions** — set agents cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, `command`, `args`, `env`, `working_dir`, `timeout`, `workflow`, `options`, `input_mapping`, `max_depth`, `retry`, `dialog`, `reasoning`, `timeout_seconds`, `max_session_seconds`, or `max_agent_iterations`. They count toward `limits.max_iterations` like any other step.
+
+**Events** — set steps emit `set_started` / `set_completed` / `set_failed` (mirroring the script-step lifecycle) in all three positions: linear main loop, parallel group member, and for-each iteration. The `set_completed` payload carries `output_type`, `output_keys` (sorted, empty for scalars), and `value_repr` (a JSON-safe preview, truncated at 512 chars).
+
 ### Sub-Workflow Steps
 
 Sub-workflow steps reference external workflow YAML files, enabling composable and reusable workflow building blocks. The sub-workflow runs as a black box — its internal agents are not visible to the parent.
