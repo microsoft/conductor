@@ -1171,6 +1171,7 @@ async def run_workflow_async(
         try:
             await dashboard.start()
             from conductor.cli.app import is_verbose
+
             if is_verbose():
                 _verbose_console.print(f"[bold cyan]Dashboard:[/bold cyan] {dashboard.url}")
         except Exception as e:
@@ -1318,6 +1319,7 @@ async def run_workflow_async(
                     await dashboard.wait_for_clients_disconnect()
                 else:
                     from conductor.cli.app import is_verbose
+
                     if is_verbose():
                         _verbose_console.print(
                             f"\n[bold green]Workflow complete.[/bold green] "
@@ -1833,6 +1835,7 @@ async def resume_workflow_async(
                 try:
                     await dashboard.start()
                     from conductor.cli.app import is_verbose
+
                     if is_verbose():
                         _verbose_console.print(f"[bold cyan]Dashboard:[/bold cyan] {dashboard.url}")
                 except Exception as e:
@@ -1885,6 +1888,7 @@ async def resume_workflow_async(
                     await dashboard.wait_for_clients_disconnect()
                 else:
                     from conductor.cli.app import is_verbose
+
                     if is_verbose():
                         _verbose_console.print(
                             f"\n[bold green]Workflow complete.[/bold green] "
