@@ -119,6 +119,7 @@ export function buildGraphElements(
       if (nodeType === 'script') flowNodeType = 'scriptNode';
       else if (nodeType === 'human_gate') flowNodeType = 'gateNode';
       else if (nodeType === 'workflow') flowNodeType = 'workflowNode';
+      else if (nodeType === 'wait') flowNodeType = 'waitNode';
 
       flowNodes.push({
         id: a.name,

@@ -10,7 +10,12 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from conductor.duration import parse_duration
 from conductor.providers.reasoning import ReasoningEffort
+
+# Maximum allowed wait-step duration (24 hours). Anything longer almost
+# certainly wants ``limits.timeout_seconds`` reconsidered first.
+MAX_WAIT_DURATION_SECONDS = 24 * 60 * 60
 
 
 class InputDef(BaseModel):
@@ -458,7 +463,7 @@ class AgentDef(BaseModel):
     description: str | None = None
     """Human-readable description of agent's purpose."""
 
-    type: Literal["agent", "human_gate", "script", "workflow"] | None = None
+    type: Literal["agent", "human_gate", "script", "workflow", "wait"] | None = None
     """Agent type. Defaults to 'agent' if not specified."""
 
     provider: Literal["copilot", "claude"] | None = None
@@ -525,6 +530,23 @@ class AgentDef(BaseModel):
 
     timeout: int | None = None
     """Per-script timeout in seconds."""
+
+    duration: str | int | float | None = None
+    """Duration to pause for ``type='wait'`` steps.
+
+    Accepts:
+    - Plain ``int`` or ``float`` — interpreted as seconds.
+    - String with a unit suffix: ``ms``, ``s``, ``m``, ``h``
+      (e.g. ``"500ms"``, ``"60s"``, ``"2.5m"``, ``"1h"``).
+    - A Jinja2 template that renders to one of the above
+      (e.g. ``"{{ workflow.input.poll_interval_seconds }}s"``).
+
+    The resolved duration must be greater than 0 and no more than 24h.
+    Templated durations defer literal validation to runtime.
+    """
+
+    reason: str | None = None
+    """Optional human-readable reason shown in the dashboard for ``type='wait'`` steps."""
 
     workflow: str | None = None
     """Path to sub-workflow YAML file (required for type='workflow').
@@ -679,6 +701,20 @@ class AgentDef(BaseModel):
             raise ValueError("timeout must be a positive integer")
         return v
 
+    @field_validator("duration", mode="before")
+    @classmethod
+    def reject_bool_duration(cls, v: Any) -> Any:
+        """Reject boolean values for ``duration`` before Pydantic coerces them to int.
+
+        Pydantic v2 coerces ``True``/``False`` to ``1``/``0`` when the union
+        accepts ``int``. Catch it pre-coercion so a YAML ``duration: true`` is
+        rejected with a clear message instead of silently becoming a 1-second
+        wait.
+        """
+        if isinstance(v, bool):
+            raise ValueError(f"duration must be a number or duration string, not boolean: {v!r}")
+        return v
+
     @model_validator(mode="after")
     def validate_agent_type(self) -> AgentDef:
         """Ensure agent has required fields for its type."""
@@ -758,6 +794,54 @@ class AgentDef(BaseModel):
                 raise ValueError("workflow agents cannot have 'dialog'")
             if self.timeout_seconds is not None:
                 raise ValueError("workflow agents cannot have 'timeout_seconds'")
+        elif self.type == "wait":
+            if self.duration is None:
+                raise ValueError("wait agents require 'duration'")
+            if self.prompt:
+                raise ValueError("wait agents cannot have 'prompt'")
+            if self.provider:
+                raise ValueError("wait agents cannot have 'provider'")
+            if self.model:
+                raise ValueError("wait agents cannot have 'model'")
+            if self.tools is not None:
+                raise ValueError("wait agents cannot have 'tools'")
+            if self.system_prompt:
+                raise ValueError("wait agents cannot have 'system_prompt'")
+            if self.options:
+                raise ValueError("wait agents cannot have 'options'")
+            if self.command:
+                raise ValueError("wait agents cannot have 'command'")
+            if self.args:
+                raise ValueError("wait agents cannot have 'args'")
+            if self.env:
+                raise ValueError("wait agents cannot have 'env'")
+            if self.working_dir:
+                raise ValueError("wait agents cannot have 'working_dir'")
+            if self.timeout is not None:
+                raise ValueError("wait agents cannot have 'timeout'")
+            if self.workflow:
+                raise ValueError("wait agents cannot have 'workflow'")
+            if self.input_mapping is not None:
+                raise ValueError("wait agents cannot have 'input_mapping'")
+            if self.max_depth is not None:
+                raise ValueError("wait agents cannot have 'max_depth'")
+            if self.max_session_seconds:
+                raise ValueError("wait agents cannot have 'max_session_seconds'")
+            if self.max_agent_iterations is not None:
+                raise ValueError("wait agents cannot have 'max_agent_iterations'")
+            if self.retry is not None:
+                raise ValueError("wait agents cannot have 'retry'")
+            if self.dialog is not None:
+                raise ValueError("wait agents cannot have 'dialog'")
+            if self.reasoning is not None:
+                raise ValueError("wait agents cannot have 'reasoning'")
+            if self.timeout_seconds is not None:
+                raise ValueError("wait agents cannot have 'timeout_seconds'")
+            if self.output is not None:
+                raise ValueError(
+                    "wait agents cannot have 'output' (output is fixed: {'waited_seconds': float})"
+                )
+            self._validate_wait_duration()
         else:
             # Regular agent or human_gate — input_mapping is not valid
             if self.input_mapping is not None:
@@ -772,7 +856,50 @@ class AgentDef(BaseModel):
                 )
         if self.type == "workflow" and self.reasoning is not None:
             raise ValueError("workflow agents cannot have 'reasoning'")
+
+        # Wait-only fields are forbidden on every other type.
+        if self.type != "wait":
+            if self.duration is not None:
+                raise ValueError(
+                    f"'{self.type or 'agent'}' agents cannot have 'duration' "
+                    "(only wait agents support duration)"
+                )
+            if self.reason is not None:
+                raise ValueError(
+                    f"'{self.type or 'agent'}' agents cannot have 'reason' "
+                    "(only wait agents support reason)"
+                )
         return self
+
+    def _validate_wait_duration(self) -> None:
+        """Validate ``duration`` for a ``wait`` agent.
+
+        Booleans are rejected outright. Templated durations (containing
+        ``{{``) defer all literal validation to runtime; for everything
+        else we parse the value and enforce ``0 < d <= 24h``.
+        """
+        value = self.duration
+        if isinstance(value, bool):
+            raise ValueError(
+                f"wait duration must be a number or duration string, not boolean: {value!r}"
+            )
+
+        if isinstance(value, str) and "{{" in value:
+            return
+
+        try:
+            seconds = parse_duration(value)  # type: ignore[arg-type]
+        except ValueError as exc:
+            raise ValueError(f"wait duration is invalid: {exc}") from exc
+
+        if seconds <= 0:
+            raise ValueError(f"wait duration must be > 0 seconds (got {seconds!r})")
+        if seconds > MAX_WAIT_DURATION_SECONDS:
+            raise ValueError(
+                f"wait duration {seconds!r}s exceeds the 24h cap "
+                f"({MAX_WAIT_DURATION_SECONDS}s); reconsider using "
+                "'limits.timeout_seconds' instead"
+            )
 
 
 class MCPServerDef(BaseModel):

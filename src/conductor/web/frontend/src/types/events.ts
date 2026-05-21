@@ -20,6 +20,9 @@ export type EventType =
   | 'script_started'
   | 'script_completed'
   | 'script_failed'
+  | 'wait_started'
+  | 'wait_completed'
+  | 'wait_failed'
   | 'gate_presented'
   | 'gate_resolved'
   | 'route_taken'
@@ -151,6 +154,35 @@ export interface ScriptCompletedData {
 }
 
 export interface ScriptFailedData {
+  agent_name: string;
+  elapsed?: number;
+  error_type?: string;
+  message?: string;
+}
+
+// --- Wait lifecycle ---
+
+export interface WaitStartedData {
+  agent_name: string;
+  iteration?: number;
+  /** Parsed duration in seconds (null if the template could not be pre-rendered). */
+  duration_seconds?: number | null;
+  reason?: string | null;
+}
+
+export interface WaitCompletedData {
+  agent_name: string;
+  elapsed?: number;
+  /** Actual wall-clock seconds slept. */
+  waited_seconds: number;
+  /** Parsed requested duration. */
+  requested_seconds: number;
+  reason?: string | null;
+  /** True if an interrupt cut the wait short. */
+  interrupted?: boolean;
+}
+
+export interface WaitFailedData {
   agent_name: string;
   elapsed?: number;
   error_type?: string;

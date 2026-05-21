@@ -24,6 +24,7 @@ import { ScriptNode } from './ScriptNode';
 import { GateNode } from './GateNode';
 import { GroupNode } from './GroupNode';
 import { WorkflowNode } from './WorkflowNode';
+import { WaitNode } from './WaitNode';
 import { EndNode } from './EndNode';
 import { StartNode } from './StartNode';
 import { IngressNode } from './IngressNode';
@@ -40,6 +41,7 @@ const nodeTypes: NodeTypes = {
   gateNode: GateNode,
   groupNode: GroupNode,
   workflowNode: WorkflowNode,
+  waitNode: WaitNode,
   endNode: EndNode,
   startNode: StartNode,
   ingressNode: IngressNode,

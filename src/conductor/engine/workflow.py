@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from conductor.duration import parse_duration
 from conductor.engine.checkpoint import CheckpointManager
 from conductor.engine.context import WorkflowContext
 from conductor.engine.limits import LimitEnforcer
@@ -41,6 +42,7 @@ from conductor.executor.linkify import linkify_markdown
 from conductor.executor.output import validate_output
 from conductor.executor.script import ScriptExecutor, ScriptOutput
 from conductor.executor.template import TemplateRenderer
+from conductor.executor.wait import WaitExecutor, WaitOutput
 from conductor.gates.human import (
     GateResult,
     HumanGateHandler,
@@ -360,6 +362,7 @@ class WorkflowEngine:
         self.gate_handler = HumanGateHandler(skip_gates=skip_gates)
         self.max_iterations_handler = MaxIterationsHandler(skip_gates=skip_gates)
         self.script_executor = ScriptExecutor()
+        self.wait_executor = WaitExecutor()
         self.usage_tracker = UsageTracker(
             pricing_overrides=self._build_pricing_overrides(),
         )
@@ -740,6 +743,32 @@ class WorkflowEngine:
         return await self.limits.wait_for_with_timeout(
             self.script_executor.execute(agent, context),
             operation_name=f"script '{agent.name}'",
+        )
+
+    async def _execute_wait(self, agent: AgentDef, context: dict[str, Any]) -> WaitOutput:
+        """Execute a wait step with workflow-level timeout enforcement.
+
+        The wait races ``asyncio.sleep`` against the engine's
+        ``interrupt_event`` so Esc / Ctrl+G cancels an in-flight wait
+        immediately. The outer ``wait_for_with_timeout`` ensures the
+        workflow-level ``limits.timeout_seconds`` still fires if it
+        would expire before the wait completes.
+
+        Args:
+            agent: Wait agent definition.
+            context: Workflow context for template rendering.
+
+        Returns:
+            :class:`WaitOutput` with elapsed seconds and interrupt flag.
+
+        Raises:
+            ValidationError: If the rendered duration is invalid.
+            ConductorTimeoutError: If the workflow timeout fires while
+                the wait is in progress.
+        """
+        return await self.limits.wait_for_with_timeout(
+            self.wait_executor.execute(agent, context, interrupt_event=self._interrupt_event),
+            operation_name=f"wait '{agent.name}'",
         )
 
     def _validate_script_output_schema(
@@ -2381,6 +2410,130 @@ class WorkflowEngine:
                             current_agent_name = route_result.target
 
                             # Check for interrupt after script step
+                            interrupt_result = await self._check_interrupt(current_agent_name)
+                            if interrupt_result is not None:
+                                current_agent_name = await self._handle_interrupt_result(
+                                    interrupt_result, current_agent_name
+                                )
+                            continue
+
+                        # Handle wait steps
+                        if agent.type == "wait":
+                            agent_context = self.context.build_for_agent(
+                                agent.name,
+                                agent.input,
+                                mode=self.config.workflow.context.mode,
+                                agent_type=agent.type,
+                            )
+                            _wait_start = _time.time()
+
+                            wait_execution_count = (
+                                self.limits.get_agent_execution_count(agent.name) + 1
+                            )
+
+                            # Resolve the duration up-front so the
+                            # ``wait_started`` event includes the parsed
+                            # value (the dashboard renders a sleeping
+                            # pill keyed off this). Templated durations
+                            # that can't be rendered will raise inside
+                            # ``_execute_wait`` below; emit ``None`` here
+                            # so the event still fires for debuggability.
+                            try:
+                                rendered_duration = self.renderer.render(
+                                    str(agent.duration), agent_context
+                                )
+                                preview_duration_seconds: float | None = parse_duration(
+                                    rendered_duration
+                                )
+                            except (ValueError, Exception):  # noqa: BLE001 — defensive
+                                preview_duration_seconds = None
+                            preview_reason: str | None = None
+                            if agent.reason is not None:
+                                try:
+                                    preview_reason = self.renderer.render(
+                                        agent.reason, agent_context
+                                    )
+                                except Exception:  # noqa: BLE001 — defensive
+                                    preview_reason = agent.reason
+
+                            self._emit(
+                                "wait_started",
+                                {
+                                    "agent_name": agent.name,
+                                    "iteration": wait_execution_count,
+                                    "duration_seconds": preview_duration_seconds,
+                                    "reason": preview_reason,
+                                },
+                            )
+
+                            try:
+                                wait_output = await self._execute_wait(agent, agent_context)
+                            except Exception as exc:
+                                _wait_elapsed = _time.time() - _wait_start
+                                self._emit(
+                                    "wait_failed",
+                                    {
+                                        "agent_name": agent.name,
+                                        "elapsed": _wait_elapsed,
+                                        "error_type": type(exc).__name__,
+                                        "message": str(exc),
+                                    },
+                                )
+                                raise
+                            _wait_elapsed = _time.time() - _wait_start
+
+                            # Public output contract (per issue #218):
+                            # only ``waited_seconds`` is exposed in the
+                            # workflow context. Extra metadata lives in
+                            # the event payload below for the dashboard.
+                            output_content: dict[str, Any] = {
+                                "waited_seconds": wait_output.waited_seconds,
+                            }
+
+                            self._emit(
+                                "wait_completed",
+                                {
+                                    "agent_name": agent.name,
+                                    "elapsed": _wait_elapsed,
+                                    "waited_seconds": wait_output.waited_seconds,
+                                    "requested_seconds": wait_output.requested_seconds,
+                                    "reason": wait_output.reason,
+                                    "interrupted": wait_output.interrupted,
+                                },
+                            )
+
+                            self.context.store(agent.name, output_content)
+                            self.limits.record_execution(agent.name)
+                            self.limits.check_timeout()
+
+                            route_result = self._evaluate_routes(agent, output_content)
+
+                            self._emit(
+                                "route_taken",
+                                {
+                                    "from_agent": agent.name,
+                                    "to_agent": route_result.target,
+                                },
+                            )
+
+                            if route_result.target == "$end":
+                                result = self._build_final_output(route_result.output_transform)
+                                self._emit(
+                                    "workflow_completed",
+                                    {
+                                        "elapsed": _time.time() - _workflow_start,
+                                        "output": result,
+                                    },
+                                )
+                                self._execute_hook("on_complete", result=result)
+                                return result
+
+                            current_agent_name = route_result.target
+
+                            # Check for interrupt after wait step. If the
+                            # sleep was cut short by ``interrupt_event``,
+                            # the flag is still set here and triggers the
+                            # normal interrupt menu / web-mode handling.
                             interrupt_result = await self._check_interrupt(current_agent_name)
                             if interrupt_result is not None:
                                 current_agent_name = await self._handle_interrupt_result(

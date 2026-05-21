@@ -14,6 +14,9 @@ import type {
   AgentMessageData,
   ScriptCompletedData,
   ScriptFailedData,
+  WaitStartedData,
+  WaitCompletedData,
+  WaitFailedData,
   GatePresentedData,
   GateResolvedData,
   GateOptionDetail,
@@ -105,6 +108,12 @@ export interface NodeData {
   stdout?: string;
   stderr?: string;
   exit_code?: number;
+  // Wait-specific
+  duration_seconds?: number | null;
+  waited_seconds?: number;
+  requested_seconds?: number;
+  reason?: string | null;
+  interrupted?: boolean;
   // Gate-specific
   options?: string[];
   option_details?: GateOptionDetail[];
@@ -1216,6 +1225,43 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     replaceNode(t.nodes, data.agent_name);
   },
 
+  wait_started: (state, _data, timestamp) => {
+    const data = _data as unknown as WaitStartedData;
+    const t = activeTarget(state, _data);
+    const nd = ensureNode(t.nodes, data.agent_name);
+    nd.status = 'running';
+    nd.startedAt = timestamp ?? Date.now() / 1000;
+    nd.duration_seconds = data.duration_seconds ?? null;
+    nd.reason = data.reason ?? null;
+    nd.iteration = data.iteration;
+    replaceNode(t.nodes, data.agent_name);
+  },
+
+  wait_completed: (state, _data) => {
+    const data = _data as unknown as WaitCompletedData;
+    const t = activeTarget(state, _data);
+    const nd = ensureNode(t.nodes, data.agent_name);
+    nd.status = 'completed';
+    t.incrCompleted();
+    nd.elapsed = data.elapsed;
+    nd.waited_seconds = data.waited_seconds;
+    nd.requested_seconds = data.requested_seconds;
+    nd.reason = data.reason ?? null;
+    nd.interrupted = data.interrupted;
+    replaceNode(t.nodes, data.agent_name);
+  },
+
+  wait_failed: (state, _data) => {
+    const data = _data as unknown as WaitFailedData;
+    const t = activeTarget(state, _data);
+    const nd = ensureNode(t.nodes, data.agent_name);
+    nd.status = 'failed';
+    nd.elapsed = data.elapsed;
+    nd.error_type = data.error_type;
+    nd.error_message = data.message;
+    replaceNode(t.nodes, data.agent_name);
+  },
+
   gate_presented: (state, _data) => {
     const data = _data as unknown as GatePresentedData;
     const t = activeTarget(state, _data);
@@ -1777,6 +1823,32 @@ function buildLogEntry(event: WorkflowEvent): LogEntry | null {
     case 'script_failed':
       return { timestamp: ts, level: 'error', source: String(d.agent_name), message: `Script failed: ${d.message || d.error_type || 'unknown error'}` };
 
+    case 'wait_started': {
+      const dur = d.duration_seconds as number | null | undefined;
+      const reason = d.reason as string | null | undefined;
+      const durStr = typeof dur === 'number' ? formatSec(dur) : '?';
+      return {
+        timestamp: ts,
+        level: 'info',
+        source: String(d.agent_name),
+        message: `Waiting ${durStr}${reason ? ` — ${reason}` : ''}`,
+      };
+    }
+
+    case 'wait_completed': {
+      const waited = d.waited_seconds as number | undefined;
+      const interrupted = d.interrupted as boolean | undefined;
+      return {
+        timestamp: ts,
+        level: 'success',
+        source: String(d.agent_name),
+        message: `Wait completed${waited != null ? ` (${formatSec(waited)})` : ''}${interrupted ? ' — interrupted' : ''}`,
+      };
+    }
+
+    case 'wait_failed':
+      return { timestamp: ts, level: 'error', source: String(d.agent_name), message: `Wait failed: ${d.message || d.error_type || 'unknown error'}` };
+
     case 'gate_presented':
       return { timestamp: ts, level: 'warning', source: String(d.agent_name), message: 'Waiting for human input…' };
 
@@ -1927,6 +1999,32 @@ function buildActivityLogEntry(event: WorkflowEvent): ActivityLogEntry | null {
 
     case 'script_failed':
       return { timestamp: ts, source: String(d.agent_name), type: 'turn', message: `Script failed: ${d.message || d.error_type || 'unknown'}` };
+
+    case 'wait_started': {
+      const dur = d.duration_seconds as number | null | undefined;
+      const reason = d.reason as string | null | undefined;
+      const durStr = typeof dur === 'number' ? formatSec(dur) : '?';
+      return {
+        timestamp: ts,
+        source: String(d.agent_name),
+        type: 'turn',
+        message: `Waiting ${durStr}${reason ? ` — ${reason}` : ''}`,
+      };
+    }
+
+    case 'wait_completed': {
+      const waited = d.waited_seconds as number | undefined;
+      const interrupted = d.interrupted as boolean | undefined;
+      return {
+        timestamp: ts,
+        source: String(d.agent_name),
+        type: 'tool-complete',
+        message: `Wait completed${waited != null ? ` (${formatSec(waited)})` : ''}${interrupted ? ' — interrupted' : ''}`,
+      };
+    }
+
+    case 'wait_failed':
+      return { timestamp: ts, source: String(d.agent_name), type: 'turn', message: `Wait failed: ${d.message || d.error_type || 'unknown'}` };
 
     default:
       return null;

@@ -8,6 +8,7 @@ import { GateDetail } from './GateDetail';
 import { GroupDetail } from './GroupDetail';
 import { DialogEngagementPrompt } from './DialogEngagementPrompt';
 import { SubworkflowDetail } from './SubworkflowDetail';
+import { WaitDetail } from './WaitDetail';
 import { cn } from '@/lib/utils';
 
 export function DetailPanel() {
@@ -47,6 +48,8 @@ export function DetailPanel() {
     switch (node.type) {
       case 'script':
         return ScriptDetail;
+      case 'wait':
+        return WaitDetail;
       case 'human_gate':
         return GateDetail;
       case 'parallel_group':

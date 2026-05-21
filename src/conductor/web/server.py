@@ -639,7 +639,7 @@ class WebDashboard:
     def _synth_agent_or_script(
         name: str, agent_def: Any, output: Any
     ) -> tuple[str, dict[str, Any], str, dict[str, Any]]:
-        """Build synthetic (started, completed) event payloads for an agent/script."""
+        """Build synthetic (started, completed) event payloads for an agent/script/wait."""
         agent_type = getattr(agent_def, "type", None) or "agent"
         output_dict = output if isinstance(output, dict) else {}
 
@@ -658,6 +658,26 @@ class WebDashboard:
                 "synthetic": True,
             }
             return "script_started", started_data, "script_completed", completed_data
+
+        if agent_type == "wait":
+            waited = output_dict.get("waited_seconds", 0.0)
+            started_data = {
+                "agent_name": name,
+                "iteration": 1,
+                "duration_seconds": waited,
+                "reason": getattr(agent_def, "reason", None),
+                "synthetic": True,
+            }
+            completed_data = {
+                "agent_name": name,
+                "elapsed": waited,
+                "waited_seconds": waited,
+                "requested_seconds": waited,
+                "reason": getattr(agent_def, "reason", None),
+                "interrupted": False,
+                "synthetic": True,
+            }
+            return "wait_started", started_data, "wait_completed", completed_data
 
         started_data = {
             "agent_name": name,

@@ -22,7 +22,7 @@ CHARS_PER_TOKEN = 4
 # once at startup and present for the lifetime of the run. Per-step agent
 # outputs remain explicitly declared in ``input:`` for traceability, even for
 # local renders.
-_LOCAL_RENDER_AGENT_TYPES = frozenset({"script", "workflow"})
+_LOCAL_RENDER_AGENT_TYPES = frozenset({"script", "workflow", "wait"})
 
 
 def estimate_tokens(text: str) -> int:
