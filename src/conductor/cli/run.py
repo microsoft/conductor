@@ -24,6 +24,7 @@ from rich.table import Table
 
 from conductor.config.loader import load_config
 from conductor.engine.workflow import ExecutionPlan, WorkflowEngine
+from conductor.exceptions import WorkflowTerminated
 from conductor.mcp_auth import resolve_mcp_server_auth
 from conductor.providers.registry import ProviderRegistry
 
@@ -1343,6 +1344,10 @@ async def run_workflow_async(
                     _verbose_console.print("[dim]Press Esc to interrupt and provide guidance[/dim]")
 
                 result = await _run_with_stop_signal(engine, inputs, dashboard)
+            except WorkflowTerminated:
+                # Explicit `type: terminate status: failed` — no resume hint
+                # because this is an intentional, non-resumable outcome.
+                raise
             except BaseException:
                 _print_resume_instructions(engine)
                 raise
@@ -1910,6 +1915,10 @@ async def resume_workflow_async(
                     _verbose_console.print("[dim]Press Esc to interrupt and provide guidance[/dim]")
 
                 result = await _resume_with_stop_signal(engine, cp.current_agent, dashboard)
+            except WorkflowTerminated:
+                # Explicit `type: terminate status: failed` — no resume hint
+                # because this is an intentional, non-resumable outcome.
+                raise
             except BaseException:
                 _print_resume_instructions(engine)
                 raise

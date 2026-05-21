@@ -204,7 +204,7 @@ def validate_workflow_config(
         parallel_errors = _validate_parallel_groups(config)
         errors.extend(parallel_errors)
 
-    # Validate for_each groups: reject script and wait steps as inline agents
+    # Validate for_each groups: reject step types that can't be used inline
     for for_each_group in config.for_each:
         if for_each_group.agent.type == "script":
             errors.append(
@@ -215,6 +215,12 @@ def validate_workflow_config(
             errors.append(
                 f"For-each group '{for_each_group.name}' uses a wait step as its "
                 "inline agent. Wait steps cannot be used in for_each groups."
+            )
+        if for_each_group.agent.type == "terminate":
+            errors.append(
+                f"For-each group '{for_each_group.name}' uses a terminate step as its "
+                "inline agent. Terminate steps cannot run inside a for_each iteration; "
+                "route to a terminate step from the for_each group's routes instead."
             )
 
     # Validate sub-workflow references (local paths and registry refs).
@@ -512,6 +518,14 @@ def _validate_parallel_groups(config: WorkflowConfig) -> list[str]:
                     "Workflow steps cannot be used in parallel groups."
                 )
 
+            # Validate no terminate steps in parallel groups
+            if agent.type == "terminate":
+                errors.append(
+                    f"Agent '{agent_name}' in parallel group '{pg.name}' is a terminate step. "
+                    "Terminate steps cannot run inside a parallel branch; route to a "
+                    "terminate step from the parallel group's routes instead."
+                )
+
         # PE-6.2: Validate parallel group route targets
         for_each_names = {fe.name for fe in config.for_each}
         all_names = agent_names | parallel_names | for_each_names
@@ -569,6 +583,15 @@ def _validate_parallel_groups(config: WorkflowConfig) -> list[str]:
     return errors
 
 
+def _terminate_agent_names(config: WorkflowConfig) -> set[str]:
+    """Names of agents whose ``type`` is ``terminate``.
+
+    Terminate steps end the workflow when reached and behave like ``$end`` for
+    path-enumeration purposes (no outbound edges, sink in the routing graph).
+    """
+    return {agent.name for agent in config.agents if agent.type == "terminate"}
+
+
 def _build_routing_graph(config: WorkflowConfig) -> dict[str, list[tuple[str, bool]]]:
     """Build adjacency list from workflow config for path analysis.
 
@@ -580,6 +603,10 @@ def _build_routing_graph(config: WorkflowConfig) -> dict[str, list[tuple[str, bo
     """
     graph: dict[str, list[tuple[str, bool]]] = {}
     for agent in config.agents:
+        # Terminate steps end the workflow; treat them as sinks with no edges.
+        if agent.type == "terminate":
+            graph[agent.name] = []
+            continue
         edges: list[tuple[str, bool]] = []
         if agent.routes:
             for route in agent.routes:
@@ -599,13 +626,17 @@ def _enumerate_paths_to_end(
     start: str,
     graph: dict[str, list[tuple[str, bool]]],
     max_depth: int = 50,
+    terminal_nodes: frozenset[str] = frozenset(),
 ) -> list[list[str]]:
-    """Enumerate paths from start to $end via DFS, up to _MAX_ENUMERATED_PATHS.
+    """Enumerate paths from start to a terminal node via DFS.
 
     Args:
         start: Entry point node name.
         graph: Adjacency list from _build_routing_graph.
         max_depth: Maximum path depth (prevents infinite exploration).
+        terminal_nodes: Set of node names that terminate the workflow in
+            addition to the implicit ``$end`` sentinel (e.g., ``type: terminate``
+            steps).
 
     Returns:
         List of paths (up to _MAX_ENUMERATED_PATHS), where each path is a list
@@ -620,6 +651,11 @@ def _enumerate_paths_to_end(
             return
         if current == "$end":
             paths.append(list(path))
+            return
+        if current in terminal_nodes:
+            # Terminal node (e.g., terminate step) — record it as part of the
+            # path so callers can inspect the terminating step.
+            paths.append(list(path) + [current])
             return
         if current not in graph or current in visited:
             return
@@ -882,7 +918,11 @@ def _validate_output_path_coverage(config: WorkflowConfig) -> list[str]:
     """Validate that output template references are reachable on all paths.
 
     Emits warnings (not errors) for output template references to agents/groups
-    that don't appear on every possible execution path from entry_point to $end.
+    that don't appear on every possible execution path from entry_point to a
+    terminal node (``$end`` or a ``type: terminate`` step). Paths that end on a
+    terminate step whose ``output_template`` is set are excluded from coverage
+    because that step supplies its own final output dict and bypasses the
+    workflow-level ``output:``.
 
     Args:
         config: The WorkflowConfig to validate.
@@ -896,7 +936,25 @@ def _validate_output_path_coverage(config: WorkflowConfig) -> list[str]:
     graph = _build_routing_graph(config)
     node_count = len(config.agents) + len(config.parallel) + len(config.for_each)
     max_depth = max(config.workflow.limits.max_iterations, node_count)
-    paths = _enumerate_paths_to_end(config.workflow.entry_point, graph, max_depth)
+    terminate_names = _terminate_agent_names(config)
+    paths = _enumerate_paths_to_end(
+        config.workflow.entry_point,
+        graph,
+        max_depth,
+        terminal_nodes=frozenset(terminate_names),
+    )
+
+    if not paths:
+        return []
+
+    # Drop paths that terminate via a `type: terminate` step whose
+    # `output_template` overrides the workflow-level `output:`. Those paths do
+    # not consume the workflow `output:` mapping and would produce spurious
+    # "not reached" warnings.
+    overriding_terminators = {
+        a.name for a in config.agents if a.type == "terminate" and a.output_template is not None
+    }
+    paths = [p for p in paths if not p or p[-1] not in overriding_terminators]
 
     if not paths:
         return []
@@ -912,7 +970,11 @@ def _validate_output_path_coverage(config: WorkflowConfig) -> list[str]:
             # Pick the shortest example path for the warning message
             missing_paths.sort(key=len)
             example = missing_paths[0]
-            path_str = " \u2192 ".join(example + ["$end"])
+            # If the path ended on a terminate step, show that explicitly;
+            # otherwise append the implicit "$end" marker.
+            tail = "$end" if not example or example[-1] not in terminate_names else ""
+            display = example + ([tail] if tail else [])
+            path_str = " \u2192 ".join(display)
             warnings.append(
                 f"Output template references '{ref}' which may not run on all paths. "
                 f"Example path where it is skipped: {path_str}. "
@@ -962,6 +1024,20 @@ def _collect_template_strings(
     if input_mapping:
         for key, expr in input_mapping.items():
             templates.append((f"agent '{agent.name}' input_mapping.{key}", expr))
+
+    # Terminate steps: validate `reason` and `output_template` like other
+    # Jinja2-rendered fields so bad refs fail at validate-time, not runtime.
+    # `getattr` matches the duck-typed-agent path used by
+    # `TestInputMappingTemplateCollection` (mirrors the `input_mapping`
+    # forward-compatibility shim above).
+    if getattr(agent, "type", None) == "terminate":
+        reason = getattr(agent, "reason", None)
+        if reason:
+            templates.append((f"agent '{agent.name}' reason", reason))
+        output_template: dict[str, str] | None = getattr(agent, "output_template", None)
+        if output_template:
+            for key, expr in output_template.items():
+                templates.append((f"agent '{agent.name}' output_template.{key}", expr))
 
     return templates
 

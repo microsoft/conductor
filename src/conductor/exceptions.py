@@ -512,6 +512,55 @@ class HumanGateError(ExecutionError):
         super().__init__(message, suggestion, file_path, line_number)
 
 
+class WorkflowTerminated(ExecutionError):
+    """Raised when a ``type: terminate`` step ends the workflow with ``status: failed``.
+
+    This is an *explicit* termination signal — not an unexpected failure. It carries
+    the rendered output, reason, and the name of the terminate step that fired so
+    the CLI, event consumers, and dashboard can distinguish it from generic errors.
+
+    The engine emits ``workflow_failed`` with ``is_explicit: True`` for this path
+    and intentionally skips checkpoint creation: an explicit termination is not a
+    resumable failure.
+
+    Attributes:
+        output: The rendered final output dict (from ``output_template`` if
+            provided, else the workflow-level ``output:`` mapping).
+        reason: The rendered termination reason (Jinja2-resolved against context).
+        terminated_by: The ``name`` of the terminate step that fired.
+        status: Always ``"failed"`` (success terminations return normally and do
+            not raise).
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        output: dict,
+        reason: str,
+        terminated_by: str,
+        status: str = "failed",
+        suggestion: str | None = None,
+    ) -> None:
+        """Initialize a WorkflowTerminated exception.
+
+        Args:
+            message: The error message describing the termination (typically the
+                rendered ``reason``).
+            output: The rendered final output dict for the workflow.
+            reason: The rendered termination reason.
+            terminated_by: Name of the terminate step that fired.
+            status: Always ``"failed"`` — kept as a parameter for forward
+                compatibility if non-binary statuses are ever added.
+            suggestion: Optional advice for resolving the termination.
+        """
+        self.output = output
+        self.reason = reason
+        self.terminated_by = terminated_by
+        self.status = status
+        super().__init__(message, suggestion=suggestion, agent_name=terminated_by)
+
+
 class InterruptError(ExecutionError):
     """Raised when the user stops a workflow via the interrupt menu.
 

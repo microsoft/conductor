@@ -469,6 +469,15 @@ def run(
         output_console.print_json(json.dumps(result))
 
     except Exception as e:
+        from conductor.exceptions import WorkflowTerminated
+
+        if isinstance(e, WorkflowTerminated):
+            # Explicit `type: terminate` with `status: failed`. Print the
+            # rendered final output so downstream tooling can read it, surface
+            # the reason as a user-facing message, then exit non-zero.
+            output_console.print_json(json.dumps(e.output))
+            console.print(f"[red]Workflow terminated[/red] at '{e.terminated_by}': {e.reason}")
+            raise typer.Exit(code=1) from None
         print_error(e)
         raise typer.Exit(code=1) from None
 
@@ -877,6 +886,12 @@ def resume(
         output_console.print_json(json.dumps(result))
 
     except Exception as e:
+        from conductor.exceptions import WorkflowTerminated
+
+        if isinstance(e, WorkflowTerminated):
+            output_console.print_json(json.dumps(e.output))
+            console.print(f"[red]Workflow terminated[/red] at '{e.terminated_by}': {e.reason}")
+            raise typer.Exit(code=1) from None
         print_error(e)
         raise typer.Exit(code=1) from None
 

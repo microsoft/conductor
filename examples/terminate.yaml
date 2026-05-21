@@ -1,0 +1,122 @@
+# Terminate Step Example
+#
+# This example demonstrates `type: terminate` steps, which end the workflow
+# with an explicit status (success/failed) and a structured reason. Reaching
+# a terminate step ends the workflow immediately:
+#
+#   - status: success  → CLI exit code 0, dashboard ✅,
+#                        emits `workflow_completed` with
+#                        `termination_reason`, `terminated_by`,
+#                        and `is_explicit: true`.
+#   - status: failed   → CLI exit code 1, dashboard ❌,
+#                        emits `workflow_failed` with the same metadata
+#                        plus `error_type: WorkflowTerminated`.
+#                        No checkpoint is saved (explicit termination
+#                        is not resumable).
+#
+# A terminate step's optional `output_template:` replaces the workflow-level
+# `output:` mapping for that termination path. When omitted, the workflow's
+# `output:` is rendered as on any normal `$end` path.
+#
+# Usage:
+#   conductor run examples/terminate.yaml --input document_state=stale
+#   conductor run examples/terminate.yaml --input document_state=current
+#   conductor run examples/terminate.yaml --input document_state=unsafe
+
+workflow:
+  name: terminate-demo
+  description: Demonstrates type=terminate with success and failure paths
+  version: "1.0.0"
+  entry_point: precheck
+
+  input:
+    document_state:
+      type: string
+      description: Simulated state of an upstream document. One of `current`, `stale`, or `unsafe`.
+      default: stale
+
+  runtime:
+    provider: copilot
+
+  limits:
+    max_iterations: 10
+
+agents:
+  - name: precheck
+    type: script
+    description: Classify the upstream document state and route accordingly
+    command: bash
+    args:
+      - "-c"
+      - |
+        state="{{ workflow.input.document_state }}"
+        case "$state" in
+          current)
+            echo '{"action":"noop","reason":"Document already up to date; no edits needed."}'
+            ;;
+          stale)
+            echo '{"action":"refresh","reason":"Document is stale; running refresh pipeline."}'
+            ;;
+          *)
+            echo '{"action":"abort","reason":"Document state \"'"$state"'\" is not safe to process."}'
+            ;;
+        esac
+    output:
+      action:
+        type: string
+        description: One of `noop`, `refresh`, or `abort`.
+      reason:
+        type: string
+        description: Human-readable explanation of the chosen action.
+    routes:
+      - when: "action == 'noop'"
+        to: noop_exit
+      - when: "action == 'abort'"
+        to: abort_unsafe
+      - to: refresh
+
+  # Success termination — workflow completes cleanly with status=success.
+  # The CLI exits 0 and the dashboard shows ✅.
+  - name: noop_exit
+    type: terminate
+    description: No work needed; document already current
+    status: success
+    reason: "{{ precheck.output.reason }}"
+    output_template:
+      result: "no-op"
+      reason: "{{ precheck.output.reason }}"
+
+  # Failure termination — workflow ends with status=failed. The CLI exits 1
+  # and the dashboard shows ❌. Downstream tooling (CI, notifications) can
+  # distinguish this from a generic exception via `is_explicit: true` in the
+  # `workflow_failed` event.
+  - name: abort_unsafe
+    type: terminate
+    description: Refuse to run downstream steps on unsafe input
+    status: failed
+    reason: "{{ precheck.output.reason }}"
+    output_template:
+      result: "aborted"
+      stage: "precheck"
+      reason: "{{ precheck.output.reason }}"
+
+  # Normal path — runs the "real" pipeline and lets the workflow-level
+  # `output:` mapping render the final result.
+  - name: refresh
+    model: claude-haiku-4.5
+    description: Refresh the stale document (simulated)
+    prompt: |
+      The upstream document needs to be refreshed.
+
+      Reason: {{ precheck.output.reason }}
+
+      Briefly summarize, in one sentence, what a refresh pipeline would do
+      for a stale document. Reply with JSON: {"summary": "..."}.
+    output:
+      summary:
+        type: string
+    routes:
+      - to: $end
+
+output:
+  result: "{{ refresh.output.summary | default('') }}"

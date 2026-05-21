@@ -33,6 +33,7 @@ from conductor.exceptions import (
     InterruptError,
     MaxIterationsError,
     ValidationError,
+    WorkflowTerminated,
 )
 from conductor.exceptions import (
     TimeoutError as ConductorTimeoutError,
@@ -1264,7 +1265,7 @@ class WorkflowEngine:
             instructions_preamble=child_preamble,
         )
 
-        return await child_engine.run(sub_inputs)
+        return await self._run_child_engine(child_engine, sub_inputs, agent)
 
     async def _execute_subworkflow_with_inputs(
         self,
@@ -1376,9 +1377,53 @@ class WorkflowEngine:
 
         child_engine = WorkflowEngine(**child_engine_kwargs)
 
-        output = await child_engine.run(sub_inputs)
+        output = await self._run_child_engine(child_engine, sub_inputs, agent)
         usage = child_engine.usage_tracker.get_summary()
         return output, usage
+
+    async def _run_child_engine(
+        self,
+        child_engine: WorkflowEngine,
+        sub_inputs: dict[str, Any],
+        agent: AgentDef,
+    ) -> dict[str, Any]:
+        """Run a child sub-workflow engine and convert child-level termination.
+
+        A ``WorkflowTerminated`` raised by a child sub-workflow (i.e. a
+        ``type: terminate`` step with ``status: failed`` inside the child)
+        must NOT propagate as ``WorkflowTerminated`` to the parent — the
+        parent did not explicitly terminate, the child did. The parent
+        should see this as a normal sub-workflow failure so its own
+        ``subworkflow_failed`` event fires and the parent's outer error
+        handling treats it like any other ``ExecutionError``.
+
+        Successful terminations inside a child propagate normally: the
+        child returns its rendered output dict and the parent continues.
+
+        Args:
+            child_engine: Already-constructed child :class:`WorkflowEngine`.
+            sub_inputs: Inputs to pass to ``child_engine.run()``.
+            agent: The parent's ``type: workflow`` agent definition (used
+                for diagnostic messages).
+
+        Returns:
+            The child workflow's final output dict.
+        """
+        try:
+            return await child_engine.run(sub_inputs)
+        except WorkflowTerminated as exc:
+            raise ExecutionError(
+                f"Sub-workflow '{agent.workflow}' (agent '{agent.name}') "
+                f"terminated explicitly: {exc.reason}",
+                suggestion=(
+                    "The sub-workflow ended with `type: terminate` and "
+                    "`status: failed`. To surface the termination details to "
+                    "the parent's routes, change the terminate step to "
+                    "`status: success` and put the reason/status in its "
+                    "`output_template:`."
+                ),
+                agent_name=agent.name,
+            ) from exc
 
     async def _get_provider_for_agent(self, agent: AgentDef) -> AgentProvider | None:
         """Resolve the provider that will (or did) execute ``agent``.
@@ -2286,6 +2331,97 @@ class WorkflowEngine:
                         # Trim context if max_tokens is configured
                         self._trim_context_if_needed()
 
+                        # Handle terminate steps — explicit workflow exit with a
+                        # structured reason and status. Reached via a normal
+                        # route from any upstream agent/group; the engine ends
+                        # the workflow immediately (no routes evaluated after).
+                        if agent.type == "terminate":
+                            terminate_elapsed = _time.time() - _workflow_start
+                            agent_context = self.context.build_for_agent(
+                                agent.name,
+                                agent.input,
+                                mode=self.config.workflow.context.mode,
+                                agent_type=agent.type,
+                            )
+                            # Render the reason against context first so the
+                            # rendered value is available to output_template
+                            # and to the workflow-level output: fallback.
+                            rendered_reason = self.renderer.render(
+                                agent.reason or "", agent_context
+                            )
+                            # Store the terminate step's own context entry
+                            # BEFORE building the final output so workflow.output
+                            # templates can reference {{ <step>.reason }} /
+                            # {{ <step>.status }} if desired.
+                            self.context.store(
+                                agent.name,
+                                {
+                                    "status": agent.status,
+                                    "reason": rendered_reason,
+                                    "terminated_by": agent.name,
+                                },
+                            )
+                            self.limits.record_execution(agent.name)
+                            self.limits.check_timeout()
+
+                            # Build the final output: prefer output_template
+                            # when set (replaces workflow-level output:);
+                            # otherwise fall back to the workflow's output:
+                            # mapping rendered as usual.
+                            output = self._build_terminate_output(agent)
+
+                            termination_meta = {
+                                "termination_reason": rendered_reason,
+                                "terminated_by": agent.name,
+                                "is_explicit": True,
+                                "status": agent.status,
+                            }
+
+                            if agent.status == "success":
+                                self._emit(
+                                    "agent_completed",
+                                    {
+                                        "agent_name": agent.name,
+                                        "elapsed": _time.time()
+                                        - _workflow_start
+                                        - terminate_elapsed,
+                                        "agent_type": "terminate",
+                                        **termination_meta,
+                                    },
+                                )
+                                self._emit(
+                                    "workflow_completed",
+                                    {
+                                        "elapsed": _time.time() - _workflow_start,
+                                        "output": output,
+                                        **termination_meta,
+                                    },
+                                )
+                                self._execute_hook("on_complete", result=output)
+                                return output
+
+                            # status == "failed" — raise an explicit termination
+                            # exception. The dedicated handler below emits
+                            # workflow_failed with is_explicit=True and skips
+                            # the on-failure checkpoint save.
+                            self._emit(
+                                "agent_failed",
+                                {
+                                    "agent_name": agent.name,
+                                    "elapsed": _time.time() - _workflow_start - terminate_elapsed,
+                                    "agent_type": "terminate",
+                                    "error_type": "WorkflowTerminated",
+                                    "message": rendered_reason,
+                                    **termination_meta,
+                                },
+                            )
+                            raise WorkflowTerminated(
+                                rendered_reason,
+                                output=output,
+                                reason=rendered_reason,
+                                terminated_by=agent.name,
+                            )
+
                         # Handle human gates
                         if agent.type == "human_gate":
                             # Build context for the gate prompt
@@ -2932,8 +3068,27 @@ class WorkflowEngine:
         except KeyboardInterrupt:
             self._save_checkpoint_on_failure(KeyboardInterrupt("Workflow interrupted by user"))
             raise
-        except ConductorError as e:
+        except WorkflowTerminated as e:
+            # Explicit `type: terminate` with `status: failed`. The workflow
+            # ended intentionally — emit `workflow_failed` with rich termination
+            # metadata so the CLI/dashboard/JSONL can distinguish it from an
+            # unexpected failure. Skip the on-failure checkpoint: an explicit
+            # termination is not a resumable transient failure.
             fail_data: dict[str, Any] = {
+                "error_type": "WorkflowTerminated",
+                "message": e.reason,
+                "agent_name": e.terminated_by,
+                "termination_reason": e.reason,
+                "terminated_by": e.terminated_by,
+                "status": e.status,
+                "is_explicit": True,
+                "output": e.output,
+            }
+            self._emit("workflow_failed", fail_data)
+            self._execute_hook("on_error", error=e)
+            raise
+        except ConductorError as e:
+            fail_data = {
                 "error_type": type(e).__name__,
                 "message": str(e),
                 "agent_name": self._current_agent_name,
@@ -4661,6 +4816,33 @@ class WorkflowEngine:
             for key, value in route_output_transform.items():
                 result[key] = self._maybe_parse_json(value) if isinstance(value, str) else value
 
+        return result
+
+    def _build_terminate_output(self, agent: AgentDef) -> dict[str, Any]:
+        """Build the final output for a ``type: terminate`` step.
+
+        When ``agent.output_template`` is set, render its entries against the
+        accumulated context and use them as the final workflow output
+        (replacing the workflow-level ``output:`` mapping). Otherwise, fall
+        back to ``_build_final_output(None)`` so the workflow-level ``output:``
+        is rendered as on any other terminal path.
+
+        Args:
+            agent: The terminate-step agent definition.
+
+        Returns:
+            Dict with rendered output values, ready for the
+            ``workflow_completed`` / ``workflow_failed`` event payload and
+            stdout JSON.
+        """
+        if agent.output_template is None:
+            return self._build_final_output(None)
+
+        ctx = self.context.get_for_template()
+        result: dict[str, Any] = {}
+        for key, template in agent.output_template.items():
+            rendered = self.renderer.render(template, ctx)
+            result[key] = self._maybe_parse_json(rendered)
         return result
 
     @staticmethod

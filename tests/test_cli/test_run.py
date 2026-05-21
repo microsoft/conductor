@@ -980,3 +980,128 @@ output:
         # agent1 should be marked as a loop target
         agent1_step = next(s for s in plan.steps if s.agent_name == "agent1")
         assert agent1_step.is_loop_target is True
+
+
+class TestRunCommandTerminate:
+    """CLI integration tests for ``type: terminate`` steps (issue #219).
+
+    The CLI must:
+    - Exit with code 0 and print the rendered output JSON when a workflow ends
+      via ``terminate status: success``.
+    - Exit with non-zero code AND still print the rendered output JSON when a
+      workflow ends via ``terminate status: failed``, plus a user-facing
+      message naming the step that fired and the rendered reason.
+
+    These tests patch ``run_workflow_async`` so we exercise only the
+    exit-code / stdout / stderr wiring; engine semantics are covered in
+    ``tests/test_engine/test_workflow.py::TestWorkflowEngineTerminate``.
+    """
+
+    def test_run_success_terminate_exits_zero_and_prints_output(self, tmp_path: Path) -> None:
+        """Success-terminate: behaves like any clean workflow exit (code 0)."""
+        workflow_file = tmp_path / "wf.yaml"
+        workflow_file.write_text("""\
+workflow:
+  name: t
+  entry_point: bye
+agents:
+  - name: bye
+    type: terminate
+    status: success
+    reason: "all done"
+    output_template:
+      result: "no-op"
+output: {}
+""")
+        # `run` (not the engine) only sees `run_workflow_async`'s return;
+        # success-terminate returns the rendered output dict normally.
+        with patch("conductor.cli.run.run_workflow_async") as mock_run:
+            mock_run.return_value = {"result": "no-op"}
+
+            result = runner.invoke(app, ["run", str(workflow_file)])
+
+        assert result.exit_code == 0, result.output
+        # Output JSON should be present (Rich's `print_json` colors it; check
+        # the structural pieces are there rather than parsing).
+        assert '"result"' in result.output
+        assert '"no-op"' in result.output
+
+    def test_run_failed_terminate_exits_nonzero_and_prints_output_and_reason(
+        self, tmp_path: Path
+    ) -> None:
+        """Failed-terminate: exits non-zero, prints rendered output AND reason.
+
+        Downstream tooling (CI scripts, dashboards) reads the JSON from stdout
+        regardless of exit code; humans read the reason from stderr. Both
+        must be present.
+        """
+        from conductor.exceptions import WorkflowTerminated
+
+        workflow_file = tmp_path / "wf.yaml"
+        workflow_file.write_text("""\
+workflow:
+  name: t
+  entry_point: bye
+agents:
+  - name: bye
+    type: terminate
+    status: failed
+    reason: "unsafe input"
+    output_template:
+      aborted: "true"
+output: {}
+""")
+        with patch("conductor.cli.run.run_workflow_async") as mock_run:
+            mock_run.side_effect = WorkflowTerminated(
+                "unsafe input",
+                output={"aborted": True, "reason": "unsafe input"},
+                reason="unsafe input",
+                terminated_by="bye",
+            )
+
+            result = runner.invoke(app, ["run", str(workflow_file)])
+
+        assert result.exit_code == 1, result.output
+        # Rendered output JSON is on stdout for tooling.
+        assert '"aborted"' in result.output
+        # Reason + step name on stderr (Rich routes the warning through the
+        # error console). CliRunner mixes stdout/stderr so look in `output`.
+        assert "unsafe input" in result.output
+        assert "bye" in result.output
+
+    def test_run_failed_terminate_does_not_print_generic_error_panel(self, tmp_path: Path) -> None:
+        """The dedicated handler must short-circuit `print_error`.
+
+        Without this, the user would see the standard exception panel
+        ("ExecutionError: ...") instead of the explicit termination message,
+        making the terminate feature indistinguishable from a generic crash.
+        """
+        from conductor.exceptions import WorkflowTerminated
+
+        workflow_file = tmp_path / "wf.yaml"
+        workflow_file.write_text("""\
+workflow:
+  name: t
+  entry_point: bye
+agents:
+  - name: bye
+    type: terminate
+    status: failed
+    reason: "halt"
+output: {}
+""")
+        with patch("conductor.cli.run.run_workflow_async") as mock_run:
+            mock_run.side_effect = WorkflowTerminated(
+                "halt",
+                output={},
+                reason="halt",
+                terminated_by="bye",
+            )
+
+            result = runner.invoke(app, ["run", str(workflow_file)])
+
+        assert result.exit_code == 1, result.output
+        # The standard error panel formats as "Error: WorkflowTerminated"
+        # via print_error -> format_error. The dedicated handler should
+        # NOT produce that — instead, a single-line red message.
+        assert "Error: WorkflowTerminated" not in result.output

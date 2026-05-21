@@ -11,6 +11,7 @@ from conductor.exceptions import (
     TemplateError,
     TimeoutError,
     ValidationError,
+    WorkflowTerminated,
 )
 
 
@@ -374,3 +375,59 @@ class TestRetryableError:
         """Test suggestion when all attempts exhausted."""
         error = RetryableError("Failed", attempt=3, max_attempts=3)
         assert "exhausted" in error.suggestion
+
+
+class TestWorkflowTerminated:
+    """Tests for the WorkflowTerminated exception (issue #219).
+
+    ``WorkflowTerminated`` is the explicit-termination signal raised by the
+    engine when a ``type: terminate`` step fires with ``status: failed``. It
+    must carry enough structured data for the CLI to print the rendered
+    output, for the dashboard to render a distinct end-state, and for the
+    engine's outer handler to skip the on-failure checkpoint.
+    """
+
+    def test_basic_construction(self) -> None:
+        """Required fields are populated and accessible on the instance."""
+        error = WorkflowTerminated(
+            "halt",
+            output={"result": "aborted"},
+            reason="halt",
+            terminated_by="abort_unsafe",
+        )
+        assert isinstance(error, ConductorError)
+        assert isinstance(error, ExecutionError)
+        assert error.output == {"result": "aborted"}
+        assert error.reason == "halt"
+        assert error.terminated_by == "abort_unsafe"
+        assert error.status == "failed"
+        # Carries the agent_name from ExecutionError contract so existing
+        # error-rendering paths can identify the offending step.
+        assert error.agent_name == "abort_unsafe"
+
+    def test_message_is_preserved(self) -> None:
+        """The message argument is used as the exception's `str()` payload."""
+        error = WorkflowTerminated(
+            "human-readable reason",
+            output={},
+            reason="human-readable reason",
+            terminated_by="abort",
+        )
+        assert "human-readable reason" in str(error)
+
+    def test_suggestion_passthrough(self) -> None:
+        """Optional suggestion is rendered through the base formatter."""
+        error = WorkflowTerminated(
+            "halt",
+            output={},
+            reason="halt",
+            terminated_by="abort",
+            suggestion="Adjust upstream config",
+        )
+        assert error.suggestion == "Adjust upstream config"
+        assert "Adjust upstream config" in str(error)
+
+    def test_status_defaults_to_failed(self) -> None:
+        """``status`` defaults to ``failed`` — success terminations return cleanly."""
+        error = WorkflowTerminated("halt", output={}, reason="halt", terminated_by="abort")
+        assert error.status == "failed"

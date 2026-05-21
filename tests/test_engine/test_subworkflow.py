@@ -2130,3 +2130,170 @@ class TestCrossWorkflowRegistryRef:
         assert sibling.exists()
         # And its sentinel was written.
         assert (meta_dir / "document-review.complete").exists()
+
+
+class TestSubWorkflowTerminate:
+    """Sub-workflow terminate semantics (issue #219).
+
+    A ``type: terminate`` step inside a child sub-workflow MUST stay scoped to
+    that child. From the parent's perspective:
+
+    - ``status: success`` → child returns its rendered output cleanly; the
+      parent continues with its next routes as if a normal `$end` had been
+      reached inside the child.
+    - ``status: failed`` → child raises ``WorkflowTerminated``; the parent's
+      ``_run_child_engine`` converts that to a normal ``ExecutionError`` so
+      the parent treats it like any other sub-workflow failure (parent
+      ``subworkflow_failed`` event fires; parent's outer ``workflow_failed``
+      does NOT carry ``is_explicit: true``).
+
+    Without this conversion, a child terminate would bubble all the way out
+    and the parent's `workflow_failed` would falsely attribute the explicit
+    termination to the parent (whose author never opted in).
+    """
+
+    @pytest.mark.asyncio
+    async def test_child_success_terminate_returns_output(self, tmp_workflow_dir: Path) -> None:
+        """A child `terminate status: success` returns its output_template to the parent."""
+        _write_yaml(
+            tmp_workflow_dir / "sub.yaml",
+            """\
+            workflow:
+              name: sub
+              entry_point: bye
+              runtime:
+                provider: copilot
+              limits:
+                max_iterations: 5
+            agents:
+              - name: bye
+                type: terminate
+                status: success
+                reason: "Document is already current."
+                output_template:
+                  result: "no-op"
+                  reason: "{{ bye.output.reason }}"
+            """,
+        )
+        parent_path = tmp_workflow_dir / "parent.yaml"
+        parent_path.write_text("dummy", encoding="utf-8")
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="parent",
+                entry_point="research",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="research",
+                    type="workflow",
+                    workflow="sub.yaml",
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={
+                "child_result": "{{ research.output.result }}",
+                "child_reason": "{{ research.output.reason }}",
+            },
+        )
+
+        engine = WorkflowEngine(config, CopilotProvider(), workflow_path=parent_path)
+        result = await engine.run({})
+        assert result == {
+            "child_result": "no-op",
+            "child_reason": "Document is already current.",
+        }
+
+    @pytest.mark.asyncio
+    async def test_child_failed_terminate_surfaces_as_execution_error(
+        self, tmp_workflow_dir: Path
+    ) -> None:
+        """Failed-terminate in a child must propagate as ExecutionError to the parent.
+
+        The parent's outer handler treats it like any other sub-workflow
+        failure (parent's workflow_failed has NO ``is_explicit: true``). This
+        protects parent authors from accidentally inheriting child-only
+        termination semantics.
+        """
+        from conductor.events import WorkflowEvent, WorkflowEventEmitter
+
+        _write_yaml(
+            tmp_workflow_dir / "sub.yaml",
+            """\
+            workflow:
+              name: sub
+              entry_point: abort
+              runtime:
+                provider: copilot
+              limits:
+                max_iterations: 5
+            agents:
+              - name: abort
+                type: terminate
+                status: failed
+                reason: "Child refused to run."
+            """,
+        )
+        parent_path = tmp_workflow_dir / "parent.yaml"
+        parent_path.write_text("dummy", encoding="utf-8")
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="parent",
+                entry_point="research",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="research",
+                    type="workflow",
+                    workflow="sub.yaml",
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={},
+        )
+
+        events: list[WorkflowEvent] = []
+        emitter = WorkflowEventEmitter()
+        emitter.subscribe(events.append)
+
+        engine = WorkflowEngine(
+            config, CopilotProvider(), workflow_path=parent_path, event_emitter=emitter
+        )
+
+        with pytest.raises(ExecutionError) as excinfo:
+            await engine.run({})
+
+        # The parent sees a sub-workflow failure, not its own explicit termination.
+        assert "Child refused to run." in str(excinfo.value)
+        assert "research" in str(excinfo.value)
+
+        # subworkflow_failed must fire so the dashboard shows the child as failed.
+        assert any(e.type == "subworkflow_failed" for e in events), (
+            f"expected subworkflow_failed; got {[e.type for e in events]}"
+        )
+
+        # The parent's OWN `workflow_failed` must NOT inherit is_explicit.
+        # Child engines share the parent's emitter and emit their own
+        # `workflow_failed` with `subworkflow_path` set; we filter those out
+        # to look only at parent-level events (no subworkflow_path).
+        outer = [
+            e for e in events if e.type == "workflow_failed" and not e.data.get("subworkflow_path")
+        ]
+        assert outer, "expected parent's workflow_failed event"
+        assert all(not e.data.get("is_explicit") for e in outer), (
+            f"parent must not inherit is_explicit from child terminate; got: "
+            f"{[e.data for e in outer]}"
+        )
+        # Parent's error_type should be ExecutionError — child's termination
+        # is downgraded at the boundary so the parent treats it normally.
+        assert all(e.data.get("error_type") == "ExecutionError" for e in outer), (
+            f"parent error_type should be ExecutionError; got: "
+            f"{[e.data.get('error_type') for e in outer]}"
+        )
