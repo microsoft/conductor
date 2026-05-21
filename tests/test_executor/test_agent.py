@@ -90,7 +90,12 @@ class TestAgentExecutorBasic:
 
     @pytest.mark.asyncio
     async def test_execute_validates_output(self, simple_agent: AgentDef) -> None:
-        """Test that execute validates output against schema."""
+        """Schema-violation surfaces as an ``internal.schema_violation`` envelope.
+
+        Previously this raised ``ValidationError`` directly. With error
+        routing, validation failures attach an envelope to
+        ``output.error`` so the engine can route on them.
+        """
 
         def mock_handler(agent, prompt, context):
             return {"answer": 42}  # Wrong type - should be string
@@ -100,8 +105,10 @@ class TestAgentExecutorBasic:
 
         context = {"workflow": {"input": {"question": "test"}}}
 
-        with pytest.raises(ValidationError, match="wrong type"):
-            await executor.execute(simple_agent, context)
+        output = await executor.execute(simple_agent, context)
+        assert output.error is not None
+        assert output.error["kind"] == "internal.schema_violation"
+        assert "wrong type" in output.error["message"]
 
     @pytest.mark.asyncio
     async def test_execute_without_schema_skips_validation(
@@ -527,7 +534,7 @@ class TestAgentExecutorOutputHandling:
 
     @pytest.mark.asyncio
     async def test_missing_output_field_raises(self) -> None:
-        """Test that missing required output field raises ValidationError."""
+        """Missing required output field surfaces as a schema-violation envelope."""
         agent = AgentDef(
             name="test",
             model="gpt-4",
@@ -544,8 +551,10 @@ class TestAgentExecutorOutputHandling:
         provider = CopilotProvider(mock_handler=mock_handler)
         executor = AgentExecutor(provider)
 
-        with pytest.raises(ValidationError, match="Missing required output field"):
-            await executor.execute(agent, {})
+        output = await executor.execute(agent, {})
+        assert output.error is not None
+        assert output.error["kind"] == "internal.schema_violation"
+        assert "Missing required output field" in output.error["message"]
 
     @pytest.mark.asyncio
     async def test_output_with_multiple_types(self) -> None:
@@ -582,3 +591,83 @@ class TestAgentExecutorOutputHandling:
         assert output.content["active"] is True
         assert output.content["items"] == [1, 2, 3]
         assert output.content["meta"] == {"key": "value"}
+
+
+class TestAgentExecutorConductorError:
+    """Tests for the ``conductor_error`` discriminator path."""
+
+    @pytest.mark.asyncio
+    async def test_well_formed_conductor_error_becomes_envelope(self) -> None:
+        """A ``conductor_error: true`` response attaches an envelope and skips schema."""
+        agent = AgentDef(
+            name="leaf",
+            model="gpt-4",
+            prompt="x",
+            output={"answer": OutputField(type="string")},
+        )
+
+        def mock_handler(agent, prompt, context):
+            return {
+                "conductor_error": True,
+                "kind": "external.git.fetch_failed",
+                "message": "remote rejected",
+                "details": {"remote": "origin"},
+            }
+
+        provider = CopilotProvider(mock_handler=mock_handler)
+        executor = AgentExecutor(provider)
+
+        output = await executor.execute(agent, {})
+        assert output.error is not None
+        assert output.error["kind"] == "external.git.fetch_failed"
+        assert output.error["message"] == "remote rejected"
+        assert output.error["details"] == {"remote": "origin"}
+        # Original content is preserved verbatim (engine may want it).
+        assert output.content["conductor_error"] is True
+
+    @pytest.mark.asyncio
+    async def test_malformed_conductor_error_becomes_schema_violation(self) -> None:
+        """A ``conductor_error: true`` with no ``kind`` is reported as a schema violation."""
+        agent = AgentDef(name="leaf", model="gpt-4", prompt="x")
+
+        def mock_handler(agent, prompt, context):
+            return {"conductor_error": True, "message": "missing kind"}
+
+        provider = CopilotProvider(mock_handler=mock_handler)
+        executor = AgentExecutor(provider)
+
+        output = await executor.execute(agent, {})
+        assert output.error is not None
+        assert output.error["kind"] == "internal.schema_violation"
+        assert "Malformed conductor_error envelope" in output.error["message"]
+
+    @pytest.mark.asyncio
+    async def test_partial_output_skips_error_checks(self) -> None:
+        """Partial output (mid-interrupt) bypasses both discriminator and schema."""
+        agent = AgentDef(
+            name="leaf",
+            model="gpt-4",
+            prompt="x",
+            output={"answer": OutputField(type="string")},
+        )
+
+        def mock_handler(agent, prompt, context):
+            return {"conductor_error": True, "kind": "external.x", "message": "y"}
+
+        provider = CopilotProvider(mock_handler=mock_handler)
+        executor = AgentExecutor(provider)
+
+        # Force partial by monkey-patching the provider's output post-call.
+        original_execute = provider.execute
+
+        async def patched_execute(*args, **kwargs):
+            out = await original_execute(*args, **kwargs)
+            out.partial = True
+            return out
+
+        provider.execute = patched_execute  # type: ignore[method-assign]
+
+        output = await executor.execute(agent, {})
+        # Partial path returns directly; no envelope coercion.
+        assert output.error is None
+        assert output.partial is True
