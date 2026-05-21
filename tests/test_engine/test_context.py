@@ -1265,3 +1265,142 @@ class TestWorkflowContextGuidance:
 
         assert section is not None
         assert section.startswith("\n\n")
+
+
+class TestWorkflowContextNonDictOutputs:
+    """Regression tests for non-dict agent outputs (e.g. 'set' steps with value:).
+
+    The pre-existing API stored only dicts. After issue #221, ``set`` steps
+    can store scalars, lists, ``None``, or arbitrary JSON-safe values. These
+    tests confirm context plumbing copes everywhere a dict was previously
+    assumed.
+    """
+
+    def test_store_scalar_output(self) -> None:
+        ctx = WorkflowContext()
+        ctx.store("compute", "myorg/myrepo")
+        assert ctx.agent_outputs["compute"] == "myorg/myrepo"
+
+    def test_store_list_output(self) -> None:
+        ctx = WorkflowContext()
+        ctx.store("items", [1, 2, 3])
+        assert ctx.agent_outputs["items"] == [1, 2, 3]
+
+    def test_store_none_output(self) -> None:
+        ctx = WorkflowContext()
+        ctx.store("flag", None)
+        assert ctx.agent_outputs["flag"] is None
+
+    def test_accumulate_mode_wraps_scalar_output(self) -> None:
+        """Templates see ``compute.output == scalar`` in accumulate mode."""
+        ctx = WorkflowContext()
+        ctx.store("compute", "myorg/myrepo")
+        rendered = ctx.build_for_agent("consumer", [], mode="accumulate")
+        assert rendered["compute"] == {"output": "myorg/myrepo"}
+
+    def test_explicit_mode_scalar_output_full(self) -> None:
+        """``compute.output`` reference in explicit mode returns the scalar."""
+        ctx = WorkflowContext()
+        ctx.store("compute", "myorg/myrepo")
+        rendered = ctx.build_for_agent(
+            "consumer", ["compute.output"], mode="explicit", agent_type="agent"
+        )
+        assert rendered["compute"]["output"] == "myorg/myrepo"
+
+    def test_explicit_mode_scalar_output_field_raises(self) -> None:
+        """``compute.output.field`` against a scalar raises with a helpful KeyError."""
+        ctx = WorkflowContext()
+        ctx.store("compute", "myorg/myrepo")
+        with pytest.raises(KeyError, match="is a str, not a dict"):
+            ctx.build_for_agent(
+                "consumer",
+                ["compute.output.field"],
+                mode="explicit",
+                agent_type="agent",
+            )
+
+    def test_explicit_mode_scalar_field_optional_skips(self) -> None:
+        """``compute.output.field?`` against a scalar is silently skipped.
+
+        The agent entry is seeded but the scalar is not surfaced because the
+        user asked for a field that cannot exist — matches dict behaviour
+        where an optional missing field leaves the output as the seed value.
+        """
+        ctx = WorkflowContext()
+        ctx.store("compute", "myorg/myrepo")
+        # Should not raise; the optional reference is dropped.
+        rendered = ctx.build_for_agent(
+            "consumer", ["compute.output.field?"], mode="explicit", agent_type="agent"
+        )
+        assert "compute" in rendered
+        # Optional missing field on a non-dict output yields the None seed.
+        assert rendered["compute"]["output"] is None
+
+    def test_explicit_mode_scalar_shorthand_field_raises(self) -> None:
+        """``compute.field`` shorthand against a scalar raises with a helpful KeyError."""
+        ctx = WorkflowContext()
+        ctx.store("compute", "myorg/myrepo")
+        with pytest.raises(KeyError, match="is a str, not a dict"):
+            ctx.build_for_agent("consumer", ["compute.field"], mode="explicit", agent_type="agent")
+
+    def test_explicit_mode_list_output_full(self) -> None:
+        ctx = WorkflowContext()
+        ctx.store("items", [1, 2, 3])
+        rendered = ctx.build_for_agent(
+            "consumer", ["items.output"], mode="explicit", agent_type="agent"
+        )
+        assert rendered["items"]["output"] == [1, 2, 3]
+
+    def test_explicit_mode_none_output_full(self) -> None:
+        ctx = WorkflowContext()
+        ctx.store("flag", None)
+        rendered = ctx.build_for_agent(
+            "consumer", ["flag.output"], mode="explicit", agent_type="agent"
+        )
+        assert rendered["flag"]["output"] is None
+
+    def test_local_render_agent_types_includes_set(self) -> None:
+        """``set`` is treated as a local-render type: workflow.input is always
+        populated in explicit mode."""
+        ctx = WorkflowContext()
+        ctx.set_workflow_inputs({"x": "hello"})
+        rendered = ctx.build_for_agent("bind", [], mode="explicit", agent_type="set")
+        assert rendered["workflow"]["input"] == {"x": "hello"}
+
+    def test_trim_truncate_skips_scalar_outputs(self) -> None:
+        """``_trim_truncate`` must not crash on scalar outputs."""
+        ctx = WorkflowContext()
+        ctx.store("scalar", "short")
+        ctx.store("dict_one", {"big": "x" * 1000})
+        # Should not raise; scalar is ignored and the dict entry is truncated.
+        ctx.trim_context(max_tokens=10, strategy="truncate")
+        assert ctx.agent_outputs["scalar"] == "short"
+
+    def test_trim_summarize_handles_scalar_outputs(self) -> None:
+        """``_trim_summarize`` renders scalar outputs as repr without crashing."""
+        from unittest.mock import MagicMock
+
+        ctx = WorkflowContext()
+        ctx.store("a", "first")
+        ctx.store("b", [1, 2, 3])
+        ctx.store("c", {"recent": "kept"})
+        # Force summarize path (mocked provider; the current implementation
+        # uses a synchronous drop-and-summarize without calling the provider).
+        provider = MagicMock()
+        ctx.trim_context(max_tokens=1, strategy="summarize", provider=provider)
+        # Most recent agent is kept; older ones are summarized without crashing
+        # on the scalar/list outputs.
+        assert "c" in ctx.agent_outputs
+        assert "_context_summary" in ctx.agent_outputs
+
+    def test_checkpoint_roundtrip_with_scalar(self) -> None:
+        """``to_dict``/``from_dict`` preserve scalar outputs verbatim."""
+        ctx = WorkflowContext()
+        ctx.store("compute", "myorg/myrepo")
+        ctx.store("items", [1, 2, 3])
+        ctx.store("flag", True)
+        data = ctx.to_dict()
+        restored = WorkflowContext.from_dict(data)
+        assert restored.agent_outputs["compute"] == "myorg/myrepo"
+        assert restored.agent_outputs["items"] == [1, 2, 3]
+        assert restored.agent_outputs["flag"] is True

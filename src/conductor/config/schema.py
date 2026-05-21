@@ -458,7 +458,7 @@ class AgentDef(BaseModel):
     description: str | None = None
     """Human-readable description of agent's purpose."""
 
-    type: Literal["agent", "human_gate", "script", "workflow"] | None = None
+    type: Literal["agent", "human_gate", "script", "set", "workflow"] | None = None
     """Agent type. Defaults to 'agent' if not specified."""
 
     provider: Literal["copilot", "claude"] | None = None
@@ -525,6 +525,53 @@ class AgentDef(BaseModel):
 
     timeout: int | None = None
     """Per-script timeout in seconds."""
+
+    value: str | None = None
+    """Jinja2 expression bound into context (required for single-binding 'set' type).
+
+    The rendered string is auto-coerced to a typed value (see ``output_type``).
+    The result is stored under ``<agent_name>.output``.
+
+    Example::
+
+        value: "{{ workflow.input.org }}/{{ workflow.input.repo }}"
+    """
+
+    values: dict[str, str] | None = None
+    """Named Jinja2 expressions bound into context (for multi-binding 'set' type).
+
+    Each value is rendered against the *original* pre-step context — bindings
+    cannot reference one another within the same step. Chain multiple ``set``
+    steps if you need ordered dependencies.
+
+    Each binding is auto-coerced to a typed value (see ``output_type`` for the
+    detection rules). The result is stored as a dict under
+    ``<agent_name>.output.<key>``.
+
+    Example::
+
+        values:
+          is_breaking: "{{ research.output.severity in ['high', 'critical'] }}"
+          target_branch: "{{ workflow.input.branch or 'main' }}"
+    """
+
+    output_type: (
+        Literal["auto", "string", "number", "integer", "boolean", "list", "dict"] | None
+    ) = None
+    """Override type detection for a single-binding 'set' step.
+
+    Only valid with ``value:``. For ``values:``, every binding uses ``auto``
+    detection (per-key typing may be added in a future enhancement).
+
+    - ``auto`` / unset: render the template and run ``yaml.safe_load`` on the
+      result; fall back to the raw string on parse failure. Empty/whitespace-only
+      rendered strings become ``""`` (not ``None``).
+    - ``string``: keep the raw rendered string.
+    - ``number``: try ``int`` then ``float``; raise on failure.
+    - ``integer``: ``int``; raise on failure.
+    - ``boolean``: case-insensitive ``true``/``false``/``1``/``0``/``yes``/``no``.
+    - ``list`` / ``dict``: parse via YAML and assert the type.
+    """
 
     workflow: str | None = None
     """Path to sub-workflow YAML file (required for type='workflow').
@@ -697,6 +744,14 @@ class AgentDef(BaseModel):
                 raise ValueError("human_gate agents cannot have 'reasoning'")
             if self.timeout_seconds is not None:
                 raise ValueError("human_gate agents cannot have 'timeout_seconds'")
+            if self.value is not None:
+                raise ValueError("human_gate agents cannot have 'value' (only 'set' agents do)")
+            if self.values is not None:
+                raise ValueError("human_gate agents cannot have 'values' (only 'set' agents do)")
+            if self.output_type is not None:
+                raise ValueError(
+                    "human_gate agents cannot have 'output_type' (only 'set' agents do)"
+                )
         elif self.type == "script":
             if not self.command:
                 raise ValueError("script agents require 'command'")
@@ -731,6 +786,12 @@ class AgentDef(BaseModel):
                     "script agents cannot have 'timeout_seconds' "
                     "(use 'timeout' for script-specific timeouts)"
                 )
+            if self.value is not None:
+                raise ValueError("script agents cannot have 'value' (only 'set' agents do)")
+            if self.values is not None:
+                raise ValueError("script agents cannot have 'values' (only 'set' agents do)")
+            if self.output_type is not None:
+                raise ValueError("script agents cannot have 'output_type' (only 'set' agents do)")
         elif self.type == "workflow":
             if not self.workflow:
                 raise ValueError("workflow agents require 'workflow' path")
@@ -758,6 +819,60 @@ class AgentDef(BaseModel):
                 raise ValueError("workflow agents cannot have 'dialog'")
             if self.timeout_seconds is not None:
                 raise ValueError("workflow agents cannot have 'timeout_seconds'")
+            if self.value is not None:
+                raise ValueError("workflow agents cannot have 'value' (only 'set' agents do)")
+            if self.values is not None:
+                raise ValueError("workflow agents cannot have 'values' (only 'set' agents do)")
+            if self.output_type is not None:
+                raise ValueError("workflow agents cannot have 'output_type' (only 'set' agents do)")
+        elif self.type == "set":
+            if (self.value is None) == (self.values is None):
+                raise ValueError("set agents require exactly one of 'value' or 'values'")
+            if self.values is not None and self.output_type is not None:
+                raise ValueError(
+                    "set agents with 'values:' cannot have 'output_type' "
+                    "(it only applies to single 'value:'; per-key typing is not yet supported)"
+                )
+            if self.prompt:
+                raise ValueError("set agents cannot have 'prompt'")
+            if self.provider:
+                raise ValueError("set agents cannot have 'provider'")
+            if self.model:
+                raise ValueError("set agents cannot have 'model'")
+            if self.tools is not None:
+                raise ValueError("set agents cannot have 'tools'")
+            if self.system_prompt:
+                raise ValueError("set agents cannot have 'system_prompt'")
+            if self.options:
+                raise ValueError("set agents cannot have 'options'")
+            if self.command:
+                raise ValueError("set agents cannot have 'command'")
+            if self.args:
+                raise ValueError("set agents cannot have 'args'")
+            if self.env:
+                raise ValueError("set agents cannot have 'env'")
+            if self.working_dir:
+                raise ValueError("set agents cannot have 'working_dir'")
+            if self.timeout is not None:
+                raise ValueError("set agents cannot have 'timeout'")
+            if self.workflow:
+                raise ValueError("set agents cannot have 'workflow'")
+            if self.input_mapping is not None:
+                raise ValueError("set agents cannot have 'input_mapping'")
+            if self.max_depth is not None:
+                raise ValueError("set agents cannot have 'max_depth'")
+            if self.max_session_seconds is not None:
+                raise ValueError("set agents cannot have 'max_session_seconds'")
+            if self.max_agent_iterations is not None:
+                raise ValueError("set agents cannot have 'max_agent_iterations'")
+            if self.retry is not None:
+                raise ValueError("set agents cannot have 'retry'")
+            if self.dialog is not None:
+                raise ValueError("set agents cannot have 'dialog'")
+            if self.reasoning is not None:
+                raise ValueError("set agents cannot have 'reasoning'")
+            if self.timeout_seconds is not None:
+                raise ValueError("set agents cannot have 'timeout_seconds'")
         else:
             # Regular agent or human_gate — input_mapping is not valid
             if self.input_mapping is not None:
@@ -769,6 +884,21 @@ class AgentDef(BaseModel):
                 raise ValueError(
                     f"'{self.type or 'agent'}' agents cannot have 'max_depth' "
                     "(only workflow agents support max_depth)"
+                )
+            if self.value is not None:
+                raise ValueError(
+                    f"'{self.type or 'agent'}' agents cannot have 'value' "
+                    "(only 'set' agents support value)"
+                )
+            if self.values is not None:
+                raise ValueError(
+                    f"'{self.type or 'agent'}' agents cannot have 'values' "
+                    "(only 'set' agents support values)"
+                )
+            if self.output_type is not None:
+                raise ValueError(
+                    f"'{self.type or 'agent'}' agents cannot have 'output_type' "
+                    "(only 'set' agents support output_type)"
                 )
         if self.type == "workflow" and self.reasoning is not None:
             raise ValueError("workflow agents cannot have 'reasoning'")

@@ -86,6 +86,7 @@ make validate-examples    # validate all examples
 - **executor/**: Agent execution
   - `agent.py` - `AgentExecutor` handles prompt rendering, tool resolution, and output validation for single agents
   - `script.py` - `ScriptExecutor` runs shell commands as workflow steps, capturing stdout/stderr/exit_code
+  - `set_step.py` - `SetExecutor` evaluates Jinja2 expressions for `type: set` steps and binds typed values into the workflow context (no LLM, no subprocess). Supports single `value:` and multi `values:` forms with auto / explicit `output_type:` coercion.
   - `template.py` - Jinja2 template rendering
   - `output.py` - JSON output parsing and schema validation
 

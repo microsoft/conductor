@@ -659,6 +659,31 @@ class WebDashboard:
             }
             return "script_started", started_data, "script_completed", completed_data
 
+        if agent_type == "set":
+            # Mirror the live runtime's set_completed payload shape. The
+            # value_repr is a short JSON preview; the frontend uses it for
+            # the node detail panel and tooltips.
+            try:
+                value_repr = json.dumps(output, default=str, ensure_ascii=False)
+            except (TypeError, ValueError):
+                value_repr = repr(output)
+            if len(value_repr) > 512:
+                value_repr = value_repr[:512] + "… [truncated]"
+            started_data = {
+                "agent_name": name,
+                "iteration": 1,
+                "synthetic": True,
+            }
+            completed_data = {
+                "agent_name": name,
+                "elapsed": 0.0,
+                "output_type": "auto",
+                "output_keys": sorted(output_dict.keys()) if output_dict else [],
+                "value_repr": value_repr,
+                "synthetic": True,
+            }
+            return "set_started", started_data, "set_completed", completed_data
+
         started_data = {
             "agent_name": name,
             "iteration": 1,

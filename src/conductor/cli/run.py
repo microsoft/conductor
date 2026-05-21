@@ -769,7 +769,7 @@ class ConsoleEventSubscriber:
                 d.get("elapsed", 0.0),
             )
 
-        elif t == "script_completed":
+        elif t in ("script_completed", "set_completed"):
             verbose_log_agent_complete(
                 d.get("agent_name", "?"),
                 d.get("elapsed", 0.0),
