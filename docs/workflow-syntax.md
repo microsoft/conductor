@@ -75,7 +75,7 @@ Agents are defined in the `agents` list. Each agent represents a unit of work.
 agents:
   - name: string                    # Required: Unique agent identifier
     description: string             # Optional: Purpose description
-    type: agent                     # agent | human_gate | script | workflow (default: agent)
+    type: agent                     # agent | human_gate | script | workflow | wait (default: agent)
     model: string                   # Optional: Model identifier (e.g., 'claude-sonnet-4.5')
     
     prompt: |                       # Required for type=agent: Agent instructions
@@ -281,6 +281,71 @@ routes:
 
 **Environment variable note** — values in `env` are passed as-is to the subprocess (they are not rendered as Jinja2 templates). Use `${VAR}` syntax in the workflow YAML loader if you need environment variable substitution in env values.
 
+### Wait Steps
+
+Wait steps pause workflow execution for a parsed duration via in-process `asyncio.sleep`. Use them for rate-limit cooldowns, polling intervals, and external-system catch-up — cross-platform, no shell `sleep` dependency.
+
+```yaml
+agents:
+  - name: cooldown
+    type: wait
+    description: "Cool down between API bursts"     # Optional
+    duration: 60s                                   # Required: see "Duration format" below
+    reason: "Avoiding rate limit"                   # Optional: shown in dashboard
+    routes:
+      - to: next_step
+```
+
+**Duration format** — `duration` accepts:
+
+- A plain `int` or `float` (seconds): `duration: 60`, `duration: 1.5`.
+- A string with a unit suffix: `ms` (milliseconds), `s` (seconds), `m` (minutes), `h` (hours). Examples: `"500ms"`, `"60s"`, `"2.5m"`, `"1h"`.
+- A Jinja2 template that renders to one of the above. Templated durations defer literal validation to runtime:
+
+  ```yaml
+  duration: "{{ workflow.input.poll_interval_seconds }}s"
+  ```
+
+The resolved duration must be **greater than 0 and no more than 24 hours** (`86400s`). Longer pauses should reconsider `workflow.limits.timeout_seconds` first.
+
+**Output structure** — wait step output is strict — only `waited_seconds` is exposed:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `waited_seconds` | `number` | Wall-clock seconds actually slept (may be less than requested on interrupt) |
+
+Access in templates: `{{ cooldown.output.waited_seconds }}`.
+
+**Polling pattern** — wait composes with routing loop-backs to build polling workflows without writing any Python:
+
+```yaml
+agents:
+  - name: check_status
+    type: script
+    command: ./poll-status.sh
+    routes:
+      - to: process_result
+        when: "status == 'ready'"
+      - to: wait_then_retry
+
+  - name: wait_then_retry
+    type: wait
+    duration: "{{ workflow.input.poll_interval_seconds }}s"
+    routes:
+      - to: check_status                           # loop back
+
+  - name: process_result
+    # ...
+```
+
+**Cancellation** — `Esc` / `Ctrl+G` cancels an in-progress wait immediately (the engine races the sleep against the interrupt event). The workflow-level `limits.timeout_seconds` also cancels in-flight waits via the standard timeout path.
+
+**Iteration counting** — wait steps count toward `workflow.limits.max_iterations` (each pause is one step). They are not subject to `max_agent_iterations`, which counts per-LLM-agent tool iterations.
+
+**Restrictions** — wait steps cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, `options`, `command`, `args`, `env`, `working_dir`, `timeout`, `workflow`, `input_mapping`, `max_depth`, `max_session_seconds`, `max_agent_iterations`, `retry`, `dialog`, `reasoning`, `timeout_seconds`, or `output`. Wait steps also cannot be used inside `parallel` groups or `for_each` groups.
+
+See [`examples/wait-step.yaml`](../examples/wait-step.yaml) for a complete polling workflow.
+
 ### Sub-Workflow Steps
 
 Sub-workflow steps reference external workflow YAML files, enabling composable and reusable workflow building blocks. The sub-workflow runs as a black box — its internal agents are not visible to the parent.
@@ -401,7 +466,7 @@ After the conversation, the agent re-executes with the dialog transcript as addi
 | `dialog.trigger_prompt` | string | Yes | Criteria for the LLM evaluator to decide when dialog is needed |
 
 **Behavior notes:**
-- Dialog is supported on regular `agent` type only (not `human_gate`, `script`, or `workflow`)
+- Dialog is supported on regular `agent` type only (not `human_gate`, `script`, `workflow`, or `wait`)
 - In web dashboard mode, the dialog temporarily replaces the graph area with a chat interface
 - When `--skip-gates` is set (e.g., CI/automation), dialogs are automatically skipped
 - The evaluator prompt should describe *when* to trigger dialog, not *what* to ask — the evaluator generates the opening question from the agent's output context
@@ -695,6 +760,7 @@ workflow:
 - Each agent execution counts as 1 iteration
 - Parallel agents count individually (3 parallel agents = 3 iterations)
 - Loop-back patterns increment the counter on each iteration
+- Script steps and wait steps each count as 1 iteration
 
 ### Timeout Behavior
 

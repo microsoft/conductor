@@ -300,6 +300,7 @@ See the [`examples/`](./examples/) directory for complete workflows:
 | [parallel-research.yaml](./examples/parallel-research.yaml) | Static parallel execution |
 | [design-review.yaml](./examples/design-review.yaml) | Human gate with loop pattern |
 | [script-step.yaml](./examples/script-step.yaml) | Script step with exit_code routing |
+| [wait-step.yaml](./examples/wait-step.yaml) | Wait step + script for a polling loop-back pattern |
 
 **More examples and running instructions:** [examples/README.md](./examples/README.md)
 

@@ -67,7 +67,7 @@ workflow:
 ```yaml
 agents:
   - name: my_agent               # Required: unique identifier
-    type: agent                  # agent (default), human_gate, script, or workflow
+    type: agent                  # agent (default), human_gate, script, workflow, or wait
     description: What it does
     model: gpt-5.2               # Override workflow default
     provider: claude             # Optional: per-agent provider override
@@ -97,9 +97,9 @@ agents:
     timeout_seconds: 120         # Hard wall-clock cancellation for this agent (provider-backed only).
                                  # Engine wraps execution in asyncio.wait_for(); raises AgentTimeoutError.
                                  # Effective limit = min(timeout_seconds, remaining_workflow_timeout).
-                                 # Non-retryable. Forbidden on script/human_gate/workflow types.
+                                 # Non-retryable. Forbidden on script/human_gate/workflow/wait types.
 
-    retry:                       # Per-agent retry policy (optional, not allowed on script/human_gate/workflow)
+    retry:                       # Per-agent retry policy (optional, not allowed on script/human_gate/workflow/wait)
       max_attempts: 3            # 1-10, default 1 (no retry)
       backoff: exponential       # exponential (default) or fixed
       delay_seconds: 2.0         # Base delay (0-300, default 2.0)
@@ -127,7 +127,7 @@ agents:
 - **Copilot**: forwarded as `reasoning_effort` on the session. Validated against the model's advertised `supported_reasoning_efforts`; raises `ValidationError` for unsupported combinations (skipped in mock-handler mode or when capability metadata is absent).
 - **Claude**: enables extended thinking via `thinking={"type": "enabled", "budget_tokens": N}` with mapping `low=2048`, `medium=8192`, `high=16384`, `xhigh=32768`. Auto-coerces `temperature` to `1.0` (logged at INFO) and bumps `max_tokens` to fit `budget + 4096` (capped at 64000, logged at INFO when clamped). Only valid on thinking-capable models (`claude-3-7-*`, `claude-opus-4*`, `claude-sonnet-4*`, `claude-haiku-4*`); raises `ValidationError` otherwise.
 
-Both providers surface reasoning content via `agent_reasoning` events visible in the dashboard, JSONL logs, and the console at `-vv`. Not allowed on `script`, `human_gate`, or `workflow` agent types.
+Both providers surface reasoning content via `agent_reasoning` events visible in the dashboard, JSONL logs, and the console at `-vv`. Not allowed on `script`, `human_gate`, `workflow`, or `wait` agent types.
 
 ```yaml
 runtime:
@@ -253,6 +253,72 @@ routes:
 Script agents **cannot** have: `prompt`, `provider`, `model`, `tools`, `output`, `system_prompt`, `options`, `retry`, `reasoning`, `dialog`, `max_session_seconds`, `max_agent_iterations`, `timeout_seconds` (use `timeout:` instead), `input_mapping`, or `max_depth`.
 Command and args support Jinja2 templating for dynamic values.
 
+## Wait Steps (`type: wait`)
+
+Pause workflow execution for a parsed duration via in-process `asyncio.sleep`. Cross-platform — no shell `sleep` dependency. Use for rate-limit cooldowns, polling intervals, and external-system catch-up.
+
+```yaml
+agents:
+  - name: cooldown
+    type: wait
+    description: Cool down between API bursts   # Optional
+    duration: 60s                               # Required (see "Duration format")
+    reason: Avoiding rate limit                 # Optional, shown in dashboard
+    routes:
+      - to: next_call
+```
+
+### Duration Format
+
+- Plain `int`/`float` → seconds (e.g. `60`, `1.5`).
+- Suffixed string: `ms`, `s`, `m`, `h` (e.g. `"500ms"`, `"60s"`, `"2.5m"`, `"1h"`).
+- Jinja2 template rendering to one of the above (templates defer literal validation to runtime):
+  ```yaml
+  duration: "{{ workflow.input.poll_interval_seconds }}s"
+  ```
+- Must resolve to `> 0` and `≤ 86400s` (24h). Booleans are rejected.
+
+### Wait Output
+
+Strict — only one field:
+
+```jinja2
+{{ wait_name.output.waited_seconds }}   # Actual seconds slept (may be < requested on interrupt)
+```
+
+### Polling Loop-back Pattern
+
+```yaml
+agents:
+  - name: check_status
+    type: script
+    command: ./poll-status.sh
+    routes:
+      - to: process_result
+        when: "status == 'ready'"
+      - to: wait_then_retry
+
+  - name: wait_then_retry
+    type: wait
+    duration: "{{ workflow.input.poll_interval_seconds }}s"
+    routes:
+      - to: check_status                  # loop back
+
+  - name: process_result
+    # ...
+```
+
+### Wait Cancellation
+
+- `Esc` / `Ctrl+G` cancels in-progress waits immediately (the engine races the sleep against the interrupt event).
+- Workflow-level `limits.timeout_seconds` cancels in-flight waits via the standard timeout path.
+
+### Wait Restrictions
+
+Wait agents **cannot** have: `prompt`, `model`, `provider`, `tools`, `system_prompt`, `options`, `command`, `args`, `env`, `working_dir`, `timeout`, `workflow`, `input_mapping`, `max_depth`, `max_session_seconds`, `max_agent_iterations`, `retry`, `dialog`, `reasoning`, `timeout_seconds`, or `output`. They also cannot be used inside `parallel` groups or `for_each` groups.
+
+See `examples/wait-step.yaml` for a complete polling workflow.
+
 ## Sub-Workflow Agents (`type: workflow`)
 
 Reference an external workflow YAML file as a black-box step. The sub-workflow runs with its own engine and inherits the parent's provider configuration.
@@ -323,7 +389,7 @@ agents:
       - to: writer
 ```
 
-Only valid on provider-backed agents (not `script`, `human_gate`, or `workflow`). See `examples/dialog-mode.yaml` for a complete example.
+Only valid on provider-backed agents (not `script`, `human_gate`, `workflow`, or `wait`). See `examples/dialog-mode.yaml` for a complete example.
 
 ## Workflow Metadata and Workspace Instructions
 

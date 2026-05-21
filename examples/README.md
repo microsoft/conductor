@@ -128,6 +128,34 @@ Research workflow demonstrating multi-provider patterns. Demonstrates:
 conductor run examples/multi-provider-research.yaml --input topic="Cloud computing"
 ```
 
+## Step Types
+
+### script-step.yaml
+
+Script step with shell command, JSON output parsing, and `exit_code`-based routing.
+Demonstrates:
+- `type: script` agents (cross-platform shell command execution)
+- Capturing stdout/stderr/exit_code
+- Routing on `exit_code` (`when: "exit_code == 0"`)
+- Passing script output to downstream LLM agents
+
+```bash
+conductor run examples/script-step.yaml
+```
+
+### wait-step.yaml
+
+Polling pattern with a wait step and a routing loop-back. Demonstrates:
+- `type: wait` agents (pure `asyncio.sleep`, cross-platform — no shell `sleep` dependency)
+- Templated `duration` (`"{{ workflow.input.poll_interval_seconds }}s"`)
+- Loop-back from wait → script for polling
+- `reason` field surfaced in the dashboard
+
+```bash
+conductor run examples/wait-step.yaml \
+  --input poll_interval_seconds=2 --input max_attempts=3
+```
+
 ## Planning and Implementation
 
 ### plan.yaml
