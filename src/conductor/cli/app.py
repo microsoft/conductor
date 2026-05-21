@@ -993,7 +993,7 @@ def replay(
         await dashboard.start()
         if is_verbose():
             console.print(f"\n[bold green]▶ Replay dashboard:[/] {dashboard.url}\n")
-        console.print("[dim]Press Ctrl+C to exit[/dim]\n")
+            console.print("[dim]Press Ctrl+C to exit[/dim]\n")
 
         try:
             await asyncio.Event().wait()
@@ -1005,7 +1005,8 @@ def replay(
     try:
         asyncio.run(_run_replay())
     except KeyboardInterrupt:
-        console.print("\n[dim]Replay stopped.[/dim]")
+        if is_verbose():
+            console.print("\n[dim]Replay stopped.[/dim]")
 
 
 @app.command()

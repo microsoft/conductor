@@ -30,8 +30,28 @@ from conductor.providers.registry import ProviderRegistry
 if TYPE_CHECKING:
     from conductor.events import WorkflowEvent
 
-# Verbose console for logging (stderr)
-_verbose_console = Console(stderr=True, highlight=False)
+
+# Verbose console for logging (stderr).
+#
+# This subclass enforces the global --silent contract ("No progress output.
+# Only JSON result on stdout.") at the source: every ``_verbose_console.print``
+# call in this module becomes a no-op when ``is_verbose()`` is False, so
+# individual call sites do not each have to remember to gate themselves
+# (see issue #209, follow-up to #203/#211). File logging is unaffected —
+# ``_file_console`` is a separate Console wired up by ``init_file_logging``.
+class _SilentAwareConsole(Console):
+    """``Console`` that honors ``--silent`` at the print level."""
+
+    def print(self, *args: Any, **kwargs: Any) -> None:
+        # Lazy import to avoid the cli.run -> cli.app import cycle at module
+        # load time, and to pick up the current ContextVar value per-call.
+        from conductor.cli.app import is_verbose
+
+        if is_verbose():
+            super().print(*args, **kwargs)
+
+
+_verbose_console = _SilentAwareConsole(stderr=True, highlight=False)
 
 # File console for file logging (None when not active)
 _file_console: Console | None = None
