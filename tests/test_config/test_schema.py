@@ -141,6 +141,89 @@ class TestRouteDef:
             RouteDef(to="")
 
 
+class TestRouteDefOnError:
+    """Tests for the ``on_error`` field added in Phase 1 error routing."""
+
+    def test_default_is_none_success_route(self) -> None:
+        """Without on_error a route is a success route."""
+        route = RouteDef(to="next")
+        assert route.on_error is None
+
+    def test_on_error_true_is_catch_all(self) -> None:
+        """``on_error: true`` marks a catch-all error route."""
+        route = RouteDef(to="handler", on_error=True)
+        assert route.on_error is True
+
+    def test_on_error_false_is_rejected(self) -> None:
+        """``on_error: false`` has no semantic meaning."""
+        with pytest.raises(ValidationError) as exc:
+            RouteDef(to="x", on_error=False)
+        assert "on_error: false" in str(exc.value)
+
+    def test_on_error_single_kind(self) -> None:
+        """A single dotted lowercase kind is accepted."""
+        route = RouteDef(to="handler", on_error="external.git.fetch_failed")
+        assert route.on_error == "external.git.fetch_failed"
+
+    def test_on_error_kind_list(self) -> None:
+        """A non-empty list of dotted lowercase kinds is accepted."""
+        route = RouteDef(to="handler", on_error=["external.git.fetch_failed", "policy.budget"])
+        assert route.on_error == ["external.git.fetch_failed", "policy.budget"]
+
+    def test_on_error_empty_string_rejected(self) -> None:
+        """Empty string is not a kind."""
+        with pytest.raises(ValidationError):
+            RouteDef(to="x", on_error="")
+
+    def test_on_error_uppercase_rejected(self) -> None:
+        """Kinds are lowercase."""
+        with pytest.raises(ValidationError) as exc:
+            RouteDef(to="x", on_error="External.Git.Fetch")
+        assert "dotted lowercase" in str(exc.value)
+
+    def test_on_error_undotted_rejected(self) -> None:
+        """Kinds must contain at least one dot — flat identifiers are not kinds."""
+        with pytest.raises(ValidationError):
+            RouteDef(to="x", on_error="oops")
+
+    def test_on_error_leading_dot_rejected(self) -> None:
+        """Leading dot is not a valid identifier."""
+        with pytest.raises(ValidationError):
+            RouteDef(to="x", on_error=".external.git")
+
+    def test_on_error_empty_list_rejected(self) -> None:
+        """Empty list is rejected — use catch-all ``true`` instead."""
+        with pytest.raises(ValidationError) as exc:
+            RouteDef(to="x", on_error=[])
+        assert "cannot be empty" in str(exc.value)
+
+    def test_on_error_list_with_bad_entry_rejected(self) -> None:
+        """One bad entry rejects the whole list."""
+        with pytest.raises(ValidationError):
+            RouteDef(to="x", on_error=["external.git.fetch_failed", "BAD"])
+
+    def test_on_error_wrong_type_rejected(self) -> None:
+        """on_error: 5 makes no sense."""
+        with pytest.raises(ValidationError):
+            RouteDef(to="x", on_error=5)
+
+    def test_on_error_reserved_kind_allowed(self) -> None:
+        """Reserved kinds (internal.*) ARE legal as on_error matchers
+        even though they're not legal in raises."""
+        route = RouteDef(to="handler", on_error="internal.schema_violation")
+        assert route.on_error == "internal.schema_violation"
+
+    def test_on_error_with_when_clause(self) -> None:
+        """``when:`` composes with on_error — both apply within the bucket."""
+        route = RouteDef(
+            to="handler",
+            on_error="external.git.fetch_failed",
+            when="{{ retry_count < 3 }}",
+        )
+        assert route.on_error == "external.git.fetch_failed"
+        assert route.when == "{{ retry_count < 3 }}"
+
+
 class TestGateOption:
     """Tests for GateOption model."""
 
@@ -309,6 +392,72 @@ class TestAgentDef:
                 options=[GateOption(label="Ok", value="ok", route="next")],
             )
         assert "prompt" in str(exc_info.value)
+
+
+class TestAgentDefRaises:
+    """Tests for the ``raises`` declaration added in Phase 1 error routing."""
+
+    def test_default_is_none(self) -> None:
+        """raises is opt-in; omitting it is the default."""
+        agent = AgentDef(name="a", model="gpt-4", prompt="x")
+        assert agent.raises is None
+
+    def test_single_kind(self) -> None:
+        agent = AgentDef(name="a", model="gpt-4", prompt="x", raises=["external.git.fetch_failed"])
+        assert agent.raises == ["external.git.fetch_failed"]
+
+    def test_multiple_kinds(self) -> None:
+        agent = AgentDef(
+            name="a",
+            model="gpt-4",
+            prompt="x",
+            raises=["external.git.fetch_failed", "policy.budget_exceeded"],
+        )
+        assert len(agent.raises) == 2
+
+    def test_empty_list_rejected(self) -> None:
+        """Empty list is rejected — omit the field instead."""
+        with pytest.raises(ValidationError) as exc:
+            AgentDef(name="a", model="gpt-4", prompt="x", raises=[])
+        assert "cannot be empty" in str(exc.value)
+
+    def test_reserved_prefix_rejected(self) -> None:
+        """Workflow authors cannot claim runtime-owned prefixes."""
+        for reserved in (
+            "internal.something",
+            "provider.exhausted",
+            "subworkflow.failed",
+            "retry.exhausted",
+        ):
+            with pytest.raises(ValidationError) as exc:
+                AgentDef(name="a", model="gpt-4", prompt="x", raises=[reserved])
+            assert "reserved prefix" in str(exc.value)
+
+    def test_uppercase_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            AgentDef(name="a", model="gpt-4", prompt="x", raises=["External.Git"])
+
+    def test_undotted_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            AgentDef(name="a", model="gpt-4", prompt="x", raises=["oops"])
+
+    def test_duplicate_rejected(self) -> None:
+        with pytest.raises(ValidationError) as exc:
+            AgentDef(
+                name="a",
+                model="gpt-4",
+                prompt="x",
+                raises=["external.git.fetch_failed", "external.git.fetch_failed"],
+            )
+        assert "more than once" in str(exc.value)
+
+    def test_non_string_entry_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            AgentDef(name="a", model="gpt-4", prompt="x", raises=["external.git", 5])
+
+    def test_empty_string_entry_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            AgentDef(name="a", model="gpt-4", prompt="x", raises=[""])
 
 
 class TestAgentDefMaxSessionSeconds:
