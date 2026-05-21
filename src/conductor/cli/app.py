@@ -155,6 +155,52 @@ def print_error(error: Exception) -> None:
         console.print(panel)
 
 
+def print_unhandled_workflow_error(error: Any) -> None:
+    """Print an :class:`UnhandledWorkflowError` summary to stderr.
+
+    Renders the typed halt distinctly from generic failures so operators
+    and CI tooling can recognise it at a glance: shows the failing leaf
+    node, the kind, the message, and the path to the ``errors.jsonl``
+    artefact (read off the engine attribute set in
+    :meth:`WorkflowEngine._execute_loop`'s ``UnhandledWorkflowError``
+    arm) when available.
+    """
+    envelope = error.envelope or {}
+    frames = error.frames or []
+    node = frames[0].get("node", "<unknown>") if frames else "<unknown>"
+    kind = envelope.get("kind", "<unknown>")
+    message = envelope.get("message", "")
+
+    content = Text()
+    content.append("Node:    ", style="bold")
+    content.append(f"{node}\n", style="cyan")
+    content.append("Kind:    ", style="bold")
+    content.append(f"{kind}\n", style="yellow")
+    content.append("Message: ", style="bold")
+    content.append(f"{message}\n", style="white")
+
+    details = envelope.get("details")
+    if details:
+        import json as _json
+
+        content.append("Details: ", style="bold")
+        content.append(_json.dumps(details, default=str), style="dim")
+        content.append("\n")
+
+    errors_path = getattr(error, "errors_jsonl_path", None)
+    if errors_path:
+        content.append("Halt log: ", style="bold")
+        content.append(f"{errors_path}\n", style="dim")
+
+    panel = Panel(
+        content,
+        title="[bold red]❌ Workflow halted: unhandled typed error[/bold red]",
+        border_style="red",
+        padding=(1, 2),
+    )
+    console.print(panel)
+
+
 def version_callback(value: bool) -> None:
     """Display version information and exit."""
     if value:
@@ -469,6 +515,11 @@ def run(
         output_console.print_json(json.dumps(result))
 
     except Exception as e:
+        from conductor.exceptions import UnhandledWorkflowError
+
+        if isinstance(e, UnhandledWorkflowError):
+            print_unhandled_workflow_error(e)
+            raise typer.Exit(code=3) from None
         print_error(e)
         raise typer.Exit(code=1) from None
 
@@ -877,6 +928,11 @@ def resume(
         output_console.print_json(json.dumps(result))
 
     except Exception as e:
+        from conductor.exceptions import UnhandledWorkflowError
+
+        if isinstance(e, UnhandledWorkflowError):
+            print_unhandled_workflow_error(e)
+            raise typer.Exit(code=3) from None
         print_error(e)
         raise typer.Exit(code=1) from None
 

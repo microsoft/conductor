@@ -2791,6 +2791,9 @@ class WorkflowEngine:
             # distinct exit code in Step 10.
             errors_path = self._write_errors_jsonl(e)
             self._errors_jsonl_path = errors_path
+            # Attach the path to the exception itself so the CLI handler
+            # can render it without needing a reference to the engine.
+            e.errors_jsonl_path = errors_path  # type: ignore[attr-defined]
             fail_data: dict[str, Any] = {
                 "error_type": "UnhandledWorkflowError",
                 "message": str(e),
