@@ -2434,10 +2434,12 @@ class WorkflowEngine:
                             # Resolve the duration up-front so the
                             # ``wait_started`` event includes the parsed
                             # value (the dashboard renders a sleeping
-                            # pill keyed off this). Templated durations
-                            # that can't be rendered will raise inside
-                            # ``_execute_wait`` below; emit ``None`` here
-                            # so the event still fires for debuggability.
+                            # pill keyed off this). Failures here are
+                            # preview-only — the canonical render+parse
+                            # runs inside ``_execute_wait`` below and
+                            # will surface the real error via
+                            # ``wait_failed``. Log at debug so the
+                            # preview path is still observable.
                             try:
                                 rendered_duration = self.renderer.render(
                                     str(agent.duration), agent_context
@@ -2445,7 +2447,12 @@ class WorkflowEngine:
                                 preview_duration_seconds: float | None = parse_duration(
                                     rendered_duration
                                 )
-                            except (ValueError, Exception):  # noqa: BLE001 — defensive
+                            except Exception as exc:  # noqa: BLE001 — defensive preview
+                                logger.debug(
+                                    "wait_started preview duration render failed for %s: %s",
+                                    agent.name,
+                                    exc,
+                                )
                                 preview_duration_seconds = None
                             preview_reason: str | None = None
                             if agent.reason is not None:
@@ -2453,8 +2460,18 @@ class WorkflowEngine:
                                     preview_reason = self.renderer.render(
                                         agent.reason, agent_context
                                     )
-                                except Exception:  # noqa: BLE001 — defensive
-                                    preview_reason = agent.reason
+                                except Exception as exc:  # noqa: BLE001 — defensive preview
+                                    # Do NOT fall back to the raw
+                                    # template string — the dashboard
+                                    # would then display literal
+                                    # ``{{ ... }}`` markup. ``None`` is
+                                    # the correct "absent" signal.
+                                    logger.debug(
+                                        "wait_started preview reason render failed for %s: %s",
+                                        agent.name,
+                                        exc,
+                                    )
+                                    preview_reason = None
 
                             self._emit(
                                 "wait_started",

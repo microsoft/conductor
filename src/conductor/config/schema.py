@@ -874,15 +874,15 @@ class AgentDef(BaseModel):
     def _validate_wait_duration(self) -> None:
         """Validate ``duration`` for a ``wait`` agent.
 
-        Booleans are rejected outright. Templated durations (containing
-        ``{{``) defer all literal validation to runtime; for everything
-        else we parse the value and enforce ``0 < d <= 24h``.
+        Templated durations (containing ``{{``) defer all literal
+        validation to runtime; for everything else we parse the value
+        and enforce ``0 < d <= MAX_WAIT_DURATION_SECONDS``.
+
+        Note: Booleans are already rejected pre-coercion by the
+        :meth:`reject_bool_duration` ``mode="before"`` field validator,
+        so this method never sees ``True``/``False``.
         """
         value = self.duration
-        if isinstance(value, bool):
-            raise ValueError(
-                f"wait duration must be a number or duration string, not boolean: {value!r}"
-            )
 
         if isinstance(value, str) and "{{" in value:
             return

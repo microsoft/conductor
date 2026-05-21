@@ -179,11 +179,14 @@ class WaitExecutor:
         except BaseException:
             # Cancellation from outside (e.g., workflow timeout) — clean
             # up both tasks and re-raise so wait_for / outer cancellation
-            # handlers see the original exception.
+            # handlers see the original exception. Only suppress
+            # CancelledError during cleanup (matches the success path
+            # above); a genuine exception from a future, non-trivial
+            # awaitable should not be silently swallowed.
             for t in (sleep_task, interrupt_task):
                 if not t.done():
                     t.cancel()
-                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                    with contextlib.suppress(asyncio.CancelledError):
                         await t
             raise
 
