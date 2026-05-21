@@ -424,6 +424,12 @@ class WorkflowEngine:
         # Checkpoint tracking
         self._current_agent_name: str | None = None
         self._last_checkpoint_path: Path | None = None
+        self._errors_jsonl_path: Path | None = None
+        """Path to ``errors.jsonl`` if this run halted on an ``UnhandledWorkflowError``.
+
+        Populated by the ``_execute_loop`` exception arm; consumed by the
+        CLI to surface the path in the end-of-run summary.
+        """
 
         # Sub-workflow depth tracking
         self._subworkflow_depth = _subworkflow_depth
@@ -1446,6 +1452,50 @@ class WorkflowEngine:
             limits: A LimitEnforcer restored via ``LimitEnforcer.from_dict()``.
         """
         self.limits = limits
+
+    def _write_errors_jsonl(self, exc: UnhandledWorkflowError) -> Path | None:
+        """Write the unhandled error envelope to ``errors.jsonl``.
+
+        Each unhandled-error halt produces one record (single line) under
+        ``$TMPDIR/conductor/`` with a filename that pairs with the
+        corresponding ``.events.jsonl`` log so external tooling can join
+        them. The record carries the envelope, the frame trail, and the
+        leaf node name so a reader doesn't need to scan the event log to
+        learn what happened.
+
+        Best-effort: I/O failures are logged but never raised — the
+        original :class:`UnhandledWorkflowError` must reach the CLI.
+        """
+        import secrets  # noqa: PLC0415
+        import tempfile  # noqa: PLC0415
+        import time  # noqa: PLC0415
+
+        workflow_name = self.config.workflow.name
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        run_id = self._run_context.run_id if self._run_context else secrets.token_hex(4)
+        path = (
+            Path(tempfile.gettempdir())
+            / "conductor"
+            / f"conductor-{workflow_name}-{ts}-{run_id}.errors.jsonl"
+        )
+        record = {
+            "type": "unhandled_workflow_error",
+            "timestamp": time.time(),
+            "workflow": workflow_name,
+            "run_id": run_id,
+            "envelope": exc.envelope,
+            "frames": exc.frames,
+            "leaf_node": (exc.frames[0].get("node") if exc.frames else None),
+        }
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(json.dumps(record, default=str))
+                f.write("\n")
+        except OSError as e:
+            logger.warning("Failed to write errors.jsonl at %s: %s", path, e)
+            return None
+        return path
 
     def _save_checkpoint_on_failure(self, error: BaseException) -> None:
         """Attempt to save a checkpoint after a failure.
@@ -2730,6 +2780,28 @@ class WorkflowEngine:
 
         except KeyboardInterrupt:
             self._save_checkpoint_on_failure(KeyboardInterrupt("Workflow interrupted by user"))
+            raise
+        except UnhandledWorkflowError as e:
+            # Typed-error halt: the workflow ran to a node that raised an
+            # error envelope and no on_error route at any reachable level
+            # matched. Write an errors.jsonl describing the halt (separate
+            # file from the event log so external tooling can pick it up
+            # without parsing the whole stream), emit a typed
+            # workflow_failed event, then re-raise so the CLI maps to its
+            # distinct exit code in Step 10.
+            errors_path = self._write_errors_jsonl(e)
+            self._errors_jsonl_path = errors_path
+            fail_data: dict[str, Any] = {
+                "error_type": "UnhandledWorkflowError",
+                "message": str(e),
+                "agent_name": self._current_agent_name,
+                "envelope": e.envelope,
+                "frames": e.frames,
+                "errors_jsonl_path": str(errors_path) if errors_path else None,
+            }
+            self._emit("workflow_failed", fail_data)
+            self._execute_hook("on_error", error=e)
+            self._save_checkpoint_on_failure(e)
             raise
         except ConductorError as e:
             fail_data: dict[str, Any] = {

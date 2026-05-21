@@ -125,7 +125,7 @@ class TestAgentErrorRouting:
 
     @pytest.mark.asyncio
     async def test_undeclared_kind_is_normalized_then_routes(self) -> None:
-        """If ``raises`` declares X but agent raises Y, kind becomes ``internal.undeclared_kind``."""
+        """If ``raises`` lists X but agent raises Y, kind becomes ``internal.undeclared_kind``."""
         config = _wf(
             AgentDef(
                 name="probe",
@@ -265,3 +265,101 @@ class TestScriptErrorRouting:
 
         result = await engine.run({})
         assert result == {"v": "fallback-ran"}
+
+
+class TestUnhandledHaltArtifacts:
+    """Step 9: errors.jsonl + ``workflow_failed`` event on unhandled halt."""
+
+    @pytest.mark.asyncio
+    async def test_writes_errors_jsonl_with_envelope_and_frame(self) -> None:
+        """An unhandled envelope produces a one-line errors.jsonl record."""
+        import json as _json
+        from pathlib import Path as _Path
+
+        config = _wf(
+            AgentDef(
+                name="probe",
+                model="gpt-4",
+                prompt="x",
+                routes=[RouteDef(to="$end")],
+            ),
+        )
+
+        def handler(agent, prompt, context):
+            return {
+                "conductor_error": True,
+                "kind": "external.api.timeout",
+                "message": "took too long",
+                "details": {"endpoint": "/v1/things"},
+            }
+
+        provider = CopilotProvider(mock_handler=handler)
+        engine = WorkflowEngine(config=config, provider=provider)
+
+        with pytest.raises(UnhandledWorkflowError):
+            await engine.run({})
+
+        path = engine._errors_jsonl_path
+        assert path is not None, "errors.jsonl path was not recorded on the engine"
+        assert _Path(path).exists(), f"errors.jsonl was not written at {path}"
+
+        lines = _Path(path).read_text(encoding="utf-8").splitlines()
+        assert len(lines) == 1, "errors.jsonl must contain exactly one record"
+        record = _json.loads(lines[0])
+
+        assert record["type"] == "unhandled_workflow_error"
+        assert record["workflow"] == "t"
+        assert record["leaf_node"] == "probe"
+        assert record["envelope"]["kind"] == "external.api.timeout"
+        assert record["envelope"]["message"] == "took too long"
+        assert record["envelope"]["details"] == {"endpoint": "/v1/things"}
+        assert record["frames"] == [
+            {"node": "probe", "kind": "external.api.timeout", "iteration": 1}
+        ]
+        assert "timestamp" in record
+        assert "run_id" in record
+
+    @pytest.mark.asyncio
+    async def test_emits_typed_workflow_failed_event_with_envelope(self) -> None:
+        """A ``workflow_failed`` event is emitted with ``error_type='UnhandledWorkflowError'``."""
+        from conductor.events import WorkflowEventEmitter
+
+        captured: list[tuple[str, dict]] = []
+
+        def _capture(event):
+            captured.append((event.type, dict(event.data)))
+
+        emitter = WorkflowEventEmitter()
+        emitter.subscribe(_capture)
+
+        config = _wf(
+            AgentDef(
+                name="probe",
+                model="gpt-4",
+                prompt="x",
+                routes=[RouteDef(to="$end")],
+            ),
+        )
+
+        def handler(agent, prompt, context):
+            return {
+                "conductor_error": True,
+                "kind": "external.api.timeout",
+                "message": "took too long",
+            }
+
+        provider = CopilotProvider(mock_handler=handler)
+        engine = WorkflowEngine(config=config, provider=provider, event_emitter=emitter)
+
+        with pytest.raises(UnhandledWorkflowError):
+            await engine.run({})
+
+        failed = [d for t, d in captured if t == "workflow_failed"]
+        assert len(failed) == 1, f"expected one workflow_failed event, got {len(failed)}"
+        data = failed[0]
+        assert data["error_type"] == "UnhandledWorkflowError"
+        assert data["agent_name"] == "probe"
+        assert data["envelope"]["kind"] == "external.api.timeout"
+        assert data["envelope"]["message"] == "took too long"
+        assert data["frames"][0]["node"] == "probe"
+        assert data["errors_jsonl_path"] is not None
