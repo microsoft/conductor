@@ -1627,13 +1627,19 @@ class WorkflowEngine:
             preview = str(partial_output.content)[:500]
 
         # CLI mode: invoke interactive interrupt handler
-        interrupt_result = await self._interrupt_handler.handle_interrupt(
-            current_agent=agent.name,
-            iteration=self.context.current_iteration,
-            last_output_preview=preview,
-            available_agents=self._get_top_level_agent_names(),
-            accumulated_guidance=list(self.context.user_guidance),
-        )
+        # Suspend keyboard listener so stdin works normally (cbreak mode would
+        # otherwise consume the user's keystrokes before Rich's Prompt sees them).
+        await self._suspend_listener()
+        try:
+            interrupt_result = await self._interrupt_handler.handle_interrupt(
+                current_agent=agent.name,
+                iteration=self.context.current_iteration,
+                last_output_preview=preview,
+                available_agents=self._get_top_level_agent_names(),
+                accumulated_guidance=list(self.context.user_guidance),
+            )
+        finally:
+            await self._resume_listener()
 
         # Apply the interrupt result
         if interrupt_result.action == InterruptAction.STOP:
