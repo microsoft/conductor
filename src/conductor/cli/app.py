@@ -156,6 +156,39 @@ def print_error(error: Exception) -> None:
         console.print(panel)
 
 
+def _abort_web_bg_if_human_gate(workflow_path: Path, *, skip_gates: bool) -> None:
+    """Reject ``--web-bg`` when the workflow has a ``human_gate`` agent.
+
+    Without this check, ``--web-bg`` forks a detached child whose stdin is
+    redirected to ``DEVNULL``; ``Prompt.ask`` then raises ``EOFError`` and
+    the parent only reports ``"Background process exited immediately"``,
+    which never mentions ``human_gate`` or ``--skip-gates``. Failing fast
+    in the parent process produces a single visible error on the user's
+    terminal. ``--skip-gates`` is a documented escape hatch and is honored.
+    """
+    if skip_gates:
+        return
+    try:
+        from conductor.config.loader import load_config
+
+        config = load_config(workflow_path)
+    except Exception:  # noqa: BLE001 — defer real validation to the loader path
+        # If config fails to load, let the normal run path surface the error.
+        return
+    if not any(getattr(a, "type", None) == "human_gate" for a in config.agents):
+        return
+    raise typer.BadParameter(
+        "--web-bg is incompatible with workflows that contain human_gate steps "
+        "because the detached process has no stdin to prompt on.\n"
+        "\n"
+        "Options:\n"
+        "  1. Use --web (foreground) instead of --web-bg\n"
+        "  2. Add --skip-gates to auto-accept the first option\n"
+        "  3. Remove human_gate steps from the workflow\n"
+        "  4. Wait for CLI gate-resolution support (planned follow-up)"
+    )
+
+
 def version_callback(value: bool) -> None:
     """Display version information and exit."""
     if value:
@@ -420,6 +453,7 @@ def run(
 
     # Handle --web-bg: fork a background process and exit immediately
     if web_bg:
+        _abort_web_bg_if_human_gate(workflow_path, skip_gates=skip_gates)
         from conductor.cli.bg_runner import launch_background
 
         try:
@@ -855,6 +889,8 @@ def resume(
 
     # Handle --web-bg: fork a background process and exit immediately
     if web_bg:
+        if resolved_workflow is not None:
+            _abort_web_bg_if_human_gate(resolved_workflow, skip_gates=skip_gates)
         from conductor.cli.bg_runner import launch_background_resume
 
         try:

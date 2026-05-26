@@ -287,3 +287,97 @@ class TestDashboardStartupFailure:
                 web=True,
             )
             assert result == {"result": "done"}
+
+
+# ---------------------------------------------------------------------------
+# --web-bg + human_gate validation (external-workflow-friction Item 4)
+# ---------------------------------------------------------------------------
+
+_GATE_WORKFLOW_YAML = """\
+workflow:
+  name: gate-workflow
+  entry_point: ask
+
+agents:
+  - name: ask
+    type: human_gate
+    prompt: "Continue?"
+    options:
+      - label: "Yes"
+        value: yes
+        route: $end
+      - label: "No"
+        value: no
+        route: $end
+
+output:
+  result: "done"
+"""
+
+
+@pytest.fixture()
+def gate_workflow_file(tmp_path: Path) -> Path:
+    """Workflow containing a ``human_gate`` agent."""
+    f = tmp_path / "gate.yaml"
+    f.write_text(_GATE_WORKFLOW_YAML)
+    return f
+
+
+class TestWebBgHumanGateValidation:
+    """``--web-bg`` must abort pre-fork when the workflow has a ``human_gate``.
+
+    Without this check, ``--web-bg`` forks a detached child whose stdin is
+    redirected to ``DEVNULL``; ``Prompt.ask`` then raises ``EOFError`` and
+    the parent only sees ``"Background process exited immediately"``, with
+    no mention of ``human_gate`` or ``--skip-gates``. See
+    ``docs/projects/usability-features/external-workflow-friction.plan.md``
+    §4.4.
+    """
+
+    def test_run_web_bg_with_human_gate_aborts_before_fork(self, gate_workflow_file: Path) -> None:
+        """``run --web-bg`` + ``human_gate`` (no ``--skip-gates``) → no fork."""
+        with patch("conductor.cli.bg_runner.launch_background") as mock_launch:
+            result = runner.invoke(app, ["run", str(gate_workflow_file), "--web-bg"])
+
+        assert result.exit_code != 0
+        assert not mock_launch.called
+        # The error must name the actual problem and at least one remedy.
+        combined = (result.output or "") + (str(result.exception) if result.exception else "")
+        assert "human_gate" in combined
+        assert "--skip-gates" in combined
+
+    def test_run_web_bg_with_human_gate_and_skip_gates_proceeds(
+        self, gate_workflow_file: Path
+    ) -> None:
+        """``--skip-gates`` removes the incompatibility; fork proceeds."""
+        from pathlib import Path as _Path
+
+        from conductor.cli.bg_runner import BackgroundLaunch
+
+        with patch("conductor.cli.bg_runner.launch_background") as mock_launch:
+            mock_launch.return_value = BackgroundLaunch(
+                url="http://127.0.0.1:9999",
+                stderr_log=_Path("/tmp/conductor-test-deadbeef.bg.stderr.log"),
+                stdout_log=_Path("/tmp/conductor-test-deadbeef.bg.stdout.log"),
+                run_id="deadbeef",
+            )
+
+            result = runner.invoke(
+                app, ["run", str(gate_workflow_file), "--web-bg", "--skip-gates"]
+            )
+
+        assert result.exit_code == 0
+        assert mock_launch.called
+
+    def test_resume_web_bg_with_human_gate_aborts_before_fork(
+        self, gate_workflow_file: Path
+    ) -> None:
+        """Same check applies to ``resume --web-bg`` (run/resume parity)."""
+        with patch("conductor.cli.bg_runner.launch_background_resume") as mock_launch:
+            result = runner.invoke(app, ["resume", str(gate_workflow_file), "--web-bg"])
+
+        assert result.exit_code != 0
+        assert not mock_launch.called
+        combined = (result.output or "") + (str(result.exception) if result.exception else "")
+        assert "human_gate" in combined
+        assert "--skip-gates" in combined
