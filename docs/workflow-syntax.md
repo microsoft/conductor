@@ -36,6 +36,8 @@ workflow:
   limits:
     max_iterations: 10              # Default: 10, max: 500
     timeout_seconds: 600            # Optional: Maximum wall-clock time (seconds)
+    budget_usd: 5.00                # Optional: Cost cap in USD (no tracking when unset)
+    budget_mode: audit              # audit (default) | enforce
 
   hooks:
     on_start: "{{ template }}"      # Optional: Expression evaluated on start
@@ -688,6 +690,8 @@ workflow:
   limits:
     max_iterations: 50              # Maximum agent executions (1-500, default: 10)
     timeout_seconds: 1800           # Maximum wall-clock time in seconds (optional)
+    budget_usd: 5.00                # Cumulative cost cap in USD (optional)
+    budget_mode: audit              # audit | enforce (default: audit)
 ```
 
 ### Iteration Counting
@@ -701,6 +705,24 @@ workflow:
 - Workflow terminates when `timeout_seconds` is exceeded
 - Includes all agent execution time and overhead
 - `None` (default) means no timeout
+
+### Cost Budget
+
+- `budget_usd` caps cumulative LLM cost across the run. When unset (default), no
+  budget tracking occurs.
+- `budget_mode: audit` (default) emits a `budget_exceeded` event and logs a
+  warning on first overshoot, but the workflow continues — use this to discover
+  cost profiles before enforcing.
+- `budget_mode: enforce` emits a `budget_exceeded` event, saves a checkpoint,
+  and stops the workflow with `BudgetExceededError`. Resume after increasing
+  the budget with `conductor resume <workflow.yaml>`.
+- Recommended graduation path:
+  1. Run without `budget_usd` to observe costs in the summary
+  2. Add `budget_usd` in `audit` mode to track overshoots non-disruptively
+  3. Switch to `enforce` once the cost profile is understood
+
+See [configuration.md](configuration.md) for an end-to-end example and
+notes on how budget tracking integrates with the provider usage callbacks.
 
 ## Tools
 
