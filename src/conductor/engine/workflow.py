@@ -520,8 +520,7 @@ class WorkflowEngine:
 
         if self.limits.budget_mode == "enforce":
             raise BudgetExceededError(
-                f"Workflow exceeded cost budget (${budget:.2f}): "
-                f"spent ${spent:.2f}",
+                f"Workflow exceeded cost budget (${budget:.2f}): spent ${spent:.2f}",
                 budget_usd=budget,
                 spent_usd=spent,
                 current_agent=self.limits.current_agent,

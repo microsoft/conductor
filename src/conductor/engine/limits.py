@@ -14,7 +14,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from conductor.exceptions import (
-    BudgetExceededError,
     MaxIterationsError,
 )
 from conductor.exceptions import (

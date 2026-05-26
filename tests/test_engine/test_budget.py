@@ -11,6 +11,7 @@ Tests cover the graduation path:
 from __future__ import annotations
 
 import pytest
+from pydantic import ValidationError as PydanticValidationError
 
 from conductor.config.schema import (
     AgentDef,
@@ -21,13 +22,11 @@ from conductor.config.schema import (
     WorkflowDef,
 )
 from conductor.engine.limits import LimitEnforcer
-from conductor.engine.usage import UsageTracker
 from conductor.engine.workflow import WorkflowEngine
 from conductor.events import WorkflowEventEmitter
 from conductor.exceptions import BudgetExceededError
 from conductor.providers.base import AgentOutput
 from conductor.providers.copilot import CopilotProvider
-
 
 # ---------------------------------------------------------------------------
 # Schema / Config Tests
@@ -58,11 +57,11 @@ class TestBudgetSchema:
         assert limits.budget_usd == 0.0
 
     def test_budget_usd_negative_rejected(self) -> None:
-        with pytest.raises(Exception):
+        with pytest.raises(PydanticValidationError):
             LimitsConfig(budget_usd=-1.0)
 
     def test_budget_mode_invalid_rejected(self) -> None:
-        with pytest.raises(Exception):
+        with pytest.raises(PydanticValidationError):
             LimitsConfig(budget_mode="invalid")  # type: ignore[arg-type]
 
 
@@ -189,9 +188,8 @@ class TestBudgetGraduationStep0:
         emitter.subscribe(lambda e: events.append(e))
 
         engine = WorkflowEngine(config, provider, event_emitter=emitter)
-        # Patch the output so usage_tracker records the expensive tokens
-        original_execute = provider.execute
 
+        # Patch the output so usage_tracker records the expensive tokens
         async def patched_execute(*args, **kwargs):
             return expensive
 
@@ -223,7 +221,6 @@ class TestBudgetGraduationStep1:
         emitter.subscribe(lambda e: events.append(e))
 
         engine = WorkflowEngine(config, provider, event_emitter=emitter)
-        original_execute = provider.execute
 
         async def patched_execute(*args, **kwargs):
             return expensive
