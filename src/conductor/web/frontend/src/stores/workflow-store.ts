@@ -17,6 +17,8 @@ import type {
   WaitStartedData,
   WaitCompletedData,
   WaitFailedData,
+  SetCompletedData,
+  SetFailedData,
   GatePresentedData,
   GateResolvedData,
   GateOptionDetail,
@@ -108,12 +110,16 @@ export interface NodeData {
   stdout?: string;
   stderr?: string;
   exit_code?: number;
-  // Wait-specific
+  // Wait-specific (issue #218)
   duration_seconds?: number | null;
   waited_seconds?: number;
   requested_seconds?: number;
   reason?: string | null;
   interrupted?: boolean;
+  // Set-step-specific (issue #221)
+  set_output_type?: import('@/types/events').SetOutputType;
+  set_output_keys?: string[];
+  set_value_repr?: string;
   // Gate-specific
   options?: string[];
   option_details?: GateOptionDetail[];
@@ -1262,6 +1268,39 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     replaceNode(t.nodes, data.agent_name);
   },
 
+  set_started: (state, _data, timestamp) => {
+    const data = _data as { agent_name: string };
+    const t = activeTarget(state, _data);
+    const nd = ensureNode(t.nodes, data.agent_name);
+    nd.status = 'running';
+    nd.startedAt = timestamp ?? Date.now() / 1000;
+    replaceNode(t.nodes, data.agent_name);
+  },
+
+  set_completed: (state, _data) => {
+    const data = _data as unknown as SetCompletedData;
+    const t = activeTarget(state, _data);
+    const nd = ensureNode(t.nodes, data.agent_name);
+    nd.status = 'completed';
+    t.incrCompleted();
+    nd.elapsed = data.elapsed;
+    nd.set_output_type = data.output_type;
+    nd.set_output_keys = data.output_keys;
+    nd.set_value_repr = data.value_repr;
+    replaceNode(t.nodes, data.agent_name);
+  },
+
+  set_failed: (state, _data) => {
+    const data = _data as unknown as SetFailedData;
+    const t = activeTarget(state, _data);
+    const nd = ensureNode(t.nodes, data.agent_name);
+    nd.status = 'failed';
+    nd.elapsed = data.elapsed;
+    nd.error_type = data.error_type;
+    nd.error_message = data.message;
+    replaceNode(t.nodes, data.agent_name);
+  },
+
   gate_presented: (state, _data) => {
     const data = _data as unknown as GatePresentedData;
     const t = activeTarget(state, _data);
@@ -1849,6 +1888,23 @@ function buildLogEntry(event: WorkflowEvent): LogEntry | null {
     case 'wait_failed':
       return { timestamp: ts, level: 'error', source: String(d.agent_name), message: `Wait failed: ${d.message || d.error_type || 'unknown error'}` };
 
+    case 'set_started':
+      return { timestamp: ts, level: 'info', source: String(d.agent_name), message: 'Set started' };
+
+    case 'set_completed': {
+      const keys = (d.output_keys as string[] | undefined) ?? [];
+      const summary = keys.length > 0 ? ` · ${keys.join(', ')}` : '';
+      return {
+        timestamp: ts,
+        level: 'success',
+        source: String(d.agent_name),
+        message: `Set completed${summary}${d.elapsed != null ? ` in ${formatSec(d.elapsed as number)}` : ''}`,
+      };
+    }
+
+    case 'set_failed':
+      return { timestamp: ts, level: 'error', source: String(d.agent_name), message: `Set failed: ${d.message || d.error_type || 'unknown error'}` };
+
     case 'gate_presented':
       return { timestamp: ts, level: 'warning', source: String(d.agent_name), message: 'Waiting for human input…' };
 
@@ -2025,6 +2081,24 @@ function buildActivityLogEntry(event: WorkflowEvent): ActivityLogEntry | null {
 
     case 'wait_failed':
       return { timestamp: ts, source: String(d.agent_name), type: 'turn', message: `Wait failed: ${d.message || d.error_type || 'unknown'}` };
+
+    case 'set_started':
+      return { timestamp: ts, source: String(d.agent_name), type: 'turn', message: 'Set started' };
+
+    case 'set_completed': {
+      const keys = (d.output_keys as string[] | undefined) ?? [];
+      const summary = keys.length > 0 ? ` (${keys.join(', ')})` : '';
+      return {
+        timestamp: ts,
+        source: String(d.agent_name),
+        type: 'tool-complete',
+        message: `Set completed${summary}`,
+        detail: d.value_repr ? truncate(String(d.value_repr), 300) : null,
+      };
+    }
+
+    case 'set_failed':
+      return { timestamp: ts, source: String(d.agent_name), type: 'turn', message: `Set failed: ${d.message || d.error_type || 'unknown'}` };
 
     default:
       return null;

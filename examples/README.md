@@ -53,6 +53,28 @@ Parallel code validation checks. Demonstrates:
 conductor run examples/parallel-validation.yaml --input code="def hello(): print('world')"
 ```
 
+## Set Step Examples
+
+### set-step.yaml
+
+Derive named values from Jinja2 expressions without spending an LLM call. Demonstrates:
+
+- Single `value:` binding (scalar output accessible as `step.output`)
+- Multi `values:` binding (dict output accessible as `step.output.<key>`)
+- Conditional routing on a derived boolean (`when: "{{ output.is_breaking }}"`)
+- Combining derived values with downstream script-step consumers
+
+```bash
+# Breaking-change branch
+conductor run examples/set-step.yaml \
+  --input org=microsoft --input repo=conductor --input severity=high
+
+# Safe-change branch with a custom model
+conductor run examples/set-step.yaml \
+  --input org=acme --input repo=widget --input severity=low \
+  --input model=claude-haiku-4.5
+```
+
 ## Human-in-the-Loop Examples
 
 ### design-review.yaml

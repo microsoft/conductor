@@ -171,8 +171,8 @@ def validate_workflow_config(
         errors.extend(input_errors)
         warnings.extend(input_warnings)
 
-        # Validate tool references (skip for script/wait-type agents, they don't use tools)
-        if agent.tools is not None and agent.tools and agent.type not in ("script", "wait"):
+        # Validate tool references (skip for script, set, and wait agents — they don't use tools)
+        if agent.tools is not None and agent.tools and agent.type not in ("script", "set", "wait"):
             tool_errors = _validate_tool_references(agent.name, agent.tools, set(config.tools))
             errors.extend(tool_errors)
 
@@ -537,6 +537,23 @@ def _validate_parallel_groups(config: WorkflowConfig) -> list[str]:
                             f"another agent '{ref_agent}' in the same parallel group. "
                             "Agents within the same parallel group cannot have dependencies "
                             "on each other."
+                        )
+
+            # For 'set' steps, also walk value/values.* templates — they can
+            # reference siblings directly without declaring them in input:.
+            # Parallel execution uses a pre-group snapshot, so any reference
+            # to a same-group member would silently miss its output.
+            if agent.type == "set":
+                for source_label, template_str in _collect_template_strings(agent):
+                    refs = _extract_template_refs(template_str)
+                    cross_refs = refs.agent_refs & pg_agents_set
+                    cross_refs.discard(agent_name)
+                    for ref_agent in sorted(cross_refs):
+                        errors.append(
+                            f"{source_label} references "
+                            f"another agent '{ref_agent}' in the same parallel group "
+                            f"'{pg.name}'. Agents within the same parallel group cannot "
+                            "have dependencies on each other."
                         )
 
         # PE-2.6: Validate no nested parallel groups
@@ -926,6 +943,17 @@ def _collect_template_strings(
         templates.append((f"agent '{agent.name}' args[{i}]", arg))
     if agent.working_dir:
         templates.append((f"agent '{agent.name}' working_dir", agent.working_dir))
+
+    # 'set' step bindings — value: single expression, values: named expressions.
+    # Use getattr so duck-typed test fixtures without these attributes still
+    # work (matches the input_mapping pattern below).
+    value: str | None = getattr(agent, "value", None)
+    if value is not None:
+        templates.append((f"agent '{agent.name}' value", value))
+    values: dict[str, str] | None = getattr(agent, "values", None)
+    if values:
+        for key, expr in values.items():
+            templates.append((f"agent '{agent.name}' values.{key}", expr))
 
     # input_mapping is on AgentDef in main (added by #109 closing #101) but may not
     # exist on the schema in branches that haven't merged that yet. getattr keeps
@@ -1369,7 +1397,7 @@ def _validate_template_references(
                     )
                 elif (
                     is_explicit
-                    and agent.type not in ("script", "workflow", "human_gate", "wait")
+                    and agent.type not in ("script", "set", "workflow", "human_gate", "wait")
                     and input_name not in declared_workflow_inputs
                 ):
                     warnings.append(

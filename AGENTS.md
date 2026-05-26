@@ -86,6 +86,7 @@ make validate-examples    # validate all examples
 - **executor/**: Agent execution
   - `agent.py` - `AgentExecutor` handles prompt rendering, tool resolution, and output validation for single agents
   - `script.py` - `ScriptExecutor` runs shell commands as workflow steps, capturing stdout/stderr/exit_code
+  - `set_step.py` - `SetExecutor` evaluates Jinja2 expressions for `type: set` steps and binds typed values into the workflow context (no LLM, no subprocess). Supports single `value:` and multi `values:` forms with auto / explicit `output_type:` coercion.
   - `wait.py` - `WaitExecutor` pauses workflow execution for a parsed duration via `asyncio.sleep`. Races the sleep against the engine's `interrupt_event` so Esc/Ctrl+G cancels in-flight waits immediately; the workflow-level `limits.timeout_seconds` also cancels it via `LimitEnforcer.wait_for_with_timeout`. Output contract is strictly `{"waited_seconds": float}` per issue #218.
   - `template.py` - Jinja2 template rendering
   - `output.py` - JSON output parsing and schema validation
@@ -116,13 +117,14 @@ make validate-examples    # validate all examples
 
 1. CLI parses YAML via `config/loader.py` → `WorkflowConfig`
 2. `WorkflowEngine` initializes with config and provider
-3. Engine loops: find agent/parallel/for-each/script/wait → execute → evaluate routes → next
+3. Engine loops: find agent/parallel/for-each/script/set/wait → execute → evaluate routes → next
 4. Parallel groups execute agents concurrently with context isolation (deep copy snapshot)
 5. For-each groups resolve source arrays at runtime, inject loop variables (`{{ item }}`, `{{ _index }}`, `{{ _key }}`)
 6. Script steps run shell commands via asyncio subprocess, expose stdout/stderr/exit_code to context
-7. Wait steps pause via `asyncio.sleep` (cancellable by interrupt or workflow timeout); expose `{"waited_seconds": float}` to context
-8. Routes evaluated via `Router` using Jinja2 or simpleeval expressions
-9. Final output built from templates in `output:` section
+7. Set steps render Jinja2 expressions and bind typed values to context (no LLM, no subprocess) via the shared `WorkflowEngine._run_set_step` helper, which enforces `output:` schema in all three positions (main loop, parallel group, for-each iteration) and emits `set_started` / `set_completed` / `set_failed`
+8. Wait steps pause via `asyncio.sleep` (cancellable by interrupt or workflow timeout); expose `{"waited_seconds": float}` to context
+9. Routes evaluated via `Router` using Jinja2 or simpleeval expressions
+10. Final output built from templates in `output:` section
 
 ### Key Patterns
 
@@ -130,6 +132,7 @@ make validate-examples    # validate all examples
 - **Failure modes** for parallel/for-each: `fail_fast`, `continue_on_error`, `all_or_nothing`
 - **Route evaluation**: First matching `when` condition wins; no `when` = always matches
 - **Tool resolution**: `null` = all workflow tools, `[]` = none, `[list]` = subset
+- **Set step typing**: `output_type` defaults to `auto` (safe YAML parse with `_to_json_safe` normalisation — `datetime`/`date`/`time` → ISO 8601, non-string dict keys and other non-JSON-safe values raise `ExecutionError`). Explicit `string`/`number`/`integer`/`boolean`/`list`/`dict` only valid on single `value:`. `WorkflowContext.store` accepts any JSON-safe value (scalars/lists from `set` steps in addition to the dicts produced by LLM / script / gate / parallel-group outputs); `_add_agent_input` returns the scalar verbatim for `step.output` and raises a clear `KeyError` for `step.output.field` shorthand on non-dict outputs.
 - **Reasoning effort**: `runtime.default_reasoning_effort` sets a workflow-wide default; per-agent `reasoning.effort` overrides it. Allowed values: `low`, `medium`, `high`, `xhigh`. Each provider translates the unified value to its native API (Copilot: `reasoning_effort` on the session, validated against the model's `supported_reasoning_efforts`; Claude: extended thinking with budget mapping low=2048, medium=8192, high=16384, xhigh=32768 tokens, with `temperature` coerced to 1.0 and `max_tokens` bumped to fit the budget). See `examples/reasoning-effort.yaml`.
 
 ### Debugging `--web-bg` failures
