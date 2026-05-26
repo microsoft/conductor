@@ -103,7 +103,7 @@ agents:
     name: string                    # Unique agent identifier
 
     # Optional fields
-    type: string                    # "agent" (default), "human_gate", "script", or "workflow"
+    type: string                    # "agent" (default), "human_gate", "script", "workflow", or "wait"
     description: string             # What this agent does
     model: string                   # Override default_model
     provider: string                # Per-agent provider override ("copilot" or "claude")
@@ -145,14 +145,14 @@ agents:
     timeout_seconds: float          # Hard wall-clock timeout (>=1.0); engine wraps in asyncio.wait_for().
                                     # Effective limit = min(timeout_seconds, remaining_workflow_timeout).
                                     # Raises AgentTimeoutError; non-retryable.
-                                    # Forbidden on script (use 'timeout' instead), human_gate, workflow.
+                                    # Forbidden on script (use 'timeout' instead), human_gate, workflow, wait.
 
     # Per-agent reasoning effort (overrides runtime.default_reasoning_effort)
-    # Not allowed for script, human_gate, or workflow agent types.
+    # Not allowed for script, human_gate, workflow, or wait agent types.
     reasoning:
       effort: string                # low, medium, high, or xhigh
 
-    # Per-agent retry policy (optional, not allowed for script, human_gate, or workflow agents)
+    # Per-agent retry policy (optional, not allowed for script, human_gate, workflow, or wait agents)
     retry:
       max_attempts: integer         # Max attempts including first (1-10, default: 1 = no retry)
       backoff: string               # "exponential" (default) or "fixed"
@@ -199,7 +199,7 @@ agents:
 
 Both providers continue to surface reasoning content via `agent_reasoning` events visible in the dashboard, JSONL logs, and console at `-vv`.
 
-Forbidden on agent types: `script`, `human_gate`, `workflow`.
+Forbidden on agent types: `script`, `human_gate`, `workflow`, `wait`.
 
 ## Script Agent Schema
 
@@ -231,6 +231,47 @@ Script agents always produce:
 {{ script_name.output.exit_code }}  # Process exit code (0 = success)
 ```
 
+## Wait Agent Schema
+
+Wait agents pause workflow execution for a parsed duration via in-process `asyncio.sleep`. Cross-platform — no shell `sleep` dependency. Use for rate-limit cooldowns, polling intervals, and external-system catch-up.
+
+```yaml
+agents:
+  - name: string
+    type: wait                      # Required
+    description: string             # Optional
+    duration: string | number       # Required: see "Duration format" below
+    reason: string                  # Optional: human-readable reason (shown in dashboard)
+    input: [string]                 # Optional: context dependencies
+    routes:                         # Required: routing rules
+      - to: string
+        when: string                # May reference waited_seconds
+```
+
+### Duration Format
+
+`duration` accepts:
+
+- A plain `int` or `float` (interpreted as seconds): `duration: 60`, `duration: 1.5`
+- A string with a unit suffix — `ms`, `s`, `m`, `h`: `"500ms"`, `"60s"`, `"2.5m"`, `"1h"`
+- A Jinja2 template rendering to one of the above: `"{{ workflow.input.interval }}s"`
+  (templates defer literal validation to runtime)
+
+The resolved duration must be **> 0 and ≤ 24h** (`86400s`). Booleans are rejected.
+
+### Wait Output
+
+Wait agents produce a single, strict field:
+
+```jinja2
+{{ wait_name.output.waited_seconds }}  # Actual seconds slept (may be < requested on interrupt)
+```
+
+### Wait Restrictions
+
+Forbidden fields: `prompt`, `model`, `provider`, `tools`, `system_prompt`, `options`, `command`, `args`, `env`, `working_dir`, `timeout`, `workflow`, `input_mapping`, `max_depth`, `max_session_seconds`, `max_agent_iterations`, `retry`, `dialog`, `reasoning`, `timeout_seconds`, `output`. Wait steps cannot be used inside `parallel` or `for_each` groups.
+
+`Esc` / `Ctrl+G` cancels in-progress waits. Workflow-level `limits.timeout_seconds` also cancels them.
 ## Set Agent Schema
 
 Set agents evaluate Jinja2 expressions and bind typed values into the workflow context — no LLM call, no subprocess:
@@ -634,12 +675,14 @@ runtime:
 - All route targets must be valid agent names, group names, `$end`, or `self`
 - `when` conditions must be valid Jinja2 expressions
 - `human_gate` agents require `options` and `prompt`
+- `wait` agents require `duration`; literal values must be `> 0` and `≤ 86400s` (24h)
 
 ### Parallel Group Validation
 
 - Must contain at least 2 agents
 - All referenced agents must exist
 - Route targets must be valid
+- `script`, `workflow`, and `wait` steps cannot be used inside parallel groups
 
 ### For-Each Validation
 
@@ -647,6 +690,7 @@ runtime:
 - `as` must be a valid Python identifier, not a reserved name
 - `max_concurrent` must be 1-100
 - Nested for-each groups are not allowed
+- `script` and `wait` steps cannot be used as inline agents in for-each groups
 
 ### Routing Validation
 

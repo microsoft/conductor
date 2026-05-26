@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.17...HEAD)
 
+### Added
+- New `type: wait` workflow step that pauses execution for a parsed
+  duration via in-process `asyncio.sleep`. Cross-platform — no shell
+  `sleep` dependency. Use for rate-limit cooldowns, polling intervals,
+  external-system catch-up, and demos. The `duration:` field accepts
+  plain numbers (seconds), suffixed strings (`"500ms"`, `"60s"`,
+  `"2.5m"`, `"1h"`), or a Jinja2 template that renders to one of
+  those (e.g. `"{{ workflow.input.poll_interval }}s"`). Schema enforces
+  `0 < duration <= 24h` and rejects boolean values pre-coercion.
+  `Esc` / `Ctrl+G` cancels in-progress waits immediately (the engine
+  races the sleep against the interrupt event), and the workflow-level
+  `limits.timeout_seconds` also cancels them. Wait steps emit
+  `wait_started` / `wait_completed` / `wait_failed` events alongside
+  the generic `agent_started` (with `agent_type: "wait"`), so existing
+  dashboards keyed on agent lifecycle pick them up automatically. The
+  dashboard adds a dedicated `WaitNode` (clock icon) and `WaitDetail`
+  panel that show the requested duration, actual elapsed time, reason,
+  and an "interrupted" indicator. The public output contract is strict
+  — only `{"waited_seconds": float}` is exposed to workflow context;
+  extra metadata lives in event payloads. Wait steps count toward
+  `limits.max_iterations` (each pause is one step) but are not subject
+  to `max_agent_iterations` (per-LLM-agent tool counter). Wait cannot
+  be used inside `parallel` or `for_each` groups. New `examples/wait-step.yaml`
+  demonstrates a polling pattern with a templated poll interval and
+  route loop-back
+  ([#224](https://github.com/microsoft/conductor/pull/224),
+  closes [#218](https://github.com/microsoft/conductor/issues/218)).
+
 ## [0.1.17](https://github.com/microsoft/conductor/compare/v0.1.16...v0.1.17) - 2026-05-21
 
 ### Added

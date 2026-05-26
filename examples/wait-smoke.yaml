@@ -1,0 +1,92 @@
+# Wait Smoke Test
+#
+# Minimal `type: wait` workflow with no LLM calls, no scripts, no
+# provider dependency. Useful for:
+#
+# - Verifying conductor installs and runs without configuring a provider.
+# - Quickly sanity-checking dashboard rendering of wait nodes (with --web).
+# - Confirming Esc / Ctrl+G cancels an in-progress wait immediately.
+# - Confirming workflow-level limits.timeout_seconds cancels a long wait.
+#
+# Three wait steps run sequentially, each demonstrating a different
+# duration syntax (suffixed string, templated workflow.input, plain
+# numeric). All three are short by default so the workflow finishes in
+# under two seconds.
+#
+# Usage:
+#   conductor run examples/wait-smoke.yaml
+#
+#   # Watch wait nodes animate in the dashboard:
+#   conductor run examples/wait-smoke.yaml --web
+#
+#   # Override the templated middle wait:
+#   conductor run examples/wait-smoke.yaml --input middle_duration_ms=750
+#
+#   # Press Esc during the workflow to cancel the in-flight wait:
+#   conductor run examples/wait-smoke.yaml --input middle_duration_ms=30000
+#
+#   # Watch the workflow timeout cancel an in-flight wait:
+#   conductor run examples/wait-smoke.yaml --input middle_duration_ms=30000
+#   # → workflow.limits.timeout_seconds (3) fires before middle finishes.
+
+workflow:
+  name: wait-smoke
+  description: Minimal wait-only workflow for smoke testing and demos
+  version: "1.0.0"
+  entry_point: first
+
+  # No runtime block: wait steps don't call a provider, so this workflow
+  # runs without any provider configuration. The CLI defaults to
+  # `copilot` for parsing purposes, but no API calls are made.
+
+  input:
+    middle_duration_ms:
+      type: number
+      default: 500
+      description: Duration of the middle wait step, in milliseconds.
+
+  limits:
+    # Each wait step counts as one iteration (it's a step, not an LLM
+    # call). Three waits + headroom for routing = 5.
+    max_iterations: 5
+    # If the templated middle_duration_ms is set very high, the workflow
+    # timeout will fire and cancel the in-flight wait — useful for
+    # exercising the timeout path.
+    timeout_seconds: 3
+
+agents:
+  # Suffixed string duration — the most common form.
+  - name: first
+    type: wait
+    description: First wait — fixed suffixed-string duration.
+    duration: 200ms
+    reason: First pause (suffixed-string duration)
+    routes:
+      - to: middle
+
+  # Templated duration — reads from workflow.input. Renders locally
+  # (no LLM), so workflow.input is available without an explicit
+  # `input:` declaration.
+  - name: middle
+    type: wait
+    description: Middle wait — duration templated from workflow.input.
+    duration: "{{ workflow.input.middle_duration_ms }}ms"
+    reason: Middle pause (templated duration)
+    routes:
+      - to: last
+
+  # Plain numeric duration — interpreted as seconds.
+  - name: last
+    type: wait
+    description: Last wait — plain numeric duration in seconds.
+    duration: 0.3
+    reason: Final pause (plain numeric seconds)
+    routes:
+      - to: $end
+
+# Workflow output exposes each step's waited_seconds so callers can
+# verify the contract end-to-end.
+output:
+  first_waited: "{{ first.output.waited_seconds }}"
+  middle_waited: "{{ middle.output.waited_seconds }}"
+  last_waited: "{{ last.output.waited_seconds }}"

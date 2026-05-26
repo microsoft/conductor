@@ -812,6 +812,19 @@ class ConsoleEventSubscriber:
                 d.get("elapsed", 0.0),
             )
 
+        elif t == "wait_completed":
+            interrupted = d.get("interrupted", False)
+            waited = d.get("waited_seconds", d.get("elapsed", 0.0))
+            suffix = " (interrupted)" if interrupted else ""
+            verbose_log(f"  Wait done: {d.get('agent_name', '?')} after {waited:.2f}s{suffix}")
+
+        elif t == "wait_failed":
+            verbose_log(
+                f"  Wait failed: {d.get('agent_name', '?')} — "
+                f"{d.get('error_type', 'Error')}: {d.get('message', 'unknown')}",
+                style="red",
+            )
+
 
 def display_usage_summary(usage_data: dict[str, Any], console: Console | None = None) -> None:
     """Display final usage summary with token counts and costs.

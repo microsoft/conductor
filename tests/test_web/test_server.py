@@ -1110,7 +1110,7 @@ class TestReplaySyntheticFromContext:
     """Tests for WebDashboard.replay_synthetic_from_context (issue #167 fallback)."""
 
     def _build_config(self):
-        """Build a minimal WorkflowConfig with one agent + one script for tests."""
+        """Build a minimal WorkflowConfig with one agent + one script + one wait for tests."""
         from conductor.config.schema import AgentDef, RuntimeConfig, WorkflowConfig, WorkflowDef
 
         return WorkflowConfig(
@@ -1122,6 +1122,7 @@ class TestReplaySyntheticFromContext:
             agents=[
                 AgentDef(name="a", prompt="x", routes=[]),
                 AgentDef(name="s", type="script", command="echo hi", routes=[]),
+                AgentDef(name="w", type="wait", duration="5s", reason="cooldown", routes=[]),
             ],
         )
 
@@ -1155,6 +1156,36 @@ class TestReplaySyntheticFromContext:
         types = [ev["type"] for ev in dashboard._event_history]
         assert types == ["script_started", "script_completed"]
         assert dashboard._event_history[1]["data"]["stdout"] == "hi"
+
+    def test_emits_wait_events_for_wait_type(self) -> None:
+        """Wait steps replay via _synth_agent_or_script's wait branch
+        (issue #218). The synthetic event pair must use the
+        wait_started/wait_completed names, propagate the persisted
+        waited_seconds, carry the AgentDef's reason, and mark
+        ``synthetic: True`` so the UI can identify replayed state."""
+        from conductor.engine.context import WorkflowContext
+
+        emitter, dashboard = _make_dashboard()
+        ctx = WorkflowContext()
+        ctx.store("w", {"waited_seconds": 3.5})
+
+        count = dashboard.replay_synthetic_from_context(ctx, self._build_config())
+
+        assert count == 2
+        types = [ev["type"] for ev in dashboard._event_history]
+        assert types == ["wait_started", "wait_completed"]
+        started = dashboard._event_history[0]["data"]
+        completed = dashboard._event_history[1]["data"]
+        assert started["agent_name"] == "w"
+        assert started["duration_seconds"] == 3.5
+        assert started["reason"] == "cooldown"
+        assert started["synthetic"] is True
+        assert completed["agent_name"] == "w"
+        assert completed["waited_seconds"] == 3.5
+        assert completed["requested_seconds"] == 3.5
+        assert completed["reason"] == "cooldown"
+        assert completed["interrupted"] is False
+        assert completed["synthetic"] is True
 
     def test_empty_history_returns_zero(self) -> None:
         from conductor.engine.context import WorkflowContext

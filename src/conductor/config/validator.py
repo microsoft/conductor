@@ -171,8 +171,8 @@ def validate_workflow_config(
         errors.extend(input_errors)
         warnings.extend(input_warnings)
 
-        # Validate tool references (skip for script and set agents, they don't use tools)
-        if agent.tools is not None and agent.tools and agent.type not in ("script", "set"):
+        # Validate tool references (skip for script, set, and wait agents — they don't use tools)
+        if agent.tools is not None and agent.tools and agent.type not in ("script", "set", "wait"):
             tool_errors = _validate_tool_references(agent.name, agent.tools, set(config.tools))
             errors.extend(tool_errors)
 
@@ -204,12 +204,17 @@ def validate_workflow_config(
         parallel_errors = _validate_parallel_groups(config)
         errors.extend(parallel_errors)
 
-    # Validate for_each groups: reject script steps as inline agents
+    # Validate for_each groups: reject script and wait steps as inline agents
     for for_each_group in config.for_each:
         if for_each_group.agent.type == "script":
             errors.append(
                 f"For-each group '{for_each_group.name}' uses a script step as its "
                 "inline agent. Script steps cannot be used in for_each groups."
+            )
+        if for_each_group.agent.type == "wait":
+            errors.append(
+                f"For-each group '{for_each_group.name}' uses a wait step as its "
+                "inline agent. Wait steps cannot be used in for_each groups."
             )
 
     # Validate sub-workflow references (local paths and registry refs).
@@ -491,6 +496,13 @@ def _validate_parallel_groups(config: WorkflowConfig) -> list[str]:
                 errors.append(
                     f"Agent '{agent_name}' in parallel group '{pg.name}' is a script step. "
                     "Script steps cannot be used in parallel groups."
+                )
+
+            # Validate no wait steps in parallel groups
+            if agent.type == "wait":
+                errors.append(
+                    f"Agent '{agent_name}' in parallel group '{pg.name}' is a wait step. "
+                    "Wait steps cannot be used in parallel groups."
                 )
 
             # Validate no workflow steps in parallel groups
@@ -1385,7 +1397,7 @@ def _validate_template_references(
                     )
                 elif (
                     is_explicit
-                    and agent.type not in ("script", "set", "workflow", "human_gate")
+                    and agent.type not in ("script", "set", "workflow", "human_gate", "wait")
                     and input_name not in declared_workflow_inputs
                 ):
                     warnings.append(

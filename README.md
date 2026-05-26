@@ -302,6 +302,8 @@ See the [`examples/`](./examples/) directory for complete workflows:
 | [design-review.yaml](./examples/design-review.yaml) | Human gate with loop pattern |
 | [script-step.yaml](./examples/script-step.yaml) | Script step with exit_code routing |
 | [set-step.yaml](./examples/set-step.yaml) | Set step deriving named values + boolean-routed branching |
+| [wait-step.yaml](./examples/wait-step.yaml) | Wait step + script for a polling loop-back pattern |
+| [wait-smoke.yaml](./examples/wait-smoke.yaml) | Minimal wait-only smoke test (no provider required) |
 
 **More examples and running instructions:** [examples/README.md](./examples/README.md)
 

@@ -159,8 +159,8 @@ agents:
 
 Per-agent overrides always win over the workflow-wide default. The
 `reasoning.effort` field is **only** valid on standard `agent`-type agents; it
-is rejected on `script`, `human_gate`, and `workflow` agents (which do not call
-a model).
+is rejected on `script`, `human_gate`, `workflow`, and `wait` agents (which do
+not call a model).
 
 ### Per-provider translation
 

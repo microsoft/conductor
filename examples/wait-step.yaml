@@ -1,0 +1,109 @@
+# Wait Step Example
+#
+# This example demonstrates the `type: wait` step. A wait step pauses
+# workflow execution for a parsed duration (seconds, "Ns/Nm/Nh/Nms",
+# or a Jinja2 template that evaluates to one of those). The pause is
+# pure in-process asyncio.sleep — no shell `sleep` command, so it works
+# cross-platform.
+#
+# This workflow demonstrates a common pattern: polling an external
+# system until it returns a "ready" status, with a cool-down between
+# attempts. The wait step's duration is templated from a workflow
+# input so the caller controls the poll cadence.
+#
+# Usage:
+#   conductor run examples/wait-step.yaml \
+#     --input poll_interval_seconds=2 --input max_attempts=3
+
+workflow:
+  name: wait-step-demo
+  description: Polling pattern with a wait step and a routing loop-back
+  version: "1.0.0"
+  entry_point: check_status
+
+  runtime:
+    provider: copilot
+
+  input:
+    poll_interval_seconds:
+      type: number
+      default: 5
+      description: Seconds to wait between polling attempts.
+    max_attempts:
+      type: number
+      default: 3
+      description: Maximum number of polling attempts before giving up.
+
+  limits:
+    # Wait steps count toward max_iterations (each pause is one step),
+    # so allow enough headroom for max_attempts polls + waits + summary.
+    max_iterations: 20
+    timeout_seconds: 600
+
+agents:
+  # A trivial script that simulates polling an external system. In a
+  # real workflow this would hit an HTTP endpoint, query a job queue,
+  # check a CDN, etc. Here we just bump a counter and report "ready"
+  # on the third attempt.
+  - name: check_status
+    type: script
+    description: Poll the (simulated) external system for readiness.
+    command: python3
+    args:
+      - "-c"
+      - |
+        import json, os, sys, pathlib
+        # Use a small counter file in /tmp so reruns are independent.
+        p = pathlib.Path(os.environ["STATUS_FILE"])
+        count = int(p.read_text()) if p.exists() else 0
+        count += 1
+        p.write_text(str(count))
+        # `args` entries ARE Jinja2-templated by the engine (unlike
+        # `env`, which is passed as-is to the subprocess). We use a
+        # positional arg for the threshold so workflow.input renders
+        # correctly.
+        ready_after = int(sys.argv[1])
+        ready = count >= ready_after
+        print(json.dumps({
+            "status": "ready" if ready else "pending",
+            "attempt": count,
+        }))
+      - "{{ workflow.input.max_attempts }}"
+    env:
+      STATUS_FILE: /tmp/wait-step-demo.count
+    routes:
+      - to: summarize
+        when: "status == 'ready'"
+      - to: cool_down
+
+  # Wait for the configured poll interval, then loop back to check_status.
+  # The duration template uses workflow.input.* directly — wait steps
+  # render locally (no LLM), so workflow.input is available without an
+  # explicit `input:` declaration.
+  - name: cool_down
+    type: wait
+    duration: "{{ workflow.input.poll_interval_seconds }}s"
+    reason: "Cooling down between polling attempts"
+    routes:
+      - to: check_status
+
+  # Summarize the polling result. An ordinary agent reading the most
+  # recent check_status output and reporting back to the caller.
+  - name: summarize
+    description: Summarize the polling result.
+    model: claude-haiku-4.5
+    input:
+      - "check_status.output"
+    prompt: |
+      The poll loop reported readiness on attempt {{ check_status.output.attempt }}.
+      Write a single short sentence summarizing the result.
+    output:
+      summary:
+        type: string
+        description: One-sentence summary of the polling result.
+    routes:
+      - to: $end
+
+output:
+  result: "{{ summarize.output.summary }}"
+  attempts: "{{ check_status.output.attempt }}"

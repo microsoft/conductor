@@ -87,8 +87,11 @@ make validate-examples    # validate all examples
   - `agent.py` - `AgentExecutor` handles prompt rendering, tool resolution, and output validation for single agents
   - `script.py` - `ScriptExecutor` runs shell commands as workflow steps, capturing stdout/stderr/exit_code
   - `set_step.py` - `SetExecutor` evaluates Jinja2 expressions for `type: set` steps and binds typed values into the workflow context (no LLM, no subprocess). Supports single `value:` and multi `values:` forms with auto / explicit `output_type:` coercion.
+  - `wait.py` - `WaitExecutor` pauses workflow execution for a parsed duration via `asyncio.sleep`. Races the sleep against the engine's `interrupt_event` so Esc/Ctrl+G cancels in-flight waits immediately; the workflow-level `limits.timeout_seconds` also cancels it via `LimitEnforcer.wait_for_with_timeout`. Output contract is strictly `{"waited_seconds": float}` per issue #218.
   - `template.py` - Jinja2 template rendering
   - `output.py` - JSON output parsing and schema validation
+
+- **duration.py**: `parse_duration(value)` shared helper. Accepts plain `int`/`float` seconds, or strings with `ms`/`s`/`m`/`h` suffix. Raises `ValueError` (nests cleanly inside Pydantic `ValidationError`). Rejects booleans. Bounds enforcement (e.g. > 0, 24h cap) lives in callers so the parser can be reused.
 
 - **providers/**: SDK provider abstraction
   - `base.py` - `AgentProvider` ABC defining `execute()`, `validate_connection()`, `close()`
@@ -114,13 +117,14 @@ make validate-examples    # validate all examples
 
 1. CLI parses YAML via `config/loader.py` → `WorkflowConfig`
 2. `WorkflowEngine` initializes with config and provider
-3. Engine loops: find agent/parallel/for-each/script/set → execute → evaluate routes → next
+3. Engine loops: find agent/parallel/for-each/script/set/wait → execute → evaluate routes → next
 4. Parallel groups execute agents concurrently with context isolation (deep copy snapshot)
 5. For-each groups resolve source arrays at runtime, inject loop variables (`{{ item }}`, `{{ _index }}`, `{{ _key }}`)
 6. Script steps run shell commands via asyncio subprocess, expose stdout/stderr/exit_code to context
 7. Set steps render Jinja2 expressions and bind typed values to context (no LLM, no subprocess) via the shared `WorkflowEngine._run_set_step` helper, which enforces `output:` schema in all three positions (main loop, parallel group, for-each iteration) and emits `set_started` / `set_completed` / `set_failed`
-8. Routes evaluated via `Router` using Jinja2 or simpleeval expressions
-9. Final output built from templates in `output:` section
+8. Wait steps pause via `asyncio.sleep` (cancellable by interrupt or workflow timeout); expose `{"waited_seconds": float}` to context
+9. Routes evaluated via `Router` using Jinja2 or simpleeval expressions
+10. Final output built from templates in `output:` section
 
 ### Key Patterns
 
