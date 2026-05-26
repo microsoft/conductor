@@ -23,6 +23,7 @@ from rich.panel import Panel
 from rich.table import Table
 
 from conductor.config.loader import load_config
+from conductor.engine.checkpoint import _conductor_run_dir
 from conductor.engine.workflow import ExecutionPlan, WorkflowEngine
 from conductor.mcp_auth import resolve_mcp_server_auth
 from conductor.providers.registry import ProviderRegistry
@@ -97,7 +98,7 @@ def generate_log_path(workflow_name: str) -> Path:
     # when multiple runs start in the same second
     suffix = secrets.token_hex(4)
     timestamp = f"{timestamp}-{suffix}"
-    path = Path(tempfile.gettempdir()) / "conductor" / f"conductor-{workflow_name}-{timestamp}.log"
+    path = _conductor_run_dir() / f"conductor-{workflow_name}-{timestamp}.log"
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
 

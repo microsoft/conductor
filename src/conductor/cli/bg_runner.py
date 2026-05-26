@@ -41,6 +41,8 @@ from io import IOBase
 from pathlib import Path
 from typing import Any
 
+from conductor.engine.checkpoint import _conductor_run_dir
+
 # Windows process creation flags. Exposed via ``getattr`` with documented
 # fallbacks so this module can be imported on POSIX (where these attributes do
 # not exist on ``subprocess``) and so tests can patch ``sys.platform`` to
@@ -306,7 +308,7 @@ def _open_bg_log_files(workflow_ref: Path) -> tuple[str, Path, Path, IOBase, IOB
     run_id = secrets.token_hex(4)
     ts = time.strftime("%Y%m%d-%H%M%S")
     base = _sanitize_name(workflow_ref.stem) if workflow_ref.stem else "workflow"
-    log_dir = Path(tempfile.gettempdir()) / "conductor"
+    log_dir = _conductor_run_dir()
     log_dir.mkdir(parents=True, exist_ok=True)
 
     stderr_path = log_dir / f"conductor-{base}-{ts}-{run_id}.bg.stderr.log"

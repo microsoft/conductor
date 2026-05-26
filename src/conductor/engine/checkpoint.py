@@ -25,6 +25,29 @@ from conductor.exceptions import CheckpointError
 logger = logging.getLogger(__name__)
 
 
+def _conductor_run_dir() -> Path:
+    """Return the base directory for conductor runtime files.
+
+    Resolution order:
+    1. ``CONDUCTOR_TMPDIR`` env var (explicit override).
+    2. ``./tmp`` relative to the current working directory (default).
+
+    Using a CWD-relative path avoids requiring write access to the system
+    temp directory and keeps all conductor runtime artefacts (checkpoints,
+    event logs, bg-runner logs, debug logs) next to the project::
+
+        # Explicit override (e.g. absolute path or different subdir):
+        CONDUCTOR_TMPDIR=/var/run/conductor conductor run workflow.yaml
+
+        # Default: ./tmp/ created automatically in the CWD.
+
+    """
+    env = os.environ.get("CONDUCTOR_TMPDIR", "")
+    if env:
+        return Path(env)
+    return Path("tmp")
+
+
 def _make_json_serializable(obj: Any) -> Any:
     """Recursively convert non-JSON-serializable types to strings.
 
@@ -129,7 +152,7 @@ class CheckpointManager:
         Returns:
             Path to ``$TMPDIR/conductor/checkpoints/``.
         """
-        path = Path(tempfile.gettempdir()) / "conductor" / "checkpoints"
+        path = _conductor_run_dir() / "checkpoints"
         path.mkdir(parents=True, exist_ok=True)
         return path
 
