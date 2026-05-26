@@ -1,0 +1,168 @@
+# OpenSpec — Propose Phase
+#
+# Creates proposal.md for the given change. Called as a sub-workflow by
+# openspec-pipeline.yaml but can also be run standalone:
+#
+#   conductor run examples/openspec/phases/propose.yaml \
+#     --input change="add-oauth-login" \
+#     --input idea="Add OAuth2 login with GitHub and Google providers"
+#
+# Steps:
+#   1. get_instructions  — ask OpenSpec CLI for the proposal template + state
+#   2. write_proposal    — LLM generates the full proposal.md text
+#   3. save_proposal     — Python script writes the file to disk via env var
+#                          (avoids shell quoting issues with arbitrary markdown)
+#
+# Idempotent: if openspec reports state="done" for the proposal artifact,
+# the workflow exits immediately without re-generating.
+
+workflow:
+  name: openspec-propose-phase
+  description: Generate the proposal artifact for an OpenSpec change
+  version: "1.0.0"
+  entry_point: get_instructions
+
+  runtime:
+    provider: copilot
+    default_model: gpt-4.1
+
+  input:
+    change:
+      type: string
+      required: true
+      description: Change name in kebab-case
+    idea:
+      type: string
+      required: false
+      description: What to build — informs the proposal when starting fresh
+
+  context:
+    mode: accumulate
+
+agents:
+  # ── Step 1 ──────────────────────────────────────────────────────────────────
+  - name: get_instructions
+    type: script
+    description: |
+      Fetch proposal generation instructions from the OpenSpec CLI.
+      Wraps the CLI response with a 'state' field derived from whether the
+      output file already exists (idempotency), and exposes 'changeDir'
+      so downstream steps can resolve the real absolute path.
+    command: python3
+    args:
+      - "-c"
+      - |
+        import subprocess, json, pathlib, sys
+
+        result = subprocess.run(
+            ["openspec", "instructions", "proposal",
+             "--change", "{{ workflow.input.change }}", "--json"],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            print(result.stderr, file=sys.stderr)
+            sys.exit(result.returncode)
+
+        data = json.loads(result.stdout)
+        change_dir = pathlib.Path(data["changeDir"])
+        output_path = data.get("outputPath", "")
+        artifact_file = change_dir / output_path if output_path else None
+        data["state"] = "done" if (artifact_file and artifact_file.exists()) else "ready"
+        print(json.dumps(data))
+    output:
+      state:
+        type: string
+        description: '"ready" or "done" (derived from filesystem)'
+      instruction:
+        type: string
+        description: AI-facing guidance from the schema
+      template:
+        type: string
+        description: Markdown template structure to fill in
+      outputPath:
+        type: string
+        description: Relative path where proposal.md should be written
+      changeDir:
+        type: string
+        description: Absolute path to the change directory
+    routes:
+      - to: $end
+        when: "state == 'done'"
+      - to: write_proposal
+
+  # ── Step 2 ──────────────────────────────────────────────────────────────────
+  - name: write_proposal
+    model: gpt-4.1
+    description: |
+      Generate the complete proposal.md following the schema template and
+      instructions. Outputs the markdown as a structured field so the next
+      step can write it cleanly without shell quoting issues.
+    prompt: |
+      You are writing an OpenSpec proposal for the change "{{ workflow.input.change }}".
+
+      {% if workflow.input.idea %}
+      What to build: {{ workflow.input.idea }}
+      {% endif %}
+
+      Follow these instructions exactly when writing:
+      {{ get_instructions.output.instruction }}
+
+      Use this template as your structure — fill in every section:
+      {{ get_instructions.output.template }}
+
+      Write the complete proposal.md content now. Be concise and specific.
+      Focus on the WHY and WHAT, not the HOW.
+
+      IMPORTANT — Capabilities section:
+        In the "New Capabilities" list, use exact kebab-case names for each spec
+        that will be created (e.g. "user-auth", "data-export").
+        These names become the directory names under specs/<name>/spec.md.
+    output:
+      content:
+        type: string
+        description: Complete proposal.md markdown (ready to write to disk)
+    routes:
+      - to: save_proposal
+
+  # ── Step 3 ──────────────────────────────────────────────────────────────────
+  - name: save_proposal
+    type: script
+    description: |
+      Write proposal.md to the path supplied by the OpenSpec CLI.
+      Content is passed via an environment variable to avoid shell quoting
+      issues with multi-line markdown text.
+    command: python3
+    args:
+      - "-c"
+      - |
+        import pathlib, os, sys, json
+
+        change = os.environ["CHANGE"]
+        # Use outputPath from CLI if provided; fall back to conventional location
+        raw_path = os.environ.get("OUTPUT_PATH", "").strip()
+        # OUTPUT_PATH is now always the absolute path from changeDir+outputPath
+        path = pathlib.Path(raw_path) if raw_path else \
+               pathlib.Path(f"openspec/changes/{change}/proposal.md")
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(os.environ["CONTENT"])
+
+        size = len(os.environ["CONTENT"])
+        print(f"Wrote {path} ({size:,} chars)", file=sys.stderr)
+        print(json.dumps({"path": str(path), "size": size}))
+    env:
+      CHANGE: "{{ workflow.input.change }}"
+      # Resolve absolute path from changeDir + outputPath
+      OUTPUT_PATH: "{{ get_instructions.output.changeDir }}/{{ get_instructions.output.outputPath }}"
+      CONTENT: "{{ write_proposal.output.content }}"
+    output:
+      path:
+        type: string
+        description: Absolute path of the written file
+      size:
+        type: number
+    routes:
+      - to: $end
+
+output:
+  written_path: "{% if save_proposal is defined %}{{ save_proposal.output.path | default('') }}{% endif %}"

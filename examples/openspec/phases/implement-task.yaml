@@ -1,0 +1,168 @@
+# OpenSpec — Implement Task (single task)
+#
+# Sub-workflow invoked by apply.yaml's for_each group.
+# Implements ONE task from tasks.md, then marks it [x].
+#
+# Called with:
+#   change:           the change name
+#   task_id:          task identifier, e.g. "1.2"
+#   task_description: full task description text
+#
+# Steps:
+#   1. read_context  — concatenate all OpenSpec artifacts for the LLM
+#   2. implement     — LLM reads codebase and makes the code changes
+#   3. mark_complete — Python regex marks the task [x] in tasks.md
+#
+# Design note: the LLM (step 2) only implements code — it does NOT write
+# to tasks.md. Marking the checkbox (step 3) is handled by a deterministic
+# script to avoid LLM-introduced formatting errors in tasks.md.
+
+workflow:
+  name: openspec-implement-task
+  description: Implement a single OpenSpec task and mark it complete in tasks.md
+  version: "1.0.0"
+  entry_point: read_context
+
+  runtime:
+    provider: copilot
+    default_model: gpt-4.1
+
+  input:
+    change:
+      type: string
+      required: true
+    task_id:
+      type: string
+      required: true
+      description: Task identifier matching the checkbox prefix, e.g. "1.2"
+    task_description:
+      type: string
+      required: true
+      description: Full task description text from tasks.md
+
+  context:
+    mode: accumulate
+
+agents:
+  # ── Step 1 ──────────────────────────────────────────────────────────────────
+  - name: read_context
+    type: script
+    description: |
+      Load all OpenSpec artifacts (proposal, specs, design, tasks) into a single
+      context string. Provides the implementation agent with the full picture of
+      what to build without requiring it to discover file paths itself.
+    command: python3
+    args:
+      - "-c"
+      - |
+        import json, pathlib, sys
+
+        change = "{{ workflow.input.change }}"
+        base = pathlib.Path(f"openspec/changes/{change}")
+        sections = []
+
+        for fname in ["proposal.md", "design.md", "tasks.md"]:
+            f = base / fname
+            if f.exists():
+                sections.append(f"## {fname}\n\n{f.read_text()}")
+
+        for spec in sorted((base / "specs").glob("*/spec.md")):
+            sections.append(f"## specs/{spec.parent.name}/spec.md\n\n{spec.read_text()}")
+
+        context = "\n\n---\n\n".join(sections) if sections else "(no artifacts found)"
+        print(json.dumps({
+            "context": context,
+            "artifact_count": len(sections),
+        }))
+    output:
+      context:
+        type: string
+        description: All OpenSpec artifact content concatenated
+      artifact_count:
+        type: number
+    routes:
+      - to: implement
+
+  # ── Step 2 ──────────────────────────────────────────────────────────────────
+  - name: implement
+    model: gpt-4.1
+    description: |
+      Implement the task using the OpenSpec artifacts as requirements.
+      Makes only the code changes needed for this specific task.
+    prompt: |
+      You are implementing task {{ workflow.input.task_id }} for the OpenSpec
+      change "{{ workflow.input.change }}".
+
+      TASK: {{ workflow.input.task_description }}
+
+      OPENSPEC ARTIFACTS (requirements, design decisions, full task list):
+      {{ read_context.output.context }}
+
+      Implementation guidelines:
+        1. Read the relevant source files to understand the current code structure
+        2. Implement ONLY what this task requires — do not implement other tasks
+        3. Follow the data model and architectural decisions in design.md
+        4. Each scenario in the specs is a potential test — cover them
+        5. Update or add tests as part of the implementation
+        6. Keep changes minimal and focused on this task
+
+      After implementing, provide a brief summary of what you changed.
+      Do NOT modify tasks.md — a separate step handles marking this task complete.
+    output:
+      summary:
+        type: string
+        description: Brief description of the code changes made for this task
+    routes:
+      - to: mark_complete
+
+  # ── Step 3 ──────────────────────────────────────────────────────────────────
+  - name: mark_complete
+    type: script
+    description: |
+      Mark this task [x] in tasks.md using a precise regex replacement.
+      Using a script (not the LLM) ensures tasks.md formatting stays consistent
+      and avoids accidental edits to other lines.
+    command: python3
+    args:
+      - "-c"
+      - |
+        import pathlib, re, os, sys, json
+
+        change = os.environ["CHANGE"]
+        task_id = os.environ["TASK_ID"]
+
+        tasks_path = pathlib.Path(f"openspec/changes/{change}/tasks.md")
+        if not tasks_path.exists():
+            print(f"WARNING: tasks.md not found at {tasks_path}", file=sys.stderr)
+            print(json.dumps({"marked": False, "task_id": task_id}))
+            sys.exit(0)
+
+        text = tasks_path.read_text()
+
+        # Match "- [ ] 1.2 " or "- [ ] 1.2:" — task IDs appear right after the bracket
+        pattern = r"(- \[ \] )(" + re.escape(task_id) + r")([ :])"
+        updated, count = re.subn(pattern, r"- [x] \2\3", text)
+
+        if count == 0:
+            print(f"WARNING: task {task_id!r} not found in tasks.md", file=sys.stderr)
+        else:
+            tasks_path.write_text(updated)
+            print(f"Marked task {task_id} complete", file=sys.stderr)
+
+        print(json.dumps({"marked": count > 0, "task_id": task_id}))
+    env:
+      CHANGE: "{{ workflow.input.change }}"
+      TASK_ID: "{{ workflow.input.task_id }}"
+    output:
+      marked:
+        type: boolean
+        description: Whether the checkbox was successfully updated
+      task_id:
+        type: string
+    routes:
+      - to: $end
+
+output:
+  task_id: "{{ workflow.input.task_id }}"
+  marked: "{{ mark_complete.output.marked | default(false) }}"
+  summary: "{{ implement.output.summary | default('') }}"

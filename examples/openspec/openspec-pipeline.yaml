@@ -1,0 +1,130 @@
+# OpenSpec Full-Lifecycle Pipeline
+#
+# Drives the spec-driven OpenSpec workflow (proposal → specs → design → tasks → apply)
+# using conductor sub-workflows — one per stage. Each phase is a self-contained
+# type:workflow agent, making distinct stages visible in the web dashboard and
+# enabling granular checkpoint/resume per stage.
+#
+# Each phase is IDEMPOTENT: it checks whether its artifact already exists and
+# skips generation if it does, so the pipeline can be re-run from any stage.
+#
+# Usage (start from scratch):
+#   conductor run examples/openspec/openspec-pipeline.yaml \
+#     --input change="add-oauth-login" \
+#     --input idea="Add OAuth2 login with GitHub and Google providers"
+#
+# Usage (resume after partial run):
+#   conductor resume examples/openspec/openspec-pipeline.yaml
+#
+# Usage (with real-time dashboard):
+#   conductor run examples/openspec/openspec-pipeline.yaml --web \
+#     --input change="add-oauth-login" --input idea="..."
+#
+# Usage (run only from specs onward if proposal already done):
+#   conductor run examples/openspec/openspec-pipeline.yaml \
+#     --input change="add-oauth-login"
+#   (Each phase skips itself if its artifact is already present)
+#
+# Prerequisites:
+#   - openspec CLI installed and `openspec init` run in this repo
+#   - A Copilot or Claude provider configured in conductor
+
+workflow:
+  name: openspec-pipeline
+  description: |
+    Full OpenSpec spec-driven lifecycle: proposal → specs → design → tasks → apply.
+    Each stage runs as a conductor sub-workflow. Phases are idempotent — already-
+    complete artifacts are detected and skipped automatically.
+  version: "1.0.0"
+  entry_point: propose_phase
+
+  runtime:
+    provider: copilot
+
+  input:
+    change:
+      type: string
+      required: true
+      description: |
+        Change name in kebab-case (e.g. "add-oauth-login").
+        Must match an existing openspec change or be the name for a new one.
+    idea:
+      type: string
+      required: false
+      description: |
+        One-sentence description of what to build.
+        Only needed when starting fresh (no proposal.md yet).
+        Example: "Add OAuth2 login with GitHub and Google providers"
+
+  limits:
+    max_iterations: 300   # generous limit for large tasks with many tasks
+
+agents:
+  # ── Stage 1 ─────────────────────────────────────────────────────────────────
+  - name: propose_phase
+    type: workflow
+    description: |
+      Create proposal.md — the WHY and WHAT of the change.
+      Skips automatically if proposal.md already exists.
+    workflow: ./phases/propose.yaml
+    input_mapping:
+      change: "{{ workflow.input.change }}"
+      idea: "{{ workflow.input.idea | default('') }}"
+    routes:
+      - to: specs_phase
+
+  # ── Stage 2 ─────────────────────────────────────────────────────────────────
+  - name: specs_phase
+    type: workflow
+    description: |
+      Create one spec file per capability listed in the proposal.
+      Uses for_each internally so capabilities are generated concurrently.
+      Skips capabilities that already have spec files.
+    workflow: ./phases/specs.yaml
+    input_mapping:
+      change: "{{ workflow.input.change }}"
+    routes:
+      - to: design_phase
+
+  # ── Stage 3 ─────────────────────────────────────────────────────────────────
+  - name: design_phase
+    type: workflow
+    description: |
+      Create design.md — technical decisions, architecture, migration plan.
+      Skips automatically if design.md already exists.
+    workflow: ./phases/design.yaml
+    input_mapping:
+      change: "{{ workflow.input.change }}"
+    routes:
+      - to: tasks_phase
+
+  # ── Stage 4 ─────────────────────────────────────────────────────────────────
+  - name: tasks_phase
+    type: workflow
+    description: |
+      Create tasks.md — the checkbox-based implementation task list.
+      Skips automatically if tasks.md already exists.
+    workflow: ./phases/tasks.yaml
+    input_mapping:
+      change: "{{ workflow.input.change }}"
+    routes:
+      - to: apply_phase
+
+  # ── Stage 5 ─────────────────────────────────────────────────────────────────
+  - name: apply_phase
+    type: workflow
+    description: |
+      Implement all pending tasks in tasks.md.
+      Uses for_each internally to iterate tasks sequentially.
+      Already-completed tasks (marked [x]) are skipped.
+    workflow: ./phases/apply.yaml
+    input_mapping:
+      change: "{{ workflow.input.change }}"
+    routes:
+      - to: $end
+
+output:
+  change: "{{ workflow.input.change }}"
+  summary: |
+    OpenSpec pipeline complete for '{{ workflow.input.change }}'.
+    Run: openspec status --change {{ workflow.input.change }}

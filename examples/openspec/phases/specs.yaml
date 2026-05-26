@@ -1,0 +1,358 @@
+# OpenSpec — Specs Phase
+#
+# Generates a spec file for every capability listed in the proposal.
+# Each capability runs as a separate type:workflow sub-workflow (write-spec.yaml),
+# allowing conductor to track per-capability progress in the dashboard.
+#
+# Run standalone:
+#   conductor run examples/openspec/phases/specs.yaml \
+#     --input change="add-oauth-login"
+#
+# Steps:
+#   1. get_pending_capabilities — Python script parses proposal.md and returns
+#      the list of capability names that still need spec files
+#   2. spec_writers (for_each)  — one write-spec.yaml sub-workflow per capability,
+#      up to 2 running concurrently
+#
+# Idempotent: capabilities that already have a spec file are filtered out in step 1.
+
+workflow:
+  name: openspec-specs-phase
+  description: Generate spec files for all pending capabilities from the proposal
+  version: "1.0.0"
+  entry_point: get_pending_capabilities
+
+  runtime:
+    provider: copilot
+    default_model: gpt-4.1
+
+  input:
+    change:
+      type: string
+      required: true
+
+  context:
+    mode: accumulate
+
+  limits:
+    max_iterations: 50
+
+agents:
+  # ── Step 1 ──────────────────────────────────────────────────────────────────
+  - name: get_pending_capabilities
+    type: script
+    description: |
+      Parse proposal.md and return structured capability objects that still need
+      spec files. Each object carries:
+        - name:               kebab-case capability name
+        - kind:               "new" or "modified"
+        - existing_spec_path: path to openspec/specs/<name>/spec.md when the
+                              main spec already exists ("modified" caps); empty
+                              string for brand-new capabilities
+
+      "New Capabilities" → write spec from scratch (no prior spec exists).
+      "Modified Capabilities" → write a delta spec; the existing main spec at
+        openspec/specs/<name>/spec.md is the baseline the LLM must read.
+
+      Capabilities whose delta spec already exists under
+      openspec/changes/<change>/specs/<name>/spec.md are filtered out (idempotent).
+    command: python3
+    args:
+      - "-c"
+      - |
+        import json, pathlib, re, sys
+
+        change = "{{ workflow.input.change }}"
+        base = pathlib.Path(f"openspec/changes/{change}")
+        proposal = base / "proposal.md"
+
+        if not proposal.exists():
+            print(json.dumps({
+                "capabilities": [],
+                "state": "blocked",
+                "message": "proposal.md not found — run propose phase first",
+            }))
+            sys.exit(0)
+
+        # ── Build an index of existing main specs ────────────────────────────
+        # Scan openspec/specs/ to get the real folder names. This is the ground
+        # truth for "modified" capability matching — we never rely on the
+        # proposal name alone.
+        #
+        # existing_specs: {folder_name → absolute path to spec.md}
+        main_specs_dir = pathlib.Path("openspec/specs")
+        existing_specs = {}
+        if main_specs_dir.is_dir():
+            for spec_file in main_specs_dir.glob("*/spec.md"):
+                existing_specs[spec_file.parent.name] = spec_file
+
+        def resolve_existing_spec(proposal_name: str) -> tuple[str, str]:
+            """Return (resolved_name, spec_path_str) for a modified capability.
+
+            Resolution order:
+              1. Exact match:     proposal_name == folder name
+              2. Prefix match:    folder name starts with proposal_name (or vice-versa)
+              3. Substring match: proposal_name is a substring of a folder name
+              4. Token overlap:   share at least one hyphen-delimited word
+            Returns ("", "") when no match is found.
+            """
+            # 1. Exact
+            if proposal_name in existing_specs:
+                p = existing_specs[proposal_name]
+                return (proposal_name, str(p))
+
+            # 2-4. Fuzzy: collect candidates and rank by token overlap
+            p_tokens = set(proposal_name.split("-"))
+            best_name, best_path, best_score = "", "", 0
+
+            for folder, path in existing_specs.items():
+                # 2. Prefix
+                if folder.startswith(proposal_name) or proposal_name.startswith(folder):
+                    score = 10
+                # 3. Substring
+                elif proposal_name in folder or folder in proposal_name:
+                    score = 5
+                # 4. Token overlap
+                else:
+                    f_tokens = set(folder.split("-"))
+                    score = len(p_tokens & f_tokens)
+
+                if score > best_score:
+                    best_score, best_name, best_path = score, folder, str(path)
+
+            if best_score > 0:
+                if best_name != proposal_name:
+                    print(
+                        f"INFO: proposal names '{proposal_name}' matched to "
+                        f"existing spec folder '{best_name}' (score={best_score})",
+                        file=sys.stderr,
+                    )
+                return (best_name, best_path)
+
+            print(
+                f"WARNING: no existing spec found for modified capability '{proposal_name}'. "
+                f"Available: {sorted(existing_specs.keys())}",
+                file=sys.stderr,
+            )
+            return ("", "")
+
+        # ── Parse proposal Capabilities section ──────────────────────────────
+        text = proposal.read_text()
+        capabilities = []
+        in_caps_section = False
+        current_kind = None   # "new" | "modified" | None
+
+        for line in text.split("\n"):
+            stripped = line.strip()
+
+            if re.match(r"^#+\s+Capabilities", stripped, re.IGNORECASE):
+                in_caps_section = True
+                current_kind = None
+                continue
+
+            if not in_caps_section:
+                continue
+
+            if re.match(r"^#\s", stripped):
+                break  # left the Capabilities section
+
+            if re.match(r"^#+\s", stripped):
+                if re.search(r"new", stripped, re.IGNORECASE):
+                    current_kind = "new"
+                elif re.search(r"modif", stripped, re.IGNORECASE):
+                    current_kind = "modified"
+                else:
+                    current_kind = None
+                continue
+
+            if current_kind and stripped.startswith("-"):
+                item = stripped.lstrip("- \t")
+                # Extract the first kebab-case token from the bullet
+                m = re.search(r"[`*]*([a-z][a-z0-9-]*)[`*]*", item)
+                if m:
+                    name = m.group(1)
+                    if "-" in name and not any(c["name"] == name for c in capabilities):
+                        if current_kind == "new":
+                            # Warn if a main spec already exists — might be a
+                            # proposal mistake (should be "Modified").
+                            if name in existing_specs:
+                                print(
+                                    f"WARNING: capability '{name}' is listed as 'new' "
+                                    f"but openspec/specs/{name}/spec.md already exists. "
+                                    f"Did you mean 'Modified Capabilities'?",
+                                    file=sys.stderr,
+                                )
+                            capabilities.append({
+                                "name": name,
+                                "kind": "new",
+                                "existing_spec_path": "",
+                            })
+                        else:  # modified
+                            resolved_name, spec_path = resolve_existing_spec(name)
+                            capabilities.append({
+                                "name": name,            # original proposal name (used
+                                                         # as the delta spec folder)
+                                "kind": "modified",
+                                "existing_spec_path": spec_path,  # real baseline path
+                                "resolved_spec_name": resolved_name,  # matched folder
+                            })
+
+        # Filter out capabilities whose delta spec already exists in this change
+        pending = [
+            c for c in capabilities
+            if not (base / "specs" / c["name"] / "spec.md").exists()
+        ]
+        all_done = bool(capabilities) and not pending
+
+        print(json.dumps({
+            "capabilities": pending,
+            "all_capabilities": capabilities,
+            "available_existing_specs": sorted(existing_specs.keys()),
+            "state": "done" if all_done else ("blocked" if not capabilities else "ready"),
+            # Precomputed for routing — avoids list operations in route expressions
+            "has_unmatched_modified": any(
+                c.get("kind") == "modified" and not c.get("existing_spec_path")
+                for c in pending
+            ),
+        }))
+    output:
+      capabilities:
+        type: array
+        description: |
+          Objects with {name, kind, existing_spec_path} for capabilities that
+          still need a spec file written in this change.
+      state:
+        type: string
+        description: '"done", "ready", or "blocked"'
+      has_unmatched_modified:
+        type: boolean
+        description: True when any modified capability has no matched existing spec
+    routes:
+      - to: $end
+        when: "state == 'done' or state == 'blocked'"
+      - to: resolve_unmatched
+        when: "has_unmatched_modified == True"
+      - to: spec_writers
+
+  # ── Step 1b (conditional) ────────────────────────────────────────────────────
+  # Only runs when the script found modified capabilities it could NOT match to
+  # any existing spec folder (score=0 on all four heuristics). An agent reads
+  # the proposal + the real folder list and makes a semantic judgement call.
+  - name: resolve_unmatched
+    model: gpt-4.1
+    description: |
+      Semantically match proposal capability names to existing spec folders when
+      the Python script's string heuristics produced no match (score=0).
+      Returns a JSON mapping of {proposal_name: matched_folder_name_or_empty}.
+    prompt: |
+      I need to match capability names from a change proposal to existing spec folders.
+      The string-matching heuristics found no match for some "Modified Capabilities".
+
+      EXISTING spec folders in openspec/specs/:
+      {{ get_pending_capabilities.output.available_existing_specs | tojson }}
+
+      UNMATCHED modified capabilities (existing_spec_path is empty):
+      {% for cap in get_pending_capabilities.output.capabilities %}
+      {% if cap.kind == 'modified' and cap.existing_spec_path == '' %}
+      - {{ cap.name }}
+      {% endif %}
+      {% endfor %}
+
+      For each unmatched capability, decide which existing spec folder it is
+      modifying — or return empty string if none of the existing folders is a
+      plausible match (e.g. the proposal is wrong or it's truly a new spec).
+
+      Rules:
+      - Use ONLY folder names from the list above — do not invent new ones
+      - Prefer semantic equivalence over partial string overlap
+        (e.g. "login-system" → "authentication" if that is clearly what is meant)
+      - If genuinely ambiguous, return empty string and let it be treated as new
+
+      Respond with ONLY a JSON object, no prose:
+      {"<proposal_name>": "<matched_folder_or_empty>", ...}
+    output:
+      mappings:
+        type: object
+        description: |
+          Keys are unmatched proposal capability names.
+          Values are matched folder names from openspec/specs/, or "" if no match.
+    routes:
+      - to: apply_resolved_mappings
+
+  # ── Step 1c ──────────────────────────────────────────────────────────────────
+  - name: apply_resolved_mappings
+    type: script
+    description: |
+      Merge the agent's semantic mappings back into the capabilities list.
+      Replaces empty existing_spec_path entries with the agent's resolution
+      and emits the final capabilities array for the for_each group.
+    command: python3
+    args:
+      - "-c"
+      - |
+        import json, pathlib, os, sys
+
+        capabilities = json.loads(os.environ["CAPABILITIES"])
+        mappings = json.loads(os.environ["MAPPINGS"])
+
+        for cap in capabilities:
+            if cap.get("kind") == "modified" and not cap.get("existing_spec_path"):
+                folder = mappings.get(cap["name"], "")
+                if folder:
+                    path = pathlib.Path(f"openspec/specs/{folder}/spec.md")
+                    if path.exists():
+                        cap["existing_spec_path"] = str(path)
+                        cap["resolved_spec_name"] = folder
+                        print(
+                            f"INFO: agent resolved '{cap['name']}' → '{folder}'",
+                            file=sys.stderr,
+                        )
+                    else:
+                        print(
+                            f"WARNING: agent suggested '{folder}' for '{cap['name']}' "
+                            f"but {path} does not exist. Proceeding without baseline.",
+                            file=sys.stderr,
+                        )
+
+        print(json.dumps({"capabilities": capabilities}))
+    env:
+      CAPABILITIES: "{{ get_pending_capabilities.output.capabilities | tojson }}"
+      MAPPINGS: "{{ resolve_unmatched.output.mappings | tojson }}"
+    output:
+      capabilities:
+        type: array
+        description: Capabilities list with agent-resolved existing_spec_path entries filled in
+    routes:
+      - to: spec_writers
+
+# ── Step 2 (for_each) ─────────────────────────────────────────────────────────
+for_each:
+  - name: spec_writers
+    type: for_each
+    description: |
+      Write a spec file for each pending capability.
+      Each capability runs as a write-spec.yaml sub-workflow so progress is
+      tracked individually in the conductor dashboard and can be resumed.
+    source: >-
+      apply_resolved_mappings.output.capabilities
+      if apply_resolved_mappings is defined
+      else get_pending_capabilities.output.capabilities
+    as: capability
+    max_concurrent: 2           # generate two specs in parallel
+    failure_mode: continue_on_error   # a bad spec doesn't block the others
+
+    agent:
+      name: write_one_spec
+      type: workflow
+      workflow: ./write-spec.yaml
+      input_mapping:
+        change: "{{ workflow.input.change }}"
+        capability: "{{ capability.name }}"
+        kind: "{{ capability.kind }}"
+        existing_spec_path: "{{ capability.existing_spec_path | default('') }}"
+
+    routes:
+      - to: $end
+
+output:
+  pending_count: "{{ get_pending_capabilities.output.capabilities | length | default(0) }}"

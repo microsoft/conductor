@@ -1,0 +1,187 @@
+# OpenSpec — Design Phase
+#
+# Generates design.md — the technical decisions and architecture document.
+# Uses proposal.md + all spec files as context for the LLM.
+#
+# Run standalone:
+#   conductor run examples/openspec/phases/design.yaml \
+#     --input change="add-oauth-login"
+#
+# Steps:
+#   1. get_instructions — fetch design template + state from OpenSpec CLI
+#   2. read_context     — concatenate proposal.md + all specs into one string
+#   3. write_design     — LLM generates design.md
+#   4. save_design      — Python writes the file via env var
+#
+# Idempotent: exits immediately if openspec reports design state = "done".
+
+workflow:
+  name: openspec-design-phase
+  description: Generate the design document for an OpenSpec change
+  version: "1.0.0"
+  entry_point: get_instructions
+
+  runtime:
+    provider: copilot
+    default_model: gpt-4.1
+
+  input:
+    change:
+      type: string
+      required: true
+
+  context:
+    mode: accumulate
+
+agents:
+  # ── Step 1 ──────────────────────────────────────────────────────────────────
+  - name: get_instructions
+    type: script
+    description: Fetch design generation instructions from the OpenSpec CLI
+    command: python3
+    args:
+      - "-c"
+      - |
+        import subprocess, json, pathlib, sys
+
+        result = subprocess.run(
+            ["openspec", "instructions", "design",
+             "--change", "{{ workflow.input.change }}", "--json"],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            print(result.stderr, file=sys.stderr)
+            sys.exit(result.returncode)
+
+        data = json.loads(result.stdout)
+        change_dir = pathlib.Path(data["changeDir"])
+        output_path = data.get("outputPath", "")
+        artifact_file = change_dir / output_path if output_path else None
+        data["state"] = "done" if (artifact_file and artifact_file.exists()) else "ready"
+        print(json.dumps(data))
+    output:
+      state:
+        type: string
+        description: '"ready" or "done"'
+      instruction:
+        type: string
+      template:
+        type: string
+      outputPath:
+        type: string
+      changeDir:
+        type: string
+    routes:
+      - to: $end
+        when: "state == 'done'"
+      - to: read_context
+
+  # ── Step 2 ──────────────────────────────────────────────────────────────────
+  - name: read_context
+    type: script
+    description: |
+      Load proposal.md and all spec files into a single context string.
+      Provides the design agent with everything it needs to make technical decisions.
+    command: python3
+    args:
+      - "-c"
+      - |
+        import json, pathlib, sys
+
+        change = "{{ workflow.input.change }}"
+        base = pathlib.Path(f"openspec/changes/{change}")
+        sections = []
+
+        proposal = base / "proposal.md"
+        if proposal.exists():
+            sections.append(f"## proposal.md\n\n{proposal.read_text()}")
+        else:
+            print("WARNING: proposal.md not found", file=sys.stderr)
+
+        for spec in sorted((base / "specs").glob("*/spec.md")):
+            sections.append(f"## specs/{spec.parent.name}/spec.md\n\n{spec.read_text()}")
+
+        if not sections:
+            print(json.dumps({"context": "", "artifact_count": 0}))
+            sys.exit(0)
+
+        context = "\n\n---\n\n".join(sections)
+        print(json.dumps({"context": context, "artifact_count": len(sections)}))
+    output:
+      context:
+        type: string
+        description: Combined proposal + specs content
+      artifact_count:
+        type: number
+    routes:
+      - to: write_design
+
+  # ── Step 3 ──────────────────────────────────────────────────────────────────
+  - name: write_design
+    model: gpt-4.1
+    description: |
+      Generate the design document. Explains HOW to implement the change —
+      key technical decisions, architecture, data model, security, and migration.
+    prompt: |
+      You are writing an OpenSpec design document for the change "{{ workflow.input.change }}".
+
+      INSTRUCTIONS:
+      {{ get_instructions.output.instruction }}
+
+      TEMPLATE:
+      {{ get_instructions.output.template }}
+
+      CONTEXT (proposal + specs):
+      {{ read_context.output.context }}
+
+      Write a complete design.md. Focus on:
+        - Key technical decisions and their rationale (why X over Y)
+        - Cross-cutting concerns (e.g. auth, caching, error handling)
+        - Data model or schema changes
+        - Security considerations
+        - Migration plan with rollback steps
+        - Open questions to resolve before implementation
+
+      Reference the proposal for motivation and the specs for requirements.
+      Do NOT duplicate requirement details from specs — reference them instead.
+    output:
+      content:
+        type: string
+        description: Complete design.md markdown content
+    routes:
+      - to: save_design
+
+  # ── Step 4 ──────────────────────────────────────────────────────────────────
+  - name: save_design
+    type: script
+    description: Write design.md to disk
+    command: python3
+    args:
+      - "-c"
+      - |
+        import pathlib, os, sys, json
+
+        change = os.environ["CHANGE"]
+        raw_path = os.environ.get("OUTPUT_PATH", "").strip()
+        path = pathlib.Path(raw_path) if raw_path else \
+               pathlib.Path(f"openspec/changes/{change}/design.md")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(os.environ["CONTENT"])
+
+        size = len(os.environ["CONTENT"])
+        print(f"Wrote {path} ({size:,} chars)", file=sys.stderr)
+        print(json.dumps({"path": str(path), "size": size}))
+    env:
+      CHANGE: "{{ workflow.input.change }}"
+      OUTPUT_PATH: "{{ get_instructions.output.changeDir }}/{{ get_instructions.output.outputPath }}"
+      CONTENT: "{{ write_design.output.content }}"
+    output:
+      path:
+        type: string
+      size:
+        type: number
+    routes:
+      - to: $end
+
+output:
+  written_path: "{% if save_design is defined %}{{ save_design.output.path | default('') }}{% endif %}"

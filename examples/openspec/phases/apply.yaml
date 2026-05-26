@@ -1,0 +1,146 @@
+# OpenSpec — Apply Phase
+#
+# Implements all pending tasks in tasks.md using a for_each loop.
+# Each task runs as a separate implement-task.yaml sub-workflow, giving it
+# its own conductor checkpoint so individual tasks are resumable.
+#
+# Run standalone:
+#   conductor run examples/openspec/phases/apply.yaml \
+#     --input change="add-oauth-login"
+#
+# Steps:
+#   1. get_pending_tasks — call `openspec instructions apply --json` and
+#      return only unchecked (- [ ]) tasks as a structured array
+#   2. task_implementers (for_each, sequential) — one implement-task.yaml
+#      sub-workflow per pending task, running one at a time to avoid
+#      concurrent writes to the same files
+#
+# Idempotent: tasks already marked [x] are excluded in step 1.
+# Resume-safe: conductor checkpoints after each completed for_each iteration.
+
+workflow:
+  name: openspec-apply-phase
+  description: Implement all pending tasks in tasks.md
+  version: "1.0.0"
+  entry_point: get_pending_tasks
+
+  runtime:
+    provider: copilot
+
+  input:
+    change:
+      type: string
+      required: true
+
+  context:
+    mode: accumulate
+
+  limits:
+    max_iterations: 200   # each task may use several agent turns
+
+agents:
+  # ── Step 1 ──────────────────────────────────────────────────────────────────
+  - name: get_pending_tasks
+    type: script
+    description: |
+      Call `openspec instructions apply --json` and extract the list of pending
+      tasks (those not yet marked [x]). Handles the "all_done" and "blocked"
+      states by routing to $end early.
+    command: python3
+    args:
+      - "-c"
+      - |
+        import json, subprocess, sys, pathlib
+
+        change = "{{ workflow.input.change }}"
+
+        result = subprocess.run(
+            ["openspec", "instructions", "apply", "--change", change, "--json"],
+            capture_output=True,
+            text=True,
+        )
+
+        if result.returncode != 0:
+            # Fallback: parse tasks.md directly when CLI fails
+            tasks_path = pathlib.Path(f"openspec/changes/{change}/tasks.md")
+            if not tasks_path.exists():
+                print(json.dumps({"pending_tasks": [], "state": "blocked",
+                                  "instruction": ""}))
+                sys.exit(0)
+            import re
+            pending = []
+            for line in tasks_path.read_text().split("\n"):
+                m = re.match(r"- \[ \] (\d+\.\d+)\s+(.*)", line)
+                if m:
+                    pending.append({"id": m.group(1), "description": m.group(2)})
+            print(json.dumps({"pending_tasks": pending, "state": "ready",
+                              "instruction": ""}))
+            sys.exit(0)
+
+        data = json.loads(result.stdout)
+        state = data.get("state", "ready")
+
+        if state in ("all_done",):
+            print(json.dumps({"pending_tasks": [], "state": "all_done",
+                              "instruction": ""}))
+            sys.exit(0)
+
+        if state == "blocked":
+            print(json.dumps({"pending_tasks": [], "state": "blocked",
+                              "instruction": data.get("instruction", "")}))
+            sys.exit(0)
+
+        # Accept both "taskList" and "tasks" field names (CLI returns "tasks")
+        task_list = data.get("tasks", data.get("taskList", []))
+        pending = [
+            t for t in task_list
+            if t.get("status") not in ("complete", "done")
+        ]
+
+        print(json.dumps({
+            "pending_tasks": pending,
+            "state": state,
+            "instruction": data.get("instruction", ""),
+        }))
+    output:
+      pending_tasks:
+        type: array
+        description: Tasks not yet marked complete
+      state:
+        type: string
+      instruction:
+        type: string
+        description: Dynamic guidance from the OpenSpec schema for this state
+    routes:
+      - to: $end
+        when: "state == 'all_done' or state == 'blocked'"
+      - to: task_implementers
+
+# ── Step 2 (for_each) ─────────────────────────────────────────────────────────
+for_each:
+  - name: task_implementers
+    type: for_each
+    description: |
+      Implement each pending task sequentially.
+      Sequential (max_concurrent: 1) to prevent race conditions on shared files.
+      Each task is a separate implement-task.yaml sub-workflow so the dashboard
+      shows per-task progress and conductor can resume from any task boundary.
+    source: get_pending_tasks.output.pending_tasks
+    as: task
+    max_concurrent: 1          # sequential: tasks may touch the same files
+    failure_mode: continue_on_error  # a failing task doesn't block the rest
+
+    agent:
+      name: implement_one_task
+      type: workflow
+      workflow: ./implement-task.yaml
+      input_mapping:
+        change: "{{ workflow.input.change }}"
+        task_id: "{{ task.id }}"
+        task_description: "{{ task.description }}"
+
+    routes:
+      - to: $end
+
+output:
+  tasks_implemented: "{{ get_pending_tasks.output.pending_tasks | length | default(0) }}"

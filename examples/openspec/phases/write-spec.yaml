@@ -1,0 +1,267 @@
+# OpenSpec — Write Spec (single capability)
+#
+# Sub-workflow invoked by specs.yaml's for_each group.
+# Generates and writes the spec file for ONE capability.
+#
+# Called with:
+#   change:     the change name
+#   capability: the kebab-case capability name (e.g. "user-auth")
+#
+# Steps:
+#   1. get_instructions — fetch schema template + instructions from OpenSpec CLI
+#   2. read_proposal    — load proposal.md content for context
+#   3. write_spec       — LLM generates the spec.md following the template
+#   4. save_spec        — Python writes the file via env var
+
+workflow:
+  name: openspec-write-spec
+  description: Generate and write the spec file for a single capability
+  version: "1.0.0"
+  entry_point: get_instructions
+
+  runtime:
+    provider: copilot
+    default_model: gpt-4.1
+
+  input:
+    change:
+      type: string
+      required: true
+    capability:
+      type: string
+      required: true
+      description: Kebab-case capability name (e.g. "user-auth")
+    kind:
+      type: string
+      required: false
+      description: '"new" (write from scratch) or "modified" (write a delta spec)'
+    existing_spec_path:
+      type: string
+      required: false
+      description: |  
+        Path to the baseline spec in openspec/specs/<capability>/spec.md.
+        Only populated for kind="modified". Empty string for new capabilities.
+
+  context:
+    mode: accumulate
+
+agents:
+  # ── Step 1 ──────────────────────────────────────────────────────────────────
+  - name: get_instructions
+    type: script
+    description: Fetch spec instructions from OpenSpec CLI for this capability
+    command: python3
+    args:
+      - "-c"
+      - |
+        import subprocess, json, pathlib, sys
+
+        result = subprocess.run(
+            ["openspec", "instructions", "specs",
+             "--change", "{{ workflow.input.change }}", "--json"],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            print(result.stderr, file=sys.stderr)
+            sys.exit(result.returncode)
+
+        data = json.loads(result.stdout)
+        # specs outputPath is a glob (specs/**/*.md) — idempotency handled
+        # by specs.yaml which filters already-written capabilities before
+        # invoking this sub-workflow.  Always report "ready" here.
+        data["state"] = "ready"
+        print(json.dumps(data))
+    output:
+      state:
+        type: string
+      instruction:
+        type: string
+        description: Spec-writing guidance from the schema
+      template:
+        type: string
+        description: Spec markdown template to follow
+      outputPath:
+        type: string
+      changeDir:
+        type: string
+    routes:
+      - to: read_proposal   # always proceed; individual capability state checked via filesystem
+
+  # ── Step 2 ──────────────────────────────────────────────────────────────────
+  - name: read_proposal
+    type: script
+    description: Read proposal.md to give the spec writer full context
+    command: python3
+    args:
+      - "-c"
+      - |
+        import pathlib, json, sys
+
+        change = "{{ workflow.input.change }}"
+        proposal = pathlib.Path(f"openspec/changes/{change}/proposal.md")
+
+        if not proposal.exists():
+            print(json.dumps({"content": "", "found": False}))
+            sys.exit(0)
+
+        print(json.dumps({"content": proposal.read_text(), "found": True}))
+    output:
+      content:
+        type: string
+        description: Full text of proposal.md
+      found:
+        type: boolean
+    routes:
+      - to: read_existing_spec
+
+  # ── Step 3 ──────────────────────────────────────────────────────────────────
+  - name: read_existing_spec
+    type: script
+    description: |
+      For "modified" capabilities: read the baseline spec from
+      openspec/specs/<capability>/spec.md so the LLM knows exactly which
+      requirements already exist and can produce a precise delta.
+      For "new" capabilities: returns empty content (no-op).
+    command: python3
+    args:
+      - "-c"
+      - |
+        import pathlib, json, sys
+
+        kind = "{{ workflow.input.kind | default('new') }}"
+        existing_path = "{{ workflow.input.existing_spec_path | default('') }}".strip()
+
+        if kind != "modified" or not existing_path:
+            print(json.dumps({"content": "", "found": False}))
+            sys.exit(0)
+
+        p = pathlib.Path(existing_path)
+        if not p.exists():
+            # Baseline spec missing — warn but don't block; LLM will note the gap
+            import sys
+            print(f"WARNING: existing spec not found at {p}", file=sys.stderr)
+            print(json.dumps({"content": "", "found": False}))
+            sys.exit(0)
+
+        print(json.dumps({"content": p.read_text(), "found": True}))
+    output:
+      content:
+        type: string
+        description: |
+          Full text of the baseline spec (openspec/specs/<capability>/spec.md).
+          Empty string when kind="new" or file not found.
+      found:
+        type: boolean
+    routes:
+      - to: write_spec
+
+  # ── Step 4 ──────────────────────────────────────────────────────────────────
+  - name: write_spec
+    model: gpt-4.1
+    description: |
+      Generate the spec.md for this capability.
+      - kind="new"      → full spec written from scratch
+      - kind="modified" → delta spec using ADDED/MODIFIED/REMOVED headers;
+                          the existing baseline spec is provided as context so
+                          the LLM knows which requirements already exist
+    prompt: |
+      You are writing an OpenSpec spec file for the capability "{{ workflow.input.capability }}"
+      as part of the change "{{ workflow.input.change }}".
+
+      CAPABILITY KIND: {{ workflow.input.kind | default('new') }}
+
+      PROPOSAL CONTEXT:
+      {{ read_proposal.output.content }}
+
+      INSTRUCTIONS:
+      {{ get_instructions.output.instruction }}
+
+      TEMPLATE:
+      {{ get_instructions.output.template }}
+
+      {% if workflow.input.kind == 'modified' %}
+      EXISTING BASELINE SPEC (openspec/specs/{{ workflow.input.capability }}/spec.md):
+      {% if read_existing_spec.output.found %}
+      {{ read_existing_spec.output.content }}
+      {% else %}
+      WARNING: Baseline spec not found. Write requirements as ADDED.
+      {% endif %}
+
+      ---
+      You are writing a DELTA spec. Rules:
+        - Only describe what CHANGES relative to the baseline spec above
+        - Use ## ADDED Requirements for brand-new requirements
+        - Use ## MODIFIED Requirements for changed behavior
+            → Copy the ENTIRE requirement block from the baseline, then edit it
+            → Partial content loses detail at archive time
+        - Use ## REMOVED Requirements for deprecated behavior
+            → Include **Reason** and **Migration** sub-fields
+        - Use ## RENAMED Requirements for name-only changes (FROM:/TO: format)
+        - Do NOT repeat requirements that are unchanged
+        - Each requirement: ### Requirement: <Name>
+        - Each scenario:    #### Scenario: <Name>   ← MUST be exactly 4 hashtags
+      {% else %}
+      ---
+      You are writing a FULL spec from scratch. Rules:
+        - Cover all capabilities described in the proposal for "{{ workflow.input.capability }}"
+        - Each requirement: ### Requirement: <Name>
+        - Each scenario:    #### Scenario: <Name>   ← MUST be exactly 4 hashtags
+          - **WHEN** <condition>
+          - **THEN** <outcome>
+        - Every requirement MUST have at least one scenario
+        - Use SHALL/MUST for normative language (avoid should/may)
+      {% endif %}
+
+      Output only the spec.md content — no preamble or commentary.
+    output:
+      content:
+        type: string
+        description: Complete spec.md markdown for this capability
+      requirements_count:
+        type: number
+        description: Number of requirements defined in the spec
+    routes:
+      - to: save_spec
+
+  # ── Step 5 ──────────────────────────────────────────────────────────────────
+  - name: save_spec
+    type: script
+    description: Write the generated spec.md to disk
+    command: python3
+    args:
+      - "-c"
+      - |
+        import pathlib, os, sys, json
+
+        change = os.environ["CHANGE"]
+        capability = os.environ["CAPABILITY"]
+        change_dir = os.environ.get("CHANGE_DIR", "").strip()
+
+        # Use changeDir from CLI if available, else fall back to conventional path
+        if change_dir:
+            path = pathlib.Path(change_dir) / "specs" / capability / "spec.md"
+        else:
+            path = pathlib.Path(f"openspec/changes/{change}/specs/{capability}/spec.md")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(os.environ["CONTENT"])
+
+        size = len(os.environ["CONTENT"])
+        print(f"Wrote {path} ({size:,} chars)", file=sys.stderr)
+        print(json.dumps({"path": str(path), "size": size, "capability": capability}))
+    env:
+      CHANGE: "{{ workflow.input.change }}"
+      CAPABILITY: "{{ workflow.input.capability }}"
+      CHANGE_DIR: "{{ get_instructions.output.changeDir | default('') }}"
+      CONTENT: "{{ write_spec.output.content }}"
+    output:
+      path:
+        type: string
+      capability:
+        type: string
+    routes:
+      - to: $end
+
+output:
+  capability: "{{ workflow.input.capability }}"
+  spec_path: "{{ save_spec.output.path | default('') }}"
+  requirements_count: "{{ write_spec.output.requirements_count | default(0) }}"

@@ -1,0 +1,188 @@
+# OpenSpec — Tasks Phase
+#
+# Generates tasks.md — the checkbox-based implementation task list.
+# Reads proposal + specs + design as context for the LLM.
+#
+# Run standalone:
+#   conductor run examples/openspec/phases/tasks.yaml \
+#     --input change="add-oauth-login"
+#
+# Steps:
+#   1. get_instructions — fetch tasks template + state from OpenSpec CLI
+#   2. read_context     — concatenate proposal.md + specs + design.md
+#   3. write_tasks      — LLM generates tasks.md
+#   4. save_tasks       — Python writes the file via env var
+#
+# Idempotent: exits immediately if openspec reports tasks state = "done".
+
+workflow:
+  name: openspec-tasks-phase
+  description: Generate the implementation task list for an OpenSpec change
+  version: "1.0.0"
+  entry_point: get_instructions
+
+  runtime:
+    provider: copilot
+    default_model: gpt-4.1
+
+  input:
+    change:
+      type: string
+      required: true
+
+  context:
+    mode: accumulate
+
+agents:
+  # ── Step 1 ──────────────────────────────────────────────────────────────────
+  - name: get_instructions
+    type: script
+    description: Fetch task-list generation instructions from the OpenSpec CLI
+    command: python3
+    args:
+      - "-c"
+      - |
+        import subprocess, json, pathlib, sys
+
+        result = subprocess.run(
+            ["openspec", "instructions", "tasks",
+             "--change", "{{ workflow.input.change }}", "--json"],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            print(result.stderr, file=sys.stderr)
+            sys.exit(result.returncode)
+
+        data = json.loads(result.stdout)
+        change_dir = pathlib.Path(data["changeDir"])
+        output_path = data.get("outputPath", "")
+        artifact_file = change_dir / output_path if output_path else None
+        data["state"] = "done" if (artifact_file and artifact_file.exists()) else "ready"
+        print(json.dumps(data))
+    output:
+      state:
+        type: string
+        description: '"ready" or "done"'
+      instruction:
+        type: string
+      template:
+        type: string
+      outputPath:
+        type: string
+      changeDir:
+        type: string
+    routes:
+      - to: $end
+        when: "state == 'done'"
+      - to: read_context
+
+  # ── Step 2 ──────────────────────────────────────────────────────────────────
+  - name: read_context
+    type: script
+    description: |
+      Load all prior artifacts (proposal + specs + design) into a context string.
+      Tasks must trace back to specific specs and design decisions.
+    command: python3
+    args:
+      - "-c"
+      - |
+        import json, pathlib, sys
+
+        change = "{{ workflow.input.change }}"
+        base = pathlib.Path(f"openspec/changes/{change}")
+        sections = []
+
+        for fname in ["proposal.md", "design.md"]:
+            f = base / fname
+            if f.exists():
+                sections.append(f"## {fname}\n\n{f.read_text()}")
+
+        for spec in sorted((base / "specs").glob("*/spec.md")):
+            sections.append(f"## specs/{spec.parent.name}/spec.md\n\n{spec.read_text()}")
+
+        context = "\n\n---\n\n".join(sections) if sections else ""
+        print(json.dumps({"context": context, "artifact_count": len(sections)}))
+    output:
+      context:
+        type: string
+        description: Combined proposal + specs + design content
+      artifact_count:
+        type: number
+    routes:
+      - to: write_tasks
+
+  # ── Step 3 ──────────────────────────────────────────────────────────────────
+  - name: write_tasks
+    model: gpt-4.1
+    description: |
+      Generate the implementation task list.
+      Tasks must use the exact checkbox format the apply phase parses:
+        - [ ] 1.1 Task description
+        - [ ] 1.2 Another task
+      The numbering scheme (section.item) is critical — the apply workflow
+      uses task IDs to mark individual completions in tasks.md.
+    prompt: |
+      You are writing an OpenSpec tasks.md for the change "{{ workflow.input.change }}".
+
+      INSTRUCTIONS:
+      {{ get_instructions.output.instruction }}
+
+      TEMPLATE (follow this format exactly — task numbering is machine-parsed):
+      {{ get_instructions.output.template }}
+
+      CONTEXT (proposal + specs + design):
+      {{ read_context.output.context }}
+
+      Write a complete tasks.md that breaks the implementation into concrete,
+      deliverable tasks. Requirements:
+
+        - Use checkbox format: - [ ] N.M Task description
+        - Group tasks into numbered sections (## 1. Section Name)
+        - Each task should be completable in 1–4 hours
+        - Tasks must be in dependency order within each section
+        - Cover: data layer, business logic, API layer, tests, docs
+        - Reference requirement IDs from specs where applicable
+        - Do NOT include tasks that are already complete
+
+      Output only the tasks.md content — no preamble or commentary.
+    output:
+      content:
+        type: string
+        description: Complete tasks.md markdown content
+    routes:
+      - to: save_tasks
+
+  # ── Step 4 ──────────────────────────────────────────────────────────────────
+  - name: save_tasks
+    type: script
+    description: Write tasks.md to disk
+    command: python3
+    args:
+      - "-c"
+      - |
+        import pathlib, os, sys, json
+
+        change = os.environ["CHANGE"]
+        raw_path = os.environ.get("OUTPUT_PATH", "").strip()
+        path = pathlib.Path(raw_path) if raw_path else \
+               pathlib.Path(f"openspec/changes/{change}/tasks.md")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(os.environ["CONTENT"])
+
+        size = len(os.environ["CONTENT"])
+        print(f"Wrote {path} ({size:,} chars)", file=sys.stderr)
+        print(json.dumps({"path": str(path), "size": size}))
+    env:
+      CHANGE: "{{ workflow.input.change }}"
+      OUTPUT_PATH: "{{ get_instructions.output.changeDir }}/{{ get_instructions.output.outputPath }}"
+      CONTENT: "{{ write_tasks.output.content }}"
+    output:
+      path:
+        type: string
+      size:
+        type: number
+    routes:
+      - to: $end
+
+output:
+  written_path: "{% if save_tasks is defined %}{{ save_tasks.output.path | default('') }}{% endif %}"
