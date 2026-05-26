@@ -50,57 +50,48 @@ agents:
     args:
       - "-c"
       - |
-        import json, subprocess, sys, pathlib
+        import json, re, subprocess, sys, pathlib
 
         change = "{{ workflow.input.change }}"
+        tasks_path = pathlib.Path(f"openspec/changes/{change}/tasks.md")
 
-        result = subprocess.run(
-            ["openspec", "instructions", "apply", "--change", change, "--json"],
-            capture_output=True,
-            text=True,
-        )
-
-        if result.returncode != 0:
-            # Fallback: parse tasks.md directly when CLI fails
-            tasks_path = pathlib.Path(f"openspec/changes/{change}/tasks.md")
-            if not tasks_path.exists():
-                print(json.dumps({"pending_tasks": [], "state": "blocked",
-                                  "instruction": ""}))
-                sys.exit(0)
-            import re
-            pending = []
-            for line in tasks_path.read_text().split("\n"):
-                m = re.match(r"- \[ \] (\d+\.\d+)\s+(.*)", line)
-                if m:
-                    pending.append({"id": m.group(1), "description": m.group(2)})
-            print(json.dumps({"pending_tasks": pending, "state": "ready",
-                              "instruction": ""}))
-            sys.exit(0)
-
-        data = json.loads(result.stdout)
-        state = data.get("state", "ready")
-
-        if state in ("all_done",):
-            print(json.dumps({"pending_tasks": [], "state": "all_done",
-                              "instruction": ""}))
-            sys.exit(0)
-
-        if state == "blocked":
+        # Always parse tasks.md directly: the CLI uses integer IDs while tasks.md
+        # uses "N.M" format — we need to match the file format for mark_complete.
+        if not tasks_path.exists():
+            # Try the CLI to get a "blocked" state message if tasks.md is absent
+            result = subprocess.run(
+                ["openspec", "instructions", "apply", "--change", change, "--json"],
+                capture_output=True, text=True,
+            )
+            instruction = ""
+            if result.returncode == 0:
+                data = json.loads(result.stdout)
+                instruction = data.get("instruction", "")
             print(json.dumps({"pending_tasks": [], "state": "blocked",
-                              "instruction": data.get("instruction", "")}))
+                              "instruction": instruction}))
             sys.exit(0)
 
-        # Accept both "taskList" and "tasks" field names (CLI returns "tasks")
-        task_list = data.get("tasks", data.get("taskList", []))
-        pending = [
-            t for t in task_list
-            if t.get("status") not in ("complete", "done")
-        ]
+        # Parse unchecked tasks from tasks.md (source of truth for task status)
+        pending = []
+        all_tasks = []
+        for line in tasks_path.read_text().split("\n"):
+            m_done = re.match(r"- \[x\] (\d+\.\d+)\s+(.*)", line)
+            m_todo = re.match(r"- \[ \] (\d+\.\d+)\s+(.*)", line)
+            if m_done:
+                all_tasks.append({"id": m_done.group(1), "description": m_done.group(2),
+                                   "status": "complete"})
+            elif m_todo:
+                t = {"id": m_todo.group(1), "description": m_todo.group(2)}
+                all_tasks.append(t)
+                pending.append(t)
+
+        state = "all_done" if all_tasks and not pending else \
+                "blocked" if not all_tasks else "ready"
 
         print(json.dumps({
             "pending_tasks": pending,
             "state": state,
-            "instruction": data.get("instruction", ""),
+            "instruction": "",
         }))
     output:
       pending_tasks:

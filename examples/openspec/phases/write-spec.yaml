@@ -231,28 +231,25 @@ agents:
     args:
       - "-c"
       - |
-        import pathlib, os, sys, json
+        import pathlib, sys, json
 
-        change = os.environ["CHANGE"]
-        capability = os.environ["CAPABILITY"]
-        change_dir = os.environ.get("CHANGE_DIR", "").strip()
+        # sys.argv[1] = changeDir (Jinja2-rendered absolute path)
+        # sys.argv[2] = capability name
+        # sys.argv[3] = full spec.md content
+        change_dir = pathlib.Path(sys.argv[1])
+        capability = sys.argv[2]
+        content = sys.argv[3]
 
-        # Use changeDir from CLI if available, else fall back to conventional path
-        if change_dir:
-            path = pathlib.Path(change_dir) / "specs" / capability / "spec.md"
-        else:
-            path = pathlib.Path(f"openspec/changes/{change}/specs/{capability}/spec.md")
+        path = change_dir / "specs" / capability / "spec.md"
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(os.environ["CONTENT"])
+        path.write_text(content)
 
-        size = len(os.environ["CONTENT"])
+        size = len(content)
         print(f"Wrote {path} ({size:,} chars)", file=sys.stderr)
         print(json.dumps({"path": str(path), "size": size, "capability": capability}))
-    env:
-      CHANGE: "{{ workflow.input.change }}"
-      CAPABILITY: "{{ workflow.input.capability }}"
-      CHANGE_DIR: "{{ get_instructions.output.changeDir | default('') }}"
-      CONTENT: "{{ write_spec.output.content }}"
+      - "{{ get_instructions.output.changeDir }}"
+      - "{{ workflow.input.capability }}"
+      - "{{ write_spec.output.content }}"
     output:
       path:
         type: string

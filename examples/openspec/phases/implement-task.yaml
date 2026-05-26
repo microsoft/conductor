@@ -25,7 +25,7 @@ workflow:
 
   runtime:
     provider: copilot
-    default_model: gpt-4.1
+    default_model: claude-sonnet-4.6
 
   input:
     change:
@@ -85,7 +85,9 @@ agents:
 
   # ── Step 2 ──────────────────────────────────────────────────────────────────
   - name: implement
-    model: gpt-4.1
+    model: claude-sonnet-4.6
+    reasoning:
+      effort: medium
     description: |
       Implement the task using the OpenSpec artifacts as requirements.
       Makes only the code changes needed for this specific task.
@@ -126,10 +128,12 @@ agents:
     args:
       - "-c"
       - |
-        import pathlib, re, os, sys, json
+        import pathlib, re, sys, json
 
-        change = os.environ["CHANGE"]
-        task_id = os.environ["TASK_ID"]
+        # sys.argv[1] = change name (Jinja2-rendered)
+        # sys.argv[2] = task_id, e.g. "1.2"
+        change = sys.argv[1]
+        task_id = sys.argv[2]
 
         tasks_path = pathlib.Path(f"openspec/changes/{change}/tasks.md")
         if not tasks_path.exists():
@@ -150,9 +154,8 @@ agents:
             print(f"Marked task {task_id} complete", file=sys.stderr)
 
         print(json.dumps({"marked": count > 0, "task_id": task_id}))
-    env:
-      CHANGE: "{{ workflow.input.change }}"
-      TASK_ID: "{{ workflow.input.task_id }}"
+      - "{{ workflow.input.change }}"
+      - "{{ workflow.input.task_id }}"
     output:
       marked:
         type: boolean

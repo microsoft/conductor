@@ -69,7 +69,10 @@ agents:
         if not proposal.exists():
             print(json.dumps({
                 "capabilities": [],
+                "all_capabilities": [],
+                "available_existing_specs": [],
                 "state": "blocked",
+                "has_unmatched_modified": False,
                 "message": "proposal.md not found — run propose phase first",
             }))
             sys.exit(0)
@@ -232,7 +235,7 @@ agents:
         when: "state == 'done' or state == 'blocked'"
       - to: resolve_unmatched
         when: "has_unmatched_modified == True"
-      - to: spec_writers
+      - to: apply_resolved_mappings
 
   # ── Step 1b (conditional) ────────────────────────────────────────────────────
   # Only runs when the script found modified capabilities it could NOT match to
@@ -280,20 +283,27 @@ agents:
       - to: apply_resolved_mappings
 
   # ── Step 1c ──────────────────────────────────────────────────────────────────
+  # Always runs — merges agent's semantic mappings (if resolve_unmatched ran)
+  # back into the capabilities list. When resolve_unmatched was skipped,
+  # passes capabilities through unchanged. This gives spec_writers a stable
+  # single source regardless of which path was taken.
   - name: apply_resolved_mappings
     type: script
     description: |
       Merge the agent's semantic mappings back into the capabilities list.
-      Replaces empty existing_spec_path entries with the agent's resolution
-      and emits the final capabilities array for the for_each group.
+      Handles both paths: resolve_unmatched ran (use its mappings) or was
+      skipped (pass capabilities through unchanged). Always emits the final
+      capabilities array so spec_writers has a stable source.
     command: python3
     args:
       - "-c"
       - |
-        import json, pathlib, os, sys
+        import json, pathlib, sys
 
-        capabilities = json.loads(os.environ["CAPABILITIES"])
-        mappings = json.loads(os.environ["MAPPINGS"])
+        # sys.argv[1] = JSON-encoded capabilities array
+        # sys.argv[2] = JSON-encoded mappings dict ("{}" when resolve_unmatched skipped)
+        capabilities = json.loads(sys.argv[1])
+        mappings = json.loads(sys.argv[2])
 
         for cap in capabilities:
             if cap.get("kind") == "modified" and not cap.get("existing_spec_path"):
@@ -304,7 +314,7 @@ agents:
                         cap["existing_spec_path"] = str(path)
                         cap["resolved_spec_name"] = folder
                         print(
-                            f"INFO: agent resolved '{cap['name']}' → '{folder}'",
+                            f"INFO: agent resolved '{cap['name']}' -> '{folder}'",
                             file=sys.stderr,
                         )
                     else:
@@ -315,9 +325,8 @@ agents:
                         )
 
         print(json.dumps({"capabilities": capabilities}))
-    env:
-      CAPABILITIES: "{{ get_pending_capabilities.output.capabilities | tojson }}"
-      MAPPINGS: "{{ resolve_unmatched.output.mappings | tojson }}"
+      - "{{ get_pending_capabilities.output.capabilities | tojson }}"
+      - "{% if resolve_unmatched is defined %}{{ resolve_unmatched.output.mappings | tojson }}{% else %}{}{% endif %}"
     output:
       capabilities:
         type: array
@@ -333,10 +342,7 @@ for_each:
       Write a spec file for each pending capability.
       Each capability runs as a write-spec.yaml sub-workflow so progress is
       tracked individually in the conductor dashboard and can be resumed.
-    source: >-
-      apply_resolved_mappings.output.capabilities
-      if apply_resolved_mappings is defined
-      else get_pending_capabilities.output.capabilities
+    source: apply_resolved_mappings.output.capabilities
     as: capability
     max_concurrent: 2           # generate two specs in parallel
     failure_mode: continue_on_error   # a bad spec doesn't block the others

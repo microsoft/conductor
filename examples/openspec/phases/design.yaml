@@ -159,22 +159,22 @@ agents:
     args:
       - "-c"
       - |
-        import pathlib, os, sys, json
+        import pathlib, sys, json
 
-        change = os.environ["CHANGE"]
-        raw_path = os.environ.get("OUTPUT_PATH", "").strip()
-        path = pathlib.Path(raw_path) if raw_path else \
-               pathlib.Path(f"openspec/changes/{change}/design.md")
+        change_dir = pathlib.Path(sys.argv[1])
+        output_path = sys.argv[2]
+        content = sys.argv[3]
+
+        path = change_dir / output_path
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(os.environ["CONTENT"])
+        path.write_text(content)
 
-        size = len(os.environ["CONTENT"])
+        size = len(content)
         print(f"Wrote {path} ({size:,} chars)", file=sys.stderr)
         print(json.dumps({"path": str(path), "size": size}))
-    env:
-      CHANGE: "{{ workflow.input.change }}"
-      OUTPUT_PATH: "{{ get_instructions.output.changeDir }}/{{ get_instructions.output.outputPath }}"
-      CONTENT: "{{ write_design.output.content }}"
+      - "{{ get_instructions.output.changeDir }}"
+      - "{{ get_instructions.output.outputPath }}"
+      - "{{ write_design.output.content }}"
     output:
       path:
         type: string
