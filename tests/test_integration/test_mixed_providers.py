@@ -46,7 +46,7 @@ agents:
 """)
 
         config = load_workflow(str(workflow_yaml))
-        assert config.workflow.runtime.provider == "claude"
+        assert config.workflow.runtime.provider.name == "claude"
 
     def test_can_override_provider_per_agent(self, tmp_path):
         """Verify agent-level provider override is now supported."""
@@ -72,7 +72,7 @@ agents:
 
         config = load_workflow(str(workflow_yaml))
         # Workflow default is copilot
-        assert config.workflow.runtime.provider == "copilot"
+        assert config.workflow.runtime.provider.name == "copilot"
         # Agent overrides to claude
         assert config.agents[0].provider == "claude"
         # Agent schema now has 'provider' field
@@ -438,4 +438,4 @@ agents:
 """)
         config = load_workflow(str(workflow_yaml))
         assert config.agents[0].provider is None
-        assert config.workflow.runtime.provider == "claude"
+        assert config.workflow.runtime.provider.name == "claude"

@@ -16,6 +16,7 @@ import pytest
 from typer.testing import CliRunner
 
 from conductor.cli.app import app
+from conductor.config.schema import ProviderSettings
 
 runner = CliRunner()
 
@@ -252,7 +253,7 @@ class TestDashboardStartupFailure:
         mock_config.workflow.name = "test"
         mock_config.workflow.entry_point = "agent1"
         mock_config.agents = []
-        mock_config.workflow.runtime.provider = "copilot"
+        mock_config.workflow.runtime.provider = ProviderSettings(name="copilot")
         mock_config.workflow.limits.max_iterations = 50
         mock_config.workflow.limits.timeout_seconds = None
         mock_config.workflow.cost.show_summary = False

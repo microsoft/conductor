@@ -8,7 +8,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.17...HEAD)
 
 ### Added
-<<<<<<< HEAD
 - New `type: wait` workflow step that pauses execution for a parsed
   duration via in-process `asyncio.sleep`. Cross-platform — no shell
   `sleep` dependency. Use for rate-limit cooldowns, polling intervals,
@@ -35,7 +34,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   route loop-back
   ([#224](https://github.com/microsoft/conductor/pull/224),
   closes [#218](https://github.com/microsoft/conductor/issues/218)).
-=======
 - New `type: terminate` workflow step that explicitly ends the workflow with
   a structured `status` (`success` | `failed`) and Jinja2-rendered `reason`,
   plus an optional `output_template` (`dict[str, str]`) that replaces the
@@ -64,7 +62,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from those groups' `routes:` instead. The example workflow lives at
   `examples/terminate.yaml`
   ([#219](https://github.com/microsoft/conductor/issues/219)).
->>>>>>> e04312b (docs(terminate): document type: terminate across user-facing docs (#219))
+- `runtime.provider` now accepts either the bare string shorthand
+  (`provider: copilot`) or a structured `ProviderSettings` object that
+  forwards a `ProviderConfig` to the Copilot SDK's
+  `create_session(provider=…)` parameter. This lets workflows route the
+  Copilot SDK at OpenAI-compatible / Azure / Anthropic endpoints —
+  Ollama, vLLM, LM Studio, Azure OpenAI, llamafile, or any other
+  OpenAI-compatible REST endpoint — instead of being locked to the
+  GitHub Copilot service. The structured form supports `name`, `type`
+  (`openai`|`azure`|`anthropic`), `wire_api`
+  (`completions`|`responses`), `base_url`, `api_key`, `bearer_token`,
+  `headers`, and `azure.api_version`. `api_key` and `bearer_token` are
+  Pydantic `SecretStr` (redacted in `model_dump`, dashboard payloads,
+  event logs, and checkpoints). Custom routing activates only when YAML
+  sets at least one non-`name` field — ambient `OPENAI_*` env vars
+  never divert default routing on their own. Once activated, missing
+  fields fall back from `COPILOT_PROVIDER_BASE_URL` → `OPENAI_BASE_URL`
+  for `base_url`, `COPILOT_PROVIDER_API_KEY` for `api_key`, and
+  `COPILOT_PROVIDER_BEARER_TOKEN` for `bearer_token`. Ambient
+  `OPENAI_API_KEY` is intentionally NOT consulted as an implicit
+  fallback (credential-leak risk); use `api_key: ${OPENAI_API_KEY}`
+  YAML interpolation for explicit opt-in. The schema rejects every
+  non-`name` field when `name != "copilot"` (structured config for
+  Claude / openai-agents is a follow-up), and rejects anchorless or
+  empty combinations (`wire_api` / `type` / `headers` / `azure` alone,
+  empty `headers`, empty `SecretStr`, empty `azure` block) so silent
+  no-ops cannot reach the SDK. Custom routing applies to both agent
+  execution and dialog turns so all sessions hit the same endpoint.
+  See `examples/copilot-local-llm.yaml` and
+  [Configuration → Custom Provider Routing](docs/configuration.md#custom-provider-routing-ollama--vllm--azure-openai)
+  ([#225](https://github.com/microsoft/conductor/pull/225),
+  [#136](https://github.com/microsoft/conductor/issues/136)).
 
 ## [0.1.17](https://github.com/microsoft/conductor/compare/v0.1.16...v0.1.17) - 2026-05-21
 

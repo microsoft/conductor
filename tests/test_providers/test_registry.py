@@ -331,6 +331,7 @@ class TestConfigPassing:
             timeout=60.0,
             max_session_seconds=None,
             max_agent_iterations=None,
+            provider_settings=config.workflow.runtime.provider,
         )
 
     @patch("conductor.providers.registry.create_provider")

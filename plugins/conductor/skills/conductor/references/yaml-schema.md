@@ -27,7 +27,8 @@ workflow:
 
   # Runtime configuration
   runtime:
-    provider: string                # "copilot" (default), "claude", or "openai-agents"
+    provider: string | object       # "copilot" (default), "claude", or "openai-agents"
+                                    # — or a ProviderSettings object (see below)
     default_model: string           # Default model for all agents
     temperature: float              # 0.0-1.0, controls randomness (optional)
     max_tokens: integer             # Max OUTPUT tokens per response, 1-200000 (optional)
@@ -666,6 +667,87 @@ runtime:
       args: ["-y", "open-websearch@latest"]
       tools: ["search", "fetch"]   # Only these tools (not ["*"])
 ```
+
+## Custom Provider Routing (Ollama / vLLM / Azure OpenAI)
+
+`runtime.provider` accepts either the bare string shorthand
+(`provider: copilot`) or a structured `ProviderSettings` object that
+routes the Copilot SDK at OpenAI-compatible / Azure / Anthropic
+endpoints (Ollama, vLLM, LM Studio, Azure OpenAI, etc.).
+
+### Schema
+
+```yaml
+runtime:
+  provider:
+    name: string                  # "copilot" (default), "claude", "openai-agents"
+    type: string                  # "openai" | "azure" | "anthropic" (Copilot-only)
+    wire_api: string              # "completions" | "responses" (Copilot-only)
+    base_url: string              # Endpoint base URL
+    api_key: string               # SecretStr; redacted in dumps. Prefer ${OPENAI_API_KEY}.
+    bearer_token: string          # SecretStr; takes precedence over api_key.
+    headers: {string: string}     # Extra HTTP headers (Copilot-only)
+    azure:                        # Azure-specific options (requires type: azure)
+      api_version: string         # e.g. "2024-10-21"
+```
+
+### Local OpenAI-compatible endpoint (Ollama)
+
+```yaml
+runtime:
+  provider:
+    name: copilot
+    type: openai
+    wire_api: completions
+    base_url: http://localhost:11434/v1
+    api_key: ${OPENAI_API_KEY:-ollama}
+  default_model: llama3.1
+```
+
+### Azure OpenAI
+
+```yaml
+runtime:
+  provider:
+    name: copilot
+    type: azure
+    base_url: https://<resource>.openai.azure.com
+    api_key: ${AZURE_OPENAI_API_KEY}
+    azure:
+      api_version: "2024-10-21"
+  default_model: gpt-4o
+```
+
+### Activation and env-var fallbacks
+
+Custom routing activates **only** when YAML sets at least one
+non-`name` field. Ambient env vars alone never divert default
+routing. Once activated, missing fields fall back from env:
+
+| Field | Env-var chain |
+|---|---|
+| `base_url` | `COPILOT_PROVIDER_BASE_URL` → `OPENAI_BASE_URL` |
+| `api_key` | `COPILOT_PROVIDER_API_KEY` *(only)* |
+| `bearer_token` | `COPILOT_PROVIDER_BEARER_TOKEN` *(only)* |
+
+Ambient `OPENAI_API_KEY` is **not** an implicit fallback (would leak
+OpenAI credentials to arbitrary `base_url`); use the
+`${OPENAI_API_KEY}` YAML interpolation for explicit opt-in.
+
+### Validator rules
+
+The schema rejects these misconfigurations at config-load time:
+
+- `name != "copilot"` with any non-`name` field set
+- `type: azure` without `azure: { api_version: ... }` (or vice versa)
+- Anchorless fields: `wire_api`, `type`, `headers`, `azure` alone
+  without `base_url` / `api_key` / `bearer_token`
+- Empty containers / `SecretStr`: `headers: {}`, `api_key: ""`,
+  `bearer_token: ""`, `azure: { api_version: null }`
+
+When custom routing activates but every resolved field ends up empty,
+the Copilot provider raises `ProviderError` rather than silently
+falling back to default routing.
 
 ## Validation Rules
 
