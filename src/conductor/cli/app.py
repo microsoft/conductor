@@ -177,9 +177,13 @@ def _abort_web_bg_if_human_gate(workflow_path: Path, *, skip_gates: bool) -> Non
         return
     if not any(getattr(a, "type", None) == "human_gate" for a in config.agents):
         return
-    raise typer.BadParameter(
-        "--web-bg is incompatible with workflows that contain human_gate steps "
-        "because the detached process has no stdin to prompt on.\n"
+    # Emit via plain typer.echo (not typer.BadParameter) so the message renders
+    # verbatim — BadParameter is rendered as a Rich panel whose text wrapping
+    # can split long flag names like ``--skip-gates`` across border lines in
+    # narrow terminals (e.g. CI runners), hiding the remediation hint.
+    message = (
+        "Error: --web-bg is incompatible with workflows that contain human_gate "
+        "steps because the detached process has no stdin to prompt on.\n"
         "\n"
         "Options:\n"
         "  1. Use --web (foreground) instead of --web-bg\n"
@@ -187,6 +191,8 @@ def _abort_web_bg_if_human_gate(workflow_path: Path, *, skip_gates: bool) -> Non
         "  3. Remove human_gate steps from the workflow\n"
         "  4. Wait for CLI gate-resolution support (planned follow-up)"
     )
+    typer.echo(message, err=True)
+    raise typer.Exit(code=2)
 
 
 def version_callback(value: bool) -> None:

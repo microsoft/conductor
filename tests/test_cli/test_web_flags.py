@@ -342,7 +342,13 @@ class TestWebBgHumanGateValidation:
         assert result.exit_code != 0
         assert not mock_launch.called
         # The error must name the actual problem and at least one remedy.
-        combined = (result.output or "") + (str(result.exception) if result.exception else "")
+        # Include stderr because Click 8.3+ separates streams and the abort
+        # message is intentionally emitted to stderr.
+        combined = (
+            (result.output or "")
+            + (result.stderr or "")
+            + (str(result.exception) if result.exception else "")
+        )
         assert "human_gate" in combined
         assert "--skip-gates" in combined
 
@@ -378,6 +384,10 @@ class TestWebBgHumanGateValidation:
 
         assert result.exit_code != 0
         assert not mock_launch.called
-        combined = (result.output or "") + (str(result.exception) if result.exception else "")
+        combined = (
+            (result.output or "")
+            + (result.stderr or "")
+            + (str(result.exception) if result.exception else "")
+        )
         assert "human_gate" in combined
         assert "--skip-gates" in combined
