@@ -156,6 +156,23 @@ conductor run examples/wait-step.yaml \
   --input poll_interval_seconds=2 --input max_attempts=3
 ```
 
+### wait-smoke.yaml
+
+Minimal wait-only workflow — no LLM, no scripts, no provider required.
+Useful as a smoke test for installation, dashboard rendering, and
+interrupt/timeout behavior. Three sequential wait steps demonstrate
+the three duration syntaxes (suffixed string, templated, plain numeric).
+
+```bash
+conductor run examples/wait-smoke.yaml
+
+# Watch wait nodes animate in the dashboard:
+conductor run examples/wait-smoke.yaml --web
+
+# Trigger the workflow timeout cancelling an in-flight wait:
+conductor run examples/wait-smoke.yaml --input middle_duration_ms=10000
+```
+
 ## Planning and Implementation
 
 ### plan.yaml

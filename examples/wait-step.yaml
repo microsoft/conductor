@@ -52,20 +52,25 @@ agents:
     args:
       - "-c"
       - |
-        import json, os, pathlib
+        import json, os, sys, pathlib
         # Use a small counter file in /tmp so reruns are independent.
-        p = pathlib.Path(os.environ.get("STATUS_FILE", "/tmp/wait-step-demo.count"))
+        p = pathlib.Path(os.environ["STATUS_FILE"])
         count = int(p.read_text()) if p.exists() else 0
         count += 1
         p.write_text(str(count))
-        ready = count >= int(os.environ.get("READY_AFTER", "3"))
+        # `args` entries ARE Jinja2-templated by the engine (unlike
+        # `env`, which is passed as-is to the subprocess). We use a
+        # positional arg for the threshold so workflow.input renders
+        # correctly.
+        ready_after = int(sys.argv[1])
+        ready = count >= ready_after
         print(json.dumps({
             "status": "ready" if ready else "pending",
             "attempt": count,
         }))
+      - "{{ workflow.input.max_attempts }}"
     env:
       STATUS_FILE: /tmp/wait-step-demo.count
-      READY_AFTER: "{{ workflow.input.max_attempts }}"
     routes:
       - to: summarize
         when: "status == 'ready'"
