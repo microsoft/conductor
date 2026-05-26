@@ -26,8 +26,9 @@
 #   (Each phase skips itself if its artifact is already present)
 #
 # Prerequisites:
-#   - openspec CLI installed and `openspec init` run in this repo
 #   - A Copilot or Claude provider configured in conductor
+#   - No openspec CLI installation required — schema and templates are bundled
+#     under examples/openspec/artifacts/
 
 workflow:
   name: openspec-pipeline

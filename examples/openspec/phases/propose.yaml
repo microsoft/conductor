@@ -8,13 +8,12 @@
 #     --input idea="Add OAuth2 login with GitHub and Google providers"
 #
 # Steps:
-#   1. get_instructions  — ask OpenSpec CLI for the proposal template + state
+#   1. get_instructions  — read proposal template + instructions from bundled schema
 #   2. write_proposal    — LLM generates the full proposal.md text
 #   3. save_proposal     — Python script writes the file to disk via env var
 #                          (avoids shell quoting issues with arbitrary markdown)
 #
-# Idempotent: if openspec reports state="done" for the proposal artifact,
-# the workflow exits immediately without re-generating.
+# Idempotent: exits immediately if proposal.md already exists.
 
 workflow:
   name: openspec-propose-phase
@@ -24,7 +23,7 @@ workflow:
 
   runtime:
     provider: copilot
-    default_model: gpt-4.1
+    default_model: claude-sonnet-4.6
 
   input:
     change:
@@ -44,31 +43,52 @@ agents:
   - name: get_instructions
     type: script
     description: |
-      Fetch proposal generation instructions from the OpenSpec CLI.
-      Wraps the CLI response with a 'state' field derived from whether the
-      output file already exists (idempotency), and exposes 'changeDir'
-      so downstream steps can resolve the real absolute path.
+      Load proposal generation instructions from the bundled schema.
+      Reads examples/openspec/artifacts/schema.yaml and the corresponding
+      template directly — no openspec CLI required.
+      Exposes 'changeDir' (absolute path) and 'state' (idempotency).
     command: python3
     args:
       - "-c"
       - |
-        import subprocess, json, pathlib, sys
+        import json, pathlib, sys
+        from ruamel.yaml import YAML
 
-        result = subprocess.run(
-            ["openspec", "instructions", "proposal",
-             "--change", "{{ workflow.input.change }}", "--json"],
-            capture_output=True, text=True,
-        )
-        if result.returncode != 0:
-            print(result.stderr, file=sys.stderr)
-            sys.exit(result.returncode)
+        yaml = YAML()
+        schema_dir = pathlib.Path("examples/openspec/artifacts")
+        schema = yaml.load(schema_dir / "schema.yaml")
 
-        data = json.loads(result.stdout)
-        change_dir = pathlib.Path(data["changeDir"])
-        output_path = data.get("outputPath", "")
-        artifact_file = change_dir / output_path if output_path else None
-        data["state"] = "done" if (artifact_file and artifact_file.exists()) else "ready"
-        print(json.dumps(data))
+        artifact_id = "proposal"
+        artifact = next((a for a in schema.get("artifacts", []) if a["id"] == artifact_id), None)
+        if not artifact:
+            print(f"ERROR: artifact '{artifact_id}' not found in schema", file=sys.stderr)
+            sys.exit(1)
+
+        template_file = schema_dir / "templates" / artifact["template"]
+        template = template_file.read_text() if template_file.exists() else ""
+
+        change = "{{ workflow.input.change }}"
+        change_dir = pathlib.Path("openspec") / "changes" / change
+        output_path = artifact["generates"]
+        artifact_file = change_dir / output_path
+        state = "done" if artifact_file.exists() else "ready"
+
+        config_context, config_rules = "", []
+        config_file = pathlib.Path("openspec/config.yaml")
+        if config_file.exists():
+            cfg = yaml.load(config_file) or {}
+            config_context = cfg.get("context", "") or ""
+            config_rules = (cfg.get("rules") or {}).get(artifact_id, []) or []
+
+        print(json.dumps({
+            "state": state,
+            "instruction": artifact.get("instruction", ""),
+            "template": template,
+            "outputPath": output_path,
+            "changeDir": str(change_dir.resolve()),
+            "context": config_context,
+            "rules": config_rules,
+        }))
     output:
       state:
         type: string
@@ -85,6 +105,12 @@ agents:
       changeDir:
         type: string
         description: Absolute path to the change directory
+      context:
+        type: string
+        description: Project background from openspec/config.yaml (constraint for AI, not artifact content)
+      rules:
+        type: array
+        description: Proposal-specific rules from openspec/config.yaml (constraints for AI, not artifact content)
     routes:
       - to: $end
         when: "state == 'done'"
@@ -104,6 +130,14 @@ agents:
       What to build: {{ workflow.input.idea }}
       {% endif %}
 
+      {% if get_instructions.output.context %}
+      PROJECT CONTEXT (background constraints — do NOT copy into the proposal):
+      {{ get_instructions.output.context }}
+      {% endif %}
+      {% if get_instructions.output.rules %}
+      RULES (must follow — do NOT copy into the proposal):
+      {% for rule in get_instructions.output.rules %}      - {{ rule }}
+      {% endfor %}{% endif %}
       Follow these instructions exactly when writing:
       {{ get_instructions.output.instruction }}
 

@@ -8,12 +8,12 @@
 #     --input change="add-oauth-login"
 #
 # Steps:
-#   1. get_instructions — fetch tasks template + state from OpenSpec CLI
+#   1. get_instructions — read tasks template + instructions from bundled schema
 #   2. read_context     — concatenate proposal.md + specs + design.md
 #   3. write_tasks      — LLM generates tasks.md
 #   4. save_tasks       — Python writes the file via env var
 #
-# Idempotent: exits immediately if openspec reports tasks state = "done".
+# Idempotent: exits immediately if tasks.md already exists.
 
 workflow:
   name: openspec-tasks-phase
@@ -37,28 +37,49 @@ agents:
   # ── Step 1 ──────────────────────────────────────────────────────────────────
   - name: get_instructions
     type: script
-    description: Fetch task-list generation instructions from the OpenSpec CLI
+    description: Load task-list generation instructions from the bundled schema (no openspec CLI required)
     command: python3
     args:
       - "-c"
       - |
-        import subprocess, json, pathlib, sys
+        import json, pathlib, sys
+        from ruamel.yaml import YAML
 
-        result = subprocess.run(
-            ["openspec", "instructions", "tasks",
-             "--change", "{{ workflow.input.change }}", "--json"],
-            capture_output=True, text=True,
-        )
-        if result.returncode != 0:
-            print(result.stderr, file=sys.stderr)
-            sys.exit(result.returncode)
+        yaml = YAML()
+        schema_dir = pathlib.Path("examples/openspec/artifacts")
+        schema = yaml.load(schema_dir / "schema.yaml")
 
-        data = json.loads(result.stdout)
-        change_dir = pathlib.Path(data["changeDir"])
-        output_path = data.get("outputPath", "")
-        artifact_file = change_dir / output_path if output_path else None
-        data["state"] = "done" if (artifact_file and artifact_file.exists()) else "ready"
-        print(json.dumps(data))
+        artifact_id = "tasks"
+        artifact = next((a for a in schema.get("artifacts", []) if a["id"] == artifact_id), None)
+        if not artifact:
+            print(f"ERROR: artifact '{artifact_id}' not found in schema", file=sys.stderr)
+            sys.exit(1)
+
+        template_file = schema_dir / "templates" / artifact["template"]
+        template = template_file.read_text() if template_file.exists() else ""
+
+        change = "{{ workflow.input.change }}"
+        change_dir = pathlib.Path("openspec") / "changes" / change
+        output_path = artifact["generates"]
+        artifact_file = change_dir / output_path
+        state = "done" if artifact_file.exists() else "ready"
+
+        config_context, config_rules = "", []
+        config_file = pathlib.Path("openspec/config.yaml")
+        if config_file.exists():
+            cfg = yaml.load(config_file) or {}
+            config_context = cfg.get("context", "") or ""
+            config_rules = (cfg.get("rules") or {}).get(artifact_id, []) or []
+
+        print(json.dumps({
+            "state": state,
+            "instruction": artifact.get("instruction", ""),
+            "template": template,
+            "outputPath": output_path,
+            "changeDir": str(change_dir.resolve()),
+            "context": config_context,
+            "rules": config_rules,
+        }))
     output:
       state:
         type: string
@@ -71,6 +92,12 @@ agents:
         type: string
       changeDir:
         type: string
+      context:
+        type: string
+        description: Project background from openspec/config.yaml (constraint for AI, not artifact content)
+      rules:
+        type: array
+        description: Tasks-specific rules from openspec/config.yaml (constraints for AI, not artifact content)
     routes:
       - to: $end
         when: "state == 'done'"
@@ -124,6 +151,14 @@ agents:
     prompt: |
       You are writing an OpenSpec tasks.md for the change "{{ workflow.input.change }}".
 
+      {% if get_instructions.output.context %}
+      PROJECT CONTEXT (background constraints — do NOT copy into tasks.md):
+      {{ get_instructions.output.context }}
+      {% endif %}
+      {% if get_instructions.output.rules %}
+      RULES (must follow — do NOT copy into tasks.md):
+      {% for rule in get_instructions.output.rules %}      - {{ rule }}
+      {% endfor %}{% endif %}
       INSTRUCTIONS:
       {{ get_instructions.output.instruction }}
 

@@ -9,8 +9,8 @@
 #     --input change="add-oauth-login"
 #
 # Steps:
-#   1. get_pending_tasks — call `openspec instructions apply --json` and
-#      return only unchecked (- [ ]) tasks as a structured array
+#   1. get_pending_tasks — parse tasks.md and return unchecked (- [ ]) tasks;
+#      falls back to bundled schema for apply instruction if tasks.md is absent
 #   2. task_implementers (for_each, sequential) — one implement-task.yaml
 #      sub-workflow per pending task, running one at a time to avoid
 #      concurrent writes to the same files
@@ -43,14 +43,14 @@ agents:
   - name: get_pending_tasks
     type: script
     description: |
-      Call `openspec instructions apply --json` and extract the list of pending
-      tasks (those not yet marked [x]). Handles the "all_done" and "blocked"
-      states by routing to $end early.
+      Parse tasks.md and extract pending tasks (those not yet marked [x]).
+      Falls back to the bundled schema for the apply instruction when tasks.md
+      is absent. Handles "all_done" and "blocked" states by routing to $end early.
     command: python3
     args:
       - "-c"
       - |
-        import json, re, subprocess, sys, pathlib
+        import json, re, sys, pathlib
 
         change = "{{ workflow.input.change }}"
         tasks_path = pathlib.Path(f"openspec/changes/{change}/tasks.md")
@@ -58,15 +58,15 @@ agents:
         # Always parse tasks.md directly: the CLI uses integer IDs while tasks.md
         # uses "N.M" format — we need to match the file format for mark_complete.
         if not tasks_path.exists():
-            # Try the CLI to get a "blocked" state message if tasks.md is absent
-            result = subprocess.run(
-                ["openspec", "instructions", "apply", "--change", change, "--json"],
-                capture_output=True, text=True,
-            )
+            # Read apply instruction from bundled schema (no openspec CLI required)
             instruction = ""
-            if result.returncode == 0:
-                data = json.loads(result.stdout)
-                instruction = data.get("instruction", "")
+            try:
+                from ruamel.yaml import YAML as _YAML
+                _yaml = _YAML()
+                _schema = _yaml.load(pathlib.Path("examples/openspec/artifacts/schema.yaml"))
+                instruction = (_schema.get("apply") or {}).get("instruction", "") or ""
+            except Exception:
+                pass
             print(json.dumps({"pending_tasks": [], "state": "blocked",
                               "instruction": instruction}))
             sys.exit(0)
