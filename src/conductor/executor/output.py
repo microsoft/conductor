@@ -116,8 +116,10 @@ def parse_json_output(raw_response: str) -> dict[str, Any]:
 
     text = raw_response.strip()
 
-    # Try to extract JSON from markdown code blocks
-    json_block_match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL)
+    # Try to extract JSON from markdown code blocks.
+    # Greedy capture so the regex closes at the LAST ``` in the response,
+    # not the first inner ``` (which may appear inside a JSON string field).
+    json_block_match = re.search(r"```(?:json)?\s*\n?(.*)\n?```", text, re.DOTALL)
     if json_block_match:
         text = json_block_match.group(1).strip()
 

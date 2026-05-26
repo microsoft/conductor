@@ -1259,8 +1259,10 @@ class CopilotProvider(AgentProvider):
         # Try to find JSON in code blocks
         import re
 
-        # Look for ```json ... ``` blocks
-        json_match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", content, re.DOTALL)
+        # Look for ```json ... ``` blocks (greedy so the regex closes at the
+        # LAST ``` in the content, not the first inner ``` which may appear
+        # inside a JSON string field).
+        json_match = re.search(r"```(?:json)?\s*\n?(.*)\n?```", content, re.DOTALL)
         if json_match:
             try:
                 return json.loads(json_match.group(1).strip())

@@ -269,3 +269,15 @@ class TestParseJsonOutput:
 
         assert result["person"]["name"] == "Alice"
         assert result["person"]["tags"] == ["dev", "py"]
+
+    def test_parse_json_with_triple_backticks_inside_string(self) -> None:
+        """Triple-backticks inside a string field must not truncate the JSON.
+
+        Reproduces brainstorm Issue #1: the non-greedy fence-extraction regex
+        closed at the first inner ``` instead of the actual closing fence,
+        producing invalid JSON and triggering parse-recovery loops.
+        """
+        raw = '```json\n{"code": "use ```fenced``` blocks", "n": 1}\n```'
+        result = parse_json_output(raw)
+
+        assert result == {"code": "use ```fenced``` blocks", "n": 1}
