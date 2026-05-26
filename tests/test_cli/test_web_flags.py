@@ -73,8 +73,17 @@ class TestWebFlagAcceptance:
 
     def test_web_bg_flag_passed(self, workflow_file: Path) -> None:
         """Test --web-bg flag forks a background process (does not call run_workflow_async)."""
+        from pathlib import Path as _Path
+
+        from conductor.cli.bg_runner import BackgroundLaunch
+
         with patch("conductor.cli.bg_runner.launch_background") as mock_launch:
-            mock_launch.return_value = "http://127.0.0.1:9999"
+            mock_launch.return_value = BackgroundLaunch(
+                url="http://127.0.0.1:9999",
+                stderr_log=_Path("/tmp/conductor-test-deadbeef.bg.stderr.log"),
+                stdout_log=_Path("/tmp/conductor-test-deadbeef.bg.stdout.log"),
+                run_id="deadbeef",
+            )
 
             result = runner.invoke(app, ["run", str(workflow_file), "--web-bg"])
 
@@ -82,6 +91,30 @@ class TestWebFlagAcceptance:
             assert mock_launch.called
             _, kwargs = mock_launch.call_args
             assert kwargs["workflow_path"] == workflow_file
+            assert "http://127.0.0.1:9999" in result.output
+
+    def test_silent_web_bg_suppresses_dashboard_output(self, workflow_file: Path) -> None:
+        """Test --silent suppresses --web-bg parent-process dashboard output."""
+        from pathlib import Path as _Path
+
+        from conductor.cli.bg_runner import BackgroundLaunch
+
+        with patch("conductor.cli.bg_runner.launch_background") as mock_launch:
+            mock_launch.return_value = BackgroundLaunch(
+                url="http://127.0.0.1:9999",
+                stderr_log=_Path("/tmp/conductor-test-deadbeef.bg.stderr.log"),
+                stdout_log=_Path("/tmp/conductor-test-deadbeef.bg.stdout.log"),
+                run_id="deadbeef",
+            )
+
+            result = runner.invoke(app, ["--silent", "run", str(workflow_file), "--web-bg"])
+
+            assert result.exit_code == 0
+            assert mock_launch.called
+            assert "http://127.0.0.1:9999" not in result.output
+            assert "Dashboard" not in result.output
+            assert "Workflow running in background" not in result.output
+            assert "Child stderr log" not in result.output
 
     def test_web_flags_default_values(self, workflow_file: Path) -> None:
         """Test that web flags default to False/0 when not specified."""
@@ -121,6 +154,71 @@ class TestWebBgMutualExclusion:
         """Test that --web and --web-bg together produce an error."""
         result = runner.invoke(app, ["run", str(workflow_file), "--web", "--web-bg"])
         assert result.exit_code != 0
+
+
+class TestLaunchBackgroundSilentFlag:
+    """Regression tests for issue #196 — bg_runner must not pass --silent.
+
+    The child's ``stdout``/``stderr`` are already redirected to ``DEVNULL``, so
+    ``--silent`` adds nothing for the user. Worse, it sets
+    ``verbose_mode=False`` in the child, which gates provider-side SDK event
+    logging that ``--log-file`` would otherwise capture.
+    """
+
+    def test_launch_background_does_not_pass_silent(self, tmp_path: Path) -> None:
+        """``launch_background`` must not inject ``--silent`` into the cmd.
+
+        Asserts both the negative contract (no ``--silent``) and the positive
+        contract (expected flags still present) so that an accidental
+        regression that drops both ``--silent`` *and* another flag would
+        still be caught. Mirrors ``test_builds_resume_subcommand_with_workflow``
+        on the resume side.
+        """
+        from conductor.cli import bg_runner
+
+        wf_path = tmp_path / "wf.yaml"
+        wf_path.write_text("workflow: {name: x, entry_point: a}\nagents: []\n")
+
+        captured: dict[str, list[str]] = {}
+
+        def _fake_popen(cmd: list[str], **_kwargs: object) -> MagicMock:
+            captured["cmd"] = cmd
+            proc = MagicMock()
+            proc.pid = 12345
+            proc.poll.return_value = None
+            return proc
+
+        with (
+            patch("conductor.cli.bg_runner.subprocess.Popen", side_effect=_fake_popen),
+            patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch("conductor.cli.pid.write_pid_file"),
+        ):
+            launch = bg_runner.launch_background(
+                workflow_path=wf_path,
+                inputs={"question": "hello"},
+                provider_override="copilot",
+                skip_gates=True,
+                metadata={"tracker": "ado"},
+                web_port=9099,
+            )
+
+        assert launch.url == "http://127.0.0.1:9099"
+        cmd = captured["cmd"]
+        # Issue #196: ``--silent`` must NOT be injected — see class docstring.
+        assert "--silent" not in cmd
+        # Positive contract: expected flags must still be present.
+        assert "run" in cmd
+        assert str(wf_path) in cmd
+        assert "--web" in cmd
+        assert "--web-port" in cmd
+        assert "9099" in cmd
+        assert "--no-interactive" in cmd
+        assert "--input" in cmd
+        assert "question=hello" in cmd
+        assert "--provider" in cmd and "copilot" in cmd
+        assert "--skip-gates" in cmd
+        assert "--metadata" in cmd
+        assert "tracker=ado" in cmd
 
 
 class TestDashboardStartupFailure:

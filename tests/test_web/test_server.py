@@ -761,6 +761,98 @@ class TestWaitForGateResponse:
         assert dashboard._gate_response_queue.empty()
 
 
+class TestWaitForIterationLimitResponse:
+    """Tests for WebDashboard.wait_for_iteration_limit_response (issue #198)."""
+
+    @pytest.mark.asyncio
+    async def test_returns_matching_response(self) -> None:
+        """Returns the response whose gate_id matches the awaited gate."""
+        _, dashboard = _make_dashboard()
+        await dashboard._iteration_limit_response_queue.put(
+            {
+                "gate_id": "gate-abc",
+                "agent_name": "researcher",
+                "additional_iterations": 5,
+            }
+        )
+
+        msg = await asyncio.wait_for(
+            dashboard.wait_for_iteration_limit_response("gate-abc"), timeout=1.0
+        )
+
+        assert msg["gate_id"] == "gate-abc"
+        assert msg["additional_iterations"] == 5
+
+    @pytest.mark.asyncio
+    async def test_discards_stale_responses_by_gate_id(self) -> None:
+        """Responses with a non-matching gate_id are dropped, not re-queued.
+
+        The same target (agent or parallel group) can trigger ``iteration_limit_reached``
+        more than once in a run. Without gate_id matching, a stale double-click
+        from the previous gate could resolve the next one with the user's
+        earlier choice. The gate_id guards against this.
+        """
+        _, dashboard = _make_dashboard()
+        await dashboard._iteration_limit_response_queue.put(
+            {
+                "gate_id": "old-gate",
+                "agent_name": "researcher",
+                "additional_iterations": 0,
+            }
+        )
+        await dashboard._iteration_limit_response_queue.put(
+            {
+                "gate_id": "current-gate",
+                "agent_name": "researcher",
+                "additional_iterations": 10,
+            }
+        )
+
+        msg = await asyncio.wait_for(
+            dashboard.wait_for_iteration_limit_response("current-gate"), timeout=1.0
+        )
+
+        assert msg["gate_id"] == "current-gate"
+        assert msg["additional_iterations"] == 10
+        # Stale message was consumed and dropped, not re-queued — otherwise
+        # a busy loop would re-examine it on every subsequent gate.
+        assert dashboard._iteration_limit_response_queue.empty()
+
+    def test_websocket_routes_iteration_limit_response_to_queue(self) -> None:
+        """``iteration_limit_response`` WS messages land in the dedicated queue.
+
+        End-to-end check: a real WebSocket client sending the message
+        type used by the dashboard reaches the queue ``_wait_for_web_iteration_limit``
+        consumes, not the gate-response or dialog queues.
+        """
+        _, dashboard = _make_dashboard()
+        with TestClient(dashboard.app) as client, client.websocket_connect("/ws") as ws:
+            ws.send_json(
+                {
+                    "type": "iteration_limit_response",
+                    "gate_id": "gate-xyz",
+                    "agent_name": "loopy_agent",
+                    "additional_iterations": 3,
+                }
+            )
+
+            # Allow the server's WS receive loop to process the message
+            # before we inspect the queue. A short poll keeps the test
+            # fast while not racing the event loop.
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                if not dashboard._iteration_limit_response_queue.empty():
+                    break
+                time.sleep(0.01)
+
+            assert not dashboard._iteration_limit_response_queue.empty()
+            assert dashboard._gate_response_queue.empty()
+            assert dashboard._dialog_response_queue.empty()
+            msg = dashboard._iteration_limit_response_queue.get_nowait()
+            assert msg["gate_id"] == "gate-xyz"
+            assert msg["additional_iterations"] == 3
+
+
 async def _short_grace(event: asyncio.Event, delay: float) -> None:
     """Helper for testing: short grace period."""
     await asyncio.sleep(delay)
@@ -882,3 +974,306 @@ class TestFileApi:
         with self._client(workflow_dir) as client:
             resp = client.get("/api/files/\\\\server\\share\\file.txt")
             assert resp.status_code in (403, 404)
+
+
+class TestReplayEventsFromJsonl:
+    """Tests for WebDashboard.replay_events_from_jsonl (issue #167)."""
+
+    def _write_jsonl(self, path: Path, events: list[dict]) -> None:
+        import json
+
+        with path.open("w", encoding="utf-8") as f:
+            for ev in events:
+                f.write(json.dumps(ev) + "\n")
+
+    def test_populates_event_history(self, tmp_path: Path) -> None:
+        """Replayed events appear in /api/state."""
+        emitter, dashboard = _make_dashboard()
+        log = tmp_path / "test.events.jsonl"
+        self._write_jsonl(
+            log,
+            [
+                {"type": "agent_started", "timestamp": 1.0, "data": {"agent_name": "a"}},
+                {"type": "agent_completed", "timestamp": 2.0, "data": {"agent_name": "a"}},
+            ],
+        )
+
+        count = dashboard.replay_events_from_jsonl(log)
+
+        assert count == 2
+        with TestClient(dashboard.app) as client:
+            resp = client.get("/api/state")
+            assert resp.status_code == 200
+            body = resp.json()
+            assert [ev["type"] for ev in body] == ["agent_started", "agent_completed"]
+
+    def test_skips_root_lifecycle_events(self, tmp_path: Path) -> None:
+        """Root workflow_started / workflow_completed / workflow_failed / checkpoint_saved
+        are filtered to avoid double-incrementing frontend wfDepth or making the
+        dashboard appear complete before resume executes.
+        """
+        emitter, dashboard = _make_dashboard()
+        log = tmp_path / "test.events.jsonl"
+        self._write_jsonl(
+            log,
+            [
+                {"type": "workflow_started", "timestamp": 1.0, "data": {"name": "wf"}},
+                {"type": "agent_started", "timestamp": 1.5, "data": {"agent_name": "a"}},
+                {"type": "agent_completed", "timestamp": 2.5, "data": {"agent_name": "a"}},
+                {"type": "checkpoint_saved", "timestamp": 2.7, "data": {"path": "/tmp/x"}},
+                {"type": "workflow_failed", "timestamp": 2.8, "data": {"error": "boom"}},
+            ],
+        )
+
+        count = dashboard.replay_events_from_jsonl(log)
+
+        assert count == 2
+        assert [ev["type"] for ev in dashboard._event_history] == [
+            "agent_started",
+            "agent_completed",
+        ]
+
+    def test_preserves_subworkflow_lifecycle_events(self, tmp_path: Path) -> None:
+        """Subworkflow-level workflow_started/completed (identified by a non-empty
+        ``data.subworkflow_path``) must be preserved so frontend wfDepth stays
+        balanced."""
+        emitter, dashboard = _make_dashboard()
+        log = tmp_path / "test.events.jsonl"
+        self._write_jsonl(
+            log,
+            [
+                {
+                    "type": "workflow_started",
+                    "timestamp": 1.0,
+                    "data": {"name": "child", "subworkflow_path": ["sub"]},
+                },
+                {
+                    "type": "workflow_completed",
+                    "timestamp": 2.0,
+                    "data": {"subworkflow_path": ["sub"]},
+                },
+            ],
+        )
+
+        count = dashboard.replay_events_from_jsonl(log)
+
+        assert count == 2
+        assert [ev["type"] for ev in dashboard._event_history] == [
+            "workflow_started",
+            "workflow_completed",
+        ]
+
+    def test_does_not_enqueue_replayed_events(self, tmp_path: Path) -> None:
+        """Replay must not enqueue on _queue — late-joiners get history via
+        /api/state and the WebSocket replay loop instead."""
+        emitter, dashboard = _make_dashboard()
+        log = tmp_path / "test.events.jsonl"
+        self._write_jsonl(
+            log,
+            [{"type": "agent_started", "timestamp": 1.0, "data": {"agent_name": "a"}}],
+        )
+
+        dashboard.replay_events_from_jsonl(log)
+
+        assert dashboard._queue.empty()
+
+    def test_missing_file_returns_zero(self, tmp_path: Path) -> None:
+        """Missing log path returns 0 and does not raise."""
+        emitter, dashboard = _make_dashboard()
+        count = dashboard.replay_events_from_jsonl(tmp_path / "nope.jsonl")
+        assert count == 0
+        assert dashboard._event_history == []
+
+    def test_corrupt_file_returns_zero(self, tmp_path: Path) -> None:
+        """A file that is not valid JSON/JSONL returns 0 and does not raise."""
+        emitter, dashboard = _make_dashboard()
+        bad = tmp_path / "bad.jsonl"
+        bad.write_text("not json at all {{{\n")
+        count = dashboard.replay_events_from_jsonl(bad)
+        assert count == 0
+        assert dashboard._event_history == []
+
+    def test_tolerates_partial_trailing_line(self, tmp_path: Path) -> None:
+        """A truncated trailing line is skipped, prior valid lines are kept."""
+        emitter, dashboard = _make_dashboard()
+        bad = tmp_path / "partial.jsonl"
+        bad.write_text(
+            '{"type":"agent_started","timestamp":1.0,"data":{"agent_name":"a"}}\n'
+            '{"type":"agent_compl'  # truncated
+        )
+        count = dashboard.replay_events_from_jsonl(bad)
+        assert count == 1
+        assert dashboard._event_history[0]["type"] == "agent_started"
+
+
+class TestReplaySyntheticFromContext:
+    """Tests for WebDashboard.replay_synthetic_from_context (issue #167 fallback)."""
+
+    def _build_config(self):
+        """Build a minimal WorkflowConfig with one agent + one script for tests."""
+        from conductor.config.schema import AgentDef, RuntimeConfig, WorkflowConfig, WorkflowDef
+
+        return WorkflowConfig(
+            workflow=WorkflowDef(
+                name="t",
+                entry_point="a",
+                runtime=RuntimeConfig(provider="copilot", model="gpt-5"),
+            ),
+            agents=[
+                AgentDef(name="a", prompt="x", routes=[]),
+                AgentDef(name="s", type="script", command="echo hi", routes=[]),
+            ],
+        )
+
+    def test_emits_started_completed_per_agent(self) -> None:
+        from conductor.engine.context import WorkflowContext
+
+        emitter, dashboard = _make_dashboard()
+        ctx = WorkflowContext()
+        ctx.store("a", {"answer": "yes"})
+
+        count = dashboard.replay_synthetic_from_context(ctx, self._build_config())
+
+        assert count == 2
+        types = [ev["type"] for ev in dashboard._event_history]
+        assert types == ["agent_started", "agent_completed"]
+        completed_data = dashboard._event_history[1]["data"]
+        assert completed_data["agent_name"] == "a"
+        assert completed_data["output"] == {"answer": "yes"}
+        assert completed_data["synthetic"] is True
+
+    def test_emits_script_events_for_script_type(self) -> None:
+        from conductor.engine.context import WorkflowContext
+
+        emitter, dashboard = _make_dashboard()
+        ctx = WorkflowContext()
+        ctx.store("s", {"stdout": "hi", "stderr": "", "exit_code": 0})
+
+        count = dashboard.replay_synthetic_from_context(ctx, self._build_config())
+
+        assert count == 2
+        types = [ev["type"] for ev in dashboard._event_history]
+        assert types == ["script_started", "script_completed"]
+        assert dashboard._event_history[1]["data"]["stdout"] == "hi"
+
+    def test_empty_history_returns_zero(self) -> None:
+        from conductor.engine.context import WorkflowContext
+
+        emitter, dashboard = _make_dashboard()
+        count = dashboard.replay_synthetic_from_context(WorkflowContext(), self._build_config())
+        assert count == 0
+        assert dashboard._event_history == []
+
+    def test_uses_checkpoint_timestamp_when_provided(self) -> None:
+        from conductor.engine.context import WorkflowContext
+
+        emitter, dashboard = _make_dashboard()
+        ctx = WorkflowContext()
+        ctx.store("a", {"answer": "yes"})
+
+        dashboard.replay_synthetic_from_context(
+            ctx, self._build_config(), checkpoint_timestamp=42.0
+        )
+
+        for ev in dashboard._event_history:
+            assert ev["timestamp"] == 42.0
+
+    def _build_for_each_config(self):
+        """WorkflowConfig with a for-each group ``f`` over a script agent."""
+        from conductor.config.schema import (
+            ForEachDef,
+            RuntimeConfig,
+            WorkflowConfig,
+            WorkflowDef,
+        )
+
+        return WorkflowConfig(
+            workflow=WorkflowDef(
+                name="t",
+                entry_point="f",
+                runtime=RuntimeConfig(provider="copilot", model="gpt-5"),
+            ),
+            agents=[],
+            for_each=[
+                ForEachDef.model_validate(
+                    {
+                        "name": "f",
+                        "type": "for_each",
+                        "source": "workflow.input.items",
+                        "as": "item",
+                        "agent": {"name": "worker", "prompt": "{{ item }}", "routes": []},
+                    }
+                ),
+            ],
+        )
+
+    def test_for_each_uses_count_field_when_present(self) -> None:
+        """Synthetic for-each replay uses the engine's authoritative ``count``."""
+        from conductor.engine.context import WorkflowContext
+
+        emitter, dashboard = _make_dashboard()
+        ctx = WorkflowContext()
+        # Mirror what WorkflowEngine._execute_for_each_group stores:
+        # {"outputs": [...], "errors": {...}, "count": N}.
+        ctx.store("f", {"outputs": [{"a": 1}, {"a": 2}], "errors": {}, "count": 2})
+
+        count = dashboard.replay_synthetic_from_context(ctx, self._build_for_each_config())
+
+        assert count == 2
+        completed = dashboard._event_history[1]["data"]
+        assert completed["item_count"] == 2
+        assert completed["success_count"] == 2
+        assert completed["failure_count"] == 0
+
+    def test_for_each_zero_count_does_not_use_wrapper_dict_length(self) -> None:
+        """Regression test: empty ``outputs`` must not fall through to wrapper dict.
+
+        A naive ``output.get("outputs") or ...`` would treat an empty list as
+        missing and return ``len(output)`` (i.e. the number of keys in the
+        wrapper dict — 3) as the item count.
+        """
+        from conductor.engine.context import WorkflowContext
+
+        emitter, dashboard = _make_dashboard()
+        ctx = WorkflowContext()
+        ctx.store("f", {"outputs": [], "errors": {}, "count": 0})
+
+        count = dashboard.replay_synthetic_from_context(ctx, self._build_for_each_config())
+
+        assert count == 2
+        completed = dashboard._event_history[1]["data"]
+        assert completed["item_count"] == 0
+        assert completed["success_count"] == 0
+
+    def test_for_each_falls_back_to_outputs_length_when_count_missing(self) -> None:
+        """If ``count`` is absent, derive item count from ``len(outputs)``."""
+        from conductor.engine.context import WorkflowContext
+
+        emitter, dashboard = _make_dashboard()
+        ctx = WorkflowContext()
+        ctx.store("f", {"outputs": [{"a": 1}], "errors": {}})
+
+        count = dashboard.replay_synthetic_from_context(ctx, self._build_for_each_config())
+
+        assert count == 2
+        completed = dashboard._event_history[1]["data"]
+        assert completed["item_count"] == 1
+
+
+class TestPrependWorkflowStarted:
+    """Tests for WebDashboard.prepend_workflow_started (issue #167)."""
+
+    def test_inserts_at_position_zero(self, tmp_path: Path) -> None:
+        emitter, dashboard = _make_dashboard()
+        # Seed some "historical" events first.
+        dashboard._event_history.append(
+            {"type": "agent_started", "timestamp": 1.0, "data": {"agent_name": "a"}}
+        )
+
+        dashboard.prepend_workflow_started({"name": "wf", "entry_point": "a", "agents": []})
+
+        assert dashboard._event_history[0]["type"] == "workflow_started"
+        assert dashboard._event_history[1]["type"] == "agent_started"
+        assert dashboard._event_history[0]["data"]["name"] == "wf"
+        # Should be carry a timestamp.
+        assert isinstance(dashboard._event_history[0]["timestamp"], float)

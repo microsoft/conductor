@@ -1749,3 +1749,61 @@ class TestConsoleEventSubscriberAgentTimeout:
                 assert "timed out" in output_text
         finally:
             verbose_mode.reset(token)
+
+
+class TestSilentAwareConsole:
+    """Tests for the ``_SilentAwareConsole`` subclass (issue #209).
+
+    The verbose console used by ``run`` / ``resume`` is silent-aware at the
+    source: every ``.print(...)`` call no-ops when ``is_verbose()`` is False.
+    This guarantees ``--silent`` compliance for *every* call site in
+    ``conductor.cli.run`` without each site having to remember to gate
+    itself.
+    """
+
+    def test_print_writes_when_verbose(self) -> None:
+        """Verbose mode (the default) lets ``print`` reach the underlying stream."""
+        from io import StringIO
+
+        from conductor.cli.run import _SilentAwareConsole
+
+        sink = StringIO()
+        console = _SilentAwareConsole(file=sink, force_terminal=True, no_color=True)
+
+        token = verbose_mode.set(True)
+        try:
+            console.print("hello world")
+        finally:
+            verbose_mode.reset(token)
+
+        assert "hello world" in sink.getvalue()
+
+    def test_print_suppresses_when_silent(self) -> None:
+        """Silent mode (``verbose_mode=False``) makes ``print`` a no-op."""
+        from io import StringIO
+
+        from conductor.cli.run import _SilentAwareConsole
+
+        sink = StringIO()
+        console = _SilentAwareConsole(file=sink, force_terminal=True, no_color=True)
+
+        token = verbose_mode.set(False)
+        try:
+            console.print("hello world")
+            console.print("[bold yellow]Warning:[/bold yellow] something failed")
+            console.print()  # empty-arg call must also be a no-op
+        finally:
+            verbose_mode.reset(token)
+
+        assert sink.getvalue() == ""
+
+    def test_module_verbose_console_is_silent_aware(self) -> None:
+        """Module-level ``_verbose_console`` is an instance of the silent-aware subclass.
+
+        Guards against a future refactor accidentally swapping it back to a
+        plain ``rich.console.Console``, which is the regression issue #209
+        is about.
+        """
+        from conductor.cli.run import _SilentAwareConsole, _verbose_console
+
+        assert isinstance(_verbose_console, _SilentAwareConsole)

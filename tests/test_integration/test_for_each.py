@@ -609,9 +609,12 @@ class TestForEachExecution:
             agent = kwargs.get("agent") if "agent" in kwargs else args[0]
             execution_times.append(asyncio.get_event_loop().time())
             await asyncio.sleep(0.1)  # Simulate processing time
+            # For-each iterations receive qualified names like "processor[0]";
+            # strip the suffix so the mock branches consistently for all items.
+            base_name = agent.name.split("[")[0]
             return AgentOutput(
                 content={"result": "ok"}
-                if agent.name == "processor"
+                if base_name == "processor"
                 else {"items": ["A", "B", "C", "D", "E"]},
                 raw_response={},
                 model="gpt-4",

@@ -37,6 +37,7 @@ import type {
   SubworkflowFailedData,
   IterationLimitReachedData,
   IterationLimitResolvedData,
+  IterationLimitResponseTarget,
 } from '@/types/events';
 
 export interface ActivityEntry {
@@ -340,6 +341,23 @@ interface WorkflowState {
   engageDialog: () => void;
   sendDialogMessage: (agentName: string, dialogId: string, message: string) => void;
   sendDialogDecline: (agentName: string, dialogId: string) => void;
+  /**
+   * Resolve a max-iterations gate from the dashboard (issue #198).
+   *
+   * Send ``additionalIterations === 0`` to stop the workflow, or any positive
+   * integer to continue with N more iterations. ``gateId`` must match the
+   * id from the most recent ``iteration_limit_reached`` event so the engine
+   * ignores stale responses.
+   *
+   * ``target`` uses a discriminated union — exactly one of ``agent_name`` or
+   * ``group_name`` must be set, preventing accidental dual-target payloads
+   * that the engine wouldn't know how to interpret.
+   */
+  sendIterationLimitResponse: (
+    target: IterationLimitResponseTarget,
+    gateId: string,
+    additionalIterations: number,
+  ) => void;
 }
 
 function ensureNode(nodes: Record<string, NodeData>, name: string, type: NodeType = 'agent'): NodeData {
@@ -568,6 +586,26 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
         dialog_id: dialogId,
       });
     }
+  },
+
+  sendIterationLimitResponse: (target, gateId, additionalIterations) => {
+    const send = useWorkflowStore.getState()._wsSend;
+    if (!send) return;
+    // Clamp to non-negative integer. 0 means "stop", N>0 means "continue with N more".
+    const additional = Math.max(0, Math.floor(Number(additionalIterations) || 0));
+    // ``target`` is a discriminated union — exactly one branch is set, so a
+    // simple `in` narrowing produces the right payload shape without risk of
+    // sending both fields.
+    const targetFields =
+      'agent_name' in target
+        ? { agent_name: target.agent_name }
+        : { group_name: target.group_name };
+    send({
+      type: 'iteration_limit_response',
+      gate_id: gateId,
+      ...targetFields,
+      additional_iterations: additional,
+    });
   },
 
   processEvent: (event: WorkflowEvent) => {
@@ -1632,7 +1670,7 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
         icon: '⚠',
         label: 'Iteration limit',
         text: `Reached ${data.current_iteration}/${data.max_iterations} iterations — ${
-          data.skip_gates ? 'auto-stopping (--skip-gates)' : 'awaiting console input'
+          data.skip_gates ? 'auto-stopping (--skip-gates)' : 'awaiting decision'
         }`,
       });
       replaceNode(state.nodes, target);
@@ -1787,7 +1825,7 @@ function buildLogEntry(event: WorkflowEvent): LogEntry | null {
 
     case 'iteration_limit_reached': {
       const target = (d.agent_name ?? d.group_name ?? 'workflow') as string;
-      const auto = d.skip_gates ? ' — auto-stopping (--skip-gates)' : ' — awaiting console input';
+      const auto = d.skip_gates ? ' — auto-stopping (--skip-gates)' : ' — awaiting decision';
       return {
         timestamp: ts,
         level: 'warning',

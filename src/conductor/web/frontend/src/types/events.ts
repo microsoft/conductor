@@ -349,7 +349,26 @@ export type IterationLimitTarget =
       agent_name?: never;
     };
 
+/**
+ * Narrowed target used in the ``iteration_limit_response`` payload sent
+ * from the dashboard back to the engine. The engine already knows the
+ * group's ``agent_count`` from the original ``iteration_limit_reached``
+ * event, so the response only needs to identify the target. Modeling
+ * this as a discriminated union prevents accidentally sending both
+ * ``agent_name`` and ``group_name`` (or neither). See issue #198.
+ */
+export type IterationLimitResponseTarget =
+  | { agent_name: string; group_name?: never }
+  | { group_name: string; agent_name?: never };
+
 export type IterationLimitReachedData = IterationLimitTarget & {
+  /**
+   * Unique id for this gate occurrence. The dashboard must echo this in the
+   * ``iteration_limit_response`` payload so a stale or duplicated response
+   * from a previous gate cannot resolve a later gate for the same target.
+   * Issue #198.
+   */
+  gate_id: string;
   current_iteration: number;
   max_iterations: number;
   /** Last up to 5 agents executed, oldest to newest. */
@@ -372,6 +391,8 @@ export type IterationLimitResolvedData = (
   | { agent_name: string; group_name?: never }
   | { group_name: string; agent_name?: never }
 ) & {
+  /** Echo of the gate_id from the corresponding ``iteration_limit_reached``. */
+  gate_id?: string;
   /**
    * ``true`` when the gate was resolved by continuing (user prompt or, in
    * ``--skip-gates`` mode, the auto-decision); ``false`` when the workflow

@@ -422,7 +422,7 @@ def run(
         from conductor.cli.bg_runner import launch_background
 
         try:
-            url = launch_background(
+            launch = launch_background(
                 workflow_path=workflow_path,
                 inputs=inputs,
                 provider_override=provider,
@@ -434,11 +434,13 @@ def run(
                 workspace_instructions=workspace_instructions,
                 cli_instructions=raw_instructions,
             )
-            console.print(f"[bold cyan]Dashboard:[/bold cyan] {url}")
-            console.print(
-                "[dim]Workflow running in background. Dashboard auto-shuts down after "
-                "workflow completes and all clients disconnect.[/dim]"
-            )
+            if is_verbose():
+                console.print(f"[bold cyan]Dashboard:[/bold cyan] {launch.url}")
+                console.print(f"[dim]Child stderr log: {launch.stderr_log}[/dim]")
+                console.print(
+                    "[dim]Workflow running in background. Dashboard auto-shuts down after "
+                    "workflow completes and all clients disconnect.[/dim]"
+                )
         except Exception as e:
             print_error(e)
             raise typer.Exit(code=1) from None
@@ -834,7 +836,7 @@ def resume(
         from conductor.cli.bg_runner import launch_background_resume
 
         try:
-            url = launch_background_resume(
+            launch = launch_background_resume(
                 workflow_path=resolved_workflow,
                 checkpoint_path=resolved_checkpoint,
                 provider_override=provider,
@@ -843,11 +845,13 @@ def resume(
                 web_port=web_port,
                 metadata=cli_metadata,
             )
-            console.print(f"[bold cyan]Dashboard:[/bold cyan] {url}")
-            console.print(
-                "[dim]Resumed workflow running in background. Dashboard auto-shuts down after "
-                "workflow completes and all clients disconnect.[/dim]"
-            )
+            if is_verbose():
+                console.print(f"[bold cyan]Dashboard:[/bold cyan] {launch.url}")
+                console.print(f"[dim]Child stderr log: {launch.stderr_log}[/dim]")
+                console.print(
+                    "[dim]Resumed workflow running in background. Dashboard auto-shuts down "
+                    "after workflow completes and all clients disconnect.[/dim]"
+                )
         except Exception as e:
             print_error(e)
             raise typer.Exit(code=1) from None
@@ -987,8 +991,9 @@ def replay(
             raise typer.Exit(1) from exc
 
         await dashboard.start()
-        console.print(f"\n[bold green]▶ Replay dashboard:[/] {dashboard.url}\n")
-        console.print("[dim]Press Ctrl+C to exit[/dim]\n")
+        if is_verbose():
+            console.print(f"\n[bold green]▶ Replay dashboard:[/] {dashboard.url}\n")
+            console.print("[dim]Press Ctrl+C to exit[/dim]\n")
 
         try:
             await asyncio.Event().wait()
@@ -1000,7 +1005,8 @@ def replay(
     try:
         asyncio.run(_run_replay())
     except KeyboardInterrupt:
-        console.print("\n[dim]Replay stopped.[/dim]")
+        if is_verbose():
+            console.print("\n[dim]Replay stopped.[/dim]")
 
 
 @app.command()

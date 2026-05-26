@@ -275,6 +275,55 @@ class TestSaveCheckpoint:
         data = json.loads(path.read_text())
         assert data["copilot_session_ids"] == {"agent_a": "sid-123"}
 
+    def test_run_id_and_event_log_path_included(self, tmp_path: Path) -> None:
+        """``run_id`` and ``event_log_path`` round-trip through save+load.
+
+        Regression coverage for issue #167: the resume web dashboard needs
+        these fields to replay the original timeline.
+        """
+        wf = _write_workflow(tmp_path)
+        ctx = _make_context()
+        limits = _make_limits()
+        error = RuntimeError("err")
+        log_path = tmp_path / "conductor-x.events.jsonl"
+        log_path.write_text("")
+
+        with patch.object(CheckpointManager, "get_checkpoints_dir", return_value=tmp_path):
+            saved_path = CheckpointManager.save_checkpoint(
+                wf,
+                ctx,
+                limits,
+                "a",
+                error,
+                {},
+                run_id="abc12345",
+                event_log_path=str(log_path),
+            )
+
+        assert saved_path is not None
+        data = json.loads(saved_path.read_text())
+        assert data["run_id"] == "abc12345"
+        assert data["event_log_path"] == str(log_path)
+
+        cp = CheckpointManager.load_checkpoint(saved_path)
+        assert cp.run_id == "abc12345"
+        assert cp.event_log_path == str(log_path)
+
+    def test_run_id_and_event_log_path_default_empty(self, tmp_path: Path) -> None:
+        """Defaults are empty strings when not supplied (backward compat)."""
+        wf = _write_workflow(tmp_path)
+        ctx = _make_context()
+        limits = _make_limits()
+        error = RuntimeError("err")
+
+        with patch.object(CheckpointManager, "get_checkpoints_dir", return_value=tmp_path):
+            saved_path = CheckpointManager.save_checkpoint(wf, ctx, limits, "a", error, {})
+
+        assert saved_path is not None
+        cp = CheckpointManager.load_checkpoint(saved_path)
+        assert cp.run_id == ""
+        assert cp.event_log_path == ""
+
     def test_no_leftover_tmp_file(self, tmp_path: Path) -> None:
         """After a successful save, no .tmp file should remain."""
         wf = _write_workflow(tmp_path)
@@ -348,6 +397,35 @@ class TestLoadCheckpoint:
 
         with pytest.raises(CheckpointError, match="missing required field"):
             CheckpointManager.load_checkpoint(f)
+
+    def test_loads_legacy_checkpoint_without_run_id_or_event_log_path(self, tmp_path: Path) -> None:
+        """Old checkpoints written before this PR have neither field.
+
+        Backward compatibility: ``load_checkpoint`` must default both
+        fields to ``""`` without raising.
+        """
+        legacy = tmp_path / "legacy.json"
+        legacy.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "workflow_path": "/x.yaml",
+                    "workflow_hash": "sha256:abc",
+                    "created_at": "2026-01-01T00:00:00+00:00",
+                    "failure": {"error_type": "X", "message": "m", "agent": "a", "iteration": 0},
+                    "inputs": {},
+                    "current_agent": "a",
+                    "context": {"workflow_inputs": {}, "agent_outputs": {}},
+                    "limits": {"current_iteration": 0, "max_iterations": 10},
+                    "copilot_session_ids": {},
+                    # No run_id, no event_log_path — pre-PR shape.
+                }
+            )
+        )
+
+        cp = CheckpointManager.load_checkpoint(legacy)
+        assert cp.run_id == ""
+        assert cp.event_log_path == ""
 
 
 # ---------------------------------------------------------------------------

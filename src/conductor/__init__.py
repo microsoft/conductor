@@ -30,6 +30,39 @@ Modules:
     exceptions: Custom exception hierarchy.
 """
 
+# Enable Python's ``faulthandler`` as early as possible — before any other
+# conductor import — so a native crash (segfault, abort, fatal Python error)
+# anywhere in the process dumps a traceback to the original stderr stream.
+# This is the earliest module imported by both ``python -m conductor`` (via
+# ``conductor.__main__``) and the installed ``conductor`` console script
+# (``conductor.cli.app:app`` in ``pyproject.toml``), so this single hook
+# covers every launch path.
+#
+# In ``--web-bg`` mode the parent passes a redirected stderr file handle to
+# ``subprocess.Popen`` (see ``conductor.cli.bg_runner``); when Python
+# initialises in the child process, ``sys.__stderr__`` already points at
+# that captured log file, so the crash trace survives the parent's exit.
+# See issue #116 for context.
+import sys as _sys
+
+try:
+    import faulthandler as _faulthandler
+
+    if _sys.__stderr__ is not None:
+        _faulthandler.enable(file=_sys.__stderr__, all_threads=True)
+except Exception as _faulthandler_exc:  # noqa: BLE001 - diagnostics must never break startup
+    # The very diagnostic this PR adds is dead if this silently fails;
+    # print a warning so the user knows the crash trace will not survive
+    # a native abort. Use ``sys.stderr`` (not ``sys.__stderr__``) because
+    # the original stderr may itself be the source of the failure.
+    try:  # noqa: SIM105 - cannot use contextlib.suppress here without an import
+        print(
+            f"conductor: WARNING: faulthandler failed to initialize: {_faulthandler_exc}",
+            file=_sys.stderr,
+        )
+    except Exception:  # noqa: BLE001 - really, truly must not break startup
+        pass
+
 from importlib.metadata import version as _pkg_version
 
 __version__ = _pkg_version("conductor-cli")

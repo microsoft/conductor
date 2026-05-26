@@ -668,74 +668,147 @@ class TestExtractTemplateRefs:
     """Unit tests for the Jinja2-AST-based reference extractor."""
 
     def test_simple_agent_output_ref(self) -> None:
-        agents, inputs = _extract_template_refs("{{ writer.output.text }}")
-        assert agents == {"writer"}
-        assert inputs == set()
+        refs = _extract_template_refs("{{ writer.output.text }}")
+        assert refs.agent_refs == {"writer"}
+        assert refs.workflow_inputs == set()
 
     def test_simple_workflow_input_ref(self) -> None:
-        agents, inputs = _extract_template_refs("Hello {{ workflow.input.name }}")
-        assert agents == set()
-        assert inputs == {"name"}
+        refs = _extract_template_refs("Hello {{ workflow.input.name }}")
+        assert refs.agent_refs == set()
+        assert refs.workflow_inputs == {"name"}
 
     def test_outputs_plural_ref(self) -> None:
-        agents, _ = _extract_template_refs("{{ pg.outputs.member.field }}")
-        assert agents == {"pg"}
+        refs = _extract_template_refs("{{ pg.outputs.member.field }}")
+        assert refs.agent_refs == {"pg"}
 
     def test_errors_ref(self) -> None:
-        agents, _ = _extract_template_refs("{% if pg.errors %}fail{% endif %}")
-        assert agents == {"pg"}
+        refs = _extract_template_refs("{% if pg.errors %}fail{% endif %}")
+        assert refs.agent_refs == {"pg"}
 
     def test_bare_output_ref(self) -> None:
-        agents, _ = _extract_template_refs("{{ writer.output }}")
-        assert agents == {"writer"}
+        refs = _extract_template_refs("{{ writer.output }}")
+        assert refs.agent_refs == {"writer"}
 
     def test_for_loop_variable_excluded(self) -> None:
         """Loop-bound vars must not be reported as agent refs (false-positive #1)."""
-        agents, _ = _extract_template_refs(
+        refs = _extract_template_refs(
             "{% for r in researcher.outputs %}{{ r.output.text }}{% endfor %}"
         )
         # Only the iterable name; the loop variable `r` is scope-bound.
-        assert agents == {"researcher"}
+        assert refs.agent_refs == {"researcher"}
 
     def test_string_literal_excluded(self) -> None:
         """Names inside string literals must not be reported (false-positive #2)."""
-        agents, _ = _extract_template_refs(
+        refs = _extract_template_refs(
             '{{ x | replace("foo.output", "y") | replace("bar.outputs", "z") }}'
         )
-        assert agents == set()
+        assert refs.agent_refs == set()
 
     def test_set_binding_excluded(self) -> None:
-        agents, _ = _extract_template_refs("{% set x = 1 %}{{ x.output }}")
-        assert agents == set()
+        refs = _extract_template_refs("{% set x = 1 %}{{ x.output }}")
+        assert refs.agent_refs == set()
 
     def test_built_in_namespaces_excluded(self) -> None:
         for builtin in ("workflow", "context", "item", "loop"):
-            agents, _ = _extract_template_refs("{{ " + builtin + ".output.x }}")
-            assert agents == set(), f"{builtin} leaked through"
+            refs = _extract_template_refs("{{ " + builtin + ".output.x }}")
+            assert refs.agent_refs == set(), f"{builtin} leaked through"
 
     def test_unrelated_attrs_ignored(self) -> None:
-        agents, inputs = _extract_template_refs("{{ writer.metadata.author }}")
-        assert agents == set()
-        assert inputs == set()
+        refs = _extract_template_refs("{{ writer.metadata.author }}")
+        assert refs.agent_refs == set()
+        assert refs.workflow_inputs == set()
 
     def test_no_template_tags(self) -> None:
-        assert _extract_template_refs("just plain text") == (set(), set())
-        assert _extract_template_refs("") == (set(), set())
+        refs = _extract_template_refs("just plain text")
+        assert refs.agent_refs == set() and refs.workflow_inputs == set()
+        refs = _extract_template_refs("")
+        assert refs.agent_refs == set() and refs.workflow_inputs == set()
 
     def test_malformed_template_returns_empty(self) -> None:
         # Don't raise — render-time validation will surface the precise error.
-        assert _extract_template_refs("{{ unterminated") == (set(), set())
+        refs = _extract_template_refs("{{ unterminated")
+        assert refs.agent_refs == set() and refs.workflow_inputs == set()
 
     def test_multiple_refs_in_one_template(self) -> None:
-        agents, inputs = _extract_template_refs(
+        refs = _extract_template_refs(
             "{{ a.output }}/{{ b.outputs.x }}/{{ workflow.input.foo }}/{{ workflow.input.bar }}"
         )
-        assert agents == {"a", "b"}
-        assert inputs == {"foo", "bar"}
+        assert refs.agent_refs == {"a", "b"}
+        assert refs.workflow_inputs == {"foo", "bar"}
+
+    def test_field_extracted_for_agent_output(self) -> None:
+        """Field-precision (Gap A): ``a.output.bar`` produces field ``bar``."""
+        refs = _extract_template_refs("{{ a.output.bar }}")
+        assert refs.agent_output_fields == {"a": {"bar"}}
+
+    def test_bare_output_marked_with_none_field(self) -> None:
+        """Field-precision (Gap A): bare ``a.output`` uses ``None`` sentinel."""
+        refs = _extract_template_refs("{{ a.output }}")
+        assert refs.agent_output_fields == {"a": {None}}
+
+    def test_prefix_chain_dedup_keeps_specific_field(self) -> None:
+        """Field-precision (Gap A): inner ``a.output`` Getattr from
+        ``{{ a.output.bar }}`` must NOT spuriously contribute a ``None`` field.
+        """
+        refs = _extract_template_refs("{{ a.output.bar }}")
+        assert refs.agent_output_fields == {"a": {"bar"}}, (
+            f"Expected only {{'bar'}}; got {refs.agent_output_fields}"
+        )
+
+    def test_method_call_does_not_emit_field(self) -> None:
+        """Field-precision (Gap A): ``a.output.items()`` is a method call —
+        the ``items`` Getattr is the callee of a Call and is filtered out.
+        Only the inner ``a.output`` Getattr is retained as a whole-output ref.
+        """
+        refs = _extract_template_refs("{% for k, v in a.output.items() %}{{ k }}{% endfor %}")
+        assert refs.agent_refs == {"a"}
+        assert refs.agent_output_fields == {"a": {None}}
+
+    def test_multiple_fields_on_same_agent(self) -> None:
+        refs = _extract_template_refs("{{ a.output.foo }} {{ a.output.bar }}")
+        assert refs.agent_output_fields == {"a": {"foo", "bar"}}
+
+    def test_group_member_field_extracted(self) -> None:
+        """Field-precision (Gap A): ``g.outputs.m.field`` populates
+        ``group_member_fields[(g, m)] = {field}``.
+        """
+        refs = _extract_template_refs("{{ pg.outputs.member.field }}")
+        assert refs.group_member_fields == {("pg", "member"): {"field"}}
+
+    def test_group_bare_outputs_uses_none_member(self) -> None:
+        refs = _extract_template_refs("{{ pg.outputs }}")
+        assert refs.group_member_fields == {("pg", None): {None}}
+
+    def test_group_errors_kept_separate(self) -> None:
+        """Errors refs never get field-precision treatment."""
+        refs = _extract_template_refs("{{ pg.errors }} {{ pg.errors.member }}")
+        assert refs.group_error_refs == {"pg"}
+        # Group_member_fields must NOT include the errors-rooted refs.
+        assert refs.group_member_fields == {}
+
+    def test_mixed_bare_and_specific_output_chains(self) -> None:
+        """``{{ a.output }} {{ a.output.foo }}`` must produce BOTH a None
+        sentinel (whole-output ref) and the ``foo`` field, since each is a
+        top-level Getattr chain in the AST.
+        """
+        refs = _extract_template_refs("{{ a.output }} {{ a.output.foo }}")
+        assert refs.agent_output_fields == {"a": {None, "foo"}}
 
 
 class TestInputRefPatternExtensions:
     """Test the extended INPUT_REF_PATTERN shapes added in this PR."""
+
+    def test_pg_kind_capture(self) -> None:
+        """Regression: ``pg_kind`` distinguishes the outputs vs errors
+        namespace at declaration time so a ``pg.errors`` declaration cannot
+        suppress warnings for ``pg.outputs.*`` references.
+        """
+        m_out = INPUT_REF_PATTERN.match("group.outputs.member.field")
+        assert m_out is not None
+        assert m_out.group("pg_kind") == "outputs"
+        m_err = INPUT_REF_PATTERN.match("group.errors")
+        assert m_err is not None
+        assert m_err.group("pg_kind") == "errors"
 
     @pytest.mark.parametrize(
         "ref,expected_parallel",
@@ -1067,6 +1140,666 @@ class TestExplicitModeWarnings:
         warnings = validate_workflow_config(config)
         assert not any("explicit context mode" in w for w in warnings)
 
+    def test_script_agent_undeclared_output_ref_warns(self) -> None:
+        """Script agents must still declare agent.output refs in explicit mode.
+
+        The engine's ``_LOCAL_RENDER_AGENT_TYPES`` carve-out makes
+        ``workflow.input`` available regardless of declarations, but
+        ``agent.output`` references are still required (the engine raises
+        ``KeyError`` via ``_add_explicit_input`` otherwise). The validator
+        should warn about this just like it does for regular LLM agents.
+        """
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="t",
+                entry_point="producer",
+                context=ContextConfig(mode="explicit"),
+            ),
+            agents=[
+                _agent_with_prompt("producer", "make it", routes=[RouteDef(to="consumer")]),
+                AgentDef(
+                    name="consumer",
+                    type="script",
+                    command="echo",
+                    args=["{{ producer.output.text }}"],
+                    # Notably absent: input=["producer.output"]
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+        )
+        warnings = validate_workflow_config(config)
+        assert any("producer.output" in w and "consumer" in w and "explicit" in w for w in warnings)
+
+    def test_script_agent_undeclared_workflow_input_no_warning(self) -> None:
+        """Regression: script-type carve-out for ``workflow.input`` is preserved.
+
+        The engine populates ``workflow.input`` for script agents regardless of
+        explicit mode (see ``_LOCAL_RENDER_AGENT_TYPES``), so no warning should
+        be emitted even when the script's ``input:`` doesn't list it.
+        """
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="t",
+                entry_point="step",
+                context=ContextConfig(mode="explicit"),
+                input={"topic": InputDef(type="string")},
+            ),
+            agents=[
+                AgentDef(
+                    name="step",
+                    type="script",
+                    command="echo",
+                    args=["{{ workflow.input.topic }}"],
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+        )
+        warnings = validate_workflow_config(config)
+        assert not any(
+            "workflow.input.topic" in w and "explicit context mode" in w for w in warnings
+        )
+
+    def test_subworkflow_input_mapping_undeclared_output_ref_warns(self) -> None:
+        """Sub-workflow input_mapping with undeclared agent.output should warn.
+
+        ``input_mapping`` is rendered against the agent's scoped context (via
+        ``build_for_agent``), so undeclared ``agent.output`` references still
+        fail at runtime. ``workflow.input`` is carved out (same as scripts)
+        but ``agent.output`` is not.
+        """
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="parent",
+                entry_point="producer",
+                context=ContextConfig(mode="explicit"),
+            ),
+            agents=[
+                _agent_with_prompt("producer", "make it", routes=[RouteDef(to="child")]),
+                AgentDef(
+                    name="child",
+                    type="workflow",
+                    workflow="./child.yaml",
+                    input_mapping={"data": "{{ producer.output.value }}"},
+                    # Notably absent: input=["producer.output"]
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+        )
+        warnings = validate_workflow_config(config)
+        assert any("producer.output" in w and "child" in w and "explicit" in w for w in warnings)
+
+    def test_subworkflow_undeclared_workflow_input_no_warning(self) -> None:
+        """Regression: sub-workflow carve-out for ``workflow.input`` is preserved."""
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="parent",
+                entry_point="child",
+                context=ContextConfig(mode="explicit"),
+                input={"topic": InputDef(type="string")},
+            ),
+            agents=[
+                AgentDef(
+                    name="child",
+                    type="workflow",
+                    workflow="./child.yaml",
+                    input_mapping={"data": "{{ workflow.input.topic }}"},
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+        )
+        warnings = validate_workflow_config(config)
+        assert not any(
+            "workflow.input.topic" in w and "explicit context mode" in w for w in warnings
+        )
+
+    def test_human_gate_prompt_explicit_mode_no_warning(self) -> None:
+        """Regression: human_gate prompts render with the FULL accumulated context.
+
+        Engine renders human_gate prompts via ``context.get_for_template()``
+        which forces ``mode='accumulate'`` (see ``WorkflowContext.get_for_template``),
+        so explicit-mode declarations are not required. The validator must not
+        emit false-positive warnings for ``workflow.input`` or ``agent.output``
+        references in human_gate prompts.
+        """
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="t",
+                entry_point="producer",
+                context=ContextConfig(mode="explicit"),
+                input={"topic": InputDef(type="string")},
+            ),
+            agents=[
+                _agent_with_prompt("producer", "make it", routes=[RouteDef(to="gate")]),
+                AgentDef(
+                    name="gate",
+                    type="human_gate",
+                    prompt=(
+                        "Topic: {{ workflow.input.topic }}. "
+                        "Producer said: {{ producer.output.text }}. Continue?"
+                    ),
+                    # Notably absent: input=[...]
+                    options=[
+                        GateOption(label="Yes", value="y", route="$end"),
+                        GateOption(label="No", value="n", route="$end"),
+                    ],
+                ),
+            ],
+        )
+        warnings = validate_workflow_config(config)
+        assert not any("explicit context mode" in w for w in warnings)
+
+
+class TestExplicitModeFieldPrecision:
+    """Field-precision warnings in explicit mode (Gap A in issue #105).
+
+    Declaring ``a.output.foo`` only brings the ``foo`` field into scope at
+    runtime (see ``engine/context.py:_add_agent_input``). If the prompt then
+    references ``{{ a.output.bar }}``, the engine fails with
+    ``TemplateError: 'dict object' has no attribute 'bar'`` — the same
+    pattern the issue body describes. The validator should catch this and
+    emit a warning at validation time.
+    """
+
+    def test_undeclared_field_on_specifically_declared_output_warns(self) -> None:
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="t",
+                entry_point="producer",
+                context=ContextConfig(mode="explicit"),
+            ),
+            agents=[
+                _agent_with_prompt("producer", "make it", routes=[RouteDef(to="writer")]),
+                _agent_with_prompt(
+                    "writer",
+                    "Bar value: {{ producer.output.bar }}",
+                    input=["producer.output.foo"],
+                ),
+            ],
+        )
+        warnings = validate_workflow_config(config)
+        assert any(
+            "producer.output.bar" in w and "producer.output.foo" in w and "explicit" in w
+            for w in warnings
+        )
+
+    def test_declared_field_matches_referenced_field_no_warning(self) -> None:
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="t",
+                entry_point="producer",
+                context=ContextConfig(mode="explicit"),
+            ),
+            agents=[
+                _agent_with_prompt("producer", "make it", routes=[RouteDef(to="writer")]),
+                _agent_with_prompt(
+                    "writer",
+                    "Foo: {{ producer.output.foo }}",
+                    input=["producer.output.foo"],
+                ),
+            ],
+        )
+        warnings = validate_workflow_config(config)
+        assert not any("explicit context mode" in w for w in warnings)
+
+    def test_whole_output_declaration_tolerates_any_field(self) -> None:
+        """Declaring ``a.output`` (no field) covers any field reference."""
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="t",
+                entry_point="producer",
+                context=ContextConfig(mode="explicit"),
+            ),
+            agents=[
+                _agent_with_prompt("producer", "make it", routes=[RouteDef(to="writer")]),
+                _agent_with_prompt(
+                    "writer",
+                    "Foo: {{ producer.output.foo }} Bar: {{ producer.output.bar }}",
+                    input=["producer.output"],
+                ),
+            ],
+        )
+        warnings = validate_workflow_config(config)
+        assert not any("explicit context mode" in w for w in warnings)
+
+    def test_multiple_declared_fields_allows_each(self) -> None:
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="t",
+                entry_point="producer",
+                context=ContextConfig(mode="explicit"),
+            ),
+            agents=[
+                _agent_with_prompt("producer", "make it", routes=[RouteDef(to="writer")]),
+                _agent_with_prompt(
+                    "writer",
+                    "{{ producer.output.foo }} {{ producer.output.bar }}",
+                    input=["producer.output.foo", "producer.output.bar"],
+                ),
+            ],
+        )
+        warnings = validate_workflow_config(config)
+        assert not any("explicit context mode" in w for w in warnings)
+
+    def test_multiple_declared_fields_warns_on_other_field(self) -> None:
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="t",
+                entry_point="producer",
+                context=ContextConfig(mode="explicit"),
+            ),
+            agents=[
+                _agent_with_prompt("producer", "make it", routes=[RouteDef(to="writer")]),
+                _agent_with_prompt(
+                    "writer",
+                    "{{ producer.output.baz }}",
+                    input=["producer.output.foo", "producer.output.bar"],
+                ),
+            ],
+        )
+        warnings = validate_workflow_config(config)
+        assert any("producer.output.baz" in w and "explicit" in w for w in warnings)
+
+    def test_bare_output_ref_with_specific_declaration_warns(self) -> None:
+        """``{{ a.output }}`` (whole-output ref) paired with only
+        specific-field declarations should warn — at runtime the engine only
+        copies the declared fields into ctx, so the whole-output access
+        gets a partial dict.
+        """
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="t",
+                entry_point="producer",
+                context=ContextConfig(mode="explicit"),
+            ),
+            agents=[
+                _agent_with_prompt("producer", "make it", routes=[RouteDef(to="writer")]),
+                _agent_with_prompt(
+                    "writer",
+                    "{{ producer.output | json }}",
+                    input=["producer.output.foo"],
+                ),
+            ],
+        )
+        warnings = validate_workflow_config(config)
+        assert any(
+            "the whole 'producer.output' object" in w and "only declares specific fields" in w
+            for w in warnings
+        )
+
+    def test_method_call_on_whole_output_declaration_no_warning(self) -> None:
+        """``{% for k,v in a.output.items() %}`` paired with a whole-output
+        declaration must NOT warn — the dict-method invocation is valid.
+        """
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="t",
+                entry_point="producer",
+                context=ContextConfig(mode="explicit"),
+            ),
+            agents=[
+                _agent_with_prompt("producer", "make it", routes=[RouteDef(to="writer")]),
+                _agent_with_prompt(
+                    "writer",
+                    "{% for k, v in producer.output.items() %}{{ k }}{% endfor %}",
+                    input=["producer.output"],
+                ),
+            ],
+        )
+        warnings = validate_workflow_config(config)
+        assert not any("explicit context mode" in w for w in warnings)
+
+    def test_method_call_on_specific_field_declaration_no_warning(self) -> None:
+        """``{% for k,v in a.output.items() %}`` paired with a SPECIFIC-field
+        declaration must NOT warn either. Without the Call-node filter the
+        validator would otherwise flag ``items`` as a missing field.
+        """
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="t",
+                entry_point="producer",
+                context=ContextConfig(mode="explicit"),
+            ),
+            agents=[
+                _agent_with_prompt("producer", "make it", routes=[RouteDef(to="writer")]),
+                _agent_with_prompt(
+                    "writer",
+                    "{% for k, v in producer.output.items() %}{{ k }}{% endfor %}",
+                    input=["producer.output.foo"],
+                ),
+            ],
+        )
+        warnings = validate_workflow_config(config)
+        assert not any("items" in w and "explicit context mode" in w for w in warnings)
+
+    def test_static_parallel_member_field_precision_warns(self) -> None:
+        """``pg.outputs.member.field`` precision works for static parallel groups
+        because the engine field-slices on len≥3 (see context.py
+        ``_add_parallel_group_input``).
+        """
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="t",
+                entry_point="pg",
+                context=ContextConfig(mode="explicit"),
+            ),
+            agents=[
+                _agent_with_prompt("a", "do a", routes=[]),
+                _agent_with_prompt("b", "do b", routes=[]),
+                _agent_with_prompt(
+                    "consumer",
+                    "{{ pg.outputs.a.baz }}",
+                    input=["pg.outputs.a.foo"],
+                ),
+            ],
+            parallel=[
+                ParallelGroup(name="pg", agents=["a", "b"], routes=[RouteDef(to="consumer")]),
+            ],
+        )
+        warnings = validate_workflow_config(config)
+        assert any(
+            "pg.outputs.a.baz" in w and "pg.outputs.a.foo" in w and "explicit" in w
+            for w in warnings
+        )
+
+    def test_for_each_member_field_precision_skipped(self) -> None:
+        """For-each groups copy the WHOLE member at runtime
+        (``elif is_for_each_dict or len(remaining_parts) == 2``), so the
+        validator must NOT emit field-precision warnings for them — that
+        would be a false positive.
+        """
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="t",
+                entry_point="finder",
+                context=ContextConfig(mode="explicit"),
+            ),
+            agents=[
+                _agent_with_prompt("finder", "find items", routes=[RouteDef(to="fe")]),
+                _agent_with_prompt(
+                    "consumer",
+                    # References a different field than declared. For for-each
+                    # groups this works at runtime, so no warning.
+                    "{{ fe.outputs.x.bar }}",
+                    input=["fe.outputs.x.foo"],
+                ),
+            ],
+            for_each=[
+                ForEachDef(
+                    name="fe",
+                    type="for_each",
+                    source="finder.output.items",
+                    **{"as": "item"},
+                    key_by="item.id",
+                    agent=AgentDef(
+                        name="worker",
+                        model="gpt-4",
+                        prompt="process {{ item }}",
+                    ),
+                    routes=[RouteDef(to="consumer")],
+                ),
+            ],
+        )
+        warnings = validate_workflow_config(config)
+        assert not any("fe.outputs.x" in w and "explicit context mode" in w for w in warnings)
+
+    def test_field_precision_in_sub_workflow_input_mapping_warns(self) -> None:
+        """input_mapping is rendered against the agent's scoped context, so
+        field-precision applies to it the same as to ``prompt``.
+        """
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="parent",
+                entry_point="producer",
+                context=ContextConfig(mode="explicit"),
+            ),
+            agents=[
+                _agent_with_prompt("producer", "make it", routes=[RouteDef(to="child")]),
+                AgentDef(
+                    name="child",
+                    type="workflow",
+                    workflow="./child.yaml",
+                    input_mapping={"data": "{{ producer.output.bar }}"},
+                    input=["producer.output.foo"],
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+        )
+        warnings = validate_workflow_config(config)
+        assert any(
+            "producer.output.bar" in w and "producer.output.foo" in w and "explicit" in w
+            for w in warnings
+        )
+
+    # ---------------------------------------------------------------------
+    # Static parallel matrix — exhaustive coverage of declaration shapes
+    # ---------------------------------------------------------------------
+
+    def _parallel_matrix_config(self, *, declared: list[str], referenced: str) -> WorkflowConfig:
+        return WorkflowConfig(
+            workflow=WorkflowDef(
+                name="t",
+                entry_point="pg",
+                context=ContextConfig(mode="explicit"),
+            ),
+            agents=[
+                _agent_with_prompt("a", "do a", routes=[]),
+                _agent_with_prompt("b", "do b", routes=[]),
+                _agent_with_prompt(
+                    "consumer",
+                    "Use {{ " + referenced + " }}",
+                    input=declared,
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            parallel=[
+                ParallelGroup(name="pg", agents=["a", "b"], routes=[RouteDef(to="consumer")]),
+            ],
+        )
+
+    def test_parallel_whole_group_declaration_tolerates_any_member_or_field(self) -> None:
+        config = self._parallel_matrix_config(
+            declared=["pg.outputs"], referenced="pg.outputs.a.foo"
+        )
+        warnings = validate_workflow_config(config)
+        assert not any("explicit context mode" in w for w in warnings)
+
+    def test_parallel_whole_member_declaration_tolerates_any_field(self) -> None:
+        config = self._parallel_matrix_config(
+            declared=["pg.outputs.a"], referenced="pg.outputs.a.foo"
+        )
+        warnings = validate_workflow_config(config)
+        assert not any("explicit context mode" in w for w in warnings)
+
+    def test_parallel_exact_field_match_no_warning(self) -> None:
+        config = self._parallel_matrix_config(
+            declared=["pg.outputs.a.foo"], referenced="pg.outputs.a.foo"
+        )
+        warnings = validate_workflow_config(config)
+        assert not any("explicit context mode" in w for w in warnings)
+
+    def test_parallel_bare_member_ref_with_specific_decl_no_field_warning(self) -> None:
+        """``{{ pg.outputs.a }}`` (bare member, no field) is not subject to
+        the field-precision check — we don't know which fields the consumer
+        actually reads on the member object.
+        """
+        config = self._parallel_matrix_config(
+            declared=["pg.outputs.a.foo"], referenced="pg.outputs.a"
+        )
+        warnings = validate_workflow_config(config)
+        # The member IS declared (just with a specific field), so no
+        # undeclared warning. And bare-member refs skip field precision.
+        assert not any("explicit context mode" in w for w in warnings)
+
+    # ---------------------------------------------------------------------
+    # Namespace separation: pg.outputs / pg.errors are NOT interchangeable
+    # ---------------------------------------------------------------------
+
+    def test_declared_errors_does_not_suppress_outputs_warning(self) -> None:
+        """``input: ["pg.errors"]`` must not suppress an undeclared-outputs
+        warning when the template references ``pg.outputs.*``. The engine
+        only populates the declared namespace at runtime, so the outputs ref
+        will fail with ``KeyError``.
+        """
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="t",
+                entry_point="pg",
+                context=ContextConfig(mode="explicit"),
+            ),
+            agents=[
+                _agent_with_prompt("a", "do a", routes=[]),
+                _agent_with_prompt("b", "do b", routes=[]),
+                _agent_with_prompt(
+                    "consumer",
+                    "{{ pg.outputs.a.val }}",
+                    input=["pg.errors"],
+                ),
+            ],
+            parallel=[
+                ParallelGroup(name="pg", agents=["a", "b"], routes=[RouteDef(to="consumer")]),
+            ],
+        )
+        warnings = validate_workflow_config(config)
+        assert any(
+            "pg.outputs" in w and "does not declare 'pg.outputs'" in w and "explicit" in w
+            for w in warnings
+        )
+
+    def test_declared_outputs_does_not_suppress_errors_warning(self) -> None:
+        """Symmetric: ``input: ["pg.outputs"]`` must not suppress an
+        undeclared-errors warning when the template references ``pg.errors``.
+        """
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="t",
+                entry_point="pg",
+                context=ContextConfig(mode="explicit"),
+            ),
+            agents=[
+                _agent_with_prompt("a", "do a", routes=[]),
+                _agent_with_prompt("b", "do b", routes=[]),
+                _agent_with_prompt(
+                    "consumer",
+                    "{% if pg.errors %}fail{% endif %}",
+                    input=["pg.outputs"],
+                ),
+            ],
+            parallel=[
+                ParallelGroup(name="pg", agents=["a", "b"], routes=[RouteDef(to="consumer")]),
+            ],
+        )
+        warnings = validate_workflow_config(config)
+        assert any(
+            "pg.errors" in w and "does not declare 'pg.errors'" in w and "explicit" in w
+            for w in warnings
+        )
+
+    def test_declared_errors_field_does_not_warn_about_outputs_field(self) -> None:
+        """Regression: declaring ``pg.errors.a.foo`` must NOT make the
+        validator emit a warning that says ``only declares pg.outputs.a.foo``.
+        The errors-namespace declaration is unrelated to the outputs ref.
+        """
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="t",
+                entry_point="pg",
+                context=ContextConfig(mode="explicit"),
+            ),
+            agents=[
+                _agent_with_prompt("a", "do a", routes=[]),
+                _agent_with_prompt("b", "do b", routes=[]),
+                _agent_with_prompt(
+                    "consumer",
+                    "{{ pg.outputs.a.bar }}",
+                    input=["pg.errors.a.foo"],
+                ),
+            ],
+            parallel=[
+                ParallelGroup(name="pg", agents=["a", "b"], routes=[RouteDef(to="consumer")]),
+            ],
+        )
+        warnings = validate_workflow_config(config)
+        # Should emit the "undeclared outputs" warning, NOT the misleading
+        # "only declares pg.outputs.a.foo" message.
+        assert not any("only declares pg.outputs.a.foo" in w for w in warnings)
+        assert any("pg.outputs" in w and "does not declare 'pg.outputs'" in w for w in warnings)
+
+    # ---------------------------------------------------------------------
+    # Other edge cases flagged by review
+    # ---------------------------------------------------------------------
+
+    def test_optional_input_with_question_mark_treated_as_declared(self) -> None:
+        """Optional inputs (``a.output.foo?``) still count as declarations
+        for explicit-mode warning purposes — the ``?`` only affects runtime
+        missing-required behavior, not the validation contract.
+        """
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="t",
+                entry_point="producer",
+                context=ContextConfig(mode="explicit"),
+            ),
+            agents=[
+                _agent_with_prompt("producer", "make it", routes=[RouteDef(to="writer")]),
+                _agent_with_prompt(
+                    "writer",
+                    "{{ producer.output.foo }}",
+                    input=["producer.output.foo?"],
+                ),
+            ],
+        )
+        warnings = validate_workflow_config(config)
+        assert not any("explicit context mode" in w for w in warnings)
+
+    def test_mixed_bare_and_specific_field_extraction(self) -> None:
+        """``{{ a.output }} {{ a.output.foo }}`` extracts BOTH the bare
+        whole-output ref and the specific-field ref, so a config declaring
+        only one specific field still warns about the bare reference.
+        """
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="t",
+                entry_point="producer",
+                context=ContextConfig(mode="explicit"),
+            ),
+            agents=[
+                _agent_with_prompt("producer", "make it", routes=[RouteDef(to="writer")]),
+                _agent_with_prompt(
+                    "writer",
+                    "{{ producer.output.foo }} {{ producer.output }}",
+                    input=["producer.output.foo"],
+                ),
+            ],
+        )
+        warnings = validate_workflow_config(config)
+        # Should warn about the whole-output ref but not the specific one.
+        assert any(
+            "the whole 'producer.output'" in w and "only declares specific fields" in w
+            for w in warnings
+        )
+
+    def test_malformed_template_with_duplicate_block_does_not_hard_fail(self) -> None:
+        """Templates that pass ``parse()`` but raise during
+        ``meta.find_undeclared_variables`` (e.g. duplicate ``{% block %}``
+        names) must not break validation — render-time will surface the
+        precise error.
+        """
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="t",
+                entry_point="writer",
+                context=ContextConfig(mode="explicit"),
+            ),
+            agents=[
+                _agent_with_prompt(
+                    "writer",
+                    "{% block a %}1{% endblock %}{% block a %}2{% endblock %}",
+                ),
+            ],
+        )
+        # Should not raise.
+        validate_workflow_config(config)
+
 
 class TestOutputTemplateValidation:
     """Tests for unknown references in workflow `output:` templates."""
@@ -1169,9 +1902,9 @@ class TestInputMappingTemplateCollection:
         # Simulates: when this PR merges with main's AgentDef.input_mapping,
         # a stale agent reference inside an input_mapping expression is caught
         # by _extract_template_refs the same as any other template field.
-        agent_refs, input_refs = _extract_template_refs("{{ old_agent.output.findings }}")
-        assert "old_agent" in agent_refs
-        assert not input_refs
+        refs = _extract_template_refs("{{ old_agent.output.findings }}")
+        assert "old_agent" in refs.agent_refs
+        assert not refs.workflow_inputs
 
 
 class TestSubWorkflowRefValidation:

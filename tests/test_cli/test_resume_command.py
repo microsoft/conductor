@@ -67,10 +67,17 @@ def _write_checkpoint(
     error_message: str = "Network error",
     timestamp: str = "20260224-153000",
     workflow_hash: str | None = None,
+    run_id: str = "",
+    event_log_path: str = "",
+    execution_history: list[str] | None = None,
+    agent_outputs: dict[str, Any] | None = None,
 ) -> Path:
     """Write a checkpoint JSON file and return its path."""
     if workflow_hash is None:
         workflow_hash = CheckpointManager.compute_workflow_hash(workflow_path)
+
+    history = execution_history or []
+    outputs = agent_outputs or {}
 
     checkpoint = {
         "version": 1,
@@ -87,16 +94,18 @@ def _write_checkpoint(
         "current_agent": current_agent,
         "context": {
             "workflow_inputs": {"name": "World"},
-            "agent_outputs": {},
-            "current_iteration": 0,
-            "execution_history": [],
+            "agent_outputs": outputs,
+            "current_iteration": len(history),
+            "execution_history": history,
         },
         "limits": {
-            "current_iteration": 0,
+            "current_iteration": len(history),
             "max_iterations": 10,
-            "execution_history": [],
+            "execution_history": history,
         },
         "copilot_session_ids": {},
+        "run_id": run_id,
+        "event_log_path": event_log_path,
     }
 
     workflow_name = workflow_path.stem
@@ -287,10 +296,17 @@ class TestResumeCommand:
 
     def test_resume_web_bg_invokes_launch_background_resume(self, tmp_path: Path) -> None:
         """Test that --web-bg dispatches to launch_background_resume."""
+        from conductor.cli.bg_runner import BackgroundLaunch
+
         wf_path = _write_workflow(tmp_path)
 
         with patch("conductor.cli.bg_runner.launch_background_resume") as mock_launch:
-            mock_launch.return_value = "http://127.0.0.1:9092"
+            mock_launch.return_value = BackgroundLaunch(
+                url="http://127.0.0.1:9092",
+                stderr_log=tmp_path / "stub-abcdef01.bg.stderr.log",
+                stdout_log=tmp_path / "stub-abcdef01.bg.stdout.log",
+                run_id="abcdef01",
+            )
             result = runner.invoke(
                 app,
                 [
@@ -318,13 +334,42 @@ class TestResumeCommand:
         assert kwargs["web_port"] == 9092
         assert kwargs["metadata"] == {"tracker": "ado"}
 
+    def test_silent_resume_web_bg_suppresses_dashboard_output(self, tmp_path: Path) -> None:
+        """Test --silent suppresses resume --web-bg parent-process dashboard output."""
+        from conductor.cli.bg_runner import BackgroundLaunch
+
+        wf_path = _write_workflow(tmp_path)
+
+        with patch("conductor.cli.bg_runner.launch_background_resume") as mock_launch:
+            mock_launch.return_value = BackgroundLaunch(
+                url="http://127.0.0.1:9092",
+                stderr_log=tmp_path / "stub-cafe1234.bg.stderr.log",
+                stdout_log=tmp_path / "stub-cafe1234.bg.stdout.log",
+                run_id="cafe1234",
+            )
+            result = runner.invoke(app, ["--silent", "resume", str(wf_path), "--web-bg"])
+
+        assert result.exit_code == 0
+        assert mock_launch.called
+        assert "http://127.0.0.1:9092" not in result.output
+        assert "Dashboard" not in result.output
+        assert "Resumed workflow running in background" not in result.output
+        assert "Child stderr log" not in result.output
+
     def test_resume_web_bg_with_from_checkpoint(self, tmp_path: Path) -> None:
         """Test --web-bg forwards --from checkpoint path."""
+        from conductor.cli.bg_runner import BackgroundLaunch
+
         wf_path = _write_workflow(tmp_path)
         cp_path = _write_checkpoint(tmp_path, wf_path)
 
         with patch("conductor.cli.bg_runner.launch_background_resume") as mock_launch:
-            mock_launch.return_value = "http://127.0.0.1:9093"
+            mock_launch.return_value = BackgroundLaunch(
+                url="http://127.0.0.1:9093",
+                stderr_log=tmp_path / "stub-abcdef02.bg.stderr.log",
+                stdout_log=tmp_path / "stub-abcdef02.bg.stdout.log",
+                run_id="abcdef02",
+            )
             result = runner.invoke(app, ["resume", "--from", str(cp_path), "--web-bg"])
 
         assert result.exit_code == 0
@@ -369,7 +414,7 @@ class TestLaunchBackgroundResume:
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
             patch("conductor.cli.pid.write_pid_file"),
         ):
-            url = bg_runner.launch_background_resume(
+            launch = bg_runner.launch_background_resume(
                 workflow_path=wf_path,
                 checkpoint_path=None,
                 provider_override="copilot",
@@ -378,11 +423,13 @@ class TestLaunchBackgroundResume:
                 web_port=9099,
             )
 
-        assert url == "http://127.0.0.1:9099"
+        assert launch.url == "http://127.0.0.1:9099"
         cmd = captured["cmd"]
-        # `--silent` is global and must precede the subcommand
-        assert "--silent" in cmd
-        assert cmd.index("resume") > cmd.index("--silent")
+        # ``--silent`` must NOT be injected: console output is already
+        # suppressed by Popen ``stdout``/``stderr=DEVNULL``, and ``--silent``
+        # would also gate provider-side verbose logging that ``--log-file``
+        # relies on. See issue #196.
+        assert "--silent" not in cmd
         assert str(wf_path) in cmd
         assert "--web" in cmd
         assert "--web-port" in cmd
@@ -760,7 +807,12 @@ class TestLaunchBackgroundResumeFailures:
         mock_write.assert_called_once_with(5556, 9202, cp_path)
 
     def test_subprocess_detachment_kwargs(self, tmp_path: Path) -> None:
-        """Verify Popen is called with detachment + DEVNULL + bg env vars."""
+        """Verify Popen is called with detachment + bg env vars + redirected stdout/stderr.
+
+        The child's stdout/stderr must be redirected to log files (NOT
+        ``DEVNULL``) so a silent crash leaves a forensic trail. See
+        issue #116.
+        """
         import sys as _sys
 
         from conductor.cli import bg_runner
@@ -789,17 +841,35 @@ class TestLaunchBackgroundResumeFailures:
 
         import subprocess as _sp
 
-        assert captured["stdout"] is _sp.DEVNULL
-        assert captured["stderr"] is _sp.DEVNULL
+        # stdin stays DEVNULL (detached child has no interactive input)
         assert captured["stdin"] is _sp.DEVNULL
+        # stdout/stderr must be redirected to writable text-mode file objects
+        # so Python tracebacks and faulthandler dumps from the child survive
+        # the parent's exit. DEVNULL is explicitly NOT allowed here.
+        for stream_name in ("stdout", "stderr"):
+            stream = captured[stream_name]
+            assert stream is not _sp.DEVNULL, (
+                f"{stream_name} must not be DEVNULL — issue #116 requires "
+                "capturing the child's output to a log file."
+            )
+            assert hasattr(stream, "write"), f"{stream_name} must be a writable file-like"
+            assert hasattr(stream, "name"), f"{stream_name} must expose a name attribute"
+            assert ".bg." in stream.name and stream.name.endswith(".log")
         if _sys.platform == "win32":
-            assert captured["creationflags"] == _sp.CREATE_NEW_PROCESS_GROUP
+            expected_flags = _sp.CREATE_NEW_PROCESS_GROUP | _sp.CREATE_BREAKAWAY_FROM_JOB
+            assert captured["creationflags"] == expected_flags
         else:
             assert captured["start_new_session"] is True
         env = captured["env"]
         assert isinstance(env, dict)
         assert env["CONDUCTOR_WEB_BG"] == "1"
         assert env["CONDUCTOR_WEB_PORT"] == "9203"
+        # New env vars wired by --web-bg so the child's EventLogSubscriber
+        # and workflow_started metadata cross-reference the bg log files.
+        assert env["CONDUCTOR_RUN_ID"]
+        assert len(env["CONDUCTOR_RUN_ID"]) == 8
+        assert env["CONDUCTOR_BG_STDERR_LOG"].endswith(".bg.stderr.log")
+        assert env["CONDUCTOR_BG_STDOUT_LOG"].endswith(".bg.stdout.log")
 
 
 # ---------------------------------------------------------------------------
@@ -1076,3 +1146,137 @@ class TestResumeWiring:
         assert result.exit_code == 0, result.output
         kwargs = mock_resume.call_args[1]
         assert kwargs["metadata"] == {"url": "https://x?a=b&c=d"}
+
+
+# ---------------------------------------------------------------------------
+# resume_workflow_async dashboard replay (issue #167)
+# ---------------------------------------------------------------------------
+
+
+class TestResumeReplaysIntoDashboard:
+    """Verify resume_workflow_async seeds the web dashboard with prior events."""
+
+    @pytest.mark.asyncio
+    async def test_replays_original_jsonl_when_path_available(self, tmp_path: Path) -> None:
+        """When the checkpoint records an existing event_log_path, the dashboard's
+        history is seeded from that file before the engine resumes."""
+        from conductor.cli.run import resume_workflow_async
+
+        # Create a real JSONL log with some prior events.
+        log_path = tmp_path / "conductor-test.events.jsonl"
+        log_path.write_text(
+            '{"type":"agent_started","timestamp":1.0,"data":{"agent_name":"greeter"}}\n'
+            '{"type":"agent_completed","timestamp":2.0,'
+            '"data":{"agent_name":"greeter","output":{"greeting":"hi"}}}\n'
+        )
+
+        wf_path = _write_workflow(tmp_path)
+        cp_path = _write_checkpoint(
+            tmp_path,
+            wf_path,
+            run_id="abc12345",
+            event_log_path=str(log_path),
+        )
+
+        captured: dict[str, Any] = {}
+
+        # Capture the dashboard so we can inspect its history.
+        from conductor.web.server import WebDashboard as _RealDashboard
+
+        def _capture_dashboard(*args, **kwargs):
+            dash = _RealDashboard(*args, **kwargs)
+            # Skip the post-execution "wait for Ctrl+C" hang.
+            dash.wait_for_clients_disconnect = AsyncMock(return_value=None)
+            captured["dashboard"] = dash
+            return dash
+
+        with (
+            patch("conductor.cli.run.ProviderRegistry") as mock_registry_cls,
+            patch("conductor.cli.run.WorkflowEngine") as mock_engine_cls,
+            patch("conductor.web.server.WebDashboard", side_effect=_capture_dashboard),
+        ):
+            mock_registry = AsyncMock()
+            mock_registry_cls.return_value = mock_registry
+            mock_registry.__aenter__ = AsyncMock(return_value=mock_registry)
+            mock_registry.__aexit__ = AsyncMock(return_value=False)
+
+            mock_engine = MagicMock()
+            mock_engine.resume = AsyncMock(return_value={"result": "ok"})
+            mock_engine.config = MagicMock()
+            mock_engine.config.workflow.cost.show_summary = False
+            mock_engine_cls.return_value = mock_engine
+
+            await resume_workflow_async(
+                checkpoint_path=cp_path,
+                web=True,
+                web_bg=True,  # use wait_for_clients_disconnect (mocked above)
+                web_port=0,
+                no_interactive=True,
+            )
+
+        dashboard = captured["dashboard"]
+        # Resume-mode dashboard history begins with a synthesised
+        # ``workflow_started`` from the current config (so replayed events
+        # apply to correct topology), followed by the replayed events.
+        types = [ev["type"] for ev in dashboard._event_history]
+        assert types[0] == "workflow_started"
+        assert "agent_started" in types
+        assert "agent_completed" in types
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_synthetic_when_log_missing(self, tmp_path: Path) -> None:
+        """If the checkpoint has no event_log_path (or the file is gone), synthetic
+        events are generated from execution_history so the dashboard isn't blank."""
+        from conductor.cli.run import resume_workflow_async
+
+        wf_path = _write_workflow(tmp_path)
+        # No event_log_path; provide execution_history so synthetic emits events.
+        cp_path = _write_checkpoint(
+            tmp_path,
+            wf_path,
+            current_agent="greeter",
+            execution_history=["greeter"],
+            agent_outputs={"greeter": {"greeting": "hi"}},
+        )
+
+        captured: dict[str, Any] = {}
+        from conductor.web.server import WebDashboard as _RealDashboard
+
+        def _capture_dashboard(*args, **kwargs):
+            dash = _RealDashboard(*args, **kwargs)
+            dash.wait_for_clients_disconnect = AsyncMock(return_value=None)
+            captured["dashboard"] = dash
+            return dash
+
+        with (
+            patch("conductor.cli.run.ProviderRegistry") as mock_registry_cls,
+            patch("conductor.cli.run.WorkflowEngine") as mock_engine_cls,
+            patch("conductor.web.server.WebDashboard", side_effect=_capture_dashboard),
+        ):
+            mock_registry = AsyncMock()
+            mock_registry_cls.return_value = mock_registry
+            mock_registry.__aenter__ = AsyncMock(return_value=mock_registry)
+            mock_registry.__aexit__ = AsyncMock(return_value=False)
+
+            mock_engine = MagicMock()
+            mock_engine.resume = AsyncMock(return_value={"result": "ok"})
+            mock_engine.config = MagicMock()
+            mock_engine.config.workflow.cost.show_summary = False
+            mock_engine_cls.return_value = mock_engine
+
+            await resume_workflow_async(
+                checkpoint_path=cp_path,
+                web=True,
+                web_bg=True,
+                web_port=0,
+                no_interactive=True,
+            )
+
+        dashboard = captured["dashboard"]
+        # Resume-mode dashboard history starts with a synthesised
+        # ``workflow_started`` (current topology) so historical events
+        # apply correctly, then the synthesised agent_started/completed.
+        types = [ev["type"] for ev in dashboard._event_history]
+        assert types == ["workflow_started", "agent_started", "agent_completed"]
+        assert dashboard._event_history[2]["data"]["agent_name"] == "greeter"
+        assert dashboard._event_history[2]["data"]["synthetic"] is True

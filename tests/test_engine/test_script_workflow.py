@@ -24,6 +24,7 @@ from conductor.config.schema import (
     AgentDef,
     ContextConfig,
     LimitsConfig,
+    OutputField,
     ParallelGroup,
     RouteDef,
     RuntimeConfig,
@@ -31,7 +32,8 @@ from conductor.config.schema import (
     WorkflowDef,
 )
 from conductor.engine.workflow import WorkflowEngine
-from conductor.exceptions import ConfigurationError
+from conductor.events import WorkflowEvent, WorkflowEventEmitter
+from conductor.exceptions import ConfigurationError, ValidationError
 from conductor.providers.copilot import CopilotProvider
 
 
@@ -599,3 +601,349 @@ class TestScriptJsonStdout:
         out = engine.context.agent_outputs["detector"]
         assert set(out.keys()) == {"stdout", "stderr", "exit_code"}
         assert out["stdout"] == ""
+
+
+class TestScriptOutputSchema:
+    """Tests for declared `output:` schemas on script agents (issue #118).
+
+    When a script declares an output schema, the engine validates JSON stdout
+    against it before emitting `script_completed`. Validation failures raise
+    ValidationError and emit `script_failed` instead.
+    """
+
+    @staticmethod
+    def _config_with_schema(
+        args: list[str],
+        output: dict[str, OutputField],
+    ) -> WorkflowConfig:
+        """Build a single-script workflow config with the given args + schema."""
+        return WorkflowConfig(
+            workflow=WorkflowDef(
+                name="schema-script",
+                entry_point="detector",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="detector",
+                    type="script",
+                    command=sys.executable,
+                    args=args,
+                    output=output,
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+        )
+
+    @staticmethod
+    def _make_collector() -> tuple[WorkflowEventEmitter, list[WorkflowEvent]]:
+        events: list[WorkflowEvent] = []
+        emitter = WorkflowEventEmitter()
+        emitter.subscribe(events.append)
+        return emitter, events
+
+    @staticmethod
+    async def _run_expect_validation_error(config: WorkflowConfig) -> ValidationError:
+        """Run the workflow and assert it raises ValidationError; return the error."""
+        engine = WorkflowEngine(config, MagicMock())
+        with pytest.raises(ValidationError) as exc_info:
+            await engine.run({})
+        return exc_info.value
+
+    @pytest.mark.asyncio
+    async def test_valid_json_matches_schema(self) -> None:
+        """Happy path: stdout JSON matches declared schema → fields available."""
+        config = self._config_with_schema(
+            args=[
+                "-c",
+                'import json; print(json.dumps({"route": "planning", "count": 3}))',
+            ],
+            output={
+                "route": OutputField(type="string"),
+                "count": OutputField(type="number"),
+            },
+        )
+        engine = WorkflowEngine(config, MagicMock())
+        await engine.run({})
+
+        out = engine.context.agent_outputs["detector"]
+        assert out["route"] == "planning"
+        assert out["count"] == 3
+        # Built-ins still present alongside declared fields.
+        assert out["exit_code"] == 0
+        assert "stdout" in out
+        assert "stderr" in out
+
+    @pytest.mark.asyncio
+    async def test_non_json_stdout_raises_validation_error(self) -> None:
+        """Schema declared + non-JSON stdout → ValidationError surfaces parser detail."""
+        config = self._config_with_schema(
+            args=["-c", "print('not json')"],
+            output={"route": OutputField(type="string")},
+        )
+
+        err = await self._run_expect_validation_error(config)
+
+        msg = str(err)
+        assert "detector" in msg
+        assert "not valid JSON" in msg
+        # The underlying json.JSONDecodeError text is surfaced so users can
+        # see WHY the parse failed (e.g. "Expecting value: line 1 column 1").
+        assert "line 1" in msg or "Expecting" in msg
+        # The suggestion explicitly mentions writing logs to stderr.
+        assert err.suggestion is not None
+        assert "stderr" in err.suggestion.lower()
+
+    @pytest.mark.asyncio
+    async def test_malformed_json_surfaces_parser_detail(self) -> None:
+        """Truncated/malformed JSON: parser error column/position appears in message."""
+        # Truncated object missing the closing brace.
+        config = self._config_with_schema(
+            args=["-c", 'print(\'{"route": "plan\')'],
+            output={"route": OutputField(type="string")},
+        )
+
+        err = await self._run_expect_validation_error(config)
+
+        msg = str(err)
+        # Underlying JSONDecodeError text describes the unterminated string.
+        assert "Unterminated" in msg or "delimiter" in msg or "line 1" in msg
+
+    @pytest.mark.asyncio
+    async def test_empty_stdout_raises_validation_error(self) -> None:
+        """Empty stdout + schema → ValidationError with stderr-for-logs suggestion."""
+        config = self._config_with_schema(
+            args=["-c", "pass"],
+            output={"route": OutputField(type="string")},
+        )
+
+        err = await self._run_expect_validation_error(config)
+
+        assert "detector" in str(err)
+        assert err.suggestion is not None
+        assert "stderr" in err.suggestion.lower()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "stdout_payload",
+        ["[1, 2, 3]", "42", '"a string"', "true"],
+        ids=["array", "int", "string", "bool"],
+    )
+    async def test_json_non_object_raises_validation_error(self, stdout_payload: str) -> None:
+        """JSON arrays/scalars at top level + schema → ValidationError."""
+        config = self._config_with_schema(
+            args=["-c", f"print({stdout_payload!r})"],
+            output={"route": OutputField(type="string")},
+        )
+
+        err = await self._run_expect_validation_error(config)
+
+        assert "object" in str(err).lower()
+
+    @pytest.mark.asyncio
+    async def test_missing_required_field_raises(self) -> None:
+        """JSON missing a declared field → ValidationError mentions script + field."""
+        config = self._config_with_schema(
+            args=["-c", 'import json; print(json.dumps({"route": "planning"}))'],
+            output={
+                "route": OutputField(type="string"),
+                "count": OutputField(type="number"),
+            },
+        )
+
+        err = await self._run_expect_validation_error(config)
+
+        msg = str(err)
+        # Wrapping in workflow.py adds the script name and stdout-JSON suggestion
+        # on top of the generic validate_output() message.
+        assert "detector" in msg
+        assert "count" in msg
+        assert err.suggestion is not None
+        assert "stderr" in err.suggestion.lower()
+
+    @pytest.mark.asyncio
+    async def test_wrong_field_type_raises(self) -> None:
+        """JSON field has wrong type → ValidationError mentions script + field."""
+        config = self._config_with_schema(
+            args=[
+                "-c",
+                'import json; print(json.dumps({"route": 42, "count": 3}))',
+            ],
+            output={
+                "route": OutputField(type="string"),
+                "count": OutputField(type="number"),
+            },
+        )
+
+        err = await self._run_expect_validation_error(config)
+
+        msg = str(err)
+        assert "detector" in msg
+        assert "route" in msg
+
+    @pytest.mark.asyncio
+    async def test_extra_fields_allowed(self) -> None:
+        """Extra JSON fields beyond schema are kept (parity with LLM agent output handling)."""
+        config = self._config_with_schema(
+            args=[
+                "-c",
+                'import json; print(json.dumps({"route": "planning", "extra": "ok"}))',
+            ],
+            output={"route": OutputField(type="string")},
+        )
+        engine = WorkflowEngine(config, MagicMock())
+        await engine.run({})
+
+        out = engine.context.agent_outputs["detector"]
+        assert out["route"] == "planning"
+        assert out["extra"] == "ok"
+
+    @pytest.mark.asyncio
+    async def test_empty_schema_requires_json_object(self) -> None:
+        """`output: {}` opts into strict mode: any JSON object passes, non-JSON fails."""
+        # Empty schema + JSON object → passes.
+        config_ok = self._config_with_schema(
+            args=["-c", 'import json; print(json.dumps({"anything": 1}))'],
+            output={},
+        )
+        engine = WorkflowEngine(config_ok, MagicMock())
+        await engine.run({})
+        assert engine.context.agent_outputs["detector"]["anything"] == 1
+
+        # Empty schema + non-JSON → ValidationError.
+        config_bad = self._config_with_schema(
+            args=["-c", "print('hi')"],
+            output={},
+        )
+        engine = WorkflowEngine(config_bad, MagicMock())
+        with pytest.raises(ValidationError):
+            await engine.run({})
+
+    @pytest.mark.asyncio
+    async def test_builtin_fields_preserved_when_not_shadowed(self) -> None:
+        """Declared schema with non-builtin fields still exposes stdout/stderr/exit_code."""
+        config = self._config_with_schema(
+            args=[
+                "-c",
+                "import sys, json;"
+                ' sys.stderr.write("warning"); '
+                'print(json.dumps({"route": "planning"}))',
+            ],
+            output={"route": OutputField(type="string")},
+        )
+        engine = WorkflowEngine(config, MagicMock())
+        await engine.run({})
+
+        out = engine.context.agent_outputs["detector"]
+        assert out["route"] == "planning"
+        assert "warning" in out["stderr"]
+        assert out["exit_code"] == 0
+        assert isinstance(out["stdout"], str)
+
+    @pytest.mark.asyncio
+    async def test_schema_validates_shadowed_builtin(self) -> None:
+        """Validation runs on the merged dict, so shadowed built-ins are validated."""
+        # Script emits {"exit_code": "ok"} which shadows the built-in int.
+        # Schema says exit_code should be a string → passes (validates merged value).
+        config = self._config_with_schema(
+            args=["-c", 'import json; print(json.dumps({"exit_code": "ok"}))'],
+            output={"exit_code": OutputField(type="string")},
+        )
+        engine = WorkflowEngine(config, MagicMock())
+        await engine.run({})
+        assert engine.context.agent_outputs["detector"]["exit_code"] == "ok"
+
+        # Conversely: if schema requires exit_code as number but script shadows
+        # it with a string → ValidationError on the merged value.
+        config_bad = self._config_with_schema(
+            args=["-c", 'import json; print(json.dumps({"exit_code": "ok"}))'],
+            output={"exit_code": OutputField(type="number")},
+        )
+        engine = WorkflowEngine(config_bad, MagicMock())
+        with pytest.raises(ValidationError, match="exit_code"):
+            await engine.run({})
+
+    @pytest.mark.asyncio
+    async def test_validation_failure_emits_script_failed_not_completed(self) -> None:
+        """On validation failure: script_failed emitted, script_completed is NOT."""
+        emitter, events = self._make_collector()
+        config = self._config_with_schema(
+            args=["-c", "print('not json')"],
+            output={"route": OutputField(type="string")},
+        )
+        engine = WorkflowEngine(config, MagicMock(), event_emitter=emitter)
+
+        with pytest.raises(ValidationError):
+            await engine.run({})
+
+        event_types = [e.type for e in events]
+        assert "script_started" in event_types
+        assert "script_failed" in event_types
+        assert "script_completed" not in event_types
+
+        # script_failed should carry stdout/stderr/exit_code so the dashboard
+        # can show what the script actually wrote.
+        failed = next(e for e in events if e.type == "script_failed")
+        assert failed.data["agent_name"] == "detector"
+        assert failed.data["error_type"] == "ValidationError"
+        assert "stdout" in failed.data
+        assert "stderr" in failed.data
+        assert "exit_code" in failed.data
+
+    @pytest.mark.asyncio
+    async def test_validation_failure_does_not_store_context(self) -> None:
+        """On validation failure: agent output is NOT stored in context."""
+        config = self._config_with_schema(
+            args=["-c", "print('not json')"],
+            output={"route": OutputField(type="string")},
+        )
+        engine = WorkflowEngine(config, MagicMock())
+
+        with pytest.raises(ValidationError):
+            await engine.run({})
+
+        # detector should not appear in stored outputs.
+        assert "detector" not in engine.context.agent_outputs
+
+    @pytest.mark.asyncio
+    async def test_schema_field_drives_route(self) -> None:
+        """End-to-end: declared field drives routing to a downstream agent."""
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="schema-route",
+                entry_point="detector",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="detector",
+                    type="script",
+                    command=sys.executable,
+                    args=[
+                        "-c",
+                        'import json; print(json.dumps({"phase": "planning"}))',
+                    ],
+                    output={"phase": OutputField(type="string")},
+                    routes=[
+                        RouteDef(to="planner", when="phase == 'planning'"),
+                        RouteDef(to="$end"),
+                    ],
+                ),
+                AgentDef(
+                    name="planner",
+                    type="script",
+                    command=sys.executable,
+                    args=["-c", "print('planning done')"],
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+        )
+        engine = WorkflowEngine(config, MagicMock())
+        await engine.run({})
+
+        assert engine.context.agent_outputs["detector"]["phase"] == "planning"
+        assert "planner" in engine.context.agent_outputs

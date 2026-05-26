@@ -36,7 +36,7 @@ export function StatusBar() {
   const statusText = (() => {
     if (iterationLimitGate && workflowStatus === 'running') {
       const target = iterationLimitGate.agent_name ?? iterationLimitGate.group_name ?? 'workflow';
-      const auto = iterationLimitGate.skip_gates ? ' — auto-stopping' : ' — awaiting console input';
+      const auto = iterationLimitGate.skip_gates ? ' — auto-stopping' : ' — awaiting decision';
       return `Iteration limit reached: ${target} ${iterationLimitGate.current_iteration}/${iterationLimitGate.max_iterations}${auto}`;
     }
     switch (workflowStatus) {
