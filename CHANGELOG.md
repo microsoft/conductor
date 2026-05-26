@@ -94,6 +94,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ([#225](https://github.com/microsoft/conductor/pull/225),
   [#136](https://github.com/microsoft/conductor/issues/136)).
 
+### Fixed
+- `parse_json_output` and the Copilot provider's `_extract_json` now use a
+  two-stage fenced-block extraction (non-greedy `re.findall` + per-candidate
+  try-parse, then a greedy single-capture fallback) so JSON whose string
+  fields contain triple-backtick substrings no longer matches prematurely
+  and falls into parse-recovery loops, while responses with multiple
+  fenced JSON blocks still pick the first valid one. Resolves a recurring
+  failure mode for agents emitting Markdown-bearing JSON
+  (external-workflow-friction Issue #1).
+- `conductor run --web-bg` and `conductor resume --web-bg` now abort before
+  forking when the workflow contains a `human_gate` agent (including gates
+  nested in `for_each.agent`) and `--skip-gates` is not set, with a message
+  listing the four supported options. `resume --web-bg` also recovers the
+  workflow path from the checkpoint when invoked without an explicit
+  workflow argument so the guard still fires. Previously the detached
+  child crashed with `EOFError` and the parent only reported
+  "Background process exited immediately with code 1" (Issue #8).
+
+### Documentation
+- New "Choosing whether to declare `output:`" section in
+  [docs/workflow-syntax.md](docs/workflow-syntax.md) describing when to declare
+  a schema versus consuming raw `<agent>.output.result` for prose or large
+  JSON. Closes a documentation gap that contributed to misconfiguration of
+  agents emitting large payloads (Issue #2).
+- `docs/cli-reference.md` `--web-bg` section now documents the `human_gate`
+  incompatibility and the new pre-fork validation behavior.
+
 ## [0.1.17](https://github.com/microsoft/conductor/compare/v0.1.16...v0.1.17) - 2026-05-21
 
 ### Added

@@ -109,6 +109,45 @@ agents:
         when: "{{ condition }}"     # Optional: Route condition
 ```
 
+### Choosing whether to declare `output:`
+
+Declaring `output:` does two things at once: it asks the model to return JSON matching the schema, and it parses the response as structured JSON. For some agents that's what you want. For others it produces parse-recovery loops and burns tokens.
+
+**Declare `output:`** when the agent emits small, strictly-structured JSON whose individual fields will be referenced downstream:
+
+```yaml
+agents:
+  - name: classifier
+    prompt: "Classify the input. Return {category, confidence}."
+    output:
+      category:
+        type: string
+      confidence:
+        type: number
+  - name: router
+    prompt: |
+      Category was {{ classifier.output.category }}.
+      Confidence was {{ classifier.output.confidence }}.
+```
+
+**Omit `output:`** when the agent emits prose, Markdown, or large/nested JSON. Without a schema, conductor stores the full raw response as a single string under `.output.result`, and downstream agents read it directly:
+
+```yaml
+agents:
+  - name: synthesizer
+    prompt: |
+      Produce a comprehensive Markdown report of the findings.
+      The report may contain code blocks, tables, and quoted examples.
+    # No output: declared — response is captured verbatim.
+  - name: reviewer
+    prompt: |
+      Review the following report:
+
+      {{ synthesizer.output.result }}
+```
+
+Why this matters: when an `output:` schema is declared, the model is asked to wrap its response in JSON. Large or prose-heavy responses tend to come back inside Markdown code fences, and any triple-backticks in the content can confuse the JSON-extraction step. Omitting `output:` for these agents avoids that whole class of failure and lets the model write naturally.
+
 ### Human Gates
 
 Human gates pause workflow execution for user input:
