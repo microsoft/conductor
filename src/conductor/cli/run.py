@@ -1338,23 +1338,24 @@ async def run_workflow_async(
             if dashboard is not None and interrupt_event is not None:
                 dashboard.set_interrupt_event(interrupt_event)
 
+            terminate_exc: WorkflowTerminated | None = None
             try:
                 if listener is not None:
                     await listener.start()
                     _verbose_console.print("[dim]Press Esc to interrupt and provide guidance[/dim]")
 
                 result = await _run_with_stop_signal(engine, inputs, dashboard)
-            except WorkflowTerminated:
-                # Defense-in-depth: `_print_resume_instructions` already early-
-                # returns when no checkpoint was saved, and the engine skips
-                # the on-failure checkpoint save for `WorkflowTerminated` —
-                # so the hint wouldn't print today regardless. Catching the
-                # exception explicitly here makes the intent ("never resume an
-                # explicit termination") visible at the CLI layer, so a future
-                # refactor of either `_print_resume_instructions` or the
-                # engine's checkpoint policy cannot accidentally start
-                # surfacing a misleading "resume?" hint for intentional exits.
-                raise
+            except WorkflowTerminated as exc:
+                # Explicit `type: terminate status: failed` is an intentional
+                # outcome, not a crash — defer the raise so the dashboard
+                # stays alive for the same post-execution lifecycle as a
+                # successful run. Without this deferral the dashboard dies
+                # immediately and a `--web` / `--web-bg` user cannot see the
+                # rendered TerminateNode / red "Workflow Terminated" banner.
+                # Resume hint is still suppressed: explicit terminations are
+                # not resumable (defense-in-depth — see issue #219).
+                terminate_exc = exc
+                result = exc.output
             except BaseException:
                 _print_resume_instructions(engine)
                 raise
@@ -1364,7 +1365,13 @@ async def run_workflow_async(
 
             # Log completion
             verbose_log_timing("Total workflow execution", time.time() - start_time)
-            verbose_log("Workflow completed successfully", style="green")
+            if terminate_exc is None:
+                verbose_log("Workflow completed successfully", style="green")
+            else:
+                verbose_log(
+                    f"Workflow terminated explicitly at '{terminate_exc.terminated_by}'",
+                    style="yellow",
+                )
 
             # Display usage summary if cost tracking is enabled
             if config.workflow.cost.show_summary:
@@ -1372,7 +1379,9 @@ async def run_workflow_async(
                 if "usage" in summary:
                     display_usage_summary(summary["usage"])
 
-            # Post-execution dashboard lifecycle
+            # Post-execution dashboard lifecycle — runs for both clean exits
+            # and explicit-terminate failures so the user can observe the
+            # final dashboard state in either case.
             if dashboard is not None:
                 # Auto-shutdown if either --web-bg was passed directly or
                 # this is a background child process (CONDUCTOR_WEB_BG env var)
@@ -1383,14 +1392,23 @@ async def run_workflow_async(
                     from conductor.cli.app import is_verbose
 
                     if is_verbose():
+                        banner = (
+                            "[bold yellow]Workflow terminated.[/bold yellow]"
+                            if terminate_exc is not None
+                            else "[bold green]Workflow complete.[/bold green]"
+                        )
                         _verbose_console.print(
-                            f"\n[bold green]Workflow complete.[/bold green] "
+                            f"\n{banner} "
                             f"Dashboard still running at {dashboard.url} — "
                             f"press [bold]Ctrl+C[/bold] to exit."
                         )
                     with contextlib.suppress(asyncio.CancelledError):
                         await asyncio.Event().wait()
 
+            if terminate_exc is not None:
+                # Re-raise so the CLI handler emits the non-zero exit code
+                # and prints the structured termination message/output.
+                raise terminate_exc
             return result
     finally:
         # Clean up PID file if this is a background child process
@@ -1916,21 +1934,21 @@ async def resume_workflow_async(
             if dashboard is not None and interrupt_event is not None:
                 dashboard.set_interrupt_event(interrupt_event)
 
+            terminate_exc: WorkflowTerminated | None = None
             try:
                 if listener is not None:
                     await listener.start()
                     _verbose_console.print("[dim]Press Esc to interrupt and provide guidance[/dim]")
 
                 result = await _resume_with_stop_signal(engine, cp.current_agent, dashboard)
-            except WorkflowTerminated:
-                # Defense-in-depth: see the matching arm in
-                # `run_workflow_async` for the full rationale. In short,
-                # `_print_resume_instructions` is already a no-op when no
-                # checkpoint was saved (which is the case for an explicit
-                # termination), but pinning that contract at the CLI layer
-                # protects against future drift in either the helper or the
-                # engine's checkpoint policy.
-                raise
+            except WorkflowTerminated as exc:
+                # Mirror of the matching arm in `run_workflow_async`: defer
+                # the raise so the dashboard stays alive for
+                # explicit-terminate failures the same as it does for
+                # successful runs. Resume hints stay suppressed because
+                # explicit terminations are not resumable (see issue #219).
+                terminate_exc = exc
+                result = exc.output
             except BaseException:
                 _print_resume_instructions(engine)
                 raise
@@ -1940,7 +1958,13 @@ async def resume_workflow_async(
 
             # Log completion
             verbose_log_timing("Total resumed execution", time.time() - start_time)
-            verbose_log("Workflow resumed successfully", style="green")
+            if terminate_exc is None:
+                verbose_log("Workflow resumed successfully", style="green")
+            else:
+                verbose_log(
+                    f"Resumed workflow terminated explicitly at '{terminate_exc.terminated_by}'",
+                    style="yellow",
+                )
 
             # Display usage summary if cost tracking is enabled
             if config.workflow.cost.show_summary:
@@ -1948,11 +1972,14 @@ async def resume_workflow_async(
                 if "usage" in summary:
                     display_usage_summary(summary["usage"])
 
-            # Cleanup checkpoint after successful resume
+            # Cleanup checkpoint after the resumed run finishes. Both clean
+            # completion and explicit termination are terminal outcomes — the
+            # checkpoint we resumed from is no longer needed in either case.
             CheckpointManager.cleanup(cp.file_path)
             verbose_log(f"Checkpoint cleaned up: {cp.file_path}", style="dim")
 
-            # Post-execution dashboard lifecycle (parity with run)
+            # Post-execution dashboard lifecycle (parity with run) — kept
+            # alive for both clean exits and explicit-terminate failures.
             if dashboard is not None:
                 is_bg = web_bg or os.environ.get("CONDUCTOR_WEB_BG") == "1"
                 if is_bg:
@@ -1961,14 +1988,21 @@ async def resume_workflow_async(
                     from conductor.cli.app import is_verbose
 
                     if is_verbose():
+                        banner = (
+                            "[bold yellow]Workflow terminated.[/bold yellow]"
+                            if terminate_exc is not None
+                            else "[bold green]Workflow complete.[/bold green]"
+                        )
                         _verbose_console.print(
-                            f"\n[bold green]Workflow complete.[/bold green] "
+                            f"\n{banner} "
                             f"Dashboard still running at {dashboard.url} — "
                             f"press [bold]Ctrl+C[/bold] to exit."
                         )
                     with contextlib.suppress(asyncio.CancelledError):
                         await asyncio.Event().wait()
 
+            if terminate_exc is not None:
+                raise terminate_exc
             return result
     finally:
         # Clean up PID file if this is a background child process
