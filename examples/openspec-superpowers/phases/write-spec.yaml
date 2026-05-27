@@ -1,0 +1,299 @@
+# OpenSpec — Write Spec (single capability)
+#
+# Sub-workflow invoked by specs.yaml's for_each group.
+# Generates and writes the spec file for ONE capability.
+#
+# Called with:
+#   change:     the change name
+#   capability: the kebab-case capability name (e.g. "user-auth")
+#
+# Steps:
+#   1. get_instructions — read spec template + instructions from bundled schema
+#   2. read_proposal    — load proposal.md content for context
+#   3. write_spec       — LLM generates the spec.md following the template
+#   4. save_spec        — Python writes the file via env var
+
+workflow:
+  name: openspec-write-spec
+  description: Generate and write the spec file for a single capability
+  version: "1.0.0"
+  entry_point: get_instructions
+
+  runtime:
+    provider: copilot
+    default_model: claude-sonnet-4.6
+
+  input:
+    change:
+      type: string
+      required: true
+    capability:
+      type: string
+      required: true
+      description: Kebab-case capability name (e.g. "user-auth")
+    kind:
+      type: string
+      required: false
+      description: '"new" (write from scratch) or "modified" (write a delta spec)'
+    existing_spec_path:
+      type: string
+      required: false
+      description: |  
+        Path to the baseline spec in openspec/specs/<capability>/spec.md.
+        Only populated for kind="modified". Empty string for new capabilities.
+
+  context:
+    mode: accumulate
+
+agents:
+  # ── Step 1 ──────────────────────────────────────────────────────────────────
+  - name: get_instructions
+    type: script
+    description: Load spec instructions from the bundled schema (no openspec CLI required)
+    command: python3
+    args:
+      - "-c"
+      - |
+        import json, pathlib, sys
+        from ruamel.yaml import YAML
+
+        yaml = YAML()
+        schema_dir = pathlib.Path("examples/openspec-superpowers/artifacts")
+        schema = yaml.load(schema_dir / "schema.yaml")
+
+        artifact_id = "specs"
+        artifact = next((a for a in schema.get("artifacts", []) if a["id"] == artifact_id), None)
+        if not artifact:
+            print(f"ERROR: artifact '{artifact_id}' not found in schema", file=sys.stderr)
+            sys.exit(1)
+
+        template_file = schema_dir / "templates" / artifact["template"]
+        template = template_file.read_text() if template_file.exists() else ""
+
+        change = "{{ workflow.input.change }}"
+        change_dir = pathlib.Path("openspec") / "changes" / change
+        output_path = artifact["generates"]
+
+        config_context, config_rules = "", []
+        config_file = pathlib.Path("openspec/config.yaml")
+        if config_file.exists():
+            cfg = yaml.load(config_file) or {}
+            config_context = cfg.get("context", "") or ""
+            config_rules = (cfg.get("rules") or {}).get(artifact_id, []) or []
+
+        # Idempotency for individual capabilities is handled by specs.yaml
+        # (it filters already-written capabilities before invoking this sub-workflow).
+        print(json.dumps({
+            "state": "ready",
+            "instruction": artifact.get("instruction", ""),
+            "template": template,
+            "outputPath": output_path,
+            "changeDir": str(change_dir.resolve()),
+            "context": config_context,
+            "rules": config_rules,
+        }))
+    output:
+      state:
+        type: string
+      instruction:
+        type: string
+        description: Spec-writing guidance from the schema
+      template:
+        type: string
+        description: Spec markdown template to follow
+      outputPath:
+        type: string
+      changeDir:
+        type: string
+      context:
+        type: string
+        description: Project background from openspec/config.yaml (constraint for AI, not artifact content)
+      rules:
+        type: array
+        description: Specs-specific rules from openspec/config.yaml (constraints for AI, not artifact content)
+    routes:
+      - to: read_proposal   # always proceed; individual capability state checked via filesystem
+
+  # ── Step 2 ──────────────────────────────────────────────────────────────────
+  - name: read_proposal
+    type: script
+    description: Read proposal.md to give the spec writer full context
+    command: python3
+    args:
+      - "-c"
+      - |
+        import pathlib, json, sys
+
+        change = "{{ workflow.input.change }}"
+        proposal = pathlib.Path(f"openspec/changes/{change}/proposal.md")
+
+        if not proposal.exists():
+            print(json.dumps({"content": "", "found": False}))
+            sys.exit(0)
+
+        print(json.dumps({"content": proposal.read_text(), "found": True}))
+    output:
+      content:
+        type: string
+        description: Full text of proposal.md
+      found:
+        type: boolean
+    routes:
+      - to: read_existing_spec
+
+  # ── Step 3 ──────────────────────────────────────────────────────────────────
+  - name: read_existing_spec
+    type: script
+    description: |
+      For "modified" capabilities: read the baseline spec from
+      openspec/specs/<capability>/spec.md so the LLM knows exactly which
+      requirements already exist and can produce a precise delta.
+      For "new" capabilities: returns empty content (no-op).
+    command: python3
+    args:
+      - "-c"
+      - |
+        import pathlib, json, sys
+
+        kind = "{{ workflow.input.kind | default('new') }}"
+        existing_path = "{{ workflow.input.existing_spec_path | default('') }}".strip()
+
+        if kind != "modified" or not existing_path:
+            print(json.dumps({"content": "", "found": False}))
+            sys.exit(0)
+
+        p = pathlib.Path(existing_path)
+        if not p.exists():
+            # Baseline spec missing — warn but don't block; LLM will note the gap
+            import sys
+            print(f"WARNING: existing spec not found at {p}", file=sys.stderr)
+            print(json.dumps({"content": "", "found": False}))
+            sys.exit(0)
+
+        print(json.dumps({"content": p.read_text(), "found": True}))
+    output:
+      content:
+        type: string
+        description: |
+          Full text of the baseline spec (openspec/specs/<capability>/spec.md).
+          Empty string when kind="new" or file not found.
+      found:
+        type: boolean
+    routes:
+      - to: write_spec
+
+  # ── Step 4 ──────────────────────────────────────────────────────────────────
+  - name: write_spec
+    model: claude-sonnet-4.6
+    description: |
+      Generate the spec.md for this capability.
+      - kind="new"      → full spec written from scratch
+      - kind="modified" → delta spec using ADDED/MODIFIED/REMOVED headers;
+                          the existing baseline spec is provided as context so
+                          the LLM knows which requirements already exist
+    prompt: |
+      You are writing an OpenSpec spec file for the capability "{{ workflow.input.capability }}"
+      as part of the change "{{ workflow.input.change }}".
+
+      CAPABILITY KIND: {{ workflow.input.kind | default('new') }}
+
+      {% if get_instructions.output.context %}
+      PROJECT CONTEXT (background constraints — do NOT copy into spec.md):
+      {{ get_instructions.output.context }}
+      {% endif %}
+      {% if get_instructions.output.rules %}
+      RULES (must follow — do NOT copy into spec.md):
+      {% for rule in get_instructions.output.rules %}      - {{ rule }}
+      {% endfor %}{% endif %}
+      PROPOSAL CONTEXT:
+      {{ read_proposal.output.content }}
+
+      INSTRUCTIONS:
+      {{ get_instructions.output.instruction }}
+
+      TEMPLATE:
+      {{ get_instructions.output.template }}
+
+      {% if workflow.input.kind == 'modified' %}
+      EXISTING BASELINE SPEC (openspec/specs/{{ workflow.input.capability }}/spec.md):
+      {% if read_existing_spec.output.found %}
+      {{ read_existing_spec.output.content }}
+      {% else %}
+      WARNING: Baseline spec not found. Write requirements as ADDED.
+      {% endif %}
+
+      ---
+      You are writing a DELTA spec. Rules:
+        - Only describe what CHANGES relative to the baseline spec above
+        - Use ## ADDED Requirements for brand-new requirements
+        - Use ## MODIFIED Requirements for changed behavior
+            → Copy the ENTIRE requirement block from the baseline, then edit it
+            → Partial content loses detail at archive time
+        - Use ## REMOVED Requirements for deprecated behavior
+            → Include **Reason** and **Migration** sub-fields
+        - Use ## RENAMED Requirements for name-only changes (FROM:/TO: format)
+        - Do NOT repeat requirements that are unchanged
+        - Each requirement: ### Requirement: <Name>
+        - Each scenario:    #### Scenario: <Name>   ← MUST be exactly 4 hashtags
+      {% else %}
+      ---
+      You are writing a FULL spec from scratch. Rules:
+        - Cover all capabilities described in the proposal for "{{ workflow.input.capability }}"
+        - Each requirement: ### Requirement: <Name>
+        - Each scenario:    #### Scenario: <Name>   ← MUST be exactly 4 hashtags
+          - **WHEN** <condition>
+          - **THEN** <outcome>
+        - Every requirement MUST have at least one scenario
+        - Use SHALL/MUST for normative language (avoid should/may)
+      {% endif %}
+
+      Output only the spec.md content — no preamble or commentary.
+    output:
+      content:
+        type: string
+        description: Complete spec.md markdown for this capability
+      requirements_count:
+        type: number
+        description: Number of requirements defined in the spec
+    routes:
+      - to: save_spec
+
+  # ── Step 5 ──────────────────────────────────────────────────────────────────
+  - name: save_spec
+    type: script
+    description: Write the generated spec.md to disk
+    command: python3
+    args:
+      - "-c"
+      - |
+        import pathlib, sys, json
+
+        # sys.argv[1] = changeDir (Jinja2-rendered absolute path)
+        # sys.argv[2] = capability name
+        # sys.argv[3] = full spec.md content
+        change_dir = pathlib.Path(sys.argv[1])
+        capability = sys.argv[2]
+        content = sys.argv[3]
+
+        path = change_dir / "specs" / capability / "spec.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+
+        size = len(content)
+        print(f"Wrote {path} ({size:,} chars)", file=sys.stderr)
+        print(json.dumps({"path": str(path), "size": size, "capability": capability}))
+      - "{{ get_instructions.output.changeDir }}"
+      - "{{ workflow.input.capability }}"
+      - "{{ write_spec.output.content }}"
+    output:
+      path:
+        type: string
+      capability:
+        type: string
+    routes:
+      - to: $end
+
+output:
+  capability: "{{ workflow.input.capability }}"
+  spec_path: "{{ save_spec.output.path | default('') }}"
+  requirements_count: "{{ write_spec.output.requirements_count | default(0) }}"

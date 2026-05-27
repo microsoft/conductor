@@ -1,0 +1,209 @@
+# OpenSpec Superpowers — Propose Phase
+#
+# Creates proposal.md based on the brainstorm.md captured in the brainstorm phase.
+# The brainstorming skill already explored the problem space, so this is a
+# concise extraction into proposal format — not a new exploration.
+#
+# Run standalone:
+#   conductor run examples/openspec-superpowers/phases/propose.yaml \
+#     --input change="add-oauth-login"
+#
+# Steps:
+#   1. get_instructions  — read proposal template + instructions from bundled schema
+#   2. read_brainstorm   — load brainstorm.md content for context
+#   3. write_proposal    — LLM extracts proposal from brainstorm output
+#   4. save_proposal     — Python writes the file to disk
+#
+# Idempotent: exits immediately if proposal.md already exists.
+
+workflow:
+  name: openspec-superpowers-propose
+  description: Generate proposal.md from brainstorm.md output
+  version: "1.0.0"
+  entry_point: get_instructions
+
+  runtime:
+    provider: copilot
+    default_model: claude-sonnet-4.6
+
+  input:
+    change:
+      type: string
+      required: true
+      description: Change name in kebab-case
+
+  context:
+    mode: accumulate
+
+agents:
+  # ── Step 1 ──────────────────────────────────────────────────────────────────
+  - name: get_instructions
+    type: script
+    description: |
+      Load proposal generation instructions from the bundled superpowers-bridge schema.
+      No openspec CLI required — reads schema.yaml and template directly.
+    command: python3
+    args:
+      - "-c"
+      - |
+        import json, pathlib, sys
+        from ruamel.yaml import YAML
+
+        yaml = YAML()
+        schema_dir = pathlib.Path("examples/openspec-superpowers/artifacts")
+        schema = yaml.load(schema_dir / "schema.yaml")
+
+        artifact_id = "proposal"
+        artifact = next((a for a in schema.get("artifacts", []) if a["id"] == artifact_id), None)
+        if not artifact:
+            print(f"ERROR: artifact '{artifact_id}' not found in schema", file=sys.stderr)
+            sys.exit(1)
+
+        template_file = schema_dir / "templates" / artifact["template"]
+        template = template_file.read_text() if template_file.exists() else ""
+
+        change = "{{ workflow.input.change }}"
+        change_dir = pathlib.Path("openspec") / "changes" / change
+        output_path = artifact["generates"]
+        artifact_file = change_dir / output_path
+        state = "done" if artifact_file.exists() else "ready"
+
+        config_context, config_rules = "", []
+        config_file = pathlib.Path("openspec/config.yaml")
+        if config_file.exists():
+            cfg = yaml.load(config_file) or {}
+            config_context = cfg.get("context", "") or ""
+            config_rules = (cfg.get("rules") or {}).get(artifact_id, []) or []
+
+        print(json.dumps({
+            "state": state,
+            "instruction": artifact.get("instruction", ""),
+            "template": template,
+            "outputPath": output_path,
+            "changeDir": str(change_dir.resolve()),
+            "context": config_context,
+            "rules": config_rules,
+        }))
+    output:
+      state:
+        type: string
+        description: '"ready" or "done"'
+      instruction:
+        type: string
+      template:
+        type: string
+      outputPath:
+        type: string
+      changeDir:
+        type: string
+      context:
+        type: string
+      rules:
+        type: array
+    routes:
+      - to: $end
+        when: "state == 'done'"
+      - to: read_brainstorm
+
+  # ── Step 2 ──────────────────────────────────────────────────────────────────
+  - name: read_brainstorm
+    type: script
+    description: Load brainstorm.md content for context
+    command: python3
+    args:
+      - "-c"
+      - |
+        import pathlib, json, sys
+
+        change = "{{ workflow.input.change }}"
+        brainstorm = pathlib.Path(f"openspec/changes/{change}/brainstorm.md")
+
+        if not brainstorm.exists():
+            print(json.dumps({"content": "", "found": False}))
+            print("WARNING: brainstorm.md not found — run brainstorm phase first", file=sys.stderr)
+            sys.exit(0)
+
+        print(json.dumps({"content": brainstorm.read_text(), "found": True}))
+    output:
+      content:
+        type: string
+      found:
+        type: boolean
+    routes:
+      - to: write_proposal
+
+  # ── Step 3 ──────────────────────────────────────────────────────────────────
+  - name: write_proposal
+    model: claude-sonnet-4.6
+    description: |
+      Extract a concise proposal from the brainstorm output.
+      Since brainstorming already explored the problem space, this is an
+      extraction — not a new exploration of requirements.
+    prompt: |
+      You are writing an OpenSpec proposal for the change "{{ workflow.input.change }}".
+
+      BRAINSTORM OUTPUT (the validated design from the brainstorming session):
+      {{ read_brainstorm.output.content }}
+
+      {% if get_instructions.output.context %}
+      PROJECT CONTEXT (background constraints — do NOT copy into the proposal):
+      {{ get_instructions.output.context }}
+      {% endif %}
+      {% if get_instructions.output.rules %}
+      RULES (must follow — do NOT copy into the proposal):
+      {% for rule in get_instructions.output.rules %}      - {{ rule }}
+      {% endfor %}{% endif %}
+      Follow these instructions exactly when writing:
+      {{ get_instructions.output.instruction }}
+
+      Use this template as your structure — fill in every section:
+      {{ get_instructions.output.template }}
+
+      Since brainstorming already explored the problem space, extract and condense
+      rather than re-explore. Focus on the WHY and WHAT from what was decided.
+
+      IMPORTANT — Capabilities section:
+        In the "New Capabilities" list, use exact kebab-case names for each spec
+        that will be created (e.g. "user-auth", "data-export").
+        These names become the directory names under specs/<name>/spec.md.
+    output:
+      content:
+        type: string
+        description: Complete proposal.md markdown
+    routes:
+      - to: save_proposal
+
+  # ── Step 4 ──────────────────────────────────────────────────────────────────
+  - name: save_proposal
+    type: script
+    description: Write proposal.md to disk
+    command: python3
+    args:
+      - "-c"
+      - |
+        import pathlib, sys, json
+
+        change_dir = pathlib.Path(sys.argv[1])
+        output_path = sys.argv[2]
+        content = sys.argv[3]
+
+        path = change_dir / output_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+
+        size = len(content)
+        print(f"Wrote {path} ({size:,} chars)", file=sys.stderr)
+        print(json.dumps({"path": str(path), "size": size}))
+      - "{{ get_instructions.output.changeDir }}"
+      - "{{ get_instructions.output.outputPath }}"
+      - "{{ write_proposal.output.content }}"
+    output:
+      path:
+        type: string
+      size:
+        type: number
+    routes:
+      - to: $end
+
+output:
+  written_path: "{% if save_proposal is defined %}{{ save_proposal.output.path | default('') }}{% endif %}"

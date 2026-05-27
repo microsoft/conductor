@@ -1,0 +1,208 @@
+# OpenSpec Superpowers — Design Phase
+#
+# Generates design.md by REORGANIZING brainstorm.md into structured sections.
+# This is a transformation: extracts Context/Goals/Decisions/Risks/Migration
+# from the raw brainstorming decision log.
+#
+# Run standalone:
+#   conductor run examples/openspec-superpowers/phases/design.yaml \
+#     --input change="add-oauth-login"
+#
+# Steps:
+#   1. get_instructions — read design template + instructions from bundled schema
+#   2. read_brainstorm  — load brainstorm.md as the transformation source
+#   3. write_design     — LLM reorganizes brainstorm into structured design.md
+#   4. save_design      — Python writes the file to disk
+#
+# Idempotent: exits immediately if design.md already exists.
+
+workflow:
+  name: openspec-superpowers-design
+  description: Transform brainstorm.md into a structured design document
+  version: "1.0.0"
+  entry_point: get_instructions
+
+  runtime:
+    provider: copilot
+    default_model: claude-sonnet-4.6
+
+  input:
+    change:
+      type: string
+      required: true
+
+  context:
+    mode: accumulate
+
+agents:
+  # ── Step 1 ──────────────────────────────────────────────────────────────────
+  - name: get_instructions
+    type: script
+    description: Load design generation instructions from the bundled superpowers-bridge schema
+    command: python3
+    args:
+      - "-c"
+      - |
+        import json, pathlib, sys
+        from ruamel.yaml import YAML
+
+        yaml = YAML()
+        schema_dir = pathlib.Path("examples/openspec-superpowers/artifacts")
+        schema = yaml.load(schema_dir / "schema.yaml")
+
+        artifact_id = "design"
+        artifact = next((a for a in schema.get("artifacts", []) if a["id"] == artifact_id), None)
+        if not artifact:
+            print(f"ERROR: artifact '{artifact_id}' not found in schema", file=sys.stderr)
+            sys.exit(1)
+
+        template_file = schema_dir / "templates" / artifact["template"]
+        template = template_file.read_text() if template_file.exists() else ""
+
+        change = "{{ workflow.input.change }}"
+        change_dir = pathlib.Path("openspec") / "changes" / change
+        output_path = artifact["generates"]
+        artifact_file = change_dir / output_path
+        state = "done" if artifact_file.exists() else "ready"
+
+        config_context, config_rules = "", []
+        config_file = pathlib.Path("openspec/config.yaml")
+        if config_file.exists():
+            cfg = yaml.load(config_file) or {}
+            config_context = cfg.get("context", "") or ""
+            config_rules = (cfg.get("rules") or {}).get(artifact_id, []) or []
+
+        print(json.dumps({
+            "state": state,
+            "instruction": artifact.get("instruction", ""),
+            "template": template,
+            "outputPath": output_path,
+            "changeDir": str(change_dir.resolve()),
+            "context": config_context,
+            "rules": config_rules,
+        }))
+    output:
+      state:
+        type: string
+        description: '"ready" or "done"'
+      instruction:
+        type: string
+      template:
+        type: string
+      outputPath:
+        type: string
+      changeDir:
+        type: string
+      context:
+        type: string
+      rules:
+        type: array
+    routes:
+      - to: $end
+        when: "state == 'done'"
+      - to: read_brainstorm
+
+  # ── Step 2 ──────────────────────────────────────────────────────────────────
+  - name: read_brainstorm
+    type: script
+    description: |
+      Load brainstorm.md as the source for design reorganization.
+      brainstorm.md is a raw capture of the brainstorming session —
+      typically a decision log (background → Q1-Qn decisions → trade-offs).
+    command: python3
+    args:
+      - "-c"
+      - |
+        import pathlib, json, sys
+
+        change = "{{ workflow.input.change }}"
+        brainstorm = pathlib.Path(f"openspec/changes/{change}/brainstorm.md")
+
+        if not brainstorm.exists():
+            print(json.dumps({"content": "", "found": False}))
+            print("WARNING: brainstorm.md not found — run brainstorm phase first", file=sys.stderr)
+            sys.exit(0)
+
+        print(json.dumps({"content": brainstorm.read_text(), "found": True}))
+    output:
+      content:
+        type: string
+      found:
+        type: boolean
+    routes:
+      - to: write_design
+
+  # ── Step 3 ──────────────────────────────────────────────────────────────────
+  - name: write_design
+    model: claude-sonnet-4.6
+    description: |
+      Reorganize brainstorm.md into a structured design document.
+      This is a TRANSFORMATION — extract and restructure, do not duplicate.
+      - Decisions (Q1-Qn from brainstorm) → design.md §Decisions
+      - Background/context → design.md §Context
+      - Trade-offs → design.md §Risks / Trade-offs
+      Goals/Non-Goals and Migration Plan may require inference from the brainstorm.
+    prompt: |
+      You are writing an OpenSpec design document for the change "{{ workflow.input.change }}".
+
+      BRAINSTORM SOURCE (raw capture — reorganize this into design.md):
+      {{ read_brainstorm.output.content }}
+
+      {% if get_instructions.output.context %}
+      PROJECT CONTEXT (background constraints — do NOT copy into design.md):
+      {{ get_instructions.output.context }}
+      {% endif %}
+      {% if get_instructions.output.rules %}
+      RULES (must follow — do NOT copy into design.md):
+      {% for rule in get_instructions.output.rules %}      - {{ rule }}
+      {% endfor %}{% endif %}
+      INSTRUCTIONS:
+      {{ get_instructions.output.instruction }}
+
+      TEMPLATE:
+      {{ get_instructions.output.template }}
+
+      This is a REORGANIZATION of brainstorm.md content into structured sections.
+      Extract and restructure — do NOT simply copy brainstorm.md content verbatim.
+      Do NOT duplicate requirement details from specs (if they exist) — reference instead.
+    output:
+      content:
+        type: string
+        description: Complete design.md markdown content
+    routes:
+      - to: save_design
+
+  # ── Step 4 ──────────────────────────────────────────────────────────────────
+  - name: save_design
+    type: script
+    description: Write design.md to disk
+    command: python3
+    args:
+      - "-c"
+      - |
+        import pathlib, sys, json
+
+        change_dir = pathlib.Path(sys.argv[1])
+        output_path = sys.argv[2]
+        content = sys.argv[3]
+
+        path = change_dir / output_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+
+        size = len(content)
+        print(f"Wrote {path} ({size:,} chars)", file=sys.stderr)
+        print(json.dumps({"path": str(path), "size": size}))
+      - "{{ get_instructions.output.changeDir }}"
+      - "{{ get_instructions.output.outputPath }}"
+      - "{{ write_design.output.content }}"
+    output:
+      path:
+        type: string
+      size:
+        type: number
+    routes:
+      - to: $end
+
+output:
+  written_path: "{% if save_design is defined %}{{ save_design.output.path | default('') }}{% endif %}"

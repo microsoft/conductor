@@ -1,0 +1,319 @@
+# OpenSpec Superpowers — Retrospective Phase
+#
+# Evidence-first retrospective of a completed, verified change.
+# Runs `git log` to gather commit evidence, then an LLM agent writes
+# retrospective.md following the superpowers-bridge template.
+#
+# Run standalone:
+#   conductor run examples/openspec-superpowers/phases/retrospective.yaml \
+#     --input change="add-oauth-login"
+#
+# Steps:
+#   1. pre_checks     — verify.md exists + Overall Decision is not FAIL
+#   2. gather_evidence — script: git log commit range + tasks.md statistics
+#   3. read_context    — load all artifacts + retro template
+#   4. write_retro     — LLM writes evidence-first retrospective.md
+#   5. save_retro      — Python writes retrospective.md to disk
+#
+# Idempotent: each run OVERWRITES retrospective.md (can be updated as needed).
+
+workflow:
+  name: openspec-superpowers-retrospective
+  description: Evidence-first retrospective — produces retrospective.md
+  version: "1.0.0"
+  entry_point: pre_checks
+
+  runtime:
+    provider: copilot
+    default_model: claude-sonnet-4.6
+
+  input:
+    change:
+      type: string
+      required: true
+      description: Change name in kebab-case
+
+  context:
+    mode: accumulate
+
+agents:
+  # ── Step 1 ──────────────────────────────────────────────────────────────────
+  - name: pre_checks
+    type: script
+    description: |
+      Guard: verify.md must exist AND Overall Decision must not be FAIL.
+      If verify.md is missing or shows FAIL, block with a clear message.
+    command: python3
+    args:
+      - "-c"
+      - |
+        import json, pathlib, re
+
+        change = "{{ workflow.input.change }}"
+        change_dir = pathlib.Path("openspec") / "changes" / change
+        verify_path = change_dir / "verify.md"
+
+        if not verify_path.exists():
+            print(json.dumps({
+                "state": "blocked",
+                "message": "verify.md not found — run the verify phase first.",
+                "changeDir": str(change_dir.resolve()),
+            }))
+            exit(0)
+
+        verify_text = verify_path.read_text()
+        # Check for FAIL checkbox: "- [x] ❌ FAIL"
+        if re.search(r"- \[x\] ❌ FAIL", verify_text):
+            print(json.dumps({
+                "state": "blocked",
+                "message": "verify.md shows Overall Decision: FAIL. Fix failing checks first.",
+                "changeDir": str(change_dir.resolve()),
+            }))
+            exit(0)
+
+        print(json.dumps({
+            "state": "ready",
+            "message": "",
+            "changeDir": str(change_dir.resolve()),
+        }))
+    output:
+      state:
+        type: string
+        description: '"ready" or "blocked"'
+      message:
+        type: string
+      changeDir:
+        type: string
+    routes:
+      - to: $end
+        when: "state == 'blocked'"
+      - to: gather_evidence
+
+  # ── Step 2 ──────────────────────────────────────────────────────────────────
+  - name: gather_evidence
+    type: script
+    description: |
+      Gather quantitative evidence for §0 of the retrospective:
+        - git log commit range (oneline, head..base)
+        - diff stats (+X/-Y lines, N files)
+        - tasks done / total from tasks.md
+        - any [~] deferred entries in plan.md
+    command: python3
+    args:
+      - "-c"
+      - |
+        import json, pathlib, re, subprocess, sys
+
+        change = "{{ workflow.input.change }}"
+        base_dir = pathlib.Path(f"openspec/changes/{change}")
+
+        # ── Git evidence ────────────────────────────────────────────────────
+        merge_base = ""
+        commit_log = []
+        diff_stats = {"added": 0, "removed": 0, "files": 0}
+
+        try:
+            for branch in ("origin/main", "origin/master", "main", "master"):
+                r = subprocess.run(
+                    ["git", "merge-base", "HEAD", branch],
+                    capture_output=True, text=True
+                )
+                if r.returncode == 0:
+                    merge_base = r.stdout.strip()
+                    break
+
+            if merge_base:
+                log_r = subprocess.run(
+                    ["git", "log", "--oneline", f"{merge_base}..HEAD"],
+                    capture_output=True, text=True
+                )
+                commit_log = [l for l in log_r.stdout.splitlines() if l.strip()]
+
+                stat_r = subprocess.run(
+                    ["git", "diff", "--stat", f"{merge_base}..HEAD"],
+                    capture_output=True, text=True
+                )
+                stat_text = stat_r.stdout
+                # Parse "X insertions(+), Y deletions(-)"
+                m = re.search(r"(\d+) insertion", stat_text)
+                if m:
+                    diff_stats["added"] = int(m.group(1))
+                m = re.search(r"(\d+) deletion", stat_text)
+                if m:
+                    diff_stats["removed"] = int(m.group(1))
+                m = re.search(r"(\d+) file", stat_text)
+                if m:
+                    diff_stats["files"] = int(m.group(1))
+        except Exception as e:
+            print(f"WARNING: git evidence collection failed: {e}", file=sys.stderr)
+
+        # ── Tasks evidence ──────────────────────────────────────────────────
+        tasks_done, tasks_total = 0, 0
+        tasks_path = base_dir / "tasks.md"
+        if tasks_path.exists():
+            for line in tasks_path.read_text().split("\n"):
+                if re.match(r"- \[x\]", line):
+                    tasks_done += 1
+                    tasks_total += 1
+                elif re.match(r"- \[ \]", line):
+                    tasks_total += 1
+
+        # ── Deferred plan entries ───────────────────────────────────────────
+        deferred_count = 0
+        plan_path = base_dir / "plan.md"
+        if plan_path.exists():
+            for line in plan_path.read_text().split("\n"):
+                if re.match(r"- \[~\]", line):
+                    deferred_count += 1
+
+        print(json.dumps({
+            "merge_base": merge_base[:8] if merge_base else "",
+            "head_sha": commit_log[0].split()[0] if commit_log else "",
+            "commit_count": len(commit_log),
+            "commit_log": "\n".join(commit_log),
+            "diff_added": diff_stats["added"],
+            "diff_removed": diff_stats["removed"],
+            "diff_files": diff_stats["files"],
+            "tasks_done": tasks_done,
+            "tasks_total": tasks_total,
+            "deferred_count": deferred_count,
+        }))
+    output:
+      merge_base:
+        type: string
+      head_sha:
+        type: string
+      commit_count:
+        type: number
+      commit_log:
+        type: string
+      diff_added:
+        type: number
+      diff_removed:
+        type: number
+      diff_files:
+        type: number
+      tasks_done:
+        type: number
+      tasks_total:
+        type: number
+      deferred_count:
+        type: number
+    routes:
+      - to: read_context
+
+  # ── Step 3 ──────────────────────────────────────────────────────────────────
+  - name: read_context
+    type: script
+    description: Load all change artifacts and the retrospective template
+    command: python3
+    args:
+      - "-c"
+      - |
+        import json, pathlib, sys
+
+        change = "{{ workflow.input.change }}"
+        base = pathlib.Path(f"openspec/changes/{change}")
+        sections = []
+
+        for fname in ["brainstorm.md", "proposal.md", "design.md", "tasks.md", "plan.md", "verify.md"]:
+            f = base / fname
+            if f.exists():
+                sections.append(f"## {fname}\n\n{f.read_text()}")
+
+        context = "\n\n---\n\n".join(sections) if sections else "(no artifacts found)"
+
+        # Load retrospective template
+        template_file = pathlib.Path(
+            "examples/openspec-superpowers/artifacts/templates/retrospective.md"
+        )
+        template = template_file.read_text() if template_file.exists() else ""
+
+        print(json.dumps({
+            "context": context,
+            "template": template,
+        }))
+    output:
+      context:
+        type: string
+      template:
+        type: string
+    routes:
+      - to: write_retro
+
+  # ── Step 4 ──────────────────────────────────────────────────────────────────
+  - name: write_retro
+    model: claude-sonnet-4.6
+    description: |
+      Write an evidence-first retrospective following the superpowers-bridge template.
+      Every claim in §1-§6 must cite evidence from §0 (commit hash, file, test).
+    prompt: |
+      You are writing a retrospective for the OpenSpec change "{{ workflow.input.change }}".
+
+      GIT EVIDENCE:
+        Commit range: {{ gather_evidence.output.merge_base }}..{{ gather_evidence.output.head_sha }}
+        Commits: {{ gather_evidence.output.commit_count }}
+        Diff: +{{ gather_evidence.output.diff_added }} / -{{ gather_evidence.output.diff_removed }} lines across {{ gather_evidence.output.diff_files }} files
+        Tasks done: {{ gather_evidence.output.tasks_done }}/{{ gather_evidence.output.tasks_total }}
+        Deferred plan entries ([~]): {{ gather_evidence.output.deferred_count }}
+
+      COMMIT LOG:
+      {{ gather_evidence.output.commit_log }}
+
+      CHANGE ARTIFACTS:
+      {{ read_context.output.context }}
+
+      RETROSPECTIVE TEMPLATE (fill in every section):
+      {{ read_context.output.template }}
+
+      Write a complete retrospective following the template exactly.
+      Requirements:
+        - §0 Evidence: use the git evidence above to populate quantitative front-matter
+        - §1-§6: every claim must cite evidence from §0 (commit SHA, file path, test name)
+        - §4 Skill/workflow compliance: list all 7 skills from the superpowers-bridge schema
+          and mark each ✓ or ✗ with reason
+        - §6 Promote candidates: use - [ ] checkboxes with Why/How body format
+        - Be honest about what went wrong and what could improve
+        - Reference specific commits, files, and test names — not vague descriptions
+
+      Output the COMPLETE retrospective.md content as your "content" field.
+    output:
+      content:
+        type: string
+        description: Complete retrospective.md content
+    routes:
+      - to: save_retro
+
+  # ── Step 5 ──────────────────────────────────────────────────────────────────
+  - name: save_retro
+    type: script
+    description: Write retrospective.md to disk (overwrites existing)
+    command: python3
+    args:
+      - "-c"
+      - |
+        import pathlib, sys, json
+
+        change_dir = pathlib.Path(sys.argv[1])
+        content = sys.argv[2]
+
+        path = change_dir / "retrospective.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+
+        size = len(content)
+        print(f"Wrote {path} ({size:,} chars)", file=sys.stderr)
+        print(json.dumps({"path": str(path), "size": size}))
+      - "{{ pre_checks.output.changeDir }}"
+      - "{{ write_retro.output.content }}"
+    output:
+      path:
+        type: string
+      size:
+        type: number
+    routes:
+      - to: $end
+
+output:
+  written_path: "{% if save_retro is defined %}{{ save_retro.output.path | default('') }}{% endif %}"
+  commit_count: "{% if gather_evidence is defined %}{{ gather_evidence.output.commit_count | default(0) }}{% else %}0{% endif %}"

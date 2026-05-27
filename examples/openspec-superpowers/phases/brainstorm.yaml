@@ -1,0 +1,161 @@
+# OpenSpec Superpowers — Brainstorm Phase
+#
+# Runs the superpowers:brainstorming skill interactively.
+# The skill explores project context, asks clarifying questions, proposes
+# 2-3 design approaches with trade-offs, and writes the validated design to
+# brainstorm.md as a raw capture.
+#
+# Run standalone:
+#   conductor run examples/openspec-superpowers/phases/brainstorm.yaml \
+#     --input change="add-oauth-login" \
+#     --input idea="Add OAuth2 login with GitHub and Google providers"
+#
+# Steps:
+#   1. check_state     — determine if brainstorm.md already exists (idempotent)
+#   2. run_brainstorm  — LLM agent with skill_directories + interactive_input
+#                        so the superpowers:brainstorming skill can ask questions
+#   3. save_brainstorm — Python writes the captured output to brainstorm.md
+#
+# Idempotent: exits immediately if brainstorm.md already exists.
+
+workflow:
+  name: openspec-superpowers-brainstorm
+  description: Collaborative design exploration using the superpowers:brainstorming skill
+  version: "1.0.0"
+  entry_point: check_state
+
+  runtime:
+    provider: copilot
+    default_model: claude-sonnet-4.6
+    skill_directories:
+      - ../artifacts/skills    # resolved relative to this YAML file
+
+  input:
+    change:
+      type: string
+      required: true
+      description: Change name in kebab-case (e.g. "add-oauth-login")
+    idea:
+      type: string
+      required: false
+      description: |
+        One-sentence seed for the brainstorming session.
+        Optional — the brainstorming skill will ask for context if absent.
+
+  context:
+    mode: accumulate
+
+agents:
+  # ── Step 1 ──────────────────────────────────────────────────────────────────
+  - name: check_state
+    type: script
+    description: |
+      Check whether brainstorm.md already exists for this change.
+      Returns state="done" to skip if it does (idempotent guard).
+    command: python3
+    args:
+      - "-c"
+      - |
+        import json, pathlib
+
+        change = "{{ workflow.input.change }}"
+        change_dir = pathlib.Path("openspec") / "changes" / change
+        artifact_file = change_dir / "brainstorm.md"
+
+        state = "done" if artifact_file.exists() else "ready"
+        print(json.dumps({
+            "state": state,
+            "changeDir": str(change_dir.resolve()),
+            "outputPath": "brainstorm.md",
+        }))
+    output:
+      state:
+        type: string
+        description: '"ready" or "done"'
+      changeDir:
+        type: string
+        description: Absolute path to the change directory
+      outputPath:
+        type: string
+    routes:
+      - to: $end
+        when: "state == 'done'"
+      - to: run_brainstorm
+
+  # ── Step 2 ──────────────────────────────────────────────────────────────────
+  - name: run_brainstorm
+    model: claude-sonnet-4.6
+    interactive_input: true
+    description: |
+      Run the superpowers:brainstorming skill to collaboratively design the change.
+      interactive_input: true allows the skill's ask_user calls to reach the terminal
+      so the human can answer clarifying questions.
+    prompt: |
+      You are helping design the OpenSpec change "{{ workflow.input.change }}".
+
+      {% if workflow.input.idea %}
+      Initial idea / seed: {{ workflow.input.idea }}
+      {% endif %}
+
+      Use the superpowers:brainstorming skill to explore this change collaboratively.
+
+      IMPORTANT output redirection (from the superpowers-bridge schema):
+      - Do NOT write to docs/superpowers/specs/. Instead, capture the brainstorming
+        output directly in your response as the full brainstorm.md content.
+      - brainstorm.md is a RAW CAPTURE — write the brainstorming skill's full output
+        as-is, without forcing any template structure.
+      - Do NOT pre-fill design.md during this step. design.md is a separate artifact
+        that reorganizes brainstorm.md content into structured sections.
+
+      The brainstorming skill will:
+      1. Explore project context
+      2. Ask clarifying questions (one at a time)
+      3. Propose 2-3 approaches with trade-offs
+      4. Present design sections for approval
+      5. Output the validated design
+
+      Once the brainstorming session is complete and you have the user's approval,
+      output the COMPLETE brainstorm.md content as your "content" field. If the session
+      was interrupted or incomplete, still output whatever was captured.
+    output:
+      content:
+        type: string
+        description: Complete brainstorm.md content — raw capture of the brainstorming session
+    routes:
+      - to: save_brainstorm
+
+  # ── Step 3 ──────────────────────────────────────────────────────────────────
+  - name: save_brainstorm
+    type: script
+    description: Write brainstorm.md to the change directory
+    command: python3
+    args:
+      - "-c"
+      - |
+        import pathlib, sys, json
+
+        change_dir = pathlib.Path(sys.argv[1])
+        output_path = sys.argv[2]
+        content = sys.argv[3]
+
+        path = change_dir / output_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+
+        size = len(content)
+        print(f"Wrote {path} ({size:,} chars)", file=sys.stderr)
+        print(json.dumps({"path": str(path), "size": size}))
+      - "{{ check_state.output.changeDir }}"
+      - "{{ check_state.output.outputPath }}"
+      - "{{ run_brainstorm.output.content }}"
+    output:
+      path:
+        type: string
+      size:
+        type: number
+    routes:
+      - to: $end
+
+output:
+  change: "{{ workflow.input.change }}"
+  brainstorm_path: "{% if save_brainstorm is defined %}{{ save_brainstorm.output.path | default('') }}{% endif %}"

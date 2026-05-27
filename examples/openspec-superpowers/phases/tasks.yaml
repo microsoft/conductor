@@ -1,0 +1,223 @@
+# OpenSpec — Tasks Phase
+#
+# Generates tasks.md — the checkbox-based implementation task list.
+# Reads proposal + specs + design as context for the LLM.
+#
+# Run standalone:
+#   conductor run examples/openspec-superpowers/phases/tasks.yaml \
+#     --input change="add-oauth-login"
+#
+# Steps:
+#   1. get_instructions — read tasks template + instructions from bundled schema
+#   2. read_context     — concatenate proposal.md + specs + design.md
+#   3. write_tasks      — LLM generates tasks.md
+#   4. save_tasks       — Python writes the file via env var
+#
+# Idempotent: exits immediately if tasks.md already exists.
+
+workflow:
+  name: openspec-tasks-phase
+  description: Generate the implementation task list for an OpenSpec change
+  version: "1.0.0"
+  entry_point: get_instructions
+
+  runtime:
+    provider: copilot
+    default_model: claude-sonnet-4.6
+
+  input:
+    change:
+      type: string
+      required: true
+
+  context:
+    mode: accumulate
+
+agents:
+  # ── Step 1 ──────────────────────────────────────────────────────────────────
+  - name: get_instructions
+    type: script
+    description: Load task-list generation instructions from the bundled schema (no openspec CLI required)
+    command: python3
+    args:
+      - "-c"
+      - |
+        import json, pathlib, sys
+        from ruamel.yaml import YAML
+
+        yaml = YAML()
+        schema_dir = pathlib.Path("examples/openspec-superpowers/artifacts")
+        schema = yaml.load(schema_dir / "schema.yaml")
+
+        artifact_id = "tasks"
+        artifact = next((a for a in schema.get("artifacts", []) if a["id"] == artifact_id), None)
+        if not artifact:
+            print(f"ERROR: artifact '{artifact_id}' not found in schema", file=sys.stderr)
+            sys.exit(1)
+
+        template_file = schema_dir / "templates" / artifact["template"]
+        template = template_file.read_text() if template_file.exists() else ""
+
+        change = "{{ workflow.input.change }}"
+        change_dir = pathlib.Path("openspec") / "changes" / change
+        output_path = artifact["generates"]
+        artifact_file = change_dir / output_path
+        state = "done" if artifact_file.exists() else "ready"
+
+        config_context, config_rules = "", []
+        config_file = pathlib.Path("openspec/config.yaml")
+        if config_file.exists():
+            cfg = yaml.load(config_file) or {}
+            config_context = cfg.get("context", "") or ""
+            config_rules = (cfg.get("rules") or {}).get(artifact_id, []) or []
+
+        print(json.dumps({
+            "state": state,
+            "instruction": artifact.get("instruction", ""),
+            "template": template,
+            "outputPath": output_path,
+            "changeDir": str(change_dir.resolve()),
+            "context": config_context,
+            "rules": config_rules,
+        }))
+    output:
+      state:
+        type: string
+        description: '"ready" or "done"'
+      instruction:
+        type: string
+      template:
+        type: string
+      outputPath:
+        type: string
+      changeDir:
+        type: string
+      context:
+        type: string
+        description: Project background from openspec/config.yaml (constraint for AI, not artifact content)
+      rules:
+        type: array
+        description: Tasks-specific rules from openspec/config.yaml (constraints for AI, not artifact content)
+    routes:
+      - to: $end
+        when: "state == 'done'"
+      - to: read_context
+
+  # ── Step 2 ──────────────────────────────────────────────────────────────────
+  - name: read_context
+    type: script
+    description: |
+      Load all prior artifacts (proposal + specs + design) into a context string.
+      Tasks must trace back to specific specs and design decisions.
+    command: python3
+    args:
+      - "-c"
+      - |
+        import json, pathlib, sys
+
+        change = "{{ workflow.input.change }}"
+        base = pathlib.Path(f"openspec/changes/{change}")
+        sections = []
+
+        for fname in ["proposal.md", "design.md"]:
+            f = base / fname
+            if f.exists():
+                sections.append(f"## {fname}\n\n{f.read_text()}")
+
+        for spec in sorted((base / "specs").glob("*/spec.md")):
+            sections.append(f"## specs/{spec.parent.name}/spec.md\n\n{spec.read_text()}")
+
+        context = "\n\n---\n\n".join(sections) if sections else ""
+        print(json.dumps({"context": context, "artifact_count": len(sections)}))
+    output:
+      context:
+        type: string
+        description: Combined proposal + specs + design content
+      artifact_count:
+        type: number
+    routes:
+      - to: write_tasks
+
+  # ── Step 3 ──────────────────────────────────────────────────────────────────
+  - name: write_tasks
+    model: claude-sonnet-4.6
+    description: |
+      Generate the implementation task list.
+      Tasks must use the exact checkbox format the apply phase parses:
+        - [ ] 1.1 Task description
+        - [ ] 1.2 Another task
+      The numbering scheme (section.item) is critical — the apply workflow
+      uses task IDs to mark individual completions in tasks.md.
+    prompt: |
+      You are writing an OpenSpec tasks.md for the change "{{ workflow.input.change }}".
+
+      {% if get_instructions.output.context %}
+      PROJECT CONTEXT (background constraints — do NOT copy into tasks.md):
+      {{ get_instructions.output.context }}
+      {% endif %}
+      {% if get_instructions.output.rules %}
+      RULES (must follow — do NOT copy into tasks.md):
+      {% for rule in get_instructions.output.rules %}      - {{ rule }}
+      {% endfor %}{% endif %}
+      INSTRUCTIONS:
+      {{ get_instructions.output.instruction }}
+
+      TEMPLATE (follow this format exactly — task numbering is machine-parsed):
+      {{ get_instructions.output.template }}
+
+      CONTEXT (proposal + specs + design):
+      {{ read_context.output.context }}
+
+      Write a complete tasks.md that breaks the implementation into concrete,
+      deliverable tasks. Requirements:
+
+        - Use checkbox format: - [ ] N.M Task description
+        - Group tasks into numbered sections (## 1. Section Name)
+        - Each task should be completable in 1–4 hours
+        - Tasks must be in dependency order within each section
+        - Cover: data layer, business logic, API layer, tests, docs
+        - Reference requirement IDs from specs where applicable
+        - Do NOT include tasks that are already complete
+
+      Output only the tasks.md content — no preamble or commentary.
+    output:
+      content:
+        type: string
+        description: Complete tasks.md markdown content
+    routes:
+      - to: save_tasks
+
+  # ── Step 4 ──────────────────────────────────────────────────────────────────
+  - name: save_tasks
+    type: script
+    description: Write tasks.md to disk
+    command: python3
+    args:
+      - "-c"
+      - |
+        import pathlib, sys, json
+
+        change_dir = pathlib.Path(sys.argv[1])
+        output_path = sys.argv[2]
+        content = sys.argv[3]
+
+        path = change_dir / output_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+
+        size = len(content)
+        print(f"Wrote {path} ({size:,} chars)", file=sys.stderr)
+        print(json.dumps({"path": str(path), "size": size}))
+      - "{{ get_instructions.output.changeDir }}"
+      - "{{ get_instructions.output.outputPath }}"
+      - "{{ write_tasks.output.content }}"
+    output:
+      path:
+        type: string
+      size:
+        type: number
+    routes:
+      - to: $end
+
+output:
+  written_path: "{% if save_tasks is defined %}{{ save_tasks.output.path | default('') }}{% endif %}"

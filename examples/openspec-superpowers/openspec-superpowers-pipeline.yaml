@@ -1,0 +1,206 @@
+# OpenSpec Superpowers Pipeline
+#
+# Full superpowers-bridge lifecycle:
+#   brainstorm → propose → specs → design → tasks → plan → apply → verify → retrospective
+#
+# Differences from examples/openspec/openspec-pipeline.yaml:
+#   - brainstorm phase: interactive superpowers:brainstorming skill session
+#   - design phase: transforms brainstorm.md (not proposal+specs → design)
+#   - plan phase: interactive superpowers:writing-plans skill session
+#   - apply phase: implement-task uses subagent-driven-development (TDD + code-review)
+#   - verify phase: script pre-checks + openspec-verify-change skill (or manual)
+#   - retrospective phase: git log + evidence-first template
+#
+# Skills are bundled under artifacts/skills/ so no Superpowers plugin install
+# is required — conductor wires them via skill_directories at the phase level.
+# The brainstorm and plan phases use interactive_input: true so the skills can
+# ask clarifying questions during execution.
+#
+# Usage (start from scratch — interactive brainstorming session):
+#   conductor run examples/openspec-superpowers/openspec-superpowers-pipeline.yaml \
+#     --input change="add-oauth-login" \
+#     --input idea="Add OAuth2 login with GitHub and Google providers"
+#
+# Usage (resume after partial run):
+#   conductor resume examples/openspec-superpowers/openspec-superpowers-pipeline.yaml
+#
+# Usage (with real-time dashboard):
+#   conductor run examples/openspec-superpowers/openspec-superpowers-pipeline.yaml --web \
+#     --input change="add-oauth-login" --input idea="..."
+#
+# Usage (skip brainstorm — proposal already exists or you want to write it manually):
+#   conductor run examples/openspec-superpowers/openspec-superpowers-pipeline.yaml \
+#     --input change="add-oauth-login"
+#   (each phase skips if its artifact file already exists)
+#
+# Prerequisites:
+#   - A Copilot provider configured in conductor
+#   - No Superpowers plugin install required — skills are bundled in artifacts/skills/
+
+workflow:
+  name: openspec-superpowers-pipeline
+  description: |
+    Full superpowers-bridge lifecycle: brainstorm → propose → specs → design →
+    tasks → plan → apply → verify → retrospective.
+    Skills bundled under artifacts/skills/; interactive phases (brainstorm, plan)
+    use interactive_input for terminal Q&A with the skill.
+  version: "1.0.0"
+  entry_point: brainstorm_phase
+
+  runtime:
+    provider: copilot
+
+  input:
+    change:
+      type: string
+      required: true
+      description: |
+        Change name in kebab-case (e.g. "add-oauth-login").
+        Used as the openspec change directory name under openspec/changes/<change>/.
+    idea:
+      type: string
+      required: false
+      description: |
+        One-sentence seed for the brainstorming session.
+        Only needed when starting fresh (no brainstorm.md yet).
+        Example: "Add OAuth2 login with GitHub and Google providers"
+
+  limits:
+    max_iterations: 400   # generous limit: long interactive phases + many tasks
+
+agents:
+  # ── Stage 1 ─────────────────────────────────────────────────────────────────
+  - name: brainstorm_phase
+    type: workflow
+    description: |
+      Interactive brainstorming session using superpowers:brainstorming.
+      Explores context, asks one question at a time, proposes design approaches,
+      and captures the validated design to brainstorm.md.
+      Skips if brainstorm.md already exists.
+    workflow: ./phases/brainstorm.yaml
+    input_mapping:
+      change: "{{ workflow.input.change }}"
+      idea: "{{ workflow.input.idea | default('') }}"
+    routes:
+      - to: propose_phase
+
+  # ── Stage 2 ─────────────────────────────────────────────────────────────────
+  - name: propose_phase
+    type: workflow
+    description: |
+      Extract proposal.md from the brainstorm.md output.
+      Since brainstorming already explored the problem space, this is a
+      concise extraction into proposal format (not a new exploration).
+      Skips if proposal.md already exists.
+    workflow: ./phases/propose.yaml
+    input_mapping:
+      change: "{{ workflow.input.change }}"
+    routes:
+      - to: specs_phase
+
+  # ── Stage 3 ─────────────────────────────────────────────────────────────────
+  - name: specs_phase
+    type: workflow
+    description: |
+      Create one spec file per capability listed in the proposal.
+      Uses for_each internally so capabilities are generated concurrently (max 2).
+      Skips capabilities that already have spec files.
+    workflow: ./phases/specs.yaml
+    input_mapping:
+      change: "{{ workflow.input.change }}"
+    routes:
+      - to: design_phase
+
+  # ── Stage 4 ─────────────────────────────────────────────────────────────────
+  - name: design_phase
+    type: workflow
+    description: |
+      Transform brainstorm.md into a structured design.md.
+      Reorganizes the raw decision log (Q1-Qn) from brainstorm.md into
+      Context / Goals / Decisions / Risks / Migration sections.
+      Skips if design.md already exists.
+    workflow: ./phases/design.yaml
+    input_mapping:
+      change: "{{ workflow.input.change }}"
+    routes:
+      - to: tasks_phase
+
+  # ── Stage 5 ─────────────────────────────────────────────────────────────────
+  - name: tasks_phase
+    type: workflow
+    description: |
+      Create tasks.md — the checkbox-based implementation task list.
+      Reads specs + design.md for requirements and architecture context.
+      Skips if tasks.md already exists.
+    workflow: ./phases/tasks.yaml
+    input_mapping:
+      change: "{{ workflow.input.change }}"
+    routes:
+      - to: plan_phase
+
+  # ── Stage 6 ─────────────────────────────────────────────────────────────────
+  - name: plan_phase
+    type: workflow
+    description: |
+      Interactive micro-task planning using superpowers:writing-plans.
+      Decomposes tasks into 2-5 minute TDD micro-steps with file paths,
+      code snippets, test commands, and commit points.
+      Skips if plan.md already exists.
+    workflow: ./phases/plan.yaml
+    input_mapping:
+      change: "{{ workflow.input.change }}"
+    routes:
+      - to: apply_phase
+
+  # ── Stage 7 ─────────────────────────────────────────────────────────────────
+  - name: apply_phase
+    type: workflow
+    description: |
+      Implement all pending tasks in tasks.md.
+      Each task runs as an implement-task sub-workflow guided by the
+      subagent-driven-development implementer-prompt (TDD + code-review).
+      Sequential (one task at a time) to prevent file conflicts.
+      Already-completed tasks [x] are skipped.
+    workflow: ./phases/apply.yaml
+    input_mapping:
+      change: "{{ workflow.input.change }}"
+    routes:
+      - to: verify_phase
+
+  # ── Stage 8 ─────────────────────────────────────────────────────────────────
+  - name: verify_phase
+    type: workflow
+    description: |
+      Post-implementation verification producing verify.md.
+      Script pre-checks confirm implementation evidence (commits + tasks done),
+      then the LLM runs 7 structured checks using the openspec-verify-change
+      skill (or manual verification if skill unavailable).
+      verify.md is overwritten on each run.
+    workflow: ./phases/verify.yaml
+    input_mapping:
+      change: "{{ workflow.input.change }}"
+    routes:
+      - to: retrospective_phase
+
+  # ── Stage 9 ─────────────────────────────────────────────────────────────────
+  - name: retrospective_phase
+    type: workflow
+    description: |
+      Evidence-first retrospective producing retrospective.md.
+      Gathers git log + diff stats + task completion metrics, then the LLM
+      writes a structured retrospective using the superpowers-bridge template
+      (§0 Evidence → §1 Wins → §2 Misses → §3 Deviations → §4 Compliance →
+       §5 Surprises → §6 Promote candidates).
+      retrospective.md is overwritten on each run.
+    workflow: ./phases/retrospective.yaml
+    input_mapping:
+      change: "{{ workflow.input.change }}"
+    routes:
+      - to: $end
+
+output:
+  change: "{{ workflow.input.change }}"
+  summary: |
+    OpenSpec Superpowers pipeline complete for '{{ workflow.input.change }}'.
+    Artifacts: brainstorm → proposal → specs → design → tasks → plan → verify → retrospective
+    Run: openspec status --change {{ workflow.input.change }}

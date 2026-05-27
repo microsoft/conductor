@@ -1,0 +1,186 @@
+# OpenSpec Superpowers — Plan Phase
+#
+# Generates plan.md using the superpowers:writing-plans skill.
+# The skill decomposes tasks.md into 2-5 minute micro-steps (TDD style),
+# adding exact file paths, code snippets, test commands, and commit points.
+#
+# Run standalone:
+#   conductor run examples/openspec-superpowers/phases/plan.yaml \
+#     --input change="add-oauth-login"
+#
+# Steps:
+#   1. check_state    — determine if plan.md already exists (idempotent)
+#   2. read_context   — load tasks.md + design.md for the skill
+#   3. run_plan       — LLM agent with skill_directories + interactive_input
+#                       invokes superpowers:writing-plans
+#   4. save_plan      — Python writes plan.md to disk
+#
+# Idempotent: exits immediately if plan.md already exists.
+
+workflow:
+  name: openspec-superpowers-plan
+  description: Generate micro-task plan.md using the superpowers:writing-plans skill
+  version: "1.0.0"
+  entry_point: check_state
+
+  runtime:
+    provider: copilot
+    default_model: claude-sonnet-4.6
+    skill_directories:
+      - ../artifacts/skills    # resolved relative to this YAML file
+
+  input:
+    change:
+      type: string
+      required: true
+      description: Change name in kebab-case
+
+  context:
+    mode: accumulate
+
+agents:
+  # ── Step 1 ──────────────────────────────────────────────────────────────────
+  - name: check_state
+    type: script
+    description: Check if plan.md already exists (idempotency guard)
+    command: python3
+    args:
+      - "-c"
+      - |
+        import json, pathlib
+
+        change = "{{ workflow.input.change }}"
+        change_dir = pathlib.Path("openspec") / "changes" / change
+        artifact_file = change_dir / "plan.md"
+
+        state = "done" if artifact_file.exists() else "ready"
+        print(json.dumps({
+            "state": state,
+            "changeDir": str(change_dir.resolve()),
+            "outputPath": "plan.md",
+        }))
+    output:
+      state:
+        type: string
+        description: '"ready" or "done"'
+      changeDir:
+        type: string
+      outputPath:
+        type: string
+    routes:
+      - to: $end
+        when: "state == 'done'"
+      - to: read_context
+
+  # ── Step 2 ──────────────────────────────────────────────────────────────────
+  - name: read_context
+    type: script
+    description: |
+      Load tasks.md and design.md to provide context for the writing-plans skill.
+      The skill decomposes tasks into micro-steps using these as input.
+    command: python3
+    args:
+      - "-c"
+      - |
+        import json, pathlib, sys
+
+        change = "{{ workflow.input.change }}"
+        base = pathlib.Path(f"openspec/changes/{change}")
+        sections = []
+
+        for fname in ["tasks.md", "design.md"]:
+            f = base / fname
+            if f.exists():
+                sections.append(f"## {fname}\n\n{f.read_text()}")
+            else:
+                print(f"WARNING: {fname} not found", file=sys.stderr)
+
+        # Also include specs for additional context
+        for spec in sorted((base / "specs").glob("*/spec.md")):
+            sections.append(f"## specs/{spec.parent.name}/spec.md\n\n{spec.read_text()}")
+
+        context = "\n\n---\n\n".join(sections) if sections else ""
+        print(json.dumps({
+            "context": context,
+            "tasks_found": (base / "tasks.md").exists(),
+            "artifact_count": len(sections),
+        }))
+    output:
+      context:
+        type: string
+        description: tasks.md + design.md + specs content
+      tasks_found:
+        type: boolean
+      artifact_count:
+        type: number
+    routes:
+      - to: run_plan
+
+  # ── Step 3 ──────────────────────────────────────────────────────────────────
+  - name: run_plan
+    model: claude-sonnet-4.6
+    interactive_input: true
+    description: |
+      Invoke the superpowers:writing-plans skill to decompose tasks into
+      micro-steps. interactive_input: true allows the skill to ask questions.
+    prompt: |
+      You are creating an implementation plan for the OpenSpec change "{{ workflow.input.change }}".
+
+      Use the superpowers:writing-plans skill to decompose the tasks into micro-steps.
+
+      Context artifacts from this change:
+      {{ read_context.output.context }}
+
+      IMPORTANT output redirection (from the superpowers-bridge schema):
+      - Do NOT write to docs/superpowers/plans/. Instead, capture the plan output
+        directly as your "content" field for this workflow to write to plan.md.
+
+      The writing-plans skill will:
+      1. Read the tasks.md and design.md above as context
+      2. Break each task into 2-5 minute micro-steps (TDD style)
+      3. Include exact file paths, code snippets, test commands
+      4. Add commit points after each task
+
+      Once the writing-plans session is complete, output the COMPLETE plan.md
+      content as your "content" field. Include everything the skill produced.
+    output:
+      content:
+        type: string
+        description: Complete plan.md content from the writing-plans skill
+    routes:
+      - to: save_plan
+
+  # ── Step 4 ──────────────────────────────────────────────────────────────────
+  - name: save_plan
+    type: script
+    description: Write plan.md to the change directory
+    command: python3
+    args:
+      - "-c"
+      - |
+        import pathlib, sys, json
+
+        change_dir = pathlib.Path(sys.argv[1])
+        output_path = sys.argv[2]
+        content = sys.argv[3]
+
+        path = change_dir / output_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+
+        size = len(content)
+        print(f"Wrote {path} ({size:,} chars)", file=sys.stderr)
+        print(json.dumps({"path": str(path), "size": size}))
+      - "{{ check_state.output.changeDir }}"
+      - "{{ check_state.output.outputPath }}"
+      - "{{ run_plan.output.content }}"
+    output:
+      path:
+        type: string
+      size:
+        type: number
+    routes:
+      - to: $end
+
+output:
+  written_path: "{% if save_plan is defined %}{{ save_plan.output.path | default('') }}{% endif %}"

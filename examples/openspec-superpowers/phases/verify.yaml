@@ -1,0 +1,244 @@
+# OpenSpec Superpowers — Verify Phase
+#
+# Post-implementation verification against specs, design, and tasks.
+# Runs structural pre-checks as scripts, then an LLM agent produces verify.md
+# using the openspec-verify-change skill (if available) or manual checks.
+#
+# Run standalone:
+#   conductor run examples/openspec-superpowers/phases/verify.yaml \
+#     --input change="add-oauth-login"
+#
+# Steps:
+#   1. pre_checks    — script: git log commit count + task completions count
+#                      (blocks verify if neither shows implementation evidence)
+#   2. read_context  — load all artifacts + verify template for the agent
+#   3. run_verify    — LLM agent produces verify.md content
+#   4. save_verify   — Python writes verify.md to disk
+#
+# Idempotent: each run OVERWRITES verify.md (verify may be re-run multiple times).
+
+workflow:
+  name: openspec-superpowers-verify
+  description: Post-implementation verification — produces verify.md
+  version: "1.0.0"
+  entry_point: pre_checks
+
+  runtime:
+    provider: copilot
+    default_model: claude-sonnet-4.6
+    skill_directories:
+      - ../artifacts/skills    # for openspec-verify-change skill if installed
+
+  input:
+    change:
+      type: string
+      required: true
+      description: Change name in kebab-case
+
+  context:
+    mode: accumulate
+
+agents:
+  # ── Step 1 ──────────────────────────────────────────────────────────────────
+  - name: pre_checks
+    type: script
+    description: |
+      Evidence pre-checks before running verify:
+        - commit_count:  git commits ahead of main/master (must be > 0)
+        - tasks_done:    number of [x] checked tasks in tasks.md (must be > 0)
+      If both are 0, state="blocked" and verify is skipped with a clear message.
+    command: python3
+    args:
+      - "-c"
+      - |
+        import json, pathlib, re, subprocess, sys
+
+        change = "{{ workflow.input.change }}"
+        change_dir = pathlib.Path("openspec") / "changes" / change
+
+        # ── Commit count ────────────────────────────────────────────────────
+        commit_count = 0
+        try:
+            # Find merge-base with main or master
+            for base_branch in ("origin/main", "origin/master", "main", "master"):
+                r = subprocess.run(
+                    ["git", "merge-base", "HEAD", base_branch],
+                    capture_output=True, text=True
+                )
+                if r.returncode == 0:
+                    merge_base = r.stdout.strip()
+                    log_r = subprocess.run(
+                        ["git", "log", "--oneline", f"{merge_base}..HEAD"],
+                        capture_output=True, text=True
+                    )
+                    commit_count = len([l for l in log_r.stdout.splitlines() if l.strip()])
+                    break
+        except Exception as e:
+            print(f"WARNING: git commit count failed: {e}", file=sys.stderr)
+
+        # ── Tasks done count ────────────────────────────────────────────────
+        tasks_done = 0
+        tasks_path = change_dir / "tasks.md"
+        if tasks_path.exists():
+            for line in tasks_path.read_text().split("\n"):
+                if re.match(r"- \[x\]", line):
+                    tasks_done += 1
+
+        # ── State decision ──────────────────────────────────────────────────
+        state = "ready" if (commit_count > 0 or tasks_done > 0) else "blocked"
+        message = ""
+        if state == "blocked":
+            message = (
+                "No implementation evidence found: "
+                f"commit_count={commit_count}, tasks_done={tasks_done}. "
+                "Run the apply phase first."
+            )
+            print(f"BLOCKED: {message}", file=sys.stderr)
+
+        print(json.dumps({
+            "state": state,
+            "commit_count": commit_count,
+            "tasks_done": tasks_done,
+            "changeDir": str(change_dir.resolve()),
+            "message": message,
+        }))
+    output:
+      state:
+        type: string
+        description: '"ready" or "blocked"'
+      commit_count:
+        type: number
+      tasks_done:
+        type: number
+      changeDir:
+        type: string
+      message:
+        type: string
+    routes:
+      - to: $end
+        when: "state == 'blocked'"
+      - to: read_context
+
+  # ── Step 2 ──────────────────────────────────────────────────────────────────
+  - name: read_context
+    type: script
+    description: |
+      Load all change artifacts and the verify.md template for the LLM agent.
+    command: python3
+    args:
+      - "-c"
+      - |
+        import json, pathlib, sys
+
+        change = "{{ workflow.input.change }}"
+        base = pathlib.Path(f"openspec/changes/{change}")
+        sections = []
+
+        for fname in ["brainstorm.md", "proposal.md", "design.md", "tasks.md", "plan.md"]:
+            f = base / fname
+            if f.exists():
+                sections.append(f"## {fname}\n\n{f.read_text()}")
+
+        for spec in sorted((base / "specs").glob("*/spec.md")):
+            sections.append(f"## specs/{spec.parent.name}/spec.md\n\n{spec.read_text()}")
+
+        context = "\n\n---\n\n".join(sections) if sections else "(no artifacts found)"
+
+        # Load verify template
+        template_file = pathlib.Path(
+            "examples/openspec-superpowers/artifacts/templates/verify.md"
+        )
+        template = template_file.read_text() if template_file.exists() else ""
+
+        print(json.dumps({
+            "context": context,
+            "template": template,
+            "artifact_count": len(sections),
+        }))
+    output:
+      context:
+        type: string
+      template:
+        type: string
+      artifact_count:
+        type: number
+    routes:
+      - to: run_verify
+
+  # ── Step 3 ──────────────────────────────────────────────────────────────────
+  - name: run_verify
+    model: claude-sonnet-4.6
+    description: |
+      Produce verify.md by running all verification checks.
+      Uses the openspec-verify-change skill if available, otherwise runs
+      the numbered checks manually.
+    prompt: |
+      You are verifying the OpenSpec change "{{ workflow.input.change }}" post-implementation.
+
+      IMPLEMENTATION EVIDENCE:
+        - Commits ahead of main: {{ pre_checks.output.commit_count }}
+        - Tasks marked [x] in tasks.md: {{ pre_checks.output.tasks_done }}
+
+      CHANGE ARTIFACTS:
+      {{ read_context.output.context }}
+
+      VERIFY TEMPLATE (fill in every section):
+      {{ read_context.output.template }}
+
+      If the `openspec-verify-change` skill (or `/opsx:verify` slash command) is
+      available in your skills list, use it now to perform the verification and
+      write the results to verify.md.
+
+      Otherwise, perform each numbered check manually:
+        1. Structural validation: run `openspec validate --all --json` (or note N/A)
+        2. Task completion: check every checkbox in tasks.md
+        3. Delta spec sync state: compare specs/ folders with openspec/specs/
+        4. Design/specs coherence: spot-check decisions vs requirements
+        5. Implementation signal: check for unstaged files, cite commit range
+        6. Front-door routing leak: run `ls docs/superpowers/specs/*.md 2>/dev/null`
+        7. Deferred dogfood equivalence: check plan.md for [~] items
+
+      Fill in the verify.md template completely. Set the Overall Decision
+      (PASS / PASS WITH WARNINGS / FAIL) based on your findings.
+      Output the COMPLETE verify.md content as your "content" field.
+    output:
+      content:
+        type: string
+        description: Complete verify.md content
+    routes:
+      - to: save_verify
+
+  # ── Step 4 ──────────────────────────────────────────────────────────────────
+  - name: save_verify
+    type: script
+    description: Write verify.md to disk (overwrites if it already exists)
+    command: python3
+    args:
+      - "-c"
+      - |
+        import pathlib, sys, json
+
+        change_dir = pathlib.Path(sys.argv[1])
+        content = sys.argv[2]
+
+        path = change_dir / "verify.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+
+        size = len(content)
+        print(f"Wrote {path} ({size:,} chars)", file=sys.stderr)
+        print(json.dumps({"path": str(path), "size": size}))
+      - "{{ pre_checks.output.changeDir }}"
+      - "{{ run_verify.output.content }}"
+    output:
+      path:
+        type: string
+      size:
+        type: number
+    routes:
+      - to: $end
+
+output:
+  written_path: "{% if save_verify is defined %}{{ save_verify.output.path | default('') }}{% endif %}"
+  commit_count: "{{ pre_checks.output.commit_count | default(0) }}"
+  tasks_done: "{{ pre_checks.output.tasks_done | default(0) }}"
