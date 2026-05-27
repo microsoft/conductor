@@ -65,7 +65,6 @@ class TestCopilotOutputModeRaw:
 
         # Capture the prompt sent to _send_and_wait
         captured_prompts: list[str] = []
-        original_send = provider._send_and_wait
 
         async def capturing_send(session: Any, prompt: str, *args: Any, **kwargs: Any) -> Any:
             captured_prompts.append(prompt)
