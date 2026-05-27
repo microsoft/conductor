@@ -407,6 +407,18 @@ class RetryPolicy(BaseModel):
     they indicate prompt/schema issues, not transience.
     """
 
+    max_parse_recovery_attempts: int | None = Field(default=None, ge=0, le=10)
+    """Maximum in-session parse-recovery attempts before giving up.
+
+    When an agent's response fails JSON extraction, Conductor sends a correction
+    prompt in the same session. This field controls how many correction prompts
+    to send.
+
+    - ``None`` (default): Use the provider default (Copilot=5, Claude=2).
+    - ``0``: Disable parse recovery entirely (fail immediately on bad JSON).
+    - ``1-10``: Custom limit.
+    """
+
 
 class DialogConfig(BaseModel):
     """Configuration for agent dialog mode.

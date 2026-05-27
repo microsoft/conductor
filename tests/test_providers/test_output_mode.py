@@ -36,9 +36,7 @@ class TestCopilotOutputModeRaw:
     @pytest.mark.asyncio
     async def test_raw_agent_wraps_response_as_result(self) -> None:
         """output_mode=raw agent produces {"result": ...} output."""
-        provider = CopilotProvider(
-            mock_handler=_make_copilot_handler({"result": "some raw text"})
-        )
+        provider = CopilotProvider(mock_handler=_make_copilot_handler({"result": "some raw text"}))
         agent = AgentDef(name="a", prompt="p", model="gpt-4", output_mode="raw")
         result = await provider.execute(agent=agent, context={}, rendered_prompt="p")
         assert result.content == {"result": "some raw text"}
@@ -86,9 +84,7 @@ class TestCopilotOutputModeRaw:
     @pytest.mark.asyncio
     async def test_envelope_with_output_is_backward_compatible(self) -> None:
         """output_mode=envelope with output: schema behaves like the default."""
-        provider = CopilotProvider(
-            mock_handler=_make_copilot_handler({"field": "value"})
-        )
+        provider = CopilotProvider(mock_handler=_make_copilot_handler({"field": "value"}))
         agent = AgentDef(
             name="a",
             prompt="p",
@@ -168,6 +164,7 @@ class TestCopilotParseExhaustionNotRetryable:
             tools: Any = None,
             interrupt_signal: Any = None,
             event_callback: Any = None,
+            retry_config: Any = None,
         ) -> Any:
             nonlocal call_count
             call_count += 1
@@ -295,9 +292,7 @@ class TestClaudeParseExhaustionNotRetryable:
         mock_anthropic_module.__version__ = "0.77.0"
 
         # Every response is text-only (no emit_output tool use) → triggers recovery
-        bad_response = _create_response(
-            [_create_text_block("I cannot format this as JSON")]
-        )
+        bad_response = _create_response([_create_text_block("I cannot format this as JSON")])
         mock_client = Mock()
         mock_client.messages = Mock()
         mock_client.messages.create = AsyncMock(return_value=bad_response)
@@ -332,9 +327,7 @@ class TestClaudeParseExhaustionNotRetryable:
         """Verify parse-exhaustion does not trigger outer retry in Claude."""
         mock_anthropic_module.__version__ = "0.77.0"
 
-        bad_response = _create_response(
-            [_create_text_block("I cannot format this as JSON")]
-        )
+        bad_response = _create_response([_create_text_block("I cannot format this as JSON")])
         mock_client = Mock()
         mock_client.messages = Mock()
         mock_client.messages.create = AsyncMock(return_value=bad_response)

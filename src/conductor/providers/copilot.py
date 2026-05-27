@@ -457,7 +457,11 @@ class CopilotProvider(AgentProvider):
             jitter=self._retry_config.jitter,
             backoff=retry.backoff,
             retry_on=list(retry.retry_on),
-            max_parse_recovery_attempts=self._retry_config.max_parse_recovery_attempts,
+            max_parse_recovery_attempts=(
+                retry.max_parse_recovery_attempts
+                if retry.max_parse_recovery_attempts is not None
+                else self._retry_config.max_parse_recovery_attempts
+            ),
         )
 
     async def _execute_with_retry(
@@ -500,6 +504,7 @@ class CopilotProvider(AgentProvider):
                     tools,
                     interrupt_signal=interrupt_signal,
                     event_callback=event_callback,
+                    retry_config=config,
                 )
                 # Extract usage data from SDK response if available
                 input_tokens = sdk_response.input_tokens if sdk_response else None
@@ -637,6 +642,7 @@ class CopilotProvider(AgentProvider):
         tools: list[str] | None = None,
         interrupt_signal: asyncio.Event | None = None,
         event_callback: EventCallback | None = None,
+        retry_config: RetryConfig | None = None,
     ) -> tuple[dict[str, Any], SDKResponse | None]:
         """Execute the actual SDK call or mock handler.
 
@@ -647,6 +653,7 @@ class CopilotProvider(AgentProvider):
             tools: List of tool names available to this agent.
             interrupt_signal: Optional event for mid-agent interrupt signaling.
             event_callback: Optional callback for streaming SDK events upstream.
+            retry_config: Resolved per-agent retry config (used for parse recovery limit).
 
         Returns:
             Tuple of (content dict, SDKResponse with usage data or None for mock).
@@ -839,7 +846,7 @@ class CopilotProvider(AgentProvider):
                     return {"result": response_content}, final_usage
 
                 # Try to parse the response as JSON with recovery loop
-                max_recovery = self._retry_config.max_parse_recovery_attempts
+                max_recovery = (retry_config or self._retry_config).max_parse_recovery_attempts
                 last_parse_error: str | None = None
 
                 for recovery_attempt in range(max_recovery + 1):  # +1 for initial attempt

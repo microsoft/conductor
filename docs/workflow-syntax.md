@@ -112,10 +112,58 @@ agents:
                                     # script, human_gate, workflow).
                                     # See docs/configuration.md#reasoning-effort.
 
+    retry:                          # Optional: per-agent retry policy
+      max_attempts: 3               # 1-10 (default 1 = no retry)
+      backoff: exponential          # exponential | fixed
+      delay_seconds: 2              # base delay before first retry
+      retry_on:                     # error categories that trigger retry
+        - provider_error
+        - timeout
+      max_parse_recovery_attempts: 3  # 0-10; omit for provider default
+
     routes:                         # Optional: Routing logic
       - to: next_agent              # Agent name or $end
         when: "{{ condition }}"     # Optional: Route condition
 ```
+
+### Retry Policy
+
+Per-agent retry controls how an agent retries on transient failures. The `retry:` block is optional; when omitted the agent makes a single attempt with no retries.
+
+```yaml
+agents:
+  - name: analyzer
+    prompt: "Analyze the input"
+    output:
+      summary:
+        type: string
+    retry:
+      max_attempts: 3
+      backoff: exponential
+      delay_seconds: 2
+      retry_on:
+        - provider_error
+        - timeout
+      max_parse_recovery_attempts: 0   # disable parse recovery for this agent
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `max_attempts` | `1-10` | `1` | Total attempts including the first. `1` = no retry. |
+| `backoff` | `exponential \| fixed` | `exponential` | Backoff strategy between retries. |
+| `delay_seconds` | `0.0-300.0` | `2.0` | Base delay in seconds before the first retry. |
+| `retry_on` | list | `[provider_error, timeout]` | Error categories that trigger a retry. |
+| `max_parse_recovery_attempts` | `0-10` | Provider default | In-session parse-recovery attempts before giving up. See below. |
+
+#### `max_parse_recovery_attempts`
+
+When an agent declares `output:` (structured JSON), the provider tries to parse JSON from the model's response. If parsing fails, a correction prompt is sent in the same session asking the model to fix its response format. This field controls how many correction prompts to send.
+
+- **Omit** (default): Use the provider default (Copilot=5, Claude=2).
+- **`0`**: Disable parse recovery entirely — fail immediately on bad JSON.
+- **`1-10`**: Custom limit.
+
+This is useful when you know an agent's output is simple and a single attempt should suffice, or when you want to fail fast instead of burning tokens on recovery loops.
 
 ### Choosing whether to declare `output:`
 

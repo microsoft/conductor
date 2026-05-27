@@ -1399,6 +1399,45 @@ class TestRuntimeConfigDefaultReasoningEffort:
             RuntimeConfig(default_reasoning_effort=effort)  # type: ignore[arg-type]
 
 
+class TestRetryPolicyMaxParseRecoveryAttempts:
+    """Tests for RetryPolicy.max_parse_recovery_attempts field."""
+
+    def test_max_parse_recovery_zero_valid(self) -> None:
+        """max_parse_recovery_attempts: 0 disables parse recovery."""
+        from conductor.config.schema import RetryPolicy
+
+        policy = RetryPolicy(max_parse_recovery_attempts=0)
+        assert policy.max_parse_recovery_attempts == 0
+
+    def test_max_parse_recovery_ten_valid(self) -> None:
+        """max_parse_recovery_attempts: 10 is the upper bound."""
+        from conductor.config.schema import RetryPolicy
+
+        policy = RetryPolicy(max_parse_recovery_attempts=10)
+        assert policy.max_parse_recovery_attempts == 10
+
+    def test_max_parse_recovery_negative_rejected(self) -> None:
+        """max_parse_recovery_attempts: -1 is rejected."""
+        from conductor.config.schema import RetryPolicy
+
+        with pytest.raises(ValidationError):
+            RetryPolicy(max_parse_recovery_attempts=-1)
+
+    def test_max_parse_recovery_eleven_rejected(self) -> None:
+        """max_parse_recovery_attempts: 11 exceeds the upper bound."""
+        from conductor.config.schema import RetryPolicy
+
+        with pytest.raises(ValidationError):
+            RetryPolicy(max_parse_recovery_attempts=11)
+
+    def test_max_parse_recovery_omitted_defaults_to_none(self) -> None:
+        """Omitting max_parse_recovery_attempts defaults to None (provider default)."""
+        from conductor.config.schema import RetryPolicy
+
+        policy = RetryPolicy()
+        assert policy.max_parse_recovery_attempts is None
+
+
 class TestExtraFieldsForbidden:
     """Tests that workflow models reject unknown fields.
 
