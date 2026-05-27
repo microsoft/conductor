@@ -678,7 +678,8 @@ class CopilotProvider(AgentProvider):
 
         # Build schema description for output schema (used in prompt and recovery)
         schema_for_prompt: dict[str, Any] | None = None
-        if agent.output:
+        has_schema = agent.output and agent.output_mode != "raw"
+        if has_schema:
             schema_for_prompt = self._build_prompt_schema(agent.output)
             schema_desc = json.dumps(schema_for_prompt, indent=2)
             full_prompt += (
@@ -826,8 +827,8 @@ class CopilotProvider(AgentProvider):
                 cache_read_tokens = sdk_response.cache_read_tokens
                 cache_write_tokens = sdk_response.cache_write_tokens
 
-                # If no output schema, we're done
-                if not agent.output:
+                # If no output schema (or output_mode is raw), we're done
+                if not has_schema:
                     final_usage = SDKResponse(
                         content=response_content,
                         input_tokens=total_input_tokens,
@@ -901,9 +902,11 @@ class CopilotProvider(AgentProvider):
                     f"Failed to parse structured output from agent response: {last_parse_error}",
                     suggestion=(
                         f"Agent was expected to return JSON with fields: {expected_fields}. "
-                        f"Response started with: {response_content[:200]}..."
+                        f"Response started with: {response_content[:500]}... "
+                        "Tip: if this agent produces large or free-form output, "
+                        "add 'output_mode: raw' to skip JSON extraction."
                     ),
-                    is_retryable=True,
+                    is_retryable=False,
                 )
 
             finally:
@@ -1287,7 +1290,7 @@ class CopilotProvider(AgentProvider):
             except json.JSONDecodeError:
                 pass
 
-        raise ValueError(f"Could not extract JSON from response: {content[:200]}...")
+        raise ValueError(f"Could not extract JSON from response: {content[:500]}...")
 
     def _build_parse_recovery_prompt(
         self,

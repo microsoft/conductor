@@ -918,8 +918,11 @@ class ClaudeProvider(AgentProvider):
         # Build tools list: emit_output (for structured output) + MCP tools
         all_tools: list[dict[str, Any]] = []
 
-        # Add emit_output tool if agent has output schema
-        if agent.output is not None:
+        # Effective schema check: skip structured output when output_mode is raw
+        has_schema = agent.output is not None and agent.output_mode != "raw"
+
+        # Add emit_output tool if agent has effective output schema
+        if has_schema:
             all_tools.extend(self._build_tools_for_structured_output(agent.output))
             # Append instruction to use the tool
             messages[-1]["content"] += (
@@ -937,8 +940,8 @@ class ClaudeProvider(AgentProvider):
         # Use tools if any are defined
         request_tools: list[dict[str, Any]] | None = all_tools if all_tools else None
 
-        # Track if agent has output schema
-        has_output_schema = agent.output is not None
+        # Track if agent has effective output schema
+        has_output_schema = has_schema
 
         for attempt in range(1, config.max_attempts + 1):
             try:
@@ -949,7 +952,7 @@ class ClaudeProvider(AgentProvider):
                     temperature=temperature,
                     max_tokens=max_tokens,
                     tools=request_tools,
-                    output_schema=agent.output,
+                    output_schema=agent.output if has_schema else None,
                     has_output_schema=has_output_schema,
                     max_iterations=max_agent_iterations,
                     max_session_seconds=max_session_seconds,
@@ -979,10 +982,12 @@ class ClaudeProvider(AgentProvider):
                     )
 
                 # Extract structured output
-                content = self._extract_output(response, agent.output)
+                content = self._extract_output(
+                    response, agent.output if has_schema else None
+                )
 
                 # Validate output if schema is defined
-                if agent.output:
+                if has_schema:
                     validate_output(content, agent.output)
 
                 # Use total_tokens from the agentic loop (includes all turns)
@@ -1870,13 +1875,21 @@ class ClaudeProvider(AgentProvider):
             f"Parse recovery exhausted after {self._max_parse_recovery_attempts} attempts. "
             f"History: {'; '.join(recovery_history)}"
         )
+        # Note: is_retryable=False is set for correctness and documentation
+        # clarity. In practice, Claude's _is_retryable_error() already
+        # returns False for ProviderError (not an Anthropic SDK type), so
+        # the outer retry loop won't retry regardless. The attribute
+        # ensures consistent behavior if the retry dispatch ever changes.
         raise ProviderError(
             f"Failed to extract valid JSON after {self._max_parse_recovery_attempts} "
             "recovery attempts",
             suggestion=(
                 "Claude did not use the emit_output tool and returned invalid JSON. "
-                f"Recovery history: {'; '.join(recovery_history)}"
+                f"Recovery history: {'; '.join(recovery_history)}. "
+                "Tip: if this agent produces large or free-form output, "
+                "add 'output_mode: raw' to skip JSON extraction."
             ),
+            is_retryable=False,
         )
 
     def _diagnose_json_failure(self, text: str) -> str:
