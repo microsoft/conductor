@@ -1,31 +1,38 @@
-# Superpowers Brainstorming Skill Demo
+# skill_directories Feature Demo
 #
-# This example demonstrates the skill_directories feature, which passes a
-# local skills folder to every Copilot session so the model can invoke
-# skills as tools.  Here we load the superpowers brainstorming skill and
-# ask a single agent to run a brainstorm for a given idea.
+# Demonstrates the skill_directories runtime option, which points conductor
+# at a local folder of SKILL.md files so the Copilot session can invoke
+# them as tools via the `skill` tool.
+#
+# This example loads the bundled superpowers brainstorming skill and runs
+# an interactive design session for a given idea.
+# interactive_input: true wires the skill's ask_user calls to the terminal so
+# the user can answer clarifying questions during the conductor run.
 #
 # Requirements:
 #   - provider: copilot  (skill_directories is Copilot-only)
-#   - The superpowers/ skills folder checked out alongside this repo
 #
 # Usage:
-#   conductor run examples/skills-brainstorm.yaml \
+#   conductor run examples/openspec-superpowers/skill-directories-demo.yaml \
 #     --input idea="a CLI tool that summarises git history using an LLM"
 
 workflow:
-  name: skills-brainstorm
-  description: Run a superpowers brainstorm for an idea using the local skills folder
+  name: skill-directories-demo
+  description: |  
+    Demonstrates skill_directories: loads the bundled brainstorming skill and
+    runs an interactive design session. interactive_input: true lets the skill's
+    ask_user calls reach the terminal for real-time Q&A.
   version: "1.0.0"
   entry_point: brainstormer
 
   runtime:
     provider: copilot
     # Paths are resolved relative to this YAML file.
-    # ../superpowers/skills contains sub-directories (brainstorming/, etc.)
-    # each with a SKILL.md that the Copilot CLI registers as a skill tool.
+    # ./artifacts/skills contains the bundled skills from superpowers/skills/
+    # (brainstorming/, writing-plans/, etc.) each with a SKILL.md registered
+    # as a skill tool by the Copilot CLI.
     skill_directories:
-      - ../superpowers/skills
+      - ./artifacts/skills
 
   input:
     idea:
