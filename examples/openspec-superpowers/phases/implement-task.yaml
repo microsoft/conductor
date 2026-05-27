@@ -74,19 +74,20 @@ agents:
 
         context = "\n\n---\n\n".join(sections) if sections else "(no artifacts found)"
 
-        # Load implementer-prompt instructions from the bundled skill
-        implementer_prompt = ""
-        prompt_file = pathlib.Path(
-            "examples/openspec-superpowers/artifacts/skills/"
-            "subagent-driven-development/implementer-prompt.md"
-        )
-        if prompt_file.exists():
-            implementer_prompt = prompt_file.read_text()
+        # Load apply instruction from bundled schema (replaces reading implementer-prompt.md as text)
+        apply_instruction = ""
+        try:
+            from ruamel.yaml import YAML as _YAML
+            _yaml = _YAML()
+            _schema = _yaml.load(pathlib.Path("examples/openspec-superpowers/artifacts/schema.yaml"))
+            apply_instruction = (_schema.get("apply") or {}).get("instruction", "") or ""
+        except Exception as e:
+            print(f"WARNING: could not load schema apply instruction: {e}", file=sys.stderr)
 
         print(json.dumps({
             "context": context,
             "artifact_count": len(sections),
-            "implementer_prompt": implementer_prompt,
+            "apply_instruction": apply_instruction,
         }))
     output:
       context:
@@ -94,9 +95,9 @@ agents:
         description: All OpenSpec artifact content concatenated
       artifact_count:
         type: number
-      implementer_prompt:
+      apply_instruction:
         type: string
-        description: implementer-prompt.md instructions from subagent-driven-development skill
+        description: Apply instruction from the superpowers-bridge schema (includes subagent-driven-development directive)
     routes:
       - to: implement
 
@@ -106,32 +107,30 @@ agents:
     reasoning:
       effort: medium
     description: |
-      Implement the task guided by the subagent-driven-development implementer prompt.
-      The skill_directories bring in TDD and code-review transitively.
+      Implement the task by invoking superpowers:subagent-driven-development.
+      The skill_directories bring in subagent-driven-development, TDD, and code-review.
     prompt: |
-      {% if read_context.output.implementer_prompt %}
-      {{ read_context.output.implementer_prompt }}
+      SCHEMA APPLY INSTRUCTIONS (from superpowers-bridge schema):
+      {{ read_context.output.apply_instruction }}
 
       ---
-      {% endif %}
-      You are implementing task {{ workflow.input.task_id }} for the OpenSpec
-      change "{{ workflow.input.change }}".
+      CONDUCTOR PIPELINE CONTEXT:
+      You are operating as part of a Conductor pipeline. Steps 1 (using-git-worktrees)
+      and steps 4-7 (verify, retrospective, archive, PR) are handled by other phases
+      in this pipeline. Your focus for this step is:
 
-      TASK: {{ workflow.input.task_description }}
+        Step 2 — Executor (subagent-driven-development):
+        Use the Skill tool to invoke **superpowers:subagent-driven-development** to
+        implement the single task below. Tell the skill to scope its work to this task
+        only (not the entire plan.md).
 
-      OPENSPEC ARTIFACTS (requirements, design decisions, full task list):
+      TASK TO IMPLEMENT: {{ workflow.input.task_id }} — {{ workflow.input.task_description }}
+
+      OPENSPEC ARTIFACTS (requirements, design decisions, full task list, micro-steps):
       {{ read_context.output.context }}
 
-      Implementation guidelines:
-        1. Read the relevant source files to understand the current code structure
-        2. Implement ONLY what this task requires — do not implement other tasks
-        3. Follow the data model and architectural decisions in design.md
-        4. Use test-driven development: write failing tests first (if applicable)
-        5. Each scenario in the specs is a potential test — cover them
-        6. Request code review via the requesting-code-review skill if changes are substantial
-        7. Keep changes minimal and focused on this task
-
-      After implementing, provide a brief summary of what you changed.
+      After the subagent-driven-development skill completes, provide a brief summary
+      of what was implemented in your "summary" field.
       Do NOT modify tasks.md — a separate step handles marking this task complete.
     output:
       summary:

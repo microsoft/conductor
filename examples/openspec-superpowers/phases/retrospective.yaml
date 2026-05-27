@@ -229,15 +229,30 @@ agents:
         )
         template = template_file.read_text() if template_file.exists() else ""
 
+        # Load retrospective instruction from bundled schema
+        instruction = ""
+        try:
+            from ruamel.yaml import YAML as _YAML
+            _yaml = _YAML()
+            _schema = _yaml.load(pathlib.Path("examples/openspec-superpowers/artifacts/schema.yaml"))
+            _artifact = next((a for a in _schema.get("artifacts", []) if a["id"] == "retrospective"), None)
+            instruction = _artifact.get("instruction", "") if _artifact else ""
+        except Exception as e:
+            print(f"WARNING: could not load schema instructions: {e}", file=sys.stderr)
+
         print(json.dumps({
             "context": context,
             "template": template,
+            "instruction": instruction,
         }))
     output:
       context:
         type: string
       template:
         type: string
+      instruction:
+        type: string
+        description: Retrospective artifact instruction from the superpowers-bridge schema
     routes:
       - to: write_retro
 
@@ -249,6 +264,9 @@ agents:
       Every claim in §1-§6 must cite evidence from §0 (commit hash, file, test).
     prompt: |
       You are writing a retrospective for the OpenSpec change "{{ workflow.input.change }}".
+
+      SCHEMA INSTRUCTIONS (from superpowers-bridge schema):
+      {{ read_context.output.instruction }}
 
       GIT EVIDENCE:
         Commit range: {{ gather_evidence.output.merge_base }}..{{ gather_evidence.output.head_sha }}
@@ -265,16 +283,6 @@ agents:
 
       RETROSPECTIVE TEMPLATE (fill in every section):
       {{ read_context.output.template }}
-
-      Write a complete retrospective following the template exactly.
-      Requirements:
-        - §0 Evidence: use the git evidence above to populate quantitative front-matter
-        - §1-§6: every claim must cite evidence from §0 (commit SHA, file path, test name)
-        - §4 Skill/workflow compliance: list all 7 skills from the superpowers-bridge schema
-          and mark each ✓ or ✗ with reason
-        - §6 Promote candidates: use - [ ] checkboxes with Why/How body format
-        - Be honest about what went wrong and what could improve
-        - Reference specific commits, files, and test names — not vague descriptions
 
       Output the COMPLETE retrospective.md content as your "content" field.
     output:

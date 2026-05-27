@@ -150,10 +150,22 @@ agents:
         )
         template = template_file.read_text() if template_file.exists() else ""
 
+        # Load verify instruction from bundled schema
+        instruction = ""
+        try:
+            from ruamel.yaml import YAML as _YAML
+            _yaml = _YAML()
+            _schema = _yaml.load(pathlib.Path("examples/openspec-superpowers/artifacts/schema.yaml"))
+            _artifact = next((a for a in _schema.get("artifacts", []) if a["id"] == "verify"), None)
+            instruction = _artifact.get("instruction", "") if _artifact else ""
+        except Exception as e:
+            print(f"WARNING: could not load schema instructions: {e}", file=sys.stderr)
+
         print(json.dumps({
             "context": context,
             "template": template,
             "artifact_count": len(sections),
+            "instruction": instruction,
         }))
     output:
       context:
@@ -162,6 +174,9 @@ agents:
         type: string
       artifact_count:
         type: number
+      instruction:
+        type: string
+        description: Verify artifact instruction from the superpowers-bridge schema
     routes:
       - to: run_verify
 
@@ -175,6 +190,9 @@ agents:
     prompt: |
       You are verifying the OpenSpec change "{{ workflow.input.change }}" post-implementation.
 
+      SCHEMA INSTRUCTIONS (from superpowers-bridge schema):
+      {{ read_context.output.instruction }}
+
       IMPLEMENTATION EVIDENCE:
         - Commits ahead of main: {{ pre_checks.output.commit_count }}
         - Tasks marked [x] in tasks.md: {{ pre_checks.output.tasks_done }}
@@ -185,21 +203,6 @@ agents:
       VERIFY TEMPLATE (fill in every section):
       {{ read_context.output.template }}
 
-      If the `openspec-verify-change` skill (or `/opsx:verify` slash command) is
-      available in your skills list, use it now to perform the verification and
-      write the results to verify.md.
-
-      Otherwise, perform each numbered check manually:
-        1. Structural validation: run `openspec validate --all --json` (or note N/A)
-        2. Task completion: check every checkbox in tasks.md
-        3. Delta spec sync state: compare specs/ folders with openspec/specs/
-        4. Design/specs coherence: spot-check decisions vs requirements
-        5. Implementation signal: check for unstaged files, cite commit range
-        6. Front-door routing leak: run `ls docs/superpowers/specs/*.md 2>/dev/null`
-        7. Deferred dogfood equivalence: check plan.md for [~] items
-
-      Fill in the verify.md template completely. Set the Overall Decision
-      (PASS / PASS WITH WARNINGS / FAIL) based on your findings.
       Output the COMPLETE verify.md content as your "content" field.
     output:
       content:

@@ -100,8 +100,26 @@ agents:
             sections.append(f"## specs/{spec.parent.name}/spec.md\n\n{spec.read_text()}")
 
         context = "\n\n---\n\n".join(sections) if sections else ""
+
+        # Load plan instruction from bundled schema
+        instruction = ""
+        template = ""
+        try:
+            from ruamel.yaml import YAML as _YAML
+            _yaml = _YAML()
+            _schema = _yaml.load(pathlib.Path("examples/openspec-superpowers/artifacts/schema.yaml"))
+            _artifact = next((a for a in _schema.get("artifacts", []) if a["id"] == "plan"), None)
+            instruction = _artifact.get("instruction", "") if _artifact else ""
+            if _artifact and _artifact.get("template"):
+                _tmpl_file = pathlib.Path("examples/openspec-superpowers/artifacts/templates") / _artifact["template"]
+                template = _tmpl_file.read_text() if _tmpl_file.exists() else ""
+        except Exception as e:
+            print(f"WARNING: could not load schema instructions: {e}", file=sys.stderr)
+
         print(json.dumps({
             "context": context,
+            "instruction": instruction,
+            "template": template,
             "tasks_found": (base / "tasks.md").exists(),
             "artifact_count": len(sections),
         }))
@@ -109,6 +127,12 @@ agents:
       context:
         type: string
         description: tasks.md + design.md + specs content
+      instruction:
+        type: string
+        description: Plan artifact instruction from the superpowers-bridge schema
+      template:
+        type: string
+        description: plan.md template from the superpowers-bridge schema
       tasks_found:
         type: boolean
       artifact_count:
@@ -126,20 +150,18 @@ agents:
     prompt: |
       You are creating an implementation plan for the OpenSpec change "{{ workflow.input.change }}".
 
-      Use the superpowers:writing-plans skill to decompose the tasks into micro-steps.
+      SCHEMA INSTRUCTIONS (from superpowers-bridge schema):
+      {{ read_context.output.instruction }}
+
+      IMPORTANT output redirection:
+      - Do NOT write to docs/superpowers/plans/. Instead, capture the plan output
+        directly as your "content" field for this workflow to write to plan.md.
 
       Context artifacts from this change:
       {{ read_context.output.context }}
 
-      IMPORTANT output redirection (from the superpowers-bridge schema):
-      - Do NOT write to docs/superpowers/plans/. Instead, capture the plan output
-        directly as your "content" field for this workflow to write to plan.md.
-
-      The writing-plans skill will:
-      1. Read the tasks.md and design.md above as context
-      2. Break each task into 2-5 minute micro-steps (TDD style)
-      3. Include exact file paths, code snippets, test commands
-      4. Add commit points after each task
+      PLAN TEMPLATE (your output should follow this structure):
+      {{ read_context.output.template }}
 
       Once the writing-plans session is complete, output the COMPLETE plan.md
       content as your "content" field. Include everything the skill produced.

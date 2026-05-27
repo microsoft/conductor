@@ -12,9 +12,10 @@
 #
 # Steps:
 #   1. check_state     — determine if brainstorm.md already exists (idempotent)
-#   2. run_brainstorm  — LLM agent with skill_directories + interactive_input
+#   2. get_instructions — load brainstorm instruction + template from bundled schema
+#   3. run_brainstorm  — LLM agent with skill_directories + interactive_input
 #                        so the superpowers:brainstorming skill can ask questions
-#   3. save_brainstorm — Python writes the captured output to brainstorm.md
+#   4. save_brainstorm — Python writes the captured output to brainstorm.md
 #
 # Idempotent: exits immediately if brainstorm.md already exists.
 
@@ -80,9 +81,47 @@ agents:
     routes:
       - to: $end
         when: "state == 'done'"
-      - to: run_brainstorm
+      - to: get_instructions
 
   # ── Step 2 ──────────────────────────────────────────────────────────────────
+  - name: get_instructions
+    type: script
+    description: Load brainstorm instruction and template from the bundled superpowers-bridge schema.
+    command: python3
+    args:
+      - "-c"
+      - |
+        import json, pathlib, sys
+        from ruamel.yaml import YAML
+
+        yaml = YAML()
+        schema_dir = pathlib.Path("examples/openspec-superpowers/artifacts")
+        schema = yaml.load(schema_dir / "schema.yaml")
+
+        artifact_id = "brainstorm"
+        artifact = next((a for a in schema.get("artifacts", []) if a["id"] == artifact_id), None)
+        if not artifact:
+            print(f"ERROR: artifact '{artifact_id}' not found in schema", file=sys.stderr)
+            sys.exit(1)
+
+        template_file = schema_dir / "templates" / artifact["template"]
+        template = template_file.read_text() if template_file.exists() else ""
+
+        print(json.dumps({
+            "instruction": artifact.get("instruction", ""),
+            "template": template,
+        }))
+    output:
+      instruction:
+        type: string
+        description: Brainstorm artifact instruction from the superpowers-bridge schema
+      template:
+        type: string
+        description: brainstorm.md template from the superpowers-bridge schema
+    routes:
+      - to: run_brainstorm
+
+  # ── Step 3 ──────────────────────────────────────────────────────────────────
   - name: run_brainstorm
     model: claude-sonnet-4.6
     interactive_input: true
@@ -97,22 +136,11 @@ agents:
       Initial idea / seed: {{ workflow.input.idea }}
       {% endif %}
 
-      Use the superpowers:brainstorming skill to explore this change collaboratively.
+      SCHEMA INSTRUCTIONS (from superpowers-bridge schema):
+      {{ get_instructions.output.instruction }}
 
-      IMPORTANT output redirection (from the superpowers-bridge schema):
-      - Do NOT write to docs/superpowers/specs/. Instead, capture the brainstorming
-        output directly in your response as the full brainstorm.md content.
-      - brainstorm.md is a RAW CAPTURE — write the brainstorming skill's full output
-        as-is, without forcing any template structure.
-      - Do NOT pre-fill design.md during this step. design.md is a separate artifact
-        that reorganizes brainstorm.md content into structured sections.
-
-      The brainstorming skill will:
-      1. Explore project context
-      2. Ask clarifying questions (one at a time)
-      3. Propose 2-3 approaches with trade-offs
-      4. Present design sections for approval
-      5. Output the validated design
+      BRAINSTORM TEMPLATE (reference — do not force structure on raw capture):
+      {{ get_instructions.output.template }}
 
       Once the brainstorming session is complete and you have the user's approval,
       output the COMPLETE brainstorm.md content as your "content" field. If the session
@@ -124,7 +152,7 @@ agents:
     routes:
       - to: save_brainstorm
 
-  # ── Step 3 ──────────────────────────────────────────────────────────────────
+  # ── Step 4 ──────────────────────────────────────────────────────────────────
   - name: save_brainstorm
     type: script
     description: Write brainstorm.md to the change directory
