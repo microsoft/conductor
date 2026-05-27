@@ -1274,6 +1274,9 @@ async def run_workflow_async(
         # Convert MCP servers from workflow config to SDK format
         mcp_servers = await _build_mcp_servers(config)
 
+        # Resolve skill directories relative to workflow file
+        skill_directories = _build_skill_directories(config, workflow_path)
+
         # Check if workflow uses multiple providers (has per-agent provider overrides)
         uses_multi_provider = any(agent.provider is not None for agent in config.agents)
 
@@ -1283,7 +1286,7 @@ async def run_workflow_async(
             verbose_log(f"Single provider mode: {config.workflow.runtime.provider}")
 
         # Use ProviderRegistry for multi-provider support
-        async with ProviderRegistry(config, mcp_servers=mcp_servers) as registry:
+        async with ProviderRegistry(config, mcp_servers=mcp_servers, skill_directories=skill_directories) as registry:
             # Create and run workflow engine
             verbose_log("Starting workflow execution...")
 
@@ -1771,8 +1774,11 @@ async def resume_workflow_async(
         # Build MCP servers config (same as run_workflow_async)
         mcp_servers = await _build_mcp_servers(config)
 
+        # Resolve skill directories relative to workflow file
+        skill_directories = _build_skill_directories(config, resolved_workflow_path)
+
         # Create engine and restore state
-        async with ProviderRegistry(config, mcp_servers=mcp_servers) as registry:
+        async with ProviderRegistry(config, mcp_servers=mcp_servers, skill_directories=skill_directories) as registry:
             verbose_log("Starting resumed workflow execution...")
 
             # Pass stored session IDs to registry for Copilot session resume
@@ -2001,3 +2007,27 @@ async def _build_mcp_servers(config: Any) -> dict[str, Any] | None:
         mcp_servers[name] = server_config
     verbose_log(f"MCP servers configured: {list(mcp_servers.keys())}")
     return mcp_servers
+
+
+def _build_skill_directories(config: Any, workflow_path: Path) -> list[str] | None:
+    """Resolve skill directories from workflow config to absolute paths.
+
+    Args:
+        config: The workflow configuration.
+        workflow_path: Path to the workflow YAML file (used to resolve relative dirs).
+
+    Returns:
+        List of resolved absolute directory paths, or None if none configured.
+    """
+    dirs = config.workflow.runtime.skill_directories
+    if not dirs:
+        return None
+    base = Path(workflow_path).resolve().parent
+    resolved: list[str] = []
+    for d in dirs:
+        p = Path(d)
+        if not p.is_absolute():
+            p = (base / p).resolve()
+        resolved.append(str(p))
+    verbose_log(f"Skill directories configured: {resolved}")
+    return resolved

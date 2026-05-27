@@ -390,6 +390,11 @@ class WorkflowEngine:
         self._interrupt_handler = InterruptHandler(skip_gates=skip_gates)
         self._keyboard_listener = keyboard_listener
 
+        # Inject the listener into the single provider if it supports it
+        # (same injection that _get_executor_for_agent does for registry providers)
+        if provider is not None and hasattr(provider, "set_keyboard_listener"):
+            provider.set_keyboard_listener(keyboard_listener)
+
         # Event emitter for workflow observability
         self._event_emitter = event_emitter
 
@@ -710,6 +715,11 @@ class WorkflowEngine:
         if self._registry is not None:
             # Multi-provider mode: get provider from registry
             provider = await self._registry.get_provider(agent)
+            # Inject the keyboard listener so interactive_input agents can
+            # suspend cbreak mode before reading from stdin (same root cause
+            # as the interrupt fix in commit 8db9adf).
+            if hasattr(provider, "set_keyboard_listener"):
+                provider.set_keyboard_listener(self._keyboard_listener)
             return AgentExecutor(
                 provider,
                 workflow_tools=self.config.tools,

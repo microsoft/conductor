@@ -26,6 +26,7 @@ async def create_provider(
     max_session_seconds: float | None = None,
     max_agent_iterations: int | None = None,
     default_reasoning_effort: ReasoningEffort | None = None,
+    skill_directories: list[str] | None = None,
 ) -> AgentProvider:
     """Factory function to create the appropriate provider.
 
@@ -49,6 +50,9 @@ async def create_provider(
         default_reasoning_effort: Workflow-wide default reasoning effort
             (``low`` / ``medium`` / ``high`` / ``xhigh``) applied when an agent
             does not specify its own ``reasoning.effort``.
+        skill_directories: Directories to load skills from for agent sessions
+            (Copilot provider only; ignored for other providers).  Paths must
+            be absolute—resolve relative paths before calling this function.
 
     Returns:
         Configured AgentProvider instance.
@@ -75,6 +79,7 @@ async def create_provider(
                 idle_recovery_config=idle_recovery_config,
                 max_agent_iterations=max_agent_iterations,
                 default_reasoning_effort=default_reasoning_effort,
+                skill_directories=skill_directories,
             )
         case "openai-agents":
             raise ProviderError(

@@ -1,0 +1,58 @@
+# Superpowers Brainstorming Skill Demo
+#
+# This example demonstrates the skill_directories feature, which passes a
+# local skills folder to every Copilot session so the model can invoke
+# skills as tools.  Here we load the superpowers brainstorming skill and
+# ask a single agent to run a brainstorm for a given idea.
+#
+# Requirements:
+#   - provider: copilot  (skill_directories is Copilot-only)
+#   - The superpowers/ skills folder checked out alongside this repo
+#
+# Usage:
+#   conductor run examples/skills-brainstorm.yaml \
+#     --input idea="a CLI tool that summarises git history using an LLM"
+
+workflow:
+  name: skills-brainstorm
+  description: Run a superpowers brainstorm for an idea using the local skills folder
+  version: "1.0.0"
+  entry_point: brainstormer
+
+  runtime:
+    provider: copilot
+    # Paths are resolved relative to this YAML file.
+    # ../superpowers/skills contains sub-directories (brainstorming/, etc.)
+    # each with a SKILL.md that the Copilot CLI registers as a skill tool.
+    skill_directories:
+      - ../superpowers/skills
+
+  input:
+    idea:
+      type: string
+      required: true
+      description: The idea or feature to brainstorm
+
+agents:
+  - name: brainstormer
+    description: Runs a superpowers brainstorm for the given idea
+    model: claude-sonnet-4.6
+    interactive_input: true   # enables stdin answers for skill ask_user calls
+    prompt: |
+      Use the superpowers:brainstorming skill to explore and design the following idea:
+
+      {{ workflow.input.idea }}
+
+      Follow the brainstorming skill checklist:
+      1. Explore project context (read relevant files if in a real repo)
+      2. Ask clarifying questions one at a time
+      3. Propose 2-3 approaches with trade-offs
+      4. Present a design and get approval
+      5. Write the design doc
+
+      Work through the full brainstorming process as defined by the skill.
+    routes:
+      - to: $end
+
+output:
+  result: "{{ brainstormer.output }}"

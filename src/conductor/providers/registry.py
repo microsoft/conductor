@@ -41,15 +41,19 @@ class ProviderRegistry:
         self,
         config: WorkflowConfig,
         mcp_servers: dict[str, Any] | None = None,
+        skill_directories: list[str] | None = None,
     ) -> None:
         """Initialize the ProviderRegistry.
 
         Args:
             config: The workflow configuration.
             mcp_servers: MCP server configurations to pass to providers.
+            skill_directories: Resolved skill directories to pass to the Copilot
+                provider.  Paths must be absolute.
         """
         self._config = config
         self._mcp_servers = mcp_servers
+        self._skill_directories = skill_directories
         self._providers: dict[ProviderType, AgentProvider] = {}
         self._default_provider_type: ProviderType = config.workflow.runtime.provider
         self._resume_session_ids: dict[str, str] = {}
@@ -118,6 +122,8 @@ class ProviderRegistry:
             timeout=runtime.timeout,
             max_session_seconds=runtime.max_session_seconds,
             max_agent_iterations=runtime.max_agent_iterations,
+            default_reasoning_effort=runtime.default_reasoning_effort,
+            skill_directories=self._skill_directories,
         )
 
         # Pass stored resume session IDs to newly created providers

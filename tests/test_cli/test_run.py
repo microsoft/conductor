@@ -20,6 +20,7 @@ from typer.testing import CliRunner
 from conductor.cli.app import app
 from conductor.cli.run import (
     InputCollector,
+    _build_skill_directories,
     coerce_value,
     parse_input_flags,
     resolve_mcp_env_vars,
@@ -980,3 +981,48 @@ output:
         # agent1 should be marked as a loop target
         agent1_step = next(s for s in plan.steps if s.agent_name == "agent1")
         assert agent1_step.is_loop_target is True
+
+
+class TestBuildSkillDirectories:
+    """Tests for _build_skill_directories path resolution."""
+
+    def _make_config(self, dirs: list[str]) -> object:
+        """Return a minimal config-like object with skill_directories set."""
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            workflow=SimpleNamespace(
+                runtime=SimpleNamespace(skill_directories=dirs)
+            )
+        )
+
+    def test_none_when_empty(self, tmp_path: Path) -> None:
+        """Returns None when skill_directories is empty."""
+        config = self._make_config([])
+        result = _build_skill_directories(config, tmp_path / "workflow.yaml")
+        assert result is None
+
+    def test_absolute_path_unchanged(self, tmp_path: Path) -> None:
+        """Absolute paths are kept as-is."""
+        abs_dir = str(tmp_path / "skills")
+        config = self._make_config([abs_dir])
+        result = _build_skill_directories(config, tmp_path / "workflow.yaml")
+        assert result == [abs_dir]
+
+    def test_relative_path_resolved_to_absolute(self, tmp_path: Path) -> None:
+        """Relative paths are resolved relative to the workflow file's directory."""
+        workflow_file = tmp_path / "workflows" / "my-flow.yaml"
+        config = self._make_config(["../skills"])
+        result = _build_skill_directories(config, workflow_file)
+        assert result == [str((tmp_path / "skills").resolve())]
+
+    def test_multiple_dirs(self, tmp_path: Path) -> None:
+        """Multiple directories are all resolved."""
+        workflow_file = tmp_path / "workflow.yaml"
+        abs_dir = str(tmp_path / "abs_skills")
+        config = self._make_config(["./rel_skills", abs_dir])
+        result = _build_skill_directories(config, workflow_file)
+        assert result is not None
+        assert len(result) == 2
+        assert result[0] == str((tmp_path / "rel_skills").resolve())
+        assert result[1] == abs_dir

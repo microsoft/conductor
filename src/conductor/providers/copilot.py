@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import random
+import sys
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -54,6 +55,81 @@ except ImportError:
     COPILOT_SDK_AVAILABLE = False
     CopilotClient = None  # type: ignore[misc, assignment]
     PermissionHandler = None  # type: ignore[misc, assignment]
+
+
+def _make_stdin_user_input_handler(keyboard_listener: Any) -> Any:
+    """Return an async-compatible user-input handler that reads from stdin.
+
+    The handler is registered on a Copilot session when
+    ``agent.interactive_input=True``.  It fires when a skill calls the
+    ``ask_user`` tool (e.g. ``superpowers:brainstorming``) and reads the
+    user's reply from the terminal.
+
+    The ``keyboard_listener`` (if active) puts the terminal in cbreak mode
+    which swallows keystrokes before ``input()`` sees them — same root
+    cause as the interrupt fix in commit 8db9adf.  The handler therefore
+    suspends the listener (restoring cooked mode) before reading and
+    resumes it afterward.
+
+    Args:
+        keyboard_listener: Optional ``KeyboardListener`` instance to
+            suspend/resume around the blocking ``input()`` call.
+
+    Returns:
+        A sync callable ``(request, invocation) -> Awaitable`` that the SDK
+        will await.
+    """
+
+    def handler(request: Any, _invocation: dict[str, str]) -> Any:
+        async def _impl() -> Any:
+            question = request.get("question", "")
+            choices: list[str] = request.get("choices") or []
+            allow_freeform: bool = request.get("allowFreeform", True)
+
+            # Build prompt string to print before reading
+            lines: list[str] = [""]
+            if question:
+                lines.append(f"\033[1;36m[skill asks]\033[0m {question}")
+            if choices:
+                for i, choice in enumerate(choices, 1):
+                    lines.append(f"  {i}. {choice}")
+                if allow_freeform:
+                    lines.append("  (or type a free-form answer)")
+            lines.append("\033[1;32m> \033[0m")
+            prompt = "\n".join(lines)
+
+            # Suspend the keyboard listener so it stops consuming stdin
+            # bytes in cbreak mode — same fix as commit 8db9adf for
+            # interrupt handling.
+            if keyboard_listener is not None:
+                await keyboard_listener.suspend()
+            try:
+                loop = asyncio.get_event_loop()
+                answer = await loop.run_in_executor(None, lambda: input(prompt))
+                answer = answer.strip()
+            except (EOFError, KeyboardInterrupt):
+                answer = ""
+            finally:
+                if keyboard_listener is not None:
+                    await keyboard_listener.resume()
+
+            # If the user typed a number matching a choice, expand it
+            was_freeform: bool
+            if choices and answer.isdigit():
+                idx = int(answer) - 1
+                if 0 <= idx < len(choices):
+                    answer = choices[idx]
+                    was_freeform = False
+                else:
+                    was_freeform = True
+            else:
+                was_freeform = bool(answer) and not (answer in choices)
+
+            return {"answer": answer, "wasFreeform": was_freeform}
+
+        return _impl()
+
+    return handler
 
 
 @dataclass
@@ -163,6 +239,7 @@ class CopilotProvider(AgentProvider):
         temperature: float | None = None,
         max_agent_iterations: int | None = None,
         default_reasoning_effort: ReasoningEffort | None = None,
+        skill_directories: list[str] | None = None,
     ) -> None:
         """Initialize the Copilot provider.
 
@@ -184,6 +261,10 @@ class CopilotProvider(AgentProvider):
                 applied to ``create_session`` when an agent does not specify
                 its own ``reasoning.effort``. One of ``low``, ``medium``,
                 ``high``, ``xhigh``, or ``None`` to send no value.
+            skill_directories: Directories to load skills from for every agent
+                session.  Each directory is scanned for sub-directories that
+                contain a ``SKILL.md`` file.  Paths must be absolute (resolve
+                relative paths before passing to the provider).
         """
         self._client: Any = None  # Will hold Copilot SDK client
         self._mock_handler = mock_handler
@@ -198,11 +279,22 @@ class CopilotProvider(AgentProvider):
         self._temperature = temperature
         self._default_max_agent_iterations = max_agent_iterations
         self._default_reasoning_effort = default_reasoning_effort
+        self._skill_directories: list[str] = skill_directories or []
+        self._keyboard_listener: Any = None
         self._max_schema_depth = 10  # Max nesting depth for recursive schema building
         self._session_ids: dict[str, str] = {}
         self._resume_session_ids: dict[str, str] = {}
         self._interrupted_session: Any = None
         self._abort_supported: bool | None = None
+
+    def set_keyboard_listener(self, listener: Any) -> None:
+        """Inject the workflow's keyboard listener for suspend/resume around stdin reads.
+
+        Called by the engine before agent execution when ``interactive_input``
+        is enabled on any agent.  The listener is suspended before
+        ``input()`` runs (to restore cooked terminal mode) and resumed after.
+        """
+        self._keyboard_listener = listener
 
     @staticmethod
     def _default_permission_handler(
@@ -564,6 +656,23 @@ class CopilotProvider(AgentProvider):
             # Add MCP servers if configured
             if self._mcp_servers:
                 session_kwargs["mcp_servers"] = self._mcp_servers
+
+            # Add skill directories if configured
+            if self._skill_directories:
+                session_kwargs["skill_directories"] = self._skill_directories
+
+            # Register an interactive stdin handler when the agent opts in.
+            # The Copilot SDK triggers on_user_input_request when a skill calls
+            # the ask_user tool (e.g. superpowers:brainstorming).  Without this
+            # handler the question is silently dropped and the session ends.
+            # The handler suspends the keyboard listener (which holds cbreak
+            # mode) so that input() can read from stdin normally — same root
+            # cause as the interrupt fix in commit 8db9adf.
+            if getattr(agent, "interactive_input", False) and sys.stdin.isatty():
+                session_kwargs["on_user_input_request"] = _make_stdin_user_input_handler(
+                    self._keyboard_listener
+                )
+                logger.debug("Interactive stdin input enabled for agent %r", agent.name)
 
             # Resolve reasoning effort: per-agent override wins over runtime default.
             # When set, validate against the model's advertised capabilities

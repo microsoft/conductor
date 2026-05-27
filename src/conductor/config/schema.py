@@ -652,6 +652,29 @@ class AgentDef(BaseModel):
             intent or needs clarification on ambiguous requirements.
     """
 
+    interactive_input: bool = False
+    """Enable interactive stdin input for SDK-level user-input requests (Copilot only).
+
+    When ``True``, the Copilot session is created with an
+    ``on_user_input_request`` handler that reads answers from the
+    terminal (stdin).  This is required for skills that call the
+    ``ask_user`` tool — such as ``superpowers:brainstorming`` — which
+    pause and wait for a human response mid-session.
+
+    Has no effect on non-Copilot providers or on non-interactive
+    sessions (e.g. CI, ``--web-bg``, piped stdin).
+
+    Only applies to provider-backed agents (``type='agent'`` or ``None``).
+
+    Example YAML::
+
+        agents:
+          - name: brainstormer
+            interactive_input: true
+            prompt: |
+              Use the superpowers:brainstorming skill ...
+    """
+
     reasoning: ReasoningConfig | None = None
     """Optional reasoning / extended-thinking effort for this agent.
 
@@ -722,6 +745,8 @@ class AgentDef(BaseModel):
                 raise ValueError("script agents cannot have 'input_mapping'")
             if self.dialog is not None:
                 raise ValueError("script agents cannot have 'dialog'")
+            if self.interactive_input:
+                raise ValueError("script agents cannot have 'interactive_input'")
             if self.max_depth is not None:
                 raise ValueError("script agents cannot have 'max_depth'")
             if self.reasoning is not None:
@@ -756,6 +781,8 @@ class AgentDef(BaseModel):
                 raise ValueError("workflow agents cannot have 'retry'")
             if self.dialog is not None:
                 raise ValueError("workflow agents cannot have 'dialog'")
+            if self.interactive_input:
+                raise ValueError("workflow agents cannot have 'interactive_input'")
             if self.timeout_seconds is not None:
                 raise ValueError("workflow agents cannot have 'timeout_seconds'")
         else:
@@ -911,6 +938,24 @@ class RuntimeConfig(BaseModel):
     match the supported prefix list; Copilot consults the SDK's advertised
     ``supported_reasoning_efforts`` (when available) and otherwise allows
     the request through to the SDK.
+    """
+
+    skill_directories: list[str] = Field(default_factory=list)
+    """Directories to load skills from for every agent session (Copilot provider only).
+
+    Each directory is scanned one level deep for sub-directories that contain
+    a ``SKILL.md`` file.  All skills found are made available to every agent
+    session created during the workflow run.
+
+    Paths are resolved relative to the workflow YAML file (or treated as
+    absolute when starting with ``/``).
+
+    Example::
+
+        runtime:
+          skill_directories:
+            - ./artifacts/skills          # relative to the workflow file
+            - /shared/company-skills      # absolute path
     """
 
 

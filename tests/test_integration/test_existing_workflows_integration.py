@@ -181,7 +181,7 @@ async def test_schema_changes_dont_affect_copilot_provider():
 
     # Serialization excludes None values
     dumped = runtime.model_dump(exclude_none=True)
-    assert dumped == {"provider": "copilot", "mcp_servers": {}}
+    assert dumped == {"provider": "copilot", "mcp_servers": {}, "skill_directories": []}
 
     # Verify provider can be instantiated
     provider = CopilotProvider()

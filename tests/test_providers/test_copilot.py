@@ -1579,3 +1579,73 @@ class TestReasoningEffort:
         assert len(provider.get_retry_history()) == 3
         # Two backoff sleeps between three attempts.
         assert len(sleep_calls) == 2
+
+
+class TestSkillDirectoriesPlumbing:
+    """Tests for skill_directories plumbing into create_session."""
+
+    @staticmethod
+    async def _build_provider(
+        captured: dict[str, Any],
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        skill_directories: list[str] | None = None,
+    ) -> CopilotProvider:
+        """Build a provider with a fake client that captures create_session kwargs."""
+
+        class _FakeSession:
+            session_id = "session-xyz"
+
+            async def disconnect(self) -> None:
+                return None
+
+        class _FakeClient:
+            async def create_session(self, **kwargs: Any) -> _FakeSession:
+                captured["create_session_kwargs"] = kwargs
+                return _FakeSession()
+
+            async def list_models(self) -> list[Any]:
+                return []
+
+        provider = CopilotProvider(
+            mock_handler=stub_handler,
+            skill_directories=skill_directories,
+        )
+        provider._mock_handler = None
+        provider._client = _FakeClient()
+        provider._started = True
+
+        async def _noop() -> None:
+            return None
+
+        async def _fake_send_and_wait(*args: Any, **kwargs: Any) -> SDKResponse:
+            return SDKResponse(content='{"ok":true}')
+
+        monkeypatch.setattr(provider, "_ensure_client_started", _noop)
+        monkeypatch.setattr(provider, "_send_and_wait", _fake_send_and_wait)
+        return provider
+
+    @pytest.mark.asyncio
+    async def test_skill_directories_forwarded_to_create_session(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """skill_directories are passed through to create_session when configured."""
+        captured: dict[str, Any] = {}
+        skill_dirs = ["/skills/brainstorming", "/skills/writing-plans"]
+        provider = await self._build_provider(
+            captured, monkeypatch, skill_directories=skill_dirs
+        )
+        agent = AgentDef(name="planner", model="gpt-4o", prompt="Plan")
+        await provider.execute(agent=agent, context={}, rendered_prompt="Plan")
+        assert captured["create_session_kwargs"]["skill_directories"] == skill_dirs
+
+    @pytest.mark.asyncio
+    async def test_no_skill_directories_key_absent_from_create_session(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When no skill_directories configured, the key must be absent from create_session."""
+        captured: dict[str, Any] = {}
+        provider = await self._build_provider(captured, monkeypatch)
+        agent = AgentDef(name="planner", model="gpt-4o", prompt="Plan")
+        await provider.execute(agent=agent, context={}, rendered_prompt="Plan")
+        assert "skill_directories" not in captured["create_session_kwargs"]

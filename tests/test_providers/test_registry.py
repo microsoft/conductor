@@ -331,6 +331,8 @@ class TestConfigPassing:
             timeout=60.0,
             max_session_seconds=None,
             max_agent_iterations=None,
+            default_reasoning_effort=None,
+            skill_directories=None,
         )
 
     @patch("conductor.providers.registry.create_provider")
@@ -350,3 +352,36 @@ class TestConfigPassing:
         # Verify MCP servers were passed
         call_kwargs = mock_create.call_args[1]
         assert call_kwargs["mcp_servers"] == mcp_servers
+
+    @patch("conductor.providers.registry.create_provider")
+    @pytest.mark.asyncio
+    async def test_skill_directories_passed_to_provider(self, mock_create: MagicMock) -> None:
+        """Test that skill_directories are passed when creating providers."""
+        mock_provider = MockProvider()
+        mock_create.return_value = mock_provider
+
+        config = create_test_config()
+        skill_dirs = ["/path/to/skills", "/other/skills"]
+
+        registry = ProviderRegistry(config, skill_directories=skill_dirs)
+        agent = AgentDef(name="agent1", prompt="test")
+        await registry.get_provider(agent)
+
+        # Verify skill_directories were passed
+        call_kwargs = mock_create.call_args[1]
+        assert call_kwargs["skill_directories"] == skill_dirs
+
+    @patch("conductor.providers.registry.create_provider")
+    @pytest.mark.asyncio
+    async def test_skill_directories_default_none(self, mock_create: MagicMock) -> None:
+        """Test that skill_directories defaults to None when not provided."""
+        mock_provider = MockProvider()
+        mock_create.return_value = mock_provider
+
+        config = create_test_config()
+        registry = ProviderRegistry(config)
+        agent = AgentDef(name="agent1", prompt="test")
+        await registry.get_provider(agent)
+
+        call_kwargs = mock_create.call_args[1]
+        assert call_kwargs["skill_directories"] is None
