@@ -290,7 +290,7 @@ class TestBasicExecution:
             rendered_prompt="Say hello",
         )
 
-        assert result.content == {"text": "Hello, world!"}
+        assert result.content == {"result": "Hello, world!"}
         assert result.tokens_used == 15
         assert result.model == "claude-3-5-sonnet-latest"
 
@@ -743,7 +743,7 @@ class TestTextContentExtraction:
         )
 
         # Verify both text blocks are combined with newline separator
-        assert result.content == {"text": "First part. \nSecond part."}
+        assert result.content == {"result": "First part. \nSecond part."}
 
 
 class TestParseRecovery:
@@ -931,7 +931,7 @@ class TestParseRecovery:
         )
 
         # Should succeed without retries
-        assert result.content == {"text": "This is just plain text"}
+        assert result.content == {"result": "This is just plain text"}
         assert mock_client.messages.create.call_count == 1
 
 
@@ -2081,7 +2081,7 @@ class TestClaudeProviderRetryLogic:
         result = await provider.execute(agent, {}, "Test prompt")
 
         # Verify we got a successful response
-        assert result.content["text"] == "Success"
+        assert result.content["result"] == "Success"
         # Verify retry was attempted
         assert len(provider._retry_history) == 1
         assert provider._retry_history[0]["is_retryable"] is True
@@ -2125,7 +2125,7 @@ class TestClaudeProviderRetryLogic:
 
         result = await provider.execute(agent, {}, "Test prompt")
 
-        assert result.content["text"] == "Success"
+        assert result.content["result"] == "Success"
         assert len(provider._retry_history) == 1
         assert provider._retry_history[0]["is_retryable"] is True
 

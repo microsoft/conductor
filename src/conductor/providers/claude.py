@@ -188,7 +188,7 @@ class ClaudeProvider(AgentProvider):
         self._sdk_version: str | None = None
         self._retry_config = retry_config or RetryConfig()
         self._retry_history: list[dict[str, Any]] = []  # For testing/debugging retries
-        self._max_parse_recovery_attempts = 2  # Max retry attempts for malformed JSON
+        self._max_parse_recovery_attempts = self._retry_config.max_parse_recovery_attempts
         self._max_schema_depth = 10  # Max nesting depth for recursive schema building
         self._default_max_agent_iterations = (
             max_agent_iterations if max_agent_iterations is not None else 50
@@ -2188,14 +2188,15 @@ class ClaudeProvider(AgentProvider):
             response: Claude API response.
 
         Returns:
-            Dict with 'text' key containing the response text.
+            Dict with 'result' key containing the response text.
+            Uses 'result' (not 'text') to maintain parity with CopilotProvider.
         """
         text_parts = []
         for block in response.content:
             if hasattr(block, "type") and block.type == "text":
                 text_parts.append(block.text)
 
-        return {"text": "\n".join(text_parts)}
+        return {"result": "\n".join(text_parts)}
 
     def _extract_structured_output(self, response: Any) -> dict[str, Any] | None:
         """Extract structured output from tool_use content blocks.

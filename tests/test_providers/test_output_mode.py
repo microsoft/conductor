@@ -47,23 +47,42 @@ class TestCopilotOutputModeRaw:
     async def test_raw_agent_no_schema_instruction_in_prompt(self) -> None:
         """output_mode=raw must not inject schema instructions into the prompt.
 
-        We verify by capturing the prompt the mock handler sees and asserting
-        the schema instruction pattern is absent.
+        Uses the SDK mock path so the full prompt-building code runs, then
+        asserts the schema-injection marker is absent.
         """
-        captured: list[str] = []
+        from conductor.providers.copilot import SDKResponse
 
-        def handler(agent: AgentDef, prompt: str, ctx: dict[str, Any]) -> dict[str, Any]:
-            captured.append(prompt)
-            return {"result": "text"}
+        provider = CopilotProvider()
+        provider._started = True
 
-        provider = CopilotProvider(mock_handler=handler)
-        # Agent has output_mode=raw — no output: declared (raw + output would fail validation)
+        # Mock the SDK client and session
+        mock_session = AsyncMock()
+        mock_session.session_id = "test-session"
+        mock_session.disconnect = AsyncMock()
+        mock_client = AsyncMock()
+        mock_client.create_session = AsyncMock(return_value=mock_session)
+        provider._client = mock_client
+
+        # Capture the prompt sent to _send_and_wait
+        captured_prompts: list[str] = []
+        original_send = provider._send_and_wait
+
+        async def capturing_send(session: Any, prompt: str, *args: Any, **kwargs: Any) -> Any:
+            captured_prompts.append(prompt)
+            return SDKResponse(content="raw text")
+
         agent = AgentDef(name="a", prompt="p", model="gpt-4", output_mode="raw")
-        await provider.execute(agent=agent, context={}, rendered_prompt="p")
-        # The mock_handler returns before the SDK path, so captured[0] is "p" (unchanged).
-        # The important assertion is that schema_for_prompt is never built —
-        # which is verified structurally by the has_schema guard.
-        assert len(captured) == 1
+
+        with (
+            patch("conductor.providers.copilot.COPILOT_SDK_AVAILABLE", True),
+            patch.object(provider, "_send_and_wait", AsyncMock(side_effect=capturing_send)),
+        ):
+            result, _ = await provider._execute_sdk_call(agent, "p", {})
+
+        assert len(captured_prompts) == 1
+        # The schema-injection marker must NOT be present
+        assert "IMPORTANT: You MUST respond with a JSON object" not in captured_prompts[0]
+        assert result == {"result": "raw text"}
 
     @pytest.mark.asyncio
     async def test_envelope_with_output_is_backward_compatible(self) -> None:
@@ -214,10 +233,10 @@ class TestClaudeOutputModeRaw:
     """output_mode=raw with the Claude provider."""
 
     @pytest.mark.asyncio
-    async def test_raw_agent_wraps_response_as_text(
+    async def test_raw_agent_wraps_response_as_result(
         self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
     ) -> None:
-        """output_mode=raw agent returns text wrapped in {"text": ...}."""
+        """output_mode=raw agent returns text wrapped in {"result": ...}."""
         mock_anthropic_module.__version__ = "0.77.0"
 
         text_response = _create_response([_create_text_block("raw output")])
@@ -232,8 +251,8 @@ class TestClaudeOutputModeRaw:
         agent = AgentDef(name="a", prompt="p", model="claude-3-5-sonnet-latest", output_mode="raw")
         result = await provider.execute(agent=agent, context={}, rendered_prompt="p")
 
-        # Raw mode wraps text response as {"text": "..."} (Claude's _extract_text_content)
-        assert result.content == {"text": "raw output"}
+        # Raw mode wraps text response as {"result": "..."} — matches Copilot parity
+        assert result.content == {"result": "raw output"}
 
     @pytest.mark.asyncio
     async def test_raw_agent_no_emit_output_tool_injected(
@@ -292,7 +311,6 @@ class TestClaudeParseExhaustionNotRetryable:
             api_key="test-key",
             retry_config=ClaudeRetryConfig(max_attempts=1, max_parse_recovery_attempts=1),
         )
-        provider._max_parse_recovery_attempts = 1
         agent = AgentDef(
             name="a",
             prompt="p",
@@ -330,7 +348,6 @@ class TestClaudeParseExhaustionNotRetryable:
             api_key="test-key",
             retry_config=ClaudeRetryConfig(max_attempts=3, max_parse_recovery_attempts=0),
         )
-        provider._max_parse_recovery_attempts = 0
         agent = AgentDef(
             name="a",
             prompt="p",
