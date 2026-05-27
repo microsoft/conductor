@@ -1,0 +1,47 @@
+{
+  "name": "@conductor/vscode",
+  "version": "0.1.0",
+  "displayName": "Conductor",
+  "description": "Run multi-agent Conductor workflows in VS Code Copilot Chat",
+  "publisher": "conductor",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": ["AI", "Other"],
+  "activationEvents": [],
+  "main": "./dist/extension.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "watch": "tsc -p tsconfig.json --watch",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist",
+    "package": "vsce package"
+  },
+  "contributes": {
+    "chatParticipants": [
+      {
+        "id": "conductor.conductor",
+        "name": "conductor",
+        "fullName": "Conductor",
+        "description": "Run multi-agent Conductor workflows",
+        "isSticky": false
+      }
+    ],
+    "commands": [
+      {
+        "command": "conductor.runWorkflow",
+        "title": "Conductor: Run Workflow"
+      }
+    ]
+  },
+  "dependencies": {
+    "@conductor/core": "workspace:*",
+    "@anthropic-ai/sdk": "^0.30.0"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.90.0",
+    "typescript": "^5.5.0",
+    "@types/node": "^20.0.0",
+    "@vscode/vsce": "^3.0.0"
+  }
+}
