@@ -81,38 +81,6 @@ artifacts:
     requires:
       - brainstorm
 
-  - id: design
-    generates: design.md
-    description: Technical design document with implementation details
-    template: design.md
-    instruction: |
-      Create the design document explaining HOW to implement the change.
-
-      Read brainstorm.md as input. brainstorm.md is a raw capture of
-      the brainstorming skill's output (typically a decision log with
-      Q1-Qn decisions, trade-offs, and context). Your job is to
-      REORGANIZE that content into the structured sections below.
-
-      This is a transformation, not a copy. Extract and restructure:
-      - Decisions (Q1-Qn from brainstorm) → design.md §Decisions
-      - Background/context → design.md §Context
-      - Trade-offs → design.md §Risks / Trade-offs
-      - Add Goals/Non-Goals and Migration Plan (may require
-        inference from brainstorm.md content)
-
-      Sections:
-      - **Context**: Background, current state, constraints, stakeholders
-      - **Goals / Non-Goals**: What this design achieves and explicitly excludes
-      - **Decisions**: Key technical choices with rationale (why X over Y?). Include alternatives considered per decision.
-      - **Risks / Trade-offs**: Known limitations, things that could go wrong. Format: [Risk] → Mitigation
-      - **Migration Plan**: Steps to deploy, rollback strategy (if applicable)
-      - **Open Questions**: Outstanding decisions or unknowns to resolve
-
-      Focus on architecture and approach, not line-by-line implementation.
-      Good design docs explain the "why" behind technical decisions.
-    requires:
-      - brainstorm
-
   - id: specs
     generates: "specs/**/*.md"
     description: Detailed specifications for the change
@@ -141,6 +109,44 @@ artifacts:
     requires:
       - proposal
 
+  - id: design
+    generates: design.md
+    description: Technical design document with implementation details
+    template: design.md
+    instruction: |
+      Create the design document explaining HOW to implement the change.
+
+      Inputs (read all three):
+      - brainstorm.md — primary source: raw Q1-Qn decision log, trade-offs, context
+      - proposal.md   — frames scope and capability names; reference, do not repeat
+      - specs/*.md    — grounded requirements; design decisions must align with them
+
+      Your job is to REORGANIZE brainstorm.md content into structured sections,
+      grounded against proposal and specs. This is a transformation, not a copy.
+      Extract and restructure:
+      - Decisions (Q1-Qn from brainstorm) → design.md §Decisions
+        Cross-check: every key decision should satisfy a spec requirement or
+        explain a design constraint not yet captured in specs.
+      - Background/context → design.md §Context
+      - Trade-offs → design.md §Risks / Trade-offs
+      - Add Goals/Non-Goals and Migration Plan (infer from brainstorm + proposal)
+
+      Sections:
+      - **Context**: Background, current state, constraints, stakeholders
+      - **Goals / Non-Goals**: What this design achieves and explicitly excludes
+      - **Decisions**: Key technical choices with rationale (why X over Y?). Include alternatives considered per decision.
+      - **Risks / Trade-offs**: Known limitations, things that could go wrong. Format: [Risk] → Mitigation
+      - **Migration Plan**: Steps to deploy, rollback strategy (if applicable)
+      - **Open Questions**: Outstanding decisions or unknowns to resolve
+
+      Do NOT duplicate requirement details from specs — reference by capability name.
+      Focus on architecture and approach, not line-by-line implementation.
+      Good design docs explain the "why" behind technical decisions.
+    requires:
+      - brainstorm
+      - proposal
+      - specs
+
   - id: tasks
     generates: tasks.md
     description: Implementation checklist with trackable tasks
@@ -160,7 +166,6 @@ artifacts:
       Reference specs for what needs to be built and design.md for
       how to build it (architecture decisions, trade-offs, migration).
     requires:
-      - specs
       - design
 
   - id: plan

@@ -1,8 +1,11 @@
 # OpenSpec Superpowers — Design Phase
 #
-# Generates design.md by REORGANIZING brainstorm.md into structured sections.
+# Generates design.md by REORGANIZING brainstorm.md into structured sections,
+# grounded against proposal.md and any spec files already written.
 # This is a transformation: extracts Context/Goals/Decisions/Risks/Migration
-# from the raw brainstorming decision log.
+# from the raw brainstorming decision log, then cross-checks decisions against
+# the grounded requirements in specs/ so design.md accurately reflects WHAT
+# the system must do (specs) and WHY the technical choices were made (brainstorm).
 #
 # Run standalone:
 #   conductor run examples/openspec-superpowers/phases/design.yaml \
@@ -10,8 +13,9 @@
 #
 # Steps:
 #   1. get_instructions — read design template + instructions from bundled schema
-#   2. read_brainstorm  — load brainstorm.md as the transformation source
-#   3. write_design     — LLM reorganizes brainstorm into structured design.md
+#   2. read_context     — load brainstorm.md + proposal.md + all spec files
+#   3. write_design     — LLM reorganizes brainstorm into structured design.md,
+#                         grounded against proposal and specs
 #   4. save_design      — Python writes the file to disk
 #
 # Idempotent: exits immediately if design.md already exists.
@@ -100,15 +104,17 @@ agents:
     routes:
       - to: $end
         when: "state == 'done'"
-      - to: read_brainstorm
+      - to: read_context
 
   # ── Step 2 ──────────────────────────────────────────────────────────────────
-  - name: read_brainstorm
+  - name: read_context
     type: script
     description: |
-      Load brainstorm.md as the source for design reorganization.
-      brainstorm.md is a raw capture of the brainstorming session —
-      typically a decision log (background → Q1-Qn decisions → trade-offs).
+      Load brainstorm.md (the primary transformation source) plus proposal.md
+      and any spec files already written by the specs phase.
+      proposal.md frames WHAT is being built; specs define grounded requirements;
+      brainstorm.md contains the raw Q1-Qn decision log to reorganize.
+      All three together let the design agent make accurate cross-references.
     command: python3
     args:
       - "-c"
@@ -116,19 +122,42 @@ agents:
         import pathlib, json, sys
 
         change = "{{ workflow.input.change }}"
-        brainstorm = pathlib.Path(f"openspec/changes/{change}/brainstorm.md")
+        base = pathlib.Path(f"openspec/changes/{change}")
 
+        brainstorm = base / "brainstorm.md"
         if not brainstorm.exists():
-            print(json.dumps({"content": "", "found": False}))
             print("WARNING: brainstorm.md not found — run brainstorm phase first", file=sys.stderr)
-            sys.exit(0)
 
-        print(json.dumps({"content": brainstorm.read_text(), "found": True}))
+        proposal = base / "proposal.md"
+        specs = sorted((base / "specs").glob("*/spec.md"))
+
+        print(json.dumps({
+            "brainstorm": brainstorm.read_text() if brainstorm.exists() else "",
+            "brainstorm_found": brainstorm.exists(),
+            "proposal": proposal.read_text() if proposal.exists() else "",
+            "proposal_found": proposal.exists(),
+            "specs": {
+                spec.parent.name: spec.read_text()
+                for spec in specs
+            },
+            "spec_count": len(specs),
+        }))
     output:
-      content:
+      brainstorm:
         type: string
-      found:
+        description: Raw brainstorm.md content — the primary reorganization source
+      brainstorm_found:
         type: boolean
+      proposal:
+        type: string
+        description: proposal.md content — frames WHAT is being built
+      proposal_found:
+        type: boolean
+      specs:
+        type: object
+        description: Mapping of capability name → spec.md content
+      spec_count:
+        type: number
     routes:
       - to: write_design
 
@@ -136,17 +165,30 @@ agents:
   - name: write_design
     model: claude-sonnet-4.6
     description: |
-      Reorganize brainstorm.md into a structured design document.
-      This is a TRANSFORMATION — extract and restructure, do not duplicate.
-      - Decisions (Q1-Qn from brainstorm) → design.md §Decisions
-      - Background/context → design.md §Context
-      - Trade-offs → design.md §Risks / Trade-offs
-      Goals/Non-Goals and Migration Plan may require inference from the brainstorm.
+      Reorganize brainstorm.md into a structured design document, grounded
+      against the proposal and specs already written.
+      - brainstorm.md → primary source: extract decisions (Q1-Qn), context, trade-offs
+      - proposal.md   → frames scope and capability names; reference, do not repeat
+      - specs/*.md    → grounded requirements; design decisions must align with them
+      Goals/Non-Goals and Migration Plan may require inference from brainstorm.
     prompt: |
       You are writing an OpenSpec design document for the change "{{ workflow.input.change }}".
 
-      BRAINSTORM SOURCE (raw capture — reorganize this into design.md):
-      {{ read_brainstorm.output.content }}
+      BRAINSTORM SOURCE (raw capture — this is your primary reorganization source):
+      {{ read_context.output.brainstorm }}
+
+      {% if read_context.output.proposal_found %}
+      PROPOSAL (frames WHAT is being built — reference, do not repeat in design.md):
+      {{ read_context.output.proposal }}
+      {% endif %}
+
+      {% if read_context.output.spec_count > 0 %}
+      SPECS (grounded requirements — design decisions must align with these):
+      {% for name, content in read_context.output.specs.items() %}
+      ## specs/{{ name }}/spec.md
+      {{ content }}
+      {% endfor %}
+      {% endif %}
 
       {% if get_instructions.output.context %}
       PROJECT CONTEXT (background constraints — do NOT copy into design.md):
@@ -163,8 +205,11 @@ agents:
       {{ get_instructions.output.template }}
 
       This is a REORGANIZATION of brainstorm.md content into structured sections.
-      Extract and restructure — do NOT simply copy brainstorm.md content verbatim.
-      Do NOT duplicate requirement details from specs (if they exist) — reference instead.
+      Extract and restructure — do NOT copy brainstorm.md verbatim.
+      Cross-check your §Decisions against the specs: every key decision should
+      either satisfy a spec requirement or explain a design constraint not yet
+      captured in specs. Reference spec capability names where relevant.
+      Do NOT duplicate requirement details from specs — reference them by name instead.
     output:
       content:
         type: string
