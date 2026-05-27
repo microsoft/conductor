@@ -1259,9 +1259,19 @@ class CopilotProvider(AgentProvider):
         # Try to find JSON in code blocks
         import re
 
-        # Look for ```json ... ``` blocks (greedy so the regex closes at the
-        # LAST ``` in the content, not the first inner ``` which may appear
-        # inside a JSON string field).
+        # Two-stage strategy (kept in parity with executor.output.parse_json_output):
+        # 1. Non-greedy findall + try-parse each candidate. First valid JSON
+        #    wins. Handles multiple fenced blocks in one response (e.g. an
+        #    initial answer followed by a revised answer).
+        # 2. Greedy single capture as fallback. Handles literal ``` inside a
+        #    JSON string field, which breaks non-greedy matching at the inner
+        #    fence but is recovered by closing at the LAST fence.
+        candidates = re.findall(r"```(?:json)?\s*\n?(.*?)\n?```", content, re.DOTALL)
+        for candidate in candidates:
+            try:
+                return json.loads(candidate.strip())
+            except json.JSONDecodeError:
+                continue
         json_match = re.search(r"```(?:json)?\s*\n?(.*)\n?```", content, re.DOTALL)
         if json_match:
             try:

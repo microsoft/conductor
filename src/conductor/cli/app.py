@@ -175,7 +175,10 @@ def _abort_web_bg_if_human_gate(workflow_path: Path, *, skip_gates: bool) -> Non
     except Exception:  # noqa: BLE001 — defer real validation to the loader path
         # If config fails to load, let the normal run path surface the error.
         return
-    if not any(getattr(a, "type", None) == "human_gate" for a in config.agents):
+    has_gate = any(getattr(a, "type", None) == "human_gate" for a in config.agents) or any(
+        getattr(getattr(fe, "agent", None), "type", None) == "human_gate" for fe in config.for_each
+    )
+    if not has_gate:
         return
     # Emit via plain typer.echo (not typer.BadParameter) so the message renders
     # verbatim — BadParameter is rendered as a Rich panel whose text wrapping
@@ -895,8 +898,25 @@ def resume(
 
     # Handle --web-bg: fork a background process and exit immediately
     if web_bg:
-        if resolved_workflow is not None:
-            _abort_web_bg_if_human_gate(resolved_workflow, skip_gates=skip_gates)
+        # When the user resumes via --from <checkpoint> alone (no workflow
+        # argument), resolved_workflow is None but the checkpoint records the
+        # original workflow path. Read it so the human_gate guard still fires
+        # and the user gets a single visible error instead of a silent crash
+        # in the detached child.
+        gate_check_workflow: Path | None = resolved_workflow
+        if gate_check_workflow is None and resolved_checkpoint is not None:
+            try:
+                ckpt_data = json.loads(resolved_checkpoint.read_text(encoding="utf-8"))
+                ckpt_workflow = ckpt_data.get("workflow_path")
+                if isinstance(ckpt_workflow, str):
+                    candidate = Path(ckpt_workflow)
+                    if candidate.exists():
+                        gate_check_workflow = candidate
+            except (OSError, json.JSONDecodeError):
+                # Checkpoint unreadable — let the normal resume path surface it.
+                pass
+        if gate_check_workflow is not None:
+            _abort_web_bg_if_human_gate(gate_check_workflow, skip_gates=skip_gates)
         from conductor.cli.bg_runner import launch_background_resume
 
         try:

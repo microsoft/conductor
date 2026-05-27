@@ -281,3 +281,17 @@ class TestParseJsonOutput:
         result = parse_json_output(raw)
 
         assert result == {"code": "use ```fenced``` blocks", "n": 1}
+
+    def test_parse_json_with_multiple_fenced_blocks_first_wins(self) -> None:
+        """When the response contains multiple fenced JSON blocks, the first
+        valid block wins.
+
+        Pins the behavior chosen for the multi-block trade-off raised in PR
+        review (greedy regex would have captured everything between the first
+        and last fence and failed to parse). The current implementation tries
+        each non-greedy candidate in order and returns the first that parses.
+        """
+        raw = '```json\n{"a": 1}\n```\n\nupdated answer:\n\n```json\n{"a": 2}\n```'
+        result = parse_json_output(raw)
+
+        assert result == {"a": 1}

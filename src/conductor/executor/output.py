@@ -116,12 +116,28 @@ def parse_json_output(raw_response: str) -> dict[str, Any]:
 
     text = raw_response.strip()
 
-    # Try to extract JSON from markdown code blocks.
-    # Greedy capture so the regex closes at the LAST ``` in the response,
-    # not the first inner ``` (which may appear inside a JSON string field).
-    json_block_match = re.search(r"```(?:json)?\s*\n?(.*)\n?```", text, re.DOTALL)
-    if json_block_match:
-        text = json_block_match.group(1).strip()
+    # Try to extract JSON from markdown code blocks. Two-stage strategy:
+    # 1. Non-greedy findall + try-parse each candidate (first valid wins).
+    #    Handles the common case of multiple fenced blocks in one response
+    #    (e.g. "initial answer ... revised answer") where the first complete
+    #    JSON block is the authoritative one.
+    # 2. Greedy single capture as fallback. Handles the case where the JSON
+    #    contains literal ``` inside a string field, which breaks non-greedy
+    #    matching at the inner fence but is recovered by closing at the LAST
+    #    fence in the response.
+    candidates = re.findall(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL)
+    for candidate in candidates:
+        stripped = candidate.strip()
+        try:
+            result = json.loads(stripped)
+            if isinstance(result, dict):
+                return result
+            return {"result": result}
+        except json.JSONDecodeError:
+            continue
+    greedy = re.search(r"```(?:json)?\s*\n?(.*)\n?```", text, re.DOTALL)
+    if greedy:
+        text = greedy.group(1).strip()
 
     # Try to find JSON object or array
     if not text.startswith(("{", "[")):

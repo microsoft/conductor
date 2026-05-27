@@ -391,3 +391,104 @@ class TestWebBgHumanGateValidation:
         )
         assert "human_gate" in combined
         assert "--skip-gates" in combined
+
+    def test_run_web_bg_with_human_gate_inside_for_each_aborts(self, tmp_path: Path) -> None:
+        """``human_gate`` nested in a ``for_each.agent`` must also abort the fork.
+
+        The top-level walk over ``config.agents`` misses inline agents
+        declared inside ``for_each`` groups. Without the extra check,
+        ``--web-bg`` still silent-crashes when the gate prompt eventually
+        fires inside the loop.
+        """
+        for_each_yaml = """\
+workflow:
+  name: gate-in-foreach
+  entry_point: source
+
+agents:
+  - name: source
+    type: agent
+    prompt: "List items"
+    output:
+      items:
+        type: array
+        items: { type: string }
+    routes:
+      - to: loop
+
+for_each:
+  - name: loop
+    type: for_each
+    source: source.output.items
+    as: item
+    agent:
+      name: inner
+      type: human_gate
+      prompt: "Approve {{ item }}?"
+      options:
+        - label: "Yes"
+          value: yes
+          route: $end
+        - label: "No"
+          value: no
+          route: $end
+
+output:
+  result: "done"
+"""
+        f = tmp_path / "gate_in_foreach.yaml"
+        f.write_text(for_each_yaml)
+
+        with patch("conductor.cli.bg_runner.launch_background") as mock_launch:
+            result = runner.invoke(app, ["run", str(f), "--web-bg"])
+
+        assert result.exit_code != 0
+        assert not mock_launch.called
+        combined = (
+            (result.output or "")
+            + (result.stderr or "")
+            + (str(result.exception) if result.exception else "")
+        )
+        assert "human_gate" in combined
+        assert "--skip-gates" in combined
+
+    def test_resume_web_bg_from_checkpoint_only_aborts(
+        self, gate_workflow_file: Path, tmp_path: Path
+    ) -> None:
+        """``resume --from <checkpoint> --web-bg`` (no workflow arg) must still
+        abort when the checkpoint's workflow contains a ``human_gate``.
+
+        Previously the abort check was skipped because ``resolved_workflow``
+        is ``None`` in this code path; the workflow path is now recovered from
+        the checkpoint JSON so the same guard fires.
+        """
+        import json as _json
+
+        checkpoint = tmp_path / "ckpt.json"
+        checkpoint.write_text(
+            _json.dumps(
+                {
+                    "workflow_path": str(gate_workflow_file.resolve()),
+                    "workflow_hash": "deadbeef",
+                    "workflow_name": "gate-workflow",
+                    "failed_agent": "ask",
+                    "completed_agents": [],
+                    "context": {},
+                    "timestamp": "2026-05-27T00:00:00",
+                    "error_message": "test",
+                }
+            )
+        )
+
+        with patch("conductor.cli.bg_runner.launch_background_resume") as mock_launch:
+            result = runner.invoke(app, ["resume", "--from", str(checkpoint), "--web-bg"])
+
+        assert result.exit_code != 0
+        assert not mock_launch.called
+        combined = (
+            (result.output or "")
+            + (result.stderr or "")
+            + (str(result.exception) if result.exception else "")
+        )
+        assert "human_gate" in combined
+        assert "--skip-gates" in combined
