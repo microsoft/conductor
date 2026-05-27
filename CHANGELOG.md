@@ -127,6 +127,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that produce large Markdown, prose, or code output that should not be
   JSON-extracted. `output_mode: raw` is incompatible with `output:` — declaring
   both raises a `ValidationError` at config load time.
+- New `max_parse_recovery_attempts` field on `RetryPolicy` (YAML `retry:`
+  block, per-agent or workflow-level). Overrides the provider default (Copilot:
+  5, Claude: 2) for agents that need tighter or looser in-session parse-recovery
+  budgets. Accepts integer 0–10; `0` disables all recovery attempts and lets
+  the first parse failure propagate immediately. Threaded through both the
+  Copilot and Claude providers.
+- New `POST /api/gate-respond` and `GET /api/gate-status` HTTP API endpoints
+  on the web dashboard server. `GET /api/gate-status` returns whether a
+  `human_gate` agent is currently waiting, and which agent name it is.
+  `POST /api/gate-respond` resolves the parked gate by injecting a
+  `GateResponse` into the engine's queue. Both endpoints respect an optional
+  `CONDUCTOR_GATE_TOKEN` secret for auth; when a token is configured on the
+  server any request without a matching `token` field is rejected with HTTP 403.
+- New `conductor gate-respond` CLI command for resolving a parked human gate
+  from the command line without opening a browser. Accepts `--port`, `--choice`,
+  `--agent` (auto-discovered via `/api/gate-status` when omitted), `--input`,
+  and `--token` / `CONDUCTOR_GATE_TOKEN` env var. Designed for SSH or headless
+  environments where the web dashboard UI is unreachable.
+
+### Changed
+- **Breaking (Claude provider):** `ClaudeProvider._extract_text_response` now
+  returns `{"result": "<text>"}` instead of `{"text": "<text>"}`. This aligns
+  the Claude provider with the Copilot provider (cross-provider parity). Any
+  existing Claude workflow that references `{{ <agent>.output.text }}` must be
+  updated to `{{ <agent>.output.result }}`. Workflows that declare an `output:`
+  schema are unaffected (the schema fields take precedence). See the new
+  `output_mode: raw` feature if you need to consume unstructured text output
+  reliably across both providers.
 
 ### Fixed
 - `_verbose_console` is now silent-aware at the source: a `_SilentAwareConsole`

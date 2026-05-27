@@ -6,6 +6,7 @@ Complete command-line reference for Conductor.
 
 - [`conductor run`](#conductor-run)
 - [`conductor stop`](#conductor-stop)
+- [`conductor gate-respond`](#conductor-gate-respond)
 - [`conductor validate`](#conductor-validate)
 - [`conductor registry`](#conductor-registry)
 
@@ -107,7 +108,7 @@ load time and aborts before forking, with a message listing the options:
 1. Use `--web` (foreground) instead of `--web-bg`
 2. Add `--skip-gates` to auto-select the first option at every gate
 3. Remove `human_gate` steps from the workflow
-4. Wait for CLI gate-resolution support (planned follow-up)
+4. Use `conductor gate-respond --port <port> --choice <value>` to resolve from CLI
 
 The same check applies to `conductor resume --web-bg`.
 
@@ -224,6 +225,58 @@ conductor stop --port 8080
 # Stop all running background workflows
 conductor stop --all
 ```
+
+## `conductor gate-respond`
+
+Resolve a parked `human_gate` step from the command line without opening a browser. Sends a gate response to a running workflow's web dashboard via HTTP — useful for SSH sessions or headless environments where the dashboard UI is unreachable.
+
+```bash
+conductor gate-respond [OPTIONS]
+```
+
+### Options
+
+| Option | Short | Description |
+|--------|-------|-------------|
+| `--port PORT` | `-p` | Dashboard port of the running workflow (**required**) |
+| `--choice VALUE` | `-c` | Selected gate option value (**required**) |
+| `--agent NAME` | `-a` | Gate agent name (auto-discovered via `/api/gate-status` when omitted) |
+| `--input TEXT` | | Additional free-text input for the gate response |
+| `--token SECRET` | | Auth token (also reads from `CONDUCTOR_GATE_TOKEN` env var) |
+
+### Authentication
+
+If the running workflow was launched with a gate token configured, requests without a matching token are rejected with HTTP 403. Supply the token via `--token` or set the `CONDUCTOR_GATE_TOKEN` environment variable (the flag takes precedence when both are present).
+
+### Auto-Discovery
+
+When `--agent` is omitted, `conductor gate-respond` queries `GET /api/gate-status` on the specified port. If a gate is currently waiting, its agent name is used automatically and printed to the console. If no gate is waiting, the command exits with code 1.
+
+### Examples
+
+```bash
+# Resolve the only waiting gate (agent auto-discovered)
+conductor gate-respond --port 8080 --choice approve
+
+# Resolve a specific named gate
+conductor gate-respond -p 8080 -c reject --agent review-gate
+
+# Pass additional free-text input
+conductor gate-respond -p 8080 -c approve --input "Looks good, ship it"
+
+# Provide auth token via flag
+conductor gate-respond -p 8080 -c approve --token my-secret
+
+# Provide auth token via environment variable
+CONDUCTOR_GATE_TOKEN=my-secret conductor gate-respond -p 8080 -c approve
+```
+
+### Exit Codes
+
+| Code | Meaning |
+|------|---------|
+| 0 | Gate resolved successfully |
+| 1 | Connection error, auth failure, validation error, or no gate waiting |
 
 ## `conductor validate`
 
@@ -355,6 +408,7 @@ See [design/registry.md](./design/registry.md) for the full design.
 | `ANTHROPIC_API_KEY` | API key for Claude provider |
 | `GITHUB_TOKEN` | Token for Copilot provider (if not using GitHub CLI auth) |
 | `CONDUCTOR_LOG_LEVEL` | Logging level: DEBUG, INFO, WARNING, ERROR |
+| `CONDUCTOR_GATE_TOKEN` | Auth token required by `conductor gate-respond` (and checked by `POST /api/gate-respond`) when the workflow dashboard is started with a gate token |
 
 ## Exit Codes
 

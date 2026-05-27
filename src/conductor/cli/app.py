@@ -192,7 +192,7 @@ def _abort_web_bg_if_human_gate(workflow_path: Path, *, skip_gates: bool) -> Non
         "  1. Use --web (foreground) instead of --web-bg\n"
         "  2. Add --skip-gates to auto-accept the first option\n"
         "  3. Remove human_gate steps from the workflow\n"
-        "  4. Wait for CLI gate-resolution support (planned follow-up)"
+        "  4. Use `conductor gate-respond --port <port> --choice <value>` to resolve from CLI"
     )
     typer.echo(message, err=True)
     raise typer.Exit(code=2)
@@ -1248,6 +1248,137 @@ def _print_running_list(entries: list[dict], con: Console) -> None:
         )
 
     con.print(table)
+
+
+@app.command(name="gate-respond")
+def gate_respond(
+    port: Annotated[
+        int,
+        typer.Option(
+            "--port",
+            "-p",
+            help="Dashboard port of the running workflow.",
+        ),
+    ],
+    choice: Annotated[
+        str,
+        typer.Option(
+            "--choice",
+            "-c",
+            help="Selected gate option value.",
+        ),
+    ],
+    agent: Annotated[
+        str | None,
+        typer.Option(
+            "--agent",
+            "-a",
+            help="Gate agent name (auto-discovered via /api/gate-status if omitted).",
+        ),
+    ] = None,
+    input_text: Annotated[
+        str | None,
+        typer.Option(
+            "--input",
+            help="Additional input text for the gate response.",
+        ),
+    ] = None,
+    token: Annotated[
+        str | None,
+        typer.Option(
+            "--token",
+            help="Auth token (also reads from CONDUCTOR_GATE_TOKEN env var).",
+        ),
+    ] = None,
+) -> None:
+    """Resolve a parked human gate from the command line.
+
+    Sends a gate response to a running workflow's web dashboard via HTTP.
+    Use this when the dashboard UI is unreachable (e.g. SSH session).
+
+    \b
+    Examples:
+        conductor gate-respond --port 8080 --choice approve
+        conductor gate-respond -p 8080 -c reject --agent review-gate
+        conductor gate-respond -p 8080 -c approve --token secret123
+        conductor gate-respond -p 8080 -c approve --input "Looks good"
+    """
+    import httpx
+
+    base_url = f"http://127.0.0.1:{port}"
+
+    # Resolve token from flag or environment variable
+    resolved_token = token or os.environ.get("CONDUCTOR_GATE_TOKEN")
+
+    # Auto-discover agent name if not provided
+    if agent is None:
+        try:
+            resp = httpx.get(f"{base_url}/api/gate-status", timeout=5)
+            resp.raise_for_status()
+            status = resp.json()
+            if not status.get("waiting"):
+                console.print(
+                    "[yellow]No gate is currently waiting on "
+                    f"port {port}.[/yellow]"
+                )
+                raise typer.Exit(code=1)
+            agent = status["agent_name"]
+        except httpx.ConnectError:
+            console.print(
+                f"[bold red]Error:[/bold red] Cannot connect to dashboard on port {port}. "
+                "Is the workflow running with --web or --web-bg?"
+            )
+            raise typer.Exit(code=1) from None
+        except httpx.HTTPError as exc:
+            console.print(
+                f"[bold red]Error:[/bold red] Failed to query gate status: {exc}"
+            )
+            raise typer.Exit(code=1) from None
+
+    # Build request body
+    body: dict[str, Any] = {
+        "agent_name": agent,
+        "selected_value": choice,
+    }
+    if input_text is not None:
+        body["additional_input"] = input_text
+    if resolved_token is not None:
+        body["token"] = resolved_token
+
+    # Send gate response
+    try:
+        resp = httpx.post(f"{base_url}/api/gate-respond", json=body, timeout=10)
+    except httpx.ConnectError:
+        console.print(
+            f"[bold red]Error:[/bold red] Cannot connect to dashboard on port {port}. "
+            "Is the workflow running with --web or --web-bg?"
+        )
+        raise typer.Exit(code=1) from None
+    except httpx.HTTPError as exc:
+        console.print(f"[bold red]Error:[/bold red] Request failed: {exc}")
+        raise typer.Exit(code=1) from None
+
+    if resp.status_code == 403:
+        console.print(
+            "[bold red]Error:[/bold red] Authentication failed. "
+            "Provide a valid token with --token or CONDUCTOR_GATE_TOKEN env var."
+        )
+        raise typer.Exit(code=1)
+    if resp.status_code == 422:
+        detail = resp.json().get("error", "Validation error")
+        console.print(f"[bold red]Error:[/bold red] {detail}")
+        raise typer.Exit(code=1)
+    if resp.status_code != 200:
+        console.print(
+            f"[bold red]Error:[/bold red] Unexpected response ({resp.status_code}): "
+            f"{resp.text}"
+        )
+        raise typer.Exit(code=1)
+
+    console.print(
+        f"[green]Gate resolved:[/green] agent=[cyan]{agent}[/cyan] "
+        f"choice=[cyan]{choice}[/cyan]"
+    )
 
 
 @app.command()
