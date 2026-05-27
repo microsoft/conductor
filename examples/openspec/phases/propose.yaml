@@ -118,7 +118,7 @@ agents:
 
   # ── Step 2 ──────────────────────────────────────────────────────────────────
   - name: write_proposal
-    model: gpt-4.1
+    model: claude-sonnet-4.6
     description: |
       Generate the complete proposal.md following the schema template and
       instructions. Outputs the markdown as a structured field so the next

@@ -21,7 +21,7 @@ workflow:
 
   runtime:
     provider: copilot
-    default_model: gpt-4.1
+    default_model: claude-sonnet-4.6
 
   input:
     change:
@@ -184,7 +184,7 @@ agents:
 
   # ── Step 4 ──────────────────────────────────────────────────────────────────
   - name: write_spec
-    model: gpt-4.1
+    model: claude-sonnet-4.6
     description: |
       Generate the spec.md for this capability.
       - kind="new"      → full spec written from scratch

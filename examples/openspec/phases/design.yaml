@@ -23,7 +23,7 @@ workflow:
 
   runtime:
     provider: copilot
-    default_model: gpt-4.1
+    default_model: claude-sonnet-4.6
 
   input:
     change:
@@ -145,7 +145,7 @@ agents:
 
   # ── Step 3 ──────────────────────────────────────────────────────────────────
   - name: write_design
-    model: gpt-4.1
+    model: claude-sonnet-4.6
     description: |
       Generate the design document. Explains HOW to implement the change —
       key technical decisions, architecture, data model, security, and migration.

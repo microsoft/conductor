@@ -24,7 +24,7 @@ workflow:
 
   runtime:
     provider: copilot
-    default_model: gpt-4.1
+    default_model: claude-sonnet-4.6
 
   input:
     change:
@@ -242,7 +242,7 @@ agents:
   # any existing spec folder (score=0 on all four heuristics). An agent reads
   # the proposal + the real folder list and makes a semantic judgement call.
   - name: resolve_unmatched
-    model: gpt-4.1
+    model: claude-sonnet-4.6
     description: |
       Semantically match proposal capability names to existing spec folders when
       the Python script's string heuristics produced no match (score=0).
