@@ -1,8 +1,8 @@
 # Verification Report
 
-> 此檔案由 `openspec-verify-change` skill 在 apply 完成後產生，用以確認實作
-> 與 specs / design / tasks 的一致性。失敗的檢查須返回對應 artifact 修正後
-> 再重跑 verify。
+> This file is produced by the `openspec-verify-change` skill after the apply phase
+> completes. It confirms that the implementation is consistent with specs, design, and tasks.
+> Any failing check must be resolved in the corresponding artifact before re-running verify.
 
 **Change**: `<change-name>`
 **Verified at**: `YYYY-MM-DD HH:mm`
@@ -12,15 +12,15 @@
 
 ## 1. Structural Validation (`openspec validate --all --json`)
 
-- [ ] 全數 items `"valid": true`
+- [ ] All items return `"valid": true`
 
-**結果**：
+**Result**:
 
 ```text
-<貼上 openspec validate --all 的輸出摘要>
+<paste summary output from openspec validate --all>
 ```
 
-若有失敗項目，列出 id + issues：
+If any items failed, list them:
 
 | Item | Type | Issues |
 |---|---|---|
@@ -30,11 +30,11 @@
 
 ## 2. Task Completion (`tasks.md`)
 
-- [ ] 所有 `- [ ]` 已變為 `- [x]`
+- [ ] All `- [ ]` entries have become `- [x]`
 
-**未完成任務**（若有）：
+**Incomplete tasks** (if any):
 
-| Task | 未完成原因 | 是否阻塞 archive |
+| Task | Reason not completed | Blocks archive? |
 |---|---|---|
 | — | — | — |
 
@@ -42,90 +42,92 @@
 
 ## 3. Delta Spec Sync State
 
-對每個 `openspec/changes/<name>/specs/` 下的 capability 目錄，與
-`openspec/specs/<capability>/spec.md` 比對：
+For each capability directory under `openspec/changes/<name>/specs/`, compare against
+`openspec/specs/<capability>/spec.md`:
 
-| Capability | Sync 狀態 | 備註 |
+| Capability | Sync status | Notes |
 |---|---|---|
-| — | ✓ 已 sync / ✗ 待 sync / N/A | — |
+| — | ✓ Already synced / ✗ Needs sync / N/A | — |
 
 ---
 
 ## 4. Design / Specs Coherence Spot Check
 
-抽樣比對 `design.md` 的決策是否反映在 `specs/*.md` 的 Requirements 與
-Scenarios 中：
+Spot-check whether decisions in `design.md` are reflected in Requirements and Scenarios
+in `specs/*.md`:
 
-| 抽樣項 | design 描述 | specs 對應 | 差距 |
+| Sample item | design.md description | specs counterpart | Drift |
 |---|---|---|---|
 | — | — | — | — |
 
-**漂移警告**（非阻塞）：
+**Drift warnings** (non-blocking):
 
-- <若有，列出；無則填「無」>
+- <list any found; or "none">
 
 ---
 
 ## 5. Implementation Signal
 
-- [ ] Worktree 內無未 staged 的檔案
-- [ ] 所有相關 commit 已推送
+- [ ] No unstaged files in the worktree
+- [ ] All relevant commits have been pushed
 
-**Commit 範圍**（若知道）：`<from-sha>..<to-sha>`
+**Commit range** (if known): `<from-sha>..<to-sha>`
 
 ---
 
-## 6. Front-Door Routing Leak Detector（warning,非阻塞）
+## 6. Front-Door Routing Leak Detector (warning, non-blocking)
 
-設計產出不應落在 `docs/superpowers/specs/`(brainstorm artifact 的
-output redirection 會把它導到 `openspec/changes/<name>/brainstorm.md`)。
+Design output should not land in `docs/superpowers/specs/` — the brainstorm artifact's
+output redirection routes it to `openspec/changes/<name>/brainstorm.md`.
 
-偵測:
+Detection:
 
 ```bash
 ls docs/superpowers/specs/*.md 2>/dev/null
 ```
 
-- [ ] 無檔案,或存在的檔案是 schema 安裝前的合法存留
+- [ ] No files found, or any existing files are legitimate pre-schema-install remnants
 
-**洩漏清單**（若有）：
+**Leak list** (if any):
 
-| 檔案 | 內容是否已 captured 進 change | 建議動作 |
+| File | Content captured in change? | Recommended action |
 |---|---|---|
 | — | — | — |
 
-> 不會擋住 archive。新的 schema-installed cycle 產生的洩漏,應搬進
-> `openspec/changes/<name>/brainstorm.md` 或 `design.md` 後刪原檔。
+> Does not block archive. Any leaks produced by a new schema-installed cycle should be
+> moved into `openspec/changes/<name>/brainstorm.md` or `design.md`, then deleted.
 
 ---
 
 ## 7. Deferred Manual Dogfood vs Automated Test Equivalence
 
-對 plan.md 中標 `[~]` deferred 的手動 dogfood / smoke task,逐項列出
-等價的自動化測試覆蓋。若沒有等價自動化測試,該項應視為**真正的 gap**
-而非合理 deferral,建議在 retrospective Misses 中記錄。
+For each `[~]` deferred manual dogfood / smoke task in plan.md, list the equivalent
+automated test coverage. If no equivalent automated test exists, the item is a **real gap**
+— not a legitimate deferral — and should be recorded in the retrospective Misses section.
 
-| Deferred dogfood (plan §) | Equivalent automated test | Coverage assessment | 真正 gap? |
+| Deferred dogfood (plan §) | Equivalent automated test | Coverage assessment | Real gap? |
 |---|---|---|---|
-| 例:§11.3 `compose up + curl /actuator/health` | `LinebcIntegrationApplicationTests` (Testcontainers,24s) | Spring context boot + Flyway 跑完 + 主要 bean 注入 | ❌ 已等價覆蓋 |
+| e.g. §11.3 `compose up + curl /actuator/health` | `IntegrationApplicationTests` (Testcontainers) | Spring context boot + Flyway + main bean wiring | ❌ Already covered |
 | — | — | — | — |
 
-> **判讀規則**:
-> - 「等價」= 自動化測試的 assertion 集合是手動 dogfood 預期 assertion 的超集
-> - 「Coverage assessment」= 列出實際被觸及的 layer (context / DB schema / wiring / HTTP path / etc.)
-> - 任何「真正 gap = ✅」的列,Overall Decision 仍可 PASS,但須在 retrospective 留 follow-up 條目
+> **Interpretation rules**:
+> - "Equivalent" = the automated test's assertion set is a superset of the manual dogfood's expected assertions
+> - "Coverage assessment" = list the layers actually exercised (context / DB schema / wiring / HTTP path / etc.)
+> - Any row with "Real gap = ✅" still allows Overall Decision PASS, but requires a follow-up entry in the retrospective
 
-> **何時可以整節空白**:plan.md 完全沒有 `[~]` 標記的 row 時,本節不需要填(空白即 PASS)。
-> 只要 plan.md 出現任何 `[~]`,本節必須逐項列出,否則 Overall Decision 應降為 FAIL。
+> **When this section may be left blank**: if plan.md has no `[~]` rows at all, this section
+> does not need to be filled (blank = PASS).
+> If plan.md contains any `[~]` rows, every one must be listed here — otherwise Overall
+> Decision must be downgraded to FAIL.
 
 ---
 
 ## Overall Decision
 
-- [ ] ✅ PASS — 可進入 finishing-a-development-branch 與 archive
-- [ ] ⚠️ PASS WITH WARNINGS — 可進入後續步驟但需注意：`<說明>`
-- [ ] ❌ FAIL — 返回失敗的 artifact 修正後重跑 verify
+- [ ] ✅ PASS — ready to proceed to finishing-a-development-branch and archive
+- [ ] ⚠️ PASS WITH WARNINGS — may proceed but note: `<description>`
+- [ ] ❌ FAIL — return to the failing artifact, fix it, then re-run verify
 
-**下一步**：
+**Next step**:
 
-<說明下一個動作>
+<describe the next action>
