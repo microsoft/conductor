@@ -10,6 +10,7 @@ Tests cover:
 - Working directory
 - Jinja2 template rendering in command/args
 - Command not found error
+- Windows path normalization
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -281,3 +283,145 @@ class TestScriptExecutorErrors:
         )
         output = await executor.execute(agent, {})
         assert output.exit_code == 42
+
+
+class TestScriptExecutorWindowsPathNormalization:
+    """Tests for Windows path normalization in rendered_command."""
+
+    @pytest.mark.asyncio
+    async def test_forward_slashes_normalized_on_windows(self, executor: ScriptExecutor) -> None:
+        """On Windows, forward slashes in rendered_command are replaced with backslashes."""
+        agent = AgentDef(
+            name="test_win_path",
+            type="script",
+            command="C:/Python314/python.exe",
+            args=["-c", "print('hello')"],
+        )
+        mock_process = AsyncMock()
+        mock_process.communicate.return_value = (b"hello\n", b"")
+        mock_process.returncode = 0
+
+        with (
+            patch("conductor.executor.script.sys") as mock_sys,
+            patch("asyncio.create_subprocess_exec", return_value=mock_process) as mock_exec,
+        ):
+            mock_sys.platform = "win32"
+            await executor.execute(agent, {})
+
+        # The first positional arg to create_subprocess_exec is the command
+        called_command = mock_exec.call_args[0][0]
+        assert called_command == "C:\\Python314\\python.exe"
+
+    @pytest.mark.asyncio
+    async def test_forward_slashes_not_normalized_on_linux(self, executor: ScriptExecutor) -> None:
+        """On Linux, forward slashes in rendered_command are preserved."""
+        agent = AgentDef(
+            name="test_linux_path",
+            type="script",
+            command="/usr/local/bin/python3",
+            args=["-c", "print('hello')"],
+        )
+        mock_process = AsyncMock()
+        mock_process.communicate.return_value = (b"hello\n", b"")
+        mock_process.returncode = 0
+
+        with (
+            patch("conductor.executor.script.sys") as mock_sys,
+            patch("asyncio.create_subprocess_exec", return_value=mock_process) as mock_exec,
+        ):
+            mock_sys.platform = "linux"
+            await executor.execute(agent, {})
+
+        called_command = mock_exec.call_args[0][0]
+        assert called_command == "/usr/local/bin/python3"
+
+    @pytest.mark.asyncio
+    async def test_args_not_normalized_on_windows(self, executor: ScriptExecutor) -> None:
+        """On Windows, args are NOT normalized (may contain URLs or flags with /)."""
+        agent = AgentDef(
+            name="test_args_preserve",
+            type="script",
+            command="C:/Python314/python.exe",
+            args=["-c", "print('hello')", "https://example.com/api/v1"],
+        )
+        mock_process = AsyncMock()
+        mock_process.communicate.return_value = (b"hello\n", b"")
+        mock_process.returncode = 0
+
+        with (
+            patch("conductor.executor.script.sys") as mock_sys,
+            patch("asyncio.create_subprocess_exec", return_value=mock_process) as mock_exec,
+        ):
+            mock_sys.platform = "win32"
+            await executor.execute(agent, {})
+
+        # Args should be passed unchanged
+        called_args = mock_exec.call_args[0][1:]
+        assert "https://example.com/api/v1" in called_args
+
+    @pytest.mark.asyncio
+    async def test_file_not_found_includes_hint_on_windows(self, executor: ScriptExecutor) -> None:
+        """FileNotFoundError on Windows with / in command includes a hint."""
+        agent = AgentDef(
+            name="test_hint",
+            type="script",
+            command="C:/nonexistent/python.exe",
+        )
+        with (
+            patch("conductor.executor.script.sys") as mock_sys,
+            patch(
+                "asyncio.create_subprocess_exec",
+                side_effect=FileNotFoundError("not found"),
+            ),
+        ):
+            mock_sys.platform = "win32"
+            with pytest.raises(ExecutionError, match="Hint: on Windows") as exc_info:
+                await executor.execute(agent, {})
+
+        error_msg = str(exc_info.value)
+        assert "C:\\nonexistent\\python.exe" in error_msg
+        assert "working_dir=cwd" in error_msg
+
+    @pytest.mark.asyncio
+    async def test_file_not_found_no_hint_on_linux(self, executor: ScriptExecutor) -> None:
+        """FileNotFoundError on Linux does not include the Windows hint."""
+        agent = AgentDef(
+            name="test_no_hint",
+            type="script",
+            command="/usr/local/bin/nonexistent",
+        )
+        with (
+            patch("conductor.executor.script.sys") as mock_sys,
+            patch(
+                "asyncio.create_subprocess_exec",
+                side_effect=FileNotFoundError("not found"),
+            ),
+        ):
+            mock_sys.platform = "linux"
+            with pytest.raises(ExecutionError, match="command not found") as exc_info:
+                await executor.execute(agent, {})
+
+        assert "Hint" not in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_file_not_found_no_hint_when_no_slash_on_windows(
+        self, executor: ScriptExecutor
+    ) -> None:
+        """FileNotFoundError on Windows without / in original command: no hint."""
+        agent = AgentDef(
+            name="test_no_slash_hint",
+            type="script",
+            command="nonexistent_command",
+        )
+        with (
+            patch("conductor.executor.script.sys") as mock_sys,
+            patch(
+                "asyncio.create_subprocess_exec",
+                side_effect=FileNotFoundError("not found"),
+            ),
+        ):
+            mock_sys.platform = "win32"
+            with pytest.raises(ExecutionError, match="command not found") as exc_info:
+                await executor.execute(agent, {})
+
+        assert "Hint" not in str(exc_info.value)

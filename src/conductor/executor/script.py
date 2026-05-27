@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -84,6 +85,8 @@ class ScriptExecutor:
         # command is guaranteed non-None by the model validator when type="script"
         assert agent.command is not None
         rendered_command = self.renderer.render(agent.command, context)
+        if sys.platform == "win32":
+            rendered_command = rendered_command.replace("/", "\\")
         rendered_args = [self.renderer.render(arg, context) for arg in agent.args]
         rendered_working_dir = (
             self.renderer.render(agent.working_dir, context) if agent.working_dir else None
@@ -111,8 +114,15 @@ class ScriptExecutor:
                 env=env,
             )
         except FileNotFoundError as exc:
+            hint = ""
+            if sys.platform == "win32" and "/" in agent.command:
+                hint = (
+                    " Hint: on Windows, use backslashes (\\) in paths "
+                    "or set the env var with backslash form."
+                )
             raise ExecutionError(
-                f"Script '{agent.name}': command not found: '{rendered_command}'",
+                f"Script '{agent.name}': command not found: '{rendered_command}'"
+                f" (working_dir={rendered_working_dir or 'cwd'}){hint}",
                 agent_name=agent.name,
                 suggestion=f"Ensure '{rendered_command}' is installed and in PATH",
             ) from exc

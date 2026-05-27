@@ -1,6 +1,6 @@
 # Solution Design: External Workflow Friction v2 — Remaining Gaps
 
-**Status:** PROPOSED (EPICs 1–3 SHIPPED; EPIC 4 open)  
+**Status:** DONE (EPICs 1–4 SHIPPED)  
 **Revision:** 3 — Rebased onto actual v0.1.17 codebase state (score 68 review)  
 **Prior plan:** [external-workflow-friction.plan.md](external-workflow-friction.plan.md) (SHIPPED — all four items landed in v0.1.17)  
 **Source brainstorm:** [external-workflow-friction.brainstorm.md](external-workflow-friction.brainstorm.md) (updated 2026-05-27 with Phase 1/2/3 validation evidence)  
@@ -437,7 +437,7 @@ The new `POST /api/gate-respond` endpoint creates a control plane surface:
 
 **Exit criteria:** `conductor gate-respond --port <port> --choice <value>` resolves a parked gate. Token auth works when `CONDUCTOR_GATE_TOKEN` is set.
 
-### Phase 4: Windows Path Normalization (Issue #3) — OPEN
+### Phase 4: Windows Path Normalization (Issue #3) — DONE
 
 **Exit criteria:** A script step with `command: "C:/Python314/python.exe"` succeeds on Windows without manual backslash workaround.
 
@@ -558,15 +558,15 @@ The new `POST /api/gate-respond` endpoint creates a control plane surface:
 
 | Task ID | Type | Description | Files | Status |
 |---------|------|-------------|-------|--------|
-| E4-T1 | IMPL | In `script.py`, after template rendering of `rendered_command` (line 86), add Windows path normalization: `if sys.platform == "win32": rendered_command = rendered_command.replace("/", "\\")`. Only normalize `rendered_command`, not args (args may contain URLs or flags with `/`). | `executor/script.py` | TO DO |
-| E4-T2 | IMPL | Improve `FileNotFoundError` handler (line 113-118): include `rendered_command`, `rendered_working_dir`, and (on Windows when original `agent.command` contains `/`) a hint about path separator normalization. | `executor/script.py` | TO DO |
-| E4-T3 | TEST | Unit tests: (a) on Windows (mocked `sys.platform`), `C:/Python314/python.exe` → normalized to `C:\Python314\python.exe`, (b) on Linux, no normalization, (c) `FileNotFoundError` message includes the hint when `/` detected on Windows. | `tests/test_executor/test_script.py` | TO DO |
+| E4-T1 | IMPL | In `script.py`, after template rendering of `rendered_command` (line 86), add Windows path normalization: `if sys.platform == "win32": rendered_command = rendered_command.replace("/", "\\")`. Only normalize `rendered_command`, not args (args may contain URLs or flags with `/`). | `executor/script.py` | DONE |
+| E4-T2 | IMPL | Improve `FileNotFoundError` handler (line 113-118): include `rendered_command`, `rendered_working_dir`, and (on Windows when original `agent.command` contains `/`) a hint about path separator normalization. | `executor/script.py` | DONE |
+| E4-T3 | TEST | Unit tests: (a) on Windows (mocked `sys.platform`), `C:/Python314/python.exe` → normalized to `C:\Python314\python.exe`, (b) on Linux, no normalization, (c) `FileNotFoundError` message includes the hint when `/` detected on Windows. | `tests/test_executor/test_script.py` | DONE |
 
 **Acceptance Criteria:**
-- [ ] Forward-slash command paths are normalized on Windows
-- [ ] POSIX paths are not modified
-- [ ] `FileNotFoundError` message includes resolved command and Windows-specific hint
-- [ ] Args are not normalized (may contain `/` for legitimate purposes)
+- [x] Forward-slash command paths are normalized on Windows
+- [x] POSIX paths are not modified
+- [x] `FileNotFoundError` message includes resolved command and Windows-specific hint
+- [x] Args are not normalized (may contain `/` for legitimate purposes)
 
 ---
 
