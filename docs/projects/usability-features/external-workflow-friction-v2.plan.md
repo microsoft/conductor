@@ -1,6 +1,6 @@
 # Solution Design: External Workflow Friction v2 — Remaining Gaps
 
-**Status:** PROPOSED (EPICs 1–2 SHIPPED; EPICs 3–4 open)  
+**Status:** PROPOSED (EPICs 1–3 SHIPPED; EPIC 4 open)  
 **Revision:** 3 — Rebased onto actual v0.1.17 codebase state (score 68 review)  
 **Prior plan:** [external-workflow-friction.plan.md](external-workflow-friction.plan.md) (SHIPPED — all four items landed in v0.1.17)  
 **Source brainstorm:** [external-workflow-friction.brainstorm.md](external-workflow-friction.brainstorm.md) (updated 2026-05-27 with Phase 1/2/3 validation evidence)  
@@ -433,7 +433,7 @@ The new `POST /api/gate-respond` endpoint creates a control plane surface:
 
 **Exit criteria:** `max_parse_recovery_attempts` is configurable from YAML `retry:` block. Per-agent value reaches the parse recovery loop in both providers. Provider defaults preserved when field is omitted.
 
-### Phase 3: CLI Gate-Respond (Issue #5) — OPEN
+### Phase 3: CLI Gate-Respond (Issue #5) — DONE
 
 **Exit criteria:** `conductor gate-respond --port <port> --choice <value>` resolves a parked gate. Token auth works when `CONDUCTOR_GATE_TOKEN` is set.
 
@@ -535,20 +535,20 @@ The new `POST /api/gate-respond` endpoint creates a control plane surface:
 
 | Task ID | Type | Description | Files | Status |
 |---------|------|-------------|-------|--------|
-| E3-T1 | IMPL | Add `POST /api/gate-respond` endpoint to `web/server.py`. Accepts JSON body `{agent_name, selected_value, additional_input?, token?}`. Validates `CONDUCTOR_GATE_TOKEN` env var when set. Puts payload onto `_gate_response_queue`. | `web/server.py` | TO DO |
-| E3-T2 | IMPL | Add `GET /api/gate-status` endpoint to `web/server.py`. Returns JSON `{waiting: bool, agent_name: str?}` reflecting whether a gate is currently waiting. Requires the engine to set a flag on the dashboard when a gate is entered/exited. | `web/server.py` | TO DO |
-| E3-T3 | IMPL | Add `gate-respond` command to `cli/app.py`. Options: `--port` (required), `--choice` (required), `--agent` (optional, auto-discovered via `/api/gate-status`), `--input` (optional additional text), `--token` (optional auth token, also reads from `CONDUCTOR_GATE_TOKEN` env). Uses `httpx.post` to `http://127.0.0.1:<port>/api/gate-respond`. | `cli/app.py` | TO DO |
+| E3-T1 | IMPL | Add `POST /api/gate-respond` endpoint to `web/server.py`. Accepts JSON body `{agent_name, selected_value, additional_input?, token?}`. Validates `CONDUCTOR_GATE_TOKEN` env var when set. Puts payload onto `_gate_response_queue`. | `web/server.py` | DONE |
+| E3-T2 | IMPL | Add `GET /api/gate-status` endpoint to `web/server.py`. Returns JSON `{waiting: bool, agent_name: str?}` reflecting whether a gate is currently waiting. Requires the engine to set a flag on the dashboard when a gate is entered/exited. | `web/server.py` | DONE |
+| E3-T3 | IMPL | Add `gate-respond` command to `cli/app.py`. Options: `--port` (required), `--choice` (required), `--agent` (optional, auto-discovered via `/api/gate-status`), `--input` (optional additional text), `--token` (optional auth token, also reads from `CONDUCTOR_GATE_TOKEN` env). Uses `httpx.post` to `http://127.0.0.1:<port>/api/gate-respond`. | `cli/app.py` | DONE |
 | E3-T4 | — | ~~Add `httpx` to `pyproject.toml` dependencies.~~ **No-op:** `httpx>=0.27.0` is already a direct dependency at `pyproject.toml:46`. No action needed. | `pyproject.toml` | DONE |
-| E3-T5 | TEST | Unit tests for `POST /api/gate-respond`: (a) valid request → 200 + payload on queue, (b) missing `selected_value` → 422, (c) token mismatch when `CONDUCTOR_GATE_TOKEN` set → 403, (d) no token required when env var unset → 200. | `tests/test_web/test_gate_respond_api.py` | TO DO |
-| E3-T6 | TEST | CLI tests for `gate-respond` command: (a) happy path with mock server, (b) unreachable port → clear error, (c) token passed from `--token` and from env var. | `tests/test_cli/test_gate_respond.py` | TO DO |
-| E3-T7 | IMPL | Update `cli/app.py` line 191 text: change "Wait for CLI gate-resolution support (planned follow-up)" → "Use `conductor gate-respond --port <port> --choice <value>` to resolve from CLI". | `cli/app.py` | TO DO |
+| E3-T5 | TEST | Unit tests for `POST /api/gate-respond`: (a) valid request → 200 + payload on queue, (b) missing `selected_value` → 422, (c) token mismatch when `CONDUCTOR_GATE_TOKEN` set → 403, (d) no token required when env var unset → 200. | `tests/test_web/test_gate_respond_api.py` | DONE |
+| E3-T6 | TEST | CLI tests for `gate-respond` command: (a) happy path with mock server, (b) unreachable port → clear error, (c) token passed from `--token` and from env var. | `tests/test_cli/test_gate_respond.py` | DONE |
+| E3-T7 | IMPL | Update `cli/app.py` line 191 text: change "Wait for CLI gate-resolution support (planned follow-up)" → "Use `conductor gate-respond --port <port> --choice <value>` to resolve from CLI". | `cli/app.py` | DONE |
 
 **Acceptance Criteria:**
-- [ ] `conductor gate-respond --port 8080 --choice approve` resolves a parked gate
-- [ ] Token auth rejects unauthorized requests when `CONDUCTOR_GATE_TOKEN` is set
-- [ ] Auto-discovery of gate agent name via `/api/gate-status` works
-- [ ] Error messages are clear when port is unreachable or no gate is waiting
-- [ ] `--web-bg` + `human_gate` error message references the new command
+- [x] `conductor gate-respond --port 8080 --choice approve` resolves a parked gate
+- [x] Token auth rejects unauthorized requests when `CONDUCTOR_GATE_TOKEN` is set
+- [x] Auto-discovery of gate agent name via `/api/gate-status` works
+- [x] Error messages are clear when port is unreachable or no gate is waiting
+- [x] `--web-bg` + `human_gate` error message references the new command
 
 ### EPIC 4: Windows Path Normalization
 
