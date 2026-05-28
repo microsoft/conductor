@@ -4,7 +4,7 @@
   "description": "CLI for Conductor multi-agent workflow orchestration",
   "type": "module",
   "bin": {
-    "conductor": "./dist/index.js"
+    "conductor-ts": "./dist/index.js"
   },
   "exports": {
     ".": {
@@ -14,7 +14,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "dev": "tsc -p tsconfig.json --watch",
-    "test": "vitest run",
+    "test": "vitest run --passWithNoTests",
     "typecheck": "tsc --noEmit",
     "clean": "rm -rf dist",
     "start": "node --enable-source-maps dist/index.js"

@@ -1,4 +1,4 @@
-.PHONY: install install-cli dev test test-cov lint format typecheck check clean build all build-frontend dev-frontend
+.PHONY: install install-cli install-ts dev test test-cov lint format typecheck check clean build all build-frontend dev-frontend
 
 # Default target
 all: check test
@@ -10,6 +10,14 @@ install:
 # Install as a global CLI tool
 install-cli:
 	uv tool install --editable .
+
+# Install TypeScript CLI as a global conductor-ts command
+install-ts:
+	cd conductor-ts && pnpm install && pnpm build
+	@echo '#!/usr/bin/env bash' > ~/.local/bin/conductor-ts
+	@echo 'exec node "$(CURDIR)/conductor-ts/packages/conductor-cli/dist/index.js" "$$@"' >> ~/.local/bin/conductor-ts
+	@chmod +x ~/.local/bin/conductor-ts
+	@echo "Installed: $$(which conductor-ts)"
 
 # Install with dev dependencies
 dev:
