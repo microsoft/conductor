@@ -74,7 +74,29 @@ class TestProviderSettingsValidation:
 
     def test_non_copilot_with_base_url_rejected(self) -> None:
         with pytest.raises(ValidationError, match="not yet implemented"):
-            ProviderSettings(name="claude", base_url="http://anthropic-proxy/v1")
+            ProviderSettings(name="hermes", base_url="http://some-proxy/v1")
+
+    def test_claude_with_base_url_accepted(self) -> None:
+        s = ProviderSettings(name="claude", base_url="https://my-gateway.example.com/api/v1")
+        assert s.base_url == "https://my-gateway.example.com/api/v1"
+
+    def test_claude_with_auth_token_accepted(self) -> None:
+        s = ProviderSettings(name="claude", auth_token="dapi-abc123")
+        assert s.auth_token is not None
+        assert s.auth_token.get_secret_value() == "dapi-abc123"
+
+    def test_claude_with_base_url_and_auth_token_accepted(self) -> None:
+        s = ProviderSettings(
+            name="claude",
+            base_url="https://my-gateway.example.com/api/v1",
+            auth_token="dapi-abc123",
+        )
+        assert s.base_url == "https://my-gateway.example.com/api/v1"
+        assert s.auth_token.get_secret_value() == "dapi-abc123"
+
+    def test_auth_token_on_non_claude_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="only supported when name='claude'"):
+            ProviderSettings(name="copilot", auth_token="some-token", base_url="http://x/v1")
 
     def test_azure_options_require_azure_type(self) -> None:
         with pytest.raises(ValidationError, match="require type='azure'"):

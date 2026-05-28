@@ -126,6 +126,8 @@ class ClaudeProvider(AgentProvider):
     def __init__(
         self,
         api_key: str | None = None,
+        auth_token: str | None = None,
+        base_url: str | None = None,
         model: str | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
@@ -140,6 +142,14 @@ class ClaudeProvider(AgentProvider):
 
         Args:
             api_key: Anthropic API key. If None, uses ANTHROPIC_API_KEY env var.
+            auth_token: Bearer token for OAuth / gateway authentication. Sent as
+                ``Authorization: Bearer <token>`` instead of ``x-api-key``.
+                If None, falls back to ANTHROPIC_AUTH_TOKEN env var (SDK-native).
+                Use this for Databricks AI Gateway, LiteLLM, or any proxy that
+                expects a bearer token rather than a raw API key.
+            base_url: Custom API endpoint (e.g. Databricks gateway URL).
+                If None, falls back to ANTHROPIC_BASE_URL env var then the
+                default Anthropic API endpoint.
             model: Default model to use. Defaults to "claude-3-5-sonnet-latest".
                 This default is chosen for stability and to avoid dated model
                 deprecation risk. The "-latest" suffix ensures compatibility
@@ -172,6 +182,8 @@ class ClaudeProvider(AgentProvider):
 
         self._client: AsyncAnthropic | None = None
         self._api_key = api_key
+        self._auth_token = auth_token
+        self._base_url = base_url
         self._default_model = model or "claude-3-5-sonnet-latest"
 
         # Validate and store temperature (enforce schema bounds at instantiation)
@@ -219,10 +231,14 @@ class ClaudeProvider(AgentProvider):
         if not ANTHROPIC_SDK_AVAILABLE or AsyncAnthropic is None:
             return
 
-        self._client = AsyncAnthropic(
-            api_key=self._api_key,
-            timeout=self._timeout,
-        )
+        client_kwargs: dict[str, Any] = {"timeout": self._timeout}
+        if self._api_key is not None:
+            client_kwargs["api_key"] = self._api_key
+        if self._auth_token is not None:
+            client_kwargs["auth_token"] = self._auth_token
+        if self._base_url is not None:
+            client_kwargs["base_url"] = self._base_url
+        self._client = AsyncAnthropic(**client_kwargs)
 
         # Log SDK version
         if anthropic is not None:

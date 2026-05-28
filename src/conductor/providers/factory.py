@@ -97,6 +97,12 @@ async def create_provider(
                     "Claude provider requires anthropic SDK",
                     suggestion="Install with: uv add 'anthropic>=0.77.0,<1.0.0'",
                 )
+            claude_auth_token: str | None = None
+            claude_base_url: str | None = None
+            if provider_settings is not None and provider_settings.name == "claude":
+                if provider_settings.auth_token is not None:
+                    claude_auth_token = provider_settings.auth_token.get_secret_value()
+                claude_base_url = provider_settings.base_url
             provider = ClaudeProvider(
                 model=default_model,
                 temperature=temperature,
@@ -106,6 +112,8 @@ async def create_provider(
                 max_agent_iterations=max_agent_iterations,
                 max_session_seconds=max_session_seconds,
                 default_reasoning_effort=default_reasoning_effort,
+                auth_token=claude_auth_token,
+                base_url=claude_base_url,
             )
         case "hermes":
             if not HERMES_SDK_AVAILABLE:

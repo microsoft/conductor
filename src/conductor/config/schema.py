@@ -1350,6 +1350,23 @@ class ProviderSettings(BaseModel):
     """Bearer token. Takes precedence over ``api_key`` when both are set.
     Copilot-only."""
 
+    auth_token: SecretStr | None = None
+    """Bearer token for OAuth / gateway authentication. Claude-only.
+
+    Sent as ``Authorization: Bearer <token>`` by the Anthropic SDK instead
+    of the usual ``x-api-key`` header. Use for Databricks AI Gateway,
+    LiteLLM proxies, or any endpoint that expects a bearer token.
+
+    Falls back to ``ANTHROPIC_AUTH_TOKEN`` env var when not set in YAML.
+
+    Example::
+
+        provider:
+          name: claude
+          base_url: https://my-gateway.example.com/api/v1
+          auth_token: ${DATABRICKS_TOKEN}
+    """
+
     headers: dict[str, str] | None = None
     """Extra HTTP headers to send with every request. Copilot-only."""
 
@@ -1366,6 +1383,9 @@ class ProviderSettings(BaseModel):
             "headers": self.headers,
             "azure": self.azure,
         }
+        claude_only_fields = {
+            "auth_token": self.auth_token,
+        }
         if self.name != "copilot":
             extras = sorted(k for k, v in copilot_only_fields.items() if v is not None)
             if extras:
@@ -1373,10 +1393,17 @@ class ProviderSettings(BaseModel):
                     f"Provider fields {extras} are only supported when name='copilot'. "
                     "Structured provider config for other providers is not yet implemented."
                 )
+        if self.name not in ("copilot", "claude"):
             if self.base_url is not None or self.api_key is not None:
                 raise ValueError(
                     f"Structured provider config (base_url/api_key) for name='{self.name}' "
                     "is not yet implemented; use environment variables for the underlying SDK."
+                )
+        if self.name != "claude":
+            extras = sorted(k for k, v in claude_only_fields.items() if v is not None)
+            if extras:
+                raise ValueError(
+                    f"Provider fields {extras} are only supported when name='claude'."
                 )
 
         if self.azure is not None and self.type != "azure":
@@ -1390,7 +1417,11 @@ class ProviderSettings(BaseModel):
             raise ValueError(
                 "'headers' must contain at least one entry; remove the key to omit headers"
             )
-        for secret_field, value in (("api_key", self.api_key), ("bearer_token", self.bearer_token)):
+        for secret_field, value in (
+            ("api_key", self.api_key),
+            ("bearer_token", self.bearer_token),
+            ("auth_token", self.auth_token),
+        ):
             if value is not None and value.get_secret_value() == "":
                 raise ValueError(
                     f"'{secret_field}' is empty; remove the key or supply a value "
@@ -1439,6 +1470,7 @@ class ProviderSettings(BaseModel):
                 self.base_url,
                 self.api_key,
                 self.bearer_token,
+                self.auth_token,
                 self.headers,
                 self.azure,
             )
