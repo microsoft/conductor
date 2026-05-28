@@ -1,4 +1,4 @@
-.PHONY: install install-cli install-ts dev test test-cov lint format typecheck check clean build all build-frontend dev-frontend
+.PHONY: install install-cli install-ts package-vscode dev test test-cov lint format typecheck check clean build all build-frontend dev-frontend
 
 # Default target
 all: check test
@@ -18,6 +18,12 @@ install-ts:
 	@echo 'exec node "$(CURDIR)/conductor-ts/packages/conductor-cli/dist/index.js" "$$@"' >> ~/.local/bin/conductor-ts
 	@chmod +x ~/.local/bin/conductor-ts
 	@echo "Installed: $$(which conductor-ts)"
+
+# Package the VS Code extension as a .vsix
+package-vscode:
+	cd conductor-ts && pnpm install
+	cd conductor-ts/packages/conductor-vscode && pnpm build && node_modules/.bin/vsce package --no-dependencies
+	@echo "Install with: code --install-extension conductor-ts/packages/conductor-vscode/conductor-vscode-*.vsix"
 
 # Install with dev dependencies
 dev:

@@ -98,9 +98,8 @@ async function handleRequest(
       const result = await runPromise;
       bridge.close();
 
-      stream.markdown(`\n✅ **Workflow complete**\n`);
       if (Object.keys(result.output).length > 0) {
-        stream.markdown("**Output:**\n```json\n" + JSON.stringify(result.output, null, 2) + "\n```");
+        stream.markdown("---\n**Workflow output:**\n```json\n" + JSON.stringify(result.output, null, 2) + "\n```\n");
       }
     } catch (err) {
       bridge.close();
@@ -142,26 +141,90 @@ async function handleBridgeInputs(
 // ---------------------------------------------------------------------------
 
 function attachChatSubscriber(emitter: WorkflowEventEmitter, stream: vscode.ChatResponseStream): void {
+  const agentStartTimes = new Map<string, number>();
+
   emitter.subscribe(async (event: WorkflowEvent) => {
+    const data = event.data;
+    // Debug: uncomment to trace events in F12 DevTools Console
+    // console.log("[conductor] event:", event.type, data);
     switch (event.type) {
-      case "agent_started":
-        stream.progress(`Running agent: ${event.data["agentName"] as string}`);
+      case "agent_started": {
+        const name = data["agentName"] as string;
+        agentStartTimes.set(name, Date.now());
+        stream.progress(`Running agent: ${name}`);
+        stream.markdown(`\n**🤖 Agent: ${name}**\n\n`);
         break;
-      case "agent_completed":
-        stream.markdown(`\n✓ Agent **${event.data["agentName"] as string}** completed\n`);
+      }
+      case "agent_turn_start": {
+        const name = data["agentName"] as string;
+        const turn = data["turn"] as number | string;
+        stream.progress(turn === "awaiting_model" ? `${name}: processing…` : `${name}: turn ${turn}…`);
         break;
-      case "agent_message":
+      }
+      case "agent_reasoning": {
+        const name = data["agentName"] as string;
+        const content = data["content"] as string;
         stream.markdown(
-          `\n**${event.data["agentName"] as string}:**\n${event.data["content"] as string}\n`,
+          `\n<details><summary>💭 Thinking (${name})</summary>\n\n${content}\n\n</details>\n\n`,
         );
         break;
-      case "agent_reasoning":
-        stream.markdown(
-          `\n<details><summary>Reasoning (${event.data["agentName"] as string})</summary>\n\n${event.data["content"] as string}\n\n</details>\n`,
-        );
+      }
+      case "agent_tool_start": {
+        const name = data["agentName"] as string;
+        const tool = data["toolName"] as string;
+        stream.progress(`${name}: calling ${tool}…`);
+        stream.markdown(`\n> ⚙ \`${tool}\`\n\n`);
         break;
-      case "agent_tool_start":
-        stream.progress(`Tool: ${event.data["toolName"] as string}`);
+      }
+      case "agent_tool_complete": {
+        const error = data["error"] as string | undefined;
+        if (error) {
+          const tool = data["toolName"] as string;
+          stream.markdown(`\n> ✗ \`${tool}\` failed: ${error}\n\n`);
+        }
+        break;
+      }
+      case "agent_completed": {
+        const name = data["agentName"] as string;
+        const startTime = agentStartTimes.get(name);
+        const elapsed = startTime ? `${((Date.now() - startTime) / 1000).toFixed(2)}s` : "";
+        const model = data["model"] as string | undefined;
+        const inputTokens = (data["inputTokens"] as number | undefined) ?? 0;
+        const outputTokens = (data["outputTokens"] as number | undefined) ?? 0;
+        const nextAgent = data["nextAgent"] as string | undefined;
+        const output = data["output"] as Record<string, unknown> | undefined;
+
+        // Render parsed output fields (answers, summaries, etc.) as readable prose
+        if (output && Object.keys(output).length > 0) {
+          for (const [key, value] of Object.entries(output)) {
+            const text = typeof value === "string" ? value : JSON.stringify(value, null, 2);
+            stream.markdown(`**${key}:**\n\n${text}\n\n`);
+          }
+        }
+
+        // Summary line
+        const parts: string[] = [];
+        if (elapsed) parts.push(elapsed);
+        if (model) parts.push(model);
+        if (inputTokens > 0 || outputTokens > 0)
+          parts.push(`${inputTokens.toLocaleString()} in / ${outputTokens.toLocaleString()} out`);
+        stream.markdown(
+          `\n*✅ ${name} — ${parts.join(" · ")}${nextAgent && nextAgent !== "$end" ? ` → ${nextAgent}` : ""}*\n\n`,
+        );
+        agentStartTimes.delete(name);
+        break;
+      }
+      case "agent_failed": {
+        const name = data["agentName"] as string;
+        stream.markdown(`\n❌ **${name}** failed: ${data["error"] as string}\n\n`);
+        agentStartTimes.delete(name);
+        break;
+      }
+      case "parallel_started":
+        stream.markdown(`\n⟳ **Parallel group:** ${data["groupName"] as string}\n\n`);
+        break;
+      case "foreach_started":
+        stream.markdown(`\n↺ **For-each:** ${data["groupName"] as string}\n\n`);
         break;
     }
   });
@@ -178,20 +241,40 @@ interface ParsedArgs {
 }
 
 function parseArgs(prompt: string): ParsedArgs {
-  const parts = prompt.split(/\s+/).filter(Boolean);
-  const command = parts[0] ?? "";
+  // Tokenize respecting double- and single-quoted strings so that
+  // --input question="What is Python?" is a single token after the flag.
+  const tokens: string[] = [];
+  let current = "";
+  let inDouble = false;
+  let inSingle = false;
+
+  for (let i = 0; i < prompt.length; i++) {
+    const ch = prompt[i]!;
+    if (ch === '"' && !inSingle) {
+      inDouble = !inDouble;
+    } else if (ch === "'" && !inDouble) {
+      inSingle = !inSingle;
+    } else if (ch === " " && !inDouble && !inSingle) {
+      if (current) { tokens.push(current); current = ""; }
+    } else {
+      current += ch;
+    }
+  }
+  if (current) tokens.push(current);
+
+  const command = tokens[0] ?? "";
   const inputs: Record<string, string> = {};
   let workflowFile: string | undefined;
 
-  for (let i = 1; i < parts.length; i++) {
-    const part = parts[i]!;
+  for (let i = 1; i < tokens.length; i++) {
+    const part = tokens[i]!;
     if (part === "--input" || part === "-i") {
-      const kv = parts[++i];
+      const kv = tokens[++i];
       if (kv) {
         const eq = kv.indexOf("=");
         if (eq !== -1) inputs[kv.slice(0, eq)] = kv.slice(eq + 1);
       }
-    } else if (part.includes("=")) {
+    } else if (part.includes("=") && !part.startsWith("-")) {
       const eq = part.indexOf("=");
       inputs[part.slice(0, eq)] = part.slice(eq + 1);
     } else if (!part.startsWith("-")) {

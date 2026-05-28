@@ -1,0 +1,6 @@
+src/
+tsconfig.json
+**/*.ts
+!**/*.d.ts
+**/*.map
+node_modules/

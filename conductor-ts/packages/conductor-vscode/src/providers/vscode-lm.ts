@@ -45,11 +45,22 @@ export class VscodeLmProvider implements AgentProvider {
       ? new vscode.CancellationTokenSource().token
       : new vscode.CancellationTokenSource().token;
 
+    // Append JSON schema instructions when the agent declares an output schema,
+    // mirroring CopilotCliProvider behaviour.
+    let fullPrompt = prompt;
+    if (agent.output && Object.keys(agent.output).length > 0) {
+      const schemaDesc = JSON.stringify(agent.output, null, 2);
+      fullPrompt +=
+        `\n\n**IMPORTANT: You MUST respond with a JSON object matching this schema:**\n` +
+        `\`\`\`json\n${schemaDesc}\n\`\`\`\n` +
+        `Return ONLY the JSON object, no other text.`;
+    }
+
     const messages: vscode.LanguageModelChatMessage[] = [];
     if (agent.system_prompt) {
       messages.push(vscode.LanguageModelChatMessage.User(agent.system_prompt));
     }
-    messages.push(vscode.LanguageModelChatMessage.User(prompt));
+    messages.push(vscode.LanguageModelChatMessage.User(fullPrompt));
 
     let content = "";
     let inputTokens = 0;

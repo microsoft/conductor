@@ -1,9 +1,14 @@
 {
-  "name": "@conductor/vscode",
+  "name": "conductor-vscode",
   "version": "0.1.0",
   "displayName": "Conductor",
   "description": "Run multi-agent Conductor workflows in VS Code Copilot Chat",
   "publisher": "conductor",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/fenghaitao/conductor"
+  },
+  "license": "MIT",
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -11,11 +16,11 @@
   "activationEvents": [],
   "main": "./dist/extension.js",
   "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "watch": "tsc -p tsconfig.json --watch",
+    "build": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --external:@github/copilot-sdk --format=cjs --platform=node --sourcemap",
+    "watch": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --external:@github/copilot-sdk --format=cjs --platform=node --sourcemap --watch",
     "typecheck": "tsc --noEmit",
     "clean": "rm -rf dist",
-    "package": "vsce package"
+    "package": "pnpm build && vsce package"
   },
   "contributes": {
     "chatParticipants": [
@@ -42,6 +47,7 @@
     "@types/vscode": "^1.90.0",
     "typescript": "^5.5.0",
     "@types/node": "^20.0.0",
+    "esbuild": "^0.21.0",
     "@vscode/vsce": "^3.0.0"
   }
 }
