@@ -138,7 +138,7 @@ agents:
 
     # Agent-level tools
     tools:                          # null = all workflow tools, [] = none, [list] = subset
-      - string
+      - string                      # For hermes: maps to enabled_toolsets (hermes toolset names, e.g. "web", "code")
 
     # Agent-level limits (override workflow runtime defaults)
     max_agent_iterations: integer   # Max tool-use roundtrips for this agent (1-500, optional)
@@ -691,9 +691,9 @@ runtime:
     name: string                  # "copilot" (default), "claude", "hermes", "openai-agents"
     type: string                  # "openai" | "azure" | "anthropic" (Copilot-only)
     wire_api: string              # "completions" | "responses" (Copilot-only)
-    base_url: string              # Endpoint base URL
-    api_key: string               # SecretStr; redacted in dumps. Prefer ${OPENAI_API_KEY}.
-    bearer_token: string          # SecretStr; takes precedence over api_key.
+    base_url: string              # Endpoint base URL (copilot + hermes)
+    api_key: string               # SecretStr; redacted in dumps. (copilot + hermes)
+    bearer_token: string          # SecretStr; takes precedence over api_key. (Copilot-only)
     headers: {string: string}     # Extra HTTP headers (Copilot-only)
     azure:                        # Azure-specific options (requires type: azure)
       api_version: string         # e.g. "2024-10-21"
