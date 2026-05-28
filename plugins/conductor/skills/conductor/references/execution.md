@@ -17,7 +17,7 @@ conductor run <workflow.yaml> [OPTIONS]
 | `--input`, `-i NAME=VALUE` | Workflow input (repeatable) |
 | `--input.NAME=VALUE` | Alternative input syntax |
 | `--metadata`, `-m KEY=VALUE` | Workflow metadata, merged on top of YAML `metadata:` (repeatable; values stay strings) |
-| `--provider`, `-p PROVIDER` | Override provider (`copilot`, `claude`, `openai-agents`) |
+| `--provider`, `-p PROVIDER` | Override provider (`copilot`, `claude`, `hermes`, `openai-agents`) |
 | `--dry-run` | Show execution plan only |
 | `--skip-gates` | Auto-select first option at human gates |
 | `--web` | Start real-time web dashboard |
@@ -556,6 +556,7 @@ If the workflow file has changed since the checkpoint was saved, a warning is di
 ```bash
 conductor run workflow.yaml -p claude          # Use Claude for all agents
 conductor run workflow.yaml -p copilot         # Use Copilot (default)
+conductor run workflow.yaml -p hermes          # Use Hermes (NousResearch agent SDK)
 conductor run workflow.yaml -p openai-agents   # Use OpenAI Agents SDK
 ```
 
