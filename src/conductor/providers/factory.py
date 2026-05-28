@@ -159,9 +159,20 @@ async def create_provider(
                     "Hermes provider requires the hermes-agent package",
                     suggestion="Install with: pip install hermes-agent",
                 )
+            hermes_base_url: str | None = None
+            hermes_api_key: str | None = None
+            if provider_settings is not None and provider_settings.name == "hermes":
+                hermes_base_url = provider_settings.base_url
+                if provider_settings.api_key is not None:
+                    hermes_api_key = provider_settings.api_key.get_secret_value()
             provider = HermesProvider(
                 model=default_model,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                base_url=hermes_base_url,
+                api_key=hermes_api_key,
                 max_agent_iterations=max_agent_iterations,
+                max_session_seconds=max_session_seconds,
                 default_reasoning_effort=default_reasoning_effort,
             )
         case _:

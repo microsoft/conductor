@@ -81,6 +81,10 @@ class HermesProvider(AgentProvider):
     def __init__(
         self,
         model: str | None = None,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        base_url: str | None = None,
+        api_key: str | None = None,
         max_agent_iterations: int | None = None,
         max_session_seconds: float | None = None,
         default_reasoning_effort: ReasoningEffort | None = None,
@@ -91,6 +95,13 @@ class HermesProvider(AgentProvider):
             model: Default model in hermes/OpenRouter format, e.g.
                 ``"anthropic/claude-sonnet-4"`` or ``"openai/gpt-4o"``.
                 If None, uses whatever model hermes has configured.
+            max_tokens: Maximum output tokens forwarded to ``AIAgent``.
+            temperature: Sampling temperature forwarded to ``AIAgent``.
+            base_url: Override endpoint base URL, e.g. OpenRouter.
+                Forwarded to ``AIAgent`` when set.
+            api_key: API key for the endpoint. Forwarded to ``AIAgent``
+                when set. Use ``${ENV_VAR}`` interpolation in YAML so the
+                literal value never appears in event logs.
             max_agent_iterations: Maximum tool-calling iterations per agent
                 execution. Maps to hermes ``max_iterations``. Defaults to
                 90 (hermes default) when None.
@@ -108,6 +119,10 @@ class HermesProvider(AgentProvider):
             )
 
         self._default_model = model
+        self._default_max_tokens = max_tokens
+        self._default_temperature = temperature
+        self._base_url = base_url
+        self._api_key = api_key
         self._default_max_agent_iterations = max_agent_iterations
         self._default_max_session_seconds = max_session_seconds
 
@@ -174,12 +189,28 @@ class HermesProvider(AgentProvider):
             agent_kwargs["model"] = resolved_model
         if resolved_max_iter is not None:
             agent_kwargs["max_iterations"] = resolved_max_iter
+        if self._default_max_tokens is not None:
+            agent_kwargs["max_tokens"] = self._default_max_tokens
+        if self._default_temperature is not None:
+            agent_kwargs["temperature"] = self._default_temperature
+        if self._base_url:
+            agent_kwargs["base_url"] = self._base_url
+        if self._api_key:
+            agent_kwargs["api_key"] = self._api_key
+        # Map Conductor tools field to hermes enabled_toolsets.
+        # tools=None → omit (hermes default: all tools)
+        # tools=[]   → enabled_toolsets=[] (empty allowlist = 0 tools)
+        # tools=[..] → enabled_toolsets=[..] (hermes toolset names)
+        if agent.tools is not None:
+            agent_kwargs["enabled_toolsets"] = agent.tools
 
         loop = asyncio.get_event_loop()
 
         def _run_sync() -> dict[str, Any]:
             hermes_agent = AIAgent(**agent_kwargs)
-            return hermes_agent.run_conversation(prompt)
+            return hermes_agent.run_conversation(
+                prompt, system_message=agent.system_prompt or None
+            )
 
         # Wrap the blocking call and optionally race against interrupt / timeout
         call_task = loop.run_in_executor(None, _run_sync)
@@ -225,7 +256,7 @@ class HermesProvider(AgentProvider):
         if result.get("failed"):
             error_msg = result.get("error") or "hermes agent run failed"
             raise ProviderError(
-                f"Hermes agent execution failed: {error_msg}",
+                f"Hermes agent execution failed (model='{resolved_model}'): {error_msg}",
             )
 
         final_response: str | None = result.get("final_response")

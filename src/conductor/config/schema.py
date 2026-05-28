@@ -1374,10 +1374,11 @@ class ProviderSettings(BaseModel):
                     "Structured provider config for other providers is not yet implemented."
                 )
             if self.base_url is not None or self.api_key is not None:
-                raise ValueError(
-                    f"Structured provider config (base_url/api_key) for name='{self.name}' "
-                    "is not yet implemented; use environment variables for the underlying SDK."
-                )
+                if self.name not in ("copilot", "hermes"):
+                    raise ValueError(
+                        f"Structured provider config (base_url/api_key) for name='{self.name}' "
+                        "is not yet implemented; use environment variables for the underlying SDK."
+                    )
 
         if self.azure is not None and self.type != "azure":
             raise ValueError("'azure' options require type='azure'")
