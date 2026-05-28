@@ -135,6 +135,13 @@ export class CopilotCliProvider implements AgentProvider {
 
     try {
       // Subscribe to events before sending
+      session.on("assistant.turn_start", (event) => {
+        const e = event as { data?: { turn_id?: number } };
+        opts.emitter?.emit("agent_turn_start", {
+          agentName: agent.name,
+          turn: e.data?.turn_id ?? 0,
+        }).catch(() => undefined);
+      });
       session.on("assistant.message_delta", (event) => {
         content += (event as { data: { deltaContent: string } }).data.deltaContent ?? "";
       });
@@ -150,6 +157,14 @@ export class CopilotCliProvider implements AgentProvider {
         if (e.data.model) resolvedModel = e.data.model;
         if (e.data.inputTokens) inputTokens = e.data.inputTokens;
         if (e.data.outputTokens) outputTokens = e.data.outputTokens;
+      });
+      session.on("assistant.usage", (event) => {
+        // Primary source for token counts — mirrors Python's assistant.usage handler
+        const e = event as {
+          data: { inputTokens?: number; outputTokens?: number };
+        };
+        if (e.data.inputTokens != null) inputTokens = Math.round(e.data.inputTokens);
+        if (e.data.outputTokens != null) outputTokens = Math.round(e.data.outputTokens);
       });
       session.on("tool.execution_start", (event) => {
         const e = event as { data: { toolName: string; args?: unknown } };

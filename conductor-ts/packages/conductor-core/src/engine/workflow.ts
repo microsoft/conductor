@@ -212,13 +212,19 @@ export class WorkflowEngine {
     const parsed = parseOutput(agentOutput.content, agent.output, agent.name);
     this.context.store(agent.name, parsed);
 
+    // Evaluate route before emitting so the destination is included in the event
+    const nextAgent = this.route(agent.routes, parsed, agent.name);
+
     await this.emitter.emit("agent_completed", {
       agentName: agent.name,
       output: parsed,
+      nextAgent,
+      model: agentOutput.model,
+      inputTokens: agentOutput.inputTokens ?? 0,
+      outputTokens: agentOutput.outputTokens ?? 0,
     });
 
-    // Route
-    return this.route(agent.routes, parsed, agent.name);
+    return nextAgent;
   }
 
   // -------------------------------------------------------------------------

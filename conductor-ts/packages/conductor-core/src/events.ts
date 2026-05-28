@@ -10,6 +10,7 @@ export type WorkflowEventType =
   | "agent_started"
   | "agent_completed"
   | "agent_failed"
+  | "agent_turn_start"
   | "agent_message"
   | "agent_reasoning"
   | "agent_tool_start"
