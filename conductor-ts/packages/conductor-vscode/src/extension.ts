@@ -4,11 +4,15 @@
  */
 import * as vscode from "vscode";
 import { registerConductorParticipant } from "./chat/participant.js";
+import { RunWorkflowTool } from "./tools/run-workflow-tool.js";
 import { initLogger } from "./logger.js";
 
 export function activate(context: vscode.ExtensionContext): void {
   initLogger(context);
   registerConductorParticipant(context);
+  context.subscriptions.push(
+    vscode.lm.registerTool("conductor_runWorkflow", new RunWorkflowTool()),
+  );
 
   context.subscriptions.push(
     vscode.commands.registerCommand("conductor.runWorkflow", async () => {

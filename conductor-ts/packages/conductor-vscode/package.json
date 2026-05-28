@@ -37,6 +37,28 @@
         "command": "conductor.runWorkflow",
         "title": "Conductor: Run Workflow"
       }
+    ],
+    "languageModelTools": [
+      {
+        "name": "conductor_runWorkflow",
+        "displayName": "Run Conductor Workflow",
+        "modelDescription": "Runs a multi-agent Conductor YAML workflow and returns its output. Use when the user wants to execute a Conductor workflow file.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "workflowPath": {
+              "type": "string",
+              "description": "Relative or absolute path to the workflow YAML file"
+            },
+            "inputs": {
+              "type": "object",
+              "description": "Key-value pairs of workflow inputs (all values must be strings)",
+              "additionalProperties": { "type": "string" }
+            }
+          },
+          "required": ["workflowPath"]
+        }
+      }
     ]
   },
   "dependencies": {
