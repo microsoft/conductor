@@ -201,6 +201,32 @@ class TestProviderSettingsSerialization:
         assert dumped["provider"]["api_key"] == "**********"
 
 
+class TestHermesProviderSettings:
+    """Hermes provider accepts ``base_url`` and ``api_key`` in structured config."""
+
+    def test_hermes_with_base_url_accepted(self) -> None:
+        s = ProviderSettings(name="hermes", base_url="https://openrouter.ai/api/v1")
+        assert s.base_url == "https://openrouter.ai/api/v1"
+        assert s.has_custom_routing()
+
+    def test_hermes_with_api_key_accepted(self) -> None:
+        s = ProviderSettings(name="hermes", base_url="https://openrouter.ai/api/v1", api_key="sk-or-test")
+        assert isinstance(s.api_key, SecretStr)
+        assert s.api_key.get_secret_value() == "sk-or-test"
+
+    def test_hermes_with_base_url_and_api_key_accepted(self) -> None:
+        s = ProviderSettings(
+            name="hermes",
+            base_url="https://openrouter.ai/api/v1",
+            api_key="sk-or-test",
+        )
+        assert s.has_custom_routing()
+
+    def test_claude_with_base_url_still_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="not yet implemented"):
+            ProviderSettings(name="claude", base_url="http://anthropic-proxy/v1")
+
+
 class TestHasCustomRouting:
     """``has_custom_routing()`` gates env-var fallback activation."""
 

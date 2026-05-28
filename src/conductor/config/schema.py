@@ -1393,7 +1393,7 @@ class ProviderSettings(BaseModel):
                     f"Provider fields {extras} are only supported when name='copilot'. "
                     "Structured provider config for other providers is not yet implemented."
                 )
-        if self.name not in ("copilot", "claude"):
+        if self.name not in ("copilot", "claude", "hermes"):
             if self.base_url is not None or self.api_key is not None:
                 raise ValueError(
                     f"Structured provider config (base_url/api_key) for name='{self.name}' "

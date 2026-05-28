@@ -19,10 +19,18 @@ def _make_agent(
     output: dict[str, OutputField] | None = None,
     max_agent_iterations: int | None = None,
     max_session_seconds: float | None = None,
+    tools: list[str] | None = None,
+    system_prompt: str | None = None,
 ) -> AgentDef:
-    return AgentDef(name=name, model=model, output=output,
-                    max_agent_iterations=max_agent_iterations,
-                    max_session_seconds=max_session_seconds)
+    return AgentDef(
+        name=name,
+        model=model,
+        output=output,
+        max_agent_iterations=max_agent_iterations,
+        max_session_seconds=max_session_seconds,
+        tools=tools,
+        system_prompt=system_prompt,
+    )
 
 
 def _make_result(
@@ -328,6 +336,212 @@ class TestHermesExecute:
                     await provider.execute(agent, {}, "hello", interrupt_signal=interrupt)
 
         asyncio.run(run_with_pre_set_interrupt())
+
+
+class TestHermesSystemPrompt:
+    def test_system_prompt_forwarded(self) -> None:
+        with patch("conductor.providers.hermes.HERMES_SDK_AVAILABLE", True), \
+             patch("conductor.providers.hermes.AIAgent"):
+            provider = HermesProvider()
+
+        agent = _make_agent(system_prompt="You are a helpful assistant.")
+        captured: list[dict] = []
+
+        def fake_run_conv(prompt: str, **kwargs: Any) -> dict[str, Any]:
+            captured.append(kwargs)
+            return _make_result()
+
+        with patch("conductor.providers.hermes.AIAgent") as mock_cls:
+            mock_instance = Mock()
+            mock_instance.run_conversation.side_effect = fake_run_conv
+            mock_cls.return_value = mock_instance
+
+            asyncio.run(provider.execute(agent, {}, "hello"))
+
+        assert captured[0].get("system_message") == "You are a helpful assistant."
+
+    def test_system_prompt_none_when_not_set(self) -> None:
+        with patch("conductor.providers.hermes.HERMES_SDK_AVAILABLE", True), \
+             patch("conductor.providers.hermes.AIAgent"):
+            provider = HermesProvider()
+
+        agent = _make_agent(system_prompt=None)
+        captured: list[dict] = []
+
+        def fake_run_conv(prompt: str, **kwargs: Any) -> dict[str, Any]:
+            captured.append(kwargs)
+            return _make_result()
+
+        with patch("conductor.providers.hermes.AIAgent") as mock_cls:
+            mock_instance = Mock()
+            mock_instance.run_conversation.side_effect = fake_run_conv
+            mock_cls.return_value = mock_instance
+
+            asyncio.run(provider.execute(agent, {}, "hello"))
+
+        assert captured[0].get("system_message") is None
+
+
+class TestHermesToolsMapping:
+    def test_tools_none_sets_neither_kwarg(self) -> None:
+        with patch("conductor.providers.hermes.HERMES_SDK_AVAILABLE", True), \
+             patch("conductor.providers.hermes.AIAgent"):
+            provider = HermesProvider()
+
+        agent = _make_agent(tools=None)
+
+        with patch("conductor.providers.hermes.AIAgent") as mock_cls:
+            mock_instance = Mock()
+            mock_instance.run_conversation.return_value = _make_result()
+            mock_cls.return_value = mock_instance
+
+            asyncio.run(provider.execute(agent, {}, "hello"))
+
+        _, kwargs = mock_cls.call_args
+        assert "enabled_toolsets" not in kwargs
+        assert "disabled_toolsets" not in kwargs
+
+    def test_tools_empty_list_sets_enabled_toolsets_empty(self) -> None:
+        with patch("conductor.providers.hermes.HERMES_SDK_AVAILABLE", True), \
+             patch("conductor.providers.hermes.AIAgent"):
+            provider = HermesProvider()
+
+        agent = _make_agent(tools=[])
+
+        with patch("conductor.providers.hermes.AIAgent") as mock_cls:
+            mock_instance = Mock()
+            mock_instance.run_conversation.return_value = _make_result()
+            mock_cls.return_value = mock_instance
+
+            asyncio.run(provider.execute(agent, {}, "hello"))
+
+        _, kwargs = mock_cls.call_args
+        assert kwargs["enabled_toolsets"] == []
+        assert "disabled_toolsets" not in kwargs
+
+    def test_tools_list_sets_enabled_toolsets(self) -> None:
+        with patch("conductor.providers.hermes.HERMES_SDK_AVAILABLE", True), \
+             patch("conductor.providers.hermes.AIAgent"):
+            provider = HermesProvider()
+
+        agent = _make_agent(tools=["web"])
+
+        with patch("conductor.providers.hermes.AIAgent") as mock_cls:
+            mock_instance = Mock()
+            mock_instance.run_conversation.return_value = _make_result()
+            mock_cls.return_value = mock_instance
+
+            asyncio.run(provider.execute(agent, {}, "hello"))
+
+        _, kwargs = mock_cls.call_args
+        assert kwargs["enabled_toolsets"] == ["web"]
+
+
+class TestHermesProviderParams:
+    def test_max_tokens_forwarded(self) -> None:
+        with patch("conductor.providers.hermes.HERMES_SDK_AVAILABLE", True), \
+             patch("conductor.providers.hermes.AIAgent"):
+            provider = HermesProvider(max_tokens=1024)
+
+        agent = _make_agent()
+
+        with patch("conductor.providers.hermes.AIAgent") as mock_cls:
+            mock_instance = Mock()
+            mock_instance.run_conversation.return_value = _make_result()
+            mock_cls.return_value = mock_instance
+
+            asyncio.run(provider.execute(agent, {}, "hello"))
+
+        _, kwargs = mock_cls.call_args
+        assert kwargs["max_tokens"] == 1024
+
+    def test_temperature_forwarded(self) -> None:
+        with patch("conductor.providers.hermes.HERMES_SDK_AVAILABLE", True), \
+             patch("conductor.providers.hermes.AIAgent"):
+            provider = HermesProvider(temperature=0.5)
+
+        agent = _make_agent()
+
+        with patch("conductor.providers.hermes.AIAgent") as mock_cls:
+            mock_instance = Mock()
+            mock_instance.run_conversation.return_value = _make_result()
+            mock_cls.return_value = mock_instance
+
+            asyncio.run(provider.execute(agent, {}, "hello"))
+
+        _, kwargs = mock_cls.call_args
+        assert kwargs["temperature"] == 0.5
+
+    def test_base_url_forwarded(self) -> None:
+        with patch("conductor.providers.hermes.HERMES_SDK_AVAILABLE", True), \
+             patch("conductor.providers.hermes.AIAgent"):
+            provider = HermesProvider(base_url="https://openrouter.ai/api/v1")
+
+        agent = _make_agent()
+
+        with patch("conductor.providers.hermes.AIAgent") as mock_cls:
+            mock_instance = Mock()
+            mock_instance.run_conversation.return_value = _make_result()
+            mock_cls.return_value = mock_instance
+
+            asyncio.run(provider.execute(agent, {}, "hello"))
+
+        _, kwargs = mock_cls.call_args
+        assert kwargs["base_url"] == "https://openrouter.ai/api/v1"
+
+    def test_api_key_forwarded(self) -> None:
+        with patch("conductor.providers.hermes.HERMES_SDK_AVAILABLE", True), \
+             patch("conductor.providers.hermes.AIAgent"):
+            provider = HermesProvider(api_key="sk-test-key")
+
+        agent = _make_agent()
+
+        with patch("conductor.providers.hermes.AIAgent") as mock_cls:
+            mock_instance = Mock()
+            mock_instance.run_conversation.return_value = _make_result()
+            mock_cls.return_value = mock_instance
+
+            asyncio.run(provider.execute(agent, {}, "hello"))
+
+        _, kwargs = mock_cls.call_args
+        assert kwargs["api_key"] == "sk-test-key"
+
+    def test_error_message_includes_model(self) -> None:
+        with patch("conductor.providers.hermes.HERMES_SDK_AVAILABLE", True), \
+             patch("conductor.providers.hermes.AIAgent"):
+            provider = HermesProvider(model="anthropic/claude-sonnet-4")
+
+        agent = _make_agent()
+
+        with patch("conductor.providers.hermes.AIAgent") as mock_cls:
+            mock_instance = Mock()
+            mock_instance.run_conversation.return_value = _make_result(
+                failed=True, final_response=None, error="quota exhausted"
+            )
+            mock_cls.return_value = mock_instance
+
+            with pytest.raises(ProviderError, match="anthropic/claude-sonnet-4"):
+                asyncio.run(provider.execute(agent, {}, "hello"))
+
+    def test_missing_params_not_forwarded(self) -> None:
+        with patch("conductor.providers.hermes.HERMES_SDK_AVAILABLE", True), \
+             patch("conductor.providers.hermes.AIAgent"):
+            provider = HermesProvider()
+
+        agent = _make_agent()
+
+        with patch("conductor.providers.hermes.AIAgent") as mock_cls:
+            mock_instance = Mock()
+            mock_instance.run_conversation.return_value = _make_result()
+            mock_cls.return_value = mock_instance
+
+            asyncio.run(provider.execute(agent, {}, "hello"))
+
+        _, kwargs = mock_cls.call_args
+        assert "max_tokens" not in kwargs
+        assert "temperature" not in kwargs
+        assert "base_url" not in kwargs
+        assert "api_key" not in kwargs
 
 
 class TestHermesClose:

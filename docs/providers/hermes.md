@@ -8,6 +8,8 @@ The Hermes provider enables Conductor workflows to use the [NousResearch hermes-
 - [Installation](#installation)
 - [Model Format](#model-format)
 - [Runtime Configuration](#runtime-configuration)
+- [Toolset Control](#toolset-control)
+- [Model Routing](#model-routing)
 - [Structured Output](#structured-output)
 - [Tool Use](#tool-use)
 - [Limitations](#limitations)
@@ -97,14 +99,13 @@ If `model` is omitted entirely (neither per-agent nor `default_model`), hermes u
 
 ## Runtime Configuration
 
-Only two runtime parameters are meaningful for the hermes provider:
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `default_model` | string | hermes default | Model in `provider/model` format |
-| `max_agent_iterations` | int | 90 | Maximum tool-calling iterations per agent |
-
-Parameters `temperature`, `max_tokens`, and `timeout` are silently ignored — hermes controls these internally per model.
+| Parameter | Forwarded to AIAgent | Default | Description |
+|-----------|----------------------|---------|-------------|
+| `default_model` | `model=` | hermes default | Model in `provider/model` format |
+| `max_agent_iterations` | `max_iterations=` | 90 | Maximum tool-calling iterations per agent |
+| `max_tokens` | `max_tokens=` | hermes default | Maximum output tokens |
+| `temperature` | `temperature=` | hermes default | Sampling temperature |
+| `max_session_seconds` | asyncio timeout | no limit | Wall-clock deadline per agent execution |
 
 ```yaml
 workflow:
@@ -112,6 +113,8 @@ workflow:
     provider: hermes
     default_model: anthropic/claude-sonnet-4
     max_agent_iterations: 25   # Limit tool iterations (default: 90)
+    max_tokens: 4096
+    temperature: 0.7
 ```
 
 ### Per-Agent Overrides
@@ -123,6 +126,48 @@ agents:
     max_agent_iterations: 5    # Fewer iterations for simple tasks
     prompt: "Summarize: {{ text }}"
 ```
+
+## Toolset Control
+
+By default, hermes loads its full set of built-in tools (approximately 33). Use the agent `tools:` field to restrict which hermes toolsets are active for a given step.
+
+| `tools:` value | Effect |
+|----------------|--------|
+| _(omitted / `null`)_ | All hermes tools active (default) |
+| `[]` (empty list) | No tools — judgment-only agent |
+| `["web"]` | Only the `web` toolset |
+| `["web", "code"]` | `web` and `code` toolsets |
+
+Tool names map to hermes toolset names (e.g. `web`, `code`, `terminal`), not individual tool names.
+
+```yaml
+agents:
+  - name: judgment_only
+    tools: []          # Disables all hermes tools — no tool calls
+    prompt: "Based on this data, what do you conclude? {{ context }}"
+
+  - name: web_researcher
+    tools: ["web"]     # Only the web search toolset
+    prompt: "Research: {{ workflow.input.topic }}"
+```
+
+**Why this matters**: Loading all 33 tools inflates the system prompt by ~25k tokens per agent step. For judgment-only steps or steps that only need one toolset, restricting tools reduces input token costs significantly.
+
+## Model Routing
+
+To route requests through a custom endpoint (e.g. OpenRouter, a litellm gateway, or a corporate API proxy), use the structured `provider:` config:
+
+```yaml
+workflow:
+  runtime:
+    provider:
+      name: hermes
+      base_url: "https://openrouter.ai/api/v1"
+      api_key: "${OPENROUTER_API_KEY}"
+    default_model: anthropic/claude-sonnet-4
+```
+
+Both `base_url` and `api_key` are forwarded directly to `AIAgent`. The `api_key` value supports `${ENV_VAR}` interpolation in YAML so the literal secret never appears in event logs or checkpoints.
 
 ## Structured Output
 
@@ -156,7 +201,7 @@ agents:
 
 ## Tool Use
 
-Hermes manages its own toolsets internally — Conductor's `tools:` field on agents is ignored. The hermes library discovers and executes tools based on the model's capabilities and the task at hand.
+Hermes manages its own toolsets internally. The `tools:` field on agents maps to hermes's `enabled_toolsets` parameter — see [Toolset Control](#toolset-control) above for details.
 
 **Isolation flags**: Conductor always passes `skip_context_files=True`, `skip_memory=True`, and `quiet_mode=True` to the hermes library. This prevents hermes from loading workspace files (`AGENTS.md`, etc.) or its own persistent memory — the conductor workflow YAML and rendered prompts are the sole source of context.
 
@@ -170,7 +215,6 @@ Hermes manages its own toolsets internally — Conductor's `tools:` field on age
 | **No streaming events** | Hermes is synchronous; responses arrive all-at-once |
 | **No session resume** | Checkpoint/resume after failure does not carry hermes session state |
 | **Reasoning effort no-op** | `reasoning.effort` is accepted but has no effect on hermes models |
-| **`temperature`/`max_tokens` ignored** | Hermes controls these per model internally |
 | **Structured output via prompt** | Less reliable than native schema enforcement (copilot/claude) |
 
 ## Troubleshooting
