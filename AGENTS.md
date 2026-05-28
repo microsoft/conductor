@@ -149,7 +149,7 @@ workflow:
 agents:
   - name: announce_ready
     type: notification
-    notification: pr_ready
+    emit: pr_ready
     payload:
       pr_url: "{{ open_pr.output.url }}"
       pr_id:  "{{ open_pr.output.id }}"
@@ -163,8 +163,9 @@ agents:
 - `schema_id` — `<namespace>.<type>@<version>`; consumers MUST pin on this, not on `notification_type` alone.
 - `namespace`, `notification_type`, `version`, `run_id`, `workflow`, `source_agent`, `subworkflow_path`.
 - `correlation` — first-class field, auto-merged from declared correlation keys and inherited from parent workflows (parent wins on key collision so the upstream trail survives).
-- `workflow_metadata` — passthrough from `workflow.metadata`.
 - `payload` — declared per-type fields, Jinja2-rendered then type-validated against the `OutputField` schema.
+
+**Output context**: A notification step stores `{}` in the workflow context — not its envelope payload. Downstream templates that reference `announce_ready.output.x` will silently render empty in `accumulate` mode rather than raise. Notifications are a fire-and-forget visibility primitive; if you need a value to flow back into the workflow, use a regular agent step instead.
 
 **Delivery (v1):** every emission flows through `WorkflowEventEmitter` and is written to `$TMPDIR/conductor/conductor-<workflow>-<ts>-<run_id>.notifications.jsonl` by `NotificationLogSubscriber`. The path is printed at end-of-run alongside the event log path. No webhooks, shell hooks, or MCP-driven emission in v1.
 

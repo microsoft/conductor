@@ -50,7 +50,7 @@ def _step(name: str = "announce_ready") -> AgentDef:
     return AgentDef(
         name=name,
         type="notification",
-        notification="pr_ready",
+        emit="pr_ready",
         payload={
             "pr_url": "{{ workflow.input.pr_url }}",
             "pr_id": "{{ workflow.input.pr_id }}",
@@ -71,7 +71,6 @@ class TestEnvelope:
             subworkflow_path=[],
             iteration=1,
             correlation={"apex_id": "apex-1"},
-            workflow_metadata={},
         )
 
         assert env["schema_id"] == "polyphony.feature_pr.pr_ready@1"
@@ -81,6 +80,7 @@ class TestEnvelope:
         assert env["emission_id"] == "run123:announce_ready:1"
         assert env["source_agent"] == "announce_ready"
         assert env["correlation"] == {"apex_id": "apex-1"}
+        assert "workflow_metadata" not in env
         # number field rendered from a string template gets json-coerced
         assert env["payload"] == {"pr_url": "https://x/42", "pr_id": 42}
 
@@ -96,7 +96,6 @@ class TestEnvelope:
             subworkflow_path=["wave_dispatch", "dispatch_items.3"],
             iteration=2,
             correlation={},
-            workflow_metadata={},
         )
         assert env["emission_id"] == "r1:wave_dispatch/dispatch_items.3/announce_ready:2"
         assert env["subworkflow_path"] == ["wave_dispatch", "dispatch_items.3"]
@@ -115,7 +114,7 @@ class TestEnvelope:
             AgentDef(
                 name="n",
                 type="notification",
-                notification="pr_ready",
+                emit="pr_ready",
                 payload={"pr_url": "x"},
             ),
             config,
@@ -125,7 +124,6 @@ class TestEnvelope:
             subworkflow_path=[],
             iteration=1,
             correlation={},
-            workflow_metadata={},
         )
         assert env["namespace"] == slug_namespace("My Feature PR!")
         assert env["schema_id"].startswith(env["namespace"] + ".pr_ready@")
@@ -136,7 +134,7 @@ class TestEnvelope:
         bad = AgentDef(
             name="bad",
             type="notification",
-            notification="pr_ready",
+            emit="pr_ready",
             payload={"pr_url": "ok", "pr_id": "not-a-number"},
         )
         with pytest.raises(ValidationError, match="pr_id"):
@@ -149,7 +147,6 @@ class TestEnvelope:
                 subworkflow_path=[],
                 iteration=1,
                 correlation={},
-                workflow_metadata={},
             )
 
     def test_undeclared_type_raises(
@@ -158,7 +155,7 @@ class TestEnvelope:
         bad = AgentDef(
             name="bad",
             type="notification",
-            notification="not_a_type",
+            emit="not_a_type",
             payload={},
         )
         with pytest.raises(ValidationError, match="undeclared notification type"):
@@ -171,7 +168,6 @@ class TestEnvelope:
                 subworkflow_path=[],
                 iteration=1,
                 correlation={},
-                workflow_metadata={},
             )
 
 

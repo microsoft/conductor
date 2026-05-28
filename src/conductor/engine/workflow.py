@@ -3046,16 +3046,17 @@ class WorkflowEngine:
                                 {
                                     "agent_name": agent.name,
                                     "iteration": notif_execution_count,
-                                    "notification_type": agent.notification,
+                                    "notification_type": agent.emit,
                                 },
                             )
 
                             notif_config = self.config.workflow.notifications
-                            # The schema/validator both guarantee a non-None
-                            # notifications block exists when a notification step
-                            # is present, but assert defensively at runtime so
-                            # the type narrowing is explicit for callers.
-                            assert notif_config is not None  # noqa: S101
+                            if notif_config is None:
+                                raise ExecutionError(
+                                    f"Agent '{agent.name}' is type=notification but no "
+                                    "'workflow.notifications' block is declared. "
+                                    "This should have been caught by schema validation."
+                                )
 
                             try:
                                 envelope = self._notification_executor.build_envelope(
@@ -3067,14 +3068,13 @@ class WorkflowEngine:
                                     subworkflow_path=self._dashboard_context_path,
                                     iteration=notif_execution_count,
                                     correlation=self._correlation_snapshot,
-                                    workflow_metadata=self.config.workflow.metadata,
                                 )
                             except Exception as exc:
                                 self._emit(
                                     "notification_failed",
                                     {
                                         "agent_name": agent.name,
-                                        "notification_type": agent.notification,
+                                        "notification_type": agent.emit,
                                         "error_type": type(exc).__name__,
                                         "message": str(exc),
                                     },
@@ -3090,7 +3090,7 @@ class WorkflowEngine:
                                 "notification_completed",
                                 {
                                     "agent_name": agent.name,
-                                    "notification_type": agent.notification,
+                                    "notification_type": agent.emit,
                                     "emission_id": envelope["emission_id"],
                                     "schema_id": envelope["schema_id"],
                                 },

@@ -119,7 +119,10 @@ def _coerce_rendered(value: Any, field_type: str) -> Any:
     try:
         return json.loads(value)
     except (json.JSONDecodeError, ValueError):
-        return value
+        raise ValidationError(
+            f"Failed to coerce rendered value {value!r} to declared type '{field_type}'. "
+            "Check that the template produces a valid JSON-serialisable value for this field."
+        ) from None
 
 
 class NotificationExecutor:
@@ -144,7 +147,6 @@ class NotificationExecutor:
         subworkflow_path: list[str],
         iteration: int,
         correlation: dict[str, Any],
-        workflow_metadata: dict[str, Any],
     ) -> dict[str, Any]:
         """Build the full notification envelope for emission.
 
@@ -153,13 +155,13 @@ class NotificationExecutor:
                 payload keys don't match the declared schema, or if any
                 rendered value fails type validation.
         """
-        if agent.notification is None or agent.payload is None:
+        if agent.emit is None or agent.payload is None:
             raise ValidationError(
-                f"Notification step '{agent.name}' is missing 'notification' or 'payload' "
+                f"Notification step '{agent.name}' is missing 'emit' or 'payload' "
                 "(this should have been caught by schema validation)"
             )
 
-        type_name = agent.notification
+        type_name = agent.emit
         type_def = notifications_config.types.get(type_name)
         if type_def is None:
             available = ", ".join(sorted(notifications_config.types.keys())) or "(none)"
@@ -199,7 +201,13 @@ class NotificationExecutor:
                         f"Failed to render payload field '{field_name}' for "
                         f"notification step '{agent.name}': {e}"
                     ) from e
-                rendered = _coerce_rendered(rendered, field_schema.type)
+                try:
+                    rendered = _coerce_rendered(rendered, field_schema.type)
+                except ValidationError as e:
+                    raise ValidationError(
+                        f"Payload field '{field_name}' for notification step "
+                        f"'{agent.name}': {e}"
+                    ) from e
             else:
                 rendered = template_value
             _validate_value(rendered, field_schema, field_name)
@@ -230,6 +238,5 @@ class NotificationExecutor:
             "source_agent": agent.name,
             "subworkflow_path": list(subworkflow_path),
             "correlation": dict(correlation),
-            "workflow_metadata": dict(workflow_metadata),
             "payload": rendered_payload,
         }

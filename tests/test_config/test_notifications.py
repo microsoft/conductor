@@ -50,33 +50,33 @@ class TestNotificationSchema:
         agent = AgentDef(
             name="announce",
             type="notification",
-            notification="pr_ready",
+            emit="pr_ready",
             payload={"pr_url": "https://x/1"},
         )
-        assert agent.notification == "pr_ready"
+        assert agent.emit == "pr_ready"
         assert agent.payload == {"pr_url": "https://x/1"}
 
-    def test_notification_step_without_notification_field_raises(self) -> None:
-        with pytest.raises(PydanticValidationError, match="notification"):
+    def test_notification_step_without_emit_field_raises(self) -> None:
+        with pytest.raises(PydanticValidationError, match="'emit'"):
             AgentDef(name="bad", type="notification", payload={"x": "y"})
 
     def test_notification_step_without_payload_raises(self) -> None:
         with pytest.raises(PydanticValidationError, match="payload"):
-            AgentDef(name="bad", type="notification", notification="pr_ready")
+            AgentDef(name="bad", type="notification", emit="pr_ready")
 
     def test_notification_step_with_prompt_raises(self) -> None:
         with pytest.raises(PydanticValidationError, match="cannot have 'prompt'"):
             AgentDef(
                 name="bad",
                 type="notification",
-                notification="pr_ready",
+                emit="pr_ready",
                 payload={"x": "y"},
                 prompt="no",
             )
 
-    def test_notification_fields_on_non_notification_step_raises(self) -> None:
-        with pytest.raises(PydanticValidationError, match="notification"):
-            AgentDef(name="bad", prompt="hi", notification="pr_ready")
+    def test_emit_field_on_non_notification_step_raises(self) -> None:
+        with pytest.raises(PydanticValidationError, match="'emit'"):
+            AgentDef(name="bad", prompt="hi", emit="pr_ready")
 
     def test_invalid_namespace_rejected(self) -> None:
         with pytest.raises(PydanticValidationError, match="dotted lowercase"):
@@ -106,7 +106,7 @@ class TestNotificationValidator:
                 AgentDef(
                     name="announce",
                     type="notification",
-                    notification="pr_ready",
+                    emit="pr_ready",
                     payload={"pr_url": "{{ workflow.input.apex_id }}", "pr_id": "1"},
                     routes=[RouteDef(to="$end")],
                 )
@@ -121,7 +121,7 @@ class TestNotificationValidator:
                 AgentDef(
                     name="bad",
                     type="notification",
-                    notification="not_declared",
+                    emit="not_declared",
                     payload={},
                     routes=[RouteDef(to="$end")],
                 )
@@ -137,7 +137,7 @@ class TestNotificationValidator:
                 AgentDef(
                     name="bad",
                     type="notification",
-                    notification="pr_ready",
+                    emit="pr_ready",
                     payload={"pr_url": "x"},  # missing pr_id
                     routes=[RouteDef(to="$end")],
                 )
@@ -156,7 +156,7 @@ class TestNotificationValidator:
                 AgentDef(
                     name="announce",
                     type="notification",
-                    notification="pr_ready",
+                    emit="pr_ready",
                     payload={"pr_url": "x", "pr_id": "1"},
                     routes=[RouteDef(to="$end")],
                 )
@@ -172,7 +172,7 @@ class TestNotificationValidator:
                 AgentDef(
                     name="bad",
                     type="notification",
-                    notification="pr_ready",
+                    emit="pr_ready",
                     payload={},
                     routes=[RouteDef(to="$end")],
                 )

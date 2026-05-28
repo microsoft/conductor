@@ -89,7 +89,7 @@ agents:
   # $end — emission is independent of routing.
   - name: announce_ready
     type: notification
-    notification: pr_ready
+    emit: pr_ready
     payload:
       pr_url:      "https://dev.azure.com/{{ workflow.input.ado_org }}/{{ workflow.input.ado_project }}/_git/repo/pullrequest/{{ workflow.input.pr_id }}"
       pr_id:       "{{ workflow.input.pr_id }}"
@@ -113,7 +113,7 @@ agents:
 
   - name: announce_needs_input
     type: notification
-    notification: pr_needs_input
+    emit: pr_needs_input
     payload:
       pr_url:         "https://dev.azure.com/{{ workflow.input.ado_org }}/{{ workflow.input.ado_project }}/_git/repo/pullrequest/{{ workflow.input.pr_id }}"
       change_summary: "{{ detect_change.output.change }}"

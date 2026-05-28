@@ -222,6 +222,13 @@ def validate_workflow_config(
                 "inline agent. Terminate steps cannot run inside a for_each iteration; "
                 "route to a terminate step from the for_each group's routes instead."
             )
+        if for_each_group.agent.type == "notification":
+            errors.append(
+                f"For-each group '{for_each_group.name}' uses a notification step as its "
+                "inline agent. Notification steps cannot be used in for_each groups; "
+                "place the notification step in the main agent list and route to it from "
+                "the for_each group's routes instead."
+            )
 
     # Validate notification configuration and notification steps
     errors.extend(_validate_notifications(config))
@@ -306,7 +313,7 @@ def _validate_notifications(config: WorkflowConfig) -> list[str]:
     # Each notification step must reference a declared type, and its payload
     # must match the declared field set exactly
     for agent in notification_steps:
-        type_name = agent.notification
+        type_name = agent.emit
         if type_name not in notif_config.types:
             available = ", ".join(sorted(notif_config.types.keys())) or "(none)"
             errors.append(
@@ -599,6 +606,14 @@ def _validate_parallel_groups(config: WorkflowConfig) -> list[str]:
                     f"Agent '{agent_name}' in parallel group '{pg.name}' is a terminate step. "
                     "Terminate steps cannot run inside a parallel branch; route to a "
                     "terminate step from the parallel group's routes instead."
+                )
+
+            # Validate no notification steps in parallel groups
+            if agent.type == "notification":
+                errors.append(
+                    f"Agent '{agent_name}' in parallel group '{pg.name}' is a notification step. "
+                    "Notification steps cannot be used in parallel groups; "
+                    "route to a notification step from the parallel group's routes instead."
                 )
 
         # PE-6.2: Validate parallel group route targets

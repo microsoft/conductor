@@ -961,7 +961,7 @@ class AgentDef(BaseModel):
           reason: "{{ precheck.output.reason }}"
     """
 
-    notification: str | None = None
+    emit: str | None = None
     """For ``type=notification`` steps: the declared notification type name
     to emit. Must reference a key under ``workflow.notifications.types``.
     """
@@ -1291,9 +1291,9 @@ class AgentDef(BaseModel):
             if self.duration is not None:
                 raise ValueError("terminate agents cannot have 'duration' (only 'wait' agents do)")
         elif self.type == "notification":
-            if not self.notification:
+            if not self.emit:
                 raise ValueError(
-                    "notification agents require 'notification' "
+                    "notification agents require 'emit' "
                     "(the declared notification type name to emit)"
                 )
             if self.payload is None:
@@ -1365,11 +1365,11 @@ class AgentDef(BaseModel):
                     f"'{self.type or 'agent'}' agents cannot have 'output_type' "
                     "(only 'set' agents support output_type)"
                 )
-        # Cross-type guard: notification/payload fields only valid on notification steps
+        # Cross-type guard: emit/payload fields only valid on notification steps
         if self.type != "notification":
-            if self.notification is not None:
+            if self.emit is not None:
                 raise ValueError(
-                    f"'{self.type or 'agent'}' agents cannot have 'notification' "
+                    f"'{self.type or 'agent'}' agents cannot have 'emit' "
                     "(only type=notification steps emit notifications)"
                 )
             if self.payload is not None:
