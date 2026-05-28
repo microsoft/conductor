@@ -23,11 +23,17 @@ export interface InputBridge {
   requests: AsyncIterable<UserInputRequest>;
   /** Close and reject any pending request. */
   close: () => void;
+  /**
+   * One-shot Promise that resolves with the next request when requestInput is
+   * called, or null when the bridge is closed.  Create a fresh call per race.
+   */
+  nextRequest: () => Promise<UserInputRequest | null>;
 }
 
 export function createInputBridge(): InputBridge {
   const queue: PendingRequest[] = [];
   let nextResolve: ((req: UserInputRequest) => void) | undefined;
+  let nextRequestResolve: ((req: UserInputRequest | null) => void) | undefined;
   let closed = false;
 
   const requestInput = (req: UserInputRequest): Promise<UserInputResponse> => {
@@ -40,6 +46,8 @@ export function createInputBridge(): InputBridge {
       queue.push(pending);
       nextResolve?.(req);
       nextResolve = undefined;
+      nextRequestResolve?.(req);
+      nextRequestResolve = undefined;
     });
   };
 
@@ -53,10 +61,20 @@ export function createInputBridge(): InputBridge {
 
   const close = (): void => {
     closed = true;
+    nextRequestResolve?.(null);
+    nextRequestResolve = undefined;
     for (const pending of queue) {
       pending.reject(new Error("InputBridge closed"));
     }
     queue.length = 0;
+  };
+
+  const nextRequest = (): Promise<UserInputRequest | null> => {
+    if (queue.length > 0) return Promise.resolve(queue[0]!.request);
+    if (closed) return Promise.resolve(null);
+    return new Promise<UserInputRequest | null>((resolve) => {
+      nextRequestResolve = resolve;
+    });
   };
 
   // Async iterable for the chat participant to await new requests
@@ -78,5 +96,5 @@ export function createInputBridge(): InputBridge {
     },
   };
 
-  return { requestInput, resume, requests, close };
+  return { requestInput, resume, requests, close, nextRequest };
 }

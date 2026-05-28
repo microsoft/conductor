@@ -112,12 +112,13 @@ export class VscodeLmProvider implements AgentProvider {
     const skills = skillDirs.length > 0 ? discoverSkills(skillDirs) : new Map<string, string>();
     log(`[vscode-lm] skillDirs=${skillDirs.length} skills discovered=${skills.size}`);
 
-    // For ask_user tool calls inside the agentic loop, always use VS Code UI
-    // (showQuickPick / showInputBox) so answers are collected inline without
-    // needing to suspend across chat turns.  opts.onUserInputRequest is the
-    // bridge-based handler intended only for engine-level human_gate agents —
-    // it must NOT be used here.
-    const userInputHandler = this.options.onUserInputRequest ?? defaultVscodeInputHandler;
+    // Prefer the bridge (opts.onUserInputRequest) so ask_user calls suspend
+    // in-chat across turns.  Fall back to the constructor-level handler, then
+    // to the VS Code UI popup as a last resort.
+    const userInputHandler =
+      opts.onUserInputRequest ??
+      this.options.onUserInputRequest ??
+      defaultVscodeInputHandler;
 
     // Build tools: skill (when skills available) + ask_user
     const tools: vscode.LanguageModelChatTool[] = [];

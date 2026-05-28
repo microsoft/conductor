@@ -18,10 +18,85 @@ import {
   WorkflowEventEmitter,
   ConductorError,
   type WorkflowEvent,
+  type WorkflowResult,
 } from "@conductor/core";
 import { VscodeLmProvider } from "../providers/vscode-lm.js";
-import { createInputBridge, type InputBridge } from "./input-bridge.js";
+import { createInputBridge } from "./input-bridge.js";
 import { log } from "../logger.js";
+
+// ---------------------------------------------------------------------------
+// Cross-turn workflow state
+// ---------------------------------------------------------------------------
+
+interface ActiveWorkflow {
+  bridge: ReturnType<typeof createInputBridge>;
+  runPromise: Promise<WorkflowResult>;
+  emitter: WorkflowEventEmitter;
+  provider: VscodeLmProvider;
+  unsubscribeStream: () => void;
+}
+
+/** At most one workflow is active at a time per extension instance. */
+let activeWorkflow: ActiveWorkflow | null = null;
+
+/** Followup chips to show after a paused turn; cleared on resume or completion. */
+let pendingFollowups: vscode.ChatFollowup[] | null = null;
+
+/**
+ * Run (or continue) a workflow until it either completes or pauses waiting
+ * for user input.  Stores `activeWorkflow` when pausing so the next chat
+ * turn can resume via `bridge.resume(answer)`.
+ */
+async function continueWorkflow(
+  wf: ActiveWorkflow,
+  stream: vscode.ChatResponseStream,
+): Promise<void> {
+  const outcome = await Promise.race([
+    wf.runPromise
+      .then(() => ({ type: "done" as const }))
+      .catch((err: unknown) => ({ type: "error" as const, err })),
+    wf.bridge.nextRequest().then((req) =>
+      req ? { type: "paused" as const, req } : { type: "done" as const },
+    ),
+  ]);
+
+  if (outcome.type === "error") {
+    pendingFollowups = null;
+    wf.unsubscribeStream();
+    wf.bridge.close();
+    await wf.provider.close();
+    const msg =
+      outcome.err instanceof ConductorError
+        ? outcome.err.message
+        : String(outcome.err);
+    stream.markdown(`\n❌ **Workflow failed:** ${msg}`);
+  } else if (outcome.type === "paused") {
+    // The question was already rendered in chat via the agent_tool_start event.
+    const choices = outcome.req.choices;
+    if (choices?.length) {
+      pendingFollowups = choices.map((c) => ({
+        prompt: c,
+        label: c,
+        participant: "conductor.conductor",
+      }));
+      stream.markdown(
+        "\n*Click an option below, or type `@conductor <free-text answer>` for a custom reply.*\n",
+      );
+    } else {
+      pendingFollowups = null;
+      stream.markdown(
+        "\n*Reply with **`@conductor <your answer>`** to continue.*\n",
+      );
+    }
+    activeWorkflow = wf;
+  } else {
+    // Workflow completed — events (workflow_completed) already rendered.
+    pendingFollowups = null;
+    wf.unsubscribeStream();
+    wf.bridge.close();
+    await wf.provider.close();
+  }
+}
 
 export function registerConductorParticipant(context: vscode.ExtensionContext): void {
   const participant = vscode.chat.createChatParticipant(
@@ -29,16 +104,44 @@ export function registerConductorParticipant(context: vscode.ExtensionContext): 
     handleRequest,
   );
   participant.iconPath = vscode.Uri.joinPath(context.extensionUri, "assets", "icon.png");
+  participant.followupProvider = {
+    provideFollowups(_result, _context, _token) {
+      return pendingFollowups ?? [];
+    },
+  };
   context.subscriptions.push(participant);
 }
 
 async function handleRequest(
   request: vscode.ChatRequest,
-  chatContext: vscode.ChatContext,
+  _chatContext: vscode.ChatContext,
   stream: vscode.ChatResponseStream,
   token: vscode.CancellationToken,
 ): Promise<void> {
   const args = parseArgs(request.prompt.trim());
+  const isKnownCommand = ["run", "validate", "help", ""].includes(args.command);
+
+  // --- resume pending workflow ---
+  if (activeWorkflow) {
+    if (!isKnownCommand) {
+      // User typed an answer — resume the suspended workflow
+      const wf = activeWorkflow;
+      activeWorkflow = null;
+      pendingFollowups = null;
+      wf.unsubscribeStream();
+      const newUnsub = attachChatSubscriber(wf.emitter, stream);
+      wf.bridge.resume(request.prompt);
+      await continueWorkflow({ ...wf, unsubscribeStream: newUnsub }, stream);
+      return;
+    } else {
+      // New command — discard stale workflow
+      pendingFollowups = null;
+      activeWorkflow.bridge.close();
+      activeWorkflow.unsubscribeStream();
+      void activeWorkflow.provider.close();
+      activeWorkflow = null;
+    }
+  }
 
   // --- help ---
   if (!args.command || args.command === "help") {
@@ -73,17 +176,13 @@ async function handleRequest(
     const bridge = createInputBridge();
     const emitter = new WorkflowEventEmitter();
     const provider = new VscodeLmProvider({ token });
+    const unsubscribe = attachChatSubscriber(emitter, stream);
 
-    attachChatSubscriber(emitter, stream);
-
-    let absPath: string;
     try {
-      absPath = resolveWorkflowPath(args.workflowFile);
+      const absPath = resolveWorkflowPath(args.workflowFile);
       const config = loadConfig(absPath);
       validateConfig(config, absPath);
 
-      // Resolve skill_directories relative to the workflow YAML file,
-      // mirroring what the CLI does in commands/run.ts.
       const workflowDir = path.dirname(absPath);
       const resolvedSkillDirs = (config.workflow.runtime?.skill_directories ?? []).map(
         (d) => path.resolve(workflowDir, d),
@@ -97,22 +196,15 @@ async function handleRequest(
         onUserInputRequest: bridge.requestInput,
       });
 
-      // Run the workflow (may be suspended waiting for input).
-      // workflow_started / agent_* / workflow_completed events drive all output
-      // via attachChatSubscriber — no extra markdown needed here.
       const runPromise = engine.run(args.inputs);
-
-      // Handle input requests from the bridge in a separate async loop
-      void handleBridgeInputs(bridge, stream, chatContext, token);
-
-      await runPromise;
-      bridge.close();
+      await continueWorkflow({ bridge, runPromise, emitter, provider, unsubscribeStream: unsubscribe }, stream);
     } catch (err) {
+      // Pre-run errors (file not found, invalid config, etc.)
+      unsubscribe();
       bridge.close();
+      await provider.close();
       const msg = err instanceof ConductorError ? err.message : String(err);
       stream.markdown(`\n❌ **Workflow failed:** ${msg}`);
-    } finally {
-      await provider.close();
     }
     return;
   }
@@ -121,38 +213,17 @@ async function handleRequest(
 }
 
 // ---------------------------------------------------------------------------
-// Bridge: suspend workflow on input request, resume on next chat turn
-// ---------------------------------------------------------------------------
-
-async function handleBridgeInputs(
-  bridge: InputBridge,
-  stream: vscode.ChatResponseStream,
-  _chatContext: vscode.ChatContext,
-  token: vscode.CancellationToken,
-): Promise<void> {
-  for await (const req of bridge.requests) {
-    if (token.isCancellationRequested) break;
-    stream.markdown(`\n🙋 **${req.question}**\n`);
-    if (req.choices?.length) {
-      req.choices.forEach((c, i) => stream.markdown(`${i + 1}. ${c}\n`));
-    }
-    stream.markdown("\n*Reply in the next message to continue the workflow.*\n");
-    // The bridge will suspend; the next chat turn triggers resume
-    break;
-  }
-}
-
-// ---------------------------------------------------------------------------
 // Chat event subscriber
 // ---------------------------------------------------------------------------
 
-function attachChatSubscriber(emitter: WorkflowEventEmitter, stream: vscode.ChatResponseStream): void {
+/** Returns an unsubscribe function so the subscriber can be swapped on resume. */
+function attachChatSubscriber(emitter: WorkflowEventEmitter, stream: vscode.ChatResponseStream): () => void {
   const agentStartTimes = new Map<string, number>();
   let iteration = 0;
   let totalInputTokens = 0;
   let totalOutputTokens = 0;
 
-  emitter.subscribe(async (event: WorkflowEvent) => {
+  return emitter.subscribe(async (event: WorkflowEvent) => {
     const data = event.data;
     log(`[participant] event=${event.type} ${JSON.stringify(data).slice(0, 200)}`);
     switch (event.type) {
@@ -197,10 +268,6 @@ function attachChatSubscriber(emitter: WorkflowEventEmitter, stream: vscode.Chat
           stream.progress(`${name}: asking user…`);
           if (args?.question) {
             stream.markdown(`\n🙋 **${args.question}**\n\n`);
-            if (args.choices?.length) {
-              args.choices.forEach((c, i) => stream.markdown(`${i + 1}. ${c}\n`));
-              stream.markdown("\n");
-            }
           }
         } else {
           stream.progress(`${name}: calling ${tool}…`);
