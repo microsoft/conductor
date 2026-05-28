@@ -746,7 +746,7 @@ OpenAI credentials to arbitrary `base_url`); use the
 
 The schema rejects these misconfigurations at config-load time:
 
-- `name != "copilot"` with any non-`name` field set (hermes and claude do not support structured ProviderSettings fields)
+- `name == "claude"` (or other non-copilot/hermes) with any non-`name` field set (`base_url`/`api_key` are supported for `copilot` and `hermes`; structured config for other providers is not yet implemented)
 - `type: azure` without `azure: { api_version: ... }` (or vice versa)
 - Anchorless fields: `wire_api`, `type`, `headers`, `azure` alone
   without `base_url` / `api_key` / `bearer_token`
