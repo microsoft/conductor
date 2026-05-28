@@ -82,10 +82,18 @@ async function handleRequest(
       const config = loadConfig(absPath);
       validateConfig(config, absPath);
 
+      // Resolve skill_directories relative to the workflow YAML file,
+      // mirroring what the CLI does in commands/run.ts.
+      const workflowDir = path.dirname(absPath);
+      const resolvedSkillDirs = (config.workflow.runtime?.skill_directories ?? []).map(
+        (d) => path.resolve(workflowDir, d),
+      );
+
       const engine = new WorkflowEngine(config, {
         provider,
         emitter,
         workflowFile: absPath,
+        skillDirectories: resolvedSkillDirs,
         onUserInputRequest: bridge.requestInput,
       });
 
@@ -184,15 +192,30 @@ function attachChatSubscriber(emitter: WorkflowEventEmitter, stream: vscode.Chat
       case "agent_tool_start": {
         const name = data["agentName"] as string;
         const tool = data["toolName"] as string;
-        stream.progress(`${name}: calling ${tool}…`);
-        stream.markdown(`\n> ⚙ \`${tool}\`\n\n`);
+        if (tool === "ask_user") {
+          const args = data["args"] as { question?: string; choices?: string[] } | undefined;
+          stream.progress(`${name}: asking user…`);
+          if (args?.question) {
+            stream.markdown(`\n🙋 **${args.question}**\n\n`);
+            if (args.choices?.length) {
+              args.choices.forEach((c, i) => stream.markdown(`${i + 1}. ${c}\n`));
+              stream.markdown("\n");
+            }
+          }
+        } else {
+          stream.progress(`${name}: calling ${tool}…`);
+          stream.markdown(`\n> ⚙ \`${tool}\`\n\n`);
+        }
         break;
       }
       case "agent_tool_complete": {
         const error = data["error"] as string | undefined;
+        const tool = data["toolName"] as string;
         if (error) {
-          const tool = data["toolName"] as string;
           stream.markdown(`\n> ✗ \`${tool}\` failed: ${error}\n\n`);
+        } else if (tool === "ask_user") {
+          const result = data["result"] as string | undefined;
+          if (result) stream.markdown(`> 💬 **${result}**\n\n`);
         }
         break;
       }
