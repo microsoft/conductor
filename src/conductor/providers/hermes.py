@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any
 from conductor.exceptions import ProviderError, ValidationError
 from conductor.executor.output import parse_json_output, validate_output
 from conductor.providers.base import AgentOutput, AgentProvider, EventCallback
+from conductor.providers.capabilities import ProviderCapabilities
 from conductor.providers.reasoning import ReasoningEffort
 
 if TYPE_CHECKING:
@@ -59,6 +60,24 @@ class HermesProvider(AgentProvider):
         True
         >>> await provider.close()
     """
+
+    CAPABILITIES = ProviderCapabilities(
+        tier="experimental",
+        mcp_tools=False,
+        workflow_tools_passthrough=False,
+        streaming_events=False,
+        agent_reasoning_events=False,
+        reasoning_effort=None,
+        structured_output="prompt_injection",
+        interrupt=False,
+        max_session_seconds=True,
+        checkpoint_resume=False,
+        usage_tracking=False,
+        concurrent_safe=True,
+        upstream_pin="hermes-agent",
+        maintainer="(community contribution)",
+    )
+
 
     def __init__(
         self,

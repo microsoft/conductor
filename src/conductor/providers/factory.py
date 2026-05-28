@@ -24,7 +24,7 @@ if TYPE_CHECKING:
 
 
 async def create_provider(
-    provider_type: Literal["copilot", "openai-agents", "claude", "claude-agent-sdk"] = "copilot",
+    provider_type: Literal["copilot", "openai-agents", "claude", "claude-agent-sdk", "hermes"] = "copilot",
     validate: bool = True,
     mcp_servers: dict[str, Any] | None = None,
     default_model: str | None = None,
@@ -171,6 +171,17 @@ async def create_provider(
                 model=default_model,
                 max_turns=max_agent_iterations,
                 max_session_seconds=max_session_seconds,
+            )
+        case "hermes":
+            if not HERMES_SDK_AVAILABLE:
+                raise ProviderError(
+                    "Hermes provider requires the hermes-agent package",
+                    suggestion="Install with: pip install hermes-agent",
+                )
+            provider = HermesProvider(
+                model=default_model,
+                max_agent_iterations=max_agent_iterations,
+                default_reasoning_effort=default_reasoning_effort,
             )
         case _:
             raise ProviderError(
