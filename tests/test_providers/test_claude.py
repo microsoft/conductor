@@ -1884,6 +1884,31 @@ class TestClaudeProviderRetryLogic:
     @patch("conductor.providers.claude.AsyncAnthropic")
     @patch("conductor.providers.claude.anthropic")
     @pytest.mark.asyncio
+    async def test_is_retryable_error_honors_provider_error_flag(
+        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
+    ) -> None:
+        """A ProviderError's own is_retryable flag is honored over SDK heuristics."""
+        from conductor.exceptions import ProviderError
+
+        mock_anthropic_module.__version__ = "0.77.0"
+        mock_client = Mock()
+        mock_client.models.list = AsyncMock(return_value=Mock(data=[]))
+        mock_anthropic_class.return_value = mock_client
+
+        provider = ClaudeProvider()
+
+        # Parse-exhaustion is raised with is_retryable=False — must not retry.
+        non_retryable = ProviderError("Failed to parse output", is_retryable=False)
+        assert provider._is_retryable_error(non_retryable) is False
+
+        # A ProviderError explicitly marked retryable must retry.
+        retryable = ProviderError("Connection timeout", is_retryable=True)
+        assert provider._is_retryable_error(retryable) is True
+
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    @pytest.mark.asyncio
     async def test_calculate_delay_exponential_backoff(
         self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
     ) -> None:

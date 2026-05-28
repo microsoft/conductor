@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import sys
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -85,8 +86,18 @@ class ScriptExecutor:
         # command is guaranteed non-None by the model validator when type="script"
         assert agent.command is not None
         rendered_command = self.renderer.render(agent.command, context)
-        if sys.platform == "win32":
-            rendered_command = rendered_command.replace("/", "\\")
+        # Resolve bare command names and absolute paths against PATH/PATHEXT so
+        # that a bare name (e.g. "python") finds the executable the shell would,
+        # and a Windows path missing its .exe suffix resolves correctly. Relative
+        # paths containing a separator are left untouched so they keep resolving
+        # against ``working_dir``. Resolution is non-destructive: when ``which``
+        # cannot resolve the command we fall back to the rendered value and let
+        # the FileNotFoundError handler below produce a clear error.
+        has_separator = os.sep in rendered_command or (
+            os.altsep is not None and os.altsep in rendered_command
+        )
+        if os.path.isabs(rendered_command) or not has_separator:
+            rendered_command = shutil.which(rendered_command) or rendered_command
         rendered_args = [self.renderer.render(arg, context) for arg in agent.args]
         rendered_working_dir = (
             self.renderer.render(agent.working_dir, context) if agent.working_dir else None
@@ -115,16 +126,16 @@ class ScriptExecutor:
             )
         except FileNotFoundError as exc:
             hint = ""
-            if sys.platform == "win32" and "/" in agent.command:
+            if sys.platform == "win32":
                 hint = (
-                    " Hint: on Windows, use backslashes (\\) in paths "
-                    "or set the env var with backslash form."
+                    " Hint: on Windows, include the file extension (e.g. .exe) "
+                    "or use an absolute path."
                 )
             raise ExecutionError(
                 f"Script '{agent.name}': command not found: '{rendered_command}'"
                 f" (working_dir={rendered_working_dir or 'cwd'}){hint}",
                 agent_name=agent.name,
-                suggestion=f"Ensure '{rendered_command}' is installed and in PATH",
+                suggestion=f"Ensure '{rendered_command}' is installed and on PATH",
             ) from exc
         except OSError as e:
             raise ExecutionError(

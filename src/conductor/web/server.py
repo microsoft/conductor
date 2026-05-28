@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hmac
 import json
 import logging
 import os
@@ -249,10 +250,11 @@ class WebDashboard:
             """Resolve a parked human gate via HTTP POST.
 
             Body: ``{"agent_name": str, "selected_value": str,
-            "additional_input": str?, "token": str?}``
+            "additional_input": str?}``
 
             When the ``CONDUCTOR_GATE_TOKEN`` environment variable is set,
-            the request must include a matching ``token`` field.
+            the request must carry a matching token in the
+            ``Authorization: Bearer <token>`` header.
             """
             try:
                 body = await request.json()
@@ -263,10 +265,15 @@ class WebDashboard:
                     {"error": "Request body must be a JSON object"}, status_code=422
                 )
 
-            # Validate token if CONDUCTOR_GATE_TOKEN is set
+            # Validate token if CONDUCTOR_GATE_TOKEN is set. The token is read
+            # from the Authorization header (not the JSON body) and compared in
+            # constant time to avoid leaking it via timing or request logs.
             expected_token = os.environ.get("CONDUCTOR_GATE_TOKEN")
-            if expected_token and body.get("token") != expected_token:
-                return JSONResponse({"error": "Invalid or missing token"}, status_code=403)
+            if expected_token:
+                auth_header = request.headers.get("authorization", "")
+                scheme, _, presented = auth_header.partition(" ")
+                if scheme.lower() != "bearer" or not hmac.compare_digest(presented, expected_token):
+                    return JSONResponse({"error": "Invalid or missing token"}, status_code=403)
 
             # Validate required fields
             if not body.get("agent_name"):
@@ -276,6 +283,27 @@ class WebDashboard:
             if not body.get("selected_value"):
                 return JSONResponse(
                     {"error": "Missing required field: selected_value"}, status_code=422
+                )
+
+            # Validate the gate is actually waiting for this agent. Without this
+            # check a mismatched agent_name would be accepted here (200) and then
+            # silently discarded by wait_for_gate_response, parking the workflow
+            # forever while the CLI reports success.
+            waiting_agent = self._gate_waiting_agent
+            if waiting_agent is None:
+                return JSONResponse(
+                    {"error": "No human gate is currently waiting for a response"},
+                    status_code=409,
+                )
+            if body["agent_name"] != waiting_agent:
+                return JSONResponse(
+                    {
+                        "error": (
+                            f"Gate response targets agent {body['agent_name']!r} but the "
+                            f"waiting gate is {waiting_agent!r}"
+                        )
+                    },
+                    status_code=409,
                 )
 
             # Put onto gate response queue (same path as WebSocket handler)

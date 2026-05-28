@@ -1337,12 +1337,16 @@ def gate_respond(
     }
     if input_text is not None:
         body["additional_input"] = input_text
+
+    # Send the token in the Authorization header (not the body) so it is not
+    # captured in request-body logs and is compared in constant time server-side.
+    headers: dict[str, str] = {}
     if resolved_token is not None:
-        body["token"] = resolved_token
+        headers["Authorization"] = f"Bearer {resolved_token}"
 
     # Send gate response
     try:
-        resp = httpx.post(f"{base_url}/api/gate-respond", json=body, timeout=10)
+        resp = httpx.post(f"{base_url}/api/gate-respond", json=body, headers=headers, timeout=10)
     except httpx.ConnectError:
         console.print(
             f"[bold red]Error:[/bold red] Cannot connect to dashboard on port {port}. "
@@ -1358,6 +1362,10 @@ def gate_respond(
             "[bold red]Error:[/bold red] Authentication failed. "
             "Provide a valid token with --token or CONDUCTOR_GATE_TOKEN env var."
         )
+        raise typer.Exit(code=1)
+    if resp.status_code == 409:
+        detail = resp.json().get("error", "Gate is not waiting for this response")
+        console.print(f"[bold red]Error:[/bold red] {detail}")
         raise typer.Exit(code=1)
     if resp.status_code == 422:
         detail = resp.json().get("error", "Validation error")

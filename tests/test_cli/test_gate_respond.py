@@ -3,10 +3,11 @@
 Covers:
 - Happy path with mock HTTP server
 - Unreachable port returns clear error
-- Token passed from --token flag
+- Token passed via Authorization header from --token flag
 - Token read from CONDUCTOR_GATE_TOKEN env var
 - Auto-discovery of agent name via /api/gate-status
 - No gate waiting error
+- Gate not waiting / agent mismatch (409) error
 """
 
 from __future__ import annotations
@@ -116,8 +117,11 @@ class TestGateRespondTokenHandling:
         )
         assert result.exit_code == 0
 
+        headers = mock_post.call_args.kwargs.get("headers") or mock_post.call_args[1]["headers"]
+        assert headers["Authorization"] == "Bearer my-secret"
+        # Token must NOT be sent in the JSON body.
         body = mock_post.call_args.kwargs.get("json") or mock_post.call_args[1]["json"]
-        assert body["token"] == "my-secret"
+        assert "token" not in body
 
     @patch("httpx.post")
     def test_token_from_env(self, mock_post: MagicMock) -> None:
@@ -130,8 +134,8 @@ class TestGateRespondTokenHandling:
             )
         assert result.exit_code == 0
 
-        body = mock_post.call_args.kwargs.get("json") or mock_post.call_args[1]["json"]
-        assert body["token"] == "env-token"
+        headers = mock_post.call_args.kwargs.get("headers") or mock_post.call_args[1]["headers"]
+        assert headers["Authorization"] == "Bearer env-token"
 
     @patch("httpx.post")
     def test_flag_token_overrides_env(self, mock_post: MagicMock) -> None:
@@ -154,8 +158,23 @@ class TestGateRespondTokenHandling:
             )
         assert result.exit_code == 0
 
-        body = mock_post.call_args.kwargs.get("json") or mock_post.call_args[1]["json"]
-        assert body["token"] == "flag-token"
+        headers = mock_post.call_args.kwargs.get("headers") or mock_post.call_args[1]["headers"]
+        assert headers["Authorization"] == "Bearer flag-token"
+
+    @patch("httpx.post")
+    def test_no_auth_header_when_no_token(self, mock_post: MagicMock) -> None:
+        mock_post.return_value = _mock_response(200, {"status": "accepted"})
+
+        env = {k: v for k, v in os.environ.items() if k != "CONDUCTOR_GATE_TOKEN"}
+        with patch.dict(os.environ, env, clear=True):
+            result = runner.invoke(
+                app,
+                ["gate-respond", "--port", "8080", "--choice", "approve", "--agent", "g1"],
+            )
+        assert result.exit_code == 0
+
+        headers = mock_post.call_args.kwargs.get("headers") or mock_post.call_args[1]["headers"]
+        assert "Authorization" not in headers
 
     @patch("httpx.post")
     def test_403_error_message(self, mock_post: MagicMock) -> None:
@@ -167,6 +186,19 @@ class TestGateRespondTokenHandling:
         )
         assert result.exit_code == 1
         assert "Authentication failed" in result.output
+
+    @patch("httpx.post")
+    def test_409_error_message(self, mock_post: MagicMock) -> None:
+        mock_post.return_value = _mock_response(
+            409, {"error": "No human gate is currently waiting for a response"}
+        )
+
+        result = runner.invoke(
+            app,
+            ["gate-respond", "--port", "8080", "--choice", "approve", "--agent", "g1"],
+        )
+        assert result.exit_code == 1
+        assert "waiting" in result.output.lower()
 
 
 class TestGateRespondAutoDiscovery:

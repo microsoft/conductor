@@ -723,6 +723,13 @@ class ClaudeProvider(AgentProvider):
         Returns:
             True if the error is transient and should be retried.
         """
+        # A ProviderError carries its own retry classification (e.g. parse
+        # exhaustion is raised with is_retryable=False). Honor it directly
+        # rather than falling through to SDK-type heuristics that would never
+        # match it.
+        if isinstance(exception, ProviderError):
+            return exception.is_retryable
+
         if anthropic is None:
             return False
 

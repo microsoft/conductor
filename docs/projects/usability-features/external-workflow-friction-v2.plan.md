@@ -16,13 +16,13 @@ The prior plan shipped four fixes in v0.1.17: greedy fence regex (#1), script-in
 - **`output_mode: raw | envelope`** (Issue #2) — SHIPPED. The `output_mode` field is implemented in `schema.py:508-523` with full validation rules, provider support (`copilot.py:524`, `claude.py:922`), documentation (`docs/workflow-syntax.md:159-203`), and tests.
 - **Parse-exhaustion `is_retryable=False`** (Issue #10) — SHIPPED. Both providers mark parse-exhaustion as non-retryable (`copilot.py:748`, `claude.py:1887`), preventing the 3× outer-retry amplification. Error messages include 500-char response prefixes and suggest `output_mode: raw`.
 
-**Three items remain open and constitute this plan's active scope:**
+**Three items constituted this plan's active scope — all now SHIPPED (EPICs 2–4 on branch `epics-1-4`, PR #234):**
 
-1. **YAML-exposed `max_parse_recovery_attempts`** (Issue #6) — the internal `_retry_config` field from v0.1.17 is not user-configurable from the YAML `retry:` block, and the resolved per-agent value does not reach the parse recovery loop due to threading gaps in both providers.
-2. **CLI `conductor gate-respond`** (Issue #5) — the dashboard gate-resolution from v0.1.17 has no CLI fallback when the dashboard is unreachable.
-3. **Windows subprocess path normalization** (Issue #3) — a ~10 LOC fix for forward-slash paths on Windows in `executor/script.py`.
+1. **YAML-exposed `max_parse_recovery_attempts`** (Issue #6) — the internal `_retry_config` field from v0.1.17 is now user-configurable from the YAML `retry:` block, and the resolved per-agent value reaches the parse recovery loop in both providers.
+2. **CLI `conductor gate-respond`** (Issue #5) — adds a CLI fallback (and `POST /api/gate-respond` endpoint) for resolving a parked gate when the dashboard is unreachable. Hardened during adversarial review with `agent_name` mismatch rejection (`409`) and header-based `hmac` token auth.
+3. **Subprocess command resolution** (Issue #3) — resolves `command:` against PATH/PATHEXT (`shutil.which`) in `executor/script.py`.
 
-The plan is sequenced: EPIC 2 (parse recovery config) first, then EPIC 3 (gate-respond), then EPIC 4 (Windows paths). EPIC 1 is retained as a reference section with all tasks marked DONE.
+The plan was sequenced: EPIC 2 (parse recovery config) first, then EPIC 3 (gate-respond), then EPIC 4 (command resolution). EPIC 1 is retained as a reference section with all tasks marked DONE.
 
 ---
 
@@ -50,19 +50,19 @@ The prior plan (v1) deliberately deferred `output_mode` as a non-goal. Phase 3 v
 
 ## 3. Problem Statement
 
-Five issues were identified after v0.1.17. Two have been **resolved** since the initial plan:
+Five issues were identified after v0.1.17. The first two were resolved before this plan's active scope; the remaining three were addressed by EPICs 2–4 (PR #234):
 
 1. ~~**No `output_mode` field**~~ → **RESOLVED.** `output_mode: raw | envelope` is implemented at `schema.py:508-523` with provider support, validation, tests, and documentation.
 
 2. ~~**Hidden 3× outer retry on parse exhaustion**~~ → **RESOLVED.** Both providers now raise parse-exhaustion with `is_retryable=False` (`copilot.py:748`, `claude.py:1887`). Error messages include 500-char prefixes and suggest `output_mode: raw`.
 
-Three issues remain open:
+The remaining three (now SHIPPED) were:
 
-3. **`max_parse_recovery_attempts` not YAML-configurable**: Both providers respect an internal `_retry_config.max_parse_recovery_attempts` value, but `_resolve_retry_config()` always copies from the provider-level default (`copilot.py:303`, `claude.py:685`), never from the YAML `RetryPolicy`. Furthermore, the resolved per-agent config does not reach the parse recovery loop: Copilot's `_execute_sdk_call` reads `self._retry_config.max_parse_recovery_attempts` at line 681 (the provider-level default, not the per-agent resolved config); Claude's `_execute_with_parse_recovery` reads `self._max_parse_recovery_attempts` (an instance variable set from the provider-level default at line 191).
+3. ~~**`max_parse_recovery_attempts` not YAML-configurable**~~ → **RESOLVED (EPIC 2).** Both providers respected an internal `_retry_config.max_parse_recovery_attempts` value, but `_resolve_retry_config()` always copied from the provider-level default (`copilot.py:303`, `claude.py:685`), never from the YAML `RetryPolicy`, and the resolved per-agent config did not reach the parse recovery loop. EPIC 2 threads the YAML value through to the recovery loop in both providers.
 
-4. **No CLI gate-resolution path**: Gate responses flow exclusively through WebSocket (`web/server.py:326-327`). When the dashboard is unreachable (socket died, network issue, shared infra without browser access), there is no fallback.
+4. ~~**No CLI gate-resolution path**~~ → **RESOLVED (EPIC 3).** Gate responses previously flowed exclusively through WebSocket (`web/server.py:326-327`); when the dashboard was unreachable there was no fallback. EPIC 3 adds the `conductor gate-respond` CLI command and `POST /api/gate-respond` endpoint (hardened post-review with `agent_name` 409 validation and header-based `hmac` token auth).
 
-5. **Windows forward-slash subprocess failure**: `script.py:105` passes `rendered_command` to `create_subprocess_exec` without normalizing path separators. On Windows, `C:/Python314/python.exe` can fail intermittently with `FileNotFoundError`.
+5. ~~**Subprocess command not resolved against PATH**~~ → **RESOLVED (EPIC 4).** `script.py` passed `rendered_command` to `create_subprocess_exec` without resolving bare names against PATH/PATHEXT. EPIC 4 resolves absolute paths and bare names via `shutil.which`. (Note: the originally-reported intermittent Windows forward-slash `FileNotFoundError` could not be reproduced — forward-slash and extension-less commands execute fine via `create_subprocess_exec`.)
 
 ---
 
@@ -75,8 +75,8 @@ Three issues remain open:
 | G1 | Agents producing large/prose output can declare `output_mode: raw` to bypass JSON envelope extraction, receiving their response as `{result: <raw text>}`. | ✅ DONE |
 | G2 | Parse-exhaustion failures are marked `is_retryable=False` by default across both providers (deterministic failures should not retry). Users can opt into outer retries for parse failures via `retry.max_attempts`. | ✅ DONE |
 | G3 | `max_parse_recovery_attempts` is configurable from YAML via the `retry:` block on `AgentDef`, with provider-specific defaults preserved for backward compat (Copilot=5, Claude=2). | ✅ DONE |
-| G4 | A `conductor gate-respond` CLI command resolves a parked gate by POSTing to the dashboard's HTTP API, with optional token-based auth for shared infrastructure. | OPEN |
-| G5 | On Windows, forward-slash absolute paths in `command:` are normalized to backslashes before `create_subprocess_exec`, and the `FileNotFoundError` message includes the resolved command and a path-separator hint. | OPEN |
+| G4 | A `conductor gate-respond` CLI command resolves a parked gate by POSTing to the dashboard's HTTP API, with optional token-based auth for shared infrastructure. | DONE |
+| G5 | Bare command names and absolute paths in `command:` are resolved against PATH/PATHEXT via `shutil.which` before `create_subprocess_exec` (non-destructive: unresolved commands fall through unchanged; relative paths with a separator are left for `working_dir` resolution), and the `FileNotFoundError` message includes the resolved command and a Windows hint. | DONE |
 
 ### Non-Goals
 
@@ -104,11 +104,11 @@ Three issues remain open:
 | FR-6 | `RetryPolicy` in `config/schema.py` accepts `max_parse_recovery_attempts: int` (optional, default `None` = provider default). | ✅ DONE |
 | FR-7 | `_resolve_retry_config()` in both providers propagates the per-agent `max_parse_recovery_attempts` when set. | ✅ DONE |
 | FR-8 | Parse-failure error messages include the first 500 characters of the response. | ✅ DONE (`copilot.py:744`, `copilot.py:1122`) |
-| FR-9 | `conductor gate-respond` CLI command accepts `--port` (to identify the running instance) and `--choice` / `--input` to resolve the gate. | OPEN |
-| FR-10 | `web/server.py` exposes a `POST /api/gate-respond` HTTP endpoint accepting JSON `{agent_name, selected_value, additional_input?, token?}`. | OPEN |
-| FR-11 | Gate-respond endpoint validates an optional `CONDUCTOR_GATE_TOKEN` env var when set (bearer token auth). | OPEN |
-| FR-12 | On Windows, `script.py` normalizes forward slashes to backslashes in `rendered_command` before calling `create_subprocess_exec`. Args are not normalized (they may contain URLs or flags with `/`). |
-| FR-13 | The `FileNotFoundError` handler in `script.py` includes the resolved command, working directory, and (on Windows when `/` detected) a hint about path separator normalization. |
+| FR-9 | `conductor gate-respond` CLI command accepts `--port` (to identify the running instance) and `--choice` / `--input` to resolve the gate. | DONE |
+| FR-10 | `web/server.py` exposes a `POST /api/gate-respond` HTTP endpoint accepting JSON `{agent_name, selected_value, additional_input?}`. The endpoint returns `409` when no gate is currently waiting or when `agent_name` does not match the waiting gate (post-review: prevents a mismatched response being silently queued so the gate never resolves). | DONE |
+| FR-11 | Gate-respond endpoint validates an optional `CONDUCTOR_GATE_TOKEN` env var when set. The token is read from the `Authorization: Bearer <token>` header (post-review: moved off the JSON body) and compared with `hmac.compare_digest` for constant-time matching. | DONE |
+| FR-12 | `script.py` resolves `rendered_command` via `shutil.which` when it is an absolute path or a bare name (no separator) before calling `create_subprocess_exec`, falling back to the rendered value when unresolved. Args are never resolved (they may contain URLs or flags with `/`). |
+| FR-13 | The `FileNotFoundError` handler in `script.py` includes the resolved command, working directory, and (on Windows) a hint to include the file extension or use an absolute path. |
 
 ### Non-Functional Requirements
 
@@ -142,7 +142,7 @@ Three issues remain open:
 │       max_parse_recovery_attempts                   (FIX)   │
 ├─────────────────────────────────────────────────────────────┤
 │                    executor/script.py                        │
-│  ├── Normalize forward-slash paths on Windows       (NEW)   │
+│  ├── Resolve command via shutil.which (PATH/PATHEXT)  (NEW)  │
 │  └── Improved FileNotFoundError message             (FIX)   │
 ├─────────────────────────────────────────────────────────────┤
 │                     web/server.py                            │
@@ -198,7 +198,7 @@ output_mode: Literal["raw", "envelope"] | None = None
 
 **Issue #10 status: ✅ RESOLVED.** Both providers mark parse-exhaustion as `is_retryable=False` (`copilot.py:748`, `claude.py:1887`). The 3× outer-retry amplification no longer occurs.
 
-**Issue #6 status: OPEN.** `max_parse_recovery_attempts` is not user-configurable from YAML.
+**Issue #6 status: ✅ RESOLVED (EPIC 2, PR #234).** `max_parse_recovery_attempts` is now user-configurable from YAML and threaded through to the parse recovery loop in both providers. The root-cause analysis below is retained as design context.
 
 **Root cause of Issue #6:**
 
@@ -206,7 +206,7 @@ In `copilot.py`, the `RetryConfig` dataclass defaults `max_parse_recovery_attemp
 
 In `claude.py`, the same `RetryConfig` defaults `max_parse_recovery_attempts=2` (line 106). `_resolve_retry_config()` (line 660-686) copies from the provider-level default at line 685.
 
-**Critical threading gap (still open):**
+**Critical threading gap (resolved by EPIC 2):**
 
 Even if `_resolve_retry_config()` propagated a per-agent value, it would not reach the parse recovery loop:
 
@@ -253,25 +253,34 @@ Both truncation points already use 500-char prefixes:
 - `copilot.py:1122`: `content[:500]` (in `_extract_json`)
 - Suggestion text mentions `output_mode: raw` (`copilot.py:745-746`, `claude.py:1884-1885`)
 
-#### 6.2.3 CLI `gate-respond` Command (Issue #5)
+#### 6.2.3 CLI `gate-respond` Command (Issue #5) — ✅ SHIPPED
 
-**New HTTP endpoint** in `web/server.py`:
+> **Hardening (post-review):** Two refinements were applied during adversarial
+> review. (1) The endpoint now rejects responses that don't match the waiting
+> gate — if no gate is waiting or `agent_name` differs from the waiting agent it
+> returns `409` instead of silently queuing a payload that would never resolve
+> the gate (and could poison a later, unrelated gate). (2) The auth token moved
+> off the JSON body to the `Authorization: Bearer <token>` header and is compared
+> with `hmac.compare_digest` for constant-time matching.
+
+**HTTP endpoint** in `web/server.py`:
 
 ```python
 @app.post("/api/gate-respond")
 async def gate_respond_api(request: Request) -> JSONResponse:
     """Resolve a parked human gate via HTTP POST.
 
-    Body: {"agent_name": str, "selected_value": str,
-           "additional_input": str?, "token": str?}
+    Body: {"agent_name": str, "selected_value": str, "additional_input": str?}
+    Auth: optional `Authorization: Bearer <token>` header.
     """
-    # Validate token if CONDUCTOR_GATE_TOKEN is set
+    # Validate token (header, hmac.compare_digest) if CONDUCTOR_GATE_TOKEN is set
+    # Reject (409) if no gate waiting or agent_name != waiting agent
     ...
     self._gate_response_queue.put_nowait(body)
     return JSONResponse({"status": "accepted"})
 ```
 
-This is a simple adapter that puts the same payload onto `_gate_response_queue` that the WebSocket handler at `server.py:326-327` does today. The `wait_for_gate_response()` method at `server.py:712-740` is unchanged.
+This is a simple adapter that puts the same payload onto `_gate_response_queue` that the WebSocket handler at `server.py:326-327` does today. The `wait_for_gate_response()` method (which sets/clears `self._gate_waiting_agent` in a try/finally) is unchanged.
 
 **New CLI command** in `cli/app.py`:
 
@@ -293,39 +302,56 @@ The `--port` flag identifies the running dashboard. If `--agent` is omitted, the
 
 **Security model (Open Question #3 resolution):**
 
-- When `CONDUCTOR_GATE_TOKEN` env var is set on the workflow process, the `POST /api/gate-respond` endpoint requires a matching `token` field in the request body.
+- When `CONDUCTOR_GATE_TOKEN` env var is set on the workflow process, the `POST /api/gate-respond` endpoint requires a matching token supplied via the `Authorization: Bearer <token>` header, compared with `hmac.compare_digest`.
 - When unset (default), no auth is required. The dashboard binds to `127.0.0.1` by default, which limits the attack surface to local processes.
 - This is proportional to the current security posture: `POST /api/stop` and `POST /api/kill` already exist without auth. The gate-respond endpoint follows the same pattern.
 
 **Run/Resume parity:** No new flag on `run`/`resume` — the gate-respond command operates independently on a running instance. The `--port` flag comes from the PID file or user knowledge.
 
-#### 6.2.4 Windows Path Normalization (Issue #3)
+#### 6.2.4 Command Resolution (Issue #3)
 
 **Location:** `src/conductor/executor/script.py:83-118`
 
-After template rendering (line 86), normalize only the command on Windows (not args, which may contain URLs or flags with `/`):
+> **Correction (post-review):** The original plan called for blindly replacing
+> `/` with `\` on Windows. That was rejected during adversarial review: the swap
+> is a deterministic transform that cannot explain an *intermittent*
+> `FileNotFoundError`, it can mangle command strings, and the hint checked the
+> unrendered `agent.command` template. Empirical testing on Windows confirmed
+> that forward-slash paths and extension-less commands already execute fine via
+> `create_subprocess_exec`. The shipped fix instead resolves the command against
+> PATH/PATHEXT with `shutil.which`, which is non-destructive and adds real value
+> (bare-name → executable resolution).
+
+After template rendering, resolve the command (not args) when it is an absolute
+path or a bare name without a separator; relative paths with a separator are
+left untouched so they resolve against `working_dir`:
 
 ```python
-import sys
-if sys.platform == "win32":
-    rendered_command = rendered_command.replace("/", "\\")
+import os
+import shutil
+
+has_separator = os.sep in rendered_command or (
+    os.altsep is not None and os.altsep in rendered_command
+)
+if os.path.isabs(rendered_command) or not has_separator:
+    rendered_command = shutil.which(rendered_command) or rendered_command
 ```
 
-Improve the `FileNotFoundError` handler (line 113-118):
+Improve the `FileNotFoundError` handler:
 
 ```python
 except FileNotFoundError as exc:
     hint = ""
-    if sys.platform == "win32" and "/" in agent.command:
+    if sys.platform == "win32":
         hint = (
-            " Hint: on Windows, use backslashes (\\) in paths "
-            "or set the env var with backslash form."
+            " Hint: on Windows, include the file extension (e.g. .exe) "
+            "or use an absolute path."
         )
     raise ExecutionError(
         f"Script '{agent.name}': command not found: '{rendered_command}'"
         f" (working_dir={rendered_working_dir or 'cwd'}){hint}",
         agent_name=agent.name,
-        suggestion=f"Ensure '{rendered_command}' is installed and in PATH",
+        suggestion=f"Ensure '{rendered_command}' is installed and on PATH",
     ) from exc
 ```
 
@@ -336,8 +362,8 @@ except FileNotFoundError as exc:
 | `output_mode` is additive with `None` default (Open Q #1 → option (a)) | Preserves full backward compat. Existing workflows continue unchanged. No deprecation churn. | (b) additive + warn — rejected as too heuristic-dependent; (c) default-flip in v0.2.x — too disruptive for a point release. | ✅ SHIPPED |
 | Parse-exhaustion marked `is_retryable=False` (Open Q #4 → simpler option) | Deterministic failures don't benefit from retries. Users opt in via YAML `retry.max_attempts`. | Smarter classifier that detects same-error-twice — more complex, fragile, and solves the same problem less transparently. | ✅ SHIPPED |
 | Per-agent `max_parse_recovery_attempts` on `RetryPolicy` with `None` default (Open Q #2 → single field, provider defaults preserved) | A single field that both providers respect. `None` means "use provider default" so Copilot=5 and Claude=2 remain the out-of-box experience. | Separate per-provider defaults in YAML — over-engineered; users shouldn't need to know which provider they're targeting. | ✅ DONE |
-| Gate-respond via HTTP POST, not WebSocket (Open Q #3) | HTTP POST is simpler for CLI tooling (`httpx` one-shot). The existing WebSocket path continues to work for the dashboard. | WebSocket-only — would require the CLI to maintain a persistent connection, which is overkill for a one-shot operation. | OPEN |
-| Token auth is opt-in via env var, not mandatory | Matches current security posture (`POST /api/stop` has no auth). Avoids breaking changes for localhost-only deployments. | Mandatory token — would break existing `--web-bg` setups that don't set env vars. | OPEN |
+| Gate-respond via HTTP POST, not WebSocket (Open Q #3) | HTTP POST is simpler for CLI tooling (`httpx` one-shot). The existing WebSocket path continues to work for the dashboard. | WebSocket-only — would require the CLI to maintain a persistent connection, which is overkill for a one-shot operation. | ✅ DONE |
+| Token auth is opt-in via env var, not mandatory; supplied via `Authorization: Bearer` header and compared with `hmac.compare_digest` (post-review) | Matches current security posture (`POST /api/stop` has no auth). Avoids breaking changes for localhost-only deployments. Header + constant-time compare avoids body-borne secrets and timing leaks. | Mandatory token — would break existing `--web-bg` setups that don't set env vars. | ✅ DONE |
 
 ---
 
@@ -370,9 +396,9 @@ except FileNotFoundError as exc:
 | `config/schema.py` | New field on `AgentDef`, new field on `RetryPolicy` | Low — additive, validated | `output_mode` ✅ DONE; `max_parse_recovery_attempts` ✅ DONE |
 | `providers/copilot.py` | Skip schema injection for `raw`, mark parse-exhaustion non-retryable, propagate per-agent parse recovery | Medium — hot path | `output_mode` + `is_retryable` ✅ DONE; parse recovery config ✅ DONE |
 | `providers/claude.py` | Mirror all copilot changes per Provider Parity | Medium — hot path | `output_mode` + `is_retryable` ✅ DONE; parse recovery config ✅ DONE |
-| `executor/script.py` | Path normalization + error message | Low — Windows-only, no logic change | OPEN |
-| `web/server.py` | New HTTP endpoint | Low — additive | OPEN |
-| `cli/app.py` | New command | Low — additive | OPEN |
+| `executor/script.py` | `shutil.which` command resolution + error message | Low — non-destructive, cross-platform | DONE |
+| `web/server.py` | New HTTP endpoint (with `agent_name` 409 validation + header/hmac token auth) | Low — additive | ✅ DONE |
+| `cli/app.py` | New command | Low — additive | ✅ DONE |
 | `executor/output.py` | No changes needed | None | — |
 
 ### Backward Compatibility
@@ -381,7 +407,7 @@ except FileNotFoundError as exc:
 - **`is_retryable=False`**: ✅ Shipped. Workflows that relied on outer-retry-after-parse-exhaustion (unlikely intentional) now fail after inner recovery exhausts. Mitigation: set `retry.max_attempts: 3` to restore old behavior.
 - **`max_parse_recovery_attempts`**: Default `None` = provider default. No existing YAML breaks.
 - **Gate-respond endpoint**: Additive. No existing clients break.
-- **Windows path normalization**: Only affects Windows. POSIX unaffected.
+- **Command resolution**: `shutil.which` is cross-platform and non-destructive — unresolved commands fall through to the original rendered value.
 
 ---
 
@@ -527,7 +553,7 @@ The new `POST /api/gate-respond` endpoint creates a control plane surface:
 - [x] Per-agent value overrides provider default for both providers
 - [x] Validation rejects out-of-range values
 
-### EPIC 3: CLI Gate-Respond Command
+### EPIC 3: CLI Gate-Respond Command — ✅ SHIPPED
 
 **Goal:** Allow users to resolve parked gates from the command line when the dashboard is unreachable.
 
@@ -535,11 +561,11 @@ The new `POST /api/gate-respond` endpoint creates a control plane surface:
 
 | Task ID | Type | Description | Files | Status |
 |---------|------|-------------|-------|--------|
-| E3-T1 | IMPL | Add `POST /api/gate-respond` endpoint to `web/server.py`. Accepts JSON body `{agent_name, selected_value, additional_input?, token?}`. Validates `CONDUCTOR_GATE_TOKEN` env var when set. Puts payload onto `_gate_response_queue`. | `web/server.py` | DONE |
+| E3-T1 | IMPL | Add `POST /api/gate-respond` endpoint to `web/server.py`. Accepts JSON body `{agent_name, selected_value, additional_input?}`. Validates `CONDUCTOR_GATE_TOKEN` via the `Authorization: Bearer` header using `hmac.compare_digest` when set. Returns `409` when no gate is waiting or `agent_name` doesn't match the waiting gate. Puts payload onto `_gate_response_queue`. | `web/server.py` | DONE |
 | E3-T2 | IMPL | Add `GET /api/gate-status` endpoint to `web/server.py`. Returns JSON `{waiting: bool, agent_name: str?}` reflecting whether a gate is currently waiting. Requires the engine to set a flag on the dashboard when a gate is entered/exited. | `web/server.py` | DONE |
 | E3-T3 | IMPL | Add `gate-respond` command to `cli/app.py`. Options: `--port` (required), `--choice` (required), `--agent` (optional, auto-discovered via `/api/gate-status`), `--input` (optional additional text), `--token` (optional auth token, also reads from `CONDUCTOR_GATE_TOKEN` env). Uses `httpx.post` to `http://127.0.0.1:<port>/api/gate-respond`. | `cli/app.py` | DONE |
 | E3-T4 | — | ~~Add `httpx` to `pyproject.toml` dependencies.~~ **No-op:** `httpx>=0.27.0` is already a direct dependency at `pyproject.toml:46`. No action needed. | `pyproject.toml` | DONE |
-| E3-T5 | TEST | Unit tests for `POST /api/gate-respond`: (a) valid request → 200 + payload on queue, (b) missing `selected_value` → 422, (c) token mismatch when `CONDUCTOR_GATE_TOKEN` set → 403, (d) no token required when env var unset → 200. | `tests/test_web/test_gate_respond_api.py` | DONE |
+| E3-T5 | TEST | Unit tests for `POST /api/gate-respond`: (a) valid request → 200 + payload on queue, (b) missing `selected_value` → 422, (c) token mismatch via `Authorization` header when `CONDUCTOR_GATE_TOKEN` set → 403, (d) no token required when env var unset → 200, (e) token in JSON body is rejected, (f) no gate waiting / `agent_name` mismatch → 409. | `tests/test_web/test_gate_respond_api.py` | DONE |
 | E3-T6 | TEST | CLI tests for `gate-respond` command: (a) happy path with mock server, (b) unreachable port → clear error, (c) token passed from `--token` and from env var. | `tests/test_cli/test_gate_respond.py` | DONE |
 | E3-T7 | IMPL | Update `cli/app.py` line 191 text: change "Wait for CLI gate-resolution support (planned follow-up)" → "Use `conductor gate-respond --port <port> --choice <value>` to resolve from CLI". | `cli/app.py` | DONE |
 
@@ -550,23 +576,31 @@ The new `POST /api/gate-respond` endpoint creates a control plane surface:
 - [x] Error messages are clear when port is unreachable or no gate is waiting
 - [x] `--web-bg` + `human_gate` error message references the new command
 
-### EPIC 4: Windows Path Normalization
+### EPIC 4: Command Resolution — ✅ SHIPPED
 
-**Goal:** Forward-slash paths in script `command:` work on Windows without manual normalization.
+**Goal:** Resolve bare command names and absolute paths in script `command:` against PATH/PATHEXT via `shutil.which`, and emit a clearer `FileNotFoundError` message.
 
 **Prerequisites:** None (independent)
 
+> **Correction (post-review):** The original tasks below called for blindly
+> replacing `/` with `\` on Windows. That deterministic transform was rejected
+> during adversarial review (it cannot explain an *intermittent* failure, can
+> mangle command strings, and the hint checked the unrendered template). The
+> shipped fix resolves the command via `shutil.which` instead — non-destructive
+> and adds bare-name → executable resolution. Empirical testing confirmed
+> forward-slash and extension-less commands already run fine.
+
 | Task ID | Type | Description | Files | Status |
 |---------|------|-------------|-------|--------|
-| E4-T1 | IMPL | In `script.py`, after template rendering of `rendered_command` (line 86), add Windows path normalization: `if sys.platform == "win32": rendered_command = rendered_command.replace("/", "\\")`. Only normalize `rendered_command`, not args (args may contain URLs or flags with `/`). | `executor/script.py` | DONE |
-| E4-T2 | IMPL | Improve `FileNotFoundError` handler (line 113-118): include `rendered_command`, `rendered_working_dir`, and (on Windows when original `agent.command` contains `/`) a hint about path separator normalization. | `executor/script.py` | DONE |
-| E4-T3 | TEST | Unit tests: (a) on Windows (mocked `sys.platform`), `C:/Python314/python.exe` → normalized to `C:\Python314\python.exe`, (b) on Linux, no normalization, (c) `FileNotFoundError` message includes the hint when `/` detected on Windows. | `tests/test_executor/test_script.py` | DONE |
+| E4-T1 | IMPL | In `script.py`, after rendering `rendered_command`, resolve it via `shutil.which` when it is an absolute path or a bare name (no separator); leave relative paths with a separator for `working_dir` resolution; fall back to the rendered value when unresolved. Only resolve `rendered_command`, never args. | `executor/script.py` | DONE |
+| E4-T2 | IMPL | Improve `FileNotFoundError` handler: include the resolved command, working directory, and (on Windows) a hint to include the file extension or use an absolute path. | `executor/script.py` | DONE |
+| E4-T3 | TEST | Unit tests (patching `shutil.which`): bare name resolved via `which`, absolute path resolved via `which`, `which` returning None falls back to rendered, relative path with separator not resolved, args not resolved, `FileNotFoundError` message includes the Windows hint, no hint on Linux. | `tests/test_executor/test_script.py` | DONE |
 
 **Acceptance Criteria:**
-- [x] Forward-slash command paths are normalized on Windows
-- [x] POSIX paths are not modified
+- [x] Bare command names and absolute paths are resolved against PATH/PATHEXT via `shutil.which`
+- [x] Unresolved commands fall through unchanged; relative paths with a separator are left for `working_dir`
 - [x] `FileNotFoundError` message includes resolved command and Windows-specific hint
-- [x] Args are not normalized (may contain `/` for legitimate purposes)
+- [x] Args are not resolved (may contain `/` for legitimate purposes)
 
 ---
 
@@ -577,7 +611,7 @@ The new `POST /api/gate-respond` endpoint creates a control plane surface:
 - [AGENTS.md](../../../AGENTS.md) — architecture overview, Provider Parity rule, Run/Resume Parity rule
 - `src/conductor/config/schema.py` — `AgentDef` (line 450), `output_mode` (line 508), `RetryPolicy` (line 359), `OutputField` (line 61), `validate_agent_type` (line 700)
 - `src/conductor/providers/copilot.py` — `RetryConfig` (line 59), `_resolve_retry_config` (line 278), `_execute_with_retry` (line 306), `has_schema` check (line 524), parse recovery loop (line 681), parse-exhaustion error (line 740, `is_retryable=False` at line 748), `_extract_json` (line 1081, truncation at line 1122)
-- `src/conductor/providers/claude.py` — `RetryConfig` (line 85), `_resolve_retry_config` (line 660), `_execute_with_retry` (line 834), `_is_retryable_error` (line 713, isinstance-based — does not read `ProviderError.is_retryable`), `has_schema` check (line 922), `_execute_with_parse_recovery` (line 1738), parse-exhaustion error (line 1878, `is_retryable=False` at line 1887), `_max_parse_recovery_attempts` instance variable (line 191)
+- `src/conductor/providers/claude.py` — `RetryConfig` (line 85), `_resolve_retry_config` (line 660), `_execute_with_retry` (line 834), `_is_retryable_error` (line 713, now honors `ProviderError.is_retryable` first, then falls back to isinstance-based SDK checks), `has_schema` check (line 922), `_execute_with_parse_recovery` (line 1738), parse-exhaustion error (line 1878, `is_retryable=False` at line 1887), `_max_parse_recovery_attempts` instance variable (line 191)
 - `src/conductor/executor/script.py` — `create_subprocess_exec` (line 105), `FileNotFoundError` handler (line 113)
 - `src/conductor/web/server.py` — gate response queue (line 85), WebSocket handler (line 326), `wait_for_gate_response` (line 712)
 - `src/conductor/cli/app.py` — `_abort_web_bg_if_human_gate` (line 158), command definitions

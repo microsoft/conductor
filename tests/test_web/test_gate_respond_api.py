@@ -3,7 +3,9 @@
 Covers:
 - Valid gate-respond request returns 200 and payload lands on queue
 - Missing selected_value returns 422
-- Token mismatch when CONDUCTOR_GATE_TOKEN is set returns 403
+- agent_name not matching the waiting gate returns 409
+- no gate waiting returns 409
+- Token mismatch when CONDUCTOR_GATE_TOKEN is set returns 403 (Authorization header)
 - No token required when env var is unset
 - Gate-status returns waiting state correctly
 """
@@ -32,6 +34,7 @@ class TestGateRespondValidRequest:
 
     def test_valid_request_accepted(self) -> None:
         _, dashboard = _make_dashboard()
+        dashboard._gate_waiting_agent = "review-gate"
         with TestClient(dashboard.app) as client:
             resp = client.post(
                 "/api/gate-respond",
@@ -51,6 +54,7 @@ class TestGateRespondValidRequest:
 
     def test_valid_request_with_additional_input(self) -> None:
         _, dashboard = _make_dashboard()
+        dashboard._gate_waiting_agent = "review-gate"
         with TestClient(dashboard.app) as client:
             resp = client.post(
                 "/api/gate-respond",
@@ -141,8 +145,8 @@ class TestGateRespondTokenAuth:
                 json={
                     "agent_name": "review-gate",
                     "selected_value": "approve",
-                    "token": "wrong-token",
                 },
+                headers={"Authorization": "Bearer wrong-token"},
             )
             assert resp.status_code == 403
             assert "token" in resp.json()["error"].lower()
@@ -162,7 +166,8 @@ class TestGateRespondTokenAuth:
             )
             assert resp.status_code == 403
 
-    def test_correct_token_accepted(self) -> None:
+    def test_token_in_body_is_rejected(self) -> None:
+        """A token supplied in the JSON body (old behavior) no longer authenticates."""
         _, dashboard = _make_dashboard()
         with (
             patch.dict(os.environ, {"CONDUCTOR_GATE_TOKEN": "correct-token"}),
@@ -176,10 +181,28 @@ class TestGateRespondTokenAuth:
                     "token": "correct-token",
                 },
             )
+            assert resp.status_code == 403
+
+    def test_correct_token_accepted(self) -> None:
+        _, dashboard = _make_dashboard()
+        dashboard._gate_waiting_agent = "review-gate"
+        with (
+            patch.dict(os.environ, {"CONDUCTOR_GATE_TOKEN": "correct-token"}),
+            TestClient(dashboard.app) as client,
+        ):
+            resp = client.post(
+                "/api/gate-respond",
+                json={
+                    "agent_name": "review-gate",
+                    "selected_value": "approve",
+                },
+                headers={"Authorization": "Bearer correct-token"},
+            )
             assert resp.status_code == 200
 
     def test_no_token_required_when_env_unset(self) -> None:
         _, dashboard = _make_dashboard()
+        dashboard._gate_waiting_agent = "review-gate"
         env = {k: v for k, v in os.environ.items() if k != "CONDUCTOR_GATE_TOKEN"}
         with (
             patch.dict(os.environ, env, clear=True),
@@ -193,6 +216,37 @@ class TestGateRespondTokenAuth:
                 },
             )
             assert resp.status_code == 200
+
+
+class TestGateRespondAgentMatch:
+    """POST /api/gate-respond validates the agent_name against the waiting gate."""
+
+    def test_no_gate_waiting_returns_409(self) -> None:
+        _, dashboard = _make_dashboard()
+        # _gate_waiting_agent defaults to None (no gate parked)
+        with TestClient(dashboard.app) as client:
+            resp = client.post(
+                "/api/gate-respond",
+                json={"agent_name": "review-gate", "selected_value": "approve"},
+            )
+            assert resp.status_code == 409
+            assert "waiting" in resp.json()["error"].lower()
+            assert dashboard._gate_response_queue.empty()
+
+    def test_mismatched_agent_returns_409(self) -> None:
+        _, dashboard = _make_dashboard()
+        dashboard._gate_waiting_agent = "review-gate"
+        with TestClient(dashboard.app) as client:
+            resp = client.post(
+                "/api/gate-respond",
+                json={"agent_name": "other-gate", "selected_value": "approve"},
+            )
+            assert resp.status_code == 409
+            error = resp.json()["error"]
+            assert "other-gate" in error
+            assert "review-gate" in error
+            # The mismatched response must NOT be queued.
+            assert dashboard._gate_response_queue.empty()
 
 
 class TestGateStatus:

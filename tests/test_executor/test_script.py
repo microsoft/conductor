@@ -10,7 +10,7 @@ Tests cover:
 - Working directory
 - Jinja2 template rendering in command/args
 - Command not found error
-- Windows path normalization
+- Command resolution via shutil.which
 """
 
 from __future__ import annotations
@@ -285,16 +285,23 @@ class TestScriptExecutorErrors:
         assert output.exit_code == 42
 
 
-class TestScriptExecutorWindowsPathNormalization:
-    """Tests for Windows path normalization in rendered_command."""
+class TestScriptExecutorCommandResolution:
+    """Tests for command resolution via ``shutil.which`` in rendered_command.
+
+    Forward-slash paths, missing Windows extensions, and bare command names
+    are resolved against PATH/PATHEXT. Relative paths containing a separator
+    are left untouched so they resolve against ``working_dir``. Resolution is
+    non-destructive: when ``which`` returns ``None`` the rendered command is
+    used as-is.
+    """
 
     @pytest.mark.asyncio
-    async def test_forward_slashes_normalized_on_windows(self, executor: ScriptExecutor) -> None:
-        """On Windows, forward slashes in rendered_command are replaced with backslashes."""
+    async def test_bare_name_resolved_via_which(self, executor: ScriptExecutor) -> None:
+        """A bare command name is resolved to the executable ``which`` finds."""
         agent = AgentDef(
-            name="test_win_path",
+            name="test_bare",
             type="script",
-            command="C:/Python314/python.exe",
+            command="python",
             args=["-c", "print('hello')"],
         )
         mock_process = AsyncMock()
@@ -302,23 +309,24 @@ class TestScriptExecutorWindowsPathNormalization:
         mock_process.returncode = 0
 
         with (
-            patch("conductor.executor.script.sys") as mock_sys,
+            patch(
+                "conductor.executor.script.shutil.which",
+                return_value="/resolved/bin/python",
+            ) as mock_which,
             patch("asyncio.create_subprocess_exec", return_value=mock_process) as mock_exec,
         ):
-            mock_sys.platform = "win32"
             await executor.execute(agent, {})
 
-        # The first positional arg to create_subprocess_exec is the command
-        called_command = mock_exec.call_args[0][0]
-        assert called_command == "C:\\Python314\\python.exe"
+        mock_which.assert_called_once_with("python")
+        assert mock_exec.call_args[0][0] == "/resolved/bin/python"
 
     @pytest.mark.asyncio
-    async def test_forward_slashes_not_normalized_on_linux(self, executor: ScriptExecutor) -> None:
-        """On Linux, forward slashes in rendered_command are preserved."""
+    async def test_absolute_path_resolved_via_which(self, executor: ScriptExecutor) -> None:
+        """An absolute path (incl. forward slashes) is resolved via ``which``."""
         agent = AgentDef(
-            name="test_linux_path",
+            name="test_abs",
             type="script",
-            command="/usr/local/bin/python3",
+            command="C:/Python314/python",
             args=["-c", "print('hello')"],
         )
         mock_process = AsyncMock()
@@ -326,22 +334,71 @@ class TestScriptExecutorWindowsPathNormalization:
         mock_process.returncode = 0
 
         with (
-            patch("conductor.executor.script.sys") as mock_sys,
+            patch(
+                "conductor.executor.script.shutil.which",
+                return_value="C:\\Python314\\python.EXE",
+            ) as mock_which,
+            patch("conductor.executor.script.os.path.isabs", return_value=True),
             patch("asyncio.create_subprocess_exec", return_value=mock_process) as mock_exec,
         ):
-            mock_sys.platform = "linux"
             await executor.execute(agent, {})
 
-        called_command = mock_exec.call_args[0][0]
-        assert called_command == "/usr/local/bin/python3"
+        mock_which.assert_called_once_with("C:/Python314/python")
+        assert mock_exec.call_args[0][0] == "C:\\Python314\\python.EXE"
 
     @pytest.mark.asyncio
-    async def test_args_not_normalized_on_windows(self, executor: ScriptExecutor) -> None:
-        """On Windows, args are NOT normalized (may contain URLs or flags with /)."""
+    async def test_which_none_falls_back_to_rendered(self, executor: ScriptExecutor) -> None:
+        """When ``which`` cannot resolve, the rendered command is used as-is."""
+        agent = AgentDef(
+            name="test_fallback",
+            type="script",
+            command="python",
+            args=["-c", "print('hello')"],
+        )
+        mock_process = AsyncMock()
+        mock_process.communicate.return_value = (b"hello\n", b"")
+        mock_process.returncode = 0
+
+        with (
+            patch("conductor.executor.script.shutil.which", return_value=None),
+            patch("asyncio.create_subprocess_exec", return_value=mock_process) as mock_exec,
+        ):
+            await executor.execute(agent, {})
+
+        assert mock_exec.call_args[0][0] == "python"
+
+    @pytest.mark.asyncio
+    async def test_relative_path_with_separator_not_resolved(
+        self, executor: ScriptExecutor
+    ) -> None:
+        """A relative path with a separator is left untouched (working_dir semantics)."""
+        agent = AgentDef(
+            name="test_relative",
+            type="script",
+            command="./scripts/run.sh",
+            args=[],
+        )
+        mock_process = AsyncMock()
+        mock_process.communicate.return_value = (b"", b"")
+        mock_process.returncode = 0
+
+        with (
+            patch("conductor.executor.script.shutil.which") as mock_which,
+            patch("conductor.executor.script.os.path.isabs", return_value=False),
+            patch("asyncio.create_subprocess_exec", return_value=mock_process) as mock_exec,
+        ):
+            await executor.execute(agent, {})
+
+        mock_which.assert_not_called()
+        assert mock_exec.call_args[0][0] == "./scripts/run.sh"
+
+    @pytest.mark.asyncio
+    async def test_args_not_resolved(self, executor: ScriptExecutor) -> None:
+        """Args are never passed through ``which`` (may contain URLs or flags with /)."""
         agent = AgentDef(
             name="test_args_preserve",
             type="script",
-            command="C:/Python314/python.exe",
+            command="python",
             args=["-c", "print('hello')", "https://example.com/api/v1"],
         )
         mock_process = AsyncMock()
@@ -349,19 +406,17 @@ class TestScriptExecutorWindowsPathNormalization:
         mock_process.returncode = 0
 
         with (
-            patch("conductor.executor.script.sys") as mock_sys,
+            patch("conductor.executor.script.shutil.which", return_value="/bin/python"),
             patch("asyncio.create_subprocess_exec", return_value=mock_process) as mock_exec,
         ):
-            mock_sys.platform = "win32"
             await executor.execute(agent, {})
 
-        # Args should be passed unchanged
         called_args = mock_exec.call_args[0][1:]
         assert "https://example.com/api/v1" in called_args
 
     @pytest.mark.asyncio
     async def test_file_not_found_includes_hint_on_windows(self, executor: ScriptExecutor) -> None:
-        """FileNotFoundError on Windows with / in command includes a hint."""
+        """FileNotFoundError on Windows includes a path-resolution hint."""
         agent = AgentDef(
             name="test_hint",
             type="script",
@@ -369,6 +424,8 @@ class TestScriptExecutorWindowsPathNormalization:
         )
         with (
             patch("conductor.executor.script.sys") as mock_sys,
+            patch("conductor.executor.script.shutil.which", return_value=None),
+            patch("conductor.executor.script.os.path.isabs", return_value=True),
             patch(
                 "asyncio.create_subprocess_exec",
                 side_effect=FileNotFoundError("not found"),
@@ -379,7 +436,7 @@ class TestScriptExecutorWindowsPathNormalization:
                 await executor.execute(agent, {})
 
         error_msg = str(exc_info.value)
-        assert "C:\\nonexistent\\python.exe" in error_msg
+        assert "C:/nonexistent/python.exe" in error_msg
         assert "working_dir=cwd" in error_msg
 
     @pytest.mark.asyncio
@@ -392,35 +449,13 @@ class TestScriptExecutorWindowsPathNormalization:
         )
         with (
             patch("conductor.executor.script.sys") as mock_sys,
+            patch("conductor.executor.script.shutil.which", return_value=None),
             patch(
                 "asyncio.create_subprocess_exec",
                 side_effect=FileNotFoundError("not found"),
             ),
         ):
             mock_sys.platform = "linux"
-            with pytest.raises(ExecutionError, match="command not found") as exc_info:
-                await executor.execute(agent, {})
-
-        assert "Hint" not in str(exc_info.value)
-
-    @pytest.mark.asyncio
-    async def test_file_not_found_no_hint_when_no_slash_on_windows(
-        self, executor: ScriptExecutor
-    ) -> None:
-        """FileNotFoundError on Windows without / in original command: no hint."""
-        agent = AgentDef(
-            name="test_no_slash_hint",
-            type="script",
-            command="nonexistent_command",
-        )
-        with (
-            patch("conductor.executor.script.sys") as mock_sys,
-            patch(
-                "asyncio.create_subprocess_exec",
-                side_effect=FileNotFoundError("not found"),
-            ),
-        ):
-            mock_sys.platform = "win32"
             with pytest.raises(ExecutionError, match="command not found") as exc_info:
                 await executor.execute(agent, {})
 
