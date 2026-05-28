@@ -230,7 +230,7 @@ pip install hermes-agent
 
 ### Model not found
 
-**Error**: `ProviderError: Hermes agent execution failed: ...`
+**Error**: `ProviderError: Hermes agent execution failed (model='anthropic/...'): ...`
 
 **Symptoms**: Hermes returns `failed: true` in the result dict.
 
