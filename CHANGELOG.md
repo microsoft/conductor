@@ -5,9 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.17...HEAD)
+## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.18...HEAD)
+
+## [0.1.18](https://github.com/microsoft/conductor/compare/v0.1.17...v0.1.18) - 2026-05-28
 
 ### Added
+- New `type: set` workflow step that evaluates Jinja2 expressions and binds
+  the results into the workflow context — no LLM call, no subprocess, no I/O.
+  Two surface forms: `value:` (single expression bound as `<step>.output`,
+  scalar / list / dict by auto-detection or explicit `output_type:`) and
+  `values:` (named bindings rendered in one pass against the pre-step context
+  and bound as `<step>.output.<key>`). Type detection defaults to YAML
+  auto-parsing with a JSON-safety pass that converts `datetime`/`date`/`time`
+  to ISO 8601 strings and raises `ExecutionError` on other non-JSON-safe
+  values (including non-string dict keys) so checkpoint round-trips stay
+  stable. Explicit `output_type:` (single-`value` only) supports `string`,
+  `number`, `integer`, `boolean`, `list`, `dict`. The engine dispatches set
+  steps in the main loop, parallel groups, and for-each groups via the
+  shared `_run_set_step` helper, emitting `set_started` / `set_completed` /
+  `set_failed` and enforcing the `output:` schema (rejected for scalar
+  outputs with a friendly suggestion). `WorkflowContext.store` was widened
+  to accept any JSON-safe value; `_add_agent_input` returns scalars verbatim
+  for `step.output` and raises a clear `KeyError` for `step.output.field`
+  shorthand on non-dict outputs. The web dashboard adds a dedicated `SetNode`
+  (variable icon, key count / value preview) and `SetDetail` panel showing
+  output type, bindings, and rendered value. New `examples/set-step.yaml`
+  demonstrates single + multi binding plus a boolean route on the derived
+  flag
+  ([#226](https://github.com/microsoft/conductor/pull/226),
+  closes [#221](https://github.com/microsoft/conductor/issues/221)).
 - New `type: wait` workflow step that pauses execution for a parsed
   duration via in-process `asyncio.sleep`. Cross-platform — no shell
   `sleep` dependency. Use for rate-limit cooldowns, polling intervals,
@@ -95,6 +121,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   [#136](https://github.com/microsoft/conductor/issues/136)).
 
 ### Fixed
+- `_verbose_console` is now silent-aware at the source: a `_SilentAwareConsole`
+  subclass no-ops every `.print(...)` when `is_verbose()` is False, so the
+  remaining `conductor --silent` stderr leaks (dashboard-failed-to-start and
+  log-file-open warnings, workflow-hash mismatch, "Press Esc to interrupt",
+  "Event log written to…", "Log written to…", `_print_resume_instructions`,
+  and the replay command's "Press Ctrl+C to exit" / "Replay stopped"
+  banners) no longer reach stderr. The app-wide `console` remains
+  unchanged because it carries real error messages; the two replay prints
+  are gated per-call. `conductor --silent replay <log>` now produces zero
+  bytes on stderr
+  ([#223](https://github.com/microsoft/conductor/pull/223),
+  closes [#209](https://github.com/microsoft/conductor/issues/209)).
 - `parse_json_output` and the Copilot provider's `_extract_json` now use a
   two-stage fenced-block extraction (non-greedy `re.findall` + per-candidate
   try-parse, then a greedy single-capture fallback) so JSON whose string
@@ -102,7 +140,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and falls into parse-recovery loops, while responses with multiple
   fenced JSON blocks still pick the first valid one. Resolves a recurring
   failure mode for agents emitting Markdown-bearing JSON
-  (external-workflow-friction Issue #1).
+  (external-workflow-friction Issue #1)
+  ([#232](https://github.com/microsoft/conductor/pull/232)).
 - `conductor run --web-bg` and `conductor resume --web-bg` now abort before
   forking when the workflow contains a `human_gate` agent (including gates
   nested in `for_each.agent`) and `--skip-gates` is not set, with a message
