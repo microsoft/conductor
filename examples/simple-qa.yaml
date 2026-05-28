@@ -37,7 +37,7 @@ workflow:
 agents:
   - name: answerer
     description: Answers the user's question clearly and concisely
-    model: claude-haiku-4.5
+    model: gpt-4.1
     prompt: |
       You are a helpful assistant. Please answer the following question 
       clearly and concisely:
