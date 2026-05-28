@@ -45,7 +45,7 @@ workflow:
   context_mode: accumulate          # accumulate | snapshot | minimal (default: accumulate)
 
   runtime:
-    provider: copilot               # copilot | claude
+    provider: copilot               # copilot | claude | hermes
     default_model: gpt-5.2
     temperature: 0.7
     max_tokens: 4096
