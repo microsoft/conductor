@@ -25,6 +25,8 @@ export interface WorkflowEngineOptions {
   agentProviders?: Map<string, AgentProvider>;
   /** Event emitter. */
   emitter?: WorkflowEventEmitter;
+  /** Absolute path to the workflow YAML file — used to resolve relative paths. */
+  workflowFile?: string;
   /** Skill directories to pass to providers. */
   skillDirectories?: string[];
   /** Callback when an agent needs interactive input. */
@@ -60,6 +62,11 @@ export class WorkflowEngine {
     this.options = options;
     this.emitter = options.emitter ?? new WorkflowEventEmitter();
     this.context = options.resumeContext ?? new WorkflowContext();
+    if (options.workflowFile) {
+      this.context.workflowFile = options.workflowFile;
+      this.context.workflowDir = path.dirname(options.workflowFile);
+    }
+    this.context.workflowName = config.workflow.name;
   }
 
   async run(inputs: Record<string, unknown> = {}): Promise<WorkflowResult> {

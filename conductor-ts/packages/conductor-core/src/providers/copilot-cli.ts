@@ -189,7 +189,13 @@ export class CopilotCliProvider implements AgentProvider {
         ? `${systemPrompt}\n\n${fullPrompt}`
         : fullPrompt;
 
-      await session.sendAndWait({ prompt: sendPrompt });
+      // Default 30 min to match Python's IdleRecoveryConfig.max_session_seconds.
+      // Per-agent max_session_seconds (in seconds) is honoured when set.
+      const timeoutMs = agent.max_session_seconds
+        ? agent.max_session_seconds * 1000
+        : 30 * 60 * 1000;
+
+      await session.sendAndWait({ prompt: sendPrompt }, timeoutMs);
     } finally {
       await session.disconnect();
     }

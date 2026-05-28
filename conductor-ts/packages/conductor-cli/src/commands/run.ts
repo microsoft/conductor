@@ -91,10 +91,18 @@ export function registerRunCommand(program: Command): void {
           totalOutputTokens += output;
         });
 
+        // Resolve skill_directories from config relative to the workflow YAML
+        const workflowDir = path.dirname(absPath);
+        const resolvedSkillDirs = (config.workflow.runtime?.skill_directories ?? []).map(
+          (d) => path.resolve(workflowDir, d),
+        );
+
         const provider = createProvider(providerName as ProviderName);
         const engine = new WorkflowEngine(config, {
           provider,
           emitter,
+          workflowFile: absPath,
+          skillDirectories: resolvedSkillDirs,
           onUserInputRequest: opts.skipGates ? undefined : stdinInputHandler,
         });
 
