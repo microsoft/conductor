@@ -1317,10 +1317,7 @@ def gate_respond(
             resp.raise_for_status()
             status = resp.json()
             if not status.get("waiting"):
-                console.print(
-                    "[yellow]No gate is currently waiting on "
-                    f"port {port}.[/yellow]"
-                )
+                console.print(f"[yellow]No gate is currently waiting on port {port}.[/yellow]")
                 raise typer.Exit(code=1)
             agent = status["agent_name"]
         except httpx.ConnectError:
@@ -1330,9 +1327,7 @@ def gate_respond(
             )
             raise typer.Exit(code=1) from None
         except httpx.HTTPError as exc:
-            console.print(
-                f"[bold red]Error:[/bold red] Failed to query gate status: {exc}"
-            )
+            console.print(f"[bold red]Error:[/bold red] Failed to query gate status: {exc}")
             raise typer.Exit(code=1) from None
 
     # Build request body
@@ -1370,14 +1365,12 @@ def gate_respond(
         raise typer.Exit(code=1)
     if resp.status_code != 200:
         console.print(
-            f"[bold red]Error:[/bold red] Unexpected response ({resp.status_code}): "
-            f"{resp.text}"
+            f"[bold red]Error:[/bold red] Unexpected response ({resp.status_code}): {resp.text}"
         )
         raise typer.Exit(code=1)
 
     console.print(
-        f"[green]Gate resolved:[/green] agent=[cyan]{agent}[/cyan] "
-        f"choice=[cyan]{choice}[/cyan]"
+        f"[green]Gate resolved:[/green] agent=[cyan]{agent}[/cyan] choice=[cyan]{choice}[/cyan]"
     )
 
 

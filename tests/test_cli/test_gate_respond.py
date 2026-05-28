@@ -62,10 +62,14 @@ class TestGateRespondHappyPath:
             app,
             [
                 "gate-respond",
-                "--port", "8080",
-                "--choice", "approve",
-                "--agent", "g1",
-                "--input", "LGTM",
+                "--port",
+                "8080",
+                "--choice",
+                "approve",
+                "--agent",
+                "g1",
+                "--input",
+                "LGTM",
             ],
         )
         assert result.exit_code == 0
@@ -100,10 +104,14 @@ class TestGateRespondTokenHandling:
             app,
             [
                 "gate-respond",
-                "--port", "8080",
-                "--choice", "approve",
-                "--agent", "g1",
-                "--token", "my-secret",
+                "--port",
+                "8080",
+                "--choice",
+                "approve",
+                "--agent",
+                "g1",
+                "--token",
+                "my-secret",
             ],
         )
         assert result.exit_code == 0
@@ -134,10 +142,14 @@ class TestGateRespondTokenHandling:
                 app,
                 [
                     "gate-respond",
-                    "--port", "8080",
-                    "--choice", "approve",
-                    "--agent", "g1",
-                    "--token", "flag-token",
+                    "--port",
+                    "8080",
+                    "--choice",
+                    "approve",
+                    "--agent",
+                    "g1",
+                    "--token",
+                    "flag-token",
                 ],
             )
         assert result.exit_code == 0

@@ -224,9 +224,7 @@ class TestGateStatus:
 
         async def _test() -> None:
             # Pre-queue a matching response
-            dashboard._gate_response_queue.put_nowait(
-                {"agent_name": "g1", "selected_value": "ok"}
-            )
+            dashboard._gate_response_queue.put_nowait({"agent_name": "g1", "selected_value": "ok"})
             result = await dashboard.wait_for_gate_response("g1")
             assert result["selected_value"] == "ok"
             assert dashboard._gate_waiting_agent is None
