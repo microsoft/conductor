@@ -16,7 +16,7 @@ Conductor makes multi-agent workflows — code review pipelines, research-then-s
 ## Features
 
 - **YAML-based workflows** - Define multi-agent workflows in readable YAML
-- **Multiple providers** - GitHub Copilot, Anthropic Claude, or Claude Agent SDK with seamless switching
+- **Multiple providers** - GitHub Copilot, Anthropic Claude, Claude Agent SDK, or NousResearch Hermes (experimental) with seamless switching
 - **Parallel execution** - Run agents concurrently (static groups or dynamic for-each)
 - **Sub-workflow composition** - Reusable sub-workflows with templated `input_mapping`, usable inside `for_each` groups for dynamic fan-out
 - **Script steps** - Run shell commands and route on exit code or parsed JSON stdout
@@ -211,13 +211,14 @@ conductor stop
 
 Conductor supports multiple AI providers. Choose based on your needs:
 
-| Feature | Copilot | Claude | Claude Agent SDK |
-|---------|---------|--------|------------------|
-| **Pricing** | Subscription ($10-39/mo) | Pay-per-token | Via Claude Code CLI |
-| **Context Window** | 8K-128K tokens | 200K tokens | 200K tokens |
-| **Tool Support (MCP)** | Yes | Planned | Yes (built-in) |
-| **Streaming** | Yes | Planned | Yes |
-| **Best For** | Heavy usage, tools | Large context, pay-per-use | Full Claude Code toolset |
+| Feature | Copilot | Claude | Claude Agent SDK | Hermes |
+|---------|---------|--------|------------------|--------|
+| **Tier** | Stable | Stable | Experimental | Experimental |
+| **Pricing** | Subscription ($10-39/mo) | Pay-per-token | Via Claude Code CLI | Pay-per-token (via hermes) |
+| **Context Window** | 8K-128K tokens | 200K tokens | 200K tokens | Per-model |
+| **Tool Support (MCP)** | Yes | Planned | Yes (built-in) | No (hermes internal tools) |
+| **Streaming** | Yes | Planned | Yes | No |
+| **Best For** | Heavy usage, tools | Large context, pay-per-use | Full Claude Code toolset | Multi-provider model access |
 
 ### Using Claude
 
@@ -243,7 +244,18 @@ Requires the `claude` CLI to be installed and authenticated. Install the SDK: `u
 
 > **Note:** The `claude-agent-sdk` provider delegates tool and MCP server management to the `claude` CLI. Workflow-level `tools` and `runtime.mcp_servers` fields are ignored — configure these through your Claude Code settings instead.
 
-**See also:** [Claude Documentation](docs/providers/claude.md) | [Provider Comparison](docs/providers/comparison.md) | [Migration Guide](docs/providers/migration.md)
+### Using Hermes (Experimental)
+
+```yaml
+workflow:
+  runtime:
+    provider: hermes
+    default_model: anthropic/claude-sonnet-4
+```
+
+Install the library: `pip install hermes-agent`
+
+**See also:** [Claude Documentation](docs/providers/claude.md) | [Hermes Documentation](docs/providers/hermes.md) | [Provider Comparison](docs/providers/comparison.md) | [Migration Guide](docs/providers/migration.md)
 
 ### Using a Local / Custom LLM Endpoint (Ollama, vLLM, Azure OpenAI, ...)
 
@@ -357,7 +369,8 @@ See the [`examples/`](./examples/) directory for complete workflows:
 | [Parallel Execution](./docs/parallel-execution.md) | Static parallel groups |
 | [Dynamic Parallel](./docs/dynamic-parallel.md) | For-each groups and array processing |
 | [Claude Provider](./docs/providers/claude.md) | Claude setup and configuration |
-| [Provider Comparison](./docs/providers/comparison.md) | Copilot vs Claude decision guide |
+| [Hermes Provider](./docs/providers/hermes.md) | Hermes setup and configuration |
+| [Provider Comparison](./docs/providers/comparison.md) | Copilot vs Claude vs Hermes decision guide |
 
 ## Development
 
