@@ -461,7 +461,7 @@ class AgentDef(BaseModel):
     type: Literal["agent", "human_gate", "script", "workflow"] | None = None
     """Agent type. Defaults to 'agent' if not specified."""
 
-    provider: Literal["copilot", "claude"] | None = None
+    provider: Literal["copilot", "claude", "pydantic-deep"] | None = None
     """Provider override for this agent.
 
     If None (default), the agent uses the workflow.runtime.provider.
@@ -851,7 +851,7 @@ class MCPServerDef(BaseModel):
 class RuntimeConfig(BaseModel):
     """Provider and runtime configuration."""
 
-    provider: Literal["copilot", "openai-agents", "claude"] = "copilot"
+    provider: Literal["copilot", "openai-agents", "claude", "pydantic-deep"] = "copilot"
     """SDK provider to use for agent execution."""
 
     default_model: str | None = None

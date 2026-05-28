@@ -67,6 +67,9 @@ exclude = [
     "src/conductor/web/frontend",
 ]
 
+[project.optional-dependencies]
+pydantic-deep = ["pydantic-deep>=0.3.14"]
+
 [dependency-groups]
 dev = [
     "pytest>=9.0.3",

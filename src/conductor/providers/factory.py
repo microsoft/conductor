@@ -12,11 +12,12 @@ from conductor.exceptions import ProviderError
 from conductor.providers.base import AgentProvider
 from conductor.providers.claude import ANTHROPIC_SDK_AVAILABLE, ClaudeProvider
 from conductor.providers.copilot import CopilotProvider, IdleRecoveryConfig
+from conductor.providers.pydantic_deep import PYDANTIC_DEEP_AVAILABLE, PydanticDeepProvider
 from conductor.providers.reasoning import ReasoningEffort
 
 
 async def create_provider(
-    provider_type: Literal["copilot", "openai-agents", "claude"] = "copilot",
+    provider_type: Literal["copilot", "openai-agents", "claude", "pydantic-deep"] = "copilot",
     validate: bool = True,
     mcp_servers: dict[str, Any] | None = None,
     default_model: str | None = None,
@@ -102,10 +103,25 @@ async def create_provider(
                 max_session_seconds=max_session_seconds,
                 default_reasoning_effort=default_reasoning_effort,
             )
+        case "pydantic-deep":
+            if not PYDANTIC_DEEP_AVAILABLE:
+                raise ProviderError(
+                    "pydantic-deep provider requires the pydantic-deep package",
+                    suggestion="Install with: uv add 'pydantic-deep>=0.3.14'",
+                )
+            provider = PydanticDeepProvider(
+                model=default_model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                timeout=timeout if timeout is not None else 600.0,
+                mcp_servers=mcp_servers,
+                max_agent_iterations=max_agent_iterations,
+                default_reasoning_effort=default_reasoning_effort,
+            )
         case _:
             raise ProviderError(
                 f"Unknown provider: {provider_type}",
-                suggestion="Valid providers are: copilot, openai-agents, claude",
+                suggestion="Valid providers are: copilot, openai-agents, claude, pydantic-deep",
             )
 
     if validate and not await provider.validate_connection():

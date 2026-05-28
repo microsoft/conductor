@@ -1,0 +1,50 @@
+# Simple Question-Answering Workflow — pydantic-deep provider
+#
+# Demonstrates using PydanticDeepProvider as a drop-in replacement for
+# the copilot or claude providers. Structured output is enforced at the
+# API level via a Pydantic model (no prompt-injection / parse-recovery).
+#
+# Usage:
+#   conductor run examples/pydantic-deep-qa.yaml \
+#       --input question="What is pydantic-ai?"
+
+workflow:
+  name: pydantic-deep-qa
+  description: Question-answering workflow powered by pydantic-deepagents
+  version: "1.0.0"
+  entry_point: answerer
+
+  runtime:
+    provider: pydantic-deep
+    default_model: litellm:github_copilot/gpt-4o
+    temperature: 0.7
+
+  input:
+    question:
+      type: string
+      required: true
+      description: The question to answer
+
+agents:
+  - name: answerer
+    description: Answers the user's question clearly and concisely
+    prompt: |
+      You are a helpful assistant. Please answer the following question
+      clearly and concisely:
+
+      Question: {{ workflow.input.question }}
+
+      Provide a direct answer without unnecessary preamble.
+    output:
+      answer:
+        type: string
+        description: The answer to the question
+      confidence:
+        type: string
+        description: Confidence level (high, medium, or low)
+    routes:
+      - to: $end
+
+output:
+  answer: "{{ answerer.output.answer }}"
+  confidence: "{{ answerer.output.confidence }}"
