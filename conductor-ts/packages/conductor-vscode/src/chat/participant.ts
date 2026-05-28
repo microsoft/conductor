@@ -21,6 +21,7 @@ import {
 } from "@conductor/core";
 import { VscodeLmProvider } from "../providers/vscode-lm.js";
 import { createInputBridge, type InputBridge } from "./input-bridge.js";
+import { log } from "../logger.js";
 
 export function registerConductorParticipant(context: vscode.ExtensionContext): void {
   const participant = vscode.chat.createChatParticipant(
@@ -99,7 +100,7 @@ async function handleRequest(
       bridge.close();
 
       if (Object.keys(result.output).length > 0) {
-        stream.markdown("---\n**Workflow output:**\n```json\n" + JSON.stringify(result.output, null, 2) + "\n```\n");
+        stream.markdown("\n\n---\n\n**Workflow output:**\n\n```json\n" + JSON.stringify(result.output, null, 2) + "\n```\n");
       }
     } catch (err) {
       bridge.close();
@@ -145,8 +146,7 @@ function attachChatSubscriber(emitter: WorkflowEventEmitter, stream: vscode.Chat
 
   emitter.subscribe(async (event: WorkflowEvent) => {
     const data = event.data;
-    // Debug: uncomment to trace events in F12 DevTools Console
-    // console.log("[conductor] event:", event.type, data);
+    log(`[participant] event=${event.type} ${JSON.stringify(data).slice(0, 200)}`);
     switch (event.type) {
       case "agent_started": {
         const name = data["agentName"] as string;

@@ -4,8 +4,10 @@
  */
 import * as vscode from "vscode";
 import { registerConductorParticipant } from "./chat/participant.js";
+import { initLogger } from "./logger.js";
 
 export function activate(context: vscode.ExtensionContext): void {
+  initLogger(context);
   registerConductorParticipant(context);
 
   context.subscriptions.push(
