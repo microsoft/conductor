@@ -27,7 +27,7 @@ workflow:
 
   # Runtime configuration
   runtime:
-    provider: string | object       # "copilot" (default), "claude", "claude-agent-sdk", or "openai-agents"
+    provider: string | object       # "copilot" (default), "claude", "claude-agent-sdk", "hermes", or "openai-agents"
                                     # — or a ProviderSettings object (see below)
     default_model: string           # Default model for all agents
     temperature: float              # 0.0-1.0, controls randomness (optional, copilot/claude only)
@@ -107,7 +107,7 @@ agents:
     type: string                    # "agent" (default), "human_gate", "script", "workflow", "wait", or "terminate"
     description: string             # What this agent does
     model: string                   # Override default_model
-    provider: string                # Per-agent provider override ("copilot", "claude", or "claude-agent-sdk")
+    provider: string                # Per-agent provider override ("copilot", "claude", "claude-agent-sdk", or "hermes")
 
     # Input specification (for explicit context mode)
     input:
@@ -688,7 +688,7 @@ endpoints (Ollama, vLLM, LM Studio, Azure OpenAI, etc.).
 ```yaml
 runtime:
   provider:
-    name: string                  # "copilot" (default), "claude", "openai-agents"
+    name: string                  # "copilot" (default), "claude", "hermes", "openai-agents"
     type: string                  # "openai" | "azure" | "anthropic" (Copilot-only)
     wire_api: string              # "completions" | "responses" (Copilot-only)
     base_url: string              # Endpoint base URL
@@ -746,7 +746,7 @@ OpenAI credentials to arbitrary `base_url`); use the
 
 The schema rejects these misconfigurations at config-load time:
 
-- `name != "copilot"` with any non-`name` field set
+- `name != "copilot"` with any non-`name` field set (hermes and claude do not support structured ProviderSettings fields)
 - `type: azure` without `azure: { api_version: ... }` (or vice versa)
 - Anchorless fields: `wire_api`, `type`, `headers`, `azure` alone
   without `base_url` / `api_key` / `bearer_token`

@@ -12,7 +12,7 @@ workflow:
   entry_point: first_agent       # Required: starting agent, parallel group, or for-each group
 
   runtime:
-    provider: copilot            # copilot (default), claude, or openai-agents
+    provider: copilot            # copilot (default), claude, hermes, or openai-agents
     default_model: gpt-5.2       # Default model for agents
     temperature: 0.7             # 0.0-1.0 (optional)
     max_tokens: 4096             # Max output tokens per response (optional)
@@ -126,6 +126,7 @@ agents:
 
 - **Copilot**: forwarded as `reasoning_effort` on the session. Validated against the model's advertised `supported_reasoning_efforts`; raises `ValidationError` for unsupported combinations (skipped in mock-handler mode or when capability metadata is absent).
 - **Claude**: enables extended thinking via `thinking={"type": "enabled", "budget_tokens": N}` with mapping `low=2048`, `medium=8192`, `high=16384`, `xhigh=32768`. Auto-coerces `temperature` to `1.0` (logged at INFO) and bumps `max_tokens` to fit `budget + 4096` (capped at 64000, logged at INFO when clamped). Only valid on thinking-capable models (`claude-3-7-*`, `claude-opus-4*`, `claude-sonnet-4*`, `claude-haiku-4*`); raises `ValidationError` otherwise.
+- **Hermes**: `reasoning.effort` is accepted for interface parity but has no effect — the hermes library controls model reasoning internally.
 
 Both providers surface reasoning content via `agent_reasoning` events visible in the dashboard, JSONL logs, and the console at `-vv`. Not allowed on `script`, `human_gate`, `workflow`, or `wait` agent types.
 
@@ -760,6 +761,11 @@ agents:
     provider: claude               # Uses Claude for this agent
     model: claude-haiku-4.5
     prompt: "Classify: {{ workflow.input.text }}"
+
+  - name: tool_using_agent
+    provider: hermes               # Uses Hermes (NousResearch agent SDK)
+    model: anthropic/claude-sonnet-4
+    prompt: "Use tools to research: {{ workflow.input.topic }}"
 
   - name: deep_analyzer
     # Uses default copilot provider

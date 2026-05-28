@@ -1,0 +1,26 @@
+workflow:
+  name: hermes-simple-qa
+  description: Simple Q&A using the Hermes provider (NousResearch hermes-agent library)
+  entry_point: answerer
+  runtime:
+    provider: hermes
+    default_model: anthropic/claude-sonnet-4
+  input:
+    question:
+      type: string
+      required: true
+      description: The question to answer
+
+agents:
+  - name: answerer
+    prompt: |
+      Answer the following question clearly and concisely:
+      {{ workflow.input.question }}
+    output:
+      answer:
+        type: string
+    routes:
+      - to: $end
+
+output:
+  answer: "{{ answerer.output.answer }}"
