@@ -12,6 +12,7 @@ from conductor.exceptions import ProviderError
 from conductor.providers.base import AgentProvider
 from conductor.providers.claude import ANTHROPIC_SDK_AVAILABLE, ClaudeProvider
 from conductor.providers.copilot import CopilotProvider, IdleRecoveryConfig
+from conductor.providers.hermes import HERMES_SDK_AVAILABLE, HermesProvider
 from conductor.providers.reasoning import ReasoningEffort
 
 if TYPE_CHECKING:
@@ -106,10 +107,21 @@ async def create_provider(
                 max_session_seconds=max_session_seconds,
                 default_reasoning_effort=default_reasoning_effort,
             )
+        case "hermes":
+            if not HERMES_SDK_AVAILABLE:
+                raise ProviderError(
+                    "Hermes provider requires the hermes-agent package",
+                    suggestion="Install with: pip install hermes-agent",
+                )
+            provider = HermesProvider(
+                model=default_model,
+                max_agent_iterations=max_agent_iterations,
+                default_reasoning_effort=default_reasoning_effort,
+            )
         case _:
             raise ProviderError(
                 f"Unknown provider: {provider_type}",
-                suggestion="Valid providers are: copilot, openai-agents, claude",
+                suggestion="Valid providers are: copilot, openai-agents, claude, hermes",
             )
 
     if validate and not await provider.validate_connection():
