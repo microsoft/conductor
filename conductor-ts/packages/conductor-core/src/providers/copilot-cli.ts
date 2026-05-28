@@ -48,23 +48,45 @@ export interface CopilotCliProviderOptions {
 
 export class CopilotCliProvider implements AgentProvider {
   private client: CopilotClientType | undefined;
+  private _started = false;
+  /** Deduplicates concurrent start() calls from parallel agents — mirrors Python's asyncio.Lock. */
+  private _startPromise: Promise<void> | undefined;
   private readonly options: CopilotCliProviderOptions;
 
   constructor(options: CopilotCliProviderOptions = {}) {
     this.options = options;
   }
 
-  async validateConnection(): Promise<void> {
+  /**
+   * Lazily start the Copilot CLI binary exactly once, even when called
+   * concurrently from parallel agents.  Mirrors Python's _ensure_client_started().
+   */
+  private async _ensureClientStarted(): Promise<void> {
+    if (this._started) return;
+    this._startPromise ??= this._doStart();
+    try {
+      await this._startPromise;
+    } catch (err) {
+      // Reset so callers can retry (mirrors Python: lock re-entered on each attempt).
+      this._startPromise = undefined;
+      throw err;
+    }
+  }
+
+  private async _doStart(): Promise<void> {
     await loadSdk();
-    const client = this.getClient();
-    await client.start();
-    await client.ping();
+    await this.getClient().start();
+    this._started = true;
+  }
+
+  async validateConnection(): Promise<void> {
+    await this._ensureClientStarted();
+    await this.getClient().ping();
   }
 
   async execute(agent: AgentDef, prompt: string, opts: ExecuteOptions = {}): Promise<AgentOutput> {
-    await loadSdk();
+    await this._ensureClientStarted();
     const client = this.getClient();
-    if (!this.client) await client.start();
 
     const model = agent.model ?? this.options.defaultModel;
     const effortStr =
@@ -167,10 +189,16 @@ export class CopilotCliProvider implements AgentProvider {
   }
 
   async close(): Promise<void> {
-    if (this.client) {
-      await this.client.stop();
-      this.client = undefined;
+    if (this.client && this._started) {
+      try {
+        await this.client.stop();
+      } catch {
+        // best-effort stop, never throw on close (mirrors Python's contextlib.suppress(Exception))
+      }
     }
+    this.client = undefined;
+    this._started = false;
+    this._startPromise = undefined;
   }
 
   private getClient(): CopilotClientType {
