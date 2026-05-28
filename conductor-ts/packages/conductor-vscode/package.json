@@ -10,10 +10,10 @@
   },
   "license": "MIT",
   "engines": {
-    "vscode": "^1.90.0"
+    "vscode": "^1.99.0"
   },
   "categories": ["AI", "Other"],
-  "activationEvents": [],
+  "activationEvents": ["onStartupFinished"],
   "main": "./dist/extension.js",
   "scripts": {
     "build": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --external:@github/copilot-sdk --format=cjs --platform=node --sourcemap",
@@ -42,6 +42,9 @@
       {
         "name": "conductor_runWorkflow",
         "displayName": "Run Conductor Workflow",
+        "toolReferenceName": "conductorRun",
+        "canBeReferencedInPrompt": true,
+        "userDescription": "Run a Conductor multi-agent workflow from a YAML file.",
         "modelDescription": "Runs a multi-agent Conductor YAML workflow and returns its output. Use when the user wants to execute a Conductor workflow file.",
         "inputSchema": {
           "type": "object",
