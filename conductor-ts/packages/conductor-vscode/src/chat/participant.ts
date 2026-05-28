@@ -82,26 +82,23 @@ async function handleRequest(
       const config = loadConfig(absPath);
       validateConfig(config, absPath);
 
-      stream.markdown(`▶ Running **${config.workflow.name}**…\n\n`);
-
       const engine = new WorkflowEngine(config, {
         provider,
         emitter,
+        workflowFile: absPath,
         onUserInputRequest: bridge.requestInput,
       });
 
-      // Run the workflow (may be suspended waiting for input)
+      // Run the workflow (may be suspended waiting for input).
+      // workflow_started / agent_* / workflow_completed events drive all output
+      // via attachChatSubscriber — no extra markdown needed here.
       const runPromise = engine.run(args.inputs);
 
       // Handle input requests from the bridge in a separate async loop
       void handleBridgeInputs(bridge, stream, chatContext, token);
 
-      const result = await runPromise;
+      await runPromise;
       bridge.close();
-
-      if (Object.keys(result.output).length > 0) {
-        stream.markdown("\n\n---\n\n**Workflow output:**\n\n```json\n" + JSON.stringify(result.output, null, 2) + "\n```\n");
-      }
     } catch (err) {
       bridge.close();
       const msg = err instanceof ConductorError ? err.message : String(err);
@@ -143,16 +140,31 @@ async function handleBridgeInputs(
 
 function attachChatSubscriber(emitter: WorkflowEventEmitter, stream: vscode.ChatResponseStream): void {
   const agentStartTimes = new Map<string, number>();
+  let iteration = 0;
+  let totalInputTokens = 0;
+  let totalOutputTokens = 0;
 
   emitter.subscribe(async (event: WorkflowEvent) => {
     const data = event.data;
     log(`[participant] event=${event.type} ${JSON.stringify(data).slice(0, 200)}`);
     switch (event.type) {
+      case "workflow_started": {
+        const name = data["workflowName"] as string;
+        const inputs = data["inputs"] as Record<string, unknown> | undefined;
+        stream.markdown(`▶ **${name}**\n\n`);
+        if (inputs && Object.keys(inputs).length > 0) {
+          stream.markdown(
+            `**Inputs:**\n\`\`\`json\n${JSON.stringify(inputs, null, 2)}\n\`\`\`\n\n`,
+          );
+        }
+        break;
+      }
       case "agent_started": {
         const name = data["agentName"] as string;
         agentStartTimes.set(name, Date.now());
-        stream.progress(`Running agent: ${name}`);
-        stream.markdown(`\n**🤖 Agent: ${name}**\n\n`);
+        iteration++;
+        stream.progress(`Running agent: ${name} [iter ${iteration}]`);
+        stream.markdown(`\n**🤖 Agent: ${name}** [iter ${iteration}]\n\n`);
         break;
       }
       case "agent_turn_start": {
@@ -184,6 +196,17 @@ function attachChatSubscriber(emitter: WorkflowEventEmitter, stream: vscode.Chat
         }
         break;
       }
+      case "agent_message": {
+        // Show raw content only for unstructured (non-JSON) agent responses.
+        // Agents with an output schema return JSON (bare or fenced); those
+        // fields are rendered in agent_completed below — skip them here.
+        const content = data["content"] as string;
+        const trimmed = content.trim();
+        if (trimmed && !isStructuredJson(trimmed)) {
+          stream.markdown(`${trimmed}\n\n`);
+        }
+        break;
+      }
       case "agent_completed": {
         const name = data["agentName"] as string;
         const startTime = agentStartTimes.get(name);
@@ -193,21 +216,31 @@ function attachChatSubscriber(emitter: WorkflowEventEmitter, stream: vscode.Chat
         const outputTokens = (data["outputTokens"] as number | undefined) ?? 0;
         const nextAgent = data["nextAgent"] as string | undefined;
         const output = data["output"] as Record<string, unknown> | undefined;
+        totalInputTokens += inputTokens;
+        totalOutputTokens += outputTokens;
 
-        // Render parsed output fields (answers, summaries, etc.) as readable prose
+        // Render structured output fields as readable prose.
+        // Skip the fallback single-key { output: rawContent } case — that raw
+        // content was already shown by the agent_message handler above.
         if (output && Object.keys(output).length > 0) {
-          for (const [key, value] of Object.entries(output)) {
-            const text = typeof value === "string" ? value : JSON.stringify(value, null, 2);
-            stream.markdown(`**${key}:**\n\n${text}\n\n`);
+          const keys = Object.keys(output);
+          const isRawFallback = keys.length === 1 && keys[0] === "output";
+          if (!isRawFallback) {
+            for (const [key, value] of Object.entries(output)) {
+              const text = typeof value === "string" ? value : JSON.stringify(value, null, 2);
+              stream.markdown(`**${key}:**\n\n${text}\n\n`);
+            }
           }
         }
 
-        // Summary line
+        // Summary line (mirrors CLI: ✓ name  (elapsed, model, tokens, → keys))
+        const outputKeys = Object.keys(output ?? {});
         const parts: string[] = [];
         if (elapsed) parts.push(elapsed);
         if (model) parts.push(model);
         if (inputTokens > 0 || outputTokens > 0)
           parts.push(`${inputTokens.toLocaleString()} in / ${outputTokens.toLocaleString()} out`);
+        if (outputKeys.length > 0) parts.push(`→ [${outputKeys.join(", ")}]`);
         stream.markdown(
           `\n*✅ ${name} — ${parts.join(" · ")}${nextAgent && nextAgent !== "$end" ? ` → ${nextAgent}` : ""}*\n\n`,
         );
@@ -223,9 +256,36 @@ function attachChatSubscriber(emitter: WorkflowEventEmitter, stream: vscode.Chat
       case "parallel_started":
         stream.markdown(`\n⟳ **Parallel group:** ${data["groupName"] as string}\n\n`);
         break;
+      case "parallel_completed":
+        stream.markdown(`\n✓ **Parallel group done:** ${data["groupName"] as string}\n\n`);
+        break;
       case "foreach_started":
         stream.markdown(`\n↺ **For-each:** ${data["groupName"] as string}\n\n`);
         break;
+      case "foreach_completed":
+        stream.markdown(`\n✓ **For-each done:** ${data["groupName"] as string}\n\n`);
+        break;
+      case "workflow_completed": {
+        const durationMs = data["durationMs"] as number | undefined;
+        const elapsed = durationMs != null ? `${(durationMs / 1000).toFixed(2)}s` : "";
+        stream.markdown(`\n---\n\n✅ **Workflow completed successfully**`);
+        if (elapsed) stream.markdown(` — ⏱ ${elapsed}`);
+        stream.markdown(`\n\n`);
+        if (totalInputTokens > 0 || totalOutputTokens > 0) {
+          stream.markdown(
+            `**Token Usage**\n` +
+            `- Input: ${totalInputTokens.toLocaleString()}\n` +
+            `- Output: ${totalOutputTokens.toLocaleString()}\n` +
+            `- Total: ${(totalInputTokens + totalOutputTokens).toLocaleString()}\n\n`,
+          );
+        }
+        break;
+      }
+      case "workflow_failed": {
+        // The outer catch block in the run handler also reports the error; this
+        // subscriber entry is for completeness / future subscribers.
+        break;
+      }
     }
   });
 }
@@ -307,3 +367,25 @@ Run multi-agent Conductor workflows inside Copilot Chat.
 @conductor run examples/simple-qa.yaml --input question="What is Python?"
 \`\`\`
 `;
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns true if the string is structured JSON — bare object/array or a
+ * markdown-fenced JSON block.  Used to suppress `agent_message` output for
+ * agents that declare an output schema (their content will be rendered by
+ * the `agent_completed` handler instead).
+ */
+function isStructuredJson(text: string): boolean {
+  // Bare JSON object or array
+  if (text.startsWith("{") || text.startsWith("[")) return true;
+  // Markdown-fenced block: ```json … ``` or ``` … ```
+  const fenceMatch = text.match(/^```(?:json)?\s*\n([\s\S]*?)```/);
+  if (fenceMatch) {
+    const inner = fenceMatch[1]?.trim() ?? "";
+    return inner.startsWith("{") || inner.startsWith("[");
+  }
+  return false;
+}
