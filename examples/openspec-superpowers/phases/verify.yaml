@@ -145,9 +145,8 @@ agents:
         context = "\n\n---\n\n".join(sections) if sections else "(no artifacts found)"
 
         # Load verify template
-        template_file = pathlib.Path(
-            "examples/openspec-superpowers/artifacts/templates/verify.md"
-        )
+        _schema_dir = pathlib.Path("{{workflow.dir}}") / ".." / "artifacts"
+        template_file = _schema_dir / "templates" / "verify.md"
         template = template_file.read_text() if template_file.exists() else ""
 
         # Load verify instruction from bundled schema
@@ -155,7 +154,7 @@ agents:
         try:
             from ruamel.yaml import YAML as _YAML
             _yaml = _YAML()
-            _schema = _yaml.load(pathlib.Path("examples/openspec-superpowers/artifacts/schema.yaml"))
+            _schema = _yaml.load(_schema_dir / "schema.yaml")
             _artifact = next((a for a in _schema.get("artifacts", []) if a["id"] == "verify"), None)
             instruction = _artifact.get("instruction", "") if _artifact else ""
         except Exception as e:

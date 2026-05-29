@@ -38,7 +38,7 @@ workflow:
     existing_spec_path:
       type: string
       required: false
-      description: |  
+      description: |
         Path to the baseline spec in openspec/specs/<capability>/spec.md.
         Only populated for kind="modified". Empty string for new capabilities.
 
@@ -58,7 +58,7 @@ agents:
         from ruamel.yaml import YAML
 
         yaml = YAML()
-        schema_dir = pathlib.Path("examples/openspec-superpowers/artifacts")
+        schema_dir = pathlib.Path("{{workflow.dir}}") / ".." / "artifacts"
         schema = yaml.load(schema_dir / "schema.yaml")
 
         artifact_id = "specs"
