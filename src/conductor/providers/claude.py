@@ -930,11 +930,14 @@ class ClaudeProvider(AgentProvider):
         all_tools: list[dict[str, Any]] = []
 
         # Effective schema check: skip structured output when output_mode is raw
-        has_schema = agent.output is not None and agent.output_mode != "raw"
+        output_schema = (
+            agent.output if (agent.output is not None and agent.output_mode != "raw") else None
+        )
+        has_schema = output_schema is not None
 
         # Add emit_output tool if agent has effective output schema
-        if has_schema:
-            all_tools.extend(self._build_tools_for_structured_output(agent.output))
+        if output_schema is not None:
+            all_tools.extend(self._build_tools_for_structured_output(output_schema))
             # Append instruction to use the tool
             messages[-1]["content"] += (
                 "\n\nPlease use the 'emit_output' tool to return your response "
@@ -963,7 +966,7 @@ class ClaudeProvider(AgentProvider):
                     temperature=temperature,
                     max_tokens=max_tokens,
                     tools=request_tools,
-                    output_schema=agent.output if has_schema else None,
+                    output_schema=output_schema,
                     has_output_schema=has_output_schema,
                     max_iterations=max_agent_iterations,
                     max_session_seconds=max_session_seconds,
@@ -994,11 +997,11 @@ class ClaudeProvider(AgentProvider):
                     )
 
                 # Extract structured output
-                content = self._extract_output(response, agent.output if has_schema else None)
+                content = self._extract_output(response, output_schema)
 
                 # Validate output if schema is defined
-                if has_schema:
-                    validate_output(content, agent.output)
+                if output_schema is not None:
+                    validate_output(content, output_schema)
 
                 # Use total_tokens from the agentic loop (includes all turns)
                 # If available, use it; otherwise fall back to extracting from final response

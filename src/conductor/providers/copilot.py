@@ -685,9 +685,9 @@ class CopilotProvider(AgentProvider):
 
         # Build schema description for output schema (used in prompt and recovery)
         schema_for_prompt: dict[str, Any] | None = None
-        has_schema = agent.output and agent.output_mode != "raw"
-        if has_schema:
-            schema_for_prompt = self._build_prompt_schema(agent.output)
+        output_schema = agent.output if (agent.output and agent.output_mode != "raw") else None
+        if output_schema is not None:
+            schema_for_prompt = self._build_prompt_schema(output_schema)
             schema_desc = json.dumps(schema_for_prompt, indent=2)
             full_prompt += (
                 f"\n\n**IMPORTANT: You MUST respond with a JSON object matching this schema:**\n"
@@ -835,7 +835,7 @@ class CopilotProvider(AgentProvider):
                 cache_write_tokens = sdk_response.cache_write_tokens
 
                 # If no output schema (or output_mode is raw), we're done
-                if not has_schema:
+                if output_schema is None:
                     final_usage = SDKResponse(
                         content=response_content,
                         input_tokens=total_input_tokens,
@@ -904,7 +904,7 @@ class CopilotProvider(AgentProvider):
                             ) + recovery_response.output_tokens
 
                 # All recovery attempts exhausted
-                expected_fields = list(agent.output.keys())
+                expected_fields = list(output_schema.keys())
                 raise ProviderError(
                     f"Failed to parse structured output from agent response: {last_parse_error}",
                     suggestion=(
