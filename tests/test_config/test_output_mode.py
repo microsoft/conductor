@@ -71,6 +71,37 @@ class TestOutputModeValidation:
                 output_mode="raw",
             )
 
+    def test_raw_on_wait_raises_validation_error(self) -> None:
+        """output_mode on wait agent type is rejected."""
+        with pytest.raises(ValidationError, match="wait agents cannot have 'output_mode'"):
+            AgentDef(
+                name="a",
+                type="wait",
+                duration=60,
+                output_mode="raw",
+            )
+
+    def test_raw_on_set_raises_validation_error(self) -> None:
+        """output_mode on set agent type is rejected."""
+        with pytest.raises(ValidationError, match="set agents cannot have 'output_mode'"):
+            AgentDef(
+                name="a",
+                type="set",
+                value="42",
+                output_mode="raw",
+            )
+
+    def test_raw_on_terminate_raises_validation_error(self) -> None:
+        """output_mode on terminate agent type is rejected."""
+        with pytest.raises(ValidationError, match="terminate agents cannot have 'output_mode'"):
+            AgentDef(
+                name="a",
+                type="terminate",
+                status="success",
+                reason="done",
+                output_mode="raw",
+            )
+
     def test_none_with_output_is_valid(self) -> None:
         """output_mode=None (default) with output schema is valid — backward compat."""
         agent = AgentDef(

@@ -241,3 +241,54 @@ class TestGateRespondAutoDiscovery:
         )
         assert result.exit_code == 1
         assert "Cannot connect" in result.output
+
+    @patch("httpx.get")
+    def test_auto_discover_http_error(self, mock_get: MagicMock) -> None:
+        """A non-connect HTTP error during auto-discovery is reported clearly."""
+        mock_get.side_effect = httpx.HTTPError("boom")
+
+        result = runner.invoke(
+            app,
+            ["gate-respond", "--port", "8080", "--choice", "approve"],
+        )
+        assert result.exit_code == 1
+        assert "Failed to query gate status" in result.output
+
+
+class TestGateRespondErrorResponses:
+    """Server error responses surface clear messages."""
+
+    @patch("httpx.post")
+    def test_post_http_error(self, mock_post: MagicMock) -> None:
+        """A non-connect HTTP error on the POST is reported clearly."""
+        mock_post.side_effect = httpx.HTTPError("boom")
+
+        result = runner.invoke(
+            app,
+            ["gate-respond", "--port", "8080", "--choice", "approve", "--agent", "g1"],
+        )
+        assert result.exit_code == 1
+        assert "Request failed" in result.output
+
+    @patch("httpx.post")
+    def test_422_error_message(self, mock_post: MagicMock) -> None:
+        mock_post.return_value = _mock_response(422, {"error": "selected_value is required"})
+
+        result = runner.invoke(
+            app,
+            ["gate-respond", "--port", "8080", "--choice", "approve", "--agent", "g1"],
+        )
+        assert result.exit_code == 1
+        assert "selected_value is required" in result.output
+
+    @patch("httpx.post")
+    def test_unexpected_status_code(self, mock_post: MagicMock) -> None:
+        mock_post.return_value = _mock_response(500, {"error": "internal"})
+
+        result = runner.invoke(
+            app,
+            ["gate-respond", "--port", "8080", "--choice", "approve", "--agent", "g1"],
+        )
+        assert result.exit_code == 1
+        assert "Unexpected response" in result.output
+        assert "500" in result.output
