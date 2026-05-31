@@ -1,0 +1,76 @@
+# Pipeline template: Sequential stages with conditional routing
+#
+# Use when: Work flows through ordered stages (analyze → review → fix)
+#
+# Run: conductor run pipeline.yaml --input task="Review the API"
+
+workflow:
+  name: pipeline-template
+  description: Multi-stage pipeline with conditional routing
+  entry_point: stage1
+  runtime:
+    provider: copilot
+    default_model: gpt-4o
+
+agents:
+  - name: stage1
+    prompt: |
+      Stage 1: Analyze
+      
+      Task: {{ workflow.input.task }}
+      
+      Perform initial analysis and return findings.
+    output:
+      findings:
+        type: array
+        items:
+          type: object
+          properties:
+            issue: { type: string }
+            severity: { type: string }
+    routes:
+      - to: stage2
+        when: "{{ output.findings | length > 0 }}"
+      - to: $end
+  
+  - name: stage2
+    prompt: |
+      Stage 2: Review
+      
+      Review these findings from stage 1:
+      {% for finding in stage1.output.findings %}
+      - {{ finding.issue }} ({{ finding.severity }})
+      {% endfor %}
+      
+      Validate each finding and return only confirmed issues.
+    output:
+      confirmed:
+        type: array
+        items:
+          type: object
+          properties:
+            issue: { type: string }
+            severity: { type: string }
+            validated: { type: boolean }
+    routes:
+      - to: stage3
+        when: "{{ output.confirmed | selectattr('validated') | list | length > 0 }}"
+      - to: $end
+  
+  - name: stage3
+    prompt: |
+      Stage 3: Fix
+      
+      Fix these confirmed issues:
+      {% for issue in stage2.output.confirmed | selectattr('validated') %}
+      - {{ issue.issue }}
+      {% endfor %}
+      
+      Implement fixes and report what was done.
+    routes:
+      - to: $end
+
+output:
+  total_findings: "{{ stage1.output.findings | length }}"
+  confirmed_issues: "{{ stage2.output.confirmed | selectattr('validated') | list | length }}"
+  fixes_applied: "{{ stage3.output if stage3.output else 'none' }}"

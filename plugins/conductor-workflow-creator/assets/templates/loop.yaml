@@ -1,0 +1,64 @@
+# Loop template: Retry until condition is met
+#
+# Use when: You need to iterate until a goal is reached (review → fix → review)
+#
+# Run: conductor run loop.yaml --input task="Implement rate limiting"
+
+workflow:
+  name: loop-template
+  description: Loop until review passes
+  entry_point: implementer
+  runtime:
+    provider: copilot
+    default_model: gpt-4o
+  limits:
+    max_iterations: 10
+
+agents:
+  - name: implementer
+    prompt: |
+      Implement: {{ workflow.input.task }}
+      
+      Make the necessary code changes.
+    routes:
+      - to: reviewer
+  
+  - name: reviewer
+    prompt: |
+      Review the implementation of: {{ workflow.input.task }}
+      
+      Check for:
+      - Correctness
+      - Edge cases
+      - Code quality
+      
+      Return whether it passes review and list any issues.
+    output:
+      passed:
+        type: boolean
+        description: "Whether the review passed"
+      issues:
+        type: array
+        items:
+          type: string
+        description: "List of issues found"
+    routes:
+      - to: fixer
+        when: "{{ not output.passed }}"
+      - to: $end
+  
+  - name: fixer
+    prompt: |
+      Fix these review issues:
+      {% for issue in reviewer.output.issues %}
+      - {{ issue }}
+      {% endfor %}
+      
+      Make the necessary corrections.
+    routes:
+      - to: reviewer
+
+output:
+  passed: "{{ reviewer.output.passed }}"
+  rounds: "{{ context.iteration }}"
+  final_issues: "{{ reviewer.output.issues if not reviewer.output.passed else [] }}"

@@ -1,0 +1,94 @@
+# review-files.yaml
+#
+# Review multiple source files in parallel for issues, then produce a
+# combined summary report.
+#
+# Topology: for_each (parallel per-file review) → summarizer → $end
+#
+# Run:
+#   conductor run tmp/review-files.yaml \
+#     --input 'files=["src/conductor/engine/router.py","src/conductor/engine/context.py","src/conductor/config/schema.py"]'
+
+workflow:
+  name: parallel-file-review
+  description: Review source files in parallel and summarize all findings
+  entry_point: file_reviews
+  runtime:
+    provider: copilot
+    default_model: gpt-4.1
+  limits:
+    max_iterations: 20
+    timeout_seconds: 300
+
+for_each:
+  - name: file_reviews
+    type: for_each
+    source: workflow.input.files
+    as: file
+    agent:
+      name: reviewer
+      prompt: |
+        You are a code reviewer. Read the file at path: {{ file }}
+
+        Return a concise review covering:
+        1. Any bugs or logic errors
+        2. Any security concerns
+        3. Code quality observations
+
+        Be specific — cite line numbers where possible. If the file looks clean, say so.
+      output:
+        file_path:
+          type: string
+          description: "The file path that was reviewed"
+        issues:
+          type: array
+          description: "List of issues found (empty array if none)"
+          items:
+            type: string
+        severity:
+          type: string
+          description: "Overall severity: clean, low, medium, or high"
+    max_concurrent: 4
+    failure_mode: continue_on_error
+    routes:
+      - to: summarizer
+
+agents:
+  - name: summarizer
+    prompt: |
+      You reviewed {{ file_reviews.count }} files. Here are the per-file findings:
+
+      {% for result in file_reviews.outputs %}
+      ## {{ result.file_path }} [{{ result.severity }}]
+      {% if result.issues | length == 0 %}
+      No issues found.
+      {% else %}
+      {% for issue in result.issues %}
+      - {{ issue }}
+      {% endfor %}
+      {% endif %}
+
+      {% endfor %}
+
+      Write a short executive summary (3-5 sentences) covering:
+      - How many files were reviewed and the overall health
+      - The most important issues to address (if any)
+      - A recommended next step
+    output:
+      summary:
+        type: string
+        description: "Executive summary of all findings"
+      total_issues:
+        type: number
+        description: "Total number of issues across all files"
+      highest_severity:
+        type: string
+        description: "Worst severity seen: clean, low, medium, or high"
+    routes:
+      - to: $end
+
+output:
+  files_reviewed: "{{ file_reviews.count }}"
+  total_issues: "{{ summarizer.output.total_issues }}"
+  highest_severity: "{{ summarizer.output.highest_severity }}"
+  summary: "{{ summarizer.output.summary }}"

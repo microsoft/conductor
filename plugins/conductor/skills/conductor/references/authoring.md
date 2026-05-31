@@ -174,7 +174,7 @@ routes:
 routes:
   - to: $end
     when: "{{ output.score >= 90 }}"
-  - to: self                    # Loop back to same agent
+  - to: creator                 # Route back to this agent's own name to loop
 ```
 
 ### Terminal

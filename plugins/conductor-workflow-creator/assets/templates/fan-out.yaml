@@ -1,0 +1,55 @@
+# Fan-out template: Process multiple items in parallel, then aggregate
+#
+# Use when: You have a known list of independent tasks and need to aggregate
+# all results at the end.
+#
+# Run: conductor run fan-out.yaml --input 'items=["item1", "item2", "item3"]'
+
+workflow:
+  name: fan-out-template
+  description: Process items in parallel, then aggregate results
+  entry_point: process_group
+  runtime:
+    provider: copilot
+    default_model: gpt-4o
+
+for_each:
+  - name: process_group
+    type: for_each
+    source: workflow.input.items
+    as: item
+    agent:
+      name: processor
+      prompt: |
+        Process this item: {{ item }}
+        
+        Return a brief summary of your findings as plain text.
+      output:
+        result:
+          type: string
+          description: "Processing result"
+        status:
+          type: string
+          description: "success or failure"
+    max_concurrent: 4
+    failure_mode: continue_on_error
+    routes:
+      - to: aggregator
+
+agents:
+  - name: aggregator
+    prompt: |
+      Aggregate all processing results:
+      
+      {% for result in process_group.outputs %}
+      Item {{ loop.index }}: {{ result.result }} ({{ result.status }})
+      {% endfor %}
+      
+      Provide a summary of all results.
+    routes:
+      - to: $end
+
+output:
+  total_processed: "{{ process_group.count }}"
+  successful: "{{ process_group.outputs | selectattr('status', 'equalto', 'success') | list | length }}"
+  summary: "{{ aggregator.output }}"

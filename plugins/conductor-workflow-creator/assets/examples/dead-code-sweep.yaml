@@ -1,0 +1,60 @@
+# dead-code-sweep.yaml
+#
+# Find and remove unused code, round by round, until clean.
+# Demonstrates: loop-until-dry pattern, for_each with test validation
+#
+# Run: conductor run dead-code-sweep.yaml
+
+workflow:
+  name: dead-code-sweep
+  description: Find and remove unused code, round by round, until a clean sweep turns up nothing
+  entry_point: finder
+  runtime:
+    provider: copilot
+    default_model: gpt-4o
+  limits:
+    max_iterations: 20
+  context:
+    mode: accumulate
+
+agents:
+  - name: finder
+    prompt: |
+      Scan the codebase for unused exports, functions, variables and imports
+      that are not referenced anywhere.
+      
+      {% if finder.output %}
+      Ignore anything already found: {{ finder.output.items | map(attribute='symbol') | join(', ') }}
+      {% endif %}
+    output:
+      items:
+        type: array
+        items:
+          type: object
+          properties:
+            file: { type: string }
+            symbol: { type: string }
+            kind: { type: string }
+    routes:
+      - to: remove_group
+        when: "{{ output.items | length > 0 }}"
+      - to: $end
+
+for_each:
+  - name: remove_group
+    type: for_each
+    source: finder.output.items
+    as: item
+    agent:
+      name: remover
+      prompt: |
+        Remove the unused {{ item.kind }} "{{ item.symbol }}" from {{ item.file }}.
+        Then run the test suite. If anything fails, revert the removal and say it was kept.
+    max_concurrent: 4
+    failure_mode: continue_on_error
+    routes:
+      - to: finder
+
+output:
+  rounds: "{{ context.iteration }}"
+  removed_count: "{{ remove_group.count }}"

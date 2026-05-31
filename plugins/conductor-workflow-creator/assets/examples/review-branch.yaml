@@ -1,0 +1,126 @@
+# review-branch.yaml
+#
+# Pre-PR review with adversarial verification.
+# Review across dimensions (bugs/security/tests), then verify each finding.
+# Demonstrates: parallel groups, for_each, structured output
+#
+# Run: conductor run review-branch.yaml
+
+workflow:
+  name: review-branch
+  description: Review the current branch across dimensions, then adversarially verify each finding
+  entry_point: review_group
+  runtime:
+    provider: copilot
+    default_model: gpt-4o
+
+parallel:
+  - name: review_group
+    agents: [review_bugs, review_security, review_tests]
+    failure_mode: continue_on_error
+    routes:
+      - to: verify_bugs  # Always chain through all three verify groups
+
+agents:
+  - name: review_bugs
+    prompt: "Find logic bugs in the files changed on this branch vs main."
+    output:
+      findings:
+        type: array
+        items:
+          type: object
+          properties:
+            title: { type: string }
+            file: { type: string }
+            severity: { type: string }
+  
+  - name: review_security
+    prompt: "Find security issues in the files changed on this branch vs main."
+    output:
+      findings:
+        type: array
+        items:
+          type: object
+          properties:
+            title: { type: string }
+            file: { type: string }
+            severity: { type: string }
+  
+  - name: review_tests
+    prompt: "Find missing or weak test coverage in the changes on this branch."
+    output:
+      findings:
+        type: array
+        items:
+          type: object
+          properties:
+            title: { type: string }
+            file: { type: string }
+            severity: { type: string }
+
+for_each:
+  - name: verify_bugs
+    type: for_each
+    source: review_group.outputs.review_bugs.findings
+    as: item
+    agent:
+      name: verifier_bugs
+      model: claude-haiku-3.5
+      prompt: |
+        Adversarially verify this finding. Try hard to refute it; if you cannot, it is real.
+        
+        Finding: {{ item.title }}
+        File: {{ item.file }}
+        Severity: {{ item.severity }}
+      output:
+        is_real: { type: boolean }
+        reason: { type: string }
+    max_concurrent: 4
+    routes:
+      - to: verify_security
+  
+  - name: verify_security
+    type: for_each
+    source: review_group.outputs.review_security.findings
+    as: item
+    agent:
+      name: verifier_security
+      model: claude-haiku-3.5
+      prompt: |
+        Adversarially verify this finding. Try hard to refute it; if you cannot, it is real.
+        
+        Finding: {{ item.title }}
+        File: {{ item.file }}
+        Severity: {{ item.severity }}
+      output:
+        is_real: { type: boolean }
+        reason: { type: string }
+    max_concurrent: 4
+    routes:
+      - to: verify_tests
+  
+  - name: verify_tests
+    type: for_each
+    source: review_group.outputs.review_tests.findings
+    as: item
+    agent:
+      name: verifier_tests
+      model: claude-haiku-3.5
+      prompt: |
+        Adversarially verify this finding. Try hard to refute it; if you cannot, it is real.
+        
+        Finding: {{ item.title }}
+        File: {{ item.file }}
+        Severity: {{ item.severity }}
+      output:
+        is_real: { type: boolean }
+        reason: { type: string }
+    max_concurrent: 4
+    routes:
+      - to: $end
+
+output:
+  confirmed_bugs: "{{ verify_bugs.outputs | selectattr('is_real') | list | length }}"
+  confirmed_security: "{{ verify_security.outputs | selectattr('is_real') | list | length }}"
+  confirmed_tests: "{{ verify_tests.outputs | selectattr('is_real') | list | length }}"
+  total_confirmed: "{{ (verify_bugs.outputs | selectattr('is_real') | list | length) + (verify_security.outputs | selectattr('is_real') | list | length) + (verify_tests.outputs | selectattr('is_real') | list | length) }}"

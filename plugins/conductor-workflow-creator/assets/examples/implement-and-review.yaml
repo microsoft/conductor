@@ -1,0 +1,53 @@
+# implement-and-review.yaml
+#
+# Implement a feature, then loop review-and-fix until the review passes.
+# Demonstrates: loop-back routing, structured output, iteration limits
+#
+# Run: conductor run implement-and-review.yaml --input task="add rate limiting to the API"
+
+workflow:
+  name: implement-and-review
+  description: Implement a feature, then loop review-and-fix until the review passes
+  entry_point: implementer
+  runtime:
+    provider: copilot
+    default_model: gpt-4o
+  limits:
+    max_iterations: 10
+
+agents:
+  - name: implementer
+    prompt: |
+      Implement {{ workflow.input.task }}.
+      Make the change in the codebase.
+    routes:
+      - to: reviewer
+  
+  - name: reviewer
+    prompt: |
+      Review the current uncommitted changes for: {{ workflow.input.task }}.
+      List concrete, specific issues.
+    output:
+      passed:
+        type: boolean
+      issues:
+        type: array
+        items: { type: string }
+    routes:
+      - to: fixer
+        when: "{{ not output.passed }}"
+      - to: $end
+  
+  - name: fixer
+    prompt: |
+      Fix these review issues in the codebase:
+      {% for issue in reviewer.output.issues %}
+      - {{ issue }}
+      {% endfor %}
+    routes:
+      - to: reviewer
+
+output:
+  passed: "{{ reviewer.output.passed }}"
+  rounds: "{{ context.iteration }}"
+  remaining_issues: "{{ reviewer.output.issues if not reviewer.output.passed else [] }}"

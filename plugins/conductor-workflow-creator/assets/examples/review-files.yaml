@@ -1,0 +1,68 @@
+# review-files.yaml
+#
+# Review multiple files in parallel, then aggregate findings.
+# Demonstrates: for_each with dynamic list, structured output
+#
+# Run: conductor run review-files.yaml --input 'files=["src/api.py", "src/auth.py"]'
+
+workflow:
+  name: review-files
+  description: Review multiple files in parallel, then aggregate findings
+  entry_point: item_finder
+  runtime:
+    provider: copilot
+    default_model: gpt-4o
+
+for_each:
+  - name: review_group
+    type: for_each
+    source: item_finder.output.files
+    as: file
+    agent:
+      name: reviewer
+      prompt: |
+        Review {{ file }} for bugs and security issues.
+        Return a list of findings.
+      output:
+        findings:
+          type: array
+          items:
+            type: object
+            properties:
+              title: { type: string }
+              severity: { type: string }
+    max_concurrent: 4
+    failure_mode: continue_on_error
+    routes:
+      - to: aggregator
+
+agents:
+  - name: item_finder
+    prompt: |
+      {% if workflow.input.files %}
+      Return the provided files: {{ workflow.input.files }}
+      {% else %}
+      Find all Python files in src/ directory.
+      {% endif %}
+    output:
+      files:
+        type: array
+        items: { type: string }
+    routes:
+      - to: review_group
+  - name: aggregator
+    prompt: |
+      Aggregate all review findings:
+      
+      {% for result in review_group.outputs %}
+      File {{ loop.index }}: {{ result.findings | length }} issues
+      {% endfor %}
+      
+      Provide a summary of all findings.
+    routes:
+      - to: $end
+
+output:
+  total_files: "{{ review_group.count }}"
+  total_findings: "{{ review_group.outputs | map(attribute='findings') | sum(start=[]) | length }}"
+  summary: "{{ aggregator.output }}"
