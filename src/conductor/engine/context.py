@@ -367,53 +367,48 @@ class WorkflowContext:
         elif "output" not in ctx[agent_name]:
             ctx[agent_name]["output"] = {} if is_dict_output else None
 
-        if not remaining_parts or remaining_parts == ["output"]:
-            # agent_name or agent_name.output — copy entire output
+        if not remaining_parts:
+            # Just agent_name - copy entire output
             ctx[agent_name]["output"] = (
                 copy.deepcopy(agent_output) if is_dict_output else (copy.copy(agent_output))
             )
-        else:
-            # Resolve field path:
-            #   agent_name.output.field[.subfield...] → path = [field, subfield, ...]
-            #   agent_name.field[.subfield...]        → path = [field, subfield, ...]  (shorthand)
-            path = remaining_parts[1:] if remaining_parts[0] == "output" else remaining_parts
-
-            if not is_dict_output:
-                if not is_optional:
+        elif len(remaining_parts) == 1 and remaining_parts[0] == "output":
+            # agent_name.output - copy entire output
+            ctx[agent_name]["output"] = (
+                copy.deepcopy(agent_output) if is_dict_output else (copy.copy(agent_output))
+            )
+        elif len(remaining_parts) >= 2 and remaining_parts[0] == "output":
+            # agent_name.output.field - copy specific field. Only meaningful
+            # when the stored output is a dict; otherwise the field access
+            # is undefined and (when required) must raise.
+            field_name = remaining_parts[1]
+            if is_dict_output and field_name in agent_output:
+                # Ensure we have a dict to write the field into (the initial
+                # output slot above seeded ``None`` for non-dict outputs).
+                if not isinstance(ctx[agent_name]["output"], dict):
+                    ctx[agent_name]["output"] = {}
+                ctx[agent_name]["output"][field_name] = agent_output[field_name]
+            elif not is_optional:
+                if not is_dict_output:
                     raise KeyError(
-                        f"Cannot access field '{path[0]}' on agent '{agent_name}': "
+                        f"Cannot access field '{field_name}' on agent '{agent_name}': "
                         f"its output is a {type(agent_output).__name__}, not a dict"
                     )
-                return
-
-            # Traverse agent_output along path
-            value: Any = agent_output
-            for i, key in enumerate(path):
-                if not isinstance(value, dict) or key not in value:
-                    if not is_optional:
-                        if not isinstance(value, dict):
-                            raise KeyError(
-                                f"Cannot access field '{key}' on agent '{agent_name}': "
-                                f"intermediate value at '{'.'.join(path[:i])}' is a "
-                                f"{type(value).__name__}, not a dict"
-                            )
-                        raise KeyError(
-                            f"Missing output field '{'.'.join(path)}' from agent '{agent_name}'"
-                        )
-                    return
-                value = value[key]
-
-            # Write the resolved leaf value into ctx at the nested output path,
-            # creating intermediate dicts as needed. deepcopy matches the
-            # whole-output copy semantics above and prevents mutation aliasing.
-            if not isinstance(ctx[agent_name]["output"], dict):
-                ctx[agent_name]["output"] = {}
-            target = ctx[agent_name]["output"]
-            for key in path[:-1]:
-                if key not in target or not isinstance(target[key], dict):
-                    target[key] = {}
-                target = target[key]
-            target[path[-1]] = copy.deepcopy(value)
+                raise KeyError(f"Missing output field '{field_name}' from agent '{agent_name}'")
+        elif len(remaining_parts) == 1 and remaining_parts[0] != "output":
+            # Shorthand format: agent_name.field -> agent_name.output.field
+            field_name = remaining_parts[0]
+            if is_dict_output and field_name in agent_output:
+                if not isinstance(ctx[agent_name]["output"], dict):
+                    ctx[agent_name]["output"] = {}
+                ctx[agent_name]["output"][field_name] = agent_output[field_name]
+            elif not is_optional:
+                if not is_dict_output:
+                    raise KeyError(
+                        f"Cannot access field '{field_name}' on agent '{agent_name}': "
+                        f"its output is a {type(agent_output).__name__}, not a dict"
+                    )
+                raise KeyError(f"Missing output field '{field_name}' from agent '{agent_name}'")
 
     def _add_parallel_group_input(
         self, ctx: dict[str, Any], group_name: str, remaining_parts: list[str], is_optional: bool
