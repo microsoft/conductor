@@ -1371,6 +1371,32 @@ async def _execute_with_stop_signal(
     raise ExecutionError(stop_message)
 
 
+def _emit_loaded_instructions_debug(start_dir: Path | None, enabled: bool) -> None:
+    """Discover-and-print the workspace instructions list when the debug flag
+    is enabled and auto-discovery actually ran.
+
+    Extracted from :func:`run_workflow_async` so the branch is directly
+    testable without spinning up the full workflow runner. ``start_dir`` must
+    be the same path that :func:`build_instructions_preamble` was given as
+    ``auto_discover_dir`` — sharing the path is what guarantees the printed
+    list cannot drift from what was actually loaded.
+
+    Args:
+        start_dir: The auto-discovery start directory used by the loader, or
+            ``None`` when auto-discovery did not run. ``None`` short-circuits
+            so the debug print is a no-op (matching the contract that this
+            flag is "meaningful only when --workspace-instructions is set").
+        enabled: Whether ``--print-loaded-instructions`` was passed on the
+            CLI. ``False`` short-circuits.
+    """
+    if not enabled or start_dir is None:
+        return
+    from conductor.config.instructions import discover_workspace_instructions_detailed
+
+    detailed = discover_workspace_instructions_detailed(start_dir)
+    _print_loaded_instructions(detailed)
+
+
 def _print_loaded_instructions(detailed: list[Any]) -> None:
     """Emit a human-readable summary of discovered workspace instruction files
     to stderr.
@@ -1574,13 +1600,7 @@ async def run_workflow_async(
             # stderr for debugging. Only meaningful when auto-discovery ran,
             # and must use the same start_dir as the loader above so the
             # printed list cannot silently drift from what was loaded.
-            if print_loaded_instructions and start_dir is not None:
-                from conductor.config.instructions import (
-                    discover_workspace_instructions_detailed,
-                )
-
-                detailed = discover_workspace_instructions_detailed(start_dir)
-                _print_loaded_instructions(detailed)
+            _emit_loaded_instructions_debug(start_dir, print_loaded_instructions)
 
         # Convert MCP servers from workflow config to SDK format
         mcp_servers = await _build_mcp_servers(config)
