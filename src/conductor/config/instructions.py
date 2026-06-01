@@ -312,9 +312,7 @@ def _single_glob_overlaps(glob: str, cwd_norm: str) -> bool:
         return True
     # Either subtree contains the other.
     return (
-        cwd_norm == prefix
-        or cwd_norm.startswith(prefix + "/")
-        or prefix.startswith(cwd_norm + "/")
+        cwd_norm == prefix or cwd_norm.startswith(prefix + "/") or prefix.startswith(cwd_norm + "/")
     )
 
 
