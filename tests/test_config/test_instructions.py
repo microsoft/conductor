@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -1221,6 +1222,213 @@ class TestScopeOverlaps:
 
         assert _scope_overlaps("services\\GW\\**", "services/GW")
         assert _scope_overlaps("services/GW/**", "services\\GW")
+
+    def test_normalize_strips_dotslash_and_dot(self) -> None:
+        """`_normalize_scope_path` strips `./` prefixes and treats `.` as the
+        empty (workspace-root) path. Authors sometimes write `./foo/**` to be
+        explicit about repo-relative paths; that must behave identically to
+        `foo/**`. Closes the normaliser's branches not exercised by the
+        realistic Chaos-repo applyTo values."""
+        from conductor.config.instructions import _normalize_scope_path, _scope_overlaps
+
+        # Direct helper coverage
+        assert _normalize_scope_path("./foo/bar") == "foo/bar"
+        assert _normalize_scope_path("././foo") == "foo"
+        assert _normalize_scope_path(".") == ""
+
+        # Through the overlap helper (CWD or glob written with `./` or `.`)
+        assert _scope_overlaps("./services/GW/**", "services/GW")
+        assert _scope_overlaps("services/GW/**", ".")  # CWD == workspace root
+
+
+class TestApplyConventionFiltersInvariants:
+    """Direct tests for the filter-chain helper to pin the `_REJECT` sentinel
+    contract and exercise the `_discovery_reason` branch that's only reached
+    when a ``ConventionDirectory`` is registered without ``extract_scope``."""
+
+    def test_extract_scope_unset_loads_unconditionally(self, tmp_path: Path) -> None:
+        """A ConventionDirectory with no `extract_scope` loads every matching
+        file as 'always-on' regardless of any frontmatter — exercises the
+        `_discovery_reason` branch where `convention.extract_scope is None`."""
+        from unittest.mock import patch
+
+        from conductor.config.instructions import (
+            ConventionDirectory,
+            DiscoveredInstruction,
+            discover_workspace_instructions_detailed,
+        )
+
+        (tmp_path / ".git").mkdir()
+        scoped_file = tmp_path / "rules" / "anything.md"
+        scoped_file.parent.mkdir(parents=True)
+        # Frontmatter with a scoped applyTo would normally narrow, but this
+        # convention has no extract_scope so it loads unconditionally.
+        scoped_file.write_text("---\napplyTo: 'services/GW/**'\n---\nbody", encoding="utf-8")
+
+        custom = ConventionDirectory(
+            path="rules",
+            pattern="*.md",
+            recursive=False,
+        )
+
+        with patch("conductor.config.instructions.CONVENTIONS", [custom]):
+            result = discover_workspace_instructions_detailed(tmp_path)
+
+        assert len(result) == 1
+        d = result[0]
+        assert isinstance(d, DiscoveredInstruction)
+        assert d.path == scoped_file
+        assert d.scope is None
+        # The 'always-on' reason here is the convention-without-extract_scope
+        # branch in _discovery_reason — distinct from the
+        # extract_scope-returning-'**' branch covered elsewhere.
+        assert d.reason == "always-on"
+
+    def test_extract_scope_opt_out_rejects(self, tmp_path: Path) -> None:
+        """When `extract_scope` returns None for a file (its opt-out
+        sentinel), the file is dropped regardless of CWD."""
+        from unittest.mock import patch
+
+        from conductor.config.instructions import (
+            ConventionDirectory,
+            discover_workspace_instructions_detailed,
+        )
+
+        (tmp_path / ".git").mkdir()
+        f = tmp_path / "rules" / "opted-out.md"
+        f.parent.mkdir(parents=True)
+        f.write_text("body", encoding="utf-8")
+
+        # extract_scope always returns None → file always opts out
+        custom = ConventionDirectory(
+            path="rules",
+            pattern="*.md",
+            recursive=False,
+            extract_scope=lambda _p: None,
+        )
+
+        with patch("conductor.config.instructions.CONVENTIONS", [custom]):
+            result = discover_workspace_instructions_detailed(tmp_path)
+
+        assert result == []
+
+    def test_relative_to_value_error_falls_back_to_empty_cwd(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When `start_resolved.relative_to(current)` raises ValueError (e.g.,
+        a symlink makes the walked `current` not an ancestor of `start_dir`),
+        the per-level `cwd_rel` falls back to '' so the overlap test stays
+        permissive — matching the over-include-rather-than-silently-skip
+        bias. Exercises the defensive ValueError branch."""
+        from unittest.mock import patch
+
+        from conductor.config.instructions import (
+            ConventionDirectory,
+            discover_workspace_instructions_detailed,
+        )
+
+        (tmp_path / ".git").mkdir()
+        f = tmp_path / "rules" / "scoped.md"
+        f.parent.mkdir(parents=True)
+        # Scoped to services/GW — would NOT overlap from a real subdir, but
+        # the ValueError fallback forces cwd_rel='' so it loads anyway.
+        f.write_text("---\napplyTo: 'services/GW/**'\n---\nbody", encoding="utf-8")
+
+        custom = ConventionDirectory(
+            path="rules",
+            pattern="*.md",
+            recursive=False,
+            extract_scope=lambda p: "services/GW/**",
+        )
+
+        # Force `Path.relative_to` to raise ValueError on the first call,
+        # simulating the symlink-induced ancestor mismatch. Subsequent calls
+        # behave normally so the walk's other logic isn't disrupted.
+        original_relative_to = Path.relative_to
+        call_count = {"n": 0}
+
+        def flaky_relative_to(self: Path, *args: Any, **kwargs: Any) -> Path:
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise ValueError("simulated symlink ancestor mismatch")
+            return original_relative_to(self, *args, **kwargs)
+
+        with (
+            patch("conductor.config.instructions.CONVENTIONS", [custom]),
+            monkeypatch.context() as m,
+        ):
+            m.setattr(Path, "relative_to", flaky_relative_to)
+            result = discover_workspace_instructions_detailed(tmp_path)
+
+        # File loads — the fallback `cwd_rel=''` matches any scope, so the
+        # services/GW/** glob overlaps (over-inclusion = principled fallback).
+        assert len(result) == 1
+        assert result[0].path == f
+
+
+class TestPrintLoadedInstructionsHelper:
+    """Direct tests for the `_print_loaded_instructions` helper.
+
+    The helper is called only from `run_workflow_async`, which is hard to
+    exercise without a full workflow run. Direct tests cover the formatting
+    branches (empty list, populated list, scope/no-scope, always-on sentinel
+    suppression) so future format tweaks are caught.
+    """
+
+    def test_emits_empty_state(self, capsys: pytest.CaptureFixture[str]) -> None:
+        from conductor.cli.run import _print_loaded_instructions
+
+        _print_loaded_instructions([])
+        captured = capsys.readouterr()
+        # stdout MUST stay clean (don't pollute JSON output)
+        assert captured.out == ""
+        assert "0 files discovered" in captured.err
+
+    def test_emits_populated_state_with_scope(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from conductor.cli.run import _print_loaded_instructions
+        from conductor.config.instructions import DiscoveredInstruction
+
+        always_on = DiscoveredInstruction(
+            path=tmp_path / "AGENTS.md",
+            source="AGENTS.md",
+            scope=None,
+            reason="file-convention",
+        )
+        scoped = DiscoveredInstruction(
+            path=tmp_path / ".github" / "instructions" / "cs.md",
+            source=".github/instructions",
+            scope="**/*.cs",
+            reason="scope-overlap",
+        )
+        always_on_dir = DiscoveredInstruction(
+            path=tmp_path / ".github" / "instructions" / "all.md",
+            source=".github/instructions",
+            scope="**",
+            reason="always-on",
+        )
+
+        _print_loaded_instructions([always_on, scoped, always_on_dir])
+        captured = capsys.readouterr()
+
+        # Header tracks count
+        assert "3 file(s) loaded from CWD" in captured.err
+        # All three paths emitted
+        assert "AGENTS.md" in captured.err
+        assert "cs.md" in captured.err
+        assert "all.md" in captured.err
+        # Reasons emitted with their source labels
+        assert "reason=file-convention" in captured.err
+        assert "reason=scope-overlap" in captured.err
+        assert "reason=always-on" in captured.err
+        # Scope shown only for the truly scoped entry (not for file-convention
+        # or for always-on `**` — `**` is the always-on sentinel; printing it
+        # would be redundant noise).
+        assert "applyTo='**/*.cs'" in captured.err
+        assert "applyTo='**'" not in captured.err
+        # stdout untouched
+        assert captured.out == ""
 
 
 # ---------------------------------------------------------------------------
