@@ -1334,6 +1334,134 @@ class TestWorkflowEngineHumanGates:
         assert "approval_gate" in summary["agents_executed"]
         assert summary["iterations"] == 3
 
+    @pytest.mark.asyncio
+    async def test_human_gate_stores_additional_input_nested_in_context(self) -> None:
+        """Test that prompt_for values are stored nested under additional_input."""
+        from unittest.mock import patch
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(name="gate-prompt-for", entry_point="ask_human"),
+            agents=[
+                AgentDef(
+                    name="ask_human",
+                    type="human_gate",
+                    prompt="Provide input:",
+                    options=[
+                        GateOption(
+                            label="Provide answer",
+                            value="provide_answer",
+                            route="next",
+                            prompt_for="answer",
+                        ),
+                    ],
+                ),
+                AgentDef(
+                    name="next",
+                    model="gpt-4",
+                    prompt="Next",
+                    output={"received": OutputField(type="string")},
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"received": "{{ next.output.received }}"},
+        )
+
+        captured_context: dict = {}
+
+        def mock_handler(agent, prompt, context):
+            captured_context.update(context)
+            return {"received": "ok"}
+
+        provider = CopilotProvider(mock_handler=mock_handler)
+        engine = WorkflowEngine(config, provider, skip_gates=False)
+
+        with patch("conductor.gates.human.Prompt.ask", side_effect=["1", "README.md"]):
+            await engine.run({})
+
+        gate_output = captured_context.get("ask_human", {}).get("output", {})
+        assert gate_output["selected"] == "provide_answer"
+        assert gate_output["additional_input"] == {"answer": "README.md"}
+
+    @pytest.mark.asyncio
+    async def test_human_gate_no_prompt_for_has_empty_additional_input(
+        self,
+        human_gate_workflow_config: WorkflowConfig,
+    ) -> None:
+        """Test that gates without prompt_for produce additional_input: {} in context."""
+        captured_context: dict = {}
+
+        def mock_handler(agent, prompt, context):
+            captured_context.update(context)
+            if agent.name == "drafter":
+                return {"draft": "Draft content"}
+            return {"published": True}
+
+        provider = CopilotProvider(mock_handler=mock_handler)
+        engine = WorkflowEngine(human_gate_workflow_config, provider, skip_gates=True)
+
+        await engine.run({})
+
+        gate_output = captured_context.get("approval_gate", {}).get("output", {})
+        assert gate_output["selected"] == "approved"
+        assert gate_output["additional_input"] == {}
+
+    @pytest.mark.asyncio
+    async def test_human_gate_prompt_for_named_selected_does_not_corrupt_selected(
+        self,
+    ) -> None:
+        """Test that prompt_for field named 'selected' cannot overwrite the selected value.
+
+        The flat spread form had a silent data-corruption bug: if prompt_for used
+        the field name 'selected', the user's typed text would overwrite the chosen
+        option value. The nested form prevents this.
+        """
+        from unittest.mock import patch
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(name="gate-collision", entry_point="gate"),
+            agents=[
+                AgentDef(
+                    name="gate",
+                    type="human_gate",
+                    prompt="Go:",
+                    options=[
+                        GateOption(
+                            label="Go",
+                            value="go",
+                            route="next",
+                            prompt_for="selected",  # collides with reserved key
+                        ),
+                    ],
+                ),
+                AgentDef(
+                    name="next",
+                    model="gpt-4",
+                    prompt="Next",
+                    output={"done": OutputField(type="boolean")},
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"done": "{{ next.output.done }}"},
+        )
+
+        captured_context: dict = {}
+
+        def mock_handler(agent, prompt, context):
+            captured_context.update(context)
+            return {"done": True}
+
+        provider = CopilotProvider(mock_handler=mock_handler)
+        engine = WorkflowEngine(config, provider, skip_gates=False)
+
+        with patch("conductor.gates.human.Prompt.ask", side_effect=["1", "user typed text"]):
+            await engine.run({})
+
+        gate_output = captured_context.get("gate", {}).get("output", {})
+        # The chosen option value must not be overwritten by the user's typed text
+        assert gate_output["selected"] == "go"
+        # The user's typed text is safely nested
+        assert gate_output["additional_input"]["selected"] == "user typed text"
+
 
 class TestWorkflowEngineLifecycleHooks:
     """Tests for lifecycle hooks execution."""
