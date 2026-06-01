@@ -1359,8 +1359,16 @@ async def run_workflow_async(
         if workspace_instructions or cli_instructions or config.workflow.instructions:
             from conductor.config.instructions import build_instructions_preamble
 
+            # Compute the auto-discovery start dir once and share it between
+            # the loader and the --print-loaded-instructions debug dump. If
+            # these diverged (e.g. the cwd changed between the two calls, or
+            # one was passed a different path), the printed list would no
+            # longer reflect what was actually loaded — defeating the whole
+            # purpose of the debug flag.
+            start_dir = Path.cwd() if workspace_instructions else None
+
             instructions_preamble = build_instructions_preamble(
-                auto_discover_dir=Path.cwd() if workspace_instructions else None,
+                auto_discover_dir=start_dir,
                 yaml_instructions=config.workflow.instructions or None,
                 cli_instruction_paths=cli_instructions,
             )
@@ -1371,13 +1379,15 @@ async def run_workflow_async(
                 )
 
             # --print-loaded-instructions: dump the resolved discovery list to
-            # stderr for debugging. Only meaningful when auto-discovery ran.
-            if print_loaded_instructions and workspace_instructions:
+            # stderr for debugging. Only meaningful when auto-discovery ran,
+            # and must use the same start_dir as the loader above so the
+            # printed list cannot silently drift from what was loaded.
+            if print_loaded_instructions and start_dir is not None:
                 from conductor.config.instructions import (
                     discover_workspace_instructions_detailed,
                 )
 
-                detailed = discover_workspace_instructions_detailed(Path.cwd())
+                detailed = discover_workspace_instructions_detailed(start_dir)
                 _print_loaded_instructions(detailed)
 
         # Convert MCP servers from workflow config to SDK format
