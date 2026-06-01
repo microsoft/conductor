@@ -89,7 +89,7 @@ runtime:
 # Or per-agent
 agents:
   - name: reviewer
-    model: gpt-4o  # Override for this agent
+    model: gpt-4.1  # Override for this agent
 ```
 
 ### Change concurrency

@@ -89,7 +89,7 @@ workflow:
 
   runtime:
     provider: copilot               # copilot | claude
-    default_model: gpt-4o           # model for all agents (unless overridden)
+    default_model: gpt-4.1           # model for all agents (unless overridden)
     temperature: 0.7                # Optional: 0.0-1.0
     max_tokens: 4096                # Optional: max output tokens
     default_reasoning_effort: medium # Optional: low | medium | high | xhigh
@@ -112,7 +112,7 @@ workflow:
 ### Provider and model
 
 - **`provider`**: `copilot` (GitHub Copilot SDK) or `claude` (Anthropic API)
-- **`default_model`**: Model identifier (e.g., `gpt-4o`, `claude-sonnet-4.5`)
+- **`default_model`**: Model identifier (e.g., `gpt-4.1`, `claude-sonnet-4.5`)
 - Per-agent `model:` overrides the default
 
 ### Reasoning effort
@@ -603,7 +603,7 @@ conductor checkpoints  # List all checkpoints
 workflow:
   name: my-workflow
   entry_point: first-agent
-  runtime: { provider: copilot, default_model: gpt-4o }
+  runtime: { provider: copilot, default_model: gpt-4.1 }
   context: { mode: accumulate }
   limits: { max_iterations: 10 }
 

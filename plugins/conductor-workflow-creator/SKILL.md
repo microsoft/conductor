@@ -140,7 +140,7 @@ workflow:
   entry_point: reviewer
   runtime:
     provider: copilot  # or claude
-    default_model: gpt-4o
+    default_model: gpt-4.1
   context:
     mode: accumulate  # or last_only, explicit
   limits:
@@ -149,7 +149,7 @@ workflow:
 
 agents:
   - name: reviewer
-    model: gpt-4o
+    model: gpt-4.1
     prompt: |
       Review {{ workflow.input.file }} for bugs and security issues.
     output:

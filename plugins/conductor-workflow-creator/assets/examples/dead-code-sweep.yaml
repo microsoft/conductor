@@ -11,7 +11,7 @@ workflow:
   entry_point: finder
   runtime:
     provider: copilot
-    default_model: gpt-4o
+    default_model: gpt-4.1
   limits:
     max_iterations: 20
   context:

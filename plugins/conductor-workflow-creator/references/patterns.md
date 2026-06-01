@@ -19,7 +19,7 @@ workflow:
   entry_point: research-group
   runtime:
     provider: copilot
-    default_model: gpt-4o
+    default_model: gpt-4.1
 
 parallel:
   - name: research-group
