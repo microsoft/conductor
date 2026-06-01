@@ -1366,6 +1366,49 @@ class TestApplyConventionFiltersInvariants:
         assert result[0].path == f
 
 
+class TestEmitLoadedInstructionsDebug:
+    """Tests for `_emit_loaded_instructions_debug`, the small helper extracted
+    from `run_workflow_async` for direct testability. Pins the
+    short-circuit-on-disabled and short-circuit-on-no-start-dir branches and
+    proves the discover→print path uses the caller-supplied start_dir."""
+
+    def test_disabled_is_noop(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        from conductor.cli.run import _emit_loaded_instructions_debug
+
+        (tmp_path / "AGENTS.md").write_text("body", encoding="utf-8")
+        _emit_loaded_instructions_debug(tmp_path, enabled=False)
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err == ""
+
+    def test_no_start_dir_is_noop(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """When auto-discovery didn't run (`start_dir is None`), the debug
+        print is suppressed even if the flag is on — matches the docstring
+        contract."""
+        from conductor.cli.run import _emit_loaded_instructions_debug
+
+        _emit_loaded_instructions_debug(None, enabled=True)
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err == ""
+
+    def test_enabled_with_start_dir_prints_discovery(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Happy path: discover→print, using the caller-supplied start_dir."""
+        from conductor.cli.run import _emit_loaded_instructions_debug
+
+        (tmp_path / ".git").mkdir()
+        (tmp_path / "AGENTS.md").write_text("body", encoding="utf-8")
+
+        _emit_loaded_instructions_debug(tmp_path, enabled=True)
+        captured = capsys.readouterr()
+        assert "1 file(s) loaded from CWD" in captured.err
+        assert "AGENTS.md" in captured.err
+        # stdout invariant preserved
+        assert captured.out == ""
+
+
 class TestPrintLoadedInstructionsHelper:
     """Direct tests for the `_print_loaded_instructions` helper.
 
