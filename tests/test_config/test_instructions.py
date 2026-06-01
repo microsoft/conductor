@@ -1001,6 +1001,50 @@ class TestDiscoverGithubInstructionsDir:
         result = discover_workspace_instructions(tmp_path)
         assert not any(p.name == "foo.md" for p in result)
 
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="Symlink creation requires elevation on Windows",
+    )
+    def test_symlinked_git_root_stops_walk(self, tmp_path: Path) -> None:
+        """Regression for R1-003: a symlinked path to the git root must stop
+        the parent-walk at the git root.
+
+        Before the fix, ``stop_at`` held the unresolved git_root path while
+        ``current`` was walked via ``start_dir.resolve()``. On a symlinked
+        git root the two paths differed, ``current == stop_at`` never held,
+        and the walk overshot into the parent filesystem — potentially
+        picking up out-of-repo instruction files.
+        """
+        # Real repo with a top-level instruction file.
+        real_repo = tmp_path / "real_repo"
+        real_repo.mkdir()
+        (real_repo / ".git").mkdir()
+        _write_with_frontmatter(
+            real_repo / ".github" / "instructions" / "in_repo.instructions.md",
+            apply_to="**",
+        )
+        # An out-of-repo instruction file in a sibling fake "outer" repo that
+        # also looks like a git root. If the walk overshoots past the real
+        # git root, it could end up here.
+        outer = tmp_path / "outer"
+        outer.mkdir()
+        (outer / ".git").mkdir()
+        _write_with_frontmatter(
+            outer / ".github" / "instructions" / "out_of_repo.instructions.md",
+            apply_to="**",
+        )
+        # Access the repo via a symlink so start_dir.resolve() differs from
+        # the unresolved git_root that _find_git_root returns.
+        link = tmp_path / "link_to_repo"
+        os.symlink(real_repo, link, target_is_directory=True)
+        sub = link / "sub"
+        sub.mkdir()
+
+        result = discover_workspace_instructions(sub)
+        names = [p.name for p in result]
+        assert "in_repo.instructions.md" in names
+        assert "out_of_repo.instructions.md" not in names
+
 
 # ---------------------------------------------------------------------------
 # _scope_overlaps + _single_glob_overlaps + _normalize_scope_path

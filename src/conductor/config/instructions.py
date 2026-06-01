@@ -531,7 +531,11 @@ def discover_workspace_instructions_detailed(start_dir: Path) -> list[Discovered
     """
     start_resolved = start_dir.resolve()
     git_root = _find_git_root(start_dir)
-    stop_at = git_root if git_root is not None else start_resolved
+    # Resolve git_root so equality against the (already-resolved) ``current``
+    # walk pointer holds even when the git root is reached via a symlinked
+    # path. Without this, ``current == stop_at`` can be False at the git
+    # root and the walk overshoots into the parent filesystem.
+    stop_at = git_root.resolve() if git_root is not None else start_resolved
 
     result: list[DiscoveredInstruction] = []
     for convention in CONVENTIONS:
@@ -612,7 +616,15 @@ def _discovery_reason(convention: ConventionDirectory, scope: str | None) -> str
         # Convention with no scope concept (or include_file-only); the file
         # passed the eligibility gate and that's all there is to say.
         return "always-on"
-    if scope == ALWAYS_ON_SCOPE or scope is None:
+    # Invariant: when ``extract_scope`` is set, ``_apply_convention_filters``
+    # returns ``_REJECT`` rather than a ``None`` scope, so a discovered file
+    # always carries a concrete scope string here. Pin this with an assert
+    # so a future regression surfaces loudly instead of being silently
+    # relabeled as "always-on".
+    assert scope is not None, (
+        "extract_scope set but scope is None — _apply_convention_filters invariant violated"
+    )
+    if scope == ALWAYS_ON_SCOPE:
         return "always-on"
     return "scope-overlap"
 
