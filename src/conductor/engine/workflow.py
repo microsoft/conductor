@@ -911,6 +911,90 @@ class WorkflowEngine:
             workflow_ctx = context.get("workflow", {})
             return dict(workflow_ctx.get("input", {})) if isinstance(workflow_ctx, dict) else {}
 
+    def _resolve_subworkflow_skill_directories(
+        self,
+        sub_config: Any,
+        sub_path: Path,
+    ) -> list[str] | None:
+        """Resolve skill_directories from a sub-workflow config to absolute paths.
+
+        When a sub-workflow defines ``runtime.skill_directories``, those paths
+        are relative to the sub-workflow YAML file. This method resolves them
+        to absolute paths so they can be passed to the provider.
+
+        Args:
+            sub_config: The loaded sub-workflow configuration.
+            sub_path: Path to the sub-workflow YAML file.
+
+        Returns:
+            List of resolved absolute directory paths, or None if none configured.
+        """
+        dirs = sub_config.workflow.runtime.skill_directories
+        if not dirs:
+            return None
+        base = Path(sub_path).resolve().parent
+        resolved: list[str] = []
+        for d in dirs:
+            p = Path(d)
+            if not p.is_absolute():
+                p = (base / p).resolve()
+            resolved.append(str(p))
+        logger.debug("Sub-workflow skill directories resolved: %s", resolved)
+        return resolved
+
+    def _apply_skill_directories_to_providers(
+        self,
+        skill_dirs: list[str],
+    ) -> dict[Any, list[str]]:
+        """Temporarily augment active providers with additional skill directories.
+
+        Merges ``skill_dirs`` into each active provider's skill directories
+        (deduplicating). Returns a snapshot of the original directories per
+        provider so the caller can restore them after the child engine finishes.
+
+        Args:
+            skill_dirs: Resolved absolute skill directory paths to add.
+
+        Returns:
+            Dict mapping provider instances to their original skill_directories
+            (for restoration after the child engine completes).
+        """
+        originals: dict[Any, list[str]] = {}
+        providers: list[Any] = []
+
+        if self._registry is not None:
+            providers.extend(self._registry.get_active_providers().values())
+        elif self._single_provider is not None:
+            providers.append(self._single_provider)
+
+        for provider in providers:
+            if hasattr(provider, "get_skill_directories") and hasattr(
+                provider, "set_skill_directories"
+            ):
+                current = provider.get_skill_directories()
+                originals[provider] = current
+                # Merge: parent dirs + child dirs, deduplicating while preserving order
+                merged = list(current)
+                for d in skill_dirs:
+                    if d not in merged:
+                        merged.append(d)
+                provider.set_skill_directories(merged)
+
+        return originals
+
+    @staticmethod
+    def _restore_skill_directories(
+        originals: dict[Any, list[str]],
+    ) -> None:
+        """Restore providers' skill_directories to their original state.
+
+        Args:
+            originals: Mapping from provider to original skill_directories list
+                       (as returned by ``_apply_skill_directories_to_providers``).
+        """
+        for provider, original_dirs in originals.items():
+            provider.set_skill_directories(original_dirs)
+
     async def _resolve_subworkflow_path(
         self,
         agent_workflow: str,
@@ -1153,7 +1237,18 @@ class WorkflowEngine:
             instructions_preamble=child_preamble,
         )
 
-        return await child_engine.run(sub_inputs)
+        # Resolve and apply sub-workflow's skill_directories (if any) before running.
+        # These are merged into active providers for the duration of the child run,
+        # then restored so the parent's subsequent agents use original directories.
+        sub_skill_dirs = self._resolve_subworkflow_skill_directories(sub_config, sub_path)
+        originals: dict[Any, list[str]] = {}
+        if sub_skill_dirs:
+            originals = self._apply_skill_directories_to_providers(sub_skill_dirs)
+        try:
+            return await child_engine.run(sub_inputs)
+        finally:
+            if originals:
+                self._restore_skill_directories(originals)
 
     async def _execute_subworkflow_with_inputs(
         self,
@@ -1265,9 +1360,18 @@ class WorkflowEngine:
 
         child_engine = WorkflowEngine(**child_engine_kwargs)
 
-        output = await child_engine.run(sub_inputs)
-        usage = child_engine.usage_tracker.get_summary()
-        return output, usage
+        # Resolve and apply sub-workflow's skill_directories (if any) before running.
+        sub_skill_dirs = self._resolve_subworkflow_skill_directories(sub_config, sub_path)
+        originals: dict[Any, list[str]] = {}
+        if sub_skill_dirs:
+            originals = self._apply_skill_directories_to_providers(sub_skill_dirs)
+        try:
+            output = await child_engine.run(sub_inputs)
+            usage = child_engine.usage_tracker.get_summary()
+            return output, usage
+        finally:
+            if originals:
+                self._restore_skill_directories(originals)
 
     async def _get_provider_for_agent(self, agent: AgentDef) -> AgentProvider | None:
         """Resolve the provider that will (or did) execute ``agent``.
