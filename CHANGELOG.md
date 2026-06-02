@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.18...HEAD)
 
+### Fixed
+
+- `human_gate` agents: the dict returned by `prompt_for` text-collection fields
+  is no longer spread into the gate's output root, where it could silently
+  overwrite the reserved `selected` key (e.g. an option declaring
+  `prompt_for: selected` would clobber the chosen option value with whatever
+  the user typed). Collected values are now nested under an explicit
+  `additional_input` key, matching the shape the `gate_resolved` event already
+  used. ([#237](https://github.com/microsoft/conductor/pull/237))
+
+### Changed
+
+- **BREAKING (templates)** — `human_gate` output shape changed.
+  - Before: `{{ <gate>.output.<prompt_for_field> }}` (root-level).
+  - After: `{{ <gate>.output.additional_input.<prompt_for_field> }}` (nested).
+  - Gates without any `prompt_for` now produce `additional_input: {}` rather
+    than just `{"selected": ...}` — the key is always present.
+  - `<gate>.output.selected` is unchanged.
+  - Templates that referenced the old flat path now raise `TemplateError`
+    (`StrictUndefined`), so the migration fails loudly rather than rendering
+    to empty strings.
+  - In `context: explicit` mode, `input:` declarations support
+    `<gate>.output.additional_input` (the parent dict) but not the dotted
+    shorthand `<gate>.output.additional_input.<field>`. Declare the parent
+    and read individual fields via Jinja2 in the consuming agent's prompt or
+    output template.
+
 ## [0.1.18](https://github.com/microsoft/conductor/compare/v0.1.17...v0.1.18) - 2026-05-28
 
 ### Added

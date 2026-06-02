@@ -390,11 +390,19 @@ agents:
         route: string               # Agent to route to when selected
         prompt_for: string          # Optional: field name to collect text input from user
 
-    output:                         # Captured automatically
-      selected:                     # The selected option value
+    output:                         # Captured automatically (do not declare in YAML)
+      selected:                     # The chosen option's `value`
         type: string
-      feedback:                     # Text from prompt_for (if used)
-        type: string
+      additional_input:             # Dict of values collected from `prompt_for` fields.
+        type: dict                  # Always present; `{}` when no `prompt_for` is set
+                                    # or when the selected option has no `prompt_for`.
+                                    # Access fields via templates as:
+                                    #   {{ <gate>.output.additional_input.<field> }}
+                                    # In `context: explicit` mode, `input:` declarations
+                                    # support `<gate>.output.additional_input` (the whole
+                                    # dict) but not the dotted shorthand
+                                    # `<gate>.output.additional_input.<field>` — declare
+                                    # the parent and traverse in Jinja2.
 ```
 
 ## Parallel Group Schema
