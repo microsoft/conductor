@@ -7,7 +7,13 @@ from dataclasses import dataclass, field
 from unittest.mock import Mock, patch
 
 import pytest
-from claude_agent_sdk import (
+
+pytest.importorskip(
+    "claude_agent_sdk",
+    reason="claude-agent-sdk extra not installed (pip install conductor[claude-agent-sdk])",
+)
+
+from claude_agent_sdk import (  # noqa: E402
     AssistantMessage,
     ResultMessage,
     TextBlock,
@@ -17,9 +23,9 @@ from claude_agent_sdk import (
     UserMessage,
 )
 
-from conductor.config.schema import AgentDef, OutputField
-from conductor.exceptions import ProviderError
-from conductor.providers.claude_agent_sdk import ClaudeAgentSdkProvider
+from conductor.config.schema import AgentDef, OutputField  # noqa: E402
+from conductor.exceptions import ProviderError  # noqa: E402
+from conductor.providers.claude_agent_sdk import ClaudeAgentSdkProvider  # noqa: E402
 
 
 def _assistant(

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from conductor.exceptions import ProviderError
 from conductor.providers.base import AgentOutput, AgentProvider, EventCallback
@@ -19,8 +19,8 @@ try:
     CLAUDE_AGENT_SDK_AVAILABLE = True
 except ImportError:
     CLAUDE_AGENT_SDK_AVAILABLE = False
-    query = None
-    ClaudeAgentOptions = None
+    query: Any = None
+    ClaudeAgentOptions: Any = None
 
 logger = logging.getLogger(__name__)
 
@@ -137,7 +137,8 @@ class ClaudeAgentSdkProvider(AgentProvider):
                 msg_type = type(message).__name__
 
                 if msg_type == "AssistantMessage":
-                    blocks = getattr(message, "content", None)
+                    msg = cast(Any, message)
+                    blocks = getattr(msg, "content", None)
                     if blocks:
                         if event_callback:
                             _safe_callback(
@@ -154,11 +155,11 @@ class ClaudeAgentSdkProvider(AgentProvider):
                             full_enabled,
                         )
 
-                    if hasattr(message, "model") and message.model:
-                        result_model = message.model
-                    if hasattr(message, "usage") and message.usage:
-                        total_input_tokens += message.usage.get("input_tokens", 0)
-                        total_output_tokens += message.usage.get("output_tokens", 0)
+                    if hasattr(msg, "model") and msg.model:
+                        result_model = msg.model
+                    if hasattr(msg, "usage") and msg.usage:
+                        total_input_tokens += msg.usage.get("input_tokens", 0)
+                        total_output_tokens += msg.usage.get("output_tokens", 0)
                     turn_count += 1
                     if event_callback:
                         _safe_callback(
@@ -179,16 +180,17 @@ class ClaudeAgentSdkProvider(AgentProvider):
                         )
 
                 elif msg_type == "ResultMessage":
-                    if getattr(message, "structured_output", None) is not None:
-                        structured_output = message.structured_output
-                    elif getattr(message, "result", None) and not content_parts:
-                        content_parts.append(message.result)
-                    if hasattr(message, "usage") and message.usage:
-                        total_input_tokens += message.usage.get("input_tokens", 0)
-                        total_output_tokens += message.usage.get("output_tokens", 0)
-                    if getattr(message, "is_error", False):
+                    msg = cast(Any, message)
+                    if getattr(msg, "structured_output", None) is not None:
+                        structured_output = msg.structured_output
+                    elif getattr(msg, "result", None) and not content_parts:
+                        content_parts.append(msg.result)
+                    if hasattr(msg, "usage") and msg.usage:
+                        total_input_tokens += msg.usage.get("input_tokens", 0)
+                        total_output_tokens += msg.usage.get("output_tokens", 0)
+                    if getattr(msg, "is_error", False):
                         raise ProviderError(
-                            self._build_error_message(message),
+                            self._build_error_message(msg),
                             is_retryable=False,
                         )
 
