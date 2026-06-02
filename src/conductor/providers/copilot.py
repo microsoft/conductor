@@ -287,6 +287,18 @@ class CopilotProvider(AgentProvider):
         self._interrupted_session: Any = None
         self._abort_supported: bool | None = None
 
+    def get_skill_directories(self) -> list[str]:
+        """Return the current skill directories list."""
+        return list(self._skill_directories)
+
+    def set_skill_directories(self, dirs: list[str]) -> None:
+        """Replace the skill directories list.
+
+        Used by the workflow engine to temporarily augment skill directories
+        when executing sub-workflows that define their own ``skill_directories``.
+        """
+        self._skill_directories = dirs
+
     def set_keyboard_listener(self, listener: Any) -> None:
         """Inject the workflow's keyboard listener for suspend/resume around stdin reads.
 

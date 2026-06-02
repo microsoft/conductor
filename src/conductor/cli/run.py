@@ -705,6 +705,37 @@ def verbose_log_for_each_summary(
         _file_console.print(text)
 
 
+def verbose_log_agent_message(content: str) -> None:
+    """Print an agent's text response to the console.
+
+    Called for every ``agent_message`` event so users see the model's output
+    as it arrives — most importantly when an interactive skill (e.g.
+    ``superpowers:brainstorming``) generates content and then immediately
+    calls ``ask_user`` for approval.  Without this the approval question
+    appears but the content being approved is invisible.
+
+    The message is gated on ``is_verbose()`` (default True) so ``--silent``
+    mode still suppresses it, but printed unconditionally in every other mode.
+
+    Args:
+        content: The model response text to display.
+    """
+    from conductor.cli.app import is_verbose
+    from rich.markdown import Markdown
+
+    should_console = is_verbose()
+    should_file = _file_console is not None
+    if not should_console and not should_file:
+        return
+
+    if should_console:
+        _verbose_console.print()
+        _verbose_console.print(Markdown(content))
+    if _file_console is not None:
+        _file_console.print()
+        _file_console.print(content)
+
+
 # ------------------------------------------------------------------
 # Console event subscriber — bridges the event emitter to verbose_log
 # ------------------------------------------------------------------
@@ -806,6 +837,9 @@ class ConsoleEventSubscriber:
                 d.get("failure_count", 0),
                 d.get("elapsed", 0.0),
             )
+
+        elif t == "agent_message":
+            verbose_log_agent_message(d.get("content", ""))
 
         elif t == "script_completed":
             verbose_log_agent_complete(

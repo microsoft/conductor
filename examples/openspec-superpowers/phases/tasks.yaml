@@ -46,7 +46,7 @@ agents:
         from ruamel.yaml import YAML
 
         yaml = YAML()
-        schema_dir = pathlib.Path("examples/openspec-superpowers/artifacts")
+        schema_dir = pathlib.Path("{{workflow.dir}}") / ".." / "artifacts"
         schema = yaml.load(schema_dir / "schema.yaml")
 
         artifact_id = "tasks"

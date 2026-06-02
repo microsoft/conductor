@@ -63,7 +63,8 @@ agents:
             try:
                 from ruamel.yaml import YAML as _YAML
                 _yaml = _YAML()
-                _schema = _yaml.load(pathlib.Path("examples/openspec/artifacts/schema.yaml"))
+                _schema_dir = pathlib.Path("{{workflow.dir}}") / ".." / "artifacts"
+                _schema = _yaml.load(_schema_dir / "schema.yaml")
                 instruction = (_schema.get("apply") or {}).get("instruction", "") or ""
             except Exception:
                 pass
