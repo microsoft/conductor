@@ -56,16 +56,16 @@ export type EventType =
 
 export interface ProviderMetadata {
   name: string;
-  /** Provider stability tier. `"unknown"` is a stub used when a provider
-   *  lacks a CAPABILITIES declaration (defensive fallback — should not
-   *  occur for the three production providers). */
-  tier: 'stable' | 'experimental' | 'unknown';
+  /** Discriminator: `"ok"` for resolved providers; `"unresolved"` when
+   *  the engine could not load capabilities (validator should have
+   *  caught this before run, so it's a forensic signal). */
+  status: 'ok' | 'unresolved';
+  /** Provider stability tier — `null` when `status: "unresolved"`. */
+  tier: 'stable' | 'experimental' | null;
   /** Upstream package pin, e.g. `"claude-agent-sdk>=0.1.0"`. */
   upstream_pin?: string | null;
   /** Free-form maintainer attribution, e.g. `"@external (best-effort)"`. */
   maintainer?: string | null;
-  /** Full ProviderCapabilities dump. Shape mirrors the Pydantic model. */
-  capabilities?: Record<string, unknown> | null;
 }
 
 export interface WorkflowStartedData {

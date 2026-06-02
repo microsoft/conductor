@@ -1389,3 +1389,117 @@ class TestPerAgentMaxSessionSeconds:
                     context={},
                     rendered_prompt="hi",
                 )
+
+
+class TestErrorClassificationGaps:
+    """Coverage for previously-untested suggestion branches (#241 test gap)."""
+
+    def test_classify_cli_connection_error(self) -> None:
+        from claude_agent_sdk import CLIConnectionError
+
+        from conductor.providers.claude_agent_sdk import _classify_error_suggestion
+
+        suggestion = _classify_error_suggestion(CLIConnectionError("subprocess died"))
+        assert "Could not connect" in suggestion or "firewall" in suggestion
+
+    def test_classify_process_error_generic_fallback(self) -> None:
+        """ProcessError whose stderr matches no auth/rate/network pattern."""
+        from claude_agent_sdk import ProcessError
+
+        from conductor.providers.claude_agent_sdk import _classify_error_suggestion
+
+        # No auth/rate/network keywords.
+        suggestion = _classify_error_suggestion(
+            ProcessError("unexpected", exit_code=1, stderr="weird subprocess output")
+        )
+        assert "subprocess failed" in suggestion.lower()
+
+
+class TestRetryableResultTextFallback:
+    """When stop_reason and api_error_status are both None, fall back to text scan (#241 gap)."""
+
+    @pytest.mark.parametrize(
+        "errors,expected",
+        [
+            (["503 Service Unavailable"], True),
+            (["network timeout"], True),
+            (["connection refused"], True),
+            (["unknown error code"], False),
+        ],
+    )
+    def test_result_message_text_fallback(self, errors, expected) -> None:
+        from conductor.providers.claude_agent_sdk import _is_retryable_result
+
+        msg = Mock(api_error_status=None, stop_reason=None, errors=errors, result=None)
+        assert _is_retryable_result(msg) is expected
+
+
+class TestBuildErrorMessage:
+    """Direct tests for _build_error_message aggregation (#241 test gap)."""
+
+    def test_includes_all_fields(self) -> None:
+        msg = Mock(errors=["e1", "e2"], result="failed", stop_reason="error", num_turns=3)
+        text = ClaudeAgentSdkProvider._build_error_message(msg)
+        assert "e1; e2" in text
+        assert "failed" in text
+        assert "stop_reason=error" in text
+        assert "after 3 turns" in text
+
+    def test_no_details_fallback(self) -> None:
+        msg = Mock(errors=None, result=None, stop_reason=None, num_turns=None)
+        text = ClaudeAgentSdkProvider._build_error_message(msg)
+        assert "no details" in text
+
+
+class TestToolResultTruncation:
+    """The 500-char preview is load-bearing for dashboard / JSONL (#241 test gap)."""
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", Mock)
+    async def test_long_tool_result_truncated_to_500_chars(self) -> None:
+        events: list[tuple[str, dict]] = []
+        long_result = "x" * 5000
+
+        async def fake_query(**kwargs):
+            yield _assistant(
+                content=[ToolUseBlock(id="t1", name="search", input={})],
+            )
+            yield UserMessage(content=[ToolResultBlock(tool_use_id="t1", content=long_result)])
+            yield _result(result="done")
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider()
+            await provider.execute(
+                agent=AgentDef(name="t", prompt="hi"),
+                context={},
+                rendered_prompt="hi",
+                event_callback=lambda t, d: events.append((t, d)),
+            )
+
+        completion = next(e for e in events if e[0] == "agent_tool_complete")
+        assert len(completion[1]["result"]) == 500
+
+
+class TestSafeCallbackSwallowing:
+    """A buggy event_callback must not abort SDK execution (#241 test gap)."""
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", Mock)
+    async def test_failing_event_callback_does_not_abort_execution(self) -> None:
+        def boom(t: str, d: dict) -> None:
+            raise RuntimeError("subscriber bug")
+
+        async def fake_query(**kwargs):
+            yield _assistant(content=[TextBlock(text="hi")])
+            yield _result(result="hi")
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider()
+            # Must NOT raise — _safe_callback swallows the subscriber's RuntimeError.
+            output = await provider.execute(
+                agent=AgentDef(name="t", prompt="hi"),
+                context={},
+                rendered_prompt="hi",
+                event_callback=boom,
+            )
+        assert output.content == {"response": "hi"}

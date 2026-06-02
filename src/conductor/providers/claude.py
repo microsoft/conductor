@@ -131,9 +131,8 @@ class ClaudeProvider(AgentProvider):
         mcp_tools=True,
         # Per-agent ``tools:`` allowlists are forwarded to the SDK.
         workflow_tools_passthrough=True,
-        # The provider is non-streaming today (Phase 1): the API call awaits
-        # the full response before events are emitted. Set False so the
-        # capability descriptor accurately reflects observable behavior.
+        # The Claude provider buffers the API response before emitting any
+        # events. Flip to True if/when a streaming codepath is wired up.
         streaming_events=False,
         # ``agent_reasoning`` events fire for extended-thinking content
         # when the model returns it.

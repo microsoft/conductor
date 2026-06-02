@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import os
 import re
 import sys
@@ -31,6 +32,9 @@ from conductor.providers.registry import ProviderRegistry
 if TYPE_CHECKING:
     from conductor.config.schema import ProviderSettings
     from conductor.events import WorkflowEvent
+
+
+logger = logging.getLogger(__name__)
 
 
 # Verbose console for logging (stderr).
@@ -772,7 +776,6 @@ def _maybe_print_experimental_banner(data: dict[str, Any]) -> None:
         or ""
     )
 
-    from rich.console import Console
     from rich.panel import Panel
 
     for provider_name, meta in providers.items():
@@ -788,20 +791,27 @@ def _maybe_print_experimental_banner(data: dict[str, Any]) -> None:
 
         pin = meta.get("upstream_pin")
         maintainer = meta.get("maintainer")
-        caps_dump = meta.get("capabilities") or {}
 
-        # Re-hydrate the descriptor so we can call ``declared_limitations``
-        # — keeps the limitation logic in one place.
+        # Re-resolve capabilities from the provider name to compute the
+        # limitations list. We don't ship the capability dump on the wire
+        # (it's not consumed by any frontend code today), so this single
+        # extra lookup keeps the limitation logic in one place AND keeps
+        # the JSONL payload lean.
         limitations: list[str] = []
         try:
-            from conductor.providers.capabilities import ProviderCapabilities
+            from conductor.providers.capabilities import get_capabilities
 
-            limitations = ProviderCapabilities(**caps_dump).declared_limitations()
-        except Exception:  # noqa: BLE001
-            # Capability dump shape may differ in future revisions; never
-            # block the banner on parsing failures — fall back to the
-            # provider name alone.
-            pass
+            limitations = get_capabilities(provider_name).declared_limitations()
+        except (KeyError, AttributeError, ImportError) as exc:
+            # Provider unknown to the resolver or missing CAPABILITIES.
+            # Same fallback as engine — log and print banner without
+            # limitations rather than crashing.
+            logger.warning(
+                "Could not resolve capabilities for experimental provider %r: %s. "
+                "Banner will omit the limitations line.",
+                provider_name,
+                exc,
+            )
 
         header_bits = [f"[bold]{provider_name}[/bold]"]
         if pin:
@@ -815,22 +825,19 @@ def _maybe_print_experimental_banner(data: dict[str, Any]) -> None:
             body_lines.append("Limitations: " + ", ".join(limitations) + ".")
         body_lines.append("See [link]docs/providers/experimental.md[/link] for stability policy.")
 
-        console = Console(stderr=True, highlight=False)
-        console.print(
-            Panel(
-                "\n".join(body_lines),
-                border_style="yellow",
-                expand=False,
-            )
+        panel = Panel(
+            "\n".join(body_lines),
+            border_style="yellow",
+            expand=False,
         )
+        # Route through the silent-aware verbose console so ``--silent`` (JSON
+        # output only) suppresses the banner consistently with every other
+        # progress-style print in this module. The banner is a warning, but
+        # ``--silent`` is the user's explicit "JSON-only" contract — emitting
+        # arbitrary Rich panels would corrupt that.
+        _verbose_console.print(panel)
         if _file_console is not None:
-            _file_console.print(
-                Panel(
-                    "\n".join(body_lines),
-                    border_style="yellow",
-                    expand=False,
-                )
-            )
+            _file_console.print(panel)
 
 
 class ConsoleEventSubscriber:
@@ -1732,7 +1739,7 @@ def build_dry_run_plan(workflow_path: Path) -> ExecutionPlan:
     from conductor.config.schema import AgentDef
     from conductor.providers.base import AgentOutput, AgentProvider
 
-    class _MockProvider(AgentProvider):
+    class _MockProvider(AgentProvider, abstract=True):
         async def execute(
             self,
             agent: AgentDef,

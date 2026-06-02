@@ -1544,8 +1544,8 @@ def _validate_provider_capabilities(
     """Cross-check workflow features against each provider's declared capabilities.
 
     Returns a ``(errors, warnings)`` tuple. Errors block ``conductor validate``;
-    warnings print but don't fail. The matrix is documented in #241 and in
-    the plan; the policy follows the rubber-duck design review:
+    warnings print but don't fail. The matrix is documented in
+    ``docs/providers/experimental.md`` (see also #241 for design rationale):
 
     * Silently-dropped features (mcp_servers, tools allowlist,
       reasoning effort, structured output, max_session_seconds) → **error**.
@@ -1612,6 +1612,37 @@ def _validate_provider_capabilities(
     # the per-agent loop because it applies to every LLM agent that does
     # NOT override ``reasoning.effort`` explicitly.
     runtime_default_effort = config.workflow.runtime.default_reasoning_effort
+    runtime_max_session_seconds = config.workflow.runtime.max_session_seconds
+
+    # ----- Workflow-level: max_session_seconds -----
+    # When the workflow sets a default session timeout, every LLM agent
+    # inherits it. A provider that ignores max_session_seconds would
+    # silently violate the operator's intent, just like the mcp_servers
+    # case above. Check against every resolved provider in use.
+    if runtime_max_session_seconds is not None:
+        providers_using_default_timeout: dict[str, list[str]] = {}
+        for agent in config.agents:
+            if not _is_llm_agent(agent):
+                continue
+            # If the agent overrides max_session_seconds explicitly, the
+            # workflow-level value does not reach the provider for this
+            # agent — its per-agent override is handled in the loop below.
+            if agent.max_session_seconds is not None:
+                continue
+            pname = _resolved_provider_name(agent, default_provider)
+            providers_using_default_timeout.setdefault(pname, []).append(agent.name)
+        for pname, agent_names in providers_using_default_timeout.items():
+            pcaps = _caps_for(pname)
+            if pcaps is not None and not pcaps.max_session_seconds:
+                errors.append(
+                    f"Workflow declares 'runtime.max_session_seconds'="
+                    f"{runtime_max_session_seconds!r} but provider '{pname}' "
+                    f"does not enforce session timeouts "
+                    f"(capabilities.max_session_seconds=False) and is used by "
+                    f"agent(s): {sorted(agent_names)!r}. Override these agents "
+                    f"to a timeout-aware provider, or remove the workflow-level "
+                    f"max_session_seconds."
+                )
 
     # ----- Per-agent checks -----
     for agent in config.agents:

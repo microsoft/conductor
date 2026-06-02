@@ -35,13 +35,13 @@ class TestProvidersBlock:
         assert "copilot" in providers
         copilot = providers["copilot"]
         assert copilot["name"] == "copilot"
+        assert copilot["status"] == "ok"
         assert copilot["tier"] == "stable"
-        # Capability dump round-trips through Pydantic — every declared
-        # field should appear.
-        caps = copilot["capabilities"]
-        assert caps is not None
-        assert "mcp_tools" in caps
-        assert "concurrent_safe" in caps
+        # The wire payload intentionally does NOT include the full
+        # capability dump — it's not consumed by any frontend and would
+        # bloat the JSONL. The CLI banner re-resolves capabilities from
+        # the provider name when needed.
+        assert "capabilities" not in copilot
 
     def test_per_agent_override_recorded(self) -> None:
         engine = _engine(
@@ -77,8 +77,13 @@ class TestProvidersBlock:
         assert sdk_meta["upstream_pin"] is not None
         assert "claude-agent-sdk" in sdk_meta["upstream_pin"]
 
-    def test_unknown_provider_gets_stub_metadata(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """If a provider somehow lacks CAPABILITIES, the event still emits a stub."""
+    def test_unknown_provider_gets_unresolved_stub(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """When CAPABILITIES is missing/broken, emit status='unresolved' (NOT tier='unknown').
+
+        The wire ``tier`` field stays constrained to the same Literal as
+        ``ProviderCapabilities.tier``; a ``status`` discriminator
+        differentiates resolved from fallback entries.
+        """
 
         def fake(name: str) -> Any:
             raise AttributeError(f"no CAPABILITIES on {name}")
@@ -87,5 +92,5 @@ class TestProvidersBlock:
         engine = _engine([AgentDef(name="a", prompt="hi")])
         data = engine.build_workflow_started_data()
         stub = data["providers"]["copilot"]
-        assert stub["tier"] == "unknown"
-        assert stub["capabilities"] is None
+        assert stub["status"] == "unresolved"
+        assert stub["tier"] is None

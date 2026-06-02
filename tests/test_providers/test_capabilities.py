@@ -86,6 +86,16 @@ class TestSchemaValidation:
         with pytest.raises(ValueError):
             _stable_capabilities(reasoning_effort=("ultra",))
 
+    def test_empty_reasoning_effort_tuple_rejected(self) -> None:
+        """Empty tuple is meaningless — None says 'no support', tuple says 'these levels'.
+
+        Without this validator, an empty tuple silently passed every per-level
+        membership check (``"high" not in ()`` always True), making the
+        validator fire spurious errors for every workflow.
+        """
+        with pytest.raises(ValueError, match="meaningless"):
+            _stable_capabilities(reasoning_effort=())
+
     def test_invalid_structured_output_mode_rejected(self) -> None:
         with pytest.raises(ValueError):
             _stable_capabilities(structured_output="json_mode")
@@ -176,3 +186,58 @@ class TestResolver:
         ):
             caps = get_capabilities("copilot")
             assert isinstance(caps, ProviderCapabilities)
+
+
+class TestSubclassEnforcement:
+    """`__init_subclass__` enforces CAPABILITIES at import time (#241 type hardening)."""
+
+    def test_subclass_without_capabilities_raises_at_definition(self) -> None:
+        """A non-abstract subclass that forgets CAPABILITIES fails at class creation."""
+        from conductor.providers.base import AgentProvider
+
+        with pytest.raises(TypeError, match="must declare a class-level CAPABILITIES"):
+
+            class _Broken(AgentProvider):  # type: ignore[misc]
+                async def execute(self, *a, **kw):
+                    raise NotImplementedError
+
+                async def validate_connection(self) -> bool:
+                    return False
+
+                async def close(self) -> None:
+                    pass
+
+    def test_subclass_with_wrong_type_raises(self) -> None:
+        """CAPABILITIES set to something other than ProviderCapabilities is rejected."""
+        from conductor.providers.base import AgentProvider
+
+        with pytest.raises(TypeError, match="must declare a class-level CAPABILITIES"):
+
+            class _WrongType(AgentProvider):  # type: ignore[misc]
+                CAPABILITIES = "not a capability descriptor"  # type: ignore[assignment]
+
+                async def execute(self, *a, **kw):
+                    raise NotImplementedError
+
+                async def validate_connection(self) -> bool:
+                    return False
+
+                async def close(self) -> None:
+                    pass
+
+    def test_abstract_subclass_opt_out(self) -> None:
+        """Test fakes can opt out of the CAPABILITIES requirement with abstract=True."""
+        from conductor.providers.base import AgentProvider
+
+        class _Fake(AgentProvider, abstract=True):
+            async def execute(self, *a, **kw):
+                raise NotImplementedError
+
+            async def validate_connection(self) -> bool:
+                return False
+
+            async def close(self) -> None:
+                pass
+
+        # No exception — abstract=True bypasses the check.
+        assert _Fake.CAPABILITIES is None

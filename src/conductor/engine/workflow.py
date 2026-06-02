@@ -608,31 +608,55 @@ class WorkflowEngine:
                 return
             try:
                 caps: ProviderCapabilities = get_capabilities(name)
-            except (KeyError, AttributeError):
-                # Provider not in the registry, or missing CAPABILITIES.
-                # Surface a minimal stub so downstream consumers can still
-                # render "unknown provider" rather than crashing.
+            except (KeyError, AttributeError, ImportError) as exc:
+                # KeyError → provider name unknown to the resolver.
+                # AttributeError → provider class missing CAPABILITIES.
+                # ImportError → provider module's top-level import failed
+                #   (e.g. an optional SDK dependency broke).
+                # All three SHOULD have been caught by the validator; if we
+                # reach the engine, something is wrong. Surface a stub with
+                # ``status: "unresolved"`` so downstream consumers can
+                # discriminate without widening the ``tier`` Literal, but
+                # log a warning so the run output carries a forensic trail.
+                logger.warning(
+                    "Provider %r has no resolvable capabilities (%s: %s); "
+                    "emitting status='unresolved' stub. This should have been "
+                    "caught by `conductor validate`.",
+                    name,
+                    type(exc).__name__,
+                    exc,
+                )
                 providers_block[name] = {
                     "name": name,
-                    "tier": "unknown",
+                    # `status` discriminator: "ok" for resolved providers,
+                    # "unresolved" for ones whose capabilities couldn't be
+                    # loaded. Keeps the wire `tier` field constrained to
+                    # the same Literal values as ProviderCapabilities.tier.
+                    "status": "unresolved",
+                    "tier": None,
                     "upstream_pin": None,
                     "maintainer": None,
-                    "capabilities": None,
                 }
                 return
             providers_block[name] = {
                 "name": name,
+                "status": "ok",
                 "tier": caps.tier,
                 "upstream_pin": caps.upstream_pin,
                 "maintainer": caps.maintainer,
-                "capabilities": caps.model_dump(),
             }
 
         # Walk agents (which may use overrides) and the workflow default
         # so the providers block always includes at least the default.
+        # ForEach inline agents are NOT in config.agents (they live on
+        # ForEachDef.agent) but they still drive provider selection at
+        # runtime — record them so the banner fires and the dashboard
+        # badge appears for for_each-only experimental providers.
         _record_provider(default_provider_name)
         for a in self.config.agents:
             _record_provider(a.provider or default_provider_name)
+        for fe in self.config.for_each:
+            _record_provider(fe.agent.provider or default_provider_name)
 
         return {
             "name": self.config.workflow.name,

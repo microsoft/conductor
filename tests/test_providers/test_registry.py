@@ -11,7 +11,7 @@ from conductor.providers.base import AgentOutput, AgentProvider
 from conductor.providers.registry import ProviderRegistry
 
 
-class MockProvider(AgentProvider):
+class MockProvider(AgentProvider, abstract=True):
     """Mock provider for testing."""
 
     def __init__(self, provider_type: str = "test") -> None:

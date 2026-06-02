@@ -6,17 +6,18 @@ validate`` can statically cross-check workflow features against what the
 provider actually supports. See issue #241 for design rationale.
 
 The schema is intentionally **declarative and provider-agnostic** — no
-Conductor imports here so it can be referenced from anywhere without
-risking circular imports. The lazy :func:`get_capabilities` resolver does
-local imports of provider modules so callers don't need to instantiate
-providers (i.e. no API keys required for ``validate``).
+top-level Conductor imports here so it can be referenced from anywhere
+without risking circular imports at module load time. The lazy
+:func:`get_capabilities` resolver performs deferred ``importlib`` imports
+of provider modules so callers don't need to instantiate providers (i.e.
+no API keys required for ``validate``).
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Final, Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
 
 if TYPE_CHECKING:
     from conductor.providers.base import AgentProvider
@@ -135,6 +136,27 @@ class ProviderCapabilities(BaseModel):
         """Shorthand: ``True`` iff ``tier == "experimental"``."""
         return self.tier == "experimental"
 
+    @field_validator("reasoning_effort")
+    @classmethod
+    def _reasoning_effort_nonempty(
+        cls, v: tuple[ReasoningEffortLevel, ...] | None
+    ) -> tuple[ReasoningEffortLevel, ...] | None:
+        """Reject empty tuples — meaningless and an easy authoring error.
+
+        ``None`` means "provider has no reasoning-effort concept"; a tuple
+        means "supports these levels". The empty tuple is neither, and
+        would silently pass every per-level membership check in the
+        validator (``"high" not in ()`` is always True → error fires for
+        every requested level). Force the author to choose ``None``.
+        """
+        if v is not None and len(v) == 0:
+            raise ValueError(
+                "reasoning_effort=() is meaningless — use None to declare "
+                "no reasoning-effort support, or a non-empty tuple of "
+                "supported levels."
+            )
+        return v
+
     def declared_limitations(self) -> list[str]:
         """Human-readable list of capability fields that read as ``false`` / ``None``.
 
@@ -198,6 +220,11 @@ def _build_unimplemented_placeholder() -> ProviderCapabilities:
     All fields read as supported so the validator never produces a
     capability-mismatch error — the factory's "not yet implemented" error
     at runtime is the authoritative failure for these names.
+
+    Note: ``tier='experimental'`` means the experimental banner WILL fire
+    at run time for these provider names before the factory raises
+    NotImplementedError. That's intentional — the banner tells the user
+    "this is a placeholder" so the eventual factory error is unsurprising.
     """
     return ProviderCapabilities(
         tier="experimental",
@@ -248,31 +275,6 @@ def get_capabilities(provider_type: str) -> ProviderCapabilities:
             f"Unknown provider {provider_type!r}. Known providers: "
             f"{sorted(set(_PROVIDER_CLASS_PATHS) | _NOT_YET_IMPLEMENTED_PROVIDERS)}"
         ) from e
-    """Resolve the :class:`ProviderCapabilities` for a provider name.
-
-    Imports the provider's module lazily — never instantiates the provider —
-    so this is safe to call from ``conductor validate`` without any
-    API keys or network access.
-
-    Args:
-        provider_type: Provider name as it appears in workflow YAML, e.g.
-            ``"copilot"`` or ``"claude-agent-sdk"``.
-
-    Returns:
-        The provider class's declared ``CAPABILITIES`` descriptor.
-
-    Raises:
-        KeyError: If ``provider_type`` is not a known provider name.
-        AttributeError: If the resolved provider class is missing the
-            required class-level ``CAPABILITIES`` attribute. Every
-            production provider must declare one.
-    """
-    try:
-        dotted_path = _PROVIDER_CLASS_PATHS[provider_type]
-    except KeyError as e:
-        raise KeyError(
-            f"Unknown provider {provider_type!r}. Known providers: {sorted(_PROVIDER_CLASS_PATHS)}"
-        ) from e
 
     module_path, _, class_name = dotted_path.partition(":")
     import importlib
@@ -302,8 +304,6 @@ def known_provider_names() -> tuple[str, ...]:
     return tuple(_PROVIDER_CLASS_PATHS) + tuple(_NOT_YET_IMPLEMENTED_PROVIDERS)
 
 
-# Convenience re-export so callers can write ``from conductor.providers.capabilities
-# import ProviderCapabilities, get_capabilities`` without remembering paths.
 __all__ = [
     "ProviderCapabilities",
     "ProviderTier",

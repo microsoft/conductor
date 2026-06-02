@@ -68,8 +68,10 @@ def _build_output_format(output: dict[str, OutputField]) -> dict[str, Any]:
 
     The SDK expects a wrapping ``{"type": "json_schema", "schema": ...}`` object
     around the actual JSON-Schema document. All declared fields are marked
-    required — partial outputs from the SDK already round-trip through
-    :meth:`_build_output` which tolerates missing keys via ``response`` wrapping.
+    required in the schema sent to the SDK. Conductor does not currently
+    validate the SDK's returned content against this schema — a missing
+    key produces a dict with that key absent rather than a hard failure.
+    If schema validation is added later, revisit this default.
     """
     return {
         "type": "json_schema",
@@ -86,19 +88,22 @@ def _build_output_format(output: dict[str, OutputField]) -> dict[str, Any]:
 # i.e. the same behavior the user gets when running the `claude` CLI directly.
 _DEFAULT_TOOL_PRESET: dict[str, str] = {"type": "preset", "preset": "claude_code"}
 
-# Truncation lengths for diagnostic output. These bound how much of a tool
-# result, tool argument blob, or reasoning trace we show in event payloads
-# and verbose logs. ``_TOOL_RESULT_PREVIEW_LEN`` is load-bearing: it is the
-# upper limit the dashboard and JSONL stream observe for ``agent_tool_complete``
-# results. Changing it changes what every downstream consumer sees.
-_TOOL_RESULT_PREVIEW_LEN: Final[int] = 500
+# Display-only previews for the verbose CLI pretty-printer (NOT surfaced
+# in events — see ``_TOOL_RESULT_PREVIEW_LEN`` below for the on-the-wire
+# truncation).
 _VERBOSE_ARG_PREVIEW_LEN: Final[int] = 200
 _VERBOSE_RESULT_PREVIEW_LEN: Final[int] = 200
 _REASONING_PREVIEW_LEN: Final[int] = 150
 
+# ``_TOOL_RESULT_PREVIEW_LEN`` is load-bearing: it is the upper limit the
+# dashboard and JSONL stream observe for ``agent_tool_complete`` results.
+# Changing it changes what every downstream consumer sees.
+_TOOL_RESULT_PREVIEW_LEN: Final[int] = 500
+
 # Default SDK-recognized model when neither the agent nor the workflow sets
-# one. Verified against the claude-agent-sdk package types — see
-# `types.py:1676` ("Examples: 'claude-sonnet-4-5', 'claude-opus-4-5'").
+# one. The string must match a model alias accepted by the upstream
+# ``claude-agent-sdk`` package; revalidate when bumping the upstream pin
+# in pyproject.toml.
 _DEFAULT_MODEL: Final[str] = "claude-sonnet-4-5"
 
 
@@ -353,7 +358,8 @@ class ClaudeAgentSdkProvider(AgentProvider):
         except ProviderError:
             raise
         except asyncio.CancelledError:
-            # Re-raise to preserve structured concurrency / interrupt semantics.
+            # Do NOT translate into ProviderError — upstream interrupt
+            # handlers rely on CancelledError to unwind cleanly.
             raise
         except Exception as e:
             raise ProviderError(
@@ -605,7 +611,6 @@ class ClaudeAgentSdkProvider(AgentProvider):
         return "Claude Agent SDK execution failed (no details available)"
 
     @staticmethod
-    @staticmethod
     def _build_output(
         content_parts: list[str],
         structured_output: Any,
@@ -672,6 +677,25 @@ class ClaudeAgentSdkProvider(AgentProvider):
                         ) from e
                     content = {"response": structured_output}
             else:
+                # The SDK returned ``structured_output`` of a shape the
+                # provider does not understand (not a dict, not a str —
+                # likely an SDK version drift). If the agent declared an
+                # output schema, silently coercing to ``{"response": ...}``
+                # would violate the schema contract; downstream routes /
+                # templates that key off declared fields would then fail
+                # with confusing KeyError / UndefinedError in unrelated
+                # parts of the workflow.
+                if agent.output and not partial:
+                    raise ValidationError(
+                        f"Agent '{agent.name}' declared an output schema but "
+                        f"the SDK returned structured_output of unexpected "
+                        f"type {type(structured_output).__name__}: "
+                        f"{str(structured_output)[:200]!r}",
+                        suggestion=(
+                            "Pin or upgrade claude-agent-sdk to a compatible "
+                            "version, or remove the `output:` schema."
+                        ),
+                    )
                 content = {"response": str(structured_output)}
         elif agent.output:
             combined = "\n".join(content_parts)
@@ -707,10 +731,10 @@ class ClaudeAgentSdkProvider(AgentProvider):
 def _log_event_verbose(event_type: str, data: dict[str, Any], full_mode: bool) -> None:
     """Pretty-print an SDK event to the verbose console (stderr) and log file.
 
-    Defensively imports the CLI's ``_file_console`` so library users that
-    never touch the CLI can still execute the provider — without a verbose
-    pretty-printer in that case, since :func:`execute` only invokes this
-    function when its own CLI imports succeeded.
+    ``execute()`` only calls this helper when its own CLI import succeeded,
+    so the ``try/except ImportError`` around ``_file_console`` is belt-and-
+    braces — kept in case a caller invokes the helper directly without
+    going through ``execute()``.
     """
     from rich.console import Console
     from rich.text import Text
@@ -800,10 +824,10 @@ def _safe_callback(callback: EventCallback, event_type: str, data: dict[str, Any
 def _classify_error_suggestion(exc: BaseException) -> str:
     """Build a remediation hint tailored to the kind of failure observed.
 
-    The previous implementation returned ``"Check that the claude CLI is
-    installed"`` for every exception, which was actively misleading for
-    auth / network / JSON-parse failures. Inspect the exception class
-    hierarchy and message text to provide an actionable hint per failure mode.
+    Inspects the exception class hierarchy and message text to provide an
+    actionable hint per failure mode (CLI missing, auth, rate limit,
+    network, parse, generic). A single generic suggestion would be
+    actively misleading for most failures.
     """
     cls = type(exc).__name__
     msg = str(exc).lower()
@@ -876,7 +900,7 @@ def _is_retryable_exception(exc: BaseException) -> bool:
             return False
         if "rate" in msg or "429" in msg or "quota" in msg or "overload" in msg:
             return True
-        if "5" in msg and ("500" in msg or "502" in msg or "503" in msg or "504" in msg):
+        if "500" in msg or "502" in msg or "503" in msg or "504" in msg:
             return True
         return bool("network" in msg or "connection" in msg or "timeout" in msg)
 

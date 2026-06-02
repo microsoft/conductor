@@ -172,7 +172,7 @@ agents:
         # This prevents provider factory from receiving irrelevant parameters
 
 
-class MockProvider(AgentProvider):
+class MockProvider(AgentProvider, abstract=True):
     """Mock provider for testing."""
 
     def __init__(self, provider_type: str = "mock") -> None:

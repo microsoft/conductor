@@ -141,18 +141,48 @@ class AgentProvider(ABC):
         ...     async def close(self):
         ...         pass
 
-    Test fakes / mocks may omit ``CAPABILITIES`` — the resolver in
-    :func:`conductor.providers.capabilities.get_capabilities` raises a
-    clear ``AttributeError`` only when the descriptor is actually consulted
-    (i.e. when a workflow uses the provider through the validator or
-    runtime), not at subclass-definition time.
+    Test fakes / mocks that don't need a real capability declaration can
+    opt out at subclass-definition time with ``abstract=True``:
+
+        >>> class _FakeProvider(AgentProvider, abstract=True):
+        ...     async def execute(self, *a, **kw): ...
+        ...     async def validate_connection(self): return True
+        ...     async def close(self): ...
+
+    Production subclasses (no ``abstract=True``) MUST set ``CAPABILITIES``
+    to a :class:`ProviderCapabilities` instance — enforced at import time
+    via :meth:`__init_subclass__`.
     """
 
     # Subclasses MUST override with their declared descriptor.
-    # Typed as Optional only so abstract-base instantiation guards still
-    # apply uniformly; the resolver raises a clear error when a production
-    # provider class fails to override this.
+    # Typed as Optional so the abstract base itself can declare ``None``;
+    # __init_subclass__ enforces the override on every non-abstract
+    # subclass at import time.
     CAPABILITIES: ClassVar[ProviderCapabilities | None] = None
+
+    def __init_subclass__(cls, *, abstract: bool = False, **kwargs: Any) -> None:
+        """Enforce that every production subclass declares ``CAPABILITIES``.
+
+        Converts a latent "lazily caught at validator/runtime" failure
+        into an import-time error so missing or mistyped descriptors
+        cannot ship. Test fakes opt out with ``abstract=True``:
+
+            class _Fake(AgentProvider, abstract=True): ...
+        """
+        super().__init_subclass__(**kwargs)
+        if abstract:
+            return
+        # Local import to avoid base.py → capabilities.py cycle at module load.
+        from conductor.providers.capabilities import ProviderCapabilities
+
+        caps = cls.__dict__.get("CAPABILITIES")
+        if not isinstance(caps, ProviderCapabilities):
+            raise TypeError(
+                f"{cls.__module__}.{cls.__name__} must declare a class-level "
+                f"CAPABILITIES: ProviderCapabilities attribute (see "
+                f"conductor.providers.capabilities). Test fakes can opt out "
+                f"with `class {cls.__name__}(AgentProvider, abstract=True)`."
+            )
 
     @abstractmethod
     async def execute(

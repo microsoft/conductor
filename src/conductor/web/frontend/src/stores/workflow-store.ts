@@ -150,7 +150,7 @@ export interface NodeData {
   // the agent's resolved provider is experimental, so the graph can
   // render a badge without re-derivation.
   provider_name?: string;
-  provider_tier?: 'stable' | 'experimental' | 'unknown';
+  provider_tier?: 'stable' | 'experimental' | null;
 }
 
 export interface GroupProgress {
@@ -175,14 +175,9 @@ export interface WorkflowAgent {
   provider_name?: string;
 }
 
-/** Per-provider tier/capability metadata from workflow_started.providers (#241). */
-export interface ProviderMetadata {
-  name: string;
-  tier: 'stable' | 'experimental' | 'unknown';
-  upstream_pin?: string | null;
-  maintainer?: string | null;
-  capabilities?: Record<string, unknown> | null;
-}
+// ProviderMetadata is defined in types/events.ts (single source of truth)
+// and re-exported here for callers that import from the store.
+export type { ProviderMetadata } from '@/types/events';
 
 export interface ParallelGroup {
   name: string;

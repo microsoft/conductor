@@ -463,3 +463,208 @@ class TestRubberDuckFollowups:
         )
         # No raise expected — placeholder permits everything.
         validate_workflow_config(config)
+
+
+class TestConcurrencyOverrides:
+    """Per-agent provider override interactions with parallel/for_each (#241 test gap)."""
+
+    def test_parallel_group_member_override_to_safe_provider_passes(self, patch_caps: Any) -> None:
+        """If a parallel group member overrides to a safe provider, no error fires."""
+        patch_caps(
+            {
+                "copilot": _caps(concurrent_safe=False),  # default (would error)
+                "claude": _caps(concurrent_safe=True),  # both members override
+            }
+        )
+        config = _build_workflow(
+            agents=[
+                AgentDef(name="a", prompt="hi", provider="claude"),
+                AgentDef(name="b", prompt="hi", provider="claude"),
+                AgentDef(name="start", prompt="hi"),
+            ],
+            parallel=[ParallelGroup(name="group", agents=["a", "b"])],
+        )
+        config.workflow.entry_point = "group"
+        validate_workflow_config(config)  # must not raise
+
+    def test_parallel_group_member_override_to_unsafe_provider_errors(
+        self, patch_caps: Any
+    ) -> None:
+        """If a member overrides to an unsafe provider while default is safe, error fires."""
+        patch_caps(
+            {
+                "copilot": _caps(concurrent_safe=True),  # default — safe
+                "claude": _caps(concurrent_safe=False),  # one member overrides — unsafe
+            }
+        )
+        config = _build_workflow(
+            agents=[
+                AgentDef(name="a", prompt="hi"),  # uses default (safe)
+                AgentDef(name="b", prompt="hi", provider="claude"),  # overrides (unsafe)
+                AgentDef(name="start", prompt="hi"),
+            ],
+            parallel=[ParallelGroup(name="group", agents=["a", "b"])],
+        )
+        config.workflow.entry_point = "group"
+        with pytest.raises(ConfigurationError, match="not safe to run in parallel"):
+            validate_workflow_config(config)
+
+    def test_for_each_inline_agent_override_to_safe_provider_passes(self, patch_caps: Any) -> None:
+        """A for_each inline agent overriding to a safe provider clears the concurrency check."""
+        patch_caps(
+            {
+                "copilot": _caps(concurrent_safe=False),  # default
+                "claude": _caps(concurrent_safe=True),  # inline override
+            }
+        )
+        inline = AgentDef(name="inner", prompt="{{ item }}", provider="claude")
+        config = _build_workflow(
+            agents=[AgentDef(name="entry", prompt="hi")],
+            for_each=[
+                ForEachDef(
+                    name="loop",
+                    type="for_each",
+                    source="entry.output.items",
+                    **{"as": "item"},
+                    agent=inline,
+                    max_concurrent=5,
+                )
+            ],
+        )
+        validate_workflow_config(config)  # must not raise
+
+    def test_for_each_inline_agent_override_to_unsafe_provider_errors(
+        self, patch_caps: Any
+    ) -> None:
+        """A for_each inline agent overriding to an unsafe provider triggers the error."""
+        patch_caps(
+            {
+                "copilot": _caps(concurrent_safe=True),  # default (safe)
+                "claude": _caps(concurrent_safe=False),  # inline override (unsafe)
+            }
+        )
+        inline = AgentDef(name="inner", prompt="{{ item }}", provider="claude")
+        config = _build_workflow(
+            agents=[AgentDef(name="entry", prompt="hi")],
+            for_each=[
+                ForEachDef(
+                    name="loop",
+                    type="for_each",
+                    source="entry.output.items",
+                    **{"as": "item"},
+                    agent=inline,
+                    max_concurrent=5,
+                )
+            ],
+        )
+        with pytest.raises(ConfigurationError, match="concurrent_safe=False"):
+            validate_workflow_config(config)
+
+
+class TestWorkflowLevelMaxSessionSeconds:
+    """Workflow-level runtime.max_session_seconds validated against capabilities."""
+
+    def test_runtime_timeout_against_unsupported_provider_errors(self, patch_caps: Any) -> None:
+        patch_caps({"copilot": _caps(max_session_seconds=False)})
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="t",
+                entry_point="a",
+                runtime=RuntimeConfig(provider="copilot", max_session_seconds=120.0),
+            ),
+            agents=[AgentDef(name="a", prompt="hi")],
+        )
+        with pytest.raises(ConfigurationError, match="does not enforce session timeouts"):
+            validate_workflow_config(config)
+
+    def test_per_agent_override_skips_workflow_level_check(self, patch_caps: Any) -> None:
+        """Per-agent max_session_seconds uses its own check, not the workflow default."""
+        patch_caps({"copilot": _caps(max_session_seconds=True)})
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="t",
+                entry_point="a",
+                # Workflow default + per-agent override; both honored by capability.
+                runtime=RuntimeConfig(provider="copilot", max_session_seconds=60.0),
+            ),
+            agents=[AgentDef(name="a", prompt="hi", max_session_seconds=30.0)],
+        )
+        validate_workflow_config(config)
+
+    def test_runtime_timeout_with_supported_provider_passes(self, patch_caps: Any) -> None:
+        patch_caps({"copilot": _caps(max_session_seconds=True)})
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="t",
+                entry_point="a",
+                runtime=RuntimeConfig(provider="copilot", max_session_seconds=120.0),
+            ),
+            agents=[AgentDef(name="a", prompt="hi")],
+        )
+        validate_workflow_config(config)
+
+
+class TestForEachProviderRecorded:
+    """ForEach inline agent providers appear in workflow_started.providers block (#241 gap)."""
+
+    def test_for_each_inline_experimental_provider_appears_in_engine_metadata(
+        self,
+    ) -> None:
+        """Engine's build_workflow_started_data must record for_each inline providers.
+
+        Without this, the experimental banner won't fire and the dashboard
+        won't badge nodes for for_each-only experimental providers.
+        """
+        pytest.importorskip("claude_agent_sdk")
+        from conductor.engine.workflow import WorkflowEngine
+
+        inline = AgentDef(name="worker", prompt="{{ item }}", provider="claude-agent-sdk")
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="t",
+                entry_point="setup",
+                runtime=RuntimeConfig(provider="copilot"),  # default is stable
+            ),
+            agents=[AgentDef(name="setup", prompt="hi")],
+            for_each=[
+                ForEachDef(
+                    name="scan",
+                    type="for_each",
+                    source="setup.output.items",
+                    **{"as": "item"},
+                    agent=inline,
+                )
+            ],
+        )
+        engine = WorkflowEngine(config=config, provider=None)
+        data = engine.build_workflow_started_data()
+        assert "claude-agent-sdk" in data["providers"]
+        assert data["providers"]["claude-agent-sdk"]["tier"] == "experimental"
+
+
+class TestMultiErrorAggregation:
+    """The validator aggregates ALL capability errors, not just the first (#241 test gap)."""
+
+    def test_multiple_independent_violations_both_reported(self, patch_caps: Any) -> None:
+        """A workflow with two unrelated mismatches must report both in one ConfigurationError."""
+        patch_caps(
+            {
+                "copilot": _caps(
+                    workflow_tools_passthrough=False,
+                    max_session_seconds=False,
+                ),
+            }
+        )
+        config = _build_workflow(
+            agents=[
+                AgentDef(name="agent_a", prompt="hi", tools=["search"]),
+                AgentDef(name="agent_b", prompt="hi", max_session_seconds=60.0),
+            ],
+        )
+        with pytest.raises(ConfigurationError) as exc_info:
+            validate_workflow_config(config)
+        msg = str(exc_info.value)
+        # Both agent names appear, proving the validator did not short-circuit
+        # on the first error.
+        assert "agent_a" in msg
+        assert "agent_b" in msg
