@@ -1,16 +1,22 @@
 import { useEffect, useState } from 'react';
 import { X } from 'lucide-react';
 import { useWorkflowStore } from '@/stores/workflow-store';
+import { useViewedNodes } from '@/hooks/use-viewed-context';
 import { AgentDetail } from './AgentDetail';
 import { ScriptDetail } from './ScriptDetail';
+import { SetDetail } from './SetDetail';
 import { GateDetail } from './GateDetail';
 import { GroupDetail } from './GroupDetail';
+import { DialogEngagementPrompt } from './DialogEngagementPrompt';
+import { SubworkflowDetail } from './SubworkflowDetail';
+import { WaitDetail } from './WaitDetail';
 import { cn } from '@/lib/utils';
 
 export function DetailPanel() {
   const selectedNode = useWorkflowStore((s) => s.selectedNode);
-  const nodes = useWorkflowStore((s) => s.nodes);
+  const viewedNodes = useViewedNodes();
   const selectNode = useWorkflowStore((s) => s.selectNode);
+  const dialogEngaged = useWorkflowStore((s) => s.dialogEngaged);
 
   // Slide-in animation state
   const [mounted, setMounted] = useState(false);
@@ -20,7 +26,7 @@ export function DetailPanel() {
     return () => setMounted(false);
   }, [selectedNode]);
 
-  const node = selectedNode ? nodes[selectedNode] : null;
+  const node = selectedNode ? viewedNodes[selectedNode] : null;
 
   if (!selectedNode || !node) {
     return (
@@ -36,14 +42,24 @@ export function DetailPanel() {
   }
 
   const DetailComponent = (() => {
+    // Show engagement prompt when dialog is active but user hasn't engaged yet
+    if (node.dialog_active && !dialogEngaged) return DialogEngagementPrompt;
+    // When dialog is active and engaged, show normal agent detail
+    if (node.dialog_active && dialogEngaged) return AgentDetail;
     switch (node.type) {
       case 'script':
         return ScriptDetail;
+      case 'wait':
+        return WaitDetail;
+      case 'set':
+        return SetDetail;
       case 'human_gate':
         return GateDetail;
       case 'parallel_group':
       case 'for_each_group':
         return GroupDetail;
+      case 'workflow':
+        return SubworkflowDetail;
       default:
         return AgentDetail;
     }

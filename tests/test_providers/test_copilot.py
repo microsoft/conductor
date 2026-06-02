@@ -643,6 +643,33 @@ class TestExtractJson:
         with pytest.raises(ValueError):
             provider._extract_json('{"key": "missing end brace"')
 
+    def test_extract_json_with_triple_backticks_inside_string(self) -> None:
+        """Triple-backticks inside a string field must not truncate the JSON.
+
+        Mirrors the parser fix in executor.output.parse_json_output — the
+        greedy fallback closes at the LAST fence in the response.
+        """
+        provider = CopilotProvider(mock_handler=stub_handler)
+
+        raw = '```json\n{"code": "use ```fenced``` blocks", "n": 1}\n```'
+        result = provider._extract_json(raw)
+
+        assert result == {"code": "use ```fenced``` blocks", "n": 1}
+
+    def test_extract_json_with_multiple_fenced_blocks_first_wins(self) -> None:
+        """When the response contains multiple fenced JSON blocks, the first
+        valid block wins.
+
+        Pins the behavior for the multi-block trade-off raised in PR review:
+        try each non-greedy candidate in order and return the first parse.
+        """
+        provider = CopilotProvider(mock_handler=stub_handler)
+
+        raw = '```json\n{"a": 1}\n```\n\nupdated answer:\n\n```json\n{"a": 2}\n```'
+        result = provider._extract_json(raw)
+
+        assert result == {"a": 1}
+
 
 class TestLogParseRecovery:
     """Tests for parse recovery logging."""
@@ -675,6 +702,308 @@ class TestLogParseRecovery:
             error=long_error,
         )
 
+    def test_log_parse_recovery_emits_agent_tag_when_named(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """When ``agent_name`` is provided, the rendered line includes it."""
+        provider = CopilotProvider(mock_handler=stub_handler)
+
+        provider._log_parse_recovery(
+            attempt=1,
+            max_attempts=5,
+            error="boom",
+            agent_name="analyzer[item_a]",
+        )
+
+        captured = capsys.readouterr().err
+        assert "[analyzer[item_a]]" in captured
+        assert "Parse Recovery 1/5" in captured
+        # The tag must precede the recovery icon
+        assert captured.index("[analyzer[item_a]]") < captured.index("🔄")
+
+    def test_log_parse_recovery_omits_tag_when_unnamed(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """When ``agent_name`` is omitted, no attribution tag is emitted."""
+        provider = CopilotProvider(mock_handler=stub_handler)
+
+        provider._log_parse_recovery(attempt=1, max_attempts=5, error="boom")
+
+        captured = capsys.readouterr().err
+        # No bracketed tag preceding the recovery icon
+        assert "[" not in captured.split("Parse Recovery")[0]
+
+
+class TestLogRecoveryAttempt:
+    """Tests for idle recovery attempt logging."""
+
+    def test_emits_agent_tag_when_named(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """When ``agent_name`` is provided, the rendered line includes it."""
+        provider = CopilotProvider(mock_handler=stub_handler)
+
+        provider._log_recovery_attempt(
+            attempt=2,
+            last_event_type="tool.execution_start",
+            last_tool_call="grep",
+            agent_name="analyzer[item_b]",
+        )
+
+        captured = capsys.readouterr().err
+        assert "[analyzer[item_b]]" in captured
+        assert "Idle Recovery" in captured
+        assert "grep" in captured
+        # The tag must precede the warning icon
+        assert captured.index("[analyzer[item_b]]") < captured.index("⚠️")
+
+    def test_omits_tag_when_unnamed(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """No attribution tag emitted when ``agent_name`` is omitted."""
+        provider = CopilotProvider(mock_handler=stub_handler)
+
+        provider._log_recovery_attempt(
+            attempt=1,
+            last_event_type="tool.execution_start",
+            last_tool_call=None,
+        )
+
+        captured = capsys.readouterr().err
+        # No bracketed tag preceding the recovery icon
+        assert "[" not in captured.split("Idle Recovery")[0]
+
+
+class TestLogEventVerbose:
+    """Tests for SDK event verbose logging and agent attribution.
+
+    The Copilot provider renders SDK events (tool calls, reasoning, processing
+    indicators, sub-agent lifecycle) directly to the console via Rich. When
+    concurrent for-each or parallel iterations interleave their output, an
+    optional ``agent_name`` parameter prefixes each line with ``[agent_name]``
+    so consumers can attribute output to a specific iteration.
+    """
+
+    @staticmethod
+    def _event(**fields: Any) -> Any:
+        """Build a fake SDK event with the given ``.data`` attributes."""
+        from types import SimpleNamespace
+
+        return SimpleNamespace(data=SimpleNamespace(**fields))
+
+    def test_tool_execution_start_renders_agent_tag(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        provider = CopilotProvider(mock_handler=stub_handler)
+
+        provider._log_event_verbose(
+            "tool.execution_start",
+            self._event(tool_name="view"),
+            full_mode=False,
+            agent_name="processor[item_a]",
+        )
+
+        out = capsys.readouterr().err
+        assert "[processor[item_a]]" in out
+        assert "view" in out
+        # Tag must appear before the wrench icon (between tree prefix and icon)
+        assert out.index("[processor[item_a]]") < out.index("🔧")
+
+    def test_tool_execution_start_without_agent_tag(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        provider = CopilotProvider(mock_handler=stub_handler)
+
+        provider._log_event_verbose(
+            "tool.execution_start",
+            self._event(tool_name="view"),
+            full_mode=False,
+        )
+
+        out = capsys.readouterr().err
+        assert "view" in out
+        # No magenta agent tag should appear before the icon
+        assert "[processor" not in out
+
+    def test_tool_execution_start_args_line_has_agent_tag(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The ``args:`` continuation line in full mode must also be tagged."""
+        provider = CopilotProvider(mock_handler=stub_handler)
+
+        provider._log_event_verbose(
+            "tool.execution_start",
+            self._event(tool_name="grep", arguments={"pattern": "needle"}),
+            full_mode=True,
+            agent_name="processor[item_c]",
+        )
+
+        out = capsys.readouterr().err
+        # Both the tool name line and the args line should carry the tag
+        assert out.count("[processor[item_c]]") >= 2
+        assert "args:" in out
+        # On the args line, the tag must come before the ``args:`` literal
+        assert out.index("[processor[item_c]]") < out.index("args:")
+
+    def test_tool_execution_complete_renders_agent_tag(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        provider = CopilotProvider(mock_handler=stub_handler)
+
+        provider._log_event_verbose(
+            "tool.execution_complete",
+            self._event(tool_name="view", result="some result"),
+            full_mode=True,
+            agent_name="processor[0]",
+        )
+
+        out = capsys.readouterr().err
+        # Both the completion line and the result line should carry the tag
+        assert out.count("[processor[0]]") >= 2
+        assert "result:" in out
+        # The tag must precede the check-mark icon on the completion line
+        assert out.index("[processor[0]]") < out.index("✓")
+
+    def test_tool_execution_complete_without_agent_tag(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        provider = CopilotProvider(mock_handler=stub_handler)
+
+        provider._log_event_verbose(
+            "tool.execution_complete",
+            self._event(tool_name="view", result="some result"),
+            full_mode=True,
+        )
+
+        out = capsys.readouterr().err
+        assert "view" in out
+        assert "result:" in out
+        assert "[processor" not in out
+
+    def test_reasoning_renders_agent_tag(self, capsys: pytest.CaptureFixture[str]) -> None:
+        provider = CopilotProvider(mock_handler=stub_handler)
+
+        provider._log_event_verbose(
+            "assistant.reasoning",
+            self._event(content="thinking about it"),
+            full_mode=True,
+            agent_name="processor[item_x]",
+        )
+
+        out = capsys.readouterr().err
+        assert "[processor[item_x]]" in out
+        assert "thinking about it" in out
+        # Tag must precede the brain icon
+        assert out.index("[processor[item_x]]") < out.index("💭")
+
+    def test_reasoning_without_agent_tag(self, capsys: pytest.CaptureFixture[str]) -> None:
+        provider = CopilotProvider(mock_handler=stub_handler)
+
+        provider._log_event_verbose(
+            "assistant.reasoning",
+            self._event(content="thinking about it"),
+            full_mode=True,
+        )
+
+        out = capsys.readouterr().err
+        assert "thinking about it" in out
+        assert "[processor" not in out
+
+    def test_subagent_started_does_not_shadow_agent_name(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """``subagent.started`` previously bound a local ``agent_name``. The
+        outer attribution tag must still come from the method parameter, not
+        from the sub-agent name."""
+        provider = CopilotProvider(mock_handler=stub_handler)
+
+        provider._log_event_verbose(
+            "subagent.started",
+            self._event(name="sub_helper"),
+            full_mode=False,
+            agent_name="planner[item_a]",
+        )
+
+        out = capsys.readouterr().err
+        # Outer tag from method parameter
+        assert "[planner[item_a]]" in out
+        # Sub-agent name still rendered as the body of the line
+        assert "sub_helper" in out
+        # Outer tag must precede the robot icon
+        assert out.index("[planner[item_a]]") < out.index("🤖")
+
+    def test_subagent_started_without_agent_tag(self, capsys: pytest.CaptureFixture[str]) -> None:
+        provider = CopilotProvider(mock_handler=stub_handler)
+
+        provider._log_event_verbose(
+            "subagent.started",
+            self._event(name="sub_helper"),
+            full_mode=False,
+        )
+
+        out = capsys.readouterr().err
+        assert "sub_helper" in out
+        # No outer attribution tag — the sub-agent name in the line body
+        # MUST NOT be confused with an attribution tag, so explicitly check
+        # there's no bracketed tag before the robot icon.
+        assert "[planner" not in out
+
+    def test_subagent_completed_does_not_shadow_agent_name(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        provider = CopilotProvider(mock_handler=stub_handler)
+
+        provider._log_event_verbose(
+            "subagent.completed",
+            self._event(name="sub_helper"),
+            full_mode=False,
+            agent_name="planner[item_b]",
+        )
+
+        out = capsys.readouterr().err
+        assert "[planner[item_b]]" in out
+        assert "sub_helper" in out
+        # Outer tag must precede the check-mark icon
+        assert out.index("[planner[item_b]]") < out.index("✓")
+
+    def test_subagent_completed_without_agent_tag(self, capsys: pytest.CaptureFixture[str]) -> None:
+        provider = CopilotProvider(mock_handler=stub_handler)
+
+        provider._log_event_verbose(
+            "subagent.completed",
+            self._event(name="sub_helper"),
+            full_mode=False,
+        )
+
+        out = capsys.readouterr().err
+        assert "sub_helper" in out
+        assert "[planner" not in out
+
+    def test_turn_start_renders_agent_tag(self, capsys: pytest.CaptureFixture[str]) -> None:
+        provider = CopilotProvider(mock_handler=stub_handler)
+
+        provider._log_event_verbose(
+            "assistant.turn_start",
+            self._event(turn_id=3),
+            full_mode=True,
+            agent_name="processor[42]",
+        )
+
+        out = capsys.readouterr().err
+        assert "[processor[42]]" in out
+        assert "Processing" in out
+        # Tag must precede the hourglass icon
+        assert out.index("[processor[42]]") < out.index("⏳")
+
+    def test_turn_start_without_agent_tag(self, capsys: pytest.CaptureFixture[str]) -> None:
+        provider = CopilotProvider(mock_handler=stub_handler)
+
+        provider._log_event_verbose(
+            "assistant.turn_start",
+            self._event(turn_id=3),
+            full_mode=True,
+        )
+
+        out = capsys.readouterr().err
+        assert "Processing" in out
+        assert "[processor" not in out
+
 
 class TestFixPipeBlockingMode:
     """Tests for _fix_pipe_blocking_mode Windows platform guard."""
@@ -695,3 +1024,585 @@ class TestFixPipeBlockingMode:
         # early — it proceeded past the guard and attempted the import.
         with contextlib.suppress(ModuleNotFoundError):
             provider._fix_pipe_blocking_mode()
+
+
+class TestCopilotExecuteDialogTurn:
+    """Tests for Copilot provider dialog-turn API (provider parity with Claude).
+
+    The Copilot SDK is session-based and event-driven, so we mock create_session
+    and synthesize the assistant.message + session.idle events that real sessions
+    emit.
+    """
+
+    @staticmethod
+    def _build_event(event_type: str, content: str = "", message: str = "") -> Any:
+        """Build a fake SDK event with .type.value, .data.content, .data.message."""
+        from unittest.mock import Mock as _Mock
+
+        ev = _Mock()
+        ev.type = _Mock()
+        ev.type.value = event_type
+        ev.data = _Mock()
+        ev.data.content = content
+        ev.data.message = message
+        return ev
+
+    async def _make_provider_with_session(
+        self,
+        captured: dict[str, Any],
+        response_text: str = "an answer",
+    ) -> CopilotProvider:
+        """Build a provider whose create_session returns a session that, on send,
+        invokes its event handler with assistant.message + session.idle.
+        """
+        from unittest.mock import AsyncMock as _AsyncMock
+
+        provider = CopilotProvider(mock_handler=stub_handler)
+        # Force the started state without invoking the real SDK
+        provider._started = True
+
+        session = _AsyncMock()
+        captured_callback: dict[str, Any] = {}
+
+        def on_event(callback: Any) -> None:
+            captured_callback["cb"] = callback
+
+        session.on = on_event
+
+        async def send(prompt: str) -> None:
+            captured["sent_prompt"] = prompt
+            cb = captured_callback["cb"]
+            cb(self._build_event("assistant.message", response_text))
+            cb(self._build_event("session.idle"))
+
+        session.send = send
+        session.destroy = _AsyncMock()
+
+        async def create_session(**kwargs: Any) -> Any:
+            captured["create_session_kwargs"] = kwargs
+            return session
+
+        client = _AsyncMock()
+        client.create_session = create_session
+        provider._client = client
+        return provider
+
+    @pytest.mark.asyncio
+    async def test_dialog_turn_empty_history_sends_only_current_message(self) -> None:
+        captured: dict[str, Any] = {}
+        provider = await self._make_provider_with_session(captured, response_text="reply")
+
+        result = await provider.execute_dialog_turn(
+            system_prompt="be helpful",
+            user_message="hello",
+            history=[],
+        )
+
+        assert result == "reply"
+        # System prompt is sent via create_session, not embedded in the prompt body
+        assert captured["create_session_kwargs"]["system_message"] == {
+            "mode": "replace",
+            "content": "be helpful",
+        }
+        # With empty history, the prompt is just the current user message line.
+        assert captured["sent_prompt"] == "User: hello"
+
+    @pytest.mark.asyncio
+    async def test_dialog_turn_multi_turn_history_serialized_in_order(self) -> None:
+        captured: dict[str, Any] = {}
+        provider = await self._make_provider_with_session(captured)
+
+        await provider.execute_dialog_turn(
+            system_prompt="sys",
+            user_message="third",
+            history=[
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "second"},
+            ],
+        )
+
+        # History serialized as User:/Assistant: blocks separated by blank lines,
+        # with the current message appended last as a User: block.
+        assert captured["sent_prompt"] == ("User: first\n\nAssistant: second\n\nUser: third")
+
+    @pytest.mark.asyncio
+    async def test_dialog_turn_model_override_used(self) -> None:
+        captured: dict[str, Any] = {}
+        provider = await self._make_provider_with_session(captured)
+
+        await provider.execute_dialog_turn(
+            system_prompt="sys",
+            user_message="hi",
+            history=None,
+            model="claude-sonnet-4.5",
+        )
+
+        assert captured["create_session_kwargs"]["model"] == "claude-sonnet-4.5"
+
+    @pytest.mark.asyncio
+    async def test_dialog_turn_session_error_wrapped_as_provider_error(self) -> None:
+        from unittest.mock import AsyncMock as _AsyncMock
+
+        provider = CopilotProvider(mock_handler=stub_handler)
+        provider._started = True
+
+        session = _AsyncMock()
+        captured_callback: dict[str, Any] = {}
+
+        def on_event(callback: Any) -> None:
+            captured_callback["cb"] = callback
+
+        session.on = on_event
+
+        async def send(prompt: str) -> None:
+            cb = captured_callback["cb"]
+            cb(self._build_event("session.error", message="internal failure"))
+
+        session.send = send
+        session.destroy = _AsyncMock()
+
+        async def create_session(**kwargs: Any) -> Any:
+            return session
+
+        client = _AsyncMock()
+        client.create_session = create_session
+        provider._client = client
+
+        with pytest.raises(ProviderError, match="Dialog turn error"):
+            await provider.execute_dialog_turn(
+                system_prompt="sys",
+                user_message="hi",
+                history=[],
+            )
+
+
+class TestGetMaxPromptTokens:
+    """Tests for CopilotProvider.get_max_prompt_tokens."""
+
+    @staticmethod
+    def _make_model(model_id: str, max_prompt_tokens: int) -> Any:
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            id=model_id,
+            capabilities=SimpleNamespace(
+                limits=SimpleNamespace(max_prompt_tokens=max_prompt_tokens)
+            ),
+        )
+
+    @staticmethod
+    def _provider_with_list_models(list_models_impl: Any) -> CopilotProvider:
+        """Build a provider with the SDK short-circuit disabled and a fake client.
+
+        Uses ``stub_handler`` for ``mock_handler`` to satisfy the constructor,
+        then nulls ``_mock_handler`` so ``get_max_prompt_tokens`` falls through
+        to the SDK path. ``_started=True`` skips ``_ensure_client_started``.
+        """
+        from types import SimpleNamespace
+
+        provider = CopilotProvider(mock_handler=stub_handler)
+        provider._mock_handler = None
+        provider._client = SimpleNamespace(list_models=list_models_impl)
+        provider._started = True
+        return provider
+
+    @pytest.mark.asyncio
+    async def test_mock_handler_mode_returns_none(self) -> None:
+        """Mock-handler mode has no SDK to query — must return None."""
+        provider = CopilotProvider(mock_handler=stub_handler)
+        assert await provider.get_max_prompt_tokens("gpt-4o") is None
+
+    @pytest.mark.asyncio
+    async def test_returns_max_prompt_tokens_for_known_model(self) -> None:
+        async def list_models() -> list[Any]:
+            return [self._make_model("gpt-4o", 128000)]
+
+        provider = self._provider_with_list_models(list_models)
+        assert await provider.get_max_prompt_tokens("gpt-4o") == 128000
+
+    @pytest.mark.asyncio
+    async def test_returns_none_for_unknown_model(self) -> None:
+        async def list_models() -> list[Any]:
+            return []
+
+        provider = self._provider_with_list_models(list_models)
+        assert await provider.get_max_prompt_tokens("anything") is None
+
+    @pytest.mark.asyncio
+    async def test_oserror_returns_none_and_does_not_cache(self) -> None:
+        """A transport-level error is swallowed; the next call retries."""
+        calls = 0
+
+        async def list_models() -> list[Any]:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise OSError("network down")
+            return [self._make_model("gpt-4o", 128000)]
+
+        provider = self._provider_with_list_models(list_models)
+        assert await provider.get_max_prompt_tokens("gpt-4o") is None
+        assert await provider.get_max_prompt_tokens("gpt-4o") == 128000
+
+    @pytest.mark.asyncio
+    async def test_value_error_from_sdk_parser_returns_none(self) -> None:
+        """SDK schema-parsing failures (e.g. ``ValueError`` from
+        ``ModelBilling.from_dict`` when the API omits the ``multiplier``
+        field) must be soft-swallowed — context-window metadata must
+        never block workflow execution.
+
+        Regression for github-copilot-sdk 0.3.0, where ``list_models()``
+        eagerly parses every model and a single malformed entry (observed
+        for ``claude-opus-4.7-1m-internal``) raises ``ValueError`` and
+        kills the whole call.
+        """
+
+        async def list_models() -> list[Any]:
+            raise ValueError("Missing required field 'multiplier' in ModelBilling")
+
+        provider = self._provider_with_list_models(list_models)
+        assert await provider.get_max_prompt_tokens("gpt-4o") is None
+
+    @pytest.mark.asyncio
+    async def test_alias_resolves_via_match_model_id(self) -> None:
+        """Versioned-suffix aliases resolve to the SDK's listed ID."""
+
+        async def list_models() -> list[Any]:
+            return [self._make_model("claude-3-5-sonnet", 200_000)]
+
+        provider = self._provider_with_list_models(list_models)
+        assert await provider.get_max_prompt_tokens("claude-3-5-sonnet-latest") == 200_000
+        assert await provider.get_max_prompt_tokens("claude-3-5-sonnet-20241022") == 200_000
+
+
+class TestReasoningEffort:
+    """Tests for reasoning_effort plumbing into create_session."""
+
+    @staticmethod
+    def _make_model(model_id: str, supported: list[str] | None) -> Any:
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            id=model_id,
+            capabilities=SimpleNamespace(
+                limits=SimpleNamespace(max_prompt_tokens=128_000),
+                supported_reasoning_efforts=supported,
+            ),
+        )
+
+    @staticmethod
+    async def _build_provider(
+        captured: dict[str, Any],
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        default_reasoning_effort: str | None = None,
+        list_models_impl: Any = None,
+    ) -> CopilotProvider:
+        """Build a provider with a fake client that captures create_session kwargs.
+
+        The provider is in real-SDK mode (``_mock_handler`` set to ``None``)
+        so the validation + plumbing path is exercised end to end.
+        """
+
+        class _FakeSession:
+            session_id = "session-xyz"
+
+            async def disconnect(self) -> None:
+                return None
+
+        class _FakeClient:
+            async def create_session(self, **kwargs: Any) -> _FakeSession:
+                captured["create_session_kwargs"] = kwargs
+                return _FakeSession()
+
+            async def list_models(self) -> list[Any]:
+                if list_models_impl is None:
+                    return []
+                return await list_models_impl()
+
+        provider = CopilotProvider(
+            mock_handler=stub_handler,
+            default_reasoning_effort=default_reasoning_effort,
+        )
+        provider._mock_handler = None
+        provider._client = _FakeClient()
+        provider._started = True
+
+        async def _noop() -> None:
+            return None
+
+        async def _fake_send_and_wait(*args: Any, **kwargs: Any) -> SDKResponse:
+            return SDKResponse(content='{"ok":true}')
+
+        monkeypatch.setattr(provider, "_ensure_client_started", _noop)
+        monkeypatch.setattr(provider, "_send_and_wait", _fake_send_and_wait)
+        return provider
+
+    @pytest.mark.asyncio
+    async def test_per_agent_effort_forwarded_to_create_session(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from conductor.config.schema import ReasoningConfig
+
+        captured: dict[str, Any] = {}
+        provider = await self._build_provider(captured, monkeypatch)
+        agent = AgentDef(
+            name="planner",
+            model="gpt-4o",
+            prompt="Plan",
+            reasoning=ReasoningConfig(effort="high"),
+        )
+        await provider.execute(agent=agent, context={}, rendered_prompt="Plan")
+        assert captured["create_session_kwargs"]["reasoning_effort"] == "high"
+
+    @pytest.mark.asyncio
+    async def test_runtime_default_used_when_agent_has_none(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        captured: dict[str, Any] = {}
+        provider = await self._build_provider(
+            captured, monkeypatch, default_reasoning_effort="medium"
+        )
+        agent = AgentDef(name="planner", model="gpt-4o", prompt="Plan")
+        await provider.execute(agent=agent, context={}, rendered_prompt="Plan")
+        assert captured["create_session_kwargs"]["reasoning_effort"] == "medium"
+
+    @pytest.mark.asyncio
+    async def test_per_agent_effort_overrides_runtime_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from conductor.config.schema import ReasoningConfig
+
+        captured: dict[str, Any] = {}
+        provider = await self._build_provider(captured, monkeypatch, default_reasoning_effort="low")
+        agent = AgentDef(
+            name="planner",
+            model="gpt-4o",
+            prompt="Plan",
+            reasoning=ReasoningConfig(effort="xhigh"),
+        )
+        await provider.execute(agent=agent, context={}, rendered_prompt="Plan")
+        assert captured["create_session_kwargs"]["reasoning_effort"] == "xhigh"
+
+    @pytest.mark.asyncio
+    async def test_no_effort_set_means_key_absent(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured: dict[str, Any] = {}
+        provider = await self._build_provider(captured, monkeypatch)
+        agent = AgentDef(name="planner", model="gpt-4o", prompt="Plan")
+        await provider.execute(agent=agent, context={}, rendered_prompt="Plan")
+        assert "reasoning_effort" not in captured["create_session_kwargs"]
+
+    @pytest.mark.asyncio
+    async def test_validation_error_when_model_does_not_support_effort(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from conductor.config.schema import ReasoningConfig
+        from conductor.exceptions import ValidationError
+
+        async def list_models() -> list[Any]:
+            return [self._make_model("gpt-4o", supported=["low", "medium"])]
+
+        captured: dict[str, Any] = {}
+        provider = await self._build_provider(captured, monkeypatch, list_models_impl=list_models)
+        agent = AgentDef(
+            name="planner",
+            model="gpt-4o",
+            prompt="Plan",
+            reasoning=ReasoningConfig(effort="xhigh"),
+        )
+        with pytest.raises(ValidationError, match="does not support reasoning_effort"):
+            await provider.execute(agent=agent, context={}, rendered_prompt="Plan")
+
+    @pytest.mark.asyncio
+    async def test_validation_skipped_in_mock_handler_mode(self) -> None:
+        """Mock-handler mode must skip capability validation entirely."""
+        provider = CopilotProvider(mock_handler=stub_handler)
+        # Even an obviously bogus effort value is accepted because the SDK
+        # path is short-circuited by the mock handler.
+        await provider._validate_reasoning_effort_for_model("gpt-4o", "xhigh")
+
+    @pytest.mark.asyncio
+    async def test_supported_efforts_none_allows_any_effort(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When the SDK reports no capability metadata, validation is permissive."""
+        from conductor.config.schema import ReasoningConfig
+
+        async def list_models() -> list[Any]:
+            return [self._make_model("gpt-4o", supported=None)]
+
+        captured: dict[str, Any] = {}
+        provider = await self._build_provider(captured, monkeypatch, list_models_impl=list_models)
+        agent = AgentDef(
+            name="planner",
+            model="gpt-4o",
+            prompt="Plan",
+            reasoning=ReasoningConfig(effort="xhigh"),
+        )
+        await provider.execute(agent=agent, context={}, rendered_prompt="Plan")
+        assert captured["create_session_kwargs"]["reasoning_effort"] == "xhigh"
+
+    @pytest.mark.asyncio
+    async def test_value_error_from_sdk_parser_skips_validation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """SDK schema-parsing failures during ``list_models()`` must not block
+        execution — validation is skipped permissively and the configured
+        ``reasoning_effort`` is still forwarded to ``create_session``.
+
+        Regression for github-copilot-sdk 0.3.0: ``ModelBilling.from_dict``
+        raises ``ValueError("Missing required field 'multiplier' in
+        ModelBilling")`` for models like ``claude-opus-4.7-1m-internal``,
+        which previously leaked through the narrow except tuple in
+        ``_validate_reasoning_effort_for_model`` and surfaced as a
+        ``Dialog turn failed: …`` error after exhausting the retry loop.
+        """
+        from conductor.config.schema import ReasoningConfig
+
+        async def list_models() -> list[Any]:
+            raise ValueError("Missing required field 'multiplier' in ModelBilling")
+
+        captured: dict[str, Any] = {}
+        provider = await self._build_provider(captured, monkeypatch, list_models_impl=list_models)
+        agent = AgentDef(
+            name="planner",
+            model="claude-opus-4.7-1m-internal",
+            prompt="Plan",
+            reasoning=ReasoningConfig(effort="xhigh"),
+        )
+        await provider.execute(agent=agent, context={}, rendered_prompt="Plan")
+        assert captured["create_session_kwargs"]["reasoning_effort"] == "xhigh"
+
+    @pytest.mark.asyncio
+    async def test_validation_error_not_retried_in_execute_with_retry(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression: ValidationError from capability check must escape unwrapped
+        from _execute_with_retry after a single attempt — no retry, no sleep,
+        and not re-wrapped as ProviderError.
+        """
+        from conductor.config.schema import ReasoningConfig
+        from conductor.exceptions import ValidationError
+
+        list_models_calls = 0
+
+        async def list_models() -> list[Any]:
+            nonlocal list_models_calls
+            list_models_calls += 1
+            return [self._make_model("gpt-4o", supported=["low", "medium"])]
+
+        sleep_calls: list[float] = []
+
+        async def fake_sleep(delay: float) -> None:
+            sleep_calls.append(delay)
+
+        monkeypatch.setattr("conductor.providers.copilot.asyncio.sleep", fake_sleep)
+
+        captured: dict[str, Any] = {}
+        provider = await self._build_provider(captured, monkeypatch, list_models_impl=list_models)
+        # Force a multi-attempt retry config so a successful retry-suppression
+        # is unambiguous (a ProviderError-wrapped path would loop 3 times).
+        provider._retry_config = RetryConfig(max_attempts=3, base_delay=0.0, max_delay=0.0)
+
+        agent = AgentDef(
+            name="planner",
+            model="gpt-4o",
+            prompt="Plan",
+            reasoning=ReasoningConfig(effort="high"),
+        )
+
+        with pytest.raises(ValidationError, match="does not support reasoning_effort"):
+            await provider.execute(agent=agent, context={}, rendered_prompt="Plan")
+
+        # Capability check ran exactly once — no retry of the SDK call.
+        assert list_models_calls == 1
+        # _retry_history is only appended on the ProviderError/Exception
+        # branches; the ValidationError branch must skip it entirely.
+        assert provider.get_retry_history() == []
+        # No backoff sleep was scheduled.
+        assert sleep_calls == []
+
+    @pytest.mark.asyncio
+    async def test_validation_error_from_dialog_turn_escapes_unwrapped(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression: ValidationError from execute_dialog_turn must propagate
+        unwrapped (not re-wrapped as ProviderError by the broad except clause).
+        """
+        from unittest.mock import AsyncMock as _AsyncMock
+
+        from conductor.exceptions import ValidationError
+
+        provider = CopilotProvider(
+            mock_handler=stub_handler,
+            default_reasoning_effort="xhigh",
+        )
+        provider._mock_handler = None
+        provider._started = True
+
+        async def list_models() -> list[Any]:
+            return [self._make_model("gpt-4o", supported=["low", "medium"])]
+
+        # create_session must NOT be reached when validation fails.
+        create_session_called = False
+
+        async def create_session(**kwargs: Any) -> Any:
+            nonlocal create_session_called
+            create_session_called = True
+            raise AssertionError("create_session should not be called when validation fails")
+
+        client = _AsyncMock()
+        client.create_session = create_session
+        client.list_models = list_models
+        provider._client = client
+
+        async def _noop() -> None:
+            return None
+
+        monkeypatch.setattr(provider, "_ensure_client_started", _noop)
+
+        with pytest.raises(ValidationError) as exc_info:
+            await provider.execute_dialog_turn(
+                system_prompt="be helpful",
+                user_message="hi",
+                history=[],
+                model="gpt-4o",
+            )
+
+        # Original typed error preserved (not stringified into ProviderError).
+        assert "does not support reasoning_effort" in str(exc_info.value)
+        assert exc_info.value.suggestion is not None
+        assert not create_session_called
+
+    @pytest.mark.asyncio
+    async def test_retryable_provider_error_is_still_retried(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Guard against an over-broad fix: non-validation ProviderError must
+        still trigger the retry loop up to max_attempts.
+        """
+        call_count = 0
+
+        def mock_handler(agent: AgentDef, prompt: str, context: dict[str, Any]) -> dict[str, Any]:
+            nonlocal call_count
+            call_count += 1
+            raise ProviderError("transient backend error", status_code=500)
+
+        sleep_calls: list[float] = []
+
+        async def fake_sleep(delay: float) -> None:
+            sleep_calls.append(delay)
+
+        monkeypatch.setattr("conductor.providers.copilot.asyncio.sleep", fake_sleep)
+
+        retry_config = RetryConfig(max_attempts=3, base_delay=0.0, max_delay=0.0, jitter=0.0)
+        provider = CopilotProvider(mock_handler=mock_handler, retry_config=retry_config)
+        agent = AgentDef(name="planner", model="gpt-4o", prompt="Plan")
+
+        with pytest.raises(ProviderError):
+            await provider.execute(agent=agent, context={}, rendered_prompt="Plan")
+
+        assert call_count == 3
+        assert len(provider.get_retry_history()) == 3
+        # Two backoff sleeps between three attempts.
+        assert len(sleep_calls) == 2

@@ -6,17 +6,22 @@ Covers:
 - ``fetch_latest_version()`` with mocked network responses
 - ``check_for_update_hint()`` with TTY/verbosity/subcommand guards
 - ``run_update()`` with mocked subprocess execution
+- ``run_update(apply=True)`` spawn-and-exit handoff to the install script
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
+import subprocess
+import sys
 from datetime import UTC, datetime, timedelta
 from io import StringIO
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+import typer
 from rich.console import Console
 from typer.testing import CliRunner
 
@@ -396,277 +401,364 @@ class TestCheckForUpdateHint:
         output = buf.getvalue()
         assert "99.0.0" in output
 
+    def test_hint_mentions_apply_for_one_step_upgrade(self, cache_dir: Path) -> None:
+        """The hint should advertise both `update` and `update --apply`."""
+        now = datetime.now(UTC)
+        (cache_dir / "update-check.json").write_text(
+            json.dumps(
+                {
+                    "version": "99.0.0",
+                    "tag_name": "v99.0.0",
+                    "url": "https://example.com",
+                    "checked_at": now.isoformat(),
+                }
+            )
+        )
+
+        c, buf = _make_console(is_terminal=True)
+        with (
+            patch("conductor.cli.update.sys.argv", ["conductor", "run", "wf.yaml"]),
+            patch("conductor.cli.app.console_verbosity") as mock_cv,
+        ):
+            from conductor.cli.app import ConsoleVerbosity
+
+            mock_cv.get.return_value = ConsoleVerbosity.FULL
+            check_for_update_hint(c)
+
+        output = buf.getvalue()
+        assert "conductor update" in output
+        assert "--apply" in output
+
+    @pytest.mark.parametrize("flag", ["--help", "-h", "--version", "-v"])
+    def test_help_or_version_flag_skips_hint(self, cache_dir: Path, flag: str) -> None:
+        """The hint must not pollute --help / --version output."""
+        now = datetime.now(UTC)
+        (cache_dir / "update-check.json").write_text(
+            json.dumps(
+                {
+                    "version": "99.0.0",
+                    "tag_name": "v99.0.0",
+                    "url": "https://example.com",
+                    "checked_at": now.isoformat(),
+                }
+            )
+        )
+
+        c, buf = _make_console(is_terminal=True)
+        with (
+            patch("conductor.cli.update.sys.argv", ["conductor", flag]),
+            patch("conductor.cli.app.console_verbosity") as mock_cv,
+        ):
+            from conductor.cli.app import ConsoleVerbosity
+
+            mock_cv.get.return_value = ConsoleVerbosity.FULL
+            check_for_update_hint(c)
+
+        assert buf.getvalue() == ""
+
+    @pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "Yes"])
+    def test_env_var_disables_hint(
+        self, cache_dir: Path, monkeypatch: pytest.MonkeyPatch, value: str
+    ) -> None:
+        """``CONDUCTOR_NO_UPDATE_CHECK`` permanently silences the hint."""
+        now = datetime.now(UTC)
+        (cache_dir / "update-check.json").write_text(
+            json.dumps(
+                {
+                    "version": "99.0.0",
+                    "tag_name": "v99.0.0",
+                    "url": "https://example.com",
+                    "checked_at": now.isoformat(),
+                }
+            )
+        )
+
+        monkeypatch.setenv("CONDUCTOR_NO_UPDATE_CHECK", value)
+        c, buf = _make_console(is_terminal=True)
+        with (
+            patch("conductor.cli.update.sys.argv", ["conductor", "run", "wf.yaml"]),
+            patch("conductor.cli.app.console_verbosity") as mock_cv,
+            patch("conductor.cli.update.fetch_latest_version") as mock_fetch,
+        ):
+            from conductor.cli.app import ConsoleVerbosity
+
+            mock_cv.get.return_value = ConsoleVerbosity.FULL
+            check_for_update_hint(c)
+
+        assert buf.getvalue() == ""
+        # Critically: the env var should also short-circuit BEFORE the
+        # network fetch, so users who opt out don't pay any latency cost.
+        mock_fetch.assert_not_called()
+
+    @pytest.mark.parametrize("value", ["", "0", "false", "no", "anything-else"])
+    def test_env_var_falsy_value_does_not_disable_hint(
+        self, cache_dir: Path, monkeypatch: pytest.MonkeyPatch, value: str
+    ) -> None:
+        """Non-truthy env values must NOT disable the hint (avoid surprise opt-outs)."""
+        now = datetime.now(UTC)
+        (cache_dir / "update-check.json").write_text(
+            json.dumps(
+                {
+                    "version": "99.0.0",
+                    "tag_name": "v99.0.0",
+                    "url": "https://example.com",
+                    "checked_at": now.isoformat(),
+                }
+            )
+        )
+
+        monkeypatch.setenv("CONDUCTOR_NO_UPDATE_CHECK", value)
+        c, buf = _make_console(is_terminal=True)
+        with (
+            patch("conductor.cli.update.sys.argv", ["conductor", "run", "wf.yaml"]),
+            patch("conductor.cli.app.console_verbosity") as mock_cv,
+        ):
+            from conductor.cli.app import ConsoleVerbosity
+
+            mock_cv.get.return_value = ConsoleVerbosity.FULL
+            check_for_update_hint(c)
+
+        assert "99.0.0" in buf.getvalue()
+
 
 # ===================================================================
-# E2-T8: run_update
+# E2-T8: run_update (now: instructs the user to run the install script)
 # ===================================================================
 
 
 class TestRunUpdate:
-    """Tests for ``run_update`` with mocked subprocess."""
-
-    def test_successful_upgrade(self, cache_dir: Path) -> None:
-        """Successful upgrade prints before/after and clears cache."""
-        # Pre-populate cache to verify it's deleted
-        cache_file = cache_dir / "update-check.json"
-        cache_file.write_text("{}")
-
-        c, buf = _make_console(is_terminal=True)
-        mock_proc = MagicMock()
-        mock_proc.returncode = 0
-        mock_proc.stderr = ""
-
-        with (
-            patch(
-                "conductor.cli.update.fetch_latest_version",
-                return_value=("99.0.0", "v99.0.0", "https://example.com"),
-            ),
-            patch("conductor.cli.update.subprocess.run", return_value=mock_proc) as mock_run,
-        ):
-            run_update(c)
-
-        output = buf.getvalue()
-        assert "99.0.0" in output
-        assert "Successfully upgraded" in output
-
-        # Verify subprocess was called with the correct command
-        args = mock_run.call_args[0][0]
-        assert args[0] == "uv"
-        assert "--force" in args
-        assert any("@v99.0.0" in a for a in args)
-
-        # Cache should be deleted
-        assert not cache_file.exists()
+    """Tests for `run_update` after the move to install-script-only upgrades."""
 
     def test_already_up_to_date(self, cache_dir: Path) -> None:
-        """When local == remote, should say 'already up to date'."""
-        import conductor
-
-        c, buf = _make_console(is_terminal=True)
-        with patch(
-            "conductor.cli.update.fetch_latest_version",
-            return_value=(
-                conductor.__version__,
-                f"v{conductor.__version__}",
-                "https://example.com",
-            ),
-        ):
-            run_update(c)
-
-        output = buf.getvalue()
-        assert "Already up to date" in output
-
-    def test_upgrade_failure(self, cache_dir: Path) -> None:
-        """Failed subprocess should report the error."""
-        c, buf = _make_console(is_terminal=True)
-        mock_proc = MagicMock()
-        mock_proc.returncode = 1
-        mock_proc.stderr = "some error output"
-
+        c, buf = _make_console()
         with (
             patch(
                 "conductor.cli.update.fetch_latest_version",
-                return_value=("99.0.0", "v99.0.0", "https://example.com"),
+                return_value=("0.1.0", "v0.1.0", "https://example/release"),
             ),
-            patch("conductor.cli.update.subprocess.run", return_value=mock_proc),
+            patch("conductor.cli.update.__version__", "0.1.0"),
         ):
             run_update(c)
-
         output = buf.getvalue()
-        assert "Upgrade failed" in output
+        assert "up to date" in output.lower()
+        assert (cache_dir / "update-check.json").exists()
 
-    def test_network_failure(self, cache_dir: Path) -> None:
-        """When fetch fails, should print an error."""
-        c, buf = _make_console(is_terminal=True)
+    def test_newer_available_prints_install_command(self, cache_dir: Path) -> None:
+        c, buf = _make_console()
+        with (
+            patch(
+                "conductor.cli.update.fetch_latest_version",
+                return_value=("99.0.0", "v99.0.0", "https://example/release"),
+            ),
+            patch("conductor.cli.update.__version__", "0.1.0"),
+        ):
+            run_update(c)
+        output = buf.getvalue()
+        assert "99.0.0" in output
+        import sys as _sys
+
+        if _sys.platform == "win32":
+            assert "install.ps1" in output
+            assert "iex" in output
+        else:
+            assert "install.sh" in output
+            assert "curl" in output
+
+    def test_no_subprocess_install_attempt(self, cache_dir: Path) -> None:
+        c, _buf = _make_console()
+        with (
+            patch(
+                "conductor.cli.update.fetch_latest_version",
+                return_value=("99.0.0", "v99.0.0", "https://example/release"),
+            ),
+            patch("conductor.cli.update.__version__", "0.1.0"),
+            patch("subprocess.run") as mock_run,
+            patch("subprocess.Popen") as mock_popen,
+        ):
+            run_update(c)
+        assert mock_run.call_count == 0
+        assert mock_popen.call_count == 0
+
+    def test_fetch_failure_prints_error(self, cache_dir: Path) -> None:
+        c, buf = _make_console()
         with patch("conductor.cli.update.fetch_latest_version", return_value=None):
             run_update(c)
+        assert "could not reach github" in buf.getvalue().lower()
 
-        output = buf.getvalue()
-        assert "Could not reach GitHub" in output
-
-    def test_command_includes_tag_name(self, cache_dir: Path) -> None:
-        """The subprocess command must include ``@{tag_name}``."""
-        c, buf = _make_console(is_terminal=True)
-        mock_proc = MagicMock()
-        mock_proc.returncode = 0
-        mock_proc.stderr = ""
-
+    def test_force_kwarg_accepted_for_back_compat(self, cache_dir: Path) -> None:
+        c, _buf = _make_console()
         with (
             patch(
                 "conductor.cli.update.fetch_latest_version",
-                return_value=("2.0.0", "v2.0.0", "https://example.com"),
+                return_value=("99.0.0", "v99.0.0", "https://example/"),
             ),
-            patch("conductor.cli.update.subprocess.run", return_value=mock_proc) as mock_run,
+            patch("conductor.cli.update.__version__", "0.1.0"),
         ):
-            run_update(c)
+            run_update(c, force=True)
 
-        args = mock_run.call_args[0][0]
-        install_arg = [a for a in args if a.startswith("git+")]
-        assert len(install_arg) == 1
-        assert install_arg[0].endswith("@v2.0.0")
 
-    def test_windows_renames_exe_before_install(self, cache_dir: Path, tmp_path: Path) -> None:
-        """On Windows, ``run_update`` renames the exe to ``.exe.old`` before calling ``uv``."""
-        # Create a fake conductor.exe
-        fake_exe = tmp_path / "conductor.exe"
-        fake_exe.write_text("fake")
+class TestRunUpdateApply:
+    """Tests for ``run_update(apply=True)`` — spawn-and-exit behavior."""
 
-        cache_file = cache_dir / "update-check.json"
-        cache_file.write_text("{}")
-
-        c, buf = _make_console(is_terminal=True)
-        mock_proc = MagicMock()
-        mock_proc.returncode = 0
-        mock_proc.stderr = ""
-
+    @pytest.fixture()
+    def newer_release(self, cache_dir: Path):
         with (
             patch(
                 "conductor.cli.update.fetch_latest_version",
-                return_value=("99.0.0", "v99.0.0", "https://example.com"),
+                return_value=("99.0.0", "v99.0.0", "https://example/release"),
             ),
+            patch("conductor.cli.update.__version__", "0.1.0"),
+        ):
+            yield
+
+    def test_apply_does_not_print_paste_command(self, newer_release) -> None:
+        """With --apply we should hand off to the installer, not print a manual command."""
+        c, buf = _make_console()
+        with (
+            patch("conductor.cli.update._spawn_installer_and_exit") as mock_spawn,
+        ):
+            run_update(c, apply=True)
+        mock_spawn.assert_called_once()
+        output = buf.getvalue()
+        # The paste-this-into-a-new-shell hint should not be shown.
+        assert "new shell" not in output.lower()
+
+    def test_apply_skipped_when_already_up_to_date(self, cache_dir: Path) -> None:
+        """If we're already on the latest version, --apply should be a no-op."""
+        c, _buf = _make_console()
+        with (
+            patch(
+                "conductor.cli.update.fetch_latest_version",
+                return_value=("0.1.0", "v0.1.0", "https://example/"),
+            ),
+            patch("conductor.cli.update.__version__", "0.1.0"),
+            patch("conductor.cli.update._spawn_installer_and_exit") as mock_spawn,
+        ):
+            run_update(c, apply=True)
+        mock_spawn.assert_not_called()
+
+    def test_apply_skipped_when_fetch_fails(self, cache_dir: Path) -> None:
+        """If we can't reach GitHub, --apply must not blindly run the installer."""
+        c, _buf = _make_console()
+        with (
+            patch("conductor.cli.update.fetch_latest_version", return_value=None),
+            patch("conductor.cli.update._spawn_installer_and_exit") as mock_spawn,
+        ):
+            run_update(c, apply=True)
+        mock_spawn.assert_not_called()
+
+    def test_apply_mentions_new_console_or_replace_in_output(self, newer_release) -> None:
+        """The handoff message should describe what is about to happen."""
+        c, buf = _make_console()
+
+        # Make _spawn_installer_and_exit do its real Rich printing but
+        # short-circuit before the actual subprocess call.
+        def fake_spawn(console):
+            if sys.platform == "win32":
+                console.print(
+                    "Installer launched in a new console window. "
+                    "This conductor process will now exit so file locks release."
+                )
+                raise SystemExit(0)
+            console.print("Replacing conductor with installer…")
+
+        with (
+            patch("conductor.cli.update._spawn_installer_and_exit", side_effect=fake_spawn),
+            contextlib.suppress(SystemExit),
+        ):
+            run_update(c, apply=True)
+        output = buf.getvalue().lower()
+        if sys.platform == "win32":
+            assert "new console" in output or "exit" in output
+        else:
+            assert "replacing" in output or "installer" in output
+
+    def test_spawn_installer_windows_uses_new_console_and_exits(self, cache_dir: Path) -> None:
+        """On Windows, the installer is spawned with CREATE_NEW_CONSOLE and we exit 0."""
+        from conductor.cli.update import _spawn_installer_and_exit
+
+        c, _buf = _make_console()
+        with (
             patch("conductor.cli.update.sys.platform", "win32"),
-            patch("conductor.cli.update._get_conductor_exe", return_value=fake_exe),
-            patch("conductor.cli.update.subprocess.run", return_value=mock_proc) as mock_run,
+            patch("subprocess.Popen") as mock_popen,
+            pytest.raises(SystemExit) as excinfo,
         ):
-            run_update(c)
+            _spawn_installer_and_exit(c)
+        assert excinfo.value.code == 0
+        mock_popen.assert_called_once()
+        kwargs = mock_popen.call_args.kwargs
+        # Must spawn detached from the current console.
+        create_new_console = getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010)
+        assert kwargs.get("creationflags", 0) & create_new_console
+        # Must also request job breakaway so the installer survives in
+        # CI runners and terminal hosts that kill all job members on close.
+        create_breakaway = getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000)
+        assert kwargs.get("creationflags", 0) & create_breakaway
+        # Must pass AUTO_STOP so the safety check doesn't trip on our
+        # about-to-die conductor process.
+        assert kwargs.get("env", {}).get("CONDUCTOR_INSTALL_AUTO_STOP") == "1"
+        # And the command must actually be the install one-liner.
+        cmd_args = mock_popen.call_args.args[0]
+        assert any("install.ps1" in str(a) for a in cmd_args)
 
-        # The exe should have been renamed to .exe.old
-        old_exe = tmp_path / "conductor.exe.old"
-        assert old_exe.exists()
-
-        # subprocess.run must be called (not Popen)
-        mock_run.assert_called_once()
-
-        # Output should say successful (synchronous path)
-        output = buf.getvalue()
-        assert "Successfully upgraded" in output
-
-        # Cache should be cleared
-        assert not cache_file.exists()
-
-    def test_windows_restores_exe_on_failure(self, cache_dir: Path, tmp_path: Path) -> None:
-        """On Windows, if ``uv`` fails and doesn't write a new exe, the old one is restored."""
-        # Create a fake conductor.exe
-        fake_exe = tmp_path / "conductor.exe"
-        fake_exe.write_text("fake")
-
-        c, buf = _make_console(is_terminal=True)
-        mock_proc = MagicMock()
-        mock_proc.returncode = 1
-        mock_proc.stderr = "install failed"
-
-        with (
-            patch(
-                "conductor.cli.update.fetch_latest_version",
-                return_value=("99.0.0", "v99.0.0", "https://example.com"),
-            ),
-            patch("conductor.cli.update.sys.platform", "win32"),
-            patch("conductor.cli.update._get_conductor_exe", return_value=fake_exe),
-            patch("conductor.cli.update.subprocess.run", return_value=mock_proc),
-        ):
-            run_update(c)
-
-        # The .old file should have been renamed back to .exe since uv didn't write a new one
-        assert fake_exe.exists()
-        old_exe = tmp_path / "conductor.exe.old"
-        assert not old_exe.exists()
-
-        # Output should report failure
-        output = buf.getvalue()
-        assert "Upgrade failed" in output
-
-    def test_windows_cleans_up_previous_old_exe(self, cache_dir: Path, tmp_path: Path) -> None:
-        """On Windows, a leftover ``.exe.old`` from a previous update is deleted first."""
-        # Create a fake conductor.exe and a pre-existing .old file
-        fake_exe = tmp_path / "conductor.exe"
-        fake_exe.write_text("new-fake")
-        old_leftover = tmp_path / "conductor.exe.old"
-        old_leftover.write_text("stale-old")
-
-        c, buf = _make_console(is_terminal=True)
-        mock_proc = MagicMock()
-        mock_proc.returncode = 0
-        mock_proc.stderr = ""
-
-        with (
-            patch(
-                "conductor.cli.update.fetch_latest_version",
-                return_value=("99.0.0", "v99.0.0", "https://example.com"),
-            ),
-            patch("conductor.cli.update.sys.platform", "win32"),
-            patch("conductor.cli.update._get_conductor_exe", return_value=fake_exe),
-            patch("conductor.cli.update.subprocess.run", return_value=mock_proc),
-        ):
-            run_update(c)
-
-        # The old leftover should be gone, replaced by the newly renamed exe
-        old_exe = tmp_path / "conductor.exe.old"
-        assert old_exe.exists()
-        # The content should be "new-fake" (current exe), not "stale-old"
-        assert old_exe.read_text() == "new-fake"
-
-    def test_unix_skips_rename(self, cache_dir: Path) -> None:
-        """On non-Windows platforms, ``_get_conductor_exe`` is not called."""
-        c, buf = _make_console(is_terminal=True)
-        mock_proc = MagicMock()
-        mock_proc.returncode = 0
-        mock_proc.stderr = ""
-
-        with (
-            patch(
-                "conductor.cli.update.fetch_latest_version",
-                return_value=("99.0.0", "v99.0.0", "https://example.com"),
-            ),
-            patch("conductor.cli.update.sys.platform", "linux"),
-            patch("conductor.cli.update.subprocess.run", return_value=mock_proc) as mock_run,
-            patch("conductor.cli.update._get_conductor_exe") as mock_get_exe,
-        ):
-            run_update(c)
-
-        # _get_conductor_exe must NOT be called on Linux
-        mock_get_exe.assert_not_called()
-
-        # subprocess.run must be called
-        mock_run.assert_called_once()
-
-        # Output should mention successful upgrade
-        output = buf.getvalue()
-        assert "Successfully upgraded" in output
-
-    def test_windows_entrypoint_failure_reports_success(
-        self, cache_dir: Path, tmp_path: Path
+    def test_spawn_installer_windows_falls_back_when_breakaway_denied(
+        self, cache_dir: Path
     ) -> None:
-        """On Windows, if uv installs the package but fails to copy the entrypoint,
-        report success with a restart note instead of failure."""
-        fake_exe = tmp_path / "conductor.exe"
-        fake_exe.write_text("fake")
+        """If the parent's job forbids breakaway, retry without that flag."""
+        from conductor.cli.update import _spawn_installer_and_exit
 
-        cache_file = cache_dir / "update-check.json"
-        cache_file.write_text("{}")
-
-        c, buf = _make_console(is_terminal=True)
-        mock_proc = MagicMock()
-        mock_proc.returncode = 2
-        mock_proc.stderr = "error: Failed to install entrypoint\n  Caused by: failed to copy file"
-
+        c, _buf = _make_console()
+        # First call (with breakaway) raises ERROR_ACCESS_DENIED;
+        # second call (CREATE_NEW_CONSOLE only) succeeds.
+        access_denied = OSError(5, "Access is denied")
         with (
-            patch(
-                "conductor.cli.update.fetch_latest_version",
-                return_value=("99.0.0", "v99.0.0", "https://example.com"),
-            ),
             patch("conductor.cli.update.sys.platform", "win32"),
-            patch("conductor.cli.update._get_conductor_exe", return_value=fake_exe),
-            patch("conductor.cli.update.subprocess.run", return_value=mock_proc),
+            patch("subprocess.Popen", side_effect=[access_denied, MagicMock()]) as mock_popen,
+            pytest.raises(SystemExit) as excinfo,
         ):
-            run_update(c)
+            _spawn_installer_and_exit(c)
+        assert excinfo.value.code == 0
+        # Two attempts: with breakaway, then without.
+        assert mock_popen.call_count == 2
+        first_flags = mock_popen.call_args_list[0].kwargs.get("creationflags", 0)
+        second_flags = mock_popen.call_args_list[1].kwargs.get("creationflags", 0)
+        create_breakaway = getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000)
+        create_new_console = getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010)
+        assert first_flags & create_breakaway
+        assert not (second_flags & create_breakaway)
+        assert second_flags & create_new_console
 
-        output = buf.getvalue()
-        assert "Successfully upgraded" in output
-        assert "restart your terminal" in output
-        assert "Upgrade failed" not in output
+    def test_spawn_installer_windows_aborts_when_all_attempts_fail(self, cache_dir: Path) -> None:
+        """If both spawn attempts fail, surface the last error and exit 1."""
+        from conductor.cli.update import _spawn_installer_and_exit
 
-        # Cache should be cleared on partial success
-        assert not cache_file.exists()
+        c, buf = _make_console()
+        with (
+            patch("conductor.cli.update.sys.platform", "win32"),
+            patch("subprocess.Popen", side_effect=OSError(5, "Access is denied")),
+            pytest.raises(SystemExit) as excinfo,
+        ):
+            _spawn_installer_and_exit(c)
+        assert excinfo.value.code == 1
+        # User-facing fallback hint must reference the manual install command.
+        assert "install.ps1" in buf.getvalue() or "install.sh" in buf.getvalue()
+
+    def test_spawn_installer_posix_execs_sh(self, cache_dir: Path) -> None:
+        """On POSIX, the installer replaces the current process via execvpe."""
+        from conductor.cli.update import _spawn_installer_and_exit
+
+        c, _buf = _make_console()
+        with (
+            patch("conductor.cli.update.sys.platform", "linux"),
+            patch("os.execvpe") as mock_exec,
+        ):
+            _spawn_installer_and_exit(c)
+        mock_exec.assert_called_once()
+        program, argv, env = mock_exec.call_args.args
+        assert program == "sh"
+        assert argv[0] == "sh" and argv[1] == "-c"
+        assert "install.sh" in argv[2]
+        assert env.get("CONDUCTOR_INSTALL_AUTO_STOP") == "1"
 
 
 # ===================================================================
@@ -685,6 +777,29 @@ class TestUpdateCommand:
             result = runner.invoke(app, ["update"])
         assert result.exit_code == 0
         mock_run.assert_called_once()
+
+    def test_update_apply_flag_passes_through(self, cache_dir: Path) -> None:
+        """``conductor update --apply`` must forward ``apply=True``."""
+        with patch("conductor.cli.update.run_update") as mock_run:
+            result = runner.invoke(app, ["update", "--apply"])
+        assert result.exit_code == 0
+        mock_run.assert_called_once()
+        kwargs = mock_run.call_args.kwargs
+        assert kwargs.get("apply") is True
+
+    def test_update_apply_flag_visible_in_help(self) -> None:
+        """``--apply`` should be a registered option on ``conductor update``.
+
+        We don't check the ``--help`` rendering directly because Rich's
+        narrow-terminal output in CI wraps the option name column in ways
+        that break naive substring search; introspecting the click command
+        is robust to that.
+        """
+        # Find the click command Typer registered for ``update``.
+        click_app = typer.main.get_command(app)
+        update_cmd = click_app.commands["update"]
+        param_names = {opt for p in update_cmd.params for opt in getattr(p, "opts", [])}
+        assert "--apply" in param_names
 
     def test_update_command_visible_in_help(self) -> None:
         """``update`` should appear in ``conductor --help``."""

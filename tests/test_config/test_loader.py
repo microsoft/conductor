@@ -101,7 +101,7 @@ class TestConfigLoader:
 
         assert config.workflow.name == "full-workflow"
         assert config.workflow.version == "1.0.0"
-        assert config.workflow.runtime.provider == "copilot"
+        assert config.workflow.runtime.provider.name == "copilot"
         assert config.workflow.limits.max_iterations == 20
         assert config.workflow.limits.timeout_seconds == 300
         assert config.workflow.context.mode == "accumulate"
@@ -162,7 +162,7 @@ class TestConfigLoader:
             loader = ConfigLoader()
             config = loader.load(fixtures_dir / "valid_env_vars.yaml")
 
-        assert config.workflow.runtime.provider == "openai-agents"
+        assert config.workflow.runtime.provider.name == "openai-agents"
         assert config.workflow.runtime.default_model == "gpt-4-turbo"
         assert config.agents[0].model == "gpt-3.5"
         assert "secret123" in config.agents[0].prompt
@@ -243,7 +243,7 @@ agents:
         config = load_config_string(yaml_content)
 
         # Check defaults
-        assert config.workflow.runtime.provider == "copilot"
+        assert config.workflow.runtime.provider.name == "copilot"
         assert config.workflow.limits.max_iterations == 10
         assert config.workflow.limits.timeout_seconds is None  # Unlimited by default
         assert config.workflow.context.mode == "accumulate"

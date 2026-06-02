@@ -9,6 +9,7 @@ The Claude provider enables Conductor workflows to use Anthropic's Claude models
 - [Model Selection](#model-selection)
 - [Runtime Configuration](#runtime-configuration)
 - [Streaming Limitations](#streaming-limitations)
+- [Extended Thinking](#extended-thinking)
 - [Troubleshooting](#troubleshooting)
 - [Cost Optimization](#cost-optimization)
 
@@ -97,7 +98,7 @@ echo '.env' >> .gitignore
 
 ## Model Selection
 
-Claude offers multiple model tiers optimized for different use cases. All models support a 200K token context window.
+Claude offers multiple model tiers optimized for different use cases. All current Claude models default to a 200K-token context window; the dashboard's "context remaining" bar sources this value from the Anthropic SDK at runtime, so it always reflects the actual cap your account has access to (rather than a hand-maintained number that can drift). Beta context modes such as Claude's 1M-token window are not enabled by default in conductor today.
 
 ### Available Models
 
@@ -286,6 +287,77 @@ Streaming support is planned for Phase 2 (estimated 2-3 weeks):
 - Streaming event handling and error recovery
 
 Track progress in the project roadmap or GitHub issues.
+
+## Extended Thinking
+
+The Claude provider supports Anthropic's extended thinking via the unified
+[`reasoning.effort`](../configuration.md#reasoning-effort) field. Set a
+workflow-wide default with `runtime.default_reasoning_effort` and/or override
+per agent with an `reasoning.effort` block:
+
+```yaml
+workflow:
+  runtime:
+    provider: claude
+    default_model: claude-sonnet-4.5
+    default_reasoning_effort: medium
+
+agents:
+  - name: planner
+    reasoning:
+      effort: high          # per-agent override
+    prompt: "Plan a deployment for {{ workflow.input.service }}"
+```
+
+### Effort → thinking budget
+
+The unified effort level is translated into Anthropic's
+`messages.create(thinking={"type": "enabled", "budget_tokens": N})` parameter:
+
+| Effort   | Budget tokens |
+|----------|---------------|
+| `low`    | 2 048         |
+| `medium` | 8 192         |
+| `high`   | 16 384        |
+| `xhigh`  | 32 768        |
+
+### Supported models
+
+Extended thinking is only valid on thinking-capable models. The provider
+accepts any model whose name starts with one of:
+
+- `claude-3-7-*`
+- `claude-opus-4*`
+- `claude-sonnet-4*`
+- `claude-haiku-4*`
+
+Requesting `reasoning.effort` on any other model raises a `ValidationError` at
+startup so you fail fast instead of silently dropping the budget.
+
+### Auto-coercion of `temperature` and `max_tokens`
+
+When extended thinking is enabled, the Anthropic API requires `temperature=1.0`
+and a `max_tokens` value large enough to contain both the thinking budget and
+the visible response. The provider handles this for you:
+
+- **`temperature`**: coerced to `1.0` (logged at INFO if you configured a
+  different value).
+- **`max_tokens`**: bumped to `budget + 4096`, capped at `64000` (logged at INFO
+  when clamped).
+
+This means you don't need to hand-tune `max_tokens` when raising the effort —
+the provider will widen the output budget to fit. If you've explicitly set a
+`max_tokens` higher than `budget + 4096`, your value is preserved.
+
+### Reasoning content in events
+
+Any thinking content the model returns is surfaced as `agent_reasoning` events
+alongside the regular `agent_message` stream, and shows up in the dashboard
+detail panel, the JSONL log, and the `-vv` console output. The Copilot provider
+emits the same event shape so workflows that mix providers render consistently.
+
+See [`examples/reasoning-effort.yaml`](../../examples/reasoning-effort.yaml) for
+a runnable end-to-end example.
 
 ## Troubleshooting
 

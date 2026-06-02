@@ -97,22 +97,26 @@ class TestListWorkflows:
 
         mock_index = RegistryIndex(
             workflows={
-                "qa-bot": WorkflowInfo(
-                    description="QA helper", path="qa/bot.yaml", versions=["1.0", "1.1"]
-                ),
-                "summarizer": WorkflowInfo(
-                    description="Summarize docs", path="summarizer.yaml", versions=["2.0"]
-                ),
+                "qa-bot": WorkflowInfo(description="QA helper", path="qa/bot.yaml"),
+                "summarizer": WorkflowInfo(description="Summarize docs", path="summarizer.yaml"),
             }
         )
 
-        with patch("conductor.cli.registry.load_index", return_value=mock_index):
+        with (
+            patch("conductor.cli.registry.load_index", return_value=mock_index),
+            patch(
+                "conductor.cli.registry.list_tags",
+                return_value=["v2.0.0", "v1.5.0", "v1.4.0", "v1.3.0", "v1.2.0", "v1.1.0"],
+            ),
+        ):
             result = runner.invoke(app, ["registry", "list", "team"])
 
         assert result.exit_code == 0
         assert "qa-bot" in result.output
         assert "summarizer" in result.output
-        assert "1.0" in result.output
+        assert "Latest tags:" in result.output
+        assert "v2.0.0" in result.output
+        assert "..." in result.output  # >5 tags → truncation indicator
 
     def test_list_workflows_unknown_registry(self) -> None:
         result = runner.invoke(app, ["registry", "list", "nope"])
@@ -182,13 +186,14 @@ class TestShow:
 
         mock_index = RegistryIndex(
             workflows={
-                "qa-bot": WorkflowInfo(
-                    description="QA helper", path="qa/bot.yaml", versions=["1.0", "1.1"]
-                ),
+                "qa-bot": WorkflowInfo(description="QA helper", path="qa/bot.yaml"),
             }
         )
 
-        with patch("conductor.cli.registry.load_index", return_value=mock_index):
+        with (
+            patch("conductor.cli.registry.load_index", return_value=mock_index),
+            patch("conductor.cli.registry.list_tags", return_value=["v1.0.0"]),
+        ):
             result = runner.invoke(app, ["registry", "show", "team"])
 
         assert result.exit_code == 0
@@ -196,6 +201,8 @@ class TestShow:
         assert "acme/workflows" in result.output
         assert "qa-bot" in result.output
         assert "QA helper" in result.output
+        assert "Latest tags:" in result.output
+        assert "v1.0.0" in result.output
         assert "conductor show" in result.output
 
     def test_show_unknown_registry(self) -> None:
@@ -252,3 +259,101 @@ class TestUpdate:
         result = runner.invoke(app, ["registry", "update"])
         assert result.exit_code == 0
         assert "No registries configured" in result.output
+
+
+# ---------------------------------------------------------------------------
+# update: tmp dir pruning
+# ---------------------------------------------------------------------------
+
+
+class TestUpdatePrunesTempDirs:
+    def test_update_prunes_temp_dirs(
+        self, tmp_path: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from pathlib import Path
+
+        runner.invoke(app, ["registry", "add", "team", "acme/workflows"])
+
+        # Drop a .tmp-* dir under the cache layout for this registry.
+        cache_base = Path(str(tmp_path)) / "cache" / "registries"
+        orphan = cache_base / "team" / "wf" / ".tmp-orphan"
+        orphan.mkdir(parents=True)
+
+        from conductor.registry.index import RegistryIndex
+
+        # Mock clear_cache as a no-op so the orphan survives until prune_temp_dirs runs.
+        with (
+            patch("conductor.cli.registry.clear_cache"),
+            patch("conductor.cli.registry.load_index", return_value=RegistryIndex(workflows={})),
+        ):
+            result = runner.invoke(app, ["registry", "update", "team"])
+
+        assert result.exit_code == 0
+        assert not orphan.exists()
+        assert "Pruned 1 stale .tmp-* directories." in result.output
+
+    def test_update_no_prune_message_when_zero(
+        self, tmp_path: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        runner.invoke(app, ["registry", "add", "team", "acme/workflows"])
+
+        from conductor.registry.index import RegistryIndex
+
+        with patch("conductor.cli.registry.load_index", return_value=RegistryIndex(workflows={})):
+            result = runner.invoke(app, ["registry", "update", "team"])
+
+        assert result.exit_code == 0
+        assert "Pruned" not in result.output
+
+
+# ---------------------------------------------------------------------------
+# _format_latest_tags: error surfacing
+# ---------------------------------------------------------------------------
+
+
+class TestFormatLatestTagsErrors:
+    def test_format_latest_tags_surfaces_registry_error_message(self) -> None:
+        from conductor.registry.errors import RegistryError
+        from conductor.registry.index import RegistryIndex, WorkflowInfo
+
+        runner.invoke(app, ["registry", "add", "team", "acme/workflows"])
+
+        mock_index = RegistryIndex(
+            workflows={"qa-bot": WorkflowInfo(description="QA helper", path="qa/bot.yaml")},
+        )
+
+        with (
+            patch("conductor.cli.registry.load_index", return_value=mock_index),
+            patch(
+                "conductor.cli.registry.list_tags",
+                side_effect=RegistryError("rate limit"),
+            ),
+        ):
+            result = runner.invoke(app, ["registry", "list", "team"])
+
+        assert result.exit_code == 0
+        assert "rate limit" in result.output
+        assert "unavailable" in result.output
+
+    def test_format_latest_tags_surfaces_http_error_class(self) -> None:
+        import httpx
+
+        from conductor.registry.index import RegistryIndex, WorkflowInfo
+
+        runner.invoke(app, ["registry", "add", "team", "acme/workflows"])
+
+        mock_index = RegistryIndex(
+            workflows={"qa-bot": WorkflowInfo(description="QA helper", path="qa/bot.yaml")},
+        )
+
+        with (
+            patch("conductor.cli.registry.load_index", return_value=mock_index),
+            patch(
+                "conductor.cli.registry.list_tags",
+                side_effect=httpx.ConnectError("boom"),
+            ),
+        ):
+            result = runner.invoke(app, ["registry", "list", "team"])
+
+        assert result.exit_code == 0
+        assert "ConnectError" in result.output

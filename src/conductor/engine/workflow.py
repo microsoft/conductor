@@ -11,34 +11,50 @@ import contextlib
 import copy
 import json
 import logging
+import sys
 import time as _time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from conductor.duration import parse_duration
 from conductor.engine.checkpoint import CheckpointManager
 from conductor.engine.context import WorkflowContext
 from conductor.engine.limits import LimitEnforcer
 from conductor.engine.pricing import ModelPricing
 from conductor.engine.router import Router, RouteResult
-from conductor.engine.usage import UsageTracker
+from conductor.engine.usage import UsageTracker, WorkflowUsage
 from conductor.events import WorkflowEvent, WorkflowEventEmitter
 from conductor.exceptions import (
+    AgentTimeoutError,
     ConductorError,
     ExecutionError,
     InterruptError,
     MaxIterationsError,
+    SubworkflowTerminatedError,
+    ValidationError,
+    WorkflowTerminated,
 )
 from conductor.exceptions import (
     TimeoutError as ConductorTimeoutError,
 )
 from conductor.executor.agent import AgentExecutor
+from conductor.executor.linkify import linkify_markdown
+from conductor.executor.output import validate_output
 from conductor.executor.script import ScriptExecutor, ScriptOutput
+from conductor.executor.set_step import (
+    SetExecutor,
+    SetOutput,
+    render_set_value_repr,
+)
 from conductor.executor.template import TemplateRenderer
+from conductor.executor.wait import WaitExecutor, WaitOutput
 from conductor.gates.human import (
     GateResult,
     HumanGateHandler,
     MaxIterationsHandler,
+    MaxIterationsPromptResult,
 )
 from conductor.gates.interrupt import InterruptAction, InterruptHandler, InterruptResult
 from conductor.providers.base import AgentOutput
@@ -285,6 +301,8 @@ class WorkflowEngine:
         web_dashboard: WebDashboard | None = None,
         _subworkflow_depth: int = 0,
         run_context: RunContext | None = None,
+        _dashboard_context_path: list[str] | None = None,
+        instructions_preamble: str | None = None,
     ) -> None:
         """Initialize the WorkflowEngine.
 
@@ -314,6 +332,17 @@ class WorkflowEngine:
             _subworkflow_depth: Current nesting depth for sub-workflow composition.
                 Used internally to enforce MAX_SUBWORKFLOW_DEPTH. Callers should
                 not set this directly.
+            _dashboard_context_path: Slot-key path identifying this engine's
+                position in the recursive sub-workflow tree. Root engine = ``[]``.
+                Sub-workflow engines spawned via ``_execute_subworkflow`` get
+                ``[*parent_path, slot_key]``. Used by ``_emit`` to auto-stamp
+                ``subworkflow_path`` on outgoing events so the dashboard can
+                route per-context state under concurrency. Callers should not
+                set this directly.
+            instructions_preamble: Optional workspace instructions text to prepend
+                to every agent's rendered prompt. Built from auto-discovered
+                workspace files, YAML ``instructions`` field, and/or CLI
+                ``--instructions`` flags. Inherited by sub-workflows.
 
         Note:
             If both provider and registry are provided, registry takes precedence.
@@ -326,7 +355,11 @@ class WorkflowEngine:
         self._run_context = run_context or RunContext()
         self._run_id = self._run_context.run_id
         self._log_file = self._run_context.log_file
-        self.context = WorkflowContext()
+        self.context = WorkflowContext(
+            workflow_dir=str(Path(workflow_path).resolve().parent) if workflow_path else "",
+            workflow_file=str(Path(workflow_path).resolve()) if workflow_path else "",
+            workflow_name=config.workflow.name,
+        )
         self.renderer = TemplateRenderer()
         self.router = Router()
         self.limits = LimitEnforcer(
@@ -336,6 +369,8 @@ class WorkflowEngine:
         self.gate_handler = HumanGateHandler(skip_gates=skip_gates)
         self.max_iterations_handler = MaxIterationsHandler(skip_gates=skip_gates)
         self.script_executor = ScriptExecutor()
+        self.set_executor = SetExecutor()
+        self.wait_executor = WaitExecutor()
         self.usage_tracker = UsageTracker(
             pricing_overrides=self._build_pricing_overrides(),
         )
@@ -344,10 +379,17 @@ class WorkflowEngine:
         self._registry = registry
         self._single_provider = provider
 
+        # Workspace instructions preamble (inherited by sub-workflows)
+        self._instructions_preamble = instructions_preamble
+
         # For backward compatibility, create a default executor with single provider
         # This is used when registry is None
         if provider is not None:
-            self.executor = AgentExecutor(provider, workflow_tools=config.tools)
+            self.executor = AgentExecutor(
+                provider,
+                workflow_tools=config.tools,
+                instructions_preamble=self._instructions_preamble,
+            )
             self.provider = provider  # Keep for backward compatibility
         else:
             # Create a placeholder - will be created per-agent when using registry
@@ -365,6 +407,17 @@ class WorkflowEngine:
         # Web dashboard for bidirectional gate input
         self._web_dashboard = web_dashboard
 
+        # Dialog mode support
+        from conductor.engine.dialog_evaluator import DialogEvaluator
+        from conductor.gates.dialog import DialogHandler
+
+        self._dialog_evaluator = DialogEvaluator()
+        self._dialog_handler = DialogHandler(
+            skip_dialogs=skip_gates,
+            emitter=event_emitter,
+            web_dashboard=web_dashboard,
+        )
+
         # Checkpoint tracking
         self._current_agent_name: str | None = None
         self._last_checkpoint_path: Path | None = None
@@ -376,6 +429,23 @@ class WorkflowEngine:
         self._dashboard_port = self._run_context.dashboard_port
         self._bg_mode = self._run_context.bg_mode
         self._system_metadata: dict[str, Any] = {}
+
+        # When True, ``_execute_loop`` skips its ``workflow_started`` emit.
+        # Set by :meth:`suppress_workflow_started_emit` from the CLI resume
+        # path after it has seeded the dashboard with a synthesized event.
+        self._suppress_workflow_started_emit: bool = False
+
+        # Recursive sub-workflow context path for dashboard routing.
+        # Root engine = []. Child engines spawned via _execute_subworkflow get
+        # [*parent_path, slot_key]. _emit auto-stamps non-empty paths onto
+        # outgoing events so the frontend can resolve the owning context
+        # without inferring parentage from activeContextPath.
+        self._dashboard_context_path: list[str] = list(_dashboard_context_path or [])
+
+    @property
+    def _workflow_dir(self) -> Path | None:
+        """Resolved parent directory of the workflow file, or None if unset."""
+        return Path(self.workflow_path).resolve().parent if self.workflow_path else None
 
     def _build_pricing_overrides(self) -> dict[str, ModelPricing] | None:
         """Build pricing overrides from workflow cost configuration.
@@ -412,6 +482,11 @@ class WorkflowEngine:
         """
         if self._event_emitter is None:
             return
+        # Auto-stamp subworkflow_path on every event from sub-engines so the
+        # dashboard can route per-context state under concurrency. Root engine
+        # has an empty path and emits no stamp (preserving legacy event shape).
+        if self._dashboard_context_path and "subworkflow_path" not in data:
+            data = {**data, "subworkflow_path": list(self._dashboard_context_path)}
         event = WorkflowEvent(type=event_type, timestamp=_time.time(), data=data)
         self._event_emitter.emit(event)
 
@@ -473,8 +548,138 @@ class WorkflowEngine:
         # Parent PID is useful in --web-bg to trace back to the forking CLI process
         if self._bg_mode:
             system["parent_pid"] = os.getppid()
+            # Surface the bg child's captured stderr/stdout log paths so a
+            # user looking at the dashboard or replaying the events JSONL
+            # can find the matching console output. Set by
+            # ``conductor.cli.bg_runner`` when launching the child. See
+            # issue #116.
+            bg_stderr_log = os.environ.get("CONDUCTOR_BG_STDERR_LOG")
+            if bg_stderr_log:
+                system["bg_stderr_log"] = bg_stderr_log
+            bg_stdout_log = os.environ.get("CONDUCTOR_BG_STDOUT_LOG")
+            if bg_stdout_log:
+                system["bg_stdout_log"] = bg_stdout_log
 
         return system
+
+    def build_workflow_started_data(self) -> dict[str, Any]:
+        """Build the ``workflow_started`` event payload from the current config.
+
+        Extracted from :meth:`_execute_loop` so the CLI resume path can
+        synthesise a topology-aware ``workflow_started`` event and prepend
+        it to the dashboard's history before replaying the original run's
+        events. The resumed engine then suppresses its own emit (via
+        :attr:`_suppress_workflow_started_emit`) so the dashboard sees
+        exactly one root ``workflow_started`` with the current YAML topology.
+
+        Returns:
+            Dict matching the shape emitted by the engine at the start of
+            :meth:`_execute_loop`.
+        """
+        # ``_system_metadata`` is normally populated inside ``_execute_loop``
+        # right before the emit. The CLI may call this method before the
+        # loop runs (during resume seeding), so build a snapshot here if it
+        # has not yet been populated.
+        if not self._system_metadata:
+            self._system_metadata = self._build_system_metadata()
+
+        default_effort = self.config.workflow.runtime.default_reasoning_effort
+        return {
+            "name": self.config.workflow.name,
+            "version": self._conductor_version(),
+            "entry_point": self.config.workflow.entry_point,
+            "agents": [
+                {
+                    "name": a.name,
+                    "type": a.type or "agent",
+                    "model": a.model,
+                    "reasoning_effort": (
+                        a.reasoning.effort if a.reasoning is not None else default_effort
+                    ),
+                }
+                for a in self.config.agents
+            ],
+            "parallel_groups": [
+                {
+                    "name": p.name,
+                    "agents": p.agents,
+                }
+                for p in self.config.parallel
+            ],
+            "for_each_groups": [
+                {
+                    "name": f.name,
+                    "source": f.source,
+                }
+                for f in self.config.for_each
+            ],
+            "routes": [
+                {
+                    "from": a.name,
+                    "to": r.to,
+                    "when": r.when,
+                }
+                for a in self.config.agents
+                for r in a.routes
+            ]
+            + [
+                {
+                    "from": a.name,
+                    "to": o.route,
+                    "when": f"selection == '{o.value}'",
+                }
+                for a in self.config.agents
+                if a.type == "human_gate" and a.options
+                for o in a.options
+            ]
+            + [
+                {
+                    "from": p.name,
+                    "to": r.to,
+                    "when": r.when,
+                }
+                for p in self.config.parallel
+                for r in p.routes
+            ]
+            + [
+                {
+                    "from": f.name,
+                    "to": r.to,
+                    "when": r.when,
+                }
+                for f in self.config.for_each
+                for r in f.routes
+            ],
+            **self._yaml_source_field(),
+            "metadata": self.config.workflow.metadata,
+            "system": self._system_metadata,
+            "run_id": self._run_id,
+            "log_file": self._log_file,
+        }
+
+    def suppress_workflow_started_emit(self) -> None:
+        """Tell :meth:`_execute_loop` to skip its ``workflow_started`` emit.
+
+        Used by ``resume_workflow_async`` after it has manually prepended
+        a topology-aware ``workflow_started`` event to the dashboard's
+        history. Without this suppression the engine would emit a second
+        root ``workflow_started`` once it resumed, double-incrementing
+        the frontend's ``wfDepth`` and routing the resumed run's events
+        into a phantom child workflow context.
+        """
+        self._suppress_workflow_started_emit = True
+
+    def clear_web_dashboard(self) -> None:
+        """Detach the web dashboard from the engine and its dialog handler.
+
+        Used by the CLI resume / run paths when ``dashboard.start()`` fails
+        after the engine has already captured the dashboard reference at
+        construction time. Without this, downstream code (human gates,
+        dialog handlers) would block forever waiting on a WebSocket
+        connection that will never arrive.
+        """
+        self._web_dashboard = None
+        self._dialog_handler.web_dashboard = None
 
     def _make_event_callback(self, agent_name: str) -> Any:
         """Create an event callback for an agent that forwards to the emitter.
@@ -516,7 +721,11 @@ class WorkflowEngine:
         if self._registry is not None:
             # Multi-provider mode: get provider from registry
             provider = await self._registry.get_provider(agent)
-            return AgentExecutor(provider, workflow_tools=self.config.tools)
+            return AgentExecutor(
+                provider,
+                workflow_tools=self.config.tools,
+                instructions_preamble=self._instructions_preamble,
+            )
         elif self.executor is not None:
             # Single provider mode (backward compatibility)
             return self.executor
@@ -544,10 +753,410 @@ class WorkflowEngine:
             operation_name=f"script '{agent.name}'",
         )
 
+    async def _execute_wait(self, agent: AgentDef, context: dict[str, Any]) -> WaitOutput:
+        """Execute a wait step with workflow-level timeout enforcement.
+
+        The wait races ``asyncio.sleep`` against the engine's
+        ``interrupt_event`` so Esc / Ctrl+G cancels an in-flight wait
+        immediately. The outer ``wait_for_with_timeout`` ensures the
+        workflow-level ``limits.timeout_seconds`` still fires if it
+        would expire before the wait completes.
+
+        Args:
+            agent: Wait agent definition.
+            context: Workflow context for template rendering.
+
+        Returns:
+            :class:`WaitOutput` with elapsed seconds and interrupt flag.
+
+        Raises:
+            ValidationError: If the rendered duration is invalid.
+            ConductorTimeoutError: If the workflow timeout fires while
+                the wait is in progress.
+        """
+        return await self.limits.wait_for_with_timeout(
+            self.wait_executor.execute(agent, context, interrupt_event=self._interrupt_event),
+            operation_name=f"wait '{agent.name}'",
+        )
+
+    async def _run_set_step(self, agent: AgentDef, agent_context: dict[str, Any]) -> SetOutput:
+        """Execute a set step end-to-end with full event + validation parity.
+
+        Shared between the main dispatch loop, parallel groups, and
+        for-each so that:
+
+        - Every set step emits ``set_started`` before execution.
+        - Every set step emits ``set_completed`` on success or ``set_failed``
+          on any exception (template, coercion, schema-on-scalar, or
+          ``validate_output``).
+        - ``output:`` schema validation runs in all three positions, not just
+          the linear main loop. The single-value scalar-with-schema case
+          raises a friendly ``ValidationError`` pointing the user to
+          ``values:`` instead.
+
+        Callers are responsible for storing the returned value into context,
+        recording iteration, evaluating routes (main loop), and emitting any
+        envelope events (``parallel_agent_completed`` /
+        ``for_each_item_completed``).
+        """
+        iteration = self.limits.get_agent_execution_count(agent.name) + 1
+        self._emit(
+            "set_started",
+            {"agent_name": agent.name, "iteration": iteration},
+        )
+
+        start = _time.time()
+        try:
+            set_output = self.set_executor.execute(agent, agent_context)
+        except Exception as exc:
+            elapsed = _time.time() - start
+            self._emit(
+                "set_failed",
+                {
+                    "agent_name": agent.name,
+                    "elapsed": elapsed,
+                    "error_type": type(exc).__name__,
+                    "message": str(exc),
+                },
+            )
+            raise
+        elapsed = _time.time() - start
+
+        # Output schema validation runs even inside parallel/for-each so
+        # `output:` is a real contract regardless of where the step lives.
+        # Only meaningful for dict-shaped outputs — single ``value:`` with a
+        # scalar result raises an explicit error instead of silently passing.
+        if agent.output is not None:
+            try:
+                if not isinstance(set_output.value, dict):
+                    raise ValidationError(
+                        f"Set step '{agent.name}' declares an output schema "
+                        f"but its rendered value is a "
+                        f"{type(set_output.value).__name__}, not a dict",
+                        suggestion=(
+                            "Use 'values:' (multi-binding) to produce a dict, "
+                            "or drop the 'output:' schema for a scalar/list value."
+                        ),
+                    )
+                validate_output(set_output.value, agent.output)
+            except ValidationError as schema_exc:
+                self._emit(
+                    "set_failed",
+                    {
+                        "agent_name": agent.name,
+                        "elapsed": elapsed,
+                        "error_type": type(schema_exc).__name__,
+                        "message": str(schema_exc),
+                    },
+                )
+                raise
+
+        self._emit(
+            "set_completed",
+            {
+                "agent_name": agent.name,
+                "elapsed": elapsed,
+                "output_type": set_output.output_type,
+                "output_keys": (
+                    sorted(set_output.value.keys()) if isinstance(set_output.value, dict) else []
+                ),
+                "value_repr": render_set_value_repr(set_output.value),
+            },
+        )
+        return set_output
+
+    def _validate_script_output_schema(
+        self,
+        agent: AgentDef,
+        parsed_json: Any,
+        json_parse_error: Exception | None,
+        output_content: dict[str, Any],
+    ) -> None:
+        """Validate script stdout against the declared output schema (issue #118).
+
+        Validation runs against the merged ``output_content`` dict (with the
+        ``stdout``/``stderr``/``exit_code`` baseline plus parsed-JSON overlay)
+        so shadowed built-ins are checked too. The wrapped error from
+        ``validate_output`` is re-raised with script-oriented wording so the
+        user sees the script name and the stdout-JSON contract instead of the
+        LLM-flavored "Ensure agent returns ..." default.
+
+        Args:
+            agent: The script agent definition. ``agent.output`` must be a dict
+                (callers check ``is not None``).
+            parsed_json: Result of ``json.loads(stdout)``, or ``None`` if
+                parsing failed.
+            json_parse_error: The ``JSONDecodeError`` instance if parsing
+                failed, else ``None``.
+            output_content: The merged dict to validate.
+
+        Raises:
+            ValidationError: If stdout was not valid JSON, was a JSON
+                array/scalar, or failed schema validation.
+        """
+        if json_parse_error is not None:
+            raise ValidationError(
+                f"Script '{agent.name}' declares an output schema but stdout "
+                f"is not valid JSON: {json_parse_error}",
+                suggestion=(
+                    "When 'output:' is declared, the script must write a JSON "
+                    "object to stdout. Write logs to stderr."
+                ),
+            )
+        if not isinstance(parsed_json, dict):
+            raise ValidationError(
+                f"Script '{agent.name}' declares an output schema but stdout "
+                f"is a JSON {type(parsed_json).__name__}, not an object",
+                suggestion=(
+                    'Emit a JSON object (e.g. {"field": value}) to stdout. '
+                    "Arrays and scalars are not accepted."
+                ),
+            )
+        assert agent.output is not None  # guaranteed by callers
+        try:
+            validate_output(output_content, agent.output)
+        except ValidationError as schema_exc:
+            raise ValidationError(
+                f"Script '{agent.name}' stdout JSON failed schema validation: {schema_exc.args[0]}",
+                suggestion=(
+                    "Emit a JSON object to stdout with the declared fields "
+                    "and types. Write logs to stderr."
+                ),
+            ) from schema_exc
+
+    async def _execute_with_agent_timeout(
+        self,
+        agent: AgentDef,
+        coro: Any,
+    ) -> Any:
+        """Wrap an agent execution coroutine with the agent's timeout_seconds.
+
+        If the agent has ``timeout_seconds`` configured, this wraps the coroutine
+        in ``asyncio.wait_for()`` with an effective timeout that is the minimum of
+        the agent's timeout and any remaining workflow-level timeout.
+
+        When the remaining workflow timeout is stricter, the coroutine runs
+        without the agent timeout wrapper so the existing workflow timeout
+        path handles the error with correct attribution.
+
+        On timeout, emits an ``agent_timeout`` event and raises ``AgentTimeoutError``.
+
+        Args:
+            agent: Agent definition with optional ``timeout_seconds``.
+            coro: The coroutine to execute (typically ``executor.execute(...)``).
+
+        Returns:
+            Result of the coroutine.
+
+        Raises:
+            AgentTimeoutError: If the agent exceeds its timeout_seconds.
+        """
+        if agent.timeout_seconds is None:
+            return await coro
+
+        # If workflow remaining timeout is stricter, let it own the error
+        remaining = self.limits.get_remaining_timeout()
+        if remaining is not None and remaining <= agent.timeout_seconds:
+            return await coro
+
+        start = _time.monotonic()
+        try:
+            return await asyncio.wait_for(coro, timeout=agent.timeout_seconds)
+        except TimeoutError as e:
+            elapsed = _time.monotonic() - start
+            self._emit(
+                "agent_timeout",
+                {
+                    "agent_name": agent.name,
+                    "elapsed": elapsed,
+                    "timeout_seconds": agent.timeout_seconds,
+                },
+            )
+            raise AgentTimeoutError(
+                agent_name=agent.name,
+                elapsed_seconds=elapsed,
+                timeout_seconds=agent.timeout_seconds,
+            ) from e
+
+    def _build_subworkflow_inputs(
+        self,
+        agent: AgentDef,
+        context: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Build sub-workflow inputs from an agent's input_mapping or defaults.
+
+        Renders each input_mapping expression against the provided context and
+        attempts JSON parsing for type coercion (so ``"5"`` becomes ``int(5)``
+        and ``"[1,2]"`` becomes a list). Falls back to the raw rendered string
+        if JSON parsing fails.
+
+        When no input_mapping is defined, forwards the parent's workflow.input
+        values as-is.
+
+        Args:
+            agent: Agent definition with optional ``input_mapping``.
+            context: Template rendering context (agent outputs, workflow vars, loop vars).
+
+        Returns:
+            Dict of sub-workflow input values.
+        """
+        if agent.input_mapping is not None:
+            renderer = TemplateRenderer()
+            sub_inputs: dict[str, Any] = {}
+            for key, template_expr in agent.input_mapping.items():
+                try:
+                    rendered = renderer.render(template_expr, context)
+                except Exception as e:
+                    raise ExecutionError(
+                        f"Failed to render input_mapping key '{key}' for agent '{agent.name}': {e}",
+                        suggestion=f"Check that the expression '{template_expr}' "
+                        "references valid context variables.",
+                    ) from e
+                # Attempt JSON parse for type coercion (int, list, dict, bool, null).
+                # Falls back to raw string if the value isn't valid JSON.
+                try:
+                    sub_inputs[key] = json.loads(rendered)
+                except (json.JSONDecodeError, ValueError):
+                    sub_inputs[key] = rendered
+            return sub_inputs
+        else:
+            # Default: forward parent's workflow.input.* values
+            workflow_ctx = context.get("workflow", {})
+            return dict(workflow_ctx.get("input", {})) if isinstance(workflow_ctx, dict) else {}
+
+    async def _resolve_subworkflow_path(
+        self,
+        agent_workflow: str,
+        agent_name: str,
+        base_dir: Path,
+    ) -> Path:
+        """Resolve a sub-workflow reference to a local filesystem path.
+
+        Handles both local file paths and registry references
+        (``workflow[@registry][#ref]`` syntax).
+
+        Resolution order:
+        1. If ``agent_workflow`` resolves to an existing file relative to
+           ``base_dir``, return that path immediately. This preserves
+           backward-compatibility for bare names like ``analysis`` that refer
+           to a sibling file without a ``.yaml`` extension.
+        1b. If the candidate path looks like a file (has separators or a
+            YAML extension) and the parent workflow lives inside a registry
+            cache, attempt to auto-fetch a sibling workflow from the same
+            registry+SHA via
+            :func:`~conductor.registry.cache.auto_fetch_relative_workflow`.
+            This handles cross-workflow refs like
+            ``../document-review/workflow.yaml`` between workflows in the
+            same registry repo.
+        2. Otherwise, parse as a registry reference via
+           :func:`~conductor.registry.resolver.resolve_ref`.
+        3. If the parsed ref is still a file kind (e.g. a path with a
+           ``.yaml`` extension that does not exist), return the resolved
+           path so the caller can emit a clear "file not found" error.
+        4. For registry refs, fetch the workflow (with caching) and return
+           the cached local path.
+
+        Note on checkpoint/resume: this helper is called on every
+        sub-workflow execution, including after :meth:`resume`. Pinned
+        registry refs (``name@registry#v1.2.3`` or ``name@registry#<sha>``)
+        always resolve to the same cached path. Mutable refs
+        (``name@registry#main`` or no ``#ref`` defaulting to "latest") may
+        resolve to a different commit on resume if the upstream branch has
+        moved. Use pinned tags or commit SHAs in production workflows when
+        deterministic resume is required.
+
+        Args:
+            agent_workflow: The ``workflow:`` field value from the agent def.
+            agent_name: Name of the containing agent (used in error messages).
+            base_dir: Directory of the parent workflow file used for relative
+                path resolution.
+
+        Returns:
+            Absolute path to the workflow YAML (local or cached registry copy).
+
+        Raises:
+            ExecutionError: If the registry reference is malformed, names an
+                unknown registry, or the registry fetch fails.
+        """
+        from conductor.registry.cache import (
+            auto_fetch_relative_workflow,
+            resolve_and_fetch,
+        )
+        from conductor.registry.errors import RegistryError
+        from conductor.registry.resolver import resolve_ref
+
+        # Step 1: check for an existing file relative to base_dir first.
+        # This ensures "analysis" beside the parent workflow is treated as a
+        # local file, not a registry lookup, even though it has no extension.
+        candidate = (base_dir / agent_workflow).resolve()
+        if candidate.is_file():
+            return candidate
+
+        # Step 1b: when the parent workflow lives inside a registry SHA cache,
+        # try to auto-fetch a sibling workflow from the same registry. This
+        # covers cross-workflow refs like ``../document-review/workflow.yaml``
+        # that were broken by the per-workflow cache layout. Only attempts
+        # when the candidate looks like a file path (has separators or a
+        # YAML extension) AND is not a registry ref ('@' present indicates
+        # named or ad-hoc registry syntax; step 2 handles those).
+        looks_like_file = "@" not in agent_workflow and (
+            "/" in agent_workflow
+            or "\\" in agent_workflow
+            or candidate.suffix.lower() in {".yaml", ".yml"}
+        )
+        if looks_like_file:
+            try:
+                auto_fetched = await asyncio.to_thread(auto_fetch_relative_workflow, candidate)
+            except RegistryError as exc:
+                raise ExecutionError(
+                    f"Failed to auto-fetch sub-workflow '{agent_workflow}' "
+                    f"(referenced by agent '{agent_name}'): {exc}",
+                    suggestion=(
+                        "The parent workflow lives in a registry cache, but "
+                        "the sibling workflow could not be fetched. Check "
+                        "that the path matches an entry in the registry index."
+                    ),
+                ) from exc
+            if auto_fetched is not None and auto_fetched.is_file():
+                return auto_fetched
+
+        # Step 2: parse as file-path / named-registry / ad-hoc reference.
+        try:
+            resolved = resolve_ref(agent_workflow)
+        except RegistryError as exc:
+            raise ExecutionError(
+                f"Failed to resolve sub-workflow '{agent_workflow}' "
+                f"(referenced by agent '{agent_name}'): {exc}",
+                suggestion=(
+                    "Check the registry reference syntax. For named registries, "
+                    "ensure the registry is configured (run 'conductor registry list'). "
+                    "For ad-hoc references, use 'workflow@owner/repo[#ref]'."
+                ),
+            ) from exc
+
+        if resolved.kind == "file":
+            # Step 3: file-path syntax but file does not exist — return the
+            # candidate path so the caller emits a clear "file not found" error.
+            return candidate
+
+        # Step 4: dispatch to the unified fetcher (handles registry + adhoc).
+        try:
+            return await asyncio.to_thread(resolve_and_fetch, resolved)
+        except RegistryError as exc:
+            raise ExecutionError(
+                f"Failed to fetch sub-workflow '{agent_workflow}' "
+                f"(referenced by agent '{agent_name}'): {exc}",
+                suggestion=(
+                    "Check that the registry/repo and workflow name are correct "
+                    "and the source is reachable."
+                ),
+            ) from exc
+
     async def _execute_subworkflow(
         self,
         agent: AgentDef,
         context: dict[str, Any],
+        slot_key: str | None = None,
     ) -> dict[str, Any]:
         """Execute a sub-workflow as a black-box step.
 
@@ -558,6 +1167,11 @@ class WorkflowEngine:
         Args:
             agent: Workflow agent definition with ``workflow`` path.
             context: Workflow context for template rendering (used as sub-workflow input).
+            slot_key: Identity of this sub-workflow run within the parent's
+                slot-key path. Defaults to ``agent.name`` for the sequential
+                path; for_each/parallel paths supply per-iteration keys
+                (e.g. ``"<group>[<key>]"``) so concurrent runs get distinct
+                identities.
 
         Returns:
             The sub-workflow's final output dict.
@@ -575,6 +1189,14 @@ class WorkflowEngine:
                 suggestion=("Check for circular sub-workflow references or reduce nesting depth."),
             )
 
+        # Per-agent depth limit (stricter than global MAX_SUBWORKFLOW_DEPTH)
+        if agent.max_depth is not None and self._subworkflow_depth >= agent.max_depth:
+            raise ExecutionError(
+                f"Agent '{agent.name}' max_depth ({agent.max_depth}) exceeded "
+                f"at depth {self._subworkflow_depth}.",
+                suggestion="Increase max_depth or restructure to reduce nesting.",
+            )
+
         assert agent.workflow is not None  # noqa: S101
 
         # Resolve sub-workflow path relative to parent workflow file
@@ -583,21 +1205,12 @@ class WorkflowEngine:
         else:
             base_dir = Path.cwd()
 
-        sub_path = (base_dir / agent.workflow).resolve()
+        sub_path = await self._resolve_subworkflow_path(agent.workflow, agent.name, base_dir)
 
-        if not sub_path.exists():
+        if not sub_path.is_file():
             raise ExecutionError(
                 f"Sub-workflow file not found: {sub_path} (referenced by agent '{agent.name}')",
                 suggestion="Check that the 'workflow' path is correct and the file exists.",
-            )
-
-        # Detect circular references via file path
-        current_path = Path(self.workflow_path).resolve() if self.workflow_path else None
-        if current_path is not None and sub_path == current_path:
-            raise ExecutionError(
-                f"Circular sub-workflow reference: agent '{agent.name}' "
-                f"references its own workflow file '{agent.workflow}'.",
-                suggestion="A workflow cannot reference itself as a sub-workflow.",
             )
 
         try:
@@ -610,27 +1223,29 @@ class WorkflowEngine:
             ) from exc
 
         # Build sub-workflow inputs from the parent context
-        sub_inputs: dict[str, Any]
-        if agent.input_mapping is not None:
-            # Dynamic inputs: render each Jinja2 expression against parent context
-            renderer = TemplateRenderer()
-            sub_inputs = {}
-            for key, template_expr in agent.input_mapping.items():
-                try:
-                    rendered = renderer.render(template_expr, context)
-                except Exception as e:
-                    raise ExecutionError(
-                        f"Failed to render input_mapping key '{key}' for agent '{agent.name}': {e}",
-                        suggestion=f"Check that the expression '{template_expr}' "
-                        "references valid context variables.",
-                    ) from e
-                sub_inputs[key] = rendered
-        else:
-            # Default: forward parent's workflow.input.* values
-            workflow_ctx = context.get("workflow", {})
-            sub_inputs = (
-                dict(workflow_ctx.get("input", {})) if isinstance(workflow_ctx, dict) else {}
+        sub_inputs = self._build_subworkflow_inputs(agent, context)
+
+        # Merge instructions preamble: parent preamble + sub-workflow's own instructions.
+        # Uses inner (unwrapped) content to avoid nested <workspace_instructions> tags,
+        # then wraps once at the outermost layer.
+        child_preamble = self._instructions_preamble
+        if sub_config.workflow.instructions:
+            from conductor.config.instructions import (
+                _unwrap_preamble,
+                _wrap_preamble,
+                build_inner_instructions,
             )
+
+            sub_inner = build_inner_instructions(
+                yaml_instructions=sub_config.workflow.instructions,
+            )
+            if sub_inner:
+                if child_preamble:
+                    # Parent preamble is already wrapped — unwrap, merge, re-wrap
+                    parent_inner = _unwrap_preamble(child_preamble)
+                    child_preamble = _wrap_preamble(parent_inner + "\n\n---\n\n" + sub_inner)
+                else:
+                    child_preamble = _wrap_preamble(sub_inner)
 
         # Create child engine inheriting provider/registry but with deeper depth
         child_engine = WorkflowEngine(
@@ -644,16 +1259,21 @@ class WorkflowEngine:
             keyboard_listener=self._keyboard_listener,
             web_dashboard=self._web_dashboard,
             _subworkflow_depth=self._subworkflow_depth + 1,
+            _dashboard_context_path=[
+                *self._dashboard_context_path,
+                slot_key or agent.name,
+            ],
+            instructions_preamble=child_preamble,
         )
 
-        return await child_engine.run(sub_inputs)
+        return await self._run_child_engine(child_engine, sub_inputs, agent)
 
     async def _execute_subworkflow_with_inputs(
         self,
         agent: AgentDef,
         sub_inputs: dict[str, Any],
         slot_key: str | None = None,
-    ) -> dict[str, Any]:
+    ) -> tuple[dict[str, Any], WorkflowUsage]:
         """Execute a sub-workflow with pre-built inputs.
 
         Like _execute_subworkflow but accepts explicit inputs instead of
@@ -670,7 +1290,7 @@ class WorkflowEngine:
                 to ``agent.name`` (matches sequential sub-workflow behavior).
 
         Returns:
-            The sub-workflow's final output dict.
+            Tuple of (output dict, child workflow usage summary).
         """
         from conductor.config.loader import load_config
 
@@ -681,6 +1301,14 @@ class WorkflowEngine:
                 suggestion="Check for circular sub-workflow references or reduce nesting depth.",
             )
 
+        # Per-agent depth limit (stricter than global MAX_SUBWORKFLOW_DEPTH)
+        if agent.max_depth is not None and self._subworkflow_depth >= agent.max_depth:
+            raise ExecutionError(
+                f"Agent '{agent.name}' max_depth ({agent.max_depth}) exceeded "
+                f"at depth {self._subworkflow_depth}.",
+                suggestion="Increase max_depth or restructure to reduce nesting.",
+            )
+
         assert agent.workflow is not None  # noqa: S101
 
         if self.workflow_path is not None:
@@ -688,21 +1316,12 @@ class WorkflowEngine:
         else:
             base_dir = Path.cwd()
 
-        sub_path = (base_dir / agent.workflow).resolve()
+        sub_path = await self._resolve_subworkflow_path(agent.workflow, agent.name, base_dir)
 
-        if not sub_path.exists():
+        if not sub_path.is_file():
             raise ExecutionError(
                 f"Sub-workflow file not found: {sub_path} (referenced by agent '{agent.name}')",
                 suggestion="Check that the 'workflow' path is correct and the file exists.",
-            )
-
-        # Detect circular references via file path
-        current_path = Path(self.workflow_path).resolve() if self.workflow_path else None
-        if current_path is not None and sub_path == current_path:
-            raise ExecutionError(
-                f"Circular sub-workflow reference: agent '{agent.name}' "
-                f"references its own workflow file '{agent.workflow}'.",
-                suggestion="A workflow cannot reference itself as a sub-workflow.",
             )
 
         try:
@@ -736,20 +1355,156 @@ class WorkflowEngine:
                 *dashboard_path,
                 slot_key or agent.name,
             ]
+
+        # Merge instructions preamble: parent preamble + sub-workflow's own instructions
+        child_preamble = self._instructions_preamble
+        if sub_config.workflow.instructions:
+            from conductor.config.instructions import (
+                _unwrap_preamble,
+                _wrap_preamble,
+                build_inner_instructions,
+            )
+
+            sub_inner = build_inner_instructions(
+                yaml_instructions=sub_config.workflow.instructions,
+            )
+            if sub_inner:
+                if child_preamble:
+                    parent_inner = _unwrap_preamble(child_preamble)
+                    child_preamble = _wrap_preamble(parent_inner + "\n\n---\n\n" + sub_inner)
+                else:
+                    child_preamble = _wrap_preamble(sub_inner)
+        child_engine_kwargs["instructions_preamble"] = child_preamble
+
         child_engine = WorkflowEngine(**child_engine_kwargs)
 
-        return await child_engine.run(sub_inputs)
+        output = await self._run_child_engine(child_engine, sub_inputs, agent)
+        usage = child_engine.usage_tracker.get_summary()
+        return output, usage
 
-    def _get_context_window_for_agent(self, agent: AgentDef) -> int | None:
-        """Return the context window size for an agent's model."""
-        from conductor.engine.pricing import get_pricing
+    async def _run_child_engine(
+        self,
+        child_engine: WorkflowEngine,
+        sub_inputs: dict[str, Any],
+        agent: AgentDef,
+    ) -> dict[str, Any]:
+        """Run a child sub-workflow engine and convert child-level termination.
 
-        model = agent.model
-        if not model:
+        A ``WorkflowTerminated`` raised by a child sub-workflow (i.e. a
+        ``type: terminate`` step with ``status: failed`` inside the child)
+        must NOT propagate as ``WorkflowTerminated`` to the parent — the
+        parent did not explicitly terminate, the child did. The parent
+        should see this as a normal sub-workflow failure so its own
+        ``subworkflow_failed`` event fires and the parent's outer error
+        handling treats it like any other ``ExecutionError``.
+
+        The child's rendered output dict (from ``output_template:`` or the
+        child workflow's ``output:`` mapping) is preserved on the raised
+        :class:`ExecutionError` as the ``terminated_output`` attribute so
+        debuggers, on_error hooks, and CLI surfaces can inspect what the
+        child intended to emit. The child's reason is also embedded in the
+        exception message for human-readable diagnostics. We deliberately do
+        NOT merge ``terminated_output`` into the parent's context — that
+        would let parent routes accidentally branch on a child's
+        "i was failing" payload (use ``status: success`` + ``output_template``
+        for that pattern).
+
+        Successful terminations inside a child propagate normally: the
+        child returns its rendered output dict and the parent continues.
+
+        Args:
+            child_engine: Already-constructed child :class:`WorkflowEngine`.
+            sub_inputs: Inputs to pass to ``child_engine.run()``.
+            agent: The parent's ``type: workflow`` agent definition (used
+                for diagnostic messages).
+
+        Returns:
+            The child workflow's final output dict.
+        """
+        try:
+            return await child_engine.run(sub_inputs)
+        except WorkflowTerminated as exc:
+            # Convert to SubworkflowTerminatedError so the parent's outer
+            # handler treats this as a normal sub-workflow failure (parent's
+            # own `workflow_failed` does NOT carry `is_explicit: true`). The
+            # child's rendered output / reason / terminate-step name are
+            # preserved as structured attributes on the wrapper so on_error
+            # hooks, debugging surfaces, and the CLI can inspect them without
+            # walking ``__cause__``.
+            raise SubworkflowTerminatedError(
+                f"Sub-workflow '{agent.workflow}' (agent '{agent.name}') "
+                f"terminated explicitly: {exc.reason}",
+                suggestion=(
+                    "The sub-workflow ended with `type: terminate` and "
+                    "`status: failed`. To surface the termination details to "
+                    "the parent's routes, change the terminate step to "
+                    "`status: success` and put the reason/status in its "
+                    "`output_template:`."
+                ),
+                agent_name=agent.name,
+                terminated_output=exc.output,
+                terminated_reason=exc.reason,
+                terminated_by=exc.terminated_by,
+            ) from exc
+
+    async def _get_provider_for_agent(self, agent: AgentDef) -> AgentProvider | None:
+        """Resolve the provider that will (or did) execute ``agent``.
+
+        Mirrors the executor-resolution logic in ``_get_executor_for_agent``
+        so context-window metadata lookups go through the same provider that
+        handles execution. Returns ``None`` only when no provider can be
+        determined (e.g. transient registry failures); callers must treat
+        ``None`` as "metadata unavailable".
+        """
+        if self._registry is not None:
+            try:
+                return await self._registry.get_provider(agent)
+            except Exception as e:
+                logger.debug("Provider lookup via registry failed for %s: %s", agent.name, e)
+                return None
+        return self._single_provider
+
+    async def _get_context_window_for_agent(
+        self, agent: AgentDef, output: AgentOutput | None = None
+    ) -> int | None:
+        """Return the SDK-reported max prompt tokens for an agent.
+
+        Tries each candidate model in priority order — the model the SDK
+        actually used (``output.model``), the agent's configured model, the
+        workflow's runtime default — and returns the first non-``None``
+        result. This is a real fallback chain: if ``output.model`` is an
+        SDK-specific variant the provider doesn't know about, the lookup
+        retries with ``agent.model`` before giving up.
+
+        Returns ``None`` when no candidate resolves, no provider can be
+        reached, or the provider's metadata call fails — context-window
+        metadata is best-effort and must never break workflow execution.
+        """
+        provider = await self._get_provider_for_agent(agent)
+        if provider is None:
             return None
-
-        pricing = get_pricing(model)
-        return pricing.context_window if pricing else None
+        candidates: list[str] = []
+        if output is not None and output.model:
+            candidates.append(output.model)
+        if agent.model and agent.model not in candidates:
+            candidates.append(agent.model)
+        default = self.config.workflow.runtime.default_model
+        if default and default not in candidates:
+            candidates.append(default)
+        for model in candidates:
+            try:
+                value = await provider.get_max_prompt_tokens(model)
+            except Exception as e:
+                logger.debug(
+                    "get_max_prompt_tokens(%r) raised on provider for agent %s: %s",
+                    model,
+                    agent.name,
+                    e,
+                )
+                continue
+            if value is not None:
+                return value
+        return None
 
     async def run(self, inputs: dict[str, Any]) -> dict[str, Any]:
         """Execute the workflow from entry_point to $end.
@@ -819,10 +1574,22 @@ class WorkflowEngine:
         Used by the CLI resume path to inject context reconstructed from
         a checkpoint file.
 
+        Workflow metadata (``workflow_dir``, ``workflow_file``, ``workflow_name``)
+        is repopulated from the engine's ``workflow_path`` and ``config`` rather
+        than the restored context. Restored contexts come from
+        ``WorkflowContext.from_dict()``, which intentionally omits absolute path
+        metadata to keep checkpoint files portable across machines and
+        relocatable when workflows move. The engine, which knows the current
+        path, is the source of truth.
+
         Args:
             context: A WorkflowContext restored via ``WorkflowContext.from_dict()``.
         """
         self.context = context
+        if self.workflow_path is not None:
+            self.context.workflow_dir = str(Path(self.workflow_path).resolve().parent)
+            self.context.workflow_file = str(Path(self.workflow_path).resolve())
+        self.context.workflow_name = self.config.workflow.name
 
     def set_limits(self, limits: LimitEnforcer) -> None:
         """Replace the engine's limit enforcer with a restored one.
@@ -868,6 +1635,9 @@ class WorkflowEngine:
             inputs=self.context.workflow_inputs,
             copilot_session_ids=copilot_session_ids,
             system_metadata=self._system_metadata,
+            instructions_preamble=self._instructions_preamble,
+            run_id=self._run_context.run_id,
+            event_log_path=self._run_context.log_file,
         )
         self._last_checkpoint_path = checkpoint_path
         if checkpoint_path is not None:
@@ -922,7 +1692,9 @@ class WorkflowEngine:
         """
         # If no web dashboard at all, use CLI only.
         if self._web_dashboard is None:
-            return await self.gate_handler.handle_gate(agent, agent_context)
+            return await self.gate_handler.handle_gate(
+                agent, agent_context, base_dir=self._workflow_dir
+            )
 
         # Race CLI vs web input. We start the web task unconditionally (not only
         # when a client is currently connected), because the human often opens
@@ -931,7 +1703,7 @@ class WorkflowEngine:
         # in the dashboard pushes a message to ``_gate_response_queue`` that
         # nobody is awaiting, and the workflow hangs forever.
         cli_task = asyncio.create_task(
-            self.gate_handler.handle_gate(agent, agent_context),
+            self.gate_handler.handle_gate(agent, agent_context, base_dir=self._workflow_dir),
             name="gate_cli",
         )
         web_task = asyncio.create_task(
@@ -1021,14 +1793,21 @@ class WorkflowEngine:
         if self._interrupt_event is None or not self._interrupt_event.is_set():
             return None
 
+        # Clearing here is safe because is_set() above is the only consumer
+        # within this method; the unwind path raised below does NOT re-check
+        # the event before reaching the parent engine. If a future change
+        # adds a between-agent recheck after the InterruptError catch, this
+        # clear must move to AFTER the raise to preserve interrupt visibility.
+        # Issue #145 (S2).
         self._interrupt_event.clear()
 
         # In web mode, the interrupt was already handled at the provider level
         # (partial output → _handle_web_pause). Consume the stale flag silently.
-        # We check for dashboard presence only (not has_connections) because in
-        # --web/--web-bg mode the CLI interactive handler is never appropriate,
-        # even if clients are transiently disconnected.
+        # EXCEPTION: in subworkflows (depth > 0), propagate the interrupt so it
+        # unwinds the child engine back to the parent, stopping the workflow.
         if self._web_dashboard is not None:
+            if self._subworkflow_depth > 0:
+                raise InterruptError(agent_name=current_agent_name)
             return None
 
         # Build output preview from last stored output
@@ -1132,6 +1911,32 @@ class WorkflowEngine:
         disconnect_task = asyncio.create_task(disconnect_event.wait())
         tasks = {resume_task, kill_task, disconnect_task}
 
+        # In subworkflows, also watch the interrupt_event so that a second
+        # Stop click while paused will stop the workflow without requiring
+        # the user to first Resume then wait for the next between-agent check.
+        #
+        # INTENTIONAL ROOT-vs-SUBWORKFLOW ASYMMETRY:
+        # At root depth, we deliberately do NOT subscribe to interrupt_event
+        # here — pause is exited only by Resume or Kill. Inside a sub-workflow
+        # we DO subscribe so a single Stop click cleanly unwinds the child
+        # engine back to the parent (Stop-during-pause is otherwise a no-op
+        # because the partial-output handler owns the only between-agent
+        # interrupt check, and the sub-engine is currently sitting in this
+        # pause loop instead of stepping through its main loop).
+        #
+        # Pre-clearing interrupt_event below means a Stop click that lands
+        # *between* clear() and the asyncio.create_task() below is silently
+        # discarded — but a Stop click that lands during the wait is honored.
+        # That window is tiny (microseconds), and the alternative (not
+        # clearing) would carry a stale Stop signal from a prior pause cycle
+        # into this one. We accept the narrow race in favor of correctness
+        # across cycles. See PR #113 review thread for the discussion.
+        stop_task = None
+        if self._subworkflow_depth > 0 and self._interrupt_event is not None:
+            self._interrupt_event.clear()
+            stop_task = asyncio.create_task(self._interrupt_event.wait())
+            tasks.add(stop_task)
+
         # If any event was set between clear() and task creation, the task
         # will already be done — no need to wait, but we still fall through
         # to the normal done/pending handling below.
@@ -1153,6 +1958,12 @@ class WorkflowEngine:
             raise
 
         if kill_task in done:
+            raise InterruptError(agent_name=agent_name)
+
+        # Stop-while-paused in a subworkflow: treat as interrupt
+        if stop_task is not None and stop_task in done:
+            if self._interrupt_event is not None:
+                self._interrupt_event.clear()
             raise InterruptError(agent_name=agent_name)
 
         if disconnect_task in done:
@@ -1229,11 +2040,104 @@ class WorkflowEngine:
         if isinstance(provider, CopilotProvider):
             session = provider.get_interrupted_session()
             if session is not None:
-                return await provider.send_followup(session, interrupt_result.guidance)
+                return await provider.send_followup(
+                    session,
+                    interrupt_result.guidance,
+                    agent_name=agent.name,
+                )
 
         # Fallback: re-execute the agent with guidance appended to prompt
         new_guidance_section = self.context.get_guidance_prompt_section()
         return await executor.execute(agent, agent_context, guidance_section=new_guidance_section)
+
+    async def _handle_dialog(
+        self,
+        agent: AgentDef,
+        output: AgentOutput,
+        agent_context: dict[str, Any],
+        executor: AgentExecutor,
+    ) -> AgentOutput:
+        """Handle dialog mode evaluation and conversation for an agent.
+
+        Runs the dialog evaluator against the agent's output. If dialog is
+        triggered, presents the user with a choice to engage or skip, then
+        manages the conversation. After dialog, re-executes the agent with
+        the dialog transcript as additional guidance so the agent can refine
+        its output.
+
+        Args:
+            agent: The agent with dialog config.
+            output: The agent's current output.
+            agent_context: The context used for agent execution.
+            executor: The executor for the agent.
+
+        Returns:
+            The original output if dialog was not triggered or declined,
+            or an updated output after re-execution with dialog context.
+        """
+        provider = executor.provider
+
+        # Suspend keyboard listener for interactive dialog
+        if self._keyboard_listener is not None:
+            await self._keyboard_listener.suspend()
+
+        try:
+            evaluation = await self._dialog_evaluator.evaluate(agent, output.content, provider)
+
+            if not evaluation.trigger:
+                logger.debug("Dialog not triggered for '%s': %s", agent.name, evaluation.reason)
+                return output
+
+            logger.info("Dialog triggered for '%s': %s", agent.name, evaluation.reason)
+
+            dialog_result = await self._dialog_handler.handle_dialog(
+                agent=agent,
+                agent_output=output.content,
+                opening_question=evaluation.question,
+                provider=provider,
+                base_dir=self.workflow_path.parent if self.workflow_path else None,
+            )
+
+            # If user declined or no meaningful dialog occurred, keep original output
+            if dialog_result.user_declined or not dialog_result.messages:
+                return output
+
+            # Build dialog transcript for re-execution guidance
+            transcript_parts = []
+            for msg in dialog_result.messages:
+                label = "User" if msg.role == "user" else "Agent"
+                transcript_parts.append(f"{label}: {msg.content}")
+            transcript = "\n".join(transcript_parts)
+
+            dialog_guidance = (
+                f"\n\n--- DIALOG WITH USER ---\n"
+                f"The following conversation occurred after your initial output. "
+                f"Use this context to refine your response:\n\n"
+                f"{transcript}\n"
+                f"--- END DIALOG ---\n\n"
+                f"Now produce your final output incorporating the dialog above."
+            )
+
+            # Re-execute with dialog context
+            guidance_section = self.context.get_guidance_prompt_section() or ""
+            guidance_section += dialog_guidance
+
+            new_output = await executor.execute(
+                agent, agent_context, guidance_section=guidance_section
+            )
+            return new_output
+
+        except Exception:
+            logger.warning(
+                "Dialog handling failed for '%s', using original output",
+                agent.name,
+                exc_info=True,
+            )
+            return output
+        finally:
+            # Resume keyboard listener
+            if self._keyboard_listener is not None:
+                await self._keyboard_listener.resume()
 
     async def _execute_loop(self, current_agent_name: str) -> dict[str, Any]:
         """Core execution loop shared by :meth:`run` and :meth:`resume`.
@@ -1251,70 +2155,16 @@ class WorkflowEngine:
         """
         try:
             async with self.limits.timeout_context():
-                # Emit workflow_started before the execution loop
+                # Emit workflow_started before the execution loop.
+                # On resume, the CLI seeds the dashboard with a synthesized
+                # workflow_started using the current config and sets
+                # ``_suppress_workflow_started_emit`` so that the engine does
+                # not re-emit one here (a second root-level emit would
+                # double-increment the frontend's ``wfDepth`` and route the
+                # resumed run's events into a phantom child workflow context).
                 self._system_metadata = self._build_system_metadata()
-                self._emit(
-                    "workflow_started",
-                    {
-                        "name": self.config.workflow.name,
-                        "version": self._conductor_version(),
-                        "entry_point": self.config.workflow.entry_point,
-                        "agents": [
-                            {
-                                "name": a.name,
-                                "type": a.type or "agent",
-                                "model": a.model,
-                            }
-                            for a in self.config.agents
-                        ],
-                        "parallel_groups": [
-                            {
-                                "name": p.name,
-                                "agents": p.agents,
-                            }
-                            for p in self.config.parallel
-                        ],
-                        "for_each_groups": [
-                            {
-                                "name": f.name,
-                                "source": f.source,
-                            }
-                            for f in self.config.for_each
-                        ],
-                        "routes": [
-                            {
-                                "from": a.name,
-                                "to": r.to,
-                                "when": r.when,
-                            }
-                            for a in self.config.agents
-                            for r in a.routes
-                        ]
-                        + [
-                            {
-                                "from": p.name,
-                                "to": r.to,
-                                "when": r.when,
-                            }
-                            for p in self.config.parallel
-                            for r in p.routes
-                        ]
-                        + [
-                            {
-                                "from": f.name,
-                                "to": r.to,
-                                "when": r.when,
-                            }
-                            for f in self.config.for_each
-                            for r in f.routes
-                        ],
-                        **self._yaml_source_field(),
-                        "metadata": self.config.workflow.metadata,
-                        "system": self._system_metadata,
-                        "run_id": self._run_id,
-                        "log_file": self._log_file,
-                    },
-                )
+                if not self._suppress_workflow_started_emit:
+                    self._emit("workflow_started", self.build_workflow_started_data())
 
                 _workflow_start = _time.time()
 
@@ -1494,12 +2344,132 @@ class WorkflowEngine:
                                 "agent_name": agent.name,
                                 "iteration": agent_execution_count,
                                 "agent_type": agent.type or "agent",
-                                "context_window_max": self._get_context_window_for_agent(agent),
+                                "context_window_max": await self._get_context_window_for_agent(
+                                    agent
+                                ),
                             },
                         )
 
                         # Trim context if max_tokens is configured
                         self._trim_context_if_needed()
+
+                        # Handle terminate steps — explicit workflow exit with a
+                        # structured reason and status. Reached via a normal
+                        # route from any upstream agent/group, OR as the
+                        # workflow's `entry_point` (a workflow whose first step
+                        # is a terminate ends immediately on dispatch). The
+                        # engine ends the workflow on this branch — no routes
+                        # evaluated after.
+                        if agent.type == "terminate":
+                            terminate_elapsed = _time.time() - _workflow_start
+                            agent_context = self.context.build_for_agent(
+                                agent.name,
+                                agent.input,
+                                mode=self.config.workflow.context.mode,
+                                agent_type=agent.type,
+                            )
+                            # Render the reason against context first so the
+                            # rendered value is available to output_template
+                            # and to the workflow-level output: fallback.
+                            rendered_reason = self.renderer.render(
+                                agent.reason or "", agent_context
+                            )
+                            # Store the terminate step's own context entry
+                            # BEFORE building the final output so workflow.output
+                            # templates can reference {{ <step>.output.reason }}
+                            # / {{ <step>.output.status }} if desired.
+                            self.context.store(
+                                agent.name,
+                                {
+                                    "status": agent.status,
+                                    "reason": rendered_reason,
+                                    "terminated_by": agent.name,
+                                },
+                            )
+                            # check_timeout before record_execution so a
+                            # workflow that has exhausted its iteration budget
+                            # exactly at this terminate step cannot mask the
+                            # user's explicit termination behind a
+                            # MaxIterationsError from record_execution.
+                            self.limits.check_timeout()
+                            self.limits.record_execution(agent.name)
+
+                            # Build the final output: prefer output_template
+                            # when set (replaces workflow-level output:);
+                            # otherwise fall back to the workflow's output:
+                            # mapping rendered as usual. A template error here
+                            # must surface through `agent_failed` so the
+                            # dashboard / JSONL log records a resolved
+                            # lifecycle for the terminate step rather than
+                            # leaving it visually "in flight".
+                            try:
+                                output = self._build_terminate_output(agent)
+                            except Exception as exc:
+                                self._emit(
+                                    "agent_failed",
+                                    {
+                                        "agent_name": agent.name,
+                                        "elapsed": _time.time()
+                                        - _workflow_start
+                                        - terminate_elapsed,
+                                        "agent_type": "terminate",
+                                        "error_type": type(exc).__name__,
+                                        "message": str(exc),
+                                    },
+                                )
+                                raise
+
+                            termination_meta = {
+                                "termination_reason": rendered_reason,
+                                "terminated_by": agent.name,
+                                "is_explicit": True,
+                                "status": agent.status,
+                            }
+
+                            if agent.status == "success":
+                                self._emit(
+                                    "agent_completed",
+                                    {
+                                        "agent_name": agent.name,
+                                        "elapsed": _time.time()
+                                        - _workflow_start
+                                        - terminate_elapsed,
+                                        "agent_type": "terminate",
+                                        **termination_meta,
+                                    },
+                                )
+                                self._emit(
+                                    "workflow_completed",
+                                    {
+                                        "elapsed": _time.time() - _workflow_start,
+                                        "output": output,
+                                        **termination_meta,
+                                    },
+                                )
+                                self._execute_hook("on_complete", result=output)
+                                return output
+
+                            # status == "failed" — raise an explicit termination
+                            # exception. The dedicated handler below emits
+                            # workflow_failed with is_explicit=True and skips
+                            # the on-failure checkpoint save.
+                            self._emit(
+                                "agent_failed",
+                                {
+                                    "agent_name": agent.name,
+                                    "elapsed": _time.time() - _workflow_start - terminate_elapsed,
+                                    "agent_type": "terminate",
+                                    "error_type": "WorkflowTerminated",
+                                    "message": rendered_reason,
+                                    **termination_meta,
+                                },
+                            )
+                            raise WorkflowTerminated(
+                                rendered_reason,
+                                output=output,
+                                reason=rendered_reason,
+                                terminated_by=agent.name,
+                            )
 
                         # Handle human gates
                         if agent.type == "human_gate":
@@ -1517,13 +2487,19 @@ class WorkflowEngine:
                                 for o in (agent.options or [])
                             ]
 
+                            # Render prompt and auto-linkify paths/URLs for markdown display
+                            rendered_prompt = self.renderer.render(agent.prompt, agent_context)
+                            rendered_prompt = linkify_markdown(
+                                rendered_prompt, base_dir=self._workflow_dir
+                            )
+
                             self._emit(
                                 "gate_presented",
                                 {
                                     "agent_name": agent.name,
                                     "options": [o.value for o in (agent.options or [])],
                                     "option_details": gate_options_data,
-                                    "prompt": self.renderer.render(agent.prompt, agent_context),
+                                    "prompt": rendered_prompt,
                                 },
                             )
 
@@ -1577,6 +2553,7 @@ class WorkflowEngine:
                                 agent.name,
                                 agent.input,
                                 mode=self.config.workflow.context.mode,
+                                agent_type=agent.type,
                             )
                             _script_start = _time.time()
 
@@ -1610,6 +2587,66 @@ class WorkflowEngine:
                                 raise
                             _script_elapsed = _time.time() - _script_start
 
+                            # Build structured output: stdout/stderr/exit_code
+                            # baseline, with parsed JSON object fields merged
+                            # on top so they're addressable as `output.field`
+                            # in templates and routes (matching LLM structured
+                            # outputs). Strict validation against `agent.output`
+                            # runs below when declared.
+                            output_content: dict[str, Any] = {
+                                "stdout": script_output.stdout,
+                                "stderr": script_output.stderr,
+                                "exit_code": script_output.exit_code,
+                            }
+                            parsed_json: Any = None
+                            json_parse_error: Exception | None = None
+                            try:
+                                parsed_json = json.loads(script_output.stdout)
+                            except json.JSONDecodeError as exc:
+                                json_parse_error = exc
+
+                            if isinstance(parsed_json, dict):
+                                shadowed = set(parsed_json.keys()) & {
+                                    "stdout",
+                                    "stderr",
+                                    "exit_code",
+                                }
+                                if shadowed:
+                                    logger.debug(
+                                        "Script '%s' JSON output shadows built-in fields: %s",
+                                        agent.name,
+                                        ", ".join(sorted(shadowed)),
+                                    )
+                                output_content.update(parsed_json)
+
+                            # Validate against declared output schema (issue #118).
+                            # `is not None` so an explicit `output: {}` opts
+                            # into strict JSON-object mode with zero declared
+                            # fields. See `_validate_script_output_schema` for
+                            # the validation rules and wrapping rationale.
+                            if agent.output is not None:
+                                try:
+                                    self._validate_script_output_schema(
+                                        agent,
+                                        parsed_json,
+                                        json_parse_error,
+                                        output_content,
+                                    )
+                                except ValidationError as exc:
+                                    self._emit(
+                                        "script_failed",
+                                        {
+                                            "agent_name": agent.name,
+                                            "elapsed": _script_elapsed,
+                                            "error_type": type(exc).__name__,
+                                            "message": str(exc),
+                                            "stdout": script_output.stdout,
+                                            "stderr": script_output.stderr,
+                                            "exit_code": script_output.exit_code,
+                                        },
+                                    )
+                                    raise
+
                             self._emit(
                                 "script_completed",
                                 {
@@ -1621,12 +2658,6 @@ class WorkflowEngine:
                                 },
                             )
 
-                            # Store structured output in context
-                            output_content = {
-                                "stdout": script_output.stdout,
-                                "stderr": script_output.stderr,
-                                "exit_code": script_output.exit_code,
-                            }
                             self.context.store(agent.name, output_content)
                             self.limits.record_execution(agent.name)
                             self.limits.check_timeout()
@@ -1663,12 +2694,210 @@ class WorkflowEngine:
                                 )
                             continue
 
+                        # Handle wait steps
+                        if agent.type == "wait":
+                            agent_context = self.context.build_for_agent(
+                                agent.name,
+                                agent.input,
+                                mode=self.config.workflow.context.mode,
+                                agent_type=agent.type,
+                            )
+                            _wait_start = _time.time()
+
+                            wait_execution_count = (
+                                self.limits.get_agent_execution_count(agent.name) + 1
+                            )
+
+                            # Resolve the duration up-front so the
+                            # ``wait_started`` event includes the parsed
+                            # value (the dashboard renders a sleeping
+                            # pill keyed off this). Failures here are
+                            # preview-only — the canonical render+parse
+                            # runs inside ``_execute_wait`` below and
+                            # will surface the real error via
+                            # ``wait_failed``. Log at debug so the
+                            # preview path is still observable.
+                            try:
+                                rendered_duration = self.renderer.render(
+                                    str(agent.duration), agent_context
+                                )
+                                preview_duration_seconds: float | None = parse_duration(
+                                    rendered_duration
+                                )
+                            except Exception as exc:  # noqa: BLE001 — defensive preview
+                                logger.debug(
+                                    "wait_started preview duration render failed for %s: %s",
+                                    agent.name,
+                                    exc,
+                                )
+                                preview_duration_seconds = None
+                            preview_reason: str | None = None
+                            if agent.reason is not None:
+                                try:
+                                    preview_reason = self.renderer.render(
+                                        agent.reason, agent_context
+                                    )
+                                except Exception as exc:  # noqa: BLE001 — defensive preview
+                                    # Do NOT fall back to the raw
+                                    # template string — the dashboard
+                                    # would then display literal
+                                    # ``{{ ... }}`` markup. ``None`` is
+                                    # the correct "absent" signal.
+                                    logger.debug(
+                                        "wait_started preview reason render failed for %s: %s",
+                                        agent.name,
+                                        exc,
+                                    )
+                                    preview_reason = None
+
+                            self._emit(
+                                "wait_started",
+                                {
+                                    "agent_name": agent.name,
+                                    "iteration": wait_execution_count,
+                                    "duration_seconds": preview_duration_seconds,
+                                    "reason": preview_reason,
+                                },
+                            )
+
+                            try:
+                                wait_output = await self._execute_wait(agent, agent_context)
+                            except Exception as exc:
+                                _wait_elapsed = _time.time() - _wait_start
+                                self._emit(
+                                    "wait_failed",
+                                    {
+                                        "agent_name": agent.name,
+                                        "elapsed": _wait_elapsed,
+                                        "error_type": type(exc).__name__,
+                                        "message": str(exc),
+                                    },
+                                )
+                                raise
+                            _wait_elapsed = _time.time() - _wait_start
+
+                            # Public output contract (per issue #218):
+                            # only ``waited_seconds`` is exposed in the
+                            # workflow context. Extra metadata lives in
+                            # the event payload below for the dashboard.
+                            output_content: dict[str, Any] = {
+                                "waited_seconds": wait_output.waited_seconds,
+                            }
+
+                            self._emit(
+                                "wait_completed",
+                                {
+                                    "agent_name": agent.name,
+                                    "elapsed": _wait_elapsed,
+                                    "waited_seconds": wait_output.waited_seconds,
+                                    "requested_seconds": wait_output.requested_seconds,
+                                    "reason": wait_output.reason,
+                                    "interrupted": wait_output.interrupted,
+                                },
+                            )
+
+                            self.context.store(agent.name, output_content)
+                            self.limits.record_execution(agent.name)
+                            self.limits.check_timeout()
+
+                            route_result = self._evaluate_routes(agent, output_content)
+
+                            self._emit(
+                                "route_taken",
+                                {
+                                    "from_agent": agent.name,
+                                    "to_agent": route_result.target,
+                                },
+                            )
+
+                            if route_result.target == "$end":
+                                result = self._build_final_output(route_result.output_transform)
+                                self._emit(
+                                    "workflow_completed",
+                                    {
+                                        "elapsed": _time.time() - _workflow_start,
+                                        "output": result,
+                                    },
+                                )
+                                self._execute_hook("on_complete", result=result)
+                                return result
+
+                            current_agent_name = route_result.target
+
+                            # Check for interrupt after wait step. If the
+                            # sleep was cut short by ``interrupt_event``,
+                            # the flag is still set here and triggers the
+                            # normal interrupt menu / web-mode handling.
+                            interrupt_result = await self._check_interrupt(current_agent_name)
+                            if interrupt_result is not None:
+                                current_agent_name = await self._handle_interrupt_result(
+                                    interrupt_result, current_agent_name
+                                )
+                            continue
+
+                        # Handle set steps. Pure context transformations:
+                        # render, coerce, validate, emit, route.
+                        if agent.type == "set":
+                            agent_context = self.context.build_for_agent(
+                                agent.name,
+                                agent.input,
+                                mode=self.config.workflow.context.mode,
+                                agent_type=agent.type,
+                            )
+
+                            set_output = await self._run_set_step(agent, agent_context)
+                            self.context.store(agent.name, set_output.value)
+                            self.limits.record_execution(agent.name)
+                            self.limits.check_timeout()
+
+                            # Routes attached to a set step evaluate against
+                            # the bound value directly. Dict-shaped outputs
+                            # expose ``output.<key>`` in Jinja ``when:`` and
+                            # bare ``<key>`` in simpleeval ``when:`` (via the
+                            # router's arithmetic-context flattening). Scalar
+                            # / list outputs expose only ``output``. The
+                            # router wraps whatever we pass under the
+                            # ``output`` key in its eval scope, so passing
+                            # the raw value here gives both patterns the
+                            # right shape.
+                            route_result = self._evaluate_routes(agent, set_output.value)
+
+                            self._emit(
+                                "route_taken",
+                                {
+                                    "from_agent": agent.name,
+                                    "to_agent": route_result.target,
+                                },
+                            )
+
+                            if route_result.target == "$end":
+                                result = self._build_final_output(route_result.output_transform)
+                                self._emit(
+                                    "workflow_completed",
+                                    {
+                                        "elapsed": _time.time() - _workflow_start,
+                                        "output": result,
+                                    },
+                                )
+                                self._execute_hook("on_complete", result=result)
+                                return result
+
+                            current_agent_name = route_result.target
+
+                            interrupt_result = await self._check_interrupt(current_agent_name)
+                            if interrupt_result is not None:
+                                current_agent_name = await self._handle_interrupt_result(
+                                    interrupt_result, current_agent_name
+                                )
+                            continue
+
                         # Handle sub-workflow steps
                         if agent.type == "workflow":
                             agent_context = self.context.build_for_agent(
                                 agent.name,
                                 agent.input,
                                 mode=self.config.workflow.context.mode,
+                                agent_type=agent.type,
                             )
                             _sub_start = _time.time()
 
@@ -1682,6 +2911,8 @@ class WorkflowEngine:
                                     "agent_name": agent.name,
                                     "iteration": sub_execution_count,
                                     "workflow": agent.workflow,
+                                    "parent_path": list(self._dashboard_context_path),
+                                    "slot_key": agent.name,
                                 },
                             )
 
@@ -1696,6 +2927,8 @@ class WorkflowEngine:
                                         "elapsed": _sub_elapsed,
                                         "error_type": type(exc).__name__,
                                         "message": str(exc),
+                                        "parent_path": list(self._dashboard_context_path),
+                                        "slot_key": agent.name,
                                     },
                                 )
                                 raise
@@ -1707,6 +2940,8 @@ class WorkflowEngine:
                                     "agent_name": agent.name,
                                     "elapsed": _sub_elapsed,
                                     "output": sub_output,
+                                    "parent_path": list(self._dashboard_context_path),
+                                    "slot_key": agent.name,
                                 },
                             )
 
@@ -1752,6 +2987,7 @@ class WorkflowEngine:
                             agent.name,
                             agent.input,
                             mode=self.config.workflow.context.mode,
+                            agent_type=agent.type,
                         )
 
                         # Execute agent (get executor for multi-provider support)
@@ -1759,12 +2995,15 @@ class WorkflowEngine:
                         executor = await self._get_executor_for_agent(agent)
                         guidance_section = self.context.get_guidance_prompt_section()
                         event_callback = self._make_event_callback(agent.name)
-                        output = await executor.execute(
+                        output = await self._execute_with_agent_timeout(
                             agent,
-                            agent_context,
-                            guidance_section=guidance_section,
-                            interrupt_signal=self._interrupt_event,
-                            event_callback=event_callback,
+                            executor.execute(
+                                agent,
+                                agent_context,
+                                guidance_section=guidance_section,
+                                interrupt_signal=self._interrupt_event,
+                                event_callback=event_callback,
+                            ),
                         )
                         _agent_elapsed = _time.time() - _agent_start
 
@@ -1798,6 +3037,16 @@ class WorkflowEngine:
                             )
                             _agent_elapsed = _time.time() - _agent_start
 
+                        # Dialog mode: evaluate whether agent should enter dialog
+                        if agent.dialog and not output.partial:
+                            output = await self._handle_dialog(
+                                agent,
+                                output,
+                                agent_context,
+                                executor,
+                            )
+                            _agent_elapsed = _time.time() - _agent_start
+
                         # Record usage and calculate cost
                         usage = self.usage_tracker.record(agent.name, output, _agent_elapsed)
 
@@ -1818,7 +3067,9 @@ class WorkflowEngine:
                                 "output": output.content,
                                 "output_keys": output_keys,
                                 "context_window_used": output.input_tokens,
-                                "context_window_max": self._get_context_window_for_agent(agent),
+                                "context_window_max": await self._get_context_window_for_agent(
+                                    agent, output
+                                ),
                             },
                         )
 
@@ -1866,8 +3117,27 @@ class WorkflowEngine:
         except KeyboardInterrupt:
             self._save_checkpoint_on_failure(KeyboardInterrupt("Workflow interrupted by user"))
             raise
-        except ConductorError as e:
+        except WorkflowTerminated as e:
+            # Explicit `type: terminate` with `status: failed`. The workflow
+            # ended intentionally — emit `workflow_failed` with rich termination
+            # metadata so the CLI/dashboard/JSONL can distinguish it from an
+            # unexpected failure. Skip the on-failure checkpoint: an explicit
+            # termination is not a resumable transient failure.
             fail_data: dict[str, Any] = {
+                "error_type": "WorkflowTerminated",
+                "message": e.reason,
+                "agent_name": e.terminated_by,
+                "termination_reason": e.reason,
+                "terminated_by": e.terminated_by,
+                "status": e.status,
+                "is_explicit": True,
+                "output": e.output,
+            }
+            self._emit("workflow_failed", fail_data)
+            self._execute_hook("on_error", error=e)
+            raise
+        except ConductorError as e:
+            fail_data = {
                 "error_type": type(e).__name__,
                 "message": str(e),
                 "agent_name": self._current_agent_name,
@@ -1894,12 +3164,96 @@ class WorkflowEngine:
             self._execute_hook("on_error", error=e)
             self._save_checkpoint_on_failure(e)
             raise
+        except asyncio.CancelledError:
+            # Normal cancellation path (dashboard stop, parent process exit,
+            # outer ``asyncio.wait_for`` timeout). The caller — typically
+            # ``conductor.cli.run._run_with_stop_signal`` — re-frames the
+            # cancellation as a ConductorError and emits the appropriate
+            # event there. Do NOT emit ``workflow_failed`` here, or the
+            # dashboard would show a spurious "CancelledError" failure
+            # whenever a user clicks Stop.
+            #
+            # No checkpoint is saved on cancellation: cancelled workflows
+            # are not resumable from this point — the user explicitly chose
+            # to stop, and the wrapper-issued ConductorError will trigger
+            # checkpoint save through the ``except ConductorError`` arm on
+            # its way out. See issue #116 review.
+            raise
+        except BaseException as e:
+            # Catch-all for exception classes that don't derive from
+            # ``Exception`` (e.g. ``SystemExit`` raised by a misbehaving
+            # library, fatal runtime errors). Without this arm the silent
+            # Windows startup crash (#116) leaves no ``workflow_failed``
+            # event in the JSONL log, making the failure invisible.
+            #
+            # NOTE: we deliberately do NOT invoke ``on_error`` lifecycle
+            # hooks here. Their declared signature accepts ``Exception |
+            # None``, so user-defined hooks may assume ``e.args`` /
+            # ``traceback`` semantics that don't hold for ``SystemExit``,
+            # and surfacing a process-exit signal to them would change
+            # their contract. Users who need hook-like notification for
+            # ``BaseException`` failures should subscribe to the
+            # ``workflow_failed`` event and check ``is_base_exception``.
+            #
+            # The diagnostic side effects below (``_emit``,
+            # ``_save_checkpoint_on_failure``) are wrapped in their own
+            # ``try/except`` blocks: if either of them raised here, the
+            # raised side-effect exception would replace the original
+            # ``BaseException`` on its way out of this handler, masking
+            # the exact crash we're trying to surface. Print a warning to
+            # stderr instead so the diagnostic regression is visible, but
+            # the ``raise`` at the end always re-raises the *original* ``e``.
+            try:
+                self._emit(
+                    "workflow_failed",
+                    {
+                        "error_type": type(e).__name__,
+                        "message": str(e),
+                        "agent_name": self._current_agent_name,
+                        "is_base_exception": True,
+                    },
+                )
+            except Exception as emit_exc:  # noqa: BLE001 - must not mask `e`
+                print(
+                    f"conductor: WARNING: failed to emit workflow_failed for "
+                    f"{type(e).__name__}: {emit_exc}",
+                    file=sys.stderr,
+                )
+            try:
+                self._save_checkpoint_on_failure(e)
+            except Exception as ckpt_exc:  # noqa: BLE001 - must not mask `e`
+                print(
+                    f"conductor: WARNING: checkpoint save raised unexpectedly: {ckpt_exc}",
+                    file=sys.stderr,
+                )
+            raise
+
+    # Type-appropriate zero values for optional inputs with no declared default.
+    # Using None causes templates to render "None" instead of empty string,
+    # and | default() won't catch None without the boolean=true flag.
+    # Note: mutable types (array, object) return fresh copies via the method below.
+    _TYPE_ZERO_VALUES: dict[str, Any] = {
+        "string": "",
+        "number": 0,
+        "boolean": False,
+    }
+
+    def _zero_value_for_type(self, type_name: str) -> Any:
+        """Return a type-appropriate zero value, with fresh copies for mutable types."""
+        if type_name == "array":
+            return []
+        if type_name == "object":
+            return {}
+        return self._TYPE_ZERO_VALUES.get(type_name)
 
     def _apply_input_defaults(self, inputs: dict[str, Any]) -> dict[str, Any]:
         """Apply default values from input schema for missing optional inputs.
 
         This ensures all defined inputs are present in the context, either
-        with provided values or their schema defaults (None if no default).
+        with provided values or their schema defaults. Optional inputs
+        without an explicit default get a type-appropriate zero value
+        (empty string, 0, false, [], {}) so they render cleanly in
+        templates without requiring ``| default()`` guards.
 
         Args:
             inputs: The input values provided at runtime.
@@ -1915,8 +3269,9 @@ class WorkflowEngine:
                 if input_def.default is not None:
                     merged[name] = input_def.default
                 elif not input_def.required:
-                    # Optional with no default - set to None so templates can check it
-                    merged[name] = None
+                    # Optional with no explicit default — use type-appropriate
+                    # zero value so templates render cleanly (not "None").
+                    merged[name] = self._zero_value_for_type(input_def.type)
 
         return merged
 
@@ -2036,20 +3391,62 @@ class WorkflowEngine:
 
         Raises:
             MaxIterationsError: If limit exceeded and user chooses not to continue.
+
+        Emits:
+            ``iteration_limit_reached`` before the gate, and
+            ``iteration_limit_resolved`` after — even when the prompt raises an
+            unexpected exception (with ``aborted=True``). See issue #134.
         """
         try:
             self.limits.check_iteration(agent_name)
         except MaxIterationsError:
-            # Prompt user for more iterations
-            await self._suspend_listener()
+            # Surface the gate to subscribers (web dashboard, JSONL log) before
+            # blocking on the console prompt — otherwise the workflow appears
+            # silently stalled when monitored via --web. See issue #134.
+            recent_history = self.limits.execution_history[-5:]
+            gate_id = uuid.uuid4().hex
+            self._emit(
+                "iteration_limit_reached",
+                {
+                    "agent_name": agent_name,
+                    "gate_id": gate_id,
+                    "current_iteration": self.limits.current_iteration,
+                    "max_iterations": self.limits.max_iterations,
+                    "agent_history": recent_history,
+                    "possible_loop": len(set(recent_history[-3:])) <= 1
+                    and len(recent_history) >= 3,
+                    "skip_gates": self.max_iterations_handler.skip_gates,
+                },
+            )
+
+            # Wrap resolved emission in an outer finally so the dashboard gate
+            # always closes — even if the prompt itself raises (EOFError on
+            # non-TTY, KeyboardInterrupt race, asyncio.CancelledError, etc.).
+            # Without this guarantee, the original #134 symptom recurs on the
+            # error path.
+            result: MaxIterationsPromptResult | None = None
             try:
-                result = await self.max_iterations_handler.handle_limit_reached(
-                    current_iteration=self.limits.current_iteration,
-                    max_iterations=self.limits.max_iterations,
-                    agent_history=self.limits.execution_history,
-                )
+                await self._suspend_listener()
+                try:
+                    result = await self._resolve_max_iterations_gate(gate_id=gate_id)
+                finally:
+                    await self._resume_listener()
             finally:
-                await self._resume_listener()
+                self._emit(
+                    "iteration_limit_resolved",
+                    {
+                        "agent_name": agent_name,
+                        "gate_id": gate_id,
+                        "continue_execution": (
+                            result.continue_execution if result is not None else False
+                        ),
+                        "additional_iterations": (
+                            result.additional_iterations if result is not None else 0
+                        ),
+                        "aborted": result is None,
+                    },
+                )
+
             if result.continue_execution:
                 self.limits.increase_limit(result.additional_iterations)
                 # Re-check should now pass
@@ -2071,26 +3468,246 @@ class WorkflowEngine:
 
         Raises:
             MaxIterationsError: If limit exceeded and user chooses not to continue.
+
+        Emits:
+            ``iteration_limit_reached`` before the gate, and
+            ``iteration_limit_resolved`` after — even when the prompt raises an
+            unexpected exception (with ``aborted=True``). See issue #134.
         """
         try:
             self.limits.check_parallel_group_iteration(group_name, agent_count)
         except MaxIterationsError:
-            # Prompt user for more iterations
-            await self._suspend_listener()
+            # See _check_iteration_with_prompt — same dashboard-visibility fix
+            # for parallel groups (issue #134). Note: agent_history here is
+            # the cross-group execution list, so the possible_loop heuristic
+            # may surface false positives for true parallel patterns.
+            recent_history = self.limits.execution_history[-5:]
+            gate_id = uuid.uuid4().hex
+            self._emit(
+                "iteration_limit_reached",
+                {
+                    "group_name": group_name,
+                    "gate_id": gate_id,
+                    "agent_count": agent_count,
+                    "current_iteration": self.limits.current_iteration,
+                    "max_iterations": self.limits.max_iterations,
+                    "agent_history": recent_history,
+                    "possible_loop": len(set(recent_history[-3:])) <= 1
+                    and len(recent_history) >= 3,
+                    "skip_gates": self.max_iterations_handler.skip_gates,
+                },
+            )
+
+            # Wrap resolved emission in an outer finally so the dashboard gate
+            # always closes — see _check_iteration_with_prompt for the rationale.
+            result: MaxIterationsPromptResult | None = None
             try:
-                result = await self.max_iterations_handler.handle_limit_reached(
-                    current_iteration=self.limits.current_iteration,
-                    max_iterations=self.limits.max_iterations,
-                    agent_history=self.limits.execution_history,
-                )
+                await self._suspend_listener()
+                try:
+                    result = await self._resolve_max_iterations_gate(gate_id=gate_id)
+                finally:
+                    await self._resume_listener()
             finally:
-                await self._resume_listener()
+                self._emit(
+                    "iteration_limit_resolved",
+                    {
+                        "group_name": group_name,
+                        "gate_id": gate_id,
+                        "continue_execution": (
+                            result.continue_execution if result is not None else False
+                        ),
+                        "additional_iterations": (
+                            result.additional_iterations if result is not None else 0
+                        ),
+                        "aborted": result is None,
+                    },
+                )
+
             if result.continue_execution:
                 self.limits.increase_limit(result.additional_iterations)
                 # Re-check should now pass
                 self.limits.check_parallel_group_iteration(group_name, agent_count)
             else:
                 raise  # Re-raise MaxIterationsError
+
+    async def _resolve_max_iterations_gate(self, *, gate_id: str) -> MaxIterationsPromptResult:
+        """Resolve a max-iterations gate, choosing CLI / web / race per environment.
+
+        Resolution policy (issue #198):
+
+        - ``skip_gates``: handler auto-stops; no UI.
+        - No web dashboard attached: existing CLI prompt path
+          (``EOFError`` → stop when stdin isn't a TTY).
+        - Web dashboard + (bg mode or non-TTY stdin): **web-only** wait. The
+          CLI prompt is deliberately NOT invoked because ``IntPrompt.ask``
+          would synchronously raise ``EOFError`` (stdin=DEVNULL in
+          ``--web-bg``), get coerced to ``0`` (stop), and race-win every
+          dashboard click. That was the original ``--web-bg`` silent-exit
+          bug. Also watches ``stop_event`` so ``POST /api/stop`` can
+          terminate the wait.
+        - Web dashboard + TTY foreground (``--web`` from a real terminal):
+          race the CLI prompt against the web response. Whichever the user
+          completes first wins; the loser is cancelled.
+
+        Args:
+            gate_id: Unique id emitted on the corresponding
+                ``iteration_limit_reached`` event. The web client echoes
+                this back so we ignore stale responses.
+
+        Returns:
+            The user's decision. Never ``None`` — abort/cancel paths are
+            handled by the calling code's outer ``finally`` block, which
+            converts a missing result into ``aborted=True``.
+
+        Raises:
+            asyncio.CancelledError: If the workflow is cancelled while
+                this gate is waiting (e.g. process shutdown, parent task
+                cancelled). The caller's outer ``finally`` detects this
+                via ``result is None`` and emits
+                ``iteration_limit_resolved`` with ``aborted=True`` before
+                the exception propagates.
+        """
+        handler = self.max_iterations_handler
+        current = self.limits.current_iteration
+        maxim = self.limits.max_iterations
+        history = self.limits.execution_history
+
+        # 1. skip_gates → handler auto-stops; no UI.
+        if handler.skip_gates:
+            return await handler.handle_limit_reached(
+                current_iteration=current,
+                max_iterations=maxim,
+                agent_history=history,
+            )
+
+        # 2. No web dashboard → existing CLI-only behavior (TTY or EOF→stop).
+        if self._web_dashboard is None:
+            return await handler.handle_limit_reached(
+                current_iteration=current,
+                max_iterations=maxim,
+                agent_history=history,
+            )
+
+        # 3. Web dashboard + bg or non-TTY → web-only wait.
+        cli_usable = not self._bg_mode and sys.stdin.isatty()
+        if not cli_usable:
+            return await self._wait_for_web_iteration_limit(gate_id)
+
+        # 4. Web dashboard + TTY → race CLI vs web.
+        cli_task = asyncio.create_task(
+            handler.handle_limit_reached(
+                current_iteration=current,
+                max_iterations=maxim,
+                agent_history=history,
+            ),
+            name="iter_limit_cli",
+        )
+        web_task = asyncio.create_task(
+            self._wait_for_web_iteration_limit(gate_id),
+            name="iter_limit_web",
+        )
+        done, pending = await asyncio.wait(
+            {cli_task, web_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        await self._drain_iteration_limit_losers(pending)
+        winner = done.pop()
+        return winner.result()
+
+    async def _wait_for_web_iteration_limit(self, gate_id: str) -> MaxIterationsPromptResult:
+        """Wait for the dashboard to resolve a max-iterations gate.
+
+        Races the gate response against the dashboard's stop signal so a
+        ``POST /api/stop`` or ``POST /api/kill`` while waiting (e.g. the
+        user closes the dashboard tab and uses ``conductor stop``) doesn't
+        leave the workflow blocked forever.
+
+        Args:
+            gate_id: Unique id of the gate being awaited.
+
+        Returns:
+            ``MaxIterationsPromptResult`` reflecting the user's choice, or
+            a stop result if the dashboard stop signal fires first.
+        """
+        assert self._web_dashboard is not None  # noqa: S101
+
+        response_task = asyncio.create_task(
+            self._web_dashboard.wait_for_iteration_limit_response(gate_id),
+            name="iter_limit_response",
+        )
+        stop_task = asyncio.create_task(
+            self._web_dashboard.wait_for_stop(),
+            name="iter_limit_stop",
+        )
+
+        try:
+            done, pending = await asyncio.wait(
+                {response_task, stop_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        except asyncio.CancelledError:
+            response_task.cancel()
+            stop_task.cancel()
+            raise
+
+        await self._drain_iteration_limit_losers(pending)
+
+        if response_task in done:
+            msg = response_task.result()
+            raw = msg.get("additional_iterations", 0)
+            try:
+                additional = max(0, int(raw))
+            except (TypeError, ValueError):
+                # Frontend bug or corrupted payload — degrade to stop so the
+                # workflow doesn't hang, but surface the malformed value so
+                # the underlying bug isn't silent (issue #198 review).
+                logger.warning(
+                    "Iteration-limit gate %s received malformed "
+                    "additional_iterations=%r; treating as stop.",
+                    gate_id,
+                    raw,
+                )
+                additional = 0
+            return MaxIterationsPromptResult(
+                continue_execution=additional > 0,
+                additional_iterations=additional,
+            )
+
+        # stop_task won the race — treat as explicit stop. Log so a
+        # post-mortem can distinguish a dashboard-stop (POST /api/stop or
+        # /api/kill) from the user clicking the modal's Stop button, which
+        # produces the same MaxIterationsPromptResult shape (issue #198
+        # review).
+        logger.info(
+            "Iteration-limit gate %s resolved by dashboard stop signal",
+            gate_id,
+        )
+        return MaxIterationsPromptResult(
+            continue_execution=False,
+            additional_iterations=0,
+        )
+
+    @staticmethod
+    async def _drain_iteration_limit_losers(pending: set[asyncio.Task[Any]]) -> None:
+        """Cancel and await the loser tasks of an iteration-limit race.
+
+        ``CancelledError`` is the expected outcome and is swallowed. Any
+        other exception means the loser task hit a real bug — log it with
+        traceback so the underlying defect isn't silent, even though the
+        winner already determined control flow (issue #198 review).
+        """
+        for task in pending:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.warning(
+                    "Iteration-limit %s task raised after cancellation",
+                    task.get_name(),
+                    exc_info=True,
+                )
 
     def _find_agent(self, name: str) -> AgentDef | None:
         """Find agent by name.
@@ -2421,15 +4038,45 @@ class WorkflowEngine:
                     agent.name,
                     agent.input,
                     mode=self.config.workflow.context.mode,
+                    agent_type=agent.type,
                 )
+
+                # `set` steps are pure context transformations — no provider,
+                # no event_callback, no usage accounting. Validator forbids
+                # same-group dependencies in their templates, so the pre-group
+                # snapshot is the right thing to render against. We still
+                # emit set_started/set_completed/set_failed via _run_set_step
+                # so the dashboard renders set nodes consistently with the
+                # linear path.
+                if agent.type == "set":
+                    set_output = await self._run_set_step(agent, agent_context)
+                    _agent_elapsed = _time.time() - _agent_start
+                    self._emit(
+                        "parallel_agent_completed",
+                        {
+                            "group_name": parallel_group.name,
+                            "agent_name": agent.name,
+                            "elapsed": _agent_elapsed,
+                            "model": "",
+                            "tokens": 0,
+                            "cost_usd": 0.0,
+                            "context_window_used": 0,
+                            "context_window_max": None,
+                            "agent_type": "set",
+                        },
+                    )
+                    return (agent.name, set_output.value)
 
                 # Execute agent (get executor for multi-provider support)
                 executor = await self._get_executor_for_agent(agent)
                 event_callback = self._make_event_callback(agent.name)
-                output = await executor.execute(
+                output = await self._execute_with_agent_timeout(
                     agent,
-                    agent_context,
-                    event_callback=event_callback,
+                    executor.execute(
+                        agent,
+                        agent_context,
+                        event_callback=event_callback,
+                    ),
                 )
                 _agent_elapsed = _time.time() - _agent_start
 
@@ -2446,7 +4093,9 @@ class WorkflowEngine:
                         "tokens": output.tokens_used,
                         "cost_usd": usage.cost_usd,
                         "context_window_used": output.input_tokens,
-                        "context_window_max": self._get_context_window_for_agent(agent),
+                        "context_window_max": await self._get_context_window_for_agent(
+                            agent, output
+                        ),
                     },
                 )
 
@@ -2755,6 +4404,7 @@ class WorkflowEngine:
                     for_each_group.agent.name,
                     for_each_group.agent.input,
                     mode=self.config.workflow.context.mode,
+                    agent_type=for_each_group.agent.type,
                 )
 
                 # Inject loop variables into context
@@ -2768,21 +4418,9 @@ class WorkflowEngine:
 
                 # Execute agent — sub-workflow or regular
                 if for_each_group.agent.type == "workflow":
-                    # Build sub-workflow inputs from input_mapping with loop vars
-                    if for_each_group.agent.input_mapping:
-                        renderer = TemplateRenderer()
-                        sub_inputs: dict[str, Any] = {}
-                        for k, tmpl in for_each_group.agent.input_mapping.items():
-                            rendered = renderer.render(tmpl, agent_context)
-                            try:
-                                sub_inputs[k] = json.loads(rendered)
-                            except (json.JSONDecodeError, ValueError):
-                                sub_inputs[k] = rendered
-                    else:
-                        wf_ctx = agent_context.get("workflow", {})
-                        sub_inputs = (
-                            dict(wf_ctx.get("input", {})) if isinstance(wf_ctx, dict) else {}
-                        )
+                    # Build sub-workflow inputs using shared helper (consistent
+                    # JSON-parse-with-fallback across all sub-workflow paths)
+                    sub_inputs = self._build_subworkflow_inputs(for_each_group.agent, agent_context)
 
                     # Execute sub-workflow per-iteration. Build a unique slot
                     # key so concurrent iterations get distinct dashboard
@@ -2800,7 +4438,7 @@ class WorkflowEngine:
                         },
                     )
                     try:
-                        output_content = await self._execute_subworkflow_with_inputs(
+                        output_content, child_usage = await self._execute_subworkflow_with_inputs(
                             for_each_group.agent,
                             sub_inputs,
                             slot_key=iteration_slot_key,
@@ -2842,26 +4480,66 @@ class WorkflowEngine:
                             "group_name": for_each_group.name,
                             "item_key": key,
                             "elapsed": _item_elapsed,
-                            "tokens": 0,
-                            "cost_usd": 0.0,
+                            "tokens": child_usage.total_tokens,
+                            "cost_usd": child_usage.total_cost_usd or 0.0,
                             "output": output_content,
                         },
                     )
                     return (key, output_content)
 
                 # Regular agent execution
+                # `set` steps in for-each are pure context transformations
+                # per item (e.g. building a normalised list of strings). No
+                # provider, no event_callback, no usage accounting. We still
+                # emit set_started/set_completed/set_failed via _run_set_step
+                # so the dashboard renders per-item set nodes consistently
+                # with the linear path.
+                if for_each_group.agent.type == "set":
+                    set_output = await self._run_set_step(for_each_group.agent, agent_context)
+                    _item_elapsed = _time.time() - _item_start
+                    self._emit(
+                        "for_each_item_completed",
+                        {
+                            "group_name": for_each_group.name,
+                            "item_key": key,
+                            "elapsed": _item_elapsed,
+                            "tokens": 0,
+                            "cost_usd": 0.0,
+                            "output": set_output.value,
+                        },
+                    )
+                    return (key, set_output.value)
+
                 executor = await self._get_executor_for_agent(for_each_group.agent)
 
-                # Item-scoped event callback that tags all streaming events with item_key
+                # Qualify the per-iteration agent name so that any verbose
+                # provider-side logging (e.g. CopilotProvider tool/reasoning
+                # lines) can attribute interleaved output to a specific
+                # for-each iteration. The original AgentDef is untouched —
+                # only this iteration's copy carries the qualified name.
+                qualified_agent = for_each_group.agent.model_copy(
+                    update={"name": f"{for_each_group.agent.name}[{key}]"}
+                )
+
+                # Item-scoped event callback that tags all streaming events
+                # with the for-each group name + item_key. Wrapper keys are
+                # placed *after* ``**data`` so they override any qualified
+                # ``agent_name`` the provider may emit (e.g. ``agent_retry``).
+                # This keeps the event contract stable for downstream
+                # consumers (dashboard, JSONL log) — they always see the
+                # for-each group name plus a separate ``item_key``.
                 def _item_callback(event_type: str, data: dict[str, Any]) -> None:
-                    data_with_agent = {"agent_name": for_each_group.name, "item_key": key, **data}
+                    data_with_agent = {**data, "agent_name": for_each_group.name, "item_key": key}
                     self._emit(event_type, data_with_agent)
 
                 event_callback = _item_callback if self._event_emitter else None
-                output = await executor.execute(
-                    for_each_group.agent,
-                    agent_context,
-                    event_callback=event_callback,
+                output = await self._execute_with_agent_timeout(
+                    qualified_agent,
+                    executor.execute(
+                        qualified_agent,
+                        agent_context,
+                        event_callback=event_callback,
+                    ),
                 )
                 _item_elapsed = _time.time() - _item_start
 
@@ -3187,6 +4865,33 @@ class WorkflowEngine:
             for key, value in route_output_transform.items():
                 result[key] = self._maybe_parse_json(value) if isinstance(value, str) else value
 
+        return result
+
+    def _build_terminate_output(self, agent: AgentDef) -> dict[str, Any]:
+        """Build the final output for a ``type: terminate`` step.
+
+        When ``agent.output_template`` is set, render its entries against the
+        accumulated context and use them as the final workflow output
+        (replacing the workflow-level ``output:`` mapping). Otherwise, fall
+        back to ``_build_final_output(None)`` so the workflow-level ``output:``
+        is rendered as on any other terminal path.
+
+        Args:
+            agent: The terminate-step agent definition.
+
+        Returns:
+            Dict with rendered output values, ready for the
+            ``workflow_completed`` / ``workflow_failed`` event payload and
+            stdout JSON.
+        """
+        if agent.output_template is None:
+            return self._build_final_output(None)
+
+        ctx = self.context.get_for_template()
+        result: dict[str, Any] = {}
+        for key, template in agent.output_template.items():
+            rendered = self.renderer.render(template, ctx)
+            result[key] = self._maybe_parse_json(rendered)
         return result
 
     @staticmethod

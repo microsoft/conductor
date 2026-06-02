@@ -9,6 +9,7 @@ export interface GraphNodeData {
   status: string;
   groupName?: string;
   progress?: GroupProgress;
+  parentAgent?: string;
   [key: string]: unknown;
 }
 
@@ -27,6 +28,7 @@ export function buildGraphElements(
   nodes: Record<string, NodeData>,
   groupProgress: Record<string, GroupProgress>,
   entryPoint: string | null,
+  parentAgent?: string | null,
 ): { nodes: Node<GraphNodeData>[]; edges: Edge[] } {
   const flowNodes: Node<GraphNodeData>[] = [];
   const flowEdges: Edge[] = [];
@@ -115,7 +117,11 @@ export function buildGraphElements(
       const nd = nodes[a.name];
       let flowNodeType = 'agentNode';
       if (nodeType === 'script') flowNodeType = 'scriptNode';
+      else if (nodeType === 'set') flowNodeType = 'setNode';
       else if (nodeType === 'human_gate') flowNodeType = 'gateNode';
+      else if (nodeType === 'workflow') flowNodeType = 'workflowNode';
+      else if (nodeType === 'wait') flowNodeType = 'waitNode';
+      else if (nodeType === 'terminate') flowNodeType = 'terminateNode';
 
       flowNodes.push({
         id: a.name,
@@ -139,14 +145,16 @@ export function buildGraphElements(
 
   if (hasEnd) {
     const nd = nodes['$end'];
+    const isSubworkflow = !!parentAgent;
     flowNodes.push({
       id: '$end',
-      type: 'endNode',
+      type: isSubworkflow ? 'egressNode' : 'endNode',
       position: { x: 0, y: 0 },
       data: {
         label: '$end',
-        type: 'end',
+        type: isSubworkflow ? 'egress' : 'end',
         status: nd?.status || 'pending',
+        ...(isSubworkflow ? { parentAgent } : {}),
       },
     });
   }
@@ -154,14 +162,16 @@ export function buildGraphElements(
   // Always add $start node if we have an entry point
   if (entryPoint) {
     const nd = nodes['$start'];
+    const isSubworkflow = !!parentAgent;
     flowNodes.push({
       id: '$start',
-      type: 'startNode',
+      type: isSubworkflow ? 'ingressNode' : 'startNode',
       position: { x: 0, y: 0 },
       data: {
         label: '$start',
-        type: 'start',
+        type: isSubworkflow ? 'ingress' : 'start',
         status: nd?.status || 'pending',
+        ...(isSubworkflow ? { parentAgent } : {}),
       },
     });
 
@@ -176,25 +186,130 @@ export function buildGraphElements(
     });
   }
 
-  // Create edges
+  // Create edges — only include edges whose source and target exist as nodes.
+  // Remap child nodes inside groups to the parent group node so edges
+  // connect at the group boundary (children use relative positioning).
+  const nodeIds = new Set(flowNodes.map((n) => n.id));
+  const childToParent = new Map<string, string>();
+  for (const node of flowNodes) {
+    if (node.parentId) childToParent.set(node.id, node.parentId);
+  }
+
+  // Dedupe edges by (from, to). YAML route lists frequently combine a
+  // conditional route with a catch-all to the same target (e.g. an "if X
+  // then $end" plus a bare "to: $end" fallback). The engine evaluates
+  // routes in order and the first match wins, so multiple entries between
+  // the same pair represent ONE visual transition, not parallel edges.
+  // Without deduping, dagre lays them as two overlapping/diverging edges
+  // which render as phantom strands going off-canvas.
+  // When collapsing routes with different `when` conditions, the label is
+  // cleared to avoid implying only one condition applies.
+  const seenPairs = new Map<string, { when: string | undefined; idx: number }>();
   for (const r of routes) {
+    const from = childToParent.get(r.from) ?? r.from;
+    const to = childToParent.get(r.to) ?? r.to;
+    if (!nodeIds.has(from) || !nodeIds.has(to)) continue;
+    // Skip self-loops created by remapping (e.g. group member → group member)
+    if (from === to) continue;
+    const pairKey = `${from}->${to}`;
+    const existing = seenPairs.get(pairKey);
+    if (existing) {
+      // Multiple distinct conditions collapse — drop the label.
+      if (existing.when !== r.when) {
+        flowEdges[existing.idx]!.data = { when: undefined };
+      }
+      continue;
+    }
+    const idx = flowEdges.length;
+    seenPairs.set(pairKey, { when: r.when, idx });
+    const edgeId = `${pairKey}${r.when ? `[${r.when}]` : ''}`;
     flowEdges.push({
-      id: `${r.from}->${r.to}`,
-      source: r.from,
-      target: r.to,
+      id: edgeId,
+      source: from,
+      target: to,
       type: 'animatedEdge',
       data: { when: r.when },
       animated: false,
     });
   }
 
+  // Classify edges as forward or back-edges using a DFS from $start.
+  // Back-edges are loop-back routes (e.g. plan_reviewer → planner when
+  // approved=false). Feeding them to Dagre as-is causes it to greedily
+  // reverse arbitrary edges to break cycles, which scrambles the ranking
+  // and produces disjointed layouts. Pre-classifying lets us pass each
+  // back-edge to Dagre in REVERSED direction so the layout reflects the
+  // true forward DAG, while we still render the edge in its original
+  // direction.
+  const backEdgeIds = findBackEdges(flowNodes, flowEdges, '$start');
+
   // Apply dagre layout to top-level nodes only (non-children)
-  applyDagreLayout(flowNodes, flowEdges);
+  applyDagreLayout(flowNodes, flowEdges, backEdgeIds);
 
   return { nodes: flowNodes, edges: flowEdges };
 }
 
-function applyDagreLayout(flowNodes: Node<GraphNodeData>[], flowEdges: Edge[]): void {
+/**
+ * Identify back-edges via DFS from the entry node. An edge u→v is a back-edge
+ * iff v is an ancestor of u in the DFS tree (i.e. v is currently on the DFS
+ * stack when we visit u→v). Operates on top-level node IDs only, since edges
+ * have already been remapped from group children to group parents.
+ *
+ * Traversal order is deterministic: outgoing edges are visited in sorted
+ * target-ID order, and unreachable subgraphs are entered in sorted source-ID
+ * order, so layout is stable across renders.
+ */
+function findBackEdges(
+  flowNodes: Node<GraphNodeData>[],
+  flowEdges: Edge[],
+  startId: string,
+): Set<string> {
+  const topLevelIds = new Set(flowNodes.filter((n) => !n.parentId).map((n) => n.id));
+
+  // Build adjacency from top-level edges. Sort targets for stability.
+  const adj = new Map<string, { target: string; edgeId: string }[]>();
+  for (const e of flowEdges) {
+    if (!topLevelIds.has(e.source) || !topLevelIds.has(e.target)) continue;
+    if (!adj.has(e.source)) adj.set(e.source, []);
+    adj.get(e.source)!.push({ target: e.target, edgeId: e.id });
+  }
+  for (const list of adj.values()) {
+    list.sort((a, b) => (a.target < b.target ? -1 : a.target > b.target ? 1 : 0));
+  }
+
+  const backEdges = new Set<string>();
+  const onStack = new Set<string>();
+  const visited = new Set<string>();
+
+  const dfs = (node: string): void => {
+    visited.add(node);
+    onStack.add(node);
+    for (const { target, edgeId } of adj.get(node) ?? []) {
+      if (onStack.has(target)) {
+        backEdges.add(edgeId);
+      } else if (!visited.has(target)) {
+        dfs(target);
+      }
+    }
+    onStack.delete(node);
+  };
+
+  if (topLevelIds.has(startId)) dfs(startId);
+
+  // Also DFS from any unvisited nodes that have outgoing edges, so back-edges
+  // in unreachable subgraphs are still classified deterministically.
+  for (const id of [...adj.keys()].sort()) {
+    if (!visited.has(id)) dfs(id);
+  }
+
+  return backEdges;
+}
+
+function applyDagreLayout(
+  flowNodes: Node<GraphNodeData>[],
+  flowEdges: Edge[],
+  backEdgeIds: Set<string>,
+): void {
   // Use a NON-compound dagre graph — compound mode causes crashes
   // when edges cross compound boundaries
   const g = new dagre.graphlib.Graph();
@@ -211,10 +326,14 @@ function applyDagreLayout(flowNodes: Node<GraphNodeData>[], flowEdges: Edge[]): 
     g.setNode(node.id, { width: w, height: h });
   }
 
-  // Add edges (dagre needs valid source/target nodes)
+  // Add edges (dagre needs valid source/target nodes). Back-edges are passed
+  // in REVERSED direction so dagre ranks the underlying DAG correctly; the
+  // visible flowEdges entries keep their original direction.
   for (const edge of flowEdges) {
-    // Only add edge if both source and target are in dagre graph
-    if (g.hasNode(edge.source) && g.hasNode(edge.target)) {
+    if (!g.hasNode(edge.source) || !g.hasNode(edge.target)) continue;
+    if (backEdgeIds.has(edge.id)) {
+      g.setEdge(edge.target, edge.source);
+    } else {
       g.setEdge(edge.source, edge.target);
     }
   }

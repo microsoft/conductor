@@ -13,9 +13,8 @@ from pydantic import BaseModel
 from ruamel.yaml import YAML, YAMLError
 
 from conductor.registry.config import RegistryEntry, RegistryType
-from conductor.registry.errors import RegistryError
+from conductor.registry.errors import RegistryError, RegistryNotFoundError
 
-_GITHUB_BRANCHES = ("main", "master")
 _INDEX_FILENAMES = ("index.yaml", "index.json")
 
 
@@ -30,7 +29,6 @@ class WorkflowInfo(BaseModel):
     description: str = ""
     path: str
     """Relative path from registry root to the workflow YAML."""
-    versions: list[str] = []
 
 
 class RegistryIndex(BaseModel):
@@ -44,17 +42,23 @@ class RegistryIndex(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-def load_index(entry: RegistryEntry) -> RegistryIndex:
+def load_index(entry: RegistryEntry, ref: str | None = None) -> RegistryIndex:
     """Load and parse the index for a registry.
 
     For path registries: reads ``index.yaml`` or ``index.json`` from the
-    source directory.
+    source directory. The ``ref`` argument is ignored for path registries
+    since they have no concept of refs.
 
-    For GitHub registries: fetches from ``raw.githubusercontent.com`` on the
-    default branch (``main``, falling back to ``master``).
+    For GitHub registries: resolves ``ref`` to an immutable commit SHA and
+    fetches the index file at that SHA. When ``ref`` is ``None`` or
+    ``"latest"``, the repository's default branch is queried first and then
+    resolved to a SHA. Pinning to a SHA bypasses Fastly's CDN cache for
+    ``raw.githubusercontent.com`` because each commit produces a unique URL.
 
     Args:
         entry: The registry entry describing the backend type and source.
+        ref: Optional git ref (branch, tag, or SHA) for GitHub registries.
+            Defaults to the repository's default branch.
 
     Returns:
         A parsed ``RegistryIndex``.
@@ -64,29 +68,7 @@ def load_index(entry: RegistryEntry) -> RegistryIndex:
     """
     if entry.type == RegistryType.path:
         return _load_path_index(entry.source)
-    return _load_github_index(entry.source)
-
-
-def resolve_latest(index: RegistryIndex, workflow_name: str) -> str:
-    """Resolve 'latest' to the last version in the versions list.
-
-    Args:
-        index: The registry index to look up.
-        workflow_name: Name of the workflow.
-
-    Returns:
-        The last element of the workflow's versions list.
-
-    Raises:
-        RegistryError: If the workflow is not found or has no versions listed.
-    """
-    info = get_workflow_info(index, workflow_name)
-    if not info.versions:
-        raise RegistryError(
-            f"Workflow '{workflow_name}' has no versions listed",
-            suggestion="Add at least one version to the workflow entry in the registry index.",
-        )
-    return info.versions[-1]
+    return _load_github_index(entry.source, ref)
 
 
 def get_workflow_info(index: RegistryIndex, workflow_name: str) -> WorkflowInfo:
@@ -194,51 +176,95 @@ def _parse_json_file(path: Path) -> RegistryIndex:
     return _parse_index_data(data, str(path))
 
 
-def _load_github_index(source: str) -> RegistryIndex:
-    """Fetch index from a GitHub repository using the shared GitHub helpers."""
-    from conductor.registry.github import fetch_file_text, parse_github_source
+def _load_github_index(source: str, ref: str | None) -> RegistryIndex:
+    """Fetch index from a GitHub repository, pinned to an immutable SHA.
+
+    Resolves ``ref`` to a commit SHA via the GitHub API before fetching, so
+    the resulting raw.githubusercontent.com URL is unique per commit and
+    bypasses Fastly's CDN cache.
+    """
+    from conductor.registry.github import (
+        fetch_file_text,
+        get_default_branch,
+        parse_github_source,
+        resolve_ref_to_sha,
+    )
 
     owner, repo = parse_github_source(source)
 
+    if ref is None or ref == "latest":
+        branch = get_default_branch(owner, repo)
+        sha = resolve_ref_to_sha(owner, repo, branch)
+    else:
+        sha = resolve_ref_to_sha(owner, repo, ref)
+
     for filename in _INDEX_FILENAMES:
-        for branch in _GITHUB_BRANCHES:
-            try:
-                text = fetch_file_text(owner, repo, filename, ref=branch)
-            except RegistryError:
-                continue
+        try:
+            text = fetch_file_text(owner, repo, filename, ref=sha)
+        except RegistryNotFoundError:
+            continue
 
-            return _parse_github_response(text, filename, f"{source}/{branch}/{filename}")
+        return _parse_github_response(text, filename, f"{source}/{sha}/{filename}")
 
-    raise RegistryError(
+    tried_label = ref if ref is not None else "default branch"
+    raise RegistryNotFoundError(
         f"No index.yaml or index.json found in GitHub repo '{source}' "
-        f"(tried branches: {', '.join(_GITHUB_BRANCHES)})",
-        suggestion="Ensure the repository contains an index.yaml or index.json on main or master.",
+        f"at ref '{tried_label}' (resolved to {sha})",
+        suggestion="Ensure the repository contains an index.yaml or index.json at this ref.",
     )
 
 
 def _parse_github_response(text: str, filename: str, url: str) -> RegistryIndex:
     """Parse the content fetched from GitHub."""
-    if filename.endswith(".yaml"):
+    fmt = "yaml" if filename.endswith(".yaml") else "json"
+    return parse_index_text(text, fmt, url)
+
+
+def parse_index_text(text: str, fmt: str, source_label: str) -> RegistryIndex:
+    """Parse a registry index from in-memory text.
+
+    Used by the cache layer to load a registry index that was previously
+    persisted to disk (``_meta/<sha>/index.yaml``) without re-fetching from
+    the upstream registry.
+
+    Args:
+        text: The full text of the index file.
+        fmt: Either ``"yaml"`` or ``"json"``.
+        source_label: Human-readable identifier of the source for use in
+            error messages (e.g. a file path or URL).
+
+    Returns:
+        The parsed :class:`RegistryIndex`.
+
+    Raises:
+        RegistryError: If parsing fails or the document is not a mapping.
+    """
+    if fmt == "yaml":
         try:
             yaml = YAML(typ="safe")
             data = yaml.load(text)
         except YAMLError as exc:
             raise RegistryError(
-                f"Failed to parse index from {url}: {exc}",
-                suggestion="Check the YAML syntax in the remote index file.",
+                f"Failed to parse index from {source_label}: {exc}",
+                suggestion="Check the YAML syntax in the index file.",
             ) from exc
-    else:
+    elif fmt == "json":
         try:
             data = json.loads(text)
         except json.JSONDecodeError as exc:
             raise RegistryError(
-                f"Failed to parse index from {url}: {exc}",
-                suggestion="Check the JSON syntax in the remote index file.",
+                f"Failed to parse index from {source_label}: {exc}",
+                suggestion="Check the JSON syntax in the index file.",
             ) from exc
+    else:
+        raise RegistryError(
+            f"Unknown index format {fmt!r}",
+            suggestion="Pass 'yaml' or 'json' as the format.",
+        )
 
     if not isinstance(data, dict):
         raise RegistryError(
-            f"Malformed registry index from {url}: expected a mapping at the top level",
+            f"Malformed registry index from {source_label}: expected a mapping at the top level",
             suggestion="Check that the index file matches the expected schema.",
         )
-    return _parse_index_data(data, url)
+    return _parse_index_data(data, source_label)

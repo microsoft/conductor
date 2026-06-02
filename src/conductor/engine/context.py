@@ -6,15 +6,28 @@ including inputs, agent outputs, and execution history.
 
 from __future__ import annotations
 
+import copy
+import json
+import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     from conductor.providers.base import AgentProvider
 
+logger = logging.getLogger(__name__)
+
 # Token estimation constants
 # Average characters per token (conservative estimate)
 CHARS_PER_TOKEN = 4
+
+# Agent types whose templates are rendered locally (not sent to an LLM).
+# For these, ``workflow.input`` is always made available regardless of context
+# mode, because workflow inputs are the workflow's external interface — set
+# once at startup and present for the lifetime of the run. Per-step agent
+# outputs remain explicitly declared in ``input:`` for traceability, even for
+# local renders.
+_LOCAL_RENDER_AGENT_TYPES = frozenset({"script", "set", "wait", "workflow"})
 
 
 def estimate_tokens(text: str) -> int:
@@ -78,6 +91,18 @@ class WorkflowContext:
     workflow_inputs: dict[str, Any] = field(default_factory=dict)
     """Inputs provided at workflow start."""
 
+    workflow_dir: str = ""
+    """Directory containing the workflow YAML file (resolved absolute path).
+    Available in templates as ``{{ workflow.dir }}``."""
+
+    workflow_file: str = ""
+    """Absolute path to the workflow YAML file.
+    Available in templates as ``{{ workflow.file }}``."""
+
+    workflow_name: str = ""
+    """Name of the workflow from the YAML config.
+    Available in templates as ``{{ workflow.name }}``."""
+
     agent_outputs: dict[str, dict[str, Any]] = field(default_factory=dict)
     """Outputs from executed agents, keyed by agent name."""
 
@@ -123,7 +148,7 @@ class WorkflowContext:
         """
         self.workflow_inputs = inputs.copy()
 
-    def store(self, agent_name: str, output: dict[str, Any]) -> None:
+    def store(self, agent_name: str, output: Any) -> None:
         """Store an agent's output in context.
 
         This method updates the agent_outputs dictionary, appends the agent
@@ -131,7 +156,10 @@ class WorkflowContext:
 
         Args:
             agent_name: The name of the agent whose output is being stored.
-            output: The structured output from the agent.
+            output: The structured output from the agent. Usually a dict (the
+                shape returned by LLM agents, script agents, gates, parallel
+                groups, etc.), but ``set`` steps with a single ``value:`` can
+                store a scalar, list, or any JSON-safe value directly.
         """
         self.agent_outputs[agent_name] = output
         self.execution_history.append(agent_name)
@@ -142,6 +170,7 @@ class WorkflowContext:
         agent_name: str,
         inputs: list[str],
         mode: str = "accumulate",
+        agent_type: str | None = None,
     ) -> dict[str, Any]:
         """Build context dict for a specific agent based on its input declarations.
 
@@ -154,6 +183,12 @@ class WorkflowContext:
             agent_name: Name of the agent needing context.
             inputs: List of input references (e.g., ['workflow.input.goal', 'planner.output']).
             mode: Context mode - accumulate, last_only, or explicit.
+            agent_type: The agent's ``type`` field (e.g., ``"agent"``, ``"script"``,
+                ``"workflow"``, ``"human_gate"``). When the type is in
+                ``_LOCAL_RENDER_AGENT_TYPES``, ``workflow.input`` is always
+                populated even in explicit mode — see the constant's docstring
+                for rationale. Outputs from prior agents remain governed by
+                ``mode`` regardless of agent type.
 
         Returns:
             Dict with 'workflow', agent outputs, and 'context' metadata.
@@ -161,11 +196,25 @@ class WorkflowContext:
         Raises:
             KeyError: If explicit mode is used and a required (non-optional) input is missing.
         """
+        # Build workflow metadata available in all modes
+        workflow_meta: dict[str, Any] = {}
+        if self.workflow_dir:
+            workflow_meta["dir"] = self.workflow_dir
+        if self.workflow_file:
+            workflow_meta["file"] = self.workflow_file
+        if self.workflow_name:
+            workflow_meta["name"] = self.workflow_name
+
         # For explicit mode, start with empty workflow inputs
         # For other modes, include all workflow inputs
         if mode == "explicit":
+            # Local-render agents (script, sub-workflow) always see the full
+            # workflow.input — see _LOCAL_RENDER_AGENT_TYPES for rationale.
+            initial_workflow_inputs: dict[str, Any] = (
+                self.workflow_inputs.copy() if agent_type in _LOCAL_RENDER_AGENT_TYPES else {}
+            )
             ctx: dict[str, Any] = {
-                "workflow": {"input": {}},
+                "workflow": {"input": initial_workflow_inputs, **workflow_meta},
                 "context": {
                     "iteration": self.current_iteration,
                     "history": self.execution_history.copy(),
@@ -176,7 +225,7 @@ class WorkflowContext:
                 self._add_explicit_input(ctx, input_ref)
         else:
             ctx = {
-                "workflow": {"input": self.workflow_inputs.copy()},
+                "workflow": {"input": self.workflow_inputs.copy(), **workflow_meta},
                 "context": {
                     "iteration": self.current_iteration,
                     "history": self.execution_history.copy(),
@@ -307,33 +356,58 @@ class WorkflowContext:
         Raises:
             KeyError: If a required field is missing.
         """
-        # Ensure the agent context exists
-        if agent_name not in ctx:
-            ctx[agent_name] = {"output": {}}
-        elif "output" not in ctx[agent_name]:
-            ctx[agent_name]["output"] = {}
-
         agent_output = self.agent_outputs[agent_name]
+        is_dict_output = isinstance(agent_output, dict)
+
+        # Initialise ``output`` to an empty dict for dict-shaped outputs (so
+        # subsequent field-writes have somewhere to land) or to ``None`` for
+        # scalar/list outputs (which are assigned whole below).
+        if agent_name not in ctx:
+            ctx[agent_name] = {"output": {} if is_dict_output else None}
+        elif "output" not in ctx[agent_name]:
+            ctx[agent_name]["output"] = {} if is_dict_output else None
 
         if not remaining_parts:
             # Just agent_name - copy entire output
-            ctx[agent_name]["output"] = agent_output.copy()
+            ctx[agent_name]["output"] = (
+                copy.deepcopy(agent_output) if is_dict_output else (copy.copy(agent_output))
+            )
         elif len(remaining_parts) == 1 and remaining_parts[0] == "output":
             # agent_name.output - copy entire output
-            ctx[agent_name]["output"] = agent_output.copy()
+            ctx[agent_name]["output"] = (
+                copy.deepcopy(agent_output) if is_dict_output else (copy.copy(agent_output))
+            )
         elif len(remaining_parts) >= 2 and remaining_parts[0] == "output":
-            # agent_name.output.field - copy specific field
+            # agent_name.output.field - copy specific field. Only meaningful
+            # when the stored output is a dict; otherwise the field access
+            # is undefined and (when required) must raise.
             field_name = remaining_parts[1]
-            if field_name in agent_output:
+            if is_dict_output and field_name in agent_output:
+                # Ensure we have a dict to write the field into (the initial
+                # output slot above seeded ``None`` for non-dict outputs).
+                if not isinstance(ctx[agent_name]["output"], dict):
+                    ctx[agent_name]["output"] = {}
                 ctx[agent_name]["output"][field_name] = agent_output[field_name]
             elif not is_optional:
+                if not is_dict_output:
+                    raise KeyError(
+                        f"Cannot access field '{field_name}' on agent '{agent_name}': "
+                        f"its output is a {type(agent_output).__name__}, not a dict"
+                    )
                 raise KeyError(f"Missing output field '{field_name}' from agent '{agent_name}'")
         elif len(remaining_parts) == 1 and remaining_parts[0] != "output":
             # Shorthand format: agent_name.field -> agent_name.output.field
             field_name = remaining_parts[0]
-            if field_name in agent_output:
+            if is_dict_output and field_name in agent_output:
+                if not isinstance(ctx[agent_name]["output"], dict):
+                    ctx[agent_name]["output"] = {}
                 ctx[agent_name]["output"][field_name] = agent_output[field_name]
             elif not is_optional:
+                if not is_dict_output:
+                    raise KeyError(
+                        f"Cannot access field '{field_name}' on agent '{agent_name}': "
+                        f"its output is a {type(agent_output).__name__}, not a dict"
+                    )
                 raise KeyError(f"Missing output field '{field_name}' from agent '{agent_name}'")
 
     def _add_parallel_group_input(
@@ -633,6 +707,18 @@ class WorkflowContext:
                 continue
 
             output = self.agent_outputs[agent_name]
+            # Set steps with single value: store scalars/lists, which have
+            # no per-field truncation surface; skip them — their token cost
+            # is treated as immutable for this strategy. Log so a user
+            # debugging "context still too big" can see why.
+            if not isinstance(output, dict):
+                logger.debug(
+                    "context.trim(truncate): skipping non-dict output for '%s' "
+                    "(type=%s); per-field truncation does not apply",
+                    agent_name,
+                    type(output).__name__,
+                )
+                continue
             for key, value in list(output.items()):
                 if isinstance(value, str) and len(value) > 100:
                     # Calculate how much to truncate from this value
@@ -691,11 +777,29 @@ class WorkflowContext:
                     output = self.agent_outputs[agent_name]
                     # Create a brief summary of the output
                     summary = f"{agent_name}: "
-                    for key, value in output.items():
-                        if isinstance(value, str):
-                            summary += f"{key}={value[:50]}... "
-                        else:
-                            summary += f"{key}={value} "
+                    if isinstance(output, dict):
+                        for key, value in output.items():
+                            if isinstance(value, str):
+                                summary += f"{key}={value[:50]}... "
+                            else:
+                                summary += f"{key}={value} "
+                    else:
+                        # Scalar/list/None output (e.g. from a set step with
+                        # single value:). Render a JSON preview instead of
+                        # iterating dict items, which would crash.
+                        try:
+                            rendered = json.dumps(output, default=str, ensure_ascii=False)
+                        except (TypeError, ValueError):
+                            rendered = repr(output)
+                        if len(rendered) > 50:
+                            rendered = rendered[:50] + "..."
+                        summary += rendered
+                        logger.debug(
+                            "context.trim(summarize): rendered non-dict output for '%s' "
+                            "as JSON preview (type=%s)",
+                            agent_name,
+                            type(output).__name__,
+                        )
                     summary_parts.append(summary.strip())
                     del self.agent_outputs[agent_name]
 

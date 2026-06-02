@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import asyncio
 import time
-from unittest.mock import AsyncMock, MagicMock
+import traceback
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from starlette.testclient import TestClient
@@ -21,10 +23,12 @@ from conductor.events import WorkflowEvent, WorkflowEventEmitter
 from conductor.web.server import WebDashboard
 
 
-def _make_dashboard(*, bg: bool = False) -> tuple[WorkflowEventEmitter, WebDashboard]:
+def _make_dashboard(
+    *, bg: bool = False, workflow_root: Path | None = None
+) -> tuple[WorkflowEventEmitter, WebDashboard]:
     """Create an emitter and dashboard pair for testing."""
     emitter = WorkflowEventEmitter()
-    dashboard = WebDashboard(emitter, host="127.0.0.1", port=0, bg=bg)
+    dashboard = WebDashboard(emitter, host="127.0.0.1", port=0, bg=bg, workflow_root=workflow_root)
     return emitter, dashboard
 
 
@@ -499,6 +503,224 @@ class TestServerStartupFailure:
             await dashboard.start()
 
 
+def _make_exc_with_asyncio_traceback() -> AssertionError:
+    """Construct an AssertionError that carries a real (non-empty) traceback.
+
+    Combined with patching ``traceback.extract_tb`` in the relevant test, this
+    simulates the proactor accept-loop race where the AssertionError surfaces
+    from inside asyncio internals.
+    """
+    try:
+        raise AssertionError("simulated proactor race")
+    except AssertionError as e:
+        return e
+
+
+class TestProactorShutdownRace:
+    """Tests for the proactor accept-loop race guard (Python 3.14+ Windows).
+
+    The proactor event loop can raise AssertionError when a new connection
+    is accepted after Server.close() sets _sockets = None during shutdown.
+    The dashboard guards against this with both a custom exception handler
+    and a guarded serve wrapper.
+    """
+
+    def test_is_proactor_shutdown_race_true_during_shutdown(self) -> None:
+        """Returns True for AssertionError raised from asyncio internals during shutdown."""
+        _, dashboard = _make_dashboard()
+        dashboard._server = MagicMock()
+        dashboard._server.should_exit = True
+
+        exc = _make_exc_with_asyncio_traceback()
+        context = {"exception": exc}
+        # Simulate the deepest traceback frame originating in asyncio internals.
+        fake_frame = traceback.FrameSummary(
+            filename="/usr/lib/python3.14/asyncio/base_events.py",
+            lineno=1,
+            name="_attach",
+        )
+        with patch("traceback.extract_tb", return_value=[fake_frame]):
+            assert dashboard._is_proactor_shutdown_race(context) is True
+
+    def test_is_proactor_shutdown_race_false_for_non_asyncio_traceback(self) -> None:
+        """Returns False when the traceback is NOT from asyncio (issue #145 I3)."""
+        _, dashboard = _make_dashboard()
+        dashboard._server = MagicMock()
+        dashboard._server.should_exit = True
+
+        # An AssertionError raised by user/workflow code during shutdown
+        # has no asyncio frame and must NOT be silently swallowed.
+        try:
+            raise AssertionError("user-code assertion")
+        except AssertionError as e:
+            exc = e
+        context = {"exception": exc}
+        assert dashboard._is_proactor_shutdown_race(context) is False
+
+    def test_is_proactor_shutdown_race_false_without_traceback(self) -> None:
+        """Returns False when traceback is absent (issue #145 I3)."""
+        _, dashboard = _make_dashboard()
+        dashboard._server = MagicMock()
+        dashboard._server.should_exit = True
+
+        # An AssertionError without a traceback cannot be classified as the
+        # known race; the gate must fail closed.
+        context = {"exception": AssertionError()}
+        assert dashboard._is_proactor_shutdown_race(context) is False
+
+    def test_is_proactor_shutdown_race_false_when_not_shutting_down(self) -> None:
+        """_is_proactor_shutdown_race returns False when server is running."""
+        _, dashboard = _make_dashboard()
+        dashboard._server = MagicMock()
+        dashboard._server.should_exit = False
+
+        context = {"exception": AssertionError()}
+        assert dashboard._is_proactor_shutdown_race(context) is False
+
+    def test_is_proactor_shutdown_race_false_for_non_assertion(self) -> None:
+        """_is_proactor_shutdown_race returns False for non-AssertionError."""
+        _, dashboard = _make_dashboard()
+        dashboard._server = MagicMock()
+        dashboard._server.should_exit = True
+
+        context = {"exception": RuntimeError("something else")}
+        assert dashboard._is_proactor_shutdown_race(context) is False
+
+    def test_is_proactor_shutdown_race_false_without_server(self) -> None:
+        """_is_proactor_shutdown_race returns False when no server exists."""
+        _, dashboard = _make_dashboard()
+        dashboard._server = None
+
+        context = {"exception": AssertionError()}
+        assert dashboard._is_proactor_shutdown_race(context) is False
+
+    def test_loop_exception_handler_suppresses_race(self) -> None:
+        """Custom exception handler suppresses the proactor race silently."""
+        _, dashboard = _make_dashboard()
+        dashboard._server = MagicMock()
+        dashboard._server.should_exit = True
+
+        loop = MagicMock()
+        exc = _make_exc_with_asyncio_traceback()
+        context = {"exception": exc, "message": "test"}
+
+        fake_frame = traceback.FrameSummary(
+            filename="/usr/lib/python3.14/asyncio/base_events.py",
+            lineno=1,
+            name="_attach",
+        )
+        with patch("traceback.extract_tb", return_value=[fake_frame]):
+            dashboard._loop_exception_handler(loop, context)
+        loop.default_exception_handler.assert_not_called()
+
+    def test_loop_exception_handler_delegates_other_errors(self) -> None:
+        """Custom exception handler delegates non-race errors to the default."""
+        _, dashboard = _make_dashboard()
+        dashboard._server = MagicMock()
+        dashboard._server.should_exit = False
+        dashboard._original_exception_handler = None
+
+        loop = MagicMock()
+        context = {"exception": RuntimeError("real error"), "message": "boom"}
+
+        dashboard._loop_exception_handler(loop, context)
+        loop.default_exception_handler.assert_called_once_with(context)
+
+    def test_loop_exception_handler_delegates_to_original(self) -> None:
+        """Custom exception handler delegates to original handler if set."""
+        _, dashboard = _make_dashboard()
+        dashboard._server = MagicMock()
+        dashboard._server.should_exit = False
+        original = MagicMock()
+        dashboard._original_exception_handler = original
+
+        loop = MagicMock()
+        context = {"exception": ValueError("other"), "message": "test"}
+
+        dashboard._loop_exception_handler(loop, context)
+        original.assert_called_once_with(loop, context)
+        loop.default_exception_handler.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_guarded_serve_suppresses_assertion_during_shutdown(self) -> None:
+        """_guarded_serve swallows AssertionError when the asyncio-frame gate passes."""
+        import traceback as tb_mod
+        from unittest.mock import patch
+
+        _, dashboard = _make_dashboard()
+
+        async def _assert_serve(self: object) -> None:
+            raise AssertionError("self._sockets is not None")
+
+        import uvicorn
+
+        fake_frame = tb_mod.FrameSummary(
+            filename="/usr/lib/python3.14/asyncio/base_events.py",
+            lineno=1,
+            name="_attach",
+        )
+        with (
+            patch.object(uvicorn.Server, "serve", _assert_serve),
+            patch("traceback.extract_tb", return_value=[fake_frame]),
+        ):
+            dashboard._server = uvicorn.Server(
+                uvicorn.Config(app=dashboard._app, host="127.0.0.1", port=0)
+            )
+            dashboard._server.should_exit = True
+            # Should not raise — asyncio frame gate passes
+            await dashboard._guarded_serve()
+
+    @pytest.mark.asyncio
+    async def test_guarded_serve_reraises_assertion_when_running(self) -> None:
+        """_guarded_serve re-raises AssertionError when server is NOT shutting down."""
+        from unittest.mock import patch
+
+        _, dashboard = _make_dashboard()
+
+        async def _assert_serve(self: object) -> None:
+            raise AssertionError("unexpected assertion")
+
+        import uvicorn
+
+        with patch.object(uvicorn.Server, "serve", _assert_serve):
+            dashboard._server = uvicorn.Server(
+                uvicorn.Config(app=dashboard._app, host="127.0.0.1", port=0)
+            )
+            dashboard._server.should_exit = False
+            with pytest.raises(AssertionError, match="unexpected assertion"):
+                await dashboard._guarded_serve()
+
+    @pytest.mark.asyncio
+    async def test_guarded_serve_reraises_non_asyncio_assertion_during_shutdown(self) -> None:
+        """_guarded_serve re-raises AssertionError from non-asyncio code even during shutdown."""
+        import traceback as tb_mod
+        from unittest.mock import patch
+
+        _, dashboard = _make_dashboard()
+
+        async def _assert_serve(self: object) -> None:
+            raise AssertionError("workflow callback assertion")
+
+        import uvicorn
+
+        # Traceback from user code, not asyncio internals
+        fake_frame = tb_mod.FrameSummary(
+            filename="/app/src/conductor/engine/workflow.py",
+            lineno=42,
+            name="execute",
+        )
+        with (
+            patch.object(uvicorn.Server, "serve", _assert_serve),
+            patch("traceback.extract_tb", return_value=[fake_frame]),
+        ):
+            dashboard._server = uvicorn.Server(
+                uvicorn.Config(app=dashboard._app, host="127.0.0.1", port=0)
+            )
+            dashboard._server.should_exit = True
+            with pytest.raises(AssertionError, match="workflow callback assertion"):
+                await dashboard._guarded_serve()
+
+
 class TestWaitForGateResponse:
     """Tests for WebDashboard.wait_for_gate_response stale-message handling."""
 
@@ -539,7 +761,606 @@ class TestWaitForGateResponse:
         assert dashboard._gate_response_queue.empty()
 
 
+class TestWaitForIterationLimitResponse:
+    """Tests for WebDashboard.wait_for_iteration_limit_response (issue #198)."""
+
+    @pytest.mark.asyncio
+    async def test_returns_matching_response(self) -> None:
+        """Returns the response whose gate_id matches the awaited gate."""
+        _, dashboard = _make_dashboard()
+        await dashboard._iteration_limit_response_queue.put(
+            {
+                "gate_id": "gate-abc",
+                "agent_name": "researcher",
+                "additional_iterations": 5,
+            }
+        )
+
+        msg = await asyncio.wait_for(
+            dashboard.wait_for_iteration_limit_response("gate-abc"), timeout=1.0
+        )
+
+        assert msg["gate_id"] == "gate-abc"
+        assert msg["additional_iterations"] == 5
+
+    @pytest.mark.asyncio
+    async def test_discards_stale_responses_by_gate_id(self) -> None:
+        """Responses with a non-matching gate_id are dropped, not re-queued.
+
+        The same target (agent or parallel group) can trigger ``iteration_limit_reached``
+        more than once in a run. Without gate_id matching, a stale double-click
+        from the previous gate could resolve the next one with the user's
+        earlier choice. The gate_id guards against this.
+        """
+        _, dashboard = _make_dashboard()
+        await dashboard._iteration_limit_response_queue.put(
+            {
+                "gate_id": "old-gate",
+                "agent_name": "researcher",
+                "additional_iterations": 0,
+            }
+        )
+        await dashboard._iteration_limit_response_queue.put(
+            {
+                "gate_id": "current-gate",
+                "agent_name": "researcher",
+                "additional_iterations": 10,
+            }
+        )
+
+        msg = await asyncio.wait_for(
+            dashboard.wait_for_iteration_limit_response("current-gate"), timeout=1.0
+        )
+
+        assert msg["gate_id"] == "current-gate"
+        assert msg["additional_iterations"] == 10
+        # Stale message was consumed and dropped, not re-queued — otherwise
+        # a busy loop would re-examine it on every subsequent gate.
+        assert dashboard._iteration_limit_response_queue.empty()
+
+    def test_websocket_routes_iteration_limit_response_to_queue(self) -> None:
+        """``iteration_limit_response`` WS messages land in the dedicated queue.
+
+        End-to-end check: a real WebSocket client sending the message
+        type used by the dashboard reaches the queue ``_wait_for_web_iteration_limit``
+        consumes, not the gate-response or dialog queues.
+        """
+        _, dashboard = _make_dashboard()
+        with TestClient(dashboard.app) as client, client.websocket_connect("/ws") as ws:
+            ws.send_json(
+                {
+                    "type": "iteration_limit_response",
+                    "gate_id": "gate-xyz",
+                    "agent_name": "loopy_agent",
+                    "additional_iterations": 3,
+                }
+            )
+
+            # Allow the server's WS receive loop to process the message
+            # before we inspect the queue. A short poll keeps the test
+            # fast while not racing the event loop.
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                if not dashboard._iteration_limit_response_queue.empty():
+                    break
+                time.sleep(0.01)
+
+            assert not dashboard._iteration_limit_response_queue.empty()
+            assert dashboard._gate_response_queue.empty()
+            assert dashboard._dialog_response_queue.empty()
+            msg = dashboard._iteration_limit_response_queue.get_nowait()
+            assert msg["gate_id"] == "gate-xyz"
+            assert msg["additional_iterations"] == 3
+
+
 async def _short_grace(event: asyncio.Event, delay: float) -> None:
     """Helper for testing: short grace period."""
     await asyncio.sleep(delay)
     event.set()
+
+
+class TestFileApi:
+    """Tests for GET /api/files/{file_path} endpoint.
+
+    Covers security checks (path traversal, extension filtering, size limits,
+    absolute path rejection) and the happy-path for reading files.
+    """
+
+    @pytest.fixture
+    def workflow_dir(self, tmp_path: Path) -> Path:
+        """Create a temporary workflow directory with sample files."""
+        (tmp_path / "plan.md").write_text("# My Plan\nSome content", encoding="utf-8")
+        (tmp_path / "data.json").write_text('{"key": "value"}', encoding="utf-8")
+        (tmp_path / "sub").mkdir()
+        (tmp_path / "sub" / "nested.yaml").write_text("key: value", encoding="utf-8")
+        (tmp_path / "secret.exe").write_bytes(b"\x00binary")
+        (tmp_path / "image.png").write_bytes(b"\x89PNG")
+        return tmp_path
+
+    def _client(self, workflow_dir: Path) -> TestClient:
+        _, dashboard = _make_dashboard(workflow_root=workflow_dir)
+        return TestClient(dashboard.app)
+
+    def test_read_markdown_file(self, workflow_dir: Path) -> None:
+        """Happy path: read a .md file."""
+        with self._client(workflow_dir) as client:
+            resp = client.get("/api/files/plan.md")
+            assert resp.status_code == 200
+            body = resp.json()
+            assert body["path"] == "plan.md"
+            assert "# My Plan" in body["content"]
+            assert body["extension"] == ".md"
+            assert body["size"] > 0
+
+    def test_read_nested_file(self, workflow_dir: Path) -> None:
+        """Read a file in a subdirectory."""
+        with self._client(workflow_dir) as client:
+            resp = client.get("/api/files/sub/nested.yaml")
+            assert resp.status_code == 200
+            assert resp.json()["path"] == "sub/nested.yaml"
+
+    def test_read_json_file(self, workflow_dir: Path) -> None:
+        """Read a JSON file."""
+        with self._client(workflow_dir) as client:
+            resp = client.get("/api/files/data.json")
+            assert resp.status_code == 200
+            assert '"key"' in resp.json()["content"]
+
+    def test_file_not_found(self, workflow_dir: Path) -> None:
+        """Non-existent file returns 404."""
+        with self._client(workflow_dir) as client:
+            resp = client.get("/api/files/nonexistent.md")
+            assert resp.status_code == 404
+
+    def test_path_traversal_dotdot(self, workflow_dir: Path) -> None:
+        """Path traversal with .. is blocked (403 containment check)."""
+        # Create a file outside workflow_dir to prove it can't be reached
+        outside = workflow_dir.parent / "secret.txt"
+        outside.write_text("top secret", encoding="utf-8")
+        with self._client(workflow_dir) as client:
+            resp = client.get("/api/files/../secret.txt")
+            assert resp.status_code in (403, 404)
+
+    def test_absolute_path_rejected(self, workflow_dir: Path) -> None:
+        """Absolute path is rejected with 403."""
+        with self._client(workflow_dir) as client:
+            resp = client.get("/api/files//etc/passwd")
+            assert resp.status_code == 403
+
+    def test_drive_path_rejected(self, workflow_dir: Path) -> None:
+        """Windows drive-qualified path is rejected."""
+        with self._client(workflow_dir) as client:
+            resp = client.get("/api/files/C:/Windows/system32/cmd.exe")
+            assert resp.status_code == 403
+
+    def test_scheme_rejected(self, workflow_dir: Path) -> None:
+        """URL scheme in path is rejected."""
+        with self._client(workflow_dir) as client:
+            resp = client.get("/api/files/file:///etc/passwd")
+            assert resp.status_code == 403
+
+    def test_disallowed_extension(self, workflow_dir: Path) -> None:
+        """Binary/disallowed extension returns 403."""
+        with self._client(workflow_dir) as client:
+            resp = client.get("/api/files/secret.exe")
+            assert resp.status_code == 403
+            assert "not supported" in resp.json()["error"]
+
+    def test_disallowed_image_extension(self, workflow_dir: Path) -> None:
+        """Image extension is not in the allowlist."""
+        with self._client(workflow_dir) as client:
+            resp = client.get("/api/files/image.png")
+            assert resp.status_code == 403
+
+    def test_large_file_rejected(self, workflow_dir: Path) -> None:
+        """File larger than 1MB is rejected with 413."""
+        big = workflow_dir / "huge.txt"
+        big.write_text("x" * (1024 * 1024 + 1), encoding="utf-8")
+        with self._client(workflow_dir) as client:
+            resp = client.get("/api/files/huge.txt")
+            assert resp.status_code == 413
+            assert "too large" in resp.json()["error"].lower()
+
+    def test_no_workflow_root_returns_404(self) -> None:
+        """When workflow_root is None, endpoint returns 404."""
+        _, dashboard = _make_dashboard(workflow_root=None)
+        with TestClient(dashboard.app) as client:
+            resp = client.get("/api/files/plan.md")
+            assert resp.status_code == 404
+            assert "No workflow root" in resp.json()["error"]
+
+    def test_unc_path_rejected(self, workflow_dir: Path) -> None:
+        """UNC path (\\\\server\\share) is rejected."""
+        with self._client(workflow_dir) as client:
+            resp = client.get("/api/files/\\\\server\\share\\file.txt")
+            assert resp.status_code in (403, 404)
+
+
+class TestReplayEventsFromJsonl:
+    """Tests for WebDashboard.replay_events_from_jsonl (issue #167)."""
+
+    def _write_jsonl(self, path: Path, events: list[dict]) -> None:
+        import json
+
+        with path.open("w", encoding="utf-8") as f:
+            for ev in events:
+                f.write(json.dumps(ev) + "\n")
+
+    def test_populates_event_history(self, tmp_path: Path) -> None:
+        """Replayed events appear in /api/state."""
+        emitter, dashboard = _make_dashboard()
+        log = tmp_path / "test.events.jsonl"
+        self._write_jsonl(
+            log,
+            [
+                {"type": "agent_started", "timestamp": 1.0, "data": {"agent_name": "a"}},
+                {"type": "agent_completed", "timestamp": 2.0, "data": {"agent_name": "a"}},
+            ],
+        )
+
+        count = dashboard.replay_events_from_jsonl(log)
+
+        assert count == 2
+        with TestClient(dashboard.app) as client:
+            resp = client.get("/api/state")
+            assert resp.status_code == 200
+            body = resp.json()
+            assert [ev["type"] for ev in body] == ["agent_started", "agent_completed"]
+
+    def test_skips_root_lifecycle_events(self, tmp_path: Path) -> None:
+        """Root workflow_started / workflow_completed / workflow_failed / checkpoint_saved
+        are filtered to avoid double-incrementing frontend wfDepth or making the
+        dashboard appear complete before resume executes.
+        """
+        emitter, dashboard = _make_dashboard()
+        log = tmp_path / "test.events.jsonl"
+        self._write_jsonl(
+            log,
+            [
+                {"type": "workflow_started", "timestamp": 1.0, "data": {"name": "wf"}},
+                {"type": "agent_started", "timestamp": 1.5, "data": {"agent_name": "a"}},
+                {"type": "agent_completed", "timestamp": 2.5, "data": {"agent_name": "a"}},
+                {"type": "checkpoint_saved", "timestamp": 2.7, "data": {"path": "/tmp/x"}},
+                {"type": "workflow_failed", "timestamp": 2.8, "data": {"error": "boom"}},
+            ],
+        )
+
+        count = dashboard.replay_events_from_jsonl(log)
+
+        assert count == 2
+        assert [ev["type"] for ev in dashboard._event_history] == [
+            "agent_started",
+            "agent_completed",
+        ]
+
+    def test_preserves_subworkflow_lifecycle_events(self, tmp_path: Path) -> None:
+        """Subworkflow-level workflow_started/completed (identified by a non-empty
+        ``data.subworkflow_path``) must be preserved so frontend wfDepth stays
+        balanced."""
+        emitter, dashboard = _make_dashboard()
+        log = tmp_path / "test.events.jsonl"
+        self._write_jsonl(
+            log,
+            [
+                {
+                    "type": "workflow_started",
+                    "timestamp": 1.0,
+                    "data": {"name": "child", "subworkflow_path": ["sub"]},
+                },
+                {
+                    "type": "workflow_completed",
+                    "timestamp": 2.0,
+                    "data": {"subworkflow_path": ["sub"]},
+                },
+            ],
+        )
+
+        count = dashboard.replay_events_from_jsonl(log)
+
+        assert count == 2
+        assert [ev["type"] for ev in dashboard._event_history] == [
+            "workflow_started",
+            "workflow_completed",
+        ]
+
+    def test_does_not_enqueue_replayed_events(self, tmp_path: Path) -> None:
+        """Replay must not enqueue on _queue — late-joiners get history via
+        /api/state and the WebSocket replay loop instead."""
+        emitter, dashboard = _make_dashboard()
+        log = tmp_path / "test.events.jsonl"
+        self._write_jsonl(
+            log,
+            [{"type": "agent_started", "timestamp": 1.0, "data": {"agent_name": "a"}}],
+        )
+
+        dashboard.replay_events_from_jsonl(log)
+
+        assert dashboard._queue.empty()
+
+    def test_missing_file_returns_zero(self, tmp_path: Path) -> None:
+        """Missing log path returns 0 and does not raise."""
+        emitter, dashboard = _make_dashboard()
+        count = dashboard.replay_events_from_jsonl(tmp_path / "nope.jsonl")
+        assert count == 0
+        assert dashboard._event_history == []
+
+    def test_corrupt_file_returns_zero(self, tmp_path: Path) -> None:
+        """A file that is not valid JSON/JSONL returns 0 and does not raise."""
+        emitter, dashboard = _make_dashboard()
+        bad = tmp_path / "bad.jsonl"
+        bad.write_text("not json at all {{{\n")
+        count = dashboard.replay_events_from_jsonl(bad)
+        assert count == 0
+        assert dashboard._event_history == []
+
+    def test_tolerates_partial_trailing_line(self, tmp_path: Path) -> None:
+        """A truncated trailing line is skipped, prior valid lines are kept."""
+        emitter, dashboard = _make_dashboard()
+        bad = tmp_path / "partial.jsonl"
+        bad.write_text(
+            '{"type":"agent_started","timestamp":1.0,"data":{"agent_name":"a"}}\n'
+            '{"type":"agent_compl'  # truncated
+        )
+        count = dashboard.replay_events_from_jsonl(bad)
+        assert count == 1
+        assert dashboard._event_history[0]["type"] == "agent_started"
+
+
+class TestReplaySyntheticFromContext:
+    """Tests for WebDashboard.replay_synthetic_from_context (issue #167 fallback)."""
+
+    def _build_config(self):
+        """Build a minimal WorkflowConfig with one agent + one script + one wait for tests."""
+        from conductor.config.schema import AgentDef, RuntimeConfig, WorkflowConfig, WorkflowDef
+
+        return WorkflowConfig(
+            workflow=WorkflowDef(
+                name="t",
+                entry_point="a",
+                runtime=RuntimeConfig(provider="copilot", model="gpt-5"),
+            ),
+            agents=[
+                AgentDef(name="a", prompt="x", routes=[]),
+                AgentDef(name="s", type="script", command="echo hi", routes=[]),
+                AgentDef(name="w", type="wait", duration="5s", reason="cooldown", routes=[]),
+            ],
+        )
+
+    def test_emits_started_completed_per_agent(self) -> None:
+        from conductor.engine.context import WorkflowContext
+
+        emitter, dashboard = _make_dashboard()
+        ctx = WorkflowContext()
+        ctx.store("a", {"answer": "yes"})
+
+        count = dashboard.replay_synthetic_from_context(ctx, self._build_config())
+
+        assert count == 2
+        types = [ev["type"] for ev in dashboard._event_history]
+        assert types == ["agent_started", "agent_completed"]
+        completed_data = dashboard._event_history[1]["data"]
+        assert completed_data["agent_name"] == "a"
+        assert completed_data["output"] == {"answer": "yes"}
+        assert completed_data["synthetic"] is True
+
+    def test_emits_script_events_for_script_type(self) -> None:
+        from conductor.engine.context import WorkflowContext
+
+        emitter, dashboard = _make_dashboard()
+        ctx = WorkflowContext()
+        ctx.store("s", {"stdout": "hi", "stderr": "", "exit_code": 0})
+
+        count = dashboard.replay_synthetic_from_context(ctx, self._build_config())
+
+        assert count == 2
+        types = [ev["type"] for ev in dashboard._event_history]
+        assert types == ["script_started", "script_completed"]
+        assert dashboard._event_history[1]["data"]["stdout"] == "hi"
+
+    def test_emits_wait_events_for_wait_type(self) -> None:
+        """Wait steps replay via _synth_agent_or_script's wait branch
+        (issue #218). The synthetic event pair must use the
+        wait_started/wait_completed names, propagate the persisted
+        waited_seconds, carry the AgentDef's reason, and mark
+        ``synthetic: True`` so the UI can identify replayed state."""
+        from conductor.engine.context import WorkflowContext
+
+        emitter, dashboard = _make_dashboard()
+        ctx = WorkflowContext()
+        ctx.store("w", {"waited_seconds": 3.5})
+
+        count = dashboard.replay_synthetic_from_context(ctx, self._build_config())
+
+        assert count == 2
+        types = [ev["type"] for ev in dashboard._event_history]
+        assert types == ["wait_started", "wait_completed"]
+        started = dashboard._event_history[0]["data"]
+        completed = dashboard._event_history[1]["data"]
+        assert started["agent_name"] == "w"
+        assert started["duration_seconds"] == 3.5
+        assert started["reason"] == "cooldown"
+        assert started["synthetic"] is True
+        assert completed["agent_name"] == "w"
+        assert completed["waited_seconds"] == 3.5
+        assert completed["requested_seconds"] == 3.5
+        assert completed["reason"] == "cooldown"
+        assert completed["interrupted"] is False
+        assert completed["synthetic"] is True
+
+    def test_empty_history_returns_zero(self) -> None:
+        from conductor.engine.context import WorkflowContext
+
+        emitter, dashboard = _make_dashboard()
+        count = dashboard.replay_synthetic_from_context(WorkflowContext(), self._build_config())
+        assert count == 0
+        assert dashboard._event_history == []
+
+    def test_uses_checkpoint_timestamp_when_provided(self) -> None:
+        from conductor.engine.context import WorkflowContext
+
+        emitter, dashboard = _make_dashboard()
+        ctx = WorkflowContext()
+        ctx.store("a", {"answer": "yes"})
+
+        dashboard.replay_synthetic_from_context(
+            ctx, self._build_config(), checkpoint_timestamp=42.0
+        )
+
+        for ev in dashboard._event_history:
+            assert ev["timestamp"] == 42.0
+
+    def _build_for_each_config(self):
+        """WorkflowConfig with a for-each group ``f`` over a script agent."""
+        from conductor.config.schema import (
+            ForEachDef,
+            RuntimeConfig,
+            WorkflowConfig,
+            WorkflowDef,
+        )
+
+        return WorkflowConfig(
+            workflow=WorkflowDef(
+                name="t",
+                entry_point="f",
+                runtime=RuntimeConfig(provider="copilot", model="gpt-5"),
+            ),
+            agents=[],
+            for_each=[
+                ForEachDef.model_validate(
+                    {
+                        "name": "f",
+                        "type": "for_each",
+                        "source": "workflow.input.items",
+                        "as": "item",
+                        "agent": {"name": "worker", "prompt": "{{ item }}", "routes": []},
+                    }
+                ),
+            ],
+        )
+
+    def test_for_each_uses_count_field_when_present(self) -> None:
+        """Synthetic for-each replay uses the engine's authoritative ``count``."""
+        from conductor.engine.context import WorkflowContext
+
+        emitter, dashboard = _make_dashboard()
+        ctx = WorkflowContext()
+        # Mirror what WorkflowEngine._execute_for_each_group stores:
+        # {"outputs": [...], "errors": {...}, "count": N}.
+        ctx.store("f", {"outputs": [{"a": 1}, {"a": 2}], "errors": {}, "count": 2})
+
+        count = dashboard.replay_synthetic_from_context(ctx, self._build_for_each_config())
+
+        assert count == 2
+        completed = dashboard._event_history[1]["data"]
+        assert completed["item_count"] == 2
+        assert completed["success_count"] == 2
+        assert completed["failure_count"] == 0
+
+    def test_for_each_zero_count_does_not_use_wrapper_dict_length(self) -> None:
+        """Regression test: empty ``outputs`` must not fall through to wrapper dict.
+
+        A naive ``output.get("outputs") or ...`` would treat an empty list as
+        missing and return ``len(output)`` (i.e. the number of keys in the
+        wrapper dict — 3) as the item count.
+        """
+        from conductor.engine.context import WorkflowContext
+
+        emitter, dashboard = _make_dashboard()
+        ctx = WorkflowContext()
+        ctx.store("f", {"outputs": [], "errors": {}, "count": 0})
+
+        count = dashboard.replay_synthetic_from_context(ctx, self._build_for_each_config())
+
+        assert count == 2
+        completed = dashboard._event_history[1]["data"]
+        assert completed["item_count"] == 0
+        assert completed["success_count"] == 0
+
+    def test_for_each_falls_back_to_outputs_length_when_count_missing(self) -> None:
+        """If ``count`` is absent, derive item count from ``len(outputs)``."""
+        from conductor.engine.context import WorkflowContext
+
+        emitter, dashboard = _make_dashboard()
+        ctx = WorkflowContext()
+        ctx.store("f", {"outputs": [{"a": 1}], "errors": {}})
+
+        count = dashboard.replay_synthetic_from_context(ctx, self._build_for_each_config())
+
+        assert count == 2
+        completed = dashboard._event_history[1]["data"]
+        assert completed["item_count"] == 1
+
+
+class TestPrependWorkflowStarted:
+    """Tests for WebDashboard.prepend_workflow_started (issue #167)."""
+
+    def test_inserts_at_position_zero(self, tmp_path: Path) -> None:
+        emitter, dashboard = _make_dashboard()
+        # Seed some "historical" events first.
+        dashboard._event_history.append(
+            {"type": "agent_started", "timestamp": 1.0, "data": {"agent_name": "a"}}
+        )
+
+        dashboard.prepend_workflow_started({"name": "wf", "entry_point": "a", "agents": []})
+
+        assert dashboard._event_history[0]["type"] == "workflow_started"
+        assert dashboard._event_history[1]["type"] == "agent_started"
+        assert dashboard._event_history[0]["data"]["name"] == "wf"
+        # Should be carry a timestamp.
+        assert isinstance(dashboard._event_history[0]["timestamp"], float)
+
+
+class TestSyntheticReplaySetStep:
+    """Coverage for ``WebDashboard._synth_agent_or_script`` set branch.
+
+    The synthetic replay path emits ``set_started``/``set_completed`` events
+    when restoring agent_outputs from a checkpoint on resume. The payload
+    shape must match what the live engine emits so the dashboard renders
+    consistently in both cases.
+    """
+
+    def _set_agent(self, *, output_type: str | None = None) -> object:
+        """Build a minimal AgentDef-like duck typed object."""
+        from types import SimpleNamespace
+
+        return SimpleNamespace(type="set", output_type=output_type)
+
+    def test_scalar_output_synthesises_set_events(self) -> None:
+        agent = self._set_agent()
+        started_type, started, completed_type, completed = WebDashboard._synth_agent_or_script(
+            "compute", agent, "microsoft/conductor"
+        )
+        assert started_type == "set_started"
+        assert completed_type == "set_completed"
+        assert started["agent_name"] == "compute"
+        assert started["synthetic"] is True
+        assert completed["output_keys"] == []
+        assert completed["value_repr"] == '"microsoft/conductor"'
+        assert completed["output_type"] == "auto"
+
+    def test_dict_output_carries_sorted_keys(self) -> None:
+        agent = self._set_agent()
+        _, _, _, completed = WebDashboard._synth_agent_or_script(
+            "derive", agent, {"is_breaking": True, "branch": "main"}
+        )
+        assert completed["output_keys"] == ["branch", "is_breaking"]
+        # value_repr is JSON; sort order matches dict insertion (Python 3.7+).
+        assert "is_breaking" in completed["value_repr"]
+        assert "branch" in completed["value_repr"]
+
+    def test_declared_output_type_preserved(self) -> None:
+        """When the AgentDef declares ``output_type``, the synthetic payload
+        carries that label instead of hard-coding "auto"."""
+        agent = self._set_agent(output_type="string")
+        _, _, _, completed = WebDashboard._synth_agent_or_script("label", agent, "raw text")
+        assert completed["output_type"] == "string"
+
+    def test_uses_shared_value_repr_helper(self) -> None:
+        """Value preview matches ``render_set_value_repr`` from the engine
+        emitter, so synthetic + live payloads stay in sync."""
+        from conductor.executor.set_step import render_set_value_repr
+
+        agent = self._set_agent()
+        big_value = "x" * 2000
+        _, _, _, completed = WebDashboard._synth_agent_or_script("big", agent, big_value)
+        assert completed["value_repr"] == render_set_value_repr(big_value)

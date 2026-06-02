@@ -4,18 +4,20 @@ This guide helps you choose between GitHub Copilot, Anthropic Claude, and Claude
 
 ## Quick Comparison
 
-| Feature | Copilot | Claude | Claude Agent SDK |
-|---------|---------|--------|------------------|
-| **Context Window** | 8K-128K | 200K (all models) | 200K |
-| **Pricing Model** | Subscription ($10-39/mo) | Pay-per-token | Via Claude Code CLI |
-| **Setup** | GitHub auth | API key | `claude` CLI auth |
-| **Model Selection** | GPT-5.2, o1 | Haiku, Sonnet, Opus | Haiku, Sonnet, Opus |
-| **Streaming** | Yes | No (Phase 1) | Yes |
-| **Tool Support** | Yes (MCP) | No (Phase 1) | Yes (built-in) |
-| **Speed** | Fast | Fast | Fast |
-| **Output Quality** | Excellent | Excellent | Excellent |
-| **Cost Predictability** | High (flat rate) | Variable (usage-based) | Variable |
-| **Agentic Loop** | SDK-managed | Manual (provider code) | SDK-managed |
+| Feature | Copilot | Claude | Claude Agent SDK | Winner |
+|---------|---------|--------|------------------|--------|
+| **Context Window** | per-model (SDK-reported) | per-model (SDK-reported) | 200K | Tie |
+| **Pricing Model** | Subscription ($10-39/mo) | Pay-per-token | Via Claude Code CLI | Depends |
+| **Setup** | GitHub auth | API key | `claude` CLI auth | Copilot (easier) |
+| **Model Selection** | GPT-5.2, o1 | Haiku, Sonnet, Opus | Haiku, Sonnet, Opus | Tie |
+| **Streaming** | Yes | No (Phase 1) | Yes | Copilot / Claude Agent SDK |
+| **Tool Support** | Yes (MCP, all types) | Yes (MCP, stdio only) | Yes (built-in, CLI-managed) | Copilot |
+| **Reasoning / Extended Thinking** | Yes (`reasoning_effort` on session) | Yes (extended `thinking` budget) | Inherits from CLI config | Tie |
+| **Speed** | Fast | Fast | Fast | Tie |
+| **Output Quality** | Excellent | Excellent | Excellent | Tie |
+| **Cost Predictability** | High (flat rate) | Variable (usage-based) | Variable | Copilot |
+| **Multi-provider** | No | Yes (via Conductor) | No | Claude |
+| **Agentic Loop** | SDK-managed | Manual (provider code) | SDK-managed (delegated to CLI) | Depends |
 
 ## When to Use Copilot
 
@@ -286,6 +288,31 @@ agents:
 **Winner**: Copilot (broader transport support)
 
 See the [MCP Tools guide](../mcp-tools.md) for details.
+
+### Reasoning / Extended Thinking
+
+Both providers expose a unified [`reasoning.effort`](../configuration.md#reasoning-effort)
+field (`low` | `medium` | `high` | `xhigh`) at workflow scope
+(`runtime.default_reasoning_effort`) or per agent (`reasoning.effort`).
+Conductor translates the value to each provider's native API:
+
+**Copilot**:
+- Forwarded as `reasoning_effort` on `CopilotClient.create_session`
+- Validated against the model's advertised `supported_reasoning_efforts`
+
+**Claude**:
+- Translated to `messages.create(thinking={"type": "enabled", "budget_tokens": N})`
+- Effort → budget: low=2048, medium=8192, high=16384, xhigh=32768 tokens
+- Restricted to thinking-capable models (`claude-3-7-*`, `claude-opus-4*`,
+  `claude-sonnet-4*`, `claude-haiku-4*`)
+- Auto-coerces `temperature=1.0` and bumps `max_tokens` to fit the budget
+
+Reasoning content from either provider surfaces as `agent_reasoning` events
+in the dashboard, JSONL log, and `-vv` console output.
+
+**Winner**: Tie (both support it; pick the provider on other grounds)
+
+See [`examples/reasoning-effort.yaml`](../../examples/reasoning-effort.yaml).
 
 ## Migration Path
 

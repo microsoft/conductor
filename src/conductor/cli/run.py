@@ -13,6 +13,7 @@ import re
 import sys
 import tempfile
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -23,14 +24,53 @@ from rich.table import Table
 
 from conductor.config.loader import load_config
 from conductor.engine.workflow import ExecutionPlan, WorkflowEngine
+from conductor.exceptions import WorkflowTerminated
 from conductor.mcp_auth import resolve_mcp_server_auth
 from conductor.providers.registry import ProviderRegistry
 
 if TYPE_CHECKING:
+    from conductor.config.schema import ProviderSettings
     from conductor.events import WorkflowEvent
 
-# Verbose console for logging (stderr)
-_verbose_console = Console(stderr=True, highlight=False)
+
+# Verbose console for logging (stderr).
+#
+# This subclass enforces the global --silent contract ("No progress output.
+# Only JSON result on stdout.") at the source: every ``.print()`` call on a
+# ``_SilentAwareConsole`` becomes a no-op when ``is_verbose()`` is False, so
+# individual call sites do not each have to remember to gate themselves
+# (see issue #209, follow-up to #203/#211). File logging is unaffected —
+# ``_file_console`` is a separate Console wired up by ``init_file_logging``.
+#
+# Scope: only ``.print()`` is gated. Other Rich ``Console`` output methods
+# (``.log()``, ``.rule()``, ``.status()``, ``.print_json()``, etc.) would
+# silently bypass ``--silent`` if used on this instance. All current call
+# sites in this module use only ``.print``; if you introduce a new one,
+# either route it through ``.print`` or extend this subclass.
+class _SilentAwareConsole(Console):
+    """``Console`` that honors ``--silent`` at the print level.
+
+    The instance is locked to ``stderr=True`` to preserve the contract that
+    ``--silent`` runs emit JSON on stdout with nothing else; routing gated
+    output to stdout would corrupt that channel.
+    """
+
+    def __init__(self, **kwargs: Any) -> None:
+        # Lock stderr=True; everything else (highlight, width, etc.) is
+        # caller-tunable.
+        kwargs.pop("stderr", None)
+        super().__init__(stderr=True, **kwargs)
+
+    def print(self, *args: Any, **kwargs: Any) -> None:
+        # Lazy import to avoid the cli.run -> cli.app import cycle at module
+        # load time.
+        from conductor.cli.app import is_verbose
+
+        if is_verbose():
+            super().print(*args, **kwargs)
+
+
+_verbose_console = _SilentAwareConsole(highlight=False)
 
 # File console for file logging (None when not active)
 _file_console: Console | None = None
@@ -147,6 +187,32 @@ def verbose_log(message: str, style: str = "dim") -> None:
         _verbose_console.print(f"[{style}]{message}[/{style}]")
     if _file_console is not None:
         _file_console.print(message)
+
+
+def _describe_provider(provider: ProviderSettings) -> str:
+    """Render a redacted single-line description of provider settings.
+
+    Used in verbose logs to surface custom routing without leaking
+    ``api_key`` or ``bearer_token`` values from ``SecretStr`` fields.
+    """
+    if not provider.has_custom_routing():
+        return provider.name
+    parts: list[str] = [provider.name]
+    if provider.type:
+        parts.append(f"type={provider.type}")
+    if provider.wire_api:
+        parts.append(f"wire_api={provider.wire_api}")
+    if provider.base_url:
+        parts.append(f"base_url={provider.base_url}")
+    if provider.api_key is not None:
+        parts.append("api_key=***")
+    if provider.bearer_token is not None:
+        parts.append("bearer_token=***")
+    if provider.headers:
+        parts.append(f"headers={sorted(provider.headers)}")
+    if provider.azure is not None and provider.azure.api_version:
+        parts.append(f"azure.api_version={provider.azure.api_version}")
+    return " ".join(parts)
 
 
 def verbose_log_agent_start(agent_name: str, iteration: int) -> None:
@@ -419,6 +485,38 @@ def verbose_log_parallel_agent_failed(
         _file_console.print(error_msg)
 
 
+def verbose_log_agent_timeout(
+    agent_name: str,
+    elapsed: float,
+    timeout_seconds: float,
+) -> None:
+    """Log agent timeout.
+
+    Args:
+        agent_name: Name of the agent that timed out.
+        elapsed: Elapsed time in seconds.
+        timeout_seconds: Configured timeout limit.
+    """
+    from rich.text import Text
+
+    from conductor.cli.app import is_verbose
+
+    should_console = is_verbose()
+    should_file = _file_console is not None
+    if not should_console and not should_file:
+        return
+
+    text = Text()
+    text.append("  ⏱ ", style="yellow")
+    text.append(agent_name, style="yellow bold")
+    text.append(f"  timed out after {elapsed:.1f}s (limit: {timeout_seconds:.0f}s)", style="dim")
+
+    if should_console:
+        _verbose_console.print(text)
+    if _file_console is not None:
+        _file_console.print(text)
+
+
 def verbose_log_parallel_summary(
     group_name: str,
     success_count: int,
@@ -665,6 +763,13 @@ class ConsoleEventSubscriber:
                 output_tokens=d.get("output_tokens"),
             )
 
+        elif t == "agent_timeout":
+            verbose_log_agent_timeout(
+                d.get("agent_name", "?"),
+                d.get("elapsed", 0.0),
+                d.get("timeout_seconds", 0.0),
+            )
+
         elif t == "route_taken":
             verbose_log_route(d.get("to_agent", "?"))
 
@@ -729,10 +834,23 @@ class ConsoleEventSubscriber:
                 d.get("elapsed", 0.0),
             )
 
-        elif t == "script_completed":
+        elif t in ("script_completed", "set_completed"):
             verbose_log_agent_complete(
                 d.get("agent_name", "?"),
                 d.get("elapsed", 0.0),
+            )
+
+        elif t == "wait_completed":
+            interrupted = d.get("interrupted", False)
+            waited = d.get("waited_seconds", d.get("elapsed", 0.0))
+            suffix = " (interrupted)" if interrupted else ""
+            verbose_log(f"  Wait done: {d.get('agent_name', '?')} after {waited:.2f}s{suffix}")
+
+        elif t == "wait_failed":
+            verbose_log(
+                f"  Wait failed: {d.get('agent_name', '?')} — "
+                f"{d.get('error_type', 'Error')}: {d.get('message', 'unknown')}",
+                style="red",
             )
 
 
@@ -989,10 +1107,53 @@ async def _run_with_stop_signal(
     Raises:
         ExecutionError: If the workflow was killed via the dashboard.
     """
-    if dashboard is None:
-        return await engine.run(inputs)
+    return await _execute_with_stop_signal(engine.run(inputs), dashboard)
 
-    engine_task = asyncio.create_task(engine.run(inputs))
+
+async def _resume_with_stop_signal(
+    engine: Any,
+    current_agent: str,
+    dashboard: Any | None,
+) -> dict[str, Any]:
+    """Resume the workflow engine, racing against a dashboard kill signal.
+
+    Mirrors :func:`_run_with_stop_signal` but invokes ``engine.resume()``.
+
+    Args:
+        engine: The ``WorkflowEngine`` instance with restored state.
+        current_agent: Name of the agent to resume from.
+        dashboard: The ``WebDashboard`` instance, or None.
+
+    Returns:
+        The workflow result dict.
+
+    Raises:
+        ExecutionError: If the workflow was killed via the dashboard.
+    """
+    return await _execute_with_stop_signal(engine.resume(current_agent), dashboard)
+
+
+async def _execute_with_stop_signal(
+    engine_coro: Any,
+    dashboard: Any | None,
+) -> dict[str, Any]:
+    """Execute an engine coroutine, racing against a dashboard kill signal.
+
+    Args:
+        engine_coro: The coroutine to execute (``engine.run()`` or
+            ``engine.resume()``).
+        dashboard: The ``WebDashboard`` instance, or None.
+
+    Returns:
+        The workflow result dict.
+
+    Raises:
+        ExecutionError: If the workflow was killed via the dashboard.
+    """
+    if dashboard is None:
+        return await engine_coro
+
+    engine_task = asyncio.create_task(engine_coro)
     stop_task = asyncio.create_task(dashboard.wait_for_stop())
 
     done, pending = await asyncio.wait(
@@ -1000,10 +1161,14 @@ async def _run_with_stop_signal(
         return_when=asyncio.FIRST_COMPLETED,
     )
 
+    # Cancel any losing task and drain it. Use ``gather(return_exceptions=True)``
+    # so a non-CancelledError stored on the losing task (e.g. dashboard.stop
+    # raised, or engine raised right as the kill button fired) does not abort
+    # the cleanup loop and leak an un-awaited task.
     for task in pending:
         task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
 
     if engine_task in done:
         return engine_task.result()
@@ -1026,6 +1191,8 @@ async def run_workflow_async(
     web_port: int = 0,
     web_bg: bool = False,
     metadata: dict[str, str] | None = None,
+    workspace_instructions: bool = False,
+    cli_instructions: list[str] | None = None,
 ) -> dict[str, Any]:
     """Execute a workflow asynchronously.
 
@@ -1040,6 +1207,8 @@ async def run_workflow_async(
         web_port: Port for the web dashboard (0 = auto-select).
         web_bg: If True, auto-shutdown dashboard after workflow + client disconnect.
         metadata: Optional CLI metadata to merge on top of YAML-declared metadata.
+        workspace_instructions: If True, auto-discover workspace instruction files.
+        cli_instructions: Optional list of instruction file paths from CLI.
 
     Returns:
         The workflow output as a dictionary.
@@ -1069,12 +1238,20 @@ async def run_workflow_async(
         from conductor.web.server import WebDashboard
 
         bg_mode = web_bg or os.environ.get("CONDUCTOR_WEB_BG") == "1"
-        dashboard = WebDashboard(emitter, host="127.0.0.1", port=web_port, bg=bg_mode)
+        dashboard = WebDashboard(
+            emitter,
+            host="127.0.0.1",
+            port=web_port,
+            bg=bg_mode,
+            workflow_root=Path(workflow_path).resolve().parent,
+        )
 
         try:
             await dashboard.start()
-            # Print URL to stderr regardless of --silent/--quiet
-            _verbose_console.print(f"[bold cyan]Dashboard:[/bold cyan] {dashboard.url}")
+            from conductor.cli.app import is_verbose
+
+            if is_verbose():
+                _verbose_console.print(f"[bold cyan]Dashboard:[/bold cyan] {dashboard.url}")
         except Exception as e:
             _verbose_console.print(
                 f"[bold yellow]Warning:[/bold yellow] "
@@ -1113,10 +1290,37 @@ async def run_workflow_async(
         if inputs:
             verbose_log_section("Workflow Inputs", json.dumps(inputs, indent=2))
 
-        # Apply provider override if specified
+        # Apply provider override if specified.
+        # Reassigning ``runtime.provider`` to a string re-triggers the
+        # before-validator on ``RuntimeConfig`` and coerces it back to a
+        # ``ProviderSettings`` with default fields, intentionally
+        # discarding any structured custom-routing config from YAML.
         if provider_override:
+            had_custom = config.workflow.runtime.provider.has_custom_routing()
             verbose_log(f"Provider override: {provider_override}", style="yellow")
+            if had_custom:
+                verbose_log(
+                    "Provider override discards structured runtime.provider settings "
+                    "(base_url/type/etc.) from YAML; using SDK defaults.",
+                    style="yellow",
+                )
             config.workflow.runtime.provider = provider_override  # type: ignore[assignment]
+
+        # Build workspace instructions preamble
+        instructions_preamble: str | None = None
+        if workspace_instructions or cli_instructions or config.workflow.instructions:
+            from conductor.config.instructions import build_instructions_preamble
+
+            instructions_preamble = build_instructions_preamble(
+                auto_discover_dir=Path.cwd() if workspace_instructions else None,
+                yaml_instructions=config.workflow.instructions or None,
+                cli_instruction_paths=cli_instructions,
+            )
+            if instructions_preamble:
+                verbose_log(
+                    f"Workspace instructions loaded ({len(instructions_preamble)} chars)",
+                    style="cyan",
+                )
 
         # Convert MCP servers from workflow config to SDK format
         mcp_servers = await _build_mcp_servers(config)
@@ -1127,7 +1331,9 @@ async def run_workflow_async(
         if uses_multi_provider:
             verbose_log("Multi-provider mode: agents use different providers", style="cyan")
         else:
-            verbose_log(f"Single provider mode: {config.workflow.runtime.provider}")
+            verbose_log(
+                f"Single provider mode: {_describe_provider(config.workflow.runtime.provider)}"
+            )
 
         # Use ProviderRegistry for multi-provider support
         async with ProviderRegistry(config, mcp_servers=mcp_servers) as registry:
@@ -1159,6 +1365,7 @@ async def run_workflow_async(
                 event_emitter=emitter,
                 keyboard_listener=listener,
                 web_dashboard=dashboard,
+                instructions_preamble=instructions_preamble,
                 run_context=RunContext(
                     run_id=event_log_subscriber.run_id if event_log_subscriber else "",
                     log_file=str(event_log_subscriber.path) if event_log_subscriber else "",
@@ -1171,12 +1378,24 @@ async def run_workflow_async(
             if dashboard is not None and interrupt_event is not None:
                 dashboard.set_interrupt_event(interrupt_event)
 
+            terminate_exc: WorkflowTerminated | None = None
             try:
                 if listener is not None:
                     await listener.start()
                     _verbose_console.print("[dim]Press Esc to interrupt and provide guidance[/dim]")
 
                 result = await _run_with_stop_signal(engine, inputs, dashboard)
+            except WorkflowTerminated as exc:
+                # Explicit `type: terminate status: failed` is an intentional
+                # outcome, not a crash — defer the raise so the dashboard
+                # stays alive for the same post-execution lifecycle as a
+                # successful run. Without this deferral the dashboard dies
+                # immediately and a `--web` / `--web-bg` user cannot see the
+                # rendered TerminateNode / red "Workflow Terminated" banner.
+                # Resume hint is still suppressed: explicit terminations are
+                # not resumable (defense-in-depth — see issue #219).
+                terminate_exc = exc
+                result = exc.output
             except BaseException:
                 _print_resume_instructions(engine)
                 raise
@@ -1186,7 +1405,13 @@ async def run_workflow_async(
 
             # Log completion
             verbose_log_timing("Total workflow execution", time.time() - start_time)
-            verbose_log("Workflow completed successfully", style="green")
+            if terminate_exc is None:
+                verbose_log("Workflow completed successfully", style="green")
+            else:
+                verbose_log(
+                    f"Workflow terminated explicitly at '{terminate_exc.terminated_by}'",
+                    style="yellow",
+                )
 
             # Display usage summary if cost tracking is enabled
             if config.workflow.cost.show_summary:
@@ -1194,7 +1419,9 @@ async def run_workflow_async(
                 if "usage" in summary:
                     display_usage_summary(summary["usage"])
 
-            # Post-execution dashboard lifecycle
+            # Post-execution dashboard lifecycle — runs for both clean exits
+            # and explicit-terminate failures so the user can observe the
+            # final dashboard state in either case.
             if dashboard is not None:
                 # Auto-shutdown if either --web-bg was passed directly or
                 # this is a background child process (CONDUCTOR_WEB_BG env var)
@@ -1202,14 +1429,26 @@ async def run_workflow_async(
                 if is_bg:
                     await dashboard.wait_for_clients_disconnect()
                 else:
-                    _verbose_console.print(
-                        f"\n[bold green]Workflow complete.[/bold green] "
-                        f"Dashboard still running at {dashboard.url} — "
-                        f"press [bold]Ctrl+C[/bold] to exit."
-                    )
+                    from conductor.cli.app import is_verbose
+
+                    if is_verbose():
+                        banner = (
+                            "[bold yellow]Workflow terminated.[/bold yellow]"
+                            if terminate_exc is not None
+                            else "[bold green]Workflow complete.[/bold green]"
+                        )
+                        _verbose_console.print(
+                            f"\n{banner} "
+                            f"Dashboard still running at {dashboard.url} — "
+                            f"press [bold]Ctrl+C[/bold] to exit."
+                        )
                     with contextlib.suppress(asyncio.CancelledError):
                         await asyncio.Event().wait()
 
+            if terminate_exc is not None:
+                # Re-raise so the CLI handler emits the non-zero exit code
+                # and prints the structured termination message/output.
+                raise terminate_exc
             return result
     finally:
         # Clean up PID file if this is a background child process
@@ -1444,9 +1683,15 @@ def _print_resume_instructions(engine: WorkflowEngine) -> None:
 async def resume_workflow_async(
     workflow_path: Path | None = None,
     checkpoint_path: Path | None = None,
+    provider_override: str | None = None,
     skip_gates: bool = False,
     log_file: Path | None = None,
     no_interactive: bool = False,
+    *,
+    web: bool = False,
+    web_port: int = 0,
+    web_bg: bool = False,
+    metadata: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Resume a workflow from a checkpoint.
 
@@ -1458,9 +1703,23 @@ async def resume_workflow_async(
             the latest checkpoint if ``checkpoint_path`` is not provided.
         checkpoint_path: Explicit path to a checkpoint file. Takes
             precedence over ``workflow_path``.
+        provider_override: Optional provider name to override workflow config
+            for the resumed run.
         skip_gates: If True, auto-selects first option at human gates.
         log_file: Optional path to write full debug output to a file.
         no_interactive: If True, disables the keyboard interrupt listener.
+        web: If True, start a real-time web dashboard for the resumed run.
+            The dashboard is seeded with the original timeline by replaying
+            the JSONL event log captured during the previous run (or by
+            synthesising minimal events from the restored ``WorkflowContext``
+            when the log file is unavailable), so previously completed
+            agents remain visible alongside live events from the resumed
+            run.
+        web_port: Port for the web dashboard (0 = auto-select).
+        web_bg: If True, auto-shutdown dashboard after workflow + client
+            disconnect.
+        metadata: Optional CLI metadata to merge on top of YAML-declared
+            metadata for the resumed run.
 
     Returns:
         The workflow output as a dictionary.
@@ -1472,6 +1731,7 @@ async def resume_workflow_async(
     from conductor.engine.checkpoint import CheckpointManager
     from conductor.engine.context import WorkflowContext
     from conductor.engine.limits import LimitEnforcer
+    from conductor.events import WorkflowEventEmitter
     from conductor.exceptions import CheckpointError
 
     start_time = time.time()
@@ -1484,6 +1744,11 @@ async def resume_workflow_async(
             _verbose_console.print(
                 f"[bold yellow]Warning:[/bold yellow] Cannot open log file {log_file}: {e}"
             )
+
+    # Always create event emitter and JSONL log subscriber (parity with run)
+    emitter = WorkflowEventEmitter()
+    event_log_subscriber: Any = None
+    dashboard: Any = None
 
     try:
         # Resolve checkpoint file
@@ -1531,8 +1796,26 @@ async def resume_workflow_async(
             f"Checkpoint created: {cp.created_at} (failed at: {cp.failure.get('agent', 'unknown')})"
         )
 
-        # Load workflow config
+        # Load workflow config first — needed both to construct the dashboard
+        # (workflow_root) and to seed the synthetic replay fallback.
         config = load_config(resolved_workflow_path)
+
+        # Merge CLI metadata on top of YAML-declared metadata (parity with run)
+        if metadata:
+            config.workflow.metadata.update(metadata)
+
+        # Apply provider override if specified (parity with run).
+        # See ``run_workflow_async`` for why we re-validate via assignment.
+        if provider_override:
+            had_custom = config.workflow.runtime.provider.has_custom_routing()
+            verbose_log(f"Provider override: {provider_override}", style="yellow")
+            if had_custom:
+                verbose_log(
+                    "Provider override discards structured runtime.provider settings "
+                    "(base_url/type/etc.) from YAML; using SDK defaults.",
+                    style="yellow",
+                )
+            config.workflow.runtime.provider = provider_override  # type: ignore[assignment]
 
         # Verify the current_agent exists in the workflow
         agent_names = {a.name for a in config.agents}
@@ -1556,6 +1839,25 @@ async def resume_workflow_async(
             timeout_seconds=config.workflow.limits.timeout_seconds,
         )
 
+        # Construct the web dashboard early (subscribes to the emitter on
+        # construction) but defer ``dashboard.start()`` until after we have
+        # seeded ``_event_history`` with the current-config
+        # ``workflow_started`` event plus the original run's replay. That
+        # way the very first ``GET /api/state`` and the first WebSocket
+        # client both see a fully populated, topology-correct history —
+        # no race window where a client connects mid-replay.
+        if web:
+            from conductor.web.server import WebDashboard
+
+            bg_mode = web_bg or os.environ.get("CONDUCTOR_WEB_BG") == "1"
+            dashboard = WebDashboard(
+                emitter,
+                host="127.0.0.1",
+                port=web_port,
+                bg=bg_mode,
+                workflow_root=resolved_workflow_path.resolve().parent,
+            )
+
         # Build MCP servers config (same as run_workflow_async)
         mcp_servers = await _build_mcp_servers(config)
 
@@ -1568,13 +1870,47 @@ async def resume_workflow_async(
                 registry.set_resume_session_ids(cp.copilot_session_ids)
 
             # Set up interrupt listener if interactive mode is enabled
+            # Disabled in --web mode since the CLI isn't used for interaction
             interrupt_event: asyncio.Event | None = None
             listener = None
-            if not no_interactive and sys.stdin.isatty():
+            if not no_interactive and not web and sys.stdin.isatty():
                 from conductor.interrupt.listener import KeyboardListener
 
                 interrupt_event = asyncio.Event()
                 listener = KeyboardListener(interrupt_event=interrupt_event)
+            elif web:
+                # In --web mode: no keyboard listener, but still need interrupt_event
+                # so POST /api/stop can interrupt the running agent mid-execution
+                interrupt_event = asyncio.Event()
+
+            from conductor.engine.workflow import RunContext
+
+            # Resume-mode log path: append to the original log when available
+            # so a multi-resume session produces one continuous file and
+            # ``run_id`` stays stable across resume generations.
+            existing_log_path: Path | None = None
+            if cp.event_log_path:
+                candidate = Path(cp.event_log_path)
+                if candidate.exists() and candidate.is_file():
+                    existing_log_path = candidate
+
+            # Build the JSONL subscriber BEFORE the engine so RunContext
+            # carries the resolved ``run_id`` and ``log_file`` (used by
+            # the engine to populate the ``workflow_started`` event payload).
+            # When the checkpoint has the original log info, the subscriber
+            # appends to it and reuses run_id; otherwise it generates fresh.
+            from conductor.engine.event_log import EventLogSubscriber
+
+            event_log_subscriber = EventLogSubscriber(
+                config.workflow.name,
+                existing_path=existing_log_path,
+                existing_run_id=cp.run_id or None,
+            )
+            emitter.subscribe(event_log_subscriber.on_event)
+
+            # Subscribe console output to the event emitter (parity with run)
+            console_subscriber = ConsoleEventSubscriber()
+            emitter.subscribe(console_subscriber.on_event)
 
             engine = WorkflowEngine(
                 config,
@@ -1582,17 +1918,85 @@ async def resume_workflow_async(
                 skip_gates=skip_gates,
                 workflow_path=resolved_workflow_path,
                 interrupt_event=interrupt_event,
+                event_emitter=emitter,
                 keyboard_listener=listener,
+                web_dashboard=dashboard,
+                instructions_preamble=cp.instructions_preamble,
+                run_context=RunContext(
+                    run_id=event_log_subscriber.run_id,
+                    log_file=str(event_log_subscriber.path),
+                    dashboard_port=(dashboard.port if dashboard is not None else None),
+                    bg_mode=web_bg or os.environ.get("CONDUCTOR_WEB_BG") == "1",
+                ),
             )
             engine.set_context(restored_context)
             engine.set_limits(restored_limits)
 
+            # Seed the dashboard with the original timeline so previously
+            # completed agents remain visible. Order matters:
+            #   1. Prepend a fresh ``workflow_started`` built from the
+            #      current config so historical events apply to the
+            #      correct topology.
+            #   2. Replay the original JSONL log (root-level lifecycle
+            #      events are filtered to keep frontend ``wfDepth`` balanced).
+            #   3. If no JSONL is available, fall back to synthesised
+            #      events from the restored context.
+            #   4. Suppress the engine's own ``workflow_started`` emit on
+            #      resume — without this the dashboard would see two root
+            #      starts and treat the live run as a child workflow.
+            if dashboard is not None:
+                dashboard.prepend_workflow_started(engine.build_workflow_started_data())
+                replayed = 0
+                if existing_log_path is not None:
+                    replayed = dashboard.replay_events_from_jsonl(existing_log_path)
+                if replayed == 0:
+                    try:
+                        cp_ts: float | None = datetime.fromisoformat(cp.created_at).timestamp()
+                    except (TypeError, ValueError):
+                        cp_ts = None
+                    replayed = dashboard.replay_synthetic_from_context(
+                        restored_context, config, checkpoint_timestamp=cp_ts
+                    )
+                verbose_log(f"Seeded dashboard with {replayed} prior event(s)")
+                engine.suppress_workflow_started_emit()
+
+                try:
+                    await dashboard.start()
+                    from conductor.cli.app import is_verbose
+
+                    if is_verbose():
+                        _verbose_console.print(f"[bold cyan]Dashboard:[/bold cyan] {dashboard.url}")
+                except Exception as e:
+                    _verbose_console.print(
+                        f"[bold yellow]Warning:[/bold yellow] "
+                        f"Dashboard failed to start: {e}. Continuing without dashboard."
+                    )
+                    # Drop the dashboard everywhere it's been wired up.
+                    # The engine + DialogHandler captured it at construction
+                    # time and would otherwise block waiting on a never-
+                    # running WebSocket for human gates / dialogs.
+                    engine.clear_web_dashboard()
+                    dashboard = None
+
+            # Share interrupt_event with dashboard so POST /api/stop can abort agents
+            if dashboard is not None and interrupt_event is not None:
+                dashboard.set_interrupt_event(interrupt_event)
+
+            terminate_exc: WorkflowTerminated | None = None
             try:
                 if listener is not None:
                     await listener.start()
                     _verbose_console.print("[dim]Press Esc to interrupt and provide guidance[/dim]")
 
-                result = await engine.resume(cp.current_agent)
+                result = await _resume_with_stop_signal(engine, cp.current_agent, dashboard)
+            except WorkflowTerminated as exc:
+                # Mirror of the matching arm in `run_workflow_async`: defer
+                # the raise so the dashboard stays alive for
+                # explicit-terminate failures the same as it does for
+                # successful runs. Resume hints stay suppressed because
+                # explicit terminations are not resumable (see issue #219).
+                terminate_exc = exc
+                result = exc.output
             except BaseException:
                 _print_resume_instructions(engine)
                 raise
@@ -1602,7 +2006,13 @@ async def resume_workflow_async(
 
             # Log completion
             verbose_log_timing("Total resumed execution", time.time() - start_time)
-            verbose_log("Workflow resumed successfully", style="green")
+            if terminate_exc is None:
+                verbose_log("Workflow resumed successfully", style="green")
+            else:
+                verbose_log(
+                    f"Resumed workflow terminated explicitly at '{terminate_exc.terminated_by}'",
+                    style="yellow",
+                )
 
             # Display usage summary if cost tracking is enabled
             if config.workflow.cost.show_summary:
@@ -1610,12 +2020,55 @@ async def resume_workflow_async(
                 if "usage" in summary:
                     display_usage_summary(summary["usage"])
 
-            # Cleanup checkpoint after successful resume
+            # Cleanup checkpoint after the resumed run finishes. Both clean
+            # completion and explicit termination are terminal outcomes — the
+            # checkpoint we resumed from is no longer needed in either case.
             CheckpointManager.cleanup(cp.file_path)
             verbose_log(f"Checkpoint cleaned up: {cp.file_path}", style="dim")
 
+            # Post-execution dashboard lifecycle (parity with run) — kept
+            # alive for both clean exits and explicit-terminate failures.
+            if dashboard is not None:
+                is_bg = web_bg or os.environ.get("CONDUCTOR_WEB_BG") == "1"
+                if is_bg:
+                    await dashboard.wait_for_clients_disconnect()
+                else:
+                    from conductor.cli.app import is_verbose
+
+                    if is_verbose():
+                        banner = (
+                            "[bold yellow]Workflow terminated.[/bold yellow]"
+                            if terminate_exc is not None
+                            else "[bold green]Workflow complete.[/bold green]"
+                        )
+                        _verbose_console.print(
+                            f"\n{banner} "
+                            f"Dashboard still running at {dashboard.url} — "
+                            f"press [bold]Ctrl+C[/bold] to exit."
+                        )
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await asyncio.Event().wait()
+
+            if terminate_exc is not None:
+                raise terminate_exc
             return result
     finally:
+        # Clean up PID file if this is a background child process
+        is_bg_child = os.environ.get("CONDUCTOR_WEB_BG") == "1"
+        if is_bg_child:
+            from conductor.cli.pid import remove_pid_file_for_current_process
+
+            remove_pid_file_for_current_process()
+
+        # Stop dashboard if it was started
+        if dashboard is not None:
+            await dashboard.stop()
+
+        # Close JSONL event log and report path
+        if event_log_subscriber is not None:
+            event_log_subscriber.close()
+            _verbose_console.print(f"[dim]Event log written to: {event_log_subscriber.path}[/dim]")
+
         # Report log file path to stderr and close file logging
         if log_file is not None and _file_console is not None:
             _verbose_console.print(f"[dim]Log written to: {log_file}[/dim]")

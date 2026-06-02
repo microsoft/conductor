@@ -7,21 +7,29 @@ A CLI tool for defining and running multi-agent workflows with the GitHub Copilo
 
 ## Why Conductor?
 
-A single LLM prompt can answer a question, but it can't review its own work, research from multiple angles, or pause for human approval. You need multi-agent workflows—but building them means coding custom solutions, managing state, handling failures, and hoping you don't create infinite loops.
+Conductor makes multi-agent workflows — code review pipelines, research-then-synthesize flows, plan-then-implement loops — **repeatable, deterministic, and version-controlled**. You define your agents, their prompts, and the routing between them in a single YAML file:
 
-Conductor provides the patterns that work: evaluator-optimizer loops for iterative refinement, parallel execution with failure modes, and human-in-the-loop gates. Define them in YAML with built-in safety limits. Version control your workflows like code.
+- **Repeatable** — Same inputs follow the same path through the same agents.
+- **Deterministic** — Routing uses Jinja2 templates and expression evaluation. First matching condition wins. No LLM in the orchestration loop, no tokens spent deciding what runs next.
+- **Source-controlled** — Plain YAML files. Diff workflows in pull requests, version them with your code, run them the same way locally and in CI.
 
 ## Features
 
 - **YAML-based workflows** - Define multi-agent workflows in readable YAML
 - **Multiple providers** - GitHub Copilot, Anthropic Claude, or Claude Agent SDK with seamless switching
 - **Parallel execution** - Run agents concurrently (static groups or dynamic for-each)
-- **Script steps** - Run shell commands and route on exit code without an AI agent
+- **Sub-workflow composition** - Reusable sub-workflows with templated `input_mapping`, usable inside `for_each` groups for dynamic fan-out
+- **Script steps** - Run shell commands and route on exit code or parsed JSON stdout
+- **Set steps** - Bind one or more Jinja2-evaluated values into the context (no LLM, no subprocess) for derived flags, computed defaults, and constants reused by many later prompts
+- **Terminate steps** - Explicit terminal step with `status` (`success`/`failed`) and structured `reason` — distinguishable from the default `$end` path in CLI exit codes, dashboard state, and event logs
+- **Dialog mode** - Agents can pause for multi-turn conversation when uncertain
+- **Reasoning effort** - Unified `reasoning.effort` (low/medium/high/xhigh) per agent or workflow-wide, translated to each provider's native API
+- **Workspace instructions** - Auto-discover and inject `AGENTS.md` / `CLAUDE.md` / `.github/copilot-instructions.md` into every agent's prompt
 - **Conditional routing** - Route between agents based on output conditions
-- **Human-in-the-loop** - Pause for human decisions with Rich terminal UI
+- **Human-in-the-loop** - Pause for human decisions with Markdown-rendered prompts and clickable file links
 - **Safety limits** - Max iterations and timeout enforcement
-- **[Web dashboard](#web-dashboard)** - Real-time workflow visualization with interactive DAG graph, live streaming, and in-browser human gates
-- **Validation** - Validate workflows before execution
+- **[Web dashboard](#web-dashboard)** - Real-time workflow visualization with interactive DAG graph, breadcrumb navigation into sub-workflows, live streaming, and in-browser human gates
+- **Validation** - Catches stale template references, missing inputs, and undeclared dependencies before runtime
 
 ## Installation
 
@@ -41,9 +49,35 @@ The installer checks for [uv](https://docs.astral.sh/uv/) (installs it if missin
 
 ### Updating
 
+`conductor update` checks for a newer release and tells you the one-line command to upgrade. Upgrades happen via the install script — the same script you used to install — because in-process self-upgrade is unreliable on Windows (the running Python interpreter sits inside the venv that needs replacing).
+
 ```bash
 conductor update
 ```
+
+To upgrade, run the install script in a **new shell** (not from inside a running `conductor` process):
+
+**macOS / Linux:**
+```bash
+curl -sSfL https://aka.ms/conductor/install.sh | sh
+```
+
+**Windows (PowerShell):**
+```powershell
+irm https://aka.ms/conductor/install.ps1 | iex
+```
+
+Or skip the copy-paste with `--apply`:
+
+```bash
+conductor update --apply
+```
+
+`--apply` launches the install script automatically — on Windows it opens in a new console window so you can watch progress; on macOS/Linux it replaces the current process. Either way, the running `conductor` exits before the installer touches the venv, so file locks release cleanly.
+
+The install script handles file-lock safety (process detection, stale-file cleanup, and on Windows a rename-fallback when the venv directory can't be removed), retries with backoff, and verifies the installed version after install. If your shell ever gets into a bad state from a failed update, re-running the install script is always the right next step.
+
+Conductor periodically checks GitHub for newer releases (cached for 24 hours under `~/.conductor/update-check.json`) and prints a one-line hint when one is available. To silence the hint permanently — for example when you manage upgrades through a package manager or company-mirrored install — set `CONDUCTOR_NO_UPDATE_CHECK=1` in your shell environment. The check is also skipped automatically for non-TTY invocations, `--silent` mode, the `update` subcommand, and `--help` / `--version`.
 
 ### Manual Install
 
@@ -82,6 +116,28 @@ conductor run workflow.yaml
 # Install a specific tag or commit
 pip install git+https://github.com/microsoft/conductor.git@v1.0.0
 ```
+
+### Use the Conductor skill in Claude Code or Copilot CLI
+
+This repo doubles as a single-plugin marketplace that ships the `conductor`
+skill from `plugins/conductor/skills/conductor/`. The skill teaches the
+assistant the workflow YAML schema, CLI commands, and execution model.
+
+**Claude Code:**
+
+```text
+/plugin marketplace add microsoft/conductor
+/plugin install conductor@conductor
+```
+
+**GitHub Copilot CLI** (`gh skill` requires GitHub CLI 2.91+, public preview):
+
+```bash
+gh skill install microsoft/conductor conductor
+```
+
+The plugin ships only markdown — no executables, hooks, or MCP servers — so
+trust verification is straightforward.
 
 ## Quick Start
 
@@ -189,6 +245,32 @@ Requires the `claude` CLI to be installed and authenticated. Install the SDK: `u
 
 **See also:** [Claude Documentation](docs/providers/claude.md) | [Provider Comparison](docs/providers/comparison.md) | [Migration Guide](docs/providers/migration.md)
 
+### Using a Local / Custom LLM Endpoint (Ollama, vLLM, Azure OpenAI, ...)
+
+`runtime.provider` also accepts a structured object that routes the
+Copilot SDK at any OpenAI-compatible / Azure / Anthropic-shaped endpoint.
+Useful for local inference (Ollama, vLLM, LM Studio) and managed
+deployments (Azure OpenAI):
+
+```yaml
+workflow:
+  runtime:
+    provider:
+      name: copilot
+      type: openai                          # openai | azure | anthropic
+      wire_api: completions                 # completions | responses
+      base_url: http://localhost:11434/v1
+      api_key: ${OPENAI_API_KEY:-ollama}
+    default_model: llama3.1                 # match your endpoint's model name
+```
+
+The structured form is opt-in: a bare `provider: copilot` keeps the
+default GitHub Copilot routing. See
+[`examples/copilot-local-llm.yaml`](examples/copilot-local-llm.yaml) for
+the full example (including an Azure OpenAI variant) and
+[Configuration Guide → Custom Provider Routing](docs/configuration.md#custom-provider-routing-ollama--vllm--azure-openai)
+for environment-variable fallbacks, security notes, and validator rules.
+
 ## CLI Reference
 
 ### `conductor run`
@@ -202,6 +284,9 @@ conductor run <workflow.yaml> [OPTIONS]
 | Option | Description |
 |--------|-------------|
 | `-i, --input NAME=VALUE` | Workflow input (repeatable) |
+| `-m, --metadata KEY=VALUE` | Workflow metadata (repeatable; surfaced in `workflow_started`) |
+| `--workspace-instructions` | Auto-discover `AGENTS.md` / `CLAUDE.md` / `.github/copilot-instructions.md` and prepend to every agent prompt |
+| `--instructions PATH` | Explicit instructions file (repeatable) |
 | `-p, --provider PROVIDER` | Override provider |
 | `--dry-run` | Preview execution plan |
 | `--skip-gates` | Auto-select at human gates |
@@ -238,8 +323,9 @@ conductor registry add official myorg/conductor-workflows --default
 conductor registry list official
 
 # Run a workflow from the registry
-conductor run qa-bot                    # latest from default registry
-conductor run qa-bot@official@1.2.3    # specific version
+conductor run qa-bot                       # latest from default registry
+conductor run 'qa-bot@official#v1.2.3'     # specific tag (quote the #)
+conductor run 'qa-bot@official#main'       # branch HEAD (re-resolved on fetch)
 ```
 
 See [docs/design/registry.md](docs/design/registry.md) for the full design.
@@ -255,6 +341,10 @@ See the [`examples/`](./examples/) directory for complete workflows:
 | [parallel-research.yaml](./examples/parallel-research.yaml) | Static parallel execution |
 | [design-review.yaml](./examples/design-review.yaml) | Human gate with loop pattern |
 | [script-step.yaml](./examples/script-step.yaml) | Script step with exit_code routing |
+| [set-step.yaml](./examples/set-step.yaml) | Set step deriving named values + boolean-routed branching |
+| [wait-step.yaml](./examples/wait-step.yaml) | Wait step + script for a polling loop-back pattern |
+| [wait-smoke.yaml](./examples/wait-smoke.yaml) | Minimal wait-only smoke test (no provider required) |
+| [terminate.yaml](./examples/terminate.yaml) | Explicit `type: terminate` with success and failure paths |
 
 **More examples and running instructions:** [examples/README.md](./examples/README.md)
 

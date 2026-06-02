@@ -23,18 +23,43 @@ workflow:
   name: string                      # Required: Unique workflow identifier
   description: string               # Optional: Human-readable description
   entry_point: string               # Required: Name of first agent to execute
-  
+
+  metadata:                         # Optional: free-form key/value metadata
+    tracker: ado                    # surfaced in the workflow_started event
+    project_url: https://...        # CLI --metadata / -m can add or override
+
+  instructions:                     # Optional: extra instruction files (paths)
+    - ./docs/conventions.md         # prepended to every agent prompt
+    - ./AGENTS.md                   # also auto-discoverable via
+                                    # --workspace-instructions (see CLI ref)
+
   limits:
     max_iterations: 10              # Default: 10, max: 500
     timeout_seconds: 600            # Optional: Maximum wall-clock time (seconds)
-  
+
   hooks:
     on_start: "{{ template }}"      # Optional: Expression evaluated on start
     on_complete: "{{ template }}"   # Optional: Expression evaluated on success
     on_error: "{{ template }}"      # Optional: Expression evaluated on error
 
   context_mode: accumulate          # accumulate | snapshot | minimal (default: accumulate)
+
+  runtime:
+    provider: copilot               # copilot | claude
+    default_model: gpt-5.2
+    temperature: 0.7
+    max_tokens: 4096
+    default_reasoning_effort: medium  # Optional: low | medium | high | xhigh
+                                      # Workflow-wide default for reasoning /
+                                      # extended-thinking effort. Inherited by
+                                      # every provider-backed agent unless it
+                                      # declares its own `reasoning.effort`.
+                                      # See docs/configuration.md#reasoning-effort.
 ```
+
+**Workflow metadata** is included verbatim in the `workflow_started` event and lets downstream consumers (dashboards, queue runners, observability tools) adapt without parsing the YAML. CLI `--metadata key=value` flags merge on top of YAML metadata (CLI wins on conflicts).
+
+**Instructions files** are loaded once and prepended to every agent's rendered prompt. They are inherited by sub-workflows and persisted in checkpoints so resume continues to use the same instructions. Use the YAML `instructions:` list for workflow-pinned context, or pass `--workspace-instructions` on the CLI to auto-discover `AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md`, and `.github/instructions/**/*.instructions.md` (recursive; only files marked `applyTo: "**"` in YAML frontmatter are loaded — see the [Workspace Instructions section in the CLI reference](cli-reference.md#workspace-instructions) for full details) by walking from CWD up to the git root.
 
 ### Context Modes
 
@@ -50,7 +75,7 @@ Agents are defined in the `agents` list. Each agent represents a unit of work.
 agents:
   - name: string                    # Required: Unique agent identifier
     description: string             # Optional: Purpose description
-    type: agent                     # agent | human_gate | script | workflow (default: agent)
+    type: agent                     # agent | human_gate | script | workflow | wait | terminate (default: agent)
     model: string                   # Optional: Model identifier (e.g., 'claude-sonnet-4.5')
     
     prompt: |                       # Required for type=agent: Agent instructions
@@ -71,11 +96,57 @@ agents:
     
     tools:                          # Optional: Agent-specific tools
       - tool_name
-    
+
+    reasoning:                      # Optional: per-agent reasoning override
+      effort: high                  # low | medium | high | xhigh
+                                    # Overrides runtime.default_reasoning_effort.
+                                    # Only valid on type=agent (rejected on
+                                    # script, human_gate, workflow).
+                                    # See docs/configuration.md#reasoning-effort.
+
     routes:                         # Optional: Routing logic
       - to: next_agent              # Agent name or $end
         when: "{{ condition }}"     # Optional: Route condition
 ```
+
+### Choosing whether to declare `output:`
+
+Declaring `output:` does two things at once: it asks the model to return JSON matching the schema, and it parses the response as structured JSON. For some agents that's what you want. For others it produces parse-recovery loops and burns tokens.
+
+**Declare `output:`** when the agent emits small, strictly-structured JSON whose individual fields will be referenced downstream:
+
+```yaml
+agents:
+  - name: classifier
+    prompt: "Classify the input. Return {category, confidence}."
+    output:
+      category:
+        type: string
+      confidence:
+        type: number
+  - name: router
+    prompt: |
+      Category was {{ classifier.output.category }}.
+      Confidence was {{ classifier.output.confidence }}.
+```
+
+**Omit `output:`** when the agent emits prose, Markdown, or large/nested JSON. Without a schema, conductor stores the full raw response as a single string under `.output.result`, and downstream agents read it directly:
+
+```yaml
+agents:
+  - name: synthesizer
+    prompt: |
+      Produce a comprehensive Markdown report of the findings.
+      The report may contain code blocks, tables, and quoted examples.
+    # No output: declared — response is captured verbatim.
+  - name: reviewer
+    prompt: |
+      Review the following report:
+
+      {{ synthesizer.output.result }}
+```
+
+Why this matters: when an `output:` schema is declared, the model is asked to wrap its response in JSON. Large or prose-heavy responses tend to come back inside Markdown code fences, and any triple-backticks in the content can confuse the JSON-extraction step. Omitting `output:` for these agents avoids that whole class of failure and lets the model write naturally.
 
 ### Human Gates
 
@@ -103,6 +174,42 @@ agents:
       - to: $end
         when: "{{ approval_gate.choice == 'reject' }}"
 ```
+
+#### Markdown in Gate Prompts
+
+Gate prompts support full **Markdown formatting**. In the terminal, prompts are rendered with Rich Markdown (headings, bold, lists, code blocks). In the web dashboard, prompts render as styled HTML with interactive features:
+
+- **Headings, bold, lists, code blocks** — all standard Markdown syntax is rendered
+- **Tables** — GitHub Flavored Markdown (GFM) pipe tables are supported
+- **File links** — relative file paths in the prompt (e.g., `./src/plan.md`) are auto-detected and rendered as clickable links that open in VS Code
+- **URLs** — bare `http://` and `https://` URLs are auto-linked
+
+```yaml
+agents:
+  - name: review_gate
+    type: human_gate
+    description: "Review the generated plan"
+    prompt: |
+      ## Review Required
+
+      The planner produced the following artifacts:
+
+      | File | Purpose |
+      |------|---------|
+      | ./output/plan.md | Implementation plan |
+      | ./output/timeline.md | Delivery timeline |
+
+      Please review the files above and choose how to proceed.
+      See also: https://wiki.example.com/review-guidelines
+
+    options:
+      - name: approve
+        description: "Looks good — proceed"
+      - name: revise
+        description: "Needs changes"
+```
+
+The auto-linkify processor is Markdown-aware: it skips fenced code blocks, inline code spans, and existing markdown links. File paths are validated against the workflow root directory (path traversal is blocked).
 
 ### Script Steps
 
@@ -136,6 +243,59 @@ agents:
 | `stderr` | string | Captured standard error |
 | `exit_code` | integer | Process exit code (0 = success) |
 
+**JSON stdout auto-parsing** — if `stdout` is valid JSON _and_ the parsed value is an object, its fields are merged into the agent's output dict alongside `stdout`/`stderr`/`exit_code`. This lets you route on parsed fields directly instead of opaque exit codes:
+
+```yaml
+# Script writes to stdout: {"route": "planning", "issue_count": 3}
+agents:
+  - name: detector
+    type: script
+    command: pwsh
+    args: ["-File", "{{ workflow.dir }}/scripts/detect.ps1"]
+    routes:
+      - to: planner
+        when: "route == 'planning'"          # parsed field
+      - to: scaler
+        when: "issue_count > 100"            # parsed field
+      - to: $end
+```
+
+JSON arrays and scalars are ignored (only objects merge). Non-JSON stdout is unchanged. Parsed fields shadow `stdout`/`stderr`/`exit_code` if a script outputs those as JSON keys.
+
+**Declared output schema (strict mode)** — script steps can also declare an `output:` schema using the same syntax as LLM agents. When declared, conductor enforces a strict contract: stdout must be a single JSON object, the JSON gets merged onto the `{stdout, stderr, exit_code}` baseline, and the **merged dict** is validated against the schema. If any check fails the workflow aborts with a `ValidationError`:
+
+```yaml
+agents:
+  - name: detector
+    type: script
+    command: pwsh
+    args: ["-File", "{{ workflow.dir }}/scripts/detect.ps1"]
+    output:
+      route:
+        type: string
+        description: Which phase to enter next
+      issue_count:
+        type: number
+    routes:
+      - to: planner
+        when: "route == 'planning'"
+      - to: scaler
+        when: "issue_count > 100"
+      - to: $end
+```
+
+Strict-mode semantics:
+
+- **stdout must be a single JSON object.** Non-JSON, empty stdout, JSON arrays, JSON scalars, and JSON followed by additional text (e.g. log lines) all fail validation with the underlying JSON parser error surfaced for diagnostics. Reserve stdout for the JSON payload and write logs to `stderr`.
+- **Missing or wrong-typed fields fail validation.** Extra fields beyond the schema are kept in the output dict (the validator only enforces declared fields — the same loose-extras policy that LLM-agent structured outputs use).
+- **Validation runs on the merged dict, not the raw JSON.** The `stdout`/`stderr`/`exit_code` built-ins are always present in the dict, with parsed JSON keys overlaid on top. Declaring `exit_code: { type: number }` asserts the built-in matches; if the script emits a shadowing JSON key (e.g. `{"exit_code": "ok"}`), the schema validates the shadowed value.
+- **Failure semantics.** On schema-validation failure, the engine emits `script_failed` (not `script_completed`) and aborts the workflow. The failure event carries the captured stdout, stderr, and exit_code so dashboards and logs can show what the script actually wrote.
+- **`output: {}` opts into strict mode with zero required fields** — useful when you want the JSON-object enforcement without listing fields yet.
+
+Note: this is **structural** parity with LLM agents — the script must emit clean JSON to stdout. The JSON-recovery heuristics LLM agents use (extracting JSON from code fences, wrapping non-object payloads) intentionally do not apply to scripts, which are deterministic.
+
+Omit `output:` to keep the lenient auto-merge behavior described above.
+
 Access in downstream agents:
 
 ```yaml
@@ -156,9 +316,160 @@ routes:
   - to: $end
 ```
 
-**Restrictions** — script steps cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, `output` schema, or `options`. Script steps also cannot be used inside `parallel` groups or `for_each` groups.
+**Restrictions** — script steps cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, or `options`. Script steps also cannot be used inside `parallel` groups or `for_each` groups.
 
 **Environment variable note** — values in `env` are passed as-is to the subprocess (they are not rendered as Jinja2 templates). Use `${VAR}` syntax in the workflow YAML loader if you need environment variable substitution in env values.
+
+### Wait Steps
+
+Wait steps pause workflow execution for a parsed duration via in-process `asyncio.sleep`. Use them for rate-limit cooldowns, polling intervals, and external-system catch-up — cross-platform, no shell `sleep` dependency.
+
+```yaml
+agents:
+  - name: cooldown
+    type: wait
+    description: "Cool down between API bursts"     # Optional
+    duration: 60s                                   # Required: see "Duration format" below
+    reason: "Avoiding rate limit"                   # Optional: shown in dashboard
+    routes:
+      - to: next_step
+```
+
+**Duration format** — `duration` accepts:
+
+- A plain `int` or `float` (seconds): `duration: 60`, `duration: 1.5`.
+- A string with a unit suffix: `ms` (milliseconds), `s` (seconds), `m` (minutes), `h` (hours). Examples: `"500ms"`, `"60s"`, `"2.5m"`, `"1h"`.
+- A Jinja2 template that renders to one of the above. Templated durations defer literal validation to runtime:
+
+  ```yaml
+  duration: "{{ workflow.input.poll_interval_seconds }}s"
+  ```
+
+The resolved duration must be **greater than 0 and no more than 24 hours** (`86400s`). Longer pauses should reconsider `workflow.limits.timeout_seconds` first.
+
+**Output structure** — wait step output is strict — only `waited_seconds` is exposed:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `waited_seconds` | `number` | Wall-clock seconds actually slept (may be less than requested on interrupt) |
+
+Access in templates: `{{ cooldown.output.waited_seconds }}`.
+
+**Polling pattern** — wait composes with routing loop-backs to build polling workflows without writing any Python:
+
+```yaml
+agents:
+  - name: check_status
+    type: script
+    command: ./poll-status.sh
+    routes:
+      - to: process_result
+        when: "status == 'ready'"
+      - to: wait_then_retry
+
+  - name: wait_then_retry
+    type: wait
+    duration: "{{ workflow.input.poll_interval_seconds }}s"
+    routes:
+      - to: check_status                           # loop back
+
+  - name: process_result
+    # ...
+```
+
+**Cancellation** — `Esc` / `Ctrl+G` cancels an in-progress wait immediately (the engine races the sleep against the interrupt event). The workflow-level `limits.timeout_seconds` also cancels in-flight waits via the standard timeout path.
+
+**Iteration counting** — wait steps count toward `workflow.limits.max_iterations` (each pause is one step). They are not subject to `max_agent_iterations`, which counts per-LLM-agent tool iterations.
+
+**Restrictions** — wait steps cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, `options`, `command`, `args`, `env`, `working_dir`, `timeout`, `workflow`, `input_mapping`, `max_depth`, `max_session_seconds`, `max_agent_iterations`, `retry`, `dialog`, `reasoning`, `timeout_seconds`, or `output`. Wait steps also cannot be used inside `parallel` groups or `for_each` groups.
+
+See [`examples/wait-step.yaml`](../examples/wait-step.yaml) for a complete polling workflow.
+### Set Steps
+
+Set steps evaluate one or more Jinja2 expressions and bind the typed results into the workflow context. No LLM call, no subprocess, no I/O — they're pure context transformations. Use them to combine inputs, derive flags from prior outputs, compute defaults, or normalise a value once for many downstream prompts to share.
+
+```yaml
+agents:
+  # Single binding — output is the typed scalar / list / dict.
+  - name: compute_slug
+    type: set
+    value: "{{ workflow.input.org }}/{{ workflow.input.repo }}"
+    # accessible as: compute_slug.output  (a string)
+    routes:
+      - to: derive_flags
+
+  # Multi-binding — output is a dict, accessible as step.output.<key>.
+  - name: derive_flags
+    type: set
+    values:
+      is_breaking: "{{ research.output.severity in ['high', 'critical'] }}"
+      target_branch: "{{ workflow.input.branch or 'main' }}"
+      effective_model: "{{ workflow.input.model or 'claude-sonnet-4-5' }}"
+    routes:
+      - to: breaking_path
+        when: "{{ output.is_breaking }}"
+      - to: safe_path
+```
+
+Exactly one of `value:` or `values:` must be present.
+
+**Type detection** — by default, the rendered string is parsed with safe YAML (equivalent to `yaml.safe_load`); booleans, numbers, lists, and dicts are returned as native types. Parse failures and pure-comment renders fall back to the raw string. Empty / whitespace-only renders become `""`, not `None`. `yaml.safe_load` produces `datetime`/`date`/`time` objects from strings like `"2024-01-02"`; these are converted to their ISO 8601 string form so checkpoint round-trips and dashboard payloads stay JSON-safe. Any other non-JSON-safe Python value raises `ExecutionError`.
+
+**Explicit `output_type:`** (single `value:` only) forces a specific coercion:
+
+| Value | Behaviour |
+|-------|-----------|
+| `auto` (default) | YAML safe-load with the rules above |
+| `string` | Keep the raw rendered string verbatim |
+| `number` | Try `int` then `float`; raise on failure |
+| `integer` | `int`; raise on failure |
+| `boolean` | Case-insensitive `true`/`false`/`1`/`0`/`yes`/`no`/`y`/`n`/`on`/`off` |
+| `list` | Parse via YAML; assert the result is a list |
+| `dict` | Parse via YAML; assert the result is a dict |
+
+Per-key typing on multi `values:` is not supported.
+
+**Multi-binding ordering** — every binding in a single `values:` step renders against the *original* pre-step context. Later bindings cannot reference earlier ones in the same step. If you need ordered dependencies, chain multiple set steps:
+
+```yaml
+- name: step_a
+  type: set
+  value: "{{ workflow.input.x | upper }}"
+- name: step_b
+  type: set
+  value: "{{ step_a.output }}-suffix"
+```
+
+**Routing on set output** — routes attached to a set step evaluate against the bound value directly. Dict outputs expose `{{ output.<key> }}` (Jinja2) and bare `<key>` (simpleeval); scalar / list outputs expose only `{{ output }}`:
+
+```yaml
+# Multi-values step — route on a derived dict field.
+- name: derive_flags
+  type: set
+  values:
+    is_breaking: "{{ severity == 'high' }}"
+  routes:
+    - to: breaking_path
+      when: "{{ output.is_breaking }}"
+    - to: safe_path
+
+# Single-value step — route on the scalar itself.
+- name: flag
+  type: set
+  value: "{{ workflow.input.severity == 'high' }}"
+  routes:
+    - to: hi
+      when: "{{ output }}"
+    - to: lo
+```
+
+**Optional output schema** — set steps support the same `output:` schema as LLM and script agents, but only when the rendered value is a dict (which is always the case for multi `values:`, and may be the case for single `value:`). If a single-`value:` step declares `output:` but produces a scalar / list, the engine raises a friendly `ValidationError` pointing to `values:` as the intended shape.
+
+**Composition** — set steps are allowed inside `parallel` groups (each member publishes its bound value to context) and as the inline agent of a `for_each` group (one bound value per item). Inside a parallel group, set templates cannot reference sibling group members (the validator catches this at config time, since the engine renders against a pre-group snapshot).
+
+**Restrictions** — set agents cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, `command`, `args`, `env`, `working_dir`, `timeout`, `workflow`, `options`, `input_mapping`, `max_depth`, `retry`, `dialog`, `reasoning`, `timeout_seconds`, `max_session_seconds`, or `max_agent_iterations`. They count toward `limits.max_iterations` like any other step.
+
+**Events** — set steps emit `set_started` / `set_completed` / `set_failed` (mirroring the script-step lifecycle) in all three positions: linear main loop, parallel group member, and for-each iteration. The `set_completed` payload carries `output_type`, `output_keys` (sorted, empty for scalars), and `value_repr` (a JSON-safe preview, truncated at 512 chars).
 
 ### Sub-Workflow Steps
 
@@ -171,6 +482,12 @@ agents:
     workflow: ./research-pipeline.yaml   # Required: path to sub-workflow YAML
     input:                               # Optional: explicit input declarations
       - workflow.input.topic
+    input_mapping:                       # Optional: per-call inputs to the sub-workflow
+      topic: "{{ workflow.input.topic }}"
+      depth: "{{ research_planner.output.depth }}"
+    max_depth: 3                         # Optional: per-agent recursion cap
+                                         #   (additionally bounded by global
+                                         #   MAX_SUBWORKFLOW_DEPTH = 10)
     output:                              # Optional: output schema for validation
       findings:
         type: string
@@ -180,11 +497,15 @@ agents:
 
 **Key semantics:**
 
-- The `workflow` path is resolved relative to the parent workflow file
+- The `workflow` field can be:
+  - A local file path: `./research-pipeline.yaml` (resolved relative to the parent)
+  - A configured registry reference: `qa-bot@team#v1.2.3` (see [Workflow Registry](design/registry.md))
+  - An ad-hoc GitHub reference: `analysis@myorg/team-a#main` (owner/repo fetched directly from GitHub)
 - Sub-workflow inherits the parent's provider configuration
 - Sub-workflow output is stored in context and accessible via `{{ agent_name.output.field }}`
-- Recursive composition is supported (sub-workflows can reference other sub-workflows) with a depth limit of 10
-- Circular references (a workflow referencing itself) are detected and rejected
+- Recursive composition is supported (sub-workflows can reference other sub-workflows) with a global depth limit of `MAX_SUBWORKFLOW_DEPTH = 10`
+- Self-referential sub-workflows (a workflow referencing itself) are allowed; depth is bounded by the global cap and the optional per-agent `max_depth` field
+- `input_mapping` keys are sub-workflow input names; each value is a Jinja2 expression evaluated against the parent's context. When `input_mapping` is omitted, the parent's `workflow.input.*` is forwarded to the sub-workflow as before
 
 **Access sub-workflow output in downstream agents:**
 
@@ -194,7 +515,139 @@ prompt: |
   {{ deep_research.output.findings }}
 ```
 
-**Restrictions** — workflow steps cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, `command`, or `options`. Workflow steps also cannot be used inside `parallel` groups or `for_each` groups.
+**Workflow reference types** — the `workflow` field supports three forms:
+
+```yaml
+agents:
+  # Local file path (relative to parent workflow)
+  - name: local_pipeline
+    type: workflow
+    workflow: ./shared/research-pipeline.yaml
+
+  # Configured registry reference
+  - name: registry_pipeline
+    type: workflow
+    workflow: qa-bot@team#v1.2.3
+
+  # Ad-hoc GitHub reference (no registry setup required)
+  - name: adhoc_pipeline
+    type: workflow
+    workflow: analysis@myorg/team-a#main
+    input_mapping:
+      data: "{{ workflow.input.raw_data }}"
+```
+
+The ad-hoc form (`workflow@owner/repo[#ref]`) allows cross-team workflow
+composition without pre-configuring registries. See
+[Ad-hoc References](design/registry.md#ad-hoc-references) in the registry design
+doc for details on caching, authentication, and ref resolution.
+
+**Sub-workflows in `for_each` groups** — `type: workflow` agents can be used inside `for_each` groups to fan out one sub-workflow run per item in the source array. Each iteration receives its own `input_mapping` evaluated against the loop variable, and emits its own `subworkflow_started` / `subworkflow_completed` events:
+
+```yaml
+parallel:
+  - name: plan_issues
+    for_each:
+      source: epic_planner.output.issues
+      as: issue
+    max_concurrent: 1
+    agent:
+      type: workflow
+      workflow: ./plan-and-review.yaml
+      input_mapping:
+        work_item_id: "{{ issue.id }}"
+        title: "{{ issue.title }}"
+```
+
+**Restrictions** — workflow steps cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, `command`, or `options`.
+
+### Terminate Steps
+
+Terminate steps end the workflow with an explicit `status` (`success` or `failed`) and a structured `reason`. Reaching a terminate step ends execution immediately — no routes are evaluated after — and produces a CLI exit code, dashboard state, and event payload that downstream tooling can distinguish from a generic crash.
+
+```yaml
+agents:
+  - name: precheck
+    type: script
+    command: bash
+    args: ["-c", "echo '{\"action\":\"abort\",\"reason\":\"unsafe input\"}'"]
+    output:
+      action:  { type: string }
+      reason:  { type: string }
+    routes:
+      - when: "action == 'abort'"
+        to: abort_unsafe
+      - when: "action == 'noop'"
+        to: noop_exit
+      - to: main_pipeline
+
+  # Soft success — workflow ends cleanly, exit 0, dashboard ✅.
+  - name: noop_exit
+    type: terminate
+    status: success
+    reason: "Document already up to date; no edits needed."
+
+  # Hard failure with reason — workflow ends, exit 1, dashboard ❌.
+  - name: abort_unsafe
+    type: terminate
+    status: failed
+    reason: "{{ precheck.output.reason }}"
+    output_template:                  # optional; replaces workflow.output
+      aborted: "true"                 # rendered then JSON-coerced to True
+      stage: precheck
+      reason: "{{ precheck.output.reason }}"
+```
+
+**Behaviour**
+
+| `status` | CLI exit code | Dashboard | Event | Resumable? |
+|----------|---------------|-----------|-------|------------|
+| `success` | `0` | ✅ | `workflow_completed { termination_reason, terminated_by, is_explicit: true, status: "success" }` | n/a (clean exit) |
+| `failed`  | `1` | ❌ | `workflow_failed { error_type: "WorkflowTerminated", termination_reason, terminated_by, is_explicit: true, status: "failed", output }` | **No** — explicit terminations skip the on-failure checkpoint |
+
+**Final output** — when `output_template:` is set, it *replaces* the workflow-level `output:` mapping for this termination path. Each rendered value is passed through the same JSON-coercion helper used elsewhere in the engine, so `"true"` becomes `True`, `"42"` becomes `42`, and JSON literals are parsed. When `output_template:` is omitted, the workflow-level `output:` is rendered as on any other terminal path.
+
+**Restrictions** — terminate steps cannot have `routes`, `tools`, `output`, `prompt`, `model`, `provider`, `system_prompt`, `command`, `args`, `env`, `working_dir`, `timeout`, `timeout_seconds`, `max_session_seconds`, `max_agent_iterations`, `max_depth`, `retry`, `dialog`, `reasoning`, `workflow`, `input_mapping`, or `options`. They cannot appear as members of a parallel group or as a `for_each` inline agent — route to them from those groups' `routes:` instead.
+
+**Sub-workflow boundary** — a `status: failed` terminate inside a sub-workflow is downgraded to a `SubworkflowTerminatedError` (subclass of `ExecutionError`) at the parent boundary so the parent treats it as a normal sub-workflow failure (its own `workflow_failed` does NOT inherit `is_explicit: true`). The child's rendered output, reason, and terminate step name are preserved on the wrapper as `terminated_output`, `terminated_reason`, and `terminated_by` for `on_error` hooks and debugging surfaces. A `status: success` terminate inside a sub-workflow returns its rendered output cleanly and the parent continues with its next routes.
+
+See [`examples/terminate.yaml`](../examples/terminate.yaml) for a complete worked example with all three paths.
+
+### Dialog Mode
+
+Dialog mode allows agents to conditionally pause after execution and enter a free-form conversation with the user. An LLM evaluator examines the agent's output against user-defined criteria and decides whether to initiate a dialog.
+
+```yaml
+agents:
+  - name: researcher
+    prompt: "Research the given topic thoroughly"
+    dialog:
+      trigger_prompt: |
+        Enter dialog if the agent expresses uncertainty about
+        the user's intent, encounters ambiguous requirements,
+        or needs clarification before proceeding.
+    routes:
+      - to: writer
+```
+
+When triggered, the user is presented with a choice:
+1. **Discuss** — engage in a multi-turn conversation with the agent
+2. **Do your best and continue** — skip the dialog and let the agent proceed
+
+After the conversation, the agent re-executes with the dialog transcript as additional context, producing a refined output.
+
+**Configuration:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `dialog.trigger_prompt` | string | Yes | Criteria for the LLM evaluator to decide when dialog is needed |
+
+**Behavior notes:**
+- Dialog is supported on regular `agent` type only (not `human_gate`, `script`, `workflow`, or `wait`)
+- In web dashboard mode, the dialog temporarily replaces the graph area with a chat interface
+- When `--skip-gates` is set (e.g., CI/automation), dialogs are automatically skipped
+- The evaluator prompt should describe *when* to trigger dialog, not *what* to ask — the evaluator generates the opening question from the agent's output context
+- After dialog, the agent sees the full conversation transcript and produces updated output
 
 ## Parallel Groups
 
@@ -403,6 +856,41 @@ input:
 
 Access in agents: `{{ workflow.input.question }}`
 
+**Optional inputs without an explicit `default`** resolve to type-appropriate zero values rather than `None`, so templates render cleanly:
+
+| Input `type` | Zero value |
+|---|---|
+| `string` | `""` |
+| `number` | `0` |
+| `boolean` | `false` |
+| `array` | `[]` |
+| `object` | `{}` |
+
+This means `{{ workflow.input.optional_msg | default("fallback") }}` correctly renders `"fallback"` when `optional_msg` is omitted, instead of the literal string `"None"`.
+
+### Workflow Metadata Variables
+
+In addition to `workflow.input.*`, every agent has access to:
+
+| Variable | Description |
+|---|---|
+| `workflow.name` | Workflow name from the YAML |
+| `workflow.description` | Workflow description from the YAML |
+| `workflow.dir` | Absolute path to the directory containing the workflow YAML |
+| `workflow.file` | Absolute path to the workflow YAML file |
+
+These are available in **all** context modes (they're metadata, not inputs). `workflow.dir` is particularly useful for registry-hosted workflows that need to reference co-located scripts or assets without depending on the caller's working directory:
+
+```yaml
+agents:
+  - name: detector
+    type: script
+    command: pwsh
+    args:
+      - "-File"
+      - "{{ workflow.dir }}/scripts/detect-state.ps1"
+```
+
 ### Workflow Outputs
 
 Define the final workflow output:
@@ -449,6 +937,7 @@ workflow:
 - Each agent execution counts as 1 iteration
 - Parallel agents count individually (3 parallel agents = 3 iterations)
 - Loop-back patterns increment the counter on each iteration
+- Script steps and wait steps each count as 1 iteration
 
 ### Timeout Behavior
 
@@ -702,7 +1191,7 @@ workflow:
 ### Available Hook Contexts
 
 **`on_start`**:
-- `workflow.name`, `workflow.description`
+- `workflow.name`, `workflow.description`, `workflow.dir`, `workflow.file`
 - `workflow.input.*` (all input values)
 
 **`on_complete`**:

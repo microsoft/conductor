@@ -103,15 +103,43 @@ class TestScriptAgentDef:
         with pytest.raises(ValidationError, match="script agents cannot have 'tools'"):
             AgentDef(name="bad", type="script", command="echo", tools=["web_search"])
 
-    def test_script_with_output_raises(self) -> None:
-        """Test that script agent with output schema raises ValidationError."""
-        with pytest.raises(ValidationError, match="script agents cannot have 'output'"):
-            AgentDef(
-                name="bad",
-                type="script",
-                command="echo",
-                output={"result": OutputField(type="string")},
-            )
+    def test_script_with_output_accepted(self) -> None:
+        """Script agents may declare an `output:` schema at config time (issue #118).
+
+        This test only covers the schema-construction path. Runtime validation
+        of the JSON stdout against the schema is exercised in
+        ``tests/test_engine/test_script_workflow.py::TestScriptOutputSchema``.
+        """
+        agent = AgentDef(
+            name="detector",
+            type="script",
+            command="python",
+            args=["-c", "import json; print(json.dumps({'route': 'planning'}))"],
+            output={
+                "route": OutputField(type="string", description="Next phase"),
+                "issue_count": OutputField(type="number"),
+            },
+        )
+        assert agent.output is not None
+        assert "route" in agent.output
+        assert agent.output["route"].type == "string"
+        assert agent.output["issue_count"].type == "number"
+
+    def test_script_with_empty_output_accepted(self) -> None:
+        """Empty `output: {}` is accepted at config time.
+
+        Runtime behavior (strict JSON-object mode with zero declared fields)
+        is exercised in
+        ``test_engine/test_script_workflow.py::test_empty_schema_requires_json_object``.
+        """
+        agent = AgentDef(
+            name="probe",
+            type="script",
+            command="echo",
+            args=["{}"],
+            output={},
+        )
+        assert agent.output == {}
 
     def test_script_with_system_prompt_raises(self) -> None:
         """Test that script agent with system_prompt raises ValidationError."""

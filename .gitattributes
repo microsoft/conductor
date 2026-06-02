@@ -1,0 +1,10 @@
+# PowerShell installer must be UTF-8 *without* BOM and use LF line endings.
+# A BOM survives `Invoke-RestMethod` as U+FEFF and breaks `irm <url> | iex`,
+# which is the documented official install command. Full rationale and the
+# regression test are in tests/test_integration/test_install_script_files.py.
+# This file pins line endings only -- it does NOT enforce "no BOM".
+install.ps1 text eol=lf
+
+# Shell + Python: always LF (covers install.sh)
+*.sh text eol=lf
+*.py text eol=lf

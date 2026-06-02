@@ -121,6 +121,42 @@ class TestAgentExecutorBasic:
         assert output.content["anything"] == "goes"
         assert output.content["here"] == 123
 
+    @pytest.mark.asyncio
+    async def test_execute_renders_system_prompt_passed_to_provider(
+        self, agent_with_system_prompt: AgentDef
+    ) -> None:
+        """Regression test: the executor must render `system_prompt` and update
+        the agent before passing it to the provider.
+
+        The Copilot provider concatenates `agent.system_prompt` into the prompt
+        sent to the model. If the executor leaves it as the raw template (with
+        unrendered `{{ }}` placeholders), the model sees literal Jinja syntax
+        and typically refuses with a "prompt template contains unfilled
+        variables" message. This test asserts the agent the provider receives
+        has its `system_prompt` fully rendered.
+        """
+        captured_agents: list[AgentDef] = []
+
+        def mock_handler(agent: AgentDef, prompt: str, context: dict) -> dict:
+            captured_agents.append(agent)
+            return {"answer": "ok"}
+
+        provider = CopilotProvider(mock_handler=mock_handler)
+        executor = AgentExecutor(provider)
+
+        context = {"workflow": {"input": {"topic": "Python", "question": "What is it?"}}}
+        await executor.execute(agent_with_system_prompt, context)
+
+        assert len(captured_agents) == 1
+        seen_system_prompt = captured_agents[0].system_prompt
+        assert seen_system_prompt is not None
+        assert "{{" not in seen_system_prompt, (
+            f"system_prompt was not rendered before being passed to provider. "
+            f"Got: {seen_system_prompt!r}"
+        )
+        assert "{%" not in seen_system_prompt
+        assert "Python" in seen_system_prompt
+
 
 class TestAgentExecutorPromptRendering:
     """Tests for prompt rendering."""

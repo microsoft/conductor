@@ -40,7 +40,6 @@ def validate_workflow(
 
     try:
         config = load_config(workflow_path)
-        return True, config
     except ConductorError as e:
         # Display structured error
         display_validation_error(e, workflow_path, output_console)
@@ -55,6 +54,20 @@ def validate_workflow(
             )
         )
         return False, None
+
+    # Semantic validation: cross-field references, template refs, etc.
+    try:
+        from conductor.config.validator import validate_workflow_config
+
+        warnings = validate_workflow_config(config, workflow_path=workflow_path)
+        if warnings:
+            for warning in warnings:
+                output_console.print(f"  [yellow]⚠[/yellow] {warning}")
+    except ConductorError as e:
+        display_validation_error(e, workflow_path, output_console)
+        return False, None
+
+    return True, config
 
 
 def display_validation_error(
@@ -107,6 +120,8 @@ def display_validation_success(
     # Build summary info
     agent_count = len(config.agents)
     human_gate_count = sum(1 for a in config.agents if a.type == "human_gate")
+    parallel_group_count = len(config.parallel)
+    for_each_group_count = len(config.for_each)
 
     # Count conditional routes
     conditional_route_count = sum(1 for a in config.agents for r in a.routes if r.when)
@@ -150,6 +165,10 @@ def display_validation_success(
     table.add_row("Agents", str(agent_count))
     if human_gate_count > 0:
         table.add_row("Human Gates", str(human_gate_count))
+    if parallel_group_count > 0:
+        table.add_row("Parallel Groups", str(parallel_group_count))
+    if for_each_group_count > 0:
+        table.add_row("For-each Groups", str(for_each_group_count))
     table.add_row("Max Iterations", str(config.workflow.limits.max_iterations))
     timeout_val = config.workflow.limits.timeout_seconds
     table.add_row("Timeout", f"{timeout_val}s" if timeout_val else "unlimited")

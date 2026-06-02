@@ -4,7 +4,9 @@ This module provides:
 - Cache-based update checking against the GitHub Releases API
 - Semantic version comparison (including pre-release detection)
 - A one-line Rich hint when a newer version is available
-- A ``run_update()`` function that self-upgrades via ``uv tool install``
+- A ``run_update()`` function that prints the install-script command, or with
+  ``apply=True`` spawns the install script as a fully detached process and
+  exits the current ``conductor`` so it releases its file locks
 
 The cache file lives at ``~/.conductor/update-check.json`` and is refreshed
 every 24 hours.  Network requests use a 2-second timeout and fail silently
@@ -13,15 +15,11 @@ so they never block the CLI.
 
 from __future__ import annotations
 
-import contextlib
-import hashlib
 import json
 import logging
 import os
-import shutil
 import subprocess
 import sys
-import tempfile
 import urllib.error
 import urllib.request
 from datetime import UTC, datetime
@@ -39,6 +37,15 @@ _API_URL = "https://api.github.com/repos/microsoft/conductor/releases/latest"
 _FETCH_TIMEOUT_SECONDS = 2
 _REPO_GIT_URL = "https://github.com/microsoft/conductor.git"
 _RELEASE_DL_URL = "https://github.com/microsoft/conductor/releases/download"
+
+# Install-script entry points. Kept as module-level constants so a future
+# redirect change is a one-line edit.
+_INSTALL_PS1_URL = "https://aka.ms/conductor/install.ps1"
+_INSTALL_SH_URL = "https://aka.ms/conductor/install.sh"
+
+# Retry settings for `uv tool install` — mirrors install.ps1
+_INSTALL_MAX_ATTEMPTS = 3
+_INSTALL_RETRY_DELAY_SECONDS = 2
 
 
 # ---------------------------------------------------------------------------
@@ -201,6 +208,10 @@ def fetch_latest_version() -> tuple[str, str, str] | None:
 # ---------------------------------------------------------------------------
 
 
+_DISABLE_ENV_VAR = "CONDUCTOR_NO_UPDATE_CHECK"
+_HINT_SKIP_FLAGS = frozenset({"--help", "-h", "--version", "-v"})
+
+
 def check_for_update_hint(console: Console) -> None:
     """Print a one-line update hint if a newer version is available.
 
@@ -208,6 +219,13 @@ def check_for_update_hint(console: Console) -> None:
     - stderr is not a TTY
     - The CLI is in ``SILENT`` mode
     - The invoked subcommand is ``update``
+    - ``--help`` / ``-h`` / ``--version`` / ``-v`` was passed (these
+      already produce focused output the user came for; a hint would be
+      noise)
+    - The ``CONDUCTOR_NO_UPDATE_CHECK`` environment variable is set to a
+      truthy value (``1``, ``true``, ``yes``, case-insensitive). Useful
+      for users who manage upgrades through a package manager and want
+      to silence the nudge permanently.
 
     Cache is read first; if the cache is stale or missing, a network fetch
     is performed and the result is cached.
@@ -215,6 +233,10 @@ def check_for_update_hint(console: Console) -> None:
     Args:
         console: The Rich console (stderr) used for output.
     """
+    # Guard: explicit opt-out via env var
+    if _update_check_disabled():
+        return
+
     # Guard: non-TTY
     if not console.is_terminal:
         return
@@ -225,8 +247,8 @@ def check_for_update_hint(console: Console) -> None:
     if console_verbosity.get() == ConsoleVerbosity.SILENT:
         return
 
-    # Guard: 'update' subcommand
-    if _is_update_subcommand():
+    # Guard: 'update' subcommand or --help/--version
+    if _is_update_subcommand() or _is_help_or_version_invocation():
         return
 
     # Try cache first
@@ -249,6 +271,12 @@ def check_for_update_hint(console: Console) -> None:
         _print_hint(console, version)
 
 
+def _update_check_disabled() -> bool:
+    """Return ``True`` if the user opted out of update checks via env var."""
+    val = os.environ.get(_DISABLE_ENV_VAR, "").strip().lower()
+    return val in {"1", "true", "yes"}
+
+
 def _is_update_subcommand() -> bool:
     """Return ``True`` if the CLI was invoked with the ``update`` subcommand."""
     args = sys.argv[1:]
@@ -257,6 +285,15 @@ def _is_update_subcommand() -> bool:
         if not arg.startswith("-"):
             return arg == "update"
     return False
+
+
+def _is_help_or_version_invocation() -> bool:
+    """Return ``True`` if any ``--help`` / ``--version`` style flag is present.
+
+    These invocations already produce the focused output the user requested;
+    sneaking an upgrade hint above (or below) it would obscure the answer.
+    """
+    return any(arg in _HINT_SKIP_FLAGS for arg in sys.argv[1:])
 
 
 def _print_hint(console: Console, remote_version: str) -> None:
@@ -269,40 +306,147 @@ def _print_hint(console: Console, remote_version: str) -> None:
     console.print(
         f"💡 Conductor v{remote_version} available "
         f"(you have v{__version__}). "
-        f"Run [bold]'conductor update'[/bold] to upgrade.",
+        f"Run [bold]'conductor update'[/bold] to see how, "
+        f"or [bold]'conductor update --apply'[/bold] to upgrade in one step.",
         style="yellow",
     )
 
 
 # ---------------------------------------------------------------------------
-# Self-upgrade
+# Upgrade instructions (formerly self-upgrade)
 # ---------------------------------------------------------------------------
 
 
-def _get_conductor_exe() -> Path | None:
-    """Return the path to the ``conductor`` executable, or ``None`` if not found.
+def _install_command() -> str:
+    """Return the OS-appropriate one-line install/upgrade command.
 
-    Uses :func:`shutil.which` to locate the executable on ``$PATH``.
-
-    Returns:
-        A :class:`Path` to the executable, or ``None``.
+    The install script is the single, canonical upgrade path. ``conductor
+    update`` no longer attempts to self-upgrade in-process because on
+    Windows the running ``python.exe`` lives inside the venv that
+    ``uv tool install --force`` is trying to delete, which makes the
+    operation fundamentally impossible from within the running process.
     """
-    which = shutil.which("conductor")
-    return Path(which) if which else None
+    if sys.platform == "win32":
+        return f"irm {_INSTALL_PS1_URL} | iex"
+    return f"curl -sSfL {_INSTALL_SH_URL} | sh"
 
 
-def run_update(console: Console) -> None:
-    """Fetch the latest version and self-upgrade via ``uv tool install``.
+def _spawn_installer_and_exit(console: Console) -> None:
+    """Spawn the install script detached from this process, then exit.
 
-    This always bypasses the cache and fetches from the network.  On success
-    the cache file is deleted so the next invocation will re-check cleanly.
+    The current ``conductor`` process holds locks on the venv that the
+    install script needs to recreate. Spawning the installer and exiting
+    immediately gives the OS a chance to release those locks before
+    ``uv tool install`` tries to delete the directory.
 
-    The upgrade pins transitive dependencies using a constraints file
-    published with each GitHub Release, verified via SHA-256 checksum.
+    On Windows the installer runs in a *new console window* (so the user
+    can watch progress) and the current process exits with code 0.
+
+    On POSIX the current process is replaced via :func:`os.execvp` so the
+    installer inherits this terminal directly.
+
+    The installer is invoked with ``CONDUCTOR_INSTALL_AUTO_STOP=1`` so any
+    leftover conductor processes (including the brief race window during
+    our exit) are reaped without blocking on a prompt.
+
+    This function does not return; it raises ``SystemExit`` (Windows) or
+    replaces the process (POSIX).
+    """
+    env = {**os.environ, "CONDUCTOR_INSTALL_AUTO_STOP": "1"}
+
+    if sys.platform == "win32":
+        ps_command = f"irm {_INSTALL_PS1_URL} | iex"
+        cmd = [
+            "powershell.exe",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            ps_command,
+        ]
+        # CREATE_NEW_CONSOLE gives the installer its own visible console
+        # window so the user can watch progress. CREATE_BREAKAWAY_FROM_JOB
+        # detaches the installer from any job object the parent is in,
+        # which matters in CI runners (GitHub Actions, Azure Pipelines)
+        # and some terminal hosts that kill all job members on close —
+        # without it the installer can be terminated mid-upgrade.
+        # Both fall back to literal Win32 values if Python lacks them.
+        create_new_console = getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010)
+        create_breakaway = getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000)
+
+        # Prefer breakaway, but the parent's job may forbid it
+        # (JOB_OBJECT_LIMIT_BREAKAWAY_OK not set), in which case
+        # CreateProcess returns ERROR_ACCESS_DENIED. Fall back to
+        # plain CREATE_NEW_CONSOLE so we still spawn something.
+        flag_attempts = (create_new_console | create_breakaway, create_new_console)
+        spawned = False
+        last_error: OSError | None = None
+        for flags in flag_attempts:
+            try:
+                subprocess.Popen(
+                    cmd,
+                    creationflags=flags,
+                    close_fds=True,
+                    env=env,
+                )
+                spawned = True
+                break
+            except OSError as e:
+                last_error = e
+                continue
+
+        if not spawned:
+            assert last_error is not None
+            console.print(f"[bold red]Could not spawn installer:[/bold red] {last_error}")
+            console.print(
+                f"Run this manually in a new shell:  [bold cyan]{_install_command()}[/bold cyan]"
+            )
+            raise SystemExit(1) from None
+
+        console.print(
+            "[green]Installer launched in a new console window.[/green] "
+            "This conductor process will now exit so file locks release. "
+            "Watch the new window for progress."
+        )
+        # Exit immediately so the venv we live in becomes deletable.
+        raise SystemExit(0)
+
+    # POSIX: no file-lock issue. Replace ourselves with the install script
+    # so its output streams directly to this terminal.
+    sh_command = f"curl -sSfL {_INSTALL_SH_URL} | sh"
+    console.print(
+        "[green]Replacing conductor with installer…[/green] (install script output follows)"
+    )
+    # os.execvpe replaces the current process image, so we need to flush
+    # any buffered Rich output first.
+    console.file.flush()
+    try:
+        os.execvpe("sh", ["sh", "-c", sh_command], env)
+    except OSError as e:
+        console.print(f"[bold red]Could not exec installer:[/bold red] {e}")
+        console.print(f"Run this manually:  [bold cyan]{_install_command()}[/bold cyan]")
+        raise SystemExit(1) from None
+
+
+def run_update(console: Console, force: bool = False, apply: bool = False) -> None:
+    """Check for a newer release and either print or run the install command.
+
+    By default, this prints the OS-appropriate install-script one-liner so
+    the user can paste it into a fresh shell. With ``apply=True`` the script
+    is spawned as a fully detached process and the current ``conductor``
+    process exits immediately so its file locks release — this avoids the
+    "Access is denied" failure that in-process self-upgrade hits on Windows.
 
     Args:
         console: Rich console for output.
+        force: Accepted for backward compatibility; currently unused
+            (the install script handles its own safety checks).
+        apply: If True, spawn the installer and exit instead of printing
+            the command. The installer runs in a new console window on
+            Windows and replaces the current process on POSIX.
     """
+    del force  # accepted for backward compatibility; ignored
+
     console.print("[bold]Checking for updates…[/bold]")
 
     result = fetch_latest_version()
@@ -310,167 +454,34 @@ def run_update(console: Console) -> None:
         console.print("[bold red]Error:[/bold red] Could not reach GitHub to check for updates.")
         return
 
-    version, tag_name, _url = result
+    version, _tag_name, _url = result
     current = __version__
 
     if not is_newer(version, current):
         console.print(f"[green]Already up to date[/green] (v{current}).")
+        # Refresh the cache so the hint stops nagging.
+        write_cache(version, _tag_name, _url)
         return
 
-    console.print(f"Upgrading Conductor: v{current} → v{version}")
+    console.print(f"[bold]Conductor v{version}[/bold] is available (you have v{current}).")
+    console.print()
 
-    install_url = f"git+{_REPO_GIT_URL}@{tag_name}"
+    if apply:
+        # Hand off to the installer and exit; this call does not return.
+        _spawn_installer_and_exit(console)
+        return  # pragma: no cover - _spawn_installer_and_exit never returns
 
-    # Download constraints file and verify checksum
-    constraints_path = _download_constraints(tag_name, console)
-
-    cmd = ["uv", "tool", "install", "--force", install_url]
-    if constraints_path:
-        cmd.extend(["-c", str(constraints_path)])
-
-    # On Windows, rename our exe out of the way so uv can write the new one.
-    # Windows locks running executables but allows renaming them.
-    renamed_exes: list[tuple[Path, Path]] = []
-    if sys.platform == "win32":
-        renamed_exes = _rename_windows_exes()
-
-    try:
-        # Set PYTHONUTF8=1 so child Python processes use UTF-8 encoding
-        # instead of the system default (cp1252 on Windows).
-        env = {**os.environ, "PYTHONUTF8": "1"}
-        proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", env=env)  # noqa: S603
-
-        if proc.returncode == 0:
-            console.print(f"[green]Successfully upgraded to v{version}[/green]")
-            cache_path = get_cache_path()
-            cache_path.unlink(missing_ok=True)
-        elif sys.platform == "win32" and "Failed to install entrypoint" in (proc.stderr or ""):
-            # On Windows, uv may fail to copy the entrypoint because the running
-            # executable is locked.  The package itself was installed successfully.
-            console.print(f"[green]Successfully upgraded to v{version}[/green]")
-            console.print(
-                "[dim]Note: restart your terminal for the update to take full effect.[/dim]"
-            )
-            cache_path = get_cache_path()
-            cache_path.unlink(missing_ok=True)
-        else:
-            console.print(f"[bold red]Upgrade failed[/bold red] (exit code {proc.returncode})")
-            if proc.stderr:
-                console.print(f"[dim]{proc.stderr.strip()}[/dim]")
-            # On Windows, restore the original exe(s) if uv failed
-            for orig, backup in renamed_exes:
-                if backup.exists() and not orig.exists():
-                    with contextlib.suppress(OSError):
-                        backup.rename(orig)
-    finally:
-        # Clean up temp constraints file
-        if constraints_path:
-            with contextlib.suppress(OSError):
-                constraints_path.unlink()
-                constraints_path.parent.rmdir()
-
-
-def _rename_windows_exes() -> list[tuple[Path, Path]]:
-    """Rename conductor executables on Windows so ``uv`` can overwrite them.
-
-    Windows locks running executables, preventing overwrite.  Renaming is
-    still allowed, so we move them out of the way before ``uv tool install``.
-
-    We target both the executable found on ``PATH`` (the one currently running)
-    and the standard ``uv`` entrypoint location at ``~/.local/bin``, deduplicating
-    by resolved path.
-
-    Returns:
-        A list of ``(original_path, backup_path)`` tuples for later restoration.
-    """
-    renamed: list[tuple[Path, Path]] = []
-    seen: set[str] = set()
-    candidates: list[Path] = []
-
-    # 1. The exe on PATH (the one currently running)
-    exe_from_which = _get_conductor_exe()
-    if exe_from_which:
-        candidates.append(exe_from_which)
-
-    # 2. The standard uv entrypoint location
-    uv_bin_exe = Path.home() / ".local" / "bin" / "conductor.exe"
-    candidates.append(uv_bin_exe)
-
-    for exe_path in candidates:
-        if not exe_path.exists():
-            continue
-
-        # Deduplicate by resolved path (case-insensitive on Windows)
-        try:
-            key = str(exe_path.resolve()).lower()
-        except OSError:
-            continue
-        if key in seen:
-            continue
-        seen.add(key)
-
-        old_path = exe_path.with_suffix(".exe.old")
-        try:
-            # replace() overwrites an existing .old file, unlike rename() which
-            # fails on Windows when the destination already exists (e.g. from a
-            # previous interrupted update).
-            exe_path.replace(old_path)
-            renamed.append((exe_path, old_path))
-        except OSError:
-            pass  # rename failed; proceed, uv will report the error
-
-    return renamed
-
-
-def _download_constraints(tag_name: str, console: Console) -> Path | None:
-    """Download and verify the constraints file for a release.
-
-    Args:
-        tag_name: The release tag (e.g. ``v0.3.0``).
-        console: Rich console for status output.
-
-    Returns:
-        Path to the downloaded constraints file, or ``None`` if unavailable.
-    """
-    constraints_url = f"{_RELEASE_DL_URL}/{tag_name}/constraints.txt"
-    checksum_url = f"{_RELEASE_DL_URL}/{tag_name}/constraints.txt.sha256"
-
-    tmpdir = Path(tempfile.mkdtemp(prefix="conductor-update-"))
-    constraints_path = tmpdir / "constraints.txt"
-
-    try:
-        # Download constraints file
-        req = urllib.request.Request(constraints_url)
-        with urllib.request.urlopen(req, timeout=10) as resp:  # noqa: S310
-            constraints_path.write_bytes(resp.read())
-
-        # Download checksum
-        req = urllib.request.Request(checksum_url)
-        with urllib.request.urlopen(req, timeout=10) as resp:  # noqa: S310
-            checksum_content = resp.read().decode().strip()
-        expected_hash = checksum_content.split()[0]
-
-        # Verify
-        actual_hash = hashlib.sha256(constraints_path.read_bytes()).hexdigest()
-        if actual_hash != expected_hash:
-            console.print(
-                "[bold red]Error:[/bold red] Constraints file checksum mismatch — "
-                "skipping constraints."
-            )
-            with contextlib.suppress(OSError):
-                constraints_path.unlink()
-                tmpdir.rmdir()
-            return None
-
-        console.print("[dim]Constraints verified ✓[/dim]")
-        return constraints_path
-
-    except Exception:  # noqa: BLE001
-        logger.debug("Failed to download constraints file", exc_info=True)
-        console.print(
-            "[dim]Constraints file not available for this release, installing without.[/dim]"
-        )
-        with contextlib.suppress(OSError):
-            constraints_path.unlink()
-            tmpdir.rmdir()
-        return None
+    cmd = _install_command()
+    console.print("To upgrade, run this in a [bold]new shell[/bold] (not inside conductor):")
+    console.print()
+    console.print(f"  [bold cyan]{cmd}[/bold cyan]")
+    console.print()
+    console.print(
+        "[dim]Or re-run with [bold]--apply[/bold] to launch the installer "
+        "automatically (conductor will exit so file locks release).[/dim]"
+    )
+    console.print(
+        "[dim]The install script handles file-lock safety, retries, and "
+        "post-install verification. It is the single supported upgrade path "
+        "on all platforms.[/dim]"
+    )

@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+  "name": "conductor",
+  "version": "0.1.15",
+  "description": "Conductor — multi-agent workflow orchestration via YAML",
+  "owner": {
+    "name": "Microsoft",
+    "email": "opensource@microsoft.com"
+  },
+  "metadata": {
+    "pluginRoot": "./plugins"
+  },
+  "plugins": [
+    {
+      "name": "conductor",
+      "source": "./conductor",
+      "description": "Validate, run, and execute Conductor multi-agent YAML workflows. Adds the conductor skill that knows the workflow schema, CLI commands, and execution model.",
+      "author": { "name": "Microsoft" },
+      "homepage": "https://github.com/microsoft/conductor",
+      "repository": "https://github.com/microsoft/conductor",
+      "license": "MIT",
+      "category": "workflow",
+      "keywords": [
+        "workflow",
+        "orchestration",
+        "multi-agent",
+        "yaml",
+        "copilot",
+        "claude",
+        "agents"
+      ],
+      "tags": ["agents", "automation", "workflow"]
+    }
+  ]
+}

@@ -1,11 +1,12 @@
 import { useState } from 'react';
-import { ChevronDown, ChevronRight, Loader2 } from 'lucide-react';
+import { ChevronDown, ChevronRight, Loader2, Layers } from 'lucide-react';
 import { MetadataGrid } from './MetadataGrid';
 import { OutputViewer } from './OutputViewer';
 import { ActivityStream } from './ActivityStream';
 import type { NodeData, ForEachItemData } from '@/stores/workflow-store';
 import { NODE_STATUS_HEX } from '@/lib/constants';
 import { formatElapsed, formatCost, formatTokens } from '@/lib/utils';
+import { useViewedGroupProgress, useViewedSubworkflowContexts } from '@/hooks/use-viewed-context';
 import { useWorkflowStore } from '@/stores/workflow-store';
 import type { NodeStatus } from '@/lib/constants';
 
@@ -16,8 +17,8 @@ interface GroupDetailProps {
 export function GroupDetail({ node }: GroupDetailProps) {
   const status = node.status as NodeStatus;
   const statusColor = NODE_STATUS_HEX[status] || NODE_STATUS_HEX.pending;
-  const groupProgress = useWorkflowStore((s) => s.groupProgress);
-  const progress = groupProgress[node.name];
+  const viewedProgress = useViewedGroupProgress();
+  const progress = viewedProgress[node.name];
   const isForEach = node.type === 'for_each_group';
 
   const [showItems, setShowItems] = useState(true);
@@ -92,7 +93,7 @@ export function GroupDetail({ node }: GroupDetailProps) {
           {showItems && (
             <div className="space-y-1">
               {forEachItems.map((item) => (
-                <ForEachItemRow key={`${item.key}-${item.index}`} item={item} />
+                <ForEachItemRow key={`${item.key}-${item.index}`} groupName={node.name} item={item} />
               ))}
             </div>
           )}
@@ -103,14 +104,25 @@ export function GroupDetail({ node }: GroupDetailProps) {
 }
 
 const ITEM_STATUS_COLORS: Record<ForEachItemData['status'], string> = {
-  running: NODE_STATUS_HEX.running,
-  completed: NODE_STATUS_HEX.completed,
-  failed: NODE_STATUS_HEX.failed,
+  running: NODE_STATUS_HEX.running!,
+  completed: NODE_STATUS_HEX.completed!,
+  failed: NODE_STATUS_HEX.failed!,
 };
 
-function ForEachItemRow({ item }: { item: ForEachItemData }) {
+function ForEachItemRow({ groupName, item }: { groupName: string; item: ForEachItemData }) {
   const [expanded, setExpanded] = useState(item.status === 'running');
   const color = ITEM_STATUS_COLORS[item.status];
+  const subworkflowContexts = useViewedSubworkflowContexts();
+  const navigateIntoSubworkflow = useWorkflowStore((s) => s.navigateIntoSubworkflow);
+
+  // For-each iterations of a workflow-type agent get their own
+  // SubworkflowContext, keyed by `${groupName}[${item.key}]`. When one
+  // exists, surface a "Dive In" affordance so the iteration's nested
+  // workflow is reachable from the group detail panel (parity with the
+  // single-iteration WorkflowNode dive-in).
+  const iterationSlotKey = `${groupName}[${item.key}]`;
+  const iterationContext = subworkflowContexts.find((c) => c.slotKey === iterationSlotKey);
+  const canDiveIn = !!iterationContext;
 
   const hasDetails = !!(
     item.prompt ||
@@ -172,6 +184,29 @@ function ForEachItemRow({ item }: { item: ForEachItemData }) {
         >
           {item.status}
         </span>
+
+        {/* Dive-in button: navigate into this iteration's sub-workflow context */}
+        {canDiveIn && (
+          <span
+            role="button"
+            tabIndex={0}
+            onClick={(e) => {
+              e.stopPropagation();
+              navigateIntoSubworkflow(iterationSlotKey);
+            }}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' || e.key === ' ') {
+                e.stopPropagation();
+                e.preventDefault();
+                navigateIntoSubworkflow(iterationSlotKey);
+              }
+            }}
+            title={`Dive into ${iterationContext?.workflowName ?? iterationSlotKey}`}
+            className="flex-shrink-0 p-1 rounded hover:bg-[var(--accent)]/20 hover:text-[var(--accent)] transition-colors text-[var(--text-muted)] cursor-pointer"
+          >
+            <Layers className="w-3 h-3" />
+          </span>
+        )}
       </button>
 
       {/* Expanded detail panel */}

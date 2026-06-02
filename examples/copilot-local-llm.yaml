@@ -1,0 +1,95 @@
+# Copilot SDK pointed at a local / custom LLM endpoint
+#
+# Demonstrates structured ``runtime.provider`` configuration (issue #136).
+# The Copilot SDK's ``create_session(provider=...)`` parameter is exposed
+# through conductor's YAML so workflows can target:
+#
+# - Local OpenAI-compatible servers (Ollama, vLLM, LM Studio, llamafile, ...)
+# - Azure OpenAI deployments
+# - Any other OpenAI-compatible REST endpoint
+#
+# Usage (Ollama running on http://localhost:11434):
+#
+#   conductor run examples/copilot-local-llm.yaml --input question="What is Python?"
+#
+# ``api_key`` uses ``${OPENAI_API_KEY:-ollama}`` YAML interpolation: the
+# literal value comes from ``$OPENAI_API_KEY`` when set, otherwise falls
+# back to the placeholder ``"ollama"`` (Ollama accepts any non-empty key).
+# Either way the literal secret never lands in checkpoints or dashboard
+# events because env interpolation happens at load time.
+#
+# When custom routing is active and a field is omitted from YAML, the
+# Copilot provider also consults environment variables:
+#
+#   base_url      <- COPILOT_PROVIDER_BASE_URL, then OPENAI_BASE_URL
+#   api_key       <- COPILOT_PROVIDER_API_KEY  (NOT ambient OPENAI_API_KEY;
+#                                               that would leak a dev creds
+#                                               to whatever base_url points
+#                                               at — use the ${OPENAI_API_KEY}
+#                                               YAML interpolation above for
+#                                               explicit opt-in.)
+#   bearer_token  <- COPILOT_PROVIDER_BEARER_TOKEN
+#
+# The ``runtime.provider`` field still accepts the bare string form
+# (``provider: copilot``); the object form below opts into custom routing.
+
+workflow:
+  name: copilot-local-llm
+  description: Route the Copilot SDK at a local OpenAI-compatible endpoint
+  version: "1.0.0"
+  entry_point: answerer
+
+  runtime:
+    # Custom routing: ``name`` plus at least one extra field activates
+    # the alternate endpoint. Setting only ``name: copilot`` is the
+    # default GitHub Copilot routing.
+    provider:
+      name: copilot
+      type: openai            # openai | azure | anthropic
+      wire_api: completions   # completions | responses
+      base_url: http://localhost:11434/v1
+      api_key: ${OPENAI_API_KEY:-ollama}
+
+    # Custom endpoints rarely expose the SDK's built-in default ``gpt-4o``,
+    # so always set ``default_model`` to a model your endpoint actually
+    # serves. The Copilot provider warns when custom routing is active
+    # without a default model configured.
+    default_model: llama3.1
+
+  input:
+    question:
+      type: string
+      required: true
+      description: The question to answer
+
+agents:
+  - name: answerer
+    description: Answers the user's question via the configured endpoint
+    prompt: |
+      You are a helpful assistant. Please answer the following question
+      clearly and concisely:
+
+      Question: {{ workflow.input.question }}
+
+      Provide a direct answer without unnecessary preamble.
+    output:
+      answer:
+        type: string
+        description: The answer to the question
+    routes:
+      - to: $end
+
+output:
+  answer: "{{ answerer.output.answer }}"
+
+# Azure OpenAI variant (commented out):
+#
+#   runtime:
+#     provider:
+#       name: copilot
+#       type: azure
+#       base_url: https://<your-resource>.openai.azure.com
+#       api_key: ${AZURE_OPENAI_API_KEY}
+#       azure:
+#         api_version: "2024-10-21"
+#     default_model: gpt-4o

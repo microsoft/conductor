@@ -525,3 +525,231 @@ class TestSetContextAndLimits:
         assert engine.limits.current_iteration == 5
         assert engine.limits.max_iterations == 20
         assert engine.limits.timeout_seconds == 120
+
+    def test_set_context_repopulates_workflow_metadata(self, tmp_path: Path) -> None:
+        """Resume must not drop workflow_dir/file/name from the context.
+
+        ``WorkflowContext.from_dict()`` intentionally omits absolute path
+        metadata so checkpoint files stay portable. The engine, which knows
+        the current ``workflow_path`` and ``config``, must repopulate those
+        fields when ``set_context()`` swaps in the restored context.
+
+        Regression test for the resume path: without this, ``{{ workflow.dir }}``
+        silently disappears from templates after resume — exactly the
+        registry-based script-path scenario this feature exists for.
+        """
+        wf_path = _write_workflow(tmp_path)
+        config = _multi_agent_config()
+        engine = WorkflowEngine(config, workflow_path=wf_path)
+
+        # Simulate a context restored from checkpoint: round-trip through
+        # to_dict/from_dict, which strips the metadata.
+        restored = WorkflowContext.from_dict(engine.context.to_dict())
+        assert restored.workflow_dir == ""
+        assert restored.workflow_file == ""
+        assert restored.workflow_name == ""
+
+        engine.set_context(restored)
+
+        assert engine.context.workflow_dir == str(tmp_path.resolve())
+        assert engine.context.workflow_file == str(wf_path.resolve())
+        assert engine.context.workflow_name == config.workflow.name
+
+        # End-to-end: the restored context must render workflow metadata
+        # in templates via build_for_agent.
+        agent_ctx = engine.context.build_for_agent("synthesizer", [], mode="accumulate")
+        assert agent_ctx["workflow"]["dir"] == str(tmp_path.resolve())
+        assert agent_ctx["workflow"]["file"] == str(wf_path.resolve())
+        assert agent_ctx["workflow"]["name"] == config.workflow.name
+
+    def test_set_context_without_workflow_path_still_sets_name(self) -> None:
+        """When the engine has no workflow_path, only name is repopulated.
+
+        Path-derived fields stay empty (and are omitted from rendered context
+        per ``build_for_agent`` semantics).
+        """
+        config = _multi_agent_config()
+        engine = WorkflowEngine(config)  # no workflow_path
+
+        restored = WorkflowContext()
+        engine.set_context(restored)
+
+        assert engine.context.workflow_dir == ""
+        assert engine.context.workflow_file == ""
+        assert engine.context.workflow_name == config.workflow.name
+
+
+# ---------------------------------------------------------------------------
+# run_id / event_log_path persistence (issue #167)
+# ---------------------------------------------------------------------------
+
+
+class TestRunIdAndEventLogPathPersistence:
+    """Verify the engine forwards RunContext.run_id/log_file into checkpoints."""
+
+    @pytest.mark.asyncio
+    async def test_checkpoint_persists_run_id_and_event_log_path(self, tmp_path: Path) -> None:
+        """When a workflow fails, the saved checkpoint records the run_id and
+        log path so resume_workflow_async can replay the original timeline
+        into the web dashboard (issue #167)."""
+        from conductor.engine.workflow import RunContext
+
+        wf_path = _write_workflow(tmp_path)
+        config = _multi_agent_config()
+
+        def mock_handler(agent, prompt, context):
+            raise ProviderError("boom")
+
+        provider = CopilotProvider(mock_handler=mock_handler)
+        log_file = tmp_path / "conductor-test.events.jsonl"
+        log_file.write_text("")  # touch
+        engine = WorkflowEngine(
+            config,
+            provider,
+            workflow_path=wf_path,
+            run_context=RunContext(run_id="r12345", log_file=str(log_file)),
+        )
+
+        with (
+            patch.object(CheckpointManager, "get_checkpoints_dir", return_value=tmp_path),
+            pytest.raises(ProviderError),
+        ):
+            await engine.run({"topic": "AI"})
+
+        cp = CheckpointManager.load_checkpoint(engine._last_checkpoint_path)
+        assert cp.run_id == "r12345"
+        assert cp.event_log_path == str(log_file)
+
+    @pytest.mark.asyncio
+    async def test_checkpoint_defaults_run_id_empty_when_unset(self, tmp_path: Path) -> None:
+        """Without a RunContext, fields default to empty strings (parity with old
+        checkpoints)."""
+        wf_path = _write_workflow(tmp_path)
+        config = _multi_agent_config()
+
+        def mock_handler(agent, prompt, context):
+            raise ProviderError("boom")
+
+        provider = CopilotProvider(mock_handler=mock_handler)
+        engine = WorkflowEngine(config, provider, workflow_path=wf_path)
+
+        with (
+            patch.object(CheckpointManager, "get_checkpoints_dir", return_value=tmp_path),
+            pytest.raises(ProviderError),
+        ):
+            await engine.run({"topic": "AI"})
+
+        cp = CheckpointManager.load_checkpoint(engine._last_checkpoint_path)
+        assert cp.run_id == ""
+        assert cp.event_log_path == ""
+
+
+# ---------------------------------------------------------------------------
+# build_workflow_started_data + suppress_workflow_started_emit (issue #167)
+# ---------------------------------------------------------------------------
+
+
+class TestBuildAndSuppressWorkflowStarted:
+    """Verify the CLI resume path can seed the dashboard with topology."""
+
+    def test_build_workflow_started_data_shape(self) -> None:
+        """The build helper returns a dict matching the engine's emit shape."""
+        config = _multi_agent_config()
+        engine = WorkflowEngine(config)
+
+        data = engine.build_workflow_started_data()
+
+        assert data["name"] == "multi-agent"
+        assert data["entry_point"] == "planner"
+        agent_names = [a["name"] for a in data["agents"]]
+        assert agent_names == ["planner", "researcher", "synthesizer"]
+        # Routes are flattened from agent.routes + human_gate + parallel + for_each
+        assert any(r["from"] == "planner" and r["to"] == "researcher" for r in data["routes"])
+        # Carries metadata, system, run_id, log_file fields
+        assert "metadata" in data
+        assert "system" in data
+        assert "run_id" in data
+        assert "log_file" in data
+
+    @pytest.mark.asyncio
+    async def test_suppress_workflow_started_emit_skips_emit(self, tmp_path: Path) -> None:
+        """When suppressed, engine.resume() does not emit ``workflow_started``."""
+        from conductor.events import WorkflowEvent, WorkflowEventEmitter
+
+        wf_path = _write_workflow(tmp_path)
+        config = _multi_agent_config()
+
+        def mock_handler(agent, prompt, context):
+            return {"plan": "p", "findings": "f", "summary": "s"}[
+                {"planner": "plan", "researcher": "findings", "synthesizer": "summary"}[agent.name]
+            ]
+
+        # ``mock_handler`` returns a string; need to wrap as dict to match
+        # the AgentDef output schema. Simpler: build per-agent stub outputs.
+        def stub_handler(agent, prompt, context):
+            if agent.name == "planner":
+                return {"plan": "p"}
+            if agent.name == "researcher":
+                return {"findings": "f"}
+            return {"summary": "s"}
+
+        emitter = WorkflowEventEmitter()
+        captured_types: list[str] = []
+
+        def capture(event: WorkflowEvent) -> None:
+            captured_types.append(event.type)
+
+        emitter.subscribe(capture)
+
+        provider = CopilotProvider(mock_handler=stub_handler)
+        engine = WorkflowEngine(config, provider, workflow_path=wf_path, event_emitter=emitter)
+
+        # Sanity: without suppression, engine.run() emits workflow_started.
+        with patch.object(CheckpointManager, "get_checkpoints_dir", return_value=tmp_path):
+            await engine.run({"topic": "AI"})
+
+        assert "workflow_started" in captured_types
+        assert "workflow_completed" in captured_types
+
+        # Reset and try resume with suppression.
+        captured_types.clear()
+        engine2 = WorkflowEngine(config, provider, workflow_path=wf_path, event_emitter=emitter)
+        engine2.set_context(WorkflowContext())
+        engine2.set_limits(
+            LimitEnforcer.from_dict(
+                {"current_iteration": 0, "max_iterations": 10, "execution_history": []},
+                timeout_seconds=120,
+            )
+        )
+        engine2.context.set_workflow_inputs({"topic": "AI"})
+        engine2.suppress_workflow_started_emit()
+        with patch.object(CheckpointManager, "get_checkpoints_dir", return_value=tmp_path):
+            await engine2.resume("planner")
+
+        # No workflow_started should have been emitted on resume.
+        assert "workflow_started" not in captured_types
+        # But workflow_completed IS still emitted (only the start is suppressed).
+        assert "workflow_completed" in captured_types
+
+    def test_clear_web_dashboard_detaches_from_engine_and_dialog(self) -> None:
+        """`clear_web_dashboard` drops the dashboard from engine + DialogHandler.
+
+        Regression coverage for the ``resume_workflow_async`` post-fix:
+        the engine captures the dashboard at construction time, so if
+        ``dashboard.start()`` later fails, simply setting the CLI's local
+        ``dashboard = None`` leaves dangling references inside the engine
+        that would block on never-arriving WebSocket gate input.
+        """
+        from unittest.mock import MagicMock
+
+        config = _multi_agent_config()
+        fake_dashboard = MagicMock()
+        engine = WorkflowEngine(config, web_dashboard=fake_dashboard)
+
+        assert engine._web_dashboard is fake_dashboard
+        assert engine._dialog_handler.web_dashboard is fake_dashboard
+
+        engine.clear_web_dashboard()
+
+        assert engine._web_dashboard is None
+        assert engine._dialog_handler.web_dashboard is None

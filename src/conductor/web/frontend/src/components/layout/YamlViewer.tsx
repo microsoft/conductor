@@ -1,3 +1,4 @@
+import type { JSX } from 'react';
 import { useEffect, useMemo, useState, useCallback } from 'react';
 import { X, ChevronRight, ChevronDown } from 'lucide-react';
 
@@ -46,7 +47,7 @@ function highlightLine(line: string): JSX.Element | string {
         {indent}{dash ?? ''}
         <span className="text-sky-400">{key}</span>
         <span className="text-[var(--text-muted)]">{colon}</span>
-        {formatValue(value)}
+        {formatValue(value ?? '')}
       </span>
     );
   }
@@ -57,7 +58,7 @@ function highlightLine(line: string): JSX.Element | string {
     const [, indent, dash, value] = listMatch;
     return (
       <span>
-        {indent}<span className="text-[var(--text-muted)]">{dash}</span>{formatValue(value)}
+        {indent}<span className="text-[var(--text-muted)]">{dash}</span>{formatValue(value ?? '')}
       </span>
     );
   }

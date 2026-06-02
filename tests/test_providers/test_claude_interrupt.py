@@ -41,6 +41,7 @@ def _make_provider() -> ClaudeProvider:
     provider._max_schema_depth = 10
     provider._default_max_agent_iterations = 50
     provider._default_max_session_seconds = None
+    provider._default_reasoning_effort = None
     return provider
 
 

@@ -1,0 +1,110 @@
+# Reasoning Effort Workflow
+#
+# This example demonstrates configuring model reasoning / extended-thinking
+# effort for provider-backed agents. It shows:
+# - A workflow-wide default via `runtime.default_reasoning_effort`
+# - A per-agent override via `reasoning.effort` (wins over the default)
+# - A simple route based on the previous agent's structured output
+#
+# Reasoning effort is mapped natively per provider:
+# - Copilot SDK: passes `reasoning_effort` to `create_session`
+# - Anthropic SDK: enables extended thinking with a budget mapped from
+#   the effort level (low=2k, medium=8k, high=16k, xhigh=32k tokens)
+#
+# Validation is strict — execution fails if the chosen model does not
+# support the requested effort.
+#
+# Usage:
+#   conductor run examples/reasoning-effort.yaml \
+#     --input topic="how the Raft consensus algorithm handles leader election"
+
+workflow:
+  name: reasoning-effort
+  description: Demonstrates workflow-wide and per-agent reasoning effort configuration
+  version: "1.0.0"
+  entry_point: explainer
+
+  runtime:
+    provider: copilot
+    temperature: 0.7
+    # Workflow-wide default applied to every provider-backed agent
+    # unless the agent declares its own `reasoning.effort`.
+    default_reasoning_effort: medium
+
+  input:
+    topic:
+      type: string
+      required: true
+      description: A tricky technical topic to first explain, then design a system around
+
+agents:
+  - name: explainer
+    description: Explains a tricky technical topic clearly (inherits the runtime default effort)
+    model: gpt-5.2
+    # No `reasoning:` block here — inherits `runtime.default_reasoning_effort: medium`.
+    prompt: |
+      Explain the following topic clearly and accurately for a senior engineer
+      who is encountering it for the first time:
+
+      Topic: {{ workflow.input.topic }}
+
+      Cover the key intuitions, the failure modes the design avoids, and one
+      concrete example that makes the mechanism click.
+
+      Then assess whether this topic warrants a follow-up system-design pass
+      (true if it implies non-trivial distributed-systems trade-offs).
+    output:
+      explanation:
+        type: string
+        description: A clear, self-contained explanation of the topic
+      needs_design:
+        type: boolean
+        description: Whether a follow-up system-design pass is warranted
+    routes:
+      - to: architect
+        when: "{{ output.needs_design }}"
+      - to: $end
+
+  - name: architect
+    description: Designs a small system around the topic (uses high reasoning effort)
+    model: gpt-5.2
+    # Per-agent override: this agent always runs at `high` effort,
+    # regardless of the workflow-wide default.
+    reasoning:
+      effort: high
+    input:
+      - workflow.input.topic
+      - explainer.output.explanation
+    prompt: |
+      Using the explanation below as grounding, design a minimal but realistic
+      system that applies the ideas from this topic in production.
+
+      **Topic:** {{ workflow.input.topic }}
+
+      **Background explanation:**
+      {{ explainer.output.explanation }}
+
+      Produce:
+      1. A short architecture sketch (components and their responsibilities).
+      2. The two or three most consequential trade-offs and how you resolved them.
+      3. The biggest failure mode and how the design contains it.
+    output:
+      architecture:
+        type: string
+        description: Architecture sketch with components and responsibilities
+      tradeoffs:
+        type: string
+        description: Key trade-offs and how they were resolved
+      failure_mode:
+        type: string
+        description: Biggest failure mode and the design's containment strategy
+    routes:
+      - to: $end
+
+output:
+  topic: "{{ workflow.input.topic }}"
+  explanation: "{{ explainer.output.explanation }}"
+  needs_design: "{{ explainer.output.needs_design }}"
+  architecture: "{% if architect is defined %}{{ architect.output.architecture }}{% else %}(skipped — no design pass needed){% endif %}"
+  tradeoffs: "{% if architect is defined %}{{ architect.output.tradeoffs }}{% endif %}"
+  failure_mode: "{% if architect is defined %}{{ architect.output.failure_mode }}{% endif %}"

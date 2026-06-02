@@ -3,7 +3,7 @@ import { Handle, Position, type NodeProps } from '@xyflow/react';
 import { GitBranch, Repeat } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { NODE_STATUS_HEX } from '@/lib/constants';
-import { useWorkflowStore } from '@/stores/workflow-store';
+import { useViewedNodes } from '@/hooks/use-viewed-context';
 import type { GraphNodeData } from './graph-layout';
 import type { NodeStatus } from '@/lib/constants';
 
@@ -13,7 +13,8 @@ export const GroupNode = memo(function GroupNode({ data, id, selected }: NodePro
   const Icon = isForEach ? Repeat : GitBranch;
   const progress = nodeData.progress;
 
-  const storeStatus = useWorkflowStore((s) => s.nodes[id]?.status);
+  const viewedNodes = useViewedNodes();
+  const storeStatus = viewedNodes[id]?.status;
   const status = (storeStatus || nodeData.status || 'pending') as NodeStatus;
   const borderColor = NODE_STATUS_HEX[status] || NODE_STATUS_HEX.pending;
 

@@ -6,7 +6,7 @@ the appropriate AgentProvider based on the requested provider type.
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from conductor.exceptions import ProviderError
 from conductor.providers.base import AgentProvider
@@ -16,6 +16,10 @@ from conductor.providers.claude_agent_sdk import (
     ClaudeAgentSdkProvider,
 )
 from conductor.providers.copilot import CopilotProvider, IdleRecoveryConfig
+from conductor.providers.reasoning import ReasoningEffort
+
+if TYPE_CHECKING:
+    from conductor.config.schema import ProviderSettings
 
 
 async def create_provider(
@@ -28,6 +32,8 @@ async def create_provider(
     timeout: float | None = None,
     max_session_seconds: float | None = None,
     max_agent_iterations: int | None = None,
+    default_reasoning_effort: ReasoningEffort | None = None,
+    provider_settings: ProviderSettings | None = None,
 ) -> AgentProvider:
     """Factory function to create the appropriate provider.
 
@@ -48,6 +54,13 @@ async def create_provider(
         timeout: Request timeout in seconds.
         max_session_seconds: Maximum wall-clock duration for agent sessions.
         max_agent_iterations: Maximum tool-use iterations per agent execution.
+        default_reasoning_effort: Workflow-wide default reasoning effort
+            (``low`` / ``medium`` / ``high`` / ``xhigh``) applied when an agent
+            does not specify its own ``reasoning.effort``.
+        provider_settings: Structured ``runtime.provider`` settings. Only
+            applied when ``provider_type == "copilot"`` and the settings
+            opted into custom routing; ignored for all other providers
+            (structured config for those providers is not yet implemented).
 
     Returns:
         Configured AgentProvider instance.
@@ -73,6 +86,8 @@ async def create_provider(
                 temperature=temperature,
                 idle_recovery_config=idle_recovery_config,
                 max_agent_iterations=max_agent_iterations,
+                default_reasoning_effort=default_reasoning_effort,
+                provider_settings=provider_settings,
             )
         case "openai-agents":
             raise ProviderError(
@@ -93,6 +108,7 @@ async def create_provider(
                 mcp_servers=mcp_servers,
                 max_agent_iterations=max_agent_iterations,
                 max_session_seconds=max_session_seconds,
+                default_reasoning_effort=default_reasoning_effort,
             )
         case "claude-agent-sdk":
             if not CLAUDE_AGENT_SDK_AVAILABLE:
@@ -148,13 +164,25 @@ class ProviderFactory:
         Raises:
             ProviderError: If provider creation or validation fails.
         """
-        provider_type = getattr(runtime_config, "provider", "copilot")
+        provider_settings = getattr(runtime_config, "provider", None)
+        # Support both the new ProviderSettings object and any legacy
+        # string-typed mock that test code might still pass in.
+        if hasattr(provider_settings, "name"):
+            provider_type = provider_settings.name
+        elif isinstance(provider_settings, str):
+            provider_type = provider_settings
+            provider_settings = None
+        else:
+            provider_type = "copilot"
+            provider_settings = None
+
         default_model = getattr(runtime_config, "model", None)
         temperature = getattr(runtime_config, "temperature", None)
         max_tokens = getattr(runtime_config, "max_tokens", None)
         timeout = getattr(runtime_config, "timeout", None)
         max_session_seconds = getattr(runtime_config, "max_session_seconds", None)
         max_agent_iterations = getattr(runtime_config, "max_agent_iterations", None)
+        default_reasoning_effort = getattr(runtime_config, "default_reasoning_effort", None)
 
         return await create_provider(
             provider_type=provider_type,
@@ -165,4 +193,6 @@ class ProviderFactory:
             timeout=timeout,
             max_session_seconds=max_session_seconds,
             max_agent_iterations=max_agent_iterations,
+            default_reasoning_effort=default_reasoning_effort,
+            provider_settings=provider_settings,
         )

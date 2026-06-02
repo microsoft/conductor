@@ -20,6 +20,12 @@ export type EventType =
   | 'script_started'
   | 'script_completed'
   | 'script_failed'
+  | 'wait_started'
+  | 'wait_completed'
+  | 'wait_failed'
+  | 'set_started'
+  | 'set_completed'
+  | 'set_failed'
   | 'gate_presented'
   | 'gate_resolved'
   | 'route_taken'
@@ -32,18 +38,26 @@ export type EventType =
   | 'for_each_item_completed'
   | 'for_each_item_failed'
   | 'for_each_completed'
+  | 'subworkflow_started'
+  | 'subworkflow_completed'
+  | 'subworkflow_failed'
   | 'workflow_completed'
   | 'workflow_failed'
   | 'checkpoint_saved'
   | 'agent_paused'
-  | 'agent_resumed';
+  | 'agent_resumed'
+  | 'dialog_started'
+  | 'dialog_message'
+  | 'dialog_completed'
+  | 'iteration_limit_reached'
+  | 'iteration_limit_resolved';
 
 // --- Workflow lifecycle ---
 
 export interface WorkflowStartedData {
   name: string;
   entry_point?: string;
-  agents: Array<{ name: string; type?: string; model?: string }>;
+  agents: Array<{ name: string; type?: string; model?: string; reasoning_effort?: string | null }>;
   routes: Array<{ from: string; to: string; when?: string }>;
   parallel_groups?: Array<{ name: string; agents: string[] }>;
   for_each_groups?: Array<{ name: string }>;
@@ -52,12 +66,16 @@ export interface WorkflowStartedData {
 export interface WorkflowCompletedData {
   elapsed?: number;
   output?: unknown;
+  /** Slot-key path of the completing engine (present only at depth > 0). */
+  subworkflow_path?: string[];
 }
 
 export interface WorkflowFailedData {
   agent_name?: string;
   error_type?: string;
   message?: string;
+  /** Slot-key path of the failing engine (present only at depth > 0). */
+  subworkflow_path?: string[];
 }
 
 // --- Agent lifecycle ---
@@ -139,6 +157,71 @@ export interface ScriptCompletedData {
 }
 
 export interface ScriptFailedData {
+  agent_name: string;
+  elapsed?: number;
+  error_type?: string;
+  message?: string;
+}
+
+// --- Wait lifecycle (issue #218) ---
+
+export interface WaitStartedData {
+  agent_name: string;
+  iteration?: number;
+  /** Parsed duration in seconds (null if the template could not be pre-rendered). */
+  duration_seconds?: number | null;
+  reason?: string | null;
+}
+
+export interface WaitCompletedData {
+  agent_name: string;
+  elapsed?: number;
+  /** Actual wall-clock seconds slept. */
+  waited_seconds: number;
+  /** Parsed requested duration. */
+  requested_seconds: number;
+  reason?: string | null;
+  /** True if an interrupt cut the wait short. */
+  interrupted?: boolean;
+}
+
+export interface WaitFailedData {
+  agent_name: string;
+  elapsed?: number;
+  error_type?: string;
+  message?: string;
+}
+
+// --- Set step lifecycle (issue #221) ---
+
+/** Effective output-type label used during coercion. Mirrors the schema's
+ * `AgentDef.output_type` enumeration and `SetOutputType` in set_step.py. */
+export type SetOutputType =
+  | 'auto'
+  | 'string'
+  | 'number'
+  | 'integer'
+  | 'boolean'
+  | 'list'
+  | 'dict';
+
+export interface SetStartedData {
+  agent_name: string;
+  iteration?: number;
+}
+
+export interface SetCompletedData {
+  agent_name: string;
+  elapsed?: number;
+  /** Effective output type used for coercion. */
+  output_type?: SetOutputType;
+  /** Sorted dict keys for multi-`values:` steps; empty array for scalars. */
+  output_keys?: string[];
+  /** Short JSON-safe preview of the bound value (truncated to ~512 chars). */
+  value_repr?: string;
+}
+
+export interface SetFailedData {
   agent_name: string;
   elapsed?: number;
   error_type?: string;
@@ -256,3 +339,144 @@ export interface AgentPausedData {
 export interface AgentResumedData {
   agent_name: string;
 }
+
+// --- Dialog events ---
+
+export interface DialogStartedData {
+  dialog_id: string;
+  agent_name: string;
+  opening_question: string;
+}
+
+export interface DialogMessageData {
+  dialog_id: string;
+  agent_name: string;
+  role: 'user' | 'agent';
+  content: string;
+}
+
+export interface DialogCompletedData {
+  dialog_id: string;
+  agent_name: string;
+  turn_count: number;
+  user_dismissed?: boolean;
+  user_declined?: boolean;
+  agent_proposed_continue?: boolean;
+}
+
+// --- Subworkflow lifecycle ---
+
+export interface SubworkflowStartedData {
+  agent_name: string;
+  iteration?: number;
+  workflow: string;
+  /** Slot-key path of the parent context in the recursive sub-workflow tree. */
+  parent_path?: string[];
+  /** Slot identifier for this child context (e.g. "agent_name" or "group[2]"). */
+  slot_key?: string;
+  /** for_each item key (when this start was emitted by a for_each iteration). */
+  item_key?: string;
+}
+
+export interface SubworkflowCompletedData {
+  agent_name: string;
+  elapsed?: number;
+  output?: unknown;
+  parent_path?: string[];
+  slot_key?: string;
+  item_key?: string;
+}
+
+export interface SubworkflowFailedData {
+  agent_name: string;
+  elapsed?: number;
+  error_type?: string;
+  message?: string;
+  parent_path?: string[];
+  slot_key?: string;
+  item_key?: string;
+}
+
+// --- Iteration limit gate ---
+
+/**
+ * Discriminated target for iteration-limit events: the Python engine emits
+ * either ``agent_name`` (single-agent gate) or ``group_name`` + ``agent_count``
+ * (parallel-group gate) — never both. Modeling them as a union prevents the
+ * "neither/both" illegal states that an independently-optional pair would admit.
+ */
+export type IterationLimitTarget =
+  | {
+      /** Agent name (when triggered before a single agent execution). */
+      agent_name: string;
+      group_name?: never;
+      agent_count?: never;
+    }
+  | {
+      /** Parallel group name (when triggered before a parallel group). */
+      group_name: string;
+      /** Number of agents in the parallel group. */
+      agent_count: number;
+      agent_name?: never;
+    };
+
+/**
+ * Narrowed target used in the ``iteration_limit_response`` payload sent
+ * from the dashboard back to the engine. The engine already knows the
+ * group's ``agent_count`` from the original ``iteration_limit_reached``
+ * event, so the response only needs to identify the target. Modeling
+ * this as a discriminated union prevents accidentally sending both
+ * ``agent_name`` and ``group_name`` (or neither). See issue #198.
+ */
+export type IterationLimitResponseTarget =
+  | { agent_name: string; group_name?: never }
+  | { group_name: string; agent_name?: never };
+
+export type IterationLimitReachedData = IterationLimitTarget & {
+  /**
+   * Unique id for this gate occurrence. The dashboard must echo this in the
+   * ``iteration_limit_response`` payload so a stale or duplicated response
+   * from a previous gate cannot resolve a later gate for the same target.
+   * Issue #198.
+   */
+  gate_id: string;
+  current_iteration: number;
+  max_iterations: number;
+  /** Last up to 5 agents executed, oldest to newest. */
+  agent_history: string[];
+  /**
+   * Heuristic: ``true`` when the last 3 entries of ``agent_history`` are all
+   * the same agent (and history has at least 3 entries). Useful for flagging
+   * stuck review loops.
+   */
+  possible_loop: boolean;
+  /**
+   * When ``true``, the workflow will auto-stop without prompting the user
+   * (``--skip-gates``). Subscribers should render the gate as auto-closing
+   * rather than awaiting console input.
+   */
+  skip_gates: boolean;
+};
+
+export type IterationLimitResolvedData = (
+  | { agent_name: string; group_name?: never }
+  | { group_name: string; agent_name?: never }
+) & {
+  /** Echo of the gate_id from the corresponding ``iteration_limit_reached``. */
+  gate_id?: string;
+  /**
+   * ``true`` when the gate was resolved by continuing (user prompt or, in
+   * ``--skip-gates`` mode, the auto-decision); ``false`` when the workflow
+   * stopped at the gate.
+   */
+  continue_execution: boolean;
+  /** Additional iterations granted; ``0`` when not continuing. */
+  additional_iterations: number;
+  /**
+   * ``true`` when the gate was resolved by an unexpected exception
+   * (e.g. ``EOFError`` on non-TTY, ``KeyboardInterrupt``) rather than by a
+   * user or auto decision. The dashboard can use this to distinguish a
+   * crash-driven stop from a deliberate one.
+   */
+  aborted?: boolean;
+};

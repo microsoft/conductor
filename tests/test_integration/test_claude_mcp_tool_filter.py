@@ -84,6 +84,7 @@ def _make_provider_with_mcp() -> ClaudeProvider:
     provider._max_schema_depth = 10
     provider._default_max_agent_iterations = 50
     provider._default_max_session_seconds = None
+    provider._default_reasoning_effort = None
 
     # Pre-wire a mock MCP manager so _ensure_mcp_connected is a no-op
     mock_mcp = MagicMock()

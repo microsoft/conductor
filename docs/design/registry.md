@@ -92,16 +92,30 @@ The `type` flag is optional; `add` infers `github` if `<source>` matches
 ### Reference syntax
 
 ```
-<workflow>[@<registry>][@<version>]
+<workflow>[@<registry>][#<ref>]
 ```
+
+`@` separates the workflow name from the registry name. `#` separates the
+ref (a git tag, branch name, or commit SHA) from the rest.
 
 Resolution rules, in order:
 
 1. If the argument exists as a file on disk, treat it as a local path.
 2. Otherwise parse as a registry reference.
 3. Missing `@<registry>` → use the configured default registry.
-4. Missing `@<version>` → use `latest` (highest version listed in the
-   registry index).
+4. An empty registry between `@` and `#` (e.g. `name@#ref`) is allowed and
+   means "use the default registry at this ref".
+5. Missing `#<ref>` → use `latest`. `latest` resolves to the **default
+   branch HEAD** of the registry repo (re-resolved to a fresh commit SHA
+   on every fetch). To pin to a release, use `#<tag>` explicitly.
+6. An empty ref after `#` (e.g. `name@reg#`) is a hard error.
+7. Multiple `@` or multiple `#` in a single reference are hard errors.
+8. Path-type registries do not support `#<ref>`. Passing
+   `name@local#anything` against a path registry is a hard error.
+
+Note: `#` is significant to most shells. Quote registry references in
+shell commands (`conductor run 'qa-bot@team#v1.2.3'`) and avoid spaces
+around the `#`.
 
 Examples:
 
@@ -109,8 +123,10 @@ Examples:
 conductor run ./my-workflow.yaml          # local file (unchanged)
 conductor run qa-bot                      # latest from default registry
 conductor run qa-bot@team                 # latest from `team` registry
-conductor run qa-bot@team@1.2.3           # exact version from `team`
-conductor run qa-bot@@1.2.3               # exact version from default registry
+conductor run 'qa-bot@team#v1.2.3'        # tag v1.2.3 from `team`
+conductor run 'qa-bot@#v1.2.3'            # tag v1.2.3 from default registry
+conductor run 'qa-bot@team#main'          # default-branch HEAD of `team`
+conductor run 'qa-bot@team#a1b2c3d'       # specific commit SHA
 ```
 
 ### Registry index
@@ -122,35 +138,64 @@ workflows:
   qa-bot:
     description: "Simple Q&A workflow"
     path: workflows/qa-bot.yaml          # path relative to registry root
-    versions: ["1.0.0", "1.1.0", "2.0.0"]
   code-review:
     description: "Multi-agent code review"
     path: workflows/code-review.yaml
-    versions: ["0.3.0"]
 ```
 
-For GitHub registries, versions correspond to git tags on the registry repo.
-For local registries, the maintainer maintains the version list directly.
+The index is the single source of truth for what workflows exist and where
+they live in the repo. Available versions are **not** listed in the index —
+for GitHub registries they are auto-discovered from the registry repo's git
+tags; for path registries no versioning exists. Conductor does not
+auto-discover YAML files in a registry — the maintainer curates the index.
 
-The index is the single source of truth for what workflows exist and what
-versions are available. Conductor does not auto-discover YAML files in a
-registry — the maintainer curates the index.
+### Versioning
+
+Versioning is automatic and tag-driven for GitHub registries:
+
+- **Auto-discovery**: available versions are the registry repo's git tags,
+  fetched on demand via the GitHub API for display in `registry list`/`show`.
+  Maintainers do not list versions in `index.yaml`.
+- **`latest` resolution**: `latest` (the default when no `#<ref>` is given)
+  always resolves to the **default branch HEAD** of the registry repo.
+  This means a bare `name@registry` reference always picks up the newest
+  commit on the default branch — typical for development workflows.
+  To pin to a tagged release, use an explicit ref: `name@registry#v1.2.3`.
+- **Flexible refs**: any tag, branch, or commit SHA can be pinned via
+  `#<ref>`. Branch refs are re-resolved to their current commit SHA at
+  fetch time, so a branch ref always refers to the latest commit on that
+  branch when a fresh fetch is performed.
+- **SHA-based caching**: workflows are cached by the resolved commit SHA
+  (`<cache>/<reg>/<workflow>/<sha[:12]>/`). When a branch advances, the
+  cache key changes automatically — no manual invalidation needed for the
+  next fresh fetch.
+- **CDN bypass**: index fetches resolve the ref to a commit SHA via the
+  GitHub API, then download from
+  `raw.githubusercontent.com/<owner>/<repo>/<sha>/index.yaml`. The unique
+  per-SHA URL bypasses Fastly's CDN cache, so you always see the current
+  index for a given ref without needing a `--force` flag.
+- **Path registries**: do not support refs at all. Local registries are
+  always read directly from disk.
 
 ### Caching
 
 Fetched workflows are cached at:
 
 ```
-~/.conductor/cache/registries/<registry>/<workflow>/<version>/
+~/.conductor/cache/registries/<registry>/<workflow>/<sha[:12]>/
 ```
 
-- Cache is keyed by `(registry, workflow, version)`.
-- Explicit versions are immutable: once cached, never re-fetched.
-- `latest` is re-resolved on `conductor registry update`. Each resolved
-  version is cached in its own directory.
+- Cache is keyed by `(registry, workflow, resolved-commit-sha)`.
+- A given commit SHA is immutable, so cached entries are never re-fetched
+  for the same SHA. Branch refs re-resolve to a (possibly new) SHA on each
+  fresh fetch, which transparently invalidates the cache.
+- Workflow files are first downloaded into a temp directory and then renamed
+  atomically into the final cache path, so a partial fetch never leaves a
+  half-populated entry visible to other commands.
 - Index files are cached separately at
   `~/.conductor/cache/registries/<registry>/index.<yaml|json>` and refreshed
-  on `update`.
+  on `update`. Index fetches always go through a SHA-pinned raw URL to
+  bypass the CDN.
 
 This produces a stable on-disk path for every registry-fetched workflow,
 which is required by:
@@ -168,17 +213,17 @@ operation. Registry maintainers should keep a workflow and its assets in the
 same directory.
 
 For GitHub registries, sibling fetch uses the Git Trees API to enumerate the
-directory and `raw.githubusercontent.com` to download files at the pinned
-ref (tag).
+directory and SHA-pinned `raw.githubusercontent.com` URLs to download files
+at the resolved commit SHA.
 
 ### Run / resume / validate
 
 These commands accept either a local path or a registry reference:
 
 ```
-conductor run qa-bot@team@1.2.3 --input question="What is X?"
-conductor resume qa-bot@team@1.2.3
-conductor validate qa-bot@team@1.2.3
+conductor run 'qa-bot@team#v1.2.3' --input question="What is X?"
+conductor resume 'qa-bot@team#v1.2.3'
+conductor validate 'qa-bot@team#v1.2.3'
 ```
 
 The resolver runs first, returns a concrete `Path` to the cached file, and
@@ -203,10 +248,10 @@ recent, undocumented in many places, and supersede-able by a 5-line
 | Module      | Responsibility                                                                                                                                                                                                       |
 | ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `config.py` | Pydantic models for `registries.toml`. Atomic load/save. Handles missing-file case (returns empty config).                                                                                                            |
-| `resolver.py` | Parses `name[@registry][@version]`. Decides file-vs-ref. Returns a `ResolvedRef` with registry name, workflow name, version, and the registry config.                                                                |
-| `index.py`  | Loads and parses `index.yaml`/`index.json`. Validates structure. Resolves `latest` to a concrete version. Backed by either the local FS or `github.py`.                                                               |
-| `cache.py`  | Manages `~/.conductor/cache/registries/`. `get_or_fetch(ref) -> Path`. Idempotent. Fetches sibling files. Knows when to refetch (`latest`) vs. reuse (explicit version).                                              |
-| `github.py` | Public-only GitHub helpers: fetch a file at a ref via raw URL, list tags via the REST API for `latest`, list directory contents via Git Trees API for sibling enumeration. Uses `httpx`, no auth.                    |
+| `resolver.py` | Parses `name[@registry][#ref]`. Decides file-vs-ref. Returns a `ResolvedRef` with registry name, workflow name, ref, and the registry config. Rejects multiple `@`/`#`, empty `#`, and `#ref` against path registries.       |
+| `index.py`  | Loads and parses `index.yaml`/`index.json`. Validates structure. Resolves `latest` to a concrete tag (or default-branch HEAD if no tags). Backed by either the local FS or `github.py`.                                |
+| `cache.py`  | Manages `~/.conductor/cache/registries/`. `get_or_fetch(ref) -> Path`. Idempotent. Fetches sibling files. Cache is keyed by resolved commit SHA; writes are staged in a temp dir and renamed atomically.                |
+| `github.py` | Public-only GitHub helpers: resolve a ref to a commit SHA via the GitHub API, fetch files at a SHA via SHA-pinned raw URLs (bypassing the CDN), list tags via the REST API for `latest`, list directory contents via Git Trees API for sibling enumeration. Uses `httpx`, no auth. |
 
 ### CLI: `src/conductor/cli/registry.py`
 
@@ -244,14 +289,127 @@ file of the same name.
 | Decision                                  | Choice                                                  | Why                                                                                                  |
 | ----------------------------------------- | ------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
 | Named registries vs always-inline source  | Named, configured once                                  | Mirrors npm/cargo. Short refs in `run` commands. Default registry makes the common case zero-config. |
-| Versioning                                | Explicit, npm-style                                     | Reproducibility. Lockfile-friendly later. Matches existing GitHub tag conventions.                   |
-| Local-registry layout                     | Directory + `index.yaml`                                | Consistent with GitHub registries. Maintainer controls what's exposed and at what versions.          |
-| Caching strategy                          | Local cache, refresh on `registry update` or new version | Avoids per-run network. Stable on-disk paths needed for `!file` and checkpoints.                     |
-| Reference syntax                          | `name@registry@version`                                 | Visually unambiguous. `@` parses cleanly. Supports either-or-both omissions.                         |
+| Versioning                                | Default branch HEAD when unpinned; pin any tag/branch/SHA via `#ref` | Bare names always follow the default branch (typical dev workflow). Tagged releases are opt-in via explicit `#<tag>`. Avoids the surprise of `latest` skipping past commits because a tag exists. Branches and SHAs are first-class refs. |
+| Local-registry layout                     | Directory + `index.yaml`                                | Consistent with GitHub registries. Maintainer controls what's exposed. Local registries do not support refs.                                                                                |
+| Caching strategy                          | Local cache keyed by resolved commit SHA, atomic writes | Avoids per-run network. SHA-based keys make branch refs self-invalidate on a fresh fetch. SHA-pinned raw URLs bypass the CDN, so no `--force` flag is needed.                              |
+| Reference syntax                          | `name@registry#ref`                                     | Visually unambiguous: `@` selects the registry, `#` selects a git ref (tag, branch, or SHA). Both segments are independently optional.                                                       |
 | Publish / publish validation              | Dropped                                                 | Distribution is `git push` + tag. Validation belongs in user CI, not the CLI.                        |
 | Authenticated/private registries          | Out of scope v1                                         | Public raw URLs cover the common case. Token support can come later via a registry config field.    |
 | SemVer ranges                             | Out of scope v1                                         | Adds resolver complexity for marginal benefit until ecosystems exist.                                |
 | Index format                              | YAML primary, JSON fallback                             | Consistent with workflow files. JSON tolerated for tooling.                                          |
+
+## Ad-hoc references
+
+A **workflow reference without pre-configured registry** allows teams to compose
+workflows across GitHub organizations and repositories without registry setup.
+
+### Motivation
+
+Configured registries are ideal for standard repos (org-wide workflows, team
+templates). But ad-hoc cross-team composition is common: Team C wants to run a
+workflow from Team A's repo in combination with Team B's workflow, without any
+team having to register each other's repos. Ad-hoc references lower friction for
+one-off usage.
+
+### Syntax
+
+```
+workflow@owner/repo[#ref]
+```
+
+If the part after `@` contains `/`, it is treated as a literal `owner/repo`
+GitHub reference (ad-hoc) and fetched directly. Otherwise it is looked up as a
+configured registry name (existing behavior).
+
+Examples:
+
+```
+analysis@myorg/team-a                # default branch HEAD of myorg/team-a
+analysis@myorg/team-a#v1.0.0         # tag v1.0.0 of myorg/team-a
+analysis@myorg/team-a#main           # main branch of myorg/team-a
+analysis@myorg/team-a#abc1234        # specific commit SHA
+```
+
+### Disambiguation rule
+
+At parse time, Conductor disambiguates between ad-hoc and registry references:
+
+- `analysis@team` → registry name `team` (no `/` in the part after `@`)
+- `analysis@myorg/team-a` → ad-hoc reference to `myorg/team-a` (contains `/`)
+
+Registry names are configured by the user and cannot contain `/`, so there is
+no ambiguity. Both forms coexist: configured registries are recommended for
+frequently-used sources, ad-hoc references for occasional cross-team pulls.
+
+### Caching
+
+Ad-hoc workflows are cached at:
+
+```
+~/.conductor/cache/registries/_adhoc/<owner>/<repo>/<workflow>/<sha[:12]>/
+```
+
+This isolates ad-hoc caches from named registries, avoiding collisions when the
+same workflow name exists in different sources.
+
+### Reference resolution
+
+Ad-hoc references follow the same resolution rules as registry references:
+
+- Missing `#<ref>` → use the **default branch HEAD** (re-resolved on each fetch).
+- Explicit `#<tag>` or `#<branch>` → pinned to that tag or the current HEAD of the branch.
+- Explicit `#<sha>` → pinned to an exact commit.
+- Multiple `@` or multiple `#` are hard errors.
+
+### Authentication
+
+Ad-hoc references use the same authentication as named GitHub registries:
+- Public repos work automatically.
+- Private repos use `gh auth token` if available, otherwise fail with a clear error.
+
+### Usage
+
+Ad-hoc references work everywhere registry references work:
+
+```bash
+conductor run 'analysis@myorg/team-a#v1.0.0' --input question="..."
+conductor validate 'analysis@myorg/team-a#main'
+conductor resume 'analysis@myorg/team-a#v1.0.0'
+```
+
+As a sub-workflow (see [Sub-workflows](#sub-workflows) in the workflow syntax guide):
+
+```yaml
+agents:
+  - name: team_a_analysis
+    type: workflow
+    workflow: analysis@myorg/team-a#v1.0.0
+    input_mapping:
+      data: "{{ workflow.input.raw_data }}"
+```
+
+### Example: Cross-team composition
+
+Team C's workflow references Team A's and Team B's workflows without any
+pre-registry setup:
+
+```yaml
+agents:
+  - name: team_a_pipeline
+    type: workflow
+    workflow: qa-bot@teamA/qa-workflows#main
+    input_mapping:
+      question: "{{ workflow.input.query }}"
+
+  - name: team_b_pipeline
+    type: workflow
+    workflow: reviewer@teamB/review-workflows#v2.1.0
+    input_mapping:
+      content: "{{ team_a_pipeline.output.answer }}"
+```
+
+Both workflows are fetched and composed in Team C's workflow without any
+registry configuration.
 
 ## Open questions
 

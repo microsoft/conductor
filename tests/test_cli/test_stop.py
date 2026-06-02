@@ -145,3 +145,46 @@ class TestStopProcessGone:
 
         assert result.exit_code == 0
         assert "already exited" in result.output
+
+
+class TestStopProcessUnexpectedOSError:
+    """Companion regression for issue #166.
+
+    The original bug crashed ``conductor stop`` when ``_is_process_alive``
+    propagated an unexpected ``OSError`` (e.g. ``WinError 11``). That probe
+    is now defensive — but ``_stop_process`` itself also calls ``os.kill``
+    one frame deeper and must tolerate the same class of failure, especially
+    because the "assume alive" fallback in ``_is_process_alive_windows`` lets
+    probe-failing PIDs reach this code path.
+    """
+
+    def test_unexpected_oserror_does_not_crash(self, pid_tmpdir: Path) -> None:
+        _write_pid(pid_tmpdir, 99999999, 8080)
+
+        with (
+            patch("conductor.cli.pid._is_process_alive", return_value=True),
+            patch(
+                "conductor.cli.app.os.kill",
+                side_effect=OSError(
+                    11, "An attempt was made to load a program with an incorrect format"
+                ),
+            ),
+        ):
+            result = runner.invoke(app, ["stop", "--port", "8080"])
+
+        assert result.exit_code == 0
+        assert "Could not signal" in result.output
+
+    def test_pid_file_is_removed_after_oserror(self, pid_tmpdir: Path) -> None:
+        # Even when os.kill raises an unexpected OSError, the PID file should
+        # be cleaned up so the user's ``conductor stop`` listings don't
+        # accumulate phantom entries.
+        _write_pid(pid_tmpdir, 99999999, 8080)
+
+        with (
+            patch("conductor.cli.pid._is_process_alive", return_value=True),
+            patch("conductor.cli.app.os.kill", side_effect=OSError(11, "boom")),
+        ):
+            runner.invoke(app, ["stop", "--port", "8080"])
+
+        assert list(pid_tmpdir.glob("*.pid")) == []

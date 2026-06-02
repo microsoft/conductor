@@ -78,6 +78,17 @@ class CheckpointData:
         limits: Serialized ``LimitEnforcer`` state.
         copilot_session_ids: Mapping of agent names to Copilot session IDs.
         file_path: Path where the checkpoint file is stored.
+        instructions_preamble: Workspace instructions preamble that was
+            active during the original run, or ``None``.
+        run_id: Original run identifier from the ``EventLogSubscriber``.
+            Empty string when the checkpoint was written by a version
+            of Conductor that predated this field.
+        event_log_path: Filesystem path to the original JSONL event log.
+            Used by the CLI resume path to seed the web dashboard with
+            the original timeline and to append further events to the
+            same log. Empty string when the checkpoint was written by a
+            version of Conductor that predated this field or when the
+            log file was unavailable at checkpoint time.
     """
 
     version: int
@@ -91,6 +102,15 @@ class CheckpointData:
     limits: dict[str, Any]
     copilot_session_ids: dict[str, str] = field(default_factory=dict)
     file_path: Path = field(default_factory=lambda: Path())
+    instructions_preamble: str | None = None
+    """Workspace instructions preamble that was active during the original run."""
+    run_id: str = ""
+    """Original run identifier from ``EventLogSubscriber``. Empty for
+    checkpoints written before this field was introduced."""
+    event_log_path: str = ""
+    """Filesystem path to the original JSONL event log. Empty for
+    checkpoints written before this field was introduced, or when the
+    log file was unavailable at checkpoint time."""
 
 
 class CheckpointManager:
@@ -137,6 +157,9 @@ class CheckpointManager:
         inputs: dict[str, Any],
         copilot_session_ids: dict[str, str] | None = None,
         system_metadata: dict[str, Any] | None = None,
+        instructions_preamble: str | None = None,
+        run_id: str = "",
+        event_log_path: str = "",
     ) -> Path | None:
         """Serialize workflow state to a checkpoint file.
 
@@ -155,6 +178,12 @@ class CheckpointManager:
             inputs: Workflow inputs.
             copilot_session_ids: Optional mapping of agent names to session IDs.
             system_metadata: Optional system metadata captured at workflow start.
+            instructions_preamble: Optional workspace instructions preamble to persist.
+            run_id: Original run identifier (from ``EventLogSubscriber``).
+                Persisted so resume can keep run-correlation stable.
+            event_log_path: Filesystem path to the original JSONL event log.
+                Persisted so resume can replay prior events into the
+                dashboard and append further events to the same log.
 
         Returns:
             Path to the saved checkpoint file, or ``None`` if saving failed.
@@ -196,6 +225,9 @@ class CheckpointManager:
                 "limits": _make_json_serializable(limits.to_dict()),
                 "copilot_session_ids": copilot_session_ids or {},
                 "system": system_metadata or {},
+                "instructions_preamble": instructions_preamble,
+                "run_id": run_id,
+                "event_log_path": event_log_path,
             }
 
             # Serialize to JSON
@@ -311,6 +343,9 @@ class CheckpointManager:
             limits=data["limits"],
             copilot_session_ids=data.get("copilot_session_ids", {}),
             file_path=checkpoint_path,
+            instructions_preamble=data.get("instructions_preamble"),
+            run_id=data.get("run_id", "") or "",
+            event_log_path=data.get("event_log_path", "") or "",
         )
 
     @staticmethod

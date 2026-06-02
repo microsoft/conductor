@@ -20,6 +20,7 @@ from conductor.config.schema import (
     LimitsConfig,
     OutputField,
     ParallelGroup,
+    ReasoningConfig,
     RouteDef,
     RuntimeConfig,
     WorkflowConfig,
@@ -199,6 +200,84 @@ class TestWorkflowStartedEvent:
         routes = event.data["routes"]
         assert any(r["from"] == "a" and r["to"] == "b" for r in routes)
         assert any(r["from"] == "b" and r["to"] == "$end" for r in routes)
+
+    @pytest.mark.asyncio
+    async def test_workflow_started_includes_reasoning_effort(self) -> None:
+        """workflow_started includes per-agent reasoning_effort.
+
+        - Agent with explicit reasoning.effort wins.
+        - Agent without explicit reasoning falls back to
+          runtime.default_reasoning_effort.
+        - When neither is set, the field is None.
+        """
+        emitter, collector = _make_emitter_and_collector()
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="reasoning-test",
+                entry_point="explicit",
+                runtime=RuntimeConfig(provider="copilot", default_reasoning_effort="medium"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="explicit",
+                    model="gpt-4",
+                    prompt="explicit override",
+                    reasoning=ReasoningConfig(effort="high"),
+                    output={"x": OutputField(type="string")},
+                    routes=[RouteDef(to="default")],
+                ),
+                AgentDef(
+                    name="default",
+                    model="gpt-4",
+                    prompt="uses workflow default",
+                    output={"y": OutputField(type="string")},
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"y": "{{ default.output.y }}"},
+        )
+        provider = CopilotProvider(
+            mock_handler=lambda a, p, c: {"x": "1"} if a.name == "explicit" else {"y": "2"}
+        )
+        engine = WorkflowEngine(config, provider, event_emitter=emitter)
+        await engine.run({})
+
+        event = collector.first("workflow_started")
+        agents = {a["name"]: a for a in event.data["agents"]}
+        assert agents["explicit"]["reasoning_effort"] == "high"
+        assert agents["default"]["reasoning_effort"] == "medium"
+
+    @pytest.mark.asyncio
+    async def test_workflow_started_reasoning_effort_unset_is_none(self) -> None:
+        """When neither agent nor workflow default sets effort, field is None."""
+        emitter, collector = _make_emitter_and_collector()
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="no-reasoning",
+                entry_point="agent1",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="agent1",
+                    model="gpt-4",
+                    prompt="no reasoning anywhere",
+                    output={"result": OutputField(type="string")},
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"result": "{{ agent1.output.result }}"},
+        )
+        provider = CopilotProvider(mock_handler=lambda a, p, c: {"result": "done"})
+        engine = WorkflowEngine(config, provider, event_emitter=emitter)
+        await engine.run({})
+
+        event = collector.first("workflow_started")
+        assert event.data["agents"][0]["reasoning_effort"] is None
 
 
 class TestAgentEvents:

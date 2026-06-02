@@ -30,7 +30,17 @@ from pydantic import BaseModel
 
 from conductor.exceptions import ProviderError, ValidationError
 from conductor.executor.output import validate_output
-from conductor.providers.base import AgentOutput, AgentProvider, EventCallback
+from conductor.providers._event_format import (
+    extract_tool_result_text,
+    format_tool_arguments,
+)
+from conductor.providers.base import AgentOutput, AgentProvider, EventCallback, match_model_id
+from conductor.providers.reasoning import (
+    ReasoningEffort,
+    effort_to_budget_tokens,
+    is_claude_thinking_model,
+    resolve_reasoning_effort,
+)
 
 if TYPE_CHECKING:
     from conductor.config.schema import AgentDef, OutputField
@@ -39,13 +49,14 @@ if TYPE_CHECKING:
 # Try to import the Anthropic SDK
 try:
     import anthropic
-    from anthropic import AsyncAnthropic
+    from anthropic import AnthropicError, AsyncAnthropic
 
     ANTHROPIC_SDK_AVAILABLE = True
 except ImportError:
     ANTHROPIC_SDK_AVAILABLE = False
     AsyncAnthropic = None  # type: ignore[misc, assignment]
     anthropic = None  # type: ignore[assignment]
+    AnthropicError = Exception  # type: ignore[misc, assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +70,9 @@ class ClaudeContentBlock(Protocol):
     id: str  # for tool_use blocks
     name: str  # for tool_use blocks
     input: dict[str, Any]  # for tool_use blocks
+    thinking: str  # for thinking blocks
+    signature: str  # for thinking blocks (optional)
+    data: str  # for redacted_thinking blocks
 
 
 class ClaudeResponse(Protocol):
@@ -120,6 +134,7 @@ class ClaudeProvider(AgentProvider):
         mcp_servers: dict[str, Any] | None = None,
         max_agent_iterations: int | None = None,
         max_session_seconds: float | None = None,
+        default_reasoning_effort: ReasoningEffort | None = None,
     ) -> None:
         """Initialize the Claude provider.
 
@@ -139,6 +154,12 @@ class ClaudeProvider(AgentProvider):
                 Defaults to 50 if not specified.
             max_session_seconds: Maximum wall-clock duration for agent sessions.
                 Defaults to None (unlimited).
+            default_reasoning_effort: Workflow-wide default reasoning effort
+                applied when an agent does not declare its own ``reasoning``
+                config. Mapped to a Claude extended-thinking ``budget_tokens``
+                value. Only valid on extended-thinking models — a per-agent
+                model that does not support thinking will raise
+                ``ValidationError`` at execute time.
 
         Raises:
             ProviderError: If SDK is not installed.
@@ -173,10 +194,18 @@ class ClaudeProvider(AgentProvider):
             max_agent_iterations if max_agent_iterations is not None else 50
         )
         self._default_max_session_seconds = max_session_seconds
+        self._default_reasoning_effort: ReasoningEffort | None = default_reasoning_effort
 
         # MCP server configuration for tool support
         self._mcp_servers_config = mcp_servers
         self._mcp_manager: MCPManager | None = None
+
+        # Cache of model_id -> max_input_tokens populated lazily on first
+        # get_max_prompt_tokens() call. Guarded by an asyncio.Lock to avoid
+        # racing concurrent first-callers and emitting duplicate models.list()
+        # requests.
+        self._max_input_cache: dict[str, int | None] | None = None
+        self._max_input_cache_lock = asyncio.Lock()
 
         # Initialize the client (sync initialization)
         self._initialize_client()
@@ -254,6 +283,41 @@ class ClaudeProvider(AgentProvider):
                 suggestion="Adjust max_tokens to be within the valid range",
             )
 
+    def _resolve_thinking_for_agent(self, agent: AgentDef, model: str) -> dict[str, Any] | None:
+        """Resolve effective extended-thinking kwargs for an agent.
+
+        Combines the per-agent ``reasoning`` config with the workflow-wide
+        ``default_reasoning_effort`` and validates that the chosen model
+        supports Anthropic extended thinking.
+
+        Args:
+            agent: Agent definition (may declare ``reasoning.effort``).
+            model: Resolved model id for this execution.
+
+        Returns:
+            ``{"type": "enabled", "budget_tokens": N}`` when reasoning is
+            requested, or ``None`` when neither agent nor runtime default
+            sets it.
+
+        Raises:
+            ValidationError: If reasoning effort is requested for a model
+                that does not support extended thinking.
+        """
+        effort = resolve_reasoning_effort(agent, self._default_reasoning_effort)
+        if effort is None:
+            return None
+        if not is_claude_thinking_model(model):
+            raise ValidationError(
+                f"Model {model!r} does not support extended thinking, but "
+                f"reasoning.effort={effort!r} was requested for agent "
+                f"{agent.name!r}.",
+                suggestion=(
+                    "Use a Claude 3.7+ or 4.x model (e.g. claude-opus-4-20250514, "
+                    "claude-sonnet-4-20250514) or remove the reasoning config."
+                ),
+            )
+        return {"type": "enabled", "budget_tokens": effort_to_budget_tokens(effort)}
+
     def get_retry_history(self) -> list[dict[str, Any]]:
         """Get the retry history for debugging purposes.
 
@@ -288,7 +352,8 @@ class ClaudeProvider(AgentProvider):
     async def _log_available_models(self) -> None:
         """List and log available models, warn if default model is unavailable.
 
-        Consolidated from the former _verify_available_models method.
+        Also seeds ``_max_input_cache`` so the first call to
+        :meth:`get_max_prompt_tokens` doesn't pay for an extra round-trip.
         """
         if self._client is None:
             return
@@ -297,20 +362,73 @@ class ClaudeProvider(AgentProvider):
             # Call client.models.list() to get available models (async)
             logger.debug("Discovering available Claude models via client.models.list()...")
             models_page = await self._client.models.list()
-            available_models = [model.id for model in models_page.data]
-
-            logger.info(f"Available Claude models: {', '.join(available_models)}")
-
-            # Warn if default model not in list
-            if self._default_model not in available_models:
-                logger.warning(
-                    f"Requested model '{self._default_model}' is not in the list of "
-                    f"available models. API calls may fail. Available: {available_models}"
-                )
-            else:
-                logger.debug(f"Default model '{self._default_model}' verified in available models")
-        except Exception as e:
+        except (TimeoutError, AnthropicError, OSError) as e:
             logger.warning(f"Could not list available models (discovery failed): {e}")
+            return
+
+        available_models = [model.id for model in models_page.data]
+        logger.info(f"Available Claude models: {', '.join(available_models)}")
+
+        # Warn if default model not in list (after stripping aliases like -latest).
+        if match_model_id(self._default_model, available_models) is None:
+            logger.warning(
+                f"Requested model '{self._default_model}' is not in the list of "
+                f"available models. API calls may fail. Available: {available_models}"
+            )
+        else:
+            logger.debug(f"Default model '{self._default_model}' verified in available models")
+
+        # Seed the metadata cache so get_max_prompt_tokens() is a pure lookup.
+        self._install_max_input_cache(models_page.data)
+
+    def _install_max_input_cache(self, models_data: list[Any]) -> None:
+        """Replace ``_max_input_cache`` with a fresh mapping of id -> max_input."""
+        self._max_input_cache = {
+            info.id: getattr(info, "max_input_tokens", None) for info in models_data
+        }
+
+    async def get_max_prompt_tokens(self, model: str) -> int | None:
+        """Return the Anthropic SDK's ``max_input_tokens`` for ``model``.
+
+        On first call, populates a per-instance cache by enumerating
+        ``client.models.list()``; subsequent calls are dictionary lookups.
+        ``validate_connection()`` already populates the cache, so callers
+        that go through normal connection setup never pay for an extra
+        round-trip.
+
+        Resolves aliases (``-latest``, dated suffixes, base/versioned name
+        mismatches) via :func:`match_model_id`. Returns ``None`` when the
+        SDK is unavailable, the model can't be resolved, or the listing
+        call fails — context-window metadata must never block workflow
+        execution.
+
+        Note: the value reflects the API's *default* input window. Claude
+        models with a 1M-context beta require an explicit beta header,
+        which Conductor does not set today; for those models the API still
+        reports the default window.
+        """
+        if not ANTHROPIC_SDK_AVAILABLE or self._client is None:
+            return None
+
+        if self._max_input_cache is None:
+            # Fetch outside the lock so concurrent callers don't all queue
+            # behind a slow round-trip; the lock only guards the install.
+            try:
+                page = await self._client.models.list()
+            except (TimeoutError, AnthropicError, OSError) as e:
+                # Don't cache the failure — let the next call retry.
+                logger.debug("Failed to list Anthropic models: %s", e)
+                return None
+            async with self._max_input_cache_lock:
+                if self._max_input_cache is None:
+                    self._install_max_input_cache(page.data)
+
+        # The block above either returned early on failure or installed the
+        # cache, so it's guaranteed non-None here.
+        cache = self._max_input_cache
+        assert cache is not None
+        matched_id = match_model_id(model, cache.keys())
+        return cache.get(matched_id) if matched_id is not None else None
 
     async def _ensure_mcp_connected(self) -> None:
         """Connect to MCP servers if configured.
@@ -398,10 +516,108 @@ class ClaudeProvider(AgentProvider):
             logger.debug("MCP manager closed")
 
         if self._client is not None:
-            # AsyncAnthropic uses httpx AsyncClient internally which should be closed
-            await self._client.close()
+            # Drop the client reference *before* awaiting close() so any
+            # in-flight get_max_prompt_tokens() observes None on its next
+            # access and skips the SDK call. Already-issued requests will
+            # error and be swallowed by the metadata path's narrow except.
+            client = self._client
             self._client = None
+            await client.close()
             logger.debug("Claude provider closed")
+
+            # Drop cached metadata so a re-initialized provider re-fetches.
+            self._max_input_cache = None
+
+    async def execute_dialog_turn(
+        self,
+        system_prompt: str,
+        user_message: str,
+        history: list[dict[str, str]] | None = None,
+        model: str | None = None,
+    ) -> str:
+        """Execute a single dialog turn using the Claude messages API.
+
+        Creates a lightweight message call with the conversation context
+        and returns the agent's response text.
+
+        Args:
+            system_prompt: System prompt providing dialog context.
+            user_message: The latest user message.
+            history: Optional prior conversation history.
+            model: Optional model override. Falls back to provider default.
+
+        Returns:
+            The agent's response text.
+
+        Raises:
+            ProviderError: If the dialog turn fails.
+        """
+        if self._client is None:
+            raise ProviderError(
+                "Claude client not initialized",
+                suggestion="Call validate_connection() first",
+            )
+
+        # Build messages list from history + current message
+        messages: list[dict[str, str]] = []
+        for msg in history or []:
+            messages.append(
+                {
+                    "role": msg["role"],
+                    "content": msg["content"],
+                }
+            )
+        messages.append({"role": "user", "content": user_message})
+
+        try:
+            kwargs: dict[str, Any] = {
+                "model": model or self._default_model,
+                "max_tokens": 4096,
+                "system": system_prompt,
+                "messages": messages,
+            }
+
+            # Apply workflow-wide default reasoning effort if configured.
+            # Per-agent reasoning is not available here (no AgentDef in scope).
+            # Mirrors _resolve_thinking_for_agent: raise ValidationError when
+            # the resolved model does not support extended thinking, rather
+            # than silently dropping the reasoning request.
+            if self._default_reasoning_effort is not None:
+                resolved_model = kwargs["model"]
+                if not is_claude_thinking_model(resolved_model):
+                    raise ValidationError(
+                        f"Model {resolved_model!r} does not support extended thinking, "
+                        f"but default_reasoning_effort={self._default_reasoning_effort!r} "
+                        "was configured.",
+                        suggestion=(
+                            "Use a Claude 3.7+ or 4.x model (e.g. claude-opus-4-20250514, "
+                            "claude-sonnet-4-20250514) or remove the reasoning config."
+                        ),
+                    )
+                budget = effort_to_budget_tokens(self._default_reasoning_effort)
+                kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
+                # Thinking requires temperature=1.0 and max_tokens > budget.
+                kwargs["max_tokens"] = max(kwargs["max_tokens"], budget + 4096)
+
+            response = await self._client.messages.create(**kwargs)
+
+            # Extract text from response (skip thinking blocks)
+            text_parts = []
+            for block in response.content:
+                if hasattr(block, "type") and block.type == "thinking":
+                    continue
+                if hasattr(block, "text"):
+                    text_parts.append(block.text)
+
+            return "\n".join(text_parts) if text_parts else ""
+
+        except ValidationError:
+            raise
+        except Exception as exc:
+            raise ProviderError(
+                f"Dialog turn failed: {exc}",
+                is_retryable=False,
+            ) from exc
 
     async def execute(
         self,
@@ -676,18 +892,28 @@ class ClaudeProvider(AgentProvider):
             else self._default_max_session_seconds
         )
 
-        # Validate max_tokens against model-specific limits
-        if "haiku" in model.lower():
-            if max_tokens > 4096:
+        # Resolve extended-thinking kwarg (validates model compatibility).
+        # Done before the per-model max_tokens warning so the warning logic
+        # accounts for thinking-aware caps.
+        thinking = self._resolve_thinking_for_agent(agent, model)
+
+        # Validate max_tokens against model-specific limits.
+        # Skip the warning when extended thinking is enabled — the per-call
+        # cap is bumped to at least ``budget_tokens + 4096`` (capped at
+        # 64000) by _coerce_for_thinking() to satisfy the
+        # ``max_tokens > budget_tokens`` constraint.
+        if thinking is None:
+            if "haiku" in model.lower():
+                if max_tokens > 4096:
+                    logger.warning(
+                        f"max_tokens={max_tokens} exceeds Haiku model limit of 4096. "
+                        "API may reject request."
+                    )
+            elif max_tokens > 8192:
                 logger.warning(
-                    f"max_tokens={max_tokens} exceeds Haiku model limit of 4096. "
+                    f"max_tokens={max_tokens} exceeds Sonnet/Opus model limit of 8192. "
                     "API may reject request."
                 )
-        elif max_tokens > 8192:
-            logger.warning(
-                f"max_tokens={max_tokens} exceeds Sonnet/Opus model limit of 8192. "
-                "API may reject request."
-            )
 
         # Build tools list: emit_output (for structured output) + MCP tools
         all_tools: list[dict[str, Any]] = []
@@ -729,6 +955,7 @@ class ClaudeProvider(AgentProvider):
                     max_session_seconds=max_session_seconds,
                     interrupt_signal=interrupt_signal,
                     event_callback=event_callback,
+                    thinking=thinking,
                 )
 
                 # Handle partial output from mid-agent interrupt
@@ -925,6 +1152,76 @@ class ClaudeProvider(AgentProvider):
 
         return None
 
+    def _coerce_for_thinking(
+        self,
+        temperature: float | None,
+        max_tokens: int,
+        model: str,
+        thinking: dict[str, Any] | None,
+    ) -> tuple[float | None, int]:
+        """Adjust temperature and max_tokens to satisfy thinking constraints.
+
+        When extended thinking is enabled the Anthropic API requires:
+
+        - ``temperature == 1.0`` (or omitted)
+        - ``max_tokens > budget_tokens``
+
+        We force temperature to 1.0 (logging an info note if the caller
+        configured a different non-1.0 value) and bump ``max_tokens`` to
+        at least ``budget_tokens + 4096``, clamped to a per-model cap.
+        Extended-thinking models accept up to 64000 output tokens, which
+        is what we use here.
+
+        When ``thinking`` is ``None`` the inputs are returned unchanged.
+
+        Args:
+            temperature: User-configured temperature (may be ``None``).
+            max_tokens: User-configured max output tokens.
+            model: Resolved model identifier.
+            thinking: Resolved thinking kwarg or ``None``.
+
+        Returns:
+            Tuple of ``(effective_temperature, effective_max_tokens)``.
+        """
+        if thinking is None:
+            return temperature, max_tokens
+
+        budget = int(thinking.get("budget_tokens", 0))
+        # Per-model cap when thinking is enabled. Extended-thinking models
+        # accept up to 64000 output tokens.
+        per_model_cap = 64_000
+        required = budget + 4096
+        effective_max_tokens = max(max_tokens, required)
+        if effective_max_tokens > per_model_cap:
+            logger.info(
+                "Clamping max_tokens %s to %s for extended thinking on model %s "
+                "(Anthropic API per-model cap)",
+                effective_max_tokens,
+                per_model_cap,
+                model,
+            )
+            effective_max_tokens = per_model_cap
+        if effective_max_tokens <= budget:
+            # Defensive: if cap collapses below budget+1, this would still
+            # violate the API constraint. Raise rather than silently send a
+            # request the API will reject.
+            raise ValidationError(
+                f"Cannot satisfy thinking budget_tokens={budget} on model "
+                f"{model!r}: per-model cap {per_model_cap} is not greater "
+                f"than the requested budget.",
+                suggestion="Lower reasoning.effort or use a model with a higher cap.",
+            )
+
+        if temperature is not None and temperature != 1.0:
+            logger.info(
+                "Coercing temperature %s to 1.0 for extended thinking on model %s "
+                "(Anthropic API requirement)",
+                temperature,
+                model,
+            )
+
+        return 1.0, effective_max_tokens
+
     async def _execute_api_call(
         self,
         messages: list[dict[str, str]],
@@ -932,6 +1229,7 @@ class ClaudeProvider(AgentProvider):
         temperature: float | None,
         max_tokens: int,
         tools: list[dict[str, Any]] | None = None,
+        thinking: dict[str, Any] | None = None,
     ) -> ClaudeResponse:
         """Execute non-streaming Claude API call using AsyncAnthropic.
 
@@ -944,6 +1242,10 @@ class ClaudeProvider(AgentProvider):
             temperature: Temperature setting (0.0-1.0, enforced by SDK).
             max_tokens: Maximum output tokens.
             tools: Optional tool definitions for structured output.
+            thinking: Optional extended-thinking kwarg for the SDK. When
+                supplied, ``temperature`` is forced to 1.0 and ``max_tokens``
+                is bumped to satisfy the API constraint
+                ``max_tokens > budget_tokens``.
 
         Returns:
             Claude API response object with content blocks and usage metadata.
@@ -958,23 +1260,31 @@ class ClaudeProvider(AgentProvider):
         if self._client is None:
             raise ProviderError("Claude client not initialized")
 
+        effective_temperature, effective_max_tokens = self._coerce_for_thinking(
+            temperature, max_tokens, model, thinking
+        )
+
         # Build API call kwargs
         kwargs: dict[str, Any] = {
             "model": model,
             "messages": messages,
-            "max_tokens": max_tokens,
+            "max_tokens": effective_max_tokens,
         }
 
-        if temperature is not None:
-            kwargs["temperature"] = temperature
+        if effective_temperature is not None:
+            kwargs["temperature"] = effective_temperature
 
         if tools:
             kwargs["tools"] = tools
 
+        if thinking is not None:
+            kwargs["thinking"] = thinking
+
         # Execute non-streaming API call (async)
         logger.debug(
             f"Executing non-streaming Claude API call: model={model}, "
-            f"max_tokens={max_tokens}, timeout={self._timeout}s"
+            f"max_tokens={effective_max_tokens}, timeout={self._timeout}s, "
+            f"thinking={'enabled' if thinking else 'disabled'}"
         )
         response = await self._client.messages.create(**kwargs)
 
@@ -993,6 +1303,7 @@ class ClaudeProvider(AgentProvider):
         max_session_seconds: float | None = None,
         interrupt_signal: asyncio.Event | None = None,
         event_callback: EventCallback | None = None,
+        thinking: dict[str, Any] | None = None,
     ) -> tuple[ClaudeResponse, int | None, bool]:
         """Execute an agentic loop that handles MCP tool calls.
 
@@ -1066,6 +1377,7 @@ class ClaudeProvider(AgentProvider):
                     max_tokens=max_tokens,
                     tools=tools,
                     has_output_schema=has_output_schema,
+                    thinking=thinking,
                 )
                 total_tokens += interrupt_tokens
                 return interrupt_response, total_tokens, True
@@ -1091,6 +1403,7 @@ class ClaudeProvider(AgentProvider):
                             max_tokens=max_tokens,
                             tools=tools,
                             output_schema=output_schema,
+                            thinking=thinking,
                         )
                     )
                 else:
@@ -1101,6 +1414,7 @@ class ClaudeProvider(AgentProvider):
                             temperature=temperature,
                             max_tokens=max_tokens,
                             tools=tools,
+                            thinking=thinking,
                         )
                     )
                 interrupt_task = asyncio.create_task(interrupt_signal.wait())
@@ -1131,6 +1445,7 @@ class ClaudeProvider(AgentProvider):
                         max_tokens=max_tokens,
                         tools=tools,
                         has_output_schema=has_output_schema,
+                        thinking=thinking,
                     )
                     total_tokens += partial_tokens
                     return partial_resp, total_tokens, True
@@ -1144,6 +1459,7 @@ class ClaudeProvider(AgentProvider):
                     max_tokens=max_tokens,
                     tools=tools,
                     output_schema=output_schema,
+                    thinking=thinking,
                 )
             else:
                 response = await self._execute_api_call(
@@ -1152,6 +1468,7 @@ class ClaudeProvider(AgentProvider):
                     temperature=temperature,
                     max_tokens=max_tokens,
                     tools=tools,
+                    thinking=thinking,
                 )
 
             # Accumulate token usage
@@ -1168,6 +1485,18 @@ class ClaudeProvider(AgentProvider):
                             event_callback("agent_message", {"content": block.text})
                         except Exception:
                             logger.debug("Error in event_callback for agent_message", exc_info=True)
+                    elif hasattr(block, "type") and block.type == "thinking":
+                        thinking_text = getattr(block, "thinking", None) or getattr(
+                            block, "text", None
+                        )
+                        if thinking_text:
+                            try:
+                                event_callback("agent_reasoning", {"content": thinking_text})
+                            except Exception:
+                                logger.debug(
+                                    "Error in event_callback for agent_reasoning",
+                                    exc_info=True,
+                                )
 
             # Check for tool_use blocks
             tool_uses = [
@@ -1214,7 +1543,7 @@ class ClaudeProvider(AgentProvider):
                 if event_callback:
                     try:
                         arguments = (
-                            str(dict(tool_use.input))[:500]
+                            format_tool_arguments(dict(tool_use.input))
                             if hasattr(tool_use, "input") and tool_use.input
                             else None
                         )
@@ -1245,7 +1574,7 @@ class ClaudeProvider(AgentProvider):
                                 "agent_tool_complete",
                                 {
                                     "tool_name": tool_use.name,
-                                    "result": str(result)[:500] if result else None,
+                                    "result": extract_tool_result_text(result),
                                 },
                             )
                         except Exception:
@@ -1302,6 +1631,21 @@ class ClaudeProvider(AgentProvider):
                                 "input": dict(block.input) if hasattr(block, "input") else {},
                             }
                         )
+                    elif block.type == "thinking":
+                        # Extended thinking requires the unmodified thinking
+                        # blocks (with signature) to be echoed back before
+                        # any tool_use blocks they preceded — otherwise the
+                        # API rejects the next request with a 400.
+                        block_dict: dict[str, Any] = {
+                            "type": "thinking",
+                            "thinking": block.thinking,
+                        }
+                        sig = getattr(block, "signature", None)
+                        if sig is not None:
+                            block_dict["signature"] = sig
+                        assistant_content.append(block_dict)
+                    elif block.type == "redacted_thinking":
+                        assistant_content.append({"type": "redacted_thinking", "data": block.data})
 
             # Add assistant response and tool results to message history
             working_messages.append(
@@ -1331,6 +1675,7 @@ class ClaudeProvider(AgentProvider):
         max_tokens: int,
         tools: list[dict[str, Any]] | None,
         has_output_schema: bool,
+        thinking: dict[str, Any] | None = None,
     ) -> tuple[Any, int]:
         """Send a final API call requesting partial output after interrupt.
 
@@ -1374,6 +1719,7 @@ class ClaudeProvider(AgentProvider):
             temperature=temperature,
             max_tokens=max_tokens,
             tools=tools,
+            thinking=thinking,
         )
 
         call_tokens = 0
@@ -1392,6 +1738,7 @@ class ClaudeProvider(AgentProvider):
         max_tokens: int,
         tools: list[dict[str, Any]] | None,
         output_schema: dict[str, OutputField] | None,
+        thinking: dict[str, Any] | None = None,
     ) -> ClaudeResponse:
         """Execute API call with parse recovery for malformed JSON responses.
 
@@ -1423,6 +1770,7 @@ class ClaudeProvider(AgentProvider):
             temperature=temperature,
             max_tokens=max_tokens,
             tools=tools,
+            thinking=thinking,
         )
 
         # If no output schema, return immediately (no recovery needed)
@@ -1487,6 +1835,7 @@ class ClaudeProvider(AgentProvider):
                 temperature=temperature,
                 max_tokens=max_tokens,
                 tools=tools,
+                thinking=thinking,
             )
 
             # Check if recovery succeeded (tool_use)

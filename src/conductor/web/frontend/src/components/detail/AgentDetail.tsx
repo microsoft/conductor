@@ -45,6 +45,7 @@ export function AgentDetail({ node }: AgentDetailProps) {
             output: node.output,
             elapsed: node.elapsed,
             model: node.model,
+            reasoning_effort: node.reasoning_effort,
             tokens: node.tokens,
             input_tokens: node.input_tokens,
             output_tokens: node.output_tokens,

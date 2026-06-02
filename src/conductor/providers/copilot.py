@@ -18,10 +18,15 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from conductor.exceptions import ProviderError, ValidationError
-from conductor.providers.base import AgentOutput, AgentProvider, EventCallback
+from conductor.providers._event_format import (
+    extract_tool_result_text,
+    format_tool_arguments,
+)
+from conductor.providers.base import AgentOutput, AgentProvider, EventCallback, match_model_id
+from conductor.providers.reasoning import ReasoningEffort, resolve_reasoning_effort
 
 if TYPE_CHECKING:
-    from conductor.config.schema import AgentDef, OutputField
+    from conductor.config.schema import AgentDef, OutputField, ProviderSettings
 
 logger = logging.getLogger(__name__)
 
@@ -157,6 +162,8 @@ class CopilotProvider(AgentProvider):
         idle_recovery_config: IdleRecoveryConfig | None = None,
         temperature: float | None = None,
         max_agent_iterations: int | None = None,
+        default_reasoning_effort: ReasoningEffort | None = None,
+        provider_settings: ProviderSettings | None = None,
     ) -> None:
         """Initialize the Copilot provider.
 
@@ -174,12 +181,31 @@ class CopilotProvider(AgentProvider):
             temperature: Default temperature for generation (0.0-1.0). Optional.
             max_agent_iterations: Maximum tool-use iterations per agent execution.
                 None means no iteration limit (only wall-clock timeout applies).
+            default_reasoning_effort: Workflow-wide default ``reasoning_effort``
+                applied to ``create_session`` when an agent does not specify
+                its own ``reasoning.effort``. One of ``low``, ``medium``,
+                ``high``, ``xhigh``, or ``None`` to send no value.
+            provider_settings: Optional structured provider settings from
+                ``runtime.provider``. When ``has_custom_routing()`` is True,
+                the resolved SDK ``ProviderConfig`` is attached to every
+                ``create_session`` call (both agent execution and dialog
+                turns), enabling custom OpenAI-compatible / Azure / Anthropic
+                endpoints. Env-var fallbacks
+                (``COPILOT_PROVIDER_BASE_URL`` → ``OPENAI_BASE_URL``,
+                ``COPILOT_PROVIDER_API_KEY`` → ``OPENAI_API_KEY``,
+                ``COPILOT_PROVIDER_BEARER_TOKEN``) fill missing fields once
+                custom routing is activated; ambient OpenAI env vars never
+                activate custom routing on their own.
         """
         self._client: Any = None  # Will hold Copilot SDK client
         self._mock_handler = mock_handler
         self._call_history: list[dict[str, Any]] = []
         self._retry_config = retry_config or RetryConfig()
         self._retry_history: list[dict[str, Any]] = []  # For testing retries
+        # Track whether the caller actually supplied a default model so the
+        # custom-routing warning can fire reliably without depending on the
+        # value of the sentinel default below.
+        self._default_model_explicit = model is not None
         self._default_model = model or "gpt-4o"
         self._mcp_servers = mcp_servers or {}
         self._started = False
@@ -187,11 +213,14 @@ class CopilotProvider(AgentProvider):
         self._idle_recovery_config = idle_recovery_config or IdleRecoveryConfig()
         self._temperature = temperature
         self._default_max_agent_iterations = max_agent_iterations
+        self._default_reasoning_effort = default_reasoning_effort
         self._max_schema_depth = 10  # Max nesting depth for recursive schema building
         self._session_ids: dict[str, str] = {}
         self._resume_session_ids: dict[str, str] = {}
         self._interrupted_session: Any = None
         self._abort_supported: bool | None = None
+        self._provider_settings = provider_settings
+        self._warn_custom_routing_default_model()
 
     @staticmethod
     def _default_permission_handler(
@@ -208,6 +237,145 @@ class CopilotProvider(AgentProvider):
         """
         logger.debug("auto-approved permission request: %s", request)
         return PermissionHandler.approve_all(request, invocation)
+
+    def _warn_custom_routing_default_model(self) -> None:
+        """Warn if custom routing is active but no default model is set.
+
+        Custom endpoints (Ollama, vLLM, Azure deployments) rarely expose
+        the SDK's built-in default model. Surface this early so users
+        don't get a confusing 404 on the first ``create_session``.
+
+        Uses ``_default_model_explicit`` (captured in ``__init__``) so
+        the heuristic does not depend on the value of the sentinel
+        fallback — a future change to the fallback model name would not
+        break this warning, and a user who deliberately picks the same
+        model name as the fallback does not get a false positive.
+        """
+        settings = self._provider_settings
+        if settings is None or not settings.has_custom_routing():
+            return
+        if not self._default_model_explicit:
+            logger.warning(
+                "Custom Copilot provider routing is active (base_url=%s) but no "
+                "runtime.default_model is set. The SDK fallback %r is unlikely "
+                "to exist on the custom endpoint; configure runtime.default_model.",
+                settings.base_url or "<from env>",
+                self._default_model,
+            )
+
+    def _resolve_sdk_provider_config(self) -> dict[str, Any] | None:
+        """Build the SDK ``ProviderConfig`` dict to forward, or ``None``.
+
+        Returns ``None`` when no structured ``runtime.provider`` was
+        configured, or when the configured object did not activate custom
+        routing (i.e. only ``name`` was set). When custom routing is
+        active, fills missing fields from environment variables in this
+        precedence order:
+
+        - ``base_url``: ``COPILOT_PROVIDER_BASE_URL`` → ``OPENAI_BASE_URL``
+        - ``api_key``: ``COPILOT_PROVIDER_API_KEY`` (only)
+        - ``bearer_token``: ``COPILOT_PROVIDER_BEARER_TOKEN`` (only)
+
+        Ambient ``OPENAI_API_KEY`` is intentionally NOT used as an
+        implicit fallback for ``api_key`` — that would silently send an
+        OpenAI credential to whatever ``base_url`` points at, which is
+        a real credential-leak risk in dev shells. Users who want
+        OpenAI-environment-style behavior should opt in explicitly via
+        ``api_key: ${OPENAI_API_KEY}`` interpolation in YAML.
+
+        ``type`` defaults to ``"openai"`` when ``base_url`` is set but
+        ``type`` is not — OpenAI-compatible endpoints (Ollama, vLLM, LM
+        Studio) are the dominant use case.
+
+        When both ``api_key`` and ``bearer_token`` resolve (from any
+        combination of YAML and env vars), both are forwarded; the
+        Copilot SDK silently prefers ``bearer_token`` and a warning is
+        emitted.
+
+        Raises ``ProviderError`` when custom routing is activated but
+        every routing field resolves to a falsy value (e.g. all
+        intended env vars are unset). Silently returning ``None`` in
+        that case would mask user misconfiguration as default behavior.
+        """
+        settings = self._provider_settings
+        if settings is None or not settings.has_custom_routing():
+            return None
+
+        base_url = (
+            settings.base_url
+            or os.environ.get("COPILOT_PROVIDER_BASE_URL")
+            or os.environ.get("OPENAI_BASE_URL")
+        )
+        api_key = (
+            settings.api_key.get_secret_value()
+            if settings.api_key is not None
+            else os.environ.get("COPILOT_PROVIDER_API_KEY")
+        )
+        bearer_token = (
+            settings.bearer_token.get_secret_value()
+            if settings.bearer_token is not None
+            else os.environ.get("COPILOT_PROVIDER_BEARER_TOKEN")
+        )
+
+        # Operate on the resolved locals so the warning also fires when
+        # one credential comes from YAML and the other from an env var.
+        if api_key and bearer_token:
+            logger.warning(
+                "Both api_key and bearer_token resolved (possibly from different sources, "
+                "YAML and/or env vars); the Copilot SDK silently prefers bearer_token."
+            )
+
+        provider_type: str | None = settings.type
+        if provider_type is None and base_url:
+            provider_type = "openai"
+
+        cfg: dict[str, Any] = {}
+        if provider_type:
+            cfg["type"] = provider_type
+        if settings.wire_api:
+            cfg["wire_api"] = settings.wire_api
+        if base_url:
+            cfg["base_url"] = base_url
+        if api_key:
+            cfg["api_key"] = api_key
+        if bearer_token:
+            cfg["bearer_token"] = bearer_token
+        if settings.headers:
+            cfg["headers"] = dict(settings.headers)
+        # Always emit the azure block when the settings carry one — the
+        # schema validator already requires at least ``api_version`` to
+        # be set, so this never produces an empty sub-dict.
+        if settings.azure is not None:
+            azure_cfg: dict[str, Any] = {}
+            if settings.azure.api_version is not None:
+                azure_cfg["api_version"] = settings.azure.api_version
+            cfg["azure"] = azure_cfg
+
+        if not cfg:
+            raise ProviderError(
+                "runtime.provider opted into custom routing but no usable fields "
+                "resolved. Set base_url / api_key / bearer_token in YAML or via the "
+                "COPILOT_PROVIDER_* environment variables.",
+                suggestion=(
+                    "Check that any ${VAR} interpolations in runtime.provider resolved "
+                    "to non-empty values and that the intended COPILOT_PROVIDER_* env "
+                    "vars are exported in the current shell."
+                ),
+                is_retryable=False,
+            )
+
+        return cfg
+
+    def _apply_provider_config(self, session_kwargs: dict[str, Any]) -> None:
+        """Attach the resolved SDK provider config to ``session_kwargs``.
+
+        Called from every ``create_session`` site (main agent execution and
+        dialog turns) so all sessions for this provider instance hit the
+        same endpoint.
+        """
+        provider_cfg = self._resolve_sdk_provider_config()
+        if provider_cfg is not None:
+            session_kwargs["provider"] = provider_cfg
 
     async def execute(
         self,
@@ -412,6 +580,11 @@ class CopilotProvider(AgentProvider):
 
                 await asyncio.sleep(delay)
 
+            except ValidationError:
+                # Configuration / capability errors are deterministic and
+                # never recoverable by retrying. Surface them unwrapped so
+                # the workflow engine can present the original message.
+                raise
             except Exception as e:
                 # Wrap unexpected errors as retryable
                 last_error = e
@@ -515,11 +688,24 @@ class CopilotProvider(AgentProvider):
             )
 
         try:
-            # Build session kwargs for the SDK
+            # Build session kwargs for the SDK.
+            #
+            # ``streaming=True`` is required: in non-streaming mode the model
+            # must emit its entire turn (text + tool_use blocks + arguments)
+            # under a single per-turn output budget. For agents that issue
+            # large tool-call arguments (e.g., ``create`` with multi-KB
+            # ``file_text``), that budget is exhausted mid-JSON and the CLI
+            # silently executes the partial tool call (e.g. ``{"path": "..."}``
+            # with ``file_text`` missing). The model sees the tool succeed
+            # with no content, retries the same broken call, and loops until
+            # the wall-clock session limit fires. The interactive ``copilot``
+            # CLI defaults to streaming, which is why the same model + tool
+            # combination works there but not via the SDK without this flag.
             session_kwargs: dict[str, Any] = {
                 "model": model,
                 "on_permission_request": self._default_permission_handler,
                 "working_directory": os.getcwd(),
+                "streaming": True,
             }
 
             # Note: Copilot SDK >=0.2.0 does not support temperature as a
@@ -535,6 +721,24 @@ class CopilotProvider(AgentProvider):
             # Add MCP servers if configured
             if self._mcp_servers:
                 session_kwargs["mcp_servers"] = self._mcp_servers
+
+            # Apply custom provider routing (Ollama / vLLM / Azure / etc.)
+            # when runtime.provider opted into it.
+            self._apply_provider_config(session_kwargs)
+
+            # Resolve reasoning effort: per-agent override wins over runtime default.
+            # When set, validate against the model's advertised capabilities
+            # before forwarding to the SDK.
+            effort = resolve_reasoning_effort(agent, self._default_reasoning_effort)
+            if effort is not None:
+                await self._validate_reasoning_effort_for_model(model, effort)
+                session_kwargs["reasoning_effort"] = effort
+                logger.debug(
+                    "Setting reasoning_effort=%s for agent %r (model=%s)",
+                    effort,
+                    agent.name,
+                    model,
+                )
 
             # Attempt to resume a previous session if one exists for this agent
             session: Any = None
@@ -592,6 +796,7 @@ class CopilotProvider(AgentProvider):
                     event_callback=event_callback,
                     max_session_seconds=effective_max_session,
                     max_agent_iterations=effective_max_iterations,
+                    agent_name=agent.name,
                 )
                 response_content = sdk_response.content
 
@@ -660,6 +865,7 @@ class CopilotProvider(AgentProvider):
                                 recovery_attempt + 1,
                                 max_recovery,
                                 last_parse_error,
+                                agent_name=agent.name,
                             )
 
                         # Build recovery prompt and send to same session
@@ -671,7 +877,11 @@ class CopilotProvider(AgentProvider):
 
                         # Send recovery prompt and get new response
                         recovery_response = await self._send_and_wait(
-                            session, recovery_prompt, verbose_enabled, full_enabled
+                            session,
+                            recovery_prompt,
+                            verbose_enabled,
+                            full_enabled,
+                            agent_name=agent.name,
                         )
                         response_content = recovery_response.content
 
@@ -703,6 +913,10 @@ class CopilotProvider(AgentProvider):
 
         except ProviderError:
             raise
+        except ValidationError:
+            # Configuration errors (e.g. unsupported reasoning_effort) are
+            # deterministic; surface unwrapped so retries don't mask them.
+            raise
         except Exception as e:
             raise ProviderError(
                 f"Copilot SDK call failed: {e}",
@@ -720,6 +934,7 @@ class CopilotProvider(AgentProvider):
         event_callback: EventCallback | None = None,
         max_session_seconds: float | None = None,
         max_agent_iterations: int | None = None,
+        agent_name: str | None = None,
     ) -> SDKResponse:
         """Send a prompt to the session and wait for response.
 
@@ -736,6 +951,12 @@ class CopilotProvider(AgentProvider):
                 If None, uses the provider-level IdleRecoveryConfig default.
             max_agent_iterations: Maximum tool-use iterations for this session.
                 None means no iteration limit.
+            agent_name: Optional agent identifier (e.g., ``"processor[item_a]"``)
+                used to tag verbose log output so concurrent parallel/for-each
+                iterations can be distinguished. When ``None``, no tag is
+                emitted. The Copilot provider's ``_execute_sdk_call`` always
+                passes ``agent.name`` here, so sequential agents are also
+                tagged with their plain name.
 
         Returns:
             SDKResponse with content and usage data. If interrupted,
@@ -772,7 +993,8 @@ class CopilotProvider(AgentProvider):
                 ):
                     tn = getattr(event.data, "tool_name", None) or getattr(event.data, "name", "?")
                     tool_info = f" tool={tn}"
-                logger.debug("sdk_event: %s%s", event_type, tool_info)
+                agent_info = f" agent={agent_name}" if agent_name else ""
+                logger.debug("sdk_event:%s %s%s", agent_info, event_type, tool_info)
 
             # Only update the idle clock for events that indicate real agent
             # work. Bookkeeping/lifecycle events are excluded via the
@@ -818,7 +1040,7 @@ class CopilotProvider(AgentProvider):
 
             # Verbose logging for intermediate progress
             if verbose_enabled:
-                self._log_event_verbose(event_type, event, full_enabled)
+                self._log_event_verbose(event_type, event, full_enabled, agent_name=agent_name)
 
         session.on(on_event)
 
@@ -842,6 +1064,7 @@ class CopilotProvider(AgentProvider):
             tool_iteration_ref=tool_iteration_ref,
             max_agent_iterations=max_agent_iterations,
             interrupt_signal=interrupt_signal,
+            agent_name=agent_name,
         )
         if was_interrupted:
             # Return partial content (don't check error_message for partial)
@@ -918,7 +1141,12 @@ class CopilotProvider(AgentProvider):
         except TimeoutError:
             logger.debug("Post-abort wait timed out after 5s")
 
-    async def send_followup(self, session: Any, guidance: str) -> AgentOutput:
+    async def send_followup(
+        self,
+        session: Any,
+        guidance: str,
+        agent_name: str | None = None,
+    ) -> AgentOutput:
         """Send follow-up guidance to an interrupted session.
 
         After a mid-agent interrupt, the session is kept alive so that
@@ -929,6 +1157,11 @@ class CopilotProvider(AgentProvider):
         Args:
             session: The Copilot SDK session handle (kept alive after interrupt).
             guidance: User-provided guidance text to send as follow-up.
+            agent_name: Optional agent identifier forwarded to verbose log
+                output for this follow-up turn. Defaults to ``None``. Today
+                interrupts only fire on sequential agents (for-each iterations
+                do not forward ``interrupt_signal`` to the executor), so the
+                tag, when supplied, is the unqualified agent name.
 
         Returns:
             AgentOutput with the follow-up response content.
@@ -940,7 +1173,11 @@ class CopilotProvider(AgentProvider):
 
         try:
             sdk_response = await self._send_and_wait(
-                session, guidance, verbose_enabled, full_enabled
+                session,
+                guidance,
+                verbose_enabled,
+                full_enabled,
+                agent_name=agent_name,
             )
 
             content: dict[str, Any]
@@ -971,6 +1208,7 @@ class CopilotProvider(AgentProvider):
         attempt: int,
         max_attempts: int,
         error: str,
+        agent_name: str | None = None,
     ) -> None:
         """Log a parse recovery attempt in verbose mode.
 
@@ -978,6 +1216,8 @@ class CopilotProvider(AgentProvider):
             attempt: Current recovery attempt number (1-based).
             max_attempts: Maximum number of recovery attempts.
             error: The parse error message.
+            agent_name: Optional agent identifier used to attribute the
+                recovery message to a specific concurrent agent.
         """
         from rich.console import Console
         from rich.text import Text
@@ -986,6 +1226,8 @@ class CopilotProvider(AgentProvider):
 
         text = Text()
         text.append("    ├─ ", style="dim")
+        if agent_name:
+            text.append(f"[{agent_name}] ", style="magenta")
         text.append("🔄 ", style="")
         text.append(f"Parse Recovery {attempt}/{max_attempts}", style="yellow bold")
         text.append(" - ", style="dim")
@@ -1017,8 +1259,20 @@ class CopilotProvider(AgentProvider):
         # Try to find JSON in code blocks
         import re
 
-        # Look for ```json ... ``` blocks
-        json_match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", content, re.DOTALL)
+        # Two-stage strategy (kept in parity with executor.output.parse_json_output):
+        # 1. Non-greedy findall + try-parse each candidate. First valid JSON
+        #    wins. Handles multiple fenced blocks in one response (e.g. an
+        #    initial answer followed by a revised answer).
+        # 2. Greedy single capture as fallback. Handles literal ``` inside a
+        #    JSON string field, which breaks non-greedy matching at the inner
+        #    fence but is recovered by closing at the LAST fence.
+        candidates = re.findall(r"```(?:json)?\s*\n?(.*?)\n?```", content, re.DOTALL)
+        for candidate in candidates:
+            try:
+                return json.loads(candidate.strip())
+            except json.JSONDecodeError:
+                continue
+        json_match = re.search(r"```(?:json)?\s*\n?(.*)\n?```", content, re.DOTALL)
         if json_match:
             try:
                 return json.loads(json_match.group(1).strip())
@@ -1135,7 +1389,13 @@ class CopilotProvider(AgentProvider):
 
         return schema
 
-    def _log_event_verbose(self, event_type: str, event: Any, full_mode: bool) -> None:
+    def _log_event_verbose(
+        self,
+        event_type: str,
+        event: Any,
+        full_mode: bool,
+        agent_name: str | None = None,
+    ) -> None:
         """Log SDK events in verbose mode for progress visibility.
 
         Note: Caller must check is_verbose() before calling - contextvars
@@ -1145,6 +1405,11 @@ class CopilotProvider(AgentProvider):
             event_type: The event type string.
             event: The event object.
             full_mode: If True, show full details (args, results, reasoning).
+            agent_name: Optional agent identifier (e.g.,
+                ``"processor[item_a]"``). When set, every rendered line is
+                tagged with ``[agent_name]`` between the tree prefix and the
+                event icon so concurrent parallel/for-each iterations can be
+                distinguished in interleaved logs.
         """
         from rich.console import Console
         from rich.text import Text
@@ -1158,6 +1423,11 @@ class CopilotProvider(AgentProvider):
             if _file_console is not None:
                 _file_console.print(renderable)
 
+        def _append_tag(text: Text) -> None:
+            """Append the optional [agent_name] tag to a Rich Text line."""
+            if agent_name:
+                text.append(f"[{agent_name}] ", style="magenta")
+
         # Log interesting events with Rich styling
         if event_type == "tool.execution_start":
             tool_name = (
@@ -1168,6 +1438,7 @@ class CopilotProvider(AgentProvider):
 
             text = Text()
             text.append("    ├─ ", style="dim")
+            _append_tag(text)
             text.append("🔧 ", style="")
             text.append(str(tool_name), style="cyan bold")
             _print(text)
@@ -1176,10 +1447,10 @@ class CopilotProvider(AgentProvider):
             if full_mode:
                 args = getattr(event.data, "arguments", None) or getattr(event.data, "args", None)
                 if args:
-                    args_str = str(args)
-                    args_preview = args_str[:200] + "..." if len(args_str) > 200 else args_str
+                    args_preview = format_tool_arguments(args, max_length=200) or ""
                     arg_text = Text()
                     arg_text.append("    │     ", style="dim")
+                    _append_tag(arg_text)
                     arg_text.append("args: ", style="dim italic")
                     arg_text.append(args_preview, style="dim")
                     _print(arg_text)
@@ -1190,6 +1461,7 @@ class CopilotProvider(AgentProvider):
             if tool_name:
                 text = Text()
                 text.append("    │  ", style="dim")
+                _append_tag(text)
                 text.append("✓ ", style="green")
                 text.append(str(tool_name), style="dim")
                 _print(text)
@@ -1198,13 +1470,10 @@ class CopilotProvider(AgentProvider):
             if full_mode:
                 result = getattr(event.data, "result", None) or getattr(event.data, "output", None)
                 if result:
-                    result_str = str(result)
-                    if len(result_str) > 200:
-                        result_preview = result_str[:200] + "..."
-                    else:
-                        result_preview = result_str
+                    result_preview = extract_tool_result_text(result, max_length=200) or ""
                     result_text = Text()
                     result_text.append("    │     ", style="dim")
+                    _append_tag(result_text)
                     result_text.append("result: ", style="dim italic")
                     result_text.append(result_preview, style="dim")
                     _print(result_text)
@@ -1221,25 +1490,28 @@ class CopilotProvider(AgentProvider):
                         display_reasoning = reasoning
                     text = Text()
                     text.append("    │  ", style="dim")
+                    _append_tag(text)
                     text.append("💭 ", style="")
                     text.append(display_reasoning.replace("\n", " "), style="italic dim")
                     _print(text)
 
         elif event_type == "subagent.started":
-            agent_name = getattr(event.data, "name", None) or "unknown"
+            subagent_name = getattr(event.data, "name", None) or "unknown"
             text = Text()
             text.append("    ├─ ", style="dim")
+            _append_tag(text)
             text.append("🤖 ", style="")
             text.append("Sub-agent: ", style="dim")
-            text.append(str(agent_name), style="magenta bold")
+            text.append(str(subagent_name), style="magenta bold")
             _print(text)
 
         elif event_type == "subagent.completed":
-            agent_name = getattr(event.data, "name", None) or "unknown"
+            subagent_name = getattr(event.data, "name", None) or "unknown"
             text = Text()
             text.append("    │  ", style="dim")
+            _append_tag(text)
             text.append("✓ ", style="green")
-            text.append(f"Sub-agent done: {agent_name}", style="dim")
+            text.append(f"Sub-agent done: {subagent_name}", style="dim")
             _print(text)
 
         elif event_type == "assistant.turn_start":
@@ -1249,6 +1521,7 @@ class CopilotProvider(AgentProvider):
                 turn_info = f" (turn {turn})" if turn else ""
                 text = Text()
                 text.append("    │  ", style="dim")
+                _append_tag(text)
                 text.append("⏳ ", style="yellow")
                 text.append(f"Processing{turn_info}...", style="dim italic")
                 _print(text)
@@ -1284,7 +1557,7 @@ class CopilotProvider(AgentProvider):
                     "agent_tool_start",
                     {
                         "tool_name": str(tool_name),
-                        "arguments": str(arguments)[:500] if arguments else None,
+                        "arguments": format_tool_arguments(arguments),
                     },
                 )
 
@@ -1297,7 +1570,7 @@ class CopilotProvider(AgentProvider):
                     "agent_tool_complete",
                     {
                         "tool_name": str(tool_name) if tool_name else None,
-                        "result": str(result)[:500] if result else None,
+                        "result": extract_tool_result_text(result),
                     },
                 )
 
@@ -1369,6 +1642,7 @@ class CopilotProvider(AgentProvider):
         attempt: int,
         last_event_type: str | None,
         last_tool_call: str | None,
+        agent_name: str | None = None,
     ) -> None:
         """Log a recovery attempt in verbose mode.
 
@@ -1376,6 +1650,8 @@ class CopilotProvider(AgentProvider):
             attempt: Current recovery attempt number (1-based).
             last_event_type: The type of the last event received.
             last_tool_call: The name of the last tool that was executing.
+            agent_name: Optional agent identifier used to attribute the
+                recovery message to a specific concurrent agent.
         """
         from rich.console import Console
         from rich.text import Text
@@ -1384,6 +1660,8 @@ class CopilotProvider(AgentProvider):
 
         text = Text()
         text.append("    ├─ ", style="dim")
+        if agent_name:
+            text.append(f"[{agent_name}] ", style="magenta")
         text.append("⚠️ ", style="yellow")
         text.append(
             f"Idle Recovery {attempt}/{self._idle_recovery_config.max_recovery_attempts}",
@@ -1408,6 +1686,7 @@ class CopilotProvider(AgentProvider):
         tool_iteration_ref: list[int] | None = None,
         max_agent_iterations: int | None = None,
         interrupt_signal: asyncio.Event | None = None,
+        agent_name: str | None = None,
     ) -> bool:
         """Wait for session completion with idle detection, recovery, and optional interrupt.
 
@@ -1432,6 +1711,10 @@ class CopilotProvider(AgentProvider):
                 None means no iteration limit.
             interrupt_signal: Optional event that signals user interrupt/revive.
                 When set, aborts the session and returns True.
+            agent_name: Optional agent identifier forwarded to verbose recovery
+                logging so that idle-recovery messages emitted from concurrent
+                for-each or parallel iterations can be attributed to a specific
+                agent. ``None`` means no attribution tag.
 
         Returns:
             True if interrupted, False if completed normally.
@@ -1575,7 +1858,12 @@ class CopilotProvider(AgentProvider):
 
                 # Log recovery attempt
                 if verbose_enabled:
-                    self._log_recovery_attempt(recovery_attempts, last_event_type, last_tool_call)
+                    self._log_recovery_attempt(
+                        recovery_attempts,
+                        last_event_type,
+                        last_tool_call,
+                        agent_name=agent_name,
+                    )
 
                 # Send recovery message
                 recovery_prompt = self._build_recovery_prompt(last_event_type, last_tool_call)
@@ -1762,6 +2050,117 @@ class CopilotProvider(AgentProvider):
                 is_retryable=False,
             ) from e
 
+    async def execute_dialog_turn(
+        self,
+        system_prompt: str,
+        user_message: str,
+        history: list[dict[str, str]] | None = None,
+        model: str | None = None,
+    ) -> str:
+        """Execute a single dialog turn using a lightweight Copilot session.
+
+        Creates a fresh session for the dialog, sends the conversation
+        context, and returns the agent's response. The session is destroyed
+        after the turn completes.
+
+        Args:
+            system_prompt: System prompt providing dialog context.
+            user_message: The latest user message.
+            history: Optional prior conversation history.
+            model: Optional model override. Falls back to provider default.
+
+        Returns:
+            The agent's response text.
+
+        Raises:
+            ProviderError: If the dialog turn fails.
+        """
+        await self._ensure_client_started()
+
+        # Build the full prompt from history + current message
+        # System prompt is passed via create_session's system_message parameter
+        # to replace the SDK's default identity instructions.
+        parts = []
+        for msg in history or []:
+            role_label = "User" if msg["role"] == "user" else "Assistant"
+            parts.append(f"{role_label}: {msg['content']}")
+        parts.append(f"User: {user_message}")
+        full_prompt = "\n\n".join(parts)
+
+        session = None
+        try:
+            dialog_kwargs: dict[str, Any] = {
+                "model": model or self._default_model,
+                "on_permission_request": self._default_permission_handler,
+                "system_message": {"mode": "replace", "content": system_prompt},
+            }
+
+            # Honor the same custom provider routing as agent sessions so
+            # dialog turns hit the same endpoint as agent execution.
+            self._apply_provider_config(dialog_kwargs)
+
+            # Dialog turns honor the workflow-wide default reasoning effort
+            # only — there's no agent-scoped override at this layer.
+            effort = self._default_reasoning_effort
+            if effort is not None:
+                await self._validate_reasoning_effort_for_model(dialog_kwargs["model"], effort)
+                dialog_kwargs["reasoning_effort"] = effort
+                logger.debug(
+                    "Setting reasoning_effort=%s for dialog turn (model=%s)",
+                    effort,
+                    dialog_kwargs["model"],
+                )
+
+            session = await self._client.create_session(**dialog_kwargs)
+
+            response_content = ""
+            done = asyncio.Event()
+            error_message: str | None = None
+
+            def on_event(event: Any) -> None:
+                nonlocal response_content, error_message
+                event_type = event.type.value if hasattr(event.type, "value") else str(event.type)
+                if event_type == "assistant.message":
+                    response_content = event.data.content
+                elif event_type == "session.idle":
+                    done.set()
+                elif event_type in ("error", "session.error"):
+                    error_message = getattr(event.data, "message", str(event.data))
+                    done.set()
+
+            session.on(on_event)
+            await session.send(full_prompt)
+
+            try:
+                await asyncio.wait_for(done.wait(), timeout=120.0)
+            except TimeoutError as exc:
+                raise ProviderError(
+                    "Dialog turn timed out after 120s",
+                    is_retryable=False,
+                ) from exc
+
+            if error_message:
+                raise ProviderError(
+                    f"Dialog turn error: {error_message}",
+                    is_retryable=False,
+                )
+
+            return response_content
+
+        except ProviderError:
+            raise
+        except ValidationError:
+            raise
+        except Exception as exc:
+            raise ProviderError(
+                f"Dialog turn failed: {exc}",
+                is_retryable=False,
+            ) from exc
+        finally:
+            if session is not None:
+                with contextlib.suppress(Exception):
+                    await session.destroy()
+
     async def close(self) -> None:
         """Close Copilot SDK client.
 
@@ -1774,6 +2173,100 @@ class CopilotProvider(AgentProvider):
         self._started = False
         self._call_history.clear()
         self._retry_history.clear()
+
+    async def get_max_prompt_tokens(self, model: str) -> int | None:
+        """Return the Copilot SDK's ``max_prompt_tokens`` for ``model``.
+
+        Queries ``client.list_models()`` (cached internally by the SDK),
+        resolves any aliases (e.g. ``-latest``, dated suffixes, base-name
+        vs versioned-name) via :func:`match_model_id`, and returns
+        ``capabilities.limits.max_prompt_tokens`` for the matched entry.
+
+        Returns ``None`` in mock-handler mode, when the SDK is unavailable,
+        when no match is found, or when the SDK call fails — context-window
+        metadata must never block workflow execution.
+
+        Catches ``Exception`` (not ``BaseException``) at the SDK boundary so
+        ``asyncio.CancelledError``/``KeyboardInterrupt``/``SystemExit`` still
+        propagate. The broad catch is required because Copilot SDK >=0.3.0
+        eagerly parses every entry in the ``models.list`` response with
+        dataclass ``from_dict`` helpers that raise ``ValueError`` on any
+        missing required field — e.g. ``ModelBilling`` requires ``multiplier``,
+        and certain models (such as ``claude-opus-4.7-1m-internal``) ship a
+        ``billing`` object without one, which kills the entire listing.
+        """
+        if self._mock_handler is not None or not COPILOT_SDK_AVAILABLE:
+            return None
+        try:
+            await self._ensure_client_started()
+            models = await self._client.list_models()
+        except Exception as e:
+            logger.debug("Failed to list Copilot models for %r: %s", model, e)
+            return None
+        by_id = {info.id: info for info in models}
+        matched_id = match_model_id(model, by_id.keys())
+        if matched_id is None:
+            return None
+        info = by_id[matched_id]
+        limits = getattr(info.capabilities, "limits", None)
+        return getattr(limits, "max_prompt_tokens", None)
+
+    async def _validate_reasoning_effort_for_model(
+        self, model: str, effort: ReasoningEffort
+    ) -> None:
+        """Validate ``effort`` against the model's advertised capabilities.
+
+        Looks up the model via ``client.list_models()`` (resolving aliases via
+        :func:`match_model_id`) and inspects
+        ``capabilities.supported_reasoning_efforts``. When that list is
+        present and ``effort`` is not in it, raises :class:`ValidationError`.
+
+        When the field is missing/``None`` (capability unknown), or when the
+        model can't be matched, or when listing fails, validation is skipped
+        — capability metadata must never block a workflow that the SDK might
+        otherwise accept.
+
+        Catches ``Exception`` (not ``BaseException``) at the SDK boundary so
+        ``asyncio.CancelledError``/``KeyboardInterrupt``/``SystemExit`` still
+        propagate. The broad catch is required because Copilot SDK >=0.3.0
+        eagerly parses every entry in the ``models.list`` response with
+        dataclass ``from_dict`` helpers that raise ``ValueError`` on any
+        missing required field — e.g. ``ModelBilling`` requires ``multiplier``,
+        and certain models (such as ``claude-opus-4.7-1m-internal``) ship a
+        ``billing`` object without one, which kills the entire listing.
+
+        Skipped entirely in mock-handler mode and when the SDK is not
+        installed.
+        """
+        if self._mock_handler is not None or not COPILOT_SDK_AVAILABLE:
+            return
+        try:
+            await self._ensure_client_started()
+            models = await self._client.list_models()
+        except Exception as e:
+            logger.debug(
+                "Failed to list Copilot models for reasoning_effort validation of %r: %s",
+                model,
+                e,
+            )
+            return
+        by_id = {info.id: info for info in models}
+        matched_id = match_model_id(model, by_id.keys())
+        if matched_id is None:
+            return
+        info = by_id[matched_id]
+        supported = getattr(info.capabilities, "supported_reasoning_efforts", None)
+        if supported is None:
+            return
+        if effort not in supported:
+            raise ValidationError(
+                f"Model {model!r} does not support reasoning_effort={effort!r}; "
+                f"supported values: {sorted(supported)}",
+                suggestion=(
+                    "Choose an effort listed in the model's capabilities, "
+                    "or pick a different model."
+                ),
+            )
 
     def get_session_ids(self) -> dict[str, str]:
         """Get tracked session IDs for all executed agents.
