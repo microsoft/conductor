@@ -5,7 +5,7 @@ description: Validate, run, and execute workflows; creating new workflows when e
 
 # Conductor
 
-CLI tool for defining and running multi-agent workflows with the GitHub Copilot SDK or Anthropic Claude.
+CLI tool for defining and running multi-agent workflows with the GitHub Copilot SDK, Anthropic Claude, or Claude Agent SDK.
 
 > **DO NOT create new workflow files unless the user explicitly asks you to create one.** Default to running, validating, or debugging existing workflows. If the user's request is ambiguous, assume they want to run or modify an existing workflow rather than create a new one.
 

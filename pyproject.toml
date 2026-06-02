@@ -47,6 +47,11 @@ dependencies = [
     "packaging>=21.0",
 ]
 
+[project.optional-dependencies]
+claude-agent-sdk = [
+    "claude-agent-sdk>=0.1.64",
+]
+
 [project.urls]
 Homepage = "https://github.com/microsoft/conductor"
 Documentation = "https://github.com/microsoft/conductor#readme"

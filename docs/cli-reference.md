@@ -26,7 +26,7 @@ conductor run <workflow.yaml> [OPTIONS]
 | `--metadata KEY=VALUE` | `-m` | Workflow metadata (repeatable). Merged on top of YAML `metadata:` and surfaced in the `workflow_started` event. |
 | `--workspace-instructions` | | Auto-discover convention files (`AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md`, and `.github/instructions/**/*.instructions.md`) by walking from CWD up to the git root. Concatenated and prepended to every agent's prompt. See [Workspace Instructions](#workspace-instructions) below for details on the `.github/instructions/` directory convention. |
 | `--instructions PATH` | | Explicit path to an instructions file (repeatable). Combines with auto-discovered files when both flags are used. |
-| `--provider PROVIDER` | `-p` | Override provider (copilot, claude) |
+| `--provider PROVIDER` | `-p` | Override provider (copilot, claude, claude-agent-sdk) |
 | `--dry-run` | | Show execution plan without running |
 | `--skip-gates` | | Auto-select first option at human gates |
 | `--quiet` | `-q` | Minimal output (agent lifecycle and routing only) |
