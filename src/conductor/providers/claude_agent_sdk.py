@@ -391,7 +391,7 @@ class ClaudeAgentSdkProvider(AgentProvider):
 
         # Bundled CLI takes precedence (matches the SDK's own resolution).
         try:
-            import claude_agent_sdk
+            import claude_agent_sdk  # ty: ignore[unresolved-import]
 
             sdk_dir = Path(claude_agent_sdk.__file__).parent
             for candidate in (sdk_dir / "_bundled" / "claude",):
