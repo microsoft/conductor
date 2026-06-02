@@ -2526,7 +2526,7 @@ class WorkflowEngine:
                                 agent.name,
                                 {
                                     "selected": gate_result.selected_option.value,
-                                    **gate_result.additional_input,
+                                    "additional_input": gate_result.additional_input,
                                 },
                             )
 

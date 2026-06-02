@@ -1334,6 +1334,271 @@ class TestWorkflowEngineHumanGates:
         assert "approval_gate" in summary["agents_executed"]
         assert summary["iterations"] == 3
 
+    @pytest.mark.asyncio
+    async def test_human_gate_stores_additional_input_nested_in_context(self) -> None:
+        """Test that prompt_for values are stored nested under additional_input."""
+        from unittest.mock import patch
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(name="gate-prompt-for", entry_point="ask_human"),
+            agents=[
+                AgentDef(
+                    name="ask_human",
+                    type="human_gate",
+                    prompt="Provide input:",
+                    options=[
+                        GateOption(
+                            label="Provide answer",
+                            value="provide_answer",
+                            route="next",
+                            prompt_for="answer",
+                        ),
+                    ],
+                ),
+                AgentDef(
+                    name="next",
+                    model="gpt-4",
+                    prompt="Next",
+                    output={"received": OutputField(type="string")},
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"received": "{{ next.output.received }}"},
+        )
+
+        captured_context: dict = {}
+
+        def mock_handler(agent, prompt, context):
+            captured_context.update(context)
+            return {"received": "ok"}
+
+        provider = CopilotProvider(mock_handler=mock_handler)
+        engine = WorkflowEngine(config, provider, skip_gates=False)
+
+        with patch("conductor.gates.human.Prompt.ask", side_effect=["1", "README.md"]):
+            await engine.run({})
+
+        gate_output = captured_context.get("ask_human", {}).get("output", {})
+        assert gate_output["selected"] == "provide_answer"
+        assert gate_output["additional_input"] == {"answer": "README.md"}
+
+    @pytest.mark.asyncio
+    async def test_human_gate_no_prompt_for_has_empty_additional_input(
+        self,
+        human_gate_workflow_config: WorkflowConfig,
+    ) -> None:
+        """Test that gates without prompt_for produce additional_input: {} in context."""
+        captured_context: dict = {}
+
+        def mock_handler(agent, prompt, context):
+            captured_context.update(context)
+            if agent.name == "drafter":
+                return {"draft": "Draft content"}
+            return {"published": True}
+
+        provider = CopilotProvider(mock_handler=mock_handler)
+        engine = WorkflowEngine(human_gate_workflow_config, provider, skip_gates=True)
+
+        await engine.run({})
+
+        gate_output = captured_context.get("approval_gate", {}).get("output", {})
+        assert gate_output["selected"] == "approved"
+        assert gate_output["additional_input"] == {}
+
+    @pytest.mark.asyncio
+    async def test_human_gate_prompt_for_named_selected_does_not_corrupt_selected(
+        self,
+    ) -> None:
+        """Test that prompt_for field named 'selected' cannot overwrite the selected value.
+
+        The flat spread form had a silent data-corruption bug: if prompt_for used
+        the field name 'selected', the user's typed text would overwrite the chosen
+        option value. The nested form prevents this.
+        """
+        from unittest.mock import patch
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(name="gate-collision", entry_point="gate"),
+            agents=[
+                AgentDef(
+                    name="gate",
+                    type="human_gate",
+                    prompt="Go:",
+                    options=[
+                        GateOption(
+                            label="Go",
+                            value="go",
+                            route="next",
+                            prompt_for="selected",  # collides with reserved key
+                        ),
+                    ],
+                ),
+                AgentDef(
+                    name="next",
+                    model="gpt-4",
+                    prompt="Next",
+                    output={"done": OutputField(type="boolean")},
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"done": "{{ next.output.done }}"},
+        )
+
+        captured_context: dict = {}
+
+        def mock_handler(agent, prompt, context):
+            captured_context.update(context)
+            return {"done": True}
+
+        provider = CopilotProvider(mock_handler=mock_handler)
+        engine = WorkflowEngine(config, provider, skip_gates=False)
+
+        with patch("conductor.gates.human.Prompt.ask", side_effect=["1", "user typed text"]):
+            await engine.run({})
+
+        gate_output = captured_context.get("gate", {}).get("output", {})
+        # The chosen option value must not be overwritten by the user's typed text
+        assert gate_output["selected"] == "go"
+        # The user's typed text is safely nested
+        assert gate_output["additional_input"]["selected"] == "user typed text"
+
+    @pytest.mark.asyncio
+    async def test_human_gate_web_response_nests_additional_input(self) -> None:
+        """Web-gate responses must land under the same nested ``additional_input`` key.
+
+        The store-site at engine/workflow.py is shared between the CLI gate
+        handler and ``_wait_for_web_gate``. This test stubs the web dashboard so
+        the web task wins the race and asserts the web-supplied
+        ``additional_input`` is stored under ``output.additional_input``, not
+        spread flat into ``output``.
+        """
+        from unittest.mock import AsyncMock, MagicMock
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(name="gate-web", entry_point="approval_gate"),
+            agents=[
+                AgentDef(
+                    name="approval_gate",
+                    type="human_gate",
+                    prompt="Approve?",
+                    options=[
+                        GateOption(
+                            label="Approve",
+                            value="approved",
+                            route="next",
+                            prompt_for="comment",
+                        ),
+                    ],
+                ),
+                AgentDef(
+                    name="next",
+                    model="gpt-4",
+                    prompt="next",
+                    output={"received": OutputField(type="string")},
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"received": "{{ next.output.received }}"},
+        )
+
+        # Stub the web dashboard so the web task returns immediately with a
+        # realistic gate-response payload from a browser client.
+        mock_dashboard = MagicMock()
+        mock_dashboard.wait_for_gate_response = AsyncMock(
+            return_value={
+                "selected_value": "approved",
+                "additional_input": {"comment": "looks good"},
+            }
+        )
+
+        captured_context: dict[str, object] = {}
+
+        def mock_handler(agent, prompt, context):
+            captured_context.update(context)
+            return {"received": "ok"}
+
+        provider = CopilotProvider(mock_handler=mock_handler)
+        engine = WorkflowEngine(
+            config,
+            provider,
+            skip_gates=False,
+            web_dashboard=mock_dashboard,
+        )
+
+        # Make the CLI side of the race never return so the web task wins
+        # deterministically. The engine's _handle_gate_with_web cancels the
+        # losing task and suppresses CancelledError, so this is safe.
+        async def _never_returns(*_args, **_kwargs):
+            await asyncio.Event().wait()
+
+        from unittest.mock import patch
+
+        with patch.object(engine.gate_handler, "handle_gate", side_effect=_never_returns):
+            await engine.run({})
+
+        gate_output = captured_context.get("approval_gate", {})  # type: ignore[assignment]
+        assert isinstance(gate_output, dict)
+        gate_output = gate_output.get("output", {})
+        assert gate_output["selected"] == "approved"
+        assert gate_output["additional_input"] == {"comment": "looks good"}
+        # Belt-and-braces: web-supplied keys must not appear flat at the root.
+        assert "comment" not in gate_output
+
+    @pytest.mark.asyncio
+    async def test_human_gate_additional_input_readable_via_template(self) -> None:
+        """A downstream agent's prompt template must be able to read the nested value.
+
+        This exercises the actual user-facing contract — templates resolving
+        ``{{ <gate>.output.additional_input.<field> }}`` — rather than only the
+        internal context shape. Locks in the rendered-prompt path so any
+        regression in template rendering or dict-attr resolution would fail
+        loudly here.
+        """
+        from unittest.mock import patch
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(name="gate-template-readthrough", entry_point="ask_human"),
+            agents=[
+                AgentDef(
+                    name="ask_human",
+                    type="human_gate",
+                    prompt="Provide input:",
+                    options=[
+                        GateOption(
+                            label="Provide answer",
+                            value="provide_answer",
+                            route="echo",
+                            prompt_for="answer",
+                        ),
+                    ],
+                ),
+                AgentDef(
+                    name="echo",
+                    model="gpt-4",
+                    prompt="User said: {{ ask_human.output.additional_input.answer }}",
+                    output={"echoed": OutputField(type="string")},
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"echoed": "{{ echo.output.echoed }}"},
+        )
+
+        rendered_prompts: list[str] = []
+
+        def mock_handler(agent, prompt, context):
+            if agent.name == "echo":
+                rendered_prompts.append(prompt)
+            return {"echoed": "ok"}
+
+        provider = CopilotProvider(mock_handler=mock_handler)
+        engine = WorkflowEngine(config, provider, skip_gates=False)
+
+        with patch("conductor.gates.human.Prompt.ask", side_effect=["1", "README.md"]):
+            await engine.run({})
+
+        assert rendered_prompts, "echo agent's mock_handler was never invoked"
+        assert "User said: README.md" in rendered_prompts[0]
+
 
 class TestWorkflowEngineLifecycleHooks:
     """Tests for lifecycle hooks execution."""

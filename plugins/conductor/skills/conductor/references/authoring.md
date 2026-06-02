@@ -696,8 +696,18 @@ agents:
 ### Gate Output
 
 Human gates automatically capture:
-- `output.selected` - the `value` of the chosen option
-- `output.feedback` - text input from `prompt_for` (if specified)
+- `output.selected` — the `value` of the chosen option.
+- `output.additional_input` — dict of values collected from `prompt_for` fields.
+  Always present; `{}` when no `prompt_for` was specified or the selected option
+  has no `prompt_for`. Access individual fields via templates as
+  `{{ <gate>.output.additional_input.<field> }}` (for example
+  `{{ approval_gate.output.additional_input.feedback }}` when an option declares
+  `prompt_for: feedback`).
+
+> **`context: explicit` mode note.** `input:` declarations support
+> `<gate>.output.additional_input` (the whole dict) but not the dotted shorthand
+> `<gate>.output.additional_input.<field>`. Declare the parent key and read
+> individual fields via Jinja2 in the agent's prompt or output template.
 
 ## Context Modes
 
