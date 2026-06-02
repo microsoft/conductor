@@ -14,7 +14,7 @@ if TYPE_CHECKING:
     from conductor.config.schema import AgentDef, OutputField
 
 try:
-    from claude_agent_sdk import ClaudeAgentOptions, query
+    from claude_agent_sdk import ClaudeAgentOptions, query  # ty: ignore[unresolved-import]
 
     CLAUDE_AGENT_SDK_AVAILABLE = True
 except ImportError:
