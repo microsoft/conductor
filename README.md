@@ -239,7 +239,7 @@ workflow:
     default_model: claude-sonnet-4-6
 ```
 
-Requires the `claude` CLI to be installed and authenticated. Install the SDK: `uv add claude-agent-sdk`
+Requires the `claude` CLI to be installed and authenticated. Install the SDK: `uv add 'claude-agent-sdk>=0.1.0'`
 
 > **Note:** The `claude-agent-sdk` provider delegates tool and MCP server management to the `claude` CLI. Workflow-level `tools` and `runtime.mcp_servers` fields are ignored — configure these through your Claude Code settings instead.
 

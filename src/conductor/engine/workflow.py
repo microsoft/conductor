@@ -584,6 +584,56 @@ class WorkflowEngine:
             self._system_metadata = self._build_system_metadata()
 
         default_effort = self.config.workflow.runtime.default_reasoning_effort
+        default_provider_name = self.config.workflow.runtime.provider.name
+
+        # Resolve the provider per agent (honoring per-agent overrides).
+        # ``providers`` is keyed by provider NAME and includes the full
+        # capability descriptor so the dashboard / log tooling can render
+        # tier badges and limitations without a separate lookup. See #241.
+        from conductor.providers.capabilities import (
+            ProviderCapabilities,
+            get_capabilities,
+        )
+
+        providers_block: dict[str, dict[str, Any]] = {}
+
+        def _provider_for(agent_name: str) -> str:
+            for agent in self.config.agents:
+                if agent.name == agent_name:
+                    return agent.provider or default_provider_name
+            return default_provider_name
+
+        def _record_provider(name: str) -> None:
+            if name in providers_block:
+                return
+            try:
+                caps: ProviderCapabilities = get_capabilities(name)
+            except (KeyError, AttributeError):
+                # Provider not in the registry, or missing CAPABILITIES.
+                # Surface a minimal stub so downstream consumers can still
+                # render "unknown provider" rather than crashing.
+                providers_block[name] = {
+                    "name": name,
+                    "tier": "unknown",
+                    "upstream_pin": None,
+                    "maintainer": None,
+                    "capabilities": None,
+                }
+                return
+            providers_block[name] = {
+                "name": name,
+                "tier": caps.tier,
+                "upstream_pin": caps.upstream_pin,
+                "maintainer": caps.maintainer,
+                "capabilities": caps.model_dump(),
+            }
+
+        # Walk agents (which may use overrides) and the workflow default
+        # so the providers block always includes at least the default.
+        _record_provider(default_provider_name)
+        for a in self.config.agents:
+            _record_provider(a.provider or default_provider_name)
+
         return {
             "name": self.config.workflow.name,
             "version": self._conductor_version(),
@@ -593,6 +643,10 @@ class WorkflowEngine:
                     "name": a.name,
                     "type": a.type or "agent",
                     "model": a.model,
+                    # Provider that this agent will actually use at runtime
+                    # — populated for every agent (including non-LLM types
+                    # for consistency; consumers can filter on `type`).
+                    "provider_name": _provider_for(a.name),
                     "reasoning_effort": (
                         a.reasoning.effort if a.reasoning is not None else default_effort
                     ),
@@ -613,6 +667,7 @@ class WorkflowEngine:
                 }
                 for f in self.config.for_each
             ],
+            "providers": providers_block,
             "routes": [
                 {
                     "from": a.name,

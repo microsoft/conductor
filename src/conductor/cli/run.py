@@ -737,6 +737,102 @@ def verbose_log_for_each_summary(
 # ------------------------------------------------------------------
 
 
+# Tracks which experimental-provider banners have been printed during the
+# current process lifetime so that synthetic ``workflow_started`` events
+# emitted during resume (which already replayed the same workflow once)
+# don't print the banner twice.
+_PRINTED_EXPERIMENTAL_BANNERS: set[str] = set()
+
+
+def _maybe_print_experimental_banner(data: dict[str, Any]) -> None:
+    """Print one Rich banner per unique experimental provider in the workflow.
+
+    Reads ``workflow_started.providers`` (the per-provider tier metadata
+    block) and prints a yellow banner per provider with ``tier ==
+    "experimental"``. Uses the auto-generated limitations list from the
+    capability descriptor so the operator can see at a glance what's
+    missing. Idempotent across resume replays via the module-level
+    ``_PRINTED_EXPERIMENTAL_BANNERS`` guard.
+
+    No-op when the providers block is absent (older event payloads) or
+    contains only stable providers — keeps the run console clean for the
+    common case.
+    """
+    providers = data.get("providers")
+    if not isinstance(providers, dict):
+        return
+
+    # ``run_id`` sits at top level in build_workflow_started_data() AND
+    # is also mirrored into the ``system`` block. Read either so the
+    # banner key stays unique across re-emitted events whether tests
+    # construct synthetic data or real engine output.
+    run_id = (
+        data.get("run_id")
+        or (data.get("system", {}) if isinstance(data.get("system"), dict) else {}).get("run_id")
+        or ""
+    )
+
+    from rich.console import Console
+    from rich.panel import Panel
+
+    for provider_name, meta in providers.items():
+        if not isinstance(meta, dict):
+            continue
+        if meta.get("tier") != "experimental":
+            continue
+
+        banner_key = f"{run_id}:{provider_name}"
+        if banner_key in _PRINTED_EXPERIMENTAL_BANNERS:
+            continue
+        _PRINTED_EXPERIMENTAL_BANNERS.add(banner_key)
+
+        pin = meta.get("upstream_pin")
+        maintainer = meta.get("maintainer")
+        caps_dump = meta.get("capabilities") or {}
+
+        # Re-hydrate the descriptor so we can call ``declared_limitations``
+        # — keeps the limitation logic in one place.
+        limitations: list[str] = []
+        try:
+            from conductor.providers.capabilities import ProviderCapabilities
+
+            limitations = ProviderCapabilities(**caps_dump).declared_limitations()
+        except Exception:  # noqa: BLE001
+            # Capability dump shape may differ in future revisions; never
+            # block the banner on parsing failures — fall back to the
+            # provider name alone.
+            pass
+
+        header_bits = [f"[bold]{provider_name}[/bold]"]
+        if pin:
+            header_bits.append(f"([dim]{pin}[/dim])")
+        if maintainer:
+            header_bits.append(f"maintained by [dim]{maintainer}[/dim]")
+        header = " ".join(header_bits)
+
+        body_lines = [f"⚠ Experimental provider in use: {header}"]
+        if limitations:
+            body_lines.append("Limitations: " + ", ".join(limitations) + ".")
+        body_lines.append("See [link]docs/providers/experimental.md[/link] for stability policy.")
+
+        console = Console(stderr=True, highlight=False)
+        console.print(
+            Panel(
+                "\n".join(body_lines),
+                border_style="yellow",
+                expand=False,
+            )
+        )
+        if _file_console is not None:
+            _file_console.print(
+                Panel(
+                    "\n".join(body_lines),
+                    border_style="yellow",
+                    expand=False,
+                )
+            )
+
+
 class ConsoleEventSubscriber:
     """Subscribes to WorkflowEventEmitter and drives console/file logging.
 
@@ -748,7 +844,10 @@ class ConsoleEventSubscriber:
         d = event.data
         t = event.type
 
-        if t == "agent_started":
+        if t == "workflow_started":
+            _maybe_print_experimental_banner(d)
+
+        elif t == "agent_started":
             verbose_log_agent_start(d.get("agent_name", "?"), d.get("iteration", 0))
 
         elif t == "agent_completed":

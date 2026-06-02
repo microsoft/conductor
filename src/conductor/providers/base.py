@@ -11,10 +11,11 @@ import re
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 if TYPE_CHECKING:
     from conductor.config.schema import AgentDef
+    from conductor.providers.capabilities import ProviderCapabilities
 
 # Type alias for event callbacks that receive structured SDK events.
 # Callback signature: (event_type: str, data: dict[str, Any]) -> None
@@ -117,9 +118,21 @@ class AgentProvider(ABC):
     - execute(): Run an agent and return normalized output
     - validate_connection(): Verify backend connectivity
     - close(): Clean up resources
+    - CAPABILITIES: class-level :class:`ProviderCapabilities` descriptor
+
+    Every production provider MUST declare a class-level ``CAPABILITIES``
+    attribute so that ``conductor validate`` can statically cross-check
+    workflow features against provider behavior. See issue #241 and
+    :mod:`conductor.providers.capabilities` for the schema.
 
     Example:
+        >>> from conductor.providers.capabilities import ProviderCapabilities
         >>> class MyProvider(AgentProvider):
+        ...     CAPABILITIES = ProviderCapabilities(
+        ...         tier="stable",
+        ...         mcp_tools=True,
+        ...         ...,
+        ...     )
         ...     async def execute(self, agent, context, rendered_prompt, tools=None):
         ...         # Call SDK and return AgentOutput
         ...         pass
@@ -127,7 +140,19 @@ class AgentProvider(ABC):
         ...         return True
         ...     async def close(self):
         ...         pass
+
+    Test fakes / mocks may omit ``CAPABILITIES`` — the resolver in
+    :func:`conductor.providers.capabilities.get_capabilities` raises a
+    clear ``AttributeError`` only when the descriptor is actually consulted
+    (i.e. when a workflow uses the provider through the validator or
+    runtime), not at subclass-definition time.
     """
+
+    # Subclasses MUST override with their declared descriptor.
+    # Typed as Optional only so abstract-base instantiation guards still
+    # apply uniformly; the resolver raises a clear error when a production
+    # provider class fails to override this.
+    CAPABILITIES: ClassVar[ProviderCapabilities | None] = None
 
     @abstractmethod
     async def execute(

@@ -27,6 +27,8 @@ export const AgentNode = memo(function AgentNode({ data, id, selected }: NodePro
   const errorType = nd?.error_type;
   const errorMessage = nd?.error_message;
   const contextPct = nd?.context_pct;
+  const providerTier = nd?.provider_tier;
+  const providerName = nd?.provider_name;
 
   // Live elapsed timer for running nodes
   const liveElapsed = useLiveElapsed(id, status);
@@ -100,6 +102,22 @@ export const AgentNode = memo(function AgentNode({ data, id, selected }: NodePro
                   }}
                 >
                   x{iteration}
+                </span>
+              )}
+              {providerTier === 'experimental' && (
+                <span
+                  // Compact "exp" pill marking an experimental provider.
+                  // Yellow palette mirrors the CLI banner color and the
+                  // existing iteration badge styling. Provider name is
+                  // exposed via title so hovering shows which one.
+                  className="flex-shrink-0 inline-flex items-center justify-center px-1.5 py-0.5 rounded-full text-[9px] font-bold leading-none uppercase tracking-wide"
+                  style={{
+                    backgroundColor: 'rgba(245, 158, 11, 0.18)',
+                    color: '#f59e0b',
+                  }}
+                  title={`Experimental provider: ${providerName ?? 'unknown'}`}
+                >
+                  exp
                 </span>
               )}
             </div>

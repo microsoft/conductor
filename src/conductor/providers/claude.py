@@ -35,6 +35,7 @@ from conductor.providers._event_format import (
     format_tool_arguments,
 )
 from conductor.providers.base import AgentOutput, AgentProvider, EventCallback, match_model_id
+from conductor.providers.capabilities import ProviderCapabilities
 from conductor.providers.reasoning import (
     ReasoningEffort,
     effort_to_budget_tokens,
@@ -122,6 +123,43 @@ class ClaudeProvider(AgentProvider):
         True
         >>> await provider.close()
     """
+
+    CAPABILITIES = ProviderCapabilities(
+        tier="stable",
+        # Claude provider accepts ``runtime.mcp_servers`` (stdio only —
+        # see provider parity notes in comparison.md).
+        mcp_tools=True,
+        # Per-agent ``tools:`` allowlists are forwarded to the SDK.
+        workflow_tools_passthrough=True,
+        # The provider is non-streaming today (Phase 1): the API call awaits
+        # the full response before events are emitted. Set False so the
+        # capability descriptor accurately reflects observable behavior.
+        streaming_events=False,
+        # ``agent_reasoning`` events fire for extended-thinking content
+        # when the model returns it.
+        agent_reasoning_events=True,
+        # Extended-thinking effort mapped to Anthropic budgets (low=2048,
+        # medium=8192, high=16384, xhigh=32768 tokens — see
+        # providers/reasoning.py).
+        reasoning_effort=("low", "medium", "high", "xhigh"),
+        # Tool-based structured output: schema is enforced via a forced
+        # tool call rather than prompt injection.
+        structured_output="native",
+        # ``interrupt_signal`` is monitored between agentic iterations and
+        # triggers ``_request_partial_output``.
+        interrupt=True,
+        # ``max_session_seconds`` is enforced at each agentic-loop iteration.
+        max_session_seconds=True,
+        # Anthropic's API is stateless per-request — no session state to
+        # persist across ``conductor resume``.
+        checkpoint_resume=False,
+        # Token counts and model identifier populated on every AgentOutput.
+        usage_tracking=True,
+        # No global mutable state — safe to run N parallel agents.
+        concurrent_safe=True,
+        upstream_pin=None,
+        maintainer="@microsoft/conductor",
+    )
 
     def __init__(
         self,

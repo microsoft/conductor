@@ -54,13 +54,36 @@ export type EventType =
 
 // --- Workflow lifecycle ---
 
+export interface ProviderMetadata {
+  name: string;
+  /** Provider stability tier. `"unknown"` is a stub used when a provider
+   *  lacks a CAPABILITIES declaration (defensive fallback — should not
+   *  occur for the three production providers). */
+  tier: 'stable' | 'experimental' | 'unknown';
+  /** Upstream package pin, e.g. `"claude-agent-sdk>=0.1.0"`. */
+  upstream_pin?: string | null;
+  /** Free-form maintainer attribution, e.g. `"@external (best-effort)"`. */
+  maintainer?: string | null;
+  /** Full ProviderCapabilities dump. Shape mirrors the Pydantic model. */
+  capabilities?: Record<string, unknown> | null;
+}
+
 export interface WorkflowStartedData {
   name: string;
   entry_point?: string;
-  agents: Array<{ name: string; type?: string; model?: string; reasoning_effort?: string | null }>;
+  agents: Array<{
+    name: string;
+    type?: string;
+    model?: string;
+    /** Provider this agent will use at runtime (honors per-agent override). */
+    provider_name?: string;
+    reasoning_effort?: string | null;
+  }>;
   routes: Array<{ from: string; to: string; when?: string }>;
   parallel_groups?: Array<{ name: string; agents: string[] }>;
   for_each_groups?: Array<{ name: string }>;
+  /** Per-provider tier/capability metadata keyed by provider name (#241). */
+  providers?: Record<string, ProviderMetadata>;
 }
 
 export interface WorkflowCompletedData {
