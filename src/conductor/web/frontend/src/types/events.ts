@@ -54,13 +54,36 @@ export type EventType =
 
 // --- Workflow lifecycle ---
 
+export interface ProviderMetadata {
+  name: string;
+  /** Discriminator: `"ok"` for resolved providers; `"unresolved"` when
+   *  the engine could not load capabilities (validator should have
+   *  caught this before run, so it's a forensic signal). */
+  status: 'ok' | 'unresolved';
+  /** Provider stability tier — `null` when `status: "unresolved"`. */
+  tier: 'stable' | 'experimental' | null;
+  /** Upstream package pin, e.g. `"claude-agent-sdk>=0.1.0"`. */
+  upstream_pin?: string | null;
+  /** Free-form maintainer attribution, e.g. `"@external (best-effort)"`. */
+  maintainer?: string | null;
+}
+
 export interface WorkflowStartedData {
   name: string;
   entry_point?: string;
-  agents: Array<{ name: string; type?: string; model?: string; reasoning_effort?: string | null }>;
+  agents: Array<{
+    name: string;
+    type?: string;
+    model?: string;
+    /** Provider this agent will use at runtime (honors per-agent override). */
+    provider_name?: string;
+    reasoning_effort?: string | null;
+  }>;
   routes: Array<{ from: string; to: string; when?: string }>;
   parallel_groups?: Array<{ name: string; agents: string[] }>;
   for_each_groups?: Array<{ name: string }>;
+  /** Per-provider tier/capability metadata keyed by provider name (#241). */
+  providers?: Record<string, ProviderMetadata>;
 }
 
 export interface WorkflowCompletedData {

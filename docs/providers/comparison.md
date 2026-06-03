@@ -6,6 +6,7 @@ This guide helps you choose between GitHub Copilot, Anthropic Claude, and Claude
 
 | Feature | Copilot | Claude | Claude Agent SDK | Winner |
 |---------|---------|--------|------------------|--------|
+| **Tier** | Stable | Stable | Experimental ([#241](https://github.com/microsoft/conductor/issues/241)) | Copilot / Claude |
 | **Context Window** | per-model (SDK-reported) | per-model (SDK-reported) | 200K | Tie |
 | **Pricing Model** | Subscription ($10-39/mo) | Pay-per-token | Via Claude Code CLI | Depends |
 | **Setup** | GitHub auth | API key | `claude` CLI auth | Copilot (easier) |
@@ -18,6 +19,14 @@ This guide helps you choose between GitHub Copilot, Anthropic Claude, and Claude
 | **Cost Predictability** | High (flat rate) | Variable (usage-based) | Variable | Copilot |
 | **Multi-provider** | No | Yes (via Conductor) | No | Claude |
 | **Agentic Loop** | SDK-managed | Manual (provider code) | SDK-managed (delegated to CLI) | Depends |
+
+> **About the experimental tier.** `claude-agent-sdk` declares specific
+> capability carve-outs (no MCP, no per-agent tools allowlist, no
+> reasoning_effort, no checkpoint resume). `conductor validate` catches
+> workflows that depend on those features against this provider, and the
+> CLI prints a one-time banner when the workflow runs. See
+> [docs/providers/experimental.md](./experimental.md) for the stability
+> policy and promotion criteria.
 
 ## When to Use Copilot
 
@@ -128,9 +137,10 @@ agents:
    - Settings inherited from your Claude Code environment
 
 3. **You want the SDK to manage the agentic loop**
-   - Retry logic, tool execution, and structured output handled by the SDK
+   - Tool execution and structured output handled by the SDK / CLI
    - Less provider code to maintain
    - Native interrupt support
+   - **Note:** the SDK does *not* retry transient API errors internally — Conductor classifies SDK errors and surfaces them so workflow-level `retry:` drives recovery.
 
 4. **You need streaming with Claude models**
    - Real-time message streaming (unlike the raw Claude provider)
@@ -138,11 +148,13 @@ agents:
 
 ### Important: Tools and MCP Servers
 
-The `claude-agent-sdk` provider delegates tool and MCP server management entirely to the `claude` CLI. This means:
+The `claude-agent-sdk` provider does not bridge workflow-level tools/MCP into the CLI. Concretely:
 
-- Workflow-level `tools` and `runtime.mcp_servers` fields are **ignored** — configure tools and MCP servers through your Claude Code settings instead
-- The full Claude Code toolset (WebSearch, Bash, Read, Write, etc.) is available automatically
-- `temperature`, `max_tokens`, and `timeout` are also managed by the CLI and not configurable per-workflow
+- `runtime.mcp_servers` — **rejected at the factory** with a clear error. Translation to the CLI's MCP configuration is not implemented. Configure MCP servers through your Claude Code settings instead.
+- Per-agent `tools: []` — disables all tools for that agent.
+- Per-agent `tools: [list]` — **refused loudly**. Workflow tool names do not translate to Claude CLI tool IDs; silently passing them through would risk granting the wrong native tool.
+- Omitting `tools:` entirely — grants the full `claude_code` preset (filesystem, bash, web), matching the bare `claude` CLI experience.
+- `temperature` and `max_tokens` are **rejected at the factory** — sampling behavior is controlled by the CLI.
 
 ### Example Claude Agent SDK Workflow
 

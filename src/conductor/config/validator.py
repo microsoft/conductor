@@ -15,6 +15,7 @@ import jinja2
 from jinja2 import Environment, meta, nodes
 
 from conductor.exceptions import ConfigurationError
+from conductor.providers.capabilities import ProviderCapabilities, get_capabilities
 
 if TYPE_CHECKING:
     from conductor.config.schema import AgentDef, WorkflowConfig
@@ -251,6 +252,13 @@ def validate_workflow_config(
     tmpl_errors, tmpl_warnings = _validate_template_references(config, workflow_path)
     errors.extend(tmpl_errors)
     warnings.extend(tmpl_warnings)
+
+    # Cross-check workflow features against each provider's declared
+    # ProviderCapabilities (issue #241). Surfaces silent capability
+    # mismatches at validate time rather than at runtime.
+    cap_errors, cap_warnings = _validate_provider_capabilities(config)
+    errors.extend(cap_errors)
+    warnings.extend(cap_warnings)
 
     if errors:
         raise ConfigurationError(
@@ -1502,5 +1510,260 @@ def _validate_template_references(
                         f"Workflow output '{field}' references unknown "
                         f"workflow input '{input_name}'"
                     )
+
+    return errors, warnings
+
+
+# ---------------------------------------------------------------------------
+# Provider capability cross-checks (issue #241)
+# ---------------------------------------------------------------------------
+
+# Agent types that drive a provider. All other types (human_gate, script,
+# set, terminate, wait, workflow) do not invoke a provider directly and are
+# skipped by every capability check.
+_LLM_AGENT_TYPES = frozenset({None, "agent"})
+
+
+def _is_llm_agent(agent: AgentDef) -> bool:
+    """True iff this agent invokes a provider (vs. human_gate, script, etc.)."""
+    return agent.type in _LLM_AGENT_TYPES
+
+
+def _resolved_provider_name(agent: AgentDef, default: str) -> str:
+    """The provider name an agent will actually use at runtime.
+
+    Honors the per-agent ``provider:`` override and falls back to the
+    workflow-level default.
+    """
+    return agent.provider or default
+
+
+def _validate_provider_capabilities(
+    config: WorkflowConfig,
+) -> tuple[list[str], list[str]]:
+    """Cross-check workflow features against each provider's declared capabilities.
+
+    Returns a ``(errors, warnings)`` tuple. Errors block ``conductor validate``;
+    warnings print but don't fail. The matrix is documented in
+    ``docs/providers/experimental.md`` (see also #241 for design rationale):
+
+    * Silently-dropped features (mcp_servers, tools allowlist,
+      reasoning effort, structured output, max_session_seconds) → **error**.
+    * Concurrency unsafety in a parallel group → **error**. Same in a
+      ``for_each`` group ONLY when its ``max_concurrent > 1`` (a serial
+      ``for_each`` is effectively sequential).
+    * Experimental + ``structured_output: "prompt_injection"`` + declared
+      ``output:`` schema → **warning** (works, may be flaky).
+    * Stable providers with ``prompt_injection`` do NOT trigger the warning;
+      they are assumed to have earned that behavior through tests and docs.
+
+    Capabilities are resolved lazily without instantiating providers so this
+    runs cleanly in environments without API keys / network.
+    """
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    default_provider = config.workflow.runtime.provider.name
+    workflow_mcp_servers = config.workflow.runtime.mcp_servers
+
+    # Cache per provider name so we don't re-resolve for every agent.
+    cache: dict[str, ProviderCapabilities] = {}
+
+    def _caps_for(name: str) -> ProviderCapabilities | None:
+        if name not in cache:
+            try:
+                cache[name] = get_capabilities(name)
+            except (KeyError, AttributeError) as exc:
+                # The provider is unknown to the resolver OR declares no
+                # CAPABILITIES. Surface as an error so the user knows
+                # capability cross-checks were skipped for this provider.
+                errors.append(
+                    f"Provider '{name}' has no declared ProviderCapabilities "
+                    f"(see issue #241): {exc}"
+                )
+                cache[name] = None  # type: ignore[assignment]
+        return cache.get(name)
+
+    # ----- Workflow-level: MCP servers -----
+    # An mcp_servers block applies only to provider-backed agents that
+    # actually resolve to a provider lacking MCP support. If every LLM
+    # agent overrides to an MCP-capable provider, the workflow-level
+    # mcp_servers block is fine even when the default provider lacks MCP.
+    if workflow_mcp_servers:
+        agents_using_default = [
+            a
+            for a in config.agents
+            if _is_llm_agent(a) and _resolved_provider_name(a, default_provider) == default_provider
+        ]
+        if agents_using_default:
+            default_caps = _caps_for(default_provider)
+            if default_caps is not None and not default_caps.mcp_tools:
+                errors.append(
+                    f"Workflow declares 'runtime.mcp_servers' "
+                    f"({sorted(workflow_mcp_servers)!r}) but the default provider "
+                    f"'{default_provider}' does not support MCP servers "
+                    f"(capabilities.mcp_tools=False) and is used by agent(s): "
+                    f"{sorted(a.name for a in agents_using_default)!r}. "
+                    f"Remove mcp_servers, override these agents to a provider with "
+                    f"MCP support, or use an MCP-capable default provider."
+                )
+
+    # Per-agent default reasoning effort (workflow-wide). Pulled outside
+    # the per-agent loop because it applies to every LLM agent that does
+    # NOT override ``reasoning.effort`` explicitly.
+    runtime_default_effort = config.workflow.runtime.default_reasoning_effort
+    runtime_max_session_seconds = config.workflow.runtime.max_session_seconds
+
+    # ----- Workflow-level: max_session_seconds -----
+    # When the workflow sets a default session timeout, every LLM agent
+    # inherits it. A provider that ignores max_session_seconds would
+    # silently violate the operator's intent, just like the mcp_servers
+    # case above. Check against every resolved provider in use.
+    if runtime_max_session_seconds is not None:
+        providers_using_default_timeout: dict[str, list[str]] = {}
+        for agent in config.agents:
+            if not _is_llm_agent(agent):
+                continue
+            # If the agent overrides max_session_seconds explicitly, the
+            # workflow-level value does not reach the provider for this
+            # agent — its per-agent override is handled in the loop below.
+            if agent.max_session_seconds is not None:
+                continue
+            pname = _resolved_provider_name(agent, default_provider)
+            providers_using_default_timeout.setdefault(pname, []).append(agent.name)
+        for pname, agent_names in providers_using_default_timeout.items():
+            pcaps = _caps_for(pname)
+            if pcaps is not None and not pcaps.max_session_seconds:
+                errors.append(
+                    f"Workflow declares 'runtime.max_session_seconds'="
+                    f"{runtime_max_session_seconds!r} but provider '{pname}' "
+                    f"does not enforce session timeouts "
+                    f"(capabilities.max_session_seconds=False) and is used by "
+                    f"agent(s): {sorted(agent_names)!r}. Override these agents "
+                    f"to a timeout-aware provider, or remove the workflow-level "
+                    f"max_session_seconds."
+                )
+
+    # ----- Per-agent checks -----
+    for agent in config.agents:
+        if not _is_llm_agent(agent):
+            continue
+
+        provider_name = _resolved_provider_name(agent, default_provider)
+        caps = _caps_for(provider_name)
+        if caps is None:
+            continue  # error already recorded by _caps_for
+
+        # Per-agent override against workflow-level mcp_servers: if the
+        # workflow declared mcp_servers but this agent's resolved provider
+        # is different from the default, the override skips MCP entirely.
+        if workflow_mcp_servers and provider_name != default_provider and not caps.mcp_tools:
+            errors.append(
+                f"Agent '{agent.name}' overrides provider to '{provider_name}', which "
+                f"does not support the workflow's declared MCP servers "
+                f"(capabilities.mcp_tools=False)."
+            )
+
+        # tools allowlist: any explicit non-empty list against a provider
+        # that doesn't pass through is a security regression risk. An empty
+        # list ("no tools") is fine — the provider may honor it as
+        # "no tools" semantics. Only non-empty triggers the security concern.
+        if agent.tools and not caps.workflow_tools_passthrough:
+            errors.append(
+                f"Agent '{agent.name}' declares tools={agent.tools!r} but provider "
+                f"'{provider_name}' does not honor per-agent tool allowlists "
+                f"(capabilities.workflow_tools_passthrough=False). Silently "
+                f"granting different tools than declared is a security regression."
+            )
+
+        # reasoning.effort: validate per-agent override OR workflow-wide
+        # default against the supported levels tuple. Per-agent override
+        # takes precedence — if it's set, the default doesn't apply.
+        effective_effort = (
+            agent.reasoning.effort
+            if (agent.reasoning is not None and agent.reasoning.effort is not None)
+            else runtime_default_effort
+        )
+        if effective_effort is not None:
+            requested = effective_effort
+            supported = caps.reasoning_effort
+            source = (
+                "reasoning.effort"
+                if (agent.reasoning is not None and agent.reasoning.effort is not None)
+                else "runtime.default_reasoning_effort"
+            )
+            if supported is None:
+                errors.append(
+                    f"Agent '{agent.name}' resolves to {source}={requested!r} "
+                    f"but provider '{provider_name}' does not support reasoning "
+                    f"effort (capabilities.reasoning_effort=None)."
+                )
+            elif requested not in supported:
+                errors.append(
+                    f"Agent '{agent.name}' resolves to {source}={requested!r} "
+                    f"but provider '{provider_name}' supports only {list(supported)!r}."
+                )
+
+        # Structured output: hard error when no support, warning when
+        # experimental + prompt injection (stable prompt-injection providers
+        # like Copilot are silent — they've earned the behavior).
+        if agent.output:
+            if caps.structured_output == "none":
+                errors.append(
+                    f"Agent '{agent.name}' declares an output schema but provider "
+                    f"'{provider_name}' does not support structured output "
+                    f"(capabilities.structured_output='none')."
+                )
+            elif caps.structured_output == "prompt_injection" and caps.is_experimental:
+                warnings.append(
+                    f"Agent '{agent.name}' declares an output schema; provider "
+                    f"'{provider_name}' enforces it via prompt injection (may be "
+                    f"flaky on edge cases)."
+                )
+
+        # max_session_seconds: silently ignoring an explicit timeout is a
+        # safety/operational regression — caller is asking for a bound.
+        if agent.max_session_seconds is not None and not caps.max_session_seconds:
+            errors.append(
+                f"Agent '{agent.name}' sets max_session_seconds={agent.max_session_seconds!r} "
+                f"but provider '{provider_name}' does not enforce session timeouts "
+                f"(capabilities.max_session_seconds=False)."
+            )
+
+    # ----- Concurrency safety in parallel / for_each groups -----
+    agent_by_name = {a.name: a for a in config.agents}
+    for pg in config.parallel:
+        for member_name in pg.agents:
+            member = agent_by_name.get(member_name)
+            if member is None or not _is_llm_agent(member):
+                continue
+            member_provider = _resolved_provider_name(member, default_provider)
+            member_caps = _caps_for(member_provider)
+            if member_caps is None or member_caps.concurrent_safe:
+                continue
+            errors.append(
+                f"Parallel group '{pg.name}' includes agent '{member_name}' which "
+                f"uses provider '{member_provider}' (capabilities.concurrent_safe=False). "
+                f"This provider is not safe to run in parallel."
+            )
+
+    for fe in config.for_each:
+        # A serial for_each (max_concurrent == 1) does not actually run
+        # concurrent provider instances, so concurrent_safe=False providers
+        # are allowed there.
+        if fe.max_concurrent <= 1:
+            continue
+        inline_agent = fe.agent
+        if not _is_llm_agent(inline_agent):
+            continue
+        provider_name = _resolved_provider_name(inline_agent, default_provider)
+        caps = _caps_for(provider_name)
+        if caps is None or caps.concurrent_safe:
+            continue
+        errors.append(
+            f"For-each group '{fe.name}' has max_concurrent={fe.max_concurrent} "
+            f"and uses provider '{provider_name}' (capabilities.concurrent_safe=False). "
+            f"Set max_concurrent: 1 to run serially, or choose a concurrent-safe provider."
+        )
 
     return errors, warnings

@@ -146,6 +146,11 @@ export interface NodeData {
   termination_status?: 'success' | 'failed';
   termination_reason?: string;
   terminated_by?: string;
+  // Provider tier (#241) — populated from workflow_started.providers when
+  // the agent's resolved provider is experimental, so the graph can
+  // render a badge without re-derivation.
+  provider_name?: string;
+  provider_tier?: 'stable' | 'experimental' | null;
 }
 
 export interface GroupProgress {
@@ -165,7 +170,14 @@ export interface WorkflowAgent {
   type?: string;
   model?: string;
   reasoning_effort?: string | null;
+  /** Provider this agent will use at runtime. Drives the experimental
+   *  badge in the graph (#241). */
+  provider_name?: string;
 }
+
+// ProviderMetadata is defined in types/events.ts (single source of truth)
+// and re-exported here for callers that import from the store.
+export type { ProviderMetadata } from '@/types/events';
 
 export interface ParallelGroup {
   name: string;
@@ -1012,6 +1024,15 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
           ensureNode(state.nodes, a.name, nodeType);
           if (a.model) state.nodes[a.name]!.model = a.model;
           if (a.reasoning_effort) state.nodes[a.name]!.reasoning_effort = a.reasoning_effort;
+          // Decorate the node with provider tier so the graph can render
+          // the experimental badge without crawling the providers block.
+          if (a.provider_name) {
+            state.nodes[a.name]!.provider_name = a.provider_name;
+            const providerMeta = data.providers?.[a.provider_name];
+            if (providerMeta?.tier) {
+              state.nodes[a.name]!.provider_tier = providerMeta.tier;
+            }
+          }
           agentNames.add(a.name);
         }
       }
@@ -1060,6 +1081,13 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
             ensureNode(ctx.nodes, a.name, nodeType);
             if (a.model) ctx.nodes[a.name]!.model = a.model;
             if (a.reasoning_effort) ctx.nodes[a.name]!.reasoning_effort = a.reasoning_effort;
+            if (a.provider_name) {
+              ctx.nodes[a.name]!.provider_name = a.provider_name;
+              const providerMeta = data.providers?.[a.provider_name];
+              if (providerMeta?.tier) {
+                ctx.nodes[a.name]!.provider_tier = providerMeta.tier;
+              }
+            }
             agentNames.add(a.name);
           }
         }

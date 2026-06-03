@@ -23,6 +23,7 @@ from conductor.providers._event_format import (
     format_tool_arguments,
 )
 from conductor.providers.base import AgentOutput, AgentProvider, EventCallback, match_model_id
+from conductor.providers.capabilities import ProviderCapabilities
 from conductor.providers.reasoning import ReasoningEffort, resolve_reasoning_effort
 
 if TYPE_CHECKING:
@@ -152,6 +153,46 @@ class CopilotProvider(AgentProvider):
         >>> output.content["answer"]
         'Mocked response'
     """
+
+    CAPABILITIES = ProviderCapabilities(
+        tier="stable",
+        # Copilot honors workflow-level ``runtime.mcp_servers`` and forwards
+        # them to the SDK session.
+        mcp_tools=True,
+        # Per-agent ``tools:`` allowlist is enforced — the executor passes
+        # the resolved subset down into ``execute()`` and the SDK respects it.
+        workflow_tools_passthrough=True,
+        # Streaming events (``agent_message``, ``agent_tool_*``) fire
+        # incrementally during execution.
+        streaming_events=True,
+        # ``agent_reasoning`` is emitted for thinking-equivalent content
+        # from models that expose it (GPT-5 / o1 series).
+        agent_reasoning_events=True,
+        # Copilot accepts the full reasoning-effort vocabulary; the SDK
+        # validates per-model support against ``supported_reasoning_efforts``
+        # at session creation and raises a clear error for unsupported levels.
+        reasoning_effort=("low", "medium", "high", "xhigh"),
+        # Copilot has no native JSON-mode; structured ``output:`` schemas
+        # are appended to the prompt and the model is asked to comply.
+        # Stable providers using prompt_injection do not trigger the
+        # tier-gated validation warning (see #241).
+        structured_output="prompt_injection",
+        # ``interrupt_signal`` is checked between tool iterations; mid-turn
+        # interrupts return partial output.
+        interrupt=True,
+        # ``max_session_seconds`` is enforced via ``IdleRecoveryConfig``.
+        max_session_seconds=True,
+        # Copilot session IDs are persisted in checkpoints and re-applied
+        # at ``conductor resume`` via ``set_resume_session_ids``.
+        checkpoint_resume=True,
+        # Token counts / model / usage are populated on every AgentOutput
+        # (with the documented mock_handler exception in test contexts).
+        usage_tracking=True,
+        # No global mutable state — safe to run N parallel agents.
+        concurrent_safe=True,
+        upstream_pin=None,
+        maintainer="@microsoft/conductor",
+    )
 
     def __init__(
         self,

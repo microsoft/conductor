@@ -202,11 +202,62 @@ When modifying any provider, check all other providers for the same change. The 
 
 #### `claude_agent_sdk.py` parity notes
 
-The Claude Agent SDK provider (`claude_agent_sdk.py`) delegates the agentic loop to the `claude` CLI via the `claude-agent-sdk` package. This achieves **event and output parity** but the following are managed by the SDK rather than Conductor:
+The Claude Agent SDK provider (`claude_agent_sdk.py`) is the canonical
+**experimental** provider — see the "Experimental Providers" section
+below for the carve-out policy. It delegates the agentic loop to the
+`claude` CLI via the `claude-agent-sdk` package. This achieves **event
+and output parity** but the following are managed by the SDK rather than
+Conductor:
 
-- **Retry and error handling**: The SDK handles retries, backoff, and parse recovery internally. The provider wraps SDK errors in `ProviderError` but does not implement its own retry logic.
-- **Tool execution**: Tools and MCP servers are managed by the `claude` CLI's own configuration. Workflow-level `tools` and `runtime.mcp_servers` fields are ignored.
-- **Runtime config**: `temperature`, `max_tokens`, and `timeout` are not configurable per-workflow — they are controlled by the CLI.
+- **Retry and error handling**: The `claude-agent-sdk` package does **not** retry API failures (429s, 5xx, network errors) internally — its built-in retry logic covers only filesystem operations. Conductor wraps SDK errors in `ProviderError` and uses `stop_reason` / error subtype to set `is_retryable`, so workflow-level `retry:` configuration drives all retry behavior. Plan for transient failures with explicit `retry:` blocks in your workflow.
+- **Tool execution**: Tools and MCP servers are managed by the `claude` CLI's own configuration. The provider rejects workflow-level `runtime.mcp_servers` at the factory and refuses any non-empty per-agent `tools:` list (workflow tool names do not translate to CLI tool IDs). An agent with `tools: []` runs with no tools; omitting `tools:` grants the full `claude_code` preset.
+- **Runtime config**: `temperature` and `max_tokens` are rejected at the factory — the CLI controls sampling behavior.
+
+### Experimental Providers
+
+Some providers delegate part of the agentic loop to an upstream SDK or
+framework and cannot honor every parity rule above. Rather than reject
+them or let parity silently erode, Conductor formalizes an
+**experimental tier** with explicit allowed carve-outs and a static
+validator that catches workflow ↔ provider mismatches at `conductor
+validate` time. See `docs/providers/experimental.md` for the full
+stability policy.
+
+**Capability declaration.** Every provider — stable or experimental —
+declares a class-level `CAPABILITIES: ProviderCapabilities` attribute
+(see `src/conductor/providers/capabilities.py`). The descriptor is a
+contract: behavior must match what the provider declares. Lying in the
+descriptor undermines the framework.
+
+**Allowed carve-outs** for experimental providers (declared as `False` /
+`None` on the descriptor):
+
+- `mcp_tools` — workflow-level `runtime.mcp_servers` is not forwarded
+- `workflow_tools_passthrough` — per-agent `tools:` allowlist is not enforced
+- `streaming_events` — events emitted only at completion (not incrementally)
+- `agent_reasoning_events` — no thinking/reasoning event surfacing
+- `reasoning_effort` — provider has no reasoning-effort concept
+- `structured_output: "prompt_injection"` — schema enforced via prompt injection only
+- `interrupt` — mid-call interrupt not honored (still cancels between iterations)
+- `max_session_seconds` — wall-clock session timeout silently ignored
+- `checkpoint_resume` — session state does not survive `conductor resume`
+
+**Non-negotiable rules** experimental providers MUST uphold:
+
+- `AgentProvider` lifecycle (`validate_connection` / `execute` / `close`).
+- `AgentOutput` shape on every successful execution (fields may be `None`).
+- Raise real exceptions on real errors — no silent failure swallowing.
+- Declare accurate `ProviderCapabilities` matching observed behavior.
+- Provide a smoke test that exercises construct + execute paths against
+  a mocked SDK.
+- Maintain `concurrent_safe: true`, or fail validation when used in
+  parallel/for_each groups with `max_concurrent > 1`.
+
+**Promotion criteria** (experimental → stable) are documented in
+`docs/providers/experimental.md` — full parity capabilities, named
+maintainer, real-API integration test, ≥6 months stable upstream,
+end-to-end example workflow.
+
 ### Run / Resume Parity
 
 The `run` and `resume` commands must accept the same flags wherever a flag is meaningful for a resumed run. When adding a new flag to `run`, add it to `resume` too unless there's a specific reason it cannot apply.
