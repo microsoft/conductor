@@ -24,7 +24,7 @@ from conductor.exceptions import ProviderError, ValidationError
 from conductor.executor.output import parse_json_output, validate_output
 from conductor.providers.base import AgentOutput, AgentProvider, EventCallback
 from conductor.providers.capabilities import ProviderCapabilities
-from conductor.providers.reasoning import ReasoningEffort
+from conductor.providers.reasoning import ReasoningEffort, resolve_reasoning_effort
 
 if TYPE_CHECKING:
     from conductor.config.schema import AgentDef
@@ -75,7 +75,7 @@ class HermesProvider(AgentProvider):
         workflow_tools_passthrough=False,
         streaming_events=True,
         agent_reasoning_events=True,
-        reasoning_effort=None,
+        reasoning_effort=("low", "medium", "high", "xhigh"),
         structured_output="prompt_injection",
         interrupt=False,
         max_session_seconds=True,
@@ -213,6 +213,12 @@ class HermesProvider(AgentProvider):
             agent_kwargs["base_url"] = self._base_url
         if self._api_key:
             agent_kwargs["api_key"] = self._api_key
+
+        # Resolve reasoning effort (per-agent override → workflow default)
+        effort = resolve_reasoning_effort(agent, self._default_reasoning_effort)
+        if effort is not None:
+            agent_kwargs["reasoning_config"] = {"effort": effort}
+
         # Conductor's per-agent tools: allowlist is NOT forwarded to hermes.
         # The two vocabularies are incompatible (Conductor MCP tool names vs
         # hermes-internal toolset names). workflow_tools_passthrough=False in
