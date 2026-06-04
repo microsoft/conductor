@@ -198,12 +198,11 @@ class HermesProvider(AgentProvider):
             agent_kwargs["base_url"] = self._base_url
         if self._api_key:
             agent_kwargs["api_key"] = self._api_key
-        # Map Conductor tools field to hermes enabled_toolsets.
-        # tools=None → omit (hermes default: all tools)
-        # tools=[]   → enabled_toolsets=[] (empty allowlist = 0 tools)
-        # tools=[..] → enabled_toolsets=[..] (hermes toolset names)
-        if agent.tools is not None:
-            agent_kwargs["enabled_toolsets"] = agent.tools
+        # Conductor's per-agent tools: allowlist is NOT forwarded to hermes.
+        # The two vocabularies are incompatible (Conductor MCP tool names vs
+        # hermes-internal toolset names). workflow_tools_passthrough=False in
+        # CAPABILITIES ensures the validator rejects any agent that sets
+        # tools: against this provider.
 
         loop = asyncio.get_event_loop()
 
@@ -240,18 +239,37 @@ class HermesProvider(AgentProvider):
                 interrupt_task.cancel()
 
         if call_task not in done:
-            # Either timeout or interrupt fired first
+            # Either timeout or interrupt fired first.
+            # Note: call_task.cancel() on a run_in_executor future cannot
+            # actually stop the thread — the hermes call continues to natural
+            # completion in the background.
             call_task.cancel()
+            logger.warning(
+                "Agent '%s' hermes executor thread cannot be stopped; "
+                "it will continue running in the background until natural completion.",
+                agent.name,
+            )
             if interrupt_task is not None and interrupt_task in done:
                 raise ProviderError(
-                    f"Agent '{agent.name}' was interrupted by user request",
+                    f"Agent '{agent.name}' was interrupted; underlying hermes call "
+                    f"may continue in the background until natural completion.",
+                    is_retryable=False,
                 )
             raise ProviderError(
                 f"Agent '{agent.name}' exceeded maximum session duration "
                 f"of {resolved_timeout:.0f}s",
+                is_retryable=True,
             )
 
-        result = call_task.result()
+        try:
+            result = call_task.result()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            raise ProviderError(
+                f"Hermes agent execution failed (model='{resolved_model}'): {e}",
+                suggestion="Check the hermes-agent logs and verify base_url/api_key.",
+            ) from e
 
         # Surface library-level failures as ProviderError
         if result.get("failed"):
@@ -326,7 +344,7 @@ def _fire(callback: EventCallback | None, event: str, data: dict[str, Any]) -> N
     try:
         callback(event, data)
     except Exception:
-        logger.debug("Error in event_callback for %s", event, exc_info=True)
+        logger.warning("Error in event_callback for %s", event, exc_info=True)
 
 
 async def _wait_for_event(event: asyncio.Event) -> None:
