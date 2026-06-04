@@ -77,7 +77,7 @@ class HermesProvider(AgentProvider):
         agent_reasoning_events=True,
         reasoning_effort=("low", "medium", "high", "xhigh"),
         structured_output="prompt_injection",
-        interrupt=False,
+        interrupt=True,
         max_session_seconds=True,
         checkpoint_resume=True,
         usage_tracking=True,
@@ -252,8 +252,13 @@ class HermesProvider(AgentProvider):
 
         loop = asyncio.get_running_loop()
 
+        # Keep a reference to the AIAgent so we can call interrupt() from
+        # the async side — hermes interrupt() is thread-safe by design.
+        hermes_agent_ref: list[Any] = []
+
         def _run_sync() -> dict[str, Any]:
             hermes_agent = AIAgent(**agent_kwargs)
+            hermes_agent_ref.append(hermes_agent)
             return hermes_agent.run_conversation(
                 prompt,
                 system_message=agent.system_prompt or None,
@@ -287,20 +292,14 @@ class HermesProvider(AgentProvider):
                 interrupt_task.cancel()
 
         if call_task not in done:
-            # Either timeout or interrupt fired first.
-            # Note: call_task.cancel() on a run_in_executor future cannot
-            # actually stop the thread — the hermes call continues to natural
-            # completion in the background.
+            # Either timeout or interrupt fired first. Signal hermes to stop
+            # cooperatively — it checks _interrupt_requested between iterations.
+            if hermes_agent_ref:
+                hermes_agent_ref[0].interrupt()
             call_task.cancel()
-            logger.warning(
-                "Agent '%s' hermes executor thread cannot be stopped; "
-                "it will continue running in the background until natural completion.",
-                agent.name,
-            )
             if interrupt_task is not None and interrupt_task in done:
                 raise ProviderError(
-                    f"Agent '{agent.name}' was interrupted; underlying hermes call "
-                    f"may continue in the background until natural completion.",
+                    f"Agent '{agent.name}' was interrupted by user request",
                     is_retryable=False,
                 )
             raise ProviderError(
