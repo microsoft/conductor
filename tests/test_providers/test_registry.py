@@ -11,7 +11,7 @@ from conductor.providers.base import AgentOutput, AgentProvider
 from conductor.providers.registry import ProviderRegistry
 
 
-class MockProvider(AgentProvider):
+class MockProvider(AgentProvider, abstract=True):
     """Mock provider for testing."""
 
     def __init__(self, provider_type: str = "test") -> None:
@@ -333,6 +333,7 @@ class TestConfigPassing:
             max_agent_iterations=None,
             default_reasoning_effort=None,
             skill_directories=None,
+            provider_settings=config.workflow.runtime.provider,
         )
 
     @patch("conductor.providers.registry.create_provider")

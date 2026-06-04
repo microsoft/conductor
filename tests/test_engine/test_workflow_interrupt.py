@@ -910,7 +910,7 @@ class TestPartialOutputHandling:
         """Verify all mock providers still instantiate and run after ABC signature change."""
         from conductor.providers.base import AgentOutput, AgentProvider
 
-        class TestMockProvider(AgentProvider):
+        class TestMockProvider(AgentProvider, abstract=True):
             async def execute(
                 self,
                 agent: AgentDef,

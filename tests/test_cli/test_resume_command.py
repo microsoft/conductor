@@ -1054,7 +1054,7 @@ class TestResumeWiring:
 
         assert captured_configs, "ProviderRegistry was not constructed"
         cfg = captured_configs[0]
-        assert cfg.workflow.runtime.provider == "claude"
+        assert cfg.workflow.runtime.provider.name == "claude"
 
     @pytest.mark.asyncio
     async def test_metadata_merges_into_config(self, tmp_path: Path) -> None:

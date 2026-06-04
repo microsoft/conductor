@@ -11,10 +11,11 @@ import re
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 if TYPE_CHECKING:
     from conductor.config.schema import AgentDef
+    from conductor.providers.capabilities import ProviderCapabilities
 
 # Type alias for event callbacks that receive structured SDK events.
 # Callback signature: (event_type: str, data: dict[str, Any]) -> None
@@ -117,9 +118,21 @@ class AgentProvider(ABC):
     - execute(): Run an agent and return normalized output
     - validate_connection(): Verify backend connectivity
     - close(): Clean up resources
+    - CAPABILITIES: class-level :class:`ProviderCapabilities` descriptor
+
+    Every production provider MUST declare a class-level ``CAPABILITIES``
+    attribute so that ``conductor validate`` can statically cross-check
+    workflow features against provider behavior. See issue #241 and
+    :mod:`conductor.providers.capabilities` for the schema.
 
     Example:
+        >>> from conductor.providers.capabilities import ProviderCapabilities
         >>> class MyProvider(AgentProvider):
+        ...     CAPABILITIES = ProviderCapabilities(
+        ...         tier="stable",
+        ...         mcp_tools=True,
+        ...         ...,
+        ...     )
         ...     async def execute(self, agent, context, rendered_prompt, tools=None):
         ...         # Call SDK and return AgentOutput
         ...         pass
@@ -127,7 +140,49 @@ class AgentProvider(ABC):
         ...         return True
         ...     async def close(self):
         ...         pass
+
+    Test fakes / mocks that don't need a real capability declaration can
+    opt out at subclass-definition time with ``abstract=True``:
+
+        >>> class _FakeProvider(AgentProvider, abstract=True):
+        ...     async def execute(self, *a, **kw): ...
+        ...     async def validate_connection(self): return True
+        ...     async def close(self): ...
+
+    Production subclasses (no ``abstract=True``) MUST set ``CAPABILITIES``
+    to a :class:`ProviderCapabilities` instance — enforced at import time
+    via :meth:`__init_subclass__`.
     """
+
+    # Subclasses MUST override with their declared descriptor.
+    # Typed as Optional so the abstract base itself can declare ``None``;
+    # __init_subclass__ enforces the override on every non-abstract
+    # subclass at import time.
+    CAPABILITIES: ClassVar[ProviderCapabilities | None] = None
+
+    def __init_subclass__(cls, *, abstract: bool = False, **kwargs: Any) -> None:
+        """Enforce that every production subclass declares ``CAPABILITIES``.
+
+        Converts a latent "lazily caught at validator/runtime" failure
+        into an import-time error so missing or mistyped descriptors
+        cannot ship. Test fakes opt out with ``abstract=True``:
+
+            class _Fake(AgentProvider, abstract=True): ...
+        """
+        super().__init_subclass__(**kwargs)
+        if abstract:
+            return
+        # Local import to avoid base.py → capabilities.py cycle at module load.
+        from conductor.providers.capabilities import ProviderCapabilities
+
+        caps = cls.__dict__.get("CAPABILITIES")
+        if not isinstance(caps, ProviderCapabilities):
+            raise TypeError(
+                f"{cls.__module__}.{cls.__name__} must declare a class-level "
+                f"CAPABILITIES: ProviderCapabilities attribute (see "
+                f"conductor.providers.capabilities). Test fakes can opt out "
+                f"with `class {cls.__name__}(AgentProvider, abstract=True)`."
+            )
 
     @abstractmethod
     async def execute(

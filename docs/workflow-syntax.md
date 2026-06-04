@@ -75,7 +75,7 @@ Agents are defined in the `agents` list. Each agent represents a unit of work.
 agents:
   - name: string                    # Required: Unique agent identifier
     description: string             # Optional: Purpose description
-    type: agent                     # agent | human_gate | script | workflow (default: agent)
+    type: agent                     # agent | human_gate | script | workflow | wait | terminate (default: agent)
     model: string                   # Optional: Model identifier (e.g., 'claude-sonnet-4.5')
     
     prompt: |                       # Required for type=agent: Agent instructions
@@ -108,6 +108,45 @@ agents:
       - to: next_agent              # Agent name or $end
         when: "{{ condition }}"     # Optional: Route condition
 ```
+
+### Choosing whether to declare `output:`
+
+Declaring `output:` does two things at once: it asks the model to return JSON matching the schema, and it parses the response as structured JSON. For some agents that's what you want. For others it produces parse-recovery loops and burns tokens.
+
+**Declare `output:`** when the agent emits small, strictly-structured JSON whose individual fields will be referenced downstream:
+
+```yaml
+agents:
+  - name: classifier
+    prompt: "Classify the input. Return {category, confidence}."
+    output:
+      category:
+        type: string
+      confidence:
+        type: number
+  - name: router
+    prompt: |
+      Category was {{ classifier.output.category }}.
+      Confidence was {{ classifier.output.confidence }}.
+```
+
+**Omit `output:`** when the agent emits prose, Markdown, or large/nested JSON. Without a schema, conductor stores the full raw response as a single string under `.output.result`, and downstream agents read it directly:
+
+```yaml
+agents:
+  - name: synthesizer
+    prompt: |
+      Produce a comprehensive Markdown report of the findings.
+      The report may contain code blocks, tables, and quoted examples.
+    # No output: declared — response is captured verbatim.
+  - name: reviewer
+    prompt: |
+      Review the following report:
+
+      {{ synthesizer.output.result }}
+```
+
+Why this matters: when an `output:` schema is declared, the model is asked to wrap its response in JSON. Large or prose-heavy responses tend to come back inside Markdown code fences, and any triple-backticks in the content can confuse the JSON-extraction step. Omitting `output:` for these agents avoids that whole class of failure and lets the model write naturally.
 
 ### Human Gates
 
@@ -281,6 +320,157 @@ routes:
 
 **Environment variable note** — values in `env` are passed as-is to the subprocess (they are not rendered as Jinja2 templates). Use `${VAR}` syntax in the workflow YAML loader if you need environment variable substitution in env values.
 
+### Wait Steps
+
+Wait steps pause workflow execution for a parsed duration via in-process `asyncio.sleep`. Use them for rate-limit cooldowns, polling intervals, and external-system catch-up — cross-platform, no shell `sleep` dependency.
+
+```yaml
+agents:
+  - name: cooldown
+    type: wait
+    description: "Cool down between API bursts"     # Optional
+    duration: 60s                                   # Required: see "Duration format" below
+    reason: "Avoiding rate limit"                   # Optional: shown in dashboard
+    routes:
+      - to: next_step
+```
+
+**Duration format** — `duration` accepts:
+
+- A plain `int` or `float` (seconds): `duration: 60`, `duration: 1.5`.
+- A string with a unit suffix: `ms` (milliseconds), `s` (seconds), `m` (minutes), `h` (hours). Examples: `"500ms"`, `"60s"`, `"2.5m"`, `"1h"`.
+- A Jinja2 template that renders to one of the above. Templated durations defer literal validation to runtime:
+
+  ```yaml
+  duration: "{{ workflow.input.poll_interval_seconds }}s"
+  ```
+
+The resolved duration must be **greater than 0 and no more than 24 hours** (`86400s`). Longer pauses should reconsider `workflow.limits.timeout_seconds` first.
+
+**Output structure** — wait step output is strict — only `waited_seconds` is exposed:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `waited_seconds` | `number` | Wall-clock seconds actually slept (may be less than requested on interrupt) |
+
+Access in templates: `{{ cooldown.output.waited_seconds }}`.
+
+**Polling pattern** — wait composes with routing loop-backs to build polling workflows without writing any Python:
+
+```yaml
+agents:
+  - name: check_status
+    type: script
+    command: ./poll-status.sh
+    routes:
+      - to: process_result
+        when: "status == 'ready'"
+      - to: wait_then_retry
+
+  - name: wait_then_retry
+    type: wait
+    duration: "{{ workflow.input.poll_interval_seconds }}s"
+    routes:
+      - to: check_status                           # loop back
+
+  - name: process_result
+    # ...
+```
+
+**Cancellation** — `Esc` / `Ctrl+G` cancels an in-progress wait immediately (the engine races the sleep against the interrupt event). The workflow-level `limits.timeout_seconds` also cancels in-flight waits via the standard timeout path.
+
+**Iteration counting** — wait steps count toward `workflow.limits.max_iterations` (each pause is one step). They are not subject to `max_agent_iterations`, which counts per-LLM-agent tool iterations.
+
+**Restrictions** — wait steps cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, `options`, `command`, `args`, `env`, `working_dir`, `timeout`, `workflow`, `input_mapping`, `max_depth`, `max_session_seconds`, `max_agent_iterations`, `retry`, `dialog`, `reasoning`, `timeout_seconds`, or `output`. Wait steps also cannot be used inside `parallel` groups or `for_each` groups.
+
+See [`examples/wait-step.yaml`](../examples/wait-step.yaml) for a complete polling workflow.
+### Set Steps
+
+Set steps evaluate one or more Jinja2 expressions and bind the typed results into the workflow context. No LLM call, no subprocess, no I/O — they're pure context transformations. Use them to combine inputs, derive flags from prior outputs, compute defaults, or normalise a value once for many downstream prompts to share.
+
+```yaml
+agents:
+  # Single binding — output is the typed scalar / list / dict.
+  - name: compute_slug
+    type: set
+    value: "{{ workflow.input.org }}/{{ workflow.input.repo }}"
+    # accessible as: compute_slug.output  (a string)
+    routes:
+      - to: derive_flags
+
+  # Multi-binding — output is a dict, accessible as step.output.<key>.
+  - name: derive_flags
+    type: set
+    values:
+      is_breaking: "{{ research.output.severity in ['high', 'critical'] }}"
+      target_branch: "{{ workflow.input.branch or 'main' }}"
+      effective_model: "{{ workflow.input.model or 'claude-sonnet-4-5' }}"
+    routes:
+      - to: breaking_path
+        when: "{{ output.is_breaking }}"
+      - to: safe_path
+```
+
+Exactly one of `value:` or `values:` must be present.
+
+**Type detection** — by default, the rendered string is parsed with safe YAML (equivalent to `yaml.safe_load`); booleans, numbers, lists, and dicts are returned as native types. Parse failures and pure-comment renders fall back to the raw string. Empty / whitespace-only renders become `""`, not `None`. `yaml.safe_load` produces `datetime`/`date`/`time` objects from strings like `"2024-01-02"`; these are converted to their ISO 8601 string form so checkpoint round-trips and dashboard payloads stay JSON-safe. Any other non-JSON-safe Python value raises `ExecutionError`.
+
+**Explicit `output_type:`** (single `value:` only) forces a specific coercion:
+
+| Value | Behaviour |
+|-------|-----------|
+| `auto` (default) | YAML safe-load with the rules above |
+| `string` | Keep the raw rendered string verbatim |
+| `number` | Try `int` then `float`; raise on failure |
+| `integer` | `int`; raise on failure |
+| `boolean` | Case-insensitive `true`/`false`/`1`/`0`/`yes`/`no`/`y`/`n`/`on`/`off` |
+| `list` | Parse via YAML; assert the result is a list |
+| `dict` | Parse via YAML; assert the result is a dict |
+
+Per-key typing on multi `values:` is not supported.
+
+**Multi-binding ordering** — every binding in a single `values:` step renders against the *original* pre-step context. Later bindings cannot reference earlier ones in the same step. If you need ordered dependencies, chain multiple set steps:
+
+```yaml
+- name: step_a
+  type: set
+  value: "{{ workflow.input.x | upper }}"
+- name: step_b
+  type: set
+  value: "{{ step_a.output }}-suffix"
+```
+
+**Routing on set output** — routes attached to a set step evaluate against the bound value directly. Dict outputs expose `{{ output.<key> }}` (Jinja2) and bare `<key>` (simpleeval); scalar / list outputs expose only `{{ output }}`:
+
+```yaml
+# Multi-values step — route on a derived dict field.
+- name: derive_flags
+  type: set
+  values:
+    is_breaking: "{{ severity == 'high' }}"
+  routes:
+    - to: breaking_path
+      when: "{{ output.is_breaking }}"
+    - to: safe_path
+
+# Single-value step — route on the scalar itself.
+- name: flag
+  type: set
+  value: "{{ workflow.input.severity == 'high' }}"
+  routes:
+    - to: hi
+      when: "{{ output }}"
+    - to: lo
+```
+
+**Optional output schema** — set steps support the same `output:` schema as LLM and script agents, but only when the rendered value is a dict (which is always the case for multi `values:`, and may be the case for single `value:`). If a single-`value:` step declares `output:` but produces a scalar / list, the engine raises a friendly `ValidationError` pointing to `values:` as the intended shape.
+
+**Composition** — set steps are allowed inside `parallel` groups (each member publishes its bound value to context) and as the inline agent of a `for_each` group (one bound value per item). Inside a parallel group, set templates cannot reference sibling group members (the validator catches this at config time, since the engine renders against a pre-group snapshot).
+
+**Restrictions** — set agents cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, `command`, `args`, `env`, `working_dir`, `timeout`, `workflow`, `options`, `input_mapping`, `max_depth`, `retry`, `dialog`, `reasoning`, `timeout_seconds`, `max_session_seconds`, or `max_agent_iterations`. They count toward `limits.max_iterations` like any other step.
+
+**Events** — set steps emit `set_started` / `set_completed` / `set_failed` (mirroring the script-step lifecycle) in all three positions: linear main loop, parallel group member, and for-each iteration. The `set_completed` payload carries `output_type`, `output_keys` (sorted, empty for scalars), and `value_repr` (a JSON-safe preview, truncated at 512 chars).
+
 ### Sub-Workflow Steps
 
 Sub-workflow steps reference external workflow YAML files, enabling composable and reusable workflow building blocks. The sub-workflow runs as a black box — its internal agents are not visible to the parent.
@@ -371,6 +561,58 @@ parallel:
 
 **Restrictions** — workflow steps cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, `command`, or `options`.
 
+### Terminate Steps
+
+Terminate steps end the workflow with an explicit `status` (`success` or `failed`) and a structured `reason`. Reaching a terminate step ends execution immediately — no routes are evaluated after — and produces a CLI exit code, dashboard state, and event payload that downstream tooling can distinguish from a generic crash.
+
+```yaml
+agents:
+  - name: precheck
+    type: script
+    command: bash
+    args: ["-c", "echo '{\"action\":\"abort\",\"reason\":\"unsafe input\"}'"]
+    output:
+      action:  { type: string }
+      reason:  { type: string }
+    routes:
+      - when: "action == 'abort'"
+        to: abort_unsafe
+      - when: "action == 'noop'"
+        to: noop_exit
+      - to: main_pipeline
+
+  # Soft success — workflow ends cleanly, exit 0, dashboard ✅.
+  - name: noop_exit
+    type: terminate
+    status: success
+    reason: "Document already up to date; no edits needed."
+
+  # Hard failure with reason — workflow ends, exit 1, dashboard ❌.
+  - name: abort_unsafe
+    type: terminate
+    status: failed
+    reason: "{{ precheck.output.reason }}"
+    output_template:                  # optional; replaces workflow.output
+      aborted: "true"                 # rendered then JSON-coerced to True
+      stage: precheck
+      reason: "{{ precheck.output.reason }}"
+```
+
+**Behaviour**
+
+| `status` | CLI exit code | Dashboard | Event | Resumable? |
+|----------|---------------|-----------|-------|------------|
+| `success` | `0` | ✅ | `workflow_completed { termination_reason, terminated_by, is_explicit: true, status: "success" }` | n/a (clean exit) |
+| `failed`  | `1` | ❌ | `workflow_failed { error_type: "WorkflowTerminated", termination_reason, terminated_by, is_explicit: true, status: "failed", output }` | **No** — explicit terminations skip the on-failure checkpoint |
+
+**Final output** — when `output_template:` is set, it *replaces* the workflow-level `output:` mapping for this termination path. Each rendered value is passed through the same JSON-coercion helper used elsewhere in the engine, so `"true"` becomes `True`, `"42"` becomes `42`, and JSON literals are parsed. When `output_template:` is omitted, the workflow-level `output:` is rendered as on any other terminal path.
+
+**Restrictions** — terminate steps cannot have `routes`, `tools`, `output`, `prompt`, `model`, `provider`, `system_prompt`, `command`, `args`, `env`, `working_dir`, `timeout`, `timeout_seconds`, `max_session_seconds`, `max_agent_iterations`, `max_depth`, `retry`, `dialog`, `reasoning`, `workflow`, `input_mapping`, or `options`. They cannot appear as members of a parallel group or as a `for_each` inline agent — route to them from those groups' `routes:` instead.
+
+**Sub-workflow boundary** — a `status: failed` terminate inside a sub-workflow is downgraded to a `SubworkflowTerminatedError` (subclass of `ExecutionError`) at the parent boundary so the parent treats it as a normal sub-workflow failure (its own `workflow_failed` does NOT inherit `is_explicit: true`). The child's rendered output, reason, and terminate step name are preserved on the wrapper as `terminated_output`, `terminated_reason`, and `terminated_by` for `on_error` hooks and debugging surfaces. A `status: success` terminate inside a sub-workflow returns its rendered output cleanly and the parent continues with its next routes.
+
+See [`examples/terminate.yaml`](../examples/terminate.yaml) for a complete worked example with all three paths.
+
 ### Dialog Mode
 
 Dialog mode allows agents to conditionally pause after execution and enter a free-form conversation with the user. An LLM evaluator examines the agent's output against user-defined criteria and decides whether to initiate a dialog.
@@ -401,7 +643,7 @@ After the conversation, the agent re-executes with the dialog transcript as addi
 | `dialog.trigger_prompt` | string | Yes | Criteria for the LLM evaluator to decide when dialog is needed |
 
 **Behavior notes:**
-- Dialog is supported on regular `agent` type only (not `human_gate`, `script`, or `workflow`)
+- Dialog is supported on regular `agent` type only (not `human_gate`, `script`, `workflow`, or `wait`)
 - In web dashboard mode, the dialog temporarily replaces the graph area with a chat interface
 - When `--skip-gates` is set (e.g., CI/automation), dialogs are automatically skipped
 - The evaluator prompt should describe *when* to trigger dialog, not *what* to ask — the evaluator generates the opening question from the agent's output context
@@ -695,6 +937,7 @@ workflow:
 - Each agent execution counts as 1 iteration
 - Parallel agents count individually (3 parallel agents = 3 iterations)
 - Loop-back patterns increment the counter on each iteration
+- Script steps and wait steps each count as 1 iteration
 
 ### Timeout Behavior
 

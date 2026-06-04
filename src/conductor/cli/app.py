@@ -18,6 +18,7 @@ from rich.panel import Panel
 from rich.text import Text
 
 from conductor import __version__
+from conductor.exceptions import WorkflowTerminated
 
 logger = logging.getLogger(__name__)
 
@@ -153,6 +154,48 @@ def print_error(error: Exception) -> None:
             padding=(1, 2),
         )
         console.print(panel)
+
+
+def _abort_web_bg_if_human_gate(workflow_path: Path, *, skip_gates: bool) -> None:
+    """Reject ``--web-bg`` when the workflow has a ``human_gate`` agent.
+
+    Without this check, ``--web-bg`` forks a detached child whose stdin is
+    redirected to ``DEVNULL``; ``Prompt.ask`` then raises ``EOFError`` and
+    the parent only reports ``"Background process exited immediately"``,
+    which never mentions ``human_gate`` or ``--skip-gates``. Failing fast
+    in the parent process produces a single visible error on the user's
+    terminal. ``--skip-gates`` is a documented escape hatch and is honored.
+    """
+    if skip_gates:
+        return
+    try:
+        from conductor.config.loader import load_config
+
+        config = load_config(workflow_path)
+    except Exception:  # noqa: BLE001 — defer real validation to the loader path
+        # If config fails to load, let the normal run path surface the error.
+        return
+    has_gate = any(getattr(a, "type", None) == "human_gate" for a in config.agents) or any(
+        getattr(getattr(fe, "agent", None), "type", None) == "human_gate" for fe in config.for_each
+    )
+    if not has_gate:
+        return
+    # Emit via plain typer.echo (not typer.BadParameter) so the message renders
+    # verbatim — BadParameter is rendered as a Rich panel whose text wrapping
+    # can split long flag names like ``--skip-gates`` across border lines in
+    # narrow terminals (e.g. CI runners), hiding the remediation hint.
+    message = (
+        "Error: --web-bg is incompatible with workflows that contain human_gate "
+        "steps because the detached process has no stdin to prompt on.\n"
+        "\n"
+        "Options:\n"
+        "  1. Use --web (foreground) instead of --web-bg\n"
+        "  2. Add --skip-gates to auto-accept the first option\n"
+        "  3. Remove human_gate steps from the workflow\n"
+        "  4. Wait for CLI gate-resolution support (planned follow-up)"
+    )
+    typer.echo(message, err=True)
+    raise typer.Exit(code=2)
 
 
 def version_callback(value: bool) -> None:
@@ -419,6 +462,7 @@ def run(
 
     # Handle --web-bg: fork a background process and exit immediately
     if web_bg:
+        _abort_web_bg_if_human_gate(workflow_path, skip_gates=skip_gates)
         from conductor.cli.bg_runner import launch_background
 
         try:
@@ -468,6 +512,27 @@ def run(
         # Output as JSON to stdout
         output_console.print_json(json.dumps(result))
 
+    except WorkflowTerminated as e:
+        # Explicit `type: terminate` with `status: failed`. Print the
+        # rendered final output so downstream tooling can read it, surface
+        # the reason (and optional suggestion) as a user-facing message,
+        # then exit non-zero. `default=str` keeps the JSON dump robust
+        # against any output value that isn't directly JSON-serialisable —
+        # today everything goes through `_maybe_parse_json` so it round-
+        # trips, but a future custom Jinja filter or output_template
+        # transform could produce a non-trivial Python object that would
+        # otherwise crash the CLI here and lose the termination message.
+        try:
+            output_console.print_json(json.dumps(e.output, default=str))
+        except (TypeError, ValueError) as json_exc:
+            logger.exception("Failed to serialise terminate output")
+            console.print(
+                f"[yellow]Warning:[/yellow] could not serialise terminate output: {json_exc}"
+            )
+        console.print(f"[red]Workflow terminated[/red] at '{e.terminated_by}': {e.reason}")
+        if e.suggestion:
+            console.print(f"[dim]Suggestion: {e.suggestion}[/dim]")
+        raise typer.Exit(code=1) from None
     except Exception as e:
         print_error(e)
         raise typer.Exit(code=1) from None
@@ -833,6 +898,25 @@ def resume(
 
     # Handle --web-bg: fork a background process and exit immediately
     if web_bg:
+        # When the user resumes via --from <checkpoint> alone (no workflow
+        # argument), resolved_workflow is None but the checkpoint records the
+        # original workflow path. Read it so the human_gate guard still fires
+        # and the user gets a single visible error instead of a silent crash
+        # in the detached child.
+        gate_check_workflow: Path | None = resolved_workflow
+        if gate_check_workflow is None and resolved_checkpoint is not None:
+            try:
+                ckpt_data = json.loads(resolved_checkpoint.read_text(encoding="utf-8"))
+                ckpt_workflow = ckpt_data.get("workflow_path")
+                if isinstance(ckpt_workflow, str):
+                    candidate = Path(ckpt_workflow)
+                    if candidate.exists():
+                        gate_check_workflow = candidate
+            except (OSError, json.JSONDecodeError):
+                # Checkpoint unreadable — let the normal resume path surface it.
+                pass
+        if gate_check_workflow is not None:
+            _abort_web_bg_if_human_gate(gate_check_workflow, skip_gates=skip_gates)
         from conductor.cli.bg_runner import launch_background_resume
 
         try:
@@ -876,6 +960,20 @@ def resume(
         # Output as JSON to stdout
         output_console.print_json(json.dumps(result))
 
+    except WorkflowTerminated as e:
+        # Mirror of the `run` handler — see commentary there for the
+        # `default=str` and `try/except` rationale.
+        try:
+            output_console.print_json(json.dumps(e.output, default=str))
+        except (TypeError, ValueError) as json_exc:
+            logger.exception("Failed to serialise terminate output")
+            console.print(
+                f"[yellow]Warning:[/yellow] could not serialise terminate output: {json_exc}"
+            )
+        console.print(f"[red]Workflow terminated[/red] at '{e.terminated_by}': {e.reason}")
+        if e.suggestion:
+            console.print(f"[dim]Suggestion: {e.suggestion}[/dim]")
+        raise typer.Exit(code=1) from None
     except Exception as e:
         print_error(e)
         raise typer.Exit(code=1) from None

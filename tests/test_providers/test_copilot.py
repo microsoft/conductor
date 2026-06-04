@@ -643,6 +643,33 @@ class TestExtractJson:
         with pytest.raises(ValueError):
             provider._extract_json('{"key": "missing end brace"')
 
+    def test_extract_json_with_triple_backticks_inside_string(self) -> None:
+        """Triple-backticks inside a string field must not truncate the JSON.
+
+        Mirrors the parser fix in executor.output.parse_json_output — the
+        greedy fallback closes at the LAST fence in the response.
+        """
+        provider = CopilotProvider(mock_handler=stub_handler)
+
+        raw = '```json\n{"code": "use ```fenced``` blocks", "n": 1}\n```'
+        result = provider._extract_json(raw)
+
+        assert result == {"code": "use ```fenced``` blocks", "n": 1}
+
+    def test_extract_json_with_multiple_fenced_blocks_first_wins(self) -> None:
+        """When the response contains multiple fenced JSON blocks, the first
+        valid block wins.
+
+        Pins the behavior for the multi-block trade-off raised in PR review:
+        try each non-greedy candidate in order and return the first parse.
+        """
+        provider = CopilotProvider(mock_handler=stub_handler)
+
+        raw = '```json\n{"a": 1}\n```\n\nupdated answer:\n\n```json\n{"a": 2}\n```'
+        result = provider._extract_json(raw)
+
+        assert result == {"a": 1}
+
 
 class TestLogParseRecovery:
     """Tests for parse recovery logging."""

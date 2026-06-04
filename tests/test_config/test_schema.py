@@ -375,7 +375,8 @@ class TestRuntimeConfig:
     def test_default_values(self) -> None:
         """Test default runtime configuration."""
         config = RuntimeConfig()
-        assert config.provider == "copilot"
+        assert config.provider.name == "copilot"
+        assert not config.provider.has_custom_routing()
         assert config.default_model is None
         assert config.temperature is None
         assert config.max_tokens is None
@@ -384,7 +385,7 @@ class TestRuntimeConfig:
     def test_custom_provider(self) -> None:
         """Test custom provider setting."""
         config = RuntimeConfig(provider="openai-agents", default_model="gpt-4")
-        assert config.provider == "openai-agents"
+        assert config.provider.name == "openai-agents"
         assert config.default_model == "gpt-4"
 
     def test_invalid_provider_raises(self) -> None:
@@ -395,7 +396,7 @@ class TestRuntimeConfig:
     def test_claude_provider_with_temperature(self) -> None:
         """Test Claude provider with temperature setting."""
         config = RuntimeConfig(provider="claude", temperature=0.7)
-        assert config.provider == "claude"
+        assert config.provider.name == "claude"
         assert config.temperature == 0.7
 
     def test_temperature_boundary_values(self) -> None:
@@ -463,7 +464,7 @@ class TestRuntimeConfig:
             max_tokens=4096,
             timeout=120.0,
         )
-        assert config.provider == "claude"
+        assert config.provider.name == "claude"
         assert config.default_model == "claude-3-5-sonnet-latest"
         assert config.temperature == 0.7
         assert config.max_tokens == 4096
@@ -588,7 +589,7 @@ class TestWorkflowDef:
         workflow = WorkflowDef(name="test", entry_point="agent1")
         assert workflow.name == "test"
         assert workflow.entry_point == "agent1"
-        assert workflow.runtime.provider == "copilot"
+        assert workflow.runtime.provider.name == "copilot"
 
     def test_full_workflow(self) -> None:
         """Test fully configured workflow definition."""
@@ -1522,3 +1523,176 @@ class TestExtraFieldsForbidden:
         assert any(err["type"] == "extra_forbidden" and "whn" in err["loc"] for err in errors), (
             f"Expected extra_forbidden error for 'whn', got: {errors}"
         )
+
+
+class TestTerminateAgent:
+    """Tests for ``type: terminate`` step schema validation (issue #219).
+
+    Terminate steps are terminal nodes that end the workflow with an explicit
+    ``status`` and ``reason``. The schema must:
+
+    - Accept ``status`` (``success`` | ``failed``), ``reason``, and optional
+      ``output_template`` only when ``type == "terminate"``.
+    - Reject those fields on any other step type (avoids silent misuse on a
+      regular agent).
+    - Reject every field that doesn't make sense for a terminal step (routes,
+      tools, output, prompt, model, provider, etc.) so authoring errors fail
+      fast.
+    """
+
+    def test_valid_terminate_success(self) -> None:
+        a = AgentDef(name="ok", type="terminate", status="success", reason="done")
+        assert a.type == "terminate"
+        assert a.status == "success"
+        assert a.reason == "done"
+        assert a.output_template is None
+
+    def test_valid_terminate_failed_with_output_template(self) -> None:
+        a = AgentDef(
+            name="abort",
+            type="terminate",
+            status="failed",
+            reason="Refusing to run on unsafe input",
+            output_template={"result": "aborted", "reason": "{{ precheck.output.reason }}"},
+        )
+        assert a.status == "failed"
+        assert a.output_template == {
+            "result": "aborted",
+            "reason": "{{ precheck.output.reason }}",
+        }
+
+    def test_missing_status_rejected(self) -> None:
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(name="x", type="terminate", reason="needed")
+        assert "status" in str(exc_info.value).lower()
+
+    def test_missing_reason_rejected(self) -> None:
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(name="x", type="terminate", status="success")
+        assert "reason" in str(exc_info.value).lower()
+
+    def test_empty_reason_rejected(self) -> None:
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(name="x", type="terminate", status="success", reason="   ")
+        assert "reason" in str(exc_info.value).lower()
+
+    def test_invalid_status_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            AgentDef(name="x", type="terminate", status="maybe", reason="x")
+
+    def test_routes_rejected_on_terminate(self) -> None:
+        """Terminate ends the workflow; outbound routes would be unreachable."""
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(
+                name="x",
+                type="terminate",
+                status="success",
+                reason="r",
+                routes=[RouteDef(to="$end")],
+            )
+        assert "routes" in str(exc_info.value).lower()
+
+    def test_tools_rejected_on_terminate(self) -> None:
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(name="x", type="terminate", status="success", reason="r", tools=["foo"])
+        assert "tools" in str(exc_info.value).lower()
+
+    def test_output_rejected_on_terminate(self) -> None:
+        """`output:` is for agent schemas; terminate uses `output_template:` instead."""
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(
+                name="x",
+                type="terminate",
+                status="success",
+                reason="r",
+                output={"k": OutputField(type="string")},
+            )
+        assert "output" in str(exc_info.value).lower()
+
+    def test_prompt_rejected_on_terminate(self) -> None:
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(name="x", type="terminate", status="success", reason="r", prompt="hi")
+        assert "prompt" in str(exc_info.value).lower()
+
+    def test_model_rejected_on_terminate(self) -> None:
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(name="x", type="terminate", status="success", reason="r", model="claude")
+        assert "model" in str(exc_info.value).lower()
+
+    def test_command_rejected_on_terminate(self) -> None:
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(name="x", type="terminate", status="success", reason="r", command="echo")
+        assert "command" in str(exc_info.value).lower()
+
+    def test_workflow_rejected_on_terminate(self) -> None:
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(
+                name="x",
+                type="terminate",
+                status="success",
+                reason="r",
+                workflow="./sub.yaml",
+            )
+        assert "workflow" in str(exc_info.value).lower()
+
+    @pytest.mark.parametrize("forbidden_field", ["status", "reason", "output_template"])
+    def test_terminate_fields_rejected_on_regular_agent(self, forbidden_field: str) -> None:
+        """`status`, `reason`, `output_template` only make sense on `type: terminate`.
+
+        Without this guard, an author who forgot to add `type: terminate` would
+        silently get a regular agent that ignores these fields entirely — a
+        subtle bug that breaks the workflow without any error surfaced.
+        """
+        payload: dict[str, object] = {"name": "a"}
+        if forbidden_field == "output_template":
+            payload[forbidden_field] = {"k": "{{ a.output }}"}
+        else:
+            payload[forbidden_field] = "success" if forbidden_field == "status" else "r"
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef.model_validate(payload)
+        assert forbidden_field in str(exc_info.value)
+
+    @pytest.mark.parametrize("step_type", ["script", "workflow", "human_gate"])
+    @pytest.mark.parametrize(
+        "forbidden_field,field_value",
+        [
+            ("status", "success"),
+            ("reason", "halt"),
+            ("output_template", {"k": "{{ a.output }}"}),
+        ],
+    )
+    def test_terminate_fields_rejected_on_other_step_types(
+        self, step_type: str, forbidden_field: str, field_value: object
+    ) -> None:
+        """The terminate-only-fields guard must trip for every non-terminate type
+        and every terminate-exclusive field — not just `status`.
+
+        Earlier iteration of this test only varied ``step_type`` and asserted on
+        ``status``. A bug in ``validate_agent_type`` that, say, rejected only
+        ``status`` on ``script`` agents but silently accepted ``reason`` and
+        ``output_template`` would have slipped through. Cross-product the
+        parametrisation so every (step_type, terminate-field) pair is exercised.
+        """
+        payload: dict[str, object] = {"name": "a", "type": step_type}
+        if step_type == "script":
+            payload["command"] = "echo"
+        elif step_type == "workflow":
+            payload["workflow"] = "./sub.yaml"
+        elif step_type == "human_gate":
+            payload["prompt"] = "Pick"
+            payload["options"] = [GateOption(value="x", label="X", route="$end")]
+        payload[forbidden_field] = field_value
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef.model_validate(payload)
+        assert forbidden_field in str(exc_info.value)
+
+    def test_input_allowed_on_terminate(self) -> None:
+        """Terminate steps may declare context inputs to drive Jinja rendering."""
+        a = AgentDef(
+            name="x",
+            type="terminate",
+            status="success",
+            reason="{{ precheck.output.reason }}",
+            input=["precheck.output"],
+        )
+        assert a.input == ["precheck.output"]

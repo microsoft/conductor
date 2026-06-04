@@ -5,7 +5,187 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.17...HEAD)
+## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.18...HEAD)
+
+### Fixed
+
+- `human_gate` agents: the dict returned by `prompt_for` text-collection fields
+  is no longer spread into the gate's output root, where it could silently
+  overwrite the reserved `selected` key (e.g. an option declaring
+  `prompt_for: selected` would clobber the chosen option value with whatever
+  the user typed). Collected values are now nested under an explicit
+  `additional_input` key, matching the shape the `gate_resolved` event already
+  used. ([#237](https://github.com/microsoft/conductor/pull/237))
+
+### Changed
+
+- **BREAKING (templates)** — `human_gate` output shape changed.
+  - Before: `{{ <gate>.output.<prompt_for_field> }}` (root-level).
+  - After: `{{ <gate>.output.additional_input.<prompt_for_field> }}` (nested).
+  - Gates without any `prompt_for` now produce `additional_input: {}` rather
+    than just `{"selected": ...}` — the key is always present.
+  - `<gate>.output.selected` is unchanged.
+  - Templates that referenced the old flat path now raise `TemplateError`
+    (`StrictUndefined`), so the migration fails loudly rather than rendering
+    to empty strings.
+  - In `context: explicit` mode, `input:` declarations support
+    `<gate>.output.additional_input` (the parent dict) but not the dotted
+    shorthand `<gate>.output.additional_input.<field>`. Declare the parent
+    and read individual fields via Jinja2 in the consuming agent's prompt or
+    output template.
+
+## [0.1.18](https://github.com/microsoft/conductor/compare/v0.1.17...v0.1.18) - 2026-05-28
+
+### Added
+- New `type: set` workflow step that evaluates Jinja2 expressions and binds
+  the results into the workflow context — no LLM call, no subprocess, no I/O.
+  Two surface forms: `value:` (single expression bound as `<step>.output`,
+  scalar / list / dict by auto-detection or explicit `output_type:`) and
+  `values:` (named bindings rendered in one pass against the pre-step context
+  and bound as `<step>.output.<key>`). Type detection defaults to YAML
+  auto-parsing with a JSON-safety pass that converts `datetime`/`date`/`time`
+  to ISO 8601 strings and raises `ExecutionError` on other non-JSON-safe
+  values (including non-string dict keys) so checkpoint round-trips stay
+  stable. Explicit `output_type:` (single-`value` only) supports `string`,
+  `number`, `integer`, `boolean`, `list`, `dict`. The engine dispatches set
+  steps in the main loop, parallel groups, and for-each groups via the
+  shared `_run_set_step` helper, emitting `set_started` / `set_completed` /
+  `set_failed` and enforcing the `output:` schema (rejected for scalar
+  outputs with a friendly suggestion). `WorkflowContext.store` was widened
+  to accept any JSON-safe value; `_add_agent_input` returns scalars verbatim
+  for `step.output` and raises a clear `KeyError` for `step.output.field`
+  shorthand on non-dict outputs. The web dashboard adds a dedicated `SetNode`
+  (variable icon, key count / value preview) and `SetDetail` panel showing
+  output type, bindings, and rendered value. New `examples/set-step.yaml`
+  demonstrates single + multi binding plus a boolean route on the derived
+  flag
+  ([#226](https://github.com/microsoft/conductor/pull/226),
+  closes [#221](https://github.com/microsoft/conductor/issues/221)).
+- New `type: wait` workflow step that pauses execution for a parsed
+  duration via in-process `asyncio.sleep`. Cross-platform — no shell
+  `sleep` dependency. Use for rate-limit cooldowns, polling intervals,
+  external-system catch-up, and demos. The `duration:` field accepts
+  plain numbers (seconds), suffixed strings (`"500ms"`, `"60s"`,
+  `"2.5m"`, `"1h"`), or a Jinja2 template that renders to one of
+  those (e.g. `"{{ workflow.input.poll_interval }}s"`). Schema enforces
+  `0 < duration <= 24h` and rejects boolean values pre-coercion.
+  `Esc` / `Ctrl+G` cancels in-progress waits immediately (the engine
+  races the sleep against the interrupt event), and the workflow-level
+  `limits.timeout_seconds` also cancels them. Wait steps emit
+  `wait_started` / `wait_completed` / `wait_failed` events alongside
+  the generic `agent_started` (with `agent_type: "wait"`), so existing
+  dashboards keyed on agent lifecycle pick them up automatically. The
+  dashboard adds a dedicated `WaitNode` (clock icon) and `WaitDetail`
+  panel that show the requested duration, actual elapsed time, reason,
+  and an "interrupted" indicator. The public output contract is strict
+  — only `{"waited_seconds": float}` is exposed to workflow context;
+  extra metadata lives in event payloads. Wait steps count toward
+  `limits.max_iterations` (each pause is one step) but are not subject
+  to `max_agent_iterations` (per-LLM-agent tool counter). Wait cannot
+  be used inside `parallel` or `for_each` groups. New `examples/wait-step.yaml`
+  demonstrates a polling pattern with a templated poll interval and
+  route loop-back
+  ([#224](https://github.com/microsoft/conductor/pull/224),
+  closes [#218](https://github.com/microsoft/conductor/issues/218)).
+- New `type: terminate` workflow step that explicitly ends the workflow with
+  a structured `status` (`success` | `failed`) and Jinja2-rendered `reason`,
+  plus an optional `output_template` (`dict[str, str]`) that replaces the
+  workflow-level `output:` mapping for that termination path. Reaching a
+  terminate step ends the workflow immediately (no routes evaluated after).
+  `status: success` returns the rendered output cleanly (CLI exit 0,
+  dashboard ✅, emits `workflow_completed { termination_reason, terminated_by,
+  is_explicit: true, status: "success" }`); `status: failed` raises a new
+  `WorkflowTerminated` exception (`ExecutionError` subclass), gives the CLI a
+  non-zero exit code while still printing the rendered output JSON to stdout
+  for downstream tooling, and intentionally **skips** the on-failure
+  checkpoint save because explicit termination is not a resumable transient
+  failure. Inside a sub-workflow, a failed terminate is downgraded at the
+  parent boundary to a new `SubworkflowTerminatedError` (also an
+  `ExecutionError`) preserving the child's rendered `terminated_output` /
+  `terminated_reason` / `terminated_by` as structured attributes, so the
+  parent treats it as a normal sub-workflow failure (its own
+  `workflow_failed` does NOT inherit `is_explicit: true`) while debugging
+  surfaces can still inspect what the child intended to emit. Schema
+  validation rejects `routes`, `tools`, `output`, `prompt`, `model`,
+  `provider`, and the other agent-only fields on terminate steps, and
+  conversely rejects `status` / `reason` / `output_template` on every other
+  step type so authors who forget `type: terminate` get a clear error
+  instead of silently dropped fields. Terminate cannot be used as a
+  parallel-group member or as a `for_each` inline agent — route to one
+  from those groups' `routes:` instead. The example workflow lives at
+  `examples/terminate.yaml`
+  ([#219](https://github.com/microsoft/conductor/issues/219)).
+- `runtime.provider` now accepts either the bare string shorthand
+  (`provider: copilot`) or a structured `ProviderSettings` object that
+  forwards a `ProviderConfig` to the Copilot SDK's
+  `create_session(provider=…)` parameter. This lets workflows route the
+  Copilot SDK at OpenAI-compatible / Azure / Anthropic endpoints —
+  Ollama, vLLM, LM Studio, Azure OpenAI, llamafile, or any other
+  OpenAI-compatible REST endpoint — instead of being locked to the
+  GitHub Copilot service. The structured form supports `name`, `type`
+  (`openai`|`azure`|`anthropic`), `wire_api`
+  (`completions`|`responses`), `base_url`, `api_key`, `bearer_token`,
+  `headers`, and `azure.api_version`. `api_key` and `bearer_token` are
+  Pydantic `SecretStr` (redacted in `model_dump`, dashboard payloads,
+  event logs, and checkpoints). Custom routing activates only when YAML
+  sets at least one non-`name` field — ambient `OPENAI_*` env vars
+  never divert default routing on their own. Once activated, missing
+  fields fall back from `COPILOT_PROVIDER_BASE_URL` → `OPENAI_BASE_URL`
+  for `base_url`, `COPILOT_PROVIDER_API_KEY` for `api_key`, and
+  `COPILOT_PROVIDER_BEARER_TOKEN` for `bearer_token`. Ambient
+  `OPENAI_API_KEY` is intentionally NOT consulted as an implicit
+  fallback (credential-leak risk); use `api_key: ${OPENAI_API_KEY}`
+  YAML interpolation for explicit opt-in. The schema rejects every
+  non-`name` field when `name != "copilot"` (structured config for
+  Claude / openai-agents is a follow-up), and rejects anchorless or
+  empty combinations (`wire_api` / `type` / `headers` / `azure` alone,
+  empty `headers`, empty `SecretStr`, empty `azure` block) so silent
+  no-ops cannot reach the SDK. Custom routing applies to both agent
+  execution and dialog turns so all sessions hit the same endpoint.
+  See `examples/copilot-local-llm.yaml` and
+  [Configuration → Custom Provider Routing](docs/configuration.md#custom-provider-routing-ollama--vllm--azure-openai)
+  ([#225](https://github.com/microsoft/conductor/pull/225),
+  [#136](https://github.com/microsoft/conductor/issues/136)).
+
+### Fixed
+- `_verbose_console` is now silent-aware at the source: a `_SilentAwareConsole`
+  subclass no-ops every `.print(...)` when `is_verbose()` is False, so the
+  remaining `conductor --silent` stderr leaks (dashboard-failed-to-start and
+  log-file-open warnings, workflow-hash mismatch, "Press Esc to interrupt",
+  "Event log written to…", "Log written to…", `_print_resume_instructions`,
+  and the replay command's "Press Ctrl+C to exit" / "Replay stopped"
+  banners) no longer reach stderr. The app-wide `console` remains
+  unchanged because it carries real error messages; the two replay prints
+  are gated per-call. `conductor --silent replay <log>` now produces zero
+  bytes on stderr
+  ([#223](https://github.com/microsoft/conductor/pull/223),
+  closes [#209](https://github.com/microsoft/conductor/issues/209)).
+- `parse_json_output` and the Copilot provider's `_extract_json` now use a
+  two-stage fenced-block extraction (non-greedy `re.findall` + per-candidate
+  try-parse, then a greedy single-capture fallback) so JSON whose string
+  fields contain triple-backtick substrings no longer matches prematurely
+  and falls into parse-recovery loops, while responses with multiple
+  fenced JSON blocks still pick the first valid one. Resolves a recurring
+  failure mode for agents emitting Markdown-bearing JSON
+  (external-workflow-friction Issue #1)
+  ([#232](https://github.com/microsoft/conductor/pull/232)).
+- `conductor run --web-bg` and `conductor resume --web-bg` now abort before
+  forking when the workflow contains a `human_gate` agent (including gates
+  nested in `for_each.agent`) and `--skip-gates` is not set, with a message
+  listing the four supported options. `resume --web-bg` also recovers the
+  workflow path from the checkpoint when invoked without an explicit
+  workflow argument so the guard still fires. Previously the detached
+  child crashed with `EOFError` and the parent only reported
+  "Background process exited immediately with code 1" (Issue #8).
+
+### Documentation
+- New "Choosing whether to declare `output:`" section in
+  [docs/workflow-syntax.md](docs/workflow-syntax.md) describing when to declare
+  a schema versus consuming raw `<agent>.output.result` for prose or large
+  JSON. Closes a documentation gap that contributed to misconfiguration of
+  agents emitting large payloads (Issue #2).
+- `docs/cli-reference.md` `--web-bg` section now documents the `human_gate`
+  incompatibility and the new pre-fork validation behavior.
 
 ## [0.1.17](https://github.com/microsoft/conductor/compare/v0.1.16...v0.1.17) - 2026-05-21
 

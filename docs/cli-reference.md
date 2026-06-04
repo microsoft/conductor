@@ -26,7 +26,7 @@ conductor run <workflow.yaml> [OPTIONS]
 | `--metadata KEY=VALUE` | `-m` | Workflow metadata (repeatable). Merged on top of YAML `metadata:` and surfaced in the `workflow_started` event. |
 | `--workspace-instructions` | | Auto-discover convention files (`AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md`, and `.github/instructions/**/*.instructions.md`) by walking from CWD up to the git root. Concatenated and prepended to every agent's prompt. See [Workspace Instructions](#workspace-instructions) below for details on the `.github/instructions/` directory convention. |
 | `--instructions PATH` | | Explicit path to an instructions file (repeatable). Combines with auto-discovered files when both flags are used. |
-| `--provider PROVIDER` | `-p` | Override provider (copilot, claude) |
+| `--provider PROVIDER` | `-p` | Override provider (copilot, claude, claude-agent-sdk) |
 | `--dry-run` | | Show execution plan without running |
 | `--skip-gates` | | Auto-select first option at human gates |
 | `--quiet` | `-q` | Minimal output (agent lifecycle and routing only) |
@@ -97,6 +97,19 @@ The `--web` flag starts a real-time browser dashboard showing:
 The `--web-bg` flag is a convenience shortcut: it forks a background process running the workflow with the dashboard, prints the URL, and exits the CLI immediately. The background process shuts down automatically after the workflow completes and all browser clients disconnect.
 
 `--web` and `--web-bg` are mutually exclusive.
+
+**`--web-bg` and `human_gate`** — `--web-bg` is incompatible with workflows
+that contain `human_gate` agents (unless `--skip-gates` is also passed),
+because the detached background process has no stdin to prompt on and the
+child would crash with `EOFError` mid-run. Conductor detects this at
+load time and aborts before forking, with a message listing the options:
+
+1. Use `--web` (foreground) instead of `--web-bg`
+2. Add `--skip-gates` to auto-select the first option at every gate
+3. Remove `human_gate` steps from the workflow
+4. Wait for CLI gate-resolution support (planned follow-up)
+
+The same check applies to `conductor resume --web-bg`.
 
 Background workflows can be stopped with `conductor stop` (see below) or via the stop button in the web dashboard.
 

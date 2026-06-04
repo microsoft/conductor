@@ -15,7 +15,7 @@ if TYPE_CHECKING:
     from conductor.config.schema import AgentDef, WorkflowConfig
 
 
-ProviderType = Literal["copilot", "openai-agents", "claude", "pydantic-deep"]
+ProviderType = Literal["copilot", "openai-agents", "claude", "pydantic-deep", "claude-agent-sdk"]
 
 
 class ProviderRegistry:
@@ -55,7 +55,7 @@ class ProviderRegistry:
         self._mcp_servers = mcp_servers
         self._skill_directories = skill_directories
         self._providers: dict[ProviderType, AgentProvider] = {}
-        self._default_provider_type: ProviderType = config.workflow.runtime.provider
+        self._default_provider_type: ProviderType = config.workflow.runtime.provider.name
         self._resume_session_ids: dict[str, str] = {}
 
     @property
@@ -112,6 +112,11 @@ class ProviderRegistry:
 
         # Create the provider with runtime config
         runtime = self._config.workflow.runtime
+        # Only forward structured provider settings to the matching
+        # provider — settings for Copilot must not bleed into a per-agent
+        # Claude override (and vice versa once Claude grows its own
+        # structured config).
+        provider_settings = runtime.provider if runtime.provider.name == provider_type else None
         provider = await create_provider(
             provider_type=provider_type,
             validate=True,
@@ -124,6 +129,7 @@ class ProviderRegistry:
             max_agent_iterations=runtime.max_agent_iterations,
             default_reasoning_effort=runtime.default_reasoning_effort,
             skill_directories=self._skill_directories,
+            provider_settings=provider_settings,
         )
 
         # Pass stored resume session IDs to newly created providers

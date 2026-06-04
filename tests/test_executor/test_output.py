@@ -269,3 +269,29 @@ class TestParseJsonOutput:
 
         assert result["person"]["name"] == "Alice"
         assert result["person"]["tags"] == ["dev", "py"]
+
+    def test_parse_json_with_triple_backticks_inside_string(self) -> None:
+        """Triple-backticks inside a string field must not truncate the JSON.
+
+        Reproduces brainstorm Issue #1: the non-greedy fence-extraction regex
+        closed at the first inner ``` instead of the actual closing fence,
+        producing invalid JSON and triggering parse-recovery loops.
+        """
+        raw = '```json\n{"code": "use ```fenced``` blocks", "n": 1}\n```'
+        result = parse_json_output(raw)
+
+        assert result == {"code": "use ```fenced``` blocks", "n": 1}
+
+    def test_parse_json_with_multiple_fenced_blocks_first_wins(self) -> None:
+        """When the response contains multiple fenced JSON blocks, the first
+        valid block wins.
+
+        Pins the behavior chosen for the multi-block trade-off raised in PR
+        review (greedy regex would have captured everything between the first
+        and last fence and failed to parse). The current implementation tries
+        each non-greedy candidate in order and returns the first that parses.
+        """
+        raw = '```json\n{"a": 1}\n```\n\nupdated answer:\n\n```json\n{"a": 2}\n```'
+        result = parse_json_output(raw)
+
+        assert result == {"a": 1}

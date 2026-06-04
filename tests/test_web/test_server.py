@@ -1110,7 +1110,7 @@ class TestReplaySyntheticFromContext:
     """Tests for WebDashboard.replay_synthetic_from_context (issue #167 fallback)."""
 
     def _build_config(self):
-        """Build a minimal WorkflowConfig with one agent + one script for tests."""
+        """Build a minimal WorkflowConfig with one agent + one script + one wait for tests."""
         from conductor.config.schema import AgentDef, RuntimeConfig, WorkflowConfig, WorkflowDef
 
         return WorkflowConfig(
@@ -1122,6 +1122,7 @@ class TestReplaySyntheticFromContext:
             agents=[
                 AgentDef(name="a", prompt="x", routes=[]),
                 AgentDef(name="s", type="script", command="echo hi", routes=[]),
+                AgentDef(name="w", type="wait", duration="5s", reason="cooldown", routes=[]),
             ],
         )
 
@@ -1155,6 +1156,36 @@ class TestReplaySyntheticFromContext:
         types = [ev["type"] for ev in dashboard._event_history]
         assert types == ["script_started", "script_completed"]
         assert dashboard._event_history[1]["data"]["stdout"] == "hi"
+
+    def test_emits_wait_events_for_wait_type(self) -> None:
+        """Wait steps replay via _synth_agent_or_script's wait branch
+        (issue #218). The synthetic event pair must use the
+        wait_started/wait_completed names, propagate the persisted
+        waited_seconds, carry the AgentDef's reason, and mark
+        ``synthetic: True`` so the UI can identify replayed state."""
+        from conductor.engine.context import WorkflowContext
+
+        emitter, dashboard = _make_dashboard()
+        ctx = WorkflowContext()
+        ctx.store("w", {"waited_seconds": 3.5})
+
+        count = dashboard.replay_synthetic_from_context(ctx, self._build_config())
+
+        assert count == 2
+        types = [ev["type"] for ev in dashboard._event_history]
+        assert types == ["wait_started", "wait_completed"]
+        started = dashboard._event_history[0]["data"]
+        completed = dashboard._event_history[1]["data"]
+        assert started["agent_name"] == "w"
+        assert started["duration_seconds"] == 3.5
+        assert started["reason"] == "cooldown"
+        assert started["synthetic"] is True
+        assert completed["agent_name"] == "w"
+        assert completed["waited_seconds"] == 3.5
+        assert completed["requested_seconds"] == 3.5
+        assert completed["reason"] == "cooldown"
+        assert completed["interrupted"] is False
+        assert completed["synthetic"] is True
 
     def test_empty_history_returns_zero(self) -> None:
         from conductor.engine.context import WorkflowContext
@@ -1277,3 +1308,59 @@ class TestPrependWorkflowStarted:
         assert dashboard._event_history[0]["data"]["name"] == "wf"
         # Should be carry a timestamp.
         assert isinstance(dashboard._event_history[0]["timestamp"], float)
+
+
+class TestSyntheticReplaySetStep:
+    """Coverage for ``WebDashboard._synth_agent_or_script`` set branch.
+
+    The synthetic replay path emits ``set_started``/``set_completed`` events
+    when restoring agent_outputs from a checkpoint on resume. The payload
+    shape must match what the live engine emits so the dashboard renders
+    consistently in both cases.
+    """
+
+    def _set_agent(self, *, output_type: str | None = None) -> object:
+        """Build a minimal AgentDef-like duck typed object."""
+        from types import SimpleNamespace
+
+        return SimpleNamespace(type="set", output_type=output_type)
+
+    def test_scalar_output_synthesises_set_events(self) -> None:
+        agent = self._set_agent()
+        started_type, started, completed_type, completed = WebDashboard._synth_agent_or_script(
+            "compute", agent, "microsoft/conductor"
+        )
+        assert started_type == "set_started"
+        assert completed_type == "set_completed"
+        assert started["agent_name"] == "compute"
+        assert started["synthetic"] is True
+        assert completed["output_keys"] == []
+        assert completed["value_repr"] == '"microsoft/conductor"'
+        assert completed["output_type"] == "auto"
+
+    def test_dict_output_carries_sorted_keys(self) -> None:
+        agent = self._set_agent()
+        _, _, _, completed = WebDashboard._synth_agent_or_script(
+            "derive", agent, {"is_breaking": True, "branch": "main"}
+        )
+        assert completed["output_keys"] == ["branch", "is_breaking"]
+        # value_repr is JSON; sort order matches dict insertion (Python 3.7+).
+        assert "is_breaking" in completed["value_repr"]
+        assert "branch" in completed["value_repr"]
+
+    def test_declared_output_type_preserved(self) -> None:
+        """When the AgentDef declares ``output_type``, the synthetic payload
+        carries that label instead of hard-coding "auto"."""
+        agent = self._set_agent(output_type="string")
+        _, _, _, completed = WebDashboard._synth_agent_or_script("label", agent, "raw text")
+        assert completed["output_type"] == "string"
+
+    def test_uses_shared_value_repr_helper(self) -> None:
+        """Value preview matches ``render_set_value_repr`` from the engine
+        emitter, so synthetic + live payloads stay in sync."""
+        from conductor.executor.set_step import render_set_value_repr
+
+        agent = self._set_agent()
+        big_value = "x" * 2000
+        _, _, _, completed = WebDashboard._synth_agent_or_script("big", agent, big_value)
+        assert completed["value_repr"] == render_set_value_repr(big_value)

@@ -1,0 +1,53 @@
+# Simple Question-Answering Workflow using Claude Agent SDK
+#
+# This example demonstrates a basic linear workflow with a single agent
+# that answers questions. It shows:
+# - Basic workflow structure
+# - Input parameters
+# - Output schema validation
+# - Simple routing to $end
+#
+# Usage:
+#   conductor run examples/test-claude-agent-sdk.yaml --input question="What is Microsoft Conductor?"
+#
+# Note: Requires Claude Code CLI installed and configured. Adjust the runtime model as needed based on your Claude Code setup.
+
+workflow:
+  name: simple-qa
+  description: A simple question-answering workflow with a single agent
+  version: "1.0.0"
+  entry_point: answerer
+  
+  runtime:
+    provider: claude-agent-sdk
+    default_model: claude-haiku-4-5@20251001 # Vertex AI naming; it depends on the backedend your Claude Code setup uses. Adjust as needed.
+        
+  input:
+    question:
+      type: string
+      required: true
+      description: The question to answer
+
+agents:
+  - name: answerer
+    description: Answers the user's question clearly and concisely
+    prompt: |
+      You are a helpful assistant and researcher. Please answer the following question 
+      clearly and concisely:
+
+      Question: {{ workflow.input.question }}
+
+      Provide a direct answer without unnecessary preamble.
+    output:
+      answer:
+        type: string
+        description: The answer to the question
+      confidence:
+        type: string
+        description: Confidence level (high, medium, low)
+    routes:
+      - to: $end
+
+output:
+  answer: "{{ answerer.output.answer }}"
+  confidence: "{{ answerer.output.confidence }}"

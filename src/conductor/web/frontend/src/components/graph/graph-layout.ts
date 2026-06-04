@@ -117,8 +117,11 @@ export function buildGraphElements(
       const nd = nodes[a.name];
       let flowNodeType = 'agentNode';
       if (nodeType === 'script') flowNodeType = 'scriptNode';
+      else if (nodeType === 'set') flowNodeType = 'setNode';
       else if (nodeType === 'human_gate') flowNodeType = 'gateNode';
       else if (nodeType === 'workflow') flowNodeType = 'workflowNode';
+      else if (nodeType === 'wait') flowNodeType = 'waitNode';
+      else if (nodeType === 'terminate') flowNodeType = 'terminateNode';
 
       flowNodes.push({
         id: a.name,

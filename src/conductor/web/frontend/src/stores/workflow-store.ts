@@ -14,6 +14,11 @@ import type {
   AgentMessageData,
   ScriptCompletedData,
   ScriptFailedData,
+  WaitStartedData,
+  WaitCompletedData,
+  WaitFailedData,
+  SetCompletedData,
+  SetFailedData,
   GatePresentedData,
   GateResolvedData,
   GateOptionDetail,
@@ -105,6 +110,16 @@ export interface NodeData {
   stdout?: string;
   stderr?: string;
   exit_code?: number;
+  // Wait-specific (issue #218)
+  duration_seconds?: number | null;
+  waited_seconds?: number;
+  requested_seconds?: number;
+  reason?: string | null;
+  interrupted?: boolean;
+  // Set-step-specific (issue #221)
+  set_output_type?: import('@/types/events').SetOutputType;
+  set_output_keys?: string[];
+  set_value_repr?: string;
   // Gate-specific
   options?: string[];
   option_details?: GateOptionDetail[];
@@ -127,6 +142,15 @@ export interface NodeData {
   dialog_messages?: Array<{ role: 'user' | 'agent'; content: string }>;
   dialog_active?: boolean;
   dialog_awaiting_response?: boolean;
+  // Terminate-specific (type: terminate steps; see issue #219)
+  termination_status?: 'success' | 'failed';
+  termination_reason?: string;
+  terminated_by?: string;
+  // Provider tier (#241) — populated from workflow_started.providers when
+  // the agent's resolved provider is experimental, so the graph can
+  // render a badge without re-derivation.
+  provider_name?: string;
+  provider_tier?: 'stable' | 'experimental' | null;
 }
 
 export interface GroupProgress {
@@ -146,7 +170,14 @@ export interface WorkflowAgent {
   type?: string;
   model?: string;
   reasoning_effort?: string | null;
+  /** Provider this agent will use at runtime. Drives the experimental
+   *  badge in the graph (#241). */
+  provider_name?: string;
 }
+
+// ProviderMetadata is defined in types/events.ts (single source of truth)
+// and re-exported here for callers that import from the store.
+export type { ProviderMetadata } from '@/types/events';
 
 export interface ParallelGroup {
   name: string;
@@ -239,11 +270,22 @@ interface WorkflowState {
   workflowName: string;
   workflowStatus: WorkflowStatus;
   workflowStartTime: number | null;
-  workflowFailure: { error_type?: string; message?: string; elapsed_seconds?: number; timeout_seconds?: number; current_agent?: string; checkpoint_path?: string } | null;
+  workflowFailure: { error_type?: string; message?: string; elapsed_seconds?: number; timeout_seconds?: number; current_agent?: string; checkpoint_path?: string; termination_reason?: string; terminated_by?: string; is_explicit?: boolean; status?: string } | null;
   workflowFailedAgent: string | null;
   workflowYaml: string | null;
   conductorVersion: string | null;
   entryPoint: string | null;
+
+  // Explicit-termination metadata, populated for both success and failure
+  // terminations (see issue #219). When present, the WorkflowSuccessBanner /
+  // WorkflowErrorBanner can show the structured reason and terminate step
+  // name in addition to the generic completion / failure banners.
+  workflowTermination: {
+    is_explicit: boolean;
+    status: 'success' | 'failed';
+    termination_reason?: string;
+    terminated_by?: string;
+  } | null;
 
   // Graph structure
   agents: WorkflowAgent[];
@@ -503,6 +545,7 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
   workflowStartTime: null,
   workflowFailure: null,
   workflowFailedAgent: null,
+  workflowTermination: null,
   workflowYaml: null,
   conductorVersion: null,
   entryPoint: null,
@@ -641,6 +684,7 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
         activityLog: [],
         workflowOutput: null,
         workflowFailedAgent: null,
+        workflowTermination: null,
         activeDialog: null,
         dialogEngaged: false,
         wfDepth: 0,
@@ -690,6 +734,7 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
         activityLog: [],
         workflowOutput: null,
         workflowFailedAgent: null,
+        workflowTermination: null,
         activeDialog: null,
         dialogEngaged: false,
         wfDepth: 0,
@@ -726,6 +771,7 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
         activityLog: [],
         workflowOutput: null,
         workflowFailedAgent: null,
+        workflowTermination: null,
         workflowStatus: 'pending',
         workflowStartTime: null,
         workflowName: '',
@@ -978,6 +1024,15 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
           ensureNode(state.nodes, a.name, nodeType);
           if (a.model) state.nodes[a.name]!.model = a.model;
           if (a.reasoning_effort) state.nodes[a.name]!.reasoning_effort = a.reasoning_effort;
+          // Decorate the node with provider tier so the graph can render
+          // the experimental badge without crawling the providers block.
+          if (a.provider_name) {
+            state.nodes[a.name]!.provider_name = a.provider_name;
+            const providerMeta = data.providers?.[a.provider_name];
+            if (providerMeta?.tier) {
+              state.nodes[a.name]!.provider_tier = providerMeta.tier;
+            }
+          }
           agentNames.add(a.name);
         }
       }
@@ -1026,6 +1081,13 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
             ensureNode(ctx.nodes, a.name, nodeType);
             if (a.model) ctx.nodes[a.name]!.model = a.model;
             if (a.reasoning_effort) ctx.nodes[a.name]!.reasoning_effort = a.reasoning_effort;
+            if (a.provider_name) {
+              ctx.nodes[a.name]!.provider_name = a.provider_name;
+              const providerMeta = data.providers?.[a.provider_name];
+              if (providerMeta?.tier) {
+                ctx.nodes[a.name]!.provider_tier = providerMeta.tier;
+              }
+            }
             agentNames.add(a.name);
           }
         }
@@ -1095,6 +1157,15 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     }
     if (data.cost_usd) t.addCost(data.cost_usd);
     if (data.tokens) t.addTokens(data.tokens);
+    // Capture terminate-step metadata when present (issue #219). The engine
+    // emits these on agent_completed for `status: success` terminate steps so
+    // the TerminateNode can render the rendered reason in its body.
+    const extra = _data as Record<string, unknown>;
+    if (extra.terminated_by) {
+      nd.termination_status = (extra.status as 'success' | 'failed' | undefined) ?? 'success';
+      nd.termination_reason = extra.termination_reason as string | undefined;
+      nd.terminated_by = extra.terminated_by as string;
+    }
     replaceNode(t.nodes, data.agent_name);
   },
 
@@ -1110,6 +1181,16 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
       if (route.to === data.agent_name) {
         t.highlightedEdges.push({ from: route.from, to: route.to, state: 'failed' });
       }
+    }
+    // Capture terminate-step metadata when present (issue #219). For
+    // `type: terminate status: failed`, the engine emits agent_failed with
+    // the rendered termination fields so the TerminateNode can render the
+    // reason directly without falling back to `error_message`.
+    const extra = _data as Record<string, unknown>;
+    if (extra.terminated_by) {
+      nd.termination_status = (extra.status as 'success' | 'failed' | undefined) ?? 'failed';
+      nd.termination_reason = extra.termination_reason as string | undefined;
+      nd.terminated_by = extra.terminated_by as string;
     }
     replaceNode(t.nodes, data.agent_name);
   },
@@ -1207,6 +1288,76 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
 
   script_failed: (state, _data) => {
     const data = _data as unknown as ScriptFailedData;
+    const t = activeTarget(state, _data);
+    const nd = ensureNode(t.nodes, data.agent_name);
+    nd.status = 'failed';
+    nd.elapsed = data.elapsed;
+    nd.error_type = data.error_type;
+    nd.error_message = data.message;
+    replaceNode(t.nodes, data.agent_name);
+  },
+
+  wait_started: (state, _data, timestamp) => {
+    const data = _data as unknown as WaitStartedData;
+    const t = activeTarget(state, _data);
+    const nd = ensureNode(t.nodes, data.agent_name);
+    nd.status = 'running';
+    nd.startedAt = timestamp ?? Date.now() / 1000;
+    nd.duration_seconds = data.duration_seconds ?? null;
+    nd.reason = data.reason ?? null;
+    nd.iteration = data.iteration;
+    replaceNode(t.nodes, data.agent_name);
+  },
+
+  wait_completed: (state, _data) => {
+    const data = _data as unknown as WaitCompletedData;
+    const t = activeTarget(state, _data);
+    const nd = ensureNode(t.nodes, data.agent_name);
+    nd.status = 'completed';
+    t.incrCompleted();
+    nd.elapsed = data.elapsed;
+    nd.waited_seconds = data.waited_seconds;
+    nd.requested_seconds = data.requested_seconds;
+    nd.reason = data.reason ?? null;
+    nd.interrupted = data.interrupted;
+    replaceNode(t.nodes, data.agent_name);
+  },
+
+  wait_failed: (state, _data) => {
+    const data = _data as unknown as WaitFailedData;
+    const t = activeTarget(state, _data);
+    const nd = ensureNode(t.nodes, data.agent_name);
+    nd.status = 'failed';
+    nd.elapsed = data.elapsed;
+    nd.error_type = data.error_type;
+    nd.error_message = data.message;
+    replaceNode(t.nodes, data.agent_name);
+  },
+
+  set_started: (state, _data, timestamp) => {
+    const data = _data as { agent_name: string };
+    const t = activeTarget(state, _data);
+    const nd = ensureNode(t.nodes, data.agent_name);
+    nd.status = 'running';
+    nd.startedAt = timestamp ?? Date.now() / 1000;
+    replaceNode(t.nodes, data.agent_name);
+  },
+
+  set_completed: (state, _data) => {
+    const data = _data as unknown as SetCompletedData;
+    const t = activeTarget(state, _data);
+    const nd = ensureNode(t.nodes, data.agent_name);
+    nd.status = 'completed';
+    t.incrCompleted();
+    nd.elapsed = data.elapsed;
+    nd.set_output_type = data.output_type;
+    nd.set_output_keys = data.output_keys;
+    nd.set_value_repr = data.value_repr;
+    replaceNode(t.nodes, data.agent_name);
+  },
+
+  set_failed: (state, _data) => {
+    const data = _data as unknown as SetFailedData;
     const t = activeTarget(state, _data);
     const nd = ensureNode(t.nodes, data.agent_name);
     nd.status = 'failed';
@@ -1390,13 +1541,27 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     state.wfDepth = Math.max(0, state.wfDepth - 1);
     if (state.wfDepth === 0) {
       // Root workflow completed
-      const data = _data as { output?: unknown };
+      const data = _data as { output?: unknown; is_explicit?: boolean; termination_reason?: string; terminated_by?: string; status?: string };
       state.workflowStatus = 'completed';
       state.isPaused = false;
       // Clear any iteration-limit gate that wasn't paired with a resolved
       // event (defense-in-depth — see issue #134).
       state.iterationLimitGate = null;
       state.workflowOutput = data.output ?? null;
+      // Explicit-termination metadata (issue #219). When the root workflow
+      // ended via `type: terminate status: success`, the engine attaches
+      // these fields; surface them via `workflowTermination` so the success
+      // banner can show the reason and terminate step name.
+      if (data.is_explicit) {
+        state.workflowTermination = {
+          is_explicit: true,
+          status: (data.status as 'success' | 'failed' | undefined) ?? 'success',
+          termination_reason: data.termination_reason,
+          terminated_by: data.terminated_by,
+        };
+      } else {
+        state.workflowTermination = null;
+      }
       if (state.nodes['$end']) {
         state.nodes['$end']!.status = 'completed';
         replaceNode(state.nodes, '$end');
@@ -1429,7 +1594,7 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
 
   workflow_failed: (state, _data) => {
     state.wfDepth = Math.max(0, state.wfDepth - 1);
-    const data = _data as { agent_name?: string; error_type?: string; message?: string; elapsed_seconds?: number; timeout_seconds?: number; current_agent?: string; subworkflow_path?: string[] };
+    const data = _data as { agent_name?: string; error_type?: string; message?: string; elapsed_seconds?: number; timeout_seconds?: number; current_agent?: string; subworkflow_path?: string[]; is_explicit?: boolean; termination_reason?: string; terminated_by?: string; status?: string };
     if (state.wfDepth === 0) {
       // Root workflow failed
       state.workflowStatus = 'failed';
@@ -1447,7 +1612,29 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
           }
         }
       }
-      state.workflowFailure = { error_type: data.error_type, message: data.message, elapsed_seconds: data.elapsed_seconds, timeout_seconds: data.timeout_seconds, current_agent: data.current_agent };
+      state.workflowFailure = {
+        error_type: data.error_type,
+        message: data.message,
+        elapsed_seconds: data.elapsed_seconds,
+        timeout_seconds: data.timeout_seconds,
+        current_agent: data.current_agent,
+        // Issue #219: forward termination metadata so the error banner can
+        // distinguish explicit terminate-step failures from generic crashes.
+        termination_reason: data.termination_reason,
+        terminated_by: data.terminated_by,
+        is_explicit: data.is_explicit,
+        status: data.status,
+      };
+      if (data.is_explicit) {
+        state.workflowTermination = {
+          is_explicit: true,
+          status: (data.status as 'success' | 'failed' | undefined) ?? 'failed',
+          termination_reason: data.termination_reason,
+          terminated_by: data.terminated_by,
+        };
+      } else {
+        state.workflowTermination = null;
+      }
       if (state.nodes['$start']) {
         state.nodes['$start']!.status = 'completed';
         replaceNode(state.nodes, '$start');
@@ -1777,6 +1964,49 @@ function buildLogEntry(event: WorkflowEvent): LogEntry | null {
     case 'script_failed':
       return { timestamp: ts, level: 'error', source: String(d.agent_name), message: `Script failed: ${d.message || d.error_type || 'unknown error'}` };
 
+    case 'wait_started': {
+      const dur = d.duration_seconds as number | null | undefined;
+      const reason = d.reason as string | null | undefined;
+      const durStr = typeof dur === 'number' ? formatSec(dur) : '?';
+      return {
+        timestamp: ts,
+        level: 'info',
+        source: String(d.agent_name),
+        message: `Waiting ${durStr}${reason ? ` — ${reason}` : ''}`,
+      };
+    }
+
+    case 'wait_completed': {
+      const waited = d.waited_seconds as number | undefined;
+      const interrupted = d.interrupted as boolean | undefined;
+      return {
+        timestamp: ts,
+        level: 'success',
+        source: String(d.agent_name),
+        message: `Wait completed${waited != null ? ` (${formatSec(waited)})` : ''}${interrupted ? ' — interrupted' : ''}`,
+      };
+    }
+
+    case 'wait_failed':
+      return { timestamp: ts, level: 'error', source: String(d.agent_name), message: `Wait failed: ${d.message || d.error_type || 'unknown error'}` };
+
+    case 'set_started':
+      return { timestamp: ts, level: 'info', source: String(d.agent_name), message: 'Set started' };
+
+    case 'set_completed': {
+      const keys = (d.output_keys as string[] | undefined) ?? [];
+      const summary = keys.length > 0 ? ` · ${keys.join(', ')}` : '';
+      return {
+        timestamp: ts,
+        level: 'success',
+        source: String(d.agent_name),
+        message: `Set completed${summary}${d.elapsed != null ? ` in ${formatSec(d.elapsed as number)}` : ''}`,
+      };
+    }
+
+    case 'set_failed':
+      return { timestamp: ts, level: 'error', source: String(d.agent_name), message: `Set failed: ${d.message || d.error_type || 'unknown error'}` };
+
     case 'gate_presented':
       return { timestamp: ts, level: 'warning', source: String(d.agent_name), message: 'Waiting for human input…' };
 
@@ -1927,6 +2157,50 @@ function buildActivityLogEntry(event: WorkflowEvent): ActivityLogEntry | null {
 
     case 'script_failed':
       return { timestamp: ts, source: String(d.agent_name), type: 'turn', message: `Script failed: ${d.message || d.error_type || 'unknown'}` };
+
+    case 'wait_started': {
+      const dur = d.duration_seconds as number | null | undefined;
+      const reason = d.reason as string | null | undefined;
+      const durStr = typeof dur === 'number' ? formatSec(dur) : '?';
+      return {
+        timestamp: ts,
+        source: String(d.agent_name),
+        type: 'turn',
+        message: `Waiting ${durStr}${reason ? ` — ${reason}` : ''}`,
+      };
+    }
+
+    case 'wait_completed': {
+      const waited = d.waited_seconds as number | undefined;
+      const interrupted = d.interrupted as boolean | undefined;
+      return {
+        timestamp: ts,
+        source: String(d.agent_name),
+        type: 'tool-complete',
+        message: `Wait completed${waited != null ? ` (${formatSec(waited)})` : ''}${interrupted ? ' — interrupted' : ''}`,
+      };
+    }
+
+    case 'wait_failed':
+      return { timestamp: ts, source: String(d.agent_name), type: 'turn', message: `Wait failed: ${d.message || d.error_type || 'unknown'}` };
+
+    case 'set_started':
+      return { timestamp: ts, source: String(d.agent_name), type: 'turn', message: 'Set started' };
+
+    case 'set_completed': {
+      const keys = (d.output_keys as string[] | undefined) ?? [];
+      const summary = keys.length > 0 ? ` (${keys.join(', ')})` : '';
+      return {
+        timestamp: ts,
+        source: String(d.agent_name),
+        type: 'tool-complete',
+        message: `Set completed${summary}`,
+        detail: d.value_repr ? truncate(String(d.value_repr), 300) : null,
+      };
+    }
+
+    case 'set_failed':
+      return { timestamp: ts, source: String(d.agent_name), type: 'turn', message: `Set failed: ${d.message || d.error_type || 'unknown'}` };
 
     default:
       return null;

@@ -1,22 +1,32 @@
-# Provider Comparison: Copilot vs Claude
+# Provider Comparison: Copilot vs Claude vs Claude Agent SDK
 
-This guide helps you choose between GitHub Copilot and Anthropic Claude providers for your workflows.
+This guide helps you choose between GitHub Copilot, Anthropic Claude, and Claude Agent SDK providers for your workflows.
 
 ## Quick Comparison
 
-| Feature | Copilot | Claude | Winner |
-|---------|---------|--------|--------|
-| **Context Window** | per-model (SDK-reported) | per-model (SDK-reported) | Tie |
-| **Pricing Model** | Subscription ($10-39/mo) | Pay-per-token | Depends |
-| **Setup** | GitHub auth | API key | Copilot (easier) |
-| **Model Selection** | GPT-5.2, o1 | Haiku, Sonnet, Opus | Tie |
-| **Streaming** | Yes | No (Phase 1) | Copilot |
-| **Tool Support** | Yes (MCP, all types) | Yes (MCP, stdio only) | Copilot |
-| **Reasoning / Extended Thinking** | Yes (`reasoning_effort` on session) | Yes (extended `thinking` budget) | Tie |
-| **Speed** | Fast | Fast | Tie |
-| **Output Quality** | Excellent | Excellent | Tie |
-| **Cost Predictability** | High (flat rate) | Variable (usage-based) | Copilot |
-| **Multi-provider** | No | Yes (via Conductor) | Claude |
+| Feature | Copilot | Claude | Claude Agent SDK | Winner |
+|---------|---------|--------|------------------|--------|
+| **Tier** | Stable | Stable | Experimental ([#241](https://github.com/microsoft/conductor/issues/241)) | Copilot / Claude |
+| **Context Window** | per-model (SDK-reported) | per-model (SDK-reported) | 200K | Tie |
+| **Pricing Model** | Subscription ($10-39/mo) | Pay-per-token | Via Claude Code CLI | Depends |
+| **Setup** | GitHub auth | API key | `claude` CLI auth | Copilot (easier) |
+| **Model Selection** | GPT-5.2, o1 | Haiku, Sonnet, Opus | Haiku, Sonnet, Opus | Tie |
+| **Streaming** | Yes | No (Phase 1) | Yes | Copilot / Claude Agent SDK |
+| **Tool Support** | Yes (MCP, all types) | Yes (MCP, stdio only) | Yes (built-in, CLI-managed) | Copilot |
+| **Reasoning / Extended Thinking** | Yes (`reasoning_effort` on session) | Yes (extended `thinking` budget) | Inherits from CLI config | Tie |
+| **Speed** | Fast | Fast | Fast | Tie |
+| **Output Quality** | Excellent | Excellent | Excellent | Tie |
+| **Cost Predictability** | High (flat rate) | Variable (usage-based) | Variable | Copilot |
+| **Multi-provider** | No | Yes (via Conductor) | No | Claude |
+| **Agentic Loop** | SDK-managed | Manual (provider code) | SDK-managed (delegated to CLI) | Depends |
+
+> **About the experimental tier.** `claude-agent-sdk` declares specific
+> capability carve-outs (no MCP, no per-agent tools allowlist, no
+> reasoning_effort, no checkpoint resume). `conductor validate` catches
+> workflows that depend on those features against this provider, and the
+> CLI prints a one-time banner when the workflow runs. See
+> [docs/providers/experimental.md](./experimental.md) for the stability
+> policy and promotion criteria.
 
 ## When to Use Copilot
 
@@ -110,6 +120,54 @@ workflow:
 agents:
   - name: analyzer
     prompt: "Analyze the following document ({{ document | length }} chars)"
+```
+
+## When to Use Claude Agent SDK
+
+### ✅ Choose Claude Agent SDK if:
+
+1. **You want built-in tool support with Claude models**
+   - WebSearch, WebFetch, Bash, file operations out of the box
+   - No MCP server configuration needed for common tools
+   - Full Claude Code toolset available
+
+2. **You already use the `claude` CLI**
+   - Authentication handled by the CLI
+   - No separate API key management
+   - Settings inherited from your Claude Code environment
+
+3. **You want the SDK to manage the agentic loop**
+   - Tool execution and structured output handled by the SDK / CLI
+   - Less provider code to maintain
+   - Native interrupt support
+   - **Note:** the SDK does *not* retry transient API errors internally — Conductor classifies SDK errors and surfaces them so workflow-level `retry:` drives recovery.
+
+4. **You need streaming with Claude models**
+   - Real-time message streaming (unlike the raw Claude provider)
+   - Typed message objects for each event
+
+### Important: Tools and MCP Servers
+
+The `claude-agent-sdk` provider does not bridge workflow-level tools/MCP into the CLI. Concretely:
+
+- `runtime.mcp_servers` — **rejected at the factory** with a clear error. Translation to the CLI's MCP configuration is not implemented. Configure MCP servers through your Claude Code settings instead.
+- Per-agent `tools: []` — disables all tools for that agent.
+- Per-agent `tools: [list]` — **refused loudly**. Workflow tool names do not translate to Claude CLI tool IDs; silently passing them through would risk granting the wrong native tool.
+- Omitting `tools:` entirely — grants the full `claude_code` preset (filesystem, bash, web), matching the bare `claude` CLI experience.
+- `temperature` and `max_tokens` are **rejected at the factory** — sampling behavior is controlled by the CLI.
+
+### Example Claude Agent SDK Workflow
+
+```yaml
+workflow:
+  name: sdk-workflow
+  runtime:
+    provider: claude-agent-sdk
+    default_model: claude-sonnet-4-6
+
+agents:
+  - name: researcher
+    prompt: "Research {{ topic }} using web search"
 ```
 
 ## Cost Comparison
@@ -326,6 +384,8 @@ Use this matrix to decide:
 | Process long documents | **Claude** |
 | Complex reasoning tasks | **Claude** (Opus) |
 | Simple high-volume tasks | **Claude** (Haiku 4.5) |
+| Already use `claude` CLI | **Claude Agent SDK** |
+| Want streaming with Claude | **Claude Agent SDK** |
 
 ## Multi-Provider Strategy
 
@@ -375,4 +435,11 @@ workflow:
 - ✅ Long document processing
 - ✅ Cost optimization (Haiku)
 
-**Bottom line**: Both are excellent. Choose based on your usage patterns, budget, and feature requirements. Conductor makes it easy to switch between them or use both strategically.
+**Choose Claude Agent SDK** for:
+- ✅ Built-in tools (WebSearch, Bash, etc.)
+- ✅ Streaming with Claude models
+- ✅ SDK-managed agentic loop
+- ✅ Existing `claude` CLI users
+- ✅ No API key management
+
+**Bottom line**: All three are excellent. Choose based on your usage patterns, budget, and feature requirements. Conductor makes it easy to switch between them or use all three strategically.

@@ -67,7 +67,7 @@ workflow:
 ```yaml
 agents:
   - name: my_agent               # Required: unique identifier
-    type: agent                  # agent (default), human_gate, script, or workflow
+    type: agent                  # agent (default), human_gate, script, workflow, wait, or terminate
     description: What it does
     model: gpt-5.2               # Override workflow default
     provider: claude             # Optional: per-agent provider override
@@ -97,9 +97,9 @@ agents:
     timeout_seconds: 120         # Hard wall-clock cancellation for this agent (provider-backed only).
                                  # Engine wraps execution in asyncio.wait_for(); raises AgentTimeoutError.
                                  # Effective limit = min(timeout_seconds, remaining_workflow_timeout).
-                                 # Non-retryable. Forbidden on script/human_gate/workflow types.
+                                 # Non-retryable. Forbidden on script/human_gate/workflow/wait types.
 
-    retry:                       # Per-agent retry policy (optional, not allowed on script/human_gate/workflow)
+    retry:                       # Per-agent retry policy (optional, not allowed on script/human_gate/workflow/wait)
       max_attempts: 3            # 1-10, default 1 (no retry)
       backoff: exponential       # exponential (default) or fixed
       delay_seconds: 2.0         # Base delay (0-300, default 2.0)
@@ -127,7 +127,7 @@ agents:
 - **Copilot**: forwarded as `reasoning_effort` on the session. Validated against the model's advertised `supported_reasoning_efforts`; raises `ValidationError` for unsupported combinations (skipped in mock-handler mode or when capability metadata is absent).
 - **Claude**: enables extended thinking via `thinking={"type": "enabled", "budget_tokens": N}` with mapping `low=2048`, `medium=8192`, `high=16384`, `xhigh=32768`. Auto-coerces `temperature` to `1.0` (logged at INFO) and bumps `max_tokens` to fit `budget + 4096` (capped at 64000, logged at INFO when clamped). Only valid on thinking-capable models (`claude-3-7-*`, `claude-opus-4*`, `claude-sonnet-4*`, `claude-haiku-4*`); raises `ValidationError` otherwise.
 
-Both providers surface reasoning content via `agent_reasoning` events visible in the dashboard, JSONL logs, and the console at `-vv`. Not allowed on `script`, `human_gate`, or `workflow` agent types.
+Both providers surface reasoning content via `agent_reasoning` events visible in the dashboard, JSONL logs, and the console at `-vv`. Not allowed on `script`, `human_gate`, `workflow`, or `wait` agent types.
 
 ```yaml
 runtime:
@@ -253,6 +253,153 @@ routes:
 Script agents **cannot** have: `prompt`, `provider`, `model`, `tools`, `output`, `system_prompt`, `options`, `retry`, `reasoning`, `dialog`, `max_session_seconds`, `max_agent_iterations`, `timeout_seconds` (use `timeout:` instead), `input_mapping`, or `max_depth`.
 Command and args support Jinja2 templating for dynamic values.
 
+## Wait Steps (`type: wait`)
+
+Pause workflow execution for a parsed duration via in-process `asyncio.sleep`. Cross-platform — no shell `sleep` dependency. Use for rate-limit cooldowns, polling intervals, and external-system catch-up.
+
+```yaml
+agents:
+  - name: cooldown
+    type: wait
+    description: Cool down between API bursts   # Optional
+    duration: 60s                               # Required (see "Duration format")
+    reason: Avoiding rate limit                 # Optional, shown in dashboard
+    routes:
+      - to: next_call
+```
+
+### Duration Format
+
+- Plain `int`/`float` → seconds (e.g. `60`, `1.5`).
+- Suffixed string: `ms`, `s`, `m`, `h` (e.g. `"500ms"`, `"60s"`, `"2.5m"`, `"1h"`).
+- Jinja2 template rendering to one of the above (templates defer literal validation to runtime):
+  ```yaml
+  duration: "{{ workflow.input.poll_interval_seconds }}s"
+  ```
+- Must resolve to `> 0` and `≤ 86400s` (24h). Booleans are rejected.
+
+### Wait Output
+
+Strict — only one field:
+
+```jinja2
+{{ wait_name.output.waited_seconds }}   # Actual seconds slept (may be < requested on interrupt)
+```
+
+### Polling Loop-back Pattern
+
+```yaml
+agents:
+  - name: check_status
+    type: script
+    command: ./poll-status.sh
+    routes:
+      - to: process_result
+        when: "status == 'ready'"
+      - to: wait_then_retry
+
+  - name: wait_then_retry
+    type: wait
+    duration: "{{ workflow.input.poll_interval_seconds }}s"
+    routes:
+      - to: check_status                  # loop back
+
+  - name: process_result
+    # ...
+```
+
+### Wait Cancellation
+
+- `Esc` / `Ctrl+G` cancels in-progress waits immediately (the engine races the sleep against the interrupt event).
+- Workflow-level `limits.timeout_seconds` cancels in-flight waits via the standard timeout path.
+
+### Wait Restrictions
+
+Wait agents **cannot** have: `prompt`, `model`, `provider`, `tools`, `system_prompt`, `options`, `command`, `args`, `env`, `working_dir`, `timeout`, `workflow`, `input_mapping`, `max_depth`, `max_session_seconds`, `max_agent_iterations`, `retry`, `dialog`, `reasoning`, `timeout_seconds`, or `output`. They also cannot be used inside `parallel` groups or `for_each` groups.
+
+See `examples/wait-step.yaml` for a complete polling workflow.
+## Set Steps
+
+Set steps evaluate one or more Jinja2 expressions and bind the typed results into context. No LLM call, no subprocess, no I/O — these are pure context transformations. Use them when you'd otherwise duplicate a Jinja expression across many prompts, run `echo`-only script steps, or burn a model call on something deterministic.
+
+```yaml
+agents:
+  # Single binding: output is the typed scalar / list / dict.
+  - name: compute_slug
+    type: set
+    value: "{{ workflow.input.org }}/{{ workflow.input.repo }}"
+    routes:
+      - to: derive_flags
+
+  # Multi-binding: output is a dict, accessible as step.output.<key>.
+  - name: derive_flags
+    type: set
+    values:
+      is_breaking: "{{ research.output.severity in ['high', 'critical'] }}"
+      target_branch: "{{ workflow.input.branch or 'main' }}"
+      effective_model: "{{ workflow.input.model or 'claude-sonnet-4-5' }}"
+    routes:
+      - to: breaking_path
+        when: "{{ output.is_breaking }}"
+      - to: safe_path
+```
+
+Exactly one of `value:` / `values:` must be present.
+
+### Type Detection
+
+Default (auto) detection uses safe YAML loading: booleans, numbers, lists, and dicts become native Python types; date-like strings are converted to ISO 8601 to stay JSON-safe; parse failures fall back to the raw string; empty renders become `""` (not `None`). Override with `output_type:` on a single `value:` to force `string`, `number`, `integer`, `boolean`, `list`, or `dict`. Per-key typing on `values:` is not supported — chain steps if you need it.
+
+### Multi-Binding Ordering
+
+Every binding in a single `values:` step renders against the *original* pre-step context. Later bindings cannot reference earlier ones in the same step. Chain multiple set steps for ordered dependencies:
+
+```yaml
+- name: step_a
+  type: set
+  value: "{{ workflow.input.x | upper }}"
+- name: step_b
+  type: set
+  value: "{{ step_a.output }}-suffix"
+```
+
+### Routing on Set Output
+
+Routes attached to a set step see the bound value directly. Dict outputs expose `{{ output.<key> }}` (Jinja2) and bare `<key>` (simpleeval); scalar / list outputs expose only `{{ output }}`:
+
+```yaml
+# Multi-values: route on a derived dict field.
+- name: derive_flags
+  type: set
+  values:
+    is_breaking: "{{ severity == 'high' }}"
+  routes:
+    - to: hot_path
+      when: "{{ output.is_breaking }}"
+    - to: safe_path
+
+# Single-value: route on the scalar itself.
+- name: flag
+  type: set
+  value: "{{ workflow.input.severity == 'high' }}"
+  routes:
+    - to: hi
+      when: "{{ output }}"
+    - to: lo
+```
+
+### Set Step Composition
+
+- Inside `parallel` groups: each member publishes its bound value to context. Templates cannot reference sibling group members (validator-enforced).
+- Inside `for_each` as the inline agent: one bound value per item, accessible via `loop.outputs`.
+- Output `value:` / `values:` chain naturally — a multi-binding step that publishes `items` can drive a downstream `for_each` whose `source:` is `step.output.items`.
+
+### Set Step Restrictions
+
+Set agents **cannot** have: `prompt`, `provider`, `model`, `tools`, `system_prompt`, `command`, `args`, `env`, `working_dir`, `timeout`, `workflow`, `options`, `input_mapping`, `max_depth`, `retry`, `dialog`, `reasoning`, `timeout_seconds`, `max_session_seconds`, or `max_agent_iterations`. They count toward `limits.max_iterations` like any other step.
+
+`output:` schema validation is permitted only when the rendered output is a dict (always for `values:`, sometimes for `value:`). A single-`value:` step with a declared schema that produces a scalar raises a `ValidationError` pointing to `values:`.
+
 ## Sub-Workflow Agents (`type: workflow`)
 
 Reference an external workflow YAML file as a black-box step. The sub-workflow runs with its own engine and inherits the parent's provider configuration.
@@ -305,6 +452,45 @@ for_each:
 
 **Restrictions** — workflow steps cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, `command`, `options`, `retry`, `reasoning`, `dialog`, `max_session_seconds`, `max_agent_iterations`, or `timeout_seconds`.
 
+## Terminate Steps (`type: terminate`)
+
+End the workflow with an explicit, structured outcome — distinguishable from a generic crash in CLI exit codes, dashboard state, and event logs. Real workflows have multiple legitimate end states beyond "the last agent finished": early success ("the document is already up to date"), soft abort ("no matching issues found"), hard failure with reason ("upstream service returned unprocessable data"), pre-condition not met ("this PR is from a fork"). With only `$end`, all of these collapse into "workflow completed" downstream. Terminate steps surface the distinction.
+
+```yaml
+agents:
+  - name: precheck
+    prompt: "Is the input safe to process? Return JSON: {safe: bool, reason: string}"
+    output:
+      safe:   { type: boolean }
+      reason: { type: string }
+    routes:
+      - when: "not precheck.output.safe"
+        to: abort_unsafe
+      - to: main_pipeline
+
+  - name: abort_unsafe
+    type: terminate
+    status: failed                     # success | failed (required)
+    reason: "{{ precheck.output.reason }}"   # required; Jinja2-templated
+    output_template:                   # optional; replaces workflow-level output:
+      aborted: "true"                  # rendered then JSON-coerced ("true" -> True)
+      stage: precheck
+      reason: "{{ precheck.output.reason }}"
+```
+
+**Semantics:**
+
+- Reaching a terminate step ends the workflow immediately — no routes evaluated after.
+- `status: success` → engine returns the rendered output, CLI exits `0`, dashboard ✅, emits `workflow_completed { termination_reason, terminated_by, is_explicit: true, status: "success" }`. Runs the `on_complete` hook.
+- `status: failed` → engine raises `WorkflowTerminated` (subclass of `ExecutionError`), CLI exits `1` (and still prints the rendered output JSON to stdout for downstream tooling), dashboard ❌, emits `workflow_failed { error_type: "WorkflowTerminated", termination_reason, terminated_by, is_explicit: true, status: "failed", output }`. Runs the `on_error` hook. **Intentionally not resumable** — the engine skips the on-failure checkpoint because the author explicitly chose this outcome.
+- `output_template:` is a `dict[str, str]` where each value is a Jinja2 expression. The rendered values are passed through the engine's JSON-coercion helper, so `"true"` becomes `True`, `"42"` becomes `42`, and JSON literals (`'{"k":"v"}'`) are parsed. When omitted, the workflow-level `output:` mapping is rendered as on any other terminal path.
+- **Sub-workflow boundary** — a `status: failed` terminate inside a child sub-workflow is downgraded to `SubworkflowTerminatedError` (also an `ExecutionError`) at the parent boundary. The parent treats it as a normal sub-workflow failure (its own `workflow_failed` does NOT inherit `is_explicit: true`). The child's rendered output, reason, and terminate-step name are preserved as `terminated_output` / `terminated_reason` / `terminated_by` attributes on the wrapper for `on_error` hooks and debugging surfaces. A `status: success` child terminate returns its rendered output cleanly and the parent continues with its next routes.
+- **Branching on a child's termination** — if the parent's routes need to react to a child's outcome, the child should use `status: success` plus an `output_template:` carrying the relevant fields. Failed terminate is an error from the parent's perspective; parent `routes:` are only evaluated after successful steps.
+
+**Restrictions** — terminate steps cannot have `routes`, `tools`, `output`, `prompt`, `model`, `provider`, `system_prompt`, `command`, `args`, `env`, `working_dir`, `timeout`, `timeout_seconds`, `max_session_seconds`, `max_agent_iterations`, `max_depth`, `retry`, `dialog`, `reasoning`, `workflow`, `input_mapping`, or `options`. Cannot appear as a parallel-group member or as a `for_each` inline agent — route to them from those groups' `routes:` instead. Conversely, regular agents cannot have `status`, `reason`, or `output_template` — those fields are rejected at schema validation to catch authors who forgot to add `type: terminate`.
+
+See `examples/terminate.yaml` for a complete example demonstrating success, failure, and pass-through paths.
+
 ## Dialog Mode
 
 Dialog mode lets an agent conditionally pause after execution and enter a free-form conversation with the user. A lightweight evaluator LLM call inspects the agent's output against `trigger_prompt` and decides whether to engage. Both Copilot and Claude providers are supported, and the dashboard provides dedicated UI (`DialogDetail`, `DialogEngagementPrompt`, `DialogOverlay`).
@@ -323,7 +509,7 @@ agents:
       - to: writer
 ```
 
-Only valid on provider-backed agents (not `script`, `human_gate`, or `workflow`). See `examples/dialog-mode.yaml` for a complete example.
+Only valid on provider-backed agents (not `script`, `human_gate`, `workflow`, or `wait`). See `examples/dialog-mode.yaml` for a complete example.
 
 ## Workflow Metadata and Workspace Instructions
 
@@ -510,8 +696,18 @@ agents:
 ### Gate Output
 
 Human gates automatically capture:
-- `output.selected` - the `value` of the chosen option
-- `output.feedback` - text input from `prompt_for` (if specified)
+- `output.selected` — the `value` of the chosen option.
+- `output.additional_input` — dict of values collected from `prompt_for` fields.
+  Always present; `{}` when no `prompt_for` was specified or the selected option
+  has no `prompt_for`. Access individual fields via templates as
+  `{{ <gate>.output.additional_input.<field> }}` (for example
+  `{{ approval_gate.output.additional_input.feedback }}` when an option declares
+  `prompt_for: feedback`).
+
+> **`context: explicit` mode note.** `input:` declarations support
+> `<gate>.output.additional_input` (the whole dict) but not the dotted shorthand
+> `<gate>.output.additional_input.<field>`. Declare the parent key and read
+> individual fields via Jinja2 in the agent's prompt or output template.
 
 ## Context Modes
 
