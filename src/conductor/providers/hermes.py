@@ -16,6 +16,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import tempfile
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from conductor.exceptions import ProviderError, ValidationError
@@ -77,7 +79,7 @@ class HermesProvider(AgentProvider):
         structured_output="prompt_injection",
         interrupt=False,
         max_session_seconds=True,
-        checkpoint_resume=False,
+        checkpoint_resume=True,
         usage_tracking=True,
         concurrent_safe=True,
         upstream_pin="hermes-agent",
@@ -133,6 +135,12 @@ class HermesProvider(AgentProvider):
         self._default_max_agent_iterations = max_agent_iterations
         self._default_max_session_seconds = max_session_seconds
         self._default_reasoning_effort = default_reasoning_effort
+
+        # Session state for checkpoint resume. Maps agent name → path to a
+        # JSON file containing the conversation history from the last run.
+        self._session_ids: dict[str, str] = {}
+        self._resume_session_ids: dict[str, str] = {}
+        self._session_dir = Path(tempfile.gettempdir()) / "conductor" / "hermes-sessions"
 
     async def execute(
         self,
@@ -221,12 +229,30 @@ class HermesProvider(AgentProvider):
                 event_callback, "agent_reasoning", {"content": text}
             )
 
+        # Load conversation history from a prior checkpoint if available
+        conversation_history: list[dict[str, Any]] | None = None
+        resume_path = self._resume_session_ids.get(agent.name)
+        if resume_path:
+            try:
+                conversation_history = json.loads(Path(resume_path).read_text())
+                logger.info(
+                    "Resuming agent '%s' with %d prior messages",
+                    agent.name, len(conversation_history),
+                )
+            except (OSError, json.JSONDecodeError) as e:
+                logger.warning(
+                    "Could not load conversation history for '%s' from %s: %s",
+                    agent.name, resume_path, e,
+                )
+
         loop = asyncio.get_running_loop()
 
         def _run_sync() -> dict[str, Any]:
             hermes_agent = AIAgent(**agent_kwargs)
             return hermes_agent.run_conversation(
-                prompt, system_message=agent.system_prompt or None
+                prompt,
+                system_message=agent.system_prompt or None,
+                conversation_history=conversation_history,
             )
 
         # Wrap the blocking call and optionally race against interrupt / timeout
@@ -324,6 +350,11 @@ class HermesProvider(AgentProvider):
         # Use the actual model reported by hermes (may differ from requested)
         actual_model = result.get("model") or resolved_model
 
+        # Persist conversation history for checkpoint resume
+        messages = result.get("messages")
+        if messages:
+            self._save_session(agent.name, messages)
+
         return AgentOutput(
             content=content,
             raw_response={
@@ -355,6 +386,43 @@ class HermesProvider(AgentProvider):
 
     async def close(self) -> None:
         """No-op — the hermes provider is stateless (no persistent sessions)."""
+
+    # ------------------------------------------------------------------
+    # Session state for checkpoint resume
+    # ------------------------------------------------------------------
+
+    def _save_session(self, agent_name: str, messages: list[dict[str, Any]]) -> None:
+        """Persist conversation history to a temp file for checkpoint resume."""
+        self._session_dir.mkdir(parents=True, exist_ok=True)
+        session_file = self._session_dir / f"{agent_name}.json"
+        try:
+            session_file.write_text(json.dumps(messages, ensure_ascii=False))
+            self._session_ids[agent_name] = str(session_file)
+        except OSError as e:
+            logger.warning("Failed to save hermes session for '%s': %s", agent_name, e)
+
+    def get_session_ids(self) -> dict[str, str]:
+        """Return mapping of agent names to session file paths."""
+        return self._session_ids.copy()
+
+    def set_resume_session_ids(self, ids: dict[str, str]) -> None:
+        """Set session file paths for resuming conversations on next execution."""
+        self._resume_session_ids = dict(ids)
+
+    def cleanup_sessions(self) -> None:
+        """Remove all saved session files."""
+        for path_str in self._session_ids.values():
+            try:
+                Path(path_str).unlink(missing_ok=True)
+            except OSError:
+                pass
+        self._session_ids.clear()
+        if self._session_dir.exists():
+            try:
+                # Remove dir only if empty (don't nuke other providers' files)
+                self._session_dir.rmdir()
+            except OSError:
+                pass
 
 
 def _fire(callback: EventCallback | None, event: str, data: dict[str, Any]) -> None:
