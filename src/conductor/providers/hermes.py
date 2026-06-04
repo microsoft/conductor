@@ -71,14 +71,14 @@ class HermesProvider(AgentProvider):
         tier="experimental",
         mcp_tools=False,
         workflow_tools_passthrough=False,
-        streaming_events=False,
-        agent_reasoning_events=False,
+        streaming_events=True,
+        agent_reasoning_events=True,
         reasoning_effort=None,
         structured_output="prompt_injection",
         interrupt=False,
         max_session_seconds=True,
         checkpoint_resume=False,
-        usage_tracking=False,
+        usage_tracking=True,
         concurrent_safe=True,
         upstream_pin="hermes-agent",
         maintainer="(community contribution)",
@@ -211,6 +211,16 @@ class HermesProvider(AgentProvider):
         # CAPABILITIES ensures the validator rejects any agent that sets
         # tools: against this provider.
 
+        # Wire streaming callbacks so events fire incrementally from the
+        # executor thread. The _fire helper is thread-safe (swallows errors).
+        if event_callback is not None:
+            agent_kwargs["stream_delta_callback"] = lambda text: _fire(
+                event_callback, "agent_message", {"content": text}
+            )
+            agent_kwargs["reasoning_callback"] = lambda text: _fire(
+                event_callback, "agent_reasoning", {"content": text}
+            )
+
         loop = asyncio.get_running_loop()
 
         def _run_sync() -> dict[str, Any]:
@@ -291,8 +301,6 @@ class HermesProvider(AgentProvider):
             raise ProviderError(
                 f"Hermes agent returned no final response: {partial_error}",
             )
-
-        _fire(event_callback, "agent_message", {"content": final_response})
 
         # Parse structured output or wrap as plain text
         if agent.output:
