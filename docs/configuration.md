@@ -71,7 +71,9 @@ workflow:
 
 **See**: [Claude Provider Documentation](providers/claude.md)
 
-### Hermes Provider
+### Hermes Provider (Experimental)
+
+> **Experimental** — see [Experimental Providers](providers/experimental.md) for stability policy.
 
 Uses the NousResearch hermes-agent library for agent execution. Supports any OpenRouter-style model identifier.
 
