@@ -27,14 +27,20 @@ from conductor.providers.reasoning import ReasoningEffort
 if TYPE_CHECKING:
     from conductor.config.schema import AgentDef
 
-# Try to import the hermes-agent SDK
+# The hermes-agent package ships its public API under the top-level module
+# name "run_agent" (not "hermes_agent"). Catch only ModuleNotFoundError so
+# that real dependency failures inside the package (e.g. missing openai)
+# propagate instead of producing a misleading "install hermes-agent" hint.
 try:
     from run_agent import AIAgent
 
     HERMES_SDK_AVAILABLE = True
-except ImportError:
-    HERMES_SDK_AVAILABLE = False
-    AIAgent = None  # type: ignore[misc, assignment]
+except ModuleNotFoundError as _e:
+    if _e.name is not None and _e.name.split(".")[0] == "run_agent":
+        HERMES_SDK_AVAILABLE = False
+        AIAgent = None  # type: ignore[misc, assignment]
+    else:
+        raise
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +132,7 @@ class HermesProvider(AgentProvider):
         self._api_key = api_key
         self._default_max_agent_iterations = max_agent_iterations
         self._default_max_session_seconds = max_session_seconds
+        self._default_reasoning_effort = default_reasoning_effort
 
     async def execute(
         self,
@@ -204,7 +211,7 @@ class HermesProvider(AgentProvider):
         # CAPABILITIES ensures the validator rejects any agent that sets
         # tools: against this provider.
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         def _run_sync() -> dict[str, Any]:
             hermes_agent = AIAgent(**agent_kwargs)
@@ -294,9 +301,14 @@ class HermesProvider(AgentProvider):
         else:
             content = {"text": final_response}
 
-        # Populate token counts from the result dict when available
-        input_tokens: int | None = result.get("input_tokens") or result.get("prompt_tokens")
-        output_tokens: int | None = result.get("output_tokens") or result.get("completion_tokens")
+        # Populate token counts from the result dict when available.
+        # Use explicit None-check (not `or`) so legitimate zero is preserved.
+        input_tokens: int | None = result.get("input_tokens")
+        if input_tokens is None:
+            input_tokens = result.get("prompt_tokens")
+        output_tokens: int | None = result.get("output_tokens")
+        if output_tokens is None:
+            output_tokens = result.get("completion_tokens")
         tokens_used: int | None = result.get("total_tokens")
         if tokens_used is None and input_tokens is not None and output_tokens is not None:
             tokens_used = input_tokens + output_tokens
@@ -323,13 +335,13 @@ class HermesProvider(AgentProvider):
         )
 
     async def validate_connection(self) -> bool:
-        """Verify the hermes-agent library is importable and functional.
+        """Confirms the hermes-agent SDK is importable.
 
-        Performs a lightweight check by importing the library. Does not
-        make any API calls — hermes uses the caller's ambient API keys.
-
-        Returns:
-            True if the hermes-agent library is available, False otherwise.
+        The import is performed at module load and reflected in the
+        module-level ``HERMES_SDK_AVAILABLE`` constant; this method
+        simply returns that value. Does NOT verify the configured
+        ``base_url``/``api_key`` are reachable — credential and endpoint
+        failures surface only at first agent execution.
         """
         return HERMES_SDK_AVAILABLE
 
