@@ -292,7 +292,7 @@ class TestHermesExecute:
             mock_instance.run_conversation.side_effect = RuntimeError("network error")
             mock_cls.return_value = mock_instance
 
-            with pytest.raises(RuntimeError, match="network error"):
+            with pytest.raises(ProviderError, match="network error"):
                 self._run(provider.execute(agent, {}, "hello"))
 
     def test_event_callback_fires(self, provider: HermesProvider) -> None:
@@ -383,58 +383,24 @@ class TestHermesSystemPrompt:
 
 
 class TestHermesToolsMapping:
-    def test_tools_none_sets_neither_kwarg(self) -> None:
+    def test_tools_not_forwarded_to_hermes(self) -> None:
+        """Conductor tools: allowlist is never passed to hermes (different vocabulary)."""
         with patch("conductor.providers.hermes.HERMES_SDK_AVAILABLE", True), \
              patch("conductor.providers.hermes.AIAgent"):
             provider = HermesProvider()
 
-        agent = _make_agent(tools=None)
+        for tools_value in (None, [], ["web", "read_file"]):
+            agent = _make_agent(tools=tools_value)
 
-        with patch("conductor.providers.hermes.AIAgent") as mock_cls:
-            mock_instance = Mock()
-            mock_instance.run_conversation.return_value = _make_result()
-            mock_cls.return_value = mock_instance
+            with patch("conductor.providers.hermes.AIAgent") as mock_cls:
+                mock_instance = Mock()
+                mock_instance.run_conversation.return_value = _make_result()
+                mock_cls.return_value = mock_instance
 
-            asyncio.run(provider.execute(agent, {}, "hello"))
+                asyncio.run(provider.execute(agent, {}, "hello"))
 
-        _, kwargs = mock_cls.call_args
-        assert "enabled_toolsets" not in kwargs
-        assert "disabled_toolsets" not in kwargs
-
-    def test_tools_empty_list_sets_enabled_toolsets_empty(self) -> None:
-        with patch("conductor.providers.hermes.HERMES_SDK_AVAILABLE", True), \
-             patch("conductor.providers.hermes.AIAgent"):
-            provider = HermesProvider()
-
-        agent = _make_agent(tools=[])
-
-        with patch("conductor.providers.hermes.AIAgent") as mock_cls:
-            mock_instance = Mock()
-            mock_instance.run_conversation.return_value = _make_result()
-            mock_cls.return_value = mock_instance
-
-            asyncio.run(provider.execute(agent, {}, "hello"))
-
-        _, kwargs = mock_cls.call_args
-        assert kwargs["enabled_toolsets"] == []
-        assert "disabled_toolsets" not in kwargs
-
-    def test_tools_list_sets_enabled_toolsets(self) -> None:
-        with patch("conductor.providers.hermes.HERMES_SDK_AVAILABLE", True), \
-             patch("conductor.providers.hermes.AIAgent"):
-            provider = HermesProvider()
-
-        agent = _make_agent(tools=["web"])
-
-        with patch("conductor.providers.hermes.AIAgent") as mock_cls:
-            mock_instance = Mock()
-            mock_instance.run_conversation.return_value = _make_result()
-            mock_cls.return_value = mock_instance
-
-            asyncio.run(provider.execute(agent, {}, "hello"))
-
-        _, kwargs = mock_cls.call_args
-        assert kwargs["enabled_toolsets"] == ["web"]
+            _, kwargs = mock_cls.call_args
+            assert "enabled_toolsets" not in kwargs
 
 
 class TestHermesProviderParams:

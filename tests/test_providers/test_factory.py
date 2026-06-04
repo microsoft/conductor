@@ -277,3 +277,45 @@ class TestClaudeAgentSdkFactoryRejections:
         )
         assert isinstance(provider, ClaudeAgentSdkProvider)
         await provider.close()
+
+
+class TestHermesFactory:
+    """Tests for the hermes factory branch."""
+
+    @patch("conductor.providers.factory.HERMES_SDK_AVAILABLE", False)
+    @pytest.mark.asyncio
+    async def test_factory_raises_when_sdk_not_available(self) -> None:
+        """Test that hermes provider raises ProviderError when SDK not available."""
+        with pytest.raises(ProviderError, match="hermes-agent package"):
+            await create_provider("hermes", validate=False)
+
+    @patch("conductor.providers.factory.HERMES_SDK_AVAILABLE", True)
+    @patch("conductor.providers.hermes.HERMES_SDK_AVAILABLE", True)
+    @pytest.mark.asyncio
+    async def test_factory_creates_hermes_provider(self) -> None:
+        """Test that hermes provider can be created successfully."""
+        from conductor.providers.hermes import HermesProvider
+
+        provider = await create_provider("hermes", validate=False)
+        assert isinstance(provider, HermesProvider)
+        await provider.close()
+
+    @patch("conductor.providers.factory.HERMES_SDK_AVAILABLE", True)
+    @patch("conductor.providers.hermes.HERMES_SDK_AVAILABLE", True)
+    @pytest.mark.asyncio
+    async def test_factory_passes_config_to_hermes(self) -> None:
+        """Test that factory forwards runtime config to HermesProvider."""
+        from conductor.providers.hermes import HermesProvider
+
+        provider = await create_provider(
+            "hermes",
+            validate=False,
+            default_model="anthropic/claude-sonnet-4",
+            max_agent_iterations=25,
+            max_session_seconds=120.0,
+        )
+        assert isinstance(provider, HermesProvider)
+        assert provider._default_model == "anthropic/claude-sonnet-4"
+        assert provider._default_max_agent_iterations == 25
+        assert provider._default_max_session_seconds == 120.0
+        await provider.close()
