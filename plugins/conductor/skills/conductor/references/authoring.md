@@ -12,7 +12,7 @@ workflow:
   entry_point: first_agent       # Required: starting agent, parallel group, or for-each group
 
   runtime:
-    provider: copilot            # copilot (default), claude, hermes, or openai-agents
+    provider: copilot            # copilot (default), claude, claude-agent-sdk, hermes (experimental), or openai-agents
     default_model: gpt-5.2       # Default model for agents
     temperature: 0.7             # 0.0-1.0 (optional)
     max_tokens: 4096             # Max output tokens per response (optional)

@@ -1,5 +1,13 @@
 # Hermes Provider Documentation
 
+> **Experimental Provider** — Hermes is an experimental provider with known
+> capability carve-outs (no MCP servers, no per-agent tools allowlist, no
+> streaming events, no reasoning effort, structured output via prompt injection
+> only). `conductor validate` catches workflows that depend on unsupported
+> features, and the CLI prints a one-time banner at runtime. See
+> [Experimental Providers](./experimental.md) for the stability policy and
+> promotion criteria.
+
 The Hermes provider enables Conductor workflows to use the [NousResearch hermes-agent](https://github.com/NousResearch/hermes-agent) library. Hermes is an agentic AI framework that manages its own tool ecosystem and supports models from multiple providers via OpenRouter-style model identifiers.
 
 ## Table of Contents

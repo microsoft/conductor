@@ -17,7 +17,7 @@ conductor run <workflow.yaml> [OPTIONS]
 | `--input`, `-i NAME=VALUE` | Workflow input (repeatable) |
 | `--input.NAME=VALUE` | Alternative input syntax |
 | `--metadata`, `-m KEY=VALUE` | Workflow metadata, merged on top of YAML `metadata:` (repeatable; values stay strings) |
-| `--provider`, `-p PROVIDER` | Override provider (`copilot`, `claude`, `hermes`, `openai-agents`) |
+| `--provider`, `-p PROVIDER` | Override provider (`copilot`, `claude`, `claude-agent-sdk`, `hermes`, `openai-agents`) |
 | `--dry-run` | Show execution plan only |
 | `--skip-gates` | Auto-select first option at human gates |
 | `--web` | Start real-time web dashboard |
