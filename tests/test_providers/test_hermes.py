@@ -309,15 +309,46 @@ class TestHermesExecute:
 
             self._run(provider.execute(agent, {}, "hello", event_callback=cb))
 
+        # agent_turn_start fires before the executor call
         event_types = [e[0] for e in events]
         assert "agent_turn_start" in event_types
-        assert "agent_message" in event_types
-
         turn_start = next(d for t, d in events if t == "agent_turn_start")
         assert turn_start == {"turn": "awaiting_model"}
 
-        agent_msg = next(d for t, d in events if t == "agent_message")
-        assert agent_msg == {"content": "hi"}
+        # Streaming callbacks are wired into AIAgent constructor
+        _, kwargs = mock_cls.call_args
+        assert "stream_delta_callback" in kwargs
+        assert "reasoning_callback" in kwargs
+
+    def test_streaming_callback_emits_events(self, provider: HermesProvider) -> None:
+        """Verify that stream_delta_callback and reasoning_callback emit events."""
+        agent = _make_agent()
+        events: list[tuple[str, dict]] = []
+
+        def cb(event: str, data: dict) -> None:
+            events.append((event, data))
+
+        with patch("conductor.providers.hermes.AIAgent") as mock_cls:
+            mock_instance = Mock()
+            mock_instance.run_conversation.return_value = _make_result(final_response="hi")
+            mock_cls.return_value = mock_instance
+
+            self._run(provider.execute(agent, {}, "hello", event_callback=cb))
+
+            # Simulate what hermes does: invoke the callbacks
+            _, kwargs = mock_cls.call_args
+            kwargs["stream_delta_callback"]("hello ")
+            kwargs["stream_delta_callback"]("world")
+            kwargs["reasoning_callback"]("thinking...")
+
+        msg_events = [(t, d) for t, d in events if t == "agent_message"]
+        assert len(msg_events) == 2
+        assert msg_events[0][1] == {"content": "hello "}
+        assert msg_events[1][1] == {"content": "world"}
+
+        reason_events = [(t, d) for t, d in events if t == "agent_reasoning"]
+        assert len(reason_events) == 1
+        assert reason_events[0][1] == {"content": "thinking..."}
 
     def test_interrupt_signal_raises_provider_error(self, provider: HermesProvider) -> None:
         agent = _make_agent()
