@@ -486,6 +486,44 @@ class AgentTimeoutError(TimeoutError):
         self.agent_name = agent_name
 
 
+class BudgetExceededError(ExecutionError):
+    """Raised when a workflow exceeds its cost budget in enforce mode.
+
+    This is a safety mechanism to prevent runaway spending in agentic
+    workflows. Only raised when ``budget_mode`` is ``enforce``.
+
+    Attributes:
+        budget_usd: The configured budget limit.
+        spent_usd: The actual amount spent when the limit was exceeded.
+        current_agent: The agent that was executing when the budget was exceeded.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        budget_usd: float,
+        spent_usd: float,
+        current_agent: str | None = None,
+        suggestion: str | None = None,
+        file_path: str | None = None,
+        line_number: int | None = None,
+    ) -> None:
+        self.budget_usd = budget_usd
+        self.spent_usd = spent_usd
+        self.current_agent = current_agent
+
+        if suggestion is None:
+            suggestion = (
+                f"Increase limits.budget_usd (currently ${budget_usd:.2f}) "
+                f"or switch to budget_mode: audit to continue without enforcement"
+            )
+            if current_agent:
+                suggestion += f". Budget exceeded after agent '{current_agent}'"
+
+        super().__init__(message, suggestion, file_path, line_number)
+
+
 class HumanGateError(ExecutionError):
     """Raised when a human gate encounters an error.
 

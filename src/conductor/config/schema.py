@@ -322,6 +322,26 @@ class LimitsConfig(BaseModel):
     a hard time limit.
     """
 
+    budget_usd: float | None = Field(default=None, ge=0.0)
+    """Maximum cost budget for the workflow in USD.
+
+    When set, the engine tracks cumulative cost and acts according to
+    ``budget_mode`` when the budget is exceeded. Default is None
+    (no budget tracking).
+    """
+
+    budget_mode: Literal["audit", "enforce"] = "audit"
+    """How the engine responds when ``budget_usd`` is exceeded.
+
+    - ``audit``: emit a ``budget_exceeded`` event and log a warning,
+      but allow the workflow to continue. Use this to discover cost
+      profiles before applying hard limits.
+    - ``enforce``: emit a ``budget_exceeded`` event, save a checkpoint,
+      and stop the workflow with a ``BudgetExceededError``.
+
+    Only takes effect when ``budget_usd`` is set. Default is ``audit``.
+    """
+
 
 class PricingOverride(BaseModel):
     """Custom pricing for a specific model.

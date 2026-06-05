@@ -397,8 +397,10 @@ Safety limits prevent runaway execution:
 ```yaml
 workflow:
   limits:
-    max_iterations: 10  # Default: 10, max: 100
-    timeout_seconds: 600  # Default: 600, max: 3600
+    max_iterations: 10  # Default: 10, max: 500
+    timeout_seconds: 600  # Default: None (unlimited)
+    budget_usd: 5.00      # Default: None (no budget tracking)
+    budget_mode: audit    # Default: audit. Options: audit, enforce
 ```
 
 **max_iterations**:
@@ -408,6 +410,21 @@ workflow:
 **timeout_seconds**:
 - Total workflow timeout
 - Includes all agent executions
+
+**budget_usd** and **budget_mode**:
+- Tracks cumulative cost and acts when the budget is exceeded
+- `audit` mode (default): emits a `budget_exceeded` event and logs a warning,
+  but the workflow continues — use this to discover cost profiles
+- `enforce` mode: emits a `budget_exceeded` event, saves a checkpoint,
+  and stops the workflow with a `BudgetExceededError` (resumable via
+  `conductor resume` after increasing the budget)
+- When `budget_usd` is not set, no budget tracking occurs
+
+**Recommended graduation path**:
+
+1. Run workflows without a budget to see costs in the summary
+2. Add `budget_usd` in `audit` mode to track overshoots without breaking workflows
+3. Switch to `enforce` mode once you know your cost profile
 
 ## Complete Examples
 
@@ -525,7 +542,8 @@ export CONDUCTOR_LOG_LEVEL=DEBUG  # INFO, DEBUG, WARNING, ERROR
 
 1. **Set conservative limits** initially (`max_iterations: 10`)
 2. **Use timeout** to prevent long-running workflows
-3. **Test with dry-run** before production
+3. **Set a cost budget** — start with `budget_usd` in `audit` mode to learn your cost profile, then switch to `enforce`
+4. **Test with dry-run** before production
 
 ## Troubleshooting
 

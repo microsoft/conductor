@@ -173,6 +173,22 @@ Tests mirror source structure in `tests/`:
 
 Use `pytest.mark.performance` for performance tests (exclude with `-m "not performance"`).
 
+### Test Fixture Patterns
+
+When writing integration tests that construct `WorkflowConfig` programmatically, follow these conventions (see `tests/test_engine/test_limits.py` for canonical examples):
+
+- `AgentDef` uses `prompt=` (not `instructions=`), `output={"key": OutputField(type="string")}` (dict, not list), and `routes=[RouteDef(...)]` (not raw dicts).
+- `WorkflowDef` requires `entry_point=` and places `limits=` inside `workflow=`. `agents=` and `output=` are top-level on `WorkflowConfig`.
+- The engine entry point is `await engine.run({})` (not `execute`).
+- To test with controlled token/cost data, patch `provider.execute` to return a custom `AgentOutput` with explicit `input_tokens`, `output_tokens`, and `model` fields.
+
+### Resume / Checkpoint Parity
+
+When adding new fields to `LimitEnforcer`:
+
+- **Transient fields** (reset each run): add to `from_dict()` as parameters sourced from the current workflow config, like `timeout_seconds`, `budget_usd`, `budget_mode`. Update the call site in `cli/run.py` → `resume_workflow_async()`.
+- **Persistent fields** (survive across resume): add to both `to_dict()` and `from_dict()` deserialization, like `max_iterations`, `current_iteration`, `execution_history`.
+
 ## Code Style
 
 - Python 3.12+
