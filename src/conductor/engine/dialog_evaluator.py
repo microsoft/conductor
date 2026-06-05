@@ -127,6 +127,8 @@ class DialogEvaluator:
         except (TypeError, ValueError):
             output_str = str(output)
 
+        assert agent.dialog is not None, "_run_evaluator requires dialog config"
+
         system_prompt = EVALUATOR_SYSTEM_PROMPT.format(
             trigger_prompt=agent.dialog.trigger_prompt,
         )
