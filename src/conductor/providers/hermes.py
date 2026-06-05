@@ -46,11 +46,11 @@ except ModuleNotFoundError as _e:
 
 logger = logging.getLogger(__name__)
 
-# JSON instruction appended to the prompt when a structured output schema is declared.
-_JSON_INSTRUCTION = (
-    "\n\nRespond ONLY with a valid JSON object. "
-    "Do not include any explanation, markdown, or text outside the JSON object."
-)
+# Maximum number of recovery attempts when JSON parsing fails.
+_MAX_PARSE_RECOVERY_ATTEMPTS = 3
+
+# Maximum schema nesting depth for prompt schema generation.
+_MAX_SCHEMA_DEPTH = 10
 
 
 class HermesProvider(AgentProvider):
@@ -192,10 +192,17 @@ class HermesProvider(AgentProvider):
             else self._default_max_session_seconds
         )
 
-        # Append JSON instruction when agent declares a structured output schema
+        # Append schema instruction when agent declares a structured output schema
         prompt = rendered_prompt
+        schema_for_prompt: dict[str, Any] | None = None
         if agent.output:
-            prompt = rendered_prompt + _JSON_INSTRUCTION
+            schema_for_prompt = _build_prompt_schema(agent.output)
+            schema_desc = json.dumps(schema_for_prompt, indent=2)
+            prompt += (
+                f"\n\n**IMPORTANT: You MUST respond with a JSON object matching this schema:**\n"
+                f"```json\n{schema_desc}\n```\n"
+                f"Return ONLY the JSON object, no other text."
+            )
 
         _fire(event_callback, "agent_turn_start", {"turn": "awaiting_model"})
 
@@ -347,12 +354,19 @@ class HermesProvider(AgentProvider):
                 f"Hermes agent returned no final response: {partial_error}",
             )
 
-        # Parse structured output or wrap as plain text
-        if agent.output:
-            content = parse_json_output(final_response)
-            validate_output(content, agent.output)
+        # If no output schema, wrap as plain text and we're done
+        if not agent.output:
+            content: dict[str, Any] = {"text": final_response}
         else:
-            content = {"text": final_response}
+            # Try to parse as JSON with recovery loop (mirrors Copilot pattern)
+            content = self._parse_with_recovery(
+                final_response,
+                result.get("messages", []),
+                schema_for_prompt,  # type: ignore[arg-type]
+                agent_kwargs,
+                agent,
+                conversation_history,
+            )
 
         # Populate token counts from the result dict when available.
         # Use explicit None-check (not `or`) so legitimate zero is preserved.
@@ -407,6 +421,63 @@ class HermesProvider(AgentProvider):
         """No-op — the hermes provider is stateless (no persistent sessions)."""
 
     # ------------------------------------------------------------------
+    # Structured output: parse with recovery (mirrors Copilot pattern)
+    # ------------------------------------------------------------------
+
+    def _parse_with_recovery(
+        self,
+        response: str,
+        messages: list[dict[str, Any]],
+        schema: dict[str, Any],
+        agent_kwargs: dict[str, Any],
+        agent: AgentDef,
+        conversation_history: list[dict[str, Any]] | None,
+    ) -> dict[str, Any]:
+        """Parse response as JSON, retrying via conversation if parsing fails."""
+        last_error: str | None = None
+
+        for attempt in range(_MAX_PARSE_RECOVERY_ATTEMPTS + 1):
+            try:
+                content = parse_json_output(response)
+                validate_output(content, agent.output)  # type: ignore[arg-type]
+                return content
+            except (json.JSONDecodeError, ValueError, ValidationError) as e:
+                last_error = str(e)
+                if attempt >= _MAX_PARSE_RECOVERY_ATTEMPTS:
+                    break
+
+                logger.info(
+                    "Agent '%s' parse recovery attempt %d/%d: %s",
+                    agent.name, attempt + 1, _MAX_PARSE_RECOVERY_ATTEMPTS, last_error,
+                )
+
+                # Build recovery prompt and re-run with conversation history
+                recovery_prompt = _build_recovery_prompt(last_error, response, schema)
+                # Use the messages from the failed run as history
+                history = messages if messages else conversation_history
+
+                recovery_kwargs = {k: v for k, v in agent_kwargs.items()
+                                   if k not in ("stream_delta_callback", "reasoning_callback")}
+                hermes_agent = AIAgent(**recovery_kwargs)
+                recovery_result = hermes_agent.run_conversation(
+                    recovery_prompt,
+                    system_message=agent.system_prompt or None,
+                    conversation_history=history,
+                )
+                response = recovery_result.get("final_response") or ""
+                messages = recovery_result.get("messages", [])
+
+        expected_fields = list(agent.output.keys()) if agent.output else []  # type: ignore[union-attr]
+        raise ProviderError(
+            f"Failed to parse structured output after {_MAX_PARSE_RECOVERY_ATTEMPTS} "
+            f"recovery attempts: {last_error}",
+            suggestion=(
+                f"Agent was expected to return JSON with fields: {expected_fields}. "
+                "Consider simplifying the output schema or making the prompt more explicit."
+            ),
+        )
+
+    # ------------------------------------------------------------------
     # Session state for checkpoint resume
     # ------------------------------------------------------------------
 
@@ -457,3 +528,54 @@ def _fire(callback: EventCallback | None, event: str, data: dict[str, Any]) -> N
 async def _wait_for_event(event: asyncio.Event) -> None:
     """Coroutine that resolves when the given asyncio.Event is set."""
     await event.wait()
+
+
+def _build_prompt_schema(
+    schema: dict[str, Any], depth: int = 0
+) -> dict[str, Any]:
+    """Build a prompt-facing schema description from OutputField definitions."""
+    if depth > _MAX_SCHEMA_DEPTH:
+        raise ValidationError(
+            f"Schema nesting depth exceeds maximum of {_MAX_SCHEMA_DEPTH} levels",
+            suggestion="Simplify your output schema to reduce nesting depth",
+        )
+    result: dict[str, Any] = {}
+    for field_name, field_def in schema.items():
+        field_schema: dict[str, Any] = {"type": field_def.type}
+        if field_def.description:
+            field_schema["description"] = field_def.description
+        else:
+            field_schema["description"] = f"The {field_name} field"
+        if field_def.type == "object" and field_def.properties:
+            field_schema["properties"] = _build_prompt_schema(field_def.properties, depth + 1)
+            field_schema["required"] = list(field_def.properties.keys())
+        if field_def.type == "array" and field_def.items:
+            item_schema: dict[str, Any] = {"type": field_def.items.type}
+            if field_def.items.description:
+                item_schema["description"] = field_def.items.description
+            if field_def.items.type == "object" and field_def.items.properties:
+                item_schema["properties"] = _build_prompt_schema(
+                    field_def.items.properties, depth + 1
+                )
+            field_schema["items"] = item_schema
+        result[field_name] = field_schema
+    return result
+
+
+def _build_recovery_prompt(
+    parse_error: str, original_response: str, schema: dict[str, Any]
+) -> str:
+    """Build a prompt to recover from JSON parse failures."""
+    truncated = original_response[:500]
+    if len(original_response) > 500:
+        truncated += "..."
+    schema_desc = json.dumps(schema, indent=2)
+    return (
+        f"Your previous response could not be parsed as valid JSON.\n\n"
+        f"**Parse Error:** {parse_error}\n\n"
+        f"**Your response started with:**\n```\n{truncated}\n```\n\n"
+        f"**Expected JSON schema:**\n```json\n{schema_desc}\n```\n\n"
+        f"Please respond with ONLY a valid JSON object matching the schema above. "
+        f"Do NOT include markdown code blocks, explanatory text, or anything other "
+        f"than the raw JSON object."
+    )
