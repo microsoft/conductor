@@ -1338,6 +1338,7 @@ async def run_workflow_async(
     # Always create event emitter and JSONL log subscriber
     emitter = WorkflowEventEmitter()
     event_log_subscriber: Any = None
+    notification_log_subscriber: Any = None
     dashboard: Any = None
 
     if web:
@@ -1384,10 +1385,19 @@ async def run_workflow_async(
         verbose_log(f"Agents: {len(config.agents)}")
 
         # Start JSONL event log subscriber (always-on structured diagnostics)
-        from conductor.engine.event_log import EventLogSubscriber
+        from conductor.engine.event_log import EventLogSubscriber, NotificationLogSubscriber
 
         event_log_subscriber = EventLogSubscriber(config.workflow.name)
         emitter.subscribe(event_log_subscriber.on_event)
+
+        # Dedicated notifications.jsonl for external tooling that only cares
+        # about domain notifications, not execution telemetry. Share the same
+        # run_id so the two files have aligned filename stems.
+        notification_log_subscriber = NotificationLogSubscriber(
+            config.workflow.name,
+            run_id=event_log_subscriber.run_id,
+        )
+        emitter.subscribe(notification_log_subscriber.on_event)
 
         # Subscribe console output to the event emitter
         console_subscriber = ConsoleEventSubscriber()
@@ -1572,6 +1582,11 @@ async def run_workflow_async(
         if event_log_subscriber is not None:
             event_log_subscriber.close()
             _verbose_console.print(f"[dim]Event log written to: {event_log_subscriber.path}[/dim]")
+        if notification_log_subscriber is not None:
+            notification_log_subscriber.close()
+            _verbose_console.print(
+                f"[dim]Notifications written to: {notification_log_subscriber.path}[/dim]"
+            )
 
         # Report log file path to stderr and close file logging
         if log_file is not None and _file_console is not None:
@@ -1854,6 +1869,7 @@ async def resume_workflow_async(
     # Always create event emitter and JSONL log subscriber (parity with run)
     emitter = WorkflowEventEmitter()
     event_log_subscriber: Any = None
+    notification_log_subscriber: Any = None
     dashboard: Any = None
 
     try:
@@ -2013,6 +2029,16 @@ async def resume_workflow_async(
                 existing_run_id=cp.run_id or None,
             )
             emitter.subscribe(event_log_subscriber.on_event)
+
+            # Dedicated notifications.jsonl (parity with run). Shares the
+            # run_id stem with the event log so the two files line up.
+            from conductor.engine.event_log import NotificationLogSubscriber
+
+            notification_log_subscriber = NotificationLogSubscriber(
+                config.workflow.name,
+                run_id=event_log_subscriber.run_id,
+            )
+            emitter.subscribe(notification_log_subscriber.on_event)
 
             # Subscribe console output to the event emitter (parity with run)
             console_subscriber = ConsoleEventSubscriber()
@@ -2174,6 +2200,11 @@ async def resume_workflow_async(
         if event_log_subscriber is not None:
             event_log_subscriber.close()
             _verbose_console.print(f"[dim]Event log written to: {event_log_subscriber.path}[/dim]")
+        if notification_log_subscriber is not None:
+            notification_log_subscriber.close()
+            _verbose_console.print(
+                f"[dim]Notifications written to: {notification_log_subscriber.path}[/dim]"
+            )
 
         # Report log file path to stderr and close file logging
         if log_file is not None and _file_console is not None:

@@ -303,6 +303,7 @@ class WorkflowEngine:
         run_context: RunContext | None = None,
         _dashboard_context_path: list[str] | None = None,
         instructions_preamble: str | None = None,
+        _parent_correlation: dict[str, Any] | None = None,
     ) -> None:
         """Initialize the WorkflowEngine.
 
@@ -441,6 +442,20 @@ class WorkflowEngine:
         # outgoing events so the frontend can resolve the owning context
         # without inferring parentage from activeContextPath.
         self._dashboard_context_path: list[str] = list(_dashboard_context_path or [])
+
+        # Notification correlation. The parent engine's snapshotted correlation
+        # map is passed in via _parent_correlation; this engine layers its own
+        # declared correlation keys (resolved from workflow.input at run start)
+        # underneath, with parent values winning on collision so deeply-nested
+        # emissions preserve the upstream trail. Populated in ``run``.
+        self._parent_correlation: dict[str, Any] = dict(_parent_correlation or {})
+        self._correlation_snapshot: dict[str, Any] = dict(self._parent_correlation)
+
+        # Pre-instantiated notification envelope builder. Stateless, so a
+        # single instance per engine is fine.
+        from conductor.executor.notification import NotificationExecutor
+
+        self._notification_executor = NotificationExecutor()
 
     @property
     def _workflow_dir(self) -> Path | None:
@@ -1057,6 +1072,29 @@ class WorkflowEngine:
                 timeout_seconds=agent.timeout_seconds,
             ) from e
 
+    def _snapshot_correlation(self, inputs: dict[str, Any]) -> None:
+        """Snapshot correlation values from workflow inputs.
+
+        Resolves every key declared in ``workflow.notifications.correlation``
+        against *inputs*, then merges the result under the parent engine's
+        correlation map. Parent values win on collision so deeply-nested
+        emissions preserve the upstream trail.
+
+        Stores the resolved map on ``self._correlation_snapshot`` for the
+        :class:`NotificationExecutor` to pick up at emission time.
+
+        Args:
+            inputs: Merged workflow input values (defaults applied).
+        """
+        own: dict[str, Any] = {}
+        notif = self.config.workflow.notifications
+        if notif is not None:
+            for key in notif.correlation:
+                if key in inputs:
+                    own[key] = inputs[key]
+        # Parent wins on key collision
+        self._correlation_snapshot = {**own, **self._parent_correlation}
+
     def _build_subworkflow_inputs(
         self,
         agent: AgentDef,
@@ -1343,6 +1381,7 @@ class WorkflowEngine:
                 slot_key or agent.name,
             ],
             instructions_preamble=child_preamble,
+            _parent_correlation=self._correlation_snapshot,
         )
 
         return await self._run_child_engine(child_engine, sub_inputs, agent)
@@ -1454,6 +1493,7 @@ class WorkflowEngine:
                 else:
                     child_preamble = _wrap_preamble(sub_inner)
         child_engine_kwargs["instructions_preamble"] = child_preamble
+        child_engine_kwargs["_parent_correlation"] = self._correlation_snapshot
 
         child_engine = WorkflowEngine(**child_engine_kwargs)
 
@@ -1612,6 +1652,7 @@ class WorkflowEngine:
         # Apply defaults from input schema for optional inputs not provided
         merged_inputs = self._apply_input_defaults(inputs)
         self.context.set_workflow_inputs(merged_inputs)
+        self._snapshot_correlation(merged_inputs)
         self.limits.start()
         current_agent_name = self.config.workflow.entry_point
 
@@ -1641,6 +1682,12 @@ class WorkflowEngine:
         """
         # Fresh timeout window for resumed execution
         self.limits.start_time = _time.monotonic()
+
+        # Rebuild correlation snapshot from restored context inputs so resumed
+        # runs emit notifications with the same correlation keys as the original.
+        restored_inputs = self.context.get_for_template().get("workflow", {}).get("input", {})
+        if isinstance(restored_inputs, dict):
+            self._snapshot_correlation(restored_inputs)
 
         # Execute on_start hook (signals resume)
         self._execute_hook("on_start")
@@ -3054,6 +3101,111 @@ class WorkflowEngine:
                             current_agent_name = route_result.target
 
                             # Check for interrupt after sub-workflow step
+                            interrupt_result = await self._check_interrupt(current_agent_name)
+                            if interrupt_result is not None:
+                                current_agent_name = await self._handle_interrupt_result(
+                                    interrupt_result, current_agent_name
+                                )
+                            continue
+
+                        # Handle notification steps (fire-and-forget visibility)
+                        if agent.type == "notification":
+                            agent_context = self.context.build_for_agent(
+                                agent.name,
+                                agent.input,
+                                mode=self.config.workflow.context.mode,
+                                agent_type=agent.type,
+                            )
+                            notif_execution_count = (
+                                self.limits.get_agent_execution_count(agent.name) + 1
+                            )
+
+                            self._emit(
+                                "notification_started",
+                                {
+                                    "agent_name": agent.name,
+                                    "iteration": notif_execution_count,
+                                    "notification_type": agent.emit,
+                                },
+                            )
+
+                            notif_config = self.config.workflow.notifications
+                            if notif_config is None:
+                                raise ExecutionError(
+                                    f"Agent '{agent.name}' is type=notification but no "
+                                    "'workflow.notifications' block is declared. "
+                                    "This should have been caught by schema validation."
+                                )
+
+                            try:
+                                envelope = self._notification_executor.build_envelope(
+                                    agent,
+                                    notif_config,
+                                    agent_context,
+                                    workflow_name=self.config.workflow.name,
+                                    run_id=self._run_id,
+                                    subworkflow_path=self._dashboard_context_path,
+                                    iteration=notif_execution_count,
+                                    correlation=self._correlation_snapshot,
+                                )
+                            except Exception as exc:
+                                self._emit(
+                                    "notification_failed",
+                                    {
+                                        "agent_name": agent.name,
+                                        "notification_type": agent.emit,
+                                        "error_type": type(exc).__name__,
+                                        "message": str(exc),
+                                    },
+                                )
+                                raise
+
+                            # The domain notification itself — this is what
+                            # external tooling tails the notifications.jsonl
+                            # subscriber for.
+                            self._emit("notification", envelope)
+
+                            self._emit(
+                                "notification_completed",
+                                {
+                                    "agent_name": agent.name,
+                                    "notification_type": agent.emit,
+                                    "emission_id": envelope["emission_id"],
+                                    "schema_id": envelope["schema_id"],
+                                },
+                            )
+
+                            # Store an empty dict so routes can fire without
+                            # exposing notification internals as agent output
+                            # (consistent with the "no response flow" contract).
+                            self.context.store(agent.name, {})
+                            self.limits.record_execution(agent.name)
+                            self.limits.check_timeout()
+
+                            route_result = self._evaluate_routes(agent, {})
+
+                            self._emit(
+                                "route_taken",
+                                {
+                                    "from_agent": agent.name,
+                                    "to_agent": route_result.target,
+                                },
+                            )
+
+                            if route_result.target == "$end":
+                                result = self._build_final_output(route_result.output_transform)
+                                self._emit(
+                                    "workflow_completed",
+                                    {
+                                        "elapsed": _time.time() - _workflow_start,
+                                        "output": result,
+                                    },
+                                )
+                                self._execute_hook("on_complete", result=result)
+                                return result
+
+                            current_agent_name = route_result.target
+
                             interrupt_result = await self._check_interrupt(current_agent_name)
                             if interrupt_result is not None:
                                 current_agent_name = await self._handle_interrupt_result(

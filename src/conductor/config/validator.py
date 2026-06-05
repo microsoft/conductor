@@ -226,6 +226,16 @@ def validate_workflow_config(
                 "inline agent. Terminate steps cannot run inside a for_each iteration; "
                 "route to a terminate step from the for_each group's routes instead."
             )
+        if for_each_group.agent.type == "notification":
+            errors.append(
+                f"For-each group '{for_each_group.name}' uses a notification step as its "
+                "inline agent. Notification steps cannot be used in for_each groups; "
+                "place the notification step in the main agent list and route to it from "
+                "the for_each group's routes instead."
+            )
+
+    # Validate notification configuration and notification steps
+    errors.extend(_validate_notifications(config))
 
     # Validate sub-workflow references (local paths and registry refs).
     # Skipped when workflow_path is not provided — relative paths cannot be
@@ -270,6 +280,78 @@ def validate_workflow_config(
         )
 
     return warnings
+
+
+def _validate_notifications(config: WorkflowConfig) -> list[str]:
+    """Validate workflow notification configuration and notification steps.
+
+    Checks:
+    - Every step with ``type=notification`` references a declared
+      ``notifications.types`` key (or fails if no notifications block exists).
+    - Provided payload keys exactly match the declared payload field set.
+    - All declared ``correlation`` keys reference actual workflow inputs.
+
+    Returns a list of error message strings (collected, not raised, so the
+    caller can aggregate them with other validator errors).
+    """
+    errors: list[str] = []
+    notif_config = config.workflow.notifications
+
+    # All notification steps need somewhere to look up their type
+    notification_steps = [a for a in config.agents if a.type == "notification"]
+
+    if notification_steps and notif_config is None:
+        for agent in notification_steps:
+            errors.append(
+                f"Agent '{agent.name}' is type=notification but no "
+                "'workflow.notifications' block is declared in the workflow."
+            )
+        return errors
+
+    if notif_config is None:
+        return errors
+
+    # Correlation keys must resolve to declared workflow inputs
+    workflow_input_keys = set(config.workflow.input.keys())
+    for key in notif_config.correlation:
+        if key not in workflow_input_keys:
+            errors.append(
+                f"workflow.notifications.correlation key '{key}' does not match "
+                f"any declared workflow input. Available inputs: "
+                f"{', '.join(sorted(workflow_input_keys)) or '(none)'}"
+            )
+
+    # Each notification step must reference a declared type, and its payload
+    # must match the declared field set exactly
+    for agent in notification_steps:
+        type_name = agent.emit
+        if type_name not in notif_config.types:
+            available = ", ".join(sorted(notif_config.types.keys())) or "(none)"
+            errors.append(
+                f"Agent '{agent.name}' references undeclared notification type "
+                f"'{type_name}'. Declared types: {available}"
+            )
+            continue
+
+        type_def = notif_config.types[type_name]
+        declared = set(type_def.payload.keys())
+        provided = set((agent.payload or {}).keys())
+        missing = declared - provided
+        extra = provided - declared
+        if missing:
+            errors.append(
+                f"Agent '{agent.name}' notification payload for type "
+                f"'{type_name}' is missing field(s): {', '.join(sorted(missing))}"
+            )
+        if extra:
+            errors.append(
+                f"Agent '{agent.name}' notification payload for type "
+                f"'{type_name}' has unexpected field(s): "
+                f"{', '.join(sorted(extra))}. "
+                f"Declared fields: {', '.join(sorted(declared)) or '(none)'}"
+            )
+
+    return errors
 
 
 def _validate_agent_routes(
@@ -538,6 +620,14 @@ def _validate_parallel_groups(config: WorkflowConfig) -> list[str]:
                     f"Agent '{agent_name}' in parallel group '{pg.name}' is a terminate step. "
                     "Terminate steps cannot run inside a parallel branch; route to a "
                     "terminate step from the parallel group's routes instead."
+                )
+
+            # Validate no notification steps in parallel groups
+            if agent.type == "notification":
+                errors.append(
+                    f"Agent '{agent_name}' in parallel group '{pg.name}' is a notification step. "
+                    "Notification steps cannot be used in parallel groups; "
+                    "route to a notification step from the parallel group's routes instead."
                 )
 
         # PE-6.2: Validate parallel group route targets

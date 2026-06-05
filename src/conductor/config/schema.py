@@ -6,6 +6,7 @@ workflow YAML configuration files.
 
 from __future__ import annotations
 
+import re
 from typing import Any, Literal
 
 from pydantic import (
@@ -460,6 +461,129 @@ class ReasoningConfig(BaseModel):
     """Reasoning effort level applied to the agent's model calls."""
 
 
+# Dotted-identifier regex used for notification namespaces.
+# e.g. ``polyphony``, ``polyphony.feature_pr``, ``my_pkg.sub_pkg.workflow``.
+_NAMESPACE_PATTERN = re.compile(r"^[a-z_][a-z0-9_]*(\.[a-z_][a-z0-9_]*)*$")
+
+
+class NotificationTypeDef(BaseModel):
+    """Declared schema for a single user-defined notification type.
+
+    Notifications are a *visibility* primitive — fire-and-forget messages
+    the workflow author publishes to the outside world for external
+    tooling to hook off. They are **not** a control-flow primitive; if
+    you need a decision to flow back into the workflow, use a
+    ``human_gate`` instead.
+
+    Each declared type has a fixed payload schema (reusing
+    :class:`OutputField` for per-field type declarations) and a version
+    that consumers MUST pin against. Bumping the version produces a
+    distinct ``schema_id`` so consumers can transition deliberately.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    version: int = Field(default=1, ge=1)
+    """Schema version. Bump when making a breaking change to ``payload``.
+
+    Bump policy:
+    - Adding an *optional* field is non-breaking; do not bump.
+    - Removing a field, renaming a field, changing a field's type, or
+      making an optional field required is breaking; bump and emit
+      under the new ``schema_id``.
+    - Consumers MUST pin on ``schema_id`` (``<namespace>.<type>@<version>``),
+      not on ``notification_type`` alone.
+    """
+
+    description: str | None = None
+    """Human-readable description of when this notification fires."""
+
+    payload: dict[str, OutputField] = Field(default_factory=dict)
+    """Declared payload field schema.
+
+    Each value is an :class:`OutputField` describing the field's type
+    (and, for arrays/objects, its item/property structure). At emission
+    time the engine renders the step's ``payload:`` block via Jinja2,
+    then validates the rendered values against this schema.
+    """
+
+
+class NotificationsConfig(BaseModel):
+    """Workflow-level notification configuration.
+
+    Declares the namespace, correlation keys, and type registry for all
+    notifications the workflow may emit.
+
+    Example YAML::
+
+        notifications:
+          namespace: polyphony.feature_pr
+          correlation:
+            - apex_id
+            - work_item_id
+          types:
+            pr_ready:
+              version: 1
+              description: A pull request has reached ready-for-review state.
+              payload:
+                pr_url:    { type: string }
+                pr_id:     { type: number }
+                ado_org:   { type: string }
+                ado_project: { type: string }
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    namespace: str | None = None
+    """Optional dotted-identifier namespace for ``schema_id`` values.
+
+    Defaults to a slugified form of the workflow ``name``. Override when
+    multiple workflows share a package boundary so consumers can
+    disambiguate same-named local types.
+
+    Format: ``[a-z_][a-z0-9_]*(\\.[a-z_][a-z0-9_]*)*``.
+    """
+
+    correlation: list[str] = Field(default_factory=list)
+    """Names of workflow inputs to surface on every notification.
+
+    Values are snapshotted from ``workflow.input.*`` at run start and
+    auto-merged into every notification's envelope under the
+    ``correlation`` field. Sub-workflows inherit the parent's correlation
+    snapshot (parent wins on key collision) so deeply-nested emissions
+    carry upstream identifiers without the leaf author wiring them.
+    """
+
+    types: dict[str, NotificationTypeDef] = Field(default_factory=dict)
+    """Registry of declared notification types, keyed by local type name.
+
+    Type names must be valid identifiers (``[a-z_][a-z0-9_]*``).
+    """
+
+    @field_validator("namespace")
+    @classmethod
+    def _validate_namespace(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        if not _NAMESPACE_PATTERN.match(v):
+            raise ValueError(
+                f"namespace '{v}' must be a dotted lowercase identifier "
+                "(e.g. 'polyphony.feature_pr')"
+            )
+        return v
+
+    @field_validator("types")
+    @classmethod
+    def _validate_type_names(
+        cls, v: dict[str, NotificationTypeDef]
+    ) -> dict[str, NotificationTypeDef]:
+        ident = re.compile(r"^[a-z_][a-z0-9_]*$")
+        for name in v:
+            if not ident.match(name):
+                raise ValueError(f"notification type name '{name}' must be a lowercase identifier")
+        return v
+
+
 class AgentDef(BaseModel):
     """Definition for a single agent in the workflow.
 
@@ -501,7 +625,7 @@ class AgentDef(BaseModel):
     """Human-readable description of agent's purpose."""
 
     type: (
-        Literal["agent", "human_gate", "script", "set", "terminate", "wait", "workflow"] | None
+        Literal["agent", "human_gate", "script", "set", "terminate", "wait", "workflow", "notification"] | None
     ) = None
     """Agent type. Defaults to 'agent' if not specified."""
 
@@ -837,6 +961,18 @@ class AgentDef(BaseModel):
           reason: "{{ precheck.output.reason }}"
     """
 
+    emit: str | None = None
+    """For ``type=notification`` steps: the declared notification type name
+    to emit. Must reference a key under ``workflow.notifications.types``.
+    """
+
+    payload: dict[str, Any] | None = None
+    """For ``type=notification`` steps: Jinja2-templated values for each
+    declared payload field. Keys must exactly match the declared payload
+    schema (no missing fields, no extras). Each value is rendered against
+    the workflow context at emission time.
+    """
+
     @field_validator("timeout")
     @classmethod
     def validate_timeout(cls, v: int | None) -> int | None:
@@ -1154,6 +1290,54 @@ class AgentDef(BaseModel):
                 )
             if self.duration is not None:
                 raise ValueError("terminate agents cannot have 'duration' (only 'wait' agents do)")
+        elif self.type == "notification":
+            if not self.emit:
+                raise ValueError(
+                    "notification agents require 'emit' "
+                    "(the declared notification type name to emit)"
+                )
+            if self.payload is None:
+                raise ValueError(
+                    "notification agents require 'payload' (values for the declared payload fields)"
+                )
+            if self.prompt:
+                raise ValueError("notification agents cannot have 'prompt'")
+            if self.provider:
+                raise ValueError("notification agents cannot have 'provider'")
+            if self.model:
+                raise ValueError("notification agents cannot have 'model'")
+            if self.tools is not None:
+                raise ValueError("notification agents cannot have 'tools'")
+            if self.system_prompt:
+                raise ValueError("notification agents cannot have 'system_prompt'")
+            if self.options:
+                raise ValueError("notification agents cannot have 'options'")
+            if self.command:
+                raise ValueError("notification agents cannot have 'command'")
+            if self.workflow:
+                raise ValueError("notification agents cannot have 'workflow'")
+            if self.output:
+                raise ValueError(
+                    "notification agents cannot have 'output' "
+                    "(notifications are fire-and-forget; if you need a value to "
+                    "flow back into the workflow, use a different step type)"
+                )
+            if self.max_session_seconds:
+                raise ValueError("notification agents cannot have 'max_session_seconds'")
+            if self.max_agent_iterations is not None:
+                raise ValueError("notification agents cannot have 'max_agent_iterations'")
+            if self.retry is not None:
+                raise ValueError("notification agents cannot have 'retry'")
+            if self.dialog is not None:
+                raise ValueError("notification agents cannot have 'dialog'")
+            if self.reasoning is not None:
+                raise ValueError("notification agents cannot have 'reasoning'")
+            if self.timeout_seconds is not None:
+                raise ValueError("notification agents cannot have 'timeout_seconds'")
+            if self.input_mapping is not None:
+                raise ValueError("notification agents cannot have 'input_mapping'")
+            if self.max_depth is not None:
+                raise ValueError("notification agents cannot have 'max_depth'")
         else:
             # Regular agent or human_gate — input_mapping is not valid
             if self.input_mapping is not None:
@@ -1180,6 +1364,18 @@ class AgentDef(BaseModel):
                 raise ValueError(
                     f"'{self.type or 'agent'}' agents cannot have 'output_type' "
                     "(only 'set' agents support output_type)"
+                )
+        # Cross-type guard: emit/payload fields only valid on notification steps
+        if self.type != "notification":
+            if self.emit is not None:
+                raise ValueError(
+                    f"'{self.type or 'agent'}' agents cannot have 'emit' "
+                    "(only type=notification steps emit notifications)"
+                )
+            if self.payload is not None:
+                raise ValueError(
+                    f"'{self.type or 'agent'}' agents cannot have 'payload' "
+                    "(only type=notification steps emit notifications)"
                 )
         if self.type == "workflow" and self.reasoning is not None:
             raise ValueError("workflow agents cannot have 'reasoning'")
@@ -1600,6 +1796,15 @@ class WorkflowDef(BaseModel):
 
     hooks: HooksConfig | None = None
     """Lifecycle event hooks."""
+
+    notifications: NotificationsConfig | None = None
+    """Optional notification configuration.
+
+    Declares the namespace, correlation keys, and type registry for
+    domain notifications this workflow may emit via ``type=notification``
+    steps. Notifications are fire-and-forget messages published to the
+    outside world for external tooling to hook off.
+    """
 
     metadata: dict[str, Any] = Field(default_factory=dict)
     """Arbitrary key-value metadata for external tooling (dashboards, trackers, etc.).

@@ -177,3 +177,61 @@ class EventLogSubscriber:
         """Close the log file handle."""
         if self._handle is not None and not self._handle.closed:
             self._handle.close()
+
+
+class NotificationLogSubscriber:
+    """Writes only domain notification events to a dedicated JSONL file.
+
+    Mirrors :class:`EventLogSubscriber` but filters to ``event.type ==
+    "notification"`` so external tooling can tail a clean stream without
+    parsing through execution telemetry.
+
+    Args:
+        workflow_name: Used in the filename for easy identification.
+        run_id: Optional pre-existing run identifier to embed in the
+            filename. When ``None``, generates a fresh 8-char hex token.
+            Pass the matching :class:`EventLogSubscriber.run_id` so the
+            notifications file and events file share a filename stem.
+    """
+
+    def __init__(self, workflow_name: str, run_id: str | None = None) -> None:
+        import secrets
+
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        self._run_id = run_id or secrets.token_hex(4)
+        ts = f"{ts}-{self._run_id}"
+        self._path = (
+            Path(tempfile.gettempdir())
+            / "conductor"
+            / f"conductor-{workflow_name}-{ts}.notifications.jsonl"
+        )
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._handle = open(self._path, "w", encoding="utf-8")  # noqa: SIM115
+
+    @property
+    def run_id(self) -> str:
+        """Unique run identifier (8-char hex)."""
+        return self._run_id
+
+    @property
+    def path(self) -> Path:
+        """Path to the notifications JSONL file."""
+        return self._path
+
+    def on_event(self, event: WorkflowEvent) -> None:
+        """Write a notification event as a JSON line; ignore other event types."""
+        if event.type != "notification":
+            return
+        if self._handle is None or self._handle.closed:
+            return
+        try:
+            line = json.dumps(_make_json_safe(event.to_dict()), separators=(",", ":"))
+            self._handle.write(line + "\n")
+            self._handle.flush()
+        except Exception:
+            logger.debug("Failed to write notification event to log", exc_info=True)
+
+    def close(self) -> None:
+        """Close the log file handle."""
+        if self._handle is not None and not self._handle.closed:
+            self._handle.close()
