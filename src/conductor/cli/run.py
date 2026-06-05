@@ -1992,6 +1992,7 @@ def build_dry_run_plan(workflow_path: Path) -> ExecutionPlan:
             tools: list[str] | None = None,
             interrupt_signal: asyncio.Event | None = None,
             event_callback: Any = None,
+            skill_directories: list[str] | None = None,
         ) -> AgentOutput:
             return AgentOutput(content={}, raw_response="")
 
