@@ -1285,6 +1285,76 @@ async def _execute_with_stop_signal(
     raise ExecutionError("Workflow stopped by user via dashboard")
 
 
+def _emit_loaded_instructions_debug(start_dir: Path | None, enabled: bool) -> None:
+    """Discover-and-print the workspace instructions list when the debug flag
+    is enabled and auto-discovery actually ran.
+
+    Extracted from :func:`run_workflow_async` so the branch is directly
+    testable without spinning up the full workflow runner. ``start_dir`` must
+    be the same path that :func:`build_instructions_preamble` was given as
+    ``auto_discover_dir`` — sharing the path is what guarantees the printed
+    list cannot drift from what was actually loaded.
+
+    Args:
+        start_dir: The auto-discovery start directory used by the loader, or
+            ``None`` when auto-discovery did not run. ``None`` short-circuits
+            so the debug print is a no-op (matching the contract that this
+            flag is "meaningful only when --workspace-instructions is set").
+        enabled: Whether ``--print-loaded-instructions`` was passed on the
+            CLI. ``False`` short-circuits.
+    """
+    if not enabled or start_dir is None:
+        return
+    from conductor.config.instructions import discover_workspace_instructions_detailed
+
+    detailed = discover_workspace_instructions_detailed(start_dir)
+    _print_loaded_instructions(detailed)
+
+
+def _print_loaded_instructions(detailed: list[Any]) -> None:
+    """Emit a human-readable summary of discovered workspace instruction files
+    to stderr.
+
+    Format:
+
+    .. code-block:: text
+
+        [workspace-instructions] 4 file(s) loaded from CWD:
+          AGENTS.md
+            source=AGENTS.md  reason=file-convention
+          .github/instructions/csharp-coding-standards.instructions.md
+            source=.github/instructions  reason=scope-overlap  applyTo='**/*.cs'
+          ...
+
+    Goes to stderr (not stdout) so it doesn't pollute JSON output. Uses a
+    plain-print rather than the rich console so it's reliably available in
+    background/non-TTY launchers.
+
+    The parameter is typed as ``list[Any]`` rather than
+    ``list[DiscoveredInstruction]`` to avoid a hard import at module load
+    time — the import is deferred to the call site in
+    :func:`run_workflow_async` so the discovery code path isn't loaded when
+    the flag is unused.
+    """
+    import sys
+
+    if not detailed:
+        print("[workspace-instructions] 0 files discovered from CWD.", file=sys.stderr)
+        return
+    print(
+        f"[workspace-instructions] {len(detailed)} file(s) loaded from CWD:",
+        file=sys.stderr,
+    )
+    for d in detailed:
+        # Use repr for the path so Windows paths render unambiguously.
+        print(f"  {d.path}", file=sys.stderr)
+        scope_part = f"  applyTo={d.scope!r}" if d.scope and d.scope != "**" else ""
+        print(
+            f"    source={d.source}  reason={d.reason}{scope_part}",
+            file=sys.stderr,
+        )
+
+
 async def run_workflow_async(
     workflow_path: Path,
     inputs: dict[str, Any],
@@ -1299,6 +1369,7 @@ async def run_workflow_async(
     metadata: dict[str, str] | None = None,
     workspace_instructions: bool = False,
     cli_instructions: list[str] | None = None,
+    print_loaded_instructions: bool = False,
 ) -> dict[str, Any]:
     """Execute a workflow asynchronously.
 
@@ -1315,6 +1386,9 @@ async def run_workflow_async(
         metadata: Optional CLI metadata to merge on top of YAML-declared metadata.
         workspace_instructions: If True, auto-discover workspace instruction files.
         cli_instructions: Optional list of instruction file paths from CLI.
+        print_loaded_instructions: If True, print the resolved instruction file
+            list (with scope and inclusion reason) to stderr before running.
+            No-op unless ``workspace_instructions`` is also True.
 
     Returns:
         The workflow output as a dictionary.
@@ -1417,8 +1491,16 @@ async def run_workflow_async(
         if workspace_instructions or cli_instructions or config.workflow.instructions:
             from conductor.config.instructions import build_instructions_preamble
 
+            # Compute the auto-discovery start dir once and share it between
+            # the loader and the --print-loaded-instructions debug dump. If
+            # these diverged (e.g. the cwd changed between the two calls, or
+            # one was passed a different path), the printed list would no
+            # longer reflect what was actually loaded — defeating the whole
+            # purpose of the debug flag.
+            start_dir = Path.cwd() if workspace_instructions else None
+
             instructions_preamble = build_instructions_preamble(
-                auto_discover_dir=Path.cwd() if workspace_instructions else None,
+                auto_discover_dir=start_dir,
                 yaml_instructions=config.workflow.instructions or None,
                 cli_instruction_paths=cli_instructions,
             )
@@ -1427,6 +1509,12 @@ async def run_workflow_async(
                     f"Workspace instructions loaded ({len(instructions_preamble)} chars)",
                     style="cyan",
                 )
+
+            # --print-loaded-instructions: dump the resolved discovery list to
+            # stderr for debugging. Only meaningful when auto-discovery ran,
+            # and must use the same start_dir as the loader above so the
+            # printed list cannot silently drift from what was loaded.
+            _emit_loaded_instructions_debug(start_dir, print_loaded_instructions)
 
         # Convert MCP servers from workflow config to SDK format
         mcp_servers = await _build_mcp_servers(config)

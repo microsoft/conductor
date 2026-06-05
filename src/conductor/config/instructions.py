@@ -62,9 +62,40 @@ class ConventionDirectory:
 
     Discovery: walk CWD → git root. At each level, look for the convention
     directory. If found, find files matching ``pattern`` (recursively when
-    ``recursive=True``), apply the optional ``include_file`` predicate, and
-    track surviving files keyed by their *relative path within the convention
-    directory*. Closest-wins per relative-path key — local to this convention.
+    ``recursive=True``), apply the optional ``include_file`` and
+    ``extract_scope`` filters, and track surviving files keyed by their
+    *relative path within the convention directory*. Closest-wins per
+    relative-path key — local to this convention.
+
+    Filter chain (applied in order, short-circuit on first reject):
+
+    1. ``include_file(file)`` — coarse eligibility gate. Retained for
+       backward-compat and for conventions whose eligibility logic is
+       orthogonal to scope (e.g., "skip files without frontmatter").
+       Convention authors writing new scoped conventions should typically
+       reach for ``extract_scope`` instead.
+    2. ``extract_scope(file)`` — returns the file's scope glob, or ``None``
+       to opt out of auto-discovery for this file. The conductor core
+       interprets the return value:
+
+       * ``None`` → opt out (file is *not* loaded by auto-discovery,
+         matching today's behavior for ``.github/instructions/`` files with
+         absent or non-string ``applyTo``).
+       * ``ALWAYS_ON_SCOPE`` (the string ``"**"``) → always include,
+         regardless of CWD. Convention authors should use the constant
+         rather than the literal so the contract is greppable.
+       * Any other string → treat as a path glob and run a bidirectional
+         overlap test against the user's CWD (relative to the convention
+         directory's owner directory). The file is included if the glob's
+         matched subtree overlaps with the CWD subtree in *either*
+         direction. Multi-glob values are supported (separators ``;`` and
+         ``,``); the file is included if *any* sub-glob overlaps.
+
+    The overlap test is owned by conductor core (single source of truth),
+    not by individual convention authors — so adding a second scoped
+    convention later (e.g., Cursor's ``.cursor/rules/*.mdc`` with a
+    ``globs:`` frontmatter field) only requires implementing its own
+    ``extract_scope`` callable, not re-implementing the overlap semantic.
 
     Symlink policy: directory traversal does NOT follow symlinked directories
     (``os.walk(followlinks=False)``) to avoid loops and out-of-tree expansion.
@@ -75,10 +106,47 @@ class ConventionDirectory:
     path: str
     pattern: str
     include_file: Callable[[Path], bool] | None = None
+    extract_scope: Callable[[Path], str | None] | None = None
     recursive: bool = True
 
 
 Convention = ConventionFile | ConventionDirectory
+
+
+# Convention-author-facing sentinel for "include this file regardless of CWD".
+# When ``ConventionDirectory.extract_scope`` returns this exact string, the
+# overlap test is short-circuited and the file is always loaded. Defined as a
+# module constant so convention authors can grep for usages instead of
+# scattering string literals.
+ALWAYS_ON_SCOPE = "**"
+
+
+@dataclass(frozen=True)
+class DiscoveredInstruction:
+    """A workspace instruction file discovered by ``--workspace-instructions``,
+    annotated with its filtering provenance.
+
+    Used by :func:`discover_workspace_instructions_detailed` so that consumers
+    (e.g., ``--print-loaded-instructions``) can report *why* each file was
+    included without re-parsing the filesystem.
+    """
+
+    path: Path
+    # The convention's path identifier (e.g. ``"AGENTS.md"``,
+    # ``".github/instructions"``), useful for grouping in output.
+    source: str
+    # The scope value that was extracted from the file, if any. ``None`` for
+    # conventions with no scope concept (single-file conventions; directory
+    # conventions without ``extract_scope``).
+    scope: str | None
+    # Stable, machine-readable reason for inclusion. One of:
+    #
+    # * ``"file-convention"`` — single-file convention, no scope concept.
+    # * ``"always-on"`` — scoped convention but file's scope is
+    #   :data:`ALWAYS_ON_SCOPE` (or the convention has no ``extract_scope``).
+    # * ``"scope-overlap"`` — scoped convention; file's scope glob overlapped
+    #   with the user's CWD subtree.
+    reason: str
 
 
 # ---------------------------------------------------------------------------
@@ -142,28 +210,129 @@ def _parse_frontmatter(path: Path) -> dict[str, object] | None:
     return fm
 
 
-def _is_always_on_instructions_file(path: Path) -> bool:
-    """Return True iff a ``.github/instructions/*.instructions.md`` file is
-    explicitly always-on per GitHub's documented convention semantics.
+def _extract_apply_to(path: Path) -> str | None:
+    """Extract the ``applyTo`` glob from a ``.github/instructions/*.instructions.md``
+    file's YAML frontmatter.
 
-    Per
-    https://docs.github.com/en/copilot/customizing-copilot/about-customizing-github-copilot-chat-responses
-    and https://code.visualstudio.com/docs/copilot/customization/custom-instructions:
+    Wired to :class:`ConventionDirectory` as the ``extract_scope`` callable for
+    GitHub Copilot's instructions convention. Conductor core interprets the
+    return value (see :class:`ConventionDirectory` docstring for the full
+    contract):
 
-    * ``applyTo: "**"`` → "always applied" → INCLUDE in conductor preamble
-    * ``applyTo: "<other glob>"`` → scoped to matched files in chat → SKIP
-      (conductor has no per-agent file-scope concept)
-    * ``applyTo`` absent → "not applied automatically; you can still add them
-      manually to a chat request" → SKIP
+    * ``None`` → file is opted out of auto-discovery (no parsable frontmatter,
+      missing ``applyTo``, or ``applyTo`` is not a string). Matches the
+      GitHub spec for "not applied automatically" files.
+    * Any string → conductor core decides what to do (``"**"`` = always include;
+      anything else = scoped glob, evaluated against CWD).
 
-    Conductor's preamble is always-on for every agent prompt. To honor the
-    convention exactly, only files explicitly marked ``applyTo: "**"`` are
-    loaded.
+    Notes on what we *don't* parse:
+
+    * GitHub's spec permits ``applyTo`` to be a single string; YAML lists are
+      not part of the documented convention. Authors expressing multiple
+      patterns use semicolon- or comma-separated strings — which conductor's
+      overlap test splits natively. A list value here returns ``None``
+      (opt-out) rather than silently joining; that mirrors the convention's
+      stated shape.
     """
     fm = _parse_frontmatter(path)
     if fm is None:
-        return False
-    return fm.get("applyTo") == "**"
+        return None
+    apply_to = fm.get("applyTo")
+    if not isinstance(apply_to, str):
+        return None
+    return apply_to
+
+
+# Multi-glob separators observed in real-world ``applyTo`` values: both ``;``
+# and ``,`` appear in production usage (see the Azure Chaos Studio sample in
+# microsoft/conductor#231). Splitting on either keeps the helper compatible
+# with authors' actual writing. NOTE: this does NOT support brace expansion
+# inside a single glob (e.g., ``{src,tests}/**``) — the inner comma would be
+# treated as a separator and the brace would never close. We don't see brace
+# expansion in real-world data; if it becomes a pain point, swap this regex
+# for a brace-aware splitter.
+_MULTI_GLOB_SEP_RE = re.compile(r"[;,]")
+
+# Characters that signal the start of a wildcard segment in a path glob.
+# Anything before the first segment containing one of these is a literal
+# directory prefix, which is what we use for the overlap approximation.
+_GLOB_WILDCARD_RE = re.compile(r"[*?\[]")
+
+
+def _normalize_scope_path(p: str) -> str:
+    """Normalize a path-glob or CWD-relative fragment to a comparable form.
+
+    * Converts backslashes (Windows-authored values) to forward slashes.
+    * Strips repeated ``./`` prefixes and leading ``/`` (some authors write
+      ``"/docs/eng.ms/**"`` — observed in real-world data).
+    * Strips a trailing ``/``.
+    * Normalises ``.`` (current dir) to the empty string so "workspace root"
+      has a single canonical representation.
+    """
+    n = p.replace("\\", "/").strip()
+    while n.startswith("./"):
+        n = n[2:]
+    n = n.lstrip("/").rstrip("/")
+    if n == ".":
+        n = ""
+    return n
+
+
+def _single_glob_overlaps(glob: str, cwd_norm: str) -> bool:
+    """Return True if a single normalized glob could match any file under
+    ``cwd_norm``, OR if the glob's target subtree is itself under ``cwd_norm``.
+
+    Uses a literal-prefix approximation: the glob's directory parts up to the
+    first wildcard segment form a "minimum prefix" subtree the glob touches.
+    Two subtrees overlap if either is contained in the other (or they're
+    identical).
+
+    This is intentionally conservative — it can over-include for globs like
+    ``"src/*/tests/**"`` evaluated against ``"src/foo/bar"`` (literal prefix
+    ``"src"`` overlaps ``"src/foo/bar"`` even though the glob can't actually
+    match a non-test file under ``bar/``). Over-inclusion is the safer failure
+    mode for this codepath: the alternative is silently dropping instructions
+    a user reasonably expects to be loaded.
+    """
+    g = _normalize_scope_path(glob)
+
+    prefix_parts: list[str] = []
+    for part in g.split("/"):
+        if _GLOB_WILDCARD_RE.search(part):
+            break
+        prefix_parts.append(part)
+    prefix = "/".join(prefix_parts)
+
+    # Empty prefix: glob's first segment is a wildcard (e.g. ``**/*.cs``),
+    # so it can match anywhere in the tree → overlaps any CWD.
+    if not prefix:
+        return True
+    # Empty CWD: user is at workspace root; everything is "inside" it.
+    if not cwd_norm:
+        return True
+    # Either subtree contains the other.
+    return (
+        cwd_norm == prefix or cwd_norm.startswith(prefix + "/") or prefix.startswith(cwd_norm + "/")
+    )
+
+
+def _scope_overlaps(scope: str, cwd_rel: str) -> bool:
+    """Return True if the ``scope`` value (a single or multi-glob string)
+    overlaps with the ``cwd_rel`` subtree.
+
+    Handles multi-glob values where authors separate sub-globs with ``;`` or
+    ``,`` (both observed in production ``applyTo`` strings). Empty sub-globs
+    (e.g., trailing separator) are skipped silently.
+
+    See :func:`_single_glob_overlaps` for the per-glob semantics; this just
+    short-circuits on the first matching sub-glob.
+    """
+    cwd_norm = _normalize_scope_path(cwd_rel)
+    for sub in _MULTI_GLOB_SEP_RE.split(scope):
+        sub = sub.strip()
+        if sub and _single_glob_overlaps(sub, cwd_norm):
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -181,7 +350,7 @@ CONVENTIONS: list[Convention] = [
     ConventionDirectory(
         path=".github/instructions",
         pattern="*.instructions.md",
-        include_file=_is_always_on_instructions_file,
+        extract_scope=_extract_apply_to,
         recursive=True,
     ),
 ]
@@ -223,13 +392,38 @@ def _find_git_root(start_dir: Path) -> Path | None:
 
 
 def _walk_directory_convention(
-    base_dir: Path, convention: ConventionDirectory
-) -> Iterator[tuple[str, Path]]:
-    """Yield ``(relative_path, absolute_path)`` for files in ``base_dir``
-    matching ``convention.pattern`` and (if set) ``convention.include_file``.
+    base_dir: Path,
+    convention: ConventionDirectory,
+    cwd_rel: str = "",
+) -> Iterator[tuple[str, Path, str | None]]:
+    """Yield ``(relative_path, absolute_path, scope)`` for files in ``base_dir``
+    matching ``convention.pattern`` and surviving the configured filter chain.
 
     The relative path is computed against ``base_dir`` and uses POSIX
     separators for cross-platform deterministic ordering.
+
+    The ``scope`` value carried in each tuple is whatever
+    ``convention.extract_scope`` returned for the file (or ``None`` when the
+    convention has no ``extract_scope`` callable). Consumers can use it to
+    build :class:`DiscoveredInstruction` records without re-parsing each
+    file's frontmatter.
+
+    Filter chain (per file, short-circuit on first reject):
+
+    1. ``convention.include_file(file)`` if set.
+    2. ``convention.extract_scope(file)`` if set — yields ``None``? Skip.
+       Returns :data:`ALWAYS_ON_SCOPE` (``"**"``)? Include unconditionally.
+       Returns any other glob string? Include only if it overlaps
+       ``cwd_rel``.
+
+    ``cwd_rel`` is interpreted as a POSIX path relative to the convention's
+    *owner directory* (the directory containing ``convention.path`` —
+    typically the git root, but may be a nested project dir when the
+    convention directory was discovered at a non-root level). Callers that
+    discover the convention at multiple levels should pass the appropriate
+    per-level ``cwd_rel`` so a nested ``.github/instructions/foo.md`` with
+    ``applyTo: "src/**"`` resolves ``src`` relative to that nested project,
+    not the workspace root.
 
     Symlinked directories are NOT traversed (``followlinks=False``); symlinked
     files inside the tree are listed and read like regular files.
@@ -238,10 +432,11 @@ def _walk_directory_convention(
         for dirpath, _dirnames, filenames in os.walk(base_dir, followlinks=False):
             for fname in fnmatch.filter(filenames, convention.pattern):
                 file_path = Path(dirpath) / fname
-                if convention.include_file is not None and not convention.include_file(file_path):
+                accepted_scope = _apply_convention_filters(convention, file_path, cwd_rel)
+                if accepted_scope is _REJECT:
                     continue
                 rel = file_path.relative_to(base_dir).as_posix()
-                yield rel, file_path
+                yield rel, file_path, accepted_scope
     else:
         try:
             entries = list(os.scandir(base_dir))
@@ -259,50 +454,128 @@ def _walk_directory_convention(
             if not fnmatch.fnmatch(entry.name, convention.pattern):
                 continue
             file_path = Path(entry.path)
-            if convention.include_file is not None and not convention.include_file(file_path):
+            accepted_scope = _apply_convention_filters(convention, file_path, cwd_rel)
+            if accepted_scope is _REJECT:
                 continue
-            yield entry.name, file_path
+            yield entry.name, file_path, accepted_scope
+
+
+# Sentinel returned by :func:`_apply_convention_filters` to signal "this file
+# was rejected by one of the filters; skip it." Distinct from ``None``, which
+# is a legitimate ``scope`` value meaning "no scope concept; the convention
+# has no ``extract_scope`` callable."
+_REJECT = object()
+
+
+def _apply_convention_filters(
+    convention: ConventionDirectory, file_path: Path, cwd_rel: str
+) -> object:
+    """Apply :class:`ConventionDirectory`'s filter chain to a candidate file.
+
+    Returns either:
+
+    * :data:`_REJECT` — the file failed a filter and must be skipped.
+    * The scope value (``None`` for conventions without ``extract_scope``,
+      otherwise whatever ``extract_scope`` returned) — the file passed.
+    """
+    if convention.include_file is not None and not convention.include_file(file_path):
+        return _REJECT
+    if convention.extract_scope is None:
+        return None  # convention has no scope concept; file passes
+    scope = convention.extract_scope(file_path)
+    if scope is None:
+        return _REJECT  # file opted out
+    if scope == ALWAYS_ON_SCOPE:
+        return scope  # always-on, no overlap test
+    if not _scope_overlaps(scope, cwd_rel):
+        return _REJECT
+    return scope
 
 
 def discover_workspace_instructions(start_dir: Path) -> list[Path]:
     """Discover convention instruction files by walking up to the git root.
 
-    Searches from ``start_dir`` up to the git repository root for each entry
-    in :data:`CONVENTIONS`. Files closer to ``start_dir`` take precedence
-    when the same logical match key exists at multiple levels (closest-wins).
+    See :func:`discover_workspace_instructions_detailed` for the underlying
+    discovery algorithm and per-file filtering provenance. This wrapper
+    projects the result to just the file paths for callers that don't need
+    the metadata (e.g., :func:`load_instruction_files`).
+    """
+    return [d.path for d in discover_workspace_instructions_detailed(start_dir)]
 
+
+def discover_workspace_instructions_detailed(start_dir: Path) -> list[DiscoveredInstruction]:
+    """Discover convention instruction files, returning structured metadata.
+
+    Walks from ``start_dir`` up to the git repository root for each entry in
+    :data:`CONVENTIONS`. Files closer to ``start_dir`` take precedence when
+    the same logical match key exists at multiple levels (closest-wins).
     Each convention has its own discovery state, so keys do not collide
     across conventions (e.g., a hypothetical ``.cursor/rules/style.md`` would
     not shadow ``.github/instructions/style.instructions.md``).
 
+    For :class:`ConventionDirectory` entries with a configured
+    ``extract_scope`` callable, each candidate file's scope is evaluated
+    against the user's CWD *relative to the convention's owner directory*
+    (the directory containing the convention's path at the level where it
+    was found). This means a nested
+    ``services/GW/.github/instructions/foo.md`` with
+    ``applyTo: "src/**"`` resolves ``src`` relative to ``services/GW`` —
+    matching the "closest-wins / local-convention" semantic that makes
+    nested conventions meaningful.
+
     Returns:
-        List of discovered instruction file paths. File conventions appear
-        first in their :data:`CONVENTIONS` declaration order; directory
+        List of :class:`DiscoveredInstruction` records. File conventions
+        appear first in :data:`CONVENTIONS` declaration order; directory
         conventions follow with their files sorted by relative path within
         the convention directory.
     """
+    start_resolved = start_dir.resolve()
     git_root = _find_git_root(start_dir)
-    stop_at = git_root if git_root is not None else start_dir.resolve()
+    # Resolve git_root so equality against the (already-resolved) ``current``
+    # walk pointer holds even when the git root is reached via a symlinked
+    # path. Without this, ``current == stop_at`` can be False at the git
+    # root and the walk overshoots into the parent filesystem.
+    stop_at = git_root.resolve() if git_root is not None else start_resolved
 
-    result: list[Path] = []
+    result: list[DiscoveredInstruction] = []
     for convention in CONVENTIONS:
         # Per-convention state: closest-wins is local to this convention only.
-        discovered: dict[str, Path] = {}
+        # Value carries the scope-at-discovery-time so we don't re-parse later.
+        discovered: dict[str, tuple[Path, str | None]] = {}
 
-        current = start_dir.resolve()
+        current = start_resolved
         while True:
+            # cwd_rel is relative to the *current* walk level — that is, the
+            # directory that owns the convention at this iteration. For a
+            # root-level convention this equals start-dir-relative-to-git-root;
+            # for a nested convention it's start-dir-relative-to-the-nested-
+            # project, which is what the convention's `applyTo` globs are
+            # naturally written against.
+            try:
+                cwd_rel = start_resolved.relative_to(current).as_posix()
+            except ValueError:
+                # current is somehow not an ancestor of start_resolved (e.g.,
+                # symlink shenanigans). Fall back to empty CWD which makes
+                # the overlap test permissive — consistent with our
+                # "over-include rather than silently skip" bias.
+                cwd_rel = ""
+            if cwd_rel == ".":
+                cwd_rel = ""
+
             if isinstance(convention, ConventionFile):
                 if convention.path not in discovered:
                     candidate = current / convention.path
                     if candidate.is_file():
-                        discovered[convention.path] = candidate
+                        discovered[convention.path] = (candidate, None)
                         logger.debug("Discovered instruction file: %s", candidate)
             else:  # ConventionDirectory
                 base_dir = current / convention.path
                 if base_dir.is_dir():
-                    for rel, abs_path in _walk_directory_convention(base_dir, convention):
+                    for rel, abs_path, scope in _walk_directory_convention(
+                        base_dir, convention, cwd_rel
+                    ):
                         if rel not in discovered:
-                            discovered[rel] = abs_path
+                            discovered[rel] = (abs_path, scope)
                             logger.debug("Discovered instruction file: %s", abs_path)
 
             if current == stop_at or current.parent == current:
@@ -312,12 +585,48 @@ def discover_workspace_instructions(start_dir: Path) -> list[Path]:
         # Append this convention's discoveries in deterministic order.
         if isinstance(convention, ConventionFile):
             if convention.path in discovered:
-                result.append(discovered[convention.path])
+                path, _ = discovered[convention.path]
+                result.append(
+                    DiscoveredInstruction(
+                        path=path,
+                        source=convention.path,
+                        scope=None,
+                        reason="file-convention",
+                    )
+                )
         else:  # ConventionDirectory
             for rel in sorted(discovered.keys()):
-                result.append(discovered[rel])
+                path, scope = discovered[rel]
+                reason = _discovery_reason(convention, scope)
+                result.append(
+                    DiscoveredInstruction(
+                        path=path,
+                        source=convention.path,
+                        scope=scope,
+                        reason=reason,
+                    )
+                )
 
     return result
+
+
+def _discovery_reason(convention: ConventionDirectory, scope: str | None) -> str:
+    """Compute the human-readable inclusion reason for a discovered file."""
+    if convention.extract_scope is None:
+        # Convention with no scope concept (or include_file-only); the file
+        # passed the eligibility gate and that's all there is to say.
+        return "always-on"
+    # Invariant: when ``extract_scope`` is set, ``_apply_convention_filters``
+    # returns ``_REJECT`` rather than a ``None`` scope, so a discovered file
+    # always carries a concrete scope string here. Pin this with an assert
+    # so a future regression surfaces loudly instead of being silently
+    # relabeled as "always-on".
+    assert scope is not None, (
+        "extract_scope set but scope is None — _apply_convention_filters invariant violated"
+    )
+    if scope == ALWAYS_ON_SCOPE:
+        return "always-on"
+    return "scope-overlap"
 
 
 def load_instruction_files(paths: list[Path]) -> str:

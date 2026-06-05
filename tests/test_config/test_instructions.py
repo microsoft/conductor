@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -656,6 +657,65 @@ class TestBgRunnerInstructionFlags:
                 assert cmd[instr_indices[0] + 1] == "AGENTS.md"
                 assert cmd[instr_indices[1] + 1] == "CLAUDE.md"
 
+    def test_print_loaded_instructions_flag_forwarded(self) -> None:
+        """--print-loaded-instructions should appear in the subprocess command
+        when set so background runs surface discovery info in their captured
+        stderr log."""
+        import contextlib
+        from unittest.mock import patch
+
+        from conductor.cli.bg_runner import launch_background
+
+        with (
+            patch("conductor.cli.bg_runner.subprocess.Popen") as mock_popen,
+            patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+        ):
+            mock_popen.return_value.pid = 12345
+
+            with contextlib.suppress(Exception):
+                launch_background(
+                    workflow_path=Path("test.yaml"),
+                    inputs={},
+                    workspace_instructions=True,
+                    print_loaded_instructions=True,
+                    web_port=9999,
+                )
+
+            # Hard-assert that the subprocess command was actually built —
+            # otherwise the `in` assertion below silently no-ops if Popen
+            # was never reached.
+            assert mock_popen.called, "expected launch_background to invoke Popen"
+            cmd = mock_popen.call_args[0][0]
+            assert "--print-loaded-instructions" in cmd
+
+    def test_print_loaded_instructions_flag_omitted_when_unset(self) -> None:
+        """--print-loaded-instructions must NOT appear when not requested
+        (avoid leaking into background runs by default)."""
+        import contextlib
+        from unittest.mock import patch
+
+        from conductor.cli.bg_runner import launch_background
+
+        with (
+            patch("conductor.cli.bg_runner.subprocess.Popen") as mock_popen,
+            patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+        ):
+            mock_popen.return_value.pid = 12345
+
+            with contextlib.suppress(Exception):
+                launch_background(
+                    workflow_path=Path("test.yaml"),
+                    inputs={},
+                    workspace_instructions=True,
+                    web_port=9999,
+                )
+
+            # Hard-assert that the subprocess command was actually built —
+            # otherwise the `not in` assertion below silently no-ops.
+            assert mock_popen.called, "expected launch_background to invoke Popen"
+            cmd = mock_popen.call_args[0][0]
+            assert "--print-loaded-instructions" not in cmd
+
 
 # ---------------------------------------------------------------------------
 # Directory-convention discovery: .github/instructions/*.instructions.md
@@ -706,13 +766,106 @@ class TestDiscoverGithubInstructionsDir:
         result = discover_workspace_instructions(tmp_path)
         assert any(p.name == "style.instructions.md" for p in result)
 
-    def test_skips_scoped_file(self, tmp_path: Path) -> None:
-        """`applyTo: '<other glob>'` is scoped per the docs and SHOULD NOT be loaded."""
+    def test_scoped_file_loads_at_root_cwd(self, tmp_path: Path) -> None:
+        """`applyTo: '<glob>'` files load when CWD is the repo root.
+
+        At the root, bidirectional overlap loads every scoped file
+        (correctness fix for the silently-skipped bug — see
+        microsoft/conductor#231). Narrowing kicks in only when the user
+        `cd`s into a subdir, exercised by
+        ``test_scoped_file_skipped_when_cwd_disjoint`` below.
+        """
         (tmp_path / ".git").mkdir()
         f = tmp_path / ".github" / "instructions" / "ts-only.instructions.md"
         _write_with_frontmatter(f, apply_to="**/*.ts", body="TS rules.")
         result = discover_workspace_instructions(tmp_path)
-        assert not any(p.name == "ts-only.instructions.md" for p in result)
+        assert any(p.name == "ts-only.instructions.md" for p in result)
+
+    def test_scoped_file_skipped_when_cwd_disjoint(self, tmp_path: Path) -> None:
+        """When CWD is a subdir whose subtree doesn't overlap the file's
+        `applyTo` glob, the scoped file is correctly skipped.
+
+        This is the narrowing case: at `services/AS`, a file scoped to
+        `services/GW/**` should NOT load.
+        """
+        (tmp_path / ".git").mkdir()
+        # Scoped instructions live at the repo root, applyTo = services/GW/**
+        _write_with_frontmatter(
+            tmp_path / ".github" / "instructions" / "gw-only.instructions.md",
+            apply_to="services/GW/**",
+            body="GW rules.",
+        )
+        # CWD is services/AS — disjoint from services/GW
+        as_dir = tmp_path / "services" / "AS"
+        as_dir.mkdir(parents=True)
+        result = discover_workspace_instructions(as_dir)
+        assert not any(p.name == "gw-only.instructions.md" for p in result)
+
+    def test_scoped_file_loads_when_cwd_inside_scope(self, tmp_path: Path) -> None:
+        """When CWD is inside the file's `applyTo` subtree, the file loads."""
+        (tmp_path / ".git").mkdir()
+        _write_with_frontmatter(
+            tmp_path / ".github" / "instructions" / "gw-only.instructions.md",
+            apply_to="services/GW/**",
+            body="GW rules.",
+        )
+        # CWD is deep inside services/GW
+        gw_src = tmp_path / "services" / "GW" / "src" / "Controllers"
+        gw_src.mkdir(parents=True)
+        result = discover_workspace_instructions(gw_src)
+        assert any(p.name == "gw-only.instructions.md" for p in result)
+
+    def test_multi_glob_applyto_semicolon(self, tmp_path: Path) -> None:
+        """Multi-glob applyTo with ';' separator loads when any sub-glob overlaps."""
+        (tmp_path / ".git").mkdir()
+        _write_with_frontmatter(
+            tmp_path / ".github" / "instructions" / "gw-or-be.instructions.md",
+            apply_to="services/GW/**;services/BE/**",
+            body="GW or BE rules.",
+        )
+        be_dir = tmp_path / "services" / "BE"
+        be_dir.mkdir(parents=True)
+        result = discover_workspace_instructions(be_dir)
+        assert any(p.name == "gw-or-be.instructions.md" for p in result)
+
+    def test_multi_glob_applyto_comma(self, tmp_path: Path) -> None:
+        """Multi-glob applyTo with ',' separator loads when any sub-glob overlaps."""
+        (tmp_path / ".git").mkdir()
+        _write_with_frontmatter(
+            tmp_path / ".github" / "instructions" / "lang-mix.instructions.md",
+            apply_to="**/*.cs,**/*.csproj",
+            body="C# and project rules.",
+        )
+        # CWD anywhere — leading-** sub-globs overlap any CWD
+        sub = tmp_path / "services" / "GW"
+        sub.mkdir(parents=True)
+        result = discover_workspace_instructions(sub)
+        assert any(p.name == "lang-mix.instructions.md" for p in result)
+
+    def test_nested_convention_scope_relative_to_owner_dir(self, tmp_path: Path) -> None:
+        """A nested `.github/instructions/foo.md` interprets its `applyTo`
+        relative to the nested project's own directory (its owner), not
+        relative to the workspace root.
+
+        Without per-walk-level cwd_rel, a nested file with
+        `applyTo: "src/**"` evaluated from `services/GW` would compare
+        `"src/**"` against cwd_rel `"services/GW"` (root-relative) and
+        miss. With per-owner cwd_rel, cwd_rel is `""` (start_dir == owner),
+        which always overlaps.
+        """
+        (tmp_path / ".git").mkdir()
+        # Nested .github/instructions/ at services/GW/
+        nested = tmp_path / "services" / "GW" / ".github" / "instructions"
+        nested.mkdir(parents=True)
+        _write_with_frontmatter(
+            nested / "gw-src.instructions.md",
+            apply_to="src/**",
+            body="GW src rules.",
+        )
+        # CWD is services/GW (the owner dir for the nested convention)
+        gw_dir = tmp_path / "services" / "GW"
+        result = discover_workspace_instructions(gw_dir)
+        assert any(p.name == "gw-src.instructions.md" for p in result)
 
     def test_skips_no_frontmatter(self, tmp_path: Path) -> None:
         """Files without any frontmatter are 'manual-attach' per the docs → SKIP."""
@@ -849,9 +1002,543 @@ class TestDiscoverGithubInstructionsDir:
         result = discover_workspace_instructions(tmp_path)
         assert not any(p.name == "foo.md" for p in result)
 
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="Symlink creation requires elevation on Windows",
+    )
+    def test_symlinked_git_root_stops_walk(self, tmp_path: Path) -> None:
+        """Regression for R1-003: a symlinked path to the git root must stop
+        the parent-walk at the git root.
+
+        Before the fix, ``stop_at`` held the unresolved git_root path while
+        ``current`` was walked via ``start_dir.resolve()``. On a symlinked
+        git root the two paths differed, ``current == stop_at`` never held,
+        and the walk overshot into the parent filesystem — potentially
+        picking up out-of-repo instruction files.
+        """
+        # Real repo with a top-level instruction file.
+        real_repo = tmp_path / "real_repo"
+        real_repo.mkdir()
+        (real_repo / ".git").mkdir()
+        _write_with_frontmatter(
+            real_repo / ".github" / "instructions" / "in_repo.instructions.md",
+            apply_to="**",
+        )
+        # An out-of-repo instruction file in a sibling fake "outer" repo that
+        # also looks like a git root. If the walk overshoots past the real
+        # git root, it could end up here.
+        outer = tmp_path / "outer"
+        outer.mkdir()
+        (outer / ".git").mkdir()
+        _write_with_frontmatter(
+            outer / ".github" / "instructions" / "out_of_repo.instructions.md",
+            apply_to="**",
+        )
+        # Access the repo via a symlink so start_dir.resolve() differs from
+        # the unresolved git_root that _find_git_root returns.
+        link = tmp_path / "link_to_repo"
+        os.symlink(real_repo, link, target_is_directory=True)
+        sub = link / "sub"
+        sub.mkdir()
+
+        result = discover_workspace_instructions(sub)
+        names = [p.name for p in result]
+        assert "in_repo.instructions.md" in names
+        assert "out_of_repo.instructions.md" not in names
+
 
 # ---------------------------------------------------------------------------
-# Frontmatter robustness: edge cases for `_is_always_on_instructions_file`
+# _scope_overlaps + _single_glob_overlaps + _normalize_scope_path
+# ---------------------------------------------------------------------------
+
+
+class TestScopeOverlaps:
+    """Tests for the bidirectional glob-vs-CWD overlap helper.
+
+    The overlap test is intentionally conservative (over-approximates): better
+    to load too many instructions than to silently skip ones the user expects.
+    These tests pin down both correct positives and the principled
+    over-approximations so future maintainers don't "fix" them into false
+    negatives.
+    """
+
+    def test_root_cwd_loads_everything(self) -> None:
+        """At repo root (cwd_rel=''), every prefix overlaps."""
+        from conductor.config.instructions import _scope_overlaps
+
+        assert _scope_overlaps("services/GW/**", "")
+        assert _scope_overlaps("**/*.cs", "")
+        assert _scope_overlaps("docs/eng.ms/**", "")
+        assert _scope_overlaps("CHANGELOG.md", "")
+
+    def test_cwd_inside_scope_subtree(self) -> None:
+        """CWD is a descendant of the glob's prefix subtree."""
+        from conductor.config.instructions import _scope_overlaps
+
+        assert _scope_overlaps("services/GW/**", "services/GW")
+        assert _scope_overlaps("services/GW/**", "services/GW/src/Controllers")
+        assert _scope_overlaps("docs/**", "docs/api/reference")
+
+    def test_scope_inside_cwd_subtree(self) -> None:
+        """The glob's prefix subtree is a descendant of CWD."""
+        from conductor.config.instructions import _scope_overlaps
+
+        # Repo root with a nested-target scope
+        assert _scope_overlaps("services/GW/**", "services")
+        # CWD = services, scope target = services/GW/** → scope is inside CWD
+        assert _scope_overlaps("docs/api/**", "docs")
+
+    def test_disjoint_subtrees(self) -> None:
+        """Disjoint prefix subtrees: no overlap."""
+        from conductor.config.instructions import _scope_overlaps
+
+        assert not _scope_overlaps("services/GW/**", "services/AS")
+        assert not _scope_overlaps("docs/eng.ms/**", "services/GW")
+        assert not _scope_overlaps("portal/extension/**", "services/GW")
+
+    def test_segment_boundary_not_prefix_match(self) -> None:
+        """`foo` must NOT overlap `food` — segment boundaries matter.
+
+        This pins down a class of regression where a future "simplification"
+        might use bare `str.startswith` (would falsely match `food` against
+        prefix `foo`). The implementation guards against this with
+        `prefix + "/"` boundary checks.
+        """
+        from conductor.config.instructions import _scope_overlaps
+
+        assert not _scope_overlaps("foo", "food")
+        assert not _scope_overlaps("services/GW", "services/GWX")
+        assert not _scope_overlaps("services/GW/**", "services/GWX/src")
+
+    def test_leading_double_star_matches_anywhere(self) -> None:
+        """Globs starting with `**` have an empty literal prefix → always overlap."""
+        from conductor.config.instructions import _scope_overlaps
+
+        assert _scope_overlaps("**/*.cs", "services/GW/src")
+        assert _scope_overlaps("**/portal-extension/**", "services/AS")
+        assert _scope_overlaps("**/kubectl/*.yaml", "anywhere/at/all")
+
+    def test_multi_glob_semicolon_separator(self) -> None:
+        """`;`-separated multi-glob: overlap iff any sub-glob overlaps."""
+        from conductor.config.instructions import _scope_overlaps
+
+        assert _scope_overlaps("services/GW/**;services/BE/**", "services/BE")
+        assert _scope_overlaps("services/GW/**;services/BE/**", "services/GW")
+        assert not _scope_overlaps("services/GW/**;services/BE/**", "services/AS")
+
+    def test_multi_glob_comma_separator(self) -> None:
+        """`,`-separated multi-glob: overlap iff any sub-glob overlaps."""
+        from conductor.config.instructions import _scope_overlaps
+
+        assert _scope_overlaps("**/*.cs,**/*.csproj,**/Directory.Packages.props", "anywhere")
+        assert _scope_overlaps("docs/**,**/*.md", "docs/api")
+        # Note: leading-** sub-globs make this trivially true; an unambiguous
+        # disjoint case requires fully-prefixed sub-globs.
+        assert not _scope_overlaps("services/GW/**,services/BE/**", "services/AS")
+
+    def test_leading_slash_in_glob(self) -> None:
+        """Authors sometimes write `/docs/...` (observed in real data).
+        Leading slash should not break the overlap test."""
+        from conductor.config.instructions import _scope_overlaps
+
+        assert _scope_overlaps("/docs/eng.ms/**", "docs/eng.ms/articles")
+        assert not _scope_overlaps("/docs/eng.ms/**", "services/GW")
+
+    def test_exact_file_glob(self) -> None:
+        """A glob with no wildcards is an exact file path. Overlap if CWD
+        is the file's directory (or an ancestor of it)."""
+        from conductor.config.instructions import _scope_overlaps
+
+        # CWD = src, scope = src/foo/bar.cs → scope is inside CWD → overlap
+        assert _scope_overlaps("src/foo/bar.cs", "src")
+        # CWD = src/foo/bar, scope = src/foo/bar.cs → scope is at parent of CWD;
+        # technically the file is at src/foo/, NOT inside src/foo/bar. The
+        # literal-prefix-overlap algorithm conservatively returns True (prefix
+        # 'src/foo/bar.cs' overlaps with cwd 'src/foo/bar' — neither contains
+        # the other strictly, so disjoint). This is OVER-APPROXIMATION in the
+        # principled direction; documenting here so it's not "fixed".
+        assert not _scope_overlaps("src/foo/bar.cs", "src/foo/baz")
+
+    def test_over_approximation_intermediate_wildcard(self) -> None:
+        """`src/*/tests/**` evaluated against `src/foo/bar` has literal prefix
+        `src` which overlaps `src/foo/bar`. The glob can't actually match any
+        file under `src/foo/bar/` (because the path doesn't go through
+        `tests/`), but we over-include rather than risk skipping. Document the
+        intentional false-positive so it isn't "fixed" into a false negative."""
+        from conductor.config.instructions import _scope_overlaps
+
+        assert _scope_overlaps("src/*/tests/**", "src/foo/bar")
+        # The narrowing case still works: cwd outside `src/*` is correctly disjoint
+        assert not _scope_overlaps("src/*/tests/**", "docs")
+
+    def test_empty_and_whitespace_components(self) -> None:
+        """Empty / whitespace sub-globs are skipped, not treated as 'always-match'."""
+        from conductor.config.instructions import _scope_overlaps
+
+        # Trailing separator → empty trailing sub-glob skipped
+        assert _scope_overlaps("services/GW/**;", "services/GW")
+        # Leading separator and whitespace → empty leading sub-glob skipped
+        assert not _scope_overlaps(" ; services/GW/**", "services/AS")
+
+    def test_only_separators_rejects(self) -> None:
+        """A scope value of just `;` or `,` (or whitespace) splits into all
+        empty sub-globs and overlaps with nothing — file is rejected.
+
+        Regression guard: a future change that treated empty-after-split as
+        "always-on" would silently broaden the filter.
+        """
+        from conductor.config.instructions import _scope_overlaps
+
+        assert not _scope_overlaps(";", "anywhere")
+        assert not _scope_overlaps(",", "anywhere")
+        assert not _scope_overlaps(" ; , ", "anywhere")
+
+    def test_brace_expansion_unsupported(self) -> None:
+        """Brace-expansion globs (e.g. `src/{foo,bar}/**`) are NOT supported:
+        the comma is treated as a multi-glob separator, splitting the brace
+        and producing nonsensical sub-globs.
+
+        This documents the known limitation. Real-world ``applyTo`` values
+        observed across Azure repos use `;`/`,`-separated whole-string
+        multi-globs rather than brace expansion, so we accept this gap.
+        If brace expansion becomes a real need, swap the separator regex for
+        a brace-aware splitter.
+        """
+        from conductor.config.instructions import _scope_overlaps
+
+        # `src/{foo,bar}/**` splits on `,` into [`src/{foo`, `bar}/**`].
+        # Neither sub-glob matches the intent. The test asserts the
+        # *current* (broken-but-documented) behavior so a future maintainer
+        # who attempts brace expansion knows to update this test.
+        # The first sub-glob `src/{foo` has literal prefix `src/{foo`
+        # (brace is not a recognized wildcard char in our regex `[*?\[]`).
+        # That prefix won't match `src/foo`, so this returns False —
+        # documenting that we DON'T magically handle braces.
+        assert not _scope_overlaps("src/{foo,bar}/**", "src/foo")
+
+    def test_windows_backslash_normalised(self) -> None:
+        """Authors on Windows may write backslashes; normalise to forward slashes."""
+        from conductor.config.instructions import _scope_overlaps
+
+        assert _scope_overlaps("services\\GW\\**", "services/GW")
+        assert _scope_overlaps("services/GW/**", "services\\GW")
+
+    def test_normalize_strips_dotslash_and_dot(self) -> None:
+        """`_normalize_scope_path` strips `./` prefixes and treats `.` as the
+        empty (workspace-root) path. Authors sometimes write `./foo/**` to be
+        explicit about repo-relative paths; that must behave identically to
+        `foo/**`. Closes the normaliser's branches not exercised by the
+        realistic Chaos-repo applyTo values."""
+        from conductor.config.instructions import _normalize_scope_path, _scope_overlaps
+
+        # Direct helper coverage
+        assert _normalize_scope_path("./foo/bar") == "foo/bar"
+        assert _normalize_scope_path("././foo") == "foo"
+        assert _normalize_scope_path(".") == ""
+
+        # Through the overlap helper (CWD or glob written with `./` or `.`)
+        assert _scope_overlaps("./services/GW/**", "services/GW")
+        assert _scope_overlaps("services/GW/**", ".")  # CWD == workspace root
+
+
+class TestApplyConventionFiltersInvariants:
+    """Direct tests for the filter-chain helper to pin the `_REJECT` sentinel
+    contract and exercise the `_discovery_reason` branch that's only reached
+    when a ``ConventionDirectory`` is registered without ``extract_scope``."""
+
+    def test_extract_scope_unset_loads_unconditionally(self, tmp_path: Path) -> None:
+        """A ConventionDirectory with no `extract_scope` loads every matching
+        file as 'always-on' regardless of any frontmatter — exercises the
+        `_discovery_reason` branch where `convention.extract_scope is None`."""
+        from unittest.mock import patch
+
+        from conductor.config.instructions import (
+            ConventionDirectory,
+            DiscoveredInstruction,
+            discover_workspace_instructions_detailed,
+        )
+
+        (tmp_path / ".git").mkdir()
+        scoped_file = tmp_path / "rules" / "anything.md"
+        scoped_file.parent.mkdir(parents=True)
+        # Frontmatter with a scoped applyTo would normally narrow, but this
+        # convention has no extract_scope so it loads unconditionally.
+        scoped_file.write_text("---\napplyTo: 'services/GW/**'\n---\nbody", encoding="utf-8")
+
+        custom = ConventionDirectory(
+            path="rules",
+            pattern="*.md",
+            recursive=False,
+        )
+
+        with patch("conductor.config.instructions.CONVENTIONS", [custom]):
+            result = discover_workspace_instructions_detailed(tmp_path)
+
+        assert len(result) == 1
+        d = result[0]
+        assert isinstance(d, DiscoveredInstruction)
+        assert d.path == scoped_file
+        assert d.scope is None
+        # The 'always-on' reason here is the convention-without-extract_scope
+        # branch in _discovery_reason — distinct from the
+        # extract_scope-returning-'**' branch covered elsewhere.
+        assert d.reason == "always-on"
+
+    def test_extract_scope_opt_out_rejects(self, tmp_path: Path) -> None:
+        """When `extract_scope` returns None for a file (its opt-out
+        sentinel), the file is dropped regardless of CWD."""
+        from unittest.mock import patch
+
+        from conductor.config.instructions import (
+            ConventionDirectory,
+            discover_workspace_instructions_detailed,
+        )
+
+        (tmp_path / ".git").mkdir()
+        f = tmp_path / "rules" / "opted-out.md"
+        f.parent.mkdir(parents=True)
+        f.write_text("body", encoding="utf-8")
+
+        # extract_scope always returns None → file always opts out
+        custom = ConventionDirectory(
+            path="rules",
+            pattern="*.md",
+            recursive=False,
+            extract_scope=lambda _p: None,
+        )
+
+        with patch("conductor.config.instructions.CONVENTIONS", [custom]):
+            result = discover_workspace_instructions_detailed(tmp_path)
+
+        assert result == []
+
+    def test_relative_to_value_error_falls_back_to_empty_cwd(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When `start_resolved.relative_to(current)` raises ValueError (e.g.,
+        a symlink makes the walked `current` not an ancestor of `start_dir`),
+        the per-level `cwd_rel` falls back to '' so the overlap test stays
+        permissive — matching the over-include-rather-than-silently-skip
+        bias. Exercises the defensive ValueError branch."""
+        from unittest.mock import patch
+
+        from conductor.config.instructions import (
+            ConventionDirectory,
+            discover_workspace_instructions_detailed,
+        )
+
+        (tmp_path / ".git").mkdir()
+        f = tmp_path / "rules" / "scoped.md"
+        f.parent.mkdir(parents=True)
+        # Scoped to services/GW — would NOT overlap from a real subdir, but
+        # the ValueError fallback forces cwd_rel='' so it loads anyway.
+        f.write_text("---\napplyTo: 'services/GW/**'\n---\nbody", encoding="utf-8")
+
+        custom = ConventionDirectory(
+            path="rules",
+            pattern="*.md",
+            recursive=False,
+            extract_scope=lambda p: "services/GW/**",
+        )
+
+        # Force `Path.relative_to` to raise ValueError on the first call,
+        # simulating the symlink-induced ancestor mismatch. Subsequent calls
+        # behave normally so the walk's other logic isn't disrupted.
+        original_relative_to = Path.relative_to
+        call_count = {"n": 0}
+
+        def flaky_relative_to(self: Path, *args: Any, **kwargs: Any) -> Path:
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise ValueError("simulated symlink ancestor mismatch")
+            return original_relative_to(self, *args, **kwargs)
+
+        with (
+            patch("conductor.config.instructions.CONVENTIONS", [custom]),
+            monkeypatch.context() as m,
+        ):
+            m.setattr(Path, "relative_to", flaky_relative_to)
+            result = discover_workspace_instructions_detailed(tmp_path)
+
+        # File loads — the fallback `cwd_rel=''` matches any scope, so the
+        # services/GW/** glob overlaps (over-inclusion = principled fallback).
+        assert len(result) == 1
+        assert result[0].path == f
+
+
+class TestEmitLoadedInstructionsDebug:
+    """Tests for `_emit_loaded_instructions_debug`, the small helper extracted
+    from `run_workflow_async` for direct testability. Pins the
+    short-circuit-on-disabled and short-circuit-on-no-start-dir branches and
+    proves the discover→print path uses the caller-supplied start_dir."""
+
+    def test_disabled_is_noop(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        from conductor.cli.run import _emit_loaded_instructions_debug
+
+        (tmp_path / "AGENTS.md").write_text("body", encoding="utf-8")
+        _emit_loaded_instructions_debug(tmp_path, enabled=False)
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err == ""
+
+    def test_no_start_dir_is_noop(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """When auto-discovery didn't run (`start_dir is None`), the debug
+        print is suppressed even if the flag is on — matches the docstring
+        contract."""
+        from conductor.cli.run import _emit_loaded_instructions_debug
+
+        _emit_loaded_instructions_debug(None, enabled=True)
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err == ""
+
+    def test_enabled_with_start_dir_prints_discovery(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Happy path: discover→print, using the caller-supplied start_dir."""
+        from conductor.cli.run import _emit_loaded_instructions_debug
+
+        (tmp_path / ".git").mkdir()
+        (tmp_path / "AGENTS.md").write_text("body", encoding="utf-8")
+
+        _emit_loaded_instructions_debug(tmp_path, enabled=True)
+        captured = capsys.readouterr()
+        assert "1 file(s) loaded from CWD" in captured.err
+        assert "AGENTS.md" in captured.err
+        # stdout invariant preserved
+        assert captured.out == ""
+
+
+class TestPrintLoadedInstructionsHelper:
+    """Direct tests for the `_print_loaded_instructions` helper.
+
+    The helper is called only from `run_workflow_async`, which is hard to
+    exercise without a full workflow run. Direct tests cover the formatting
+    branches (empty list, populated list, scope/no-scope, always-on sentinel
+    suppression) so future format tweaks are caught.
+    """
+
+    def test_emits_empty_state(self, capsys: pytest.CaptureFixture[str]) -> None:
+        from conductor.cli.run import _print_loaded_instructions
+
+        _print_loaded_instructions([])
+        captured = capsys.readouterr()
+        # stdout MUST stay clean (don't pollute JSON output)
+        assert captured.out == ""
+        assert "0 files discovered" in captured.err
+
+    def test_emits_populated_state_with_scope(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from conductor.cli.run import _print_loaded_instructions
+        from conductor.config.instructions import DiscoveredInstruction
+
+        always_on = DiscoveredInstruction(
+            path=tmp_path / "AGENTS.md",
+            source="AGENTS.md",
+            scope=None,
+            reason="file-convention",
+        )
+        scoped = DiscoveredInstruction(
+            path=tmp_path / ".github" / "instructions" / "cs.md",
+            source=".github/instructions",
+            scope="**/*.cs",
+            reason="scope-overlap",
+        )
+        always_on_dir = DiscoveredInstruction(
+            path=tmp_path / ".github" / "instructions" / "all.md",
+            source=".github/instructions",
+            scope="**",
+            reason="always-on",
+        )
+
+        _print_loaded_instructions([always_on, scoped, always_on_dir])
+        captured = capsys.readouterr()
+
+        # Header tracks count
+        assert "3 file(s) loaded from CWD" in captured.err
+        # All three paths emitted
+        assert "AGENTS.md" in captured.err
+        assert "cs.md" in captured.err
+        assert "all.md" in captured.err
+        # Reasons emitted with their source labels
+        assert "reason=file-convention" in captured.err
+        assert "reason=scope-overlap" in captured.err
+        assert "reason=always-on" in captured.err
+        # Scope shown only for the truly scoped entry (not for file-convention
+        # or for always-on `**` — `**` is the always-on sentinel; printing it
+        # would be redundant noise).
+        assert "applyTo='**/*.cs'" in captured.err
+        assert "applyTo='**'" not in captured.err
+        # stdout untouched
+        assert captured.out == ""
+
+
+# ---------------------------------------------------------------------------
+# discover_workspace_instructions_detailed (metadata-bearing variant)
+# ---------------------------------------------------------------------------
+
+
+class TestDiscoverDetailed:
+    """Tests for the structured-discovery variant used by
+    --print-loaded-instructions and any future caller that needs to reason
+    about *why* a file was included."""
+
+    def test_returns_discovered_instruction_records(self, tmp_path: Path) -> None:
+        from conductor.config.instructions import (
+            DiscoveredInstruction,
+            discover_workspace_instructions_detailed,
+        )
+
+        (tmp_path / ".git").mkdir()
+        (tmp_path / "AGENTS.md").write_text("agents")
+        _write_with_frontmatter(
+            tmp_path / ".github" / "instructions" / "always.instructions.md",
+            apply_to="**",
+        )
+        _write_with_frontmatter(
+            tmp_path / ".github" / "instructions" / "cs.instructions.md",
+            apply_to="**/*.cs",
+        )
+
+        result = discover_workspace_instructions_detailed(tmp_path)
+        assert all(isinstance(d, DiscoveredInstruction) for d in result)
+        by_name = {d.path.name: d for d in result}
+
+        # AGENTS.md is a file convention — no scope concept.
+        assert by_name["AGENTS.md"].reason == "file-convention"
+        assert by_name["AGENTS.md"].scope is None
+
+        # always.instructions.md is always-on per applyTo: "**"
+        assert by_name["always.instructions.md"].reason == "always-on"
+        assert by_name["always.instructions.md"].scope == "**"
+
+        # cs.instructions.md is scoped; at root CWD it loads via overlap
+        assert by_name["cs.instructions.md"].reason == "scope-overlap"
+        assert by_name["cs.instructions.md"].scope == "**/*.cs"
+
+    def test_paths_wrapper_matches_detailed(self, tmp_path: Path) -> None:
+        """`discover_workspace_instructions` is a thin wrapper over the
+        detailed variant; the paths must match exactly."""
+        from conductor.config.instructions import (
+            discover_workspace_instructions,
+            discover_workspace_instructions_detailed,
+        )
+
+        (tmp_path / ".git").mkdir()
+        (tmp_path / "AGENTS.md").write_text("agents")
+        _write_with_frontmatter(
+            tmp_path / ".github" / "instructions" / "always.instructions.md",
+            apply_to="**",
+        )
+
+        paths = discover_workspace_instructions(tmp_path)
+        detailed = discover_workspace_instructions_detailed(tmp_path)
+        assert paths == [d.path for d in detailed]
+
+
+# ---------------------------------------------------------------------------
+# Frontmatter robustness: edge cases for `_extract_apply_to`
 # ---------------------------------------------------------------------------
 
 
@@ -1031,7 +1718,7 @@ class TestConventionDirectoryNonRecursive:
         (sub / "csharp.md").write_text("nested rule", encoding="utf-8")
 
         conv = ConventionDirectory(path="rules", pattern="*.md", recursive=False)
-        results = dict(_walk_directory_convention(base, conv))
+        results = {rel: path for rel, path, _scope in _walk_directory_convention(base, conv)}
 
         assert "top.md" in results
         assert "csharp.md" not in results
@@ -1051,7 +1738,7 @@ class TestConventionDirectoryNonRecursive:
         (base / "skip.txt").write_text("txt", encoding="utf-8")
 
         conv = ConventionDirectory(path="rules", pattern="*.md", recursive=False)
-        results = dict(_walk_directory_convention(base, conv))
+        results = {rel: path for rel, path, _scope in _walk_directory_convention(base, conv)}
 
         assert "match.md" in results
         assert "skip.txt" not in results
@@ -1074,7 +1761,7 @@ class TestConventionDirectoryNonRecursive:
             recursive=False,
             include_file=lambda p: "INCLUDE" in p.read_text(encoding="utf-8"),
         )
-        results = dict(_walk_directory_convention(base, conv))
+        results = {rel: path for rel, path, _scope in _walk_directory_convention(base, conv)}
 
         assert "include.md" in results
         assert "skip.md" not in results
@@ -1119,7 +1806,7 @@ class TestConventionDirectoryNonRecursive:
             return original_is_file(self, follow_symlinks=follow_symlinks)
 
         with patch.object(os.DirEntry, "is_file", patched_is_file):
-            results = dict(_walk_directory_convention(base, conv))
+            results = {rel: path for rel, path, _scope in _walk_directory_convention(base, conv)}
 
         assert "good.md" in results
         assert "broken.md" not in results
