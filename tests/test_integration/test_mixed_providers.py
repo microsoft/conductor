@@ -89,7 +89,7 @@ agents:
 
         # Serialization excludes None values
         dumped = runtime.model_dump(exclude_none=True)
-        assert dumped == {"provider": "copilot", "mcp_servers": {}}
+        assert dumped == {"provider": "copilot", "mcp_servers": {}, "skills": []}
 
     def test_provider_parameter_isolation(self, tmp_path):
         """Test that provider-specific parameters don't interfere.
@@ -188,6 +188,7 @@ class MockProvider(AgentProvider, abstract=True):
         tools: list[str] | None = None,
         interrupt_signal: asyncio.Event | None = None,
         event_callback=None,
+        skill_directories: list[str] | None = None,
     ) -> AgentOutput:
         self.executed_agents.append(agent.name)
         return AgentOutput(

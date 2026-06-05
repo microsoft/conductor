@@ -919,6 +919,7 @@ class TestPartialOutputHandling:
                 tools: list[str] | None = None,
                 interrupt_signal: asyncio.Event | None = None,
                 event_callback=None,
+                skill_directories: list[str] | None = None,
             ) -> AgentOutput:
                 return AgentOutput(content={"result": "mock"}, raw_response="mock")
 
