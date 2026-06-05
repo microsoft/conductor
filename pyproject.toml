@@ -72,6 +72,9 @@ exclude = [
     "src/conductor/web/frontend",
 ]
 
+[tool.hatch.build.targets.wheel.force-include]
+"plugins/conductor/skills/conductor" = "plugins/conductor/skills/conductor"
+
 [dependency-groups]
 dev = [
     "pytest>=9.0.3",

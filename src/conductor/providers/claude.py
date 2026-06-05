@@ -156,6 +156,10 @@ class ClaudeProvider(AgentProvider):
         usage_tracking=True,
         # No global mutable state — safe to run N parallel agents.
         concurrent_safe=True,
+        # Skill content is eagerly injected into the rendered prompt by
+        # AgentExecutor (Claude's Messages API has no server-side skill
+        # surface without adopting the container/code-execution beta).
+        skills=True,
         upstream_pin=None,
         maintainer="@microsoft/conductor",
     )
@@ -664,6 +668,7 @@ class ClaudeProvider(AgentProvider):
         tools: list[str] | None = None,
         interrupt_signal: asyncio.Event | None = None,
         event_callback: EventCallback | None = None,
+        skill_directories: list[str] | None = None,
     ) -> AgentOutput:
         """Execute an agent using the Claude SDK.
 
@@ -676,6 +681,11 @@ class ClaudeProvider(AgentProvider):
                 When set during the agentic loop, Claude is asked to emit
                 partial output via the ``emit_output`` tool, and the result
                 is returned with ``partial=True``.
+            skill_directories: Ignored. Claude has no server-side skill
+                surface without adopting the container/code-execution
+                beta, so :class:`AgentExecutor` has already eager-injected
+                the skill content into ``rendered_prompt`` for this
+                provider (see :attr:`AgentProvider.supports_native_skills`).
 
         Returns:
             Normalized AgentOutput with structured content.
@@ -684,6 +694,7 @@ class ClaudeProvider(AgentProvider):
             ProviderError: If SDK execution fails.
             ValidationError: If output doesn't match schema.
         """
+        del skill_directories  # Claude relies on eager preamble injection (see docstring).
         # Use retry logic wrapper for execution
         return await self._execute_with_retry(
             agent,

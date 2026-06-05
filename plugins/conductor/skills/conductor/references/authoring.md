@@ -20,6 +20,7 @@ workflow:
     max_agent_iterations: 50     # Max tool-use roundtrips per agent (1-500, optional)
     max_session_seconds: 120     # Wall-clock timeout per agent session (optional)
     default_reasoning_effort: medium  # Workflow-wide reasoning effort: low, medium, high, xhigh (optional)
+    skills: [conductor]              # Skills available to every provider-backed agent (optional)
 
   input:                         # Define workflow inputs
     param_name:
@@ -116,6 +117,11 @@ agents:
     reasoning:                   # Override runtime.default_reasoning_effort (optional)
       effort: high               # low, medium, high, or xhigh
 
+    skills: [conductor]          # Skills this agent has access to (optional, tri-state)
+                                 # Omit = inherit runtime.skills; [] = explicit opt-out;
+                                 # [name, ...] = explicit set. Not allowed on
+                                 # script/human_gate/workflow/wait/set/terminate agents.
+
     routes:                      # Where to go next
       - to: next_agent
 ```
@@ -147,6 +153,40 @@ agents:
 ```
 
 See `examples/reasoning-effort.yaml` for a complete example.
+
+### Skills
+
+`skills` enables reusable knowledge or capability bundles for provider-backed agents. The Conductor distribution ships one built-in skill — `conductor` — which packages the YAML schema, execution model, and authoring patterns (the same content this reference doc covers) so an agent can evaluate, improve, debug, or generate Conductor workflows.
+
+**Tri-state per-agent field (resolved via list presence):**
+- Omit `skills:` — inherit from `runtime.skills`
+- `skills: []` — explicit opt-out (no skills for this agent, regardless of workflow default)
+- `skills: [name, ...]` — explicit set, replaces the workflow default
+
+**Workflow-wide default:** `runtime.skills: [conductor]` enables it for every provider-backed agent. Individual agents can override.
+
+**Provider mechanism (same observable contract — "the agent has access to the named skill"):**
+- **Copilot** — the resolved skill directory is registered on the SDK session via `skill_directories`, so the agent discovers and loads skill content natively (progressive disclosure via `SKILL.md` frontmatter). This is more token-efficient than eager injection.
+- **Claude** — the loader reads `SKILL.md` plus every `references/*.md` file in the skill directory and prepends them to the agent's rendered prompt inside `<skills><skill name="...">...</skill></skills>` tags. Inserted between workspace instructions and the user prompt.
+
+Not allowed on `script`, `human_gate`, `workflow`, `wait`, `set`, or `terminate` agent types. Unknown skill names fail at workflow validation time.
+
+```yaml
+workflow:
+  runtime:
+    skills: [conductor]             # all provider-backed agents get the conductor skill
+
+agents:
+  - name: workflow_reviewer
+    skills: [conductor]             # per-agent opt-in (redundant here, kept for clarity)
+    prompt: "Review this workflow for correctness..."
+
+  - name: simple_agent
+    skills: []                      # opt out even when runtime default is set
+    prompt: "Do something simple."
+```
+
+See `examples/skills-self-improving-workflow.yaml` for a complete example.
 
 ## Routing Patterns
 
@@ -696,18 +736,8 @@ agents:
 ### Gate Output
 
 Human gates automatically capture:
-- `output.selected` — the `value` of the chosen option.
-- `output.additional_input` — dict of values collected from `prompt_for` fields.
-  Always present; `{}` when no `prompt_for` was specified or the selected option
-  has no `prompt_for`. Access individual fields via templates as
-  `{{ <gate>.output.additional_input.<field> }}` (for example
-  `{{ approval_gate.output.additional_input.feedback }}` when an option declares
-  `prompt_for: feedback`).
-
-> **`context: explicit` mode note.** `input:` declarations support
-> `<gate>.output.additional_input` (the whole dict) but not the dotted shorthand
-> `<gate>.output.additional_input.<field>`. Declare the parent key and read
-> individual fields via Jinja2 in the agent's prompt or output template.
+- `output.selected` - the `value` of the chosen option
+- `output.feedback` - text input from `prompt_for` (if specified)
 
 ## Context Modes
 

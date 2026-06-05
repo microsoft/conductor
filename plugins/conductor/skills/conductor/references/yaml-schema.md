@@ -6,7 +6,7 @@ Complete reference for all YAML configuration options. Derived from the Pydantic
 
 ```yaml
 workflow: WorkflowDef              # Required: workflow configuration
-tools: [string]                    # Optional: workflow-level tool names (ignored by claude-agent-sdk — uses CLI config)
+tools: [string]                    # Optional: workflow-level tool names
 agents: [AgentDef]                 # Required: agent definitions
 parallel: [ParallelGroup]         # Optional: static parallel groups
 for_each: [ForEachDef]            # Optional: dynamic parallel groups
@@ -27,16 +27,20 @@ workflow:
 
   # Runtime configuration
   runtime:
-    provider: string | object       # "copilot" (default), "claude", "claude-agent-sdk", or "openai-agents"
+    provider: string | object       # "copilot" (default), "claude", or "openai-agents"
                                     # — or a ProviderSettings object (see below)
     default_model: string           # Default model for all agents
-    temperature: float              # 0.0-1.0, controls randomness (optional, copilot/claude only)
-    max_tokens: integer             # Max OUTPUT tokens per response, 1-200000 (optional, copilot/claude only)
-    timeout: float                  # Per-request timeout in seconds (optional, default: 600, copilot/claude only)
+    temperature: float              # 0.0-1.0, controls randomness (optional)
+    max_tokens: integer             # Max OUTPUT tokens per response, 1-200000 (optional)
+    timeout: float                  # Per-request timeout in seconds (optional, default: 600)
     max_agent_iterations: integer   # Max tool-use roundtrips per agent (1-500, optional)
     max_session_seconds: float      # Wall-clock timeout per agent session in seconds (optional)
     default_reasoning_effort: string # Workflow-wide reasoning/thinking effort: low, medium, high, xhigh (optional)
-    mcp_servers:                    # MCP server configurations (ignored by claude-agent-sdk — uses CLI config)
+    skills: [string]                # Skills enabled for every provider-backed agent (default: [])
+                                    # Currently registered built-ins: "conductor"
+                                    # Copilot loads natively via `skill_directories`;
+                                    # Claude eagerly injects SKILL.md + references/*.md into the prompt.
+    mcp_servers:                    # MCP server configurations
       <server_name>:
         type: string                # "stdio" (default), "http", or "sse"
         command: string             # Command to run (required for stdio)
@@ -107,7 +111,7 @@ agents:
     type: string                    # "agent" (default), "human_gate", "script", "workflow", "wait", or "terminate"
     description: string             # What this agent does
     model: string                   # Override default_model
-    provider: string                # Per-agent provider override ("copilot", "claude", or "claude-agent-sdk")
+    provider: string                # Per-agent provider override ("copilot" or "claude")
 
     # Input specification (for explicit context mode)
     input:
@@ -152,6 +156,13 @@ agents:
     # Not allowed for script, human_gate, workflow, or wait agent types.
     reasoning:
       effort: string                # low, medium, high, or xhigh
+
+    # Skills (optional, only on provider-backed agents)
+    # Tri-state via list presence:
+    #   - omit:           inherit runtime.skills
+    #   - skills: []      explicit opt-out (no skills for this agent)
+    #   - skills: [a, b]  explicit set, replaces the workflow default
+    skills: [string]                # Skill names enabled for this agent (built-ins: "conductor")
 
     # Per-agent retry policy (optional, not allowed for script, human_gate, workflow, or wait agents)
     retry:
@@ -390,19 +401,11 @@ agents:
         route: string               # Agent to route to when selected
         prompt_for: string          # Optional: field name to collect text input from user
 
-    output:                         # Captured automatically (do not declare in YAML)
-      selected:                     # The chosen option's `value`
+    output:                         # Captured automatically
+      selected:                     # The selected option value
         type: string
-      additional_input:             # Dict of values collected from `prompt_for` fields.
-        type: dict                  # Always present; `{}` when no `prompt_for` is set
-                                    # or when the selected option has no `prompt_for`.
-                                    # Access fields via templates as:
-                                    #   {{ <gate>.output.additional_input.<field> }}
-                                    # In `context: explicit` mode, `input:` declarations
-                                    # support `<gate>.output.additional_input` (the whole
-                                    # dict) but not the dotted shorthand
-                                    # `<gate>.output.additional_input.<field>` — declare
-                                    # the parent and traverse in Jinja2.
+      feedback:                     # Text from prompt_for (if used)
+        type: string
 ```
 
 ## Parallel Group Schema

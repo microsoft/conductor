@@ -382,6 +382,11 @@ class WorkflowEngine:
         # Workspace instructions preamble (inherited by sub-workflows)
         self._instructions_preamble = instructions_preamble
 
+        # Workflow-level default skills (runtime.skills) — inherited by
+        # every provider-backed agent unless the agent overrides with
+        # its own ``skills`` field.
+        self._workflow_skills = list(config.workflow.runtime.skills)
+
         # For backward compatibility, create a default executor with single provider
         # This is used when registry is None
         if provider is not None:
@@ -389,6 +394,7 @@ class WorkflowEngine:
                 provider,
                 workflow_tools=config.tools,
                 instructions_preamble=self._instructions_preamble,
+                workflow_skills=self._workflow_skills,
             )
             self.provider = provider  # Keep for backward compatibility
         else:
@@ -804,6 +810,7 @@ class WorkflowEngine:
                 provider,
                 workflow_tools=self.config.tools,
                 instructions_preamble=self._instructions_preamble,
+                workflow_skills=self._workflow_skills,
             )
         elif self.executor is not None:
             # Single provider mode (backward compatibility)

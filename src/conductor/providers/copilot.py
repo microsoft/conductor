@@ -190,9 +190,25 @@ class CopilotProvider(AgentProvider):
         usage_tracking=True,
         # No global mutable state — safe to run N parallel agents.
         concurrent_safe=True,
+        # Skill directories are registered on the SDK session via
+        # ``session_kwargs["skill_directories"]`` and the agent discovers
+        # skill content natively (progressive disclosure).
+        skills=True,
         upstream_pin=None,
         maintainer="@microsoft/conductor",
     )
+
+    @property
+    def supports_native_skills(self) -> bool:
+        """Copilot SDK loads skills natively via ``skill_directories``.
+
+        When :class:`AgentExecutor` resolves an agent's effective
+        skills, it forwards the resolved directories on the
+        :meth:`execute` ``skill_directories`` kwarg and skips eager
+        preamble injection — the SDK is expected to discover skills via
+        their ``SKILL.md`` frontmatter (progressive disclosure).
+        """
+        return True
 
     def __init__(
         self,
@@ -426,6 +442,7 @@ class CopilotProvider(AgentProvider):
         tools: list[str] | None = None,
         interrupt_signal: asyncio.Event | None = None,
         event_callback: EventCallback | None = None,
+        skill_directories: list[str] | None = None,
     ) -> AgentOutput:
         """Execute an agent using the Copilot SDK.
 
@@ -441,6 +458,10 @@ class CopilotProvider(AgentProvider):
                 When set during execution, the provider will attempt to abort
                 the current session and return partial output.
             event_callback: Optional callback for streaming SDK events upstream.
+            skill_directories: Optional directories to register as
+                ``skill_directories`` on the SDK session so the Copilot
+                agent can discover and load skills natively (progressive
+                disclosure).
 
         Returns:
             Normalized AgentOutput with structured content.
@@ -471,6 +492,7 @@ class CopilotProvider(AgentProvider):
             tools,
             interrupt_signal=interrupt_signal,
             event_callback=event_callback,
+            skill_directories=skill_directories,
         )
 
     def _resolve_retry_config(self, agent: AgentDef) -> RetryConfig:
@@ -509,6 +531,7 @@ class CopilotProvider(AgentProvider):
         tools: list[str] | None = None,
         interrupt_signal: asyncio.Event | None = None,
         event_callback: EventCallback | None = None,
+        skill_directories: list[str] | None = None,
     ) -> AgentOutput:
         """Execute with exponential backoff retry logic.
 
@@ -522,6 +545,8 @@ class CopilotProvider(AgentProvider):
             tools: List of tool names available to this agent.
             interrupt_signal: Optional event for mid-agent interrupt signaling.
             event_callback: Optional callback for streaming SDK events upstream.
+            skill_directories: Optional skill directories forwarded to the
+                SDK session for native skill discovery.
 
         Returns:
             Normalized AgentOutput with structured content.
@@ -541,6 +566,7 @@ class CopilotProvider(AgentProvider):
                     tools,
                     interrupt_signal=interrupt_signal,
                     event_callback=event_callback,
+                    skill_directories=skill_directories,
                 )
                 # Extract usage data from SDK response if available
                 input_tokens = sdk_response.input_tokens if sdk_response else None
@@ -678,6 +704,7 @@ class CopilotProvider(AgentProvider):
         tools: list[str] | None = None,
         interrupt_signal: asyncio.Event | None = None,
         event_callback: EventCallback | None = None,
+        skill_directories: list[str] | None = None,
     ) -> tuple[dict[str, Any], SDKResponse | None]:
         """Execute the actual SDK call or mock handler.
 
@@ -688,6 +715,11 @@ class CopilotProvider(AgentProvider):
             tools: List of tool names available to this agent.
             interrupt_signal: Optional event for mid-agent interrupt signaling.
             event_callback: Optional callback for streaming SDK events upstream.
+            skill_directories: Optional skill directories registered on the
+                SDK session via ``session_kwargs["skill_directories"]`` so
+                the Copilot agent can discover and load bundled skills
+                natively (progressive disclosure via ``SKILL.md``
+                frontmatter).
 
         Returns:
             Tuple of (content dict, SDKResponse with usage data or None for mock).
@@ -762,6 +794,11 @@ class CopilotProvider(AgentProvider):
             # Add MCP servers if configured
             if self._mcp_servers:
                 session_kwargs["mcp_servers"] = self._mcp_servers
+
+            # Register skill directories so the SDK agent can discover
+            # bundled skills (progressive disclosure via SKILL.md frontmatter).
+            if skill_directories:
+                session_kwargs["skill_directories"] = list(skill_directories)
 
             # Apply custom provider routing (Ollama / vLLM / Azure / etc.)
             # when runtime.provider opted into it.
