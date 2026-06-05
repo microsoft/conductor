@@ -290,7 +290,7 @@ class TestBasicExecution:
             rendered_prompt="Say hello",
         )
 
-        assert result.content == {"text": "Hello, world!"}
+        assert result.content == {"result": "Hello, world!"}
         assert result.tokens_used == 15
         assert result.model == "claude-3-5-sonnet-latest"
 
@@ -743,7 +743,7 @@ class TestTextContentExtraction:
         )
 
         # Verify both text blocks are combined with newline separator
-        assert result.content == {"text": "First part. \nSecond part."}
+        assert result.content == {"result": "First part. \nSecond part."}
 
 
 class TestParseRecovery:
@@ -931,7 +931,7 @@ class TestParseRecovery:
         )
 
         # Should succeed without retries
-        assert result.content == {"text": "This is just plain text"}
+        assert result.content == {"result": "This is just plain text"}
         assert mock_client.messages.create.call_count == 1
 
 
@@ -1884,6 +1884,31 @@ class TestClaudeProviderRetryLogic:
     @patch("conductor.providers.claude.AsyncAnthropic")
     @patch("conductor.providers.claude.anthropic")
     @pytest.mark.asyncio
+    async def test_is_retryable_error_honors_provider_error_flag(
+        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
+    ) -> None:
+        """A ProviderError's own is_retryable flag is honored over SDK heuristics."""
+        from conductor.exceptions import ProviderError
+
+        mock_anthropic_module.__version__ = "0.77.0"
+        mock_client = Mock()
+        mock_client.models.list = AsyncMock(return_value=Mock(data=[]))
+        mock_anthropic_class.return_value = mock_client
+
+        provider = ClaudeProvider()
+
+        # Parse-exhaustion is raised with is_retryable=False — must not retry.
+        non_retryable = ProviderError("Failed to parse output", is_retryable=False)
+        assert provider._is_retryable_error(non_retryable) is False
+
+        # A ProviderError explicitly marked retryable must retry.
+        retryable = ProviderError("Connection timeout", is_retryable=True)
+        assert provider._is_retryable_error(retryable) is True
+
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    @pytest.mark.asyncio
     async def test_calculate_delay_exponential_backoff(
         self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
     ) -> None:
@@ -2081,7 +2106,7 @@ class TestClaudeProviderRetryLogic:
         result = await provider.execute(agent, {}, "Test prompt")
 
         # Verify we got a successful response
-        assert result.content["text"] == "Success"
+        assert result.content["result"] == "Success"
         # Verify retry was attempted
         assert len(provider._retry_history) == 1
         assert provider._retry_history[0]["is_retryable"] is True
@@ -2125,7 +2150,7 @@ class TestClaudeProviderRetryLogic:
 
         result = await provider.execute(agent, {}, "Test prompt")
 
-        assert result.content["text"] == "Success"
+        assert result.content["result"] == "Success"
         assert len(provider._retry_history) == 1
         assert provider._retry_history[0]["is_retryable"] is True
 

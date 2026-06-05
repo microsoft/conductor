@@ -93,6 +93,14 @@ agents:
       field_name:
         type: string
         description: "Field purpose"
+
+    output_mode: raw                # Optional: raw | envelope (default: inferred)
+                                    # raw: skip JSON extraction, wrap response
+                                    #   as {"result": "<text>"}. Cannot be
+                                    #   combined with output:.
+                                    # envelope: explicit opt-in to structured
+                                    #   output pipeline (same as default when
+                                    #   output: is declared).
     
     tools:                          # Optional: Agent-specific tools
       - tool_name
@@ -104,10 +112,58 @@ agents:
                                     # script, human_gate, workflow).
                                     # See docs/configuration.md#reasoning-effort.
 
+    retry:                          # Optional: per-agent retry policy
+      max_attempts: 3               # 1-10 (default 1 = no retry)
+      backoff: exponential          # exponential | fixed
+      delay_seconds: 2              # base delay before first retry
+      retry_on:                     # error categories that trigger retry
+        - provider_error
+        - timeout
+      max_parse_recovery_attempts: 3  # 0-10; omit for provider default
+
     routes:                         # Optional: Routing logic
       - to: next_agent              # Agent name or $end
         when: "{{ condition }}"     # Optional: Route condition
 ```
+
+### Retry Policy
+
+Per-agent retry controls how an agent retries on transient failures. The `retry:` block is optional; when omitted the agent makes a single attempt with no retries.
+
+```yaml
+agents:
+  - name: analyzer
+    prompt: "Analyze the input"
+    output:
+      summary:
+        type: string
+    retry:
+      max_attempts: 3
+      backoff: exponential
+      delay_seconds: 2
+      retry_on:
+        - provider_error
+        - timeout
+      max_parse_recovery_attempts: 0   # disable parse recovery for this agent
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `max_attempts` | `1-10` | `1` | Total attempts including the first. `1` = no retry. |
+| `backoff` | `exponential \| fixed` | `exponential` | Backoff strategy between retries. |
+| `delay_seconds` | `0.0-300.0` | `2.0` | Base delay in seconds before the first retry. |
+| `retry_on` | list | `[provider_error, timeout]` | Error categories that trigger a retry. |
+| `max_parse_recovery_attempts` | `0-10` | Provider default | In-session parse-recovery attempts before giving up. See below. |
+
+#### `max_parse_recovery_attempts`
+
+When an agent declares `output:` (structured JSON), the provider tries to parse JSON from the model's response. If parsing fails, a correction prompt is sent in the same session asking the model to fix its response format. This field controls how many correction prompts to send.
+
+- **Omit** (default): Use the provider default (Copilot=5, Claude=2).
+- **`0`**: Disable parse recovery entirely — fail immediately on bad JSON.
+- **`1-10`**: Custom limit.
+
+This is useful when you know an agent's output is simple and a single attempt should suffice, or when you want to fail fast instead of burning tokens on recovery loops.
 
 ### Choosing whether to declare `output:`
 
@@ -147,6 +203,52 @@ agents:
 ```
 
 Why this matters: when an `output:` schema is declared, the model is asked to wrap its response in JSON. Large or prose-heavy responses tend to come back inside Markdown code fences, and any triple-backticks in the content can confuse the JSON-extraction step. Omitting `output:` for these agents avoids that whole class of failure and lets the model write naturally.
+
+### `output_mode`
+
+The `output_mode` field gives you explicit control over how the provider handles the agent's response. It accepts two values:
+
+| `output_mode` | `output:` declared? | Behavior |
+|---|---|---|
+| *(not set)* | yes | Default structured-output pipeline: schema injected, JSON parsed and validated |
+| *(not set)* | no | Raw response captured as `{"result": "<text>"}` |
+| `raw` | no | Same as above, but makes intent explicit — useful for agents that must *never* attempt JSON extraction |
+| `raw` | yes | **ValidationError** — these options are incompatible |
+| `envelope` | yes | Same as the default structured pipeline (explicit opt-in) |
+| `envelope` | no | Raw response captured as `{"result": "<text>"}` |
+
+**Use `output_mode: raw`** when an agent produces large Markdown reports, code, or free-form prose. This bypasses JSON extraction entirely — no schema instructions are injected, no parse-recovery loop runs, and the model's full response is available as `{{ agent.output.result }}`:
+
+```yaml
+agents:
+  - name: report_writer
+    output_mode: raw
+    prompt: |
+      Write a detailed analysis report. Include code examples,
+      tables, and any formatting you need.
+    # No output: block — output_mode: raw is incompatible with output:
+  - name: reviewer
+    prompt: |
+      Review the following report:
+
+      {{ report_writer.output.result }}
+```
+
+**Use `output_mode: envelope`** when you want to make the structured-output intent explicit (equivalent to the default when `output:` is declared):
+
+```yaml
+agents:
+  - name: classifier
+    output_mode: envelope
+    prompt: "Classify the input."
+    output:
+      category:
+        type: string
+      confidence:
+        type: number
+```
+
+`output_mode` is only valid on provider-backed agents (the default type). It cannot be set on `script`, `human_gate`, or `workflow` agents.
 
 ### Human Gates
 

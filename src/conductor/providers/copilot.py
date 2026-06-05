@@ -498,7 +498,11 @@ class CopilotProvider(AgentProvider):
             jitter=self._retry_config.jitter,
             backoff=retry.backoff,
             retry_on=list(retry.retry_on),
-            max_parse_recovery_attempts=self._retry_config.max_parse_recovery_attempts,
+            max_parse_recovery_attempts=(
+                retry.max_parse_recovery_attempts
+                if retry.max_parse_recovery_attempts is not None
+                else self._retry_config.max_parse_recovery_attempts
+            ),
         )
 
     async def _execute_with_retry(
@@ -541,6 +545,7 @@ class CopilotProvider(AgentProvider):
                     tools,
                     interrupt_signal=interrupt_signal,
                     event_callback=event_callback,
+                    retry_config=config,
                 )
                 # Extract usage data from SDK response if available
                 input_tokens = sdk_response.input_tokens if sdk_response else None
@@ -678,6 +683,7 @@ class CopilotProvider(AgentProvider):
         tools: list[str] | None = None,
         interrupt_signal: asyncio.Event | None = None,
         event_callback: EventCallback | None = None,
+        retry_config: RetryConfig | None = None,
     ) -> tuple[dict[str, Any], SDKResponse | None]:
         """Execute the actual SDK call or mock handler.
 
@@ -688,6 +694,7 @@ class CopilotProvider(AgentProvider):
             tools: List of tool names available to this agent.
             interrupt_signal: Optional event for mid-agent interrupt signaling.
             event_callback: Optional callback for streaming SDK events upstream.
+            retry_config: Resolved per-agent retry config (used for parse recovery limit).
 
         Returns:
             Tuple of (content dict, SDKResponse with usage data or None for mock).
@@ -719,8 +726,9 @@ class CopilotProvider(AgentProvider):
 
         # Build schema description for output schema (used in prompt and recovery)
         schema_for_prompt: dict[str, Any] | None = None
-        if agent.output:
-            schema_for_prompt = self._build_prompt_schema(agent.output)
+        output_schema = agent.output if (agent.output and agent.output_mode != "raw") else None
+        if output_schema is not None:
+            schema_for_prompt = self._build_prompt_schema(output_schema)
             schema_desc = json.dumps(schema_for_prompt, indent=2)
             full_prompt += (
                 f"\n\n**IMPORTANT: You MUST respond with a JSON object matching this schema:**\n"
@@ -867,8 +875,8 @@ class CopilotProvider(AgentProvider):
                 cache_read_tokens = sdk_response.cache_read_tokens
                 cache_write_tokens = sdk_response.cache_write_tokens
 
-                # If no output schema, we're done
-                if not agent.output:
+                # If no output schema (or output_mode is raw), we're done
+                if output_schema is None:
                     final_usage = SDKResponse(
                         content=response_content,
                         input_tokens=total_input_tokens,
@@ -879,7 +887,7 @@ class CopilotProvider(AgentProvider):
                     return {"result": response_content}, final_usage
 
                 # Try to parse the response as JSON with recovery loop
-                max_recovery = self._retry_config.max_parse_recovery_attempts
+                max_recovery = (retry_config or self._retry_config).max_parse_recovery_attempts
                 last_parse_error: str | None = None
 
                 for recovery_attempt in range(max_recovery + 1):  # +1 for initial attempt
@@ -937,14 +945,16 @@ class CopilotProvider(AgentProvider):
                             ) + recovery_response.output_tokens
 
                 # All recovery attempts exhausted
-                expected_fields = list(agent.output.keys())
+                expected_fields = list(output_schema.keys())
                 raise ProviderError(
                     f"Failed to parse structured output from agent response: {last_parse_error}",
                     suggestion=(
                         f"Agent was expected to return JSON with fields: {expected_fields}. "
-                        f"Response started with: {response_content[:200]}..."
+                        f"Response started with: {response_content[:500]}... "
+                        "Tip: if this agent produces large or free-form output, "
+                        "add 'output_mode: raw' to skip JSON extraction."
                     ),
-                    is_retryable=True,
+                    is_retryable=False,
                 )
 
             finally:
@@ -1328,7 +1338,7 @@ class CopilotProvider(AgentProvider):
             except json.JSONDecodeError:
                 pass
 
-        raise ValueError(f"Could not extract JSON from response: {content[:200]}...")
+        raise ValueError(f"Could not extract JSON from response: {content[:500]}...")
 
     def _build_parse_recovery_prompt(
         self,

@@ -20,14 +20,16 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hmac
 import json
 import logging
+import os
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -83,6 +85,10 @@ class WebDashboard:
 
         # Gate response channel (web client → engine)
         self._gate_response_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+        # Gate waiting state — set/cleared by the engine so the HTTP API
+        # can report whether a gate is currently waiting for a response.
+        self._gate_waiting_agent: str | None = None
 
         # Dialog response channel (web client → engine)
         self._dialog_response_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
@@ -232,6 +238,84 @@ class WebDashboard:
             """Resume a paused agent after it was interrupted by ``POST /api/stop``."""
             self._resume_event.set()
             return JSONResponse({"status": "resuming"})
+
+        @app.get("/api/gate-status")
+        async def gate_status() -> JSONResponse:
+            """Return whether a human gate is currently waiting for a response."""
+            agent = self._gate_waiting_agent
+            return JSONResponse({"waiting": agent is not None, "agent_name": agent})
+
+        @app.post("/api/gate-respond")
+        async def gate_respond_api(request: Request) -> JSONResponse:
+            """Resolve a parked human gate via HTTP POST.
+
+            Body: ``{"agent_name": str, "selected_value": str,
+            "additional_input": str?}``
+
+            When the ``CONDUCTOR_GATE_TOKEN`` environment variable is set,
+            the request must carry a matching token in the
+            ``Authorization: Bearer <token>`` header.
+            """
+            try:
+                body = await request.json()
+            except Exception:
+                return JSONResponse({"error": "Invalid JSON body"}, status_code=422)
+            if not isinstance(body, dict):
+                return JSONResponse(
+                    {"error": "Request body must be a JSON object"}, status_code=422
+                )
+
+            # Validate token if CONDUCTOR_GATE_TOKEN is set. The token is read
+            # from the Authorization header (not the JSON body) and compared in
+            # constant time to avoid leaking it via timing or request logs.
+            expected_token = os.environ.get("CONDUCTOR_GATE_TOKEN")
+            if expected_token:
+                auth_header = request.headers.get("authorization", "")
+                scheme, _, presented = auth_header.partition(" ")
+                if scheme.lower() != "bearer" or not hmac.compare_digest(presented, expected_token):
+                    return JSONResponse({"error": "Invalid or missing token"}, status_code=403)
+
+            # Validate required fields
+            if not body.get("agent_name"):
+                return JSONResponse(
+                    {"error": "Missing required field: agent_name"}, status_code=422
+                )
+            if not body.get("selected_value"):
+                return JSONResponse(
+                    {"error": "Missing required field: selected_value"}, status_code=422
+                )
+
+            # Validate the gate is actually waiting for this agent. Without this
+            # check a mismatched agent_name would be accepted here (200) and then
+            # silently discarded by wait_for_gate_response, parking the workflow
+            # forever while the CLI reports success.
+            waiting_agent = self._gate_waiting_agent
+            if waiting_agent is None:
+                return JSONResponse(
+                    {"error": "No human gate is currently waiting for a response"},
+                    status_code=409,
+                )
+            if body["agent_name"] != waiting_agent:
+                return JSONResponse(
+                    {
+                        "error": (
+                            f"Gate response targets agent {body['agent_name']!r} but the "
+                            f"waiting gate is {waiting_agent!r}"
+                        )
+                    },
+                    status_code=409,
+                )
+
+            # Put onto gate response queue (same path as WebSocket handler)
+            self._gate_response_queue.put_nowait(
+                {
+                    "type": "gate_response",
+                    "agent_name": body["agent_name"],
+                    "selected_value": body["selected_value"],
+                    "additional_input": body.get("additional_input"),
+                }
+            )
+            return JSONResponse({"status": "accepted"})
 
         @app.get("/api/files/{file_path:path}")
         async def get_file(file_path: str) -> JSONResponse:
@@ -756,7 +840,7 @@ class WebDashboard:
         """Wait for a gate response from a web client.
 
         Blocks until a ``gate_response`` message is received via WebSocket
-        that matches the given agent name.
+        or HTTP POST that matches the given agent name.
 
         Non-matching messages are discarded with a warning. Because
         conductor only presents one gate at a time, any ``gate_response``
@@ -772,15 +856,19 @@ class WebDashboard:
             The gate response payload dict with keys ``selected_value``
             and optionally ``additional_input``.
         """
-        while True:
-            msg = await self._gate_response_queue.get()
-            if msg.get("agent_name") == agent_name:
-                return msg
-            logger.warning(
-                "Discarding stale gate_response for agent %r while waiting on %r",
-                msg.get("agent_name"),
-                agent_name,
-            )
+        self._gate_waiting_agent = agent_name
+        try:
+            while True:
+                msg = await self._gate_response_queue.get()
+                if msg.get("agent_name") == agent_name:
+                    return msg
+                logger.warning(
+                    "Discarding stale gate_response for agent %r while waiting on %r",
+                    msg.get("agent_name"),
+                    agent_name,
+                )
+        finally:
+            self._gate_waiting_agent = None
 
     async def wait_for_dialog_message(self, agent_name: str, dialog_id: str) -> dict[str, Any]:
         """Wait for a dialog message or decline from the web client.
