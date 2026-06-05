@@ -1,12 +1,11 @@
 # Hermes Provider Documentation
 
 > **Experimental Provider** — Hermes is an experimental provider with known
-> capability carve-outs (no MCP servers, no per-agent tools allowlist, no
-> streaming events, no reasoning effort, structured output via prompt injection
-> only). `conductor validate` catches workflows that depend on unsupported
-> features, and the CLI prints a one-time banner at runtime. See
-> [Experimental Providers](./experimental.md) for the stability policy and
-> promotion criteria.
+> capability carve-outs (no MCP servers, no per-agent tools allowlist,
+> structured output via prompt injection only). `conductor validate` catches
+> workflows that depend on unsupported features, and the CLI prints a one-time
+> banner at runtime. See [Experimental Providers](./experimental.md) for the
+> stability policy and promotion criteria.
 
 The Hermes provider enables Conductor workflows to use the [NousResearch hermes-agent](https://github.com/NousResearch/hermes-agent) library. Hermes is an agentic AI framework that manages its own tool ecosystem and supports models from multiple providers via OpenRouter-style model identifiers.
 
@@ -137,29 +136,35 @@ agents:
 
 ## Toolset Control
 
-By default, hermes loads its full set of built-in tools (approximately 33). Use the agent `tools:` field to restrict which hermes toolsets are active for a given step.
+By default, hermes loads its full set of built-in tools (approximately 33). Use the `hermes_toolsets` provider setting to restrict which toolsets are available across the workflow.
 
-| `tools:` value | Effect |
-|----------------|--------|
-| _(omitted / `null`)_ | All hermes tools active (default) |
-| `[]` (empty list) | No tools — judgment-only agent |
-| `["web"]` | Only the `web` toolset |
-| `["web", "code"]` | `web` and `code` toolsets |
+> **Important**: The per-agent `tools:` field uses Conductor workflow tool names, which do not translate to Hermes toolset names. Setting a non-empty `tools:` list on an agent will raise a validation error. Use `tools: []` to disable all tools for a specific agent, or `hermes_toolsets` to restrict toolsets at the provider level.
 
-Tool names map to hermes toolset names (e.g. `web`, `code`, `terminal`), not individual tool names.
+| Configuration | Effect |
+|---------------|--------|
+| _(no `hermes_toolsets`)_ | All hermes tools active (default) |
+| `hermes_toolsets: [web, filesystem]` | Only named toolsets enabled |
+| `hermes_toolsets: []` | No tools for any agent |
+| Per-agent `tools: []` | No tools for that specific agent |
 
 ```yaml
+workflow:
+  runtime:
+    provider:
+      name: hermes
+      hermes_toolsets: [web, filesystem]  # Restrict at provider level
+
 agents:
   - name: judgment_only
-    tools: []          # Disables all hermes tools — no tool calls
+    tools: []          # Disables all hermes tools for this agent
     prompt: "Based on this data, what do you conclude? {{ context }}"
 
   - name: web_researcher
-    tools: ["web"]     # Only the web search toolset
     prompt: "Research: {{ workflow.input.topic }}"
+    # Gets the provider-level toolsets (web, filesystem)
 ```
 
-**Why this matters**: Loading all 33 tools inflates the system prompt by ~25k tokens per agent step. For judgment-only steps or steps that only need one toolset, restricting tools reduces input token costs significantly.
+**Why this matters**: Loading all 33 tools inflates the system prompt by ~25k tokens per agent step. For workflows that only need specific toolsets, restricting via `hermes_toolsets` reduces input token costs significantly.
 
 ## Model Routing
 
@@ -209,7 +214,9 @@ agents:
 
 ## Tool Use
 
-Hermes manages its own toolsets internally. The `tools:` field on agents maps to hermes's `enabled_toolsets` parameter — see [Toolset Control](#toolset-control) above for details.
+Hermes manages its own toolsets internally. Conductor's per-agent `tools:` field contains workflow tool names (resolved via `runtime.tools`) — these are a different vocabulary from Hermes toolset names and cannot be forwarded. Use `hermes_toolsets` in provider settings to control which Hermes toolsets are active — see [Toolset Control](#toolset-control) above.
+
+**Per-agent `tools: []`** is supported and disables all tools for that agent (judgment-only mode).
 
 **Isolation flags**: Conductor always passes `skip_context_files=True`, `skip_memory=True`, and `quiet_mode=True` to the hermes library. This prevents hermes from loading workspace files (`AGENTS.md`, etc.) or its own persistent memory — the conductor workflow YAML and rendered prompts are the sole source of context.
 
@@ -220,9 +227,7 @@ Hermes manages its own toolsets internally. The `tools:` field on agents maps to
 | Limitation | Details |
 |------------|---------|
 | **No MCP server support** | `runtime.mcp_servers` is ignored; hermes uses its own tools |
-| **No streaming events** | Hermes is synchronous; responses arrive all-at-once |
-| **No session resume** | Checkpoint/resume after failure does not carry hermes session state |
-| **Reasoning effort no-op** | `reasoning.effort` is accepted but has no effect on hermes models |
+| **No per-agent tools allowlist** | Per-agent `tools: [names]` is rejected; use `hermes_toolsets` in provider settings |
 | **Structured output via prompt** | Less reliable than native schema enforcement (copilot/claude) |
 
 ## Troubleshooting
