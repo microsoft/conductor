@@ -10,7 +10,7 @@ import pytest
 
 from conductor.config.schema import AgentDef, OutputField
 from conductor.exceptions import ProviderError, ValidationError
-from conductor.providers.hermes import HermesProvider, _JSON_INSTRUCTION
+from conductor.providers.hermes import HermesProvider
 
 
 def _make_agent(
@@ -139,13 +139,13 @@ class TestHermesExecute:
 
             output = self._run(provider.execute(agent, {}, "answer this"))
 
-        assert _JSON_INSTRUCTION in captured_prompts[0]
+        assert "MUST respond with a JSON object matching this schema" in captured_prompts[0]
         assert output.content == {"answer": "pong"}
 
     def test_json_schema_validation_error(self, provider: HermesProvider) -> None:
         schema = {"answer": OutputField(type="string")}
         agent = _make_agent(output=schema)
-        # Missing required field 'answer'
+        # Missing required field 'answer' — recovery loop exhausted
         result_dict = _make_result(final_response='{"wrong": "field"}')
 
         with patch("conductor.providers.hermes.AIAgent") as mock_cls:
@@ -153,7 +153,7 @@ class TestHermesExecute:
             mock_instance.run_conversation.return_value = result_dict
             mock_cls.return_value = mock_instance
 
-            with pytest.raises(ValidationError, match="answer"):
+            with pytest.raises(ProviderError, match="Failed to parse structured output"):
                 self._run(provider.execute(agent, {}, "answer this"))
 
     def test_passes_model_to_aiagent(self, provider: HermesProvider) -> None:
