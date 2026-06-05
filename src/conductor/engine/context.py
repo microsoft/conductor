@@ -276,8 +276,8 @@ class WorkflowContext:
         Input reference formats:
         - workflow.input.param_name - References a workflow input
         - agent_name.output - References an agent's entire output
-        - agent_name.output.field - References a specific output field
-        - agent_name.field - Shorthand for agent_name.output.field (deprecated but supported)
+        - agent_name.output.field[.subfield...] - Nested output projection
+        - agent_name.field[.subfield...] - Shorthand nested projection
         - parallel_group.outputs - References all parallel group outputs
         - parallel_group.outputs.agent_name - References a specific parallel agent's output
         - parallel_group.outputs.agent_name.field - Specific field from parallel agent
@@ -347,6 +347,13 @@ class WorkflowContext:
     ) -> None:
         """Add a regular agent output reference to context.
 
+        Supported behaviors:
+        - ``agent_name`` or ``agent_name.output`` copies the full output.
+        - ``agent_name.output.field[.subfield...]`` projects nested fields.
+        - ``agent_name.field[.subfield...]`` projects the same nested fields via shorthand.
+        - Optional refs (``?``) skip missing leaves/intermediate paths.
+        - Projected leaves are deep-copied to avoid mutation aliasing.
+
         Args:
             ctx: The context dictionary to update.
             agent_name: The name of the agent.
@@ -359,6 +366,7 @@ class WorkflowContext:
         agent_output = self.agent_outputs[agent_name]
         is_dict_output = isinstance(agent_output, dict)
 
+        # Seed ctx[agent_name] so optional-skip returns still leave a stub entry.
         # Initialise ``output`` to an empty dict for dict-shaped outputs (so
         # subsequent field-writes have somewhere to land) or to ``None`` for
         # scalar/list outputs (which are assigned whole below).
@@ -389,19 +397,19 @@ class WorkflowContext:
             # Traverse agent_output along path
             value: Any = agent_output
             for i, key in enumerate(path):
-                if not isinstance(value, dict) or key not in value:
-                    if not is_optional:
-                        if not isinstance(value, dict):
-                            raise KeyError(
-                                f"Cannot access field '{key}' on agent '{agent_name}': "
-                                f"intermediate value at '{'.'.join(path[:i])}' is a "
-                                f"{type(value).__name__}, not a dict"
-                            )
-                        raise KeyError(
-                            f"Missing output field '{'.'.join(path)}' from agent '{agent_name}'"
-                        )
+                if isinstance(value, dict) and key in value:
+                    value = value[key]
+                    continue
+                if is_optional:
                     return
-                value = value[key]
+                intermediate_path = ".".join(path[:i]) if i > 0 else agent_name
+                if not isinstance(value, dict):
+                    raise KeyError(
+                        f"Cannot access field '{key}' on agent '{agent_name}': "
+                        f"intermediate value at '{intermediate_path}' is a "
+                        f"{type(value).__name__}, not a dict"
+                    )
+                raise KeyError(f"Missing output field '{'.'.join(path)}' from agent '{agent_name}'")
 
             # Write the resolved leaf value into ctx at the nested output path,
             # creating intermediate dicts as needed. deepcopy matches the

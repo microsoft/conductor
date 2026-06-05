@@ -355,7 +355,10 @@ class TestWorkflowContextExplicitMode:
     def test_explicit_mode_nested_field_shorthand(self) -> None:
         """Shorthand agent.foo.bar exposes output.foo.bar; sibling keys are excluded."""
         ctx = WorkflowContext()
-        ctx.store("gate", {"selected": "go", "additional_input": {"answer": "README.md", "other": "x"}})
+        ctx.store(
+            "gate",
+            {"selected": "go", "additional_input": {"answer": "README.md", "other": "x"}},
+        )
 
         agent_ctx = ctx.build_for_agent(
             "next",
@@ -398,6 +401,60 @@ class TestWorkflowContextExplicitMode:
         assert agent_ctx["agent1"]["output"]["data"]["y"] == 2
         assert "z" not in agent_ctx["agent1"]["output"]["data"]
 
+    def test_explicit_mode_nested_leaf_projection_excludes_sibling(self) -> None:
+        """Declaring a leaf path copies only that leaf, excluding sibling keys."""
+        ctx = WorkflowContext()
+        ctx.store("a", {"foo": {"bar": 1, "baz": 2}})
+
+        agent_ctx = ctx.build_for_agent(
+            "next",
+            ["a.output.foo.bar"],
+            mode="explicit",
+        )
+
+        assert agent_ctx["a"]["output"]["foo"]["bar"] == 1
+        assert "baz" not in agent_ctx["a"]["output"]["foo"]
+
+    def test_explicit_mode_parent_decl_then_child_keeps_all_siblings(self) -> None:
+        """Declaring parent then child keeps full parent dict in projected output."""
+        ctx = WorkflowContext()
+        ctx.store("a", {"foo": {"bar": 1, "baz": 2}})
+
+        agent_ctx = ctx.build_for_agent(
+            "next",
+            ["a.foo", "a.foo.bar"],
+            mode="explicit",
+        )
+
+        assert agent_ctx["a"]["output"]["foo"] == {"bar": 1, "baz": 2}
+
+    def test_explicit_mode_child_decl_then_parent_overwrites(self) -> None:
+        """Declaring child then parent ends with the full parent dict."""
+        ctx = WorkflowContext()
+        ctx.store("a", {"foo": {"bar": 1, "baz": 2}})
+
+        agent_ctx = ctx.build_for_agent(
+            "next",
+            ["a.foo.bar", "a.foo"],
+            mode="explicit",
+        )
+
+        assert agent_ctx["a"]["output"]["foo"] == {"bar": 1, "baz": 2}
+
+    def test_explicit_mode_deep_three_level_projection(self) -> None:
+        """Nested projections beyond two levels keep only the declared deep leaf."""
+        ctx = WorkflowContext()
+        ctx.store("a", {"x": {"y": {"z": 42, "other": 99}}})
+
+        agent_ctx = ctx.build_for_agent(
+            "next",
+            ["a.x.y.z"],
+            mode="explicit",
+        )
+
+        assert agent_ctx["a"]["output"]["x"]["y"]["z"] == 42
+        assert "other" not in agent_ctx["a"]["output"]["x"]["y"]
+
     def test_explicit_mode_nested_field_missing_required_raises(self) -> None:
         """Missing required nested path raises KeyError."""
         ctx = WorkflowContext()
@@ -421,8 +478,8 @@ class TestWorkflowContextExplicitMode:
             mode="explicit",
         )
 
-        # No error; the key is simply absent
-        assert "answer" not in agent_ctx.get("gate", {}).get("output", {}).get("additional_input", {})
+        # Stub is always created; optional path not written so output dict is empty.
+        assert agent_ctx["gate"] == {"output": {}}
 
     def test_explicit_mode_nested_intermediate_not_dict_raises(self) -> None:
         """Traversing through a non-dict intermediate value raises KeyError."""
@@ -435,6 +492,20 @@ class TestWorkflowContextExplicitMode:
                 ["agent1.foo.bar"],
                 mode="explicit",
             )
+
+    def test_explicit_mode_deep_missing_mid_path_error_includes_path(self) -> None:
+        """Mid-path non-dict errors should include a non-empty intermediate path label."""
+        ctx = WorkflowContext()
+        ctx.store("a", {"foo": "not_a_dict"})
+
+        with pytest.raises(KeyError, match="intermediate value") as exc_info:
+            ctx.build_for_agent(
+                "next",
+                ["a.foo.bar"],
+                mode="explicit",
+            )
+
+        assert "'a'" in str(exc_info.value)
 
 
 class TestWorkflowContextOptionalDeps:
