@@ -138,6 +138,27 @@ class ProviderCapabilities(BaseModel):
     the directory would run the agent in the wrong repository. Defaults to
     ``False`` (conservative)."""
 
+    skills: bool = False
+    """``True`` when the provider exposes :mod:`conductor.skills` content
+    to the agent. The user-facing contract is the same regardless of
+    mechanism — *"the agent has access to the named skill"* — but how
+    the content reaches the model is selected by
+    :attr:`AgentProvider.supports_native_skills`:
+
+    * ``supports_native_skills=True`` — resolved skill directories are
+      passed to the SDK on the ``skill_directories`` kwarg of
+      :meth:`AgentProvider.execute` and the SDK loads skill content
+      itself (progressive disclosure via ``SKILL.md`` frontmatter).
+    * ``supports_native_skills=False`` — :class:`AgentExecutor` reads
+      every enabled skill's ``SKILL.md`` plus ``references/*.md`` and
+      eagerly prepends them to ``rendered_prompt`` inside
+      ``<skills><skill name="...">...</skill></skills>`` tags.
+
+    Workflows that declare ``runtime.skills`` or per-agent ``skills:``
+    against a provider with ``skills=False`` fail validation. Defaults
+    to ``False`` so providers that have not been audited for skills
+    surface the mismatch loudly."""
+
     upstream_pin: str | None = None
     """Upstream package pin surfaced in the experimental banner, e.g.
     ``"claude-agent-sdk>=0.1.0"``. ``None`` for providers that have no
@@ -208,6 +229,8 @@ class ProviderCapabilities(BaseModel):
             items.append("not safe to run in parallel")
         if not self.working_dir:
             items.append("working_dir ignored")
+        if not self.skills:
+            items.append("no skills support")
         return items
 
 
@@ -261,6 +284,7 @@ def _build_unimplemented_placeholder() -> ProviderCapabilities:
         usage_tracking=True,
         concurrent_safe=True,
         working_dir=True,
+        skills=True,
         upstream_pin=None,
         maintainer="(not yet implemented)",
     )

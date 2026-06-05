@@ -335,6 +335,11 @@ class ClaudeAgentSdkProvider(AgentProvider):
         # servers it spawns). Declared False so ``conductor validate`` errors
         # instead of lying about where the agent runs.
         working_dir=False,
+        # Skill content is eagerly injected into the rendered prompt by
+        # AgentExecutor (the claude-agent-sdk surfaces no
+        # ``skill_directories`` kwarg today; once it does we can flip
+        # to native via ``supports_native_skills``).
+        skills=True,
         upstream_pin="claude-agent-sdk>=0.2.82",
         maintainer="@lesandiz (best-effort)",
     )
@@ -368,7 +373,14 @@ class ClaudeAgentSdkProvider(AgentProvider):
         tools: list[str] | None = None,
         interrupt_signal: asyncio.Event | None = None,
         event_callback: EventCallback | None = None,
+        skill_directories: list[str] | None = None,
     ) -> AgentOutput:
+        # Skill content is eager-injected by AgentExecutor for this
+        # provider — ``claude-agent-sdk`` exposes no skill kwarg today.
+        # If/when the upstream SDK gains one, flip
+        # ``supports_native_skills`` to True and forward this arg.
+        del skill_directories
+
         if query is None or ClaudeAgentOptions is None:
             raise ProviderError("Claude Agent SDK not available")
 

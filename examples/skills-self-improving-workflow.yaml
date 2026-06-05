@@ -1,0 +1,161 @@
+# Self-improving workflow using the `conductor` skill
+#
+# This example shows how the generalized `skills:` capability gives an
+# agent reusable, version-accurate knowledge of Conductor's YAML
+# schema, execution model, and authoring patterns. It's the building
+# block that a future `conductor watch` (issue #181) would chain into a
+# closed-loop generate → review → fix cycle. The example demonstrates
+# all three sides of that loop in one pass.
+#
+# Provider mechanism — same observable contract, different mechanism:
+#   * Copilot: the skill directory is registered on the SDK session via
+#     `skill_directories`. The agent discovers and loads SKILL.md and
+#     references on demand (progressive disclosure).
+#   * Claude: SKILL.md + references/*.md are eagerly prepended to the
+#     agent's rendered prompt inside <skills><skill name="conductor">
+#     ... </skill></skills> tags.
+#
+# Tri-state opt-in via list presence:
+#   * Omit `skills:`     → inherit `runtime.skills`
+#   * `skills: []`       → explicit opt-out (e.g. the `formatter` agent
+#                          below, which doesn't need workflow knowledge)
+#   * `skills: [name]`   → explicit set, replaces the workflow default
+#
+# Usage:
+#   conductor run examples/skills-self-improving-workflow.yaml \
+#     --input task="Write a workflow that summarises a GitHub issue."
+
+workflow:
+  name: skills-self-improving-workflow
+  description: |
+    Generate a Conductor workflow, review it for correctness against
+    the bundled `conductor` skill, then revise it based on the review.
+    Demonstrates the building-block pattern for future iterative
+    fix-validate loops (see issue #181).
+  version: "1.0.0"
+  entry_point: author
+
+  runtime:
+    provider: copilot
+    skills: [conductor]   # every provider-backed agent inherits this
+
+  input:
+    task:
+      type: string
+      required: true
+      description: A short description of the workflow the author should generate.
+
+agents:
+  - name: author
+    description: Drafts an initial Conductor workflow for the given task.
+    prompt: |
+      You are authoring a brand-new Conductor workflow.
+
+      Task: {{ workflow.input.task }}
+
+      Produce a complete, runnable workflow YAML that solves the task.
+      Use the `conductor` skill for schema details, allowed step types,
+      routing patterns, and naming conventions. Prefer a minimal,
+      idiomatic design over an exhaustive one.
+    output:
+      workflow_yaml:
+        type: string
+        description: The drafted workflow YAML.
+      notes:
+        type: string
+        description: Author's notes on design choices.
+    routes:
+      - to: reviewer
+
+  - name: reviewer
+    description: Reviews the drafted workflow for schema and design issues.
+    prompt: |
+      Review the following Conductor workflow YAML.
+
+      ```yaml
+      {{ author.output.workflow_yaml }}
+      ```
+
+      Use the `conductor` skill to verify:
+        * Schema correctness (field names, types, required fields)
+        * Routing soundness (no orphan agents, no unreachable routes,
+          terminating routes present)
+        * Sensible context mode and failure-mode choices
+        * Appropriate use of step types (agent / script / set / wait /
+          terminate / parallel / for_each / human_gate / workflow)
+
+      List blocking issues separately from suggestions. If the workflow
+      is already correct and idiomatic, say so plainly and return an
+      empty `issues` list.
+    output:
+      issues:
+        type: string
+        description: Blocking schema or correctness issues. Empty if none.
+      suggestions:
+        type: string
+        description: Non-blocking improvements.
+      verdict:
+        type: string
+        description: One of "approved" or "needs_revision".
+    routes:
+      - to: fixer
+        when: "{{ reviewer.output.verdict == 'needs_revision' }}"
+      - to: formatter
+
+  - name: fixer
+    description: Applies the reviewer's findings and produces a revised workflow.
+    prompt: |
+      The reviewer flagged issues with the drafted workflow.
+
+      Original:
+      ```yaml
+      {{ author.output.workflow_yaml }}
+      ```
+
+      Review findings:
+      - Issues: {{ reviewer.output.issues }}
+      - Suggestions: {{ reviewer.output.suggestions }}
+
+      Use the `conductor` skill to produce a corrected, complete
+      workflow YAML that addresses every blocking issue. Adopt
+      suggestions where they materially improve the design. Output the
+      final YAML and a brief changelog.
+    output:
+      workflow_yaml:
+        type: string
+        description: The revised workflow YAML.
+      changelog:
+        type: string
+        description: Short summary of what changed and why.
+    routes:
+      - to: formatter
+
+  - name: formatter
+    description: Renders the final workflow + report. Doesn't need the skill.
+    # Explicit opt-out: this agent only formats existing strings. No
+    # need to bloat its prompt with the full skill content.
+    skills: []
+    prompt: |
+      Produce a Markdown report containing two sections:
+
+      ## Workflow
+
+      ```yaml
+      {{ fixer.output.workflow_yaml | default(author.output.workflow_yaml) }}
+      ```
+
+      ## Notes
+
+      Original notes: {{ author.output.notes }}
+      Review verdict: {{ reviewer.output.verdict }}
+      {% if fixer.output.changelog is defined %}
+      Changelog: {{ fixer.output.changelog }}
+      {% endif %}
+    output:
+      report:
+        type: string
+        description: The final Markdown report.
+
+output:
+  report: "{{ formatter.output.report }}"
+  verdict: "{{ reviewer.output.verdict }}"
