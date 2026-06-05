@@ -1018,6 +1018,46 @@ class AgentDef(BaseModel):
           max_retries: 1
     """
 
+    skills: list[str] | None = None
+    """Opt this agent into a list of named built-in skills.
+
+    Each entry is a skill name registered in :mod:`conductor.skills`.
+    The agent receives that skill's content via whichever mechanism the
+    provider supports natively:
+
+    * **Copilot** — skill directories are passed to the SDK session via
+      ``skill_directories``; the model discovers and loads skill content
+      as relevant (progressive disclosure, token-efficient).
+    * **Claude / Claude Agent SDK** — ``SKILL.md`` plus
+      ``references/*.md`` is eagerly injected into the agent's rendered
+      prompt, wrapped in ``<skill name="...">`` tags. There is no native
+      skill surface on the Anthropic API without adopting the
+      container/code-execution beta.
+
+    Tri-state semantics via list presence:
+
+    * ``None`` (omitted): inherit from ``workflow.runtime.skills``
+    * ``[]`` (empty list): explicit none — overrides any workflow
+      default
+    * ``[name, ...]``: explicit set — overrides any workflow default
+
+    Skills built into Conductor today:
+
+    * ``conductor`` — comprehensive knowledge of Conductor's YAML
+      schema, execution model, authoring patterns, and CLI commands.
+      Enables agents to evaluate, improve, debug, or generate Conductor
+      workflows.
+
+    Only applies to provider-backed agents (type='agent' or None).
+
+    Example YAML::
+
+        agents:
+          - name: workflow_reviewer
+            skills: [conductor]
+            prompt: "Review this workflow for correctness..."
+    """
+
     status: Literal["success", "failed"] | None = None
     """Outcome status for ``type: terminate`` steps.
 
@@ -1084,6 +1124,28 @@ class AgentDef(BaseModel):
             raise ValueError("timeout must be a positive integer")
         return v
 
+    @field_validator("skills")
+    @classmethod
+    def validate_skills(cls, v: list[str] | None) -> list[str] | None:
+        """Ensure every skill name resolves to a known built-in.
+
+        Validates at load time so unknown skill names surface in
+        ``conductor validate`` and ``conductor run`` startup rather than
+        at execute time. Empty lists are allowed (explicit opt-out).
+        """
+        if v is None:
+            return v
+        from conductor.skills import SkillNotFoundError, get_skill_directory
+
+        for name in v:
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError(f"skills entries must be non-empty strings, got {name!r}")
+            try:
+                get_skill_directory(name)
+            except SkillNotFoundError as exc:
+                raise ValueError(str(exc)) from exc
+        return v
+
     @field_validator("duration", mode="before")
     @classmethod
     def reject_bool_duration(cls, v: Any) -> Any:
@@ -1148,6 +1210,8 @@ class AgentDef(BaseModel):
                 raise ValueError("human_gate agents cannot have 'reasoning'")
             if self.context_tier is not None:
                 raise ValueError("human_gate agents cannot have 'context_tier'")
+            if self.skills is not None:
+                raise ValueError("human_gate agents cannot have 'skills'")
             if self.timeout_seconds is not None:
                 raise ValueError("human_gate agents cannot have 'timeout_seconds'")
             if self.value is not None:
@@ -1193,6 +1257,8 @@ class AgentDef(BaseModel):
                 raise ValueError("script agents cannot have 'reasoning'")
             if self.context_tier is not None:
                 raise ValueError("script agents cannot have 'context_tier'")
+            if self.skills is not None:
+                raise ValueError("script agents cannot have 'skills'")
             if self.timeout_seconds is not None:
                 raise ValueError(
                     "script agents cannot have 'timeout_seconds' "
@@ -1288,6 +1354,8 @@ class AgentDef(BaseModel):
                 raise ValueError("wait agents cannot have 'reasoning'")
             if self.context_tier is not None:
                 raise ValueError("wait agents cannot have 'context_tier'")
+            if self.skills is not None:
+                raise ValueError("wait agents cannot have 'skills'")
             if self.timeout_seconds is not None:
                 raise ValueError("wait agents cannot have 'timeout_seconds'")
             if self.output is not None:
@@ -1353,6 +1421,8 @@ class AgentDef(BaseModel):
                 raise ValueError("set agents cannot have 'reasoning'")
             if self.context_tier is not None:
                 raise ValueError("set agents cannot have 'context_tier'")
+            if self.skills is not None:
+                raise ValueError("set agents cannot have 'skills'")
             if self.timeout_seconds is not None:
                 raise ValueError("set agents cannot have 'timeout_seconds'")
             if self.duration is not None:
@@ -1417,6 +1487,8 @@ class AgentDef(BaseModel):
                 raise ValueError("terminate agents cannot have 'reasoning'")
             if self.context_tier is not None:
                 raise ValueError("terminate agents cannot have 'context_tier'")
+            if self.skills is not None:
+                raise ValueError("terminate agents cannot have 'skills'")
             if self.workflow:
                 raise ValueError("terminate agents cannot have 'workflow'")
             if self.input_mapping is not None:
@@ -1475,6 +1547,8 @@ class AgentDef(BaseModel):
             raise ValueError("workflow agents cannot have 'reasoning'")
         if self.type == "workflow" and self.context_tier is not None:
             raise ValueError("workflow agents cannot have 'context_tier'")
+        if self.type == "workflow" and self.skills is not None:
+            raise ValueError("workflow agents cannot have 'skills'")
 
         # Wait-only fields are forbidden on every other type. ``reason`` is
         # shared with ``type: terminate`` (which has its own required-non-
@@ -2051,6 +2125,45 @@ class RuntimeConfig(BaseModel):
     Only the Copilot provider forwards this (maps to the SDK's
     ``create_session`` ``context_tier`` param). Other providers ignore it.
     """
+
+    skills: list[str] = Field(default_factory=list)
+    """Workflow-wide default skills for every provider-backed agent.
+
+    Each entry is a skill name registered in :mod:`conductor.skills` (e.g.
+    ``conductor``). Every provider-backed agent inherits this list as its
+    default; individual agents override by setting their own ``skills:``
+    field (use ``skills: []`` for explicit opt-out).
+
+    Skill content reaches the model differently per provider:
+
+    * **Copilot** — registered on the SDK session via ``skill_directories``
+    * **Claude / Claude Agent SDK** — eagerly injected into the rendered
+      prompt inside ``<skills><skill name="...">...</skill></skills>`` tags
+
+    Defaults to an empty list (no skills). Phase 1 ships one built-in
+    skill (``conductor``); user-defined skill directories will be added
+    in a follow-up.
+
+    Example YAML::
+
+        runtime:
+            skills: [conductor]
+    """
+
+    @field_validator("skills")
+    @classmethod
+    def validate_skills(cls, v: list[str]) -> list[str]:
+        """Ensure every workflow-default skill name resolves to a known built-in."""
+        from conductor.skills import SkillNotFoundError, get_skill_directory
+
+        for name in v:
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError(f"skills entries must be non-empty strings, got {name!r}")
+            try:
+                get_skill_directory(name)
+            except SkillNotFoundError as exc:
+                raise ValueError(str(exc)) from exc
+        return v
 
 
 class WorkflowDef(BaseModel):

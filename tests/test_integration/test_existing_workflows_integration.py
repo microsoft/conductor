@@ -187,6 +187,7 @@ async def test_schema_changes_dont_affect_copilot_provider():
         # Periodic checkpoints are off by default (issue #244); every_seconds is
         # None and excluded by exclude_none.
         "checkpoint": {"every_agent": False, "keep_last": 5},
+        "skills": [],
     }
 
     # Verify provider can be instantiated

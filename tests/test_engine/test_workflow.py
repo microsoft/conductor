@@ -2625,6 +2625,7 @@ class _RecordingReasoningProvider:
         tools=None,
         interrupt_signal=None,
         event_callback=None,
+        skill_directories=None,
     ):
         from conductor.providers.base import AgentOutput
         from conductor.providers.reasoning import resolve_reasoning_effort

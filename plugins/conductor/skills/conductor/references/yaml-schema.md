@@ -36,6 +36,10 @@ workflow:
     max_agent_iterations: integer   # Max tool-use roundtrips per agent (1-500, optional)
     max_session_seconds: float      # Wall-clock timeout per agent session in seconds (optional)
     default_reasoning_effort: string # Workflow-wide reasoning/thinking effort: low, medium, high, xhigh (optional)
+    skills: [string]                # Skills enabled for every provider-backed agent (default: [])
+                                    # Currently registered built-ins: "conductor"
+                                    # Copilot loads natively via `skill_directories`;
+                                    # Claude eagerly injects SKILL.md + references/*.md into the prompt.
     mcp_servers:                    # MCP server configurations (ignored by claude-agent-sdk — uses CLI config)
       <server_name>:
         type: string                # "stdio" (default), "http", or "sse"
@@ -153,6 +157,13 @@ agents:
     # Not allowed for script, human_gate, workflow, or wait agent types.
     reasoning:
       effort: string                # low, medium, high, or xhigh
+
+    # Skills (optional, only on provider-backed agents)
+    # Tri-state via list presence:
+    #   - omit:           inherit runtime.skills
+    #   - skills: []      explicit opt-out (no skills for this agent)
+    #   - skills: [a, b]  explicit set, replaces the workflow default
+    skills: [string]                # Skill names enabled for this agent (built-ins: "conductor")
 
     # Per-agent retry policy (optional, not allowed for script, human_gate, workflow, or wait agents)
     retry:

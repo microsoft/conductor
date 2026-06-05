@@ -161,6 +161,30 @@ class AgentProvider(ABC):
     # subclass at import time.
     CAPABILITIES: ClassVar[ProviderCapabilities | None] = None
 
+    @property
+    def supports_native_skills(self) -> bool:
+        """Whether the provider loads skill content natively.
+
+        When ``True``, the :class:`~conductor.executor.agent.AgentExecutor`
+        passes resolved skill directories to :meth:`execute` via
+        ``skill_directories`` and skips eager preamble injection — the
+        provider's SDK is expected to discover and load skill content
+        itself (e.g. Copilot's session-level ``skill_directories``).
+
+        When ``False`` (default), the executor eagerly injects the full
+        ``SKILL.md`` plus ``references/*.md`` content into the agent's
+        rendered prompt — appropriate for providers like Claude where
+        there is no server-side skill surface without adopting the
+        container/code-execution beta.
+
+        Providers MUST also declare ``skills=True`` on their
+        :class:`ProviderCapabilities` descriptor regardless of which
+        mechanism they use — the capability flag asserts the user-facing
+        contract ("the agent has access to the named skill"), this
+        property selects the mechanism.
+        """
+        return False
+
     def __init_subclass__(cls, *, abstract: bool = False, **kwargs: Any) -> None:
         """Enforce that every production subclass declares ``CAPABILITIES``.
 
@@ -194,6 +218,7 @@ class AgentProvider(ABC):
         tools: list[str] | None = None,
         interrupt_signal: asyncio.Event | None = None,
         event_callback: EventCallback | None = None,
+        skill_directories: list[str] | None = None,
     ) -> AgentOutput:
         """Execute an agent and return normalized output.
 
@@ -211,6 +236,14 @@ class AgentProvider(ABC):
             event_callback: Optional callback for streaming SDK events
                 upstream (reasoning, tool calls, messages). Called with
                 (event_type, data_dict) for each interesting SDK event.
+            skill_directories: Optional skill directories resolved from
+                the agent's effective ``skills`` list. Providers that
+                set :attr:`supports_native_skills` to ``True`` should
+                forward these to their SDK's native skill-loading
+                mechanism. Providers that do not support native skills
+                may ignore this parameter (the executor will have
+                eager-injected the skill content into
+                ``rendered_prompt`` instead).
 
         Returns:
             Normalized AgentOutput with structured content.
