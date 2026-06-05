@@ -93,6 +93,7 @@ class HermesProvider(AgentProvider):
         temperature: float | None = None,
         base_url: str | None = None,
         api_key: str | None = None,
+        hermes_home: str | None = None,
         max_agent_iterations: int | None = None,
         max_session_seconds: float | None = None,
         default_reasoning_effort: ReasoningEffort | None = None,
@@ -110,6 +111,9 @@ class HermesProvider(AgentProvider):
             api_key: API key for the endpoint. Forwarded to ``AIAgent``
                 when set. Use ``${ENV_VAR}`` interpolation in YAML so the
                 literal value never appears in event logs.
+            hermes_home: Path to a Hermes home directory (profile). When
+                set, hermes loads config/soul/memory from this path instead
+                of ``~/.hermes``. Thread-safe via ``ContextVar`` override.
             max_agent_iterations: Maximum tool-calling iterations per agent
                 execution. Maps to hermes ``max_iterations``. Defaults to
                 90 (hermes default) when None.
@@ -117,8 +121,7 @@ class HermesProvider(AgentProvider):
                 Not directly supported by the hermes library — used only to
                 impose an ``asyncio.wait_for`` timeout around each call.
             default_reasoning_effort: Workflow-wide default reasoning effort.
-                Hermes controls reasoning internally per-model; this parameter
-                is accepted for interface parity but has no effect.
+                Forwarded to hermes via ``reasoning_config``.
         """
         if not HERMES_SDK_AVAILABLE:
             raise ProviderError(
@@ -131,6 +134,7 @@ class HermesProvider(AgentProvider):
         self._default_temperature = temperature
         self._base_url = base_url
         self._api_key = api_key
+        self._hermes_home = hermes_home
         self._default_max_agent_iterations = max_agent_iterations
         self._default_max_session_seconds = max_session_seconds
         self._default_reasoning_effort = default_reasoning_effort
@@ -257,13 +261,23 @@ class HermesProvider(AgentProvider):
         hermes_agent_ref: list[Any] = []
 
         def _run_sync() -> dict[str, Any]:
-            hermes_agent = AIAgent(**agent_kwargs)
-            hermes_agent_ref.append(hermes_agent)
-            return hermes_agent.run_conversation(
-                prompt,
-                system_message=agent.system_prompt or None,
-                conversation_history=conversation_history,
-            )
+            # Apply hermes_home profile override (thread-safe ContextVar)
+            _home_token = None
+            if self._hermes_home:
+                from hermes_constants import set_hermes_home_override
+                _home_token = set_hermes_home_override(self._hermes_home)
+            try:
+                hermes_agent = AIAgent(**agent_kwargs)
+                hermes_agent_ref.append(hermes_agent)
+                return hermes_agent.run_conversation(
+                    prompt,
+                    system_message=agent.system_prompt or None,
+                    conversation_history=conversation_history,
+                )
+            finally:
+                if _home_token is not None:
+                    from hermes_constants import reset_hermes_home_override
+                    reset_hermes_home_override(_home_token)
 
         # Wrap the blocking call and optionally race against interrupt / timeout
         call_task = loop.run_in_executor(None, _run_sync)

@@ -1357,6 +1357,17 @@ class ProviderSettings(BaseModel):
     """Azure-specific options (e.g. ``api_version``). Requires
     ``type: azure``. Copilot-only."""
 
+    hermes_home: str | None = None
+    """Path to a Hermes home directory (profile). Hermes-only.
+
+    When set, the Hermes provider loads its config (soul, memory, toolsets)
+    from this path instead of the default ``~/.hermes``. Supports
+    ``${ENV_VAR}`` interpolation.
+
+    Example:
+        hermes_home: ~/.hermes-research
+    """
+
     @model_validator(mode="after")
     def _check_field_compatibility(self) -> ProviderSettings:
         copilot_only_fields = {
@@ -1379,6 +1390,9 @@ class ProviderSettings(BaseModel):
                         f"Structured provider config (base_url/api_key) for name='{self.name}' "
                         "is not yet implemented; use environment variables for the underlying SDK."
                     )
+
+        if self.hermes_home is not None and self.name != "hermes":
+            raise ValueError("'hermes_home' is only supported when name='hermes'.")
 
         if self.azure is not None and self.type != "azure":
             raise ValueError("'azure' options require type='azure'")
