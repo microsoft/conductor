@@ -83,15 +83,18 @@ _DICT_METHOD_NAMES = frozenset({"items", "keys", "values", "get"})
 _MAX_ENUMERATED_PATHS = 100
 
 # Pattern for input references:
-# - agent.output(.field)?
-# - parallel_group.outputs.agent(.field)?
+# - agent.output[.field[.subfield...]]
+# - parallel_group.outputs|errors[.agent[.field]]  (parallel depth unchanged)
 # - workflow.input.param
+# - agent.field[.subfield...]  (shorthand; excludes workflow.*)
 # All with optional ? suffix
 INPUT_REF_PATTERN = re.compile(
     r"^(?:"
-    r"(?P<agent>[a-zA-Z_][a-zA-Z0-9_]*)\.output(?:\.(?P<field>[a-zA-Z_][a-zA-Z0-9_]*))?|"
+    r"(?P<agent>[a-zA-Z_][a-zA-Z0-9_]*)\.output(?:\.(?P<field>[a-zA-Z_][a-zA-Z0-9_]*)(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*)?|"
     r"(?P<parallel>[a-zA-Z_][a-zA-Z0-9_]*)\.(?P<pg_kind>outputs|errors)(?:\.(?P<pg_agent>[a-zA-Z_][a-zA-Z0-9_]*)(?:\.(?P<pg_field>[a-zA-Z_][a-zA-Z0-9_]*))?)?|"
-    r"workflow\.input\.(?P<input>[a-zA-Z_][a-zA-Z0-9_]*)"
+    r"workflow\.input\.(?P<input>[a-zA-Z_][a-zA-Z0-9_]*)|"
+    r"(?!workflow\b)(?![a-zA-Z_][a-zA-Z0-9_]*\.(?:outputs|errors)(?:\.|$))"
+    r"(?P<shorthand>[a-zA-Z_][a-zA-Z0-9_]*)\.(?P<sh_field>[a-zA-Z_][a-zA-Z0-9_]*)(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*"
     r")(?P<optional>\?)?$"
 )
 
@@ -329,14 +332,17 @@ def _validate_input_references(
         if not match:
             errors.append(
                 f"Agent '{agent_name}' has invalid input reference '{input_ref}'. "
-                "Expected format: 'agent_name.output', 'agent_name.output.field', "
-                "'parallel_group.outputs.agent_name', 'parallel_group.outputs.agent_name.field', "
+                "Expected formats: 'agent_name.output', "
+                "'agent_name.output.field[.subfield...]', "
+                "'agent_name.field[.subfield...]' (shorthand), "
+                "'parallel_group.outputs[.agent_name[.field]]', "
+                "'parallel_group.errors[.agent_name]', "
                 "or 'workflow.input.param_name' (append '?' for optional)"
             )
             continue
 
         # Check if referencing another agent's output
-        ref_agent = match.group("agent")
+        ref_agent = match.group("agent") or match.group("shorthand")
         if ref_agent and ref_agent not in agent_names:
             is_optional = match.group("optional") == "?"
             if is_optional:
@@ -866,6 +872,9 @@ def _extract_template_refs(template: str) -> TemplateRefs:
         agent_refs.add(root)
         if kind == "output":
             # attrs is ["output"] or ["output", "<field>", ...]
+            # Keep first-level precision only: deeper chains like
+            # a.output.foo.bar intentionally record field="foo" so advisory
+            # checks compare declared first-level fields.
             field: str | None = attrs[1] if len(attrs) >= 2 else None
             agent_output_fields.setdefault(root, set()).add(field)
         else:  # kind == "outputs"
@@ -1320,10 +1329,14 @@ def _validate_template_references(
             match = INPUT_REF_PATTERN.match(ref.rstrip("?"))
             if not match:
                 continue
-            ref_agent = match.group("agent")
+            ref_agent = match.group("agent") or match.group("shorthand")
             if ref_agent:
-                field = match.group("field")
-                # field is None for bare ``a.output`` (whole output declared).
+                # For explicit refs, ``field`` is the first component after
+                # ``.output`` (or None for bare ``a.output``). For shorthand
+                # refs, ``sh_field`` is the first component after the agent
+                # name. Nested paths intentionally degrade to first-level
+                # advisory precision.
+                field = match.group("field") if match.group("agent") else match.group("sh_field")
                 declared_agent_output_fields.setdefault(ref_agent, set()).add(field)
             ref_parallel = match.group("parallel")
             if ref_parallel:

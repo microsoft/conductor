@@ -276,8 +276,8 @@ class WorkflowContext:
         Input reference formats:
         - workflow.input.param_name - References a workflow input
         - agent_name.output - References an agent's entire output
-        - agent_name.output.field - References a specific output field
-        - agent_name.field - Shorthand for agent_name.output.field (deprecated but supported)
+        - agent_name.output.field[.subfield...] - Nested output projection
+        - agent_name.field[.subfield...] - Shorthand nested projection
         - parallel_group.outputs - References all parallel group outputs
         - parallel_group.outputs.agent_name - References a specific parallel agent's output
         - parallel_group.outputs.agent_name.field - Specific field from parallel agent
@@ -347,6 +347,13 @@ class WorkflowContext:
     ) -> None:
         """Add a regular agent output reference to context.
 
+        Supported behaviors:
+        - ``agent_name`` or ``agent_name.output`` copies the full output.
+        - ``agent_name.output.field[.subfield...]`` projects nested fields.
+        - ``agent_name.field[.subfield...]`` projects the same nested fields via shorthand.
+        - Optional refs (``?``) skip missing leaves/intermediate paths.
+        - Projected leaves are deep-copied to avoid mutation aliasing.
+
         Args:
             ctx: The context dictionary to update.
             agent_name: The name of the agent.
@@ -359,6 +366,7 @@ class WorkflowContext:
         agent_output = self.agent_outputs[agent_name]
         is_dict_output = isinstance(agent_output, dict)
 
+        # Seed ctx[agent_name] so optional-skip returns still leave a stub entry.
         # Initialise ``output`` to an empty dict for dict-shaped outputs (so
         # subsequent field-writes have somewhere to land) or to ``None`` for
         # scalar/list outputs (which are assigned whole below).
@@ -367,48 +375,53 @@ class WorkflowContext:
         elif "output" not in ctx[agent_name]:
             ctx[agent_name]["output"] = {} if is_dict_output else None
 
-        if not remaining_parts:
-            # Just agent_name - copy entire output
+        if not remaining_parts or remaining_parts == ["output"]:
+            # agent_name or agent_name.output — copy entire output
             ctx[agent_name]["output"] = (
                 copy.deepcopy(agent_output) if is_dict_output else (copy.copy(agent_output))
             )
-        elif len(remaining_parts) == 1 and remaining_parts[0] == "output":
-            # agent_name.output - copy entire output
-            ctx[agent_name]["output"] = (
-                copy.deepcopy(agent_output) if is_dict_output else (copy.copy(agent_output))
-            )
-        elif len(remaining_parts) >= 2 and remaining_parts[0] == "output":
-            # agent_name.output.field - copy specific field. Only meaningful
-            # when the stored output is a dict; otherwise the field access
-            # is undefined and (when required) must raise.
-            field_name = remaining_parts[1]
-            if is_dict_output and field_name in agent_output:
-                # Ensure we have a dict to write the field into (the initial
-                # output slot above seeded ``None`` for non-dict outputs).
-                if not isinstance(ctx[agent_name]["output"], dict):
-                    ctx[agent_name]["output"] = {}
-                ctx[agent_name]["output"][field_name] = agent_output[field_name]
-            elif not is_optional:
-                if not is_dict_output:
+        else:
+            # Resolve field path:
+            #   agent_name.output.field[.subfield...] → path = [field, subfield, ...]
+            #   agent_name.field[.subfield...]        → path = [field, subfield, ...]  (shorthand)
+            path = remaining_parts[1:] if remaining_parts[0] == "output" else remaining_parts
+
+            if not is_dict_output:
+                if not is_optional:
                     raise KeyError(
-                        f"Cannot access field '{field_name}' on agent '{agent_name}': "
+                        f"Cannot access field '{path[0]}' on agent '{agent_name}': "
                         f"its output is a {type(agent_output).__name__}, not a dict"
                     )
-                raise KeyError(f"Missing output field '{field_name}' from agent '{agent_name}'")
-        elif len(remaining_parts) == 1 and remaining_parts[0] != "output":
-            # Shorthand format: agent_name.field -> agent_name.output.field
-            field_name = remaining_parts[0]
-            if is_dict_output and field_name in agent_output:
-                if not isinstance(ctx[agent_name]["output"], dict):
-                    ctx[agent_name]["output"] = {}
-                ctx[agent_name]["output"][field_name] = agent_output[field_name]
-            elif not is_optional:
-                if not is_dict_output:
+                return
+
+            # Traverse agent_output along path
+            value: Any = agent_output
+            for i, key in enumerate(path):
+                if isinstance(value, dict) and key in value:
+                    value = value[key]
+                    continue
+                if is_optional:
+                    return
+                intermediate_path = ".".join(path[:i]) if i > 0 else agent_name
+                if not isinstance(value, dict):
                     raise KeyError(
-                        f"Cannot access field '{field_name}' on agent '{agent_name}': "
-                        f"its output is a {type(agent_output).__name__}, not a dict"
+                        f"Cannot access field '{key}' on agent '{agent_name}': "
+                        f"intermediate value at '{intermediate_path}' is a "
+                        f"{type(value).__name__}, not a dict"
                     )
-                raise KeyError(f"Missing output field '{field_name}' from agent '{agent_name}'")
+                raise KeyError(f"Missing output field '{'.'.join(path)}' from agent '{agent_name}'")
+
+            # Write the resolved leaf value into ctx at the nested output path,
+            # creating intermediate dicts as needed. deepcopy matches the
+            # whole-output copy semantics above and prevents mutation aliasing.
+            if not isinstance(ctx[agent_name]["output"], dict):
+                ctx[agent_name]["output"] = {}
+            target = ctx[agent_name]["output"]
+            for key in path[:-1]:
+                if key not in target or not isinstance(target[key], dict):
+                    target[key] = {}
+                target = target[key]
+            target[path[-1]] = copy.deepcopy(value)
 
     def _add_parallel_group_input(
         self, ctx: dict[str, Any], group_name: str, remaining_parts: list[str], is_optional: bool
