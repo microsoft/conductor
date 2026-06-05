@@ -95,6 +95,7 @@ class HermesProvider(AgentProvider):
         base_url: str | None = None,
         api_key: str | None = None,
         hermes_home: str | None = None,
+        hermes_toolsets: list[str] | None = None,
         max_agent_iterations: int | None = None,
         max_session_seconds: float | None = None,
         default_reasoning_effort: ReasoningEffort | None = None,
@@ -115,6 +116,9 @@ class HermesProvider(AgentProvider):
             hermes_home: Path to a Hermes home directory (profile). When
                 set, hermes loads config/soul/memory from this path instead
                 of ``~/.hermes``. Thread-safe via ``ContextVar`` override.
+            hermes_toolsets: Hermes toolset names to enable (e.g.
+                ``["filesystem", "web"]``). None = hermes defaults (all
+                available toolsets); empty list = no tools.
             max_agent_iterations: Maximum tool-calling iterations per agent
                 execution. Maps to hermes ``max_iterations``. Defaults to
                 90 (hermes default) when None.
@@ -136,6 +140,7 @@ class HermesProvider(AgentProvider):
         self._base_url = base_url
         self._api_key = api_key
         self._hermes_home = hermes_home
+        self._hermes_toolsets = hermes_toolsets
         self._default_max_agent_iterations = max_agent_iterations
         self._default_max_session_seconds = max_session_seconds
         self._default_reasoning_effort = default_reasoning_effort
@@ -162,7 +167,8 @@ class HermesProvider(AgentProvider):
             context: Accumulated workflow context (not passed to hermes directly;
                 context is already rendered into ``rendered_prompt``).
             rendered_prompt: Jinja2-rendered user prompt.
-            tools: Unused — hermes manages its own toolsets independently.
+            tools: Hermes toolset names to enable (e.g. ["filesystem", "web"]).
+                None = hermes defaults; empty list = no tools.
             interrupt_signal: Optional event that, when set, signals a
                 mid-agent interrupt request. Monitored during execution;
                 when fired the current library call is cancelled and a
@@ -230,11 +236,29 @@ class HermesProvider(AgentProvider):
         if effort is not None:
             agent_kwargs["reasoning_config"] = {"effort": effort}
 
-        # Conductor's per-agent tools: allowlist is NOT forwarded to hermes.
-        # The two vocabularies are incompatible (Conductor MCP tool names vs
-        # hermes-internal toolset names). workflow_tools_passthrough=False in
-        # CAPABILITIES ensures the validator rejects any agent that sets
-        # tools: against this provider.
+        # Resolve enabled_toolsets. Conductor's per-agent tools: field
+        # contains workflow tool names (not Hermes toolset names), so a
+        # non-empty list cannot be forwarded. Provider-level hermes_toolsets
+        # gives authors the knob to restrict which Hermes toolsets are active.
+        if tools:
+            raise ProviderError(
+                f"Agent '{agent.name}' declares tools={tools!r}, but "
+                "the Hermes provider does not support per-agent workflow tool "
+                "allowlists (workflow tool names do not translate to Hermes "
+                "toolset names).",
+                suggestion=(
+                    "Remove the 'tools:' field to use Hermes default toolsets, "
+                    "set 'tools: []' to disable all tools, or configure "
+                    "'hermes_toolsets' in the provider settings to restrict "
+                    "which Hermes toolsets are available."
+                ),
+            )
+        elif tools is not None:
+            # Explicit empty list = no tools
+            agent_kwargs["enabled_toolsets"] = []
+        elif self._hermes_toolsets is not None:
+            # Provider-level toolset restriction
+            agent_kwargs["enabled_toolsets"] = self._hermes_toolsets
 
         # Wire streaming callbacks so events fire incrementally from the
         # executor thread. The _fire helper is thread-safe (swallows errors).

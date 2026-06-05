@@ -1385,6 +1385,17 @@ class ProviderSettings(BaseModel):
         hermes_home: ~/.hermes-research
     """
 
+    hermes_toolsets: list[str] | None = None
+    """Hermes toolset names to enable for all agents. Hermes-only.
+
+    When set, restricts which Hermes toolsets are available during agent
+    execution. ``None`` (default) = Hermes uses all available toolsets.
+    Empty list = no tools at all.
+
+    Example:
+        hermes_toolsets: [filesystem, web]
+    """
+
     @model_validator(mode="after")
     def _check_field_compatibility(self) -> ProviderSettings:
         copilot_only_fields = {
@@ -1419,6 +1430,9 @@ class ProviderSettings(BaseModel):
 
         if self.hermes_home is not None and self.name != "hermes":
             raise ValueError("'hermes_home' is only supported when name='hermes'.")
+
+        if self.hermes_toolsets is not None and self.name != "hermes":
+            raise ValueError("'hermes_toolsets' is only supported when name='hermes'.")
 
         if self.azure is not None and self.type != "azure":
             raise ValueError("'azure' options require type='azure'")

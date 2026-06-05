@@ -11,21 +11,20 @@ This guide helps you choose between GitHub Copilot, Anthropic Claude, Claude Age
 | **Pricing Model** | Subscription ($10-39/mo) | Pay-per-token | Via Claude Code CLI | Pay-per-token (via hermes) |
 | **Setup** | GitHub auth | API key | `claude` CLI auth | API key (model-provider's key) |
 | **Model Selection** | GPT-5.2, o1 | Haiku, Sonnet, Opus | Haiku, Sonnet, Opus | Any OpenRouter-style model |
-| **Streaming** | Yes | No (Phase 1) | Yes | No |
-| **Tool Support** | Yes (MCP, all types) | Yes (MCP, stdio only) | Yes (built-in, CLI-managed) | Yes (hermes internal tools) |
+| **Streaming** | Yes | No (Phase 1) | Yes | Yes |
+| **Tool Support** | Yes (MCP, all types) | Yes (MCP, stdio only) | Yes (built-in, CLI-managed) | Yes (hermes toolsets) |
 | **MCP Servers** | Yes | Yes (stdio) | No | No |
-| **Reasoning / Extended Thinking** | Yes (`reasoning_effort` on session) | Yes (extended `thinking` budget) | Inherits from CLI config | No-op (hermes internal) |
+| **Reasoning / Extended Thinking** | Yes (`reasoning_effort` on session) | Yes (extended `thinking` budget) | Inherits from CLI config | Yes (`reasoning_config`) |
 | **Speed** | Fast | Fast | Fast | Depends on model |
 | **Output Quality** | Excellent | Excellent | Excellent | Depends on model |
 | **Cost Predictability** | High (flat rate) | Variable (usage-based) | Variable | Variable (usage-based) |
 | **Structured Output** | Prompt injection | Native | Prompt injection | Prompt injection |
-| **Session Resume** | Yes | No | No | No |
+| **Session Resume** | Yes | No | No | Yes |
 
 > **About the experimental tier.** `claude-agent-sdk` and `hermes` declare
-> specific capability carve-outs (no MCP, no per-agent tools allowlist,
-> etc.). `conductor validate` catches workflows that depend on those
-> features against these providers, and the CLI prints a one-time banner
-> when the workflow runs. See
+> specific capability carve-outs (e.g. no MCP servers). `conductor validate`
+> catches workflows that depend on those features against these providers,
+> and the CLI prints a one-time banner when the workflow runs. See
 > [docs/providers/experimental.md](./experimental.md) for the stability
 > policy and promotion criteria.
 
