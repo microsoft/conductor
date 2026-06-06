@@ -225,7 +225,11 @@ class HermesProvider(AgentProvider):
         if self._default_max_tokens is not None:
             agent_kwargs["max_tokens"] = self._default_max_tokens
         if self._default_temperature is not None:
-            agent_kwargs["temperature"] = self._default_temperature
+            # AIAgent doesn't accept temperature directly; route through
+            # request_overrides which is applied at the transport layer.
+            agent_kwargs.setdefault("request_overrides", {})["temperature"] = (
+                self._default_temperature
+            )
         if self._base_url:
             agent_kwargs["base_url"] = self._base_url
         if self._api_key:
