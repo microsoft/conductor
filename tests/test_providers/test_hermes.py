@@ -533,7 +533,7 @@ class TestHermesProviderParams:
             asyncio.run(provider.execute(agent, {}, "hello"))
 
         _, kwargs = mock_cls.call_args
-        assert kwargs["temperature"] == 0.5
+        assert kwargs["request_overrides"] == {"temperature": 0.5}
 
     def test_base_url_forwarded(self) -> None:
         with patch("conductor.providers.hermes.HERMES_SDK_AVAILABLE", True), \
