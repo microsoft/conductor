@@ -69,12 +69,15 @@ make validate-examples    # validate all examples
   - `run.py` - Workflow execution command with verbose logging helpers
   - `bg_runner.py` - Background process forking for `--web-bg` mode. Captures the detached child's stdout/stderr to `$TMPDIR/conductor/conductor-<name>-<ts>-<runid>.bg.{stderr,stdout}.log` so silent crashes (uncaught Python exceptions, `faulthandler` dumps) leave a forensic trail — DEVNULL is **not** used for stdout/stderr. Passes `CONDUCTOR_RUN_ID`, `CONDUCTOR_BG_STDERR_LOG`, and `CONDUCTOR_BG_STDOUT_LOG` to the child via env so the child's `EventLogSubscriber` shares a run id with the bg log files and surfaces both paths in `workflow_started` system metadata. Returns a `BackgroundLaunch` dataclass (`url`, `stderr_log`, `stdout_log`, `run_id`).
   - `pid.py` - PID file utilities for tracking/stopping background processes
+  - `update.py` - Update check, version comparison, and self-upgrade via `uv tool install`
+  - `pricing.py` - `conductor pricing path` subcommand: print where conductor reads user-level pricing from
   - `update.py` - Update check and version comparison. Upgrades are delegated to the install script (`install.ps1`/`install.sh`); in-process self-upgrade was removed because on Windows the running Python interpreter sits inside the venv `uv tool install --force` is trying to recreate, which fails with "Access is denied". `conductor update` prints the OS-appropriate install-script one-liner; `conductor update --apply` spawns the installer detached (Windows: new console window; POSIX: `os.execvpe` replace) and exits the current process so file locks release. The startup hint is suppressed by `CONDUCTOR_NO_UPDATE_CHECK=1`, `--silent`, `--help`/`--version`, and the `update` subcommand itself.
 
 - **config/**: YAML loading and Pydantic schema validation
   - `schema.py` - Pydantic models for all workflow YAML structures (WorkflowConfig, AgentDef, ParallelGroup, ForEachDef, etc.)
   - `loader.py` - YAML parsing with environment variable resolution (${VAR:-default}) and `!file` tag support
   - `validator.py` - Cross-reference validation (agent names, routes, parallel groups)
+  - `user_pricing.py` - Loads optional machine-wide pricing overrides from `~/.conductor/pricing.yaml` (path overridable via `CONDUCTOR_PRICING_FILE`); missing file is silent, malformed file is a hard error
 
 - **engine/**: Workflow execution orchestration
   - `workflow.py` - Main `WorkflowEngine` class that orchestrates agent execution, parallel groups, for-each groups, and routing
