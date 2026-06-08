@@ -126,7 +126,7 @@ agents:
 
 - **Copilot**: forwarded as `reasoning_effort` on the session. Validated against the model's advertised `supported_reasoning_efforts`; raises `ValidationError` for unsupported combinations (skipped in mock-handler mode or when capability metadata is absent).
 - **Claude**: enables extended thinking via `thinking={"type": "enabled", "budget_tokens": N}` with mapping `low=2048`, `medium=8192`, `high=16384`, `xhigh=32768`. Auto-coerces `temperature` to `1.0` (logged at INFO) and bumps `max_tokens` to fit `budget + 4096` (capped at 64000, logged at INFO when clamped). Only valid on thinking-capable models (`claude-3-7-*`, `claude-opus-4*`, `claude-sonnet-4*`, `claude-haiku-4*`); raises `ValidationError` otherwise.
-- **Hermes**: `reasoning.effort` is accepted for interface parity but has no effect — the hermes library controls model reasoning internally.
+- **Hermes**: forwarded to the hermes-agent library via `reasoning_config={"effort": value}`. Support depends on the underlying model and hermes version.
 
 Both providers surface reasoning content via `agent_reasoning` events visible in the dashboard, JSONL logs, and the console at `-vv`. Not allowed on `script`, `human_gate`, `workflow`, or `wait` agent types.
 
@@ -742,8 +742,9 @@ agents:
   - name: agent
     input:
       - workflow.input.question
-      - other_agent.output.result   # Required
-      - optional_agent.output?      # Optional (? suffix)
+      - other_agent.output.result        # Required field
+      - other_agent.output.nested.field  # Nested projection (deep path)
+      - optional_agent.output?           # Optional (? suffix)
 ```
 
 ## Multi-Provider Workflows

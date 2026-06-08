@@ -30,8 +30,8 @@ workflow:
     provider: string | object       # "copilot" (default), "claude", "claude-agent-sdk", "hermes", or "openai-agents"
                                     # — or a ProviderSettings object (see below)
     default_model: string           # Default model for all agents
-    temperature: float              # 0.0-1.0, controls randomness (optional, copilot/claude only)
-    max_tokens: integer             # Max OUTPUT tokens per response, 1-200000 (optional, copilot/claude only)
+    temperature: float              # 0.0-1.0, controls randomness (optional, copilot/claude/hermes)
+    max_tokens: integer             # Max OUTPUT tokens per response, 1-200000 (optional, copilot/claude/hermes)
     timeout: float                  # Per-request timeout in seconds (optional, default: 600, copilot/claude only)
     max_agent_iterations: integer   # Max tool-use roundtrips per agent (1-500, optional)
     max_session_seconds: float      # Wall-clock timeout per agent session in seconds (optional)
@@ -112,6 +112,7 @@ agents:
     # Input specification (for explicit context mode)
     input:
       - string                      # Reference paths, e.g., "workflow.input.question"
+                                    # Nested projection: "agent.output.field.subfield"
                                     # Use "?" suffix for optional: "other_agent.output?"
 
     # Prompt templates
@@ -138,7 +139,7 @@ agents:
 
     # Agent-level tools
     tools:                          # null = all workflow tools, [] = none, [list] = subset
-      - string                      # For hermes: maps to enabled_toolsets (hermes toolset names, e.g. "web", "code")
+      - string                      # Hermes: non-empty lists rejected (use hermes_toolsets in ProviderSettings)
 
     # Agent-level limits (override workflow runtime defaults)
     max_agent_iterations: integer   # Max tool-use roundtrips for this agent (1-500, optional)
@@ -206,8 +207,9 @@ agents:
 
 - **Copilot**: forwards `reasoning_effort` to the session. Validated against the model's advertised `supported_reasoning_efforts` (when available); raises `ValidationError` for unsupported combinations.
 - **Claude**: enables extended thinking via `thinking={"type":"enabled","budget_tokens":N}` with mapping low=2048, medium=8192, high=16384, xhigh=32768. Auto-coerces `temperature=1.0` (Anthropic API requirement) and bumps `max_tokens` to fit `budget+4096` (capped at 64000). Only valid on thinking-capable models (Claude 3.7+, Opus/Sonnet/Haiku 4.x); raises `ValidationError` otherwise.
+- **Hermes**: forwarded to hermes-agent via `reasoning_config={"effort": value}`. Support depends on the underlying model and hermes version.
 
-Both providers continue to surface reasoning content via `agent_reasoning` events visible in the dashboard, JSONL logs, and console at `-vv`.
+All three providers surface reasoning content via `agent_reasoning` events visible in the dashboard, JSONL logs, and console at `-vv`.
 
 Forbidden on agent types: `script`, `human_gate`, `workflow`, `wait`.
 
@@ -697,6 +699,8 @@ runtime:
     headers: {string: string}     # Extra HTTP headers (Copilot-only)
     azure:                        # Azure-specific options (requires type: azure)
       api_version: string         # e.g. "2024-10-21"
+    hermes_home: string           # Path to Hermes home directory/profile (Hermes-only)
+    hermes_toolsets: [string]     # Hermes toolset names to enable (Hermes-only; null=all, []=none)
 ```
 
 ### Local OpenAI-compatible endpoint (Ollama)
