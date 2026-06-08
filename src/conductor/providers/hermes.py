@@ -318,7 +318,8 @@ class HermesProvider(AgentProvider):
             if self._hermes_home:
                 from hermes_constants import set_hermes_home_override
 
-                _home_token = set_hermes_home_override(self._hermes_home)
+                expanded_home = str(Path(self._hermes_home).expanduser())
+                _home_token = set_hermes_home_override(expanded_home)
             try:
                 hermes_agent = AIAgent(**agent_kwargs)
                 hermes_agent_ref.append(hermes_agent)
