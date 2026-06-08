@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, Mock, patch
 import pytest
 
 from conductor.config.schema import AgentDef, OutputField
-from conductor.exceptions import ProviderError, ValidationError
+from conductor.exceptions import ProviderError
 from conductor.providers.hermes import HermesProvider
 
 
@@ -100,8 +100,10 @@ class TestHermesValidateConnection:
 class TestHermesExecute:
     @pytest.fixture()
     def provider(self) -> HermesProvider:
-        with patch("conductor.providers.hermes.HERMES_SDK_AVAILABLE", True), \
-             patch("conductor.providers.hermes.AIAgent"):
+        with (
+            patch("conductor.providers.hermes.HERMES_SDK_AVAILABLE", True),
+            patch("conductor.providers.hermes.AIAgent"),
+        ):
             return HermesProvider(model="anthropic/claude-sonnet-4", max_agent_iterations=10)
 
     def _run(self, coro: Any) -> Any:
@@ -169,7 +171,9 @@ class TestHermesExecute:
         _, kwargs = mock_cls.call_args
         assert kwargs["model"] == "openai/gpt-4o"
 
-    def test_uses_provider_default_model_when_agent_has_none(self, provider: HermesProvider) -> None:
+    def test_uses_provider_default_model_when_agent_has_none(
+        self, provider: HermesProvider
+    ) -> None:
         agent = _make_agent(model=None)
 
         with patch("conductor.providers.hermes.AIAgent") as mock_cls:
@@ -183,8 +187,10 @@ class TestHermesExecute:
         assert kwargs["model"] == "anthropic/claude-sonnet-4"
 
     def test_omits_model_when_neither_set(self) -> None:
-        with patch("conductor.providers.hermes.HERMES_SDK_AVAILABLE", True), \
-             patch("conductor.providers.hermes.AIAgent"):
+        with (
+            patch("conductor.providers.hermes.HERMES_SDK_AVAILABLE", True),
+            patch("conductor.providers.hermes.AIAgent"),
+        ):
             provider_no_model = HermesProvider()
 
         agent = _make_agent(model=None)
@@ -212,7 +218,7 @@ class TestHermesExecute:
         _, kwargs = mock_cls.call_args
         assert kwargs["max_iterations"] == 42
 
-    def test_isolation_flags_always_set(self, provider: HermesProvider) -> None:
+    def test_quiet_mode_always_set(self, provider: HermesProvider) -> None:
         agent = _make_agent()
 
         with patch("conductor.providers.hermes.AIAgent") as mock_cls:
@@ -224,8 +230,81 @@ class TestHermesExecute:
 
         _, kwargs = mock_cls.call_args
         assert kwargs["quiet_mode"] is True
-        assert kwargs["skip_context_files"] is True
+
+    def test_skip_flags_omitted_by_default(self, provider: HermesProvider) -> None:
+        """When skip_memory/skip_context_files are not configured, they are omitted
+        from agent_kwargs so the hermes-agent library defaults apply (False)."""
+        agent = _make_agent()
+
+        with patch("conductor.providers.hermes.AIAgent") as mock_cls:
+            mock_instance = Mock()
+            mock_instance.run_conversation.return_value = _make_result()
+            mock_cls.return_value = mock_instance
+
+            self._run(provider.execute(agent, {}, "hello"))
+
+        _, kwargs = mock_cls.call_args
+        assert "skip_context_files" not in kwargs
+        assert "skip_memory" not in kwargs
+
+    def test_skip_memory_true_forwarded(self) -> None:
+        with (
+            patch("conductor.providers.hermes.HERMES_SDK_AVAILABLE", True),
+            patch("conductor.providers.hermes.AIAgent"),
+        ):
+            provider = HermesProvider(skip_memory=True)
+
+        agent = _make_agent()
+
+        with patch("conductor.providers.hermes.AIAgent") as mock_cls:
+            mock_instance = Mock()
+            mock_instance.run_conversation.return_value = _make_result()
+            mock_cls.return_value = mock_instance
+
+            asyncio.run(provider.execute(agent, {}, "hello"))
+
+        _, kwargs = mock_cls.call_args
         assert kwargs["skip_memory"] is True
+
+    def test_skip_context_files_true_forwarded(self) -> None:
+        with (
+            patch("conductor.providers.hermes.HERMES_SDK_AVAILABLE", True),
+            patch("conductor.providers.hermes.AIAgent"),
+        ):
+            provider = HermesProvider(skip_context_files=True)
+
+        agent = _make_agent()
+
+        with patch("conductor.providers.hermes.AIAgent") as mock_cls:
+            mock_instance = Mock()
+            mock_instance.run_conversation.return_value = _make_result()
+            mock_cls.return_value = mock_instance
+
+            asyncio.run(provider.execute(agent, {}, "hello"))
+
+        _, kwargs = mock_cls.call_args
+        assert kwargs["skip_context_files"] is True
+
+    def test_skip_flags_false_forwarded(self) -> None:
+        """Explicit False is forwarded (though it matches library default)."""
+        with (
+            patch("conductor.providers.hermes.HERMES_SDK_AVAILABLE", True),
+            patch("conductor.providers.hermes.AIAgent"),
+        ):
+            provider = HermesProvider(skip_memory=False, skip_context_files=False)
+
+        agent = _make_agent()
+
+        with patch("conductor.providers.hermes.AIAgent") as mock_cls:
+            mock_instance = Mock()
+            mock_instance.run_conversation.return_value = _make_result()
+            mock_cls.return_value = mock_instance
+
+            asyncio.run(provider.execute(agent, {}, "hello"))
+
+        _, kwargs = mock_cls.call_args
+        assert kwargs["skip_memory"] is False
+        assert kwargs["skip_context_files"] is False
 
     def test_token_counts_populated(self, provider: HermesProvider) -> None:
         agent = _make_agent()
@@ -359,6 +438,7 @@ class TestHermesExecute:
 
             with patch("conductor.providers.hermes.AIAgent") as mock_cls:
                 import time
+
                 mock_instance = Mock()
                 mock_instance.run_conversation.side_effect = lambda *a, **kw: time.sleep(5)
                 mock_cls.return_value = mock_instance
@@ -371,8 +451,10 @@ class TestHermesExecute:
 
 class TestHermesSystemPrompt:
     def test_system_prompt_forwarded(self) -> None:
-        with patch("conductor.providers.hermes.HERMES_SDK_AVAILABLE", True), \
-             patch("conductor.providers.hermes.AIAgent"):
+        with (
+            patch("conductor.providers.hermes.HERMES_SDK_AVAILABLE", True),
+            patch("conductor.providers.hermes.AIAgent"),
+        ):
             provider = HermesProvider()
 
         agent = _make_agent(system_prompt="You are a helpful assistant.")
@@ -392,8 +474,10 @@ class TestHermesSystemPrompt:
         assert captured[0].get("system_message") == "You are a helpful assistant."
 
     def test_system_prompt_none_when_not_set(self) -> None:
-        with patch("conductor.providers.hermes.HERMES_SDK_AVAILABLE", True), \
-             patch("conductor.providers.hermes.AIAgent"):
+        with (
+            patch("conductor.providers.hermes.HERMES_SDK_AVAILABLE", True),
+            patch("conductor.providers.hermes.AIAgent"),
+        ):
             provider = HermesProvider()
 
         agent = _make_agent(system_prompt=None)
@@ -416,8 +500,10 @@ class TestHermesSystemPrompt:
 class TestHermesToolsMapping:
     def test_tools_none_uses_hermes_defaults(self) -> None:
         """tools=None (omitted) does not set enabled_toolsets — hermes uses its defaults."""
-        with patch("conductor.providers.hermes.HERMES_SDK_AVAILABLE", True), \
-             patch("conductor.providers.hermes.AIAgent"):
+        with (
+            patch("conductor.providers.hermes.HERMES_SDK_AVAILABLE", True),
+            patch("conductor.providers.hermes.AIAgent"),
+        ):
             provider = HermesProvider()
 
         agent = _make_agent(tools=None)
@@ -434,8 +520,10 @@ class TestHermesToolsMapping:
 
     def test_tools_empty_disables_all(self) -> None:
         """tools=[] explicitly disables all hermes toolsets."""
-        with patch("conductor.providers.hermes.HERMES_SDK_AVAILABLE", True), \
-             patch("conductor.providers.hermes.AIAgent"):
+        with (
+            patch("conductor.providers.hermes.HERMES_SDK_AVAILABLE", True),
+            patch("conductor.providers.hermes.AIAgent"),
+        ):
             provider = HermesProvider()
 
         agent = _make_agent(tools=[])
@@ -452,21 +540,23 @@ class TestHermesToolsMapping:
 
     def test_tools_nonempty_raises_provider_error(self) -> None:
         """Non-empty tools: list raises ProviderError (vocabulary mismatch)."""
-        with patch("conductor.providers.hermes.HERMES_SDK_AVAILABLE", True), \
-             patch("conductor.providers.hermes.AIAgent"):
+        with (
+            patch("conductor.providers.hermes.HERMES_SDK_AVAILABLE", True),
+            patch("conductor.providers.hermes.AIAgent"),
+        ):
             provider = HermesProvider()
 
         agent = _make_agent(tools=["web_search", "read_file"])
 
         with pytest.raises(ProviderError, match="does not support per-agent workflow tool"):
-            asyncio.run(
-                provider.execute(agent, {}, "hello", tools=["web_search", "read_file"])
-            )
+            asyncio.run(provider.execute(agent, {}, "hello", tools=["web_search", "read_file"]))
 
     def test_hermes_toolsets_forwarded_as_enabled_toolsets(self) -> None:
         """Provider-level hermes_toolsets is forwarded when tools=None."""
-        with patch("conductor.providers.hermes.HERMES_SDK_AVAILABLE", True), \
-             patch("conductor.providers.hermes.AIAgent"):
+        with (
+            patch("conductor.providers.hermes.HERMES_SDK_AVAILABLE", True),
+            patch("conductor.providers.hermes.AIAgent"),
+        ):
             provider = HermesProvider(hermes_toolsets=["filesystem", "web"])
 
         agent = _make_agent()
@@ -483,8 +573,10 @@ class TestHermesToolsMapping:
 
     def test_hermes_toolsets_empty_disables_all(self) -> None:
         """Provider-level hermes_toolsets=[] disables all toolsets."""
-        with patch("conductor.providers.hermes.HERMES_SDK_AVAILABLE", True), \
-             patch("conductor.providers.hermes.AIAgent"):
+        with (
+            patch("conductor.providers.hermes.HERMES_SDK_AVAILABLE", True),
+            patch("conductor.providers.hermes.AIAgent"),
+        ):
             provider = HermesProvider(hermes_toolsets=[])
 
         agent = _make_agent()
@@ -502,8 +594,10 @@ class TestHermesToolsMapping:
 
 class TestHermesProviderParams:
     def test_max_tokens_forwarded(self) -> None:
-        with patch("conductor.providers.hermes.HERMES_SDK_AVAILABLE", True), \
-             patch("conductor.providers.hermes.AIAgent"):
+        with (
+            patch("conductor.providers.hermes.HERMES_SDK_AVAILABLE", True),
+            patch("conductor.providers.hermes.AIAgent"),
+        ):
             provider = HermesProvider(max_tokens=1024)
 
         agent = _make_agent()
@@ -519,8 +613,10 @@ class TestHermesProviderParams:
         assert kwargs["max_tokens"] == 1024
 
     def test_temperature_forwarded(self) -> None:
-        with patch("conductor.providers.hermes.HERMES_SDK_AVAILABLE", True), \
-             patch("conductor.providers.hermes.AIAgent"):
+        with (
+            patch("conductor.providers.hermes.HERMES_SDK_AVAILABLE", True),
+            patch("conductor.providers.hermes.AIAgent"),
+        ):
             provider = HermesProvider(temperature=0.5)
 
         agent = _make_agent()
@@ -536,8 +632,10 @@ class TestHermesProviderParams:
         assert kwargs["request_overrides"] == {"temperature": 0.5}
 
     def test_base_url_forwarded(self) -> None:
-        with patch("conductor.providers.hermes.HERMES_SDK_AVAILABLE", True), \
-             patch("conductor.providers.hermes.AIAgent"):
+        with (
+            patch("conductor.providers.hermes.HERMES_SDK_AVAILABLE", True),
+            patch("conductor.providers.hermes.AIAgent"),
+        ):
             provider = HermesProvider(base_url="https://openrouter.ai/api/v1")
 
         agent = _make_agent()
@@ -553,8 +651,10 @@ class TestHermesProviderParams:
         assert kwargs["base_url"] == "https://openrouter.ai/api/v1"
 
     def test_api_key_forwarded(self) -> None:
-        with patch("conductor.providers.hermes.HERMES_SDK_AVAILABLE", True), \
-             patch("conductor.providers.hermes.AIAgent"):
+        with (
+            patch("conductor.providers.hermes.HERMES_SDK_AVAILABLE", True),
+            patch("conductor.providers.hermes.AIAgent"),
+        ):
             provider = HermesProvider(api_key="sk-test-key")
 
         agent = _make_agent()
@@ -570,8 +670,10 @@ class TestHermesProviderParams:
         assert kwargs["api_key"] == "sk-test-key"
 
     def test_error_message_includes_model(self) -> None:
-        with patch("conductor.providers.hermes.HERMES_SDK_AVAILABLE", True), \
-             patch("conductor.providers.hermes.AIAgent"):
+        with (
+            patch("conductor.providers.hermes.HERMES_SDK_AVAILABLE", True),
+            patch("conductor.providers.hermes.AIAgent"),
+        ):
             provider = HermesProvider(model="anthropic/claude-sonnet-4")
 
         agent = _make_agent()
@@ -587,8 +689,10 @@ class TestHermesProviderParams:
                 asyncio.run(provider.execute(agent, {}, "hello"))
 
     def test_missing_params_not_forwarded(self) -> None:
-        with patch("conductor.providers.hermes.HERMES_SDK_AVAILABLE", True), \
-             patch("conductor.providers.hermes.AIAgent"):
+        with (
+            patch("conductor.providers.hermes.HERMES_SDK_AVAILABLE", True),
+            patch("conductor.providers.hermes.AIAgent"),
+        ):
             provider = HermesProvider()
 
         agent = _make_agent()
@@ -605,6 +709,8 @@ class TestHermesProviderParams:
         assert "temperature" not in kwargs
         assert "base_url" not in kwargs
         assert "api_key" not in kwargs
+        assert "skip_memory" not in kwargs
+        assert "skip_context_files" not in kwargs
 
 
 class TestHermesClose:

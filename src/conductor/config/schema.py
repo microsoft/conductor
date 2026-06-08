@@ -1396,6 +1396,21 @@ class ProviderSettings(BaseModel):
         hermes_toolsets: [filesystem, web]
     """
 
+    hermes_skip_memory: bool | None = None
+    """Skip loading Hermes memory files during agent initialization. Hermes-only.
+
+    ``None`` (default) = the hermes-agent library default applies (memory is loaded).
+    Set to ``True`` to explicitly disable memory for stateless workflows.
+    """
+
+    hermes_skip_context_files: bool | None = None
+    """Skip loading Hermes context/soul files during agent initialization. Hermes-only.
+
+    ``None`` (default) = the hermes-agent library default applies (context files
+    including SOUL.md are loaded, preserving the agent's persona).
+    Set to ``True`` to explicitly disable context file loading.
+    """
+
     @model_validator(mode="after")
     def _check_field_compatibility(self) -> ProviderSettings:
         copilot_only_fields = {
@@ -1433,6 +1448,12 @@ class ProviderSettings(BaseModel):
 
         if self.hermes_toolsets is not None and self.name != "hermes":
             raise ValueError("'hermes_toolsets' is only supported when name='hermes'.")
+
+        if self.hermes_skip_memory is not None and self.name != "hermes":
+            raise ValueError("'hermes_skip_memory' is only supported when name='hermes'.")
+
+        if self.hermes_skip_context_files is not None and self.name != "hermes":
+            raise ValueError("'hermes_skip_context_files' is only supported when name='hermes'.")
 
         if self.azure is not None and self.type != "azure":
             raise ValueError("'azure' options require type='azure'")

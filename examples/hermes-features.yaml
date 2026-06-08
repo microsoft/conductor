@@ -35,6 +35,8 @@ workflow:
   runtime:
     provider:
       name: hermes
+      # hermes_skip_memory: false         # default: load profile memory
+      # hermes_skip_context_files: false   # default: load SOUL.md / context
     default_model: anthropic/claude-sonnet-4
     temperature: 0.7
     max_tokens: 2048
