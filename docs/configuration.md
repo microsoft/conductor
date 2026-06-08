@@ -11,7 +11,7 @@ The `runtime` section of your workflow defines provider settings and global defa
 ```yaml
 workflow:
   runtime:
-    provider: copilot  # or 'claude' or 'claude-agent-sdk'
+    provider: copilot  # or 'claude', 'claude-agent-sdk', 'hermes'
     default_model: gpt-5.2
     temperature: 0.7
     max_tokens: 4096
@@ -70,6 +70,31 @@ workflow:
 **Models**: `claude-sonnet-4.5`, `claude-haiku-4.5`, `claude-opus-4.5`
 
 **See**: [Claude Provider Documentation](providers/claude.md)
+
+### Hermes Provider (Experimental)
+
+> **Experimental** — see [Experimental Providers](providers/experimental.md) for stability policy.
+
+Uses the NousResearch hermes-agent library for agent execution. Supports any OpenRouter-style model identifier.
+
+```yaml
+workflow:
+  runtime:
+    provider: hermes
+    default_model: anthropic/claude-sonnet-4
+    max_agent_iterations: 25
+    max_tokens: 4096
+    temperature: 0.7
+```
+
+**Features**:
+- Access to Anthropic, OpenAI, and OpenRouter models via one provider
+- Built-in hermes tool ecosystem (no MCP config required)
+- Custom endpoint routing via structured `provider:` config
+
+**Models**: `anthropic/claude-sonnet-4`, `openai/gpt-4o`, any OpenRouter `provider/model` string
+
+**See**: [Hermes Provider Documentation](providers/hermes.md)
 
 ### Custom Provider Routing (Ollama / vLLM / Azure OpenAI)
 

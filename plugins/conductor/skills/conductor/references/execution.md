@@ -17,7 +17,7 @@ conductor run <workflow.yaml> [OPTIONS]
 | `--input`, `-i NAME=VALUE` | Workflow input (repeatable) |
 | `--input.NAME=VALUE` | Alternative input syntax |
 | `--metadata`, `-m KEY=VALUE` | Workflow metadata, merged on top of YAML `metadata:` (repeatable; values stay strings) |
-| `--provider`, `-p PROVIDER` | Override provider (`copilot`, `claude`, `openai-agents`) |
+| `--provider`, `-p PROVIDER` | Override provider (`copilot`, `claude`, `claude-agent-sdk`, `hermes`, `openai-agents`) |
 | `--dry-run` | Show execution plan only |
 | `--skip-gates` | Auto-select first option at human gates |
 | `--web` | Start real-time web dashboard |
@@ -221,7 +221,7 @@ Performs both schema and **semantic** checks:
 - Parallel group agent references
 - For-each `source` format and reserved names
 - Stale agent references and undeclared explicit-mode dependencies in `prompt`, `system_prompt`, `command`, `args`, `working_dir`, `input_mapping`, parallel-group inputs, and workflow `output:` templates
-- Warning when an agent defines `system_prompt` but no `prompt:` (portability hazard since the Claude provider drops `system_prompt`)
+- Warning when an agent defines `system_prompt` but no `prompt:` (unusual — system prompts are only meaningful alongside a user prompt)
 
 The success summary table includes Parallel Groups and For-each Groups counts.
 
@@ -556,6 +556,7 @@ If the workflow file has changed since the checkpoint was saved, a warning is di
 ```bash
 conductor run workflow.yaml -p claude          # Use Claude for all agents
 conductor run workflow.yaml -p copilot         # Use Copilot (default)
+conductor run workflow.yaml -p hermes          # Use Hermes (NousResearch agent SDK)
 conductor run workflow.yaml -p openai-agents   # Use OpenAI Agents SDK
 ```
 

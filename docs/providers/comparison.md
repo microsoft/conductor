@@ -1,30 +1,30 @@
-# Provider Comparison: Copilot vs Claude vs Claude Agent SDK
+# Provider Comparison: Copilot vs Claude vs Claude Agent SDK vs Hermes
 
-This guide helps you choose between GitHub Copilot, Anthropic Claude, and Claude Agent SDK providers for your workflows.
+This guide helps you choose between GitHub Copilot, Anthropic Claude, Claude Agent SDK, and NousResearch Hermes providers for your workflows.
 
 ## Quick Comparison
 
-| Feature | Copilot | Claude | Claude Agent SDK | Winner |
+| Feature | Copilot | Claude | Claude Agent SDK | Hermes |
 |---------|---------|--------|------------------|--------|
-| **Tier** | Stable | Stable | Experimental ([#241](https://github.com/microsoft/conductor/issues/241)) | Copilot / Claude |
-| **Context Window** | per-model (SDK-reported) | per-model (SDK-reported) | 200K | Tie |
-| **Pricing Model** | Subscription ($10-39/mo) | Pay-per-token | Via Claude Code CLI | Depends |
-| **Setup** | GitHub auth | API key | `claude` CLI auth | Copilot (easier) |
-| **Model Selection** | GPT-5.2, o1 | Haiku, Sonnet, Opus | Haiku, Sonnet, Opus | Tie |
-| **Streaming** | Yes | No (Phase 1) | Yes | Copilot / Claude Agent SDK |
-| **Tool Support** | Yes (MCP, all types) | Yes (MCP, stdio only) | Yes (built-in, CLI-managed) | Copilot |
-| **Reasoning / Extended Thinking** | Yes (`reasoning_effort` on session) | Yes (extended `thinking` budget) | Inherits from CLI config | Tie |
-| **Speed** | Fast | Fast | Fast | Tie |
-| **Output Quality** | Excellent | Excellent | Excellent | Tie |
-| **Cost Predictability** | High (flat rate) | Variable (usage-based) | Variable | Copilot |
-| **Multi-provider** | No | Yes (via Conductor) | No | Claude |
-| **Agentic Loop** | SDK-managed | Manual (provider code) | SDK-managed (delegated to CLI) | Depends |
+| **Tier** | Stable | Stable | Experimental | Experimental |
+| **Context Window** | per-model (SDK-reported) | per-model (SDK-reported) | 200K | per-model |
+| **Pricing Model** | Subscription ($10-39/mo) | Pay-per-token | Via Claude Code CLI | Pay-per-token (via hermes) |
+| **Setup** | GitHub auth | API key | `claude` CLI auth | API key (model-provider's key) |
+| **Model Selection** | GPT-5.2, o1 | Haiku, Sonnet, Opus | Haiku, Sonnet, Opus | Any OpenRouter-style model |
+| **Streaming** | Yes | No (Phase 1) | Yes | Yes |
+| **Tool Support** | Yes (MCP, all types) | Yes (MCP, stdio only) | Yes (built-in, CLI-managed) | Yes (hermes toolsets) |
+| **MCP Servers** | Yes | Yes (stdio) | No | No |
+| **Reasoning / Extended Thinking** | Yes (`reasoning_effort` on session) | Yes (extended `thinking` budget) | Inherits from CLI config | Yes (`reasoning_config`) |
+| **Speed** | Fast | Fast | Fast | Depends on model |
+| **Output Quality** | Excellent | Excellent | Excellent | Depends on model |
+| **Cost Predictability** | High (flat rate) | Variable (usage-based) | Variable | Variable (usage-based) |
+| **Structured Output** | Prompt injection | Native | Prompt injection | Prompt injection |
+| **Session Resume** | Yes | No | No | Yes |
 
-> **About the experimental tier.** `claude-agent-sdk` declares specific
-> capability carve-outs (no MCP, no per-agent tools allowlist, no
-> reasoning_effort, no checkpoint resume). `conductor validate` catches
-> workflows that depend on those features against this provider, and the
-> CLI prints a one-time banner when the workflow runs. See
+> **About the experimental tier.** `claude-agent-sdk` and `hermes` declare
+> specific capability carve-outs (e.g. no MCP servers). `conductor validate`
+> catches workflows that depend on those features against these providers,
+> and the CLI prints a one-time banner when the workflow runs. See
 > [docs/providers/experimental.md](./experimental.md) for the stability
 > policy and promotion criteria.
 
@@ -32,30 +32,19 @@ This guide helps you choose between GitHub Copilot, Anthropic Claude, and Claude
 
 ### ✅ Choose Copilot if:
 
-1. **You have a GitHub Copilot subscription**
-   - Already paying $10-39/month
-   - No additional costs for API usage
-   - Predictable monthly billing
+1. **You have a GitHub Copilot subscription** — Already paying $10-39/month, no additional API costs
+2. **You need MCP tool support** — Web search, code execution, file operations, external API integrations
+3. **You want streaming responses** — Real-time feedback, better UX for long-running workflows
+4. **You prefer enterprise support** — GitHub Enterprise integration, SSO, access controls
+5. **Heavy usage** — Flat rate beats pay-per-token at scale
 
-2. **You need tool support (MCP)**
-   - Web search, code execution, file operations
-   - Real-time data access
-   - External API integrations
+### When to Use Copilot
 
-3. **You want streaming responses**
-   - Real-time feedback as the model generates
-   - Better UX for long-running workflows
-   - Progress visibility
-
-4. **You prefer enterprise support**
-   - GitHub Enterprise integration
-   - SSO and access controls
-   - Enterprise SLA and support
-
-5. **You need smaller context windows (cost optimization)**
-   - GPT-4: 8K context (cheaper)
-   - GPT-4 Turbo: 128K context (when needed)
-   - Pay only for subscription, not per token
+1. **You have a GitHub Copilot subscription** — No additional costs, predictable billing
+2. **You need MCP tool support** — Web search, code execution, file operations
+3. **You want streaming responses** — Real-time feedback as the model generates
+4. **Heavy usage** — Flat rate beats pay-per-token at scale
+5. **Enterprise features** — SSO, GitHub Enterprise integration
 
 ### Example Copilot Workflow
 
@@ -81,30 +70,11 @@ agents:
 
 ### ✅ Choose Claude if:
 
-1. **You need a large context window**
-   - 200K tokens (all models)
-   - Process long documents, code, transcripts
-   - Multi-agent workflows with extensive context
-
-2. **You want fine-grained cost control**
-   - Pay only for what you use
-   - Scale to zero when idle
-   - Optimize costs with model selection (Haiku vs Opus)
-
-3. **You value output quality for reasoning tasks**
-   - Claude excels at analysis, synthesis, reasoning
-   - More verbose explanations
-   - Better at following complex instructions
-
-4. **You run low-volume or intermittent workflows**
-   - Pay-per-use cheaper than subscription
-   - No minimum monthly cost
-   - Scale up/down as needed
-
-5. **You want to avoid vendor lock-in**
-   - Anthropic API works with multiple tools
-   - Easier migration between platforms
-   - Future-proof for multi-provider strategies
+1. **You need a large context window** — 200K tokens, all models; great for long documents and multi-agent workflows
+2. **You want fine-grained cost control** — Pay only for what you use; scale to zero when idle
+3. **You value reasoning quality** — Claude excels at analysis, synthesis, and following complex instructions
+4. **Light/intermittent usage** — Pay-per-use is cheaper than a subscription at low volumes
+5. **You need reliable structured output** — Native schema enforcement more robust than prompt injection
 
 ### Example Claude Workflow
 
@@ -168,6 +138,45 @@ workflow:
 agents:
   - name: researcher
     prompt: "Research {{ topic }} using web search"
+```
+
+## When to Use Hermes
+
+> **Experimental Provider** — Hermes is an experimental provider. See
+> [Experimental Providers](./experimental.md) for stability policy and
+> known limitations.
+
+### ✅ Choose Hermes if:
+
+1. **You want access to many model providers** — Anthropic, OpenAI, and any OpenRouter-supported model via a single provider
+2. **You need hermes's built-in tool ecosystem** — Hermes manages its own tools internally; no MCP config required
+3. **You're already using hermes-agent** — Integrate your existing hermes workflows with Conductor's orchestration
+4. **Model flexibility matters most** — Switch between `anthropic/claude-sonnet-4` and `openai/gpt-4o` by changing a single field
+
+### ✅ Avoid Hermes if:
+
+- You need **MCP server support** — use Copilot or Claude instead
+- You need **reliable structured output** — Hermes uses prompt injection; Claude/Copilot use native APIs
+- You need **reasoning effort control** — the `reasoning.effort` field is a no-op for Hermes
+
+### Example Hermes Workflow
+
+```yaml
+workflow:
+  name: hermes-workflow
+  runtime:
+    provider: hermes
+    default_model: anthropic/claude-sonnet-4
+    max_agent_iterations: 25
+
+agents:
+  - name: researcher
+    prompt: "Research the following topic thoroughly: {{ workflow.input.topic }}"
+    output:
+      findings:
+        type: string
+    routes:
+      - to: $end
 ```
 
 ## Cost Comparison
@@ -375,7 +384,7 @@ Use this matrix to decide:
 | Your Situation | Recommended Provider |
 |----------------|---------------------|
 | Already have Copilot subscription | **Copilot** |
-| Need tools (web search, code exec) | **Copilot** |
+| Need MCP tools (web search, code exec) | **Copilot** |
 | Need streaming responses | **Copilot** |
 | Heavy usage (>160 hrs/mo) | **Copilot** |
 | Need 200K context window | **Claude** |
@@ -386,6 +395,9 @@ Use this matrix to decide:
 | Simple high-volume tasks | **Claude** (Haiku 4.5) |
 | Already use `claude` CLI | **Claude Agent SDK** |
 | Want streaming with Claude | **Claude Agent SDK** |
+| Need multi-provider model access | **Hermes** |
+| Already using hermes-agent | **Hermes** |
+| Want hermes's built-in tool ecosystem | **Hermes** |
 
 ## Multi-Provider Strategy
 
@@ -422,7 +434,7 @@ workflow:
 ## Summary
 
 **Choose Copilot** for:
-- ✅ Tool support (MCP)
+- ✅ MCP tool support (web search, code execution)
 - ✅ Streaming responses
 - ✅ Predictable costs (subscription)
 - ✅ Heavy usage
@@ -433,6 +445,7 @@ workflow:
 - ✅ Pay-per-use pricing
 - ✅ Light/intermittent usage
 - ✅ Long document processing
+- ✅ Reliable structured output
 - ✅ Cost optimization (Haiku)
 
 **Choose Claude Agent SDK** for:
@@ -442,4 +455,10 @@ workflow:
 - ✅ Existing `claude` CLI users
 - ✅ No API key management
 
-**Bottom line**: All three are excellent. Choose based on your usage patterns, budget, and feature requirements. Conductor makes it easy to switch between them or use all three strategically.
+**Choose Hermes** for:
+- ✅ Multi-provider model access (Anthropic, OpenAI, OpenRouter)
+- ✅ Hermes's built-in tool ecosystem (no MCP config)
+- ✅ Existing hermes-agent workflows
+- ✅ Maximum model flexibility
+
+**Bottom line**: All four providers are excellent at what they do. Choose based on your usage patterns, budget, tool requirements, and model preferences. Conductor makes it easy to switch between them or use multiple strategically within a single multi-provider workflow.

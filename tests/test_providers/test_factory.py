@@ -4,7 +4,9 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
+from pydantic import SecretStr
 
+from conductor.config.schema import ProviderSettings
 from conductor.exceptions import ProviderError
 from conductor.providers.copilot import CopilotProvider
 from conductor.providers.factory import create_provider
@@ -276,4 +278,104 @@ class TestClaudeAgentSdkFactoryRejections:
             mcp_servers=None,
         )
         assert isinstance(provider, ClaudeAgentSdkProvider)
+        await provider.close()
+
+
+class TestHermesFactory:
+    """Tests for the hermes factory branch."""
+
+    @patch("conductor.providers.factory.HERMES_SDK_AVAILABLE", False)
+    @pytest.mark.asyncio
+    async def test_factory_raises_when_sdk_not_available(self) -> None:
+        """Test that hermes provider raises ProviderError when SDK not available."""
+        with pytest.raises(ProviderError, match="hermes-agent package"):
+            await create_provider("hermes", validate=False)
+
+    @patch("conductor.providers.factory.HERMES_SDK_AVAILABLE", True)
+    @patch("conductor.providers.hermes.HERMES_SDK_AVAILABLE", True)
+    @pytest.mark.asyncio
+    async def test_factory_creates_hermes_provider(self) -> None:
+        """Test that hermes provider can be created successfully."""
+        from conductor.providers.hermes import HermesProvider
+
+        provider = await create_provider("hermes", validate=False)
+        assert isinstance(provider, HermesProvider)
+        await provider.close()
+
+    @patch("conductor.providers.factory.HERMES_SDK_AVAILABLE", True)
+    @patch("conductor.providers.hermes.HERMES_SDK_AVAILABLE", True)
+    @pytest.mark.asyncio
+    async def test_factory_passes_all_config_to_hermes(self) -> None:
+        """Test that factory forwards all runtime config to HermesProvider."""
+        from conductor.providers.hermes import HermesProvider
+
+        provider = await create_provider(
+            "hermes",
+            validate=False,
+            default_model="anthropic/claude-sonnet-4",
+            max_tokens=4096,
+            temperature=0.7,
+            max_agent_iterations=25,
+            max_session_seconds=120.0,
+            default_reasoning_effort="high",
+        )
+        assert isinstance(provider, HermesProvider)
+        assert provider._default_model == "anthropic/claude-sonnet-4"
+        assert provider._default_max_tokens == 4096
+        assert provider._default_temperature == 0.7
+        assert provider._default_max_agent_iterations == 25
+        assert provider._default_max_session_seconds == 120.0
+        assert provider._default_reasoning_effort == "high"
+        await provider.close()
+
+    @patch("conductor.providers.factory.HERMES_SDK_AVAILABLE", True)
+    @patch("conductor.providers.hermes.HERMES_SDK_AVAILABLE", True)
+    @pytest.mark.asyncio
+    async def test_factory_extracts_provider_settings_for_hermes(self) -> None:
+        """Test that ProviderSettings with name='hermes' extracts base_url and api_key."""
+        from conductor.providers.hermes import HermesProvider
+
+        settings = ProviderSettings(
+            name="hermes",
+            base_url="http://localhost:8080",
+            api_key=SecretStr("sk-test-key"),
+            hermes_home="/tmp/hermes-test",
+            hermes_toolsets=["filesystem", "web"],
+            hermes_skip_memory=True,
+            hermes_skip_context_files=False,
+        )
+        provider = await create_provider(
+            "hermes",
+            validate=False,
+            provider_settings=settings,
+        )
+        assert isinstance(provider, HermesProvider)
+        assert provider._base_url == "http://localhost:8080"
+        assert provider._api_key == "sk-test-key"
+        assert provider._hermes_home == "/tmp/hermes-test"
+        assert provider._hermes_toolsets == ["filesystem", "web"]
+        assert provider._skip_memory is True
+        assert provider._skip_context_files is False
+        await provider.close()
+
+    @patch("conductor.providers.factory.HERMES_SDK_AVAILABLE", True)
+    @patch("conductor.providers.hermes.HERMES_SDK_AVAILABLE", True)
+    @pytest.mark.asyncio
+    async def test_factory_ignores_non_hermes_provider_settings(self) -> None:
+        """Test that ProviderSettings with name != 'hermes' leaves base_url/api_key as None."""
+        from conductor.providers.hermes import HermesProvider
+
+        settings = ProviderSettings(name="copilot")
+        provider = await create_provider(
+            "hermes",
+            validate=False,
+            provider_settings=settings,
+        )
+        assert isinstance(provider, HermesProvider)
+        assert provider._base_url is None
+        assert provider._api_key is None
+        assert provider._hermes_home is None
+        assert provider._hermes_toolsets is None
+        assert provider._skip_memory is None
+        assert provider._skip_context_files is None
         await provider.close()
