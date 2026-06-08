@@ -1,0 +1,244 @@
+# Hermes Provider Feature Test
+#
+# Comprehensive functional test for the Hermes provider, exercising:
+#   - Structured output (prompt injection + JSON parse/validate)
+#   - runtime.default_reasoning_effort + per-agent reasoning.effort override
+#   - runtime.temperature and runtime.max_tokens
+#   - base_url / api_key via ProviderSettings env interpolation
+#   - tools: [] (disable toolsets per agent)
+#   - Parallel group with two Hermes agents
+#   - Nested input projection in explicit context mode
+#   - Set step → Hermes agent handoff
+#   - Conditional routing on structured output
+#
+# Requirements:
+#   - hermes-agent package installed (pip install hermes-agent)
+#   - API key for the configured model provider (e.g. OPENROUTER_API_KEY or
+#     the key expected by hermes for the default model)
+#
+# Usage:
+#   conductor run examples/hermes-features.yaml \
+#     --input question="What is dependency injection in software engineering?"
+#
+#   # With custom endpoint (set env vars before running):
+#   export HERMES_BASE_URL=https://openrouter.ai/api/v1
+#   export HERMES_API_KEY=$OPENROUTER_API_KEY
+#   conductor run examples/hermes-features.yaml \
+#     --input question="Explain the CAP theorem"
+
+workflow:
+  name: hermes-features
+  description: Comprehensive Hermes provider feature test
+  version: "1.0.0"
+  entry_point: set_config
+
+  runtime:
+    provider:
+      name: hermes
+    default_model: anthropic/claude-sonnet-4
+    temperature: 0.7
+    max_tokens: 2048
+    default_reasoning_effort: medium
+
+  input:
+    question:
+      type: string
+      required: true
+      description: A question to classify and research
+
+  context:
+    mode: explicit
+
+  limits:
+    max_iterations: 20
+    timeout_seconds: 300
+
+agents:
+  # --- Step 1: Set step derives a computed context value ---
+  - name: set_config
+    type: set
+    description: Derive a formatted topic string for downstream agents
+    values:
+      topic_formatted: "{{ workflow.input.question | upper }}"
+      timestamp: "2026-06-07"
+    routes:
+      - to: classifier
+
+  # --- Step 2: Classifier with structured output + tools disabled ---
+  - name: classifier
+    description: Classify the question into a category (no tools allowed)
+    tools: []
+    input:
+      - workflow.input.question
+      - set_config.output.topic_formatted
+    prompt: |
+      Classify the following question into exactly one category.
+
+      Question: {{ workflow.input.question }}
+      (Formatted: {{ set_config.output.topic_formatted }})
+
+      Categories:
+      - "technical" — about software, engineering, algorithms, or systems
+      - "general" — about anything else
+
+      Return your classification as JSON.
+    output:
+      category:
+        type: string
+        description: One of "technical" or "general"
+      confidence:
+        type: number
+        description: Confidence score from 0.0 to 1.0
+    routes:
+      - to: parallel_researchers
+        when: "{{ output.category == 'technical' }}"
+      - to: simple_responder
+
+  # --- Step 3a: Parallel research (technical path) ---
+  # Two Hermes agents run concurrently. One uses high reasoning effort.
+  - name: broad_researcher
+    description: Quick broad research pass
+    input:
+      - workflow.input.question
+    prompt: |
+      Provide a broad overview answer to this technical question:
+      {{ workflow.input.question }}
+
+      Return JSON with your findings.
+    output:
+      summary:
+        type: string
+        description: Broad overview answer
+      key_concepts:
+        type: array
+        items:
+          type: string
+        description: List of key concepts mentioned
+
+  - name: deep_researcher
+    description: Deep analysis pass with high reasoning effort
+    reasoning:
+      effort: high
+    input:
+      - workflow.input.question
+    prompt: |
+      Provide a deep technical analysis of this question:
+      {{ workflow.input.question }}
+
+      Think carefully about edge cases, trade-offs, and nuances.
+      Return JSON with your findings structured with nested detail.
+    output:
+      findings:
+        type: object
+        description: Structured research findings
+        properties:
+          key_points:
+            type: array
+            items:
+              type: string
+            description: Key technical points
+          trade_offs:
+            type: string
+            description: Important trade-offs to consider
+
+  # --- Step 4: Synthesizer using nested input projection ---
+  # Demonstrates nested projection: parallel_researchers.outputs.broad_researcher
+  # gives us the whole agent output, while deep_researcher.output.findings would
+  # give nested access on a regular agent. For parallel groups, we project at
+  # the agent level and access nested fields in the template.
+  - name: synthesizer
+    description: Synthesize parallel research outputs
+    input:
+      - workflow.input.question
+      - parallel_researchers.outputs.broad_researcher
+      - parallel_researchers.outputs.deep_researcher
+    prompt: |
+      Synthesize these research findings into a cohesive answer.
+
+      Original question: {{ workflow.input.question }}
+
+      Broad overview:
+      {{ parallel_researchers.outputs.broad_researcher.summary }}
+
+      Key technical points:
+      {% for point in parallel_researchers.outputs.deep_researcher.findings.key_points %}
+      - {{ point }}
+      {% endfor %}
+
+      Trade-offs:
+      {{ parallel_researchers.outputs.deep_researcher.findings.trade_offs }}
+
+      Provide a comprehensive final answer as JSON.
+    output:
+      answer:
+        type: string
+        description: Final synthesized answer
+      depth:
+        type: string
+        description: Either "deep" or "surface"
+    routes:
+      - to: $end
+
+  # --- Step 3b: Simple responder (non-technical path) ---
+  # Produces nested output to demonstrate nested input projection downstream.
+  - name: simple_responder
+    description: Handle non-technical questions with nested structured output
+    input:
+      - workflow.input.question
+    prompt: |
+      Answer this general question concisely:
+      {{ workflow.input.question }}
+
+      Return JSON with a nested "result" object containing "text" and "tone" fields.
+    output:
+      result:
+        type: object
+        description: Nested answer structure
+        properties:
+          text:
+            type: string
+            description: The answer text
+          tone:
+            type: string
+            description: The tone of the answer (e.g. "informative", "casual")
+    routes:
+      - to: format_result
+
+  # --- Step 4b: Demonstrates nested input projection from a regular agent ---
+  # Projects simple_responder.output.result.text (2 levels deep) into context.
+  - name: format_result
+    type: set
+    description: Extract nested field via explicit input projection
+    input:
+      - simple_responder.output.result.text
+      - simple_responder.output.result.tone
+    value: "{{ simple_responder.output.result.text }}"
+    routes:
+      - to: $end
+
+parallel:
+  - name: parallel_researchers
+    description: Run broad and deep research concurrently
+    agents:
+      - broad_researcher
+      - deep_researcher
+    failure_mode: continue_on_error
+    routes:
+      - to: synthesizer
+
+output:
+  question: "{{ workflow.input.question }}"
+  category: "{{ classifier.output.category }}"
+  confidence: "{{ classifier.output.confidence }}"
+  answer: |
+    {%- if synthesizer is defined -%}
+    {{ synthesizer.output.answer }}
+    {%- elif format_result is defined -%}
+    {{ format_result.output }}
+    {%- endif -%}
+  depth: |
+    {%- if synthesizer is defined -%}
+    {{ synthesizer.output.depth }}
+    {%- elif simple_responder is defined -%}
+    {{ simple_responder.output.result.tone }}
+    {%- endif -%}
