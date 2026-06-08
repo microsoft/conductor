@@ -713,6 +713,37 @@ class TestHermesProviderParams:
         assert "skip_context_files" not in kwargs
 
 
+class TestHermesHome:
+    def test_tilde_expanded_before_sdk_call(self) -> None:
+        """hermes_home with ~ is expanded to an absolute path."""
+        import sys
+
+        mock_hermes_constants = MagicMock()
+        mock_hermes_constants.set_hermes_home_override.return_value = "token"
+
+        with (
+            patch("conductor.providers.hermes.HERMES_SDK_AVAILABLE", True),
+            patch("conductor.providers.hermes.AIAgent"),
+        ):
+            provider = HermesProvider(hermes_home="~/.hermes/profiles/chloe")
+
+        agent = _make_agent()
+
+        with (
+            patch("conductor.providers.hermes.AIAgent") as mock_cls,
+            patch.dict(sys.modules, {"hermes_constants": mock_hermes_constants}),
+        ):
+            mock_instance = Mock()
+            mock_instance.run_conversation.return_value = _make_result()
+            mock_cls.return_value = mock_instance
+
+            asyncio.run(provider.execute(agent, {}, "hello"))
+
+        called_path = mock_hermes_constants.set_hermes_home_override.call_args[0][0]
+        assert "~" not in called_path
+        assert called_path.endswith(".hermes/profiles/chloe")
+
+
 class TestHermesClose:
     @patch("conductor.providers.hermes.HERMES_SDK_AVAILABLE", True)
     @patch("conductor.providers.hermes.AIAgent", MagicMock())
