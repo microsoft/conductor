@@ -1,0 +1,135 @@
+# Hermes Provider — Toolsets & For-Each Test
+#
+# Focused functional test for:
+#   - hermes_toolsets in ProviderSettings (restrict available toolsets globally)
+#   - for_each dynamic fan-out with Hermes agents
+#   - max_agent_iterations forwarding
+#   - max_session_seconds wall-clock timeout
+#
+# This workflow uses hermes_toolsets: [] to disable all tools globally,
+# forcing the agents to respond from knowledge only (no tool use).
+#
+# Requirements:
+#   - hermes-agent package installed (pip install hermes-agent)
+#   - API key for the configured model provider
+#
+# Usage:
+#   conductor run examples/hermes-toolsets.yaml \
+#     --input topic="Python design patterns"
+#
+#   # With custom endpoint (set env vars before running):
+#   export HERMES_BASE_URL=https://openrouter.ai/api/v1
+#   export HERMES_API_KEY=$OPENROUTER_API_KEY
+#   conductor run examples/hermes-toolsets.yaml \
+#     --input topic="Rust ownership model"
+
+workflow:
+  name: hermes-toolsets
+  description: Test hermes_toolsets restriction and for_each dynamic fan-out
+  version: "1.0.0"
+  entry_point: generate_subtopics
+
+  runtime:
+    provider:
+      name: hermes
+      hermes_toolsets: []
+    default_model: anthropic/claude-sonnet-4
+    max_tokens: 1024
+    max_agent_iterations: 5
+    max_session_seconds: 60
+
+  input:
+    topic:
+      type: string
+      required: true
+      description: A topic to break into subtopics and analyze
+
+  limits:
+    max_iterations: 20
+    timeout_seconds: 180
+
+agents:
+  # Step 1: Hermes agent generates subtopics (no tools available due to hermes_toolsets: [])
+  - name: generate_subtopics
+    description: Break the topic into 3 subtopics for parallel analysis
+    prompt: |
+      Break the following topic into exactly 3 focused subtopics for deeper analysis.
+
+      Topic: {{ workflow.input.topic }}
+
+      Return JSON with an array of subtopics, each having a name and a guiding question.
+    output:
+      subtopics:
+        type: array
+        items:
+          type: object
+          properties:
+            name:
+              type: string
+            question:
+              type: string
+        description: Array of 3 subtopics with guiding questions
+    routes:
+      - to: analyze_subtopics
+
+  # Step 2: For-each fans out over the subtopics array
+  - name: aggregator
+    description: Combine all subtopic analyses into a final summary
+    prompt: |
+      Combine these subtopic analyses into a cohesive summary.
+
+      Topic: {{ workflow.input.topic }}
+
+      Analyses:
+      {% for result in analyze_subtopics.outputs %}
+      ## {{ result.subtopic_name }}
+      {{ result.analysis }}
+      {% endfor %}
+
+      Return JSON with a final summary and the total number of subtopics covered.
+    output:
+      summary:
+        type: string
+        description: Combined analysis summary
+      subtopics_covered:
+        type: number
+        description: Number of subtopics successfully analyzed
+    routes:
+      - to: $end
+
+for_each:
+  - name: analyze_subtopics
+    type: for_each
+    description: Analyze each subtopic independently
+    source: generate_subtopics.output.subtopics
+    as: subtopic
+    max_concurrent: 3
+    failure_mode: continue_on_error
+
+    agent:
+      name: subtopic_analyzer
+      prompt: |
+        Analyze this subtopic in depth. You have no tools available — rely on
+        your training knowledge only.
+
+        Subtopic {{ _index + 1 }}: {{ subtopic.name }}
+        Guiding question: {{ subtopic.question }}
+
+        Provide a focused analysis answering the guiding question.
+        Return JSON with your analysis.
+      output:
+        subtopic_name:
+          type: string
+          description: Name of the subtopic analyzed
+        analysis:
+          type: string
+          description: Focused analysis of the subtopic
+
+    routes:
+      - to: aggregator
+
+output:
+  topic: "{{ workflow.input.topic }}"
+  subtopics_generated: "{{ generate_subtopics.output.subtopics | length }}"
+  summary: "{{ aggregator.output.summary }}"
+  subtopics_covered: "{{ aggregator.output.subtopics_covered }}"
