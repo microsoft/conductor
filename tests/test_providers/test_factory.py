@@ -341,6 +341,8 @@ class TestHermesFactory:
             api_key=SecretStr("sk-test-key"),
             hermes_home="/tmp/hermes-test",
             hermes_toolsets=["filesystem", "web"],
+            hermes_skip_memory=True,
+            hermes_skip_context_files=False,
         )
         provider = await create_provider(
             "hermes",
@@ -352,6 +354,8 @@ class TestHermesFactory:
         assert provider._api_key == "sk-test-key"
         assert provider._hermes_home == "/tmp/hermes-test"
         assert provider._hermes_toolsets == ["filesystem", "web"]
+        assert provider._skip_memory is True
+        assert provider._skip_context_files is False
         await provider.close()
 
     @patch("conductor.providers.factory.HERMES_SDK_AVAILABLE", True)
@@ -372,4 +376,6 @@ class TestHermesFactory:
         assert provider._api_key is None
         assert provider._hermes_home is None
         assert provider._hermes_toolsets is None
+        assert provider._skip_memory is None
+        assert provider._skip_context_files is None
         await provider.close()

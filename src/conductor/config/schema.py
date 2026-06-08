@@ -1379,6 +1379,21 @@ class ProviderSettings(BaseModel):
         hermes_toolsets: [filesystem, web]
     """
 
+    hermes_skip_memory: bool | None = None
+    """Skip loading Hermes memory files during agent initialization. Hermes-only.
+
+    ``None`` (default) = the hermes-agent library default applies (memory is loaded).
+    Set to ``True`` to explicitly disable memory for stateless workflows.
+    """
+
+    hermes_skip_context_files: bool | None = None
+    """Skip loading Hermes context/soul files during agent initialization. Hermes-only.
+
+    ``None`` (default) = the hermes-agent library default applies (context files
+    including SOUL.md are loaded, preserving the agent's persona).
+    Set to ``True`` to explicitly disable context file loading.
+    """
+
     @model_validator(mode="after")
     def _check_field_compatibility(self) -> ProviderSettings:
         copilot_only_fields = {
@@ -1395,18 +1410,23 @@ class ProviderSettings(BaseModel):
                     f"Provider fields {extras} are only supported when name='copilot'. "
                     "Structured provider config for other providers is not yet implemented."
                 )
-            if self.base_url is not None or self.api_key is not None:
-                if self.name != "hermes":
-                    raise ValueError(
-                        f"Structured provider config (base_url/api_key) for name='{self.name}' "
-                        "is not yet implemented; use environment variables for the underlying SDK."
-                    )
+            if (self.base_url is not None or self.api_key is not None) and self.name != "hermes":
+                raise ValueError(
+                    f"Structured provider config (base_url/api_key) for name='{self.name}' "
+                    "is not yet implemented; use environment variables for the underlying SDK."
+                )
 
         if self.hermes_home is not None and self.name != "hermes":
             raise ValueError("'hermes_home' is only supported when name='hermes'.")
 
         if self.hermes_toolsets is not None and self.name != "hermes":
             raise ValueError("'hermes_toolsets' is only supported when name='hermes'.")
+
+        if self.hermes_skip_memory is not None and self.name != "hermes":
+            raise ValueError("'hermes_skip_memory' is only supported when name='hermes'.")
+
+        if self.hermes_skip_context_files is not None and self.name != "hermes":
+            raise ValueError("'hermes_skip_context_files' is only supported when name='hermes'.")
 
         if self.azure is not None and self.type != "azure":
             raise ValueError("'azure' options require type='azure'")

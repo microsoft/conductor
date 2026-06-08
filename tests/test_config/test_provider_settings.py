@@ -188,7 +188,9 @@ class TestHermesProviderSettings:
         assert s.has_custom_routing()
 
     def test_hermes_with_api_key_accepted(self) -> None:
-        s = ProviderSettings(name="hermes", base_url="https://openrouter.ai/api/v1", api_key="sk-or-test")
+        s = ProviderSettings(
+            name="hermes", base_url="https://openrouter.ai/api/v1", api_key="sk-or-test"
+        )
         assert isinstance(s.api_key, SecretStr)
         assert s.api_key.get_secret_value() == "sk-or-test"
 
@@ -199,6 +201,22 @@ class TestHermesProviderSettings:
             api_key="sk-or-test",
         )
         assert s.has_custom_routing()
+
+    def test_hermes_skip_memory_accepted(self) -> None:
+        s = ProviderSettings(name="hermes", hermes_skip_memory=True)
+        assert s.hermes_skip_memory is True
+
+    def test_hermes_skip_context_files_accepted(self) -> None:
+        s = ProviderSettings(name="hermes", hermes_skip_context_files=False)
+        assert s.hermes_skip_context_files is False
+
+    def test_hermes_skip_memory_rejected_for_non_hermes(self) -> None:
+        with pytest.raises(ValidationError, match="hermes_skip_memory"):
+            ProviderSettings(name="copilot", hermes_skip_memory=True)
+
+    def test_hermes_skip_context_files_rejected_for_non_hermes(self) -> None:
+        with pytest.raises(ValidationError, match="hermes_skip_context_files"):
+            ProviderSettings(name="copilot", hermes_skip_context_files=True)
 
     def test_claude_with_base_url_still_rejected(self) -> None:
         with pytest.raises(ValidationError, match="not yet implemented"):

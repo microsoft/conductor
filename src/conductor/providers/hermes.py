@@ -14,6 +14,7 @@ Error Handling Strategy:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import tempfile
@@ -95,6 +96,8 @@ class HermesProvider(AgentProvider):
         api_key: str | None = None,
         hermes_home: str | None = None,
         hermes_toolsets: list[str] | None = None,
+        skip_memory: bool | None = None,
+        skip_context_files: bool | None = None,
         max_agent_iterations: int | None = None,
         max_session_seconds: float | None = None,
         default_reasoning_effort: ReasoningEffort | None = None,
@@ -118,6 +121,13 @@ class HermesProvider(AgentProvider):
             hermes_toolsets: Hermes toolset names to enable (e.g.
                 ``["filesystem", "web"]``). None = hermes defaults (all
                 available toolsets); empty list = no tools.
+            skip_memory: Whether to skip loading Hermes memory files.
+                None (default) = hermes library default (False, memory is
+                loaded). Set True to disable memory for stateless workflows.
+            skip_context_files: Whether to skip loading context/soul files.
+                None (default) = hermes library default (False, SOUL.md and
+                context files are loaded, preserving persona). Set True to
+                disable context file loading.
             max_agent_iterations: Maximum tool-calling iterations per agent
                 execution. Maps to hermes ``max_iterations``. Defaults to
                 90 (hermes default) when None.
@@ -140,6 +150,8 @@ class HermesProvider(AgentProvider):
         self._api_key = api_key
         self._hermes_home = hermes_home
         self._hermes_toolsets = hermes_toolsets
+        self._skip_memory = skip_memory
+        self._skip_context_files = skip_context_files
         self._default_max_agent_iterations = max_agent_iterations
         self._default_max_session_seconds = max_session_seconds
         self._default_reasoning_effort = default_reasoning_effort
@@ -214,9 +226,11 @@ class HermesProvider(AgentProvider):
         # Build AIAgent kwargs — omit model when not set to use hermes default
         agent_kwargs: dict[str, Any] = {
             "quiet_mode": True,
-            "skip_context_files": True,
-            "skip_memory": True,
         }
+        if self._skip_context_files is not None:
+            agent_kwargs["skip_context_files"] = self._skip_context_files
+        if self._skip_memory is not None:
+            agent_kwargs["skip_memory"] = self._skip_memory
         if resolved_model:
             agent_kwargs["model"] = resolved_model
         if resolved_max_iter is not None:
@@ -281,12 +295,15 @@ class HermesProvider(AgentProvider):
                 conversation_history = json.loads(Path(resume_path).read_text())
                 logger.info(
                     "Resuming agent '%s' with %d prior messages",
-                    agent.name, len(conversation_history),
+                    agent.name,
+                    len(conversation_history),
                 )
             except (OSError, json.JSONDecodeError) as e:
                 logger.warning(
                     "Could not load conversation history for '%s' from %s: %s",
-                    agent.name, resume_path, e,
+                    agent.name,
+                    resume_path,
+                    e,
                 )
 
         loop = asyncio.get_running_loop()
@@ -300,6 +317,7 @@ class HermesProvider(AgentProvider):
             _home_token = None
             if self._hermes_home:
                 from hermes_constants import set_hermes_home_override
+
                 _home_token = set_hermes_home_override(self._hermes_home)
             try:
                 hermes_agent = AIAgent(**agent_kwargs)
@@ -312,6 +330,7 @@ class HermesProvider(AgentProvider):
             finally:
                 if _home_token is not None:
                     from hermes_constants import reset_hermes_home_override
+
                     reset_hermes_home_override(_home_token)
 
         # Wrap the blocking call and optionally race against interrupt / timeout
@@ -475,7 +494,10 @@ class HermesProvider(AgentProvider):
 
                 logger.info(
                     "Agent '%s' parse recovery attempt %d/%d: %s",
-                    agent.name, attempt + 1, _MAX_PARSE_RECOVERY_ATTEMPTS, last_error,
+                    agent.name,
+                    attempt + 1,
+                    _MAX_PARSE_RECOVERY_ATTEMPTS,
+                    last_error,
                 )
 
                 # Build recovery prompt and re-run with conversation history
@@ -483,8 +505,11 @@ class HermesProvider(AgentProvider):
                 # Use the messages from the failed run as history
                 history = messages if messages else conversation_history
 
-                recovery_kwargs = {k: v for k, v in agent_kwargs.items()
-                                   if k not in ("stream_delta_callback", "reasoning_callback")}
+                recovery_kwargs = {
+                    k: v
+                    for k, v in agent_kwargs.items()
+                    if k not in ("stream_delta_callback", "reasoning_callback")
+                }
                 hermes_agent = AIAgent(**recovery_kwargs)
                 recovery_result = hermes_agent.run_conversation(
                     recovery_prompt,
@@ -529,17 +554,12 @@ class HermesProvider(AgentProvider):
     def cleanup_sessions(self) -> None:
         """Remove all saved session files."""
         for path_str in self._session_ids.values():
-            try:
+            with contextlib.suppress(OSError):
                 Path(path_str).unlink(missing_ok=True)
-            except OSError:
-                pass
         self._session_ids.clear()
         if self._session_dir.exists():
-            try:
-                # Remove dir only if empty (don't nuke other providers' files)
+            with contextlib.suppress(OSError):
                 self._session_dir.rmdir()
-            except OSError:
-                pass
 
 
 def _fire(callback: EventCallback | None, event: str, data: dict[str, Any]) -> None:
@@ -557,9 +577,7 @@ async def _wait_for_event(event: asyncio.Event) -> None:
     await event.wait()
 
 
-def _build_prompt_schema(
-    schema: dict[str, Any], depth: int = 0
-) -> dict[str, Any]:
+def _build_prompt_schema(schema: dict[str, Any], depth: int = 0) -> dict[str, Any]:
     """Build a prompt-facing schema description from OutputField definitions."""
     if depth > _MAX_SCHEMA_DEPTH:
         raise ValidationError(
@@ -589,9 +607,7 @@ def _build_prompt_schema(
     return result
 
 
-def _build_recovery_prompt(
-    parse_error: str, original_response: str, schema: dict[str, Any]
-) -> str:
+def _build_recovery_prompt(parse_error: str, original_response: str, schema: dict[str, Any]) -> str:
     """Build a prompt to recover from JSON parse failures."""
     truncated = original_response[:500]
     if len(original_response) > 500:
