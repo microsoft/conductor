@@ -153,7 +153,8 @@ The `claude-agent-sdk` provider does not bridge workflow-level tools/MCP into th
 - `runtime.mcp_servers` — **rejected at the factory** with a clear error. Translation to the CLI's MCP configuration is not implemented. Configure MCP servers through your Claude Code settings instead.
 - Per-agent `tools: []` — disables all tools for that agent.
 - Per-agent `tools: [list]` — **refused loudly**. Workflow tool names do not translate to Claude CLI tool IDs; silently passing them through would risk granting the wrong native tool.
-- Omitting `tools:` entirely — grants the full `claude_code` preset (filesystem, bash, web), matching the bare `claude` CLI experience.
+- Workflow-level `tools:` combined with an agent that omits `tools:` — **rejected at `conductor validate`**. The agent would otherwise inherit that non-empty list at runtime and hit the same refusal with a confusing message. Remove the workflow-level `tools:` (so omitting `tools:` grants the preset) or set the agent's `tools: []`.
+- Omitting `tools:` entirely (with no workflow-level `tools:`) — grants the full `claude_code` preset (filesystem, bash, web), matching the bare `claude` CLI experience.
 - `temperature` and `max_tokens` are **rejected at the factory** — sampling behavior is controlled by the CLI.
 
 ### Example Claude Agent SDK Workflow

@@ -1689,6 +1689,24 @@ def _validate_provider_capabilities(
                 f"granting different tools than declared is a security regression."
             )
 
+        # Omitted per-agent ``tools:`` inherits the workflow-level ``tools:``
+        # list at runtime (``resolve_agent_tools`` returns a copy of it). For a
+        # non-passthrough provider that inherited list is a non-empty allowlist
+        # it cannot honor, so the agent fails at execute time with a confusing
+        # "declares tools=[...]" error even though it declared none. Catch it at
+        # validate time with an accurate message. (An explicit ``tools: []`` is
+        # the "no tools" opt-out and stays valid — only ``None`` inherits.)
+        elif agent.tools is None and config.tools and not caps.workflow_tools_passthrough:
+            errors.append(
+                f"Agent '{agent.name}' omits 'tools:' and would inherit the "
+                f"workflow-level tools={config.tools!r}, but provider "
+                f"'{provider_name}' does not honor tool allowlists "
+                f"(capabilities.workflow_tools_passthrough=False). Remove the "
+                f"workflow-level 'tools:' so omitting 'tools:' grants the "
+                f"provider's default tool preset, or set this agent's "
+                f"'tools: []' to disable all tools."
+            )
+
         # reasoning.effort: validate per-agent override OR workflow-wide
         # default against the supported levels tuple. Per-agent override
         # takes precedence — if it's set, the default doesn't apply.

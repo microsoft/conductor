@@ -494,13 +494,14 @@ class ClaudeAgentSdkProvider(AgentProvider):
             # Explicit `tools: []` -> no tools, no permission bypass.
             return [], None
         raise ProviderError(
-            f"Agent '{agent.name}' declares tools={tools!r}, but "
-            "claude-agent-sdk does not support per-agent workflow tool "
-            "allowlists (workflow tool names do not translate to Claude "
-            "CLI tool IDs).",
+            f"Agent '{agent.name}' resolves to tools={tools!r} (declared on "
+            "the agent or inherited from the workflow-level 'tools:' list), "
+            "but claude-agent-sdk does not support workflow tool allowlists "
+            "(workflow tool names do not translate to Claude CLI tool IDs).",
             suggestion=(
-                "Remove the 'tools:' field to grant the full claude_code "
-                "preset, or set 'tools: []' to disable all tools."
+                "Omit both the per-agent and workflow-level 'tools:' to grant "
+                "the full claude_code preset, or set 'tools: []' to disable "
+                "all tools."
             ),
         )
 

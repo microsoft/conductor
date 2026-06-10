@@ -620,7 +620,7 @@ class TestToolResolution:
         with patch("conductor.providers.claude_agent_sdk.query", fake_query):
             provider = ClaudeAgentSdkProvider()
             agent = AgentDef(name="my_agent", prompt="hi")
-            with pytest.raises(ProviderError, match="does not support per-agent workflow tool"):
+            with pytest.raises(ProviderError, match="does not support workflow tool allowlists"):
                 await provider.execute(
                     agent=agent,
                     context={},
@@ -715,7 +715,7 @@ class TestOmittedToolsDefaultPreset:
         with patch("conductor.providers.claude_agent_sdk.query", fake_query):
             provider = ClaudeAgentSdkProvider()
             agent = AgentDef(name="my_agent", prompt="hi", tools=["search", "read_file"])
-            with pytest.raises(ProviderError, match="does not support per-agent workflow tool"):
+            with pytest.raises(ProviderError, match="does not support workflow tool allowlists"):
                 await provider.execute(
                     agent=agent,
                     context={},
