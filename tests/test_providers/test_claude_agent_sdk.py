@@ -576,11 +576,15 @@ class TestToolResolution:
 
     @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
     async def test_empty_tools_list_disables_tools(self) -> None:
-        """``tools: []`` disables ALL tools and drops the permission bypass.
+        """Explicit ``tools: []`` disables ALL tools and drops the permission bypass.
 
         Regression test for #241 (A1): previously the empty list was silently
         ignored and the agent got the full ``claude_code`` preset
         (filesystem/bash/web) — a security regression.
+
+        The agent here declares ``tools: []`` explicitly (``agent.tools == []``),
+        which is what distinguishes it from an omitted ``tools:`` (the latter
+        gets the preset — see :class:`TestOmittedToolsDefaultPreset`).
         """
         options_mock = Mock()
 
@@ -592,7 +596,7 @@ class TestToolResolution:
             patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", options_mock),
         ):
             provider = ClaudeAgentSdkProvider()
-            agent = AgentDef(name="test", prompt="hi")
+            agent = AgentDef(name="test", prompt="hi", tools=[])
             await provider.execute(agent=agent, context={}, rendered_prompt="hi", tools=[])
 
         call_kwargs = options_mock.call_args[1]
@@ -623,6 +627,137 @@ class TestToolResolution:
                     rendered_prompt="hi",
                     tools=["search", "read_file"],
                 )
+
+
+class TestOmittedToolsDefaultPreset:
+    """An agent that omits ``tools:`` must receive the ``claude_code`` preset.
+
+    Regression test for the executor↔provider contract bug: the executor's
+    ``resolve_agent_tools(agent.tools, workflow_tools)`` returns
+    ``workflow_tools.copy()`` (``[]`` when the workflow declares no
+    ``runtime`` MCP tools) for an omitted ``tools:``, so the provider is
+    ALWAYS handed a concrete list and never ``None``. Before the fix, the
+    provider could not tell "omitted (defaults to all)" from explicit
+    ``tools: []`` (both arrive as ``[]``) and granted ZERO tools to an agent
+    that simply forgot to declare ``tools:`` — e.g. a "read a file and
+    answer" agent came up with no filesystem tools and failed.
+
+    The provider distinguishes the two cases by inspecting the raw
+    ``agent.tools`` field, which preserves the omitted (``None``) vs.
+    explicit-empty (``[]``) distinction the executor erases.
+    """
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_omitted_tools_with_empty_executor_list_grants_preset(self) -> None:
+        """The real bug: executor passes ``tools=[]`` for an omitted ``tools:``.
+
+        ``AgentDef`` defaults ``tools`` to ``None`` (omitted), and the
+        executor turns that into ``[]`` before calling the provider. The
+        provider must still grant the ``claude_code`` preset, not no tools.
+        """
+        options_mock = Mock()
+
+        async def fake_query(**kwargs):
+            yield _result(result="done")
+
+        with (
+            patch("conductor.providers.claude_agent_sdk.query", fake_query),
+            patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", options_mock),
+        ):
+            provider = ClaudeAgentSdkProvider()
+            # agent.tools is None (omitted), but the executor erases that to []
+            # before calling the provider — exactly what AgentExecutor does.
+            agent = AgentDef(name="reader", prompt="read a file and answer")
+            assert agent.tools is None
+            await provider.execute(agent=agent, context={}, rendered_prompt="hi", tools=[])
+
+        call_kwargs = options_mock.call_args[1]
+        assert call_kwargs["tools"] == {"type": "preset", "preset": "claude_code"}, (
+            "An agent that omits `tools:` must receive the claude_code preset "
+            "even though the executor hands the provider an empty list."
+        )
+        assert call_kwargs["permission_mode"] == "bypassPermissions"
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_explicit_empty_tools_still_disables_tools(self) -> None:
+        """An agent that explicitly declares ``tools: []`` still gets no tools.
+
+        The executor passes ``[]`` here too, but ``agent.tools == []`` (not
+        ``None``) records the explicit opt-out, so the provider disables all
+        tools and drops the permission bypass.
+        """
+        options_mock = Mock()
+
+        async def fake_query(**kwargs):
+            yield _result(result="done")
+
+        with (
+            patch("conductor.providers.claude_agent_sdk.query", fake_query),
+            patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", options_mock),
+        ):
+            provider = ClaudeAgentSdkProvider()
+            agent = AgentDef(name="no_tools", prompt="hi", tools=[])
+            assert agent.tools == []
+            await provider.execute(agent=agent, context={}, rendered_prompt="hi", tools=[])
+
+        call_kwargs = options_mock.call_args[1]
+        assert call_kwargs["tools"] == []
+        assert call_kwargs["permission_mode"] is None
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", Mock)
+    async def test_explicit_non_empty_tools_still_raises(self) -> None:
+        """An explicit non-empty per-agent allowlist is still refused loudly."""
+
+        async def fake_query(**kwargs):
+            yield _result(result="done")
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider()
+            agent = AgentDef(name="my_agent", prompt="hi", tools=["search", "read_file"])
+            with pytest.raises(ProviderError, match="does not support per-agent workflow tool"):
+                await provider.execute(
+                    agent=agent,
+                    context={},
+                    rendered_prompt="hi",
+                    tools=["search", "read_file"],
+                )
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_executor_to_provider_end_to_end_grants_preset(self) -> None:
+        """End-to-end through AgentExecutor: an omitted ``tools:`` reaches the
+        provider as the ``claude_code`` preset, with NO workflow tools declared.
+
+        This pins the full call chain that the original bug broke:
+        ``AgentExecutor.execute`` → ``resolve_agent_tools(None, [])`` → ``[]``
+        → ``provider.execute(tools=[])`` → preset.
+        """
+        from conductor.executor.agent import AgentExecutor
+
+        options_mock = Mock()
+        captured: dict = {}
+
+        async def fake_query(**kwargs):
+            yield _result(structured_output={"answer": "from the file"})
+
+        with (
+            patch("conductor.providers.claude_agent_sdk.query", fake_query),
+            patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", options_mock),
+        ):
+            provider = ClaudeAgentSdkProvider()
+            # No workflow-level tools — resolve_agent_tools returns [].
+            executor = AgentExecutor(provider, workflow_tools=[])
+            agent = AgentDef(
+                name="reader",
+                prompt="Read README.md and answer.",
+                output={"answer": OutputField(type="string")},
+            )
+            assert agent.tools is None
+            await executor.execute(agent=agent, context={})
+            captured.update(options_mock.call_args[1])
+
+        assert captured["tools"] == {"type": "preset", "preset": "claude_code"}
+        assert captured["permission_mode"] == "bypassPermissions"
 
 
 class TestAgentTurnStartOrdering:

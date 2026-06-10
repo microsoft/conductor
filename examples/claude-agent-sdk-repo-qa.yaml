@@ -1,0 +1,77 @@
+# Repo Q&A with the claude-agent-sdk provider (default tools preset)
+#
+# This single-agent workflow asks the claude-agent-sdk provider to READ a file
+# in its working directory and answer a question about it. The agent does NOT
+# declare a `tools:` list — it relies on the provider's default behavior.
+#
+# WHY THIS EXAMPLE EXISTS (the bug it guards against):
+#   Before the fix, an agent that omitted `tools:` received NO tools and could
+#   not read the file: the executor's resolve_agent_tools() turned the omitted
+#   `tools:` into an empty list (the workflow had no `runtime` MCP tools to
+#   inherit), and the provider could not tell that empty list apart from an
+#   explicit `tools: []`, so it disabled every tool. The agent came up with
+#   ZERO filesystem tools and failed to read the file.
+#
+#   After the fix, the provider inspects the raw `agent.tools` field: an OMITTED
+#   `tools:` (agent.tools is None) now grants the full `claude_code` preset
+#   (Read / Bash / Edit / Glob / Grep / WebFetch / ...), exactly like the bare
+#   `claude` CLI. An explicit `tools: []` still disables all tools.
+#
+# Pre-requisites:
+#   pip install conductor[claude-agent-sdk]      # or: uv add 'claude-agent-sdk>=0.1.64'
+#   npm install -g @anthropic-ai/claude-code     # the `claude` CLI
+#   claude login
+#
+# Usage (run from the repo root so README.md is in the working directory):
+#   conductor run examples/claude-agent-sdk-repo-qa.yaml \
+#     --input question="In one sentence, what is Conductor?"
+#
+# Validation only (no execution / no API calls):
+#   conductor validate examples/claude-agent-sdk-repo-qa.yaml
+
+workflow:
+  name: claude-agent-sdk-repo-qa
+  description: >
+    Single claude-agent-sdk agent that reads a file in its working
+    directory and answers a question about it. Demonstrates the default
+    claude_code tool preset granted when `tools:` is omitted.
+  version: "1.0.0"
+  entry_point: repo_reader
+
+  runtime:
+    provider: claude-agent-sdk
+    # claude-sonnet-4-5 is the SDK's documented default; adjust to whatever
+    # your Claude Code backend (anthropic.com / Vertex AI / Bedrock) expects.
+    default_model: claude-sonnet-4-5
+
+  input:
+    question:
+      type: string
+      required: true
+      description: A question to answer using a file in the working directory.
+
+agents:
+  - name: repo_reader
+    description: Read README.md in the working directory and answer the question.
+    # NOTE: there is intentionally NO `tools:` field here. Omitting it grants
+    # the full `claude_code` preset (Read/Bash/Edit/...). Before the fix this
+    # agent received no tools and could not read the file; after the fix it can.
+    prompt: |
+      Read the file README.md in your current working directory, then answer
+      the following question using only what that file says. Cite the relevant
+      phrase from the file.
+
+      Question: {{ workflow.input.question }}
+    output:
+      answer:
+        type: string
+        description: The answer, grounded in README.md.
+      evidence:
+        type: string
+        description: A short quote from README.md that supports the answer.
+    routes:
+      - to: $end
+
+output:
+  answer: "{{ repo_reader.output.answer }}"
+  evidence: "{{ repo_reader.output.evidence }}"
