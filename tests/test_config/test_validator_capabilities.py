@@ -190,6 +190,77 @@ class TestToolsAllowlistCrossCheck:
         validate_workflow_config(config)  # no raise
 
 
+class TestForEachInlineToolsCrossCheck:
+    """The tools cross-check must also cover a for_each group's INLINE agent.
+
+    A ``for_each`` group carries an inline ``AgentDef`` that is NOT in
+    ``config.agents`` but runs at runtime with ``workflow_tools=config.tools``,
+    exactly like a top-level agent. Without an explicit pass it would slip past
+    ``validate`` and fail mid-iteration with the same confusing error.
+    """
+
+    def _for_each_config(
+        self,
+        *,
+        inline: AgentDef,
+        tools: list[str] | None = None,
+    ) -> WorkflowConfig:
+        # The entry agent opts out with ``tools: []`` so only the inline agent
+        # can trip the check — isolating the assertion to the for_each path.
+        return _build_workflow(
+            agents=[AgentDef(name="entry", prompt="hi", tools=[])],
+            tools=tools,
+            for_each=[
+                ForEachDef(
+                    name="loop",
+                    type="for_each",
+                    source="entry.output.items",
+                    **{"as": "item"},
+                    agent=inline,
+                )
+            ],
+        )
+
+    def test_inline_omitted_tools_inherits_workflow_tools_errors(self, patch_caps: Any) -> None:
+        """Inline agent omits ``tools:`` + non-empty workflow ``tools:`` -> error."""
+        patch_caps({"copilot": _caps(workflow_tools_passthrough=False)})
+        config = self._for_each_config(
+            inline=AgentDef(name="inner", prompt="{{ item }}"),
+            tools=["search"],
+        )
+        with pytest.raises(
+            ConfigurationError, match="Agent 'inner' omits 'tools:' and would inherit"
+        ):
+            validate_workflow_config(config)
+
+    def test_inline_explicit_empty_tools_passes(self, patch_caps: Any) -> None:
+        """Inline ``tools: []`` opts out of inheritance, so it stays valid."""
+        patch_caps({"copilot": _caps(workflow_tools_passthrough=False)})
+        config = self._for_each_config(
+            inline=AgentDef(name="inner", prompt="{{ item }}", tools=[]),
+            tools=["search"],
+        )
+        validate_workflow_config(config)  # no raise
+
+    def test_inline_explicit_nonempty_tools_errors(self, patch_caps: Any) -> None:
+        """An explicit non-empty inline allowlist against a non-passthrough provider errors."""
+        patch_caps({"copilot": _caps(workflow_tools_passthrough=False)})
+        config = self._for_each_config(
+            inline=AgentDef(name="inner", prompt="{{ item }}", tools=["search"]),
+        )
+        with pytest.raises(ConfigurationError, match="Agent 'inner' declares tools="):
+            validate_workflow_config(config)
+
+    def test_inline_omitted_tools_with_passthrough_passes(self, patch_caps: Any) -> None:
+        """A passthrough provider honors the inherited list, so no error."""
+        patch_caps({"copilot": _caps(workflow_tools_passthrough=True)})
+        config = self._for_each_config(
+            inline=AgentDef(name="inner", prompt="{{ item }}"),
+            tools=["search"],
+        )
+        validate_workflow_config(config)  # no raise
+
+
 class TestReasoningEffortCrossCheck:
     def test_unsupported_level_errors(self, patch_caps: Any) -> None:
         patch_caps({"copilot": _caps(reasoning_effort=("low", "medium"))})

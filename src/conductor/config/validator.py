@@ -1597,6 +1597,38 @@ def _validate_provider_capabilities(
                 cache[name] = None  # type: ignore[assignment]
         return cache.get(name)
 
+    def _check_agent_tools(agent: AgentDef, provider_name: str, caps: ProviderCapabilities) -> None:
+        """Tools-capability cross-check shared by top-level and for_each agents.
+
+        Two failure modes against a non-passthrough provider:
+
+        * Explicit non-empty ``tools:`` — a declared allowlist the provider
+          cannot honor; silently granting different tools is a security
+          regression.
+        * Omitted ``tools:`` + non-empty workflow-level ``tools:`` — the agent
+          inherits that list at runtime (``resolve_agent_tools`` returns a copy)
+          and hits the same refusal mid-run with a confusing "declares
+          tools=[...]" error even though it declared none. An explicit
+          ``tools: []`` is the "no tools" opt-out and stays valid.
+        """
+        if agent.tools and not caps.workflow_tools_passthrough:
+            errors.append(
+                f"Agent '{agent.name}' declares tools={agent.tools!r} but provider "
+                f"'{provider_name}' does not honor per-agent tool allowlists "
+                f"(capabilities.workflow_tools_passthrough=False). Silently "
+                f"granting different tools than declared is a security regression."
+            )
+        elif agent.tools is None and config.tools and not caps.workflow_tools_passthrough:
+            errors.append(
+                f"Agent '{agent.name}' omits 'tools:' and would inherit the "
+                f"workflow-level tools={config.tools!r}, but provider "
+                f"'{provider_name}' does not honor tool allowlists "
+                f"(capabilities.workflow_tools_passthrough=False). Remove the "
+                f"workflow-level 'tools:' so omitting 'tools:' grants the "
+                f"provider's default tool preset, or set this agent's "
+                f"'tools: []' to disable all tools."
+            )
+
     # ----- Workflow-level: MCP servers -----
     # An mcp_servers block applies only to provider-backed agents that
     # actually resolve to a provider lacking MCP support. If every LLM
@@ -1677,35 +1709,10 @@ def _validate_provider_capabilities(
                 f"(capabilities.mcp_tools=False)."
             )
 
-        # tools allowlist: any explicit non-empty list against a provider
-        # that doesn't pass through is a security regression risk. An empty
-        # list ("no tools") is fine — the provider may honor it as
-        # "no tools" semantics. Only non-empty triggers the security concern.
-        if agent.tools and not caps.workflow_tools_passthrough:
-            errors.append(
-                f"Agent '{agent.name}' declares tools={agent.tools!r} but provider "
-                f"'{provider_name}' does not honor per-agent tool allowlists "
-                f"(capabilities.workflow_tools_passthrough=False). Silently "
-                f"granting different tools than declared is a security regression."
-            )
-
-        # Omitted per-agent ``tools:`` inherits the workflow-level ``tools:``
-        # list at runtime (``resolve_agent_tools`` returns a copy of it). For a
-        # non-passthrough provider that inherited list is a non-empty allowlist
-        # it cannot honor, so the agent fails at execute time with a confusing
-        # "declares tools=[...]" error even though it declared none. Catch it at
-        # validate time with an accurate message. (An explicit ``tools: []`` is
-        # the "no tools" opt-out and stays valid — only ``None`` inherits.)
-        elif agent.tools is None and config.tools and not caps.workflow_tools_passthrough:
-            errors.append(
-                f"Agent '{agent.name}' omits 'tools:' and would inherit the "
-                f"workflow-level tools={config.tools!r}, but provider "
-                f"'{provider_name}' does not honor tool allowlists "
-                f"(capabilities.workflow_tools_passthrough=False). Remove the "
-                f"workflow-level 'tools:' so omitting 'tools:' grants the "
-                f"provider's default tool preset, or set this agent's "
-                f"'tools: []' to disable all tools."
-            )
+        # tools allowlist (explicit non-empty list) and the omitted-tools
+        # inheritance footgun against non-passthrough providers. Shared with
+        # the for_each inline-agent pass below.
+        _check_agent_tools(agent, provider_name, caps)
 
         # reasoning.effort: validate per-agent override OR workflow-wide
         # default against the supported levels tuple. Per-agent override
@@ -1760,6 +1767,24 @@ def _validate_provider_capabilities(
                 f"but provider '{provider_name}' does not enforce session timeouts "
                 f"(capabilities.max_session_seconds=False)."
             )
+
+    # ----- For-each inline agents: tools capability cross-check -----
+    # A for_each group carries an INLINE ``AgentDef`` (not in ``config.agents``)
+    # that runs with ``workflow_tools=config.tools``, exactly like a top-level
+    # agent. The per-agent loop above skips it, so re-run the tools check here —
+    # otherwise an inline agent that omits ``tools:`` against a non-passthrough
+    # provider slips past ``validate`` and fails mid-iteration with the same
+    # confusing runtime error. (The other per-agent capability checks for inline
+    # agents are a separate, broader follow-up; this closes the tools footgun.)
+    for fe in config.for_each:
+        inline_agent = fe.agent
+        if not _is_llm_agent(inline_agent):
+            continue
+        inline_provider = _resolved_provider_name(inline_agent, default_provider)
+        inline_caps = _caps_for(inline_provider)
+        if inline_caps is None:
+            continue  # error already recorded by _caps_for
+        _check_agent_tools(inline_agent, inline_provider, inline_caps)
 
     # ----- Concurrency safety in parallel / for_each groups -----
     agent_by_name = {a.name: a for a in config.agents}

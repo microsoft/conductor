@@ -241,7 +241,7 @@ workflow:
 
 Requires the `claude` CLI to be installed and authenticated. Install the SDK: `uv add 'claude-agent-sdk>=0.1.0'`
 
-> **Note:** The `claude-agent-sdk` provider delegates tool and MCP server management to the `claude` CLI. Workflow-level `tools` and `runtime.mcp_servers` fields are ignored — configure these through your Claude Code settings instead.
+> **Note:** The `claude-agent-sdk` provider delegates tool and MCP management to the `claude` CLI; workflow-level tool/MCP config is **not** bridged into it. `runtime.mcp_servers` is rejected at the factory, and a workflow-level `tools:` block is rejected at `conductor validate` for any agent that omits `tools:` (it would otherwise inherit a list the CLI can't map). Omit `tools:` to grant the full `claude_code` preset, set an agent's `tools: []` to disable all tools, and configure MCP servers through your Claude Code settings instead.
 
 **See also:** [Claude Documentation](docs/providers/claude.md) | [Provider Comparison](docs/providers/comparison.md) | [Migration Guide](docs/providers/migration.md)
 

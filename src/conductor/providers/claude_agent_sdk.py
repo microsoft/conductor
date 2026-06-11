@@ -488,7 +488,7 @@ class ClaudeAgentSdkProvider(AgentProvider):
             # The executor passes [] for BOTH "omitted (no workflow tools to
             # inherit)" and explicit "tools: []". Disambiguate via the raw
             # per-agent field, which the executor's resolution erased.
-            if getattr(agent, "tools", None) is None:
+            if agent.tools is None:
                 # Omitted -> default claude_code preset (filesystem/bash/web).
                 return _DEFAULT_TOOL_PRESET, "bypassPermissions"
             # Explicit `tools: []` -> no tools, no permission bypass.
