@@ -15,7 +15,7 @@ if TYPE_CHECKING:
     from conductor.config.schema import AgentDef, WorkflowConfig
 
 
-ProviderType = Literal["copilot", "openai-agents", "claude", "claude-agent-sdk"]
+ProviderType = Literal["copilot", "openai-agents", "claude", "claude-agent-sdk", "codex"]
 
 
 class ProviderRegistry:
@@ -52,7 +52,7 @@ class ProviderRegistry:
         self._mcp_servers = mcp_servers
         self._providers: dict[ProviderType, AgentProvider] = {}
         self._default_provider_type: ProviderType = config.workflow.runtime.provider.name
-        self._resume_session_ids: dict[str, str] = {}
+        self._resume_session_ids_by_provider: dict[str, dict[str, str]] = {}
 
     @property
     def default_provider_type(self) -> ProviderType:
@@ -123,12 +123,16 @@ class ProviderRegistry:
             timeout=runtime.timeout,
             max_session_seconds=runtime.max_session_seconds,
             max_agent_iterations=runtime.max_agent_iterations,
+            default_reasoning_effort=runtime.default_reasoning_effort,
             provider_settings=provider_settings,
         )
 
-        # Pass stored resume session IDs to newly created providers
-        if self._resume_session_ids and hasattr(provider, "set_resume_session_ids"):
-            provider.set_resume_session_ids(self._resume_session_ids)  # type: ignore[union-attr]
+        # Pass stored resume session IDs to newly created providers. Session
+        # identifiers are provider-specific (Copilot session IDs, Codex thread
+        # IDs, etc.), so never forward another provider's IDs across the boundary.
+        resume_ids = self._resume_session_ids_by_provider.get(provider_type)
+        if resume_ids and hasattr(provider, "set_resume_session_ids"):
+            provider.set_resume_session_ids(resume_ids)  # type: ignore[union-attr]
 
         self._providers[provider_type] = provider
         return provider
@@ -181,16 +185,29 @@ class ProviderRegistry:
         return provider_type in self._providers
 
     def set_resume_session_ids(self, ids: dict[str, str]) -> None:
-        """Store session IDs for Copilot session resume.
+        """Store legacy Copilot session IDs for session resume.
 
-        The IDs are forwarded to providers that support
-        ``set_resume_session_ids`` — both already-active providers
-        and providers created lazily in the future.
+        Kept for compatibility with older checkpoint files and tests. New
+        callers should use :meth:`set_provider_resume_session_ids`.
 
         Args:
             ids: Mapping of agent names to Copilot session IDs.
         """
-        self._resume_session_ids = dict(ids)
-        for provider in self._providers.values():
-            if hasattr(provider, "set_resume_session_ids"):
-                provider.set_resume_session_ids(ids)  # type: ignore[union-attr]
+        self.set_provider_resume_session_ids({"copilot": ids})
+
+    def set_provider_resume_session_ids(self, ids_by_provider: dict[str, dict[str, str]]) -> None:
+        """Store provider-specific session IDs for workflow resume.
+
+        Args:
+            ids_by_provider: Mapping of provider name to that provider's
+                ``{agent_name: session_or_thread_id}`` mapping.
+        """
+        self._resume_session_ids_by_provider = {
+            provider_name: dict(ids)
+            for provider_name, ids in ids_by_provider.items()
+            if ids
+        }
+        for provider_type, provider in self._providers.items():
+            resume_ids = self._resume_session_ids_by_provider.get(provider_type)
+            if resume_ids and hasattr(provider, "set_resume_session_ids"):
+                provider.set_resume_session_ids(resume_ids)  # type: ignore[union-attr]

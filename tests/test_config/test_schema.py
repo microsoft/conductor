@@ -399,6 +399,31 @@ class TestRuntimeConfig:
         assert config.provider.name == "claude"
         assert config.temperature == 0.7
 
+    def test_codex_provider_with_options(self) -> None:
+        """Test Codex provider structured options."""
+        config = RuntimeConfig(
+            provider={
+                "name": "codex",
+                "codex": {
+                    "codex_bin": "/usr/local/bin/codex",
+                    "sandbox": "workspace-write",
+                    "approval_mode": "auto_review",
+                    "model_provider": "openai",
+                    "service_tier": "priority",
+                },
+            }
+        )
+        assert config.provider.name == "codex"
+        assert config.provider.codex is not None
+        assert config.provider.codex.codex_bin == "/usr/local/bin/codex"
+        assert config.provider.codex.sandbox == "workspace-write"
+        assert config.provider.codex.approval_mode == "auto_review"
+
+    def test_codex_options_rejected_for_other_provider(self) -> None:
+        """Codex-specific provider options cannot be attached to another provider."""
+        with pytest.raises(ValidationError, match="only supported when name='codex'"):
+            RuntimeConfig(provider={"name": "copilot", "codex": {"sandbox": "read-only"}})
+
     def test_temperature_boundary_values(self) -> None:
         """Test temperature field accepts boundary values."""
         # Lower bound

@@ -1694,16 +1694,27 @@ class WorkflowEngine:
             logger.debug("No workflow_path set; skipping checkpoint save")
             return
 
-        # Collect session IDs from provider if available
+        # Collect provider-specific session IDs from active providers if available.
+        # ``copilot_session_ids`` remains as a legacy checkpoint field; the
+        # provider-neutral map is the source of truth for new checkpoints.
+        provider_session_ids: dict[str, dict[str, str]] = {}
         copilot_session_ids: dict[str, str] | None = None
         provider = self._single_provider
         if provider is not None and hasattr(provider, "get_session_ids"):
-            copilot_session_ids = provider.get_session_ids()  # type: ignore[union-attr]
+            provider_name = self.config.workflow.runtime.provider.name
+            ids = provider.get_session_ids()  # type: ignore[union-attr]
+            if ids:
+                provider_session_ids[provider_name] = ids
+                if provider_name == "copilot":
+                    copilot_session_ids = ids
         elif self._registry is not None:
-            for p in self._registry.get_active_providers().values():
+            for provider_name, p in self._registry.get_active_providers().items():
                 if hasattr(p, "get_session_ids"):
-                    copilot_session_ids = p.get_session_ids()  # type: ignore[union-attr]
-                    break
+                    ids = p.get_session_ids()  # type: ignore[union-attr]
+                    if ids:
+                        provider_session_ids[provider_name] = ids
+                        if provider_name == "copilot":
+                            copilot_session_ids = ids
 
         checkpoint_path = CheckpointManager.save_checkpoint(
             workflow_path=self.workflow_path,
@@ -1712,6 +1723,7 @@ class WorkflowEngine:
             current_agent=self._current_agent_name or "unknown",
             error=error,
             inputs=self.context.workflow_inputs,
+            provider_session_ids=provider_session_ids,
             copilot_session_ids=copilot_session_ids,
             system_metadata=self._system_metadata,
             instructions_preamble=self._instructions_preamble,

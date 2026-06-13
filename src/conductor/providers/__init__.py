@@ -13,6 +13,7 @@ from conductor.providers.base import AgentOutput, AgentProvider
 if TYPE_CHECKING:
     from conductor.providers.claude import ClaudeProvider
     from conductor.providers.claude_agent_sdk import ClaudeAgentSdkProvider
+    from conductor.providers.codex import CodexProvider
     from conductor.providers.copilot import CopilotProvider
     from conductor.providers.factory import create_provider
 
@@ -21,6 +22,7 @@ __all__ = [
     "AgentProvider",
     "ClaudeAgentSdkProvider",
     "ClaudeProvider",
+    "CodexProvider",
     "CopilotProvider",
     "create_provider",
 ]
@@ -39,6 +41,10 @@ def __getattr__(name: str) -> Any:
         from conductor.providers.copilot import CopilotProvider
 
         return CopilotProvider
+    if name == "CodexProvider":
+        from conductor.providers.codex import CodexProvider
+
+        return CodexProvider
     if name == "create_provider":
         from conductor.providers.factory import create_provider
 

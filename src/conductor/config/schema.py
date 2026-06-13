@@ -505,7 +505,7 @@ class AgentDef(BaseModel):
     ) = None
     """Agent type. Defaults to 'agent' if not specified."""
 
-    provider: Literal["copilot", "claude", "claude-agent-sdk"] | None = None
+    provider: Literal["copilot", "claude", "claude-agent-sdk", "codex"] | None = None
     """Provider override for this agent.
 
     If None (default), the agent uses the workflow.runtime.provider.
@@ -1293,6 +1293,34 @@ class AzureProviderOptions(BaseModel):
     falls back to its own default when unset."""
 
 
+class CodexProviderOptions(BaseModel):
+    """Codex-specific provider options forwarded to ``openai-codex``.
+
+    These settings intentionally mirror stable knobs exposed by the Codex
+    Python SDK / app-server boundary. Shared runtime settings such as
+    ``default_model``, ``default_reasoning_effort``, ``max_session_seconds``,
+    and ``mcp_servers`` remain on :class:`RuntimeConfig`.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    codex_bin: str | None = None
+    """Optional path to a specific ``codex`` executable. When omitted, the
+    ``openai-codex`` SDK uses its pinned bundled runtime."""
+
+    sandbox: Literal["read-only", "workspace-write", "full-access"] | None = None
+    """Filesystem sandbox preset for Codex turns."""
+
+    approval_mode: Literal["deny_all", "auto_review"] | None = None
+    """Approval behavior used when starting/resuming Codex threads."""
+
+    model_provider: str | None = None
+    """Optional Codex model provider name, e.g. a configured Bedrock provider."""
+
+    service_tier: str | None = None
+    """Optional Codex service tier."""
+
+
 class ProviderSettings(BaseModel):
     """Structured provider configuration for ``runtime.provider``.
 
@@ -1319,7 +1347,7 @@ class ProviderSettings(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    name: Literal["copilot", "openai-agents", "claude", "claude-agent-sdk"] = "copilot"
+    name: Literal["copilot", "openai-agents", "claude", "claude-agent-sdk", "codex"] = "copilot"
     """SDK provider to use for agent execution."""
 
     type: Literal["openai", "azure", "anthropic"] | None = None
@@ -1356,6 +1384,9 @@ class ProviderSettings(BaseModel):
     """Azure-specific options (e.g. ``api_version``). Requires
     ``type: azure``. Copilot-only."""
 
+    codex: CodexProviderOptions | None = None
+    """Codex-specific options. Only valid when ``name: codex``."""
+
     @model_validator(mode="after")
     def _check_field_compatibility(self) -> ProviderSettings:
         copilot_only_fields = {
@@ -1365,6 +1396,9 @@ class ProviderSettings(BaseModel):
             "headers": self.headers,
             "azure": self.azure,
         }
+        if self.codex is not None and self.name != "codex":
+            raise ValueError("'codex' provider options are only supported when name='codex'")
+
         if self.name != "copilot":
             extras = sorted(k for k, v in copilot_only_fields.items() if v is not None)
             if extras:
@@ -1440,6 +1474,7 @@ class ProviderSettings(BaseModel):
                 self.bearer_token,
                 self.headers,
                 self.azure,
+                self.codex,
             )
         )
 

@@ -204,6 +204,7 @@ _PROVIDER_CLASS_PATHS: Final[dict[str, str]] = {
     "copilot": "conductor.providers.copilot:CopilotProvider",
     "claude": "conductor.providers.claude:ClaudeProvider",
     "claude-agent-sdk": "conductor.providers.claude_agent_sdk:ClaudeAgentSdkProvider",
+    "codex": "conductor.providers.codex:CodexProvider",
 }
 
 # Provider names that appear in the schema / factory but are not yet

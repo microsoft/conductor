@@ -1971,8 +1971,13 @@ async def resume_workflow_async(
         async with ProviderRegistry(config, mcp_servers=mcp_servers) as registry:
             verbose_log("Starting resumed workflow execution...")
 
-            # Pass stored session IDs to registry for Copilot session resume
-            if cp.copilot_session_ids:
+            # Pass stored session IDs to registry for provider-specific resume
+            # (Copilot session IDs, Codex thread IDs, etc.). Older checkpoints
+            # only have ``copilot_session_ids``; CheckpointManager projects
+            # those into provider_session_ids["copilot"] on load.
+            if cp.provider_session_ids:
+                registry.set_provider_resume_session_ids(cp.provider_session_ids)
+            elif cp.copilot_session_ids:
                 registry.set_resume_session_ids(cp.copilot_session_ids)
 
             # Set up interrupt listener if interactive mode is enabled

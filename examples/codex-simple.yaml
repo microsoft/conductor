@@ -1,0 +1,37 @@
+# Simple Codex provider workflow
+#
+# Requires:
+#   uv add --prerelease allow 'openai-codex==0.1.0b3'
+#   codex authentication already configured
+#
+# Run:
+#   uv run conductor run examples/codex-simple.yaml
+
+workflow:
+  name: codex-simple
+  version: "1.0.0"
+  description: Minimal workflow using the OpenAI Codex provider
+  entry_point: inspect_repo
+  runtime:
+    provider:
+      name: codex
+      codex:
+        sandbox: read-only
+        approval_mode: auto_review
+    default_model: gpt-5.4
+    default_reasoning_effort: medium
+
+agents:
+  - name: inspect_repo
+    description: Summarize the repository with Codex
+    prompt: |
+      Summarize this repository in three concise bullets.
+    output:
+      summary:
+        type: string
+        description: Three-bullet repository summary
+    routes:
+      - to: $end
+
+output:
+  summary: "{{ inspect_repo.output.summary }}"

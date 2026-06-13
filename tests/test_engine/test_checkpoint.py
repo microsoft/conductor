@@ -274,6 +274,64 @@ class TestSaveCheckpoint:
         assert path is not None
         data = json.loads(path.read_text())
         assert data["copilot_session_ids"] == {"agent_a": "sid-123"}
+        assert data["provider_session_ids"] == {"copilot": {"agent_a": "sid-123"}}
+
+    def test_provider_session_ids_roundtrip(self, tmp_path: Path) -> None:
+        wf = _write_workflow(tmp_path)
+        ctx = _make_context()
+        limits = _make_limits()
+        error = RuntimeError("err")
+
+        with patch.object(CheckpointManager, "get_checkpoints_dir", return_value=tmp_path):
+            path = CheckpointManager.save_checkpoint(
+                wf,
+                ctx,
+                limits,
+                "a",
+                error,
+                {},
+                provider_session_ids={
+                    "copilot": {"agent_a": "sid-123"},
+                    "codex": {"agent_b": "thread-456"},
+                },
+            )
+
+        assert path is not None
+        data = json.loads(path.read_text())
+        assert data["provider_session_ids"] == {
+            "copilot": {"agent_a": "sid-123"},
+            "codex": {"agent_b": "thread-456"},
+        }
+        assert data["copilot_session_ids"] == {"agent_a": "sid-123"}
+
+        cp = CheckpointManager.load_checkpoint(path)
+        assert cp.provider_session_ids["codex"] == {"agent_b": "thread-456"}
+        assert cp.provider_session_ids["copilot"] == {"agent_a": "sid-123"}
+
+    def test_legacy_copilot_session_ids_project_to_provider_session_ids(
+        self, tmp_path: Path
+    ) -> None:
+        wf = _write_workflow(tmp_path)
+        checkpoint_path = tmp_path / "legacy.json"
+        checkpoint_path.write_text(
+            json.dumps(
+                {
+                    "version": CheckpointManager.CHECKPOINT_VERSION,
+                    "workflow_path": str(wf),
+                    "workflow_hash": "sha256:abc",
+                    "created_at": "2026-01-01T00:00:00+00:00",
+                    "failure": {"error_type": "RuntimeError", "message": "err"},
+                    "current_agent": "agent_a",
+                    "context": _make_context().to_dict(),
+                    "limits": _make_limits().to_dict(),
+                    "copilot_session_ids": {"agent_a": "sid-123"},
+                }
+            )
+        )
+
+        cp = CheckpointManager.load_checkpoint(checkpoint_path)
+        assert cp.copilot_session_ids == {"agent_a": "sid-123"}
+        assert cp.provider_session_ids == {"copilot": {"agent_a": "sid-123"}}
 
     def test_run_id_and_event_log_path_included(self, tmp_path: Path) -> None:
         """``run_id`` and ``event_log_path`` round-trip through save+load.
