@@ -1,7 +1,7 @@
 """Unit tests for the provider factory."""
 
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -154,6 +154,50 @@ class TestCreateProvider:
         assert "copilot" in suggestion
         assert "openai-agents" in suggestion
         assert "claude" in suggestion
+        assert "codex" in suggestion
+
+
+class TestCodexFactory:
+    """Tests for Codex provider factory wiring."""
+
+    @patch("conductor.providers.factory.CODEX_SDK_AVAILABLE", False)
+    @pytest.mark.asyncio
+    async def test_create_codex_provider_raises_when_sdk_not_available(self) -> None:
+        with pytest.raises(ProviderError, match="openai-codex SDK"):
+            await create_provider("codex", validate=False)
+
+    @patch("conductor.providers.factory.CODEX_SDK_AVAILABLE", True)
+    @patch("conductor.providers.factory.CodexProvider")
+    @pytest.mark.asyncio
+    async def test_create_codex_provider_success(self, mock_codex_provider: Any) -> None:
+        provider = MagicMock()
+        provider.validate_connection = AsyncMock(return_value=True)
+        mock_codex_provider.return_value = provider
+
+        result = await create_provider(
+            "codex",
+            validate=False,
+            default_model="gpt-5.4",
+            max_session_seconds=120.0,
+        )
+
+        assert result is provider
+        mock_codex_provider.assert_called_once()
+        kwargs = mock_codex_provider.call_args.kwargs
+        assert kwargs["model"] == "gpt-5.4"
+        assert kwargs["max_session_seconds"] == 120.0
+
+    @patch("conductor.providers.factory.CODEX_SDK_AVAILABLE", True)
+    @pytest.mark.asyncio
+    async def test_codex_rejects_unsupported_runtime_fields(self) -> None:
+        with pytest.raises(ProviderError, match="temperature"):
+            await create_provider("codex", validate=False, temperature=0.2)
+        with pytest.raises(ProviderError, match="max_tokens"):
+            await create_provider("codex", validate=False, max_tokens=100)
+        with pytest.raises(ProviderError, match="timeout"):
+            await create_provider("codex", validate=False, timeout=30.0)
+        with pytest.raises(ProviderError, match="max_agent_iterations"):
+            await create_provider("codex", validate=False, max_agent_iterations=5)
 
 
 class TestProviderValidation:

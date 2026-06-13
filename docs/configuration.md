@@ -11,7 +11,7 @@ The `runtime` section of your workflow defines provider settings and global defa
 ```yaml
 workflow:
   runtime:
-    provider: copilot  # or 'claude' or 'claude-agent-sdk'
+    provider: copilot  # or 'claude', 'claude-agent-sdk', or 'codex'
     default_model: gpt-5.2
     temperature: 0.7
     max_tokens: 4096
@@ -70,6 +70,32 @@ workflow:
 **Models**: `claude-sonnet-4.5`, `claude-haiku-4.5`, `claude-opus-4.5`
 
 **See**: [Claude Provider Documentation](providers/claude.md)
+
+### Codex Provider
+
+Uses the official `openai-codex` Python SDK and local `codex app-server`
+for agent execution.
+
+```yaml
+workflow:
+  runtime:
+    provider:
+      name: codex
+      codex:
+        sandbox: workspace-write
+        approval_mode: auto_review
+    default_model: gpt-5.4
+    default_reasoning_effort: high
+```
+
+**Features**:
+- Native Codex threads with checkpoint resume
+- Native JSON Schema structured output
+- Streaming message, reasoning, and tool events
+- Workflow MCP server and per-agent `tools:` mapping
+
+Install the optional SDK extra before using this provider:
+`uv add --prerelease allow 'openai-codex==0.1.0b3'`.
 
 ### Custom Provider Routing (Ollama / vLLM / Azure OpenAI)
 
@@ -204,7 +230,8 @@ OpenAI (commented variant).
 
 ## Common Configuration Options
 
-These options work with both providers:
+These options apply across model providers unless a provider-specific note
+below says otherwise.
 
 ### Model Selection
 
@@ -238,6 +265,9 @@ workflow:
 **Ranges**:
 - **Copilot (OpenAI)**: 0.0 - 2.0
 - **Claude**: 0.0 - 1.0 (enforced by SDK)
+
+**Provider note**: Codex does not accept `runtime.temperature`; remove this
+field for workflows that use `provider: codex`.
 
 **Guidelines**:
 - `0.0 - 0.3`: Factual, deterministic (data extraction, classification)
@@ -318,14 +348,18 @@ agents (none of which call a model).
   `temperature` to `1.0` (required by the Anthropic API for extended thinking,
   logged at INFO) and bumps `max_tokens` to fit `budget + 4096`, capped at
   `64000` (logged at INFO when clamped).
+- **Codex** — Forwards the chosen effort as `effort` on each Codex turn and
+  validates it against Codex model capability metadata when available.
 
 Reasoning / thinking content emitted by the model is surfaced via
 `agent_reasoning` events and rendered in the dashboard, JSONL logs, and
-`-vv` console output for both providers.
+`-vv` console output.
 
 ## MCP Servers
 
-Configure [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) servers for tool access. Both the Copilot and Claude providers support MCP tools.
+Configure [Model Context Protocol (MCP)](https://modelcontextprotocol.io/)
+servers for tool access. Copilot, Claude, and Codex providers support MCP
+tools with provider-specific transport and routing behavior.
 
 ```yaml
 workflow:
@@ -343,7 +377,9 @@ workflow:
         tools: ["*"]
 ```
 
-> **Provider note:** The Claude provider supports `stdio` servers only. HTTP and SSE servers are Copilot-only.
+> **Provider note:** The Claude provider supports `stdio` servers only. Copilot
+> and Codex receive Conductor MCP server definitions through their native SDK
+> configuration surfaces.
 
 For full details on server types, tool filtering, environment variables, and OAuth authentication, see the [MCP Tools guide](mcp-tools.md).
 

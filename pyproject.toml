@@ -51,6 +51,10 @@ dependencies = [
 claude-agent-sdk = [
     "claude-agent-sdk>=0.1.64",
 ]
+codex = [
+    "openai-codex==0.1.0b3",
+    "openai-codex-cli-bin==0.137.0a4",
+]
 
 [project.urls]
 Homepage = "https://github.com/microsoft/conductor"

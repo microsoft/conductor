@@ -1,6 +1,6 @@
 # Conductor
 
-A CLI tool for defining and running multi-agent workflows with the GitHub Copilot SDK and Anthropic Claude.
+A CLI tool for defining and running multi-agent workflows with GitHub Copilot, Anthropic Claude, Claude Agent SDK, and OpenAI Codex.
 
 [![CI](https://github.com/microsoft/conductor/actions/workflows/ci.yml/badge.svg)](https://github.com/microsoft/conductor/actions/workflows/ci.yml)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
@@ -16,7 +16,7 @@ Conductor makes multi-agent workflows — code review pipelines, research-then-s
 ## Features
 
 - **YAML-based workflows** - Define multi-agent workflows in readable YAML
-- **Multiple providers** - GitHub Copilot, Anthropic Claude, or Claude Agent SDK with seamless switching
+- **Multiple providers** - GitHub Copilot, Anthropic Claude, Claude Agent SDK, or OpenAI Codex with seamless switching
 - **Parallel execution** - Run agents concurrently (static groups or dynamic for-each)
 - **Sub-workflow composition** - Reusable sub-workflows with templated `input_mapping`, usable inside `for_each` groups for dynamic fan-out
 - **Script steps** - Run shell commands and route on exit code or parsed JSON stdout
@@ -211,13 +211,13 @@ conductor stop
 
 Conductor supports multiple AI providers. Choose based on your needs:
 
-| Feature | Copilot | Claude | Claude Agent SDK |
-|---------|---------|--------|------------------|
-| **Pricing** | Subscription ($10-39/mo) | Pay-per-token | Via Claude Code CLI |
-| **Context Window** | 8K-128K tokens | 200K tokens | 200K tokens |
-| **Tool Support (MCP)** | Yes | Planned | Yes (built-in) |
-| **Streaming** | Yes | Planned | Yes |
-| **Best For** | Heavy usage, tools | Large context, pay-per-use | Full Claude Code toolset |
+| Feature | Copilot | Claude | Claude Agent SDK | Codex |
+|---------|---------|--------|------------------|-------|
+| **Pricing** | Subscription ($10-39/mo) | Pay-per-token | Via Claude Code CLI | Via Codex auth/API |
+| **Context Window** | per-model | 200K tokens | 200K tokens | per-model |
+| **Tool Support (MCP)** | Yes | Yes (stdio) | Yes (CLI-managed) | Yes |
+| **Streaming** | Yes | Yes | Yes | Yes |
+| **Best For** | Heavy usage, tools | Large context, pay-per-use | Full Claude Code toolset | Codex coding agent workflows |
 
 ### Using Claude
 
@@ -242,6 +242,23 @@ workflow:
 Requires the `claude` CLI to be installed and authenticated. Install the SDK: `uv add 'claude-agent-sdk>=0.1.0'`
 
 > **Note:** The `claude-agent-sdk` provider delegates tool and MCP server management to the `claude` CLI. Workflow-level `tools` and `runtime.mcp_servers` fields are ignored — configure these through your Claude Code settings instead.
+
+### Using Codex
+
+```yaml
+workflow:
+  runtime:
+    provider: codex
+    default_model: gpt-5.4
+```
+
+Requires Codex authentication and the optional SDK extra. Install with:
+`uv add --prerelease allow 'openai-codex==0.1.0b3'`.
+
+Codex runs through the official `openai-codex` Python SDK and local
+`codex app-server`. Conductor maps workflow MCP servers, per-agent
+`tools:`, reasoning effort, structured output schemas, streaming events,
+interrupts, and checkpoint resume to Codex threads.
 
 **See also:** [Claude Documentation](docs/providers/claude.md) | [Provider Comparison](docs/providers/comparison.md) | [Migration Guide](docs/providers/migration.md)
 

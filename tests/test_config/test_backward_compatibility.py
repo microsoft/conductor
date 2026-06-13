@@ -43,8 +43,8 @@ def get_copilot_example_files() -> list[Path]:
     copilot_examples = []
 
     for example in all_examples:
-        # Skip Claude-specific examples
-        if "claude" in example.name.lower():
+        # Skip provider-specific examples that are not Copilot.
+        if "claude" in example.name.lower() or "codex" in example.name.lower():
             continue
 
         copilot_examples.append(example)

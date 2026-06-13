@@ -76,7 +76,9 @@ class CheckpointData:
         current_agent: Name of the agent that was executing when failure occurred.
         context: Serialized ``WorkflowContext`` state.
         limits: Serialized ``LimitEnforcer`` state.
-        copilot_session_ids: Mapping of agent names to Copilot session IDs.
+        provider_session_ids: Mapping of provider names to their per-agent
+            resumable session/thread IDs.
+        copilot_session_ids: Legacy mapping of agent names to Copilot session IDs.
         file_path: Path where the checkpoint file is stored.
         instructions_preamble: Workspace instructions preamble that was
             active during the original run, or ``None``.
@@ -100,6 +102,7 @@ class CheckpointData:
     current_agent: str
     context: dict[str, Any]
     limits: dict[str, Any]
+    provider_session_ids: dict[str, dict[str, str]] = field(default_factory=dict)
     copilot_session_ids: dict[str, str] = field(default_factory=dict)
     file_path: Path = field(default_factory=lambda: Path())
     instructions_preamble: str | None = None
@@ -155,6 +158,7 @@ class CheckpointManager:
         current_agent: str,
         error: BaseException,
         inputs: dict[str, Any],
+        provider_session_ids: dict[str, dict[str, str]] | None = None,
         copilot_session_ids: dict[str, str] | None = None,
         system_metadata: dict[str, Any] | None = None,
         instructions_preamble: str | None = None,
@@ -176,7 +180,10 @@ class CheckpointManager:
             current_agent: Name of the agent executing when the error occurred.
             error: The exception that triggered the checkpoint.
             inputs: Workflow inputs.
-            copilot_session_ids: Optional mapping of agent names to session IDs.
+            provider_session_ids: Optional provider-keyed mapping of agent names
+                to resumable provider session/thread IDs.
+            copilot_session_ids: Optional legacy mapping of agent names to
+                Copilot session IDs.
             system_metadata: Optional system metadata captured at workflow start.
             instructions_preamble: Optional workspace instructions preamble to persist.
             run_id: Original run identifier (from ``EventLogSubscriber``).
@@ -207,6 +214,10 @@ class CheckpointManager:
             timestamp = f"{timestamp}-{suffix}"
             created_at = datetime.now(UTC).isoformat()
             workflow_name = workflow_path.stem
+            provider_ids = dict(provider_session_ids or {})
+            if copilot_session_ids and "copilot" not in provider_ids:
+                provider_ids["copilot"] = dict(copilot_session_ids)
+            legacy_copilot_ids = copilot_session_ids or provider_ids.get("copilot", {})
 
             checkpoint = {
                 "version": CheckpointManager.CHECKPOINT_VERSION,
@@ -223,7 +234,8 @@ class CheckpointManager:
                 "current_agent": current_agent,
                 "context": _make_json_serializable(context.to_dict()),
                 "limits": _make_json_serializable(limits.to_dict()),
-                "copilot_session_ids": copilot_session_ids or {},
+                "provider_session_ids": _make_json_serializable(provider_ids),
+                "copilot_session_ids": _make_json_serializable(legacy_copilot_ids),
                 "system": system_metadata or {},
                 "instructions_preamble": instructions_preamble,
                 "run_id": run_id,
@@ -331,6 +343,14 @@ class CheckpointManager:
                     checkpoint_path=str(checkpoint_path),
                 )
 
+        provider_session_ids = data.get("provider_session_ids", {}) or {}
+        copilot_session_ids = data.get("copilot_session_ids", {}) or {}
+        if copilot_session_ids and "copilot" not in provider_session_ids:
+            provider_session_ids = {
+                **provider_session_ids,
+                "copilot": copilot_session_ids,
+            }
+
         return CheckpointData(
             version=data["version"],
             workflow_path=data["workflow_path"],
@@ -341,7 +361,8 @@ class CheckpointManager:
             current_agent=data["current_agent"],
             context=data["context"],
             limits=data["limits"],
-            copilot_session_ids=data.get("copilot_session_ids", {}),
+            provider_session_ids=provider_session_ids,
+            copilot_session_ids=copilot_session_ids,
             file_path=checkpoint_path,
             instructions_preamble=data.get("instructions_preamble"),
             run_id=data.get("run_id", "") or "",

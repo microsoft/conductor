@@ -1,24 +1,24 @@
-# Provider Comparison: Copilot vs Claude vs Claude Agent SDK
+# Provider Comparison: Copilot vs Claude vs Claude Agent SDK vs Codex
 
-This guide helps you choose between GitHub Copilot, Anthropic Claude, and Claude Agent SDK providers for your workflows.
+This guide helps you choose between GitHub Copilot, Anthropic Claude, Claude Agent SDK, and Codex providers for your workflows.
 
 ## Quick Comparison
 
-| Feature | Copilot | Claude | Claude Agent SDK | Winner |
-|---------|---------|--------|------------------|--------|
-| **Tier** | Stable | Stable | Experimental ([#241](https://github.com/microsoft/conductor/issues/241)) | Copilot / Claude |
-| **Context Window** | per-model (SDK-reported) | per-model (SDK-reported) | 200K | Tie |
-| **Pricing Model** | Subscription ($10-39/mo) | Pay-per-token | Via Claude Code CLI | Depends |
-| **Setup** | GitHub auth | API key | `claude` CLI auth | Copilot (easier) |
-| **Model Selection** | GPT-5.2, o1 | Haiku, Sonnet, Opus | Haiku, Sonnet, Opus | Tie |
-| **Streaming** | Yes | No (Phase 1) | Yes | Copilot / Claude Agent SDK |
-| **Tool Support** | Yes (MCP, all types) | Yes (MCP, stdio only) | Yes (built-in, CLI-managed) | Copilot |
-| **Reasoning / Extended Thinking** | Yes (`reasoning_effort` on session) | Yes (extended `thinking` budget) | Inherits from CLI config | Tie |
-| **Speed** | Fast | Fast | Fast | Tie |
-| **Output Quality** | Excellent | Excellent | Excellent | Tie |
-| **Cost Predictability** | High (flat rate) | Variable (usage-based) | Variable | Copilot |
-| **Multi-provider** | No | Yes (via Conductor) | No | Claude |
-| **Agentic Loop** | SDK-managed | Manual (provider code) | SDK-managed (delegated to CLI) | Depends |
+| Feature | Copilot | Claude | Claude Agent SDK | Codex | Winner |
+|---------|---------|--------|------------------|-------|--------|
+| **Tier** | Stable | Stable | Experimental ([#241](https://github.com/microsoft/conductor/issues/241)) | Experimental | Copilot / Claude |
+| **Context Window** | per-model (SDK-reported) | per-model (SDK-reported) | 200K | per-model | Tie |
+| **Pricing Model** | Subscription ($10-39/mo) | Pay-per-token | Via Claude Code CLI | Via Codex auth/API | Depends |
+| **Setup** | GitHub auth | API key | `claude` CLI auth | Codex auth | Copilot (easier) |
+| **Model Selection** | GPT-5.2, o1 | Haiku, Sonnet, Opus | Haiku, Sonnet, Opus | GPT/Codex models | Tie |
+| **Streaming** | Yes | No (Phase 1) | Yes | Yes | Copilot / SDK providers |
+| **Tool Support** | Yes (MCP, all types) | Yes (MCP, stdio only) | Yes (built-in, CLI-managed) | Yes (MCP via Codex config) | Copilot / Codex |
+| **Reasoning / Extended Thinking** | Yes (`reasoning_effort` on session) | Yes (extended `thinking` budget) | Inherits from CLI config | Yes (`effort` on turn) | Tie |
+| **Speed** | Fast | Fast | Fast | Fast | Tie |
+| **Output Quality** | Excellent | Excellent | Excellent | Excellent | Tie |
+| **Cost Predictability** | High (flat rate) | Variable (usage-based) | Variable | Variable | Copilot |
+| **Multi-provider** | No | Yes (via Conductor) | No | Yes (via Conductor) | Claude / Codex |
+| **Agentic Loop** | SDK-managed | Manual (provider code) | SDK-managed (delegated to CLI) | SDK-managed (app-server) | Depends |
 
 > **About the experimental tier.** `claude-agent-sdk` declares specific
 > capability carve-outs (no MCP, no per-agent tools allowlist, no
@@ -27,6 +27,12 @@ This guide helps you choose between GitHub Copilot, Anthropic Claude, and Claude
 > CLI prints a one-time banner when the workflow runs. See
 > [docs/providers/experimental.md](./experimental.md) for the stability
 > policy and promotion criteria.
+
+`codex` is also experimental because the upstream `openai-codex` Python
+SDK and bundled app-server runtime are beta. Unlike `claude-agent-sdk`,
+Conductor declares no capability carve-outs for Codex: workflow MCP
+servers, per-agent `tools:`, reasoning effort, native structured output,
+streaming events, interrupts, usage, and checkpoint resume are wired.
 
 ## When to Use Copilot
 
@@ -168,6 +174,42 @@ workflow:
 agents:
   - name: researcher
     prompt: "Research {{ topic }} using web search"
+```
+
+## When to Use Codex
+
+### ✅ Choose Codex if:
+
+1. **You want Codex's coding-agent behavior inside Conductor**
+   - Local repository understanding
+   - Codex thread persistence and resume
+   - Native Codex sandbox and approval controls
+
+2. **You need native JSON Schema output**
+   - Conductor `output:` schemas are passed to Codex as `output_schema`
+   - Returned JSON is still validated by Conductor
+
+3. **You want Codex streaming and reasoning events**
+   - Message deltas
+   - Reasoning deltas
+   - Tool lifecycle events
+
+### Example Codex Workflow
+
+```yaml
+workflow:
+  name: codex-workflow
+  runtime:
+    provider: codex
+    default_model: gpt-5.4
+    default_reasoning_effort: high
+
+agents:
+  - name: planner
+    prompt: "Inspect this repository and propose the next change."
+    output:
+      summary:
+        type: string
 ```
 
 ## Cost Comparison

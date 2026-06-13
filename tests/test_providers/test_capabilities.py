@@ -152,12 +152,13 @@ class TestResolver:
         assert "copilot" in names
         assert "claude" in names
         assert "claude-agent-sdk" in names
+        assert "codex" in names
 
     def test_unknown_provider_raises_keyerror(self) -> None:
         with pytest.raises(KeyError, match="Unknown provider"):
             get_capabilities("nonexistent-provider")
 
-    @pytest.mark.parametrize("provider_name", ["copilot", "claude", "claude-agent-sdk"])
+    @pytest.mark.parametrize("provider_name", ["copilot", "claude", "claude-agent-sdk", "codex"])
     def test_every_production_provider_has_capabilities(self, provider_name: str) -> None:
         """Hard requirement: every provider in the registry declares CAPABILITIES.
 

@@ -15,6 +15,7 @@ from conductor.providers.claude_agent_sdk import (
     CLAUDE_AGENT_SDK_AVAILABLE,
     ClaudeAgentSdkProvider,
 )
+from conductor.providers.codex import CODEX_SDK_AVAILABLE, CodexProvider
 from conductor.providers.copilot import CopilotProvider, IdleRecoveryConfig
 from conductor.providers.reasoning import ReasoningEffort
 
@@ -23,7 +24,9 @@ if TYPE_CHECKING:
 
 
 async def create_provider(
-    provider_type: Literal["copilot", "openai-agents", "claude", "claude-agent-sdk"] = "copilot",
+    provider_type: Literal[
+        "copilot", "openai-agents", "claude", "claude-agent-sdk", "codex"
+    ] = "copilot",
     validate: bool = True,
     mcp_servers: dict[str, Any] | None = None,
     default_model: str | None = None,
@@ -152,10 +155,53 @@ async def create_provider(
                 max_turns=max_agent_iterations,
                 max_session_seconds=max_session_seconds,
             )
+        case "codex":
+            if not CODEX_SDK_AVAILABLE:
+                raise ProviderError(
+                    "Codex provider requires the openai-codex SDK",
+                    suggestion=(
+                        "Install with: uv add --prerelease allow 'openai-codex==0.1.0b3'"
+                    ),
+                )
+            if temperature is not None:
+                raise ProviderError(
+                    f"codex does not support `temperature` (received {temperature!r}).",
+                    suggestion="Remove `runtime.temperature` for workflows that use codex.",
+                )
+            if max_tokens is not None:
+                raise ProviderError(
+                    f"codex does not support `max_tokens` (received {max_tokens!r}).",
+                    suggestion="Remove `runtime.max_tokens` for workflows that use codex.",
+                )
+            if timeout is not None:
+                raise ProviderError(
+                    f"codex does not support `timeout` (received {timeout!r}).",
+                    suggestion=(
+                        "Use `runtime.max_session_seconds`, per-agent "
+                        "`max_session_seconds`, or workflow `limits.timeout_seconds`."
+                    ),
+                )
+            if max_agent_iterations is not None:
+                raise ProviderError(
+                    "codex does not support `max_agent_iterations`.",
+                    suggestion=(
+                        "Remove `runtime.max_agent_iterations` for workflows that use codex."
+                    ),
+                )
+            provider = CodexProvider(
+                model=default_model,
+                mcp_servers=mcp_servers,
+                max_session_seconds=max_session_seconds,
+                default_reasoning_effort=default_reasoning_effort,
+                provider_settings=provider_settings,
+            )
         case _:
             raise ProviderError(
                 f"Unknown provider: {provider_type}",
-                suggestion="Valid providers are: copilot, openai-agents, claude, claude-agent-sdk",
+                suggestion=(
+                    "Valid providers are: copilot, openai-agents, claude, "
+                    "claude-agent-sdk, codex"
+                ),
             )
 
     if validate and not await provider.validate_connection():
