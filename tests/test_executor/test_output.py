@@ -282,6 +282,19 @@ class TestParseJsonOutput:
 
         assert result == {"code": "use ```fenced``` blocks", "n": 1}
 
+    def test_parse_raw_json_with_markdown_fence_inside_string(self) -> None:
+        """Raw JSON may contain fenced code blocks inside string fields."""
+        raw = (
+            '{"passed": false, "details": "Preferred:\\n'
+            '```python\\ndef add(a, b):\\n    return a + b\\n```"}'
+        )
+        result = parse_json_output(raw)
+
+        assert result == {
+            "passed": False,
+            "details": "Preferred:\n```python\ndef add(a, b):\n    return a + b\n```",
+        }
+
     def test_parse_json_with_multiple_fenced_blocks_first_wins(self) -> None:
         """When the response contains multiple fenced JSON blocks, the first
         valid block wins.

@@ -57,8 +57,60 @@ class _FakeTurn:
         return self._iter_events()
 
 
+class _BlockingStream:
+    """Async stream that reproduces close-while-anext-is-pending failures."""
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.cancelled = asyncio.Event()
+        self.closed = False
+
+    def __aiter__(self) -> _BlockingStream:
+        return self
+
+    async def __anext__(self) -> Any:
+        self.started.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            await asyncio.sleep(0)
+            raise
+        raise StopAsyncIteration
+
+    async def aclose(self) -> None:
+        if not self.cancelled.is_set():
+            raise RuntimeError("aclose(): asynchronous generator is already running")
+        self.closed = True
+
+
+class _BlockingTurn:
+    id = "turn-blocking"
+    thread_id = "thread-new"
+
+    def __init__(self, stream: _BlockingStream) -> None:
+        self._stream = stream
+        self.interrupted = False
+
+    async def interrupt(self) -> None:
+        self.interrupted = True
+
+    def stream(self) -> _BlockingStream:
+        return self._stream
+
+
+class _BlockingThread:
+    def __init__(self, turn: _BlockingTurn) -> None:
+        self.id = "thread-new"
+        self.turn_obj = turn
+
+    async def turn(self, _input_text: str, **_kwargs: Any) -> _BlockingTurn:
+        return self.turn_obj
+
+
 class _FakeThread:
     last_turn_kwargs: dict[str, Any] = {}
+    next_events: list[Any] | None = None
     event_delay: float = 0.0
 
     def __init__(self, thread_id: str = "thread-new") -> None:
@@ -66,6 +118,11 @@ class _FakeThread:
 
     async def turn(self, input_text: str, **kwargs: Any) -> _FakeTurn:
         _FakeThread.last_turn_kwargs = {"input": input_text, **kwargs}
+        if _FakeThread.next_events is not None:
+            events = _FakeThread.next_events
+            _FakeThread.next_events = None
+            return _FakeTurn(events, event_delay=self.event_delay)
+
         agent_message = SimpleNamespace(
             type="agentMessage",
             phase=SimpleNamespace(value="final_answer"),
@@ -113,6 +170,7 @@ class _FakeAsyncCodex:
     last_thread_start_kwargs: dict[str, Any] = {}
     last_thread_resume_kwargs: dict[str, Any] = {}
     account_response: Any = SimpleNamespace(requires_openai_auth=False)
+    last_account_refresh_token: bool | None = None
 
     def __init__(self, config: Any | None = None) -> None:
         self.config = config
@@ -124,6 +182,7 @@ class _FakeAsyncCodex:
         return None
 
     async def account(self, *, refresh_token: bool = False) -> Any:
+        _FakeAsyncCodex.last_account_refresh_token = refresh_token
         return self.account_response
 
     async def models(self) -> Any:
@@ -154,6 +213,11 @@ class _FakeAsyncCodex:
 @pytest.fixture(autouse=True)
 def fake_codex_sdk(monkeypatch: pytest.MonkeyPatch) -> None:
     _FakeAsyncCodex.account_response = SimpleNamespace(requires_openai_auth=False)
+    _FakeAsyncCodex.last_account_refresh_token = None
+    _FakeAsyncCodex.last_thread_start_kwargs = {}
+    _FakeAsyncCodex.last_thread_resume_kwargs = {}
+    _FakeThread.last_turn_kwargs = {}
+    _FakeThread.next_events = None
     _FakeThread.event_delay = 0.0
     monkeypatch.setattr(codex_module, "CODEX_SDK_AVAILABLE", True)
     monkeypatch.setattr(codex_module, "AsyncCodex", _FakeAsyncCodex)
@@ -210,6 +274,223 @@ async def test_execute_does_not_cancel_codex_stream_while_polling_interrupts() -
 
 
 @pytest.mark.asyncio
+async def test_reasoning_deltas_are_buffered_until_next_non_reasoning_event() -> None:
+    provider = CodexProvider(model="gpt-5.4")
+    agent = AgentDef(name="answerer", prompt="answer")
+    agent_message = SimpleNamespace(
+        type="agentMessage",
+        phase=SimpleNamespace(value="final_answer"),
+        text='{"answer": "42"}',
+    )
+    tool_item = SimpleNamespace(type="commandExecution", command="pwd")
+    _FakeThread.next_events = [
+        SimpleNamespace(method="turn/started", payload=SimpleNamespace()),
+        SimpleNamespace(
+            method="item/reasoning/textDelta",
+            payload=SimpleNamespace(delta="I"),
+        ),
+        SimpleNamespace(
+            method="item/reasoning/textDelta",
+            payload=SimpleNamespace(delta=" need"),
+        ),
+        SimpleNamespace(
+            method="item/reasoning/textDelta",
+            payload=SimpleNamespace(delta=" to inspect"),
+        ),
+        SimpleNamespace(
+            method="item/started",
+            payload=SimpleNamespace(item=tool_item),
+        ),
+        SimpleNamespace(
+            method="item/agentMessage/delta",
+            payload=SimpleNamespace(delta='{"answer": "42"}'),
+        ),
+        SimpleNamespace(
+            method="item/completed",
+            payload=SimpleNamespace(turn_id="turn-1", item=agent_message),
+        ),
+        SimpleNamespace(
+            method="turn/completed",
+            payload=SimpleNamespace(
+                turn=SimpleNamespace(status=SimpleNamespace(value="completed"))
+            ),
+        ),
+    ]
+    events: list[tuple[str, dict[str, Any]]] = []
+
+    result = await provider.execute(
+        agent=agent,
+        context={},
+        rendered_prompt="answer",
+        event_callback=lambda event_type, data: events.append((event_type, data)),
+    )
+
+    reasoning_events = [data for event_type, data in events if event_type == "agent_reasoning"]
+    event_types = [event_type for event_type, _ in events]
+    assert result.content == {"result": '{"answer": "42"}'}
+    assert reasoning_events == [{"content": "I need to inspect"}]
+    assert event_types.index("agent_reasoning") < event_types.index("agent_tool_start")
+    assert event_types.index("agent_reasoning") < event_types.index("agent_message")
+
+
+@pytest.mark.asyncio
+async def test_reasoning_deltas_ignore_token_usage_updates_until_visible_boundary() -> None:
+    provider = CodexProvider(model="gpt-5.4")
+    agent = AgentDef(name="answerer", prompt="answer")
+    agent_message = SimpleNamespace(
+        type="agentMessage",
+        phase=SimpleNamespace(value="final_answer"),
+        text='{"answer": "42"}',
+    )
+    usage = SimpleNamespace(total=SimpleNamespace(total_tokens=3))
+    _FakeThread.next_events = [
+        SimpleNamespace(method="turn/started", payload=SimpleNamespace()),
+        SimpleNamespace(
+            method="item/reasoning/textDelta",
+            payload=SimpleNamespace(
+                delta="I",
+                item_id="reasoning-1",
+                content_index=0,
+            ),
+        ),
+        SimpleNamespace(
+            method="thread/tokenUsage/updated",
+            payload=SimpleNamespace(turn_id="turn-1", token_usage=usage),
+        ),
+        SimpleNamespace(
+            method="item/reasoning/textDelta",
+            payload=SimpleNamespace(
+                delta=" need",
+                item_id="reasoning-1",
+                content_index=0,
+            ),
+        ),
+        SimpleNamespace(
+            method="thread/tokenUsage/updated",
+            payload=SimpleNamespace(turn_id="turn-1", token_usage=usage),
+        ),
+        SimpleNamespace(
+            method="item/reasoning/textDelta",
+            payload=SimpleNamespace(
+                delta=" to inspect",
+                item_id="reasoning-1",
+                content_index=0,
+            ),
+        ),
+        SimpleNamespace(
+            method="item/agentMessage/delta",
+            payload=SimpleNamespace(delta='{"answer": "42"}'),
+        ),
+        SimpleNamespace(
+            method="item/completed",
+            payload=SimpleNamespace(turn_id="turn-1", item=agent_message),
+        ),
+        SimpleNamespace(
+            method="turn/completed",
+            payload=SimpleNamespace(
+                turn=SimpleNamespace(status=SimpleNamespace(value="completed"))
+            ),
+        ),
+    ]
+    events: list[tuple[str, dict[str, Any]]] = []
+
+    await provider.execute(
+        agent=agent,
+        context={},
+        rendered_prompt="answer",
+        event_callback=lambda event_type, data: events.append((event_type, data)),
+    )
+
+    reasoning_events = [data for event_type, data in events if event_type == "agent_reasoning"]
+    event_types = [event_type for event_type, _ in events]
+    assert reasoning_events == [{"content": "I need to inspect"}]
+    assert event_types.index("agent_reasoning") < event_types.index("agent_message")
+
+
+@pytest.mark.asyncio
+async def test_reasoning_delta_method_change_flushes_current_buffer() -> None:
+    provider = CodexProvider(model="gpt-5.4")
+    agent = AgentDef(name="answerer", prompt="answer")
+    agent_message = SimpleNamespace(
+        type="agentMessage",
+        phase=SimpleNamespace(value="final_answer"),
+        text='{"answer": "42"}',
+    )
+    _FakeThread.next_events = [
+        SimpleNamespace(method="turn/started", payload=SimpleNamespace()),
+        SimpleNamespace(
+            method="item/reasoning/textDelta",
+            payload=SimpleNamespace(delta="private text"),
+        ),
+        SimpleNamespace(
+            method="item/reasoning/summaryTextDelta",
+            payload=SimpleNamespace(delta="summary text"),
+        ),
+        SimpleNamespace(
+            method="item/agentMessage/delta",
+            payload=SimpleNamespace(delta='{"answer": "42"}'),
+        ),
+        SimpleNamespace(
+            method="item/completed",
+            payload=SimpleNamespace(turn_id="turn-1", item=agent_message),
+        ),
+        SimpleNamespace(
+            method="turn/completed",
+            payload=SimpleNamespace(
+                turn=SimpleNamespace(status=SimpleNamespace(value="completed"))
+            ),
+        ),
+    ]
+    events: list[tuple[str, dict[str, Any]]] = []
+
+    await provider.execute(
+        agent=agent,
+        context={},
+        rendered_prompt="answer",
+        event_callback=lambda event_type, data: events.append((event_type, data)),
+    )
+
+    reasoning_contents = [
+        data["content"] for event_type, data in events if event_type == "agent_reasoning"
+    ]
+    event_types = [event_type for event_type, _ in events]
+    assert reasoning_contents == ["private text", "summary text"]
+    assert event_types.index("agent_reasoning") < event_types.index("agent_message")
+
+
+@pytest.mark.asyncio
+async def test_run_turn_awaits_cancelled_stream_task_before_close() -> None:
+    provider = CodexProvider(model="gpt-5.4")
+    agent = AgentDef(name="answerer", prompt="answer")
+    stream = _BlockingStream()
+    turn = _BlockingTurn(stream)
+    interrupt_signal = asyncio.Event()
+
+    async def interrupt_after_stream_starts() -> None:
+        await stream.started.wait()
+        interrupt_signal.set()
+
+    trigger = asyncio.create_task(interrupt_after_stream_starts())
+
+    result = await provider._run_turn(
+        thread=_BlockingThread(turn),
+        agent=agent,
+        rendered_prompt="answer",
+        model="gpt-5.4",
+        effort=None,
+        output_schema=None,
+        max_session_seconds=None,
+        interrupt_signal=interrupt_signal,
+        event_callback=None,
+    )
+    await trigger
+
+    assert result.partial is True
+    assert turn.interrupted is True
+    assert stream.closed is True
+
+
+@pytest.mark.asyncio
 async def test_resume_thread_id_is_used() -> None:
     provider = CodexProvider(model="gpt-5.4")
     provider.set_resume_session_ids({"answerer": "thread-old"})
@@ -252,11 +533,49 @@ def test_mcp_config_translates_agent_tool_filter() -> None:
     }
 
 
+def test_final_response_uses_stream_fallback_for_blank_completed_message() -> None:
+    completed_item = SimpleNamespace(
+        type="agentMessage",
+        phase=SimpleNamespace(value="final_answer"),
+        text="",
+    )
+
+    response = codex_module._final_response_from_items(
+        [completed_item],
+        '{"answer": "42"}',
+    )
+
+    assert response == '{"answer": "42"}'
+
+
+def test_build_agent_output_falls_back_to_streamed_json() -> None:
+    provider = CodexProvider(model="gpt-5.4")
+    agent = AgentDef(
+        name="answerer",
+        prompt="answer",
+        output={"answer": OutputField(type="string")},
+    )
+    result = codex_module._CodexRunResult(
+        turn_id="turn-1",
+        final_response="not json",
+        streamed_response='{"answer": "42"}',
+        items=[],
+        usage=None,
+        raw_turn=None,
+    )
+
+    output = provider._build_agent_output(result, agent, "gpt-5.4")
+
+    assert output.content == {"answer": "42"}
+    assert output.raw_response["selected_response"] == '{"answer": "42"}'
+
+
 @pytest.mark.asyncio
 async def test_validate_connection_uses_account_state() -> None:
     provider = CodexProvider(model="gpt-5.4")
 
     assert await provider.validate_connection() is True
+    assert _FakeAsyncCodex.last_account_refresh_token is True
 
 
 @pytest.mark.asyncio
@@ -268,6 +587,7 @@ async def test_validate_connection_accepts_chatgpt_account_requiring_openai_auth
     provider = CodexProvider(model="gpt-5.4")
 
     assert await provider.validate_connection() is True
+    assert _FakeAsyncCodex.last_account_refresh_token is True
 
 
 @pytest.mark.asyncio

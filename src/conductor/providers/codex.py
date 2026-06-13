@@ -45,6 +45,10 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_MODEL: Final[str] = "gpt-5.4"
 _TOOL_RESULT_PREVIEW_LEN: Final[int] = 500
+_REASONING_DELTA_METHODS: Final[frozenset[str]] = frozenset(
+    {"item/reasoning/textDelta", "item/reasoning/summaryTextDelta"}
+)
+_ReasoningKey = tuple[str, Any, Any]
 
 
 @dataclass(slots=True)
@@ -53,6 +57,7 @@ class _CodexRunResult:
 
     turn_id: str
     final_response: str
+    streamed_response: str
     items: list[Any]
     usage: Any | None
     raw_turn: Any | None
@@ -144,6 +149,14 @@ def _reasoning_effort_value(effort_option: Any) -> str:
     return str(_enum_value(getattr(effort_option, "reasoning_effort", effort_option)))
 
 
+def _reasoning_delta_key(method: str, payload: Any) -> _ReasoningKey:
+    """Group Codex reasoning deltas that belong to the same text stream."""
+    item_id = getattr(payload, "item_id", None)
+    if method == "item/reasoning/summaryTextDelta":
+        return (method, item_id, getattr(payload, "summary_index", None))
+    return (method, item_id, getattr(payload, "content_index", None))
+
+
 def _tool_name_from_item(item: Any) -> str | None:
     root = _thread_item(item)
     item_type = _item_type(root)
@@ -169,8 +182,10 @@ def _final_response_from_items(items: list[Any], fallback: str) -> str:
             continue
         phase = _enum_value(getattr(root, "phase", None))
         if phase == "final_answer":
-            return text
-        if phase is None and last_unknown_phase is None:
+            if text.strip():
+                return text
+            continue
+        if phase is None and text.strip() and last_unknown_phase is None:
             last_unknown_phase = text
     return last_unknown_phase or fallback
 
@@ -522,9 +537,24 @@ class CodexProvider(AgentProvider):
         usage: Any | None = None
         completed_turn: Any | None = None
         message_deltas: list[str] = []
+        reasoning_deltas: list[str] = []
+        reasoning_key: _ReasoningKey | None = None
         started_turn_emitted = False
         start_time = time.monotonic()
         next_event_task: asyncio.Task[Any] | None = asyncio.create_task(anext(stream))
+
+        def flush_reasoning() -> None:
+            nonlocal reasoning_key
+            if not reasoning_deltas:
+                reasoning_key = None
+                return
+            _safe_callback(
+                event_callback,
+                "agent_reasoning",
+                {"content": "".join(reasoning_deltas)},
+            )
+            reasoning_deltas.clear()
+            reasoning_key = None
 
         try:
             while True:
@@ -532,10 +562,13 @@ class CodexProvider(AgentProvider):
                     if next_event_task is not None:
                         next_event_task.cancel()
                     await turn.interrupt()
+                    flush_reasoning()
                     final_response = _final_response_from_items(items, "".join(message_deltas))
+                    streamed_response = "".join(message_deltas)
                     return _CodexRunResult(
                         turn_id=turn.id,
                         final_response=final_response,
+                        streamed_response=streamed_response,
                         items=items,
                         usage=usage,
                         raw_turn=completed_turn,
@@ -549,6 +582,7 @@ class CodexProvider(AgentProvider):
                     if next_event_task is not None:
                         next_event_task.cancel()
                     await turn.interrupt()
+                    flush_reasoning()
                     raise ProviderError(
                         f"Agent '{agent.name}' exceeded maximum session duration "
                         f"of {max_session_seconds:.0f}s",
@@ -571,34 +605,51 @@ class CodexProvider(AgentProvider):
 
                 payload = event.payload
                 method = getattr(event, "method", "")
+                is_reasoning_delta = method in _REASONING_DELTA_METHODS
 
                 if method == "turn/started" and not started_turn_emitted:
                     started_turn_emitted = True
                     _safe_callback(event_callback, "agent_turn_start", {"turn": 1})
                 elif method == "item/agentMessage/delta":
+                    flush_reasoning()
                     delta = getattr(payload, "delta", "")
                     if delta:
                         message_deltas.append(delta)
                         _safe_callback(event_callback, "agent_message", {"content": delta})
-                elif method in {"item/reasoning/textDelta", "item/reasoning/summaryTextDelta"}:
+                elif is_reasoning_delta:
                     delta = getattr(payload, "delta", "")
                     if delta:
-                        _safe_callback(event_callback, "agent_reasoning", {"content": delta})
+                        next_reasoning_key = _reasoning_delta_key(method, payload)
+                        if reasoning_key is not None and reasoning_key != next_reasoning_key:
+                            flush_reasoning()
+                        reasoning_key = next_reasoning_key
+                        reasoning_deltas.append(delta)
                 elif method == "item/started":
+                    flush_reasoning()
                     self._handle_item_started(payload, event_callback)
                 elif method == "item/completed":
                     if getattr(payload, "turn_id", None) == turn.id:
                         items.append(payload.item)
+                    if _tool_name_from_item(getattr(payload, "item", None)):
+                        flush_reasoning()
                     self._handle_item_completed(payload, event_callback)
                 elif method == "thread/tokenUsage/updated":
                     if getattr(payload, "turn_id", None) == turn.id:
                         usage = getattr(payload, "token_usage", None)
                 elif method == "turn/completed":
+                    flush_reasoning()
                     completed_turn = getattr(payload, "turn", None)
                     break
+            flush_reasoning()
         finally:
             if next_event_task is not None:
                 next_event_task.cancel()
+                try:
+                    await next_event_task
+                except (asyncio.CancelledError, StopAsyncIteration):
+                    pass
+                except Exception:
+                    logger.debug("Ignored Codex stream task error during cleanup", exc_info=True)
             await stream.aclose()
 
         if completed_turn is None:
@@ -614,10 +665,12 @@ class CodexProvider(AgentProvider):
             message = getattr(error, "message", None) or "Codex turn failed"
             raise ProviderError(message, provider_name="codex", is_retryable=False)
 
-        final_response = _final_response_from_items(items, "".join(message_deltas))
+        streamed_response = "".join(message_deltas)
+        final_response = _final_response_from_items(items, streamed_response)
         return _CodexRunResult(
             turn_id=turn.id,
             final_response=final_response,
+            streamed_response=streamed_response,
             items=items,
             usage=usage,
             raw_turn=completed_turn,
@@ -667,13 +720,26 @@ class CodexProvider(AgentProvider):
         model: str,
     ) -> AgentOutput:
         content: dict[str, Any]
+        selected_response = result.final_response
         if agent.output:
             try:
-                content = parse_json_output(result.final_response)
-            except ValidationError:
-                if not result.partial:
+                content = parse_json_output(selected_response)
+            except ValidationError as exc:
+                if (
+                    result.streamed_response
+                    and result.streamed_response != selected_response
+                ):
+                    try:
+                        selected_response = result.streamed_response
+                        content = parse_json_output(selected_response)
+                    except ValidationError as fallback_exc:
+                        if not result.partial:
+                            raise exc from fallback_exc
+                        content = {"result": result.final_response}
+                elif not result.partial:
                     raise
-                content = {"result": result.final_response}
+                else:
+                    content = {"result": result.final_response}
             if not result.partial:
                 validate_output(content, agent.output)
         else:
@@ -690,6 +756,8 @@ class CodexProvider(AgentProvider):
             "items": _dump_model(result.items),
             "usage": _dump_model(result.usage),
             "final_response": result.final_response,
+            "streamed_response": result.streamed_response,
+            "selected_response": selected_response,
         }
         return AgentOutput(
             content=content,

@@ -116,6 +116,17 @@ def parse_json_output(raw_response: str) -> dict[str, Any]:
 
     text = raw_response.strip()
 
+    # Native structured-output providers can return a raw JSON object whose
+    # string fields contain markdown fences. Parse that first so inner fences
+    # are treated as ordinary string content instead of extraction delimiters.
+    try:
+        result = json.loads(text)
+        if isinstance(result, dict):
+            return result
+        return {"result": result}
+    except json.JSONDecodeError:
+        pass
+
     # Try to extract JSON from markdown code blocks. Two-stage strategy:
     # 1. Non-greedy findall + try-parse each candidate (first valid wins).
     #    Handles the common case of multiple fenced blocks in one response
