@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from typing import Any
 
@@ -36,16 +37,19 @@ class _FakeReasoningEffort:
 
 
 class _FakeTurn:
-    def __init__(self, events: list[Any]) -> None:
+    def __init__(self, events: list[Any], event_delay: float = 0.0) -> None:
         self.id = "turn-1"
         self.thread_id = "thread-new"
         self._events = events
+        self._event_delay = event_delay
         self.interrupted = False
 
     async def interrupt(self) -> None:
         self.interrupted = True
 
     async def _iter_events(self):
+        if self._event_delay:
+            await asyncio.sleep(self._event_delay)
         for event in self._events:
             yield event
 
@@ -55,6 +59,7 @@ class _FakeTurn:
 
 class _FakeThread:
     last_turn_kwargs: dict[str, Any] = {}
+    event_delay: float = 0.0
 
     def __init__(self, thread_id: str = "thread-new") -> None:
         self.id = thread_id
@@ -97,7 +102,7 @@ class _FakeThread:
                 payload=SimpleNamespace(turn=SimpleNamespace(status=SimpleNamespace(value="completed"))),
             ),
         ]
-        return _FakeTurn(events)
+        return _FakeTurn(events, event_delay=self.event_delay)
 
     async def run(self, input_text: str, **kwargs: Any) -> Any:
         _FakeThread.last_turn_kwargs = {"input": input_text, **kwargs}
@@ -107,6 +112,7 @@ class _FakeThread:
 class _FakeAsyncCodex:
     last_thread_start_kwargs: dict[str, Any] = {}
     last_thread_resume_kwargs: dict[str, Any] = {}
+    account_response: Any = SimpleNamespace(requires_openai_auth=False)
 
     def __init__(self, config: Any | None = None) -> None:
         self.config = config
@@ -118,7 +124,7 @@ class _FakeAsyncCodex:
         return None
 
     async def account(self, *, refresh_token: bool = False) -> Any:
-        return SimpleNamespace(requires_openai_auth=False)
+        return self.account_response
 
     async def models(self) -> Any:
         return SimpleNamespace(
@@ -127,10 +133,10 @@ class _FakeAsyncCodex:
                     id="gpt-5.4",
                     model="gpt-5.4",
                     supported_reasoning_efforts=[
-                        SimpleNamespace(value="low"),
-                        SimpleNamespace(value="medium"),
-                        SimpleNamespace(value="high"),
-                        SimpleNamespace(value="xhigh"),
+                        SimpleNamespace(reasoning_effort=SimpleNamespace(value="low")),
+                        SimpleNamespace(reasoning_effort=SimpleNamespace(value="medium")),
+                        SimpleNamespace(reasoning_effort=SimpleNamespace(value="high")),
+                        SimpleNamespace(reasoning_effort=SimpleNamespace(value="xhigh")),
                     ],
                 )
             ]
@@ -147,6 +153,8 @@ class _FakeAsyncCodex:
 
 @pytest.fixture(autouse=True)
 def fake_codex_sdk(monkeypatch: pytest.MonkeyPatch) -> None:
+    _FakeAsyncCodex.account_response = SimpleNamespace(requires_openai_auth=False)
+    _FakeThread.event_delay = 0.0
     monkeypatch.setattr(codex_module, "CODEX_SDK_AVAILABLE", True)
     monkeypatch.setattr(codex_module, "AsyncCodex", _FakeAsyncCodex)
     monkeypatch.setattr(codex_module, "CodexConfig", _FakeCodexConfig)
@@ -184,6 +192,21 @@ async def test_execute_uses_native_output_schema_and_tracks_usage() -> None:
     assert ("agent_turn_start", {"turn": "awaiting_model"}) in events
     assert any(event_type == "agent_reasoning" for event_type, _ in events)
     assert any(event_type == "agent_message" for event_type, _ in events)
+
+
+@pytest.mark.asyncio
+async def test_execute_does_not_cancel_codex_stream_while_polling_interrupts() -> None:
+    _FakeThread.event_delay = 0.3
+    provider = CodexProvider(model="gpt-5.4", default_reasoning_effort="medium")
+    agent = AgentDef(
+        name="answerer",
+        prompt="answer",
+        output={"answer": OutputField(type="string")},
+    )
+
+    result = await provider.execute(agent=agent, context={}, rendered_prompt="answer")
+
+    assert result.content == {"answer": "42"}
 
 
 @pytest.mark.asyncio
@@ -231,6 +254,17 @@ def test_mcp_config_translates_agent_tool_filter() -> None:
 
 @pytest.mark.asyncio
 async def test_validate_connection_uses_account_state() -> None:
+    provider = CodexProvider(model="gpt-5.4")
+
+    assert await provider.validate_connection() is True
+
+
+@pytest.mark.asyncio
+async def test_validate_connection_accepts_chatgpt_account_requiring_openai_auth() -> None:
+    _FakeAsyncCodex.account_response = SimpleNamespace(
+        account=SimpleNamespace(email="user@example.com"),
+        requires_openai_auth=True,
+    )
     provider = CodexProvider(model="gpt-5.4")
 
     assert await provider.validate_connection() is True

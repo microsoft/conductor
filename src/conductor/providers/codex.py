@@ -140,6 +140,10 @@ def _codex_effort(effort: ReasoningEffort | None) -> Any:
     }[effort]
 
 
+def _reasoning_effort_value(effort_option: Any) -> str:
+    return str(_enum_value(getattr(effort_option, "reasoning_effort", effort_option)))
+
+
 def _tool_name_from_item(item: Any) -> str | None:
     root = _thread_item(item)
     item_type = _item_type(root)
@@ -312,8 +316,11 @@ class CodexProvider(AgentProvider):
     async def validate_connection(self) -> bool:
         try:
             async with self._new_codex() as codex:
-                account = await codex.account(refresh_token=False)
-                return not bool(getattr(account, "requires_openai_auth", False))
+                account_state = await codex.account(refresh_token=True)
+                return (
+                    getattr(account_state, "account", None) is not None
+                    or not bool(getattr(account_state, "requires_openai_auth", False))
+                )
         except Exception as exc:
             logger.debug("Codex validate_connection failed: %s", exc, exc_info=True)
             return False
@@ -517,10 +524,13 @@ class CodexProvider(AgentProvider):
         message_deltas: list[str] = []
         started_turn_emitted = False
         start_time = time.monotonic()
+        next_event_task: asyncio.Task[Any] | None = asyncio.create_task(anext(stream))
 
         try:
             while True:
                 if interrupt_signal is not None and interrupt_signal.is_set():
+                    if next_event_task is not None:
+                        next_event_task.cancel()
                     await turn.interrupt()
                     final_response = _final_response_from_items(items, "".join(message_deltas))
                     return _CodexRunResult(
@@ -536,6 +546,8 @@ class CodexProvider(AgentProvider):
                     max_session_seconds is not None
                     and time.monotonic() - start_time > max_session_seconds
                 ):
+                    if next_event_task is not None:
+                        next_event_task.cancel()
                     await turn.interrupt()
                     raise ProviderError(
                         f"Agent '{agent.name}' exceeded maximum session duration "
@@ -544,12 +556,18 @@ class CodexProvider(AgentProvider):
                         is_retryable=False,
                     )
 
-                try:
-                    event = await asyncio.wait_for(anext(stream), timeout=0.25)
-                except TimeoutError:
+                if next_event_task is None:
+                    next_event_task = asyncio.create_task(anext(stream))
+                done, _pending = await asyncio.wait({next_event_task}, timeout=0.25)
+                if not done:
                     continue
+
+                try:
+                    event = next_event_task.result()
                 except StopAsyncIteration:
                     break
+                finally:
+                    next_event_task = None
 
                 payload = event.payload
                 method = getattr(event, "method", "")
@@ -579,6 +597,8 @@ class CodexProvider(AgentProvider):
                     completed_turn = getattr(payload, "turn", None)
                     break
         finally:
+            if next_event_task is not None:
+                next_event_task.cancel()
             await stream.aclose()
 
         if completed_turn is None:
@@ -711,7 +731,7 @@ class CodexProvider(AgentProvider):
                     return
                 efforts = getattr(selected, "supported_reasoning_efforts", None)
                 supported = (
-                    tuple(str(_enum_value(effort_option)) for effort_option in efforts)
+                    tuple(_reasoning_effort_value(effort) for effort in efforts)
                     if efforts
                     else None
                 )
