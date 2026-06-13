@@ -1,0 +1,287 @@
+# Codex Repository Review Workflow
+#
+# This example is based on the repository's parallel research and dashboard
+# workflows, but uses provider: codex. It exercises:
+# - A deterministic script step with typed output
+# - A Codex planning agent
+# - A parallel Codex review group
+# - A final synthesis agent that aggregates parallel outputs
+#
+# Usage:
+#   uv run conductor run examples/codex-repo-review.yaml
+#   uv run conductor run examples/codex-repo-review.yaml --input focus="provider resume support"
+
+workflow:
+  name: codex-repo-review
+  description: Review selected Conductor implementation areas with Codex
+  version: "1.0.0"
+  entry_point: repo_snapshot
+
+  runtime:
+    provider:
+      name: codex
+      codex:
+        sandbox: read-only
+        approval_mode: auto_review
+    default_model: gpt-5.4
+    default_reasoning_effort: low
+
+  input:
+    focus:
+      type: string
+      required: false
+      default: "Codex provider implementation"
+      description: Review focus for the Codex agents
+
+  context:
+    mode: explicit
+
+  limits:
+    max_iterations: 10
+    timeout_seconds: 480
+
+  cost:
+    show_summary: true
+
+parallel:
+  - name: codex_parallel_review
+    description: Run independent Codex reviewers in parallel
+    agents:
+      - provider_contract_reviewer
+      - workflow_integration_reviewer
+    failure_mode: continue_on_error
+    routes:
+      - to: final_synthesis
+
+agents:
+  - name: repo_snapshot
+    type: script
+    description: Collect a small deterministic repository snapshot
+    command: python3
+    args:
+      - "-c"
+      - |
+        import json
+        import pathlib
+        import subprocess
+
+        files = [
+            "src/conductor/providers/codex.py",
+            "src/conductor/providers/factory.py",
+            "src/conductor/providers/registry.py",
+            "src/conductor/config/schema.py",
+            "tests/test_providers/test_codex.py",
+            "examples/codex-simple.yaml",
+        ]
+
+        def git(args):
+            try:
+                return subprocess.check_output(
+                    ["git", *args],
+                    text=True,
+                    stderr=subprocess.DEVNULL,
+                ).strip()
+            except Exception:
+                return ""
+
+        print(json.dumps({
+            "branch": git(["branch", "--show-current"]) or "unknown",
+            "head": git(["rev-parse", "--short", "HEAD"]) or "unknown",
+            "changed_files": [
+                line.strip()
+                for line in git(["status", "--short"]).splitlines()
+                if line.strip()
+            ],
+            "review_files": [
+                {"path": path, "exists": pathlib.Path(path).exists()}
+                for path in files
+            ],
+        }))
+    output:
+      branch:
+        type: string
+        description: Current git branch
+      head:
+        type: string
+        description: Current git commit
+      changed_files:
+        type: array
+        description: Current working tree changes
+      review_files:
+        type: array
+        description: Files the reviewers should inspect
+    routes:
+      - to: review_planner
+
+  - name: review_planner
+    description: Plan the Codex review areas
+    input:
+      - workflow.input.focus
+      - repo_snapshot.output
+    prompt: |
+      You are planning a focused code review for this Conductor repository.
+
+      Focus: {{ workflow.input.focus }}
+      Branch: {{ repo_snapshot.output.branch }}
+      Head: {{ repo_snapshot.output.head }}
+      Files to inspect:
+      {{ repo_snapshot.output.review_files | json }}
+
+      Create a concise review plan for two reviewers:
+      1. provider contract and runtime behavior
+      2. workflow/schema integration and examples
+
+      Keep the plan specific to the listed files.
+    output:
+      review_goal:
+        type: string
+        description: One-sentence review goal
+      provider_contract_questions:
+        type: array
+        items:
+          type: string
+        description: Questions for the provider contract reviewer
+      workflow_integration_questions:
+        type: array
+        items:
+          type: string
+        description: Questions for the workflow integration reviewer
+      success_criteria:
+        type: array
+        items:
+          type: string
+        description: Criteria for a successful review
+    routes:
+      - to: codex_parallel_review
+
+  - name: provider_contract_reviewer
+    description: Review Codex provider runtime behavior
+    input:
+      - workflow.input.focus
+      - repo_snapshot.output
+      - review_planner.output
+    prompt: |
+      You are reviewing provider contract behavior for Conductor.
+
+      Focus: {{ workflow.input.focus }}
+      Questions:
+      {{ review_planner.output.provider_contract_questions | json }}
+
+      Inspect these files in read-only mode:
+      - src/conductor/providers/codex.py
+      - src/conductor/providers/factory.py
+      - src/conductor/providers/capabilities.py
+      - tests/test_providers/test_codex.py
+
+      Report concrete findings. If you find no blocking issues, say so and
+      still include residual risks.
+    output:
+      findings:
+        type: array
+        items:
+          type: string
+        description: Concrete provider-contract findings
+      risk_level:
+        type: string
+        description: low, medium, or high
+      recommendation:
+        type: string
+        description: Recommended follow-up
+
+  - name: workflow_integration_reviewer
+    description: Review schema, checkpoint, and example integration
+    input:
+      - workflow.input.focus
+      - repo_snapshot.output
+      - review_planner.output
+    prompt: |
+      You are reviewing workflow integration behavior for Conductor.
+
+      Focus: {{ workflow.input.focus }}
+      Questions:
+      {{ review_planner.output.workflow_integration_questions | json }}
+
+      Inspect these files in read-only mode:
+      - src/conductor/config/schema.py
+      - src/conductor/providers/registry.py
+      - src/conductor/engine/checkpoint.py
+      - examples/codex-simple.yaml
+      - examples/codex-repo-review.yaml
+
+      Report concrete findings. If you find no blocking issues, say so and
+      still include residual risks.
+    output:
+      findings:
+        type: array
+        items:
+          type: string
+        description: Concrete workflow-integration findings
+      risk_level:
+        type: string
+        description: low, medium, or high
+      recommendation:
+        type: string
+        description: Recommended follow-up
+
+  - name: final_synthesis
+    description: Aggregate the parallel Codex review findings
+    input:
+      - workflow.input.focus
+      - repo_snapshot.output
+      - review_planner.output
+      - codex_parallel_review.outputs
+      - codex_parallel_review.errors
+    prompt: |
+      Synthesize the Codex review results into a compact final report.
+
+      Focus: {{ workflow.input.focus }}
+      Review goal: {{ review_planner.output.review_goal }}
+
+      {% if codex_parallel_review.errors %}
+      Some reviewers failed:
+      {% for agent, error in codex_parallel_review.errors.items() %}
+      - {{ agent }}: {{ error.message }}
+      {% endfor %}
+      {% endif %}
+
+      Provider contract reviewer:
+      {% if 'provider_contract_reviewer' in codex_parallel_review.outputs %}
+      {{ codex_parallel_review.outputs.provider_contract_reviewer | json }}
+      {% else %}
+      No provider contract output was available.
+      {% endif %}
+
+      Workflow integration reviewer:
+      {% if 'workflow_integration_reviewer' in codex_parallel_review.outputs %}
+      {{ codex_parallel_review.outputs.workflow_integration_reviewer | json }}
+      {% else %}
+      No workflow integration output was available.
+      {% endif %}
+
+      Produce an actionable report for a maintainer.
+    output:
+      summary:
+        type: string
+        description: Overall review summary
+      top_risks:
+        type: array
+        items:
+          type: string
+        description: Highest-priority risks or gaps
+      next_steps:
+        type: array
+        items:
+          type: string
+        description: Recommended next steps
+      ready_for_pr:
+        type: boolean
+        description: Whether the reviewed changes look ready for PR discussion
+    routes:
+      - to: $end
+
+output:
+  focus: "{{ workflow.input.focus }}"
+  summary: "{{ final_synthesis.output.summary }}"
+  top_risks: "{{ final_synthesis.output.top_risks | json }}"
+  next_steps: "{{ final_synthesis.output.next_steps | json }}"
+  ready_for_pr: "{{ final_synthesis.output.ready_for_pr }}"
