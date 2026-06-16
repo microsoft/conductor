@@ -1458,6 +1458,53 @@ class ProviderSettings(BaseModel):
         return nxt(self)
 
 
+class CheckpointConfig(BaseModel):
+    """Periodic checkpoint configuration (issue #244).
+
+    Opt-in automatic checkpointing at workflow step boundaries so a stalled or
+    hard-killed long-running workflow can be resumed without an exception ever
+    being raised. All fields default to "off" — the existing failure-only
+    checkpoint behavior is unchanged unless at least one trigger is set.
+
+    Checkpoints are evaluated at each step boundary (after a step's output is
+    committed to context, before the next step runs). There is no background
+    wall-clock timer: the engine only commits recoverable state at step
+    boundaries, so ``every_seconds`` is enforced as a throttle evaluated at
+    those boundaries.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    every_agent: bool = False
+    """Save a checkpoint at every step boundary (after each agent, parallel
+    group, for-each group, gate, script, set, or wait step completes)."""
+
+    every_seconds: int | None = Field(default=None, ge=1)
+    """Minimum seconds between periodic checkpoints, evaluated at step
+    boundaries.
+
+    A checkpoint is saved at the first boundary reached after this many seconds
+    have elapsed since the last checkpoint. ``None`` disables the time-based
+    trigger.
+
+    Note: if a single step runs longer than this interval, no checkpoint fires
+    during that step — the boundary checkpoint taken *before* the step started
+    is the recovery point.
+    """
+
+    keep_last: int = Field(default=5, ge=1, le=100)
+    """Number of recent periodic checkpoints to retain per run.
+
+    Older periodic checkpoints for the same run are deleted after each save.
+    Failure checkpoints are never rotated.
+    """
+
+    @property
+    def is_enabled(self) -> bool:
+        """Return True if any periodic checkpoint trigger is configured."""
+        return self.every_agent or self.every_seconds is not None
+
+
 class RuntimeConfig(BaseModel):
     """Provider and runtime configuration."""
 
@@ -1563,6 +1610,14 @@ class RuntimeConfig(BaseModel):
     match the supported prefix list; Copilot consults the SDK's advertised
     ``supported_reasoning_efforts`` (when available) and otherwise allows
     the request through to the SDK.
+    """
+
+    checkpoint: CheckpointConfig = Field(default_factory=CheckpointConfig)
+    """Periodic checkpoint configuration.
+
+    Opt-in automatic checkpointing at step boundaries so stalled or killed
+    long-running workflows stay resumable. Defaults to off (failure-only
+    checkpoints). See :class:`CheckpointConfig`.
     """
 
 

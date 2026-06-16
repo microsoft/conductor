@@ -55,6 +55,11 @@ workflow:
                                       # every provider-backed agent unless it
                                       # declares its own `reasoning.effort`.
                                       # See docs/configuration.md#reasoning-effort.
+
+    checkpoint:                       # Optional: periodic checkpoints (off by default)
+      every_agent: true               # Save after each step completes
+      every_seconds: 300              # OR/AND throttle by elapsed time
+      keep_last: 5                    # Retain this many periodic checkpoints per run
 ```
 
 **Workflow metadata** is included verbatim in the `workflow_started` event and lets downstream consumers (dashboards, queue runners, observability tools) adapt without parsing the YAML. CLI `--metadata key=value` flags merge on top of YAML metadata (CLI wins on conflicts).
@@ -944,6 +949,56 @@ workflow:
 - Workflow terminates when `timeout_seconds` is exceeded
 - Includes all agent execution time and overhead
 - `None` (default) means no timeout
+
+### Periodic Checkpoints
+
+By default Conductor writes a checkpoint **only when a workflow fails** with an
+exception. A long run that *stalls* (a provider hang, an MCP deadlock, a network
+blip, a sub-agent that never returns) produces no recoverable state, so
+`conductor resume` has nothing to resume.
+
+Enable **periodic checkpoints** to make stalled or hard-killed runs resumable:
+
+```yaml
+workflow:
+  runtime:
+    checkpoint:
+      every_agent: true     # Save a checkpoint after each step completes
+      every_seconds: 300    # OR: save at most every N seconds (throttle)
+      keep_last: 5          # Retain this many periodic checkpoints per run (1-100)
+```
+
+- **`every_agent`** (default `false`) — save at every step boundary (after each
+  agent, parallel group, for-each group, gate, script, set, or wait step).
+- **`every_seconds`** (default `null`) — save at the first step boundary reached
+  after this many seconds have elapsed since the last checkpoint. Set either
+  trigger, or both (a save fires when **either** condition is met).
+- **`keep_last`** (default `5`) — older periodic checkpoints for the run are
+  rotated away after each save; **failure checkpoints are never rotated**.
+
+How it works:
+
+- Checkpoints are evaluated at **step boundaries**, where all prior step outputs
+  are already committed. The checkpoint points at the step that was *about to
+  run*, so `conductor resume` continues forward and re-runs only that step.
+- There is no background timer. If a single step runs longer than
+  `every_seconds`, the recovery point is the boundary checkpoint taken **before**
+  that step started — which is exactly what you resume from after killing a
+  stalled run.
+- Periodic checkpoints are written by the **root** workflow only (sub-workflow
+  state is re-run from scratch on resume) and are **deleted automatically when
+  the run completes successfully**. On failure they are kept alongside the
+  on-failure checkpoint.
+
+Recover a stalled run by killing the process (e.g. `conductor stop` for a
+`--web-bg` run) and then:
+
+```bash
+conductor checkpoints workflow.yaml     # list checkpoints (Trigger column shows periodic/failure)
+conductor resume workflow.yaml          # resume from the latest checkpoint
+```
+
+See `examples/periodic-checkpoints.yaml` for a complete example.
 
 ## Tools
 

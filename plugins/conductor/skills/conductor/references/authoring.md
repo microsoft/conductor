@@ -20,6 +20,10 @@ workflow:
     max_agent_iterations: 50     # Max tool-use roundtrips per agent (1-500, optional)
     max_session_seconds: 120     # Wall-clock timeout per agent session (optional)
     default_reasoning_effort: medium  # Workflow-wide reasoning effort: low, medium, high, xhigh (optional)
+    checkpoint:                  # Periodic checkpoints for resumable stalled runs (optional, off by default)
+      every_agent: true          #   save after each step completes
+      every_seconds: 300         #   AND/OR throttle by elapsed seconds (a save fires when EITHER is met)
+      keep_last: 5               #   retain this many periodic checkpoints per run (1-100)
 
   input:                         # Define workflow inputs
     param_name:
@@ -61,6 +65,27 @@ workflow:
     # / .github/instructions/**/*.instructions.md with applyTo: "**") so target-repo
     # context is loaded at run time instead of being baked into the YAML.
 ```
+
+### Periodic Checkpoints (`runtime.checkpoint`)
+
+Off by default — Conductor otherwise checkpoints only on failure, so a *stalled*
+long run (provider hang, MCP deadlock, sub-agent that never returns) leaves
+nothing to `conductor resume`. Enable periodic checkpoints to make stalled or
+hard-killed runs recoverable:
+
+- `every_agent: true` — save at every step boundary.
+- `every_seconds: N` — save at the first boundary past N seconds since the last
+  save (set either trigger or both; a save fires when **either** is met).
+- `keep_last` (default 5) — rotate older periodic checkpoints for the run;
+  failure checkpoints are never rotated.
+
+Semantics: checkpoints are taken at step boundaries (all prior outputs
+committed) and point at the step *about to run*, so resume continues forward and
+re-runs only that step. No background timer — if a step runs longer than
+`every_seconds`, the recovery point is the boundary checkpoint taken before it
+started. Root workflow only (sub-workflows re-run from scratch on resume), and
+periodic checkpoints are deleted automatically on successful completion. See
+`examples/periodic-checkpoints.yaml`.
 
 ## Agent Definition
 

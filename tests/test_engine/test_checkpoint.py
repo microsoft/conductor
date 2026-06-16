@@ -696,3 +696,231 @@ class TestSaveLoadRoundTrip:
         assert saved is not None
         cp = CheckpointManager.load_checkpoint(saved)
         assert cp.workflow_hash == expected_hash
+
+
+# ---------------------------------------------------------------------------
+# Periodic checkpoint trigger tests (issue #244)
+# ---------------------------------------------------------------------------
+
+
+class TestPeriodicCheckpointTrigger:
+    """save_checkpoint with error=None and trigger='periodic'."""
+
+    def test_periodic_save_has_null_failure_fields(self, tmp_path: Path) -> None:
+        wf = _write_workflow(tmp_path)
+        ctx = _make_context({"q": "hi"}, {"a": {"x": 1}})
+        limits = _make_limits(2, 10, ["a", "b"])
+
+        with patch.object(CheckpointManager, "get_checkpoints_dir", return_value=tmp_path):
+            path = CheckpointManager.save_checkpoint(
+                wf, ctx, limits, "c", None, {"q": "hi"}, trigger="periodic"
+            )
+
+        assert path is not None
+        data = json.loads(path.read_text())
+        assert data["trigger"] == "periodic"
+        assert data["failure"]["error_type"] is None
+        assert data["failure"]["message"] is None
+        # The about-to-run agent is still recorded so resume can continue.
+        assert data["failure"]["agent"] == "c"
+        assert data["current_agent"] == "c"
+
+    def test_default_trigger_is_failure(self, tmp_path: Path) -> None:
+        wf = _write_workflow(tmp_path)
+        ctx = _make_context()
+        limits = _make_limits()
+        with patch.object(CheckpointManager, "get_checkpoints_dir", return_value=tmp_path):
+            path = CheckpointManager.save_checkpoint(wf, ctx, limits, "a", RuntimeError("boom"), {})
+        assert path is not None
+        assert json.loads(path.read_text())["trigger"] == "failure"
+
+    def test_periodic_trigger_round_trips(self, tmp_path: Path) -> None:
+        wf = _write_workflow(tmp_path)
+        ctx = _make_context()
+        limits = _make_limits()
+        with patch.object(CheckpointManager, "get_checkpoints_dir", return_value=tmp_path):
+            path = CheckpointManager.save_checkpoint(
+                wf, ctx, limits, "a", None, {}, trigger="periodic"
+            )
+        assert path is not None
+        assert CheckpointManager.load_checkpoint(path).trigger == "periodic"
+
+    def test_load_defaults_trigger_for_legacy_checkpoint(self, tmp_path: Path) -> None:
+        """Checkpoints written before the trigger field load as 'failure'."""
+        wf = _write_workflow(tmp_path)
+        ctx = _make_context()
+        limits = _make_limits()
+        with patch.object(CheckpointManager, "get_checkpoints_dir", return_value=tmp_path):
+            path = CheckpointManager.save_checkpoint(wf, ctx, limits, "a", RuntimeError("x"), {})
+        assert path is not None
+        data = json.loads(path.read_text())
+        del data["trigger"]
+        path.write_text(json.dumps(data))
+        assert CheckpointManager.load_checkpoint(path).trigger == "failure"
+
+
+# ---------------------------------------------------------------------------
+# Rotation / per-run cleanup tests (issue #244)
+# ---------------------------------------------------------------------------
+
+
+def _write_checkpoint_file(
+    directory: Path,
+    name: str,
+    created_at: str,
+    *,
+    run_id: str,
+    trigger: str,
+    workflow_path: str = "/wf.yaml",
+) -> Path:
+    """Write a valid checkpoint JSON with controllable trigger/run_id/created_at."""
+    is_failure = trigger == "failure"
+    data = {
+        "version": 1,
+        "workflow_path": workflow_path,
+        "workflow_hash": "sha256:abc",
+        "created_at": created_at,
+        "trigger": trigger,
+        "failure": {
+            "error_type": "E" if is_failure else None,
+            "message": "m" if is_failure else None,
+            "agent": "a",
+            "iteration": 0,
+        },
+        "current_agent": "a",
+        "context": {
+            "workflow_inputs": {},
+            "agent_outputs": {},
+            "current_iteration": 0,
+            "execution_history": [],
+        },
+        "limits": {"current_iteration": 0, "max_iterations": 10, "execution_history": []},
+        "inputs": {},
+        "copilot_session_ids": {},
+        "run_id": run_id,
+    }
+    f = directory / name
+    f.write_text(json.dumps(data))
+    return f
+
+
+class TestRotatePeriodicCheckpoints:
+    def _seed(self, directory: Path, *, run_id: str, count: int, trigger: str = "periodic") -> None:
+        for i in range(count):
+            _write_checkpoint_file(
+                directory,
+                f"workflow-2026010{i}-100000-{i:02d}.json",
+                f"2026-01-0{i}T10:00:00.{i:06d}Z",
+                run_id=run_id,
+                trigger=trigger,
+            )
+
+    def test_keeps_newest_keep_last(self, tmp_path: Path) -> None:
+        wf = _write_workflow(tmp_path, "name: wf\n")
+        self._seed(tmp_path, run_id="r1", count=5)
+
+        with patch.object(CheckpointManager, "get_checkpoints_dir", return_value=tmp_path):
+            CheckpointManager.rotate_periodic_checkpoints(wf, "r1", keep_last=2)
+            remaining = CheckpointManager.list_checkpoints(wf)
+
+        assert len(remaining) == 2
+        # Newest two by created_at are kept.
+        kept = sorted(c.created_at for c in remaining)
+        assert kept == ["2026-01-03T10:00:00.000003Z", "2026-01-04T10:00:00.000004Z"]
+
+    def test_never_deletes_failure_checkpoints(self, tmp_path: Path) -> None:
+        wf = _write_workflow(tmp_path, "name: wf\n")
+        self._seed(tmp_path, run_id="r1", count=4)
+        _write_checkpoint_file(
+            tmp_path,
+            "workflow-20260105-100000-ff.json",
+            "2026-01-05T10:00:00Z",
+            run_id="r1",
+            trigger="failure",
+        )
+
+        with patch.object(CheckpointManager, "get_checkpoints_dir", return_value=tmp_path):
+            CheckpointManager.rotate_periodic_checkpoints(wf, "r1", keep_last=1)
+            remaining = CheckpointManager.list_checkpoints(wf)
+
+        triggers = sorted(c.trigger for c in remaining)
+        assert triggers == ["failure", "periodic"]  # 1 periodic kept + the failure
+
+    def test_does_not_touch_other_runs(self, tmp_path: Path) -> None:
+        wf = _write_workflow(tmp_path, "name: wf\n")
+        self._seed(tmp_path, run_id="r1", count=3)
+        _write_checkpoint_file(
+            tmp_path,
+            "workflow-20260109-100000-o1.json",
+            "2026-01-09T10:00:00Z",
+            run_id="other",
+            trigger="periodic",
+        )
+
+        with patch.object(CheckpointManager, "get_checkpoints_dir", return_value=tmp_path):
+            CheckpointManager.rotate_periodic_checkpoints(wf, "r1", keep_last=1)
+            remaining = CheckpointManager.list_checkpoints(wf)
+
+        run_ids = sorted(c.run_id for c in remaining)
+        assert run_ids == ["other", "r1"]  # other run untouched, 1 r1 kept
+
+    def test_keep_last_zero_is_noop(self, tmp_path: Path) -> None:
+        wf = _write_workflow(tmp_path, "name: wf\n")
+        self._seed(tmp_path, run_id="r1", count=3)
+
+        with patch.object(CheckpointManager, "get_checkpoints_dir", return_value=tmp_path):
+            CheckpointManager.rotate_periodic_checkpoints(wf, "r1", keep_last=0)
+            remaining = CheckpointManager.list_checkpoints(wf)
+
+        assert len(remaining) == 3
+
+
+class TestCleanupPeriodicForRun:
+    def test_removes_all_periodic_for_run_keeps_failure(self, tmp_path: Path) -> None:
+        wf = _write_workflow(tmp_path, "name: wf\n")
+        for i in range(3):
+            _write_checkpoint_file(
+                tmp_path,
+                f"workflow-2026020{i}-100000-{i:02d}.json",
+                f"2026-02-0{i}T10:00:00.{i:06d}Z",
+                run_id="r1",
+                trigger="periodic",
+            )
+        _write_checkpoint_file(
+            tmp_path,
+            "workflow-20260205-100000-ff.json",
+            "2026-02-05T10:00:00Z",
+            run_id="r1",
+            trigger="failure",
+        )
+
+        with patch.object(CheckpointManager, "get_checkpoints_dir", return_value=tmp_path):
+            CheckpointManager.cleanup_periodic_for_run(wf, "r1")
+            remaining = CheckpointManager.list_checkpoints(wf)
+
+        assert len(remaining) == 1
+        assert remaining[0].trigger == "failure"
+
+    def test_other_run_periodic_untouched(self, tmp_path: Path) -> None:
+        wf = _write_workflow(tmp_path, "name: wf\n")
+        _write_checkpoint_file(
+            tmp_path,
+            "workflow-20260201-100000-a.json",
+            "2026-02-01T10:00:00Z",
+            run_id="r1",
+            trigger="periodic",
+        )
+        _write_checkpoint_file(
+            tmp_path,
+            "workflow-20260202-100000-b.json",
+            "2026-02-02T10:00:00Z",
+            run_id="r2",
+            trigger="periodic",
+        )
+
+        with patch.object(CheckpointManager, "get_checkpoints_dir", return_value=tmp_path):
+            CheckpointManager.cleanup_periodic_for_run(wf, "r1")
+            remaining = CheckpointManager.list_checkpoints(wf)
+
+        assert len(remaining) == 1
+        assert remaining[0].run_id == "r2"

@@ -1,0 +1,98 @@
+# Periodic / Milestone Checkpoints
+#
+# This example demonstrates opt-in periodic checkpointing (issue #244) so that
+# a long-running workflow that stalls or is hard-killed stays recoverable —
+# without ever raising an exception.
+#
+# By default Conductor only checkpoints on failure. The `runtime.checkpoint`
+# block below saves a resumable checkpoint at each step boundary, so if any
+# stage hangs you can kill the run and pick up where you left off.
+#
+# It shows:
+# - runtime.checkpoint with every_agent + every_seconds + keep_last
+# - a multi-stage pipeline where each stage is an expensive, long-running step
+#
+# Usage:
+#   conductor run examples/periodic-checkpoints.yaml --input topic="vector databases"
+#
+# If the run stalls, kill it, then:
+#   conductor checkpoints examples/periodic-checkpoints.yaml   # inspect (Trigger column)
+#   conductor resume examples/periodic-checkpoints.yaml        # continue from the last step
+
+workflow:
+  name: periodic-checkpoints
+  description: A multi-stage research pipeline with periodic checkpoints
+  version: "1.0.0"
+  entry_point: research
+
+  runtime:
+    provider: copilot
+    checkpoint:
+      # Save a checkpoint after each step completes. Combine with every_seconds
+      # to also bound how frequently checkpoints are written for fast steps.
+      every_agent: true
+      # Save at most once every 5 minutes (a save fires when EITHER trigger is
+      # satisfied). Useful when some steps are quick and others run for hours.
+      every_seconds: 300
+      # Keep only the 5 most recent periodic checkpoints for the run; failure
+      # checkpoints are never rotated.
+      keep_last: 5
+
+  input:
+    topic:
+      type: string
+      required: true
+      description: The topic to research and summarize
+
+  limits:
+    max_iterations: 20
+
+agents:
+  - name: research
+    description: Gather raw findings about the topic (long-running)
+    prompt: |
+      Research the topic below and produce a thorough list of findings,
+      claims, and sources.
+
+      Topic: {{ workflow.input.topic }}
+    output:
+      findings:
+        type: string
+        description: Raw research findings
+    routes:
+      - to: analyze
+
+  - name: analyze
+    description: Analyze the findings and extract key themes
+    prompt: |
+      Analyze the following research findings and extract the key themes,
+      tensions, and open questions.
+
+      Findings:
+      {{ research.output.findings }}
+    output:
+      themes:
+        type: string
+        description: Key themes and analysis
+    routes:
+      - to: summarize
+
+  - name: summarize
+    description: Write a concise summary for the reader
+    prompt: |
+      Write a concise, well-structured summary of the topic for a technical
+      reader, grounded in the analysis below.
+
+      Topic: {{ workflow.input.topic }}
+
+      Analysis:
+      {{ analyze.output.themes }}
+    output:
+      summary:
+        type: string
+        description: Final summary
+    routes:
+      - to: $end
+
+output:
+  summary: "{{ summarize.output.summary }}"

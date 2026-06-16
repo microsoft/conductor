@@ -421,6 +421,10 @@ class WorkflowEngine:
         # Checkpoint tracking
         self._current_agent_name: str | None = None
         self._last_checkpoint_path: Path | None = None
+        # Monotonic timestamp of the last periodic checkpoint (issue #244),
+        # used to evaluate the runtime.checkpoint.every_seconds throttle at
+        # step boundaries. None until the first periodic checkpoint is saved.
+        self._last_periodic_checkpoint_time: float | None = None
 
         # Sub-workflow depth tracking
         self._subworkflow_depth = _subworkflow_depth
@@ -1618,7 +1622,10 @@ class WorkflowEngine:
         # Execute on_start hook
         self._execute_hook("on_start")
 
-        return await self._execute_loop(current_agent_name)
+        result = await self._execute_loop(current_agent_name)
+        # Successful completion: this run's periodic checkpoints are now stale.
+        self._cleanup_periodic_checkpoints_on_success()
+        return result
 
     async def resume(self, current_agent_name: str) -> dict[str, Any]:
         """Resume workflow execution from a specific agent.
@@ -1645,7 +1652,10 @@ class WorkflowEngine:
         # Execute on_start hook (signals resume)
         self._execute_hook("on_start")
 
-        return await self._execute_loop(current_agent_name)
+        result = await self._execute_loop(current_agent_name)
+        # Successful completion: this run's periodic checkpoints are now stale.
+        self._cleanup_periodic_checkpoints_on_success()
+        return result
 
     def set_context(self, context: WorkflowContext) -> None:
         """Replace the engine's workflow context with a restored one.
@@ -1681,18 +1691,25 @@ class WorkflowEngine:
         """
         self.limits = limits
 
-    def _save_checkpoint_on_failure(self, error: BaseException) -> None:
-        """Attempt to save a checkpoint after a failure.
+    def _write_checkpoint(self, error: BaseException | None, trigger: str) -> Path | None:
+        """Serialize the current workflow state to a checkpoint file.
 
-        This method never raises — on failure it logs a warning so the
-        original error is not masked.
+        Shared by the on-failure and periodic checkpoint paths. Collects
+        provider session IDs (for Copilot session resume) and delegates to
+        :meth:`CheckpointManager.save_checkpoint`, which never raises.
 
         Args:
-            error: The exception that triggered the checkpoint save.
+            error: The exception that triggered the save, or ``None`` for a
+                periodic checkpoint.
+            trigger: ``"failure"``, ``"periodic"``, or ``"interrupt"``.
+
+        Returns:
+            Path to the saved checkpoint, or ``None`` when no ``workflow_path``
+            is set or saving failed.
         """
         if self.workflow_path is None:
             logger.debug("No workflow_path set; skipping checkpoint save")
-            return
+            return None
 
         # Collect session IDs from provider if available
         copilot_session_ids: dict[str, str] | None = None
@@ -1705,7 +1722,7 @@ class WorkflowEngine:
                     copilot_session_ids = p.get_session_ids()  # type: ignore[union-attr]
                     break
 
-        checkpoint_path = CheckpointManager.save_checkpoint(
+        return CheckpointManager.save_checkpoint(
             workflow_path=self.workflow_path,
             context=self.context,
             limits=self.limits,
@@ -1717,7 +1734,19 @@ class WorkflowEngine:
             instructions_preamble=self._instructions_preamble,
             run_id=self._run_context.run_id,
             event_log_path=self._run_context.log_file,
+            trigger=trigger,
         )
+
+    def _save_checkpoint_on_failure(self, error: BaseException) -> None:
+        """Attempt to save a checkpoint after a failure.
+
+        This method never raises — on failure it logs a warning so the
+        original error is not masked.
+
+        Args:
+            error: The exception that triggered the checkpoint save.
+        """
+        checkpoint_path = self._write_checkpoint(error, trigger="failure")
         self._last_checkpoint_path = checkpoint_path
         if checkpoint_path is not None:
             self._emit(
@@ -1726,8 +1755,86 @@ class WorkflowEngine:
                     "path": str(checkpoint_path),
                     "agent_name": self._current_agent_name,
                     "error_type": type(error).__name__,
+                    "trigger": "failure",
                 },
             )
+
+    def _maybe_save_periodic_checkpoint(self) -> None:
+        """Save a periodic checkpoint at a step boundary, if configured.
+
+        Called at the top of the execution loop, where all prior step outputs
+        are already committed to ``self.context`` and ``self._current_agent_name``
+        is the step *about to run* — so a resume from this checkpoint re-runs
+        exactly that step with all prior context restored (identical semantics
+        to a failure checkpoint).
+
+        Opt-in via ``runtime.checkpoint`` and **root engine only**: sub-workflow
+        state is not independently resumable (the parent re-runs the child from
+        scratch). The very first boundary of a fresh run is skipped (empty
+        context). Never raises — a failed periodic save must not disrupt the
+        running workflow. See issue #244.
+        """
+        cfg = self.config.workflow.runtime.checkpoint
+        if not cfg.is_enabled:
+            return
+        if self._subworkflow_depth > 0:
+            return
+        # Skip the first boundary of a fresh run (nothing executed yet). Resume
+        # enters with current_iteration > 0, so its first boundary is allowed.
+        if self.limits.current_iteration == 0:
+            return
+
+        now = _time.monotonic()
+        should_save = cfg.every_agent
+        if not should_save and cfg.every_seconds is not None:
+            last = self._last_periodic_checkpoint_time
+            if last is None or (now - last) >= cfg.every_seconds:
+                should_save = True
+        if not should_save:
+            return
+
+        try:
+            checkpoint_path = self._write_checkpoint(None, trigger="periodic")
+        except Exception:
+            logger.warning("Periodic checkpoint save raised unexpectedly", exc_info=True)
+            return
+
+        if checkpoint_path is None:
+            return
+
+        self._last_checkpoint_path = checkpoint_path
+        self._last_periodic_checkpoint_time = now
+        self._emit(
+            "checkpoint_saved",
+            {
+                "path": str(checkpoint_path),
+                "agent_name": self._current_agent_name,
+                "error_type": None,
+                "trigger": "periodic",
+            },
+        )
+        if self.workflow_path is not None:
+            CheckpointManager.rotate_periodic_checkpoints(
+                self.workflow_path,
+                self._run_context.run_id,
+                cfg.keep_last,
+            )
+
+    def _cleanup_periodic_checkpoints_on_success(self) -> None:
+        """Delete this run's periodic checkpoints after a successful run.
+
+        Periodic checkpoints are stale recovery points once the workflow has
+        completed cleanly. Root engine only; best-effort. Not called on
+        failure, so periodic checkpoints remain alongside the failure
+        checkpoint for diagnosis if the run did not complete.
+        """
+        if self._subworkflow_depth > 0:
+            return
+        if not self.config.workflow.runtime.checkpoint.is_enabled:
+            return
+        if self.workflow_path is None:
+            return
+        CheckpointManager.cleanup_periodic_for_run(self.workflow_path, self._run_context.run_id)
 
     def _get_top_level_agent_names(self) -> list[str]:
         """Return names of top-level agents (excluding parallel/for-each nested agents).
@@ -2249,6 +2356,12 @@ class WorkflowEngine:
 
                 while True:
                     self._current_agent_name = current_agent_name
+
+                    # Periodic checkpoint at this step boundary (opt-in,
+                    # root engine only). All prior step outputs are committed
+                    # to context and current_agent_name is the step about to
+                    # run, so a resume re-runs exactly this step. See issue #244.
+                    self._maybe_save_periodic_checkpoint()
 
                     # Try to find agent, parallel group, or for-each group
                     agent = self._find_agent(current_agent_name)

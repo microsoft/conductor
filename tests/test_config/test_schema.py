@@ -7,6 +7,7 @@ from pydantic import ValidationError
 
 from conductor.config.schema import (
     AgentDef,
+    CheckpointConfig,
     ContextConfig,
     ForEachDef,
     GateOption,
@@ -225,6 +226,55 @@ class TestLimitsConfig:
         # No upper bound - large values are allowed (unlimited when None)
         config = LimitsConfig(timeout_seconds=3601)
         assert config.timeout_seconds == 3601
+
+
+class TestCheckpointConfig:
+    """Tests for CheckpointConfig model (issue #244)."""
+
+    def test_default_values_disabled(self) -> None:
+        """Periodic checkpoints are off by default to preserve behavior."""
+        config = CheckpointConfig()
+        assert config.every_agent is False
+        assert config.every_seconds is None
+        assert config.keep_last == 5
+        assert config.is_enabled is False
+
+    def test_is_enabled_with_every_agent(self) -> None:
+        assert CheckpointConfig(every_agent=True).is_enabled is True
+
+    def test_is_enabled_with_every_seconds(self) -> None:
+        assert CheckpointConfig(every_seconds=300).is_enabled is True
+
+    def test_every_seconds_must_be_positive(self) -> None:
+        with pytest.raises(ValidationError):
+            CheckpointConfig(every_seconds=0)
+
+    def test_keep_last_bounds(self) -> None:
+        with pytest.raises(ValidationError):
+            CheckpointConfig(keep_last=0)
+        with pytest.raises(ValidationError):
+            CheckpointConfig(keep_last=101)
+        assert CheckpointConfig(keep_last=100).keep_last == 100
+
+    def test_extra_fields_forbidden(self) -> None:
+        """Typos like every_second should be rejected, not silently ignored."""
+        with pytest.raises(ValidationError):
+            CheckpointConfig(every_second=1)  # type: ignore[call-arg]
+
+    def test_runtime_config_default_checkpoint(self) -> None:
+        """RuntimeConfig exposes a disabled checkpoint config by default."""
+        runtime = RuntimeConfig()
+        assert isinstance(runtime.checkpoint, CheckpointConfig)
+        assert runtime.checkpoint.is_enabled is False
+
+    def test_runtime_config_parses_checkpoint_block(self) -> None:
+        runtime = RuntimeConfig(
+            checkpoint={"every_agent": True, "every_seconds": 120, "keep_last": 3}
+        )
+        assert runtime.checkpoint.every_agent is True
+        assert runtime.checkpoint.every_seconds == 120
+        assert runtime.checkpoint.keep_last == 3
+        assert runtime.checkpoint.is_enabled is True
 
 
 class TestHooksConfig:

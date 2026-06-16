@@ -547,6 +547,38 @@ class TestCheckpointsCommand:
         assert "TimeoutError" in result.output
         assert "2 checkpoint(s)" in result.output
 
+    def test_checkpoints_shows_periodic_trigger(self, tmp_path: Path) -> None:
+        """Periodic checkpoints render a 'periodic' trigger and no error type."""
+        checkpoints = [
+            CheckpointData(
+                version=1,
+                workflow_path="/path/to/workflow-a.yaml",
+                workflow_hash="sha256:abc",
+                created_at="2026-02-24T15:30:00+00:00",
+                failure={
+                    "error_type": None,
+                    "message": None,
+                    "agent": "researcher",
+                    "iteration": 2,
+                },
+                inputs={},
+                current_agent="researcher",
+                context={},
+                limits={},
+                file_path=Path("/tmp/conductor/checkpoints/workflow-a-20260224-153000.json"),
+                trigger="periodic",
+            ),
+        ]
+
+        with patch.object(CheckpointManager, "list_checkpoints", return_value=checkpoints):
+            result = runner.invoke(app, ["checkpoints"])
+
+        assert result.exit_code == 0
+        assert "periodic" in result.output
+        assert "researcher" in result.output
+        # No error type for a periodic checkpoint — rendered as an em dash.
+        assert "—" in result.output
+
     def test_checkpoints_filtered_by_workflow(self, tmp_path: Path) -> None:
         """Test filtering checkpoints by workflow path."""
         wf_path = _write_workflow(tmp_path, "my-workflow")
