@@ -147,9 +147,7 @@ export interface NodeData {
   dialog_awaiting_response?: boolean;
   // Validator-specific (issue #220)
   validator_state?: 'running' | 'passed' | 'failed' | 'error';
-  validator_passed?: boolean;
   validator_issues?: string[];
-  validator_errored?: boolean;
   validator_will_retry?: boolean;
   /** Number of times the validator has run for this node (1 normally). */
   validator_attempts?: number;
@@ -1975,7 +1973,7 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     const verdict = data.errored ? 'error' : data.passed ? 'passed' : 'failed';
     const entry: ActivityEntry = {
       type: 'validator-complete',
-      icon: data.passed ? '✅' : data.errored ? '⚠️' : '❌',
+      icon: data.errored ? '⚠️' : data.passed ? '✅' : '❌',
       label: 'validator',
       text: data.errored
         ? 'validation error (treated as pass)'
@@ -1990,9 +1988,7 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     } else {
       const nd = ensureNode(t.nodes, data.agent_name);
       nd.validator_state = verdict;
-      nd.validator_passed = data.passed;
       nd.validator_issues = data.issues ?? [];
-      nd.validator_errored = data.errored ?? false;
       nd.validator_cost_usd = data.cost_usd ?? null;
       nd.validator_model = data.model ?? nd.validator_model ?? null;
     }
@@ -2003,11 +1999,16 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     const data = _data as unknown as AgentValidationFailedData;
     const itemKey = (_data as Record<string, unknown>).item_key as string | undefined;
     const t = activeTarget(state, _data);
+    const rerunErrored = data.rerun_errored === true;
     const entry: ActivityEntry = {
       type: 'validation-failed',
-      icon: '❌',
+      icon: rerunErrored ? '⚠️' : '❌',
       label: 'validator',
-      text: data.will_retry ? 're-running once with feedback' : 'validation failed (no retry)',
+      text: rerunErrored
+        ? 're-run failed — keeping original output'
+        : data.will_retry
+          ? 're-running once with feedback'
+          : 'validation failed (no retry)',
       detail: data.issues && data.issues.length ? data.issues.join('\n') : null,
     };
     addActivity(t.nodes, data.agent_name, entry);
@@ -2017,12 +2018,20 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
       const nd = ensureNode(t.nodes, data.agent_name);
       nd.validator_will_retry = data.will_retry;
       nd.validator_issues = data.issues ?? [];
+      // A failed feedback re-run leaves the node in an error state (the
+      // original failing output was kept).
+      if (rerunErrored) nd.validator_state = 'error';
     }
     replaceNode(t.nodes, data.agent_name);
   },
 };
 
 // --- Build log entries from events ---
+
+/** Label an event source as ``agent`` or ``agent[item_key]`` (for-each). */
+function eventSource(d: Record<string, unknown>): string {
+  return d.item_key != null ? `${d.agent_name}[${d.item_key}]` : String(d.agent_name);
+}
 
 function buildLogEntry(event: WorkflowEvent): LogEntry | null {
   const ts = event.timestamp;
@@ -2174,12 +2183,12 @@ function buildLogEntry(event: WorkflowEvent): LogEntry | null {
       return { timestamp: ts, level: 'success', source: String(d.agent_name), message: `Dialog completed (${d.turn_count || 0} messages)` };
 
     case 'agent_validator_start': {
-      const src = d.item_key != null ? `${d.agent_name}[${d.item_key}]` : String(d.agent_name);
+      const src = eventSource(d);
       return { timestamp: ts, level: 'info', source: src, message: 'Validating output…' };
     }
 
     case 'agent_validator_complete': {
-      const src = d.item_key != null ? `${d.agent_name}[${d.item_key}]` : String(d.agent_name);
+      const src = eventSource(d);
       if (d.errored) {
         return { timestamp: ts, level: 'warning', source: src, message: 'Validator error — treated as pass' };
       }
@@ -2191,7 +2200,10 @@ function buildLogEntry(event: WorkflowEvent): LogEntry | null {
     }
 
     case 'agent_validation_failed': {
-      const src = d.item_key != null ? `${d.agent_name}[${d.item_key}]` : String(d.agent_name);
+      const src = eventSource(d);
+      if (d.rerun_errored) {
+        return { timestamp: ts, level: 'error', source: src, message: 'Validation re-run failed — keeping original output' };
+      }
       const action = d.will_retry ? 're-running once with feedback' : 'no retry';
       return { timestamp: ts, level: 'warning', source: src, message: `Validation failed — ${action}` };
     }

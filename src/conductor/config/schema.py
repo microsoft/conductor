@@ -464,6 +464,8 @@ class ValidatorConfig(BaseModel):
           max_retries: 1
     """
 
+    model_config = ConfigDict(extra="forbid")
+
     criteria: str
     """User-defined rubric the primary output is checked against.
 
@@ -491,7 +493,11 @@ class ValidatorConfig(BaseModel):
     @field_validator("criteria")
     @classmethod
     def validate_criteria(cls, v: str) -> str:
-        """Ensure criteria is non-empty after stripping whitespace."""
+        """Reject criteria that is empty or whitespace-only.
+
+        The original (unstripped) value is returned so multi-line rubric
+        formatting is preserved.
+        """
         if not v or not v.strip():
             raise ValueError("validator 'criteria' must be a non-empty string")
         return v

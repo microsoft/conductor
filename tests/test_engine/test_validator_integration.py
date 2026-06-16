@@ -9,6 +9,7 @@ can serve both by inspecting ``agent.output``. No SDK or network needed.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
@@ -29,6 +30,8 @@ from conductor.config.schema import (
 )
 from conductor.engine.workflow import WorkflowEngine
 from conductor.events import WorkflowEvent, WorkflowEventEmitter
+from conductor.executor.agent import AgentExecutor
+from conductor.providers.base import AgentOutput
 from conductor.providers.copilot import CopilotProvider
 
 
@@ -367,3 +370,157 @@ class TestValidatorForEach:
         rows = _validator_rows(engine)
         assert "process[0] (validator)" in rows
         assert "process[1] (validator)" in rows
+
+
+class TestValidatorCostAndFailurePaths:
+    """Direct ``_apply_validator`` tests for cost attribution and re-run failure.
+
+    These call the helper directly with a provider whose ``execute`` returns
+    explicit token counts, because the shared ``mock_handler`` path yields
+    ``usage=None`` (all-zero tokens) and so cannot verify cost attribution.
+    """
+
+    def _engine_and_executor(
+        self, exec_fn: Any, *, timeout_seconds: float | None = None
+    ) -> tuple[WorkflowEngine, AgentExecutor, AgentDef]:
+        agent = AgentDef(
+            name="reviewer",
+            model="gpt-4",
+            prompt="Review the diff.",  # no template vars → renders against {}
+            output={"summary": OutputField(type="string")},
+            validator=ValidatorConfig(criteria="check"),
+            timeout_seconds=timeout_seconds,
+            routes=[RouteDef(to="$end")],
+        )
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="v",
+                entry_point="reviewer",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[agent],
+            output={"summary": "{{ reviewer.output.summary }}"},
+        )
+        provider = CopilotProvider(mock_handler=lambda a, p, c: {})
+        provider.execute = exec_fn  # type: ignore[method-assign]
+        engine = WorkflowEngine(config, provider)
+        executor = AgentExecutor(provider, workflow_tools=[])
+        return engine, executor, agent
+
+    @pytest.mark.asyncio
+    async def test_rerun_success_records_two_validator_rows(self) -> None:
+        primary_n = {"n": 0}
+
+        async def exec_fn(*, agent: AgentDef, rendered_prompt: str, **kw: Any) -> AgentOutput:
+            if agent.output and "passed" in agent.output:
+                return AgentOutput(
+                    content={"passed": False, "issues": ["fix"]},
+                    raw_response="",
+                    model="judge",
+                    input_tokens=10,
+                    output_tokens=5,
+                )
+            primary_n["n"] += 1
+            return AgentOutput(
+                content={"summary": f"v{primary_n['n']}"},
+                raw_response="",
+                model="gpt-4",
+                input_tokens=1000,
+                output_tokens=500,
+            )
+
+        engine, executor, agent = self._engine_and_executor(exec_fn)
+        original = AgentOutput(
+            content={"summary": "v0"},
+            raw_response="",
+            model="gpt-4",
+            input_tokens=900,
+            output_tokens=400,
+        )
+
+        result = await engine._apply_validator(agent, original, 0.5, {}, executor, None, None)
+
+        assert result.content == {"summary": "v1"}  # the re-run output
+        vrows = [
+            r
+            for r in engine.usage_tracker.get_summary().agents
+            if r.agent_name == "reviewer (validator)"
+        ]
+        assert len(vrows) == 2  # validator call + discarded first attempt
+        assert any(r.input_tokens == 10 and r.output_tokens == 5 for r in vrows)
+        assert any(r.input_tokens == 900 and r.output_tokens == 400 for r in vrows)
+
+    @pytest.mark.asyncio
+    async def test_rerun_failure_keeps_original_no_double_count_and_emits_event(self) -> None:
+        async def exec_fn(*, agent: AgentDef, rendered_prompt: str, **kw: Any) -> AgentOutput:
+            if agent.output and "passed" in agent.output:
+                return AgentOutput(
+                    content={"passed": False, "issues": ["fix"]},
+                    raw_response="",
+                    model="judge",
+                    input_tokens=10,
+                    output_tokens=5,
+                )
+            raise RuntimeError("rerun boom")
+
+        engine, executor, agent = self._engine_and_executor(exec_fn)
+        original = AgentOutput(
+            content={"summary": "orig"}, raw_response="", model="gpt-4", input_tokens=900
+        )
+        events: list[tuple[str, dict[str, Any]]] = []
+
+        result = await engine._apply_validator(
+            agent, original, 0.5, {}, executor, None, lambda e, d: events.append((e, d))
+        )
+
+        assert result is original  # original kept on re-run failure
+        # Discarded run is NOT recorded when the re-run fails (no double count):
+        vrows = [
+            r
+            for r in engine.usage_tracker.get_summary().agents
+            if r.agent_name == "reviewer (validator)"
+        ]
+        assert len(vrows) == 1  # only the grading call
+        failed = [d for (e, d) in events if e == "agent_validation_failed"]
+        assert any(d.get("rerun_errored") for d in failed)
+
+    @pytest.mark.asyncio
+    async def test_partial_rerun_keeps_original(self) -> None:
+        async def exec_fn(*, agent: AgentDef, rendered_prompt: str, **kw: Any) -> AgentOutput:
+            if agent.output and "passed" in agent.output:
+                return AgentOutput(
+                    content={"passed": False, "issues": ["fix"]}, raw_response="", model="judge"
+                )
+            return AgentOutput(
+                content={"summary": "partial"}, raw_response="", model="gpt-4", partial=True
+            )
+
+        engine, executor, agent = self._engine_and_executor(exec_fn)
+        original = AgentOutput(content={"summary": "orig"}, raw_response="", model="gpt-4")
+
+        result = await engine._apply_validator(agent, original, 0.5, {}, executor, None, None)
+
+        assert result is original  # partial re-run is discarded
+        vrows = [
+            r
+            for r in engine.usage_tracker.get_summary().agents
+            if r.agent_name == "reviewer (validator)"
+        ]
+        assert len(vrows) == 1  # discarded run not recorded on the partial path
+
+    @pytest.mark.asyncio
+    async def test_validator_timeout_fails_open(self) -> None:
+        async def exec_fn(*, agent: AgentDef, rendered_prompt: str, **kw: Any) -> AgentOutput:
+            if agent.output and "passed" in agent.output:
+                await asyncio.sleep(5)  # hang the grader past the agent timeout
+            return AgentOutput(content={"summary": "x"}, raw_response="", model="gpt-4")
+
+        engine, executor, agent = self._engine_and_executor(exec_fn, timeout_seconds=1.0)
+        original = AgentOutput(content={"summary": "orig"}, raw_response="", model="gpt-4")
+
+        result = await engine._apply_validator(agent, original, 0.5, {}, executor, None, None)
+
+        # Grader timed out → fail open (treated as pass) → original returned, no re-run.
+        assert result is original

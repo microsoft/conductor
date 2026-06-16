@@ -395,7 +395,7 @@ export interface DialogCompletedData {
 export interface AgentValidatorStartData {
   agent_name: string;
   /** Present when the validated agent runs inside a for-each loop. */
-  item_key?: string | number;
+  item_key?: string;
   /** Model used for the validator call (defaults to the agent's model). */
   model?: string | null;
   /** First ~200 chars of the validator criteria, for display. */
@@ -404,7 +404,7 @@ export interface AgentValidatorStartData {
 
 export interface AgentValidatorCompleteData {
   agent_name: string;
-  item_key?: string | number;
+  item_key?: string;
   /** Whether the output satisfied the criteria. */
   passed: boolean;
   /** Concrete issues reported when not passed (empty when passed). */
@@ -421,10 +421,13 @@ export interface AgentValidatorCompleteData {
 
 export interface AgentValidationFailedData {
   agent_name: string;
-  item_key?: string | number;
+  item_key?: string;
   issues: string[];
   /** Whether the primary agent will be re-run once with feedback. */
   will_retry: boolean;
+  /** True on the second emission, when the feedback re-run itself failed and
+   *  the original (failing) output was kept. */
+  rerun_errored?: boolean;
 }
 
 // --- Subworkflow lifecycle ---

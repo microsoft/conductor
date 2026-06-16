@@ -2237,22 +2237,29 @@ class WorkflowEngine:
 
         1. Render the primary agent's prompt and run a second LLM call
            (:class:`OutputValidator`) that grades ``output`` against
-           ``agent.validator.criteria``.
+           ``agent.validator.criteria``. The call is bounded by the agent's
+           ``timeout_seconds`` and is cancellable via interrupt; a timeout or
+           error fails open (treated as a pass with ``errored=True``).
         2. Record the validator call as a separate ``"<agent> (validator)"``
            usage row and emit ``agent_validator_start`` /
            ``agent_validator_complete``.
-        3. If it passes (or ``max_retries == 0``) return ``output`` unchanged.
-        4. Otherwise emit ``agent_validation_failed`` and, when
-           ``max_retries > 0``, re-run the primary agent exactly once with a
-           ``## Validation feedback`` section appended. The re-run output is
-           taken as final — there is no second validation loop.
+        3. If it passes, return ``output`` unchanged (no failure event).
+        4. Otherwise emit ``agent_validation_failed`` (always, on every
+           failure — including ``max_retries == 0``). When ``max_retries > 0``,
+           re-run the primary agent exactly once with a ``## Validation
+           feedback`` section appended and take the re-run output as final
+           (no second validation loop). When ``max_retries == 0``, return
+           ``output`` unchanged.
 
         Validation is fail-open: a validator error never blocks the workflow
         (the original output flows through). Cost accounting: the
-        ``"<agent> (validator)"`` row bundles the validation call(s) and, when
-        a re-run occurs, the discarded first attempt — so the primary row
-        reflects the effective output while the validator row makes the full
-        cost of the feature explicit.
+        ``"<agent> (validator)"`` usage rows capture the grading call and, when
+        a re-run succeeds, the discarded first attempt (two rows sharing that
+        label) — so the primary row reflects the effective output while the
+        validator rows make the feature's extra cost explicit. If the re-run
+        itself fails (or is interrupted), the original output is returned and
+        recorded once by the caller under the primary name — it is *not* also
+        attributed to the validator row.
 
         Args:
             agent: The primary agent (must have ``validator`` set).
@@ -2278,6 +2285,8 @@ class WorkflowEngine:
         if cfg is None:  # defensive; callers guard on this
             return output
 
+        from conductor.engine.validator import ValidationOutcome
+
         provider = executor.provider
         validator_row = f"{usage_label or agent.name} (validator)"
 
@@ -2298,9 +2307,32 @@ class WorkflowEngine:
         )
 
         _v_start = _time.time()
-        outcome = await self._output_validator.validate(
-            agent, primary_prompt, output.content, provider
+        # Bound the grading call by the agent's timeout (when set) and forward
+        # the interrupt signal, so a hung or slow grader can't block the
+        # workflow — failing open on timeout rather than hanging. A direct
+        # ``wait_for`` is used (not ``_execute_with_agent_timeout``) to avoid
+        # emitting a misleading ``agent_timeout`` event for the primary agent.
+        validate_coro = self._output_validator.validate(
+            agent,
+            primary_prompt,
+            output.content,
+            provider,
+            interrupt_signal=self._interrupt_event,
         )
+        try:
+            if agent.timeout_seconds is not None:
+                outcome = await asyncio.wait_for(validate_coro, timeout=agent.timeout_seconds)
+            else:
+                outcome = await validate_coro
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                "Validator call for '%s' timed out or failed; treating as pass",
+                agent.name,
+                exc_info=True,
+            )
+            outcome = ValidationOutcome(passed=True, errored=True)
         _v_elapsed = _time.time() - _v_start
 
         v_cost: float | None = None
@@ -2308,16 +2340,17 @@ class WorkflowEngine:
             v_usage = self.usage_tracker.record(validator_row, outcome.output, _v_elapsed)
             v_cost = v_usage.cost_usd
 
+        out = outcome.output
         _emit_v(
             "agent_validator_complete",
             {
                 "passed": outcome.passed,
                 "issues": outcome.issues,
                 "errored": outcome.errored,
-                "model": outcome.output.model if outcome.output else validator_model,
-                "tokens": outcome.output.tokens_used if outcome.output else None,
-                "input_tokens": outcome.output.input_tokens if outcome.output else None,
-                "output_tokens": outcome.output.output_tokens if outcome.output else None,
+                "model": out.model if out else validator_model,
+                "tokens": out.tokens_used if out else None,
+                "input_tokens": out.input_tokens if out else None,
+                "output_tokens": out.output_tokens if out else None,
                 "cost_usd": v_cost,
                 "elapsed": _v_elapsed,
             },
@@ -2335,11 +2368,6 @@ class WorkflowEngine:
         if not will_retry:
             return output
 
-        # Preserve the discarded first attempt's cost under the validator row
-        # so it isn't lost when the re-run output replaces it under the
-        # primary name downstream.
-        self.usage_tracker.record(validator_row, output, primary_elapsed)
-
         feedback = self._build_validation_feedback(outcome.issues)
         new_guidance = (guidance_section or "") + feedback
         try:
@@ -2353,14 +2381,37 @@ class WorkflowEngine:
                     event_callback=event_callback,
                 ),
             )
-            return new_output
+        except asyncio.CancelledError:
+            raise
         except Exception:
+            # The re-run hit a real failure (provider error, agent timeout, or
+            # the retried output failed the agent's output schema). Fail open
+            # to the original output, but surface it — otherwise enabling the
+            # validator would silently downgrade a hard failure into a quiet
+            # one. The original is recorded once by the caller under the
+            # primary name; it is NOT also attributed to the validator row.
             logger.warning(
                 "Validator re-run failed for '%s'; using original output",
                 agent.name,
                 exc_info=True,
             )
+            _emit_v(
+                "agent_validation_failed",
+                {"issues": outcome.issues, "will_retry": False, "rerun_errored": True},
+            )
             return output
+
+        # A re-run interrupted mid-flight returns partial output; keep the
+        # original so the caller's partial / pause-resume handling (which ran
+        # against the non-partial original) isn't bypassed.
+        if new_output.partial:
+            return output
+
+        # The re-run succeeded and is now the effective output (recorded under
+        # the primary name by the caller). Attribute the now-discarded first
+        # attempt to the validator row so its cost isn't lost.
+        self.usage_tracker.record(validator_row, output, primary_elapsed)
+        return new_output
 
     @staticmethod
     def _build_validation_feedback(issues: list[str]) -> str:

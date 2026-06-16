@@ -1472,6 +1472,16 @@ class TestAgentDefValidator:
                 validator={"criteria": "Check", "max_retries": -1},
             )
 
+    def test_unknown_validator_field_rejected(self) -> None:
+        """Test that a typo'd validator key is rejected (extra='forbid')."""
+        with pytest.raises(ValidationError):
+            AgentDef(
+                name="a",
+                model="gpt-4",
+                prompt="test",
+                validator={"criteria": "Check", "max_retreis": 1},  # typo
+            )
+
     def test_human_gate_with_validator_raises(self) -> None:
         """Test that human_gate agents cannot have validator."""
         with pytest.raises(ValidationError) as exc_info:

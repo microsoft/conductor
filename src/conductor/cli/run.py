@@ -978,14 +978,16 @@ class ConsoleEventSubscriber:
         elif t == "agent_validation_failed":
             label = _validator_label(d)
             issues = d.get("issues") or []
-            action = (
-                "re-running once with feedback"
-                if d.get("will_retry")
-                else "no retry (max_retries=0)"
-            )
+            if d.get("rerun_errored"):
+                action = "re-run failed — keeping original output"
+            elif d.get("will_retry"):
+                action = "re-running once with feedback"
+            else:
+                action = "no retry (max_retries=0)"
+            style = "red" if d.get("rerun_errored") else "yellow"
             verbose_log(
                 f"  Validation failed for '{label}' ({len(issues)} issue(s)) — {action}:",
-                style="yellow",
+                style=style,
             )
             for issue in issues:
                 verbose_log(f"    - {issue}", style="dim")

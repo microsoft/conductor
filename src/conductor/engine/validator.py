@@ -9,7 +9,8 @@ the concrete issues to fix.
 This module is deliberately side-effect free: it does not emit workflow
 events or record usage. It returns the raw :class:`AgentOutput` from the
 validator call so the engine helper can attribute token cost to a separate
-``"<agent> (validator)"`` row and emit the ``agent_validator_*`` events.
+``"<agent> (validator)"`` usage row and emit the ``agent_validator_start`` /
+``agent_validator_complete`` / ``agent_validation_failed`` events.
 
 The validator runs as a synthetic agent through the provider's normal
 ``execute()`` path (with an ``output:`` schema of
@@ -25,6 +26,7 @@ warning) so a flaky grader never blocks an otherwise-valid workflow.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from dataclasses import dataclass, field
@@ -101,22 +103,36 @@ def _truncate(text: str, limit: int) -> str:
 class ValidationOutcome:
     """Result of a single output-validation call.
 
+    Invariants (enforced in :meth:`__post_init__`): a passing or fail-open
+    outcome never carries issues, and ``errored`` implies ``passed`` (fail-open
+    never reports a failure). This keeps illegal/contradictory states — e.g.
+    ``passed=True`` alongside a non-empty ``issues`` list — unrepresentable, so
+    downstream consumers (the dashboard verdict + issue list) can't disagree.
+
     Attributes:
         passed: Whether the primary output satisfied the criteria. Defaults
             to ``True`` on validator error/parse failure (fail-open).
-        issues: Concrete, actionable problems reported by the validator
-            (empty when ``passed`` is ``True``).
+        issues: Concrete, actionable problems reported by the validator.
+            Always empty when ``passed`` is ``True``.
         output: The raw :class:`AgentOutput` from the validator call, used by
             the engine to attribute usage/cost. ``None`` when the validator
             call raised before producing output.
         errored: ``True`` when the validator failed open due to an exception
-            or unparseable response (as opposed to a genuine pass).
+            or unparseable response (as opposed to a genuine pass). Implies
+            ``passed`` is ``True``.
     """
 
     passed: bool
     issues: list[str] = field(default_factory=list)
     output: AgentOutput | None = None
     errored: bool = False
+
+    def __post_init__(self) -> None:
+        """Normalise to the documented invariants (passed/errored ⇒ no issues)."""
+        if self.errored:
+            self.passed = True
+        if self.passed:
+            self.issues = []
 
 
 class OutputValidator:
@@ -128,6 +144,7 @@ class OutputValidator:
         primary_prompt: str,
         primary_output: dict[str, Any],
         provider: AgentProvider,
+        interrupt_signal: asyncio.Event | None = None,
     ) -> ValidationOutcome:
         """Validate ``primary_output`` against ``agent.validator.criteria``.
 
@@ -137,6 +154,8 @@ class OutputValidator:
             primary_output: The primary agent's output content.
             provider: Provider used for the validator LLM call (the primary
                 agent's provider).
+            interrupt_signal: Optional event forwarded to the provider so an
+                Esc/Ctrl+G interrupt cancels an in-flight grading call.
 
         Returns:
             A :class:`ValidationOutcome`. Always fail-open on error.
@@ -162,7 +181,11 @@ class OutputValidator:
                 context={},
                 rendered_prompt=rendered_prompt,
                 tools=[],
+                interrupt_signal=interrupt_signal,
             )
+        except asyncio.CancelledError:
+            # Interrupt / cancellation must propagate — never silently pass.
+            raise
         except Exception:
             logger.warning(
                 "Validator call failed for agent '%s'; treating as pass",
@@ -202,7 +225,9 @@ class OutputValidator:
 
         Fail-open: any content that does not clearly express ``passed: false``
         is treated as a pass. ``parse_ok`` is ``False`` when the content was
-        not a usable dict (so the engine can flag the fall-back to pass).
+        not a usable dict, lacked a ``passed`` field, or carried a ``passed``
+        value that was not a recognisable boolean (so the engine flags the
+        fall-back to pass via ``errored``).
         """
         if not isinstance(content, dict):
             logger.warning("Validator returned non-dict content; treating as pass: %r", content)
@@ -212,7 +237,25 @@ class OutputValidator:
             logger.warning("Validator response missing 'passed'; treating as pass: %r", content)
             return True, [], False
 
-        passed = bool(content.get("passed"))
+        # Interpret ``passed`` explicitly. The validator call bypasses
+        # ``executor.execute``'s output coercion, so a model may emit the
+        # value as a JSON string (e.g. ``"false"``) — and ``bool("false")``
+        # is ``True``, which would silently turn a genuine failure into a
+        # pass. Accept real booleans and the literal strings "true"/"false";
+        # route anything else to the fail-open ``errored`` path so it is
+        # visible rather than a silent affirmative.
+        raw_passed = content.get("passed")
+        if isinstance(raw_passed, bool):
+            passed = raw_passed
+        elif isinstance(raw_passed, str) and raw_passed.strip().lower() in {"true", "false"}:
+            passed = raw_passed.strip().lower() == "true"
+        else:
+            logger.warning(
+                "Validator 'passed' was not a recognised boolean (%r); treating as pass",
+                raw_passed,
+            )
+            return True, [], False
+
         raw_issues = content.get("issues") or []
         if isinstance(raw_issues, str):
             issues = [raw_issues]

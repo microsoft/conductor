@@ -71,6 +71,48 @@ class TestValidatorParsing:
         assert issues == []
         assert ok is True
 
+    def test_parse_string_false_is_false(self) -> None:
+        # bool("false") is True, so the parser must interpret the string.
+        passed, issues, ok = self.validator._parse({"passed": "false", "issues": ["x"]})
+        assert passed is False
+        assert issues == ["x"]
+        assert ok is True
+
+    def test_parse_string_true_case_insensitive(self) -> None:
+        passed, issues, ok = self.validator._parse({"passed": "TRUE"})
+        assert passed is True
+        assert ok is True
+
+    def test_parse_non_bool_passed_fails_open(self) -> None:
+        # An unrecognized type (e.g. int) routes to the errored/fail-open path.
+        passed, issues, ok = self.validator._parse({"passed": 1})
+        assert passed is True
+        assert ok is False
+
+
+class TestValidationOutcomeInvariants:
+    """ValidationOutcome.__post_init__ keeps illegal states unrepresentable."""
+
+    def test_passed_drops_issues(self) -> None:
+        from conductor.engine.validator import ValidationOutcome
+
+        outcome = ValidationOutcome(passed=True, issues=["leftover"])
+        assert outcome.issues == []
+
+    def test_errored_implies_passed_and_no_issues(self) -> None:
+        from conductor.engine.validator import ValidationOutcome
+
+        outcome = ValidationOutcome(passed=False, issues=["x"], errored=True)
+        assert outcome.passed is True
+        assert outcome.issues == []
+
+    def test_failed_keeps_issues(self) -> None:
+        from conductor.engine.validator import ValidationOutcome
+
+        outcome = ValidationOutcome(passed=False, issues=["real problem"])
+        assert outcome.passed is False
+        assert outcome.issues == ["real problem"]
+
 
 class TestValidatorAgentConstruction:
     """Tests for the synthetic validator AgentDef."""
@@ -199,3 +241,42 @@ class TestValidatorValidate:
         await OutputValidator().validate(agent, "p", {"x": 1}, provider)
 
         assert provider.execute.call_args.kwargs["tools"] == []
+
+    @pytest.mark.asyncio
+    async def test_validator_forwards_interrupt_signal(self) -> None:
+        import asyncio
+
+        agent = _agent()
+        provider = MagicMock()
+        provider.execute = AsyncMock(return_value=_agent_output({"passed": True, "issues": []}))
+        signal = asyncio.Event()
+
+        await OutputValidator().validate(agent, "p", {"x": 1}, provider, interrupt_signal=signal)
+
+        assert provider.execute.call_args.kwargs["interrupt_signal"] is signal
+
+    @pytest.mark.asyncio
+    async def test_passed_with_issues_is_normalized(self) -> None:
+        # A grader that returns passed=true but also lists issues must not
+        # surface a contradictory outcome.
+        agent = _agent()
+        provider = MagicMock()
+        provider.execute = AsyncMock(
+            return_value=_agent_output({"passed": True, "issues": ["ignored"]})
+        )
+
+        outcome = await OutputValidator().validate(agent, "p", {"x": 1}, provider)
+
+        assert outcome.passed is True
+        assert outcome.issues == []
+
+    @pytest.mark.asyncio
+    async def test_cancelled_error_propagates(self) -> None:
+        import asyncio
+
+        agent = _agent()
+        provider = MagicMock()
+        provider.execute = AsyncMock(side_effect=asyncio.CancelledError())
+
+        with pytest.raises(asyncio.CancelledError):
+            await OutputValidator().validate(agent, "p", {"x": 1}, provider)
