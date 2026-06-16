@@ -1,0 +1,80 @@
+# Script Stdin Payload Example (issue #18)
+#
+# Demonstrates handing a structured payload to a script step via stdin
+# instead of command-line args. This is the cross-platform-safe way to pass
+# large or structured data into scripts: command-line arguments have OS
+# length limits (notably Windows ARG_MAX, ~32 KB), but stdin does not.
+#
+# Flow:
+#   1. `evaluate` (LLM agent) produces a structured list of findings as JSON.
+#   2. `summarize` (script) receives that JSON on stdin via `{{ ... | tojson }}`,
+#      aggregates it with Python, and prints a JSON summary to stdout.
+#   3. The script's auto-parsed JSON output flows to the workflow output.
+#
+# Key line:  stdin: "{{ evaluate.output | tojson }}"
+#   - `stdin:` is a Jinja2 string template written to the child as UTF-8.
+#   - The `tojson` filter emits valid JSON (plain `{{ x }}` would emit a
+#     Python repr, which is not valid JSON).
+#   - `stdin` and `args` are orthogonal — both reach the child when set.
+#
+# Usage:
+#   conductor run examples/script-stdin.yaml --input topic="error handling"
+
+workflow:
+  name: script-stdin-demo
+  description: Pass a structured payload to a script step via stdin
+  version: "1.0.0"
+  entry_point: evaluate
+
+  runtime:
+    provider: copilot
+
+  limits:
+    max_iterations: 10
+
+agents:
+  - name: evaluate
+    description: Produce a structured list of findings about the topic
+    model: claude-haiku-4.5
+    prompt: |
+      Produce exactly 3 short findings about "{{ workflow.input.topic }}".
+      Each finding is an object with a `title` (string) and a `severity`
+      integer from 1 (minor) to 5 (critical).
+    output:
+      findings:
+        type: array
+        description: List of {title, severity} objects
+        items:
+          type: object
+          properties:
+            title:
+              type: string
+            severity:
+              type: number
+    routes:
+      - to: summarize
+
+  - name: summarize
+    type: script
+    description: Aggregate the findings received as JSON on stdin
+    command: python3
+    args:
+      - "-c"
+      - |
+        import sys, json
+        data = json.load(sys.stdin)
+        findings = data["findings"]
+        severities = [int(f["severity"]) for f in findings]
+        print(json.dumps({
+            "count": len(findings),
+            "total_severity": sum(severities),
+            "max_severity": max(severities),
+        }))
+    stdin: "{{ evaluate.output | tojson }}"
+    routes:
+      - to: $end
+
+output:
+  count: "{{ summarize.output.count }}"
+  total_severity: "{{ summarize.output.total_severity }}"
+  max_severity: "{{ summarize.output.max_severity }}"

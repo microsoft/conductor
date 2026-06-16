@@ -1696,3 +1696,52 @@ class TestTerminateAgent:
             input=["precheck.output"],
         )
         assert a.input == ["precheck.output"]
+
+
+class TestScriptStdinField:
+    """The `stdin` field is exclusive to `type: script` (issue #18)."""
+
+    def test_stdin_accepted_on_script(self) -> None:
+        """A script step may declare a stdin payload template."""
+        agent = AgentDef(
+            name="s",
+            type="script",
+            command="cat",
+            stdin="{{ upstream.output.evaluations | tojson }}",
+        )
+        assert agent.stdin == "{{ upstream.output.evaluations | tojson }}"
+
+    def test_stdin_empty_string_accepted_on_script(self) -> None:
+        """An explicit empty stdin is valid (pipes immediate EOF), distinct from omission."""
+        agent = AgentDef(name="s", type="script", command="cat", stdin="")
+        assert agent.stdin == ""
+
+    def test_stdin_defaults_to_none(self) -> None:
+        """Omitting stdin leaves it None (legacy inherit-stdin behavior)."""
+        agent = AgentDef(name="s", type="script", command="echo")
+        assert agent.stdin is None
+
+    @pytest.mark.parametrize(
+        "step_type",
+        ["agent", "human_gate", "set", "wait", "terminate", "workflow"],
+    )
+    def test_stdin_rejected_on_non_script_types(self, step_type: str) -> None:
+        """The script-exclusive guard trips for every non-script step type."""
+        payload: dict[str, object] = {"name": "a", "type": step_type, "stdin": "data"}
+        if step_type == "human_gate":
+            payload["prompt"] = "Pick"
+            payload["options"] = [GateOption(value="x", label="X", route="$end")]
+        elif step_type == "set":
+            payload["value"] = "{{ 1 }}"
+        elif step_type == "wait":
+            payload["duration"] = "1s"
+        elif step_type == "terminate":
+            payload["status"] = "success"
+            payload["reason"] = "r"
+        elif step_type == "workflow":
+            payload["workflow"] = "./sub.yaml"
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef.model_validate(payload)
+        message = str(exc_info.value)
+        assert "stdin" in message
+        assert "only 'script' agents support this field" in message

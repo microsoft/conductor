@@ -38,11 +38,14 @@ class ScriptOutput:
         stdout: Captured standard output as text.
         stderr: Captured standard error as text.
         exit_code: Process exit code.
+        stdin_bytes: Number of UTF-8 bytes written to the child's stdin, or
+            ``None`` when no ``stdin`` payload was configured (stdin inherited).
     """
 
     stdout: str
     stderr: str
     exit_code: int
+    stdin_bytes: int | None = None
 
 
 class ScriptExecutor:
@@ -68,14 +71,18 @@ class ScriptExecutor:
     ) -> ScriptOutput:
         """Execute a script step.
 
-        Renders command/args with Jinja2, spawns subprocess, captures output.
+        Renders command/args with Jinja2, spawns the subprocess, and captures
+        output. If ``agent.stdin`` is set, the rendered payload is piped to the
+        child's stdin as UTF-8 (via ``communicate``, so large payloads don't
+        deadlock or hit command-line length limits); otherwise the child
+        inherits the parent's stdin.
 
         Args:
             agent: Agent definition with type="script".
             context: Workflow context for template rendering.
 
         Returns:
-            ScriptOutput with stdout, stderr, and exit_code.
+            ScriptOutput with stdout, stderr, exit_code, and stdin_bytes.
 
         Raises:
             ExecutionError: If the script times out or cannot be started.
@@ -89,6 +96,17 @@ class ScriptExecutor:
             self.renderer.render(agent.working_dir, context) if agent.working_dir else None
         )
 
+        # Render the optional stdin payload. ``None`` means "inherit the
+        # parent's stdin" (the legacy behavior); any string — including an
+        # empty one — means "pipe this to the child", so we check
+        # ``is not None`` rather than truthiness. Writing via
+        # ``communicate(input=...)`` streams stdin in the background while
+        # draining stdout/stderr, so large payloads cannot deadlock the pipe
+        # or hit command-line length limits (e.g. Windows ARG_MAX).
+        stdin_payload: bytes | None = None
+        if agent.stdin is not None:
+            stdin_payload = self.renderer.render(agent.stdin, context).encode("utf-8")
+
         # Build environment (merge os.environ + agent.env)
         # Note: ${VAR:-default} patterns in agent.env are already resolved
         # by the config loader during YAML parsing.
@@ -99,12 +117,15 @@ class ScriptExecutor:
         env = {**base_env, **agent.env} if agent.env else base_env
 
         _verbose_log(f"  Script: {rendered_command} {' '.join(rendered_args)}")
+        if stdin_payload is not None:
+            _verbose_log(f"  Script stdin: {len(stdin_payload)} bytes")
 
         # Create subprocess
         try:
             process = await asyncio.create_subprocess_exec(
                 rendered_command,
                 *rendered_args,
+                stdin=asyncio.subprocess.PIPE if stdin_payload is not None else None,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=rendered_working_dir,
@@ -126,7 +147,7 @@ class ScriptExecutor:
         timeout = agent.timeout
         try:
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                process.communicate(), timeout=timeout
+                process.communicate(input=stdin_payload), timeout=timeout
             )
         except TimeoutError:
             process.kill()
@@ -149,4 +170,5 @@ class ScriptExecutor:
             stdout=stdout_text,
             stderr=stderr_text,
             exit_code=process.returncode,
+            stdin_bytes=len(stdin_payload) if stdin_payload is not None else None,
         )

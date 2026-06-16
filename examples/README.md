@@ -209,6 +209,19 @@ Demonstrates:
 conductor run examples/script-step.yaml
 ```
 
+### script-stdin.yaml
+
+Hand a structured payload to a script step via **stdin** instead of
+command-line `args` — the cross-platform-safe way to pass large or
+structured data (no Windows `ARG_MAX` limit, no temp files). Demonstrates:
+- `stdin:` as a Jinja2 string template piped to the child as UTF-8
+- JSON handoff via the built-in `tojson` filter (`{{ x | tojson }}`)
+- A script consuming an upstream agent's structured output (`json.load(sys.stdin)`)
+
+```bash
+conductor run examples/script-stdin.yaml --input topic="error handling"
+```
+
 ### wait-step.yaml
 
 Polling pattern with a wait step and a routing loop-back. Demonstrates:

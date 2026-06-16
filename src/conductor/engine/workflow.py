@@ -2734,6 +2734,7 @@ class WorkflowEngine:
                                     "stdout": script_output.stdout,
                                     "stderr": script_output.stderr,
                                     "exit_code": script_output.exit_code,
+                                    "stdin_bytes": script_output.stdin_bytes,
                                 },
                             )
 

@@ -207,11 +207,14 @@ agents:
     working_dir: /tmp            # Working directory (optional, Jinja2 templated)
     env:                         # Extra environment variables (optional)
       MY_VAR: "value"
+    stdin: "{{ data | tojson }}" # Payload piped to the child's stdin (optional, Jinja2 templated)
     routes:
       - to: analyzer
         when: "exit_code == 0"
       - to: error_handler
 ```
+
+Use `stdin:` to hand large or structured payloads to a script without hitting command-line length limits (notably Windows `ARG_MAX`). It is a Jinja2 string template rendered to the child's stdin as UTF-8 — use `{{ x | tojson }}` for JSON, or render text directly. Omitting it inherits the parent's stdin (legacy behavior); `stdin` and `args` can be set together (orthogonal).
 
 ### Script Output
 

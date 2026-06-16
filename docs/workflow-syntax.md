@@ -229,6 +229,7 @@ agents:
       PYTHONPATH: "/app/src"
     working_dir: "/app"                         # Optional: working directory (Jinja2 template)
     timeout: 120                                # Optional: per-step timeout in seconds
+    stdin: "{{ planner.output | tojson }}"      # Optional: payload piped to the child's stdin (Jinja2 template)
     routes:
       - to: analyzer
         when: "exit_code == 0"
@@ -319,6 +320,29 @@ routes:
 **Restrictions** — script steps cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, or `options`. Script steps also cannot be used inside `parallel` groups or `for_each` groups.
 
 **Environment variable note** — values in `env` are passed as-is to the subprocess (they are not rendered as Jinja2 templates). Use `${VAR}` syntax in the workflow YAML loader if you need environment variable substitution in env values.
+
+**Passing payloads via stdin** — set `stdin:` to pipe a rendered payload to the script's standard input instead of (or in addition to) command-line `args`. This is the cross-platform way to hand large or structured data to a script: command-line arguments are subject to OS length limits (notably Windows, where the total command line is capped at ~32 KB), but stdin is not. Reach for `stdin:` whenever a script consumes an upstream agent's structured output.
+
+```yaml
+agents:
+  - name: analyze
+    type: script
+    command: python3
+    args: ["scripts/analyze.py"]
+    stdin: "{{ evaluator.output.evaluations | tojson }}"   # JSON payload via the tojson filter
+    routes:
+      - to: $end
+```
+
+- **`stdin:` is a Jinja2 string template**, rendered against the workflow context and written to the child as UTF-8.
+  - For JSON, use the built-in `tojson` filter: `stdin: "{{ data | tojson }}"`. Plain `{{ data }}` renders a Python `repr` (single-quoted), which is **not** valid JSON.
+  - For arbitrary text — a diff, CSV, or a prompt — use it directly: `stdin: "{{ patch }}"`.
+  - The script reads it like any stdin source: `data = json.load(sys.stdin)` (Python), or pipe into `jq` / `cat` (shell).
+- **Omitting `stdin`** keeps the legacy behavior — the child inherits the parent's stdin.
+- **An explicit empty string** (`stdin: ""`) still pipes, sending the child immediate EOF (distinct from omitting it).
+- **`stdin` and `args` are orthogonal.** When both are set, `args` are passed on the command line *and* `stdin` is piped — there is no precedence conflict. Keep flags in `args` and put the bulky/structured payload in `stdin`.
+
+This replaces the older pattern of writing large structured arguments to a temp file and passing `--something-file <path>`; the engine pipes the payload directly, so there is no temp file to manage or clean up.
 
 ### Wait Steps
 
