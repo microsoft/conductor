@@ -1140,6 +1140,33 @@ class TestCopilotExecuteDialogTurn:
         assert captured["create_session_kwargs"]["model"] == "claude-sonnet-4.5"
 
     @pytest.mark.asyncio
+    async def test_dialog_turn_default_context_tier_forwarded(self) -> None:
+        captured: dict[str, Any] = {}
+        provider = await self._make_provider_with_session(captured)
+        provider._default_context_tier = "long_context"
+
+        await provider.execute_dialog_turn(
+            system_prompt="sys",
+            user_message="hi",
+            history=None,
+        )
+
+        assert captured["create_session_kwargs"]["context_tier"] == "long_context"
+
+    @pytest.mark.asyncio
+    async def test_dialog_turn_no_context_tier_means_key_absent(self) -> None:
+        captured: dict[str, Any] = {}
+        provider = await self._make_provider_with_session(captured)
+
+        await provider.execute_dialog_turn(
+            system_prompt="sys",
+            user_message="hi",
+            history=None,
+        )
+
+        assert "context_tier" not in captured["create_session_kwargs"]
+
+    @pytest.mark.asyncio
     async def test_dialog_turn_session_error_wrapped_as_provider_error(self) -> None:
         from unittest.mock import AsyncMock as _AsyncMock
 
