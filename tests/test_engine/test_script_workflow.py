@@ -947,3 +947,92 @@ class TestScriptOutputSchema:
 
         assert engine.context.agent_outputs["detector"]["phase"] == "planning"
         assert "planner" in engine.context.agent_outputs
+
+
+class TestScriptStdinWorkflow:
+    """End-to-end stdin payload transport through the engine (issue #18)."""
+
+    @pytest.mark.asyncio
+    async def test_structured_payload_piped_via_stdin(self) -> None:
+        """A structured upstream payload is handed to a script as JSON over stdin.
+
+        The script parses it, transforms it, and the auto-parsed result flows to
+        the workflow output — exercising the full render → pipe → parse round trip.
+        """
+        reader = (
+            "import sys, json; "
+            "d = json.load(sys.stdin); "
+            "print(json.dumps({'received_name': d['name'], 'doubled': d['count'] * 2}))"
+        )
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="script-stdin",
+                entry_point="consume",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="consume",
+                    type="script",
+                    command=sys.executable,
+                    args=["-c", reader],
+                    stdin="{{ workflow.input.payload | tojson }}",
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={
+                "name": "{{ consume.output.received_name }}",
+                "doubled": "{{ consume.output.doubled }}",
+            },
+        )
+        engine = WorkflowEngine(config, MagicMock())
+        result = await engine.run({"payload": {"name": "widget", "count": 21}})
+
+        assert result["name"] == "widget"
+        assert str(result["doubled"]) == "42"
+
+    @pytest.mark.asyncio
+    async def test_large_payload_via_stdin_reports_byte_count(self) -> None:
+        """A payload far larger than ARG_MAX flows through stdin intact.
+
+        Also asserts the ``script_completed`` event carries ``stdin_bytes`` so the
+        dashboard / JSONL log can surface payload size without the payload itself.
+        """
+        payload = "z" * (1024 * 1024)  # 1 MB — well beyond any OS arg-length limit
+        reader = "import sys; print(len(sys.stdin.read()))"
+
+        events: list[WorkflowEvent] = []
+        emitter = WorkflowEventEmitter()
+        emitter.subscribe(events.append)
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="script-stdin-large",
+                entry_point="sizer",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="sizer",
+                    type="script",
+                    command=sys.executable,
+                    args=["-c", reader],
+                    stdin="{{ workflow.input.blob }}",
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"size": "{{ sizer.output.stdout | trim }}"},
+        )
+        engine = WorkflowEngine(config, MagicMock(), event_emitter=emitter)
+        result = await engine.run({"blob": payload})
+
+        # The output template auto-parses the numeric stdout to an int; compare
+        # type-robustly. The point is the full 1 MB survived the stdin round trip.
+        assert str(result["size"]) == str(len(payload))
+        completed = [e for e in events if e.type == "script_completed"]
+        assert len(completed) == 1
+        assert completed[0].data["stdin_bytes"] == len(payload)

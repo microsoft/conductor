@@ -24,6 +24,7 @@ from conductor.providers._event_format import (
 )
 from conductor.providers.base import AgentOutput, AgentProvider, EventCallback, match_model_id
 from conductor.providers.capabilities import ProviderCapabilities
+from conductor.providers.context_tier import ContextTier, resolve_context_tier
 from conductor.providers.reasoning import ReasoningEffort, resolve_reasoning_effort
 
 if TYPE_CHECKING:
@@ -204,6 +205,7 @@ class CopilotProvider(AgentProvider):
         temperature: float | None = None,
         max_agent_iterations: int | None = None,
         default_reasoning_effort: ReasoningEffort | None = None,
+        default_context_tier: ContextTier | None = None,
         provider_settings: ProviderSettings | None = None,
     ) -> None:
         """Initialize the Copilot provider.
@@ -226,6 +228,10 @@ class CopilotProvider(AgentProvider):
                 applied to ``create_session`` when an agent does not specify
                 its own ``reasoning.effort``. One of ``low``, ``medium``,
                 ``high``, ``xhigh``, or ``None`` to send no value.
+            default_context_tier: Workflow-wide default ``context_tier`` applied
+                to ``create_session`` when an agent does not specify its own
+                ``context_tier``. One of ``default``, ``long_context``, or
+                ``None`` to send no value.
             provider_settings: Optional structured provider settings from
                 ``runtime.provider``. When ``has_custom_routing()`` is True,
                 the resolved SDK ``ProviderConfig`` is attached to every
@@ -255,6 +261,7 @@ class CopilotProvider(AgentProvider):
         self._temperature = temperature
         self._default_max_agent_iterations = max_agent_iterations
         self._default_reasoning_effort = default_reasoning_effort
+        self._default_context_tier = default_context_tier
         self._max_schema_depth = 10  # Max nesting depth for recursive schema building
         self._session_ids: dict[str, str] = {}
         self._resume_session_ids: dict[str, str] = {}
@@ -777,6 +784,21 @@ class CopilotProvider(AgentProvider):
                 logger.debug(
                     "Setting reasoning_effort=%s for agent %r (model=%s)",
                     effort,
+                    agent.name,
+                    model,
+                )
+
+            # Resolve context tier: per-agent override wins over runtime default.
+            # Unlike reasoning effort (validated against the model's advertised
+            # supported_reasoning_efforts first), the tier is forwarded as-is:
+            # there is no advertised supported_context_tiers, so the SDK is the
+            # sole authority and validates it at session creation.
+            tier = resolve_context_tier(agent, self._default_context_tier)
+            if tier is not None:
+                session_kwargs["context_tier"] = tier
+                logger.debug(
+                    "Setting context_tier=%s for agent %r (model=%s)",
+                    tier,
                     agent.name,
                     model,
                 )
@@ -2149,6 +2171,17 @@ class CopilotProvider(AgentProvider):
                 logger.debug(
                     "Setting reasoning_effort=%s for dialog turn (model=%s)",
                     effort,
+                    dialog_kwargs["model"],
+                )
+
+            # Dialog turns likewise honor only the workflow-wide default
+            # context tier (no agent-scoped override at this layer).
+            tier = self._default_context_tier
+            if tier is not None:
+                dialog_kwargs["context_tier"] = tier
+                logger.debug(
+                    "Setting context_tier=%s for dialog turn (model=%s)",
+                    tier,
                     dialog_kwargs["model"],
                 )
 

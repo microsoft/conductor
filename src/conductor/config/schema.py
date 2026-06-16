@@ -19,6 +19,7 @@ from pydantic import (
 )
 
 from conductor.duration import parse_duration
+from conductor.providers.context_tier import ContextTier
 from conductor.providers.reasoning import ReasoningEffort
 
 # Maximum allowed wait-step duration (24 hours). Anything longer almost
@@ -533,6 +534,26 @@ class AgentDef(BaseModel):
     Supports Jinja2 templates: {{ workflow.input.model_name }}
     """
 
+    context_tier: ContextTier | None = None
+    """Context-window tier for models that support it (Copilot provider only).
+
+    Set ``context_tier: long_context`` to pin a heavy-reasoning agent to the
+    model's long-context (e.g. 1M-token) window. ``default`` selects the
+    standard tier; ``None`` sends no value (provider default).
+
+    Falls back to ``runtime.default_context_tier`` when unset. Composes
+    independently with ``reasoning`` — an agent may set both.
+
+    Only the Copilot provider forwards this today (maps to the SDK's
+    ``create_session`` ``context_tier`` param). Other providers ignore it.
+
+    Only applies to provider-backed agents (type='agent' or None).
+
+    Example YAML::
+
+        context_tier: long_context
+    """
+
     input: list[str] = Field(default_factory=list)
     """Context dependencies. Format: 'agent_name.output' or 'workflow.input.param'.
     Suffix with '?' for optional dependencies."""
@@ -566,6 +587,28 @@ class AgentDef(BaseModel):
 
     working_dir: str | None = None
     """Working directory for script subprocess execution."""
+
+    stdin: str | None = None
+    """Payload written to the script subprocess's stdin (script type only).
+
+    A Jinja2 string template rendered against the workflow context and written
+    to the child process's stdin as UTF-8. Use this to hand large structured
+    payloads to scripts without hitting OS command-line length limits (notably
+    Windows's ~32 KB command-line cap):
+
+    - JSON: ``stdin: "{{ upstream.output.evaluations | tojson }}"`` — the
+      built-in ``tojson`` filter emits valid JSON.
+    - Arbitrary text: ``stdin: "{{ diff }}"``.
+
+    Semantics:
+
+    - Omitted (``None``) — the child inherits the parent's stdin (the
+      unchanged legacy behavior).
+    - Present (any string, including ``""``) — stdin is piped; an explicit
+      empty string sends immediate EOF.
+    - Orthogonal to ``args`` — when both are set, ``args`` are still passed on
+      the command line and ``stdin`` is piped.
+    """
 
     timeout: int | None = None
     """Per-script timeout in seconds."""
@@ -879,6 +922,19 @@ class AgentDef(BaseModel):
                         "(only 'terminate' agents support this field)"
                     )
 
+        # Field exclusive to ``type: script`` — reject if set on any other
+        # type. No per-type branch below inspects ``stdin``, so this single
+        # guard is the sole rejection path for every non-script type. It
+        # mirrors the terminate-exclusive guard above so the message names the
+        # conflict; being a standalone guard (rather than a per-branch check)
+        # it also covers ``agent`` / ``human_gate``, which have no
+        # ``command``/``args`` branch.
+        if self.type != "script" and self.stdin is not None:
+            raise ValueError(
+                f"'{self.type or 'agent'}' agents cannot have 'stdin' "
+                "(only 'script' agents support this field)"
+            )
+
         if self.type == "human_gate":
             if not self.options:
                 raise ValueError("human_gate agents require 'options'")
@@ -892,6 +948,8 @@ class AgentDef(BaseModel):
                 raise ValueError("human_gate agents cannot have 'max_depth'")
             if self.reasoning is not None:
                 raise ValueError("human_gate agents cannot have 'reasoning'")
+            if self.context_tier is not None:
+                raise ValueError("human_gate agents cannot have 'context_tier'")
             if self.timeout_seconds is not None:
                 raise ValueError("human_gate agents cannot have 'timeout_seconds'")
             if self.value is not None:
@@ -931,6 +989,8 @@ class AgentDef(BaseModel):
                 raise ValueError("script agents cannot have 'max_depth'")
             if self.reasoning is not None:
                 raise ValueError("script agents cannot have 'reasoning'")
+            if self.context_tier is not None:
+                raise ValueError("script agents cannot have 'context_tier'")
             if self.timeout_seconds is not None:
                 raise ValueError(
                     "script agents cannot have 'timeout_seconds' "
@@ -1016,6 +1076,8 @@ class AgentDef(BaseModel):
                 raise ValueError("wait agents cannot have 'dialog'")
             if self.reasoning is not None:
                 raise ValueError("wait agents cannot have 'reasoning'")
+            if self.context_tier is not None:
+                raise ValueError("wait agents cannot have 'context_tier'")
             if self.timeout_seconds is not None:
                 raise ValueError("wait agents cannot have 'timeout_seconds'")
             if self.output is not None:
@@ -1075,6 +1137,8 @@ class AgentDef(BaseModel):
                 raise ValueError("set agents cannot have 'dialog'")
             if self.reasoning is not None:
                 raise ValueError("set agents cannot have 'reasoning'")
+            if self.context_tier is not None:
+                raise ValueError("set agents cannot have 'context_tier'")
             if self.timeout_seconds is not None:
                 raise ValueError("set agents cannot have 'timeout_seconds'")
             if self.duration is not None:
@@ -1133,6 +1197,8 @@ class AgentDef(BaseModel):
                 raise ValueError("terminate agents cannot have 'dialog'")
             if self.reasoning is not None:
                 raise ValueError("terminate agents cannot have 'reasoning'")
+            if self.context_tier is not None:
+                raise ValueError("terminate agents cannot have 'context_tier'")
             if self.workflow:
                 raise ValueError("terminate agents cannot have 'workflow'")
             if self.input_mapping is not None:
@@ -1183,6 +1249,8 @@ class AgentDef(BaseModel):
                 )
         if self.type == "workflow" and self.reasoning is not None:
             raise ValueError("workflow agents cannot have 'reasoning'")
+        if self.type == "workflow" and self.context_tier is not None:
+            raise ValueError("workflow agents cannot have 'context_tier'")
 
         # Wait-only fields are forbidden on every other type. ``reason`` is
         # shared with ``type: terminate`` (which has its own required-non-
@@ -1621,6 +1689,17 @@ class RuntimeConfig(BaseModel):
     Opt-in automatic checkpointing at step boundaries so stalled or killed
     long-running workflows stay resumable. Defaults to off (failure-only
     checkpoints). See :class:`CheckpointConfig`.
+    """
+
+    default_context_tier: ContextTier | None = None
+    """Workflow-wide default context-window tier (Copilot provider only).
+
+    Each agent may override with its own ``context_tier``. ``long_context``
+    selects a model's long-context (e.g. 1M-token) window; ``default`` selects
+    the standard tier; ``None`` sends no value.
+
+    Only the Copilot provider forwards this (maps to the SDK's
+    ``create_session`` ``context_tier`` param). Other providers ignore it.
     """
 
 

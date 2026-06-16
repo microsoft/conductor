@@ -230,6 +230,157 @@ class TestCheckpointSaveOnFailure:
 
 
 # ---------------------------------------------------------------------------
+# handle_dashboard_stop tests (issue #245)
+# ---------------------------------------------------------------------------
+
+
+class TestHandleDashboardStop:
+    """Verify a dashboard-cancelled run still gets a checkpoint + terminal event.
+
+    ``handle_dashboard_stop`` is invoked by the CLI wrapper after a Stop/Kill
+    cancels the engine task mid-agent — a path that bypasses the engine's own
+    ``workflow_failed`` / checkpoint handling. See issue #245.
+    """
+
+    @staticmethod
+    def _engine_with_emitter(config, provider, *, workflow_path=None):
+        from conductor.events import WorkflowEvent, WorkflowEventEmitter
+
+        emitter = WorkflowEventEmitter()
+        events: list[WorkflowEvent] = []
+        emitter.subscribe(events.append)
+        engine = WorkflowEngine(
+            config, provider, workflow_path=workflow_path, event_emitter=emitter
+        )
+        return engine, events
+
+    @pytest.mark.asyncio
+    async def test_saves_checkpoint_and_emits_stopped_failed(self, tmp_path: Path) -> None:
+        """A cancelled run gets a best-effort checkpoint + stopped_by_user event."""
+        wf_path = _write_workflow(tmp_path)
+        config = _multi_agent_config()
+        provider = CopilotProvider(mock_handler=lambda a, p, c: {"plan": "p"})
+        engine, events = self._engine_with_emitter(config, provider, workflow_path=wf_path)
+
+        # Simulate a run that was cancelled while 'researcher' was in flight,
+        # with the planner output already committed to context.
+        engine.context.set_workflow_inputs({"topic": "AI"})
+        engine.context.store("planner", {"plan": "research AI"})
+        engine._current_agent_name = "researcher"
+
+        with patch.object(CheckpointManager, "get_checkpoints_dir", return_value=tmp_path):
+            path = engine.handle_dashboard_stop("Workflow stopped by user via dashboard")
+
+        assert path is not None
+        assert path.exists()
+        assert engine._last_checkpoint_path == path
+
+        failed = [e for e in events if e.type == "workflow_failed"]
+        assert len(failed) == 1
+        assert failed[0].data["stopped_by_user"] is True
+        assert failed[0].data["agent_name"] == "researcher"
+        assert failed[0].data["error_type"] == "ExecutionError"
+        assert failed[0].data["checkpoint_path"] == str(path)
+
+        assert any(e.type == "checkpoint_saved" for e in events)
+
+        cp = CheckpointManager.load_checkpoint(path)
+        assert cp.current_agent == "researcher"
+        assert cp.context["agent_outputs"]["planner"]["plan"] == "research AI"
+
+    @pytest.mark.asyncio
+    async def test_idempotent_when_checkpoint_already_saved(self, tmp_path: Path) -> None:
+        """A repeat/direct call once a checkpoint is already recorded is a no-op:
+        no duplicate events, same path returned. (In production the CLI wrapper
+        only calls this for genuinely cancelled tasks, so this guard is a
+        defensive backstop rather than the InterruptError path.)"""
+        wf_path = _write_workflow(tmp_path)
+        config = _multi_agent_config()
+        provider = CopilotProvider(mock_handler=lambda a, p, c: {"plan": "p"})
+        engine, events = self._engine_with_emitter(config, provider, workflow_path=wf_path)
+        engine.context.set_workflow_inputs({"topic": "AI"})
+        engine._current_agent_name = "researcher"
+
+        with patch.object(CheckpointManager, "get_checkpoints_dir", return_value=tmp_path):
+            first = engine.handle_dashboard_stop("Workflow stopped by user via dashboard")
+            second = engine.handle_dashboard_stop("Workflow stopped by user via dashboard")
+
+        assert first is not None
+        assert second == first
+        # Only one terminal event despite two calls.
+        assert len([e for e in events if e.type == "workflow_failed"]) == 1
+        assert len([e for e in events if e.type == "checkpoint_saved"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_surfaces_absence_without_workflow_path(self) -> None:
+        """When no checkpoint can be written, the failure event explains why."""
+        config = _multi_agent_config()
+        provider = CopilotProvider(mock_handler=lambda a, p, c: {"plan": "p"})
+        engine, events = self._engine_with_emitter(config, provider)  # no workflow_path
+        engine._current_agent_name = "planner"
+
+        path = engine.handle_dashboard_stop("Workflow stopped by user via dashboard")
+
+        assert path is None
+        assert engine._last_checkpoint_path is None
+        failed = [e for e in events if e.type == "workflow_failed"]
+        assert len(failed) == 1
+        assert failed[0].data["stopped_by_user"] is True
+        assert "checkpoint_path" not in failed[0].data
+        assert (
+            failed[0].data["checkpoint_unavailable_reason"]
+            == "no workflow file is associated with this run"
+        )
+        assert not any(e.type == "checkpoint_saved" for e in events)
+
+    @pytest.mark.asyncio
+    async def test_surfaces_absence_when_checkpoint_write_fails(self, tmp_path: Path) -> None:
+        """workflow_path IS set but the checkpoint write fails (save returns
+        None): the failure event explains *that* distinct reason (issue #245
+        Expected #2)."""
+        wf_path = _write_workflow(tmp_path)
+        config = _multi_agent_config()
+        provider = CopilotProvider(mock_handler=lambda a, p, c: {"plan": "p"})
+        engine, events = self._engine_with_emitter(config, provider, workflow_path=wf_path)
+        engine._current_agent_name = "researcher"
+
+        # CheckpointManager.save_checkpoint never raises — it returns None when
+        # the write fails (e.g. disk full / permissions). Simulate that.
+        with patch.object(CheckpointManager, "save_checkpoint", return_value=None):
+            path = engine.handle_dashboard_stop("Workflow stopped by user via dashboard")
+
+        assert path is None
+        assert engine._last_checkpoint_path is None
+        failed = [e for e in events if e.type == "workflow_failed"]
+        assert len(failed) == 1
+        assert failed[0].data["stopped_by_user"] is True
+        assert "checkpoint_path" not in failed[0].data
+        assert (
+            failed[0].data["checkpoint_unavailable_reason"] == "the checkpoint could not be written"
+        )
+        assert not any(e.type == "checkpoint_saved" for e in events)
+
+    @pytest.mark.asyncio
+    async def test_runs_on_error_hook(self, tmp_path: Path) -> None:
+        """The on_error lifecycle hook runs on a dashboard stop (parity with the
+        in-loop ConductorError path)."""
+        wf_path = _write_workflow(tmp_path)
+        config = _multi_agent_config()
+        provider = CopilotProvider(mock_handler=lambda a, p, c: {"plan": "p"})
+        engine, _events = self._engine_with_emitter(config, provider, workflow_path=wf_path)
+        engine._current_agent_name = "researcher"
+
+        with (
+            patch.object(CheckpointManager, "get_checkpoints_dir", return_value=tmp_path),
+            patch.object(engine, "_execute_hook") as mock_hook,
+        ):
+            engine.handle_dashboard_stop("Workflow stopped by user via dashboard")
+
+        assert mock_hook.call_args is not None
+        assert mock_hook.call_args.args[0] == "on_error"
+
+
+# ---------------------------------------------------------------------------
 # Resume tests
 # ---------------------------------------------------------------------------
 

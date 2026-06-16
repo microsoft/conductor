@@ -1226,7 +1226,7 @@ async def _run_with_stop_signal(
     Raises:
         ExecutionError: If the workflow was killed via the dashboard.
     """
-    return await _execute_with_stop_signal(engine.run(inputs), dashboard)
+    return await _execute_with_stop_signal(engine.run(inputs), dashboard, engine=engine)
 
 
 async def _resume_with_stop_signal(
@@ -1249,12 +1249,13 @@ async def _resume_with_stop_signal(
     Raises:
         ExecutionError: If the workflow was killed via the dashboard.
     """
-    return await _execute_with_stop_signal(engine.resume(current_agent), dashboard)
+    return await _execute_with_stop_signal(engine.resume(current_agent), dashboard, engine=engine)
 
 
 async def _execute_with_stop_signal(
     engine_coro: Any,
     dashboard: Any | None,
+    engine: Any | None = None,
 ) -> dict[str, Any]:
     """Execute an engine coroutine, racing against a dashboard kill signal.
 
@@ -1262,6 +1263,12 @@ async def _execute_with_stop_signal(
         engine_coro: The coroutine to execute (``engine.run()`` or
             ``engine.resume()``).
         dashboard: The ``WebDashboard`` instance, or None.
+        engine: The ``WorkflowEngine`` instance backing ``engine_coro``. When a
+            dashboard stop/kill cancels the engine task, this is used to write a
+            best-effort checkpoint and emit ``workflow_failed`` so the run is
+            never lost silently (issue #245). May be ``None`` (e.g. in unit
+            tests that pass a bare coroutine), in which case the checkpoint step
+            is skipped.
 
     Returns:
         The workflow result dict.
@@ -1292,10 +1299,36 @@ async def _execute_with_stop_signal(
     if engine_task in done:
         return engine_task.result()
 
-    # Stop was requested — raise an error so the workflow is treated as failed
+    # Stop/kill won the race. The engine task was in ``pending`` and we just
+    # cancelled + drained it. Three outcomes are possible:
+    #
+    #   * It actually cancelled (``engine_task.cancelled()``) — the engine's
+    #     ``except asyncio.CancelledError`` arm ran, which intentionally emits
+    #     no ``workflow_failed`` and saves no checkpoint. Give the run a
+    #     best-effort checkpoint + terminal event here so progress isn't lost.
+    #   * It completed with its own exception (e.g. ``InterruptError`` from a
+    #     pause -> Kill that raised inside the loop just as Stop fired). In that
+    #     case the engine already emitted ``workflow_failed`` and saved a
+    #     checkpoint, so re-raise that exception untouched — do not double-handle.
+    #   * It completed with a *result* (swallowed the cancellation and returned).
+    #     Unreachable today since ``run``/``resume`` re-raise ``CancelledError``,
+    #     but guard against a future refactor by returning that result rather
+    #     than emitting a spurious ``workflow_failed`` after ``workflow_completed``.
+    if not engine_task.cancelled():
+        exc = engine_task.exception()
+        if exc is not None:
+            raise exc
+        return engine_task.result()
+
+    # Single source of truth for the user-facing stop reason: it feeds both the
+    # engine's checkpoint/``workflow_failed`` message and the raised exception.
+    stop_message = "Workflow stopped by user via dashboard"
+    if engine is not None:
+        engine.handle_dashboard_stop(stop_message)
+
     from conductor.exceptions import ExecutionError
 
-    raise ExecutionError("Workflow stopped by user via dashboard")
+    raise ExecutionError(stop_message)
 
 
 async def run_workflow_async(

@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { AlertTriangle, CheckCircle2, X, Eye } from 'lucide-react';
+import { AlertTriangle, CheckCircle2, X, Eye, Square } from 'lucide-react';
 import { useWorkflowStore } from '@/stores/workflow-store';
 import { formatCost, formatTokens, cn } from '@/lib/utils';
 import { useElapsedTimer } from '@/hooks/use-elapsed-timer';
@@ -12,6 +12,64 @@ export function WorkflowErrorBanner() {
   const selectNode = useWorkflowStore((s) => s.selectNode);
 
   if (workflowStatus !== 'failed' || !workflowFailure) return null;
+
+  // Issue #245: a user-initiated Stop/Kill from the dashboard is an
+  // intentional outcome, not a crash. Render a calm "Workflow Stopped" banner
+  // that surfaces the checkpoint outcome (saved path, or why none was written)
+  // instead of the alarming red "Workflow Failed" banner.
+  if (workflowFailure.stopped_by_user) {
+    const checkpointName = workflowFailure.checkpoint_path?.split('/').pop();
+    return (
+      <div className="absolute top-3 left-1/2 -translate-x-1/2 z-20 animate-[banner-in_200ms_ease-out]">
+        <div
+          className={cn(
+            'flex items-center gap-2 px-4 py-2 rounded-lg',
+            'bg-slate-900/90 border border-slate-500/40 shadow-lg shadow-slate-500/10',
+            'backdrop-blur-sm max-w-[560px]',
+          )}
+        >
+          <Square className="w-4 h-4 text-slate-300 flex-shrink-0" />
+          <div className="flex flex-col min-w-0">
+            <span className="text-xs font-medium text-slate-200">Workflow Stopped</span>
+            {workflowFailure.checkpoint_path ? (
+              <>
+                <span
+                  className="text-[11px] text-slate-300/80 truncate"
+                  title={workflowFailure.checkpoint_path}
+                >
+                  Checkpoint saved: {checkpointName}
+                </span>
+                <span className="text-[10px] text-slate-400/70 truncate">
+                  Resume from the CLI with: conductor resume
+                </span>
+              </>
+            ) : workflowFailure.checkpoint_unavailable_reason ? (
+              <span
+                className="text-[11px] text-amber-300/80 truncate"
+                title={workflowFailure.checkpoint_unavailable_reason}
+              >
+                No checkpoint could be saved — {workflowFailure.checkpoint_unavailable_reason}
+              </span>
+            ) : (
+              // Checkpoint outcome not known yet (pause→Kill emits the path via a
+              // later checkpoint_saved event). Show a neutral pending line rather
+              // than flashing "No checkpoint could be saved" before it arrives.
+              <span className="text-[11px] text-slate-400/70 truncate">Saving checkpoint…</span>
+            )}
+          </div>
+          {workflowFailedAgent && (
+            <button
+              onClick={() => selectNode(workflowFailedAgent)}
+              className="flex items-center gap-1 px-2 py-1 rounded text-[10px] font-medium text-slate-200 bg-slate-500/20 hover:bg-slate-500/30 transition-colors flex-shrink-0 ml-1"
+            >
+              <Eye className="w-3 h-3" />
+              View
+            </button>
+          )}
+        </div>
+      </div>
+    );
+  }
 
   // Issue #219: explicit `type: terminate status: failed` deserves a distinct
   // banner — it is an intentional outcome, not a crash. Use the rendered

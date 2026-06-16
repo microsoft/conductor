@@ -569,3 +569,58 @@ class TestPeriodicCleanupTerminalOutcomes:
             ]
 
         assert remaining == []
+
+
+class TestDashboardStopWithPeriodicCheckpoints:
+    """Merge-interaction guard (#244 x #245): a prior periodic checkpoint sets
+    _last_checkpoint_path, which must NOT cause handle_dashboard_stop to skip
+    its save + workflow_failed emit (it uses a dedicated _dashboard_stop_handled
+    flag instead)."""
+
+    def test_stop_not_skipped_by_prior_periodic_checkpoint(self, tmp_path: Path) -> None:
+        wf = tmp_path / "wf.yaml"
+        wf.write_text("name: periodic-ckpt\n")
+        ckpt_dir = tmp_path / "ckpts"
+        ckpt_dir.mkdir()
+        emitter = WorkflowEventEmitter()
+        failed: list[dict[str, Any]] = []
+        emitter.subscribe(
+            lambda e: failed.append(dict(e.data)) if e.type == "workflow_failed" else None
+        )
+
+        config = _three_step_config(CheckpointConfig(every_agent=True))
+        with patch.object(CheckpointManager, "get_checkpoints_dir", return_value=ckpt_dir):
+            engine = _make_engine(config, wf, emitter)
+            engine._current_agent_name = "step2"
+            # Simulate a periodic checkpoint already recorded earlier this run.
+            engine._last_checkpoint_path = ckpt_dir / "prior-periodic.json"
+
+            result = engine.handle_dashboard_stop("stopped by user")
+
+        # handle_dashboard_stop still ran: it emitted the terminal event and
+        # wrote a fresh checkpoint (did not early-return on the periodic path).
+        assert len(failed) == 1
+        assert failed[0]["stopped_by_user"] is True
+        assert result is not None and result.exists()
+
+    def test_stop_is_idempotent(self, tmp_path: Path) -> None:
+        wf = tmp_path / "wf.yaml"
+        wf.write_text("name: periodic-ckpt\n")
+        ckpt_dir = tmp_path / "ckpts"
+        ckpt_dir.mkdir()
+        emitter = WorkflowEventEmitter()
+        failed: list[dict[str, Any]] = []
+        emitter.subscribe(
+            lambda e: failed.append(dict(e.data)) if e.type == "workflow_failed" else None
+        )
+
+        config = _three_step_config(CheckpointConfig(every_agent=True))
+        with patch.object(CheckpointManager, "get_checkpoints_dir", return_value=ckpt_dir):
+            engine = _make_engine(config, wf, emitter)
+            engine._current_agent_name = "step2"
+            first = engine.handle_dashboard_stop("stopped by user")
+            second = engine.handle_dashboard_stop("stopped by user")
+
+        # Second call is a no-op: same path returned, no duplicate event.
+        assert first == second
+        assert len(failed) == 1
