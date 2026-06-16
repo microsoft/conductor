@@ -86,18 +86,6 @@ class ScriptExecutor:
         # command is guaranteed non-None by the model validator when type="script"
         assert agent.command is not None
         rendered_command = self.renderer.render(agent.command, context)
-        # Resolve bare command names and absolute paths against PATH/PATHEXT so
-        # that a bare name (e.g. "python") finds the executable the shell would,
-        # and a Windows path missing its .exe suffix resolves correctly. Relative
-        # paths containing a separator are left untouched so they keep resolving
-        # against ``working_dir``. Resolution is non-destructive: when ``which``
-        # cannot resolve the command we fall back to the rendered value and let
-        # the FileNotFoundError handler below produce a clear error.
-        has_separator = os.sep in rendered_command or (
-            os.altsep is not None and os.altsep in rendered_command
-        )
-        if os.path.isabs(rendered_command) or not has_separator:
-            rendered_command = shutil.which(rendered_command) or rendered_command
         rendered_args = [self.renderer.render(arg, context) for arg in agent.args]
         rendered_working_dir = (
             self.renderer.render(agent.working_dir, context) if agent.working_dir else None
@@ -111,6 +99,23 @@ class ScriptExecutor:
         # Unicode characters in script output.
         base_env = {**os.environ, "PYTHONUTF8": "1"}
         env = {**base_env, **agent.env} if agent.env else base_env
+
+        # Resolve bare command names and absolute paths against PATH so that a
+        # bare name (e.g. "python") finds the executable the shell would, and a
+        # path missing an extension resolves correctly. Resolution uses the
+        # subprocess's own ``PATH`` (``env`` may override it via ``agent.env``),
+        # so the resolved binary matches the one the child would have executed.
+        # Relative paths containing a separator are left untouched so they keep
+        # resolving against ``working_dir``. Resolution is non-destructive: when
+        # ``which`` cannot resolve the command we fall back to the rendered value
+        # and let the FileNotFoundError handler below produce a clear error.
+        has_separator = os.sep in rendered_command or (
+            os.altsep is not None and os.altsep in rendered_command
+        )
+        if os.path.isabs(rendered_command) or not has_separator:
+            rendered_command = (
+                shutil.which(rendered_command, path=env.get("PATH")) or rendered_command
+            )
 
         _verbose_log(f"  Script: {rendered_command} {' '.join(rendered_args)}")
 

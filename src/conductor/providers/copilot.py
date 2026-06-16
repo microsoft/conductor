@@ -685,7 +685,7 @@ class CopilotProvider(AgentProvider):
 
         # Build schema description for output schema (used in prompt and recovery)
         schema_for_prompt: dict[str, Any] | None = None
-        output_schema = agent.output if (agent.output and agent.output_mode != "raw") else None
+        output_schema = agent.effective_output_schema()
         if output_schema is not None:
             schema_for_prompt = self._build_prompt_schema(output_schema)
             schema_desc = json.dumps(schema_for_prompt, indent=2)

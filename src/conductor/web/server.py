@@ -258,7 +258,7 @@ class WebDashboard:
             """
             try:
                 body = await request.json()
-            except Exception:
+            except (json.JSONDecodeError, UnicodeDecodeError):
                 return JSONResponse({"error": "Invalid JSON body"}, status_code=422)
             if not isinstance(body, dict):
                 return JSONResponse(
@@ -268,12 +268,8 @@ class WebDashboard:
             # Validate token if CONDUCTOR_GATE_TOKEN is set. The token is read
             # from the Authorization header (not the JSON body) and compared in
             # constant time to avoid leaking it via timing or request logs.
-            expected_token = os.environ.get("CONDUCTOR_GATE_TOKEN")
-            if expected_token:
-                auth_header = request.headers.get("authorization", "")
-                scheme, _, presented = auth_header.partition(" ")
-                if scheme.lower() != "bearer" or not hmac.compare_digest(presented, expected_token):
-                    return JSONResponse({"error": "Invalid or missing token"}, status_code=403)
+            if not self._gate_token_ok(request.headers.get("authorization")):
+                return JSONResponse({"error": "Invalid or missing token"}, status_code=403)
 
             # Validate required fields
             if not body.get("agent_name"):
@@ -289,22 +285,9 @@ class WebDashboard:
             # check a mismatched agent_name would be accepted here (200) and then
             # silently discarded by wait_for_gate_response, parking the workflow
             # forever while the CLI reports success.
-            waiting_agent = self._gate_waiting_agent
-            if waiting_agent is None:
-                return JSONResponse(
-                    {"error": "No human gate is currently waiting for a response"},
-                    status_code=409,
-                )
-            if body["agent_name"] != waiting_agent:
-                return JSONResponse(
-                    {
-                        "error": (
-                            f"Gate response targets agent {body['agent_name']!r} but the "
-                            f"waiting gate is {waiting_agent!r}"
-                        )
-                    },
-                    status_code=409,
-                )
+            target_error = self._validate_gate_target(body["agent_name"])
+            if target_error is not None:
+                return JSONResponse({"error": target_error}, status_code=409)
 
             # Put onto gate response queue (same path as WebSocket handler)
             self._gate_response_queue.put_nowait(
@@ -408,7 +391,21 @@ class WebDashboard:
                     try:
                         msg = json.loads(raw)
                         if isinstance(msg, dict) and msg.get("type") == "gate_response":
-                            self._gate_response_queue.put_nowait(msg)
+                            # Apply the same auth + waiting-state checks as the
+                            # HTTP endpoint so the WebSocket path cannot bypass
+                            # CONDUCTOR_GATE_TOKEN or resolve a non-waiting gate.
+                            if not self._gate_token_ok(ws.headers.get("authorization")):
+                                logger.warning(
+                                    "Rejecting WS gate_response: invalid or missing token"
+                                )
+                            elif (
+                                target_error := self._validate_gate_target(
+                                    str(msg.get("agent_name", ""))
+                                )
+                            ) is not None:
+                                logger.warning("Rejecting WS gate_response: %s", target_error)
+                            else:
+                                self._gate_response_queue.put_nowait(msg)
                         elif isinstance(msg, dict) and msg.get("type") in (
                             "dialog_message",
                             "dialog_decline",
@@ -836,6 +833,46 @@ class WebDashboard:
         """
         return len(self._connections) > 0
 
+    def _gate_token_ok(self, auth_header: str | None) -> bool:
+        """Return True if the gate token requirement is satisfied.
+
+        When ``CONDUCTOR_GATE_TOKEN`` is unset, gate responses are always
+        allowed. Otherwise the header must be ``Authorization: Bearer
+        <token>`` matching the env var, compared in constant time so the
+        token cannot be recovered via timing.
+
+        Args:
+            auth_header: The raw ``Authorization`` header value, or None.
+
+        Returns:
+            True if the token check passes (or no token is configured).
+        """
+        expected_token = os.environ.get("CONDUCTOR_GATE_TOKEN")
+        if not expected_token:
+            return True
+        scheme, _, presented = (auth_header or "").partition(" ")
+        return scheme.lower() == "bearer" and hmac.compare_digest(presented, expected_token)
+
+    def _validate_gate_target(self, agent_name: str) -> str | None:
+        """Validate that a gate response targets the currently-waiting gate.
+
+        Args:
+            agent_name: The agent name the response is addressed to.
+
+        Returns:
+            An error message string if no gate is waiting or the name does
+            not match the waiting gate, otherwise None.
+        """
+        waiting_agent = self._gate_waiting_agent
+        if waiting_agent is None:
+            return "No human gate is currently waiting for a response"
+        if agent_name != waiting_agent:
+            return (
+                f"Gate response targets agent {agent_name!r} but the "
+                f"waiting gate is {waiting_agent!r}"
+            )
+        return None
+
     async def wait_for_gate_response(self, agent_name: str) -> dict[str, Any]:
         """Wait for a gate response from a web client.
 
@@ -861,6 +898,18 @@ class WebDashboard:
             while True:
                 msg = await self._gate_response_queue.get()
                 if msg.get("agent_name") == agent_name:
+                    # Drain any responses still queued on resolution. Two
+                    # concurrent submits for this same gate can both pass the
+                    # waiting-state check and enqueue; we consume one here and
+                    # the duplicate would otherwise linger and auto-resolve the
+                    # next same-named gate reached via loop-back. Clearing it now
+                    # (no ``await`` before the queue is empty) prevents that.
+                    while not self._gate_response_queue.empty():
+                        dup = self._gate_response_queue.get_nowait()
+                        logger.warning(
+                            "Draining duplicate gate_response for agent %r on resolution",
+                            dup.get("agent_name"),
+                        )
                     return msg
                 logger.warning(
                     "Discarding stale gate_response for agent %r while waiting on %r",

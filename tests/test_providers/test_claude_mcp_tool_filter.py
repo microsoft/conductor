@@ -30,8 +30,8 @@ def _make_provider_with_mcp_tools(tools: list[dict[str, Any]]) -> ClaudeProvider
     provider._default_max_tokens = 8192
     provider._retry_config = MagicMock()
     provider._retry_config.max_attempts = 1
+    provider._retry_config.max_parse_recovery_attempts = 2
     provider._retry_history = []
-    provider._max_parse_recovery_attempts = 2
     provider._max_schema_depth = 10
 
     # Set up a mock MCP manager with tools
@@ -169,8 +169,8 @@ def _make_bare_provider() -> ClaudeProvider:
     provider._default_max_tokens = 8192
     provider._retry_config = MagicMock()
     provider._retry_config.max_attempts = 1
+    provider._retry_config.max_parse_recovery_attempts = 2
     provider._retry_history = []
-    provider._max_parse_recovery_attempts = 2
     provider._max_schema_depth = 10
     return provider
 

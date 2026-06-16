@@ -35,11 +35,36 @@ class TestCopilotOutputModeRaw:
 
     @pytest.mark.asyncio
     async def test_raw_agent_wraps_response_as_result(self) -> None:
-        """output_mode=raw agent produces {"result": ...} output."""
-        provider = CopilotProvider(mock_handler=_make_copilot_handler({"result": "some raw text"}))
+        """output_mode=raw wraps a plain-text SDK response as {"result": <text>}.
+
+        Drives the real SDK path (not the mock_handler short-circuit, which
+        returns a fixed dict and bypasses the output_mode wrapping logic) so
+        the wrapping is actually exercised: the model returns plain text that
+        is *not* JSON, and raw mode must wrap it verbatim instead of trying to
+        extract a JSON object.
+        """
+        from conductor.providers.copilot import SDKResponse
+
+        provider = CopilotProvider()
+        provider._started = True
+        mock_session = AsyncMock()
+        mock_session.session_id = "test-session"
+        mock_session.disconnect = AsyncMock()
+        mock_client = AsyncMock()
+        mock_client.create_session = AsyncMock(return_value=mock_session)
+        provider._client = mock_client
+
         agent = AgentDef(name="a", prompt="p", model="gpt-4", output_mode="raw")
-        result = await provider.execute(agent=agent, context={}, rendered_prompt="p")
-        assert result.content == {"result": "some raw text"}
+        with (
+            patch("conductor.providers.copilot.COPILOT_SDK_AVAILABLE", True),
+            patch.object(
+                provider,
+                "_send_and_wait",
+                AsyncMock(return_value=SDKResponse(content="some raw text")),
+            ),
+        ):
+            result, _ = await provider._execute_sdk_call(agent, "p", {})
+        assert result == {"result": "some raw text"}
 
     @pytest.mark.asyncio
     async def test_raw_agent_no_schema_instruction_in_prompt(self) -> None:
@@ -83,8 +108,23 @@ class TestCopilotOutputModeRaw:
 
     @pytest.mark.asyncio
     async def test_envelope_with_output_is_backward_compatible(self) -> None:
-        """output_mode=envelope with output: schema behaves like the default."""
-        provider = CopilotProvider(mock_handler=_make_copilot_handler({"field": "value"}))
+        """output_mode=envelope with output: schema extracts JSON like the default.
+
+        Drives the real SDK path so the schema-extraction logic runs. The
+        mock_handler short-circuit would return a fixed dict and never exercise
+        extraction, making the assertion tautological.
+        """
+        from conductor.providers.copilot import SDKResponse
+
+        provider = CopilotProvider()
+        provider._started = True
+        mock_session = AsyncMock()
+        mock_session.session_id = "test-session"
+        mock_session.disconnect = AsyncMock()
+        mock_client = AsyncMock()
+        mock_client.create_session = AsyncMock(return_value=mock_session)
+        provider._client = mock_client
+
         agent = AgentDef(
             name="a",
             prompt="p",
@@ -92,8 +132,16 @@ class TestCopilotOutputModeRaw:
             output_mode="envelope",
             output={"field": OutputField(type="string")},
         )
-        result = await provider.execute(agent=agent, context={}, rendered_prompt="p")
-        assert result.content == {"field": "value"}
+        with (
+            patch("conductor.providers.copilot.COPILOT_SDK_AVAILABLE", True),
+            patch.object(
+                provider,
+                "_send_and_wait",
+                AsyncMock(return_value=SDKResponse(content='{"field": "value"}')),
+            ),
+        ):
+            result, _ = await provider._execute_sdk_call(agent, "p", {})
+        assert result == {"field": "value"}
 
 
 class TestCopilotParseExhaustionNotRetryable:

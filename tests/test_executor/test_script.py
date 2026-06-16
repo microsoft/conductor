@@ -317,7 +317,8 @@ class TestScriptExecutorCommandResolution:
         ):
             await executor.execute(agent, {})
 
-        mock_which.assert_called_once_with("python")
+        mock_which.assert_called_once()
+        assert mock_which.call_args[0][0] == "python"
         assert mock_exec.call_args[0][0] == "/resolved/bin/python"
 
     @pytest.mark.asyncio
@@ -343,7 +344,8 @@ class TestScriptExecutorCommandResolution:
         ):
             await executor.execute(agent, {})
 
-        mock_which.assert_called_once_with("C:/Python314/python")
+        mock_which.assert_called_once()
+        assert mock_which.call_args[0][0] == "C:/Python314/python"
         assert mock_exec.call_args[0][0] == "C:\\Python314\\python.EXE"
 
     @pytest.mark.asyncio
@@ -406,13 +408,48 @@ class TestScriptExecutorCommandResolution:
         mock_process.returncode = 0
 
         with (
-            patch("conductor.executor.script.shutil.which", return_value="/bin/python"),
+            patch(
+                "conductor.executor.script.shutil.which", return_value="/bin/python"
+            ) as mock_which,
             patch("asyncio.create_subprocess_exec", return_value=mock_process) as mock_exec,
         ):
             await executor.execute(agent, {})
 
         called_args = mock_exec.call_args[0][1:]
         assert "https://example.com/api/v1" in called_args
+        # Only the command itself is resolved — args are never passed through which.
+        assert mock_which.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_command_resolved_against_agent_env_path(self, executor: ScriptExecutor) -> None:
+        """``which`` resolves against the subprocess PATH, including agent.env overrides.
+
+        Regression test: previously the command was resolved against the parent
+        ``os.environ["PATH"]`` before ``env`` was built, so an ``agent.env`` PATH
+        override silently ran a different binary than the subprocess would use.
+        """
+        agent = AgentDef(
+            name="test_env_path",
+            type="script",
+            command="toolx",
+            env={"PATH": "/childbin"},
+        )
+        mock_process = AsyncMock()
+        mock_process.communicate.return_value = (b"", b"")
+        mock_process.returncode = 0
+
+        with (
+            patch(
+                "conductor.executor.script.shutil.which", return_value="/childbin/toolx"
+            ) as mock_which,
+            patch("asyncio.create_subprocess_exec", return_value=mock_process) as mock_exec,
+        ):
+            await executor.execute(agent, {})
+
+        # which must be called with the subprocess's PATH (the agent.env override),
+        # not the parent process PATH.
+        assert mock_which.call_args.kwargs.get("path") == "/childbin"
+        assert mock_exec.call_args[0][0] == "/childbin/toolx"
 
     @pytest.mark.asyncio
     async def test_file_not_found_includes_hint_on_windows(self, executor: ScriptExecutor) -> None:

@@ -188,7 +188,6 @@ class ClaudeProvider(AgentProvider):
         self._sdk_version: str | None = None
         self._retry_config = retry_config or RetryConfig()
         self._retry_history: list[dict[str, Any]] = []  # For testing/debugging retries
-        self._max_parse_recovery_attempts = self._retry_config.max_parse_recovery_attempts
         self._max_schema_depth = 10  # Max nesting depth for recursive schema building
         self._default_max_agent_iterations = (
             max_agent_iterations if max_agent_iterations is not None else 50
@@ -930,10 +929,8 @@ class ClaudeProvider(AgentProvider):
         all_tools: list[dict[str, Any]] = []
 
         # Effective schema check: skip structured output when output_mode is raw
-        output_schema = (
-            agent.output if (agent.output is not None and agent.output_mode != "raw") else None
-        )
-        has_schema = output_schema is not None
+        output_schema = agent.effective_output_schema()
+        has_output_schema = output_schema is not None
 
         # Add emit_output tool if agent has effective output schema
         if output_schema is not None:
@@ -953,9 +950,6 @@ class ClaudeProvider(AgentProvider):
 
         # Use tools if any are defined
         request_tools: list[dict[str, Any]] | None = all_tools if all_tools else None
-
-        # Track if agent has effective output schema
-        has_output_schema = has_schema
 
         for attempt in range(1, config.max_attempts + 1):
             try:
@@ -1789,7 +1783,7 @@ class ClaudeProvider(AgentProvider):
         effective_max_recovery = (
             max_parse_recovery_attempts
             if max_parse_recovery_attempts is not None
-            else self._max_parse_recovery_attempts
+            else self._retry_config.max_parse_recovery_attempts
         )
         # Track recovery attempts for error reporting
         recovery_history: list[str] = []
@@ -1901,11 +1895,9 @@ class ClaudeProvider(AgentProvider):
             f"Parse recovery exhausted after {effective_max_recovery} attempts. "
             f"History: {'; '.join(recovery_history)}"
         )
-        # Note: is_retryable=False is set for correctness and documentation
-        # clarity. In practice, Claude's _is_retryable_error() already
-        # returns False for ProviderError (not an Anthropic SDK type), so
-        # the outer retry loop won't retry regardless. The attribute
-        # ensures consistent behavior if the retry dispatch ever changes.
+        # is_retryable=False marks this as terminal: _is_retryable_error()
+        # honors the flag directly for ProviderError, so the outer retry loop
+        # will not retry parse exhaustion.
         raise ProviderError(
             f"Failed to extract valid JSON after {effective_max_recovery} recovery attempts",
             suggestion=(

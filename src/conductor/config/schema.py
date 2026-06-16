@@ -1247,6 +1247,20 @@ class AgentDef(BaseModel):
             )
         return self
 
+    def effective_output_schema(self) -> dict[str, OutputField] | None:
+        """Return the structured-output schema providers should enforce, or None.
+
+        Centralizes the rule shared by every provider: an agent has an
+        effective output schema only when ``output:`` is a non-empty mapping
+        *and* ``output_mode`` is not ``raw``. An empty ``output: {}`` is
+        treated as "no schema" so all providers agree (Copilot previously
+        used a truthiness check while Claude used an ``is not None`` check,
+        diverging on the empty-dict case).
+        """
+        if self.output and self.output_mode != "raw":
+            return self.output
+        return None
+
     def _validate_wait_duration(self) -> None:
         """Validate ``duration`` for a ``wait`` agent.
 
