@@ -19,6 +19,7 @@ from pydantic import (
 )
 
 from conductor.duration import parse_duration
+from conductor.providers.context_tier import ContextTier
 from conductor.providers.reasoning import ReasoningEffort
 
 # Maximum allowed wait-step duration (24 hours). Anything longer almost
@@ -533,6 +534,26 @@ class AgentDef(BaseModel):
     Supports Jinja2 templates: {{ workflow.input.model_name }}
     """
 
+    context_tier: ContextTier | None = None
+    """Context-window tier for models that support it (Copilot provider only).
+
+    Set ``context_tier: long_context`` to pin a heavy-reasoning agent to the
+    model's long-context (e.g. 1M-token) window. ``default`` selects the
+    standard tier; ``None`` sends no value (provider default).
+
+    Falls back to ``runtime.default_context_tier`` when unset. Composes
+    independently with ``reasoning`` — an agent may set both.
+
+    Only the Copilot provider forwards this today (maps to the SDK's
+    ``create_session`` ``context_tier`` param). Other providers ignore it.
+
+    Only applies to provider-backed agents (type='agent' or None).
+
+    Example YAML::
+
+        context_tier: long_context
+    """
+
     input: list[str] = Field(default_factory=list)
     """Context dependencies. Format: 'agent_name.output' or 'workflow.input.param'.
     Suffix with '?' for optional dependencies."""
@@ -892,6 +913,8 @@ class AgentDef(BaseModel):
                 raise ValueError("human_gate agents cannot have 'max_depth'")
             if self.reasoning is not None:
                 raise ValueError("human_gate agents cannot have 'reasoning'")
+            if self.context_tier is not None:
+                raise ValueError("human_gate agents cannot have 'context_tier'")
             if self.timeout_seconds is not None:
                 raise ValueError("human_gate agents cannot have 'timeout_seconds'")
             if self.value is not None:
@@ -931,6 +954,8 @@ class AgentDef(BaseModel):
                 raise ValueError("script agents cannot have 'max_depth'")
             if self.reasoning is not None:
                 raise ValueError("script agents cannot have 'reasoning'")
+            if self.context_tier is not None:
+                raise ValueError("script agents cannot have 'context_tier'")
             if self.timeout_seconds is not None:
                 raise ValueError(
                     "script agents cannot have 'timeout_seconds' "
@@ -1183,6 +1208,8 @@ class AgentDef(BaseModel):
                 )
         if self.type == "workflow" and self.reasoning is not None:
             raise ValueError("workflow agents cannot have 'reasoning'")
+        if self.type == "workflow" and self.context_tier is not None:
+            raise ValueError("workflow agents cannot have 'context_tier'")
 
         # Wait-only fields are forbidden on every other type. ``reason`` is
         # shared with ``type: terminate`` (which has its own required-non-
@@ -1563,6 +1590,17 @@ class RuntimeConfig(BaseModel):
     match the supported prefix list; Copilot consults the SDK's advertised
     ``supported_reasoning_efforts`` (when available) and otherwise allows
     the request through to the SDK.
+    """
+
+    default_context_tier: ContextTier | None = None
+    """Workflow-wide default context-window tier (Copilot provider only).
+
+    Each agent may override with its own ``context_tier``. ``long_context``
+    selects a model's long-context (e.g. 1M-token) window; ``default`` selects
+    the standard tier; ``None`` sends no value.
+
+    Only the Copilot provider forwards this (maps to the SDK's
+    ``create_session`` ``context_tier`` param). Other providers ignore it.
     """
 
 

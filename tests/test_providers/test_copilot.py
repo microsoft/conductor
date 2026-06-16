@@ -1606,3 +1606,117 @@ class TestReasoningEffort:
         assert len(provider.get_retry_history()) == 3
         # Two backoff sleeps between three attempts.
         assert len(sleep_calls) == 2
+
+
+class TestContextTier:
+    """Tests for context_tier plumbing into create_session."""
+
+    @staticmethod
+    async def _build_provider(
+        captured: dict[str, Any],
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        default_context_tier: str | None = None,
+    ) -> CopilotProvider:
+        """Build a real-SDK-mode provider that captures create_session kwargs."""
+
+        class _FakeSession:
+            session_id = "session-xyz"
+
+            async def disconnect(self) -> None:
+                return None
+
+        class _FakeClient:
+            async def create_session(self, **kwargs: Any) -> _FakeSession:
+                captured["create_session_kwargs"] = kwargs
+                return _FakeSession()
+
+            async def list_models(self) -> list[Any]:
+                return []
+
+        provider = CopilotProvider(
+            mock_handler=stub_handler,
+            default_context_tier=default_context_tier,  # type: ignore[arg-type]
+        )
+        provider._mock_handler = None
+        provider._client = _FakeClient()
+        provider._started = True
+
+        async def _noop() -> None:
+            return None
+
+        async def _fake_send_and_wait(*args: Any, **kwargs: Any) -> SDKResponse:
+            return SDKResponse(content='{"ok":true}')
+
+        monkeypatch.setattr(provider, "_ensure_client_started", _noop)
+        monkeypatch.setattr(provider, "_send_and_wait", _fake_send_and_wait)
+        return provider
+
+    @pytest.mark.asyncio
+    async def test_per_agent_tier_forwarded_to_create_session(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        captured: dict[str, Any] = {}
+        provider = await self._build_provider(captured, monkeypatch)
+        agent = AgentDef(
+            name="analyze",
+            model="claude-opus-4.8",
+            prompt="Analyze",
+            context_tier="long_context",
+        )
+        await provider.execute(agent=agent, context={}, rendered_prompt="Analyze")
+        assert captured["create_session_kwargs"]["context_tier"] == "long_context"
+
+    @pytest.mark.asyncio
+    async def test_runtime_default_used_when_agent_has_none(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        captured: dict[str, Any] = {}
+        provider = await self._build_provider(
+            captured, monkeypatch, default_context_tier="long_context"
+        )
+        agent = AgentDef(name="analyze", model="claude-opus-4.8", prompt="Analyze")
+        await provider.execute(agent=agent, context={}, rendered_prompt="Analyze")
+        assert captured["create_session_kwargs"]["context_tier"] == "long_context"
+
+    @pytest.mark.asyncio
+    async def test_per_agent_tier_overrides_runtime_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        captured: dict[str, Any] = {}
+        provider = await self._build_provider(
+            captured, monkeypatch, default_context_tier="long_context"
+        )
+        agent = AgentDef(
+            name="cheap",
+            model="claude-opus-4.8",
+            prompt="Cheap",
+            context_tier="default",
+        )
+        await provider.execute(agent=agent, context={}, rendered_prompt="Cheap")
+        assert captured["create_session_kwargs"]["context_tier"] == "default"
+
+    @pytest.mark.asyncio
+    async def test_no_tier_set_means_key_absent(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured: dict[str, Any] = {}
+        provider = await self._build_provider(captured, monkeypatch)
+        agent = AgentDef(name="analyze", model="claude-opus-4.8", prompt="Analyze")
+        await provider.execute(agent=agent, context={}, rendered_prompt="Analyze")
+        assert "context_tier" not in captured["create_session_kwargs"]
+
+    @pytest.mark.asyncio
+    async def test_tier_and_reasoning_compose(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from conductor.config.schema import ReasoningConfig
+
+        captured: dict[str, Any] = {}
+        provider = await self._build_provider(captured, monkeypatch)
+        agent = AgentDef(
+            name="analyze",
+            model="claude-opus-4.8",
+            prompt="Analyze",
+            context_tier="long_context",
+            reasoning=ReasoningConfig(effort="high"),
+        )
+        await provider.execute(agent=agent, context={}, rendered_prompt="Analyze")
+        assert captured["create_session_kwargs"]["context_tier"] == "long_context"
+        assert captured["create_session_kwargs"]["reasoning_effort"] == "high"

@@ -135,6 +135,23 @@ conductor run examples/reasoning-effort.yaml \
 
 See [Reasoning Effort](../docs/configuration.md#reasoning-effort) for the per-provider translation, supported models, and validation rules.
 
+## Context Tier
+
+### context-tier.yaml
+
+A two-stage workflow that demonstrates selecting a model's long-context (e.g. 1M-token) window. Demonstrates:
+- Workflow-wide default via `runtime.default_context_tier`
+- Per-agent override via `context_tier` (wins over the default)
+- Composition with `reasoning.effort` — the two map to separate `create_session` kwargs
+- Conditional routing on a structured boolean output
+
+```bash
+conductor run examples/context-tier.yaml \
+  --input topic="root-causing a multi-service latency regression"
+```
+
+See [Context Tier](../docs/configuration.md#context-tier) for details. This is a Copilot-only capability.
+
 ## Multi-Agent Workflows
 
 ### research-assistant.yaml

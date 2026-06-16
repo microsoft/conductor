@@ -1399,6 +1399,105 @@ class TestRuntimeConfigDefaultReasoningEffort:
             RuntimeConfig(default_reasoning_effort=effort)  # type: ignore[arg-type]
 
 
+class TestAgentDefContextTier:
+    """Tests for the context_tier field on AgentDef."""
+
+    @pytest.mark.parametrize("tier", ["default", "long_context"])
+    def test_accepts_valid_tier(self, tier: str) -> None:
+        """Test that AgentDef accepts each valid context tier."""
+        agent = AgentDef(name="a", model="gpt-4", prompt="test", context_tier=tier)  # type: ignore[arg-type]
+        assert agent.context_tier == tier
+
+    @pytest.mark.parametrize("tier", ["1m", "huge", 42, ""])
+    def test_rejects_invalid_tier(self, tier: object) -> None:
+        """Test that invalid context_tier values raise ValidationError."""
+        with pytest.raises(ValidationError):
+            AgentDef(
+                name="a",
+                model="gpt-4",
+                prompt="test",
+                context_tier=tier,  # type: ignore[arg-type]
+            )
+
+    def test_context_tier_defaults_to_none(self) -> None:
+        """Test that context_tier defaults to None when omitted."""
+        agent = AgentDef(name="x", model="gpt-4", prompt="test")
+        assert agent.context_tier is None
+
+    def test_context_tier_composes_with_reasoning(self) -> None:
+        """Test that context_tier and reasoning can be set together."""
+        agent = AgentDef(
+            name="a",
+            model="claude-opus-4.8",
+            prompt="test",
+            context_tier="long_context",
+            reasoning={"effort": "high"},
+        )
+        assert agent.context_tier == "long_context"
+        assert agent.reasoning is not None
+        assert agent.reasoning.effort == "high"
+
+    def test_human_gate_with_context_tier_raises(self) -> None:
+        """Test that human_gate agents cannot have context_tier."""
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(
+                name="g",
+                type="human_gate",
+                prompt="Approve?",
+                options=[GateOption(label="Ok", value="ok", route="next")],
+                context_tier="long_context",
+            )
+        assert "human_gate agents cannot have 'context_tier'" in str(exc_info.value)
+
+    def test_script_with_context_tier_raises(self) -> None:
+        """Test that script agents cannot have context_tier."""
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(
+                name="s",
+                type="script",
+                command="echo hi",
+                context_tier="long_context",
+            )
+        assert "script agents cannot have 'context_tier'" in str(exc_info.value)
+
+    def test_workflow_with_context_tier_raises(self) -> None:
+        """Test that workflow agents cannot have context_tier."""
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(
+                name="w",
+                type="workflow",
+                workflow="./sub.yaml",
+                context_tier="long_context",
+            )
+        assert "workflow agents cannot have 'context_tier'" in str(exc_info.value)
+
+
+class TestRuntimeConfigDefaultContextTier:
+    """Tests for default_context_tier on RuntimeConfig."""
+
+    def test_default_is_none(self) -> None:
+        """Test that default_context_tier defaults to None."""
+        config = RuntimeConfig()
+        assert config.default_context_tier is None
+
+    def test_explicit_none_is_valid(self) -> None:
+        """Test that explicitly passing None is valid."""
+        config = RuntimeConfig(default_context_tier=None)
+        assert config.default_context_tier is None
+
+    @pytest.mark.parametrize("tier", ["default", "long_context"])
+    def test_accepts_valid_tier(self, tier: str) -> None:
+        """Test that each valid context tier is accepted."""
+        config = RuntimeConfig(default_context_tier=tier)  # type: ignore[arg-type]
+        assert config.default_context_tier == tier
+
+    @pytest.mark.parametrize("tier", ["1m", "huge", 42, ""])
+    def test_rejects_invalid_tier(self, tier: object) -> None:
+        """Test that invalid context tier values raise ValidationError."""
+        with pytest.raises(ValidationError):
+            RuntimeConfig(default_context_tier=tier)  # type: ignore[arg-type]
+
+
 class TestExtraFieldsForbidden:
     """Tests that workflow models reject unknown fields.
 

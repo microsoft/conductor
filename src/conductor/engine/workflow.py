@@ -584,6 +584,7 @@ class WorkflowEngine:
             self._system_metadata = self._build_system_metadata()
 
         default_effort = self.config.workflow.runtime.default_reasoning_effort
+        default_tier = self.config.workflow.runtime.default_context_tier
         default_provider_name = self.config.workflow.runtime.provider.name
 
         # Resolve the provider per agent (honoring per-agent overrides).
@@ -673,6 +674,9 @@ class WorkflowEngine:
                     "provider_name": _provider_for(a.name),
                     "reasoning_effort": (
                         a.reasoning.effort if a.reasoning is not None else default_effort
+                    ),
+                    "context_tier": (
+                        a.context_tier if a.context_tier is not None else default_tier
                     ),
                 }
                 for a in self.config.agents

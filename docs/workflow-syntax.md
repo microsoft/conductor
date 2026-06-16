@@ -55,6 +55,12 @@ workflow:
                                       # every provider-backed agent unless it
                                       # declares its own `reasoning.effort`.
                                       # See docs/configuration.md#reasoning-effort.
+    default_context_tier: default     # Optional: default | long_context (Copilot only)
+                                      # Workflow-wide default for the model's
+                                      # context-window tier. Inherited by every
+                                      # provider-backed agent unless it declares
+                                      # its own `context_tier`.
+                                      # See docs/configuration.md#context-tier.
 ```
 
 **Workflow metadata** is included verbatim in the `workflow_started` event and lets downstream consumers (dashboards, queue runners, observability tools) adapt without parsing the YAML. CLI `--metadata key=value` flags merge on top of YAML metadata (CLI wins on conflicts).
@@ -103,6 +109,14 @@ agents:
                                     # Only valid on type=agent (rejected on
                                     # script, human_gate, workflow).
                                     # See docs/configuration.md#reasoning-effort.
+
+    context_tier: long_context      # Optional: per-agent context-tier override
+                                    # default | long_context (Copilot only)
+                                    # Overrides runtime.default_context_tier.
+                                    # Composes with reasoning. Only valid on
+                                    # type=agent (rejected on script,
+                                    # human_gate, workflow).
+                                    # See docs/configuration.md#context-tier.
 
     routes:                         # Optional: Routing logic
       - to: next_agent              # Agent name or $end

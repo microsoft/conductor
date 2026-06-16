@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.18...HEAD)
 
+### Added
+
+- **Context tier** — new `context_tier` knob (`default` | `long_context`) to
+  select a model's long-context (e.g. 1M-token) window on the Copilot provider.
+  Set per agent via `context_tier:` (sibling to `model`) or workflow-wide via
+  `runtime.default_context_tier`; the per-agent value wins. It composes
+  independently with `reasoning.effort` (the two map to separate
+  `create_session` kwargs). The Copilot provider forwards the resolved value as
+  `context_tier` to `create_session`; other providers ignore it. Only valid on
+  standard `agent`-type agents (rejected on `script`, `human_gate`, and
+  `workflow` agents). See [`examples/context-tier.yaml`](examples/context-tier.yaml)
+  and [Context Tier](docs/configuration.md#context-tier).
+  ([#251](https://github.com/microsoft/conductor/issues/251))
+
 ### Fixed
 
 - `human_gate` agents: the dict returned by `prompt_for` text-collection fields
