@@ -959,6 +959,44 @@ class ConsoleEventSubscriber:
                 style="red",
             )
 
+        elif t == "agent_validator_start":
+            verbose_log(f"  Validating '{_validator_label(d)}' output…", style="cyan")
+
+        elif t == "agent_validator_complete":
+            label = _validator_label(d)
+            cost = d.get("cost_usd")
+            cost_str = f" · ${cost:.4f}" if isinstance(cost, int | float) else ""
+            if d.get("errored"):
+                verbose_log(
+                    f"  Validation error for '{label}' (treated as pass){cost_str}",
+                    style="yellow",
+                )
+            elif d.get("passed", True):
+                verbose_log(f"  Validation passed for '{label}'{cost_str}", style="green")
+            # Failure detail is emitted via agent_validation_failed below.
+
+        elif t == "agent_validation_failed":
+            label = _validator_label(d)
+            issues = d.get("issues") or []
+            action = (
+                "re-running once with feedback"
+                if d.get("will_retry")
+                else "no retry (max_retries=0)"
+            )
+            verbose_log(
+                f"  Validation failed for '{label}' ({len(issues)} issue(s)) — {action}:",
+                style="yellow",
+            )
+            for issue in issues:
+                verbose_log(f"    - {issue}", style="dim")
+
+
+def _validator_label(data: dict[str, Any]) -> str:
+    """Build an agent label including a for-each ``item_key`` when present."""
+    agent = data.get("agent_name", "?")
+    item = data.get("item_key")
+    return f"{agent}[{item}]" if item is not None else str(agent)
+
 
 def display_usage_summary(usage_data: dict[str, Any], console: Console | None = None) -> None:
     """Display final usage summary with token counts and costs.

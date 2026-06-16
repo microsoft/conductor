@@ -116,6 +116,13 @@ agents:
     reasoning:                   # Override runtime.default_reasoning_effort (optional)
       effort: high               # low, medium, high, or xhigh
 
+    validator:                   # Optional: grade output, re-run once on failure
+      criteria: |                # Required: rubric the output is checked against
+        Verify every issue has an actionable suggestion and no
+        function names are fabricated.
+      model: claude-sonnet-4-5   # Optional: defaults to the agent's model
+      max_retries: 1             # 0 or 1 (default 1; hard-capped at 1)
+
     routes:                      # Where to go next
       - to: next_agent
 ```
@@ -147,6 +154,29 @@ agents:
 ```
 
 See `examples/reasoning-effort.yaml` for a complete example.
+
+### Validator (semantic output validation)
+
+`validator.criteria` (required) is graded by a **second LLM call** after the agent completes, returning `{passed, issues}`. On `passed: false` and `max_retries > 0` (default `1`, hard-capped at `1`; `0` = report-only), the agent re-runs once with a `## Validation feedback` section (the issues) appended to its prompt; the second output is final (no second validation loop). `validator.model` defaults to the agent's model.
+
+Distinct from `retry:` (transient failures, same prompt) and `output:` (shape/type, not content). Provider-backed `agent` steps only (not `script`, `human_gate`, `workflow`, `wait`, `set`, `terminate`); works in the main loop, parallel groups, and for-each loops. **Fail-open** — validator errors / unparseable responses are treated as a pass with a logged warning, so a flaky grader never blocks the workflow. Validator (and any discarded first attempt) token cost is reported as a separate `<agent> (validator)` usage row. Emits `agent_validator_start`, `agent_validator_complete`, and `agent_validation_failed` events (surfaced in the dashboard and at `-vv`).
+
+```yaml
+agents:
+  - name: code_reviewer
+    model: claude-sonnet-4-5
+    prompt: "Review the diff for bugs.\n{{ workflow.input.diff }}"
+    output:
+      summary: { type: string }
+      issues:  { type: array }
+    validator:
+      criteria: |
+        Verify the review identifies all null-safety issues, every suggestion
+        is actionable, and no function names are fabricated.
+      max_retries: 1
+```
+
+See `examples/validator.yaml` for a complete example.
 
 ## Routing Patterns
 
@@ -250,7 +280,7 @@ routes:
 
 ### Script Restrictions
 
-Script agents **cannot** have: `prompt`, `provider`, `model`, `tools`, `output`, `system_prompt`, `options`, `retry`, `reasoning`, `dialog`, `max_session_seconds`, `max_agent_iterations`, `timeout_seconds` (use `timeout:` instead), `input_mapping`, or `max_depth`.
+Script agents **cannot** have: `prompt`, `provider`, `model`, `tools`, `output`, `system_prompt`, `options`, `retry`, `reasoning`, `dialog`, `validator`, `max_session_seconds`, `max_agent_iterations`, `timeout_seconds` (use `timeout:` instead), `input_mapping`, or `max_depth`.
 Command and args support Jinja2 templating for dynamic values.
 
 ## Wait Steps (`type: wait`)
@@ -315,7 +345,7 @@ agents:
 
 ### Wait Restrictions
 
-Wait agents **cannot** have: `prompt`, `model`, `provider`, `tools`, `system_prompt`, `options`, `command`, `args`, `env`, `working_dir`, `timeout`, `workflow`, `input_mapping`, `max_depth`, `max_session_seconds`, `max_agent_iterations`, `retry`, `dialog`, `reasoning`, `timeout_seconds`, or `output`. They also cannot be used inside `parallel` groups or `for_each` groups.
+Wait agents **cannot** have: `prompt`, `model`, `provider`, `tools`, `system_prompt`, `options`, `command`, `args`, `env`, `working_dir`, `timeout`, `workflow`, `input_mapping`, `max_depth`, `max_session_seconds`, `max_agent_iterations`, `retry`, `dialog`, `validator`, `reasoning`, `timeout_seconds`, or `output`. They also cannot be used inside `parallel` groups or `for_each` groups.
 
 See `examples/wait-step.yaml` for a complete polling workflow.
 ## Set Steps
@@ -396,7 +426,7 @@ Routes attached to a set step see the bound value directly. Dict outputs expose 
 
 ### Set Step Restrictions
 
-Set agents **cannot** have: `prompt`, `provider`, `model`, `tools`, `system_prompt`, `command`, `args`, `env`, `working_dir`, `timeout`, `workflow`, `options`, `input_mapping`, `max_depth`, `retry`, `dialog`, `reasoning`, `timeout_seconds`, `max_session_seconds`, or `max_agent_iterations`. They count toward `limits.max_iterations` like any other step.
+Set agents **cannot** have: `prompt`, `provider`, `model`, `tools`, `system_prompt`, `command`, `args`, `env`, `working_dir`, `timeout`, `workflow`, `options`, `input_mapping`, `max_depth`, `retry`, `dialog`, `validator`, `reasoning`, `timeout_seconds`, `max_session_seconds`, or `max_agent_iterations`. They count toward `limits.max_iterations` like any other step.
 
 `output:` schema validation is permitted only when the rendered output is a dict (always for `values:`, sometimes for `value:`). A single-`value:` step with a declared schema that produces a scalar raises a `ValidationError` pointing to `values:`.
 
@@ -450,7 +480,7 @@ for_each:
         title: "{{ issue.title }}"
 ```
 
-**Restrictions** — workflow steps cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, `command`, `options`, `retry`, `reasoning`, `dialog`, `max_session_seconds`, `max_agent_iterations`, or `timeout_seconds`.
+**Restrictions** — workflow steps cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, `command`, `options`, `retry`, `reasoning`, `dialog`, `validator`, `max_session_seconds`, `max_agent_iterations`, or `timeout_seconds`.
 
 ## Terminate Steps (`type: terminate`)
 
@@ -487,7 +517,7 @@ agents:
 - **Sub-workflow boundary** — a `status: failed` terminate inside a child sub-workflow is downgraded to `SubworkflowTerminatedError` (also an `ExecutionError`) at the parent boundary. The parent treats it as a normal sub-workflow failure (its own `workflow_failed` does NOT inherit `is_explicit: true`). The child's rendered output, reason, and terminate-step name are preserved as `terminated_output` / `terminated_reason` / `terminated_by` attributes on the wrapper for `on_error` hooks and debugging surfaces. A `status: success` child terminate returns its rendered output cleanly and the parent continues with its next routes.
 - **Branching on a child's termination** — if the parent's routes need to react to a child's outcome, the child should use `status: success` plus an `output_template:` carrying the relevant fields. Failed terminate is an error from the parent's perspective; parent `routes:` are only evaluated after successful steps.
 
-**Restrictions** — terminate steps cannot have `routes`, `tools`, `output`, `prompt`, `model`, `provider`, `system_prompt`, `command`, `args`, `env`, `working_dir`, `timeout`, `timeout_seconds`, `max_session_seconds`, `max_agent_iterations`, `max_depth`, `retry`, `dialog`, `reasoning`, `workflow`, `input_mapping`, or `options`. Cannot appear as a parallel-group member or as a `for_each` inline agent — route to them from those groups' `routes:` instead. Conversely, regular agents cannot have `status`, `reason`, or `output_template` — those fields are rejected at schema validation to catch authors who forgot to add `type: terminate`.
+**Restrictions** — terminate steps cannot have `routes`, `tools`, `output`, `prompt`, `model`, `provider`, `system_prompt`, `command`, `args`, `env`, `working_dir`, `timeout`, `timeout_seconds`, `max_session_seconds`, `max_agent_iterations`, `max_depth`, `retry`, `dialog`, `validator`, `reasoning`, `workflow`, `input_mapping`, or `options`. Cannot appear as a parallel-group member or as a `for_each` inline agent — route to them from those groups' `routes:` instead. Conversely, regular agents cannot have `status`, `reason`, or `output_template` — those fields are rejected at schema validation to catch authors who forgot to add `type: terminate`.
 
 See `examples/terminate.yaml` for a complete example demonstrating success, failure, and pass-through paths.
 

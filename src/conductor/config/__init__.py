@@ -21,6 +21,7 @@ from conductor.config.schema import (
     OutputField,
     RouteDef,
     RuntimeConfig,
+    ValidatorConfig,
     WorkflowConfig,
     WorkflowDef,
 )
@@ -43,6 +44,7 @@ __all__ = [
     "OutputField",
     "RouteDef",
     "RuntimeConfig",
+    "ValidatorConfig",
     "WorkflowConfig",
     "WorkflowDef",
     # Validator

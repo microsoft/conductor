@@ -316,7 +316,7 @@ routes:
   - to: $end
 ```
 
-**Restrictions** — script steps cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, or `options`. Script steps also cannot be used inside `parallel` groups or `for_each` groups.
+**Restrictions** — script steps cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, `options`, or `validator`. Script steps also cannot be used inside `parallel` groups or `for_each` groups.
 
 **Environment variable note** — values in `env` are passed as-is to the subprocess (they are not rendered as Jinja2 templates). Use `${VAR}` syntax in the workflow YAML loader if you need environment variable substitution in env values.
 
@@ -381,7 +381,7 @@ agents:
 
 **Iteration counting** — wait steps count toward `workflow.limits.max_iterations` (each pause is one step). They are not subject to `max_agent_iterations`, which counts per-LLM-agent tool iterations.
 
-**Restrictions** — wait steps cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, `options`, `command`, `args`, `env`, `working_dir`, `timeout`, `workflow`, `input_mapping`, `max_depth`, `max_session_seconds`, `max_agent_iterations`, `retry`, `dialog`, `reasoning`, `timeout_seconds`, or `output`. Wait steps also cannot be used inside `parallel` groups or `for_each` groups.
+**Restrictions** — wait steps cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, `options`, `command`, `args`, `env`, `working_dir`, `timeout`, `workflow`, `input_mapping`, `max_depth`, `max_session_seconds`, `max_agent_iterations`, `retry`, `dialog`, `reasoning`, `validator`, `timeout_seconds`, or `output`. Wait steps also cannot be used inside `parallel` groups or `for_each` groups.
 
 See [`examples/wait-step.yaml`](../examples/wait-step.yaml) for a complete polling workflow.
 ### Set Steps
@@ -467,7 +467,7 @@ Per-key typing on multi `values:` is not supported.
 
 **Composition** — set steps are allowed inside `parallel` groups (each member publishes its bound value to context) and as the inline agent of a `for_each` group (one bound value per item). Inside a parallel group, set templates cannot reference sibling group members (the validator catches this at config time, since the engine renders against a pre-group snapshot).
 
-**Restrictions** — set agents cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, `command`, `args`, `env`, `working_dir`, `timeout`, `workflow`, `options`, `input_mapping`, `max_depth`, `retry`, `dialog`, `reasoning`, `timeout_seconds`, `max_session_seconds`, or `max_agent_iterations`. They count toward `limits.max_iterations` like any other step.
+**Restrictions** — set agents cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, `command`, `args`, `env`, `working_dir`, `timeout`, `workflow`, `options`, `input_mapping`, `max_depth`, `retry`, `dialog`, `reasoning`, `validator`, `timeout_seconds`, `max_session_seconds`, or `max_agent_iterations`. They count toward `limits.max_iterations` like any other step.
 
 **Events** — set steps emit `set_started` / `set_completed` / `set_failed` (mirroring the script-step lifecycle) in all three positions: linear main loop, parallel group member, and for-each iteration. The `set_completed` payload carries `output_type`, `output_keys` (sorted, empty for scalars), and `value_repr` (a JSON-safe preview, truncated at 512 chars).
 
@@ -559,7 +559,7 @@ parallel:
         title: "{{ issue.title }}"
 ```
 
-**Restrictions** — workflow steps cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, `command`, or `options`.
+**Restrictions** — workflow steps cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, `command`, `options`, or `validator`.
 
 ### Terminate Steps
 
@@ -607,7 +607,7 @@ agents:
 
 **Final output** — when `output_template:` is set, it *replaces* the workflow-level `output:` mapping for this termination path. Each rendered value is passed through the same JSON-coercion helper used elsewhere in the engine, so `"true"` becomes `True`, `"42"` becomes `42`, and JSON literals are parsed. When `output_template:` is omitted, the workflow-level `output:` is rendered as on any other terminal path.
 
-**Restrictions** — terminate steps cannot have `routes`, `tools`, `output`, `prompt`, `model`, `provider`, `system_prompt`, `command`, `args`, `env`, `working_dir`, `timeout`, `timeout_seconds`, `max_session_seconds`, `max_agent_iterations`, `max_depth`, `retry`, `dialog`, `reasoning`, `workflow`, `input_mapping`, or `options`. They cannot appear as members of a parallel group or as a `for_each` inline agent — route to them from those groups' `routes:` instead.
+**Restrictions** — terminate steps cannot have `routes`, `tools`, `output`, `prompt`, `model`, `provider`, `system_prompt`, `command`, `args`, `env`, `working_dir`, `timeout`, `timeout_seconds`, `max_session_seconds`, `max_agent_iterations`, `max_depth`, `retry`, `dialog`, `reasoning`, `validator`, `workflow`, `input_mapping`, or `options`. They cannot appear as members of a parallel group or as a `for_each` inline agent — route to them from those groups' `routes:` instead.
 
 **Sub-workflow boundary** — a `status: failed` terminate inside a sub-workflow is downgraded to a `SubworkflowTerminatedError` (subclass of `ExecutionError`) at the parent boundary so the parent treats it as a normal sub-workflow failure (its own `workflow_failed` does NOT inherit `is_explicit: true`). The child's rendered output, reason, and terminate step name are preserved on the wrapper as `terminated_output`, `terminated_reason`, and `terminated_by` for `on_error` hooks and debugging surfaces. A `status: success` terminate inside a sub-workflow returns its rendered output cleanly and the parent continues with its next routes.
 
@@ -648,6 +648,48 @@ After the conversation, the agent re-executes with the dialog transcript as addi
 - When `--skip-gates` is set (e.g., CI/automation), dialogs are automatically skipped
 - The evaluator prompt should describe *when* to trigger dialog, not *what* to ask — the evaluator generates the opening question from the agent's output context
 - After dialog, the agent sees the full conversation transcript and produces updated output
+
+### Validator
+
+A `validator:` block runs a **second LLM call** after a provider-backed agent completes, grading its output against a user-defined rubric. If validation fails, the agent is re-run **once** with the validator's feedback appended. This is distinct from `retry:` (transient failures, same prompt) and the `output:` schema (shape/type, not content quality) — it catches output that is structurally valid but semantically wrong, incomplete, or off-rubric.
+
+```yaml
+agents:
+  - name: code_reviewer
+    model: claude-sonnet-4-5
+    prompt: "Review the diff for bugs.\n{{ workflow.input.diff }}"
+    output:
+      summary: { type: string }
+      issues:  { type: array }
+    validator:
+      model: claude-sonnet-4-5   # optional; defaults to the agent's model
+      criteria: |
+        Verify the review identifies all null-safety issues, every suggestion
+        is actionable, and no function names are fabricated.
+      max_retries: 1
+```
+
+**Mechanics:**
+1. The primary agent runs and produces output.
+2. The validator runs a second LLM call that receives the agent's rendered prompt, its output, and the `criteria`, and must answer `{ "passed": bool, "issues": [str, ...] }`.
+3. If `passed` is true, the output flows downstream unchanged.
+4. If `passed` is false and `max_retries > 0`, the agent re-runs once with a `## Validation feedback` section (the issues) appended to its prompt. The second output is taken as final — there is no second validation loop.
+
+**Configuration:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `validator.criteria` | string | Yes | The rubric the output is graded against. Describe what a *good* output looks like (the checks to perform). |
+| `validator.model` | string | No | Model for the validator call. Defaults to the primary agent's model. |
+| `validator.max_retries` | int | No | Re-runs on failure. Default `1`, **hard-capped at 1**. `0` = validate-and-report without re-running. |
+
+**Behavior notes:**
+- Supported on provider-backed `agent` steps only (not `human_gate`, `script`, `workflow`, `wait`, `set`, or `terminate`). Works in the main loop, parallel groups, and for-each loops.
+- The validator uses the primary agent's provider; only `model` is overridable.
+- **Fail-open:** if the validator call errors or returns unparseable output, it is treated as a pass (with a logged warning) so a flaky grader never blocks the workflow.
+- The validator sees only the agent's prompt + output + criteria, not other agents' outputs — keeping validation focused and cheap.
+- Validator (and any discarded first attempt) token cost is reported as a separate `<agent> (validator)` row in the usage summary.
+- Emits `agent_validator_start`, `agent_validator_complete`, and `agent_validation_failed` events, surfaced in the web dashboard and `--verbose` console output.
 
 ## Parallel Groups
 

@@ -49,6 +49,9 @@ export type EventType =
   | 'dialog_started'
   | 'dialog_message'
   | 'dialog_completed'
+  | 'agent_validator_start'
+  | 'agent_validator_complete'
+  | 'agent_validation_failed'
   | 'iteration_limit_reached'
   | 'iteration_limit_resolved';
 
@@ -385,6 +388,43 @@ export interface DialogCompletedData {
   user_dismissed?: boolean;
   user_declined?: boolean;
   agent_proposed_continue?: boolean;
+}
+
+// --- Validator events (issue #220) ---
+
+export interface AgentValidatorStartData {
+  agent_name: string;
+  /** Present when the validated agent runs inside a for-each loop. */
+  item_key?: string | number;
+  /** Model used for the validator call (defaults to the agent's model). */
+  model?: string | null;
+  /** First ~200 chars of the validator criteria, for display. */
+  criteria_preview?: string;
+}
+
+export interface AgentValidatorCompleteData {
+  agent_name: string;
+  item_key?: string | number;
+  /** Whether the output satisfied the criteria. */
+  passed: boolean;
+  /** Concrete issues reported when not passed (empty when passed). */
+  issues: string[];
+  /** True when the validator failed open (call error / unparseable output). */
+  errored?: boolean;
+  model?: string | null;
+  tokens?: number | null;
+  input_tokens?: number | null;
+  output_tokens?: number | null;
+  cost_usd?: number | null;
+  elapsed?: number;
+}
+
+export interface AgentValidationFailedData {
+  agent_name: string;
+  item_key?: string | number;
+  issues: string[];
+  /** Whether the primary agent will be re-run once with feedback. */
+  will_retry: boolean;
 }
 
 // --- Subworkflow lifecycle ---

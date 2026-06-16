@@ -57,7 +57,7 @@ from conductor.gates.human import (
     MaxIterationsPromptResult,
 )
 from conductor.gates.interrupt import InterruptAction, InterruptHandler, InterruptResult
-from conductor.providers.base import AgentOutput
+from conductor.providers.base import AgentOutput, EventCallback
 
 logger = logging.getLogger(__name__)
 
@@ -409,9 +409,11 @@ class WorkflowEngine:
 
         # Dialog mode support
         from conductor.engine.dialog_evaluator import DialogEvaluator
+        from conductor.engine.validator import OutputValidator
         from conductor.gates.dialog import DialogHandler
 
         self._dialog_evaluator = DialogEvaluator()
+        self._output_validator = OutputValidator()
         self._dialog_handler = DialogHandler(
             skip_dialogs=skip_gates,
             emitter=event_emitter,
@@ -2218,6 +2220,162 @@ class WorkflowEngine:
             if self._keyboard_listener is not None:
                 await self._keyboard_listener.resume()
 
+    async def _apply_validator(
+        self,
+        agent: AgentDef,
+        output: AgentOutput,
+        primary_elapsed: float,
+        agent_context: dict[str, Any],
+        executor: AgentExecutor,
+        guidance_section: str | None,
+        event_callback: EventCallback | None,
+        usage_label: str | None = None,
+    ) -> AgentOutput:
+        """Run an agent's ``validator:`` and, on failure, re-run the primary once.
+
+        Mechanics (issue #220):
+
+        1. Render the primary agent's prompt and run a second LLM call
+           (:class:`OutputValidator`) that grades ``output`` against
+           ``agent.validator.criteria``.
+        2. Record the validator call as a separate ``"<agent> (validator)"``
+           usage row and emit ``agent_validator_start`` /
+           ``agent_validator_complete``.
+        3. If it passes (or ``max_retries == 0``) return ``output`` unchanged.
+        4. Otherwise emit ``agent_validation_failed`` and, when
+           ``max_retries > 0``, re-run the primary agent exactly once with a
+           ``## Validation feedback`` section appended. The re-run output is
+           taken as final — there is no second validation loop.
+
+        Validation is fail-open: a validator error never blocks the workflow
+        (the original output flows through). Cost accounting: the
+        ``"<agent> (validator)"`` row bundles the validation call(s) and, when
+        a re-run occurs, the discarded first attempt — so the primary row
+        reflects the effective output while the validator row makes the full
+        cost of the feature explicit.
+
+        Args:
+            agent: The primary agent (must have ``validator`` set).
+            output: The primary agent's output.
+            primary_elapsed: Wall-clock seconds the primary execution took
+                (used to attribute the discarded run's time on re-run).
+            agent_context: Context the primary agent executed against.
+            executor: Executor (and provider) for the primary agent.
+            guidance_section: Any guidance already appended to the primary
+                prompt; the validation feedback is appended after it on re-run.
+            event_callback: Callback used to emit validator events and stream
+                re-run events with the correct agent/item tagging. May be
+                ``None`` when no emitter is configured.
+            usage_label: Base name for the validator usage row(s). Defaults to
+                ``agent.name``; for-each iterations pass the qualified
+                ``"<group>[<key>]"`` label so the validator row matches the
+                primary row's naming convention.
+
+        Returns:
+            The final output (original, or the re-run output on failure).
+        """
+        cfg = agent.validator
+        if cfg is None:  # defensive; callers guard on this
+            return output
+
+        provider = executor.provider
+        validator_row = f"{usage_label or agent.name} (validator)"
+
+        def _emit_v(event_type: str, data: dict[str, Any]) -> None:
+            if event_callback is not None:
+                with contextlib.suppress(Exception):
+                    event_callback(event_type, data)
+
+        try:
+            primary_prompt = executor.render_prompt(agent, agent_context)
+        except Exception:
+            primary_prompt = agent.prompt
+
+        validator_model = cfg.model or agent.model
+        _emit_v(
+            "agent_validator_start",
+            {"model": validator_model, "criteria_preview": cfg.criteria[:200]},
+        )
+
+        _v_start = _time.time()
+        outcome = await self._output_validator.validate(
+            agent, primary_prompt, output.content, provider
+        )
+        _v_elapsed = _time.time() - _v_start
+
+        v_cost: float | None = None
+        if outcome.output is not None:
+            v_usage = self.usage_tracker.record(validator_row, outcome.output, _v_elapsed)
+            v_cost = v_usage.cost_usd
+
+        _emit_v(
+            "agent_validator_complete",
+            {
+                "passed": outcome.passed,
+                "issues": outcome.issues,
+                "errored": outcome.errored,
+                "model": outcome.output.model if outcome.output else validator_model,
+                "tokens": outcome.output.tokens_used if outcome.output else None,
+                "input_tokens": outcome.output.input_tokens if outcome.output else None,
+                "output_tokens": outcome.output.output_tokens if outcome.output else None,
+                "cost_usd": v_cost,
+                "elapsed": _v_elapsed,
+            },
+        )
+
+        if outcome.passed:
+            return output
+
+        will_retry = cfg.max_retries > 0
+        _emit_v(
+            "agent_validation_failed",
+            {"issues": outcome.issues, "will_retry": will_retry},
+        )
+
+        if not will_retry:
+            return output
+
+        # Preserve the discarded first attempt's cost under the validator row
+        # so it isn't lost when the re-run output replaces it under the
+        # primary name downstream.
+        self.usage_tracker.record(validator_row, output, primary_elapsed)
+
+        feedback = self._build_validation_feedback(outcome.issues)
+        new_guidance = (guidance_section or "") + feedback
+        try:
+            new_output = await self._execute_with_agent_timeout(
+                agent,
+                executor.execute(
+                    agent,
+                    agent_context,
+                    guidance_section=new_guidance,
+                    interrupt_signal=self._interrupt_event,
+                    event_callback=event_callback,
+                ),
+            )
+            return new_output
+        except Exception:
+            logger.warning(
+                "Validator re-run failed for '%s'; using original output",
+                agent.name,
+                exc_info=True,
+            )
+            return output
+
+    @staticmethod
+    def _build_validation_feedback(issues: list[str]) -> str:
+        """Build the ``## Validation feedback`` section appended on re-run."""
+        if issues:
+            bullets = "\n".join(f"- {issue}" for issue in issues)
+        else:
+            bullets = "- The output did not satisfy the acceptance criteria."
+        return (
+            "\n\n## Validation feedback\n"
+            "Your previous output did not pass validation. Address the following "
+            "and produce a corrected output:\n"
+            f"{bullets}\n"
+        )
+
     async def _execute_loop(self, current_agent_name: str) -> dict[str, Any]:
         """Core execution loop shared by :meth:`run` and :meth:`resume`.
 
@@ -3123,6 +3281,19 @@ class WorkflowEngine:
                                 output,
                                 agent_context,
                                 executor,
+                            )
+                            _agent_elapsed = _time.time() - _agent_start
+
+                        # Validator: grade output and re-run once on failure
+                        if agent.validator and not output.partial:
+                            output = await self._apply_validator(
+                                agent,
+                                output,
+                                _agent_elapsed,
+                                agent_context,
+                                executor,
+                                guidance_section,
+                                event_callback,
                             )
                             _agent_elapsed = _time.time() - _agent_start
 
@@ -4159,6 +4330,19 @@ class WorkflowEngine:
                 )
                 _agent_elapsed = _time.time() - _agent_start
 
+                # Validator: grade output and re-run once on failure
+                if agent.validator and not output.partial:
+                    output = await self._apply_validator(
+                        agent,
+                        output,
+                        _agent_elapsed,
+                        agent_context,
+                        executor,
+                        None,
+                        event_callback,
+                    )
+                    _agent_elapsed = _time.time() - _agent_start
+
                 # Record usage and calculate cost
                 usage = self.usage_tracker.record(agent.name, output, _agent_elapsed)
 
@@ -4621,6 +4805,20 @@ class WorkflowEngine:
                     ),
                 )
                 _item_elapsed = _time.time() - _item_start
+
+                # Validator: grade output and re-run once on failure
+                if qualified_agent.validator and not output.partial:
+                    output = await self._apply_validator(
+                        qualified_agent,
+                        output,
+                        _item_elapsed,
+                        agent_context,
+                        executor,
+                        None,
+                        event_callback,
+                        usage_label=f"{for_each_group.name}[{key}]",
+                    )
+                    _item_elapsed = _time.time() - _item_start
 
                 # Record usage and calculate cost
                 usage = self.usage_tracker.record(

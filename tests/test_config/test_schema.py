@@ -17,6 +17,7 @@ from conductor.config.schema import (
     ReasoningConfig,
     RouteDef,
     RuntimeConfig,
+    ValidatorConfig,
     WorkflowConfig,
     WorkflowDef,
 )
@@ -1371,6 +1372,173 @@ class TestAgentDefReasoning:
                 reasoning={"effort": "medium"},
             )
         assert "workflow agents cannot have 'reasoning'" in str(exc_info.value)
+
+
+class TestAgentDefValidator:
+    """Tests for the validator field on AgentDef."""
+
+    def test_accepts_minimal_validator(self) -> None:
+        """Test that a default agent accepts a minimal validator block."""
+        agent = AgentDef(
+            name="a",
+            model="gpt-4",
+            prompt="test",
+            validator={"criteria": "Output must cite a real source."},
+        )
+        assert agent.validator is not None
+        assert agent.validator.criteria == "Output must cite a real source."
+        assert agent.validator.model is None
+        assert agent.validator.max_retries == 1
+
+    def test_accepts_validator_config_instance(self) -> None:
+        """Test that a ValidatorConfig instance is accepted."""
+        agent = AgentDef(
+            name="a",
+            model="gpt-4",
+            prompt="test",
+            validator=ValidatorConfig(criteria="Check it", model="cheap-model", max_retries=0),
+        )
+        assert agent.validator is not None
+        assert agent.validator.model == "cheap-model"
+        assert agent.validator.max_retries == 0
+
+    def test_validator_defaults_to_none(self) -> None:
+        """Test that validator defaults to None when omitted."""
+        agent = AgentDef(name="x", model="gpt-4", prompt="test")
+        assert agent.validator is None
+
+    def test_explicit_agent_type_accepts_validator(self) -> None:
+        """Test that type='agent' accepts validator."""
+        agent = AgentDef(
+            name="a",
+            type="agent",
+            model="gpt-4",
+            prompt="test",
+            validator={"criteria": "Be correct"},
+        )
+        assert agent.validator is not None
+
+    def test_empty_criteria_rejected(self) -> None:
+        """Test that blank criteria is rejected."""
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(
+                name="a",
+                model="gpt-4",
+                prompt="test",
+                validator={"criteria": "   "},
+            )
+        assert "non-empty string" in str(exc_info.value)
+
+    def test_missing_criteria_rejected(self) -> None:
+        """Test that criteria is required."""
+        with pytest.raises(ValidationError):
+            AgentDef(
+                name="a",
+                model="gpt-4",
+                prompt="test",
+                validator={"model": "gpt-4"},  # type: ignore[arg-type]
+            )
+
+    @pytest.mark.parametrize("retries", [0, 1])
+    def test_accepts_max_retries_zero_and_one(self, retries: int) -> None:
+        """Test that max_retries of 0 and 1 are accepted."""
+        agent = AgentDef(
+            name="a",
+            model="gpt-4",
+            prompt="test",
+            validator={"criteria": "Check", "max_retries": retries},
+        )
+        assert agent.validator is not None
+        assert agent.validator.max_retries == retries
+
+    @pytest.mark.parametrize("retries", [2, 3, 10])
+    def test_rejects_max_retries_above_one(self, retries: int) -> None:
+        """Test that max_retries > 1 is rejected (hard cap at 1)."""
+        with pytest.raises(ValidationError):
+            AgentDef(
+                name="a",
+                model="gpt-4",
+                prompt="test",
+                validator={"criteria": "Check", "max_retries": retries},
+            )
+
+    def test_rejects_negative_max_retries(self) -> None:
+        """Test that negative max_retries is rejected."""
+        with pytest.raises(ValidationError):
+            AgentDef(
+                name="a",
+                model="gpt-4",
+                prompt="test",
+                validator={"criteria": "Check", "max_retries": -1},
+            )
+
+    def test_human_gate_with_validator_raises(self) -> None:
+        """Test that human_gate agents cannot have validator."""
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(
+                name="gate1",
+                type="human_gate",
+                prompt="Choose:",
+                options=[GateOption(label="Ok", value="ok", route="next")],
+                validator={"criteria": "Check"},
+            )
+        assert "human_gate agents cannot have 'validator'" in str(exc_info.value)
+
+    def test_script_with_validator_raises(self) -> None:
+        """Test that script agents cannot have validator."""
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(
+                name="s",
+                type="script",
+                command="echo hello",
+                validator={"criteria": "Check"},
+            )
+        assert "script agents cannot have 'validator'" in str(exc_info.value)
+
+    def test_workflow_with_validator_raises(self) -> None:
+        """Test that workflow agents cannot have validator."""
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(
+                name="w",
+                type="workflow",
+                workflow="./sub.yaml",
+                validator={"criteria": "Check"},
+            )
+        assert "workflow agents cannot have 'validator'" in str(exc_info.value)
+
+    def test_wait_with_validator_raises(self) -> None:
+        """Test that wait agents cannot have validator."""
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(
+                name="w",
+                type="wait",
+                duration="5s",
+                validator={"criteria": "Check"},
+            )
+        assert "wait agents cannot have 'validator'" in str(exc_info.value)
+
+    def test_set_with_validator_raises(self) -> None:
+        """Test that set agents cannot have validator."""
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(
+                name="s",
+                type="set",
+                value="{{ workflow.input.x }}",
+                validator={"criteria": "Check"},
+            )
+        assert "set agents cannot have 'validator'" in str(exc_info.value)
+
+    def test_terminate_with_validator_raises(self) -> None:
+        """Test that terminate agents cannot have validator."""
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(
+                name="t",
+                type="terminate",
+                status="success",
+                reason="done",
+                validator={"criteria": "Check"},
+            )
+        assert "terminate agents cannot have 'validator'" in str(exc_info.value)
 
 
 class TestRuntimeConfigDefaultReasoningEffort:

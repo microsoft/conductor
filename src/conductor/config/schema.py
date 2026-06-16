@@ -435,6 +435,68 @@ class DialogConfig(BaseModel):
     """
 
 
+class ValidatorConfig(BaseModel):
+    """Configuration for semantic output validation with retry-once.
+
+    When present on a provider-backed agent, the engine runs a **second
+    LLM call** after the primary agent completes. The validator receives
+    the primary agent's rendered prompt, its output, and the ``criteria``
+    rubric, and must answer whether the output passes
+    (``{"passed": bool, "issues": [str, ...]}``).
+
+    If the validator returns ``passed: false`` and ``max_retries > 0``, the
+    primary agent is re-run **once** with the validator's feedback appended
+    to its prompt. The second output is taken as final — there is no second
+    validation loop.
+
+    This is distinct from ``retry:`` (transient/provider failures, same
+    prompt) and the ``output:`` schema (shape/type, not content quality).
+    It targets structurally valid but semantically wrong, incomplete, or
+    off-rubric output.
+
+    Example YAML::
+
+        validator:
+          model: claude-sonnet-4-5   # optional; defaults to the agent's model
+          criteria: |
+            Verify the review identifies all null-safety issues, every
+            suggestion is actionable, and no function names are fabricated.
+          max_retries: 1
+    """
+
+    criteria: str
+    """User-defined rubric the primary output is checked against.
+
+    Wrapped in the validator's system prompt. Should describe concretely
+    what a *good* output looks like (the checks the validator must perform),
+    not merely restate the agent's task.
+    """
+
+    model: str | None = None
+    """Model for the validator call. Defaults to the primary agent's model.
+
+    Often set to a cheaper or faster model than the primary agent, since
+    grading an output is usually lighter than producing it.
+    """
+
+    max_retries: int = Field(default=1, ge=0, le=1)
+    """Number of times the primary agent is re-run on validation failure.
+
+    Hard-capped at 1 by design — beyond a single feedback-driven retry you
+    are fighting prompt design, not output noise. ``0`` validates and
+    reports (emitting ``agent_validation_failed``) but never re-runs the
+    primary agent.
+    """
+
+    @field_validator("criteria")
+    @classmethod
+    def validate_criteria(cls, v: str) -> str:
+        """Ensure criteria is non-empty after stripping whitespace."""
+        if not v or not v.strip():
+            raise ValueError("validator 'criteria' must be a non-empty string")
+        return v
+
+
 class ReasoningConfig(BaseModel):
     """Configuration for model reasoning / extended thinking effort.
 
@@ -779,6 +841,27 @@ class AgentDef(BaseModel):
           effort: high
     """
 
+    validator: ValidatorConfig | None = None
+    """Optional semantic output validation with retry-once.
+
+    When set, the engine runs a second LLM call after this agent completes,
+    checking the output against ``validator.criteria``. On failure the
+    primary agent is re-run once with the validator's feedback appended.
+
+    Distinct from ``retry:`` (transient failures, same prompt) and
+    ``output:`` (shape validation). Only applies to provider-backed agents
+    (type='agent' or None). Works in the main loop, parallel groups, and
+    for-each loops.
+
+    Example YAML::
+
+        validator:
+          criteria: |
+            Verify every issue has an actionable suggestion and no
+            function names are fabricated.
+          max_retries: 1
+    """
+
     status: Literal["success", "failed"] | None = None
     """Outcome status for ``type: terminate`` steps.
 
@@ -888,6 +971,8 @@ class AgentDef(BaseModel):
                 raise ValueError("human_gate agents cannot have 'input_mapping'")
             if self.dialog is not None:
                 raise ValueError("human_gate agents cannot have 'dialog'")
+            if self.validator is not None:
+                raise ValueError("human_gate agents cannot have 'validator'")
             if self.max_depth is not None:
                 raise ValueError("human_gate agents cannot have 'max_depth'")
             if self.reasoning is not None:
@@ -927,6 +1012,8 @@ class AgentDef(BaseModel):
                 raise ValueError("script agents cannot have 'input_mapping'")
             if self.dialog is not None:
                 raise ValueError("script agents cannot have 'dialog'")
+            if self.validator is not None:
+                raise ValueError("script agents cannot have 'validator'")
             if self.max_depth is not None:
                 raise ValueError("script agents cannot have 'max_depth'")
             if self.reasoning is not None:
@@ -967,6 +1054,8 @@ class AgentDef(BaseModel):
                 raise ValueError("workflow agents cannot have 'retry'")
             if self.dialog is not None:
                 raise ValueError("workflow agents cannot have 'dialog'")
+            if self.validator is not None:
+                raise ValueError("workflow agents cannot have 'validator'")
             if self.timeout_seconds is not None:
                 raise ValueError("workflow agents cannot have 'timeout_seconds'")
             if self.value is not None:
@@ -1014,6 +1103,8 @@ class AgentDef(BaseModel):
                 raise ValueError("wait agents cannot have 'retry'")
             if self.dialog is not None:
                 raise ValueError("wait agents cannot have 'dialog'")
+            if self.validator is not None:
+                raise ValueError("wait agents cannot have 'validator'")
             if self.reasoning is not None:
                 raise ValueError("wait agents cannot have 'reasoning'")
             if self.timeout_seconds is not None:
@@ -1073,6 +1164,8 @@ class AgentDef(BaseModel):
                 raise ValueError("set agents cannot have 'retry'")
             if self.dialog is not None:
                 raise ValueError("set agents cannot have 'dialog'")
+            if self.validator is not None:
+                raise ValueError("set agents cannot have 'validator'")
             if self.reasoning is not None:
                 raise ValueError("set agents cannot have 'reasoning'")
             if self.timeout_seconds is not None:
@@ -1131,6 +1224,8 @@ class AgentDef(BaseModel):
                 raise ValueError("terminate agents cannot have 'retry'")
             if self.dialog is not None:
                 raise ValueError("terminate agents cannot have 'dialog'")
+            if self.validator is not None:
+                raise ValueError("terminate agents cannot have 'validator'")
             if self.reasoning is not None:
                 raise ValueError("terminate agents cannot have 'reasoning'")
             if self.workflow:
