@@ -14,6 +14,7 @@ Tests cover:
 
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 import tempfile
@@ -21,7 +22,7 @@ import tempfile
 import pytest
 
 from conductor.config.schema import AgentDef
-from conductor.exceptions import ExecutionError
+from conductor.exceptions import ExecutionError, TemplateError
 from conductor.executor.script import ScriptExecutor, ScriptOutput
 
 
@@ -425,3 +426,94 @@ class TestScriptExecutorStdin:
         assert output.stdin_bytes == len(payload.encode("utf-8"))
         # Byte length exceeds character length for multi-byte code points.
         assert output.stdin_bytes > len(payload)
+
+    @pytest.mark.asyncio
+    async def test_stdin_large_bidirectional_no_deadlock(self, executor: ScriptExecutor) -> None:
+        """A multi-MB payload in AND multi-MB out streams without deadlock.
+
+        The other large-payload tests use a tiny stdout, which always fits the
+        OS pipe buffer — so a regression to write-then-read piping would pass
+        them yet deadlock here. The child echoes the full payload back, so both
+        pipes exceed the buffer simultaneously. Wrapped in a timeout so a
+        deadlock regression fails fast instead of hanging CI.
+        """
+        payload = "m" * (4 * 1024 * 1024)  # 4 MB each direction
+        agent = AgentDef(
+            name="test_stdin_bidi",
+            type="script",
+            command=sys.executable,
+            args=["-c", _ECHO_STDIN],
+            stdin="{{ blob }}",
+        )
+        output = await asyncio.wait_for(executor.execute(agent, {"blob": payload}), timeout=30)
+        assert len(output.stdout) == len(payload)
+        assert output.exit_code == 0
+        assert output.stdin_bytes == len(payload)
+
+    @pytest.mark.asyncio
+    async def test_stdin_child_exits_without_reading(self, executor: ScriptExecutor) -> None:
+        """A child that exits before reading a large stdin payload is handled cleanly.
+
+        ``communicate`` lets asyncio absorb the resulting BrokenPipeError, so the
+        step completes with the child's real exit code rather than crashing.
+        """
+        agent = AgentDef(
+            name="test_stdin_early_exit",
+            type="script",
+            command=sys.executable,
+            args=["-c", "import sys; sys.exit(3)"],  # never reads stdin
+            stdin="y" * (2 * 1024 * 1024),
+        )
+        output = await executor.execute(agent, {})
+        assert output.exit_code == 3
+        # Byte count reflects the submitted payload even though the child read none.
+        assert output.stdin_bytes == 2 * 1024 * 1024
+
+    @pytest.mark.asyncio
+    async def test_stdin_timeout_while_writing(self, executor: ScriptExecutor) -> None:
+        """Timeout fires cleanly even while a large stdin payload is mid-write."""
+        agent = AgentDef(
+            name="test_stdin_timeout",
+            type="script",
+            command=sys.executable,
+            args=["-c", "import time; time.sleep(30)"],  # sleeps, never drains stdin
+            stdin="q" * (4 * 1024 * 1024),
+            timeout=1,
+        )
+        with pytest.raises(ExecutionError, match="timed out after 1s"):
+            await executor.execute(agent, {})
+
+    @pytest.mark.asyncio
+    async def test_stdin_invalid_utf8_raises_execution_error(
+        self, executor: ScriptExecutor
+    ) -> None:
+        """A payload that can't be UTF-8 encoded raises a clear ExecutionError.
+
+        Lone surrogates reach the context via upstream JSON (``json.loads`` of
+        ``"\\ud800"``). The strict ``.encode`` must surface a named error, not a
+        bare UnicodeEncodeError.
+        """
+        agent = AgentDef(
+            name="test_stdin_bad_utf8",
+            type="script",
+            command=sys.executable,
+            args=["-c", _ECHO_STDIN],
+            stdin="{{ bad }}",
+        )
+        with pytest.raises(ExecutionError, match="not valid UTF-8"):
+            await executor.execute(agent, {"bad": "\ud800"})
+
+    @pytest.mark.asyncio
+    async def test_stdin_render_failure_raises_template_error(
+        self, executor: ScriptExecutor
+    ) -> None:
+        """An undefined variable in stdin fails like command/args (TemplateError)."""
+        agent = AgentDef(
+            name="test_stdin_bad_template",
+            type="script",
+            command=sys.executable,
+            args=["-c", _ECHO_STDIN],
+            stdin="{{ does_not_exist }}",
+        )
+        with pytest.raises(TemplateError):
+            await executor.execute(agent, {})

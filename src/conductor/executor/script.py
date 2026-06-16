@@ -38,7 +38,8 @@ class ScriptOutput:
         stdout: Captured standard output as text.
         stderr: Captured standard error as text.
         exit_code: Process exit code.
-        stdin_bytes: Number of UTF-8 bytes written to the child's stdin, or
+        stdin_bytes: Number of UTF-8 bytes in the stdin payload submitted to
+            the child (the child may read fewer if it exits early), or
             ``None`` when no ``stdin`` payload was configured (stdin inherited).
     """
 
@@ -73,9 +74,11 @@ class ScriptExecutor:
 
         Renders command/args with Jinja2, spawns the subprocess, and captures
         output. If ``agent.stdin`` is set, the rendered payload is piped to the
-        child's stdin as UTF-8 (via ``communicate``, so large payloads don't
-        deadlock or hit command-line length limits); otherwise the child
-        inherits the parent's stdin.
+        child's stdin as UTF-8 via ``communicate`` (which streams stdin while
+        draining stdout/stderr, so large payloads can't deadlock the pipe);
+        routing the payload through stdin also keeps it off the command line
+        and clear of OS argv length limits. Otherwise the child inherits the
+        parent's stdin.
 
         Args:
             agent: Agent definition with type="script".
@@ -99,13 +102,32 @@ class ScriptExecutor:
         # Render the optional stdin payload. ``None`` means "inherit the
         # parent's stdin" (the legacy behavior); any string — including an
         # empty one — means "pipe this to the child", so we check
-        # ``is not None`` rather than truthiness. Writing via
-        # ``communicate(input=...)`` streams stdin in the background while
-        # draining stdout/stderr, so large payloads cannot deadlock the pipe
-        # or hit command-line length limits (e.g. Windows ARG_MAX).
+        # ``is not None`` rather than truthiness. Routing the payload through
+        # stdin (rather than argv) is what keeps it clear of OS command-line
+        # length limits — Windows caps the command line at ~32 KB; POSIX
+        # ARG_MAX is larger. We write it via ``communicate(input=...)``, which
+        # feeds stdin concurrently with draining stdout/stderr so a large
+        # payload can't deadlock the pipe.
         stdin_payload: bytes | None = None
         if agent.stdin is not None:
-            stdin_payload = self.renderer.render(agent.stdin, context).encode("utf-8")
+            rendered_stdin = self.renderer.render(agent.stdin, context)
+            try:
+                stdin_payload = rendered_stdin.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                # Strict encode (unlike the lenient ``decode(errors="replace")``
+                # on output) — surface a clear, named error instead of a bare
+                # codec traceback. Do NOT use ``errors="replace"`` here: that
+                # would silently corrupt the payload delivered to the child.
+                raise ExecutionError(
+                    f"Script '{agent.name}': stdin payload is not valid UTF-8 ({exc})",
+                    agent_name=agent.name,
+                    suggestion=(
+                        "The rendered stdin contains characters that cannot be "
+                        "UTF-8 encoded (e.g. unpaired surrogates from upstream "
+                        "JSON). Sanitize the value or render it through the "
+                        "'tojson' filter."
+                    ),
+                ) from exc
 
         # Build environment (merge os.environ + agent.env)
         # Note: ${VAR:-default} patterns in agent.env are already resolved

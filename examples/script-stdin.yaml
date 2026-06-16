@@ -3,7 +3,8 @@
 # Demonstrates handing a structured payload to a script step via stdin
 # instead of command-line args. This is the cross-platform-safe way to pass
 # large or structured data into scripts: command-line arguments have OS
-# length limits (notably Windows ARG_MAX, ~32 KB), but stdin does not.
+# length limits (notably Windows, where the command line is capped at
+# ~32 KB), but stdin does not.
 #
 # Flow:
 #   1. `evaluate` (LLM agent) produces a structured list of findings as JSON.

@@ -822,7 +822,7 @@ class WorkflowEngine:
             context: Workflow context for template rendering.
 
         Returns:
-            ScriptOutput with stdout, stderr, and exit_code.
+            ScriptOutput with stdout, stderr, exit_code, and stdin_bytes.
 
         Raises:
             ExecutionError: If script fails or times out.

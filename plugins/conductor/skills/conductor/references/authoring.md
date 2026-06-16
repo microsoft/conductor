@@ -214,7 +214,7 @@ agents:
       - to: error_handler
 ```
 
-Use `stdin:` to hand large or structured payloads to a script without hitting command-line length limits (notably Windows `ARG_MAX`). It is a Jinja2 string template rendered to the child's stdin as UTF-8 — use `{{ x | tojson }}` for JSON, or render text directly. Omitting it inherits the parent's stdin (legacy behavior); `stdin` and `args` can be set together (orthogonal).
+Use `stdin:` to hand large or structured payloads to a script without hitting OS command-line length limits (notably Windows's ~32 KB command-line cap). It is a Jinja2 string template rendered to the child's stdin as UTF-8 — use `{{ x | tojson }}` for JSON, or render text directly. Omitting it inherits the parent's stdin (legacy behavior); `stdin` and `args` can be set together (orthogonal).
 
 ### Script Output
 

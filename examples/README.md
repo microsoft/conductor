@@ -213,7 +213,7 @@ conductor run examples/script-step.yaml
 
 Hand a structured payload to a script step via **stdin** instead of
 command-line `args` — the cross-platform-safe way to pass large or
-structured data (no Windows `ARG_MAX` limit, no temp files). Demonstrates:
+structured data (no Windows ~32 KB command-line limit, no temp files). Demonstrates:
 - `stdin:` as a Jinja2 string template piped to the child as UTF-8
 - JSON handoff via the built-in `tojson` filter (`{{ x | tojson }}`)
 - A script consuming an upstream agent's structured output (`json.load(sys.stdin)`)
