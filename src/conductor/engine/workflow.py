@@ -1729,6 +1729,72 @@ class WorkflowEngine:
                 },
             )
 
+    def handle_dashboard_stop(self, message: str) -> Path | None:
+        """Give a dashboard-cancelled run the same terminal treatment as an
+        in-loop failure (issue #245).
+
+        The web dashboard's Stop/Kill can cancel the engine task from the CLI
+        wrapper (``conductor.cli.run._execute_with_stop_signal``) while an agent
+        is mid-execution. That cancellation unwinds through the engine's
+        ``except asyncio.CancelledError`` arm, which deliberately does *not*
+        emit ``workflow_failed`` or save a checkpoint. Without this method the
+        user would lose all progress with no checkpoint and no failure event.
+
+        Called by the CLI *after* the cancelled engine task has been fully
+        drained, so reading ``self.context`` / ``self._current_agent_name`` /
+        ``self.limits`` is safe. Saves a best-effort checkpoint (resuming
+        re-runs the in-flight agent, identical to the pause -> Kill path) and
+        emits a single ``workflow_failed`` event flagged ``stopped_by_user`` so
+        the dashboard can render a calm "Workflow Stopped" banner. When no
+        checkpoint can be written, the event carries
+        ``checkpoint_unavailable_reason`` instead so the UI/CLI can explain the
+        absence (Expected #2 in the issue).
+
+        Idempotent: the CLI only calls this when the engine task was genuinely
+        *cancelled* (its own terminal ``except`` arms re-raise out of the engine
+        and are handled separately by the wrapper, so in practice this runs with
+        ``_last_checkpoint_path`` still ``None``). The ``_last_checkpoint_path``
+        guard is therefore a defensive backstop against repeat or direct
+        invocation: if a checkpoint was already recorded this run, it is returned
+        without emitting duplicate events. Does not raise on the expected failure
+        paths — ``_save_checkpoint_on_failure``, ``_emit`` (per-subscriber
+        guarded), and ``_execute_hook`` all swallow their own errors.
+
+        Args:
+            message: Human-readable reason for the stop. Used as the failure
+                message and the checkpoint error.
+
+        Returns:
+            Path to the saved checkpoint, or ``None`` if none could be written.
+        """
+        if self._last_checkpoint_path is not None:
+            return self._last_checkpoint_path
+
+        error = ExecutionError(message)
+        # Save first so the single ``workflow_failed`` event below reports the
+        # outcome (path, or the reason none was written) atomically. This emits
+        # ``checkpoint_saved`` on success; harmless here since the dashboard
+        # reads the path inline from ``workflow_failed``.
+        self._save_checkpoint_on_failure(error)
+
+        fail_data: dict[str, Any] = {
+            "error_type": type(error).__name__,
+            "message": message,
+            "agent_name": self._current_agent_name,
+            "stopped_by_user": True,
+        }
+        if self._last_checkpoint_path is not None:
+            fail_data["checkpoint_path"] = str(self._last_checkpoint_path)
+        else:
+            fail_data["checkpoint_unavailable_reason"] = (
+                "no workflow file is associated with this run"
+                if self.workflow_path is None
+                else "the checkpoint could not be written"
+            )
+        self._emit("workflow_failed", fail_data)
+        self._execute_hook("on_error", error=error)
+        return self._last_checkpoint_path
+
     def _get_top_level_agent_names(self) -> list[str]:
         """Return names of top-level agents (excluding parallel/for-each nested agents).
 
@@ -3225,6 +3291,12 @@ class WorkflowEngine:
                 fail_data["elapsed_seconds"] = e.elapsed_seconds
                 fail_data["timeout_seconds"] = e.timeout_seconds
                 fail_data["current_agent"] = e.current_agent
+            if isinstance(e, InterruptError):
+                # An interactive Stop/Esc or a dashboard pause -> Kill is a
+                # user-initiated stop, not a crash. Flag it so the dashboard
+                # renders a calm "Workflow Stopped" banner, matching the
+                # hard-Kill path handled by ``handle_dashboard_stop``. #245.
+                fail_data["stopped_by_user"] = True
             self._emit("workflow_failed", fail_data)
             # Execute on_error hook with error information
             self._execute_hook("on_error", error=e)
@@ -3245,18 +3317,19 @@ class WorkflowEngine:
             raise
         except asyncio.CancelledError:
             # Normal cancellation path (dashboard stop, parent process exit,
-            # outer ``asyncio.wait_for`` timeout). The caller — typically
-            # ``conductor.cli.run._run_with_stop_signal`` — re-frames the
-            # cancellation as a ConductorError and emits the appropriate
-            # event there. Do NOT emit ``workflow_failed`` here, or the
-            # dashboard would show a spurious "CancelledError" failure
+            # outer ``asyncio.wait_for`` timeout). Do NOT emit
+            # ``workflow_failed`` or save a checkpoint here: the engine can't
+            # tell *why* it was cancelled (a Stop/Kill vs. process teardown),
+            # and emitting here would show a spurious "CancelledError" failure
             # whenever a user clicks Stop.
             #
-            # No checkpoint is saved on cancellation: cancelled workflows
-            # are not resumable from this point — the user explicitly chose
-            # to stop, and the wrapper-issued ConductorError will trigger
-            # checkpoint save through the ``except ConductorError`` arm on
-            # its way out. See issue #116 review.
+            # For a dashboard-initiated Stop/Kill, the CLI wrapper
+            # (``conductor.cli.run._execute_with_stop_signal``) detects that it
+            # cancelled this task and calls ``handle_dashboard_stop`` once the
+            # task is fully drained — that is what emits ``workflow_failed`` and
+            # writes the best-effort checkpoint (issue #245). Other cancellation
+            # sources (process exit, outer timeout) intentionally leave no
+            # checkpoint. See issue #116 review.
             raise
         except BaseException as e:
             # Catch-all for exception classes that don't derive from

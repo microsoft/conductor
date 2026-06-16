@@ -92,7 +92,7 @@ export function Header() {
                 hover:bg-red-500/20 hover:border-red-500/30
                 disabled:opacity-50 disabled:cursor-not-allowed
                 transition-colors"
-              title="Stop workflow entirely (checkpoint saved for CLI resume)"
+              title="Stop the workflow and save a checkpoint for CLI resume"
             >
               <X className="w-3 h-3" />
               {killing ? 'Killing...' : 'Kill'}
@@ -107,6 +107,7 @@ export function Header() {
               hover:bg-red-500/20 hover:border-red-500/30
               disabled:opacity-50 disabled:cursor-not-allowed
               transition-colors"
+            title="Pause the current agent, then choose Resume or Kill"
           >
             <Square className="w-3 h-3" />
             {stopping ? 'Stopping...' : 'Stop'}

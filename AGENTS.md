@@ -81,7 +81,7 @@ make validate-examples    # validate all examples
   - `context.py` - `WorkflowContext` manages accumulated agent outputs with three modes: accumulate, last_only, explicit
   - `router.py` - Route evaluation with Jinja2 templates and simpleeval expressions
   - `limits.py` - Safety enforcement (max iterations, timeout)
-  - `checkpoint.py` - Automatic checkpoint saving on failure and resume support
+  - `checkpoint.py` - Automatic checkpoint saving on failure and resume support. The engine saves a checkpoint inside its main-loop exception handlers; for a dashboard Stop/Kill that *cancels* the engine task from the CLI wrapper (bypassing those handlers), `WorkflowEngine.handle_dashboard_stop(message)` is invoked from `cli/run.py::_execute_with_stop_signal` after the cancelled task is drained. It writes a best-effort checkpoint and emits a single `workflow_failed` (flagged `stopped_by_user: true`, plus `checkpoint_path` or `checkpoint_unavailable_reason`). The `_last_checkpoint_path` guard is a defensive backstop against repeat/direct invocation — the engine's own terminal paths (e.g. pause→Kill `InterruptError`) re-raise out of the engine and are handled separately by the wrapper, so `handle_dashboard_stop` is reached only for genuinely cancelled tasks. Issue #245.
 
 - **executor/**: Agent execution
   - `agent.py` - `AgentExecutor` handles prompt rendering, tool resolution, and output validation for single agents
@@ -107,7 +107,7 @@ make validate-examples    # validate all examples
   - `listener.py` - Keyboard listener daemon thread for Esc/Ctrl+G detection
 
 - **web/**: Real-time web dashboard for workflow visualization
-  - `server.py` - FastAPI + uvicorn server with WebSocket broadcasting, late-joiner state replay, and `POST /api/stop` endpoint
+  - `server.py` - FastAPI + uvicorn server with WebSocket broadcasting, late-joiner state replay, and `POST /api/stop` + `POST /api/kill` endpoints. `/api/stop` interrupts/pauses the current agent (a user can then Resume or Kill); if it arrives before the engine binds its interrupt event, it is latched via `_pending_stop` and drained by `set_interrupt_event` so the startup window takes the graceful pause path instead of a progress-losing hard stop. `/api/kill` hard-stops the run. Whenever a stop/kill actually *terminates* the run (cancels the engine task), it routes through `handle_dashboard_stop` so a best-effort checkpoint is written (or its absence explained) — see `handle_dashboard_stop` above (issue #245).
   - `static/index.html` - Single-file Cytoscape.js frontend with DAG graph, agent detail panel, and streaming activity
 
 - **events.py**: Pub/sub event system decoupling workflow execution from rendering (console, web dashboard)
