@@ -924,3 +924,86 @@ class TestCleanupPeriodicForRun:
 
         assert len(remaining) == 1
         assert remaining[0].run_id == "r2"
+
+
+class TestEmptyRunIdScoping:
+    """Empty run_id matches only other empty-run_id periodic checkpoints."""
+
+    def test_rotation_with_empty_run_id_leaves_named_runs(self, tmp_path: Path) -> None:
+        wf = _write_workflow(tmp_path, "name: wf\n")
+        for i in range(3):
+            _write_checkpoint_file(
+                tmp_path,
+                f"workflow-2026030{i}-100000-{i:02d}.json",
+                f"2026-03-0{i}T10:00:00.{i:06d}Z",
+                run_id="",
+                trigger="periodic",
+            )
+        _write_checkpoint_file(
+            tmp_path,
+            "workflow-20260309-100000-r1.json",
+            "2026-03-09T10:00:00Z",
+            run_id="r1",
+            trigger="periodic",
+        )
+
+        with patch.object(CheckpointManager, "get_checkpoints_dir", return_value=tmp_path):
+            CheckpointManager.rotate_periodic_checkpoints(wf, "", keep_last=1)
+            remaining = CheckpointManager.list_checkpoints(wf)
+
+        run_ids = sorted(c.run_id for c in remaining)
+        # 1 empty-run_id periodic kept + the r1 periodic untouched.
+        assert run_ids == ["", "r1"]
+
+    def test_cleanup_with_empty_run_id_leaves_named_runs(self, tmp_path: Path) -> None:
+        wf = _write_workflow(tmp_path, "name: wf\n")
+        _write_checkpoint_file(
+            tmp_path,
+            "workflow-20260301-100000-a.json",
+            "2026-03-01T10:00:00Z",
+            run_id="",
+            trigger="periodic",
+        )
+        _write_checkpoint_file(
+            tmp_path,
+            "workflow-20260302-100000-b.json",
+            "2026-03-02T10:00:00Z",
+            run_id="r1",
+            trigger="periodic",
+        )
+
+        with patch.object(CheckpointManager, "get_checkpoints_dir", return_value=tmp_path):
+            CheckpointManager.cleanup_periodic_for_run(wf, "")
+            remaining = CheckpointManager.list_checkpoints(wf)
+
+        assert [c.run_id for c in remaining] == ["r1"]
+
+
+class TestFindLatestByCreatedAt:
+    """find_latest_checkpoint orders by created_at, not by filename."""
+
+    def test_picks_newest_created_at_for_same_second_filenames(self, tmp_path: Path) -> None:
+        wf = _write_workflow(tmp_path, "name: wf\n")
+        # Two checkpoints whose filenames share the same per-second timestamp
+        # (periodic checkpoints can land in the same wall-clock second). The
+        # random suffix makes the lexicographically-largest filename the OLDER
+        # checkpoint, so a filename sort would pick the wrong one.
+        _write_checkpoint_file(
+            tmp_path,
+            "workflow-20260101-120000-ffffffff.json",
+            "2026-01-01T12:00:00.000001Z",
+            run_id="r1",
+            trigger="periodic",
+        )
+        newest = _write_checkpoint_file(
+            tmp_path,
+            "workflow-20260101-120000-00000000.json",
+            "2026-01-01T12:00:00.000002Z",
+            run_id="r1",
+            trigger="periodic",
+        )
+
+        with patch.object(CheckpointManager, "get_checkpoints_dir", return_value=tmp_path):
+            latest = CheckpointManager.find_latest_checkpoint(wf)
+
+        assert latest == newest

@@ -959,6 +959,19 @@ class ConsoleEventSubscriber:
                 style="red",
             )
 
+        elif t == "checkpoint_save_failed":
+            n = d.get("consecutive_failures", 1)
+            # Avoid spamming when every boundary fails (e.g. disk full): warn on
+            # the first failure, then every 10th.
+            if n == 1 or n % 10 == 0:
+                err = d.get("error_type")
+                detail = f" ({err})" if err else ""
+                verbose_log(
+                    f"  WARNING: periodic checkpoint save failed{detail} — "
+                    f"this run may not be resumable if it stalls (failure #{n})",
+                    style="yellow",
+                )
+
 
 def display_usage_summary(usage_data: dict[str, Any], console: Console | None = None) -> None:
     """Display final usage summary with token counts and costs.

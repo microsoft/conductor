@@ -1463,7 +1463,7 @@ class CheckpointConfig(BaseModel):
 
     Opt-in automatic checkpointing at workflow step boundaries so a stalled or
     hard-killed long-running workflow can be resumed without an exception ever
-    being raised. All fields default to "off" — the existing failure-only
+    being raised. All triggers default to off — the existing failure-only
     checkpoint behavior is unchanged unless at least one trigger is set.
 
     Checkpoints are evaluated at each step boundary (after a step's output is
@@ -1477,7 +1477,9 @@ class CheckpointConfig(BaseModel):
 
     every_agent: bool = False
     """Save a checkpoint at every step boundary (after each agent, parallel
-    group, for-each group, gate, script, set, or wait step completes)."""
+    group, for-each group, gate, script, set, wait, or sub-workflow step). When
+    true it governs on its own and ``every_seconds`` is ignored (a save already
+    fires at every boundary)."""
 
     every_seconds: int | None = Field(default=None, ge=1)
     """Minimum seconds between periodic checkpoints, evaluated at step
@@ -1485,7 +1487,8 @@ class CheckpointConfig(BaseModel):
 
     A checkpoint is saved at the first boundary reached after this many seconds
     have elapsed since the last checkpoint. ``None`` disables the time-based
-    trigger.
+    trigger. The first periodic checkpoint of a run fires at the first eligible
+    boundary; the interval only throttles subsequent saves.
 
     Note: if a single step runs longer than this interval, no checkpoint fires
     during that step — the boundary checkpoint taken *before* the step started

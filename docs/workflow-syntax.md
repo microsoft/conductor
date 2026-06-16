@@ -57,8 +57,8 @@ workflow:
                                       # See docs/configuration.md#reasoning-effort.
 
     checkpoint:                       # Optional: periodic checkpoints (off by default)
-      every_agent: true               # Save after each step completes
-      every_seconds: 300              # OR/AND throttle by elapsed time
+      every_agent: true               # Save after each step boundary (governs alone when true)
+      every_seconds: 300              # Throttle: save at most this often (used only when every_agent is false)
       keep_last: 5                    # Retain this many periodic checkpoints per run
 ```
 
@@ -963,16 +963,19 @@ Enable **periodic checkpoints** to make stalled or hard-killed runs resumable:
 workflow:
   runtime:
     checkpoint:
-      every_agent: true     # Save a checkpoint after each step completes
-      every_seconds: 300    # OR: save at most every N seconds (throttle)
+      every_seconds: 300    # Save at most once every 5 minutes (throttle)
       keep_last: 5          # Retain this many periodic checkpoints per run (1-100)
+      # every_agent: true   # Alternative: save after EVERY step boundary
 ```
 
 - **`every_agent`** (default `false`) — save at every step boundary (after each
-  agent, parallel group, for-each group, gate, script, set, or wait step).
-- **`every_seconds`** (default `null`) — save at the first step boundary reached
-  after this many seconds have elapsed since the last checkpoint. Set either
-  trigger, or both (a save fires when **either** condition is met).
+  agent, parallel group, for-each group, gate, script, set, wait, or sub-workflow
+  step). When `true` it governs on its own and `every_seconds` is ignored.
+- **`every_seconds`** (default `null`) — a throttle: save at the first step
+  boundary reached after this many seconds have elapsed since the last
+  checkpoint. The first periodic checkpoint of a run fires at the first
+  boundary; the interval only throttles subsequent saves.
+- Set either trigger (or both — a save fires when **either** is met).
 - **`keep_last`** (default `5`) — older periodic checkpoints for the run are
   rotated away after each save; **failure checkpoints are never rotated**.
 
@@ -987,8 +990,12 @@ How it works:
   stalled run.
 - Periodic checkpoints are written by the **root** workflow only (sub-workflow
   state is re-run from scratch on resume) and are **deleted automatically when
-  the run completes successfully**. On failure they are kept alongside the
-  on-failure checkpoint.
+  the run reaches a terminal, non-resumable outcome** (clean completion or an
+  explicit `status: failed` terminate). On an unexpected failure they are kept
+  alongside the on-failure checkpoint.
+- If a periodic save itself fails (e.g. the disk fills), the run is not
+  interrupted; the failure is surfaced via a `checkpoint_save_failed` event and
+  a console warning so you know recovery may be unavailable.
 
 Recover a stalled run by killing the process (e.g. `conductor stop` for a
 `--web-bg` run) and then:

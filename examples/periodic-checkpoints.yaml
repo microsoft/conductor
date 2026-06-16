@@ -9,7 +9,8 @@
 # stage hangs you can kill the run and pick up where you left off.
 #
 # It shows:
-# - runtime.checkpoint with every_agent + every_seconds + keep_last
+# - runtime.checkpoint with every_seconds throttling + keep_last rotation
+#   (every_agent is shown as a commented alternative)
 # - a multi-stage pipeline where each stage is an expensive, long-running step
 #
 # Usage:
@@ -28,13 +29,21 @@ workflow:
   runtime:
     provider: copilot
     checkpoint:
-      # Save a checkpoint after each step completes. Combine with every_seconds
-      # to also bound how frequently checkpoints are written for fast steps.
-      every_agent: true
-      # Save at most once every 5 minutes (a save fires when EITHER trigger is
-      # satisfied). Useful when some steps are quick and others run for hours.
+      # Periodic checkpoints make a stalled or hard-killed run resumable. There
+      # are two triggers, OR-combined — set either one (or both):
+      #
+      #   every_agent: true
+      #     Save after EVERY step boundary. Best when steps are few or each is
+      #     expensive. When true it governs on its own and `every_seconds` below
+      #     is ignored (a save already fires at every boundary).
+      #
+      # `every_seconds` is a throttle: save at the first boundary reached once
+      # this many seconds have elapsed since the last checkpoint. Best for long
+      # runs that mix quick and slow steps, so you don't checkpoint after every
+      # fast step. The first checkpoint of the run is taken at the first boundary;
+      # the interval only throttles subsequent saves.
       every_seconds: 300
-      # Keep only the 5 most recent periodic checkpoints for the run; failure
+      # Retain at most this many periodic checkpoints per run. Failure
       # checkpoints are never rotated.
       keep_last: 5
 
