@@ -789,6 +789,10 @@ class CopilotProvider(AgentProvider):
                 )
 
             # Resolve context tier: per-agent override wins over runtime default.
+            # Unlike reasoning effort (validated against the model's advertised
+            # supported_reasoning_efforts first), the tier is forwarded as-is:
+            # there is no advertised supported_context_tiers, so the SDK is the
+            # sole authority and validates it at session creation.
             tier = resolve_context_tier(agent, self._default_context_tier)
             if tier is not None:
                 session_kwargs["context_tier"] = tier

@@ -1041,6 +1041,8 @@ class AgentDef(BaseModel):
                 raise ValueError("wait agents cannot have 'dialog'")
             if self.reasoning is not None:
                 raise ValueError("wait agents cannot have 'reasoning'")
+            if self.context_tier is not None:
+                raise ValueError("wait agents cannot have 'context_tier'")
             if self.timeout_seconds is not None:
                 raise ValueError("wait agents cannot have 'timeout_seconds'")
             if self.output is not None:
@@ -1100,6 +1102,8 @@ class AgentDef(BaseModel):
                 raise ValueError("set agents cannot have 'dialog'")
             if self.reasoning is not None:
                 raise ValueError("set agents cannot have 'reasoning'")
+            if self.context_tier is not None:
+                raise ValueError("set agents cannot have 'context_tier'")
             if self.timeout_seconds is not None:
                 raise ValueError("set agents cannot have 'timeout_seconds'")
             if self.duration is not None:
@@ -1158,6 +1162,8 @@ class AgentDef(BaseModel):
                 raise ValueError("terminate agents cannot have 'dialog'")
             if self.reasoning is not None:
                 raise ValueError("terminate agents cannot have 'reasoning'")
+            if self.context_tier is not None:
+                raise ValueError("terminate agents cannot have 'context_tier'")
             if self.workflow:
                 raise ValueError("terminate agents cannot have 'workflow'")
             if self.input_mapping is not None:

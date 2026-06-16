@@ -1471,6 +1471,30 @@ class TestAgentDefContextTier:
             )
         assert "workflow agents cannot have 'context_tier'" in str(exc_info.value)
 
+    def test_wait_with_context_tier_raises(self) -> None:
+        """Test that wait agents cannot have context_tier."""
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(name="w", type="wait", duration="1s", context_tier="long_context")
+        assert "wait agents cannot have 'context_tier'" in str(exc_info.value)
+
+    def test_set_with_context_tier_raises(self) -> None:
+        """Test that set agents cannot have context_tier."""
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(name="s", type="set", value="42", context_tier="long_context")
+        assert "set agents cannot have 'context_tier'" in str(exc_info.value)
+
+    def test_terminate_with_context_tier_raises(self) -> None:
+        """Test that terminate agents cannot have context_tier."""
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(
+                name="t",
+                type="terminate",
+                status="success",
+                reason="done",
+                context_tier="long_context",
+            )
+        assert "terminate agents cannot have 'context_tier'" in str(exc_info.value)
+
 
 class TestRuntimeConfigDefaultContextTier:
     """Tests for default_context_tier on RuntimeConfig."""
