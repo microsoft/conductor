@@ -20,6 +20,10 @@ workflow:
     max_agent_iterations: 50     # Max tool-use roundtrips per agent (1-500, optional)
     max_session_seconds: 120     # Wall-clock timeout per agent session (optional)
     default_reasoning_effort: medium  # Workflow-wide reasoning effort: low, medium, high, xhigh (optional)
+    checkpoint:                  # Periodic checkpoints for resumable stalled runs (optional, off by default)
+      every_agent: true          #   save after each step boundary (governs alone when true)
+      every_seconds: 300         #   throttle by elapsed seconds (used only when every_agent is false)
+      keep_last: 5               #   retain this many periodic checkpoints per run (1-100)
 
   input:                         # Define workflow inputs
     param_name:
@@ -61,6 +65,33 @@ workflow:
     # / .github/instructions/**/*.instructions.md with applyTo: "**") so target-repo
     # context is loaded at run time instead of being baked into the YAML.
 ```
+
+### Periodic Checkpoints (`runtime.checkpoint`)
+
+Off by default — Conductor otherwise checkpoints only on failure, so a *stalled*
+long run (provider hang, MCP deadlock, sub-agent that never returns) leaves
+nothing to `conductor resume`. Enable periodic checkpoints to make stalled or
+hard-killed runs recoverable:
+
+- `every_agent: true` — save at every step boundary. Governs alone when true
+  (`every_seconds` is then ignored).
+- `every_seconds: N` — throttle: save at the first boundary past N seconds since
+  the last save (set either trigger or both; a save fires when **either** is
+  met). The first save of a run fires at the first boundary; the interval only
+  throttles later saves.
+- `keep_last` (default 5) — rotate older periodic checkpoints for the run;
+  failure checkpoints are never rotated.
+
+Semantics: checkpoints are taken at step boundaries (all prior outputs
+committed) and point at the step *about to run*, so resume continues forward and
+re-runs only that step. No background timer — if a step runs longer than
+`every_seconds`, the recovery point is the boundary checkpoint taken before it
+started. Root workflow only (sub-workflows re-run from scratch on resume), and
+periodic checkpoints are deleted automatically at a terminal non-resumable
+outcome (clean completion or explicit `status: failed` terminate). A failed
+periodic save never interrupts the run — it emits a `checkpoint_save_failed`
+event + console warning. See
+`examples/periodic-checkpoints.yaml`.
 
 ## Agent Definition
 
@@ -237,11 +268,14 @@ agents:
     working_dir: /tmp            # Working directory (optional, Jinja2 templated)
     env:                         # Extra environment variables (optional)
       MY_VAR: "value"
+    stdin: "{{ data | tojson }}" # Payload piped to the child's stdin (optional, Jinja2 templated)
     routes:
       - to: analyzer
         when: "exit_code == 0"
       - to: error_handler
 ```
+
+Use `stdin:` to hand large or structured payloads to a script without hitting OS command-line length limits (notably Windows's ~32 KB command-line cap). It is a Jinja2 string template rendered to the child's stdin as UTF-8 — use `{{ x | tojson }}` for JSON, or render text directly. Omitting it inherits the parent's stdin (legacy behavior); `stdin` and `args` can be set together (orthogonal).
 
 ### Script Output
 

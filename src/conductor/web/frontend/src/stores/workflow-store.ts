@@ -281,7 +281,7 @@ interface WorkflowState {
   workflowName: string;
   workflowStatus: WorkflowStatus;
   workflowStartTime: number | null;
-  workflowFailure: { error_type?: string; message?: string; elapsed_seconds?: number; timeout_seconds?: number; current_agent?: string; checkpoint_path?: string; termination_reason?: string; terminated_by?: string; is_explicit?: boolean; status?: string } | null;
+  workflowFailure: { error_type?: string; message?: string; elapsed_seconds?: number; timeout_seconds?: number; current_agent?: string; checkpoint_path?: string; checkpoint_unavailable_reason?: string; stopped_by_user?: boolean; termination_reason?: string; terminated_by?: string; is_explicit?: boolean; status?: string } | null;
   workflowFailedAgent: string | null;
   workflowYaml: string | null;
   conductorVersion: string | null;
@@ -1604,8 +1604,15 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
   },
 
   workflow_failed: (state, _data) => {
-    state.wfDepth = Math.max(0, state.wfDepth - 1);
-    const data = _data as { agent_name?: string; error_type?: string; message?: string; elapsed_seconds?: number; timeout_seconds?: number; current_agent?: string; subworkflow_path?: string[]; is_explicit?: boolean; termination_reason?: string; terminated_by?: string; status?: string };
+    const data = _data as { agent_name?: string; error_type?: string; message?: string; elapsed_seconds?: number; timeout_seconds?: number; current_agent?: string; subworkflow_path?: string[]; is_explicit?: boolean; termination_reason?: string; terminated_by?: string; status?: string; checkpoint_path?: string; checkpoint_unavailable_reason?: string; stopped_by_user?: boolean };
+    // Issue #245: a user-initiated Stop/Kill terminates the entire run,
+    // including any active subworkflows. On the hard-cancel path the child
+    // engines are cancelled silently (no per-level workflow_failed/subworkflow_failed),
+    // so this single root-level event (no subworkflow_path) must collapse
+    // wfDepth straight to 0 — otherwise the root-failed block never runs and the
+    // "Workflow Stopped" banner never renders for runs that use subworkflows.
+    const isRootUserStop = Boolean(data.stopped_by_user) && !data.subworkflow_path;
+    state.wfDepth = isRootUserStop ? 0 : Math.max(0, state.wfDepth - 1);
     if (state.wfDepth === 0) {
       // Root workflow failed
       state.workflowStatus = 'failed';
@@ -1629,6 +1636,13 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
         elapsed_seconds: data.elapsed_seconds,
         timeout_seconds: data.timeout_seconds,
         current_agent: data.current_agent,
+        // Issue #245: a user-initiated Stop/Kill carries the checkpoint outcome
+        // inline (hard-Kill path) and a flag so the banner renders "Stopped"
+        // rather than "Failed". The pause -> Kill path also sets stopped_by_user
+        // but delivers checkpoint_path via a later checkpoint_saved event.
+        checkpoint_path: data.checkpoint_path,
+        checkpoint_unavailable_reason: data.checkpoint_unavailable_reason,
+        stopped_by_user: data.stopped_by_user,
         // Issue #219: forward termination metadata so the error banner can
         // distinguish explicit terminate-step failures from generic crashes.
         termination_reason: data.termination_reason,

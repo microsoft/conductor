@@ -55,6 +55,18 @@ workflow:
                                       # every provider-backed agent unless it
                                       # declares its own `reasoning.effort`.
                                       # See docs/configuration.md#reasoning-effort.
+
+    checkpoint:                       # Optional: periodic checkpoints (off by default)
+      every_agent: true               # Save after each step boundary (governs alone when true)
+      every_seconds: 300              # Throttle: save at most this often (used only when every_agent is false)
+      keep_last: 5                    # Retain this many periodic checkpoints per run
+
+    default_context_tier: default     # Optional: default | long_context (Copilot only)
+                                      # Workflow-wide default for the model's
+                                      # context-window tier. Inherited by every
+                                      # provider-backed agent unless it declares
+                                      # its own `context_tier`.
+                                      # See docs/configuration.md#context-tier.
 ```
 
 **Workflow metadata** is included verbatim in the `workflow_started` event and lets downstream consumers (dashboards, queue runners, observability tools) adapt without parsing the YAML. CLI `--metadata key=value` flags merge on top of YAML metadata (CLI wins on conflicts).
@@ -103,6 +115,14 @@ agents:
                                     # Only valid on type=agent (rejected on
                                     # script, human_gate, workflow).
                                     # See docs/configuration.md#reasoning-effort.
+
+    context_tier: long_context      # Optional: per-agent context-tier override
+                                    # default | long_context (Copilot only)
+                                    # Overrides runtime.default_context_tier.
+                                    # Composes with reasoning. Only valid on
+                                    # type=agent (rejected on script,
+                                    # human_gate, workflow).
+                                    # See docs/configuration.md#context-tier.
 
     routes:                         # Optional: Routing logic
       - to: next_agent              # Agent name or $end
@@ -229,6 +249,7 @@ agents:
       PYTHONPATH: "/app/src"
     working_dir: "/app"                         # Optional: working directory (Jinja2 template)
     timeout: 120                                # Optional: per-step timeout in seconds
+    stdin: "{{ planner.output | tojson }}"      # Optional: payload piped to the child's stdin (Jinja2 template)
     routes:
       - to: analyzer
         when: "exit_code == 0"
@@ -319,6 +340,29 @@ routes:
 **Restrictions** — script steps cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, `options`, or `validator`. Script steps also cannot be used inside `parallel` groups or `for_each` groups.
 
 **Environment variable note** — values in `env` are passed as-is to the subprocess (they are not rendered as Jinja2 templates). Use `${VAR}` syntax in the workflow YAML loader if you need environment variable substitution in env values.
+
+**Passing payloads via stdin** — set `stdin:` to pipe a rendered payload to the script's standard input instead of (or in addition to) command-line `args`. This is the cross-platform way to hand large or structured data to a script: command-line arguments are subject to OS length limits (notably Windows, where the total command line is capped at ~32 KB), but stdin is not. Reach for `stdin:` whenever a script consumes an upstream agent's structured output.
+
+```yaml
+agents:
+  - name: analyze
+    type: script
+    command: python3
+    args: ["scripts/analyze.py"]
+    stdin: "{{ evaluator.output.evaluations | tojson }}"   # JSON payload via the tojson filter
+    routes:
+      - to: $end
+```
+
+- **`stdin:` is a Jinja2 string template**, rendered against the workflow context and written to the child as UTF-8.
+  - For JSON, use the built-in `tojson` filter: `stdin: "{{ data | tojson }}"`. Plain `{{ data }}` renders a Python `repr` (single-quoted), which is **not** valid JSON.
+  - For arbitrary text — a diff, CSV, or a prompt — use it directly: `stdin: "{{ patch }}"`.
+  - The script reads it like any stdin source: `data = json.load(sys.stdin)` (Python), or pipe into `jq` / `cat` (shell).
+- **Omitting `stdin`** keeps the legacy behavior — the child inherits the parent's stdin.
+- **An explicit empty string** (`stdin: ""`) still pipes, sending the child immediate EOF (distinct from omitting it).
+- **`stdin` and `args` are orthogonal.** When both are set, `args` are passed on the command line *and* `stdin` is piped — there is no precedence conflict. Keep flags in `args` and put the bulky/structured payload in `stdin`.
+
+This replaces the older pattern of writing large structured arguments to a temp file and passing `--something-file <path>`; the engine pipes the payload directly, so there is no temp file to manage or clean up.
 
 ### Wait Steps
 
@@ -986,6 +1030,63 @@ workflow:
 - Workflow terminates when `timeout_seconds` is exceeded
 - Includes all agent execution time and overhead
 - `None` (default) means no timeout
+
+### Periodic Checkpoints
+
+By default Conductor writes a checkpoint **only when a workflow fails** with an
+exception. A long run that *stalls* (a provider hang, an MCP deadlock, a network
+blip, a sub-agent that never returns) produces no recoverable state, so
+`conductor resume` has nothing to resume.
+
+Enable **periodic checkpoints** to make stalled or hard-killed runs resumable:
+
+```yaml
+workflow:
+  runtime:
+    checkpoint:
+      every_seconds: 300    # Save at most once every 5 minutes (throttle)
+      keep_last: 5          # Retain this many periodic checkpoints per run (1-100)
+      # every_agent: true   # Alternative: save after EVERY step boundary
+```
+
+- **`every_agent`** (default `false`) — save at every step boundary (after each
+  agent, parallel group, for-each group, gate, script, set, wait, or sub-workflow
+  step). When `true` it governs on its own and `every_seconds` is ignored.
+- **`every_seconds`** (default `null`) — a throttle: save at the first step
+  boundary reached after this many seconds have elapsed since the last
+  checkpoint. The first periodic checkpoint of a run fires at the first
+  boundary; the interval only throttles subsequent saves.
+- Set either trigger (or both — a save fires when **either** is met).
+- **`keep_last`** (default `5`) — older periodic checkpoints for the run are
+  rotated away after each save; **failure checkpoints are never rotated**.
+
+How it works:
+
+- Checkpoints are evaluated at **step boundaries**, where all prior step outputs
+  are already committed. The checkpoint points at the step that was *about to
+  run*, so `conductor resume` continues forward and re-runs only that step.
+- There is no background timer. If a single step runs longer than
+  `every_seconds`, the recovery point is the boundary checkpoint taken **before**
+  that step started — which is exactly what you resume from after killing a
+  stalled run.
+- Periodic checkpoints are written by the **root** workflow only (sub-workflow
+  state is re-run from scratch on resume) and are **deleted automatically when
+  the run reaches a terminal, non-resumable outcome** (clean completion or an
+  explicit `status: failed` terminate). On an unexpected failure they are kept
+  alongside the on-failure checkpoint.
+- If a periodic save itself fails (e.g. the disk fills), the run is not
+  interrupted; the failure is surfaced via a `checkpoint_save_failed` event and
+  a console warning so you know recovery may be unavailable.
+
+Recover a stalled run by killing the process (e.g. `conductor stop` for a
+`--web-bg` run) and then:
+
+```bash
+conductor checkpoints workflow.yaml     # list checkpoints (Trigger column shows periodic/failure)
+conductor resume workflow.yaml          # resume from the latest checkpoint
+```
+
+See `examples/periodic-checkpoints.yaml` for a complete example.
 
 ## Tools
 

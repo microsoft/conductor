@@ -102,6 +102,12 @@ export interface WorkflowFailedData {
   message?: string;
   /** Slot-key path of the failing engine (present only at depth > 0). */
   subworkflow_path?: string[];
+  /** Issue #245: true when the run ended via a user Stop/Kill from the UI. */
+  stopped_by_user?: boolean;
+  /** Best-effort checkpoint written for a user Stop/Kill (hard-Kill path). */
+  checkpoint_path?: string;
+  /** Why no checkpoint could be written, when one couldn't (Stop/Kill). */
+  checkpoint_unavailable_reason?: string;
 }
 
 // --- Agent lifecycle ---

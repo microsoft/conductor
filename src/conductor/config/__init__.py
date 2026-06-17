@@ -12,6 +12,7 @@ from conductor.config.loader import (
 )
 from conductor.config.schema import (
     AgentDef,
+    CheckpointConfig,
     ContextConfig,
     DialogConfig,
     GateOption,
@@ -35,6 +36,7 @@ __all__ = [
     "resolve_env_vars",
     # Schema models
     "AgentDef",
+    "CheckpointConfig",
     "ContextConfig",
     "DialogConfig",
     "GateOption",

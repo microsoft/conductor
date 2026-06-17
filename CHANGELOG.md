@@ -7,8 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.18...HEAD)
 
+### Added
+
+- **Context tier** — new `context_tier` knob (`default` | `long_context`) to
+  select a model's long-context (e.g. 1M-token) window on the Copilot provider.
+  Set per agent via `context_tier:` (sibling to `model`) or workflow-wide via
+  `runtime.default_context_tier`; the per-agent value wins. It composes
+  independently with `reasoning.effort` (the two map to separate
+  `create_session` kwargs). The Copilot provider forwards the resolved value as
+  `context_tier` to `create_session`; other providers ignore it. Only valid on
+  standard `agent`-type agents (rejected on `script`, `human_gate`, and
+  `workflow` agents). See [`examples/context-tier.yaml`](examples/context-tier.yaml)
+  and [Context Tier](docs/configuration.md#context-tier).
+  ([#251](https://github.com/microsoft/conductor/issues/251))
+
 ### Fixed
 
+- Web dashboard **Stop/Kill now always writes a checkpoint** (or clearly
+  explains why it couldn't). Previously, killing a run while an agent was
+  actively executing — or clicking Stop during the brief startup window before
+  the engine bound its interrupt event — cancelled the engine task from the CLI
+  wrapper, bypassing the engine's failure handling so **no checkpoint and no
+  `workflow_failed` event** were produced and progress was silently lost. Now:
+  - A dashboard stop that cancels the engine routes through a best-effort
+    checkpoint + `workflow_failed`/`checkpoint_saved` emit
+    (`WorkflowEngine.handle_dashboard_stop`), so the run is resumable with
+    `conductor resume`.
+  - `POST /api/stop` during startup is **queued** until the interrupt event is
+    bound (graceful pause path) instead of falling back to a hard cancel.
+  - The dashboard shows a dedicated, calm **"Workflow Stopped"** banner with
+    `Checkpoint saved: <path>` — or `No checkpoint could be saved — <reason>`
+    when one genuinely couldn't be written — instead of an alarming red
+    "Workflow Failed". ([#245](https://github.com/microsoft/conductor/issues/245))
 - `human_gate` agents: the dict returned by `prompt_for` text-collection fields
   is no longer spread into the gate's output root, where it could silently
   overwrite the reserved `selected` key (e.g. an option declaring

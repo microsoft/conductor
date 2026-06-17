@@ -1025,18 +1025,24 @@ def checkpoints(
     table = Table(title="Workflow Checkpoints", show_lines=True)
     table.add_column("Workflow", style="cyan")
     table.add_column("Timestamp", style="green")
-    table.add_column("Failed Agent", style="yellow")
-    table.add_column("Error Type", style="red")
-    table.add_column("File", style="dim")
+    table.add_column("Trigger", style="magenta")
+    table.add_column("Agent", style="yellow")
+    table.add_column("Error Type", style="red", no_wrap=True, min_width=13)
+    # File path absorbs truncation so the triage columns stay readable.
+    table.add_column("File", style="dim", overflow="ellipsis")
 
     for cp in checkpoint_list:
         workflow_name = Path(cp.workflow_path).stem
         timestamp = cp.created_at
-        failed_agent = cp.failure.get("agent", "unknown")
-        error_type = cp.failure.get("error_type", "unknown")
+        trigger = cp.trigger
+        # For failure checkpoints this is the failed agent; for periodic
+        # checkpoints it is the step that was about to run.
+        agent = cp.failure.get("agent") or "unknown"
+        # Periodic checkpoints have no error; show an em dash.
+        error_type = cp.failure.get("error_type") or "—"
         file_path = str(cp.file_path)
 
-        table.add_row(workflow_name, timestamp, failed_agent, error_type, file_path)
+        table.add_row(workflow_name, timestamp, trigger, agent, error_type, file_path)
 
     output_console.print(table)
     output_console.print(f"\n[dim]Total: {len(checkpoint_list)} checkpoint(s)[/dim]")
