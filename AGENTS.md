@@ -128,6 +128,57 @@ make validate-examples    # validate all examples
 9. Routes evaluated via `Router` using Jinja2 or simpleeval expressions
 10. Final output built from templates in `output:` section
 
+### Notifications (domain events)
+
+A `type: notification` step lets workflow authors publish typed, declared **domain events** to a dedicated JSONL stream for external tooling to hook off. Distinct from execution events (`agent_started`, `route_evaluated`, …): execution events describe what the runtime is doing; notifications describe what the workflow is asserting to the outside world.
+
+**Notifications are a visibility primitive, not a control-flow primitive.** They do not block, do not wait for an ack, and do not gate routing. If a decision needs to flow back into the workflow, use `human_gate`. Routes on a notification step fire independently of emission.
+
+YAML surface (full example in `examples/notifications.yaml`):
+
+```yaml
+workflow:
+  notifications:
+    namespace: polyphony.feature_pr   # optional; defaults to slugified workflow name
+    correlation: [apex_id]            # workflow input keys auto-surfaced + inherited by sub-workflows
+    types:
+      pr_ready:
+        version: 1
+        payload:
+          pr_url: { type: string }
+          pr_id:  { type: number }
+
+agents:
+  - name: announce_ready
+    type: notification
+    emit: pr_ready
+    payload:
+      pr_url: "{{ open_pr.output.url }}"
+      pr_id:  "{{ open_pr.output.id }}"
+    routes:
+      - to: poll_for_review    # continues; emission is independent of routing
+```
+
+**Envelope** (the `data` of each `notification` event):
+
+- `emission_id` — `<run_id>:<dotted_step_path>:<iteration>`; stable across resume/replay so consumers can dedupe at the first hop.
+- `schema_id` — `<namespace>.<type>@<version>`; consumers MUST pin on this, not on `notification_type` alone.
+- `namespace`, `notification_type`, `version`, `run_id`, `workflow`, `source_agent`, `subworkflow_path`.
+- `correlation` — first-class field, auto-merged from declared correlation keys and inherited from parent workflows (parent wins on key collision so the upstream trail survives).
+- `payload` — declared per-type fields, Jinja2-rendered then type-validated against the `OutputField` schema.
+
+**Output context**: A notification step stores `{}` in the workflow context — not its envelope payload. Downstream templates that reference `announce_ready.output.x` will silently render empty in `accumulate` mode rather than raise. Notifications are a fire-and-forget visibility primitive; if you need a value to flow back into the workflow, use a regular agent step instead.
+
+**Delivery (v1):** every emission flows through `WorkflowEventEmitter` and is written to `$TMPDIR/conductor/conductor-<workflow>-<ts>-<run_id>.notifications.jsonl` by `NotificationLogSubscriber`. The path is printed at end-of-run alongside the event log path. No webhooks, shell hooks, or MCP-driven emission in v1.
+
+**Schema-version-bump policy** (documented; not enforced):
+- Adding an optional field is non-breaking; do **not** bump `version`.
+- Removing/renaming a field, changing a field's type, or making an optional field required is breaking; bump `version` and emit under the new `schema_id`.
+- During a transition a workflow MAY emit both `pr_ready@1` and `pr_ready@2` from adjacent steps.
+- Consumers MUST pin on `schema_id`.
+
+**Validation failures** (undeclared type, payload field mismatch, unknown correlation key, type mismatch on a rendered value) fail the workflow loudly with `ValidationError`. The contract is the whole point.
+
 ### Key Patterns
 
 - **Context modes**: `accumulate` (all prior outputs), `last_only` (previous only), `explicit` (only declared inputs)

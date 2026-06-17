@@ -1,0 +1,125 @@
+# Notifications Example
+#
+# Demonstrates user-defined domain notifications: fire-and-forget messages
+# the workflow publishes to the outside world for external tooling to hook
+# off. Notifications are a VISIBILITY primitive — they do not block, do
+# not wait for an ack, and do not gate control flow. If you need a
+# decision to flow back into the workflow, use a human_gate instead.
+#
+# Each emission is written to a dedicated notifications.jsonl file
+# alongside the standard event log. The file path is printed at the end
+# of the run.
+#
+# Usage:
+#   conductor run examples/notifications.yaml \
+#     --input pr_id=42 \
+#     --input apex_id=apex-2026-05-18
+
+workflow:
+  name: notifications-demo
+  description: Demonstrates user-defined fire-and-forget notifications
+  version: "1.0.0"
+  entry_point: open_pr
+
+  runtime:
+    provider: copilot
+
+  limits:
+    max_iterations: 10
+
+  input:
+    pr_id:
+      type: number
+      description: ADO pull-request id
+    apex_id:
+      type: string
+      description: Apex run id (correlation key)
+    ado_org:
+      type: string
+      default: contoso
+    ado_project:
+      type: string
+      default: feature-pr
+
+  # Workflow-level notification configuration.
+  notifications:
+    # Optional. Defaults to the slugified workflow name.
+    namespace: polyphony.feature_pr
+
+    # Workflow input keys auto-surfaced on every notification. Inherited
+    # by sub-workflows (parent wins on key collision).
+    correlation:
+      - apex_id
+
+    # Type registry. Each entry declares a fixed payload schema and a
+    # version. Consumers MUST pin on schema_id (<namespace>.<type>@<version>),
+    # not on type name alone.
+    types:
+      pr_ready:
+        version: 1
+        description: A pull request has reached ready-for-review state.
+        payload:
+          pr_url:      { type: string }
+          pr_id:       { type: number }
+          ado_org:     { type: string }
+          ado_project: { type: string }
+
+      pr_needs_input:
+        version: 1
+        description: A PR has changed and requires reviewer input.
+        payload:
+          pr_url:         { type: string }
+          change_summary: { type: string }
+
+agents:
+  - name: open_pr
+    description: Stand-in for whatever opens / discovers the PR.
+    model: claude-haiku-4.5
+    prompt: |
+      Pretend you are creating pull request {{ workflow.input.pr_id }} in
+      {{ workflow.input.ado_org }}/{{ workflow.input.ado_project }}.
+      Reply with a one-sentence summary of what was done.
+    output:
+      summary:
+        type: string
+    routes:
+      - to: announce_ready
+
+  # Notifications fire mid-flow. Note we route to the next step, NOT to
+  # $end — emission is independent of routing.
+  - name: announce_ready
+    type: notification
+    emit: pr_ready
+    payload:
+      pr_url:      "https://dev.azure.com/{{ workflow.input.ado_org }}/{{ workflow.input.ado_project }}/_git/repo/pullrequest/{{ workflow.input.pr_id }}"
+      pr_id:       "{{ workflow.input.pr_id }}"
+      ado_org:     "{{ workflow.input.ado_org }}"
+      ado_project: "{{ workflow.input.ado_project }}"
+    routes:
+      - to: detect_change
+
+  - name: detect_change
+    description: Stand-in for whatever notices the PR changed.
+    model: claude-haiku-4.5
+    prompt: |
+      Pretend a reviewer pushed a small change to PR
+      {{ workflow.input.pr_id }}. Reply with a one-line description of
+      the change.
+    output:
+      change:
+        type: string
+    routes:
+      - to: announce_needs_input
+
+  - name: announce_needs_input
+    type: notification
+    emit: pr_needs_input
+    payload:
+      pr_url:         "https://dev.azure.com/{{ workflow.input.ado_org }}/{{ workflow.input.ado_project }}/_git/repo/pullrequest/{{ workflow.input.pr_id }}"
+      change_summary: "{{ detect_change.output.change }}"
+    routes:
+      - to: $end
+
+output:
+  pr_summary: "{{ open_pr.output.summary }}"
+  change:     "{{ detect_change.output.change }}"
