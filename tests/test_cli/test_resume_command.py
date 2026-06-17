@@ -547,6 +547,38 @@ class TestCheckpointsCommand:
         assert "TimeoutError" in result.output
         assert "2 checkpoint(s)" in result.output
 
+    def test_checkpoints_shows_periodic_trigger(self, tmp_path: Path) -> None:
+        """Periodic checkpoints render a 'periodic' trigger and no error type."""
+        checkpoints = [
+            CheckpointData(
+                version=1,
+                workflow_path="/path/to/workflow-a.yaml",
+                workflow_hash="sha256:abc",
+                created_at="2026-02-24T15:30:00+00:00",
+                failure={
+                    "error_type": None,
+                    "message": None,
+                    "agent": "researcher",
+                    "iteration": 2,
+                },
+                inputs={},
+                current_agent="researcher",
+                context={},
+                limits={},
+                file_path=Path("/tmp/conductor/checkpoints/workflow-a-20260224-153000.json"),
+                trigger="periodic",
+            ),
+        ]
+
+        with patch.object(CheckpointManager, "list_checkpoints", return_value=checkpoints):
+            result = runner.invoke(app, ["checkpoints"])
+
+        assert result.exit_code == 0
+        assert "periodic" in result.output
+        assert "researcher" in result.output
+        # No error type for a periodic checkpoint — rendered as an em dash.
+        assert "—" in result.output
+
     def test_checkpoints_filtered_by_workflow(self, tmp_path: Path) -> None:
         """Test filtering checkpoints by workflow path."""
         wf_path = _write_workflow(tmp_path, "my-workflow")
@@ -930,6 +962,99 @@ class TestExecuteWithStopSignal:
 
         with pytest.raises(ExecutionError, match="stopped by user"):
             await _execute_with_stop_signal(_engine(), dashboard=dashboard)
+
+    @pytest.mark.asyncio
+    async def test_handle_dashboard_stop_called_when_stop_cancels_engine(self) -> None:
+        """When stop wins and the engine task is genuinely cancelled, the helper
+        asks the engine to write a best-effort checkpoint before raising (#245)."""
+        import asyncio
+
+        from conductor.cli.run import _execute_with_stop_signal
+        from conductor.exceptions import ExecutionError
+
+        dashboard = MagicMock()
+
+        async def _stop() -> None:
+            return None  # stop fires immediately
+
+        dashboard.wait_for_stop = _stop
+
+        async def _engine_coro() -> dict[str, str]:
+            await asyncio.Event().wait()  # blocks → gets cancelled
+            return {}
+
+        engine = MagicMock()
+
+        with pytest.raises(ExecutionError, match="stopped by user"):
+            await _execute_with_stop_signal(_engine_coro(), dashboard=dashboard, engine=engine)
+
+        engine.handle_dashboard_stop.assert_called_once_with(
+            "Workflow stopped by user via dashboard"
+        )
+
+    @pytest.mark.asyncio
+    async def test_engine_own_exception_reraised_without_double_handling(self) -> None:
+        """If the engine raised its own terminal exception (e.g. InterruptError
+        from a pause→Kill that already emitted workflow_failed + checkpointed),
+        re-raise it untouched and do NOT call handle_dashboard_stop (#245)."""
+        import asyncio
+
+        from conductor.cli.run import _execute_with_stop_signal
+        from conductor.exceptions import InterruptError
+
+        dashboard = MagicMock()
+
+        async def _stop() -> None:
+            return None  # stop fires immediately
+
+        dashboard.wait_for_stop = _stop
+
+        async def _engine_coro() -> dict[str, str]:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                # Engine handled the stop itself and raised its own exception
+                # instead of propagating the cancellation.
+                raise InterruptError(agent_name="researcher") from None
+            return {}
+
+        engine = MagicMock()
+
+        with pytest.raises(InterruptError):
+            await _execute_with_stop_signal(_engine_coro(), dashboard=dashboard, engine=engine)
+
+        engine.handle_dashboard_stop.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_resume_with_stop_signal_forwards_engine(self) -> None:
+        """`_resume_with_stop_signal` forwards `engine=` so a Kill during a
+        resumed run also writes a best-effort checkpoint (run/resume parity, #245)."""
+        import asyncio
+
+        from conductor.cli.run import _resume_with_stop_signal
+        from conductor.exceptions import ExecutionError
+
+        dashboard = MagicMock()
+
+        async def _stop() -> None:
+            return None  # stop fires immediately
+
+        dashboard.wait_for_stop = _stop
+
+        engine = MagicMock()
+
+        async def _resume(_agent: str) -> dict[str, str]:
+            await asyncio.Event().wait()  # blocks → gets cancelled
+            return {}
+
+        engine.resume = _resume
+
+        with pytest.raises(ExecutionError, match="stopped by user"):
+            await _resume_with_stop_signal(engine, "researcher", dashboard)
+
+        engine.handle_dashboard_stop.assert_called_once_with(
+            "Workflow stopped by user via dashboard"
+        )
 
     @pytest.mark.asyncio
     async def test_losing_task_with_exception_does_not_leak(self) -> None:

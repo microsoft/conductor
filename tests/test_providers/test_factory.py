@@ -47,6 +47,26 @@ class TestCreateProvider:
         assert exc_info.value.suggestion is not None
         assert "copilot" in exc_info.value.suggestion
 
+    @pytest.mark.asyncio
+    async def test_copilot_provider_receives_default_context_tier(self) -> None:
+        """default_context_tier is threaded into the Copilot provider."""
+        provider = await create_provider(
+            "copilot",
+            validate=False,
+            default_context_tier="long_context",
+        )
+        assert isinstance(provider, CopilotProvider)
+        assert provider._default_context_tier == "long_context"
+        await provider.close()
+
+    @pytest.mark.asyncio
+    async def test_copilot_provider_default_context_tier_none(self) -> None:
+        """default_context_tier defaults to None on the Copilot provider."""
+        provider = await create_provider("copilot", validate=False)
+        assert isinstance(provider, CopilotProvider)
+        assert provider._default_context_tier is None
+        await provider.close()
+
     @patch("conductor.providers.factory.ANTHROPIC_SDK_AVAILABLE", False)
     @pytest.mark.asyncio
     async def test_create_claude_provider_raises_when_sdk_not_available(self) -> None:

@@ -5,10 +5,142 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.18...HEAD)
+## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.19...HEAD)
+
+### Added
+
+- **Hermes provider (experimental)** — optional third provider built on the
+  NousResearch [`hermes-agent`](https://github.com/NousResearch/hermes-agent)
+  library, which manages its own tool ecosystem (no MCP configuration). Install
+  separately with `pip install hermes-agent`; Conductor works without it.
+  Declared in the experimental provider tier with documented capability
+  carve-outs (no MCP servers, no per-agent workflow `tools:` allowlist,
+  structured output via prompt injection). Supports custom endpoints via
+  structured `runtime.provider` (`base_url` / `api_key`), `hermes_home`
+  profiles, `hermes_toolsets`, streaming + reasoning event callbacks,
+  cooperative interrupt, session-history resume, and `max_session_seconds`.
+  See [`docs/providers/hermes.md`](docs/providers/hermes.md).
+  ([#235](https://github.com/microsoft/conductor/pull/235))
+
+## [0.1.19](https://github.com/microsoft/conductor/compare/v0.1.18...v0.1.19) - 2026-06-16
+
+### Added
+
+- **Context tier** — new `context_tier` knob (`default` | `long_context`) to
+  select a model's long-context (e.g. 1M-token) window on the Copilot provider.
+  Set per agent via `context_tier:` (sibling to `model`) or workflow-wide via
+  `runtime.default_context_tier`; the per-agent value wins. It composes
+  independently with `reasoning.effort` (the two map to separate
+  `create_session` kwargs). The Copilot provider forwards the resolved value as
+  `context_tier` to `create_session`; other providers ignore it. Only valid on
+  standard `agent`-type agents (rejected on `script`, `human_gate`, and
+  `workflow` agents). See [`examples/context-tier.yaml`](examples/context-tier.yaml)
+  and [Context Tier](docs/configuration.md#context-tier).
+  ([#251](https://github.com/microsoft/conductor/issues/251))
+- **Validator block** — an optional `validator:` block on provider-backed
+  agents that runs a second LLM call to grade the agent's output against a
+  user-defined rubric. Distinct from `retry:` (transient failures, same
+  prompt) and `output:` (shape/type): it catches structurally valid but
+  semantically wrong, incomplete, or off-rubric output. Fields: `criteria`
+  (required), `model` (defaults to the agent's model), and `max_retries`
+  (`0` or `1`, default `1`, hard-capped at `1`). On `passed: false` the agent
+  re-runs **once** with the validator's issues appended under a
+  `## Validation feedback` section; the second output is final (no second
+  validation loop). Validation is **fail-open** — grader errors or unparseable
+  responses are logged and treated as a pass, so a hung or broken grader can't
+  block the workflow. Wired into the main loop, parallel groups, and for-each
+  loops; emits `agent_validator_start` / `agent_validator_complete` /
+  `agent_validation_failed` events surfaced in `--verbose` console output and
+  the web dashboard, and records the grading call (plus any discarded first
+  attempt) as a separate `<agent> (validator)` usage row. Rejected on
+  `script` / `human_gate` / `workflow` / `wait` / `set` / `terminate` steps.
+  See [`examples/validator.yaml`](examples/validator.yaml) and the
+  [Validator section](docs/workflow-syntax.md) of the workflow syntax docs.
+  ([#256](https://github.com/microsoft/conductor/pull/256),
+  closes [#220](https://github.com/microsoft/conductor/issues/220))
+- **Periodic / milestone checkpoints** — opt-in `runtime.checkpoint` block that
+  saves a resumable checkpoint at step boundaries so a long run that stalls or
+  is hard-killed stays recoverable (previously Conductor only checkpointed on
+  failure). Two OR-combined triggers — `every_agent: true` (save at every step
+  boundary) and `every_seconds: N` (a throttle: save at the first boundary once
+  `N` seconds have elapsed since the last checkpoint) — plus `keep_last`
+  (default `5`) to rotate older periodic checkpoints per run. Off by default, so
+  failure-only behaviour is preserved. Periodic checkpoints are scoped to their
+  own run and trigger, so failure checkpoints and other runs' files are never
+  rotated away, and they are cleaned up automatically on clean completion or an
+  explicit `terminate`. A failed periodic save emits a `checkpoint_save_failed`
+  event (console + JSONL + dashboard) so a recovery-reliant run is never left
+  silently without checkpoints, and `conductor checkpoints` gains a `Trigger`
+  column. See
+  [`examples/periodic-checkpoints.yaml`](examples/periodic-checkpoints.yaml)
+  and the [Periodic Checkpoints section](docs/workflow-syntax.md) of the
+  workflow syntax docs.
+  ([#255](https://github.com/microsoft/conductor/pull/255),
+  closes [#244](https://github.com/microsoft/conductor/issues/244))
+- **Script `stdin:` payload transport** — `type: script` steps accept a new
+  `stdin:` field: a Jinja2 string template rendered against the workflow
+  context and piped to the child process on stdin as UTF-8. Workflows can now
+  hand large or structured payloads to scripts without hitting command-line
+  length limits (notably Windows, which caps the command line at ~32 KB),
+  removing argument-name-specific temp-file workarounds. `stdin` and `args` are
+  orthogonal; an explicit empty string pipes an immediate EOF, and omitting it
+  preserves the legacy behaviour of inheriting the parent's stdin. The payload
+  is streamed in the background so multi-MB inputs can't deadlock, the submitted
+  byte count is surfaced as `stdin_bytes` on the `script_completed` event, and
+  an unencodable payload raises a named `ExecutionError`. Rejected on every
+  non-script step type. See
+  [`examples/script-stdin.yaml`](examples/script-stdin.yaml).
+  ([#253](https://github.com/microsoft/conductor/pull/253),
+  refs [#18](https://github.com/microsoft/conductor/issues/18))
+- **Experimental provider tier** — providers that delegate part of the agentic
+  loop to an upstream SDK can now declare an *experimental* stability tier with
+  explicit, allowed capability carve-outs instead of silently eroding provider
+  parity. Every provider declares a class-level `CAPABILITIES`
+  (`ProviderCapabilities`) descriptor, and `conductor validate` cross-checks
+  workflow features against each agent's resolved provider — surfacing silent
+  mismatches (unsupported `runtime.mcp_servers`, non-empty per-agent `tools:`
+  allowlists, `reasoning.effort`, structured `output:`, concurrent use in
+  parallel/for-each groups, `max_session_seconds`) at validate time rather than
+  at runtime. The `workflow_started` event gains a `providers` block (tier,
+  upstream pin, maintainer, full capability dump) plus a `provider_name` per
+  agent; the CLI prints a one-time banner per experimental provider per run, and
+  the web dashboard renders a yellow "exp" badge on affected agent nodes. See
+  [Experimental Providers](docs/providers/experimental.md).
+  ([#242](https://github.com/microsoft/conductor/pull/242),
+  closes [#241](https://github.com/microsoft/conductor/issues/241))
+- **`claude-agent-sdk` provider** — a new, experimental provider that delegates
+  the agentic loop, tool execution, and structured-output extraction to the
+  Claude Code CLI via the `claude-agent-sdk` package. Unlike the raw `claude`
+  provider it does not manage its own retry logic, MCP servers, or tool wiring —
+  the SDK runtime owns those. It achieves event and output parity
+  (`agent_turn_start`, `agent_message`, `agent_reasoning`,
+  `agent_tool_start` / `agent_tool_complete`, and the standard `AgentOutput`
+  shape), pairing real `ToolResultBlock` results rather than emitting nulls.
+  Workflow-level `runtime.mcp_servers`, non-empty per-agent `tools:` lists, and
+  `temperature` / `max_tokens` are rejected at the factory (the CLI controls
+  these). Install with the optional extra
+  (`pip install conductor[claude-agent-sdk]`) plus the `claude` CLI. See
+  [`examples/experimental-claude-agent-sdk.yaml`](examples/experimental-claude-agent-sdk.yaml).
+  ([#104](https://github.com/microsoft/conductor/pull/104))
 
 ### Fixed
 
+- Web dashboard **Stop/Kill now always writes a checkpoint** (or clearly
+  explains why it couldn't). Previously, killing a run while an agent was
+  actively executing — or clicking Stop during the brief startup window before
+  the engine bound its interrupt event — cancelled the engine task from the CLI
+  wrapper, bypassing the engine's failure handling so **no checkpoint and no
+  `workflow_failed` event** were produced and progress was silently lost. Now:
+  - A dashboard stop that cancels the engine routes through a best-effort
+    checkpoint + `workflow_failed`/`checkpoint_saved` emit
+    (`WorkflowEngine.handle_dashboard_stop`), so the run is resumable with
+    `conductor resume`.
+  - `POST /api/stop` during startup is **queued** until the interrupt event is
+    bound (graceful pause path) instead of falling back to a hard cancel.
+  - The dashboard shows a dedicated, calm **"Workflow Stopped"** banner with
+    `Checkpoint saved: <path>` — or `No checkpoint could be saved — <reason>`
+    when one genuinely couldn't be written — instead of an alarming red
+    "Workflow Failed". ([#245](https://github.com/microsoft/conductor/issues/245))
 - `human_gate` agents: the dict returned by `prompt_for` text-collection fields
   is no longer spread into the gate's output root, where it could silently
   overwrite the reserved `selected` key (e.g. an option declaring
@@ -16,6 +148,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the user typed). Collected values are now nested under an explicit
   `additional_input` key, matching the shape the `gate_resolved` event already
   used. ([#237](https://github.com/microsoft/conductor/pull/237))
+- `context: explicit` mode now supports **nested output projection** in
+  `input:` declarations. References of the form
+  `agent_name.output.field.subfield...` (and the
+  `agent_name.field.subfield...` shorthand) project arbitrarily deep into a
+  prior step's structured output, where previously only a single level
+  (`agent_name.output.field`) resolved and deeper paths silently failed.
+  Optional refs (`?`) skip missing intermediate paths, and projected leaves are
+  deep-copied to avoid mutation aliasing. Static validation in
+  `conductor validate` was aligned with the runtime so valid nested references
+  no longer fail validation.
+  ([#239](https://github.com/microsoft/conductor/pull/239))
 
 ### Changed
 
@@ -28,11 +171,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Templates that referenced the old flat path now raise `TemplateError`
     (`StrictUndefined`), so the migration fails loudly rather than rendering
     to empty strings.
-  - In `context: explicit` mode, `input:` declarations support
-    `<gate>.output.additional_input` (the parent dict) but not the dotted
-    shorthand `<gate>.output.additional_input.<field>`. Declare the parent
-    and read individual fields via Jinja2 in the consuming agent's prompt or
-    output template.
+  - In `context: explicit` mode, `input:` declarations can reference either
+    `<gate>.output.additional_input` (the whole dict) or an individual
+    `<gate>.output.additional_input.<field>`. Nested explicit-input projection
+    landed in this same release
+    ([#239](https://github.com/microsoft/conductor/pull/239)), so the dotted
+    field path now resolves directly; you can also still declare the parent and
+    read individual fields via Jinja2 in the consuming agent's prompt or output
+    template.
 
 ## [0.1.18](https://github.com/microsoft/conductor/compare/v0.1.17...v0.1.18) - 2026-05-28
 

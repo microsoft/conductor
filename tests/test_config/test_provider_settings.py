@@ -74,7 +74,7 @@ class TestProviderSettingsValidation:
 
     def test_non_copilot_with_base_url_rejected(self) -> None:
         with pytest.raises(ValidationError, match="not yet implemented"):
-            ProviderSettings(name="hermes", base_url="http://some-proxy/v1")
+            ProviderSettings(name="openai-agents", base_url="http://some-proxy/v1")
 
     def test_claude_with_base_url_accepted(self) -> None:
         s = ProviderSettings(name="claude", base_url="https://my-gateway.example.com/api/v1")
@@ -240,9 +240,10 @@ class TestHermesProviderSettings:
         with pytest.raises(ValidationError, match="hermes_skip_context_files"):
             ProviderSettings(name="copilot", hermes_skip_context_files=True)
 
-    def test_claude_with_base_url_still_rejected(self) -> None:
+    def test_unsupported_provider_with_base_url_still_rejected(self) -> None:
+        # claude/copilot/hermes support base_url; other providers must still reject it.
         with pytest.raises(ValidationError, match="not yet implemented"):
-            ProviderSettings(name="claude", base_url="http://anthropic-proxy/v1")
+            ProviderSettings(name="claude-agent-sdk", base_url="http://proxy/v1")
 
 
 class TestHasCustomRouting:

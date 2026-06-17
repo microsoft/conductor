@@ -35,13 +35,13 @@ if TYPE_CHECKING:
 # that real dependency failures inside the package (e.g. missing openai)
 # propagate instead of producing a misleading "install hermes-agent" hint.
 try:
-    from run_agent import AIAgent
+    from run_agent import AIAgent  # ty: ignore[unresolved-import]
 
     HERMES_SDK_AVAILABLE = True
 except ModuleNotFoundError as _e:
     if _e.name is not None and _e.name.split(".")[0] == "run_agent":
         HERMES_SDK_AVAILABLE = False
-        AIAgent = None  # type: ignore[misc, assignment]
+        AIAgent: Any = None
     else:
         raise
 
@@ -86,7 +86,6 @@ class HermesProvider(AgentProvider):
         upstream_pin="hermes-agent",
         maintainer="(community contribution)",
     )
-
 
     def __init__(
         self,
@@ -317,12 +316,12 @@ class HermesProvider(AgentProvider):
             # Apply hermes_home profile override (thread-safe ContextVar)
             _home_token = None
             if self._hermes_home:
-                from hermes_constants import set_hermes_home_override
+                import hermes_constants  # ty: ignore[unresolved-import]
 
                 expanded_home = str(Path(self._hermes_home).expanduser())
-                _home_token = set_hermes_home_override(expanded_home)
+                _home_token = hermes_constants.set_hermes_home_override(expanded_home)
             try:
-                hermes_agent = AIAgent(**agent_kwargs)
+                hermes_agent = AIAgent(**agent_kwargs)  # ty: ignore[call-non-callable]
                 hermes_agent_ref.append(hermes_agent)
                 return hermes_agent.run_conversation(
                     prompt,
@@ -331,9 +330,9 @@ class HermesProvider(AgentProvider):
                 )
             finally:
                 if _home_token is not None:
-                    from hermes_constants import reset_hermes_home_override
+                    import hermes_constants
 
-                    reset_hermes_home_override(_home_token)
+                    hermes_constants.reset_hermes_home_override(_home_token)
 
         # Wrap the blocking call and optionally race against interrupt / timeout
         call_task = loop.run_in_executor(None, _run_sync)
@@ -512,7 +511,7 @@ class HermesProvider(AgentProvider):
                     for k, v in agent_kwargs.items()
                     if k not in ("stream_delta_callback", "reasoning_callback")
                 }
-                hermes_agent = AIAgent(**recovery_kwargs)
+                hermes_agent = AIAgent(**recovery_kwargs)  # ty: ignore[call-non-callable]
                 recovery_result = hermes_agent.run_conversation(
                     recovery_prompt,
                     system_message=agent.system_prompt or None,
@@ -521,7 +520,7 @@ class HermesProvider(AgentProvider):
                 response = recovery_result.get("final_response") or ""
                 messages = recovery_result.get("messages", [])
 
-        expected_fields = list(agent.output.keys()) if agent.output else []  # type: ignore[union-attr]
+        expected_fields = list(agent.output.keys()) if agent.output else []
         raise ProviderError(
             f"Failed to parse structured output after {_MAX_PARSE_RECOVERY_ATTEMPTS} "
             f"recovery attempts: {last_error}",

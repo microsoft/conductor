@@ -37,6 +37,9 @@ import type {
   DialogStartedData,
   DialogMessageData,
   DialogCompletedData,
+  AgentValidatorStartData,
+  AgentValidatorCompleteData,
+  AgentValidationFailedData,
   SubworkflowStartedData,
   SubworkflowCompletedData,
   SubworkflowFailedData,
@@ -142,6 +145,14 @@ export interface NodeData {
   dialog_messages?: Array<{ role: 'user' | 'agent'; content: string }>;
   dialog_active?: boolean;
   dialog_awaiting_response?: boolean;
+  // Validator-specific (issue #220)
+  validator_state?: 'running' | 'passed' | 'failed' | 'error';
+  validator_issues?: string[];
+  validator_will_retry?: boolean;
+  /** Number of times the validator has run for this node (1 normally). */
+  validator_attempts?: number;
+  validator_cost_usd?: number | null;
+  validator_model?: string | null;
   // Terminate-specific (type: terminate steps; see issue #219)
   termination_status?: 'success' | 'failed';
   termination_reason?: string;
@@ -270,7 +281,7 @@ interface WorkflowState {
   workflowName: string;
   workflowStatus: WorkflowStatus;
   workflowStartTime: number | null;
-  workflowFailure: { error_type?: string; message?: string; elapsed_seconds?: number; timeout_seconds?: number; current_agent?: string; checkpoint_path?: string; termination_reason?: string; terminated_by?: string; is_explicit?: boolean; status?: string } | null;
+  workflowFailure: { error_type?: string; message?: string; elapsed_seconds?: number; timeout_seconds?: number; current_agent?: string; checkpoint_path?: string; checkpoint_unavailable_reason?: string; stopped_by_user?: boolean; termination_reason?: string; terminated_by?: string; is_explicit?: boolean; status?: string } | null;
   workflowFailedAgent: string | null;
   workflowYaml: string | null;
   conductorVersion: string | null;
@@ -1593,8 +1604,15 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
   },
 
   workflow_failed: (state, _data) => {
-    state.wfDepth = Math.max(0, state.wfDepth - 1);
-    const data = _data as { agent_name?: string; error_type?: string; message?: string; elapsed_seconds?: number; timeout_seconds?: number; current_agent?: string; subworkflow_path?: string[]; is_explicit?: boolean; termination_reason?: string; terminated_by?: string; status?: string };
+    const data = _data as { agent_name?: string; error_type?: string; message?: string; elapsed_seconds?: number; timeout_seconds?: number; current_agent?: string; subworkflow_path?: string[]; is_explicit?: boolean; termination_reason?: string; terminated_by?: string; status?: string; checkpoint_path?: string; checkpoint_unavailable_reason?: string; stopped_by_user?: boolean };
+    // Issue #245: a user-initiated Stop/Kill terminates the entire run,
+    // including any active subworkflows. On the hard-cancel path the child
+    // engines are cancelled silently (no per-level workflow_failed/subworkflow_failed),
+    // so this single root-level event (no subworkflow_path) must collapse
+    // wfDepth straight to 0 — otherwise the root-failed block never runs and the
+    // "Workflow Stopped" banner never renders for runs that use subworkflows.
+    const isRootUserStop = Boolean(data.stopped_by_user) && !data.subworkflow_path;
+    state.wfDepth = isRootUserStop ? 0 : Math.max(0, state.wfDepth - 1);
     if (state.wfDepth === 0) {
       // Root workflow failed
       state.workflowStatus = 'failed';
@@ -1618,6 +1636,13 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
         elapsed_seconds: data.elapsed_seconds,
         timeout_seconds: data.timeout_seconds,
         current_agent: data.current_agent,
+        // Issue #245: a user-initiated Stop/Kill carries the checkpoint outcome
+        // inline (hard-Kill path) and a flag so the banner renders "Stopped"
+        // rather than "Failed". The pause -> Kill path also sets stopped_by_user
+        // but delivers checkpoint_path via a later checkpoint_saved event.
+        checkpoint_path: data.checkpoint_path,
+        checkpoint_unavailable_reason: data.checkpoint_unavailable_reason,
+        stopped_by_user: data.stopped_by_user,
         // Issue #219: forward termination metadata so the error banner can
         // distinguish explicit terminate-step failures from generic crashes.
         termination_reason: data.termination_reason,
@@ -1931,9 +1956,96 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     state.dialogEngaged = false;
     replaceNode(state.nodes, data.agent_name);
   },
+
+  agent_validator_start: (state, _data) => {
+    const data = _data as unknown as AgentValidatorStartData;
+    const itemKey = (_data as Record<string, unknown>).item_key as string | undefined;
+    const t = activeTarget(state, _data);
+    const entry: ActivityEntry = {
+      type: 'validator-start',
+      icon: '🔎',
+      label: 'validator',
+      text: 'validating output',
+      detail: data.criteria_preview || null,
+    };
+    addActivity(t.nodes, data.agent_name, entry);
+    if (itemKey != null) {
+      addForEachItemActivity(t.nodes, data.agent_name, String(itemKey), entry);
+    } else {
+      const nd = ensureNode(t.nodes, data.agent_name);
+      nd.validator_state = 'running';
+      nd.validator_model = data.model ?? null;
+      nd.validator_attempts = (nd.validator_attempts ?? 0) + 1;
+    }
+    replaceNode(t.nodes, data.agent_name);
+  },
+
+  agent_validator_complete: (state, _data) => {
+    const data = _data as unknown as AgentValidatorCompleteData;
+    const itemKey = (_data as Record<string, unknown>).item_key as string | undefined;
+    const t = activeTarget(state, _data);
+    const verdict = data.errored ? 'error' : data.passed ? 'passed' : 'failed';
+    const entry: ActivityEntry = {
+      type: 'validator-complete',
+      icon: data.errored ? '⚠️' : data.passed ? '✅' : '❌',
+      label: 'validator',
+      text: data.errored
+        ? 'validation error (treated as pass)'
+        : data.passed
+          ? 'validation passed'
+          : 'validation failed',
+      detail: data.issues && data.issues.length ? data.issues.join('\n') : null,
+    };
+    addActivity(t.nodes, data.agent_name, entry);
+    if (itemKey != null) {
+      addForEachItemActivity(t.nodes, data.agent_name, String(itemKey), entry);
+    } else {
+      const nd = ensureNode(t.nodes, data.agent_name);
+      nd.validator_state = verdict;
+      nd.validator_issues = data.issues ?? [];
+      nd.validator_cost_usd = data.cost_usd ?? null;
+      nd.validator_model = data.model ?? nd.validator_model ?? null;
+    }
+    replaceNode(t.nodes, data.agent_name);
+  },
+
+  agent_validation_failed: (state, _data) => {
+    const data = _data as unknown as AgentValidationFailedData;
+    const itemKey = (_data as Record<string, unknown>).item_key as string | undefined;
+    const t = activeTarget(state, _data);
+    const rerunErrored = data.rerun_errored === true;
+    const entry: ActivityEntry = {
+      type: 'validation-failed',
+      icon: rerunErrored ? '⚠️' : '❌',
+      label: 'validator',
+      text: rerunErrored
+        ? 're-run failed — keeping original output'
+        : data.will_retry
+          ? 're-running once with feedback'
+          : 'validation failed (no retry)',
+      detail: data.issues && data.issues.length ? data.issues.join('\n') : null,
+    };
+    addActivity(t.nodes, data.agent_name, entry);
+    if (itemKey != null) {
+      addForEachItemActivity(t.nodes, data.agent_name, String(itemKey), entry);
+    } else {
+      const nd = ensureNode(t.nodes, data.agent_name);
+      nd.validator_will_retry = data.will_retry;
+      nd.validator_issues = data.issues ?? [];
+      // A failed feedback re-run leaves the node in an error state (the
+      // original failing output was kept).
+      if (rerunErrored) nd.validator_state = 'error';
+    }
+    replaceNode(t.nodes, data.agent_name);
+  },
 };
 
 // --- Build log entries from events ---
+
+/** Label an event source as ``agent`` or ``agent[item_key]`` (for-each). */
+function eventSource(d: Record<string, unknown>): string {
+  return d.item_key != null ? `${d.agent_name}[${d.item_key}]` : String(d.agent_name);
+}
 
 function buildLogEntry(event: WorkflowEvent): LogEntry | null {
   const ts = event.timestamp;
@@ -2083,6 +2195,32 @@ function buildLogEntry(event: WorkflowEvent): LogEntry | null {
 
     case 'dialog_completed':
       return { timestamp: ts, level: 'success', source: String(d.agent_name), message: `Dialog completed (${d.turn_count || 0} messages)` };
+
+    case 'agent_validator_start': {
+      const src = eventSource(d);
+      return { timestamp: ts, level: 'info', source: src, message: 'Validating output…' };
+    }
+
+    case 'agent_validator_complete': {
+      const src = eventSource(d);
+      if (d.errored) {
+        return { timestamp: ts, level: 'warning', source: src, message: 'Validator error — treated as pass' };
+      }
+      if (d.passed) {
+        return { timestamp: ts, level: 'success', source: src, message: 'Validation passed' };
+      }
+      const issues = Array.isArray(d.issues) ? d.issues.length : 0;
+      return { timestamp: ts, level: 'warning', source: src, message: `Validation failed (${issues} issue${issues === 1 ? '' : 's'})` };
+    }
+
+    case 'agent_validation_failed': {
+      const src = eventSource(d);
+      if (d.rerun_errored) {
+        return { timestamp: ts, level: 'error', source: src, message: 'Validation re-run failed — keeping original output' };
+      }
+      const action = d.will_retry ? 're-running once with feedback' : 'no retry';
+      return { timestamp: ts, level: 'warning', source: src, message: `Validation failed — ${action}` };
+    }
 
     // Skip high-frequency streaming events from the log
     default:

@@ -16,6 +16,7 @@ workflow:
     temperature: 0.7
     max_tokens: 4096
     default_reasoning_effort: medium  # low | medium | high | xhigh (optional)
+    default_context_tier: default  # default | long_context (optional, Copilot only)
     # Provider-specific settings...
 ```
 
@@ -24,6 +25,11 @@ reasoning / extended-thinking effort that every provider-backed agent inherits
 unless it declares its own `reasoning.effort` override. See
 [Reasoning Effort](#reasoning-effort) for the per-provider translation and
 constraints.
+
+The `default_context_tier` field sets a workflow-wide default for the model's
+context-window tier that every provider-backed agent inherits unless it
+declares its own `context_tier` override. See [Context Tier](#context-tier)
+for details. This is a Copilot-only capability.
 
 ## Provider Selection
 
@@ -347,6 +353,52 @@ agents (none of which call a model).
 Reasoning / thinking content emitted by the model is surfaced via
 `agent_reasoning` events and rendered in the dashboard, JSONL logs, and
 `-vv` console output for both providers.
+
+## Context Tier
+
+Some models expose a larger context window (e.g. a 1M-token tier) selected via
+a separate session parameter rather than the model name. Conductor surfaces
+this as a unified `context_tier` knob. Allowed values: `default`,
+`long_context`.
+
+Use `long_context` for heavy-reasoning agents that ingest large evidence
+(multi-MB logs, many candidate source files) and would otherwise truncate at
+the default (~200K) tier.
+
+`context_tier` composes independently with `reasoning.effort` — they map to two
+separate `create_session` kwargs, so an agent may set both.
+
+Set a workflow-wide default and/or override per agent:
+
+```yaml
+workflow:
+  runtime:
+    provider: copilot
+    default_context_tier: default       # workflow-wide default
+
+agents:
+  - name: triage
+    # No context_tier — inherits `default` from the runtime default.
+    prompt: "Triage {{ workflow.input.topic }}"
+
+  - name: analyze
+    context_tier: long_context          # per-agent override wins
+    reasoning:
+      effort: high                      # composes with context_tier
+    prompt: "Deeply analyze {{ workflow.input.topic }}"
+```
+
+Per-agent overrides always win over the workflow-wide default. The
+`context_tier` field is **only** valid on standard `agent`-type agents; it is
+rejected on `script`, `human_gate`, and `workflow` agents (none of which call a
+model).
+
+### Per-provider translation
+
+- **Copilot** — Forwards the chosen tier as `context_tier` to
+  `CopilotClient.create_session`. No static capability validation is performed;
+  the SDK accepts or rejects the value at session creation.
+- **Other providers** — The value is ignored; there is no equivalent knob.
 
 ## MCP Servers
 

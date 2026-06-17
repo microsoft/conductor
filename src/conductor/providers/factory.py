@@ -15,6 +15,7 @@ from conductor.providers.claude_agent_sdk import (
     CLAUDE_AGENT_SDK_AVAILABLE,
     ClaudeAgentSdkProvider,
 )
+from conductor.providers.context_tier import ContextTier
 from conductor.providers.copilot import CopilotProvider, IdleRecoveryConfig
 from conductor.providers.hermes import HERMES_SDK_AVAILABLE, HermesProvider
 from conductor.providers.reasoning import ReasoningEffort
@@ -37,6 +38,7 @@ async def create_provider(
     max_session_seconds: float | None = None,
     max_agent_iterations: int | None = None,
     default_reasoning_effort: ReasoningEffort | None = None,
+    default_context_tier: ContextTier | None = None,
     provider_settings: ProviderSettings | None = None,
 ) -> AgentProvider:
     """Factory function to create the appropriate provider.
@@ -61,6 +63,10 @@ async def create_provider(
         default_reasoning_effort: Workflow-wide default reasoning effort
             (``low`` / ``medium`` / ``high`` / ``xhigh``) applied when an agent
             does not specify its own ``reasoning.effort``.
+        default_context_tier: Workflow-wide default context-window tier
+            (``default`` / ``long_context``) applied when an agent does not
+            specify its own ``context_tier``. Only the Copilot provider
+            forwards this; ignored for all other providers.
         provider_settings: Structured ``runtime.provider`` settings. Only
             applied when ``provider_type == "copilot"`` and the settings
             opted into custom routing; ignored for all other providers
@@ -91,6 +97,7 @@ async def create_provider(
                 idle_recovery_config=idle_recovery_config,
                 max_agent_iterations=max_agent_iterations,
                 default_reasoning_effort=default_reasoning_effort,
+                default_context_tier=default_context_tier,
                 provider_settings=provider_settings,
             )
         case "openai-agents":
@@ -128,9 +135,32 @@ async def create_provider(
                     "Hermes provider requires the hermes-agent package",
                     suggestion="Install with: pip install hermes-agent",
                 )
+            hermes_base_url: str | None = None
+            hermes_api_key: str | None = None
+            hermes_home: str | None = None
+            hermes_toolsets: list[str] | None = None
+            hermes_skip_memory: bool | None = None
+            hermes_skip_context_files: bool | None = None
+            if provider_settings is not None and provider_settings.name == "hermes":
+                hermes_base_url = provider_settings.base_url
+                if provider_settings.api_key is not None:
+                    hermes_api_key = provider_settings.api_key.get_secret_value()
+                hermes_home = provider_settings.hermes_home
+                hermes_toolsets = provider_settings.hermes_toolsets
+                hermes_skip_memory = provider_settings.hermes_skip_memory
+                hermes_skip_context_files = provider_settings.hermes_skip_context_files
             provider = HermesProvider(
                 model=default_model,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                base_url=hermes_base_url,
+                api_key=hermes_api_key,
+                hermes_home=hermes_home,
+                hermes_toolsets=hermes_toolsets,
+                skip_memory=hermes_skip_memory,
+                skip_context_files=hermes_skip_context_files,
                 max_agent_iterations=max_agent_iterations,
+                max_session_seconds=max_session_seconds,
                 default_reasoning_effort=default_reasoning_effort,
             )
         case "claude-agent-sdk":
@@ -174,40 +204,6 @@ async def create_provider(
                 model=default_model,
                 max_turns=max_agent_iterations,
                 max_session_seconds=max_session_seconds,
-            )
-        case "hermes":
-            if not HERMES_SDK_AVAILABLE:
-                raise ProviderError(
-                    "Hermes provider requires the hermes-agent package",
-                    suggestion="Install with: pip install hermes-agent",
-                )
-            hermes_base_url: str | None = None
-            hermes_api_key: str | None = None
-            hermes_home: str | None = None
-            hermes_toolsets: list[str] | None = None
-            hermes_skip_memory: bool | None = None
-            hermes_skip_context_files: bool | None = None
-            if provider_settings is not None and provider_settings.name == "hermes":
-                hermes_base_url = provider_settings.base_url
-                if provider_settings.api_key is not None:
-                    hermes_api_key = provider_settings.api_key.get_secret_value()
-                hermes_home = provider_settings.hermes_home
-                hermes_toolsets = provider_settings.hermes_toolsets
-                hermes_skip_memory = provider_settings.hermes_skip_memory
-                hermes_skip_context_files = provider_settings.hermes_skip_context_files
-            provider = HermesProvider(
-                model=default_model,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                base_url=hermes_base_url,
-                api_key=hermes_api_key,
-                hermes_home=hermes_home,
-                hermes_toolsets=hermes_toolsets,
-                skip_memory=hermes_skip_memory,
-                skip_context_files=hermes_skip_context_files,
-                max_agent_iterations=max_agent_iterations,
-                max_session_seconds=max_session_seconds,
-                default_reasoning_effort=default_reasoning_effort,
             )
         case _:
             raise ProviderError(
@@ -273,6 +269,7 @@ class ProviderFactory:
         max_session_seconds = getattr(runtime_config, "max_session_seconds", None)
         max_agent_iterations = getattr(runtime_config, "max_agent_iterations", None)
         default_reasoning_effort = getattr(runtime_config, "default_reasoning_effort", None)
+        default_context_tier = getattr(runtime_config, "default_context_tier", None)
 
         return await create_provider(
             provider_type=provider_type,
@@ -284,5 +281,6 @@ class ProviderFactory:
             max_session_seconds=max_session_seconds,
             max_agent_iterations=max_agent_iterations,
             default_reasoning_effort=default_reasoning_effort,
+            default_context_tier=default_context_tier,
             provider_settings=provider_settings,
         )
