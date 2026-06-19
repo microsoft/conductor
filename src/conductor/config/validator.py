@@ -1720,7 +1720,7 @@ def _validate_provider_capabilities(
                     f"but provider '{provider_name}' does not support reasoning "
                     f"effort (capabilities.reasoning_effort=None)."
                 )
-            elif isinstance(requested, str) and "{{" in requested:
+            elif isinstance(requested, str) and ("{{" in requested or "{%" in requested):
                 pass
             elif requested not in supported:
                 errors.append(

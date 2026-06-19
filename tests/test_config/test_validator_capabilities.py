@@ -206,6 +206,32 @@ class TestReasoningEffortCrossCheck:
         )
         validate_workflow_config(config)  # must not raise
 
+    def test_statement_style_templated_effort_defers_capability_check(
+        self, patch_caps: Any
+    ) -> None:
+        """#262 (pr-review R1-001): a ``{% %}`` statement-style effort must
+        ALSO defer the membership check, not just ``{{ }}``.
+
+        The schema, executor, and context_tier validator all defer on ``{{``
+        OR ``{%``; the capability cross-check must mirror that predicate.
+        Provider supports only ``low``/``medium`` (a restricted non-None
+        tuple), but a ``{% if %}...{% endif %}`` effort must NOT raise at
+        validate time — it's resolved + re-validated at runtime.
+        """
+        patch_caps({"copilot": _caps(reasoning_effort=("low", "medium"))})
+        config = _build_workflow(
+            agents=[
+                AgentDef(
+                    name="a",
+                    prompt="hi",
+                    reasoning=ReasoningConfig(
+                        effort="{% if workflow.input.heavy %}xhigh{% else %}low{% endif %}"
+                    ),
+                ),
+            ],
+        )
+        validate_workflow_config(config)  # must not raise
+
     def test_templated_effort_on_no_reasoning_provider_still_errors(self, patch_caps: Any) -> None:
         """#262 (dual-RD): whether a provider supports reasoning AT ALL is a
         value-INDEPENDENT fact known at validate time. A templated effort on a
