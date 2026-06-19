@@ -55,6 +55,18 @@ workflow:
                                       # every provider-backed agent unless it
                                       # declares its own `reasoning.effort`.
                                       # See docs/configuration.md#reasoning-effort.
+
+    checkpoint:                       # Optional: periodic checkpoints (off by default)
+      every_agent: true               # Save after each step boundary (governs alone when true)
+      every_seconds: 300              # Throttle: save at most this often (used only when every_agent is false)
+      keep_last: 5                    # Retain this many periodic checkpoints per run
+
+    default_context_tier: default     # Optional: default | long_context (Copilot only)
+                                      # Workflow-wide default for the model's
+                                      # context-window tier. Inherited by every
+                                      # provider-backed agent unless it declares
+                                      # its own `context_tier`.
+                                      # See docs/configuration.md#context-tier.
 ```
 
 **Workflow metadata** is included verbatim in the `workflow_started` event and lets downstream consumers (dashboards, queue runners, observability tools) adapt without parsing the YAML. CLI `--metadata key=value` flags merge on top of YAML metadata (CLI wins on conflicts).
@@ -120,6 +132,14 @@ agents:
         - provider_error
         - timeout
       max_parse_recovery_attempts: 3  # 0-10; omit for provider default
+
+    context_tier: long_context      # Optional: per-agent context-tier override
+                                    # default | long_context (Copilot only)
+                                    # Overrides runtime.default_context_tier.
+                                    # Composes with reasoning. Only valid on
+                                    # type=agent (rejected on script,
+                                    # human_gate, workflow).
+                                    # See docs/configuration.md#context-tier.
 
     routes:                         # Optional: Routing logic
       - to: next_agent              # Agent name or $end
@@ -331,6 +351,7 @@ agents:
       PYTHONPATH: "/app/src"
     working_dir: "/app"                         # Optional: working directory (Jinja2 template)
     timeout: 120                                # Optional: per-step timeout in seconds
+    stdin: "{{ planner.output | tojson }}"      # Optional: payload piped to the child's stdin (Jinja2 template)
     routes:
       - to: analyzer
         when: "exit_code == 0"
@@ -418,9 +439,32 @@ routes:
   - to: $end
 ```
 
-**Restrictions** — script steps cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, or `options`. Script steps also cannot be used inside `parallel` groups or `for_each` groups.
+**Restrictions** — script steps cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, `options`, or `validator`. Script steps also cannot be used inside `parallel` groups or `for_each` groups.
 
 **Environment variable note** — values in `env` are passed as-is to the subprocess (they are not rendered as Jinja2 templates). Use `${VAR}` syntax in the workflow YAML loader if you need environment variable substitution in env values.
+
+**Passing payloads via stdin** — set `stdin:` to pipe a rendered payload to the script's standard input instead of (or in addition to) command-line `args`. This is the cross-platform way to hand large or structured data to a script: command-line arguments are subject to OS length limits (notably Windows, where the total command line is capped at ~32 KB), but stdin is not. Reach for `stdin:` whenever a script consumes an upstream agent's structured output.
+
+```yaml
+agents:
+  - name: analyze
+    type: script
+    command: python3
+    args: ["scripts/analyze.py"]
+    stdin: "{{ evaluator.output.evaluations | tojson }}"   # JSON payload via the tojson filter
+    routes:
+      - to: $end
+```
+
+- **`stdin:` is a Jinja2 string template**, rendered against the workflow context and written to the child as UTF-8.
+  - For JSON, use the built-in `tojson` filter: `stdin: "{{ data | tojson }}"`. Plain `{{ data }}` renders a Python `repr` (single-quoted), which is **not** valid JSON.
+  - For arbitrary text — a diff, CSV, or a prompt — use it directly: `stdin: "{{ patch }}"`.
+  - The script reads it like any stdin source: `data = json.load(sys.stdin)` (Python), or pipe into `jq` / `cat` (shell).
+- **Omitting `stdin`** keeps the legacy behavior — the child inherits the parent's stdin.
+- **An explicit empty string** (`stdin: ""`) still pipes, sending the child immediate EOF (distinct from omitting it).
+- **`stdin` and `args` are orthogonal.** When both are set, `args` are passed on the command line *and* `stdin` is piped — there is no precedence conflict. Keep flags in `args` and put the bulky/structured payload in `stdin`.
+
+This replaces the older pattern of writing large structured arguments to a temp file and passing `--something-file <path>`; the engine pipes the payload directly, so there is no temp file to manage or clean up.
 
 ### Wait Steps
 
@@ -483,7 +527,7 @@ agents:
 
 **Iteration counting** — wait steps count toward `workflow.limits.max_iterations` (each pause is one step). They are not subject to `max_agent_iterations`, which counts per-LLM-agent tool iterations.
 
-**Restrictions** — wait steps cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, `options`, `command`, `args`, `env`, `working_dir`, `timeout`, `workflow`, `input_mapping`, `max_depth`, `max_session_seconds`, `max_agent_iterations`, `retry`, `dialog`, `reasoning`, `timeout_seconds`, or `output`. Wait steps also cannot be used inside `parallel` groups or `for_each` groups.
+**Restrictions** — wait steps cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, `options`, `command`, `args`, `env`, `working_dir`, `timeout`, `workflow`, `input_mapping`, `max_depth`, `max_session_seconds`, `max_agent_iterations`, `retry`, `dialog`, `reasoning`, `validator`, `timeout_seconds`, or `output`. Wait steps also cannot be used inside `parallel` groups or `for_each` groups.
 
 See [`examples/wait-step.yaml`](../examples/wait-step.yaml) for a complete polling workflow.
 ### Set Steps
@@ -569,7 +613,7 @@ Per-key typing on multi `values:` is not supported.
 
 **Composition** — set steps are allowed inside `parallel` groups (each member publishes its bound value to context) and as the inline agent of a `for_each` group (one bound value per item). Inside a parallel group, set templates cannot reference sibling group members (the validator catches this at config time, since the engine renders against a pre-group snapshot).
 
-**Restrictions** — set agents cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, `command`, `args`, `env`, `working_dir`, `timeout`, `workflow`, `options`, `input_mapping`, `max_depth`, `retry`, `dialog`, `reasoning`, `timeout_seconds`, `max_session_seconds`, or `max_agent_iterations`. They count toward `limits.max_iterations` like any other step.
+**Restrictions** — set agents cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, `command`, `args`, `env`, `working_dir`, `timeout`, `workflow`, `options`, `input_mapping`, `max_depth`, `retry`, `dialog`, `reasoning`, `validator`, `timeout_seconds`, `max_session_seconds`, or `max_agent_iterations`. They count toward `limits.max_iterations` like any other step.
 
 **Events** — set steps emit `set_started` / `set_completed` / `set_failed` (mirroring the script-step lifecycle) in all three positions: linear main loop, parallel group member, and for-each iteration. The `set_completed` payload carries `output_type`, `output_keys` (sorted, empty for scalars), and `value_repr` (a JSON-safe preview, truncated at 512 chars).
 
@@ -661,7 +705,7 @@ parallel:
         title: "{{ issue.title }}"
 ```
 
-**Restrictions** — workflow steps cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, `command`, or `options`.
+**Restrictions** — workflow steps cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, `command`, `options`, or `validator`.
 
 ### Terminate Steps
 
@@ -709,7 +753,7 @@ agents:
 
 **Final output** — when `output_template:` is set, it *replaces* the workflow-level `output:` mapping for this termination path. Each rendered value is passed through the same JSON-coercion helper used elsewhere in the engine, so `"true"` becomes `True`, `"42"` becomes `42`, and JSON literals are parsed. When `output_template:` is omitted, the workflow-level `output:` is rendered as on any other terminal path.
 
-**Restrictions** — terminate steps cannot have `routes`, `tools`, `output`, `prompt`, `model`, `provider`, `system_prompt`, `command`, `args`, `env`, `working_dir`, `timeout`, `timeout_seconds`, `max_session_seconds`, `max_agent_iterations`, `max_depth`, `retry`, `dialog`, `reasoning`, `workflow`, `input_mapping`, or `options`. They cannot appear as members of a parallel group or as a `for_each` inline agent — route to them from those groups' `routes:` instead.
+**Restrictions** — terminate steps cannot have `routes`, `tools`, `output`, `prompt`, `model`, `provider`, `system_prompt`, `command`, `args`, `env`, `working_dir`, `timeout`, `timeout_seconds`, `max_session_seconds`, `max_agent_iterations`, `max_depth`, `retry`, `dialog`, `reasoning`, `validator`, `workflow`, `input_mapping`, or `options`. They cannot appear as members of a parallel group or as a `for_each` inline agent — route to them from those groups' `routes:` instead.
 
 **Sub-workflow boundary** — a `status: failed` terminate inside a sub-workflow is downgraded to a `SubworkflowTerminatedError` (subclass of `ExecutionError`) at the parent boundary so the parent treats it as a normal sub-workflow failure (its own `workflow_failed` does NOT inherit `is_explicit: true`). The child's rendered output, reason, and terminate step name are preserved on the wrapper as `terminated_output`, `terminated_reason`, and `terminated_by` for `on_error` hooks and debugging surfaces. A `status: success` terminate inside a sub-workflow returns its rendered output cleanly and the parent continues with its next routes.
 
@@ -750,6 +794,48 @@ After the conversation, the agent re-executes with the dialog transcript as addi
 - When `--skip-gates` is set (e.g., CI/automation), dialogs are automatically skipped
 - The evaluator prompt should describe *when* to trigger dialog, not *what* to ask — the evaluator generates the opening question from the agent's output context
 - After dialog, the agent sees the full conversation transcript and produces updated output
+
+### Validator
+
+A `validator:` block runs a **second LLM call** after a provider-backed agent completes, grading its output against a user-defined rubric. If validation fails, the agent is re-run **once** with the validator's feedback appended. This is distinct from `retry:` (transient failures, same prompt) and the `output:` schema (shape/type, not content quality) — it catches output that is structurally valid but semantically wrong, incomplete, or off-rubric.
+
+```yaml
+agents:
+  - name: code_reviewer
+    model: claude-sonnet-4-5
+    prompt: "Review the diff for bugs.\n{{ workflow.input.diff }}"
+    output:
+      summary: { type: string }
+      issues:  { type: array }
+    validator:
+      model: claude-sonnet-4-5   # optional; defaults to the agent's model
+      criteria: |
+        Verify the review identifies all null-safety issues, every suggestion
+        is actionable, and no function names are fabricated.
+      max_retries: 1
+```
+
+**Mechanics:**
+1. The primary agent runs and produces output.
+2. The validator runs a second LLM call that receives the agent's rendered prompt, its output, and the `criteria`, and must answer `{ "passed": bool, "issues": [str, ...] }`.
+3. If `passed` is true, the output flows downstream unchanged.
+4. If `passed` is false and `max_retries > 0`, the agent re-runs once with a `## Validation feedback` section (the issues) appended to its prompt. The second output is taken as final — there is no second validation loop.
+
+**Configuration:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `validator.criteria` | string | Yes | The rubric the output is graded against. Describe what a *good* output looks like (the checks to perform). |
+| `validator.model` | string | No | Model for the validator call. Defaults to the primary agent's model. |
+| `validator.max_retries` | int | No | Re-runs on failure. Default `1`, **hard-capped at 1**. `0` = validate-and-report without re-running. |
+
+**Behavior notes:**
+- Supported on provider-backed `agent` steps only (not `human_gate`, `script`, `workflow`, `wait`, `set`, or `terminate`). Works in the main loop, parallel groups, and for-each loops.
+- The validator uses the primary agent's provider; only `model` is overridable.
+- **Fail-open:** if the validator call errors or returns unparseable output, it is treated as a pass (with a logged warning) so a flaky grader never blocks the workflow.
+- The validator sees only the agent's prompt + output + criteria, not other agents' outputs — keeping validation focused and cheap.
+- Validator (and any discarded first attempt) token cost is reported as a separate `<agent> (validator)` row in the usage summary.
+- Emits `agent_validator_start`, `agent_validator_complete`, and `agent_validation_failed` events, surfaced in the web dashboard and `--verbose` console output.
 
 ## Parallel Groups
 
@@ -1046,6 +1132,63 @@ workflow:
 - Workflow terminates when `timeout_seconds` is exceeded
 - Includes all agent execution time and overhead
 - `None` (default) means no timeout
+
+### Periodic Checkpoints
+
+By default Conductor writes a checkpoint **only when a workflow fails** with an
+exception. A long run that *stalls* (a provider hang, an MCP deadlock, a network
+blip, a sub-agent that never returns) produces no recoverable state, so
+`conductor resume` has nothing to resume.
+
+Enable **periodic checkpoints** to make stalled or hard-killed runs resumable:
+
+```yaml
+workflow:
+  runtime:
+    checkpoint:
+      every_seconds: 300    # Save at most once every 5 minutes (throttle)
+      keep_last: 5          # Retain this many periodic checkpoints per run (1-100)
+      # every_agent: true   # Alternative: save after EVERY step boundary
+```
+
+- **`every_agent`** (default `false`) — save at every step boundary (after each
+  agent, parallel group, for-each group, gate, script, set, wait, or sub-workflow
+  step). When `true` it governs on its own and `every_seconds` is ignored.
+- **`every_seconds`** (default `null`) — a throttle: save at the first step
+  boundary reached after this many seconds have elapsed since the last
+  checkpoint. The first periodic checkpoint of a run fires at the first
+  boundary; the interval only throttles subsequent saves.
+- Set either trigger (or both — a save fires when **either** is met).
+- **`keep_last`** (default `5`) — older periodic checkpoints for the run are
+  rotated away after each save; **failure checkpoints are never rotated**.
+
+How it works:
+
+- Checkpoints are evaluated at **step boundaries**, where all prior step outputs
+  are already committed. The checkpoint points at the step that was *about to
+  run*, so `conductor resume` continues forward and re-runs only that step.
+- There is no background timer. If a single step runs longer than
+  `every_seconds`, the recovery point is the boundary checkpoint taken **before**
+  that step started — which is exactly what you resume from after killing a
+  stalled run.
+- Periodic checkpoints are written by the **root** workflow only (sub-workflow
+  state is re-run from scratch on resume) and are **deleted automatically when
+  the run reaches a terminal, non-resumable outcome** (clean completion or an
+  explicit `status: failed` terminate). On an unexpected failure they are kept
+  alongside the on-failure checkpoint.
+- If a periodic save itself fails (e.g. the disk fills), the run is not
+  interrupted; the failure is surfaced via a `checkpoint_save_failed` event and
+  a console warning so you know recovery may be unavailable.
+
+Recover a stalled run by killing the process (e.g. `conductor stop` for a
+`--web-bg` run) and then:
+
+```bash
+conductor checkpoints workflow.yaml     # list checkpoints (Trigger column shows periodic/failure)
+conductor resume workflow.yaml          # resume from the latest checkpoint
+```
+
+See `examples/periodic-checkpoints.yaml` for a complete example.
 
 ## Tools
 

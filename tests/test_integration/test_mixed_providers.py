@@ -89,7 +89,13 @@ agents:
 
         # Serialization excludes None values
         dumped = runtime.model_dump(exclude_none=True)
-        assert dumped == {"provider": "copilot", "mcp_servers": {}}
+        assert dumped == {
+            "provider": "copilot",
+            "mcp_servers": {},
+            # Periodic checkpoints are off by default (issue #244); every_seconds
+            # is None and excluded by exclude_none.
+            "checkpoint": {"every_agent": False, "keep_last": 5},
+        }
 
     def test_provider_parameter_isolation(self, tmp_path):
         """Test that provider-specific parameters don't interfere.
@@ -172,7 +178,7 @@ agents:
         # This prevents provider factory from receiving irrelevant parameters
 
 
-class MockProvider(AgentProvider):
+class MockProvider(AgentProvider, abstract=True):
     """Mock provider for testing."""
 
     def __init__(self, provider_type: str = "mock") -> None:

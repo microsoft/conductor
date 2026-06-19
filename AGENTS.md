@@ -81,7 +81,8 @@ make validate-examples    # validate all examples
   - `context.py` - `WorkflowContext` manages accumulated agent outputs with three modes: accumulate, last_only, explicit
   - `router.py` - Route evaluation with Jinja2 templates and simpleeval expressions
   - `limits.py` - Safety enforcement (max iterations, timeout)
-  - `checkpoint.py` - Automatic checkpoint saving on failure and resume support
+  - `checkpoint.py` - Checkpoint save/load/list/cleanup + resume support. `save_checkpoint(error=..., trigger=...)` writes a top-level `trigger` typed `CheckpointTrigger = Literal["failure", "periodic"]`; `error=None` (periodic) writes null `failure.error_type`/`message`. No `CHECKPOINT_VERSION` bump — `trigger` is additive and any unknown/missing on-disk value normalizes to `"failure"` on load. `rotate_periodic_checkpoints` / `cleanup_periodic_for_run` both delegate to `_delete_periodic_checkpoints(..., keep_last, action)` (cleanup == rotate with `keep_last=0`), scoped to `trigger == "periodic"` **and** an exact `run_id` match so failure checkpoints and other runs' files are never touched. `find_latest_checkpoint` returns `list_checkpoints(...)[0]` (newest by microsecond `created_at`, not filename) so resume-latest isn't fooled by same-second periodic checkpoints. The engine saves a checkpoint inside its main-loop exception handlers; for a dashboard Stop/Kill that *cancels* the engine task from the CLI wrapper (bypassing those handlers), `WorkflowEngine.handle_dashboard_stop(message)` is invoked from `cli/run.py::_execute_with_stop_signal` after the cancelled task is drained — it writes a best-effort checkpoint and emits a single `workflow_failed` (flagged `stopped_by_user: true`, plus `checkpoint_path` or `checkpoint_unavailable_reason`). `handle_dashboard_stop` is idempotent via a dedicated `_dashboard_stop_handled` flag (not `_last_checkpoint_path`, which periodic checkpoints also set). Issues #244, #245.
+  - `validator.py` - `OutputValidator` runs the optional per-agent `validator:` block (issue #220): a second LLM call (synthetic agent via `provider.execute`, no tools, `{passed, issues}` schema) that grades the primary output against `criteria`. Fail-open on error/parse failure. The engine helper `WorkflowEngine._apply_validator` (in `workflow.py`) wires it into the main loop, parallel groups, and for-each loops; emits `agent_validator_start` / `agent_validator_complete` / `agent_validation_failed`; records a separate `"<agent> (validator)"` usage row; and re-runs the primary once with a `## Validation feedback` section on failure (`max_retries` hard-capped at 1).
 
 - **executor/**: Agent execution
   - `agent.py` - `AgentExecutor` handles prompt rendering, tool resolution, and output validation for single agents
@@ -97,6 +98,7 @@ make validate-examples    # validate all examples
   - `base.py` - `AgentProvider` ABC defining `execute()`, `validate_connection()`, `close()`
   - `copilot.py` - GitHub Copilot SDK implementation
   - `claude.py` - Anthropic Claude API implementation
+  - `claude_agent_sdk.py` - Claude Agent SDK implementation (uses `claude-agent-sdk` package)
   - `factory.py` - Provider instantiation
 
 - **gates/**: Human-in-the-loop support
@@ -106,7 +108,7 @@ make validate-examples    # validate all examples
   - `listener.py` - Keyboard listener daemon thread for Esc/Ctrl+G detection
 
 - **web/**: Real-time web dashboard for workflow visualization
-  - `server.py` - FastAPI + uvicorn server with WebSocket broadcasting, late-joiner state replay, and `POST /api/stop` endpoint
+  - `server.py` - FastAPI + uvicorn server with WebSocket broadcasting, late-joiner state replay, and `POST /api/stop` + `POST /api/kill` endpoints. `/api/stop` interrupts/pauses the current agent (a user can then Resume or Kill); if it arrives before the engine binds its interrupt event, it is latched via `_pending_stop` and drained by `set_interrupt_event` so the startup window takes the graceful pause path instead of a progress-losing hard stop. `/api/kill` hard-stops the run. Whenever a stop/kill actually *terminates* the run (cancels the engine task), it routes through `handle_dashboard_stop` so a best-effort checkpoint is written (or its absence explained) — see `handle_dashboard_stop` above (issue #245).
   - `static/index.html` - Single-file Cytoscape.js frontend with DAG graph, agent detail panel, and streaming activity
 
 - **events.py**: Pub/sub event system decoupling workflow execution from rendering (console, web dashboard)
@@ -134,8 +136,10 @@ make validate-examples    # validate all examples
 - **Tool resolution**: `null` = all workflow tools, `[]` = none, `[list]` = subset
 - **Set step typing**: `output_type` defaults to `auto` (safe YAML parse with `_to_json_safe` normalisation — `datetime`/`date`/`time` → ISO 8601, non-string dict keys and other non-JSON-safe values raise `ExecutionError`). Explicit `string`/`number`/`integer`/`boolean`/`list`/`dict` only valid on single `value:`. `WorkflowContext.store` accepts any JSON-safe value (scalars/lists from `set` steps in addition to the dicts produced by LLM / script / gate / parallel-group outputs); `_add_agent_input` returns the scalar verbatim for `step.output` and raises a clear `KeyError` for `step.output.field` shorthand on non-dict outputs.
 - **Reasoning effort**: `runtime.default_reasoning_effort` sets a workflow-wide default; per-agent `reasoning.effort` overrides it. Allowed values: `low`, `medium`, `high`, `xhigh`. Each provider translates the unified value to its native API (Copilot: `reasoning_effort` on the session, validated against the model's `supported_reasoning_efforts`; Claude: extended thinking with budget mapping low=2048, medium=8192, high=16384, xhigh=32768 tokens, with `temperature` coerced to 1.0 and `max_tokens` bumped to fit the budget). See `examples/reasoning-effort.yaml`.
+- **Periodic checkpoints** (`runtime.checkpoint`, issue #244): opt-in `CheckpointConfig` (`every_agent: bool`, `every_seconds: int|None`, `keep_last: int=5`; `is_enabled = every_agent or every_seconds is not None`). Off by default → failure-only behavior preserved. `WorkflowEngine._maybe_save_periodic_checkpoint()` is called once at the **top of `_execute_loop`** (single choke point), where prior outputs are committed and `_current_agent_name` is the step *about to run* — so a periodic checkpoint reuses failure-checkpoint `current_agent` semantics and resume continues forward with no special-casing. Gated via the `_periodic_checkpoints_active` property (**root engine only**, `_subworkflow_depth == 0`, + `is_enabled`) and skips the first iteration (`limits.current_iteration == 0`). The save decision is `_periodic_checkpoint_due(now)` (`every_agent` OR `every_seconds` throttle; first save always fires). `_save_checkpoint_on_failure` and the periodic path share `_write_checkpoint(error, trigger)` (which best-effort-guards provider `get_session_ids()` so it never raises). The periodic save wraps write+emit+rotate; on any failure it calls `_record_periodic_checkpoint_failure()` which emits a **`checkpoint_save_failed`** event (consecutive-failure count; surfaced by `ConsoleEventSubscriber` + JSONL + dashboard) so a recovery-reliant user isn't silently left without checkpoints. After a save the engine calls `rotate_periodic_checkpoints`; at a terminal **non-resumable** outcome (clean completion via `run()`/`resume()`, or an explicit `status: failed` terminate) `_cleanup_run_periodic_checkpoints()` deletes the run's periodic checkpoints (an unexpected failure leaves them in place alongside the failure checkpoint). `conductor checkpoints` shows a `Trigger` column and `—` for periodic rows' error type. See `examples/periodic-checkpoints.yaml` and `docs/workflow-syntax.md` (Periodic Checkpoints section).
 - **Terminate steps** (`type: terminate`): explicit terminal step with `status` (`success` | `failed`), Jinja2 `reason`, and optional `output_template` (a `dict[str, str]` that replaces `workflow.output:` when set; each value is rendered then passed through `_maybe_parse_json` so `"true"` becomes `True`, `"42"` becomes `42`, JSON literals are parsed). Reaching a terminate step ends the workflow immediately (no routes evaluated after). `success` → CLI exit 0, dashboard ✅, `workflow_completed { termination_reason, terminated_by, is_explicit: true, status }`; runs `on_complete` hook. `failed` → CLI exit 1 (with rendered output JSON still printed to stdout for downstream tooling), dashboard ❌, raises `WorkflowTerminated` (subclass of `ExecutionError`), emits `workflow_failed { error_type: "WorkflowTerminated", is_explicit: true, status, output }`, runs `on_error` hook, and **does not** save an on-failure checkpoint (explicit terminations are intentionally non-resumable). Terminate steps cannot have `routes`, `tools`, `output`, `prompt`, `model`, etc.; cannot be used as parallel-group members or as a for_each inline agent (route to one from those groups' `routes:` instead). Inside a sub-workflow, a `status: failed` terminate is downgraded at the parent boundary to `SubworkflowTerminatedError` (also a subclass of `ExecutionError`) preserving the child's rendered `terminated_output` / `terminated_reason` / `terminated_by` as structured attributes — the parent treats it as a normal sub-workflow failure (its own `workflow_failed` does NOT inherit `is_explicit: true`). For more detail see `examples/terminate.yaml`, `docs/workflow-syntax.md` (Terminate Steps section), and `plugins/conductor/skills/conductor/references/authoring.md`.
 - **Structured `runtime.provider` (Copilot custom routing)**: `runtime.provider` accepts either the bare string shorthand (`provider: copilot`) or a structured `ProviderSettings` object that routes the Copilot SDK at OpenAI-compatible / Azure / Anthropic endpoints (Ollama, vLLM, LM Studio, Azure OpenAI, etc.). Object fields: `name` (defaults to `copilot`), `type` (`openai`|`azure`|`anthropic`), `wire_api` (`completions`|`responses`), `base_url`, `api_key`, `bearer_token`, `headers`, `azure.api_version`. `api_key` and `bearer_token` are `SecretStr` (redacted in `model_dump` / dashboard / event logs). The model is frozen after construction. Custom routing activates only when at least one non-`name` field is set in YAML — ambient `OPENAI_*` env vars never divert default routing on their own. Once activated, missing fields fall back from env vars in this order: `base_url` ← `COPILOT_PROVIDER_BASE_URL` → `OPENAI_BASE_URL`; `api_key` ← `COPILOT_PROVIDER_API_KEY` (only — ambient `OPENAI_API_KEY` is intentionally NOT a fallback to avoid credential leaks); `bearer_token` ← `COPILOT_PROVIDER_BEARER_TOKEN`. The schema rejects every non-`name` field when `name != "copilot"` (structured config for other providers is a follow-up). It also rejects anchorless / broken combinations that would silently no-op at the SDK boundary: `wire_api` / `type` / `headers` / `azure` cannot stand alone without `base_url` / `api_key` / `bearer_token`; empty `headers`, empty `SecretStr`, and `azure: {api_version: null}` are rejected. The resolver raises `ProviderError` when custom routing is activated but every resolved field is falsy (e.g. expected env vars all unset). Custom routing applies to both agent execution and dialog turns so all sessions hit the same endpoint. `--provider <name>` CLI override replaces the whole `ProviderSettings` (logs a notice when YAML had structured fields). See `examples/copilot-local-llm.yaml`.
+- **Validator block** (`validator:` on a provider-backed agent, issue #220): semantic output validation with retry-once. After the primary agent completes, `WorkflowEngine._apply_validator` runs `OutputValidator` (`engine/validator.py`) — a second LLM call (synthetic agent via `provider.execute`, `tools=[]`, `{passed, issues}` output schema) grading the output against `validator.criteria`. Fields: `criteria` (required, non-empty), `model` (defaults to the agent's model), `max_retries` (`Field(1, ge=0, le=1)` — hard-capped at 1; `0` = report-only). On `passed: false` and `max_retries > 0`, the primary re-runs **once** via `executor.execute` with a `## Validation feedback` section (the issues) appended to `guidance_section`; the second output is final (no second validation loop). **Fail-open**: validator errors / unparseable responses → treated as pass with a logged warning. Wired into the main loop, parallel groups, and for-each loops (guarded by `agent.validator and not output.partial`; for-each passes a `usage_label` so the row matches `<group>[<key>]`). Emits `agent_validator_start` / `agent_validator_complete { passed, issues, errored, tokens, cost_usd }` / `agent_validation_failed { issues, will_retry }` through the per-agent `event_callback` (so for-each events carry `item_key`). Cost: the validation call and any discarded first attempt are recorded as a separate `"<agent> (validator)"` usage row (primary row = effective output). Rejected on `script` / `human_gate` / `workflow` / `wait` / `set` / `terminate` types. Frontend: event types in `web/frontend/src/types/events.ts`, store handlers + `NodeData.validator_*` fields in `web/frontend/src/stores/workflow-store.ts`, detail UI in `web/frontend/src/components/detail/ValidatorDetail.tsx` (rebuild with `make build-frontend`). See `examples/validator.yaml` and `docs/workflow-syntax.md` (Validator section).
 
 ### Debugging `--web-bg` failures
 
@@ -183,7 +187,7 @@ Use `pytest.mark.performance` for performance tests (exclude with `-m "not perfo
 
 ### Provider Parity
 
-All providers (`copilot.py`, `claude.py`) must maintain feature parity. Any change to one provider's behavior, contract, or capabilities must be applied to all providers. This includes:
+All providers must maintain feature parity where applicable. Any change to one provider's behavior, contract, or capabilities must be applied to all providers. This includes:
 
 - **Event callbacks**: Same event types emitted at the same semantic points
   - `agent_turn_start` with `{"turn": "awaiting_model"}` — immediately before each API call
@@ -198,6 +202,64 @@ All providers (`copilot.py`, `claude.py`) must maintain feature parity. Any chan
 - **Reasoning effort**: All providers must accept the unified `reasoning.effort` field (`low` | `medium` | `high` | `xhigh`), translate it to the native API (Copilot `reasoning_effort` on the session; Claude extended `thinking` budget), validate that the selected model supports the requested effort, and raise `ValidationError` with a clear message when it does not. Any reasoning/thinking content the model returns must be surfaced via `agent_reasoning` events so the dashboard, JSONL logger, and console subscriber render it consistently.
 
 When modifying any provider, check all other providers for the same change. The dashboard, JSONL logger, console subscriber, and workflow engine all depend on consistent behavior across providers.
+
+#### `claude_agent_sdk.py` parity notes
+
+The Claude Agent SDK provider (`claude_agent_sdk.py`) is the canonical
+**experimental** provider — see the "Experimental Providers" section
+below for the carve-out policy. It delegates the agentic loop to the
+`claude` CLI via the `claude-agent-sdk` package. This achieves **event
+and output parity** but the following are managed by the SDK rather than
+Conductor:
+
+- **Retry and error handling**: The `claude-agent-sdk` package does **not** retry API failures (429s, 5xx, network errors) internally — its built-in retry logic covers only filesystem operations. Conductor wraps SDK errors in `ProviderError` and uses `stop_reason` / error subtype to set `is_retryable`, so workflow-level `retry:` configuration drives all retry behavior. Plan for transient failures with explicit `retry:` blocks in your workflow.
+- **Tool execution**: Tools and MCP servers are managed by the `claude` CLI's own configuration. The provider rejects workflow-level `runtime.mcp_servers` at the factory and refuses any non-empty per-agent `tools:` list (workflow tool names do not translate to CLI tool IDs). An agent with `tools: []` runs with no tools; omitting `tools:` grants the full `claude_code` preset.
+- **Runtime config**: `temperature` and `max_tokens` are rejected at the factory — the CLI controls sampling behavior.
+
+### Experimental Providers
+
+Some providers delegate part of the agentic loop to an upstream SDK or
+framework and cannot honor every parity rule above. Rather than reject
+them or let parity silently erode, Conductor formalizes an
+**experimental tier** with explicit allowed carve-outs and a static
+validator that catches workflow ↔ provider mismatches at `conductor
+validate` time. See `docs/providers/experimental.md` for the full
+stability policy.
+
+**Capability declaration.** Every provider — stable or experimental —
+declares a class-level `CAPABILITIES: ProviderCapabilities` attribute
+(see `src/conductor/providers/capabilities.py`). The descriptor is a
+contract: behavior must match what the provider declares. Lying in the
+descriptor undermines the framework.
+
+**Allowed carve-outs** for experimental providers (declared as `False` /
+`None` on the descriptor):
+
+- `mcp_tools` — workflow-level `runtime.mcp_servers` is not forwarded
+- `workflow_tools_passthrough` — per-agent `tools:` allowlist is not enforced
+- `streaming_events` — events emitted only at completion (not incrementally)
+- `agent_reasoning_events` — no thinking/reasoning event surfacing
+- `reasoning_effort` — provider has no reasoning-effort concept
+- `structured_output: "prompt_injection"` — schema enforced via prompt injection only
+- `interrupt` — mid-call interrupt not honored (still cancels between iterations)
+- `max_session_seconds` — wall-clock session timeout silently ignored
+- `checkpoint_resume` — session state does not survive `conductor resume`
+
+**Non-negotiable rules** experimental providers MUST uphold:
+
+- `AgentProvider` lifecycle (`validate_connection` / `execute` / `close`).
+- `AgentOutput` shape on every successful execution (fields may be `None`).
+- Raise real exceptions on real errors — no silent failure swallowing.
+- Declare accurate `ProviderCapabilities` matching observed behavior.
+- Provide a smoke test that exercises construct + execute paths against
+  a mocked SDK.
+- Maintain `concurrent_safe: true`, or fail validation when used in
+  parallel/for_each groups with `max_concurrent > 1`.
+
+**Promotion criteria** (experimental → stable) are documented in
+`docs/providers/experimental.md` — full parity capabilities, named
+maintainer, real-API integration test, ≥6 months stable upstream,
+end-to-end example workflow.
 
 ### Run / Resume Parity
 

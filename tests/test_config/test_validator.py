@@ -309,6 +309,79 @@ class TestInputReferenceValidation:
         warnings = validate_workflow_config(config)
         assert any("unknown" in w for w in warnings)
 
+    def test_valid_nested_explicit_output_reference(self) -> None:
+        """Nested explicit refs (agent.output.foo.bar) pass validation."""
+        config = WorkflowConfig(
+            workflow=WorkflowDef(name="test", entry_point="producer"),
+            agents=[
+                AgentDef(
+                    name="producer",
+                    model="gpt-4",
+                    prompt="Produce",
+                    routes=[RouteDef(to="consumer")],
+                ),
+                AgentDef(
+                    name="consumer",
+                    model="gpt-4",
+                    prompt="Consume",
+                    input=["producer.output.foo.bar"],
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+        )
+
+        validate_workflow_config(config)
+
+    def test_valid_nested_shorthand_output_reference(self) -> None:
+        """Nested shorthand refs (agent.foo.bar) pass validation."""
+        config = WorkflowConfig(
+            workflow=WorkflowDef(name="test", entry_point="producer"),
+            agents=[
+                AgentDef(
+                    name="producer",
+                    model="gpt-4",
+                    prompt="Produce",
+                    routes=[RouteDef(to="consumer")],
+                ),
+                AgentDef(
+                    name="consumer",
+                    model="gpt-4",
+                    prompt="Consume",
+                    input=["producer.foo.bar"],
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+        )
+
+        validate_workflow_config(config)
+
+    def test_invalid_nested_ref_message_mentions_explicit_and_shorthand_forms(self) -> None:
+        """Malformed nested refs should mention both supported nested forms."""
+        config = WorkflowConfig(
+            workflow=WorkflowDef(name="test", entry_point="producer"),
+            agents=[
+                AgentDef(
+                    name="producer",
+                    model="gpt-4",
+                    prompt="Produce",
+                    routes=[RouteDef(to="consumer")],
+                ),
+                AgentDef(
+                    name="consumer",
+                    model="gpt-4",
+                    prompt="Consume",
+                    input=["producer.output.foo..bar"],
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+        )
+
+        with pytest.raises(ConfigurationError) as exc_info:
+            validate_workflow_config(config)
+        msg = str(exc_info.value)
+        assert "agent_name.output.field[.subfield...]" in msg
+        assert "agent_name.field[.subfield...]" in msg
+
 
 class TestToolValidation:
     """Tests for tool reference validation."""
@@ -811,6 +884,32 @@ class TestInputRefPatternExtensions:
         assert m_err.group("pg_kind") == "errors"
 
     @pytest.mark.parametrize(
+        "ref",
+        [
+            # Legacy shapes (must still pass)
+            "agent.output",
+            "agent.output.field",
+            "agent.output?",
+            "agent.output.field?",
+            "workflow.input.param",
+            "workflow.input.param?",
+            "group.outputs.agent.field",
+            # New: nested explicit output
+            "agent.output.field.subfield",
+            "agent.output.field.subfield?",
+            "agent.output.a.b.c",
+            # New: shorthand
+            "agent.field",
+            "agent.field?",
+            "agent.field.subfield",
+            "agent.field.subfield?",
+            "agent.foo.bar.baz",
+        ],
+    )
+    def test_pattern_accepts_nested_and_shorthand_shapes(self, ref: str) -> None:
+        assert INPUT_REF_PATTERN.match(ref) is not None
+
+    @pytest.mark.parametrize(
         "ref,expected_parallel",
         [
             ("group.errors", "group"),
@@ -823,7 +922,7 @@ class TestInputRefPatternExtensions:
             ("group.outputs?", "group"),
         ],
     )
-    def test_pattern_accepts_new_shapes(self, ref: str, expected_parallel: str) -> None:
+    def test_pattern_accepts_parallel_shapes(self, ref: str, expected_parallel: str) -> None:
         match = INPUT_REF_PATTERN.match(ref)
         assert match is not None, f"{ref!r} should match INPUT_REF_PATTERN"
         assert match.group("parallel") == expected_parallel
@@ -831,24 +930,9 @@ class TestInputRefPatternExtensions:
     @pytest.mark.parametrize(
         "ref",
         [
-            "agent.output",
-            "agent.output.field",
-            "agent.output?",
-            "agent.output.field?",
-            "workflow.input.param",
-            "workflow.input.param?",
-        ],
-    )
-    def test_pattern_still_accepts_legacy_shapes(self, ref: str) -> None:
-        assert INPUT_REF_PATTERN.match(ref) is not None
-
-    @pytest.mark.parametrize(
-        "ref",
-        [
             "workflow.input",  # bare workflow.input no longer accepted
             "agent",
-            "agent.foo",
-            "group.bogus",
+            "group.outputs.agent.field.subfield",  # deeper parallel projection not supported
         ],
     )
     def test_pattern_rejects_invalid_shapes(self, ref: str) -> None:

@@ -6,7 +6,7 @@ Complete reference for all YAML configuration options. Derived from the Pydantic
 
 ```yaml
 workflow: WorkflowDef              # Required: workflow configuration
-tools: [string]                    # Optional: workflow-level tool names
+tools: [string]                    # Optional: workflow-level tool names (ignored by claude-agent-sdk — uses CLI config)
 agents: [AgentDef]                 # Required: agent definitions
 parallel: [ParallelGroup]         # Optional: static parallel groups
 for_each: [ForEachDef]            # Optional: dynamic parallel groups
@@ -27,16 +27,16 @@ workflow:
 
   # Runtime configuration
   runtime:
-    provider: string | object       # "copilot" (default), "claude", or "openai-agents"
+    provider: string | object       # "copilot" (default), "claude", "claude-agent-sdk", or "openai-agents"
                                     # — or a ProviderSettings object (see below)
     default_model: string           # Default model for all agents
-    temperature: float              # 0.0-1.0, controls randomness (optional)
-    max_tokens: integer             # Max OUTPUT tokens per response, 1-200000 (optional)
-    timeout: float                  # Per-request timeout in seconds (optional, default: 600)
+    temperature: float              # 0.0-1.0, controls randomness (optional, copilot/claude only)
+    max_tokens: integer             # Max OUTPUT tokens per response, 1-200000 (optional, copilot/claude only)
+    timeout: float                  # Per-request timeout in seconds (optional, default: 600, copilot/claude only)
     max_agent_iterations: integer   # Max tool-use roundtrips per agent (1-500, optional)
     max_session_seconds: float      # Wall-clock timeout per agent session in seconds (optional)
     default_reasoning_effort: string # Workflow-wide reasoning/thinking effort: low, medium, high, xhigh (optional)
-    mcp_servers:                    # MCP server configurations
+    mcp_servers:                    # MCP server configurations (ignored by claude-agent-sdk — uses CLI config)
       <server_name>:
         type: string                # "stdio" (default), "http", or "sse"
         command: string             # Command to run (required for stdio)
@@ -107,7 +107,7 @@ agents:
     type: string                    # "agent" (default), "human_gate", "script", "workflow", "wait", or "terminate"
     description: string             # What this agent does
     model: string                   # Override default_model
-    provider: string                # Per-agent provider override ("copilot" or "claude")
+    provider: string                # Per-agent provider override ("copilot", "claude", or "claude-agent-sdk")
 
     # Input specification (for explicit context mode)
     input:
@@ -165,6 +165,12 @@ agents:
     dialog:
       trigger_prompt: string        # Criteria evaluated against agent output by an LLM gate
 
+    # Semantic output validation with retry-once (optional, provider-backed agents only)
+    validator:
+      criteria: string              # Required: rubric the output is graded against
+      model: string                 # Optional: validator model (defaults to the agent's model)
+      max_retries: integer          # Re-runs on failure: 0 or 1 (default 1; hard-capped at 1)
+
     # Sub-workflow fields (type: workflow)
     workflow: string                # Path to sub-workflow YAML (relative to parent), required
     input_mapping:                  # Optional Jinja2 expressions per sub-workflow input parameter
@@ -194,13 +200,13 @@ agents:
                                     # ("true" -> True, "42" -> 42, JSON literals parsed)
 ```
 
-**Script agent restrictions:** Cannot have `prompt`, `provider`, `model`, `tools`, `output`, `system_prompt`, `options`, `retry`, `reasoning`, `dialog`, `max_session_seconds`, `max_agent_iterations`, `timeout_seconds` (use `timeout`), `input_mapping`, or `max_depth`. Output is always `{stdout, stderr, exit_code}`. If `stdout` is valid JSON, its top-level keys are auto-merged into the output dict.
+**Script agent restrictions:** Cannot have `prompt`, `provider`, `model`, `tools`, `output`, `system_prompt`, `options`, `retry`, `reasoning`, `dialog`, `validator`, `max_session_seconds`, `max_agent_iterations`, `timeout_seconds` (use `timeout`), `input_mapping`, or `max_depth`. Output is always `{stdout, stderr, exit_code}`. If `stdout` is valid JSON, its top-level keys are auto-merged into the output dict.
 
-**Set agent restrictions:** Cannot have `prompt`, `provider`, `model`, `tools`, `system_prompt`, `options`, `command`, `args`, `env`, `working_dir`, `timeout`, `workflow`, `input_mapping`, `max_depth`, `retry`, `dialog`, `reasoning`, `timeout_seconds`, `max_session_seconds`, or `max_agent_iterations`. Requires exactly one of `value:` or `values:`. `output_type:` is forbidden with `values:` (per-key typing not yet supported). `output:` schema validation is permitted only when the rendered output is a dict (always for `values:`, sometimes for `value:`); a scalar with a declared schema raises `ValidationError`. Set agents are allowed inside `parallel` groups and as `for_each` inline agents, and count toward `limits.max_iterations` like any other step.
+**Set agent restrictions:** Cannot have `prompt`, `provider`, `model`, `tools`, `system_prompt`, `options`, `command`, `args`, `env`, `working_dir`, `timeout`, `workflow`, `input_mapping`, `max_depth`, `retry`, `dialog`, `validator`, `reasoning`, `timeout_seconds`, `max_session_seconds`, or `max_agent_iterations`. Requires exactly one of `value:` or `values:`. `output_type:` is forbidden with `values:` (per-key typing not yet supported). `output:` schema validation is permitted only when the rendered output is a dict (always for `values:`, sometimes for `value:`); a scalar with a declared schema raises `ValidationError`. Set agents are allowed inside `parallel` groups and as `for_each` inline agents, and count toward `limits.max_iterations` like any other step.
 
-**Workflow agent restrictions (`type: workflow`):** Cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, `command`, `options`, `retry`, `reasoning`, `dialog`, `max_session_seconds`, `max_agent_iterations`, or `timeout_seconds`. Requires `workflow:` path. Supports `input_mapping` and `max_depth`. Allowed inside `for_each` groups for dynamic fan-out.
+**Workflow agent restrictions (`type: workflow`):** Cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, `command`, `options`, `retry`, `reasoning`, `dialog`, `validator`, `max_session_seconds`, `max_agent_iterations`, or `timeout_seconds`. Requires `workflow:` path. Supports `input_mapping` and `max_depth`. Allowed inside `for_each` groups for dynamic fan-out.
 
-**Terminate agent restrictions (`type: terminate`):** Requires `status` (`success` | `failed`) and a non-empty `reason`. Cannot have `routes`, `tools`, `output`, `prompt`, `model`, `provider`, `system_prompt`, `command`, `args`, `env`, `working_dir`, `timeout`, `timeout_seconds`, `max_session_seconds`, `max_agent_iterations`, `max_depth`, `retry`, `dialog`, `reasoning`, `workflow`, `input_mapping`, or `options`. Cannot be used as a parallel-group member or as a `for_each` inline agent — route to a terminate step from those groups' `routes:` instead. Reaching a terminate step ends the workflow immediately (no routes evaluated after) and produces a distinguishable event payload: `workflow_completed` (for `success`) or `workflow_failed` (for `failed`) with `termination_reason`, `terminated_by`, `is_explicit: true`, and `status`. `status: failed` raises `WorkflowTerminated` (an `ExecutionError` subclass), gives the CLI a non-zero exit code, and is intentionally NOT resumable (no on-failure checkpoint saved). Inside a sub-workflow, a `status: failed` terminate is downgraded at the parent boundary to `SubworkflowTerminatedError` (also an `ExecutionError`), preserving the child's rendered `terminated_output`/`terminated_reason`/`terminated_by` as attributes on the wrapper.
+**Terminate agent restrictions (`type: terminate`):** Requires `status` (`success` | `failed`) and a non-empty `reason`. Cannot have `routes`, `tools`, `output`, `prompt`, `model`, `provider`, `system_prompt`, `command`, `args`, `env`, `working_dir`, `timeout`, `timeout_seconds`, `max_session_seconds`, `max_agent_iterations`, `max_depth`, `retry`, `dialog`, `validator`, `reasoning`, `workflow`, `input_mapping`, or `options`. Cannot be used as a parallel-group member or as a `for_each` inline agent — route to a terminate step from those groups' `routes:` instead. Reaching a terminate step ends the workflow immediately (no routes evaluated after) and produces a distinguishable event payload: `workflow_completed` (for `success`) or `workflow_failed` (for `failed`) with `termination_reason`, `terminated_by`, `is_explicit: true`, and `status`. `status: failed` raises `WorkflowTerminated` (an `ExecutionError` subclass), gives the CLI a non-zero exit code, and is intentionally NOT resumable (no on-failure checkpoint saved). Inside a sub-workflow, a `status: failed` terminate is downgraded at the parent boundary to `SubworkflowTerminatedError` (also an `ExecutionError`), preserving the child's rendered `terminated_output`/`terminated_reason`/`terminated_by` as attributes on the wrapper.
 
 **Reasoning effort:** `reasoning.effort` (and `runtime.default_reasoning_effort`) accepts `low`, `medium`, `high`, or `xhigh`. Per-agent value overrides the runtime default. Each provider translates the unified value to its native API:
 
@@ -210,6 +216,8 @@ agents:
 Both providers continue to surface reasoning content via `agent_reasoning` events visible in the dashboard, JSONL logs, and console at `-vv`.
 
 Forbidden on agent types: `script`, `human_gate`, `workflow`, `wait`.
+
+**Validator (semantic output validation):** `validator.criteria` (required) is graded by a second LLM call after the agent completes, returning `{passed, issues}`. On `passed: false` and `max_retries > 0` (default 1, hard-capped at 1; `0` = report-only), the agent re-runs once with a `## Validation feedback` section appended to its prompt; the second output is final (no second validation loop). `validator.model` defaults to the agent's model. Distinct from `retry:` (transient failures, same prompt) and `output:` (shape/type). Provider-backed `agent` steps only (forbidden on `script`, `human_gate`, `workflow`, `wait`, `set`, `terminate`); works in the main loop, parallel groups, and for-each loops. Fail-open: validator errors / unparseable responses are treated as a pass with a logged warning. Validator (and any discarded first attempt) token cost is recorded as a separate `<agent> (validator)` usage row. Emits `agent_validator_start`, `agent_validator_complete`, and `agent_validation_failed` events.
 
 ## Script Agent Schema
 
@@ -279,7 +287,7 @@ Wait agents produce a single, strict field:
 
 ### Wait Restrictions
 
-Forbidden fields: `prompt`, `model`, `provider`, `tools`, `system_prompt`, `options`, `command`, `args`, `env`, `working_dir`, `timeout`, `workflow`, `input_mapping`, `max_depth`, `max_session_seconds`, `max_agent_iterations`, `retry`, `dialog`, `reasoning`, `timeout_seconds`, `output`. Wait steps cannot be used inside `parallel` or `for_each` groups.
+Forbidden fields: `prompt`, `model`, `provider`, `tools`, `system_prompt`, `options`, `command`, `args`, `env`, `working_dir`, `timeout`, `workflow`, `input_mapping`, `max_depth`, `max_session_seconds`, `max_agent_iterations`, `retry`, `dialog`, `validator`, `reasoning`, `timeout_seconds`, `output`. Wait steps cannot be used inside `parallel` or `for_each` groups.
 
 `Esc` / `Ctrl+G` cancels in-progress waits. Workflow-level `limits.timeout_seconds` also cancels them.
 ## Set Agent Schema
@@ -390,11 +398,19 @@ agents:
         route: string               # Agent to route to when selected
         prompt_for: string          # Optional: field name to collect text input from user
 
-    output:                         # Captured automatically
-      selected:                     # The selected option value
+    output:                         # Captured automatically (do not declare in YAML)
+      selected:                     # The chosen option's `value`
         type: string
-      feedback:                     # Text from prompt_for (if used)
-        type: string
+      additional_input:             # Dict of values collected from `prompt_for` fields.
+        type: dict                  # Always present; `{}` when no `prompt_for` is set
+                                    # or when the selected option has no `prompt_for`.
+                                    # Access fields via templates as:
+                                    #   {{ <gate>.output.additional_input.<field> }}
+                                    # In `context: explicit` mode, `input:` declarations
+                                    # support `<gate>.output.additional_input` (the whole
+                                    # dict) but not the dotted shorthand
+                                    # `<gate>.output.additional_input.<field>` — declare
+                                    # the parent and traverse in Jinja2.
 ```
 
 ## Parallel Group Schema

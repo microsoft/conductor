@@ -128,6 +128,24 @@ wheels = [
 ]
 
 [[package]]
+name = "claude-agent-sdk"
+version = "0.2.87"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "anyio" },
+    { name = "mcp" },
+    { name = "sniffio" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/26/dc/e2afd59a1dd6484b6500245fa2331a0d8c0b68e6c180bc29d8ce9540f38a/claude_agent_sdk-0.2.87.tar.gz", hash = "sha256:56f02a49a97f7be37e0cd7323494d1c09e52fb0db7ab94f53bba8a230bb4bd0e", size = 252063, upload-time = "2026-05-23T04:19:25Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/6c/4e/b83c4c6ec1e0b63e9d4d58ba9a5abfd9936c55b8ee4c06b88f5e93bdfd70/claude_agent_sdk-0.2.87-py3-none-macosx_11_0_arm64.whl", hash = "sha256:52204a9609dec3aa96032afd48c07d72e05d13311faf614978f17b61326e6e31", size = 63037960, upload-time = "2026-05-23T04:19:29.056Z" },
+    { url = "https://files.pythonhosted.org/packages/13/d7/5fb02260c5b95c66e108c35e046d4d66011921251f7896274b6b21594f14/claude_agent_sdk-0.2.87-py3-none-macosx_11_0_x86_64.whl", hash = "sha256:1713e34e50b830ecac54386d39af14e3a2775f833f1ef715eb53566eaa1b6325", size = 65095745, upload-time = "2026-05-23T04:19:32.533Z" },
+    { url = "https://files.pythonhosted.org/packages/1d/84/1061f6580bbbc78de629467abf051cdbbabe71b982297b401e3fde65c7e0/claude_agent_sdk-0.2.87-py3-none-manylinux_2_17_aarch64.whl", hash = "sha256:e9e23119d2a02ad1ea1a2707214db98f5baf2c8809577186629843ddfcb8ec18", size = 72725120, upload-time = "2026-05-23T04:19:36.539Z" },
+    { url = "https://files.pythonhosted.org/packages/04/50/449f5044d76d9de18cf6a9f4b1c9386a74f41b4e2da5312df245d9dd23ef/claude_agent_sdk-0.2.87-py3-none-manylinux_2_17_x86_64.whl", hash = "sha256:5ac525d9ae3481296df5639d005e12ce2b6b0427426991f35da64db30be25c6e", size = 72875504, upload-time = "2026-05-23T04:19:40.839Z" },
+    { url = "https://files.pythonhosted.org/packages/80/dd/3f9d7c491d5a98138d293192b31cc9ed792d3552b3a7e276163d7fe2d43a/claude_agent_sdk-0.2.87-py3-none-win_amd64.whl", hash = "sha256:f34973669a1efaeb1543e7b22d7b22feefd8af2fae3adfd39181635077dae432", size = 73514880, upload-time = "2026-05-23T04:19:44.65Z" },
+]
+
+[[package]]
 name = "click"
 version = "8.3.1"
 source = { registry = "https://pypi.org/simple" }
@@ -150,7 +168,7 @@ wheels = [
 
 [[package]]
 name = "conductor-cli"
-version = "0.1.18"
+version = "0.1.19"
 source = { editable = "." }
 dependencies = [
     { name = "anthropic" },
@@ -169,6 +187,11 @@ dependencies = [
     { name = "websockets" },
 ]
 
+[package.optional-dependencies]
+claude-agent-sdk = [
+    { name = "claude-agent-sdk" },
+]
+
 [package.dev-dependencies]
 dev = [
     { name = "pytest" },
@@ -181,8 +204,9 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "anthropic", specifier = ">=0.77.0,<1.0.0" },
+    { name = "claude-agent-sdk", marker = "extra == 'claude-agent-sdk'", specifier = ">=0.1.64" },
     { name = "fastapi", specifier = ">=0.115.0" },
-    { name = "github-copilot-sdk", specifier = ">=0.3.0" },
+    { name = "github-copilot-sdk", specifier = ">=1.0.0" },
     { name = "httpx", specifier = ">=0.27.0" },
     { name = "jinja2", specifier = ">=3.1.0" },
     { name = "mcp", specifier = ">=1.0.0" },
@@ -195,6 +219,7 @@ requires-dist = [
     { name = "uvicorn", specifier = ">=0.30.0" },
     { name = "websockets", specifier = ">=12.0" },
 ]
+provides-extras = ["claude-agent-sdk"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -368,19 +393,19 @@ wheels = [
 
 [[package]]
 name = "github-copilot-sdk"
-version = "0.3.0"
+version = "1.0.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "pydantic" },
     { name = "python-dateutil" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/6c/d7/3d71064646a24d633c9dec035ff8b5b6d72c11d3aad765e54efd71737f0f/github_copilot_sdk-0.3.0-py3-none-macosx_10_9_x86_64.whl", hash = "sha256:ed8f27989158824c754d7febb473bdf25744a1e6bc07a06f114f7e7deebd2c22", size = 58566984, upload-time = "2026-04-24T16:05:37.535Z" },
-    { url = "https://files.pythonhosted.org/packages/4f/18/439854722b951a2f213c23cc731e9a31d46c8b1e2f1b1de080745c03c798/github_copilot_sdk-0.3.0-py3-none-macosx_11_0_arm64.whl", hash = "sha256:7e241d9b00ebf8bb4d10b2d6101c75fcef38de04d144d729e07fa48394270ee1", size = 55318729, upload-time = "2026-04-24T16:05:41.734Z" },
-    { url = "https://files.pythonhosted.org/packages/11/56/931a65b17ad36d3b8987d8cb9bd2835f759c79ae1799fdc34d1252c38b6f/github_copilot_sdk-0.3.0-py3-none-manylinux_2_28_aarch64.whl", hash = "sha256:f4d98a67b8f038885ddd38bd7033d1ac20c3010f04c72ee0fc74ba4984b69ffa", size = 61452705, upload-time = "2026-04-24T16:05:45.225Z" },
-    { url = "https://files.pythonhosted.org/packages/00/e5/7e275fc76a7f9cc3240da393ed631d9647c346a36d6392ea4b0ed56326f6/github_copilot_sdk-0.3.0-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:b591546d789f9f8243fb59ca71b08cb0bb1dbec818fbef060c3830c6787de2c8", size = 59646875, upload-time = "2026-04-24T16:05:48.832Z" },
-    { url = "https://files.pythonhosted.org/packages/cf/67/00e3bf21842b0c418aad6ce233ec8cd7e8ca91859e4f7e571fc47c682ed9/github_copilot_sdk-0.3.0-py3-none-win_amd64.whl", hash = "sha256:c5712d57a2c6291b805c79e039c55c48d858034b1a37fc8e1653925403a028e9", size = 54165496, upload-time = "2026-04-24T16:05:52.712Z" },
-    { url = "https://files.pythonhosted.org/packages/91/1c/76bb5159018a1c0d44b17ded340c91085fb48dd3dc912eb349781c54c200/github_copilot_sdk-0.3.0-py3-none-win_arm64.whl", hash = "sha256:93b07c46f60cebbbb003d5bddba22eab886849b1d052b98037b52b6434a5bc07", size = 52103138, upload-time = "2026-04-24T16:05:56.329Z" },
+    { url = "https://files.pythonhosted.org/packages/89/22/d4d576becff84146501e043831bdd2ca5aee57fcfdfface4ee7db7883655/github_copilot_sdk-1.0.1-py3-none-macosx_10_9_x86_64.whl", hash = "sha256:d1ca7fff62b69f8c9aa24eb2d1f615195730d6b7297050e8e240aa38fbae5eba", size = 94824679, upload-time = "2026-06-10T16:54:17.004Z" },
+    { url = "https://files.pythonhosted.org/packages/a9/5f/f3d935b81f11930539cdf47a7e0dbd4d5ccaadba1f4daf0c64892421a81d/github_copilot_sdk-1.0.1-py3-none-macosx_11_0_arm64.whl", hash = "sha256:dc4b59dfe034bec6a031b291dbe49de8a8558e42d28aee25213c680ab771d54e", size = 88837334, upload-time = "2026-06-10T16:54:23.056Z" },
+    { url = "https://files.pythonhosted.org/packages/6b/94/225ec0258e1630a81e13b193a9258d8c4550b552b6197f903b75002abf75/github_copilot_sdk-1.0.1-py3-none-manylinux_2_28_aarch64.whl", hash = "sha256:bedb442ee4dd40d43870719f91a9fb6e117ca5d76bbbf1807af80cc77ff64257", size = 97255205, upload-time = "2026-06-10T16:54:29.828Z" },
+    { url = "https://files.pythonhosted.org/packages/0f/34/72fb3936e7e8a425f1498bd6693a4e7db678e43fc3912dc5ce9cecccfe23/github_copilot_sdk-1.0.1-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:a498fffba3d8a521eb73f31d08fef9f534e7c57ae6d0a76fa1848beebb3fb6a9", size = 94572477, upload-time = "2026-06-10T16:54:37.253Z" },
+    { url = "https://files.pythonhosted.org/packages/df/95/34aa49c08033acabbe129acf83a2d71a382bd2977ce92f5114a299508a4e/github_copilot_sdk-1.0.1-py3-none-win_amd64.whl", hash = "sha256:29d850cf5cf2b85c0513b68cba112d4a7aba0a9a447893fc7cc69136dd4e6ac1", size = 91387201, upload-time = "2026-06-10T16:54:45.164Z" },
+    { url = "https://files.pythonhosted.org/packages/ea/b1/900b278e519442d4a5fc9dd070b9100f6f1e6b3c6af3b8642b0b3a65d2f5/github_copilot_sdk-1.0.1-py3-none-win_arm64.whl", hash = "sha256:5f69245b1cb2fc1054e78543ee5c10464b53ebbba11e749c7a42002b02ce6b13", size = 90455774, upload-time = "2026-06-10T16:54:53.093Z" },
 ]
 
 [[package]]
@@ -801,11 +826,11 @@ wheels = [
 
 [[package]]
 name = "pyjwt"
-version = "2.12.0"
+version = "2.13.0"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/a8/10/e8192be5f38f3e8e7e046716de4cae33d56fd5ae08927a823bb916be36c1/pyjwt-2.12.0.tar.gz", hash = "sha256:2f62390b667cd8257de560b850bb5a883102a388829274147f1d724453f8fb02", size = 102511, upload-time = "2026-03-12T17:15:30.831Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/3b/81/58d0ac84e1ef3a3843791d6954d94c0b33d526c75eeb1efbce9d0a4c4077/pyjwt-2.13.0.tar.gz", hash = "sha256:41571c89ca91598c79e8ef18a2d07367d4810fbbd6f637794879baf1b7703423", size = 107515, upload-time = "2026-05-21T19:54:36.618Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/15/70/70f895f404d363d291dcf62c12c85fdd47619ad9674ac0f53364d035925a/pyjwt-2.12.0-py3-none-any.whl", hash = "sha256:9bb459d1bdd0387967d287f5656bf7ec2b9a26645d1961628cda1764e087fd6e", size = 29700, upload-time = "2026-03-12T17:15:29.257Z" },
+    { url = "https://files.pythonhosted.org/packages/a3/5e/ecf12fdb62546d64385c158514e9b2b671f7832108ef2ecd2020ce0af2d1/pyjwt-2.13.0-py3-none-any.whl", hash = "sha256:66adcc2aff09b3f1bbd95fc1e1577df8ac8723c978552fd43304c8a290ac5728", size = 31274, upload-time = "2026-05-21T19:54:35.362Z" },
 ]
 
 [package.optional-dependencies]
@@ -879,11 +904,11 @@ wheels = [
 
 [[package]]
 name = "python-multipart"
-version = "0.0.27"
+version = "0.0.31"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/69/9b/f23807317a113dc36e74e75eb265a02dd1a4d9082abc3c1064acd22997c4/python_multipart-0.0.27.tar.gz", hash = "sha256:9870a6a8c5a20a5bf4f07c017bd1489006ff8836cff097b6933355ee2b49b602", size = 44043, upload-time = "2026-04-27T10:51:26.649Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/64/7e/9b35ad8f3d9ca680f7c87a88f19612fdd8da9796c4d3b46e560ac79dcc4a/python_multipart-0.0.31.tar.gz", hash = "sha256:fc631183bb13e56db3158a4909908dfb2e23565286744e798241e63750e5d680", size = 46689, upload-time = "2026-06-04T08:27:49.014Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/99/78/4126abcbdbd3c559d43e0db7f7b9173fc6befe45d39a2856cc0b8ec2a5a6/python_multipart-0.0.27-py3-none-any.whl", hash = "sha256:6fccfad17a27334bd0193681b369f476eda3409f17381a2d65aa7df3f7275645", size = 29254, upload-time = "2026-04-27T10:51:24.997Z" },
+    { url = "https://files.pythonhosted.org/packages/5e/1e/7f7f299527a5a8ad90acd5f2f78dfa6c8495c6301a3205106ea68a84de96/python_multipart-0.0.31-py3-none-any.whl", hash = "sha256:8408153d68a9773291fc1da39a8b85a50044bddbabd2dd72e9229776b7b15e28", size = 29996, upload-time = "2026-06-04T08:27:47.804Z" },
 ]
 
 [[package]]
@@ -1096,15 +1121,15 @@ wheels = [
 
 [[package]]
 name = "starlette"
-version = "0.52.1"
+version = "1.0.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyio" },
     { name = "typing-extensions", marker = "python_full_version < '3.13'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/c4/68/79977123bb7be889ad680d79a40f339082c1978b5cfcf62c2d8d196873ac/starlette-0.52.1.tar.gz", hash = "sha256:834edd1b0a23167694292e94f597773bc3f89f362be6effee198165a35d62933", size = 2653702, upload-time = "2026-01-18T13:34:11.062Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/08/a3/84e821cc54b4ab50ae6dbc6ac3800a651b65ec35f045cc73785380654057/starlette-1.0.1.tar.gz", hash = "sha256:512399c5f1de7fac99c88572212ded9ddeddef2fb32afa82d724000e88b38f4f", size = 2659596, upload-time = "2026-05-21T21:58:58.433Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/81/0d/13d1d239a25cbfb19e740db83143e95c772a1fe10202dda4b76792b114dd/starlette-0.52.1-py3-none-any.whl", hash = "sha256:0029d43eb3d273bc4f83a08720b4912ea4b071087a3b48db01b7c839f7954d74", size = 74272, upload-time = "2026-01-18T13:34:09.188Z" },
+    { url = "https://files.pythonhosted.org/packages/ec/e1/b2df4bc09a1e51ff664c1e17018a4274b42e5e9352e4a478ea540512dc88/starlette-1.0.1-py3-none-any.whl", hash = "sha256:7c0e69b2ee1c848bd54669d908500117a3ee13de603a21427e5c6fc1adf98dcd", size = 72802, upload-time = "2026-05-21T21:58:56.551Z" },
 ]
 
 [[package]]

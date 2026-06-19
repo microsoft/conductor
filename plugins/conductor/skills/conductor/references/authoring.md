@@ -20,6 +20,10 @@ workflow:
     max_agent_iterations: 50     # Max tool-use roundtrips per agent (1-500, optional)
     max_session_seconds: 120     # Wall-clock timeout per agent session (optional)
     default_reasoning_effort: medium  # Workflow-wide reasoning effort: low, medium, high, xhigh (optional)
+    checkpoint:                  # Periodic checkpoints for resumable stalled runs (optional, off by default)
+      every_agent: true          #   save after each step boundary (governs alone when true)
+      every_seconds: 300         #   throttle by elapsed seconds (used only when every_agent is false)
+      keep_last: 5               #   retain this many periodic checkpoints per run (1-100)
 
   input:                         # Define workflow inputs
     param_name:
@@ -61,6 +65,33 @@ workflow:
     # / .github/instructions/**/*.instructions.md with applyTo: "**") so target-repo
     # context is loaded at run time instead of being baked into the YAML.
 ```
+
+### Periodic Checkpoints (`runtime.checkpoint`)
+
+Off by default — Conductor otherwise checkpoints only on failure, so a *stalled*
+long run (provider hang, MCP deadlock, sub-agent that never returns) leaves
+nothing to `conductor resume`. Enable periodic checkpoints to make stalled or
+hard-killed runs recoverable:
+
+- `every_agent: true` — save at every step boundary. Governs alone when true
+  (`every_seconds` is then ignored).
+- `every_seconds: N` — throttle: save at the first boundary past N seconds since
+  the last save (set either trigger or both; a save fires when **either** is
+  met). The first save of a run fires at the first boundary; the interval only
+  throttles later saves.
+- `keep_last` (default 5) — rotate older periodic checkpoints for the run;
+  failure checkpoints are never rotated.
+
+Semantics: checkpoints are taken at step boundaries (all prior outputs
+committed) and point at the step *about to run*, so resume continues forward and
+re-runs only that step. No background timer — if a step runs longer than
+`every_seconds`, the recovery point is the boundary checkpoint taken before it
+started. Root workflow only (sub-workflows re-run from scratch on resume), and
+periodic checkpoints are deleted automatically at a terminal non-resumable
+outcome (clean completion or explicit `status: failed` terminate). A failed
+periodic save never interrupts the run — it emits a `checkpoint_save_failed`
+event + console warning. See
+`examples/periodic-checkpoints.yaml`.
 
 ## Agent Definition
 
@@ -116,6 +147,13 @@ agents:
     reasoning:                   # Override runtime.default_reasoning_effort (optional)
       effort: high               # low, medium, high, or xhigh
 
+    validator:                   # Optional: grade output, re-run once on failure
+      criteria: |                # Required: rubric the output is checked against
+        Verify every issue has an actionable suggestion and no
+        function names are fabricated.
+      model: claude-sonnet-4-5   # Optional: defaults to the agent's model
+      max_retries: 1             # 0 or 1 (default 1; hard-capped at 1)
+
     routes:                      # Where to go next
       - to: next_agent
 ```
@@ -147,6 +185,29 @@ agents:
 ```
 
 See `examples/reasoning-effort.yaml` for a complete example.
+
+### Validator (semantic output validation)
+
+`validator.criteria` (required) is graded by a **second LLM call** after the agent completes, returning `{passed, issues}`. On `passed: false` and `max_retries > 0` (default `1`, hard-capped at `1`; `0` = report-only), the agent re-runs once with a `## Validation feedback` section (the issues) appended to its prompt; the second output is final (no second validation loop). `validator.model` defaults to the agent's model.
+
+Distinct from `retry:` (transient failures, same prompt) and `output:` (shape/type, not content). Provider-backed `agent` steps only (not `script`, `human_gate`, `workflow`, `wait`, `set`, `terminate`); works in the main loop, parallel groups, and for-each loops. **Fail-open** — validator errors / unparseable responses are treated as a pass with a logged warning, so a flaky grader never blocks the workflow. Validator (and any discarded first attempt) token cost is reported as a separate `<agent> (validator)` usage row. Emits `agent_validator_start`, `agent_validator_complete`, and `agent_validation_failed` events (surfaced in the dashboard and at `-vv`).
+
+```yaml
+agents:
+  - name: code_reviewer
+    model: claude-sonnet-4-5
+    prompt: "Review the diff for bugs.\n{{ workflow.input.diff }}"
+    output:
+      summary: { type: string }
+      issues:  { type: array }
+    validator:
+      criteria: |
+        Verify the review identifies all null-safety issues, every suggestion
+        is actionable, and no function names are fabricated.
+      max_retries: 1
+```
+
+See `examples/validator.yaml` for a complete example.
 
 ## Routing Patterns
 
@@ -207,11 +268,14 @@ agents:
     working_dir: /tmp            # Working directory (optional, Jinja2 templated)
     env:                         # Extra environment variables (optional)
       MY_VAR: "value"
+    stdin: "{{ data | tojson }}" # Payload piped to the child's stdin (optional, Jinja2 templated)
     routes:
       - to: analyzer
         when: "exit_code == 0"
       - to: error_handler
 ```
+
+Use `stdin:` to hand large or structured payloads to a script without hitting OS command-line length limits (notably Windows's ~32 KB command-line cap). It is a Jinja2 string template rendered to the child's stdin as UTF-8 — use `{{ x | tojson }}` for JSON, or render text directly. Omitting it inherits the parent's stdin (legacy behavior); `stdin` and `args` can be set together (orthogonal).
 
 ### Script Output
 
@@ -250,7 +314,7 @@ routes:
 
 ### Script Restrictions
 
-Script agents **cannot** have: `prompt`, `provider`, `model`, `tools`, `output`, `system_prompt`, `options`, `retry`, `reasoning`, `dialog`, `max_session_seconds`, `max_agent_iterations`, `timeout_seconds` (use `timeout:` instead), `input_mapping`, or `max_depth`.
+Script agents **cannot** have: `prompt`, `provider`, `model`, `tools`, `output`, `system_prompt`, `options`, `retry`, `reasoning`, `dialog`, `validator`, `max_session_seconds`, `max_agent_iterations`, `timeout_seconds` (use `timeout:` instead), `input_mapping`, or `max_depth`.
 Command and args support Jinja2 templating for dynamic values.
 
 ## Wait Steps (`type: wait`)
@@ -315,7 +379,7 @@ agents:
 
 ### Wait Restrictions
 
-Wait agents **cannot** have: `prompt`, `model`, `provider`, `tools`, `system_prompt`, `options`, `command`, `args`, `env`, `working_dir`, `timeout`, `workflow`, `input_mapping`, `max_depth`, `max_session_seconds`, `max_agent_iterations`, `retry`, `dialog`, `reasoning`, `timeout_seconds`, or `output`. They also cannot be used inside `parallel` groups or `for_each` groups.
+Wait agents **cannot** have: `prompt`, `model`, `provider`, `tools`, `system_prompt`, `options`, `command`, `args`, `env`, `working_dir`, `timeout`, `workflow`, `input_mapping`, `max_depth`, `max_session_seconds`, `max_agent_iterations`, `retry`, `dialog`, `validator`, `reasoning`, `timeout_seconds`, or `output`. They also cannot be used inside `parallel` groups or `for_each` groups.
 
 See `examples/wait-step.yaml` for a complete polling workflow.
 ## Set Steps
@@ -396,7 +460,7 @@ Routes attached to a set step see the bound value directly. Dict outputs expose 
 
 ### Set Step Restrictions
 
-Set agents **cannot** have: `prompt`, `provider`, `model`, `tools`, `system_prompt`, `command`, `args`, `env`, `working_dir`, `timeout`, `workflow`, `options`, `input_mapping`, `max_depth`, `retry`, `dialog`, `reasoning`, `timeout_seconds`, `max_session_seconds`, or `max_agent_iterations`. They count toward `limits.max_iterations` like any other step.
+Set agents **cannot** have: `prompt`, `provider`, `model`, `tools`, `system_prompt`, `command`, `args`, `env`, `working_dir`, `timeout`, `workflow`, `options`, `input_mapping`, `max_depth`, `retry`, `dialog`, `validator`, `reasoning`, `timeout_seconds`, `max_session_seconds`, or `max_agent_iterations`. They count toward `limits.max_iterations` like any other step.
 
 `output:` schema validation is permitted only when the rendered output is a dict (always for `values:`, sometimes for `value:`). A single-`value:` step with a declared schema that produces a scalar raises a `ValidationError` pointing to `values:`.
 
@@ -450,7 +514,7 @@ for_each:
         title: "{{ issue.title }}"
 ```
 
-**Restrictions** — workflow steps cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, `command`, `options`, `retry`, `reasoning`, `dialog`, `max_session_seconds`, `max_agent_iterations`, or `timeout_seconds`.
+**Restrictions** — workflow steps cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, `command`, `options`, `retry`, `reasoning`, `dialog`, `validator`, `max_session_seconds`, `max_agent_iterations`, or `timeout_seconds`.
 
 ## Terminate Steps (`type: terminate`)
 
@@ -487,7 +551,7 @@ agents:
 - **Sub-workflow boundary** — a `status: failed` terminate inside a child sub-workflow is downgraded to `SubworkflowTerminatedError` (also an `ExecutionError`) at the parent boundary. The parent treats it as a normal sub-workflow failure (its own `workflow_failed` does NOT inherit `is_explicit: true`). The child's rendered output, reason, and terminate-step name are preserved as `terminated_output` / `terminated_reason` / `terminated_by` attributes on the wrapper for `on_error` hooks and debugging surfaces. A `status: success` child terminate returns its rendered output cleanly and the parent continues with its next routes.
 - **Branching on a child's termination** — if the parent's routes need to react to a child's outcome, the child should use `status: success` plus an `output_template:` carrying the relevant fields. Failed terminate is an error from the parent's perspective; parent `routes:` are only evaluated after successful steps.
 
-**Restrictions** — terminate steps cannot have `routes`, `tools`, `output`, `prompt`, `model`, `provider`, `system_prompt`, `command`, `args`, `env`, `working_dir`, `timeout`, `timeout_seconds`, `max_session_seconds`, `max_agent_iterations`, `max_depth`, `retry`, `dialog`, `reasoning`, `workflow`, `input_mapping`, or `options`. Cannot appear as a parallel-group member or as a `for_each` inline agent — route to them from those groups' `routes:` instead. Conversely, regular agents cannot have `status`, `reason`, or `output_template` — those fields are rejected at schema validation to catch authors who forgot to add `type: terminate`.
+**Restrictions** — terminate steps cannot have `routes`, `tools`, `output`, `prompt`, `model`, `provider`, `system_prompt`, `command`, `args`, `env`, `working_dir`, `timeout`, `timeout_seconds`, `max_session_seconds`, `max_agent_iterations`, `max_depth`, `retry`, `dialog`, `validator`, `reasoning`, `workflow`, `input_mapping`, or `options`. Cannot appear as a parallel-group member or as a `for_each` inline agent — route to them from those groups' `routes:` instead. Conversely, regular agents cannot have `status`, `reason`, or `output_template` — those fields are rejected at schema validation to catch authors who forgot to add `type: terminate`.
 
 See `examples/terminate.yaml` for a complete example demonstrating success, failure, and pass-through paths.
 
@@ -696,8 +760,18 @@ agents:
 ### Gate Output
 
 Human gates automatically capture:
-- `output.selected` - the `value` of the chosen option
-- `output.feedback` - text input from `prompt_for` (if specified)
+- `output.selected` — the `value` of the chosen option.
+- `output.additional_input` — dict of values collected from `prompt_for` fields.
+  Always present; `{}` when no `prompt_for` was specified or the selected option
+  has no `prompt_for`. Access individual fields via templates as
+  `{{ <gate>.output.additional_input.<field> }}` (for example
+  `{{ approval_gate.output.additional_input.feedback }}` when an option declares
+  `prompt_for: feedback`).
+
+> **`context: explicit` mode note.** `input:` declarations support
+> `<gate>.output.additional_input` (the whole dict) but not the dotted shorthand
+> `<gate>.output.additional_input.<field>`. Declare the parent key and read
+> individual fields via Jinja2 in the agent's prompt or output template.
 
 ## Context Modes
 

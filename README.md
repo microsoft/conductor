@@ -16,7 +16,7 @@ Conductor makes multi-agent workflows — code review pipelines, research-then-s
 ## Features
 
 - **YAML-based workflows** - Define multi-agent workflows in readable YAML
-- **Multiple providers** - GitHub Copilot or Anthropic Claude with seamless switching
+- **Multiple providers** - GitHub Copilot, Anthropic Claude, or Claude Agent SDK with seamless switching
 - **Parallel execution** - Run agents concurrently (static groups or dynamic for-each)
 - **Sub-workflow composition** - Reusable sub-workflows with templated `input_mapping`, usable inside `for_each` groups for dynamic fan-out
 - **Script steps** - Run shell commands and route on exit code or parsed JSON stdout
@@ -211,13 +211,13 @@ conductor stop
 
 Conductor supports multiple AI providers. Choose based on your needs:
 
-| Feature | Copilot | Claude |
-|---------|---------|--------|
-| **Pricing** | Subscription ($10-39/mo) | Pay-per-token |
-| **Context Window** | 8K-128K tokens | 200K tokens |
-| **Tool Support (MCP)** | Yes | Planned |
-| **Streaming** | Yes | Planned |
-| **Best For** | Heavy usage, tools | Large context, pay-per-use |
+| Feature | Copilot | Claude | Claude Agent SDK |
+|---------|---------|--------|------------------|
+| **Pricing** | Subscription ($10-39/mo) | Pay-per-token | Via Claude Code CLI |
+| **Context Window** | 8K-128K tokens | 200K tokens | 200K tokens |
+| **Tool Support (MCP)** | Yes | Planned | Yes (built-in) |
+| **Streaming** | Yes | Planned | Yes |
+| **Best For** | Heavy usage, tools | Large context, pay-per-use | Full Claude Code toolset |
 
 ### Using Claude
 
@@ -229,6 +229,19 @@ workflow:
 ```
 
 Set your API key: `export ANTHROPIC_API_KEY=sk-ant-...`
+
+### Using Claude Agent SDK
+
+```yaml
+workflow:
+  runtime:
+    provider: claude-agent-sdk
+    default_model: claude-sonnet-4-6
+```
+
+Requires the `claude` CLI to be installed and authenticated. Install the SDK: `uv add 'claude-agent-sdk>=0.1.0'`
+
+> **Note:** The `claude-agent-sdk` provider delegates tool and MCP server management to the `claude` CLI. Workflow-level `tools` and `runtime.mcp_servers` fields are ignored — configure these through your Claude Code settings instead.
 
 **See also:** [Claude Documentation](docs/providers/claude.md) | [Provider Comparison](docs/providers/comparison.md) | [Migration Guide](docs/providers/migration.md)
 

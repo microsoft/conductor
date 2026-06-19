@@ -45,6 +45,26 @@ class TestCreateProvider:
         assert exc_info.value.suggestion is not None
         assert "copilot" in exc_info.value.suggestion
 
+    @pytest.mark.asyncio
+    async def test_copilot_provider_receives_default_context_tier(self) -> None:
+        """default_context_tier is threaded into the Copilot provider."""
+        provider = await create_provider(
+            "copilot",
+            validate=False,
+            default_context_tier="long_context",
+        )
+        assert isinstance(provider, CopilotProvider)
+        assert provider._default_context_tier == "long_context"
+        await provider.close()
+
+    @pytest.mark.asyncio
+    async def test_copilot_provider_default_context_tier_none(self) -> None:
+        """default_context_tier defaults to None on the Copilot provider."""
+        provider = await create_provider("copilot", validate=False)
+        assert isinstance(provider, CopilotProvider)
+        assert provider._default_context_tier is None
+        await provider.close()
+
     @patch("conductor.providers.factory.ANTHROPIC_SDK_AVAILABLE", False)
     @pytest.mark.asyncio
     async def test_create_claude_provider_raises_when_sdk_not_available(self) -> None:
@@ -196,4 +216,84 @@ class TestMaxSessionSeconds:
         # Other fields should retain their defaults
         assert provider._idle_recovery_config.idle_timeout_seconds == 90.0
         assert provider._idle_recovery_config.max_recovery_attempts == 5
+        await provider.close()
+
+
+class TestClaudeAgentSdkFactoryRejections:
+    """Factory rejects workflow features claude-agent-sdk does not honor (#241 / A2).
+
+    Silently dropping mcp_servers, temperature, or max_tokens at the factory
+    boundary is a parity violation: agents that expect those features end up
+    running with different behavior than declared. Refuse loudly until proper
+    plumbing exists.
+    """
+
+    @pytest.mark.asyncio
+    async def test_factory_rejects_mcp_servers(self) -> None:
+        pytest.importorskip("claude_agent_sdk")
+        with pytest.raises(ProviderError, match="does not support workflow MCP servers"):
+            await create_provider(
+                "claude-agent-sdk",
+                validate=False,
+                mcp_servers={"docs": {"command": "docs-server"}},
+            )
+
+    @pytest.mark.asyncio
+    async def test_factory_rejects_temperature(self) -> None:
+        pytest.importorskip("claude_agent_sdk")
+        with pytest.raises(ProviderError, match="does not support `temperature`"):
+            await create_provider(
+                "claude-agent-sdk",
+                validate=False,
+                temperature=0.5,
+            )
+
+    @pytest.mark.asyncio
+    async def test_factory_rejects_max_tokens(self) -> None:
+        pytest.importorskip("claude_agent_sdk")
+        with pytest.raises(ProviderError, match="does not support `max_tokens`"):
+            await create_provider(
+                "claude-agent-sdk",
+                validate=False,
+                max_tokens=4096,
+            )
+
+    @pytest.mark.asyncio
+    async def test_factory_accepts_supported_params(self) -> None:
+        pytest.importorskip("claude_agent_sdk")
+        from conductor.providers.claude_agent_sdk import ClaudeAgentSdkProvider
+
+        provider = await create_provider(
+            "claude-agent-sdk",
+            validate=False,
+            default_model="claude-sonnet-4-5",
+            max_agent_iterations=20,
+            max_session_seconds=600.0,
+        )
+        assert isinstance(provider, ClaudeAgentSdkProvider)
+        assert provider._default_model == "claude-sonnet-4-5"
+        assert provider._default_max_turns == 20
+        assert provider._max_session_seconds == 600.0
+        await provider.close()
+
+    @pytest.mark.asyncio
+    async def test_factory_accepts_empty_mcp_servers(self) -> None:
+        """Empty dict / None mcp_servers should NOT raise — only non-empty values."""
+        pytest.importorskip("claude_agent_sdk")
+        from conductor.providers.claude_agent_sdk import ClaudeAgentSdkProvider
+
+        provider = await create_provider(
+            "claude-agent-sdk",
+            validate=False,
+            mcp_servers={},
+        )
+        assert isinstance(provider, ClaudeAgentSdkProvider)
+        await provider.close()
+
+        provider = await create_provider(
+            "claude-agent-sdk",
+            validate=False,
+            mcp_servers=None,
+        )
+        assert isinstance(provider, ClaudeAgentSdkProvider)
         await provider.close()

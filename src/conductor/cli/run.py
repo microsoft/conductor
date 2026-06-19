@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import os
 import re
 import sys
@@ -31,6 +32,9 @@ from conductor.providers.registry import ProviderRegistry
 if TYPE_CHECKING:
     from conductor.config.schema import ProviderSettings
     from conductor.events import WorkflowEvent
+
+
+logger = logging.getLogger(__name__)
 
 
 # Verbose console for logging (stderr).
@@ -737,6 +741,105 @@ def verbose_log_for_each_summary(
 # ------------------------------------------------------------------
 
 
+# Tracks which experimental-provider banners have been printed during the
+# current process lifetime so that synthetic ``workflow_started`` events
+# emitted during resume (which already replayed the same workflow once)
+# don't print the banner twice.
+_PRINTED_EXPERIMENTAL_BANNERS: set[str] = set()
+
+
+def _maybe_print_experimental_banner(data: dict[str, Any]) -> None:
+    """Print one Rich banner per unique experimental provider in the workflow.
+
+    Reads ``workflow_started.providers`` (the per-provider tier metadata
+    block) and prints a yellow banner per provider with ``tier ==
+    "experimental"``. Uses the auto-generated limitations list from the
+    capability descriptor so the operator can see at a glance what's
+    missing. Idempotent across resume replays via the module-level
+    ``_PRINTED_EXPERIMENTAL_BANNERS`` guard.
+
+    No-op when the providers block is absent (older event payloads) or
+    contains only stable providers — keeps the run console clean for the
+    common case.
+    """
+    providers = data.get("providers")
+    if not isinstance(providers, dict):
+        return
+
+    # ``run_id`` sits at top level in build_workflow_started_data() AND
+    # is also mirrored into the ``system`` block. Read either so the
+    # banner key stays unique across re-emitted events whether tests
+    # construct synthetic data or real engine output.
+    run_id = (
+        data.get("run_id")
+        or (data.get("system", {}) if isinstance(data.get("system"), dict) else {}).get("run_id")
+        or ""
+    )
+
+    from rich.panel import Panel
+
+    for provider_name, meta in providers.items():
+        if not isinstance(meta, dict):
+            continue
+        if meta.get("tier") != "experimental":
+            continue
+
+        banner_key = f"{run_id}:{provider_name}"
+        if banner_key in _PRINTED_EXPERIMENTAL_BANNERS:
+            continue
+        _PRINTED_EXPERIMENTAL_BANNERS.add(banner_key)
+
+        pin = meta.get("upstream_pin")
+        maintainer = meta.get("maintainer")
+
+        # Re-resolve capabilities from the provider name to compute the
+        # limitations list. We don't ship the capability dump on the wire
+        # (it's not consumed by any frontend code today), so this single
+        # extra lookup keeps the limitation logic in one place AND keeps
+        # the JSONL payload lean.
+        limitations: list[str] = []
+        try:
+            from conductor.providers.capabilities import get_capabilities
+
+            limitations = get_capabilities(provider_name).declared_limitations()
+        except (KeyError, AttributeError, ImportError) as exc:
+            # Provider unknown to the resolver or missing CAPABILITIES.
+            # Same fallback as engine — log and print banner without
+            # limitations rather than crashing.
+            logger.warning(
+                "Could not resolve capabilities for experimental provider %r: %s. "
+                "Banner will omit the limitations line.",
+                provider_name,
+                exc,
+            )
+
+        header_bits = [f"[bold]{provider_name}[/bold]"]
+        if pin:
+            header_bits.append(f"([dim]{pin}[/dim])")
+        if maintainer:
+            header_bits.append(f"maintained by [dim]{maintainer}[/dim]")
+        header = " ".join(header_bits)
+
+        body_lines = [f"⚠ Experimental provider in use: {header}"]
+        if limitations:
+            body_lines.append("Limitations: " + ", ".join(limitations) + ".")
+        body_lines.append("See [link]docs/providers/experimental.md[/link] for stability policy.")
+
+        panel = Panel(
+            "\n".join(body_lines),
+            border_style="yellow",
+            expand=False,
+        )
+        # Route through the silent-aware verbose console so ``--silent`` (JSON
+        # output only) suppresses the banner consistently with every other
+        # progress-style print in this module. The banner is a warning, but
+        # ``--silent`` is the user's explicit "JSON-only" contract — emitting
+        # arbitrary Rich panels would corrupt that.
+        _verbose_console.print(panel)
+        if _file_console is not None:
+            _file_console.print(panel)
+
+
 class ConsoleEventSubscriber:
     """Subscribes to WorkflowEventEmitter and drives console/file logging.
 
@@ -748,7 +851,10 @@ class ConsoleEventSubscriber:
         d = event.data
         t = event.type
 
-        if t == "agent_started":
+        if t == "workflow_started":
+            _maybe_print_experimental_banner(d)
+
+        elif t == "agent_started":
             verbose_log_agent_start(d.get("agent_name", "?"), d.get("iteration", 0))
 
         elif t == "agent_completed":
@@ -852,6 +958,59 @@ class ConsoleEventSubscriber:
                 f"{d.get('error_type', 'Error')}: {d.get('message', 'unknown')}",
                 style="red",
             )
+
+        elif t == "agent_validator_start":
+            verbose_log(f"  Validating '{_validator_label(d)}' output…", style="cyan")
+
+        elif t == "agent_validator_complete":
+            label = _validator_label(d)
+            cost = d.get("cost_usd")
+            cost_str = f" · ${cost:.4f}" if isinstance(cost, int | float) else ""
+            if d.get("errored"):
+                verbose_log(
+                    f"  Validation error for '{label}' (treated as pass){cost_str}",
+                    style="yellow",
+                )
+            elif d.get("passed", True):
+                verbose_log(f"  Validation passed for '{label}'{cost_str}", style="green")
+            # Failure detail is emitted via agent_validation_failed below.
+
+        elif t == "agent_validation_failed":
+            label = _validator_label(d)
+            issues = d.get("issues") or []
+            if d.get("rerun_errored"):
+                action = "re-run failed — keeping original output"
+            elif d.get("will_retry"):
+                action = "re-running once with feedback"
+            else:
+                action = "no retry (max_retries=0)"
+            style = "red" if d.get("rerun_errored") else "yellow"
+            verbose_log(
+                f"  Validation failed for '{label}' ({len(issues)} issue(s)) — {action}:",
+                style=style,
+            )
+            for issue in issues:
+                verbose_log(f"    - {issue}", style="dim")
+
+        elif t == "checkpoint_save_failed":
+            n = d.get("consecutive_failures", 1)
+            # Avoid spamming when every boundary fails (e.g. disk full): warn on
+            # the first failure, then every 10th.
+            if n == 1 or n % 10 == 0:
+                err = d.get("error_type")
+                detail = f" ({err})" if err else ""
+                verbose_log(
+                    f"  WARNING: periodic checkpoint save failed{detail} — "
+                    f"this run may not be resumable if it stalls (failure #{n})",
+                    style="yellow",
+                )
+
+
+def _validator_label(data: dict[str, Any]) -> str:
+    """Build an agent label including a for-each ``item_key`` when present."""
+    agent = data.get("agent_name", "?")
+    item = data.get("item_key")
+    return f"{agent}[{item}]" if item is not None else str(agent)
 
 
 def display_usage_summary(usage_data: dict[str, Any], console: Console | None = None) -> None:
@@ -1107,7 +1266,7 @@ async def _run_with_stop_signal(
     Raises:
         ExecutionError: If the workflow was killed via the dashboard.
     """
-    return await _execute_with_stop_signal(engine.run(inputs), dashboard)
+    return await _execute_with_stop_signal(engine.run(inputs), dashboard, engine=engine)
 
 
 async def _resume_with_stop_signal(
@@ -1130,12 +1289,13 @@ async def _resume_with_stop_signal(
     Raises:
         ExecutionError: If the workflow was killed via the dashboard.
     """
-    return await _execute_with_stop_signal(engine.resume(current_agent), dashboard)
+    return await _execute_with_stop_signal(engine.resume(current_agent), dashboard, engine=engine)
 
 
 async def _execute_with_stop_signal(
     engine_coro: Any,
     dashboard: Any | None,
+    engine: Any | None = None,
 ) -> dict[str, Any]:
     """Execute an engine coroutine, racing against a dashboard kill signal.
 
@@ -1143,6 +1303,12 @@ async def _execute_with_stop_signal(
         engine_coro: The coroutine to execute (``engine.run()`` or
             ``engine.resume()``).
         dashboard: The ``WebDashboard`` instance, or None.
+        engine: The ``WorkflowEngine`` instance backing ``engine_coro``. When a
+            dashboard stop/kill cancels the engine task, this is used to write a
+            best-effort checkpoint and emit ``workflow_failed`` so the run is
+            never lost silently (issue #245). May be ``None`` (e.g. in unit
+            tests that pass a bare coroutine), in which case the checkpoint step
+            is skipped.
 
     Returns:
         The workflow result dict.
@@ -1173,10 +1339,36 @@ async def _execute_with_stop_signal(
     if engine_task in done:
         return engine_task.result()
 
-    # Stop was requested — raise an error so the workflow is treated as failed
+    # Stop/kill won the race. The engine task was in ``pending`` and we just
+    # cancelled + drained it. Three outcomes are possible:
+    #
+    #   * It actually cancelled (``engine_task.cancelled()``) — the engine's
+    #     ``except asyncio.CancelledError`` arm ran, which intentionally emits
+    #     no ``workflow_failed`` and saves no checkpoint. Give the run a
+    #     best-effort checkpoint + terminal event here so progress isn't lost.
+    #   * It completed with its own exception (e.g. ``InterruptError`` from a
+    #     pause -> Kill that raised inside the loop just as Stop fired). In that
+    #     case the engine already emitted ``workflow_failed`` and saved a
+    #     checkpoint, so re-raise that exception untouched — do not double-handle.
+    #   * It completed with a *result* (swallowed the cancellation and returned).
+    #     Unreachable today since ``run``/``resume`` re-raise ``CancelledError``,
+    #     but guard against a future refactor by returning that result rather
+    #     than emitting a spurious ``workflow_failed`` after ``workflow_completed``.
+    if not engine_task.cancelled():
+        exc = engine_task.exception()
+        if exc is not None:
+            raise exc
+        return engine_task.result()
+
+    # Single source of truth for the user-facing stop reason: it feeds both the
+    # engine's checkpoint/``workflow_failed`` message and the raised exception.
+    stop_message = "Workflow stopped by user via dashboard"
+    if engine is not None:
+        engine.handle_dashboard_stop(stop_message)
+
     from conductor.exceptions import ExecutionError
 
-    raise ExecutionError("Workflow stopped by user via dashboard")
+    raise ExecutionError(stop_message)
 
 
 async def run_workflow_async(
@@ -1633,7 +1825,7 @@ def build_dry_run_plan(workflow_path: Path) -> ExecutionPlan:
     from conductor.config.schema import AgentDef
     from conductor.providers.base import AgentOutput, AgentProvider
 
-    class _MockProvider(AgentProvider):
+    class _MockProvider(AgentProvider, abstract=True):
         async def execute(
             self,
             agent: AgentDef,
