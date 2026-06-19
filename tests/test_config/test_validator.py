@@ -309,6 +309,79 @@ class TestInputReferenceValidation:
         warnings = validate_workflow_config(config)
         assert any("unknown" in w for w in warnings)
 
+    def test_valid_nested_explicit_output_reference(self) -> None:
+        """Nested explicit refs (agent.output.foo.bar) pass validation."""
+        config = WorkflowConfig(
+            workflow=WorkflowDef(name="test", entry_point="producer"),
+            agents=[
+                AgentDef(
+                    name="producer",
+                    model="gpt-4",
+                    prompt="Produce",
+                    routes=[RouteDef(to="consumer")],
+                ),
+                AgentDef(
+                    name="consumer",
+                    model="gpt-4",
+                    prompt="Consume",
+                    input=["producer.output.foo.bar"],
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+        )
+
+        validate_workflow_config(config)
+
+    def test_valid_nested_shorthand_output_reference(self) -> None:
+        """Nested shorthand refs (agent.foo.bar) pass validation."""
+        config = WorkflowConfig(
+            workflow=WorkflowDef(name="test", entry_point="producer"),
+            agents=[
+                AgentDef(
+                    name="producer",
+                    model="gpt-4",
+                    prompt="Produce",
+                    routes=[RouteDef(to="consumer")],
+                ),
+                AgentDef(
+                    name="consumer",
+                    model="gpt-4",
+                    prompt="Consume",
+                    input=["producer.foo.bar"],
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+        )
+
+        validate_workflow_config(config)
+
+    def test_invalid_nested_ref_message_mentions_explicit_and_shorthand_forms(self) -> None:
+        """Malformed nested refs should mention both supported nested forms."""
+        config = WorkflowConfig(
+            workflow=WorkflowDef(name="test", entry_point="producer"),
+            agents=[
+                AgentDef(
+                    name="producer",
+                    model="gpt-4",
+                    prompt="Produce",
+                    routes=[RouteDef(to="consumer")],
+                ),
+                AgentDef(
+                    name="consumer",
+                    model="gpt-4",
+                    prompt="Consume",
+                    input=["producer.output.foo..bar"],
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+        )
+
+        with pytest.raises(ConfigurationError) as exc_info:
+            validate_workflow_config(config)
+        msg = str(exc_info.value)
+        assert "agent_name.output.field[.subfield...]" in msg
+        assert "agent_name.field[.subfield...]" in msg
+
 
 class TestToolValidation:
     """Tests for tool reference validation."""
@@ -811,6 +884,32 @@ class TestInputRefPatternExtensions:
         assert m_err.group("pg_kind") == "errors"
 
     @pytest.mark.parametrize(
+        "ref",
+        [
+            # Legacy shapes (must still pass)
+            "agent.output",
+            "agent.output.field",
+            "agent.output?",
+            "agent.output.field?",
+            "workflow.input.param",
+            "workflow.input.param?",
+            "group.outputs.agent.field",
+            # New: nested explicit output
+            "agent.output.field.subfield",
+            "agent.output.field.subfield?",
+            "agent.output.a.b.c",
+            # New: shorthand
+            "agent.field",
+            "agent.field?",
+            "agent.field.subfield",
+            "agent.field.subfield?",
+            "agent.foo.bar.baz",
+        ],
+    )
+    def test_pattern_accepts_nested_and_shorthand_shapes(self, ref: str) -> None:
+        assert INPUT_REF_PATTERN.match(ref) is not None
+
+    @pytest.mark.parametrize(
         "ref,expected_parallel",
         [
             ("group.errors", "group"),
@@ -823,7 +922,7 @@ class TestInputRefPatternExtensions:
             ("group.outputs?", "group"),
         ],
     )
-    def test_pattern_accepts_new_shapes(self, ref: str, expected_parallel: str) -> None:
+    def test_pattern_accepts_parallel_shapes(self, ref: str, expected_parallel: str) -> None:
         match = INPUT_REF_PATTERN.match(ref)
         assert match is not None, f"{ref!r} should match INPUT_REF_PATTERN"
         assert match.group("parallel") == expected_parallel
@@ -831,24 +930,9 @@ class TestInputRefPatternExtensions:
     @pytest.mark.parametrize(
         "ref",
         [
-            "agent.output",
-            "agent.output.field",
-            "agent.output?",
-            "agent.output.field?",
-            "workflow.input.param",
-            "workflow.input.param?",
-        ],
-    )
-    def test_pattern_still_accepts_legacy_shapes(self, ref: str) -> None:
-        assert INPUT_REF_PATTERN.match(ref) is not None
-
-    @pytest.mark.parametrize(
-        "ref",
-        [
             "workflow.input",  # bare workflow.input no longer accepted
             "agent",
-            "agent.foo",
-            "group.bogus",
+            "group.outputs.agent.field.subfield",  # deeper parallel projection not supported
         ],
     )
     def test_pattern_rejects_invalid_shapes(self, ref: str) -> None:
@@ -2636,3 +2720,254 @@ class TestSubWorkflowRefValidation:
         # Confirm the sibling was actually auto-fetched into the shared SHA root.
         sibling = official_sha_root / "document-review" / "workflow.yaml"
         assert sibling.exists()
+
+
+class TestTerminateValidation:
+    """Cross-field validation for ``type: terminate`` steps (issue #219).
+
+    The schema layer alone cannot catch every misuse — terminate steps
+    interact with the wider workflow in several ways the validator must guard:
+
+    - Routes from regular agents are allowed to target a terminate step,
+      because that is the point of the feature.
+    - Terminate cannot be used as a parallel-group member or as a for_each
+      inline agent — those execution contexts swallow exceptions or assume
+      the inline step is a normal agent.
+    - When a terminate step provides its own ``output_template``, the
+      workflow-level ``output:`` coverage analysis must NOT flag missing
+      refs against that path (the path skips ``workflow.output`` entirely).
+    - Jinja2 templates inside ``reason`` and ``output_template`` must be
+      validated like every other template (no stale agent refs).
+    """
+
+    def test_routes_can_target_terminate(self) -> None:
+        config = WorkflowConfig(
+            workflow=WorkflowDef(name="t", entry_point="precheck"),
+            agents=[
+                AgentDef(
+                    name="precheck",
+                    model="gpt-4",
+                    prompt="check",
+                    routes=[RouteDef(to="abort"), RouteDef(to="$end")],
+                ),
+                AgentDef(
+                    name="abort",
+                    type="terminate",
+                    status="failed",
+                    reason="nope",
+                ),
+            ],
+        )
+        validate_workflow_config(config)  # must not raise
+
+    def test_terminate_can_be_entry_point(self) -> None:
+        """Unusual but valid — workflow ends immediately on the first step."""
+        config = WorkflowConfig(
+            workflow=WorkflowDef(name="t", entry_point="goodbye"),
+            agents=[
+                AgentDef(
+                    name="goodbye",
+                    type="terminate",
+                    status="success",
+                    reason="nothing to do",
+                ),
+            ],
+        )
+        validate_workflow_config(config)  # must not raise
+
+    def test_terminate_rejected_inside_parallel_group(self) -> None:
+        """Parallel branches run inside `asyncio.gather(return_exceptions=True)`;
+        an explicit termination from one branch would be wrapped/swallowed
+        rather than ending the workflow as intended."""
+        config = WorkflowConfig(
+            workflow=WorkflowDef(name="t", entry_point="group"),
+            agents=[
+                AgentDef(name="a", model="gpt-4", prompt="x"),
+                AgentDef(
+                    name="b",
+                    type="terminate",
+                    status="failed",
+                    reason="nope",
+                ),
+            ],
+            parallel=[
+                ParallelGroup(name="group", agents=["a", "b"], routes=[RouteDef(to="$end")]),
+            ],
+        )
+        with pytest.raises(ConfigurationError, match="terminate step"):
+            validate_workflow_config(config)
+
+    def test_terminate_rejected_as_for_each_inline_agent(self) -> None:
+        # ``as`` is a Python keyword; construct via dict so the validation
+        # alias resolves to ``as_`` correctly.
+        for_each = ForEachDef.model_validate(
+            {
+                "name": "loop",
+                "type": "for_each",
+                "source": "workflow.input.items",
+                "as": "item",
+                "agent": AgentDef(
+                    name="bail",
+                    type="terminate",
+                    status="failed",
+                    reason="r",
+                ),
+                "routes": [RouteDef(to="$end")],
+            }
+        )
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="t",
+                entry_point="finder",
+                input={"items": InputDef(type="array")},
+            ),
+            agents=[
+                AgentDef(
+                    name="finder",
+                    model="gpt-4",
+                    prompt="x",
+                    routes=[RouteDef(to="loop")],
+                ),
+            ],
+            for_each=[for_each],
+        )
+        with pytest.raises(ConfigurationError, match="terminate step"):
+            validate_workflow_config(config)
+
+    def test_output_template_skips_workflow_output_coverage(self) -> None:
+        """Paths ending in terminate-with-output_template bypass workflow.output.
+
+        Without the path-coverage carve-out, the validator would warn that
+        ``writer`` is "not reached on all paths" — true, but irrelevant: the
+        terminate path doesn't use ``workflow.output`` at all.
+        """
+        config = WorkflowConfig(
+            workflow=WorkflowDef(name="t", entry_point="check"),
+            agents=[
+                AgentDef(
+                    name="check",
+                    model="gpt-4",
+                    prompt="x",
+                    routes=[RouteDef(to="bail"), RouteDef(to="writer")],
+                ),
+                AgentDef(
+                    name="bail",
+                    type="terminate",
+                    status="failed",
+                    reason="nope",
+                    output_template={"result": "aborted"},
+                ),
+                AgentDef(
+                    name="writer",
+                    model="gpt-4",
+                    prompt="x",
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"result": "{{ writer.output.result }}"},
+        )
+        warnings = validate_workflow_config(config)
+        # Only the writer path consumes workflow.output; the bail-path
+        # supplies its own output_template and is excluded from coverage.
+        assert not any("writer" in w and "not run on all paths" in w for w in warnings), (
+            f"unexpected coverage warning: {warnings!r}"
+        )
+
+    def test_output_template_with_fallback_still_warns(self) -> None:
+        """A terminate path WITHOUT `output_template` falls back to workflow.output —
+        it should be analyzed for coverage like any normal terminal path."""
+        config = WorkflowConfig(
+            workflow=WorkflowDef(name="t", entry_point="check"),
+            agents=[
+                AgentDef(
+                    name="check",
+                    model="gpt-4",
+                    prompt="x",
+                    routes=[RouteDef(to="bail"), RouteDef(to="writer")],
+                ),
+                AgentDef(
+                    name="bail",
+                    type="terminate",
+                    status="failed",
+                    reason="nope",
+                ),
+                AgentDef(
+                    name="writer",
+                    model="gpt-4",
+                    prompt="x",
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"result": "{{ writer.output.result }}"},
+        )
+        warnings = validate_workflow_config(config)
+        assert any("writer" in w and "not run on all paths" in w for w in warnings), (
+            f"expected coverage warning for terminate fallback path; got: {warnings!r}"
+        )
+
+    def test_reason_template_validated(self) -> None:
+        """Bad refs in ``reason`` must fail validation, not surprise at runtime."""
+        config = WorkflowConfig(
+            workflow=WorkflowDef(name="t", entry_point="check"),
+            agents=[
+                AgentDef(
+                    name="check",
+                    model="gpt-4",
+                    prompt="x",
+                    routes=[RouteDef(to="bail"), RouteDef(to="$end")],
+                ),
+                AgentDef(
+                    name="bail",
+                    type="terminate",
+                    status="failed",
+                    reason="{{ ghost.output.value }}",
+                ),
+            ],
+        )
+        with pytest.raises(ConfigurationError, match=r"ghost"):
+            validate_workflow_config(config)
+
+    def test_output_template_template_validated(self) -> None:
+        """Bad refs in ``output_template`` values must fail validation too."""
+        config = WorkflowConfig(
+            workflow=WorkflowDef(name="t", entry_point="check"),
+            agents=[
+                AgentDef(
+                    name="check",
+                    model="gpt-4",
+                    prompt="x",
+                    routes=[RouteDef(to="bail"), RouteDef(to="$end")],
+                ),
+                AgentDef(
+                    name="bail",
+                    type="terminate",
+                    status="failed",
+                    reason="halt",
+                    output_template={"r": "{{ ghost.output.value }}"},
+                ),
+            ],
+        )
+        with pytest.raises(ConfigurationError, match=r"ghost"):
+            validate_workflow_config(config)
+
+    def test_unknown_route_target_message_unchanged_for_terminate(self) -> None:
+        """Routes to an undefined name still error — terminate doesn't bypass this.
+
+        The schema-level route-target check runs on every WorkflowConfig, so
+        the unknown target surfaces as a Pydantic ValidationError at
+        construction time (not via :func:`validate_workflow_config`).
+        """
+        from pydantic import ValidationError as PydanticValidationError
+
+        with pytest.raises(PydanticValidationError, match=r"unknown agent"):
+            WorkflowConfig(
+                workflow=WorkflowDef(name="t", entry_point="check"),
+                agents=[
+                    AgentDef(
+                        name="check",
+                        model="gpt-4",
+                        prompt="x",
+                        routes=[RouteDef(to="not_defined")],
+                    ),
+                ],
+            )

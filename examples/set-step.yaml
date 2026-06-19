@@ -1,0 +1,113 @@
+# Set Step Example
+#
+# Demonstrates `type: set` — a deterministic step that evaluates one or more
+# Jinja2 expressions and binds the typed results into the workflow context.
+# No LLM call, no subprocess; ideal for combining inputs, deriving flags,
+# computing constants, or normalising values once for many downstream
+# consumers.
+#
+# This workflow:
+#   1. compute_slug — single `value:` step combining org + repo into a string.
+#                     Accessible as compute_slug.output.
+#   2. derive_flags — multi `values:` step deriving a boolean, a default
+#                     branch, and a default model. Accessible as
+#                     derive_flags.output.is_breaking, .target_branch,
+#                     .effective_model.
+#   3. A route on derive_flags branches on the boolean using
+#      `when: "{{ output.is_breaking }}"`. Routes attached directly to a set
+#      step evaluate against the step's bound value — dict outputs expose
+#      `{{ output.<key> }}`, scalar outputs expose `{{ output }}`.
+#   4. The destination is a script step that simply echoes the chosen path,
+#      so the example runs without a provider connection.
+#
+# Try it:
+#   uv run conductor run examples/set-step.yaml \
+#     --input org=microsoft --input repo=conductor --input severity=high
+#   uv run conductor run examples/set-step.yaml \
+#     --input org=microsoft --input repo=conductor --input severity=low
+
+workflow:
+  name: set-step-demo
+  description: "Demonstrates `type: set` for deriving named values from Jinja2"
+  version: "1.0.0"
+  entry_point: compute_slug
+
+  input:
+    org:
+      type: string
+      description: GitHub org
+    repo:
+      type: string
+      description: GitHub repo
+    severity:
+      type: string
+      description: Severity label used to derive the is_breaking flag
+    branch:
+      type: string
+      description: Optional branch override
+      required: false
+    model:
+      type: string
+      description: Optional model identifier
+      required: false
+
+  runtime:
+    provider: copilot
+
+  limits:
+    max_iterations: 10
+
+agents:
+  # Single value: bind a single Jinja2 expression as a scalar.
+  - name: compute_slug
+    type: set
+    description: Combine org + repo into a single string accessible as compute_slug.output
+    value: "{{ workflow.input.org }}/{{ workflow.input.repo }}"
+    routes:
+      - to: derive_flags
+
+  # Multi values: render each key independently against the original context.
+  # Output is a dict accessible as derive_flags.output.<key>.
+  - name: derive_flags
+    type: set
+    description: Derive a boolean flag, default branch, and default model
+    values:
+      is_breaking: "{{ workflow.input.severity in ['high', 'critical'] }}"
+      target_branch: "{{ workflow.input.branch or 'main' }}"
+      effective_model: "{{ workflow.input.model | default('claude-sonnet-4-5') }}"
+    routes:
+      - to: breaking_path
+        when: "{{ output.is_breaking }}"
+      - to: safe_path
+
+  - name: breaking_path
+    type: script
+    description: Handler for breaking changes
+    command: python3
+    args:
+      - "-c"
+      - "print('BREAKING change on {{ derive_flags.output.target_branch }} for {{ compute_slug.output }}')"
+    routes:
+      - to: $end
+
+  - name: safe_path
+    type: script
+    description: Handler for non-breaking changes
+    command: python3
+    args:
+      - "-c"
+      - "print('safe change on {{ derive_flags.output.target_branch }} for {{ compute_slug.output }}')"
+    routes:
+      - to: $end
+
+output:
+  slug: "{{ compute_slug.output }}"
+  is_breaking: "{{ derive_flags.output.is_breaking }}"
+  target_branch: "{{ derive_flags.output.target_branch }}"
+  effective_model: "{{ derive_flags.output.effective_model }}"
+  summary: |
+    {%- if breaking_path is defined -%}
+    {{ breaking_path.output.stdout | trim }}
+    {%- else -%}
+    {{ safe_path.output.stdout | trim }}
+    {%- endif -%}

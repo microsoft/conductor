@@ -6,7 +6,7 @@ Complete reference for all YAML configuration options. Derived from the Pydantic
 
 ```yaml
 workflow: WorkflowDef              # Required: workflow configuration
-tools: [string]                    # Optional: workflow-level tool names
+tools: [string]                    # Optional: workflow-level tool names (ignored by claude-agent-sdk — uses CLI config)
 agents: [AgentDef]                 # Required: agent definitions
 parallel: [ParallelGroup]         # Optional: static parallel groups
 for_each: [ForEachDef]            # Optional: dynamic parallel groups
@@ -27,15 +27,16 @@ workflow:
 
   # Runtime configuration
   runtime:
-    provider: string                # "copilot" (default), "claude", or "openai-agents"
+    provider: string | object       # "copilot" (default), "claude", "claude-agent-sdk", or "openai-agents"
+                                    # — or a ProviderSettings object (see below)
     default_model: string           # Default model for all agents
-    temperature: float              # 0.0-1.0, controls randomness (optional)
-    max_tokens: integer             # Max OUTPUT tokens per response, 1-200000 (optional)
-    timeout: float                  # Per-request timeout in seconds (optional, default: 600)
+    temperature: float              # 0.0-1.0, controls randomness (optional, copilot/claude only)
+    max_tokens: integer             # Max OUTPUT tokens per response, 1-200000 (optional, copilot/claude only)
+    timeout: float                  # Per-request timeout in seconds (optional, default: 600, copilot/claude only)
     max_agent_iterations: integer   # Max tool-use roundtrips per agent (1-500, optional)
     max_session_seconds: float      # Wall-clock timeout per agent session in seconds (optional)
     default_reasoning_effort: string # Workflow-wide reasoning/thinking effort: low, medium, high, xhigh (optional)
-    mcp_servers:                    # MCP server configurations
+    mcp_servers:                    # MCP server configurations (ignored by claude-agent-sdk — uses CLI config)
       <server_name>:
         type: string                # "stdio" (default), "http", or "sse"
         command: string             # Command to run (required for stdio)
@@ -103,10 +104,10 @@ agents:
     name: string                    # Unique agent identifier
 
     # Optional fields
-    type: string                    # "agent" (default), "human_gate", "script", or "workflow"
+    type: string                    # "agent" (default), "human_gate", "script", "workflow", "wait", or "terminate"
     description: string             # What this agent does
     model: string                   # Override default_model
-    provider: string                # Per-agent provider override ("copilot" or "claude")
+    provider: string                # Per-agent provider override ("copilot", "claude", or "claude-agent-sdk")
 
     # Input specification (for explicit context mode)
     input:
@@ -145,14 +146,14 @@ agents:
     timeout_seconds: float          # Hard wall-clock timeout (>=1.0); engine wraps in asyncio.wait_for().
                                     # Effective limit = min(timeout_seconds, remaining_workflow_timeout).
                                     # Raises AgentTimeoutError; non-retryable.
-                                    # Forbidden on script (use 'timeout' instead), human_gate, workflow.
+                                    # Forbidden on script (use 'timeout' instead), human_gate, workflow, wait.
 
     # Per-agent reasoning effort (overrides runtime.default_reasoning_effort)
-    # Not allowed for script, human_gate, or workflow agent types.
+    # Not allowed for script, human_gate, workflow, or wait agent types.
     reasoning:
       effort: string                # low, medium, high, or xhigh
 
-    # Per-agent retry policy (optional, not allowed for script, human_gate, or workflow agents)
+    # Per-agent retry policy (optional, not allowed for script, human_gate, workflow, or wait agents)
     retry:
       max_attempts: integer         # Max attempts including first (1-10, default: 1 = no retry)
       backoff: string               # "exponential" (default) or "fixed"
@@ -163,6 +164,12 @@ agents:
     # Conditional dialog mode (optional, only on provider-backed agents)
     dialog:
       trigger_prompt: string        # Criteria evaluated against agent output by an LLM gate
+
+    # Semantic output validation with retry-once (optional, provider-backed agents only)
+    validator:
+      criteria: string              # Required: rubric the output is graded against
+      model: string                 # Optional: validator model (defaults to the agent's model)
+      max_retries: integer          # Re-runs on failure: 0 or 1 (default 1; hard-capped at 1)
 
     # Sub-workflow fields (type: workflow)
     workflow: string                # Path to sub-workflow YAML (relative to parent), required
@@ -177,11 +184,29 @@ agents:
     env: {string: string}           # Extra environment variables
     working_dir: string             # Working directory (Jinja2 templated)
     timeout: integer                # Per-script timeout in seconds
+
+    # Set-only fields (type: set) — exactly one of value: / values: required
+    value: string                   # Single Jinja2 expression (typed result)
+    values:                         # Multi-binding: each key gets its own typed result
+      <key>: string
+    output_type: string             # auto|string|number|integer|boolean|list|dict
+                                    # (single value: only; per-key typing on values: not supported)
+
+    # Terminate-only fields (type: terminate)
+    status: string                  # Required: "success" or "failed"
+    reason: string                  # Required: Jinja2-templated termination reason
+    output_template:                # Optional: replaces workflow-level output: for this path
+      <key>: string                 # Each value Jinja2-templated, then JSON-coerced
+                                    # ("true" -> True, "42" -> 42, JSON literals parsed)
 ```
 
-**Script agent restrictions:** Cannot have `prompt`, `provider`, `model`, `tools`, `output`, `system_prompt`, `options`, `retry`, `reasoning`, `dialog`, `max_session_seconds`, `max_agent_iterations`, `timeout_seconds` (use `timeout`), `input_mapping`, or `max_depth`. Output is always `{stdout, stderr, exit_code}`. If `stdout` is valid JSON, its top-level keys are auto-merged into the output dict.
+**Script agent restrictions:** Cannot have `prompt`, `provider`, `model`, `tools`, `output`, `system_prompt`, `options`, `retry`, `reasoning`, `dialog`, `validator`, `max_session_seconds`, `max_agent_iterations`, `timeout_seconds` (use `timeout`), `input_mapping`, or `max_depth`. Output is always `{stdout, stderr, exit_code}`. If `stdout` is valid JSON, its top-level keys are auto-merged into the output dict.
 
-**Workflow agent restrictions (`type: workflow`):** Cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, `command`, `options`, `retry`, `reasoning`, `dialog`, `max_session_seconds`, `max_agent_iterations`, or `timeout_seconds`. Requires `workflow:` path. Supports `input_mapping` and `max_depth`. Allowed inside `for_each` groups for dynamic fan-out.
+**Set agent restrictions:** Cannot have `prompt`, `provider`, `model`, `tools`, `system_prompt`, `options`, `command`, `args`, `env`, `working_dir`, `timeout`, `workflow`, `input_mapping`, `max_depth`, `retry`, `dialog`, `validator`, `reasoning`, `timeout_seconds`, `max_session_seconds`, or `max_agent_iterations`. Requires exactly one of `value:` or `values:`. `output_type:` is forbidden with `values:` (per-key typing not yet supported). `output:` schema validation is permitted only when the rendered output is a dict (always for `values:`, sometimes for `value:`); a scalar with a declared schema raises `ValidationError`. Set agents are allowed inside `parallel` groups and as `for_each` inline agents, and count toward `limits.max_iterations` like any other step.
+
+**Workflow agent restrictions (`type: workflow`):** Cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, `command`, `options`, `retry`, `reasoning`, `dialog`, `validator`, `max_session_seconds`, `max_agent_iterations`, or `timeout_seconds`. Requires `workflow:` path. Supports `input_mapping` and `max_depth`. Allowed inside `for_each` groups for dynamic fan-out.
+
+**Terminate agent restrictions (`type: terminate`):** Requires `status` (`success` | `failed`) and a non-empty `reason`. Cannot have `routes`, `tools`, `output`, `prompt`, `model`, `provider`, `system_prompt`, `command`, `args`, `env`, `working_dir`, `timeout`, `timeout_seconds`, `max_session_seconds`, `max_agent_iterations`, `max_depth`, `retry`, `dialog`, `validator`, `reasoning`, `workflow`, `input_mapping`, or `options`. Cannot be used as a parallel-group member or as a `for_each` inline agent — route to a terminate step from those groups' `routes:` instead. Reaching a terminate step ends the workflow immediately (no routes evaluated after) and produces a distinguishable event payload: `workflow_completed` (for `success`) or `workflow_failed` (for `failed`) with `termination_reason`, `terminated_by`, `is_explicit: true`, and `status`. `status: failed` raises `WorkflowTerminated` (an `ExecutionError` subclass), gives the CLI a non-zero exit code, and is intentionally NOT resumable (no on-failure checkpoint saved). Inside a sub-workflow, a `status: failed` terminate is downgraded at the parent boundary to `SubworkflowTerminatedError` (also an `ExecutionError`), preserving the child's rendered `terminated_output`/`terminated_reason`/`terminated_by` as attributes on the wrapper.
 
 **Reasoning effort:** `reasoning.effort` (and `runtime.default_reasoning_effort`) accepts `low`, `medium`, `high`, or `xhigh`. Per-agent value overrides the runtime default. Each provider translates the unified value to its native API:
 
@@ -190,7 +215,9 @@ agents:
 
 Both providers continue to surface reasoning content via `agent_reasoning` events visible in the dashboard, JSONL logs, and console at `-vv`.
 
-Forbidden on agent types: `script`, `human_gate`, `workflow`.
+Forbidden on agent types: `script`, `human_gate`, `workflow`, `wait`.
+
+**Validator (semantic output validation):** `validator.criteria` (required) is graded by a second LLM call after the agent completes, returning `{passed, issues}`. On `passed: false` and `max_retries > 0` (default 1, hard-capped at 1; `0` = report-only), the agent re-runs once with a `## Validation feedback` section appended to its prompt; the second output is final (no second validation loop). `validator.model` defaults to the agent's model. Distinct from `retry:` (transient failures, same prompt) and `output:` (shape/type). Provider-backed `agent` steps only (forbidden on `script`, `human_gate`, `workflow`, `wait`, `set`, `terminate`); works in the main loop, parallel groups, and for-each loops. Fail-open: validator errors / unparseable responses are treated as a pass with a logged warning. Validator (and any discarded first attempt) token cost is recorded as a separate `<agent> (validator)` usage row. Emits `agent_validator_start`, `agent_validator_complete`, and `agent_validation_failed` events.
 
 ## Script Agent Schema
 
@@ -221,6 +248,121 @@ Script agents always produce:
 {{ script_name.output.stderr }}     # Captured standard error
 {{ script_name.output.exit_code }}  # Process exit code (0 = success)
 ```
+
+## Wait Agent Schema
+
+Wait agents pause workflow execution for a parsed duration via in-process `asyncio.sleep`. Cross-platform — no shell `sleep` dependency. Use for rate-limit cooldowns, polling intervals, and external-system catch-up.
+
+```yaml
+agents:
+  - name: string
+    type: wait                      # Required
+    description: string             # Optional
+    duration: string | number       # Required: see "Duration format" below
+    reason: string                  # Optional: human-readable reason (shown in dashboard)
+    input: [string]                 # Optional: context dependencies
+    routes:                         # Required: routing rules
+      - to: string
+        when: string                # May reference waited_seconds
+```
+
+### Duration Format
+
+`duration` accepts:
+
+- A plain `int` or `float` (interpreted as seconds): `duration: 60`, `duration: 1.5`
+- A string with a unit suffix — `ms`, `s`, `m`, `h`: `"500ms"`, `"60s"`, `"2.5m"`, `"1h"`
+- A Jinja2 template rendering to one of the above: `"{{ workflow.input.interval }}s"`
+  (templates defer literal validation to runtime)
+
+The resolved duration must be **> 0 and ≤ 24h** (`86400s`). Booleans are rejected.
+
+### Wait Output
+
+Wait agents produce a single, strict field:
+
+```jinja2
+{{ wait_name.output.waited_seconds }}  # Actual seconds slept (may be < requested on interrupt)
+```
+
+### Wait Restrictions
+
+Forbidden fields: `prompt`, `model`, `provider`, `tools`, `system_prompt`, `options`, `command`, `args`, `env`, `working_dir`, `timeout`, `workflow`, `input_mapping`, `max_depth`, `max_session_seconds`, `max_agent_iterations`, `retry`, `dialog`, `validator`, `reasoning`, `timeout_seconds`, `output`. Wait steps cannot be used inside `parallel` or `for_each` groups.
+
+`Esc` / `Ctrl+G` cancels in-progress waits. Workflow-level `limits.timeout_seconds` also cancels them.
+## Set Agent Schema
+
+Set agents evaluate Jinja2 expressions and bind typed values into the workflow context — no LLM call, no subprocess:
+
+```yaml
+agents:
+  # Single binding form — output is the typed scalar / list / dict.
+  - name: string
+    type: set                       # Required
+    description: string             # Optional
+    value: string                   # Required (when not using values:): Jinja2 expression
+    output_type: string             # Optional: auto|string|number|integer|boolean|list|dict
+    input: [string]                 # Optional: context dependencies
+    routes:                         # Optional: routing rules
+      - to: string
+
+  # Multi-binding form — output is a dict, each key gets its own typed result.
+  - name: string
+    type: set
+    values:                         # Required (when not using value:): named bindings
+      <key>: string                 # Jinja2 expression per key
+    input: [string]
+    routes:
+      - to: string
+        when: string                # e.g. "{{ output.<key> }}" (Jinja2) or "<key>" (simpleeval)
+```
+
+Exactly one of `value:` or `values:` must be present. `output_type:` only applies to single `value:`.
+
+### Set Output
+
+```jinja2
+# Single value:
+{{ step.output }}                  # The typed scalar / list / dict directly
+
+# Multi values:
+{{ step.output.is_breaking }}      # Each declared key
+{{ step.output.target_branch }}
+```
+
+### Type Detection (auto)
+
+Default (`output_type` unset or `auto`) uses safe YAML loading (equivalent to `yaml.safe_load`):
+
+- Booleans, numbers, lists, dicts → native Python types
+- Parse failures and pure-comment renders → raw string
+- Empty / whitespace-only renders → `""` (not `None`)
+- `datetime` / `date` / `time` (e.g. from `"2024-01-02"`) → ISO 8601 string (keeps checkpoints JSON-safe)
+- Any other non-JSON-safe Python value → `ExecutionError`
+
+### Routing on Set Output
+
+Routes attached to a set step evaluate against the bound value directly:
+
+```yaml
+# Dict-shaped output → access fields via Jinja2 or simpleeval flattening.
+routes:
+  - to: hot_path
+    when: "{{ output.is_breaking }}"     # Jinja2
+  - to: hot_path
+    when: "is_breaking"                  # simpleeval (flattened)
+
+# Scalar output → use {{ output }}.
+routes:
+  - to: hot_path
+    when: "{{ output }}"
+```
+
+### Set Step Composition
+
+- Allowed inside `parallel` groups (each member publishes to context). Templates cannot reference sibling group members — the validator catches this at config time.
+- Allowed as the inline agent of a `for_each` group (one bound value per item).
+- Each invocation emits `set_started` / `set_completed` / `set_failed` events with `output_type`, `output_keys`, and a 512-char-truncated `value_repr`.
 
 ## File Includes (`!file` Tag)
 
@@ -256,11 +398,19 @@ agents:
         route: string               # Agent to route to when selected
         prompt_for: string          # Optional: field name to collect text input from user
 
-    output:                         # Captured automatically
-      selected:                     # The selected option value
+    output:                         # Captured automatically (do not declare in YAML)
+      selected:                     # The chosen option's `value`
         type: string
-      feedback:                     # Text from prompt_for (if used)
-        type: string
+      additional_input:             # Dict of values collected from `prompt_for` fields.
+        type: dict                  # Always present; `{}` when no `prompt_for` is set
+                                    # or when the selected option has no `prompt_for`.
+                                    # Access fields via templates as:
+                                    #   {{ <gate>.output.additional_input.<field> }}
+                                    # In `context: explicit` mode, `input:` declarations
+                                    # support `<gate>.output.additional_input` (the whole
+                                    # dict) but not the dotted shorthand
+                                    # `<gate>.output.additional_input.<field>` — declare
+                                    # the parent and traverse in Jinja2.
 ```
 
 ## Parallel Group Schema
@@ -534,6 +684,87 @@ runtime:
       tools: ["search", "fetch"]   # Only these tools (not ["*"])
 ```
 
+## Custom Provider Routing (Ollama / vLLM / Azure OpenAI)
+
+`runtime.provider` accepts either the bare string shorthand
+(`provider: copilot`) or a structured `ProviderSettings` object that
+routes the Copilot SDK at OpenAI-compatible / Azure / Anthropic
+endpoints (Ollama, vLLM, LM Studio, Azure OpenAI, etc.).
+
+### Schema
+
+```yaml
+runtime:
+  provider:
+    name: string                  # "copilot" (default), "claude", "openai-agents"
+    type: string                  # "openai" | "azure" | "anthropic" (Copilot-only)
+    wire_api: string              # "completions" | "responses" (Copilot-only)
+    base_url: string              # Endpoint base URL
+    api_key: string               # SecretStr; redacted in dumps. Prefer ${OPENAI_API_KEY}.
+    bearer_token: string          # SecretStr; takes precedence over api_key.
+    headers: {string: string}     # Extra HTTP headers (Copilot-only)
+    azure:                        # Azure-specific options (requires type: azure)
+      api_version: string         # e.g. "2024-10-21"
+```
+
+### Local OpenAI-compatible endpoint (Ollama)
+
+```yaml
+runtime:
+  provider:
+    name: copilot
+    type: openai
+    wire_api: completions
+    base_url: http://localhost:11434/v1
+    api_key: ${OPENAI_API_KEY:-ollama}
+  default_model: llama3.1
+```
+
+### Azure OpenAI
+
+```yaml
+runtime:
+  provider:
+    name: copilot
+    type: azure
+    base_url: https://<resource>.openai.azure.com
+    api_key: ${AZURE_OPENAI_API_KEY}
+    azure:
+      api_version: "2024-10-21"
+  default_model: gpt-4o
+```
+
+### Activation and env-var fallbacks
+
+Custom routing activates **only** when YAML sets at least one
+non-`name` field. Ambient env vars alone never divert default
+routing. Once activated, missing fields fall back from env:
+
+| Field | Env-var chain |
+|---|---|
+| `base_url` | `COPILOT_PROVIDER_BASE_URL` → `OPENAI_BASE_URL` |
+| `api_key` | `COPILOT_PROVIDER_API_KEY` *(only)* |
+| `bearer_token` | `COPILOT_PROVIDER_BEARER_TOKEN` *(only)* |
+
+Ambient `OPENAI_API_KEY` is **not** an implicit fallback (would leak
+OpenAI credentials to arbitrary `base_url`); use the
+`${OPENAI_API_KEY}` YAML interpolation for explicit opt-in.
+
+### Validator rules
+
+The schema rejects these misconfigurations at config-load time:
+
+- `name != "copilot"` with any non-`name` field set
+- `type: azure` without `azure: { api_version: ... }` (or vice versa)
+- Anchorless fields: `wire_api`, `type`, `headers`, `azure` alone
+  without `base_url` / `api_key` / `bearer_token`
+- Empty containers / `SecretStr`: `headers: {}`, `api_key: ""`,
+  `bearer_token: ""`, `azure: { api_version: null }`
+
+When custom routing activates but every resolved field ends up empty,
+the Copilot provider raises `ProviderError` rather than silently
+falling back to default routing.
+
 ## Validation Rules
 
 ### Workflow Validation
@@ -551,12 +782,14 @@ runtime:
 - All route targets must be valid agent names, group names, `$end`, or `self`
 - `when` conditions must be valid Jinja2 expressions
 - `human_gate` agents require `options` and `prompt`
+- `wait` agents require `duration`; literal values must be `> 0` and `≤ 86400s` (24h)
 
 ### Parallel Group Validation
 
 - Must contain at least 2 agents
 - All referenced agents must exist
 - Route targets must be valid
+- `script`, `workflow`, and `wait` steps cannot be used inside parallel groups
 
 ### For-Each Validation
 
@@ -564,6 +797,7 @@ runtime:
 - `as` must be a valid Python identifier, not a reserved name
 - `max_concurrent` must be 1-100
 - Nested for-each groups are not allowed
+- `script` and `wait` steps cannot be used as inline agents in for-each groups
 
 ### Routing Validation
 

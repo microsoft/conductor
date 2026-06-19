@@ -53,6 +53,28 @@ Parallel code validation checks. Demonstrates:
 conductor run examples/parallel-validation.yaml --input code="def hello(): print('world')"
 ```
 
+## Set Step Examples
+
+### set-step.yaml
+
+Derive named values from Jinja2 expressions without spending an LLM call. Demonstrates:
+
+- Single `value:` binding (scalar output accessible as `step.output`)
+- Multi `values:` binding (dict output accessible as `step.output.<key>`)
+- Conditional routing on a derived boolean (`when: "{{ output.is_breaking }}"`)
+- Combining derived values with downstream script-step consumers
+
+```bash
+# Breaking-change branch
+conductor run examples/set-step.yaml \
+  --input org=microsoft --input repo=conductor --input severity=high
+
+# Safe-change branch with a custom model
+conductor run examples/set-step.yaml \
+  --input org=acme --input repo=widget --input severity=low \
+  --input model=claude-haiku-4.5
+```
+
 ## Human-in-the-Loop Examples
 
 ### design-review.yaml
@@ -72,6 +94,30 @@ conductor run examples/design-review.yaml --input requirement="Build a REST API"
 conductor run examples/design-review.yaml --input requirement="Build a REST API" --skip-gates
 ```
 
+## Explicit Termination
+
+### terminate.yaml
+
+A workflow with multiple legitimate end states beyond "the last agent finished," using `type: terminate` steps to surface each outcome distinctly. Demonstrates:
+
+- `status: success` — early-exit when there's nothing to do (CLI exit 0, dashboard ✅)
+- `status: failed` — refuse-to-run on unsafe input (CLI exit 1, dashboard ❌, emits `workflow_failed` with `is_explicit: true` and `error_type: WorkflowTerminated`)
+- Pass-through normal pipeline for the "do the work" path
+- Optional `output_template:` that replaces the workflow-level `output:` for a termination path
+
+```bash
+# Success path — soft no-op, exit 0
+conductor run examples/terminate.yaml --input document_state=current
+
+# Failure path — hard refusal, exit 1 with structured reason
+conductor run examples/terminate.yaml --input document_state=unsafe
+
+# Normal pipeline (no terminate hit)
+conductor run examples/terminate.yaml --input document_state=stale
+```
+
+CI / dashboard / notification tooling can read `is_explicit: true` from the JSONL event log to distinguish an intentional termination from a generic crash.
+
 ## Reasoning Effort
 
 ### reasoning-effort.yaml
@@ -88,6 +134,40 @@ conductor run examples/reasoning-effort.yaml \
 ```
 
 See [Reasoning Effort](../docs/configuration.md#reasoning-effort) for the per-provider translation, supported models, and validation rules.
+
+## Context Tier
+
+### context-tier.yaml
+
+A two-stage workflow that demonstrates selecting a model's long-context (e.g. 1M-token) window. Demonstrates:
+- Workflow-wide default via `runtime.default_context_tier`
+- Per-agent override via `context_tier` (wins over the default)
+- Composition with `reasoning.effort` — the two map to separate `create_session` kwargs
+- Conditional routing on a structured boolean output
+
+```bash
+conductor run examples/context-tier.yaml \
+  --input topic="root-causing a multi-service latency regression"
+```
+
+See [Context Tier](../docs/configuration.md#context-tier) for details. This is a Copilot-only capability.
+
+## Output Validation
+
+### validator.yaml
+
+A code-review workflow that demonstrates the `validator:` block — a second LLM call that grades an agent's output against a rubric and re-runs the agent once with feedback when it fails. Demonstrates:
+- A `validator.criteria` rubric checking for a real bug, actionable suggestions, and no fabricated names
+- Optional `validator.model` (defaults to the primary agent's model)
+- `max_retries: 1` (hard cap; `0` validates-and-reports without re-running)
+- Validator cost appears as a separate `code_reviewer (validator)` usage row
+
+```bash
+conductor run examples/validator.yaml
+conductor run examples/validator.yaml --input diff="$(git diff HEAD~1)"
+```
+
+See [Validator](../docs/workflow-syntax.md#validator) for the full field reference and behavior notes.
 
 ## Multi-Agent Workflows
 
@@ -126,6 +206,84 @@ Research workflow demonstrating multi-provider patterns. Demonstrates:
 
 ```bash
 conductor run examples/multi-provider-research.yaml --input topic="Cloud computing"
+```
+
+### copilot-local-llm.yaml
+
+Routes the Copilot SDK at a local / custom OpenAI-compatible endpoint
+(Ollama, vLLM, LM Studio, Azure OpenAI, etc.) via structured
+`runtime.provider` configuration. Demonstrates:
+- Object form of `runtime.provider` (the bare-string `provider: copilot`
+  shorthand still works)
+- `type` / `wire_api` / `base_url` / `api_key` forwarded to the Copilot
+  SDK's `create_session(provider=…)` parameter
+- Secret hygiene via `${OPENAI_API_KEY:-ollama}` interpolation
+- Azure OpenAI variant in a commented block
+
+```bash
+# Requires Ollama running on http://localhost:11434
+conductor run examples/copilot-local-llm.yaml --input question="What is Python?"
+```
+
+See [Configuration → Custom Provider Routing](../docs/configuration.md#custom-provider-routing-ollama--vllm--azure-openai)
+for env-var fallbacks, validator rules, and the security rationale.
+
+## Step Types
+
+### script-step.yaml
+
+Script step with shell command, JSON output parsing, and `exit_code`-based routing.
+Demonstrates:
+- `type: script` agents (cross-platform shell command execution)
+- Capturing stdout/stderr/exit_code
+- Routing on `exit_code` (`when: "exit_code == 0"`)
+- Passing script output to downstream LLM agents
+
+```bash
+conductor run examples/script-step.yaml
+```
+
+### script-stdin.yaml
+
+Hand a structured payload to a script step via **stdin** instead of
+command-line `args` — the cross-platform-safe way to pass large or
+structured data (no Windows ~32 KB command-line limit, no temp files). Demonstrates:
+- `stdin:` as a Jinja2 string template piped to the child as UTF-8
+- JSON handoff via the built-in `tojson` filter (`{{ x | tojson }}`)
+- A script consuming an upstream agent's structured output (`json.load(sys.stdin)`)
+
+```bash
+conductor run examples/script-stdin.yaml --input topic="error handling"
+```
+
+### wait-step.yaml
+
+Polling pattern with a wait step and a routing loop-back. Demonstrates:
+- `type: wait` agents (pure `asyncio.sleep`, cross-platform — no shell `sleep` dependency)
+- Templated `duration` (`"{{ workflow.input.poll_interval_seconds }}s"`)
+- Loop-back from wait → script for polling
+- `reason` field surfaced in the dashboard
+
+```bash
+conductor run examples/wait-step.yaml \
+  --input poll_interval_seconds=2 --input max_attempts=3
+```
+
+### wait-smoke.yaml
+
+Minimal wait-only workflow — no LLM, no scripts, no provider required.
+Useful as a smoke test for installation, dashboard rendering, and
+interrupt/timeout behavior. Three sequential wait steps demonstrate
+the three duration syntaxes (suffixed string, templated, plain numeric).
+
+```bash
+conductor run examples/wait-smoke.yaml
+
+# Watch wait nodes animate in the dashboard:
+conductor run examples/wait-smoke.yaml --web
+
+# Trigger the workflow timeout cancelling an in-flight wait:
+conductor run examples/wait-smoke.yaml --input middle_duration_ms=10000
 ```
 
 ## Planning and Implementation

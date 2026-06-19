@@ -279,6 +279,83 @@ class TestWorkflowStartedEvent:
         event = collector.first("workflow_started")
         assert event.data["agents"][0]["reasoning_effort"] is None
 
+    @pytest.mark.asyncio
+    async def test_workflow_started_includes_context_tier(self) -> None:
+        """workflow_started includes per-agent context_tier.
+
+        - Agent with explicit context_tier wins.
+        - Agent without explicit context_tier falls back to
+          runtime.default_context_tier.
+        """
+        emitter, collector = _make_emitter_and_collector()
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="context-tier-test",
+                entry_point="explicit",
+                runtime=RuntimeConfig(provider="copilot", default_context_tier="default"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="explicit",
+                    model="gpt-4",
+                    prompt="explicit override",
+                    context_tier="long_context",
+                    output={"x": OutputField(type="string")},
+                    routes=[RouteDef(to="default")],
+                ),
+                AgentDef(
+                    name="default",
+                    model="gpt-4",
+                    prompt="uses workflow default",
+                    output={"y": OutputField(type="string")},
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"y": "{{ default.output.y }}"},
+        )
+        provider = CopilotProvider(
+            mock_handler=lambda a, p, c: {"x": "1"} if a.name == "explicit" else {"y": "2"}
+        )
+        engine = WorkflowEngine(config, provider, event_emitter=emitter)
+        await engine.run({})
+
+        event = collector.first("workflow_started")
+        agents = {a["name"]: a for a in event.data["agents"]}
+        assert agents["explicit"]["context_tier"] == "long_context"
+        assert agents["default"]["context_tier"] == "default"
+
+    @pytest.mark.asyncio
+    async def test_workflow_started_context_tier_unset_is_none(self) -> None:
+        """When neither agent nor workflow default sets context_tier, field is None."""
+        emitter, collector = _make_emitter_and_collector()
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="no-context-tier",
+                entry_point="agent1",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="agent1",
+                    model="gpt-4",
+                    prompt="no context tier anywhere",
+                    output={"result": OutputField(type="string")},
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"result": "{{ agent1.output.result }}"},
+        )
+        provider = CopilotProvider(mock_handler=lambda a, p, c: {"result": "done"})
+        engine = WorkflowEngine(config, provider, event_emitter=emitter)
+        await engine.run({})
+
+        event = collector.first("workflow_started")
+        assert event.data["agents"][0]["context_tier"] is None
+
 
 class TestAgentEvents:
     """Tests for agent_started, agent_completed, and agent_failed events."""

@@ -116,6 +116,12 @@ class WebDashboard:
         # Interrupt event — shared with engine for POST /api/stop to abort agent
         self._interrupt_event: asyncio.Event | None = None
 
+        # Pending-stop latch — set by POST /api/stop when it arrives during the
+        # startup window before the engine has bound the interrupt event (via
+        # set_interrupt_event). Draining it there honors the Stop gracefully
+        # instead of falling back to a hard cancel that loses progress (#245).
+        self._pending_stop = False
+
         # Server internals
         self._server: Any = None
         self._serve_task: asyncio.Task[None] | None = None
@@ -211,13 +217,14 @@ class WebDashboard:
             if self._interrupt_event is not None:
                 self._interrupt_event.set()
                 return JSONResponse({"status": "stopping"})
-            # Fallback for the window before engine sets the interrupt event
-            # (e.g., during startup). This triggers _run_with_stop_signal to
-            # cancel the engine task, which may not emit workflow_failed.
-            logger.warning("POST /api/stop: interrupt_event not set; falling back to hard stop")
-            self._stop_event.set()
-            self._bg_event.set()
-            return JSONResponse({"status": "stopping"})
+            # Startup race: the engine hasn't bound the interrupt event yet.
+            # Queue the Stop instead of hard-cancelling — set_interrupt_event
+            # honors it the moment the engine binds the event, so the run takes
+            # the graceful interrupt/pause path and a checkpoint is written
+            # rather than the progress-losing hard stop (issue #245).
+            logger.info("POST /api/stop: interrupt_event not bound yet; queuing stop")
+            self._pending_stop = True
+            return JSONResponse({"status": "stopping", "queued": True})
 
         @app.post("/api/kill")
         async def kill_workflow() -> JSONResponse:
@@ -401,6 +408,7 @@ class WebDashboard:
             "workflow_completed",
             "workflow_failed",
             "checkpoint_saved",
+            "checkpoint_save_failed",
         }
     )
 
@@ -639,7 +647,7 @@ class WebDashboard:
     def _synth_agent_or_script(
         name: str, agent_def: Any, output: Any
     ) -> tuple[str, dict[str, Any], str, dict[str, Any]]:
-        """Build synthetic (started, completed) event payloads for an agent/script."""
+        """Build synthetic (started, completed) event payloads for an agent/script/wait."""
         agent_type = getattr(agent_def, "type", None) or "agent"
         output_dict = output if isinstance(output, dict) else {}
 
@@ -658,6 +666,49 @@ class WebDashboard:
                 "synthetic": True,
             }
             return "script_started", started_data, "script_completed", completed_data
+
+        if agent_type == "wait":
+            waited = output_dict.get("waited_seconds", 0.0)
+            started_data = {
+                "agent_name": name,
+                "iteration": 1,
+                "duration_seconds": waited,
+                "reason": getattr(agent_def, "reason", None),
+                "synthetic": True,
+            }
+            completed_data = {
+                "agent_name": name,
+                "elapsed": waited,
+                "waited_seconds": waited,
+                "requested_seconds": waited,
+                "reason": getattr(agent_def, "reason", None),
+                "interrupted": False,
+                "synthetic": True,
+            }
+            return "wait_started", started_data, "wait_completed", completed_data
+
+        if agent_type == "set":
+            # Mirror the live runtime's set_completed payload shape so
+            # synthetic replays render identically to live runs. Reuse
+            # render_set_value_repr to keep the 512-char truncation marker
+            # in sync with the engine emitter.
+            from conductor.executor.set_step import render_set_value_repr
+
+            declared_type = getattr(agent_def, "output_type", None) or "auto"
+            started_data = {
+                "agent_name": name,
+                "iteration": 1,
+                "synthetic": True,
+            }
+            completed_data = {
+                "agent_name": name,
+                "elapsed": 0.0,
+                "output_type": declared_type,
+                "output_keys": sorted(output_dict.keys()) if output_dict else [],
+                "value_repr": render_set_value_repr(output),
+                "synthetic": True,
+            }
+            return "set_started", started_data, "set_completed", completed_data
 
         started_data = {
             "agent_name": name,
@@ -1061,5 +1112,18 @@ class WebDashboard:
 
         Called during engine setup so POST /api/stop can abort the
         current agent via the same event the engine monitors.
+
+        If a Stop request arrived during the startup window before this was
+        called (``_pending_stop``), it is honored immediately by setting the
+        event, so the queued Stop takes the graceful interrupt path (#245).
+
+        Note: at root depth the interrupt only produces a visible pause from
+        *inside* LLM agent execution. If the workflow's first step is a
+        ``script`` / ``set`` / ``wait`` step, a queued startup Stop is consumed
+        by the between-step check without pausing — best-effort, matching
+        steady-state Stop semantics.
         """
         self._interrupt_event = event
+        if self._pending_stop:
+            self._pending_stop = False
+            event.set()

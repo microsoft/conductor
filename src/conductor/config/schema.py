@@ -8,8 +8,18 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
+from conductor.duration import parse_duration
+from conductor.providers.context_tier import ContextTier
 from conductor.providers.reasoning import ReasoningEffort
 
 BudgetMode = Literal["audit", "enforce"]
@@ -18,6 +28,10 @@ BudgetMode = Literal["audit", "enforce"]
 Shared between :class:`LimitsConfig` and :class:`conductor.engine.limits.LimitEnforcer`
 so the literal type is defined in exactly one place.
 """
+
+# Maximum allowed wait-step duration (24 hours). Anything longer almost
+# certainly wants ``limits.timeout_seconds`` reconsidered first.
+MAX_WAIT_DURATION_SECONDS = 24 * 60 * 60
 
 
 class InputDef(BaseModel):
@@ -450,6 +464,74 @@ class DialogConfig(BaseModel):
     """
 
 
+class ValidatorConfig(BaseModel):
+    """Configuration for semantic output validation with retry-once.
+
+    When present on a provider-backed agent, the engine runs a **second
+    LLM call** after the primary agent completes. The validator receives
+    the primary agent's rendered prompt, its output, and the ``criteria``
+    rubric, and must answer whether the output passes
+    (``{"passed": bool, "issues": [str, ...]}``).
+
+    If the validator returns ``passed: false`` and ``max_retries > 0``, the
+    primary agent is re-run **once** with the validator's feedback appended
+    to its prompt. The second output is taken as final — there is no second
+    validation loop.
+
+    This is distinct from ``retry:`` (transient/provider failures, same
+    prompt) and the ``output:`` schema (shape/type, not content quality).
+    It targets structurally valid but semantically wrong, incomplete, or
+    off-rubric output.
+
+    Example YAML::
+
+        validator:
+          model: claude-sonnet-4-5   # optional; defaults to the agent's model
+          criteria: |
+            Verify the review identifies all null-safety issues, every
+            suggestion is actionable, and no function names are fabricated.
+          max_retries: 1
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    criteria: str
+    """User-defined rubric the primary output is checked against.
+
+    Wrapped in the validator's system prompt. Should describe concretely
+    what a *good* output looks like (the checks the validator must perform),
+    not merely restate the agent's task.
+    """
+
+    model: str | None = None
+    """Model for the validator call. Defaults to the primary agent's model.
+
+    Often set to a cheaper or faster model than the primary agent, since
+    grading an output is usually lighter than producing it.
+    """
+
+    max_retries: int = Field(default=1, ge=0, le=1)
+    """Number of times the primary agent is re-run on validation failure.
+
+    Hard-capped at 1 by design — beyond a single feedback-driven retry you
+    are fighting prompt design, not output noise. ``0`` validates and
+    reports (emitting ``agent_validation_failed``) but never re-runs the
+    primary agent.
+    """
+
+    @field_validator("criteria")
+    @classmethod
+    def validate_criteria(cls, v: str) -> str:
+        """Reject criteria that is empty or whitespace-only.
+
+        The original (unstripped) value is returned so multi-line rubric
+        formatting is preserved.
+        """
+        if not v or not v.strip():
+            raise ValueError("validator 'criteria' must be a non-empty string")
+        return v
+
+
 class ReasoningConfig(BaseModel):
     """Configuration for model reasoning / extended thinking effort.
 
@@ -476,7 +558,36 @@ class ReasoningConfig(BaseModel):
 
 
 class AgentDef(BaseModel):
-    """Definition for a single agent in the workflow."""
+    """Definition for a single agent in the workflow.
+
+    A single Pydantic model covers all step kinds. The ``type`` field
+    discriminates between them:
+
+    - ``agent`` (default): LLM-backed agent. Requires ``prompt``; supports
+      ``model``, ``provider``, ``tools``, ``output``, ``reasoning``, ``retry``,
+      ``dialog``, and ``timeout_seconds``.
+    - ``human_gate``: Pause for user decision. Requires ``prompt`` and
+      ``options``.
+    - ``script``: Shell command step. Requires ``command``; supports
+      ``args``, ``env``, ``working_dir``, ``timeout``. Output is always
+      ``{stdout, stderr, exit_code}`` with parsed-JSON keys merged on top
+      when ``stdout`` is valid JSON.
+    - ``workflow``: Sub-workflow black-box step. Requires ``workflow:``
+      (path or registry reference); supports ``input_mapping`` and
+      ``max_depth``.
+    - ``terminate``: Explicit terminal step. Requires ``status`` (``success``
+      | ``failed``) and ``reason``; supports optional ``output_template``.
+      Reaching one ends the workflow immediately (no routes evaluated
+      after) and surfaces in the CLI exit code / dashboard / event log as
+      a distinct, intentional outcome — distinguishable from a generic
+      crash via ``is_explicit: true`` on the emitted lifecycle event.
+
+    Per-type field forbidden-lists are enforced in
+    :meth:`validate_agent_type`. Cross-cutting structural rules (e.g.,
+    terminate steps cannot appear as parallel-group members or as a
+    for_each inline agent) are enforced in
+    :func:`conductor.config.validator.validate_workflow_config`.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -486,10 +597,12 @@ class AgentDef(BaseModel):
     description: str | None = None
     """Human-readable description of agent's purpose."""
 
-    type: Literal["agent", "human_gate", "script", "workflow"] | None = None
+    type: (
+        Literal["agent", "human_gate", "script", "set", "terminate", "wait", "workflow"] | None
+    ) = None
     """Agent type. Defaults to 'agent' if not specified."""
 
-    provider: Literal["copilot", "claude"] | None = None
+    provider: Literal["copilot", "claude", "claude-agent-sdk"] | None = None
     """Provider override for this agent.
 
     If None (default), the agent uses the workflow.runtime.provider.
@@ -515,6 +628,26 @@ class AgentDef(BaseModel):
 
     Supports environment variables: ${MODEL:-default_value}
     Supports Jinja2 templates: {{ workflow.input.model_name }}
+    """
+
+    context_tier: ContextTier | None = None
+    """Context-window tier for models that support it (Copilot provider only).
+
+    Set ``context_tier: long_context`` to pin a heavy-reasoning agent to the
+    model's long-context (e.g. 1M-token) window. ``default`` selects the
+    standard tier; ``None`` sends no value (provider default).
+
+    Falls back to ``runtime.default_context_tier`` when unset. Composes
+    independently with ``reasoning`` — an agent may set both.
+
+    Only the Copilot provider forwards this today (maps to the SDK's
+    ``create_session`` ``context_tier`` param). Other providers ignore it.
+
+    Only applies to provider-backed agents (type='agent' or None).
+
+    Example YAML::
+
+        context_tier: long_context
     """
 
     input: list[str] = Field(default_factory=list)
@@ -551,8 +684,94 @@ class AgentDef(BaseModel):
     working_dir: str | None = None
     """Working directory for script subprocess execution."""
 
+    stdin: str | None = None
+    """Payload written to the script subprocess's stdin (script type only).
+
+    A Jinja2 string template rendered against the workflow context and written
+    to the child process's stdin as UTF-8. Use this to hand large structured
+    payloads to scripts without hitting OS command-line length limits (notably
+    Windows's ~32 KB command-line cap):
+
+    - JSON: ``stdin: "{{ upstream.output.evaluations | tojson }}"`` — the
+      built-in ``tojson`` filter emits valid JSON.
+    - Arbitrary text: ``stdin: "{{ diff }}"``.
+
+    Semantics:
+
+    - Omitted (``None``) — the child inherits the parent's stdin (the
+      unchanged legacy behavior).
+    - Present (any string, including ``""``) — stdin is piped; an explicit
+      empty string sends immediate EOF.
+    - Orthogonal to ``args`` — when both are set, ``args`` are still passed on
+      the command line and ``stdin`` is piped.
+    """
+
     timeout: int | None = None
     """Per-script timeout in seconds."""
+
+    duration: str | int | float | None = None
+    """Duration to pause for ``type='wait'`` steps.
+
+    Accepts:
+    - Plain ``int`` or ``float`` — interpreted as seconds.
+    - String with a unit suffix: ``ms``, ``s``, ``m``, ``h``
+      (e.g. ``"500ms"``, ``"60s"``, ``"2.5m"``, ``"1h"``).
+    - A Jinja2 template that renders to one of the above
+      (e.g. ``"{{ workflow.input.poll_interval_seconds }}s"``).
+
+    The resolved duration must be greater than 0 and no more than 24h.
+    Templated durations defer literal validation to runtime.
+    """
+
+    reason: str | None = None
+    """Optional human-readable reason shown in the dashboard for ``type='wait'`` steps."""
+
+    value: str | None = None
+    """Jinja2 expression bound into context (required for single-binding 'set' type).
+
+    The rendered string is auto-coerced to a typed value (see ``output_type``).
+    The result is stored under ``<agent_name>.output``.
+
+    Example::
+
+        value: "{{ workflow.input.org }}/{{ workflow.input.repo }}"
+    """
+
+    values: dict[str, str] | None = None
+    """Named Jinja2 expressions bound into context (for multi-binding 'set' type).
+
+    Each value is rendered against the *original* pre-step context — bindings
+    cannot reference one another within the same step. Chain multiple ``set``
+    steps if you need ordered dependencies.
+
+    Each binding is auto-coerced to a typed value (see ``output_type`` for the
+    detection rules). The result is stored as a dict under
+    ``<agent_name>.output.<key>``.
+
+    Example::
+
+        values:
+          is_breaking: "{{ research.output.severity in ['high', 'critical'] }}"
+          target_branch: "{{ workflow.input.branch or 'main' }}"
+    """
+
+    output_type: (
+        Literal["auto", "string", "number", "integer", "boolean", "list", "dict"] | None
+    ) = None
+    """Override type detection for a single-binding 'set' step.
+
+    Only valid with ``value:``. For ``values:``, every binding uses
+    ``auto`` detection; per-key ``output_type`` is not supported.
+
+    - ``auto`` / unset: render the template and run ``yaml.safe_load`` on the
+      result; fall back to the raw string on parse failure. Empty/whitespace-only
+      rendered strings become ``""`` (not ``None``).
+    - ``string``: keep the raw rendered string.
+    - ``number``: try ``int`` then ``float``; raise on failure.
+    - ``integer``: ``int``; raise on failure.
+    - ``boolean``: case-insensitive ``true``/``false``/``1``/``0``/``yes``/``no``.
+    - ``list`` / ``dict``: parse via YAML and assert the type.
+    """
 
     workflow: str | None = None
     """Path to sub-workflow YAML file (required for type='workflow').
@@ -699,6 +918,85 @@ class AgentDef(BaseModel):
           effort: high
     """
 
+    validator: ValidatorConfig | None = None
+    """Optional semantic output validation with retry-once.
+
+    When set, the engine runs a second LLM call after this agent completes,
+    checking the output against ``validator.criteria``. On failure the
+    primary agent is re-run once with the validator's feedback appended.
+
+    Distinct from ``retry:`` (transient failures, same prompt) and
+    ``output:`` (shape validation). Only applies to provider-backed agents
+    (type='agent' or None). Works in the main loop, parallel groups, and
+    for-each loops.
+
+    Example YAML::
+
+        validator:
+          criteria: |
+            Verify every issue has an actionable suggestion and no
+            function names are fabricated.
+          max_retries: 1
+    """
+
+    status: Literal["success", "failed"] | None = None
+    """Outcome status for ``type: terminate`` steps.
+
+    ``success`` ends the workflow cleanly (exit code 0, dashboard ✅,
+    ``workflow_completed`` event with ``is_explicit: true``). ``failed``
+    ends the workflow as an explicit error (non-zero exit code, dashboard
+    ❌, ``workflow_failed`` event with ``is_explicit: true``). Required
+    for ``type: terminate``; forbidden on all other step types.
+
+    Example YAML::
+
+        type: terminate
+        status: failed
+        reason: "Upstream service returned unprocessable data"
+    """
+
+    reason: str | None = None
+    """Termination reason for ``type: terminate`` steps (Jinja2-rendered).
+
+    Surfaced in the ``workflow_completed`` / ``workflow_failed`` event as
+    ``termination_reason`` and stored in the step's context entry. Required
+    for ``type: terminate``; forbidden on all other step types.
+
+    Supports Jinja2 templating against accumulated context.
+
+    Example YAML::
+
+        reason: "{{ precheck.output.reason }}"
+    """
+
+    output_template: dict[str, str] | None = None
+    """Optional final-output mapping for ``type: terminate`` steps.
+
+    When present, *replaces* the workflow-level ``output:`` mapping for
+    this termination path. Each value is a Jinja2 expression evaluated
+    against the accumulated context (including the terminate step's own
+    ``status`` / ``reason``). When omitted, the workflow-level ``output:``
+    mapping is rendered as usual.
+
+    Each rendered value is then passed through the engine's JSON-coercion
+    helper before being placed in the final output dict: literal strings
+    ``"true"`` / ``"false"`` become Python booleans, numeric strings become
+    ``int`` / ``float``, and strings that parse as JSON objects/arrays are
+    deserialised. This matches the behaviour of workflow-level ``output:``
+    and route output transforms, but it means the example below produces
+    ``{"aborted": True, "stage": "precheck", ...}`` — not all-string values.
+    Quote with backslashes if you genuinely want the literal text ``"true"``.
+
+    Forbidden on all step types other than ``terminate``.
+
+    Example YAML::
+
+        output_template:
+          aborted: "true"            # rendered to Python True
+          stage: precheck
+          reason: "{{ precheck.output.reason }}"
+    """
+
     @field_validator("timeout")
     @classmethod
     def validate_timeout(cls, v: int | None) -> int | None:
@@ -707,9 +1005,53 @@ class AgentDef(BaseModel):
             raise ValueError("timeout must be a positive integer")
         return v
 
+    @field_validator("duration", mode="before")
+    @classmethod
+    def reject_bool_duration(cls, v: Any) -> Any:
+        """Reject boolean values for ``duration`` before Pydantic coerces them to int.
+
+        Pydantic v2 coerces ``True``/``False`` to ``1``/``0`` when the union
+        accepts ``int``. Catch it pre-coercion so a YAML ``duration: true`` is
+        rejected with a clear message instead of silently becoming a 1-second
+        wait.
+        """
+        if isinstance(v, bool):
+            raise ValueError(f"duration must be a number or duration string, not boolean: {v!r}")
+        return v
+
     @model_validator(mode="after")
     def validate_agent_type(self) -> AgentDef:
         """Ensure agent has required fields for its type."""
+        # Fields exclusive to ``type: terminate`` — reject if set on any
+        # other type. This is enforced before the per-type branches so the
+        # error message clearly names the conflict.
+        #
+        # NOTE: ``reason`` is intentionally NOT in this list because it is
+        # shared with ``type: wait`` (which uses it as an optional dashboard
+        # label, vs. terminate's required Jinja2-rendered message). The wait
+        # PR's cross-rejection block at the end of this method enforces
+        # "not allowed on anything except wait OR terminate" for ``reason``.
+        if self.type != "terminate":
+            for field_name in ("status", "output_template"):
+                if getattr(self, field_name) is not None:
+                    raise ValueError(
+                        f"'{self.type or 'agent'}' agents cannot have '{field_name}' "
+                        "(only 'terminate' agents support this field)"
+                    )
+
+        # Field exclusive to ``type: script`` — reject if set on any other
+        # type. No per-type branch below inspects ``stdin``, so this single
+        # guard is the sole rejection path for every non-script type. It
+        # mirrors the terminate-exclusive guard above so the message names the
+        # conflict; being a standalone guard (rather than a per-branch check)
+        # it also covers ``agent`` / ``human_gate``, which have no
+        # ``command``/``args`` branch.
+        if self.type != "script" and self.stdin is not None:
+            raise ValueError(
+                f"'{self.type or 'agent'}' agents cannot have 'stdin' "
+                "(only 'script' agents support this field)"
+            )
+
         if self.type == "human_gate":
             if not self.options:
                 raise ValueError("human_gate agents require 'options'")
@@ -719,12 +1061,24 @@ class AgentDef(BaseModel):
                 raise ValueError("human_gate agents cannot have 'input_mapping'")
             if self.dialog is not None:
                 raise ValueError("human_gate agents cannot have 'dialog'")
+            if self.validator is not None:
+                raise ValueError("human_gate agents cannot have 'validator'")
             if self.max_depth is not None:
                 raise ValueError("human_gate agents cannot have 'max_depth'")
             if self.reasoning is not None:
                 raise ValueError("human_gate agents cannot have 'reasoning'")
+            if self.context_tier is not None:
+                raise ValueError("human_gate agents cannot have 'context_tier'")
             if self.timeout_seconds is not None:
                 raise ValueError("human_gate agents cannot have 'timeout_seconds'")
+            if self.value is not None:
+                raise ValueError("human_gate agents cannot have 'value' (only 'set' agents do)")
+            if self.values is not None:
+                raise ValueError("human_gate agents cannot have 'values' (only 'set' agents do)")
+            if self.output_type is not None:
+                raise ValueError(
+                    "human_gate agents cannot have 'output_type' (only 'set' agents do)"
+                )
         elif self.type == "script":
             if not self.command:
                 raise ValueError("script agents require 'command'")
@@ -750,15 +1104,25 @@ class AgentDef(BaseModel):
                 raise ValueError("script agents cannot have 'input_mapping'")
             if self.dialog is not None:
                 raise ValueError("script agents cannot have 'dialog'")
+            if self.validator is not None:
+                raise ValueError("script agents cannot have 'validator'")
             if self.max_depth is not None:
                 raise ValueError("script agents cannot have 'max_depth'")
             if self.reasoning is not None:
                 raise ValueError("script agents cannot have 'reasoning'")
+            if self.context_tier is not None:
+                raise ValueError("script agents cannot have 'context_tier'")
             if self.timeout_seconds is not None:
                 raise ValueError(
                     "script agents cannot have 'timeout_seconds' "
                     "(use 'timeout' for script-specific timeouts)"
                 )
+            if self.value is not None:
+                raise ValueError("script agents cannot have 'value' (only 'set' agents do)")
+            if self.values is not None:
+                raise ValueError("script agents cannot have 'values' (only 'set' agents do)")
+            if self.output_type is not None:
+                raise ValueError("script agents cannot have 'output_type' (only 'set' agents do)")
         elif self.type == "workflow":
             if not self.workflow:
                 raise ValueError("workflow agents require 'workflow' path")
@@ -784,8 +1148,207 @@ class AgentDef(BaseModel):
                 raise ValueError("workflow agents cannot have 'retry'")
             if self.dialog is not None:
                 raise ValueError("workflow agents cannot have 'dialog'")
+            if self.validator is not None:
+                raise ValueError("workflow agents cannot have 'validator'")
             if self.timeout_seconds is not None:
                 raise ValueError("workflow agents cannot have 'timeout_seconds'")
+            if self.value is not None:
+                raise ValueError("workflow agents cannot have 'value' (only 'set' agents do)")
+            if self.values is not None:
+                raise ValueError("workflow agents cannot have 'values' (only 'set' agents do)")
+            if self.output_type is not None:
+                raise ValueError("workflow agents cannot have 'output_type' (only 'set' agents do)")
+        elif self.type == "wait":
+            if self.duration is None:
+                raise ValueError("wait agents require 'duration'")
+            if self.prompt:
+                raise ValueError("wait agents cannot have 'prompt'")
+            if self.provider:
+                raise ValueError("wait agents cannot have 'provider'")
+            if self.model:
+                raise ValueError("wait agents cannot have 'model'")
+            if self.tools is not None:
+                raise ValueError("wait agents cannot have 'tools'")
+            if self.system_prompt:
+                raise ValueError("wait agents cannot have 'system_prompt'")
+            if self.options:
+                raise ValueError("wait agents cannot have 'options'")
+            if self.command:
+                raise ValueError("wait agents cannot have 'command'")
+            if self.args:
+                raise ValueError("wait agents cannot have 'args'")
+            if self.env:
+                raise ValueError("wait agents cannot have 'env'")
+            if self.working_dir:
+                raise ValueError("wait agents cannot have 'working_dir'")
+            if self.timeout is not None:
+                raise ValueError("wait agents cannot have 'timeout'")
+            if self.workflow:
+                raise ValueError("wait agents cannot have 'workflow'")
+            if self.input_mapping is not None:
+                raise ValueError("wait agents cannot have 'input_mapping'")
+            if self.max_depth is not None:
+                raise ValueError("wait agents cannot have 'max_depth'")
+            if self.max_session_seconds:
+                raise ValueError("wait agents cannot have 'max_session_seconds'")
+            if self.max_agent_iterations is not None:
+                raise ValueError("wait agents cannot have 'max_agent_iterations'")
+            if self.retry is not None:
+                raise ValueError("wait agents cannot have 'retry'")
+            if self.dialog is not None:
+                raise ValueError("wait agents cannot have 'dialog'")
+            if self.validator is not None:
+                raise ValueError("wait agents cannot have 'validator'")
+            if self.reasoning is not None:
+                raise ValueError("wait agents cannot have 'reasoning'")
+            if self.context_tier is not None:
+                raise ValueError("wait agents cannot have 'context_tier'")
+            if self.timeout_seconds is not None:
+                raise ValueError("wait agents cannot have 'timeout_seconds'")
+            if self.output is not None:
+                raise ValueError(
+                    "wait agents cannot have 'output' (output is fixed: {'waited_seconds': float})"
+                )
+            if self.value is not None:
+                raise ValueError("wait agents cannot have 'value' (only 'set' agents do)")
+            if self.values is not None:
+                raise ValueError("wait agents cannot have 'values' (only 'set' agents do)")
+            if self.output_type is not None:
+                raise ValueError("wait agents cannot have 'output_type' (only 'set' agents do)")
+            self._validate_wait_duration()
+        elif self.type == "set":
+            if (self.value is None) == (self.values is None):
+                raise ValueError("set agents require exactly one of 'value' or 'values'")
+            if self.values is not None and self.output_type is not None:
+                raise ValueError(
+                    "set agents with 'values:' cannot have 'output_type' "
+                    "(it only applies to single 'value:'; per-key typing is not yet supported)"
+                )
+            if self.prompt:
+                raise ValueError("set agents cannot have 'prompt'")
+            if self.provider:
+                raise ValueError("set agents cannot have 'provider'")
+            if self.model:
+                raise ValueError("set agents cannot have 'model'")
+            if self.tools is not None:
+                raise ValueError("set agents cannot have 'tools'")
+            if self.system_prompt:
+                raise ValueError("set agents cannot have 'system_prompt'")
+            if self.options:
+                raise ValueError("set agents cannot have 'options'")
+            if self.command:
+                raise ValueError("set agents cannot have 'command'")
+            if self.args:
+                raise ValueError("set agents cannot have 'args'")
+            if self.env:
+                raise ValueError("set agents cannot have 'env'")
+            if self.working_dir:
+                raise ValueError("set agents cannot have 'working_dir'")
+            if self.timeout is not None:
+                raise ValueError("set agents cannot have 'timeout'")
+            if self.workflow:
+                raise ValueError("set agents cannot have 'workflow'")
+            if self.input_mapping is not None:
+                raise ValueError("set agents cannot have 'input_mapping'")
+            if self.max_depth is not None:
+                raise ValueError("set agents cannot have 'max_depth'")
+            if self.max_session_seconds is not None:
+                raise ValueError("set agents cannot have 'max_session_seconds'")
+            if self.max_agent_iterations is not None:
+                raise ValueError("set agents cannot have 'max_agent_iterations'")
+            if self.retry is not None:
+                raise ValueError("set agents cannot have 'retry'")
+            if self.dialog is not None:
+                raise ValueError("set agents cannot have 'dialog'")
+            if self.validator is not None:
+                raise ValueError("set agents cannot have 'validator'")
+            if self.reasoning is not None:
+                raise ValueError("set agents cannot have 'reasoning'")
+            if self.context_tier is not None:
+                raise ValueError("set agents cannot have 'context_tier'")
+            if self.timeout_seconds is not None:
+                raise ValueError("set agents cannot have 'timeout_seconds'")
+            if self.duration is not None:
+                raise ValueError("set agents cannot have 'duration' (only 'wait' agents do)")
+        elif self.type == "terminate":
+            # Required fields
+            if self.status is None:
+                raise ValueError(
+                    "terminate agents require 'status' (must be 'success' or 'failed')"
+                )
+            if not self.reason or not self.reason.strip():
+                raise ValueError("terminate agents require a non-empty 'reason'")
+            # Routing and per-step machinery are meaningless on a terminal
+            # step — the engine ends the workflow as soon as it dispatches.
+            if self.routes:
+                raise ValueError(
+                    "terminate agents cannot have 'routes' "
+                    "(reaching a terminate step ends the workflow immediately)"
+                )
+            if self.tools is not None:
+                raise ValueError("terminate agents cannot have 'tools'")
+            if self.output is not None:
+                raise ValueError(
+                    "terminate agents cannot have 'output' "
+                    "(use 'output_template' to override the workflow's final output)"
+                )
+            if self.prompt:
+                raise ValueError("terminate agents cannot have 'prompt'")
+            if self.model:
+                raise ValueError("terminate agents cannot have 'model'")
+            if self.provider:
+                raise ValueError("terminate agents cannot have 'provider'")
+            if self.system_prompt:
+                raise ValueError("terminate agents cannot have 'system_prompt'")
+            if self.command:
+                raise ValueError("terminate agents cannot have 'command'")
+            if self.args:
+                raise ValueError("terminate agents cannot have 'args'")
+            if self.env:
+                raise ValueError("terminate agents cannot have 'env'")
+            if self.working_dir:
+                raise ValueError("terminate agents cannot have 'working_dir'")
+            if self.timeout is not None:
+                raise ValueError("terminate agents cannot have 'timeout'")
+            if self.timeout_seconds is not None:
+                raise ValueError("terminate agents cannot have 'timeout_seconds'")
+            if self.max_session_seconds is not None:
+                raise ValueError("terminate agents cannot have 'max_session_seconds'")
+            if self.max_agent_iterations is not None:
+                raise ValueError("terminate agents cannot have 'max_agent_iterations'")
+            if self.max_depth is not None:
+                raise ValueError("terminate agents cannot have 'max_depth'")
+            if self.retry is not None:
+                raise ValueError("terminate agents cannot have 'retry'")
+            if self.dialog is not None:
+                raise ValueError("terminate agents cannot have 'dialog'")
+            if self.validator is not None:
+                raise ValueError("terminate agents cannot have 'validator'")
+            if self.reasoning is not None:
+                raise ValueError("terminate agents cannot have 'reasoning'")
+            if self.context_tier is not None:
+                raise ValueError("terminate agents cannot have 'context_tier'")
+            if self.workflow:
+                raise ValueError("terminate agents cannot have 'workflow'")
+            if self.input_mapping is not None:
+                raise ValueError("terminate agents cannot have 'input_mapping'")
+            if self.options:
+                raise ValueError("terminate agents cannot have 'options'")
+            # Cross-rejection with sibling step types: terminate has its own
+            # `reason` so we do NOT reject it (the `if self.type not in ...`
+            # block at the bottom of this method handles the
+            # other-type-rejection for `reason`). But these are exclusive to
+            # other step types and must not leak in.
+            if self.value is not None:
+                raise ValueError("terminate agents cannot have 'value' (only 'set' agents do)")
+            if self.values is not None:
+                raise ValueError("terminate agents cannot have 'values' (only 'set' agents do)")
+            if self.output_type is not None:
+                raise ValueError(
+                    "terminate agents cannot have 'output_type' (only 'set' agents do)"
+                )
+            if self.duration is not None:
+                raise ValueError("terminate agents cannot have 'duration' (only 'wait' agents do)")
         else:
             # Regular agent or human_gate — input_mapping is not valid
             if self.input_mapping is not None:
@@ -798,9 +1361,72 @@ class AgentDef(BaseModel):
                     f"'{self.type or 'agent'}' agents cannot have 'max_depth' "
                     "(only workflow agents support max_depth)"
                 )
+            if self.value is not None:
+                raise ValueError(
+                    f"'{self.type or 'agent'}' agents cannot have 'value' "
+                    "(only 'set' agents support value)"
+                )
+            if self.values is not None:
+                raise ValueError(
+                    f"'{self.type or 'agent'}' agents cannot have 'values' "
+                    "(only 'set' agents support values)"
+                )
+            if self.output_type is not None:
+                raise ValueError(
+                    f"'{self.type or 'agent'}' agents cannot have 'output_type' "
+                    "(only 'set' agents support output_type)"
+                )
         if self.type == "workflow" and self.reasoning is not None:
             raise ValueError("workflow agents cannot have 'reasoning'")
+        if self.type == "workflow" and self.context_tier is not None:
+            raise ValueError("workflow agents cannot have 'context_tier'")
+
+        # Wait-only fields are forbidden on every other type. ``reason`` is
+        # shared with ``type: terminate`` (which has its own required-non-
+        # empty semantics enforced earlier), so it is rejected on every
+        # non-wait, non-terminate type with a message naming both owners.
+        if self.type != "wait":
+            if self.duration is not None:
+                raise ValueError(
+                    f"'{self.type or 'agent'}' agents cannot have 'duration' "
+                    "(only wait agents support duration)"
+                )
+            if self.type != "terminate" and self.reason is not None:
+                raise ValueError(
+                    f"'{self.type or 'agent'}' agents cannot have 'reason' "
+                    "(only 'terminate' and 'wait' agents support this field)"
+                )
         return self
+
+    def _validate_wait_duration(self) -> None:
+        """Validate ``duration`` for a ``wait`` agent.
+
+        Templated durations (containing ``{{``) defer all literal
+        validation to runtime; for everything else we parse the value
+        and enforce ``0 < d <= MAX_WAIT_DURATION_SECONDS``.
+
+        Note: Booleans are already rejected pre-coercion by the
+        :meth:`reject_bool_duration` ``mode="before"`` field validator,
+        so this method never sees ``True``/``False``.
+        """
+        value = self.duration
+
+        if isinstance(value, str) and "{{" in value:
+            return
+
+        try:
+            seconds = parse_duration(value)  # type: ignore[arg-type]
+        except ValueError as exc:
+            raise ValueError(f"wait duration is invalid: {exc}") from exc
+
+        if seconds <= 0:
+            raise ValueError(f"wait duration must be > 0 seconds (got {seconds!r})")
+        if seconds > MAX_WAIT_DURATION_SECONDS:
+            raise ValueError(
+                f"wait duration {seconds!r}s exceeds the 24h cap "
+                f"({MAX_WAIT_DURATION_SECONDS}s); reconsider using "
+                "'limits.timeout_seconds' instead"
+            )
 
 
 class MCPServerDef(BaseModel):
@@ -849,11 +1475,256 @@ class MCPServerDef(BaseModel):
         return self
 
 
+class AzureProviderOptions(BaseModel):
+    """Azure-specific provider options forwarded to the Copilot SDK.
+
+    Mirrors :class:`copilot.session.AzureProviderOptions`. Currently only
+    ``api_version`` is recognized; additional fields the SDK adds in the
+    future can be enumerated here.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    api_version: str | None = None
+    """Azure OpenAI API version (e.g. ``"2024-10-21"``). Optional; the SDK
+    falls back to its own default when unset."""
+
+
+class ProviderSettings(BaseModel):
+    """Structured provider configuration for ``runtime.provider``.
+
+    Supports two YAML shapes via :meth:`RuntimeConfig._coerce_provider`:
+
+    - String shorthand: ``provider: copilot`` (equivalent to
+      ``provider: {name: copilot}``).
+    - Object form: enables routing the Copilot SDK at custom endpoints
+      such as Azure OpenAI, Ollama, vLLM, LM Studio, or any other
+      OpenAI-compatible server. Object fields beyond ``name`` are
+      currently supported only for ``name: copilot``; they are forwarded
+      verbatim to ``copilot.client.create_session(provider=...)``.
+
+    When any field beyond ``name`` is set, the Copilot provider activates
+    "custom routing" mode and fills any missing field from environment
+    variables (see :meth:`has_custom_routing`).
+
+    The model is frozen after construction (``frozen=True``) because
+    custom routing is set-once at config load. This avoids the
+    Pydantic gotcha where ``model_validator(mode="after")``
+    cross-field invariants do not re-fire on per-attribute assignment
+    even with ``validate_assignment=True``.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    name: Literal["copilot", "openai-agents", "claude", "claude-agent-sdk"] = "copilot"
+    """SDK provider to use for agent execution."""
+
+    type: Literal["openai", "azure", "anthropic"] | None = None
+    """Wire-format dialect for the upstream endpoint. Copilot-only.
+
+    Defaults to ``"openai"`` at activation time when ``base_url`` is set
+    but ``type`` is not.
+    """
+
+    wire_api: Literal["completions", "responses"] | None = None
+    """OpenAI wire API variant. Copilot-only.
+
+    ``"completions"`` for the classic ``/v1/chat/completions`` shape used by
+    Ollama, vLLM, LM Studio, and the legacy OpenAI API. ``"responses"`` for
+    the newer OpenAI Responses API.
+    """
+
+    base_url: str | None = None
+    """Endpoint base URL (e.g. ``http://localhost:11434/v1``)."""
+
+    api_key: SecretStr | None = None
+    """API key for the endpoint. Prefer ``${OPENAI_API_KEY}`` interpolation
+    in YAML so the literal value never lands in ``workflow_started`` events
+    or checkpoints."""
+
+    bearer_token: SecretStr | None = None
+    """Bearer token. Takes precedence over ``api_key`` when both are set.
+    Copilot-only."""
+
+    headers: dict[str, str] | None = None
+    """Extra HTTP headers to send with every request. Copilot-only."""
+
+    azure: AzureProviderOptions | None = None
+    """Azure-specific options (e.g. ``api_version``). Requires
+    ``type: azure``. Copilot-only."""
+
+    @model_validator(mode="after")
+    def _check_field_compatibility(self) -> ProviderSettings:
+        copilot_only_fields = {
+            "type": self.type,
+            "wire_api": self.wire_api,
+            "bearer_token": self.bearer_token,
+            "headers": self.headers,
+            "azure": self.azure,
+        }
+        if self.name != "copilot":
+            extras = sorted(k for k, v in copilot_only_fields.items() if v is not None)
+            if extras:
+                raise ValueError(
+                    f"Provider fields {extras} are only supported when name='copilot'. "
+                    "Structured provider config for other providers is not yet implemented."
+                )
+            if self.base_url is not None or self.api_key is not None:
+                raise ValueError(
+                    f"Structured provider config (base_url/api_key) for name='{self.name}' "
+                    "is not yet implemented; use environment variables for the underlying SDK."
+                )
+
+        if self.azure is not None and self.type != "azure":
+            raise ValueError("'azure' options require type='azure'")
+
+        # Reject empty containers and empty SecretStr — they activate
+        # custom routing via has_custom_routing() but resolve to falsy
+        # values in the resolver and would silently drop the entire
+        # SDK provider kwarg.
+        if self.headers is not None and len(self.headers) == 0:
+            raise ValueError(
+                "'headers' must contain at least one entry; remove the key to omit headers"
+            )
+        for secret_field, value in (("api_key", self.api_key), ("bearer_token", self.bearer_token)):
+            if value is not None and value.get_secret_value() == "":
+                raise ValueError(
+                    f"'{secret_field}' is empty; remove the key or supply a value "
+                    "(typo / unset env interpolation?)"
+                )
+
+        # Positive precondition: structured fields that only make sense
+        # alongside an endpoint must not be the *only* thing set.
+        # ``base_url`` may still come from an env-var fallback, so this
+        # check is intentionally narrow: ``wire_api`` / ``type`` /
+        # ``headers`` / ``azure`` alone (with no other field) is almost
+        # certainly a misconfiguration.
+        if self.base_url is None and self.api_key is None and self.bearer_token is None:
+            anchorless = sorted(
+                k
+                for k in ("type", "wire_api", "headers", "azure")
+                if copilot_only_fields.get(k) is not None
+            )
+            if anchorless:
+                raise ValueError(
+                    f"Provider fields {anchorless} require base_url, api_key, or "
+                    "bearer_token to also be set (in YAML or via environment variables); "
+                    "they cannot stand alone."
+                )
+
+        if self.azure is not None and self.azure.api_version is None:
+            raise ValueError(
+                "'azure' block is empty; either set azure.api_version or remove the block"
+            )
+
+        return self
+
+    def has_custom_routing(self) -> bool:
+        """Return True when YAML explicitly opted into custom routing.
+
+        Custom routing is gated on at least one non-``name`` field being
+        set. We never activate from ambient environment variables alone —
+        that would silently divert default Copilot traffic based on
+        unrelated shell state.
+        """
+        return any(
+            value is not None
+            for value in (
+                self.type,
+                self.wire_api,
+                self.base_url,
+                self.api_key,
+                self.bearer_token,
+                self.headers,
+                self.azure,
+            )
+        )
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, nxt: Any) -> Any:
+        """Collapse to bare string when only ``name`` is set.
+
+        Preserves backward compatibility with the original
+        ``provider: copilot`` YAML/JSON shape: a ``ProviderSettings`` with
+        no custom routing round-trips as the plain string ``"copilot"``,
+        not as ``{"name": "copilot"}``. Once any structured field is set,
+        the full object is emitted.
+        """
+        if not self.has_custom_routing():
+            return self.name
+        return nxt(self)
+
+
+class CheckpointConfig(BaseModel):
+    """Periodic checkpoint configuration (issue #244).
+
+    Opt-in automatic checkpointing at workflow step boundaries so a stalled or
+    hard-killed long-running workflow can be resumed without an exception ever
+    being raised. All triggers default to off — the existing failure-only
+    checkpoint behavior is unchanged unless at least one trigger is set.
+
+    Checkpoints are evaluated at each step boundary (after a step's output is
+    committed to context, before the next step runs). There is no background
+    wall-clock timer: the engine only commits recoverable state at step
+    boundaries, so ``every_seconds`` is enforced as a throttle evaluated at
+    those boundaries.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    every_agent: bool = False
+    """Save a checkpoint at every step boundary (after each agent, parallel
+    group, for-each group, gate, script, set, wait, or sub-workflow step). When
+    true it governs on its own and ``every_seconds`` is ignored (a save already
+    fires at every boundary)."""
+
+    every_seconds: int | None = Field(default=None, ge=1)
+    """Minimum seconds between periodic checkpoints, evaluated at step
+    boundaries.
+
+    A checkpoint is saved at the first boundary reached after this many seconds
+    have elapsed since the last checkpoint. ``None`` disables the time-based
+    trigger. The first periodic checkpoint of a run fires at the first eligible
+    boundary; the interval only throttles subsequent saves.
+
+    Note: if a single step runs longer than this interval, no checkpoint fires
+    during that step — the boundary checkpoint taken *before* the step started
+    is the recovery point.
+    """
+
+    keep_last: int = Field(default=5, ge=1, le=100)
+    """Number of recent periodic checkpoints to retain per run.
+
+    Older periodic checkpoints for the same run are deleted after each save.
+    Failure checkpoints are never rotated.
+    """
+
+    @property
+    def is_enabled(self) -> bool:
+        """Return True if any periodic checkpoint trigger is configured."""
+        return self.every_agent or self.every_seconds is not None
+
+
 class RuntimeConfig(BaseModel):
     """Provider and runtime configuration."""
 
-    provider: Literal["copilot", "openai-agents", "claude"] = "copilot"
-    """SDK provider to use for agent execution."""
+    model_config = ConfigDict(validate_assignment=True)
+
+    provider: ProviderSettings = Field(default_factory=ProviderSettings)
+    """SDK provider configuration.
+
+    Accepts either a string shorthand (``provider: copilot``) or a
+    structured :class:`ProviderSettings` object. See
+    :class:`ProviderSettings` for the full field reference and custom
+    routing semantics.
+    """
+
+    @field_validator("provider", mode="before")
+    @classmethod
+    def _coerce_provider(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return {"name": value}
+        return value
 
     default_model: str | None = None
     """Default model for agents that don't specify one."""
@@ -939,6 +1810,25 @@ class RuntimeConfig(BaseModel):
     match the supported prefix list; Copilot consults the SDK's advertised
     ``supported_reasoning_efforts`` (when available) and otherwise allows
     the request through to the SDK.
+    """
+
+    checkpoint: CheckpointConfig = Field(default_factory=CheckpointConfig)
+    """Periodic checkpoint configuration.
+
+    Opt-in automatic checkpointing at step boundaries so stalled or killed
+    long-running workflows stay resumable. Defaults to off (failure-only
+    checkpoints). See :class:`CheckpointConfig`.
+    """
+
+    default_context_tier: ContextTier | None = None
+    """Workflow-wide default context-window tier (Copilot provider only).
+
+    Each agent may override with its own ``context_tier``. ``long_context``
+    selects a model's long-context (e.g. 1M-token) window; ``default`` selects
+    the standard tier; ``None`` sends no value.
+
+    Only the Copilot provider forwards this (maps to the SDK's
+    ``create_session`` ``context_tier`` param). Other providers ignore it.
     """
 
 

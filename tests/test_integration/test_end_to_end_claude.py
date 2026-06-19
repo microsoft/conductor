@@ -63,7 +63,7 @@ output:
 
         # Load and validate workflow
         config = load_workflow(str(workflow_yaml))
-        assert config.workflow.runtime.provider == "claude"
+        assert config.workflow.runtime.provider.name == "claude"
         assert config.workflow.runtime.temperature == 0.7
         assert config.workflow.runtime.max_tokens == 1000
 
@@ -267,7 +267,7 @@ output:
 """)
 
         config = load_workflow(str(workflow_yaml))
-        assert config.workflow.runtime.provider == "copilot"
+        assert config.workflow.runtime.provider.name == "copilot"
 
         # Verify no Claude fields leaked
         assert config.workflow.runtime.temperature is None

@@ -86,8 +86,8 @@ class TestBackwardCompatibility:
         assert isinstance(config.workflow.runtime, RuntimeConfig)
 
         # Verify provider is copilot (or not explicitly set to claude)
-        if config.workflow.runtime.provider:
-            assert config.workflow.runtime.provider in ["copilot", "openai-agents"]
+        if config.workflow.runtime.provider.name:
+            assert config.workflow.runtime.provider.name in ["copilot", "openai-agents"]
 
     def test_copilot_workflow_with_new_schema_no_validation_errors(self):
         """Test that Copilot workflows load without validation errors with new schema.
@@ -122,7 +122,7 @@ class TestBackwardCompatibility:
 
         # Verify basic structure
         assert config.workflow.name == "test-copilot"
-        assert config.workflow.runtime.provider == "copilot"
+        assert config.workflow.runtime.provider.name == "copilot"
         assert len(config.agents) == 1
 
         # Verify no validation errors occurred (if we got here, validation passed)
@@ -156,7 +156,8 @@ class TestBackwardCompatibility:
 
         # Verify runtime config is preserved
         assert (
-            reloaded_config.workflow.runtime.provider == original_config.workflow.runtime.provider
+            reloaded_config.workflow.runtime.provider.name
+            == original_config.workflow.runtime.provider.name
         )
 
         # Verify serialized dict does not contain optional fields when not set
@@ -278,7 +279,7 @@ class TestBackwardCompatibility:
         assert config.workflow.runtime is not None
 
         # If it's a Claude workflow, verify common fields can be accessed
-        if config.workflow.runtime.provider == "claude":
+        if config.workflow.runtime.provider.name == "claude":
             # These fields should be accessible (no assertion on values)
             _ = config.workflow.runtime.temperature
             _ = config.workflow.runtime.max_tokens
@@ -357,7 +358,7 @@ class TestBackwardCompatibility:
         )
 
         # Verify schema validation passed and fields are set
-        assert config.workflow.runtime.provider == "claude"
+        assert config.workflow.runtime.provider.name == "claude"
         assert config.workflow.runtime.temperature == 0.7
         assert config.workflow.runtime.max_tokens == 1024
         assert config.workflow.runtime.timeout == 120.0
@@ -403,7 +404,7 @@ class TestBackwardCompatibility:
         config = WorkflowConfig.model_validate(config_dict)
 
         # Verify provider defaults to 'copilot'
-        assert config.workflow.runtime.provider == "copilot"
+        assert config.workflow.runtime.provider.name == "copilot"
 
         # Verify no optional fields are set
         assert config.workflow.runtime.temperature is None
@@ -443,7 +444,7 @@ class TestBackwardCompatibility:
         config = WorkflowConfig.model_validate(config_dict)
 
         # Verify provider defaults to 'copilot'
-        assert config.workflow.runtime.provider == "copilot"
+        assert config.workflow.runtime.provider.name == "copilot"
 
         # Verify serialization doesn't include None optional fields
         serialized = config.model_dump(mode="json", exclude_none=True)

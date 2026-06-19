@@ -46,7 +46,7 @@ agents:
 """)
 
         config = load_workflow(str(workflow_yaml))
-        assert config.workflow.runtime.provider == "claude"
+        assert config.workflow.runtime.provider.name == "claude"
 
     def test_can_override_provider_per_agent(self, tmp_path):
         """Verify agent-level provider override is now supported."""
@@ -72,7 +72,7 @@ agents:
 
         config = load_workflow(str(workflow_yaml))
         # Workflow default is copilot
-        assert config.workflow.runtime.provider == "copilot"
+        assert config.workflow.runtime.provider.name == "copilot"
         # Agent overrides to claude
         assert config.agents[0].provider == "claude"
         # Agent schema now has 'provider' field
@@ -89,7 +89,13 @@ agents:
 
         # Serialization excludes None values
         dumped = runtime.model_dump(exclude_none=True)
-        assert dumped == {"provider": "copilot", "mcp_servers": {}}
+        assert dumped == {
+            "provider": "copilot",
+            "mcp_servers": {},
+            # Periodic checkpoints are off by default (issue #244); every_seconds
+            # is None and excluded by exclude_none.
+            "checkpoint": {"every_agent": False, "keep_last": 5},
+        }
 
     def test_provider_parameter_isolation(self, tmp_path):
         """Test that provider-specific parameters don't interfere.
@@ -172,7 +178,7 @@ agents:
         # This prevents provider factory from receiving irrelevant parameters
 
 
-class MockProvider(AgentProvider):
+class MockProvider(AgentProvider, abstract=True):
     """Mock provider for testing."""
 
     def __init__(self, provider_type: str = "mock") -> None:
@@ -438,4 +444,4 @@ agents:
 """)
         config = load_workflow(str(workflow_yaml))
         assert config.agents[0].provider is None
-        assert config.workflow.runtime.provider == "claude"
+        assert config.workflow.runtime.provider.name == "claude"

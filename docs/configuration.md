@@ -11,11 +11,12 @@ The `runtime` section of your workflow defines provider settings and global defa
 ```yaml
 workflow:
   runtime:
-    provider: copilot  # or 'claude'
+    provider: copilot  # or 'claude' or 'claude-agent-sdk'
     default_model: gpt-5.2
     temperature: 0.7
     max_tokens: 4096
     default_reasoning_effort: medium  # low | medium | high | xhigh (optional)
+    default_context_tier: default  # default | long_context (optional, Copilot only)
     # Provider-specific settings...
 ```
 
@@ -24,6 +25,11 @@ reasoning / extended-thinking effort that every provider-backed agent inherits
 unless it declares its own `reasoning.effort` override. See
 [Reasoning Effort](#reasoning-effort) for the per-provider translation and
 constraints.
+
+The `default_context_tier` field sets a workflow-wide default for the model's
+context-window tier that every provider-backed agent inherits unless it
+declares its own `context_tier` override. See [Context Tier](#context-tier)
+for details. This is a Copilot-only capability.
 
 ## Provider Selection
 
@@ -70,6 +76,137 @@ workflow:
 **Models**: `claude-sonnet-4.5`, `claude-haiku-4.5`, `claude-opus-4.5`
 
 **See**: [Claude Provider Documentation](providers/claude.md)
+
+### Custom Provider Routing (Ollama / vLLM / Azure OpenAI)
+
+`runtime.provider` accepts either the bare string shorthand
+(`provider: copilot`) **or** a structured object that forwards a
+`ProviderConfig` to the Copilot SDK's `create_session(provider=…)`
+parameter. This lets workflows route the Copilot SDK at:
+
+- Local OpenAI-compatible servers — Ollama, vLLM, LM Studio, llamafile
+- Azure OpenAI deployments
+- Anthropic-compatible proxies
+- Any other OpenAI-compatible REST endpoint
+
+```yaml
+workflow:
+  runtime:
+    provider:
+      name: copilot
+      type: openai                          # openai | azure | anthropic
+      wire_api: completions                 # completions | responses
+      base_url: http://localhost:11434/v1
+      api_key: ${OPENAI_API_KEY:-ollama}
+    default_model: llama3.1                 # required for non-Copilot endpoints
+```
+
+Azure OpenAI variant:
+
+```yaml
+workflow:
+  runtime:
+    provider:
+      name: copilot
+      type: azure
+      base_url: https://<your-resource>.openai.azure.com
+      api_key: ${AZURE_OPENAI_API_KEY}
+      azure:
+        api_version: "2024-10-21"
+    default_model: gpt-4o
+```
+
+#### Activation rule (opt-in)
+
+Custom routing activates **only** when at least one non-`name` field is
+set in YAML. Ambient `OPENAI_*` environment variables alone will NOT
+divert default Copilot traffic — that would be too easy a way to break
+a workflow based on unrelated shell state. A bare `provider: copilot`
+always means default GitHub Copilot routing.
+
+#### Environment-variable fallbacks
+
+Once a structured object opts in, missing fields fall back to env vars
+in this precedence:
+
+| Field | Env-var chain |
+|---|---|
+| `base_url` | `COPILOT_PROVIDER_BASE_URL` → `OPENAI_BASE_URL` |
+| `api_key` | `COPILOT_PROVIDER_API_KEY` *(only)* |
+| `bearer_token` | `COPILOT_PROVIDER_BEARER_TOKEN` *(only)* |
+| `type` | defaults to `"openai"` when `base_url` is set |
+
+Ambient `OPENAI_API_KEY` is intentionally **not** consulted as an
+implicit fallback — that would silently send an OpenAI dev credential
+to whatever `base_url` points at, which is a real credential-leak risk.
+Users who want OpenAI-environment-style behavior must opt in
+explicitly via `api_key: ${OPENAI_API_KEY}` interpolation in YAML.
+
+#### Secrets
+
+`api_key` and `bearer_token` are stored as Pydantic `SecretStr` — they
+redact in `model_dump`, dashboard payloads, event logs, and
+checkpoints. Prefer `${VAR}` env interpolation for the values in YAML
+so the literal secret never lands in `workflow_started` events:
+
+```yaml
+api_key: ${OPENAI_API_KEY}           # good — interpolated at load time
+api_key: sk-aaaaaaaaaaaaaaaa         # avoid — literal in yaml_source
+```
+
+If both `api_key` and `bearer_token` resolve (from any combination of
+YAML and env), both are forwarded; the Copilot SDK silently prefers
+`bearer_token`, and conductor logs a warning so the precedence is
+visible.
+
+#### Validator rules
+
+`ProviderSettings` is frozen after construction. The schema rejects
+the following misconfigurations at config load time so they cannot
+silently produce a no-op SDK call:
+
+- `name != "copilot"` combined with **any** non-`name` field
+  (structured config for `claude` / `openai-agents` is not yet
+  implemented).
+- `type: azure` without an `azure: { api_version: ... }` block
+  (and the reverse: `azure` block without `type: azure`).
+- Anchorless routing fields: `wire_api`, `type`, `headers`, or
+  `azure` cannot stand alone — at least one of `base_url`, `api_key`,
+  `bearer_token` must also be set (in YAML or via the
+  `COPILOT_PROVIDER_*` env vars).
+- Empty `headers: {}`, empty `api_key: ""`, empty `bearer_token: ""`,
+  empty `azure: { api_version: null }`.
+
+When custom routing activates but every resolved field ends up empty
+(for example, the workflow expects `COPILOT_PROVIDER_*` env vars and
+none are set), the resolver raises `ProviderError` with a clear
+message rather than silently routing back to default Copilot.
+
+#### CLI override
+
+`--provider <name>` (and `-p`) replaces the entire `ProviderSettings`
+with the bare-string default for that name. When YAML had structured
+fields, conductor logs a notice telling the user the custom routing
+was dropped:
+
+```
+Provider override: claude
+Provider override discards structured runtime.provider settings (base_url/type/etc.) from YAML; using SDK defaults.
+```
+
+#### Custom routing and dialog mode
+
+The resolved provider config is attached to **every** Copilot
+`create_session` call this provider makes — including the dialog-mode
+turns used by `agent.dialog` evaluators. All sessions hit the same
+endpoint, so you can mix custom-routed agents with dialog mode without
+worrying about per-call drift.
+
+#### Example workflow
+
+[`examples/copilot-local-llm.yaml`](../examples/copilot-local-llm.yaml)
+demonstrates the full pattern with both Ollama (active) and Azure
+OpenAI (commented variant).
 
 ## Common Configuration Options
 
@@ -159,8 +296,8 @@ agents:
 
 Per-agent overrides always win over the workflow-wide default. The
 `reasoning.effort` field is **only** valid on standard `agent`-type agents; it
-is rejected on `script`, `human_gate`, and `workflow` agents (which do not call
-a model).
+is rejected on `script`, `human_gate`, `workflow`, `wait`, and `terminate`
+agents (none of which call a model).
 
 ### Per-provider translation
 
@@ -191,6 +328,52 @@ a model).
 Reasoning / thinking content emitted by the model is surfaced via
 `agent_reasoning` events and rendered in the dashboard, JSONL logs, and
 `-vv` console output for both providers.
+
+## Context Tier
+
+Some models expose a larger context window (e.g. a 1M-token tier) selected via
+a separate session parameter rather than the model name. Conductor surfaces
+this as a unified `context_tier` knob. Allowed values: `default`,
+`long_context`.
+
+Use `long_context` for heavy-reasoning agents that ingest large evidence
+(multi-MB logs, many candidate source files) and would otherwise truncate at
+the default (~200K) tier.
+
+`context_tier` composes independently with `reasoning.effort` — they map to two
+separate `create_session` kwargs, so an agent may set both.
+
+Set a workflow-wide default and/or override per agent:
+
+```yaml
+workflow:
+  runtime:
+    provider: copilot
+    default_context_tier: default       # workflow-wide default
+
+agents:
+  - name: triage
+    # No context_tier — inherits `default` from the runtime default.
+    prompt: "Triage {{ workflow.input.topic }}"
+
+  - name: analyze
+    context_tier: long_context          # per-agent override wins
+    reasoning:
+      effort: high                      # composes with context_tier
+    prompt: "Deeply analyze {{ workflow.input.topic }}"
+```
+
+Per-agent overrides always win over the workflow-wide default. The
+`context_tier` field is **only** valid on standard `agent`-type agents; it is
+rejected on `script`, `human_gate`, and `workflow` agents (none of which call a
+model).
+
+### Per-provider translation
+
+- **Copilot** — Forwards the chosen tier as `context_tier` to
+  `CopilotClient.create_session`. No static capability validation is performed;
+  the SDK accepts or rejects the value at session creation.
+- **Other providers** — The value is ignored; there is no equivalent knob.
 
 ## MCP Servers
 

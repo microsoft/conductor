@@ -1,0 +1,105 @@
+# Context Tier Workflow
+#
+# This example demonstrates selecting a model's long-context (e.g. 1M-token)
+# window for heavy-reasoning agents. It shows:
+# - A workflow-wide default via `runtime.default_context_tier`
+# - A per-agent override via `context_tier` (wins over the default)
+# - Composition with `reasoning.effort` — the two are independent and
+#   map to two separate `create_session` kwargs
+#
+# Context tier is a Copilot-provider capability:
+# - Copilot SDK: passes `context_tier` ("default" | "long_context") to
+#   `create_session` to select the model's context-window tier.
+# - Other providers ignore the value.
+#
+# Use `long_context` for agents that ingest large evidence (multi-MB logs,
+# many candidate source files) and would otherwise truncate at the default
+# (~200K) tier.
+#
+# Usage:
+#   conductor run examples/context-tier.yaml \
+#     --input topic="root-causing a multi-service latency regression"
+
+workflow:
+  name: context-tier
+  description: Demonstrates workflow-wide and per-agent context-tier configuration
+  version: "1.0.0"
+  entry_point: triage
+
+  runtime:
+    provider: copilot
+    # Workflow-wide default applied to every provider-backed agent
+    # unless the agent declares its own `context_tier`.
+    default_context_tier: default
+
+  input:
+    topic:
+      type: string
+      required: true
+      description: An investigation topic that may require ingesting large evidence
+
+agents:
+  - name: triage
+    description: Lightweight triage that inherits the runtime default tier
+    model: claude-opus-4.8
+    # No `context_tier` here — inherits `runtime.default_context_tier: default`.
+    prompt: |
+      Briefly triage the following investigation. Decide whether a deep,
+      evidence-heavy analysis pass is warranted (true when it implies sifting
+      large logs or many source files).
+
+      Topic: {{ workflow.input.topic }}
+    output:
+      summary:
+        type: string
+        description: A short triage summary
+      needs_deep_analysis:
+        type: boolean
+        description: Whether a long-context analysis pass is warranted
+    routes:
+      - to: analyze
+        when: "{{ output.needs_deep_analysis }}"
+      - to: $end
+
+  - name: analyze
+    description: Deep analysis over large evidence (pinned to the long-context tier)
+    model: claude-opus-4.8
+    # Per-agent override: this agent always runs on the long-context tier,
+    # regardless of the workflow-wide default. Composes with reasoning.
+    context_tier: long_context
+    reasoning:
+      effort: high
+    input:
+      - workflow.input.topic
+      - triage.output.summary
+    prompt: |
+      Perform a thorough analysis of the investigation below. Assume you may
+      need to reason over a large body of evidence.
+
+      **Topic:** {{ workflow.input.topic }}
+
+      **Triage summary:**
+      {{ triage.output.summary }}
+
+      Produce a root-cause hypothesis, the evidence that supports it, and the
+      next concrete step to confirm it.
+    output:
+      hypothesis:
+        type: string
+        description: Root-cause hypothesis
+      evidence:
+        type: string
+        description: Evidence supporting the hypothesis
+      next_step:
+        type: string
+        description: The next concrete step to confirm the hypothesis
+    routes:
+      - to: $end
+
+output:
+  topic: "{{ workflow.input.topic }}"
+  summary: "{{ triage.output.summary }}"
+  needs_deep_analysis: "{{ triage.output.needs_deep_analysis }}"
+  hypothesis: "{% if analyze is defined %}{{ analyze.output.hypothesis }}{% else %}(skipped — no deep analysis needed){% endif %}"
+  evidence: "{% if analyze is defined %}{{ analyze.output.evidence }}{% endif %}"
+  next_step: "{% if analyze is defined %}{{ analyze.output.next_step }}{% endif %}"

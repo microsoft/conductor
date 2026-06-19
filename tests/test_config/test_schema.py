@@ -7,6 +7,7 @@ from pydantic import ValidationError
 
 from conductor.config.schema import (
     AgentDef,
+    CheckpointConfig,
     ContextConfig,
     ForEachDef,
     GateOption,
@@ -17,6 +18,7 @@ from conductor.config.schema import (
     ReasoningConfig,
     RouteDef,
     RuntimeConfig,
+    ValidatorConfig,
     WorkflowConfig,
     WorkflowDef,
 )
@@ -227,6 +229,55 @@ class TestLimitsConfig:
         assert config.timeout_seconds == 3601
 
 
+class TestCheckpointConfig:
+    """Tests for CheckpointConfig model (issue #244)."""
+
+    def test_default_values_disabled(self) -> None:
+        """Periodic checkpoints are off by default to preserve behavior."""
+        config = CheckpointConfig()
+        assert config.every_agent is False
+        assert config.every_seconds is None
+        assert config.keep_last == 5
+        assert config.is_enabled is False
+
+    def test_is_enabled_with_every_agent(self) -> None:
+        assert CheckpointConfig(every_agent=True).is_enabled is True
+
+    def test_is_enabled_with_every_seconds(self) -> None:
+        assert CheckpointConfig(every_seconds=300).is_enabled is True
+
+    def test_every_seconds_must_be_positive(self) -> None:
+        with pytest.raises(ValidationError):
+            CheckpointConfig(every_seconds=0)
+
+    def test_keep_last_bounds(self) -> None:
+        with pytest.raises(ValidationError):
+            CheckpointConfig(keep_last=0)
+        with pytest.raises(ValidationError):
+            CheckpointConfig(keep_last=101)
+        assert CheckpointConfig(keep_last=100).keep_last == 100
+
+    def test_extra_fields_forbidden(self) -> None:
+        """Typos like every_second should be rejected, not silently ignored."""
+        with pytest.raises(ValidationError):
+            CheckpointConfig(every_second=1)  # type: ignore[call-arg]
+
+    def test_runtime_config_default_checkpoint(self) -> None:
+        """RuntimeConfig exposes a disabled checkpoint config by default."""
+        runtime = RuntimeConfig()
+        assert isinstance(runtime.checkpoint, CheckpointConfig)
+        assert runtime.checkpoint.is_enabled is False
+
+    def test_runtime_config_parses_checkpoint_block(self) -> None:
+        runtime = RuntimeConfig(
+            checkpoint={"every_agent": True, "every_seconds": 120, "keep_last": 3}
+        )
+        assert runtime.checkpoint.every_agent is True
+        assert runtime.checkpoint.every_seconds == 120
+        assert runtime.checkpoint.keep_last == 3
+        assert runtime.checkpoint.is_enabled is True
+
+
 class TestHooksConfig:
     """Tests for HooksConfig model."""
 
@@ -375,7 +426,8 @@ class TestRuntimeConfig:
     def test_default_values(self) -> None:
         """Test default runtime configuration."""
         config = RuntimeConfig()
-        assert config.provider == "copilot"
+        assert config.provider.name == "copilot"
+        assert not config.provider.has_custom_routing()
         assert config.default_model is None
         assert config.temperature is None
         assert config.max_tokens is None
@@ -384,7 +436,7 @@ class TestRuntimeConfig:
     def test_custom_provider(self) -> None:
         """Test custom provider setting."""
         config = RuntimeConfig(provider="openai-agents", default_model="gpt-4")
-        assert config.provider == "openai-agents"
+        assert config.provider.name == "openai-agents"
         assert config.default_model == "gpt-4"
 
     def test_invalid_provider_raises(self) -> None:
@@ -395,7 +447,7 @@ class TestRuntimeConfig:
     def test_claude_provider_with_temperature(self) -> None:
         """Test Claude provider with temperature setting."""
         config = RuntimeConfig(provider="claude", temperature=0.7)
-        assert config.provider == "claude"
+        assert config.provider.name == "claude"
         assert config.temperature == 0.7
 
     def test_temperature_boundary_values(self) -> None:
@@ -463,7 +515,7 @@ class TestRuntimeConfig:
             max_tokens=4096,
             timeout=120.0,
         )
-        assert config.provider == "claude"
+        assert config.provider.name == "claude"
         assert config.default_model == "claude-3-5-sonnet-latest"
         assert config.temperature == 0.7
         assert config.max_tokens == 4096
@@ -588,7 +640,7 @@ class TestWorkflowDef:
         workflow = WorkflowDef(name="test", entry_point="agent1")
         assert workflow.name == "test"
         assert workflow.entry_point == "agent1"
-        assert workflow.runtime.provider == "copilot"
+        assert workflow.runtime.provider.name == "copilot"
 
     def test_full_workflow(self) -> None:
         """Test fully configured workflow definition."""
@@ -1372,6 +1424,183 @@ class TestAgentDefReasoning:
         assert "workflow agents cannot have 'reasoning'" in str(exc_info.value)
 
 
+class TestAgentDefValidator:
+    """Tests for the validator field on AgentDef."""
+
+    def test_accepts_minimal_validator(self) -> None:
+        """Test that a default agent accepts a minimal validator block."""
+        agent = AgentDef(
+            name="a",
+            model="gpt-4",
+            prompt="test",
+            validator={"criteria": "Output must cite a real source."},
+        )
+        assert agent.validator is not None
+        assert agent.validator.criteria == "Output must cite a real source."
+        assert agent.validator.model is None
+        assert agent.validator.max_retries == 1
+
+    def test_accepts_validator_config_instance(self) -> None:
+        """Test that a ValidatorConfig instance is accepted."""
+        agent = AgentDef(
+            name="a",
+            model="gpt-4",
+            prompt="test",
+            validator=ValidatorConfig(criteria="Check it", model="cheap-model", max_retries=0),
+        )
+        assert agent.validator is not None
+        assert agent.validator.model == "cheap-model"
+        assert agent.validator.max_retries == 0
+
+    def test_validator_defaults_to_none(self) -> None:
+        """Test that validator defaults to None when omitted."""
+        agent = AgentDef(name="x", model="gpt-4", prompt="test")
+        assert agent.validator is None
+
+    def test_explicit_agent_type_accepts_validator(self) -> None:
+        """Test that type='agent' accepts validator."""
+        agent = AgentDef(
+            name="a",
+            type="agent",
+            model="gpt-4",
+            prompt="test",
+            validator={"criteria": "Be correct"},
+        )
+        assert agent.validator is not None
+
+    def test_empty_criteria_rejected(self) -> None:
+        """Test that blank criteria is rejected."""
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(
+                name="a",
+                model="gpt-4",
+                prompt="test",
+                validator={"criteria": "   "},
+            )
+        assert "non-empty string" in str(exc_info.value)
+
+    def test_missing_criteria_rejected(self) -> None:
+        """Test that criteria is required."""
+        with pytest.raises(ValidationError):
+            AgentDef(
+                name="a",
+                model="gpt-4",
+                prompt="test",
+                validator={"model": "gpt-4"},  # type: ignore[arg-type]
+            )
+
+    @pytest.mark.parametrize("retries", [0, 1])
+    def test_accepts_max_retries_zero_and_one(self, retries: int) -> None:
+        """Test that max_retries of 0 and 1 are accepted."""
+        agent = AgentDef(
+            name="a",
+            model="gpt-4",
+            prompt="test",
+            validator={"criteria": "Check", "max_retries": retries},
+        )
+        assert agent.validator is not None
+        assert agent.validator.max_retries == retries
+
+    @pytest.mark.parametrize("retries", [2, 3, 10])
+    def test_rejects_max_retries_above_one(self, retries: int) -> None:
+        """Test that max_retries > 1 is rejected (hard cap at 1)."""
+        with pytest.raises(ValidationError):
+            AgentDef(
+                name="a",
+                model="gpt-4",
+                prompt="test",
+                validator={"criteria": "Check", "max_retries": retries},
+            )
+
+    def test_rejects_negative_max_retries(self) -> None:
+        """Test that negative max_retries is rejected."""
+        with pytest.raises(ValidationError):
+            AgentDef(
+                name="a",
+                model="gpt-4",
+                prompt="test",
+                validator={"criteria": "Check", "max_retries": -1},
+            )
+
+    def test_unknown_validator_field_rejected(self) -> None:
+        """Test that a typo'd validator key is rejected (extra='forbid')."""
+        with pytest.raises(ValidationError):
+            AgentDef(
+                name="a",
+                model="gpt-4",
+                prompt="test",
+                validator={"criteria": "Check", "max_retreis": 1},  # typo
+            )
+
+    def test_human_gate_with_validator_raises(self) -> None:
+        """Test that human_gate agents cannot have validator."""
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(
+                name="gate1",
+                type="human_gate",
+                prompt="Choose:",
+                options=[GateOption(label="Ok", value="ok", route="next")],
+                validator={"criteria": "Check"},
+            )
+        assert "human_gate agents cannot have 'validator'" in str(exc_info.value)
+
+    def test_script_with_validator_raises(self) -> None:
+        """Test that script agents cannot have validator."""
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(
+                name="s",
+                type="script",
+                command="echo hello",
+                validator={"criteria": "Check"},
+            )
+        assert "script agents cannot have 'validator'" in str(exc_info.value)
+
+    def test_workflow_with_validator_raises(self) -> None:
+        """Test that workflow agents cannot have validator."""
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(
+                name="w",
+                type="workflow",
+                workflow="./sub.yaml",
+                validator={"criteria": "Check"},
+            )
+        assert "workflow agents cannot have 'validator'" in str(exc_info.value)
+
+    def test_wait_with_validator_raises(self) -> None:
+        """Test that wait agents cannot have validator."""
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(
+                name="w",
+                type="wait",
+                duration="5s",
+                validator={"criteria": "Check"},
+            )
+        assert "wait agents cannot have 'validator'" in str(exc_info.value)
+
+    def test_set_with_validator_raises(self) -> None:
+        """Test that set agents cannot have validator."""
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(
+                name="s",
+                type="set",
+                value="{{ workflow.input.x }}",
+                validator={"criteria": "Check"},
+            )
+        assert "set agents cannot have 'validator'" in str(exc_info.value)
+
+    def test_terminate_with_validator_raises(self) -> None:
+        """Test that terminate agents cannot have validator."""
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(
+                name="t",
+                type="terminate",
+                status="success",
+                reason="done",
+                validator={"criteria": "Check"},
+            )
+        assert "terminate agents cannot have 'validator'" in str(exc_info.value)
+
+
 class TestRuntimeConfigDefaultReasoningEffort:
     """Tests for default_reasoning_effort on RuntimeConfig."""
 
@@ -1396,6 +1625,129 @@ class TestRuntimeConfigDefaultReasoningEffort:
         """Test that invalid effort values raise ValidationError."""
         with pytest.raises(ValidationError):
             RuntimeConfig(default_reasoning_effort=effort)  # type: ignore[arg-type]
+
+
+class TestAgentDefContextTier:
+    """Tests for the context_tier field on AgentDef."""
+
+    @pytest.mark.parametrize("tier", ["default", "long_context"])
+    def test_accepts_valid_tier(self, tier: str) -> None:
+        """Test that AgentDef accepts each valid context tier."""
+        agent = AgentDef(name="a", model="gpt-4", prompt="test", context_tier=tier)  # type: ignore[arg-type]
+        assert agent.context_tier == tier
+
+    @pytest.mark.parametrize("tier", ["1m", "huge", 42, ""])
+    def test_rejects_invalid_tier(self, tier: object) -> None:
+        """Test that invalid context_tier values raise ValidationError."""
+        with pytest.raises(ValidationError):
+            AgentDef(
+                name="a",
+                model="gpt-4",
+                prompt="test",
+                context_tier=tier,  # type: ignore[arg-type]
+            )
+
+    def test_context_tier_defaults_to_none(self) -> None:
+        """Test that context_tier defaults to None when omitted."""
+        agent = AgentDef(name="x", model="gpt-4", prompt="test")
+        assert agent.context_tier is None
+
+    def test_context_tier_composes_with_reasoning(self) -> None:
+        """Test that context_tier and reasoning can be set together."""
+        agent = AgentDef(
+            name="a",
+            model="claude-opus-4.8",
+            prompt="test",
+            context_tier="long_context",
+            reasoning={"effort": "high"},
+        )
+        assert agent.context_tier == "long_context"
+        assert agent.reasoning is not None
+        assert agent.reasoning.effort == "high"
+
+    def test_human_gate_with_context_tier_raises(self) -> None:
+        """Test that human_gate agents cannot have context_tier."""
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(
+                name="g",
+                type="human_gate",
+                prompt="Approve?",
+                options=[GateOption(label="Ok", value="ok", route="next")],
+                context_tier="long_context",
+            )
+        assert "human_gate agents cannot have 'context_tier'" in str(exc_info.value)
+
+    def test_script_with_context_tier_raises(self) -> None:
+        """Test that script agents cannot have context_tier."""
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(
+                name="s",
+                type="script",
+                command="echo hi",
+                context_tier="long_context",
+            )
+        assert "script agents cannot have 'context_tier'" in str(exc_info.value)
+
+    def test_workflow_with_context_tier_raises(self) -> None:
+        """Test that workflow agents cannot have context_tier."""
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(
+                name="w",
+                type="workflow",
+                workflow="./sub.yaml",
+                context_tier="long_context",
+            )
+        assert "workflow agents cannot have 'context_tier'" in str(exc_info.value)
+
+    def test_wait_with_context_tier_raises(self) -> None:
+        """Test that wait agents cannot have context_tier."""
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(name="w", type="wait", duration="1s", context_tier="long_context")
+        assert "wait agents cannot have 'context_tier'" in str(exc_info.value)
+
+    def test_set_with_context_tier_raises(self) -> None:
+        """Test that set agents cannot have context_tier."""
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(name="s", type="set", value="42", context_tier="long_context")
+        assert "set agents cannot have 'context_tier'" in str(exc_info.value)
+
+    def test_terminate_with_context_tier_raises(self) -> None:
+        """Test that terminate agents cannot have context_tier."""
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(
+                name="t",
+                type="terminate",
+                status="success",
+                reason="done",
+                context_tier="long_context",
+            )
+        assert "terminate agents cannot have 'context_tier'" in str(exc_info.value)
+
+
+class TestRuntimeConfigDefaultContextTier:
+    """Tests for default_context_tier on RuntimeConfig."""
+
+    def test_default_is_none(self) -> None:
+        """Test that default_context_tier defaults to None."""
+        config = RuntimeConfig()
+        assert config.default_context_tier is None
+
+    def test_explicit_none_is_valid(self) -> None:
+        """Test that explicitly passing None is valid."""
+        config = RuntimeConfig(default_context_tier=None)
+        assert config.default_context_tier is None
+
+    @pytest.mark.parametrize("tier", ["default", "long_context"])
+    def test_accepts_valid_tier(self, tier: str) -> None:
+        """Test that each valid context tier is accepted."""
+        config = RuntimeConfig(default_context_tier=tier)  # type: ignore[arg-type]
+        assert config.default_context_tier == tier
+
+    @pytest.mark.parametrize("tier", ["1m", "huge", 42, ""])
+    def test_rejects_invalid_tier(self, tier: object) -> None:
+        """Test that invalid context tier values raise ValidationError."""
+        with pytest.raises(ValidationError):
+            RuntimeConfig(default_context_tier=tier)  # type: ignore[arg-type]
 
 
 class TestExtraFieldsForbidden:
@@ -1522,3 +1874,225 @@ class TestExtraFieldsForbidden:
         assert any(err["type"] == "extra_forbidden" and "whn" in err["loc"] for err in errors), (
             f"Expected extra_forbidden error for 'whn', got: {errors}"
         )
+
+
+class TestTerminateAgent:
+    """Tests for ``type: terminate`` step schema validation (issue #219).
+
+    Terminate steps are terminal nodes that end the workflow with an explicit
+    ``status`` and ``reason``. The schema must:
+
+    - Accept ``status`` (``success`` | ``failed``), ``reason``, and optional
+      ``output_template`` only when ``type == "terminate"``.
+    - Reject those fields on any other step type (avoids silent misuse on a
+      regular agent).
+    - Reject every field that doesn't make sense for a terminal step (routes,
+      tools, output, prompt, model, provider, etc.) so authoring errors fail
+      fast.
+    """
+
+    def test_valid_terminate_success(self) -> None:
+        a = AgentDef(name="ok", type="terminate", status="success", reason="done")
+        assert a.type == "terminate"
+        assert a.status == "success"
+        assert a.reason == "done"
+        assert a.output_template is None
+
+    def test_valid_terminate_failed_with_output_template(self) -> None:
+        a = AgentDef(
+            name="abort",
+            type="terminate",
+            status="failed",
+            reason="Refusing to run on unsafe input",
+            output_template={"result": "aborted", "reason": "{{ precheck.output.reason }}"},
+        )
+        assert a.status == "failed"
+        assert a.output_template == {
+            "result": "aborted",
+            "reason": "{{ precheck.output.reason }}",
+        }
+
+    def test_missing_status_rejected(self) -> None:
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(name="x", type="terminate", reason="needed")
+        assert "status" in str(exc_info.value).lower()
+
+    def test_missing_reason_rejected(self) -> None:
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(name="x", type="terminate", status="success")
+        assert "reason" in str(exc_info.value).lower()
+
+    def test_empty_reason_rejected(self) -> None:
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(name="x", type="terminate", status="success", reason="   ")
+        assert "reason" in str(exc_info.value).lower()
+
+    def test_invalid_status_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            AgentDef(name="x", type="terminate", status="maybe", reason="x")
+
+    def test_routes_rejected_on_terminate(self) -> None:
+        """Terminate ends the workflow; outbound routes would be unreachable."""
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(
+                name="x",
+                type="terminate",
+                status="success",
+                reason="r",
+                routes=[RouteDef(to="$end")],
+            )
+        assert "routes" in str(exc_info.value).lower()
+
+    def test_tools_rejected_on_terminate(self) -> None:
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(name="x", type="terminate", status="success", reason="r", tools=["foo"])
+        assert "tools" in str(exc_info.value).lower()
+
+    def test_output_rejected_on_terminate(self) -> None:
+        """`output:` is for agent schemas; terminate uses `output_template:` instead."""
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(
+                name="x",
+                type="terminate",
+                status="success",
+                reason="r",
+                output={"k": OutputField(type="string")},
+            )
+        assert "output" in str(exc_info.value).lower()
+
+    def test_prompt_rejected_on_terminate(self) -> None:
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(name="x", type="terminate", status="success", reason="r", prompt="hi")
+        assert "prompt" in str(exc_info.value).lower()
+
+    def test_model_rejected_on_terminate(self) -> None:
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(name="x", type="terminate", status="success", reason="r", model="claude")
+        assert "model" in str(exc_info.value).lower()
+
+    def test_command_rejected_on_terminate(self) -> None:
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(name="x", type="terminate", status="success", reason="r", command="echo")
+        assert "command" in str(exc_info.value).lower()
+
+    def test_workflow_rejected_on_terminate(self) -> None:
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(
+                name="x",
+                type="terminate",
+                status="success",
+                reason="r",
+                workflow="./sub.yaml",
+            )
+        assert "workflow" in str(exc_info.value).lower()
+
+    @pytest.mark.parametrize("forbidden_field", ["status", "reason", "output_template"])
+    def test_terminate_fields_rejected_on_regular_agent(self, forbidden_field: str) -> None:
+        """`status`, `reason`, `output_template` only make sense on `type: terminate`.
+
+        Without this guard, an author who forgot to add `type: terminate` would
+        silently get a regular agent that ignores these fields entirely — a
+        subtle bug that breaks the workflow without any error surfaced.
+        """
+        payload: dict[str, object] = {"name": "a"}
+        if forbidden_field == "output_template":
+            payload[forbidden_field] = {"k": "{{ a.output }}"}
+        else:
+            payload[forbidden_field] = "success" if forbidden_field == "status" else "r"
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef.model_validate(payload)
+        assert forbidden_field in str(exc_info.value)
+
+    @pytest.mark.parametrize("step_type", ["script", "workflow", "human_gate"])
+    @pytest.mark.parametrize(
+        "forbidden_field,field_value",
+        [
+            ("status", "success"),
+            ("reason", "halt"),
+            ("output_template", {"k": "{{ a.output }}"}),
+        ],
+    )
+    def test_terminate_fields_rejected_on_other_step_types(
+        self, step_type: str, forbidden_field: str, field_value: object
+    ) -> None:
+        """The terminate-only-fields guard must trip for every non-terminate type
+        and every terminate-exclusive field — not just `status`.
+
+        Earlier iteration of this test only varied ``step_type`` and asserted on
+        ``status``. A bug in ``validate_agent_type`` that, say, rejected only
+        ``status`` on ``script`` agents but silently accepted ``reason`` and
+        ``output_template`` would have slipped through. Cross-product the
+        parametrisation so every (step_type, terminate-field) pair is exercised.
+        """
+        payload: dict[str, object] = {"name": "a", "type": step_type}
+        if step_type == "script":
+            payload["command"] = "echo"
+        elif step_type == "workflow":
+            payload["workflow"] = "./sub.yaml"
+        elif step_type == "human_gate":
+            payload["prompt"] = "Pick"
+            payload["options"] = [GateOption(value="x", label="X", route="$end")]
+        payload[forbidden_field] = field_value
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef.model_validate(payload)
+        assert forbidden_field in str(exc_info.value)
+
+    def test_input_allowed_on_terminate(self) -> None:
+        """Terminate steps may declare context inputs to drive Jinja rendering."""
+        a = AgentDef(
+            name="x",
+            type="terminate",
+            status="success",
+            reason="{{ precheck.output.reason }}",
+            input=["precheck.output"],
+        )
+        assert a.input == ["precheck.output"]
+
+
+class TestScriptStdinField:
+    """The `stdin` field is exclusive to `type: script` (issue #18)."""
+
+    def test_stdin_accepted_on_script(self) -> None:
+        """A script step may declare a stdin payload template."""
+        agent = AgentDef(
+            name="s",
+            type="script",
+            command="cat",
+            stdin="{{ upstream.output.evaluations | tojson }}",
+        )
+        assert agent.stdin == "{{ upstream.output.evaluations | tojson }}"
+
+    def test_stdin_empty_string_accepted_on_script(self) -> None:
+        """An explicit empty stdin is valid (pipes immediate EOF), distinct from omission."""
+        agent = AgentDef(name="s", type="script", command="cat", stdin="")
+        assert agent.stdin == ""
+
+    def test_stdin_defaults_to_none(self) -> None:
+        """Omitting stdin leaves it None (legacy inherit-stdin behavior)."""
+        agent = AgentDef(name="s", type="script", command="echo")
+        assert agent.stdin is None
+
+    @pytest.mark.parametrize(
+        "step_type",
+        ["agent", "human_gate", "set", "wait", "terminate", "workflow"],
+    )
+    def test_stdin_rejected_on_non_script_types(self, step_type: str) -> None:
+        """The script-exclusive guard trips for every non-script step type."""
+        payload: dict[str, object] = {"name": "a", "type": step_type, "stdin": "data"}
+        if step_type == "human_gate":
+            payload["prompt"] = "Pick"
+            payload["options"] = [GateOption(value="x", label="X", route="$end")]
+        elif step_type == "set":
+            payload["value"] = "{{ 1 }}"
+        elif step_type == "wait":
+            payload["duration"] = "1s"
+        elif step_type == "terminate":
+            payload["status"] = "success"
+            payload["reason"] = "r"
+        elif step_type == "workflow":
+            payload["workflow"] = "./sub.yaml"
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef.model_validate(payload)
+        message = str(exc_info.value)
+        assert "stdin" in message
+        assert "only 'script' agents support this field" in message

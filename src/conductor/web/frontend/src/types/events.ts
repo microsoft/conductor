@@ -20,6 +20,12 @@ export type EventType =
   | 'script_started'
   | 'script_completed'
   | 'script_failed'
+  | 'wait_started'
+  | 'wait_completed'
+  | 'wait_failed'
+  | 'set_started'
+  | 'set_completed'
+  | 'set_failed'
   | 'gate_presented'
   | 'gate_resolved'
   | 'route_taken'
@@ -43,19 +49,45 @@ export type EventType =
   | 'dialog_started'
   | 'dialog_message'
   | 'dialog_completed'
+  | 'agent_validator_start'
+  | 'agent_validator_complete'
+  | 'agent_validation_failed'
   | 'iteration_limit_reached'
   | 'iteration_limit_resolved'
   | 'budget_exceeded';
 
 // --- Workflow lifecycle ---
 
+export interface ProviderMetadata {
+  name: string;
+  /** Discriminator: `"ok"` for resolved providers; `"unresolved"` when
+   *  the engine could not load capabilities (validator should have
+   *  caught this before run, so it's a forensic signal). */
+  status: 'ok' | 'unresolved';
+  /** Provider stability tier — `null` when `status: "unresolved"`. */
+  tier: 'stable' | 'experimental' | null;
+  /** Upstream package pin, e.g. `"claude-agent-sdk>=0.1.0"`. */
+  upstream_pin?: string | null;
+  /** Free-form maintainer attribution, e.g. `"@external (best-effort)"`. */
+  maintainer?: string | null;
+}
+
 export interface WorkflowStartedData {
   name: string;
   entry_point?: string;
-  agents: Array<{ name: string; type?: string; model?: string; reasoning_effort?: string | null }>;
+  agents: Array<{
+    name: string;
+    type?: string;
+    model?: string;
+    /** Provider this agent will use at runtime (honors per-agent override). */
+    provider_name?: string;
+    reasoning_effort?: string | null;
+  }>;
   routes: Array<{ from: string; to: string; when?: string }>;
   parallel_groups?: Array<{ name: string; agents: string[] }>;
   for_each_groups?: Array<{ name: string }>;
+  /** Per-provider tier/capability metadata keyed by provider name (#241). */
+  providers?: Record<string, ProviderMetadata>;
 }
 
 export interface WorkflowCompletedData {
@@ -71,6 +103,12 @@ export interface WorkflowFailedData {
   message?: string;
   /** Slot-key path of the failing engine (present only at depth > 0). */
   subworkflow_path?: string[];
+  /** Issue #245: true when the run ended via a user Stop/Kill from the UI. */
+  stopped_by_user?: boolean;
+  /** Best-effort checkpoint written for a user Stop/Kill (hard-Kill path). */
+  checkpoint_path?: string;
+  /** Why no checkpoint could be written, when one couldn't (Stop/Kill). */
+  checkpoint_unavailable_reason?: string;
 }
 
 // --- Agent lifecycle ---
@@ -152,6 +190,71 @@ export interface ScriptCompletedData {
 }
 
 export interface ScriptFailedData {
+  agent_name: string;
+  elapsed?: number;
+  error_type?: string;
+  message?: string;
+}
+
+// --- Wait lifecycle (issue #218) ---
+
+export interface WaitStartedData {
+  agent_name: string;
+  iteration?: number;
+  /** Parsed duration in seconds (null if the template could not be pre-rendered). */
+  duration_seconds?: number | null;
+  reason?: string | null;
+}
+
+export interface WaitCompletedData {
+  agent_name: string;
+  elapsed?: number;
+  /** Actual wall-clock seconds slept. */
+  waited_seconds: number;
+  /** Parsed requested duration. */
+  requested_seconds: number;
+  reason?: string | null;
+  /** True if an interrupt cut the wait short. */
+  interrupted?: boolean;
+}
+
+export interface WaitFailedData {
+  agent_name: string;
+  elapsed?: number;
+  error_type?: string;
+  message?: string;
+}
+
+// --- Set step lifecycle (issue #221) ---
+
+/** Effective output-type label used during coercion. Mirrors the schema's
+ * `AgentDef.output_type` enumeration and `SetOutputType` in set_step.py. */
+export type SetOutputType =
+  | 'auto'
+  | 'string'
+  | 'number'
+  | 'integer'
+  | 'boolean'
+  | 'list'
+  | 'dict';
+
+export interface SetStartedData {
+  agent_name: string;
+  iteration?: number;
+}
+
+export interface SetCompletedData {
+  agent_name: string;
+  elapsed?: number;
+  /** Effective output type used for coercion. */
+  output_type?: SetOutputType;
+  /** Sorted dict keys for multi-`values:` steps; empty array for scalars. */
+  output_keys?: string[];
+  /** Short JSON-safe preview of the bound value (truncated to ~512 chars). */
+  value_repr?: string;
+}
+
+export interface SetFailedData {
   agent_name: string;
   elapsed?: number;
   error_type?: string;
@@ -292,6 +395,46 @@ export interface DialogCompletedData {
   user_dismissed?: boolean;
   user_declined?: boolean;
   agent_proposed_continue?: boolean;
+}
+
+// --- Validator events (issue #220) ---
+
+export interface AgentValidatorStartData {
+  agent_name: string;
+  /** Present when the validated agent runs inside a for-each loop. */
+  item_key?: string;
+  /** Model used for the validator call (defaults to the agent's model). */
+  model?: string | null;
+  /** First ~200 chars of the validator criteria, for display. */
+  criteria_preview?: string;
+}
+
+export interface AgentValidatorCompleteData {
+  agent_name: string;
+  item_key?: string;
+  /** Whether the output satisfied the criteria. */
+  passed: boolean;
+  /** Concrete issues reported when not passed (empty when passed). */
+  issues: string[];
+  /** True when the validator failed open (call error / unparseable output). */
+  errored?: boolean;
+  model?: string | null;
+  tokens?: number | null;
+  input_tokens?: number | null;
+  output_tokens?: number | null;
+  cost_usd?: number | null;
+  elapsed?: number;
+}
+
+export interface AgentValidationFailedData {
+  agent_name: string;
+  item_key?: string;
+  issues: string[];
+  /** Whether the primary agent will be re-run once with feedback. */
+  will_retry: boolean;
+  /** True on the second emission, when the feedback re-run itself failed and
+   *  the original (failing) output was kept. */
+  rerun_errored?: boolean;
 }
 
 // --- Subworkflow lifecycle ---

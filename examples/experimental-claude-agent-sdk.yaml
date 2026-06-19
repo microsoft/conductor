@@ -1,0 +1,105 @@
+# Experimental Provider Showcase: claude-agent-sdk
+#
+# This example demonstrates the **experimental** claude-agent-sdk provider
+# end-to-end. The provider delegates the agentic loop to the `claude` CLI
+# via the `claude-agent-sdk` package — see docs/providers/experimental.md
+# for the stability policy and full list of capability carve-outs.
+#
+# When you run this workflow, you will see a one-time banner in the console
+# (and an "exp" badge on each agent node in the web dashboard) advertising
+# the experimental tier. That is by design — it surfaces tier metadata so
+# operators are never surprised by missing features.
+#
+# What this example exercises:
+#   - Provider tier surfacing (banner + dashboard badge)
+#   - Structured output via the SDK's prompt-injection JSON schema
+#   - Per-agent `tools: []` (the only safe per-agent allowlist for this
+#     provider — see #241 / A1 for why non-empty lists are refused)
+#   - `max_session_seconds` enforcement (now wired — see #241 / A7)
+#
+# Pre-requisites:
+#   pip install conductor[claude-agent-sdk]
+#   # Or with uv:
+#   uv add 'claude-agent-sdk>=0.1.0'
+#   # Plus the `claude` CLI:
+#   npm install -g @anthropic-ai/claude-code
+#   claude login
+#
+# Usage:
+#   conductor run examples/experimental-claude-agent-sdk.yaml \
+#     --input topic="multi-agent workflow orchestration"
+#
+# Validation only (no execution / no API calls):
+#   conductor validate examples/experimental-claude-agent-sdk.yaml
+
+workflow:
+  name: experimental-claude-agent-sdk-showcase
+  description: >
+    End-to-end smoke example for the experimental claude-agent-sdk
+    provider. Two LLM agents (analyze + summarize) chained linearly,
+    each with a declared output schema and a session timeout.
+  version: "1.0.0"
+  entry_point: analyze
+
+  runtime:
+    provider: claude-agent-sdk
+    # claude-sonnet-4-5 is the SDK's documented default; adjust to your
+    # Claude Code backend (Vertex AI / Bedrock / anthropic.com).
+    default_model: claude-sonnet-4-5
+
+  input:
+    topic:
+      type: string
+      required: true
+      description: The topic to analyze and summarize.
+
+agents:
+  - name: analyze
+    description: Analyze the topic and produce structured findings.
+    prompt: |
+      Analyze the following topic and produce:
+      1. A short 1-2 sentence analysis of why it matters
+      2. Three concrete facets that anyone learning about it should know
+
+      Topic: {{ workflow.input.topic }}
+    # Empty tools list = no tools available to this agent. Required for
+    # the security boundary documented in #241 / A1: non-empty lists are
+    # refused loudly because workflow tool names do not translate to
+    # Claude CLI tool IDs.
+    tools: []
+    # Wall-clock timeout for the entire agent execution. Honored by the
+    # provider per #241 / A7.
+    max_session_seconds: 120
+    output:
+      analysis:
+        type: string
+        description: One- or two-sentence analysis.
+      facets:
+        type: array
+        description: Three concrete facets to know.
+        items:
+          type: string
+    routes:
+      - to: summarize
+
+  - name: summarize
+    description: Condense the analyzer's output into a tight one-paragraph summary.
+    prompt: |
+      Given this analysis and the facets, write a single tight paragraph
+      (3-4 sentences) suitable for a TL;DR. Be specific, not generic.
+
+      Analysis: {{ analyze.output.analysis }}
+      Facets: {% for f in analyze.output.facets %}
+      - {{ f }}{% endfor %}
+    tools: []
+    max_session_seconds: 60
+    output:
+      summary:
+        type: string
+        description: One-paragraph TL;DR.
+    routes:
+      - to: $end
+
+output:
+  analysis: "{{ analyze.output.analysis }}"
+  summary: "{{ summarize.output.summary }}"

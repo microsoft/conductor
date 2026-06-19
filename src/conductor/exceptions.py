@@ -7,6 +7,8 @@ to help users resolve issues.
 
 from __future__ import annotations
 
+from typing import Any
+
 
 class ConductorError(Exception):
     """Base exception for all Conductor errors.
@@ -573,6 +575,132 @@ class HumanGateError(ExecutionError):
         """
         self.gate_name = gate_name
         super().__init__(message, suggestion, file_path, line_number)
+
+
+class WorkflowTerminated(ExecutionError):
+    """Raised when a ``type: terminate`` step ends the workflow with ``status: failed``.
+
+    This is an *explicit* termination signal — not an unexpected failure. It carries
+    the rendered output, reason, and the name of the terminate step that fired so
+    the CLI, event consumers, and dashboard can distinguish it from generic errors.
+
+    The engine's top-level ``except WorkflowTerminated`` handler emits
+    ``workflow_failed`` with ``is_explicit: True`` for this exception and
+    intentionally skips checkpoint creation. The skip is a property of the
+    handler, not of the type — a future refactor that moves checkpointing into
+    a nested handler would need to preserve that contract.
+
+    Attributes:
+        output: The rendered final output dict (from ``output_template`` if
+            provided, else the workflow-level ``output:`` mapping).
+        reason: The rendered termination reason (Jinja2-resolved against context).
+        terminated_by: Alias for ``agent_name`` — the ``name`` of the terminate
+            step that fired. Exposed as a property over ``agent_name`` so the
+            two cannot drift apart.
+        status: Always the string ``"failed"``. Successful terminations return
+            from :meth:`WorkflowEngine.run` cleanly and do not raise, so this
+            exception only ever represents the failed-termination branch.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        output: dict[str, Any],
+        reason: str,
+        terminated_by: str,
+        suggestion: str | None = None,
+    ) -> None:
+        """Initialize a WorkflowTerminated exception.
+
+        Args:
+            message: The error message describing the termination (typically the
+                rendered ``reason``).
+            output: The rendered final output dict for the workflow.
+            reason: The rendered termination reason.
+            terminated_by: Name of the terminate step that fired. Stored on the
+                base class as ``agent_name``; exposed here via the
+                :attr:`terminated_by` property so both names point at the same
+                underlying value.
+            suggestion: Optional advice for resolving the termination.
+        """
+        self.output = output
+        self.reason = reason
+        super().__init__(message, suggestion=suggestion, agent_name=terminated_by)
+
+    @property
+    def terminated_by(self) -> str:
+        """Name of the terminate step that fired (alias for ``agent_name``)."""
+        # Stored on the base class to keep one source of truth — both `agent_name`
+        # (used by generic ConductorError consumers) and `terminated_by` (used by
+        # terminate-specific code paths) MUST agree. A property guarantees that.
+        return self.agent_name or ""
+
+    @property
+    def status(self) -> str:
+        """Always ``"failed"``; success terminations return without raising.
+
+        Kept as an attribute (rather than a constant) so call sites that want
+        to log or serialise the termination status have a single API regardless
+        of whether the engine introduces additional non-binary statuses in the
+        future. Today the value is invariantly ``"failed"``.
+        """
+        return "failed"
+
+
+class SubworkflowTerminatedError(ExecutionError):
+    """Wraps a child sub-workflow's :class:`WorkflowTerminated` at the parent boundary.
+
+    When a child sub-workflow ends with ``type: terminate, status: failed``,
+    its :class:`WorkflowTerminated` is converted to this error before
+    propagating to the parent. The conversion serves two goals:
+
+    1. The parent's outer exception handler treats this as a normal
+       sub-workflow failure (parent ``workflow_failed`` does not inherit
+       ``is_explicit: true``) because the parent author did not opt into
+       explicit termination — the child did.
+    2. The structured payload the child built (its rendered ``output_template``
+       dict, the rendered reason, the terminate step's name) is preserved on
+       the wrapper so on_error hooks, debugging surfaces, and the CLI can
+       inspect it without walking ``__cause__``.
+
+    Attributes:
+        terminated_output: The child's rendered final-output dict (from the
+            child's ``output_template:`` or its ``output:`` mapping).
+        terminated_reason: The child's rendered termination reason.
+        terminated_by: The ``name`` of the terminate step inside the child
+            workflow that fired. (Distinct from ``agent_name``, which is the
+            parent's ``type: workflow`` agent that invoked the child.)
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        terminated_output: dict[str, Any],
+        terminated_reason: str,
+        terminated_by: str,
+        suggestion: str | None = None,
+        agent_name: str | None = None,
+    ) -> None:
+        """Initialize a SubworkflowTerminatedError.
+
+        Args:
+            message: Human-readable description of the boundary downgrade.
+            terminated_output: The child's rendered final-output dict.
+            terminated_reason: The child's rendered termination reason.
+            terminated_by: Name of the terminate step inside the child
+                workflow that fired.
+            suggestion: Optional advice for resolving the failure.
+            agent_name: Name of the parent's ``type: workflow`` agent that
+                invoked the child (set on the base class so generic
+                ``ExecutionError`` consumers see the parent's agent name,
+                not the child's).
+        """
+        self.terminated_output = terminated_output
+        self.terminated_reason = terminated_reason
+        self.terminated_by = terminated_by
+        super().__init__(message, suggestion=suggestion, agent_name=agent_name)
 
 
 class InterruptError(ExecutionError):

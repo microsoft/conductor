@@ -6,17 +6,25 @@ the appropriate AgentProvider based on the requested provider type.
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from conductor.exceptions import ProviderError
 from conductor.providers.base import AgentProvider
 from conductor.providers.claude import ANTHROPIC_SDK_AVAILABLE, ClaudeProvider
+from conductor.providers.claude_agent_sdk import (
+    CLAUDE_AGENT_SDK_AVAILABLE,
+    ClaudeAgentSdkProvider,
+)
+from conductor.providers.context_tier import ContextTier
 from conductor.providers.copilot import CopilotProvider, IdleRecoveryConfig
 from conductor.providers.reasoning import ReasoningEffort
 
+if TYPE_CHECKING:
+    from conductor.config.schema import ProviderSettings
+
 
 async def create_provider(
-    provider_type: Literal["copilot", "openai-agents", "claude"] = "copilot",
+    provider_type: Literal["copilot", "openai-agents", "claude", "claude-agent-sdk"] = "copilot",
     validate: bool = True,
     mcp_servers: dict[str, Any] | None = None,
     default_model: str | None = None,
@@ -26,6 +34,8 @@ async def create_provider(
     max_session_seconds: float | None = None,
     max_agent_iterations: int | None = None,
     default_reasoning_effort: ReasoningEffort | None = None,
+    default_context_tier: ContextTier | None = None,
+    provider_settings: ProviderSettings | None = None,
 ) -> AgentProvider:
     """Factory function to create the appropriate provider.
 
@@ -49,6 +59,14 @@ async def create_provider(
         default_reasoning_effort: Workflow-wide default reasoning effort
             (``low`` / ``medium`` / ``high`` / ``xhigh``) applied when an agent
             does not specify its own ``reasoning.effort``.
+        default_context_tier: Workflow-wide default context-window tier
+            (``default`` / ``long_context``) applied when an agent does not
+            specify its own ``context_tier``. Only the Copilot provider
+            forwards this; ignored for all other providers.
+        provider_settings: Structured ``runtime.provider`` settings. Only
+            applied when ``provider_type == "copilot"`` and the settings
+            opted into custom routing; ignored for all other providers
+            (structured config for those providers is not yet implemented).
 
     Returns:
         Configured AgentProvider instance.
@@ -75,6 +93,8 @@ async def create_provider(
                 idle_recovery_config=idle_recovery_config,
                 max_agent_iterations=max_agent_iterations,
                 default_reasoning_effort=default_reasoning_effort,
+                default_context_tier=default_context_tier,
+                provider_settings=provider_settings,
             )
         case "openai-agents":
             raise ProviderError(
@@ -97,10 +117,52 @@ async def create_provider(
                 max_session_seconds=max_session_seconds,
                 default_reasoning_effort=default_reasoning_effort,
             )
+        case "claude-agent-sdk":
+            if not CLAUDE_AGENT_SDK_AVAILABLE:
+                raise ProviderError(
+                    "Claude Agent SDK provider requires claude-agent-sdk package",
+                    suggestion="Install with: uv add 'claude-agent-sdk>=0.1.0'",
+                )
+            # claude-agent-sdk delegates the agentic loop to the underlying
+            # `claude` CLI, which currently does not expose hooks for
+            # workflow-level MCP servers, sampling temperature, or token
+            # caps. Silently dropping any of these would either change
+            # behavior (mcp tools the workflow expects suddenly missing)
+            # or quietly violate user intent (temperature/max_tokens).
+            # Refuse loudly until proper plumbing exists.
+            if mcp_servers:
+                raise ProviderError(
+                    "claude-agent-sdk does not support workflow MCP servers "
+                    f"(received {sorted(mcp_servers)!r}).",
+                    suggestion=(
+                        "Remove `runtime.mcp_servers` for this workflow, or "
+                        "use the `copilot` or `claude` provider for agents "
+                        "that need MCP tools."
+                    ),
+                )
+            if temperature is not None:
+                raise ProviderError(
+                    f"claude-agent-sdk does not support `temperature` (received {temperature!r}).",
+                    suggestion=(
+                        "Remove `runtime.temperature` for workflows that use claude-agent-sdk."
+                    ),
+                )
+            if max_tokens is not None:
+                raise ProviderError(
+                    f"claude-agent-sdk does not support `max_tokens` (received {max_tokens!r}).",
+                    suggestion=(
+                        "Remove `runtime.max_tokens` for workflows that use claude-agent-sdk."
+                    ),
+                )
+            provider = ClaudeAgentSdkProvider(
+                model=default_model,
+                max_turns=max_agent_iterations,
+                max_session_seconds=max_session_seconds,
+            )
         case _:
             raise ProviderError(
                 f"Unknown provider: {provider_type}",
-                suggestion="Valid providers are: copilot, openai-agents, claude",
+                suggestion="Valid providers are: copilot, openai-agents, claude, claude-agent-sdk",
             )
 
     if validate and not await provider.validate_connection():
@@ -140,7 +202,18 @@ class ProviderFactory:
         Raises:
             ProviderError: If provider creation or validation fails.
         """
-        provider_type = getattr(runtime_config, "provider", "copilot")
+        provider_settings = getattr(runtime_config, "provider", None)
+        # Support both the new ProviderSettings object and any legacy
+        # string-typed mock that test code might still pass in.
+        if hasattr(provider_settings, "name"):
+            provider_type = provider_settings.name
+        elif isinstance(provider_settings, str):
+            provider_type = provider_settings
+            provider_settings = None
+        else:
+            provider_type = "copilot"
+            provider_settings = None
+
         default_model = getattr(runtime_config, "model", None)
         temperature = getattr(runtime_config, "temperature", None)
         max_tokens = getattr(runtime_config, "max_tokens", None)
@@ -148,6 +221,7 @@ class ProviderFactory:
         max_session_seconds = getattr(runtime_config, "max_session_seconds", None)
         max_agent_iterations = getattr(runtime_config, "max_agent_iterations", None)
         default_reasoning_effort = getattr(runtime_config, "default_reasoning_effort", None)
+        default_context_tier = getattr(runtime_config, "default_context_tier", None)
 
         return await create_provider(
             provider_type=provider_type,
@@ -159,4 +233,6 @@ class ProviderFactory:
             max_session_seconds=max_session_seconds,
             max_agent_iterations=max_agent_iterations,
             default_reasoning_effort=default_reasoning_effort,
+            default_context_tier=default_context_tier,
+            provider_settings=provider_settings,
         )

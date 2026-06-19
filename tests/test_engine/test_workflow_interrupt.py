@@ -29,6 +29,7 @@ from conductor.config.schema import (
     WorkflowDef,
 )
 from conductor.engine.workflow import WorkflowEngine
+from conductor.events import WorkflowEvent, WorkflowEventEmitter
 from conductor.exceptions import InterruptError
 from conductor.gates.interrupt import InterruptAction, InterruptResult
 from conductor.providers.copilot import CopilotProvider
@@ -376,6 +377,43 @@ class TestInterruptBetweenAgents:
         mock_checkpoint.assert_called_once()
         saved_error = mock_checkpoint.call_args[0][0]
         assert isinstance(saved_error, InterruptError)
+
+    @pytest.mark.asyncio
+    async def test_stop_emits_stopped_by_user_flag(self, two_agent_config: WorkflowConfig) -> None:
+        """The in-loop Stop (InterruptError) path flags ``workflow_failed`` with
+        ``stopped_by_user`` so the dashboard renders the calm "Workflow Stopped"
+        banner rather than a crash banner (issue #245)."""
+        event = asyncio.Event()
+
+        def mock_handler(agent, prompt, context):
+            if agent.name == "planner":
+                event.set()
+            key = list(agent.output.keys())[0]
+            return {key: f"result from {agent.name}"}
+
+        emitter = WorkflowEventEmitter()
+        events: list[WorkflowEvent] = []
+        emitter.subscribe(events.append)
+
+        provider = CopilotProvider(mock_handler=mock_handler)
+        engine = WorkflowEngine(
+            two_agent_config,
+            provider,
+            interrupt_event=event,
+            event_emitter=emitter,
+        )
+
+        stop_result = InterruptResult(action=InterruptAction.STOP)
+        with (
+            patch.object(engine._interrupt_handler, "handle_interrupt", return_value=stop_result),
+            pytest.raises(InterruptError),
+        ):
+            await engine.run({"goal": "test"})
+
+        failed = [e for e in events if e.type == "workflow_failed"]
+        assert len(failed) == 1
+        assert failed[0].data["stopped_by_user"] is True
+        assert failed[0].data["error_type"] == "InterruptError"
 
     @pytest.mark.asyncio
     async def test_keyboard_interrupt_still_works(self, two_agent_config: WorkflowConfig) -> None:
@@ -910,7 +948,7 @@ class TestPartialOutputHandling:
         """Verify all mock providers still instantiate and run after ABC signature change."""
         from conductor.providers.base import AgentOutput, AgentProvider
 
-        class TestMockProvider(AgentProvider):
+        class TestMockProvider(AgentProvider, abstract=True):
             async def execute(
                 self,
                 agent: AgentDef,
