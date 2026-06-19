@@ -44,7 +44,8 @@ export type EventType =
   | 'dialog_message'
   | 'dialog_completed'
   | 'iteration_limit_reached'
-  | 'iteration_limit_resolved';
+  | 'iteration_limit_resolved'
+  | 'budget_exceeded';
 
 // --- Workflow lifecycle ---
 

@@ -714,15 +714,19 @@ workflow:
   warning on first overshoot, but the workflow continues — use this to discover
   cost profiles before enforcing.
 - `budget_mode: enforce` emits a `budget_exceeded` event, saves a checkpoint,
-  and stops the workflow with `BudgetExceededError`. Resume after increasing
-  the budget with `conductor resume <workflow.yaml>`.
+  and stops the workflow with `BudgetExceededError`. Resuming with
+  `conductor resume <workflow.yaml>` starts a fresh budget window (cumulative
+  spend resets to $0); raising `budget_usd` first is optional.
+- Sub-workflow (`type: workflow`) spend is merged into the parent's budget, so
+  a parent-level budget accounts for cost incurred by delegated workflows.
 - Recommended graduation path:
   1. Run without `budget_usd` to observe costs in the summary
   2. Add `budget_usd` in `audit` mode to track overshoots non-disruptively
   3. Switch to `enforce` once the cost profile is understood
 
-See [configuration.md](configuration.md) for an end-to-end example and
-notes on how budget tracking integrates with the provider usage callbacks.
+See [configuration.md](configuration.md#limits) for the budget
+configuration reference and notes on how budget tracking integrates with the
+provider usage callbacks.
 
 ## Tools
 

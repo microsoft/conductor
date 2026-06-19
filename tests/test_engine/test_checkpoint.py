@@ -651,7 +651,9 @@ class TestSaveLoadRoundTrip:
         assert saved is not None
         cp = CheckpointManager.load_checkpoint(saved)
 
-        restored = LimitEnforcer.from_dict(cp.limits, timeout_seconds=120)
+        restored = LimitEnforcer.from_dict(
+            cp.limits, timeout_seconds=120, budget_usd=None, budget_mode="audit"
+        )
         assert restored.current_iteration == 5
         assert restored.max_iterations == 25
         assert restored.execution_history == ["a", "b", "c", "d", "e"]

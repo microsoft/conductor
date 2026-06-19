@@ -367,6 +367,10 @@ class WorkflowEngine:
             pricing_overrides=self._build_pricing_overrides(),
         )
 
+        # One-time latch so the "budget set but no pricing" degraded warning
+        # is emitted at most once per workflow run (see _check_budget).
+        self._budget_unpriced_warned = False
+
         # Multi-provider support: registry takes precedence
         self._registry = registry
         self._single_provider = provider
@@ -489,25 +493,46 @@ class WorkflowEngine:
         threshold check to ``LimitEnforcer.check_budget()``, and acts
         according to ``budget_mode``:
 
-        - On first overshoot: emit a ``budget_exceeded`` event.
+        - On first overshoot (and each further budget increment): emit a
+          ``budget_exceeded`` event.
         - ``enforce`` mode: raise ``BudgetExceededError`` (triggers
           checkpoint + workflow stop).
         - ``audit`` mode: log a warning and continue.
 
-        Subsequent overshoots in ``audit`` mode are silent (no repeated
-        events or warnings).
+        When a budget is configured but token usage carries no pricing
+        (e.g. an unpriced model), cost cannot be computed and the budget
+        cannot be enforced. A one-time degraded warning is emitted so the
+        silent no-op is visible.
         """
-        summary = self.usage_tracker.get_summary()
-        spent = summary.total_cost_usd or 0.0
-        exceeded, first_time = self.limits.check_budget(spent)
-
-        if not exceeded:
+        if self.limits.budget_usd is None:
             return
 
-        budget = self.limits.budget_usd  # guaranteed non-None when exceeded
-        assert budget is not None  # for type narrowing
+        summary = self.usage_tracker.get_summary()
+        cost = summary.total_cost_usd
 
-        if first_time:
+        # Degraded path: tokens flowed but no priced model, so cost is None.
+        # ``check_budget`` would see $0 and never trip — warn once instead of
+        # silently disabling the budget.
+        if cost is None:
+            if summary.total_tokens > 0 and not self._budget_unpriced_warned:
+                self._budget_unpriced_warned = True
+                logger.warning(
+                    "Cost budget set ($%.2f) but no pricing is available for the "
+                    "models used (%d tokens spent so far); the budget cannot be "
+                    "enforced. Add limits.budget pricing overrides or use a priced model.",
+                    self.limits.budget_usd,
+                    summary.total_tokens,
+                )
+            return
+
+        result = self.limits.check_budget(cost)
+        if not result.exceeded:
+            return
+
+        budget = result.budget_usd
+        spent = result.spent_usd
+
+        if result.should_emit:
             self._emit(
                 "budget_exceeded",
                 {
@@ -521,16 +546,17 @@ class WorkflowEngine:
         if self.limits.budget_mode == "enforce":
             raise BudgetExceededError(
                 f"Workflow exceeded cost budget (${budget:.2f}): spent ${spent:.2f}",
-                budget_usd=budget,
+                budget_usd=budget,  # type: ignore[arg-type]  # non-None when exceeded
                 spent_usd=spent,
                 current_agent=self.limits.current_agent,
             )
 
-        if first_time:
+        if result.should_emit:
             logger.warning(
-                "Budget exceeded (audit mode): spent $%.4f of $%.2f budget",
+                "Budget exceeded (audit mode): spent $%.4f of $%.2f budget%s",
                 spent,
                 budget,
+                f" at agent '{self.limits.current_agent}'" if self.limits.current_agent else "",
             )
 
     def _yaml_source_field(self) -> dict[str, str]:
@@ -1197,7 +1223,13 @@ class WorkflowEngine:
             instructions_preamble=child_preamble,
         )
 
-        return await child_engine.run(sub_inputs)
+        output = await child_engine.run(sub_inputs)
+        # Roll the child's spend up into the parent tracker so a parent-level
+        # cost budget accounts for sub-workflow delegation. Without this,
+        # type:workflow spend lives only in the child's tracker and bypasses
+        # the parent's enforce-mode budget entirely.
+        self.usage_tracker.merge(child_engine.usage_tracker.get_summary())
+        return output
 
     async def _execute_subworkflow_with_inputs(
         self,
@@ -1311,6 +1343,9 @@ class WorkflowEngine:
 
         output = await child_engine.run(sub_inputs)
         usage = child_engine.usage_tracker.get_summary()
+        # Roll child spend up into the parent tracker (see _execute_subworkflow)
+        # so a parent-level cost budget accounts for delegated sub-workflow cost.
+        self.usage_tracker.merge(usage)
         return output, usage
 
     async def _get_provider_for_agent(self, agent: AgentDef) -> AgentProvider | None:

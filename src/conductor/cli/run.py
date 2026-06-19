@@ -489,6 +489,46 @@ def verbose_log_agent_timeout(
         _file_console.print(text)
 
 
+def verbose_log_budget_exceeded(
+    budget_usd: float,
+    spent_usd: float,
+    budget_mode: str,
+    current_agent: str | None = None,
+) -> None:
+    """Log a cost-budget overshoot.
+
+    Renders the ``budget_exceeded`` event so audit-mode overshoots are
+    visible on the console/log instead of only reaching the logging
+    lastResort stderr handler.
+
+    Args:
+        budget_usd: Configured budget limit in USD.
+        spent_usd: Cumulative spend that crossed the budget.
+        budget_mode: Active mode (``audit`` or ``enforce``).
+        current_agent: Agent executing when the budget was exceeded.
+    """
+    from rich.text import Text
+
+    from conductor.cli.app import is_verbose
+
+    should_console = is_verbose()
+    should_file = _file_console is not None
+    if not should_console and not should_file:
+        return
+
+    style = "red bold" if budget_mode == "enforce" else "yellow bold"
+    text = Text()
+    text.append("  💸 budget exceeded ", style=style)
+    text.append(f"(${spent_usd:.2f} of ${budget_usd:.2f}, {budget_mode} mode)", style="dim")
+    if current_agent:
+        text.append(f" at agent '{current_agent}'", style="dim")
+
+    if should_console:
+        _verbose_console.print(text)
+    if _file_console is not None:
+        _file_console.print(text)
+
+
 def verbose_log_parallel_summary(
     group_name: str,
     success_count: int,
@@ -810,6 +850,14 @@ class ConsoleEventSubscriber:
             verbose_log_agent_complete(
                 d.get("agent_name", "?"),
                 d.get("elapsed", 0.0),
+            )
+
+        elif t == "budget_exceeded":
+            verbose_log_budget_exceeded(
+                d.get("budget_usd", 0.0),
+                d.get("spent_usd", 0.0),
+                d.get("budget_mode", "audit"),
+                d.get("current_agent"),
             )
 
 

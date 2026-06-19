@@ -4,7 +4,7 @@ Tests cover the graduation path:
 1. No budget set (default) — no tracking, no warnings, no errors.
 2. Budget set in audit mode — event emitted on overshoot, workflow continues.
 3. Budget set in enforce mode — event emitted, workflow stops with BudgetExceededError.
-4. LimitEnforcer.check_budget() unit tests (first-time flag, repeated calls).
+4. LimitEnforcer.check_budget() unit tests (BudgetCheckResult, re-emission, repeated calls).
 5. Schema validation for budget fields.
 """
 
@@ -52,9 +52,10 @@ class TestBudgetSchema:
         assert limits.budget_usd == 5.0
         assert limits.budget_mode == "enforce"
 
-    def test_budget_usd_zero_allowed(self) -> None:
-        limits = LimitsConfig(budget_usd=0.0)
-        assert limits.budget_usd == 0.0
+    def test_budget_usd_zero_rejected(self) -> None:
+        """Zero budget is rejected: a $0 limit would trip after the first token."""
+        with pytest.raises(PydanticValidationError):
+            LimitsConfig(budget_usd=0.0)
 
     def test_budget_usd_negative_rejected(self) -> None:
         with pytest.raises(PydanticValidationError):
@@ -74,38 +75,56 @@ class TestLimitEnforcerBudget:
     """Unit tests for LimitEnforcer.check_budget()."""
 
     def test_no_budget_set_returns_not_exceeded(self) -> None:
-        """When budget_usd is None, check_budget always returns (False, False)."""
+        """When budget_usd is None, check_budget always returns not-exceeded."""
         enforcer = LimitEnforcer()
-        exceeded, first_time = enforcer.check_budget(100.0)
-        assert exceeded is False
-        assert first_time is False
+        result = enforcer.check_budget(100.0)
+        assert result.exceeded is False
+        assert result.should_emit is False
+        assert result.budget_usd is None
+        assert result.spent_usd == 100.0
 
     def test_under_budget_returns_not_exceeded(self) -> None:
         enforcer = LimitEnforcer(budget_usd=10.0)
-        exceeded, first_time = enforcer.check_budget(5.0)
-        assert exceeded is False
-        assert first_time is False
+        result = enforcer.check_budget(5.0)
+        assert result.exceeded is False
+        assert result.should_emit is False
+        assert result.budget_usd == 10.0
+        assert result.spent_usd == 5.0
 
     def test_at_budget_returns_not_exceeded(self) -> None:
         """Exactly at budget is not exceeded (> not >=)."""
         enforcer = LimitEnforcer(budget_usd=10.0)
-        exceeded, first_time = enforcer.check_budget(10.0)
-        assert exceeded is False
-        assert first_time is False
+        result = enforcer.check_budget(10.0)
+        assert result.exceeded is False
+        assert result.should_emit is False
 
     def test_over_budget_returns_exceeded_first_time(self) -> None:
         enforcer = LimitEnforcer(budget_usd=10.0)
-        exceeded, first_time = enforcer.check_budget(10.01)
-        assert exceeded is True
-        assert first_time is True
+        result = enforcer.check_budget(10.01)
+        assert result.exceeded is True
+        assert result.should_emit is True
+        assert result.budget_usd == 10.0
+        assert result.spent_usd == 10.01
 
-    def test_over_budget_second_call_not_first_time(self) -> None:
-        """After first overshoot detection, subsequent calls return first_time=False."""
+    def test_over_budget_small_growth_does_not_re_emit(self) -> None:
+        """After first overshoot, a small extra spend does not re-emit."""
         enforcer = LimitEnforcer(budget_usd=10.0)
-        _, first1 = enforcer.check_budget(10.01)
-        assert first1 is True
-        _, first2 = enforcer.check_budget(15.0)
-        assert first2 is False
+        first = enforcer.check_budget(10.01)
+        assert first.should_emit is True
+        # Still over budget, but not by another full $10 increment.
+        second = enforcer.check_budget(15.0)
+        assert second.exceeded is True
+        assert second.should_emit is False
+
+    def test_over_budget_re_emits_per_budget_increment(self) -> None:
+        """Crossing another full budget increment re-arms emission."""
+        enforcer = LimitEnforcer(budget_usd=10.0)
+        first = enforcer.check_budget(10.01)
+        assert first.should_emit is True
+        # Spend has now climbed past another full $10 beyond the last emission.
+        third = enforcer.check_budget(20.02)
+        assert third.exceeded is True
+        assert third.should_emit is True
 
     def test_budget_mode_stored(self) -> None:
         enforcer = LimitEnforcer(budget_usd=5.0, budget_mode="enforce")
@@ -114,6 +133,32 @@ class TestLimitEnforcerBudget:
     def test_default_budget_mode_is_audit(self) -> None:
         enforcer = LimitEnforcer(budget_usd=5.0)
         assert enforcer.budget_mode == "audit"
+
+    def test_from_dict_applies_budget_from_config(self) -> None:
+        """from_dict sources budget from the current config (fresh window)."""
+        enforcer = LimitEnforcer(budget_usd=10.0, budget_mode="enforce")
+        # Simulate having emitted during the original run.
+        enforcer.check_budget(10.01)
+        data = enforcer.to_dict()
+
+        restored = LimitEnforcer.from_dict(
+            data,
+            timeout_seconds=None,
+            budget_usd=3.0,
+            budget_mode="audit",
+        )
+        # Budget comes from the supplied (current config) values, not the dict.
+        assert restored.budget_usd == 3.0
+        assert restored.budget_mode == "audit"
+        # Emission tracking is reset: resume starts a fresh budget window.
+        first = restored.check_budget(3.01)
+        assert first.exceeded is True
+        assert first.should_emit is True
+
+    def test_from_dict_requires_budget_kwargs(self) -> None:
+        """from_dict refuses to silently default the budget kwargs (I5)."""
+        with pytest.raises(TypeError):
+            LimitEnforcer.from_dict({"max_iterations": 10})  # type: ignore[call-arg]
 
 
 # ---------------------------------------------------------------------------
@@ -179,10 +224,7 @@ class TestBudgetGraduationStep0:
         config = _make_config(budget_usd=None)
         expensive = _make_expensive_output()
 
-        def mock_handler(agent, prompt, context):
-            return expensive.content
-
-        provider = CopilotProvider(mock_handler=mock_handler)
+        provider = CopilotProvider(mock_handler=lambda *_a, **_kw: {})
         emitter = WorkflowEventEmitter()
         events: list = []
         emitter.subscribe(lambda e: events.append(e))
@@ -212,10 +254,7 @@ class TestBudgetGraduationStep1:
         config = _make_config(budget_usd=0.001, budget_mode="audit")
         expensive = _make_expensive_output()
 
-        def mock_handler(agent, prompt, context):
-            return expensive.content
-
-        provider = CopilotProvider(mock_handler=mock_handler)
+        provider = CopilotProvider(mock_handler=lambda *_a, **_kw: {})
         emitter = WorkflowEventEmitter()
         events: list = []
         emitter.subscribe(lambda e: events.append(e))
@@ -238,8 +277,13 @@ class TestBudgetGraduationStep1:
         assert budget_events[0].data["spent_usd"] > 0.001
 
     @pytest.mark.asyncio
-    async def test_audit_mode_emits_event_only_once(self) -> None:
-        """In audit mode with looping workflow, event emits only on first overshoot."""
+    async def test_audit_mode_re_emits_as_spend_grows(self) -> None:
+        """In audit mode, emission re-arms per budget increment as spend grows.
+
+        The old behavior latched after a single event (stale "$11/$10"
+        figure). Now each agent that pushes spend past another full budget
+        increment re-emits with the updated ``spent_usd``.
+        """
         config = WorkflowConfig(
             workflow=WorkflowDef(
                 name="budget-loop-test",
@@ -270,10 +314,7 @@ class TestBudgetGraduationStep1:
 
         call_count = 0
 
-        def mock_handler(agent, prompt, context):
-            return expensive.content
-
-        provider = CopilotProvider(mock_handler=mock_handler)
+        provider = CopilotProvider(mock_handler=lambda *_a, **_kw: {})
         emitter = WorkflowEventEmitter()
         events: list = []
         emitter.subscribe(lambda e: events.append(e))
@@ -291,9 +332,13 @@ class TestBudgetGraduationStep1:
         assert result is not None
         assert call_count >= 2
 
-        # budget_exceeded emitted exactly once despite multiple over-budget agents
+        # Each over-budget agent crosses another full budget increment, so the
+        # event re-emits with a growing spent_usd (no longer latched at one).
         budget_events = [e for e in events if e.type == "budget_exceeded"]
-        assert len(budget_events) == 1
+        assert len(budget_events) >= 2
+        spent_values = [e.data["spent_usd"] for e in budget_events]
+        assert spent_values == sorted(spent_values)
+        assert all(e.data["budget_mode"] == "audit" for e in budget_events)
 
 
 class TestBudgetGraduationStep2:
@@ -305,10 +350,7 @@ class TestBudgetGraduationStep2:
         config = _make_config(budget_usd=0.001, budget_mode="enforce")
         expensive = _make_expensive_output()
 
-        def mock_handler(agent, prompt, context):
-            return expensive.content
-
-        provider = CopilotProvider(mock_handler=mock_handler)
+        provider = CopilotProvider(mock_handler=lambda *_a, **_kw: {})
         emitter = WorkflowEventEmitter()
         events: list = []
         emitter.subscribe(lambda e: events.append(e))
@@ -344,10 +386,7 @@ class TestBudgetGraduationStep2:
         config = _make_config(budget_usd=100.0, budget_mode="enforce")
         cheap = _make_cheap_output()
 
-        def mock_handler(agent, prompt, context):
-            return cheap.content
-
-        provider = CopilotProvider(mock_handler=mock_handler)
+        provider = CopilotProvider(mock_handler=lambda *_a, **_kw: {})
         emitter = WorkflowEventEmitter()
         events: list = []
         emitter.subscribe(lambda e: events.append(e))

@@ -12,6 +12,13 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from conductor.providers.reasoning import ReasoningEffort
 
+BudgetMode = Literal["audit", "enforce"]
+"""How the engine responds when a workflow cost budget is exceeded.
+
+Shared between :class:`LimitsConfig` and :class:`conductor.engine.limits.LimitEnforcer`
+so the literal type is defined in exactly one place.
+"""
+
 
 class InputDef(BaseModel):
     """Definition for a workflow input parameter."""
@@ -309,15 +316,16 @@ class LimitsConfig(BaseModel):
     a hard time limit.
     """
 
-    budget_usd: float | None = Field(default=None, ge=0.0)
+    budget_usd: float | None = Field(default=None, gt=0.0)
     """Maximum cost budget for the workflow in USD.
 
     When set, the engine tracks cumulative cost and acts according to
-    ``budget_mode`` when the budget is exceeded. Default is None
-    (no budget tracking).
+    ``budget_mode`` when the budget is exceeded. Must be strictly positive
+    (a zero budget would trip after the first priced token, which is never
+    a useful limit). Default is None (no budget tracking).
     """
 
-    budget_mode: Literal["audit", "enforce"] = "audit"
+    budget_mode: BudgetMode = "audit"
     """How the engine responds when ``budget_usd`` is exceeded.
 
     - ``audit``: emit a ``budget_exceeded`` event and log a warning,

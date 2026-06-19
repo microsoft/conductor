@@ -1843,6 +1843,8 @@ class TestRegistrySubWorkflowResolution:
             LimitEnforcer.from_dict(
                 cp.limits,
                 timeout_seconds=config.workflow.limits.timeout_seconds,
+                budget_usd=config.workflow.limits.budget_usd,
+                budget_mode=config.workflow.limits.budget_mode,
             )
         )
 

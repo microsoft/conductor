@@ -300,7 +300,55 @@ class TestUsageTracker:
         tracker.reset()
         assert len(tracker.get_summary().agents) == 0
 
-    def test_usage_tracker_check_budget_not_exceeded(self) -> None:
+    def test_usage_tracker_merge(self) -> None:
+        """Merging another workflow's usage rolls its per-agent records up."""
+        parent = UsageTracker()
+        child = UsageTracker()
+
+        parent_output = AgentOutput(
+            content={"result": "parent"},
+            raw_response="{}",
+            input_tokens=1000,
+            output_tokens=500,
+            model="claude-sonnet-4",
+        )
+        child_output = AgentOutput(
+            content={"result": "child"},
+            raw_response="{}",
+            input_tokens=2000,
+            output_tokens=1000,
+            model="claude-sonnet-4",
+        )
+
+        parent.record("parent-agent", parent_output, elapsed=1.0)
+        child.record("child-agent", child_output, elapsed=1.0)
+
+        parent.merge(child.get_summary())
+
+        summary = parent.get_summary()
+        assert len(summary.agents) == 2
+        names = {a.agent_name for a in summary.agents}
+        assert names == {"parent-agent", "child-agent"}
+        # Parent budget now accounts for the child's tokens too.
+        assert summary.total_input_tokens == 3000
+        assert summary.total_output_tokens == 1500
+
+    def test_usage_tracker_merge_empty(self) -> None:
+        """Merging an empty summary leaves the tracker unchanged."""
+        tracker = UsageTracker()
+        output = AgentOutput(
+            content={"result": "test"},
+            raw_response="{}",
+            input_tokens=1000,
+            output_tokens=500,
+            model="claude-sonnet-4",
+        )
+        tracker.record("agent1", output, elapsed=1.0)
+
+        tracker.merge(WorkflowUsage())
+
+        assert len(tracker.get_summary().agents) == 1
+
         """Test budget check when under budget."""
         tracker = UsageTracker()
 

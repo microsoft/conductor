@@ -285,8 +285,11 @@ workflow:
 - `audit` mode (default): emits a `budget_exceeded` event and logs a warning,
   but the workflow continues — use this to discover cost profiles
 - `enforce` mode: emits a `budget_exceeded` event, saves a checkpoint,
-  and stops the workflow with a `BudgetExceededError` (resumable via
-  `conductor resume` after increasing the budget)
+  and stops the workflow with a `BudgetExceededError`. Resuming with
+  `conductor resume` starts a fresh budget window (cumulative spend resets
+  to $0), so raising the budget first is optional
+- Sub-workflow spend is merged into the parent budget, so a parent-level
+  budget accounts for delegated `type: workflow` cost
 - When `budget_usd` is not set, no budget tracking occurs
 
 **Recommended graduation path**:
