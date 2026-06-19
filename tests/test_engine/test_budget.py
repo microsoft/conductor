@@ -10,6 +10,9 @@ Tests cover the graduation path:
 
 from __future__ import annotations
 
+import textwrap
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError as PydanticValidationError
 
@@ -18,6 +21,7 @@ from conductor.config.schema import (
     LimitsConfig,
     OutputField,
     RouteDef,
+    RuntimeConfig,
     WorkflowConfig,
     WorkflowDef,
 )
@@ -445,3 +449,129 @@ class TestBudgetExceededError:
             spent_usd=2.0,
         )
         assert isinstance(error, ExecutionError)
+
+
+# ---------------------------------------------------------------------------
+# Sub-workflow Budget Roll-up Tests (C1)
+# ---------------------------------------------------------------------------
+
+
+def _make_subworkflow_parent_config(
+    budget_usd: float | None = None,
+    budget_mode: str = "audit",
+) -> WorkflowConfig:
+    """Parent workflow whose only step delegates to a sub-workflow.
+
+    The parent has no direct LLM agent, so any spend in the parent's usage
+    tracker can only have arrived via the child roll-up.
+    """
+    return WorkflowConfig(
+        workflow=WorkflowDef(
+            name="rollup-parent",
+            entry_point="delegate",
+            runtime=RuntimeConfig(provider="copilot"),
+            limits=LimitsConfig(
+                max_iterations=10,
+                budget_usd=budget_usd,
+                budget_mode=budget_mode,
+            ),
+        ),
+        agents=[
+            AgentDef(
+                name="delegate",
+                type="workflow",
+                workflow="child.yaml",
+                routes=[RouteDef(to="$end")],
+            ),
+        ],
+        output={"result": "{{ delegate.output.result }}"},
+    )
+
+
+def _write_child_workflow(dir_path: Path) -> None:
+    """Write a single-agent child workflow (cost is supplied via the mocked provider)."""
+    (dir_path / "child.yaml").write_text(
+        textwrap.dedent(
+            """\
+            workflow:
+              name: rollup-child
+              entry_point: inner
+              runtime:
+                provider: copilot
+              limits:
+                max_iterations: 5
+            agents:
+              - name: inner
+                prompt: "Inner work"
+                routes:
+                  - to: "$end"
+            output:
+              result: "{{ inner.output.result }}"
+            """
+        ),
+        encoding="utf-8",
+    )
+
+
+class TestBudgetSubworkflowRollup:
+    """C1: sub-workflow (type: workflow) spend rolls into the parent budget.
+
+    Guards the parent-level merge call site
+    (``self.usage_tracker.merge(child_engine.usage_tracker.get_summary())``)
+    that had to be re-applied on top of main's ``_run_child_engine`` refactor.
+    The ``merge()`` unit test proves the primitive; these prove the engine
+    actually wires it end-to-end so a parent budget accounts for delegated cost.
+    """
+
+    @pytest.mark.asyncio
+    async def test_child_spend_rolls_into_parent_tracker(self, tmp_path: Path) -> None:
+        """A sub-workflow's per-agent spend appears in the parent's usage summary."""
+        _write_child_workflow(tmp_path)
+        parent_path = tmp_path / "parent.yaml"
+        parent_path.write_text("dummy", encoding="utf-8")
+
+        config = _make_subworkflow_parent_config()
+        expensive = _make_expensive_output()
+
+        provider = CopilotProvider(mock_handler=lambda *_a, **_kw: {})
+
+        async def patched_execute(*args, **kwargs):
+            return expensive
+
+        provider.execute = patched_execute  # type: ignore[assignment]
+
+        engine = WorkflowEngine(config, provider, workflow_path=parent_path)
+        await engine.run({})
+
+        summary = engine.usage_tracker.get_summary()
+        # The parent has no direct LLM agent, so "inner" appearing here — and
+        # any non-zero cost at all — can only come from the child roll-up.
+        agent_names = {a.agent_name for a in summary.agents}
+        assert "inner" in agent_names
+        assert summary.total_cost_usd is not None
+        assert summary.total_cost_usd > 0.0
+
+    @pytest.mark.asyncio
+    async def test_enforce_budget_trips_on_child_spend(self, tmp_path: Path) -> None:
+        """A parent enforce-mode budget trips on cost incurred only by the child."""
+        _write_child_workflow(tmp_path)
+        parent_path = tmp_path / "parent.yaml"
+        parent_path.write_text("dummy", encoding="utf-8")
+
+        config = _make_subworkflow_parent_config(budget_usd=0.001, budget_mode="enforce")
+        expensive = _make_expensive_output()
+
+        provider = CopilotProvider(mock_handler=lambda *_a, **_kw: {})
+
+        async def patched_execute(*args, **kwargs):
+            return expensive
+
+        provider.execute = patched_execute  # type: ignore[assignment]
+
+        engine = WorkflowEngine(config, provider, workflow_path=parent_path)
+
+        with pytest.raises(BudgetExceededError) as exc_info:
+            await engine.run({})
+
+        # The overshoot is entirely attributable to delegated child spend.
+        assert exc_info.value.spent_usd > 0.001
