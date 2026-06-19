@@ -13,7 +13,7 @@ and a per-agent override.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, cast
 
 if TYPE_CHECKING:
     from conductor.config.schema import AgentDef
@@ -39,5 +39,10 @@ def resolve_context_tier(
         The resolved ``ContextTier``, or ``None`` to send no value.
     """
     if agent.context_tier is not None:
-        return agent.context_tier
+        # #262: AgentDef widens ``context_tier`` to ``ContextTier | str`` so a
+        # ``{{ ... }}`` template survives schema validation. By the time this
+        # resolver runs (provider execute, after AgentExecutor renders +
+        # validates the field) the value is a concrete, validated literal, so
+        # narrowing back to ContextTier is sound.
+        return cast(ContextTier, agent.context_tier)
     return runtime_default

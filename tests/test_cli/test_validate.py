@@ -44,6 +44,16 @@ class TestValidateCommand:
         assert result.exit_code == 0
         assert "Validation Successful" in result.output
 
+    def test_validate_templated_enums(self, fixtures_dir: Path) -> None:
+        """#262: a workflow with templated reasoning.effort + context_tier
+        validates clean (templates are deferred to runtime, not rejected)."""
+        workflow_file = fixtures_dir / "valid_templated_enums.yaml"
+        result = runner.invoke(app, ["validate", str(workflow_file)])
+
+        assert result.exit_code == 0
+        assert "Validation Successful" in result.output
+        assert "templated-enums-workflow" in result.output
+
     def test_validate_malformed_yaml(self, fixtures_dir: Path) -> None:
         """Test validating a file with malformed YAML."""
         workflow_file = fixtures_dir / "invalid_malformed.yaml"

@@ -187,6 +187,44 @@ class TestReasoningEffortCrossCheck:
         )
         validate_workflow_config(config)
 
+    def test_templated_effort_defers_capability_check(self, patch_caps: Any) -> None:
+        """#262: a templated effort can't be checked vs caps until runtime.
+
+        The provider only advertises ``low``/``medium``, but a templated
+        effort must NOT raise at validate time — the resolved value is
+        checked by the runtime resolver instead.
+        """
+        patch_caps({"copilot": _caps(reasoning_effort=("low", "medium"))})
+        config = _build_workflow(
+            agents=[
+                AgentDef(
+                    name="a",
+                    prompt="hi",
+                    reasoning=ReasoningConfig(effort="{{ workflow.input.eff }}"),
+                ),
+            ],
+        )
+        validate_workflow_config(config)  # must not raise
+
+    def test_templated_effort_on_no_reasoning_provider_still_errors(self, patch_caps: Any) -> None:
+        """#262 (dual-RD): whether a provider supports reasoning AT ALL is a
+        value-INDEPENDENT fact known at validate time. A templated effort on a
+        provider with ``reasoning_effort=None`` must STILL error — no resolved
+        value could ever be valid, and the provider ignores reasoning at
+        runtime, so deferring would silently drop operator intent."""
+        patch_caps({"copilot": _caps(reasoning_effort=None)})
+        config = _build_workflow(
+            agents=[
+                AgentDef(
+                    name="a",
+                    prompt="hi",
+                    reasoning=ReasoningConfig(effort="{{ workflow.input.eff }}"),
+                ),
+            ],
+        )
+        with pytest.raises(ConfigurationError, match="does not support reasoning effort"):
+            validate_workflow_config(config)
+
 
 class TestStructuredOutputCrossCheck:
     def test_schema_against_no_support_errors(self, patch_caps: Any) -> None:

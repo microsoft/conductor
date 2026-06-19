@@ -1705,12 +1705,23 @@ def _validate_provider_capabilities(
                 if (agent.reasoning is not None and agent.reasoning.effort is not None)
                 else "runtime.default_reasoning_effort"
             )
+            # #262: whether the provider supports reasoning effort AT ALL is a
+            # value-INDEPENDENT fact known at validate time, so reject even a
+            # templated effort here — no resolved value could ever be valid on
+            # a provider with reasoning_effort=None (e.g. claude-agent-sdk,
+            # which ignores reasoning entirely). Only the membership check
+            # (does the resolved literal fall in the supported subset?) is
+            # value-dependent and must be deferred for templates; providers
+            # that support reasoning re-validate the resolved value at runtime
+            # (copilot._validate_reasoning_effort_for_model / claude thinking).
             if supported is None:
                 errors.append(
                     f"Agent '{agent.name}' resolves to {source}={requested!r} "
                     f"but provider '{provider_name}' does not support reasoning "
                     f"effort (capabilities.reasoning_effort=None)."
                 )
+            elif isinstance(requested, str) and "{{" in requested:
+                pass
             elif requested not in supported:
                 errors.append(
                     f"Agent '{agent.name}' resolves to {source}={requested!r} "
