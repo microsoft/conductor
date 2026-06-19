@@ -318,6 +318,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `docs/cli-reference.md` `--web-bg` section now documents the `human_gate`
   incompatibility and the new pre-fork validation behavior.
 
+### Added
+- Workflow `limits.budget_usd` and `limits.budget_mode` (`audit` | `enforce`)
+  cap cumulative LLM cost across a run. `audit` (default) emits a
+  `budget_exceeded` event and continues so users can profile costs before
+  enforcing; `enforce` saves a checkpoint and stops with
+  `BudgetExceededError`. Resuming with `conductor resume` starts a fresh
+  budget window (cumulative spend resets to $0), so the remaining work runs
+  under a full budget — raising `budget_usd` first is optional. Sub-workflow
+  spend is merged into the parent so a parent budget accounts for delegated
+  cost. Schema, engine enforcement at all five existing limit-check points,
+  resume parity for restored budget state, and the new `BudgetExceededError`
+  type are wired end-to-end. See
+  [docs/workflow-syntax.md](docs/workflow-syntax.md#cost-budget) and
+  [docs/configuration.md](docs/configuration.md) for the graduation path.
+
 ## [0.1.17](https://github.com/microsoft/conductor/compare/v0.1.16...v0.1.17) - 2026-05-21
 
 ### Added

@@ -315,7 +315,11 @@ class TestPeriodicCheckpointEngine:
 
             resume_engine = _make_engine(build(), wf, WorkflowEventEmitter())
             resume_engine.set_context(WorkflowContext.from_dict(step3_cp.context))
-            resume_engine.set_limits(LimitEnforcer.from_dict(step3_cp.limits, timeout_seconds=None))
+            resume_engine.set_limits(
+                LimitEnforcer.from_dict(
+                    step3_cp.limits, timeout_seconds=None, budget_usd=None, budget_mode="audit"
+                )
+            )
             await resume_engine.resume("step3")
 
         # Resume re-ran only step3; step1 and step2 were not executed again.
@@ -526,7 +530,11 @@ class TestPeriodicCleanupTerminalOutcomes:
             # Resume with a healthy config and let it complete successfully.
             resume_engine = _make_engine(config, wf, WorkflowEventEmitter())
             resume_engine.set_context(WorkflowContext.from_dict(step3_cp.context))
-            resume_engine.set_limits(LimitEnforcer.from_dict(step3_cp.limits, timeout_seconds=None))
+            resume_engine.set_limits(
+                LimitEnforcer.from_dict(
+                    step3_cp.limits, timeout_seconds=None, budget_usd=None, budget_mode="audit"
+                )
+            )
             await resume_engine.resume("step3")
 
             remaining = [

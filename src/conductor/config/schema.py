@@ -22,6 +22,13 @@ from conductor.duration import parse_duration
 from conductor.providers.context_tier import ContextTier
 from conductor.providers.reasoning import ReasoningEffort
 
+BudgetMode = Literal["audit", "enforce"]
+"""How the engine responds when a workflow cost budget is exceeded.
+
+Shared between :class:`LimitsConfig` and :class:`conductor.engine.limits.LimitEnforcer`
+so the literal type is defined in exactly one place.
+"""
+
 # Maximum allowed wait-step duration (24 hours). Anything longer almost
 # certainly wants ``limits.timeout_seconds`` reconsidered first.
 MAX_WAIT_DURATION_SECONDS = 24 * 60 * 60
@@ -321,6 +328,27 @@ class LimitsConfig(BaseModel):
     Default is None (unlimited). Idle detection at the session level (5 min)
     handles most stuck cases. Set an explicit value for workflows that need
     a hard time limit.
+    """
+
+    budget_usd: float | None = Field(default=None, gt=0.0)
+    """Maximum cost budget for the workflow in USD.
+
+    When set, the engine tracks cumulative cost and acts according to
+    ``budget_mode`` when the budget is exceeded. Must be strictly positive
+    (a zero budget would trip after the first priced token, which is never
+    a useful limit). Default is None (no budget tracking).
+    """
+
+    budget_mode: BudgetMode = "audit"
+    """How the engine responds when ``budget_usd`` is exceeded.
+
+    - ``audit``: emit a ``budget_exceeded`` event and log a warning,
+      but allow the workflow to continue. Use this to discover cost
+      profiles before applying hard limits.
+    - ``enforce``: emit a ``budget_exceeded`` event, save a checkpoint,
+      and stop the workflow with a ``BudgetExceededError``.
+
+    Only takes effect when ``budget_usd`` is set. Default is ``audit``.
     """
 
 

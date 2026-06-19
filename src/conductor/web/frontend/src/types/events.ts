@@ -53,7 +53,8 @@ export type EventType =
   | 'agent_validator_complete'
   | 'agent_validation_failed'
   | 'iteration_limit_reached'
-  | 'iteration_limit_resolved';
+  | 'iteration_limit_resolved'
+  | 'budget_exceeded';
 
 // --- Workflow lifecycle ---
 

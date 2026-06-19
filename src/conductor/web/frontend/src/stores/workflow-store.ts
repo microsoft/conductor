@@ -2156,6 +2156,19 @@ function buildLogEntry(event: WorkflowEvent): LogEntry | null {
     case 'workflow_failed':
       return { timestamp: ts, level: 'error', source: 'workflow', message: `Workflow failed: ${d.message || d.error_type || 'unknown error'}` };
 
+    case 'budget_exceeded': {
+      const spent = (d.spent_usd as number) ?? 0;
+      const budget = (d.budget_usd as number) ?? 0;
+      const mode = String(d.budget_mode ?? 'audit');
+      const at = d.current_agent ? ` at ${d.current_agent}` : '';
+      return {
+        timestamp: ts,
+        level: mode === 'enforce' ? 'error' : 'warning',
+        source: 'workflow',
+        message: `Budget exceeded — $${spent.toFixed(2)} of $${budget.toFixed(2)} (${mode})${at}`,
+      };
+    }
+
     case 'checkpoint_saved':
       return { timestamp: ts, level: 'info', source: 'workflow', message: `Checkpoint saved: ${(d.path as string)?.split('/').pop() || 'unknown'}` };
 

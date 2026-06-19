@@ -195,6 +195,19 @@ class UsageTracker:
         """Clear all recorded usage data."""
         self._agents.clear()
 
+    def merge(self, other: WorkflowUsage) -> None:
+        """Merge another workflow's usage records into this tracker.
+
+        Appends every per-agent record from ``other`` so that this
+        tracker's aggregate token and cost totals include the other
+        workflow's spend. Used to roll a sub-workflow's usage up into its
+        parent so a parent-level cost budget accounts for delegated spend.
+
+        Args:
+            other: Aggregated usage from another (typically child) workflow.
+        """
+        self._agents.extend(other.agents)
+
     def check_budget(self, budget_usd: float) -> tuple[bool, float]:
         """Check if budget is exceeded.
 

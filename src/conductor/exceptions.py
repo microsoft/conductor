@@ -486,6 +486,69 @@ class AgentTimeoutError(TimeoutError):
         self.agent_name = agent_name
 
 
+class BudgetExceededError(ExecutionError):
+    """Raised when a workflow exceeds its cost budget in enforce mode.
+
+    This is a safety mechanism to prevent runaway spending in agentic
+    workflows. Only raised when ``budget_mode`` is ``enforce``.
+
+    Attributes:
+        budget_usd: The configured budget limit.
+        spent_usd: The actual amount spent when the limit was exceeded.
+        current_agent: The agent that was executing when the budget was exceeded.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        budget_usd: float,
+        spent_usd: float,
+        current_agent: str | None = None,
+        suggestion: str | None = None,
+        file_path: str | None = None,
+        line_number: int | None = None,
+    ) -> None:
+        """Initialize a BudgetExceededError.
+
+        Args:
+            message: The error message describing the overshoot.
+            budget_usd: The configured budget limit in USD.
+            spent_usd: The cumulative cost when the limit was exceeded.
+            current_agent: The agent that was executing when the budget was
+                exceeded. Forwarded to ``ExecutionError.agent_name`` so both
+                ``.agent_name`` and ``.current_agent`` resolve to the same value.
+            suggestion: Optional advice. When omitted, an actionable default is
+                generated.
+            file_path: Optional path to the workflow file.
+            line_number: Optional line number within the workflow file.
+        """
+        self.budget_usd = budget_usd
+        self.spent_usd = spent_usd
+        self.current_agent = current_agent
+
+        if suggestion is None:
+            suggestion = (
+                f"Increase limits.budget_usd (currently ${budget_usd:.2f}) "
+                f"or switch to budget_mode: audit to continue without enforcement. "
+                f"Resuming this workflow starts a fresh budget window "
+                f"(cumulative spend resets to $0)"
+            )
+            if current_agent:
+                suggestion += f". Budget exceeded after agent '{current_agent}'"
+
+        super().__init__(
+            message,
+            suggestion,
+            file_path,
+            line_number,
+            agent_name=current_agent,
+        )
+        # ExecutionError.__init__ already stored agent_name; keep current_agent
+        # as the canonical attribute used by callers/tests.
+        self.current_agent = current_agent
+
+
 class HumanGateError(ExecutionError):
     """Raised when a human gate encounters an error.
 

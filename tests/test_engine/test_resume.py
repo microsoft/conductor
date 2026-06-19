@@ -411,6 +411,8 @@ class TestResume:
         restored_limits = LimitEnforcer.from_dict(
             {"current_iteration": 1, "max_iterations": 10, "execution_history": ["planner"]},
             timeout_seconds=300,
+            budget_usd=None,
+            budget_mode="audit",
         )
 
         engine.set_context(restored_ctx)
@@ -443,6 +445,9 @@ class TestResume:
 
         restored_limits = LimitEnforcer.from_dict(
             {"current_iteration": 1, "max_iterations": 10, "execution_history": ["planner"]},
+            timeout_seconds=None,
+            budget_usd=None,
+            budget_mode="audit",
         )
 
         engine.set_context(restored_ctx)
@@ -505,6 +510,8 @@ class TestFullRoundTrip:
             LimitEnforcer.from_dict(
                 cp.limits,
                 timeout_seconds=config.workflow.limits.timeout_seconds,
+                budget_usd=config.workflow.limits.budget_usd,
+                budget_mode=config.workflow.limits.budget_mode,
             )
         )
 
@@ -540,6 +547,9 @@ class TestFullRoundTrip:
 
         restored_limits = LimitEnforcer.from_dict(
             {"current_iteration": 1, "max_iterations": 10, "execution_history": ["planner"]},
+            timeout_seconds=None,
+            budget_usd=None,
+            budget_mode="audit",
         )
         engine.set_limits(restored_limits)
 
@@ -668,6 +678,8 @@ class TestSetContextAndLimits:
         new_limits = LimitEnforcer.from_dict(
             {"current_iteration": 5, "max_iterations": 20, "execution_history": ["a"] * 5},
             timeout_seconds=120,
+            budget_usd=None,
+            budget_mode="audit",
         )
 
         engine.set_limits(new_limits)
@@ -870,6 +882,8 @@ class TestBuildAndSuppressWorkflowStarted:
             LimitEnforcer.from_dict(
                 {"current_iteration": 0, "max_iterations": 10, "execution_history": []},
                 timeout_seconds=120,
+                budget_usd=None,
+                budget_mode="audit",
             )
         )
         engine2.context.set_workflow_inputs({"topic": "AI"})

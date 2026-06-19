@@ -372,7 +372,9 @@ class TestLimitEnforcerFromDict:
             "execution_history": ["a1", "a2", "a3", "a3", "a3"],
         }
 
-        enforcer = LimitEnforcer.from_dict(data)
+        enforcer = LimitEnforcer.from_dict(
+            data, timeout_seconds=None, budget_usd=None, budget_mode="audit"
+        )
 
         assert enforcer.current_iteration == 5
         assert enforcer.max_iterations == 20
@@ -387,7 +389,9 @@ class TestLimitEnforcerFromDict:
         }
 
         before = time.monotonic()
-        enforcer = LimitEnforcer.from_dict(data)
+        enforcer = LimitEnforcer.from_dict(
+            data, timeout_seconds=None, budget_usd=None, budget_mode="audit"
+        )
         after = time.monotonic()
 
         assert enforcer.start_time is not None
@@ -401,7 +405,9 @@ class TestLimitEnforcerFromDict:
             "execution_history": [],
         }
 
-        enforcer = LimitEnforcer.from_dict(data, timeout_seconds=300)
+        enforcer = LimitEnforcer.from_dict(
+            data, timeout_seconds=300, budget_usd=None, budget_mode="audit"
+        )
 
         assert enforcer.timeout_seconds == 300
 
@@ -413,7 +419,9 @@ class TestLimitEnforcerFromDict:
             "execution_history": [],
         }
 
-        enforcer = LimitEnforcer.from_dict(data)
+        enforcer = LimitEnforcer.from_dict(
+            data, timeout_seconds=None, budget_usd=None, budget_mode="audit"
+        )
 
         assert enforcer.timeout_seconds is None
 
@@ -425,13 +433,17 @@ class TestLimitEnforcerFromDict:
             "execution_history": ["a", "b"],
         }
 
-        enforcer = LimitEnforcer.from_dict(data)
+        enforcer = LimitEnforcer.from_dict(
+            data, timeout_seconds=None, budget_usd=None, budget_mode="audit"
+        )
 
         assert enforcer.current_agent is None
 
     def test_defaults_for_missing_fields(self) -> None:
         """from_dict handles missing fields gracefully with defaults."""
-        enforcer = LimitEnforcer.from_dict({})
+        enforcer = LimitEnforcer.from_dict(
+            {}, timeout_seconds=None, budget_usd=None, budget_mode="audit"
+        )
 
         assert enforcer.current_iteration == 0
         assert enforcer.max_iterations == 10
@@ -445,7 +457,9 @@ class TestLimitEnforcerFromDict:
             "execution_history": ["a"] * 8,
         }
 
-        enforcer = LimitEnforcer.from_dict(data, timeout_seconds=60)
+        enforcer = LimitEnforcer.from_dict(
+            data, timeout_seconds=60, budget_usd=None, budget_mode="audit"
+        )
 
         assert enforcer.max_iterations == 25
         assert enforcer.current_iteration == 8
@@ -457,7 +471,9 @@ class TestLimitEnforcerRoundTrip:
     def test_default_round_trip(self) -> None:
         """Default enforcer survives round-trip."""
         original = LimitEnforcer()
-        restored = LimitEnforcer.from_dict(original.to_dict())
+        restored = LimitEnforcer.from_dict(
+            original.to_dict(), timeout_seconds=None, budget_usd=None, budget_mode="audit"
+        )
 
         assert restored.current_iteration == original.current_iteration
         assert restored.max_iterations == original.max_iterations
@@ -471,7 +487,9 @@ class TestLimitEnforcerRoundTrip:
         original.record_execution("researcher")
         original.record_execution("researcher")
 
-        restored = LimitEnforcer.from_dict(original.to_dict(), timeout_seconds=120)
+        restored = LimitEnforcer.from_dict(
+            original.to_dict(), timeout_seconds=120, budget_usd=None, budget_mode="audit"
+        )
 
         assert restored.current_iteration == original.current_iteration
         assert restored.max_iterations == original.max_iterations
@@ -487,7 +505,9 @@ class TestLimitEnforcerRoundTrip:
 
         json_str = json.dumps(original.to_dict())
         data = json.loads(json_str)
-        restored = LimitEnforcer.from_dict(data, timeout_seconds=60)
+        restored = LimitEnforcer.from_dict(
+            data, timeout_seconds=60, budget_usd=None, budget_mode="audit"
+        )
 
         assert restored.current_iteration == 4
         assert restored.max_iterations == 15
@@ -501,7 +521,9 @@ class TestLimitEnforcerRoundTrip:
         original.record_execution("b")
         original.record_execution("c")
 
-        restored = LimitEnforcer.from_dict(original.to_dict())
+        restored = LimitEnforcer.from_dict(
+            original.to_dict(), timeout_seconds=None, budget_usd=None, budget_mode="audit"
+        )
 
         # Should allow 2 more iterations
         restored.check_iteration("d")
