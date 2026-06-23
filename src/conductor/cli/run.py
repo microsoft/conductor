@@ -521,6 +521,46 @@ def verbose_log_agent_timeout(
         _file_console.print(text)
 
 
+def verbose_log_budget_exceeded(
+    budget_usd: float,
+    spent_usd: float,
+    budget_mode: str,
+    current_agent: str | None = None,
+) -> None:
+    """Log a cost-budget overshoot.
+
+    Renders the ``budget_exceeded`` event so audit-mode overshoots are
+    visible on the console/log instead of only reaching the logging
+    lastResort stderr handler.
+
+    Args:
+        budget_usd: Configured budget limit in USD.
+        spent_usd: Cumulative spend that crossed the budget.
+        budget_mode: Active mode (``audit`` or ``enforce``).
+        current_agent: Agent executing when the budget was exceeded.
+    """
+    from rich.text import Text
+
+    from conductor.cli.app import is_verbose
+
+    should_console = is_verbose()
+    should_file = _file_console is not None
+    if not should_console and not should_file:
+        return
+
+    style = "red bold" if budget_mode == "enforce" else "yellow bold"
+    text = Text()
+    text.append("  💸 budget exceeded ", style=style)
+    text.append(f"(${spent_usd:.2f} of ${budget_usd:.2f}, {budget_mode} mode)", style="dim")
+    if current_agent:
+        text.append(f" at agent '{current_agent}'", style="dim")
+
+    if should_console:
+        _verbose_console.print(text)
+    if _file_console is not None:
+        _file_console.print(text)
+
+
 def verbose_log_parallel_summary(
     group_name: str,
     success_count: int,
@@ -946,6 +986,14 @@ class ConsoleEventSubscriber:
                 d.get("elapsed", 0.0),
             )
 
+        elif t == "budget_exceeded":
+            verbose_log_budget_exceeded(
+                d.get("budget_usd", 0.0),
+                d.get("spent_usd", 0.0),
+                d.get("budget_mode", "audit"),
+                d.get("current_agent"),
+            )
+
         elif t == "wait_completed":
             interrupted = d.get("interrupted", False)
             waited = d.get("waited_seconds", d.get("elapsed", 0.0))
@@ -958,6 +1006,59 @@ class ConsoleEventSubscriber:
                 f"{d.get('error_type', 'Error')}: {d.get('message', 'unknown')}",
                 style="red",
             )
+
+        elif t == "agent_validator_start":
+            verbose_log(f"  Validating '{_validator_label(d)}' output…", style="cyan")
+
+        elif t == "agent_validator_complete":
+            label = _validator_label(d)
+            cost = d.get("cost_usd")
+            cost_str = f" · ${cost:.4f}" if isinstance(cost, int | float) else ""
+            if d.get("errored"):
+                verbose_log(
+                    f"  Validation error for '{label}' (treated as pass){cost_str}",
+                    style="yellow",
+                )
+            elif d.get("passed", True):
+                verbose_log(f"  Validation passed for '{label}'{cost_str}", style="green")
+            # Failure detail is emitted via agent_validation_failed below.
+
+        elif t == "agent_validation_failed":
+            label = _validator_label(d)
+            issues = d.get("issues") or []
+            if d.get("rerun_errored"):
+                action = "re-run failed — keeping original output"
+            elif d.get("will_retry"):
+                action = "re-running once with feedback"
+            else:
+                action = "no retry (max_retries=0)"
+            style = "red" if d.get("rerun_errored") else "yellow"
+            verbose_log(
+                f"  Validation failed for '{label}' ({len(issues)} issue(s)) — {action}:",
+                style=style,
+            )
+            for issue in issues:
+                verbose_log(f"    - {issue}", style="dim")
+
+        elif t == "checkpoint_save_failed":
+            n = d.get("consecutive_failures", 1)
+            # Avoid spamming when every boundary fails (e.g. disk full): warn on
+            # the first failure, then every 10th.
+            if n == 1 or n % 10 == 0:
+                err = d.get("error_type")
+                detail = f" ({err})" if err else ""
+                verbose_log(
+                    f"  WARNING: periodic checkpoint save failed{detail} — "
+                    f"this run may not be resumable if it stalls (failure #{n})",
+                    style="yellow",
+                )
+
+
+def _validator_label(data: dict[str, Any]) -> str:
+    """Build an agent label including a for-each ``item_key`` when present."""
+    agent = data.get("agent_name", "?")
+    item = data.get("item_key")
+    return f"{agent}[{item}]" if item is not None else str(agent)
 
 
 def display_usage_summary(usage_data: dict[str, Any], console: Console | None = None) -> None:
@@ -1213,7 +1314,7 @@ async def _run_with_stop_signal(
     Raises:
         ExecutionError: If the workflow was killed via the dashboard.
     """
-    return await _execute_with_stop_signal(engine.run(inputs), dashboard)
+    return await _execute_with_stop_signal(engine.run(inputs), dashboard, engine=engine)
 
 
 async def _resume_with_stop_signal(
@@ -1236,12 +1337,13 @@ async def _resume_with_stop_signal(
     Raises:
         ExecutionError: If the workflow was killed via the dashboard.
     """
-    return await _execute_with_stop_signal(engine.resume(current_agent), dashboard)
+    return await _execute_with_stop_signal(engine.resume(current_agent), dashboard, engine=engine)
 
 
 async def _execute_with_stop_signal(
     engine_coro: Any,
     dashboard: Any | None,
+    engine: Any | None = None,
 ) -> dict[str, Any]:
     """Execute an engine coroutine, racing against a dashboard kill signal.
 
@@ -1249,6 +1351,12 @@ async def _execute_with_stop_signal(
         engine_coro: The coroutine to execute (``engine.run()`` or
             ``engine.resume()``).
         dashboard: The ``WebDashboard`` instance, or None.
+        engine: The ``WorkflowEngine`` instance backing ``engine_coro``. When a
+            dashboard stop/kill cancels the engine task, this is used to write a
+            best-effort checkpoint and emit ``workflow_failed`` so the run is
+            never lost silently (issue #245). May be ``None`` (e.g. in unit
+            tests that pass a bare coroutine), in which case the checkpoint step
+            is skipped.
 
     Returns:
         The workflow result dict.
@@ -1279,10 +1387,36 @@ async def _execute_with_stop_signal(
     if engine_task in done:
         return engine_task.result()
 
-    # Stop was requested — raise an error so the workflow is treated as failed
+    # Stop/kill won the race. The engine task was in ``pending`` and we just
+    # cancelled + drained it. Three outcomes are possible:
+    #
+    #   * It actually cancelled (``engine_task.cancelled()``) — the engine's
+    #     ``except asyncio.CancelledError`` arm ran, which intentionally emits
+    #     no ``workflow_failed`` and saves no checkpoint. Give the run a
+    #     best-effort checkpoint + terminal event here so progress isn't lost.
+    #   * It completed with its own exception (e.g. ``InterruptError`` from a
+    #     pause -> Kill that raised inside the loop just as Stop fired). In that
+    #     case the engine already emitted ``workflow_failed`` and saved a
+    #     checkpoint, so re-raise that exception untouched — do not double-handle.
+    #   * It completed with a *result* (swallowed the cancellation and returned).
+    #     Unreachable today since ``run``/``resume`` re-raise ``CancelledError``,
+    #     but guard against a future refactor by returning that result rather
+    #     than emitting a spurious ``workflow_failed`` after ``workflow_completed``.
+    if not engine_task.cancelled():
+        exc = engine_task.exception()
+        if exc is not None:
+            raise exc
+        return engine_task.result()
+
+    # Single source of truth for the user-facing stop reason: it feeds both the
+    # engine's checkpoint/``workflow_failed`` message and the raised exception.
+    stop_message = "Workflow stopped by user via dashboard"
+    if engine is not None:
+        engine.handle_dashboard_stop(stop_message)
+
     from conductor.exceptions import ExecutionError
 
-    raise ExecutionError("Workflow stopped by user via dashboard")
+    raise ExecutionError(stop_message)
 
 
 async def run_workflow_async(
@@ -1943,6 +2077,8 @@ async def resume_workflow_async(
         restored_limits = LimitEnforcer.from_dict(
             cp.limits,
             timeout_seconds=config.workflow.limits.timeout_seconds,
+            budget_usd=config.workflow.limits.budget_usd,
+            budget_mode=config.workflow.limits.budget_mode,
         )
 
         # Construct the web dashboard early (subscribes to the emitter on

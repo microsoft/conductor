@@ -135,6 +135,40 @@ conductor run examples/reasoning-effort.yaml \
 
 See [Reasoning Effort](../docs/configuration.md#reasoning-effort) for the per-provider translation, supported models, and validation rules.
 
+## Context Tier
+
+### context-tier.yaml
+
+A two-stage workflow that demonstrates selecting a model's long-context (e.g. 1M-token) window. Demonstrates:
+- Workflow-wide default via `runtime.default_context_tier`
+- Per-agent override via `context_tier` (wins over the default)
+- Composition with `reasoning.effort` — the two map to separate `create_session` kwargs
+- Conditional routing on a structured boolean output
+
+```bash
+conductor run examples/context-tier.yaml \
+  --input topic="root-causing a multi-service latency regression"
+```
+
+See [Context Tier](../docs/configuration.md#context-tier) for details. This is a Copilot-only capability.
+
+## Output Validation
+
+### validator.yaml
+
+A code-review workflow that demonstrates the `validator:` block — a second LLM call that grades an agent's output against a rubric and re-runs the agent once with feedback when it fails. Demonstrates:
+- A `validator.criteria` rubric checking for a real bug, actionable suggestions, and no fabricated names
+- Optional `validator.model` (defaults to the primary agent's model)
+- `max_retries: 1` (hard cap; `0` validates-and-reports without re-running)
+- Validator cost appears as a separate `code_reviewer (validator)` usage row
+
+```bash
+conductor run examples/validator.yaml
+conductor run examples/validator.yaml --input diff="$(git diff HEAD~1)"
+```
+
+See [Validator](../docs/workflow-syntax.md#validator) for the full field reference and behavior notes.
+
 ## Multi-Agent Workflows
 
 ### research-assistant.yaml
@@ -207,6 +241,19 @@ Demonstrates:
 
 ```bash
 conductor run examples/script-step.yaml
+```
+
+### script-stdin.yaml
+
+Hand a structured payload to a script step via **stdin** instead of
+command-line `args` — the cross-platform-safe way to pass large or
+structured data (no Windows ~32 KB command-line limit, no temp files). Demonstrates:
+- `stdin:` as a Jinja2 string template piped to the child as UTF-8
+- JSON handoff via the built-in `tojson` filter (`{{ x | tojson }}`)
+- A script consuming an upstream agent's structured output (`json.load(sys.stdin)`)
+
+```bash
+conductor run examples/script-stdin.yaml --input topic="error handling"
 ```
 
 ### wait-step.yaml

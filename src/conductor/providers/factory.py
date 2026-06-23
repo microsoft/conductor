@@ -15,6 +15,7 @@ from conductor.providers.claude_agent_sdk import (
     CLAUDE_AGENT_SDK_AVAILABLE,
     ClaudeAgentSdkProvider,
 )
+from conductor.providers.context_tier import ContextTier
 from conductor.providers.copilot import CopilotProvider, IdleRecoveryConfig
 from conductor.providers.reasoning import ReasoningEffort
 
@@ -33,6 +34,7 @@ async def create_provider(
     max_session_seconds: float | None = None,
     max_agent_iterations: int | None = None,
     default_reasoning_effort: ReasoningEffort | None = None,
+    default_context_tier: ContextTier | None = None,
     provider_settings: ProviderSettings | None = None,
 ) -> AgentProvider:
     """Factory function to create the appropriate provider.
@@ -57,6 +59,10 @@ async def create_provider(
         default_reasoning_effort: Workflow-wide default reasoning effort
             (``low`` / ``medium`` / ``high`` / ``xhigh``) applied when an agent
             does not specify its own ``reasoning.effort``.
+        default_context_tier: Workflow-wide default context-window tier
+            (``default`` / ``long_context``) applied when an agent does not
+            specify its own ``context_tier``. Only the Copilot provider
+            forwards this; ignored for all other providers.
         provider_settings: Structured ``runtime.provider`` settings. Only
             applied when ``provider_type == "copilot"`` and the settings
             opted into custom routing; ignored for all other providers
@@ -87,6 +93,7 @@ async def create_provider(
                 idle_recovery_config=idle_recovery_config,
                 max_agent_iterations=max_agent_iterations,
                 default_reasoning_effort=default_reasoning_effort,
+                default_context_tier=default_context_tier,
                 provider_settings=provider_settings,
             )
         case "openai-agents":
@@ -214,6 +221,7 @@ class ProviderFactory:
         max_session_seconds = getattr(runtime_config, "max_session_seconds", None)
         max_agent_iterations = getattr(runtime_config, "max_agent_iterations", None)
         default_reasoning_effort = getattr(runtime_config, "default_reasoning_effort", None)
+        default_context_tier = getattr(runtime_config, "default_context_tier", None)
 
         return await create_provider(
             provider_type=provider_type,
@@ -225,5 +233,6 @@ class ProviderFactory:
             max_session_seconds=max_session_seconds,
             max_agent_iterations=max_agent_iterations,
             default_reasoning_effort=default_reasoning_effort,
+            default_context_tier=default_context_tier,
             provider_settings=provider_settings,
         )

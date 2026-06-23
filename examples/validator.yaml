@@ -1,0 +1,96 @@
+# Validator Workflow
+#
+# Demonstrates the `validator:` block (issue #220): a second LLM call that
+# grades a provider-backed agent's output against a rubric, and re-runs the
+# agent once with feedback when it fails.
+#
+# This is distinct from the two correctness mechanisms Conductor already has:
+#   - `retry:`  handles *transient* failures (provider errors, timeouts) by
+#               re-running the same prompt unchanged.
+#   - `output:` schema handles *shape* failures (missing field, wrong type).
+#
+# The validator catches the case neither does: a structurally valid output
+# that is semantically wrong, incomplete, or off-rubric — here, a code review
+# that misses a real bug or fabricates a function name.
+#
+# Mechanics:
+#   1. `code_reviewer` produces a review of the diff.
+#   2. The validator runs a second LLM call checking the review against
+#      `criteria`. It returns {passed, issues}.
+#   3. If it fails, `code_reviewer` re-runs ONCE with the validator's issues
+#      appended under a "## Validation feedback" section. The second output is
+#      taken as final (no second validation loop).
+#
+# Validator token cost shows up as a separate `code_reviewer (validator)` row
+# in the usage summary, and validator activity is surfaced in the web
+# dashboard and `--verbose` console output.
+#
+# Usage:
+#   conductor run examples/validator.yaml
+#   conductor run examples/validator.yaml --input diff="$(git diff HEAD~1)"
+
+workflow:
+  name: validator
+  description: Code review with a semantic validator that re-runs once on failure
+  version: "1.0.0"
+  entry_point: code_reviewer
+
+  runtime:
+    provider: copilot
+
+  input:
+    diff:
+      type: string
+      required: false
+      description: A unified diff to review
+      default: |
+        --- a/auth.py
+        +++ b/auth.py
+        @@ -10,6 +10,9 @@ class TokenStore:
+        -    def get(self, key):
+        -        return self._cache[key]
+        +    def get(self, key):
+        +        entry = self._cache.get(key)
+        +        return entry.value
+
+agents:
+  - name: code_reviewer
+    description: Reviews a diff for bugs and suggests concrete fixes
+    model: claude-sonnet-4-5
+    prompt: |
+      Review the following diff for bugs, with a focus on null-safety and
+      correctness. For each problem, give a concrete, actionable suggestion.
+
+      Diff:
+      {{ workflow.input.diff }}
+    output:
+      summary:
+        type: string
+        description: One-line summary of the review
+      issues:
+        type: array
+        description: List of problems found, each with an actionable suggestion
+
+    # The validator runs a SECOND LLM call after code_reviewer completes,
+    # grading its output against the criteria below. On failure the agent is
+    # re-run once with the validator's feedback appended.
+    validator:
+      # Optional: validate with a cheaper/different model than the primary.
+      # Defaults to the primary agent's model when omitted.
+      model: claude-sonnet-4-5
+      criteria: |
+        Verify the review:
+        1. Identifies the null-safety issue in the diff (`entry` may be None
+           when the key is missing, so `entry.value` can raise AttributeError).
+        2. Each entry in `issues` includes a concrete, actionable suggestion
+           (not just "fix it").
+        3. Does not reference any function or attribute names that do not
+           appear in the diff (no fabrication).
+      # Hard-capped at 1. Use 0 to validate-and-report without re-running.
+      max_retries: 1
+    routes:
+      - to: $end
+
+output:
+  summary: "{{ code_reviewer.output.summary }}"
+  issues: "{{ code_reviewer.output.issues }}"

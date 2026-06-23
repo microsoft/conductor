@@ -11,14 +11,34 @@ import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, NamedTuple
 
+from conductor.config.schema import BudgetMode
 from conductor.exceptions import (
     MaxIterationsError,
 )
 from conductor.exceptions import (
     TimeoutError as ConductorTimeoutError,
 )
+
+
+class BudgetCheckResult(NamedTuple):
+    """Result of a :meth:`LimitEnforcer.check_budget` call.
+
+    Attributes:
+        exceeded: True when ``spent_usd`` is over ``budget_usd``.
+        should_emit: True when the caller should surface a ``budget_exceeded``
+            event/warning now. True on the first overshoot and again each time
+            spend crosses another full ``budget_usd`` increment (so audit-mode
+            users get periodic updates instead of a single stale figure).
+        budget_usd: The configured budget (None when no budget is set).
+        spent_usd: The cumulative spend that was checked.
+    """
+
+    exceeded: bool
+    should_emit: bool
+    budget_usd: float | None
+    spent_usd: float
 
 
 @dataclass
@@ -52,6 +72,12 @@ class LimitEnforcer:
     timeout_seconds: int | None = None
     """Maximum wall-clock time for entire workflow. None means unlimited."""
 
+    budget_usd: float | None = None
+    """Maximum cost budget in USD. None means no budget tracking."""
+
+    budget_mode: BudgetMode = "audit"
+    """Budget enforcement mode: 'audit' (warn only) or 'enforce' (stop)."""
+
     current_iteration: int = 0
     """Current iteration count."""
 
@@ -63,6 +89,13 @@ class LimitEnforcer:
 
     current_agent: str | None = None
     """Currently executing agent name."""
+
+    _budget_last_emitted_usd: float | None = field(default=None, repr=False)
+    """Spend at the last ``budget_exceeded`` emission, or None if never emitted.
+
+    Used to re-arm audit-mode emission once spend climbs by another full
+    ``budget_usd`` increment, instead of latching after a single event.
+    """
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize limit state to a JSON-compatible dict.
@@ -84,18 +117,29 @@ class LimitEnforcer:
     def from_dict(
         cls,
         data: dict[str, Any],
-        timeout_seconds: int | None = None,
+        *,
+        timeout_seconds: int | None,
+        budget_usd: float | None,
+        budget_mode: BudgetMode,
     ) -> LimitEnforcer:
         """Reconstruct a LimitEnforcer from a serialized dict.
 
         Uses ``max_iterations`` from the checkpoint (it may have been
         increased by the user) and ``timeout_seconds`` from the current
         workflow config so that the resumed run gets a fresh timeout
-        window.
+        window. ``budget_usd`` and ``budget_mode`` come from the current
+        config so that the resumed run gets a fresh budget window.
+
+        The transient fields are keyword-only and required: callers must
+        source them from the current workflow config. Defaulting them here
+        previously let non-CLI callers silently disable the budget on
+        resume.
 
         Args:
             data: Dict previously produced by ``to_dict()``.
             timeout_seconds: Timeout from the workflow config (fresh window).
+            budget_usd: Budget from the workflow config (fresh window).
+            budget_mode: Budget mode from the workflow config.
 
         Returns:
             A new LimitEnforcer with restored iteration state and a fresh
@@ -104,6 +148,8 @@ class LimitEnforcer:
         enforcer = cls(
             max_iterations=data.get("max_iterations", 10),
             timeout_seconds=timeout_seconds,
+            budget_usd=budget_usd,
+            budget_mode=budget_mode,
         )
         enforcer.current_iteration = data.get("current_iteration", 0)
         enforcer.execution_history = list(data.get("execution_history", []))
@@ -238,6 +284,41 @@ class LimitEnforcer:
                 timeout_seconds=float(self.timeout_seconds),
                 current_agent=self.current_agent,
             )
+
+    def check_budget(self, spent_usd: float) -> BudgetCheckResult:
+        """Check if the workflow cost budget has been exceeded.
+
+        In ``enforce`` mode the caller should raise ``BudgetExceededError``
+        after emitting the event. In ``audit`` mode the caller should
+        log a warning and continue.
+
+        Emission re-arms per budget increment: ``should_emit`` is True on
+        the first overshoot and again once cumulative spend climbs by
+        another full ``budget_usd`` beyond the last emission. This keeps
+        audit-mode output current as spend grows, rather than latching on
+        a single stale figure.
+
+        Args:
+            spent_usd: Current cumulative cost from UsageTracker.
+
+        Returns:
+            A ``BudgetCheckResult`` carrying the overshoot flag, the
+            should-emit flag, and the budget/spend figures so the caller
+            does not need to re-derive them.
+        """
+        if self.budget_usd is None:
+            return BudgetCheckResult(False, False, None, spent_usd)
+
+        if spent_usd <= self.budget_usd:
+            return BudgetCheckResult(False, False, self.budget_usd, spent_usd)
+
+        should_emit = (
+            self._budget_last_emitted_usd is None
+            or spent_usd >= self._budget_last_emitted_usd + self.budget_usd
+        )
+        if should_emit:
+            self._budget_last_emitted_usd = spent_usd
+        return BudgetCheckResult(True, should_emit, self.budget_usd, spent_usd)
 
     def get_elapsed_time(self) -> float:
         """Get the elapsed time since workflow start.

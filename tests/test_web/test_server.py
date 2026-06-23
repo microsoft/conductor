@@ -363,17 +363,23 @@ class TestWaitForClientsDisconnectGuard:
 class TestApiStop:
     """Tests for POST /api/stop endpoint."""
 
-    def test_stop_falls_back_to_stop_event_without_interrupt(self) -> None:
-        """POST /api/stop falls back to stop_event when no interrupt_event is set."""
+    def test_stop_queues_when_interrupt_event_not_bound(self) -> None:
+        """POST /api/stop queues the stop (no hard cancel) before the engine
+        binds the interrupt event."""
         emitter, dashboard = _make_dashboard(bg=True)
         assert not dashboard.stop_requested
+        assert not dashboard._pending_stop
 
         with TestClient(dashboard.app) as client:
             resp = client.post("/api/stop")
             assert resp.status_code == 200
-            assert resp.json() == {"status": "stopping"}
+            assert resp.json() == {"status": "stopping", "queued": True}
 
-        assert dashboard.stop_requested
+        # Queued, not hard-stopped: the progress-losing hard cancel path
+        # (_stop_event / _bg_event) must NOT be triggered (issue #245).
+        assert dashboard._pending_stop
+        assert not dashboard.stop_requested
+        assert not dashboard._bg_event.is_set()
 
     def test_stop_sets_interrupt_event_when_available(self) -> None:
         """POST /api/stop sets interrupt_event when one is configured."""
@@ -389,15 +395,25 @@ class TestApiStop:
         assert interrupt.is_set()
         assert not dashboard.stop_requested  # should NOT set hard stop
 
-    def test_stop_sets_bg_event_as_fallback(self) -> None:
-        """POST /api/stop also sets the bg auto-shutdown event in fallback mode."""
+    def test_queued_stop_honored_when_interrupt_event_bound(self) -> None:
+        """A Stop queued during startup is honored the moment the engine binds
+        the interrupt event, taking the graceful interrupt path."""
         emitter, dashboard = _make_dashboard(bg=True)
-        assert not dashboard._bg_event.is_set()
 
         with TestClient(dashboard.app) as client:
-            client.post("/api/stop")
+            client.post("/api/stop")  # arrives before set_interrupt_event
 
-        assert dashboard._bg_event.is_set()
+        assert dashboard._pending_stop
+
+        interrupt = asyncio.Event()
+        dashboard.set_interrupt_event(interrupt)
+
+        # Draining the queued stop sets the interrupt event (graceful path),
+        # not the hard-stop event, and clears the latch.
+        assert interrupt.is_set()
+        assert not dashboard._pending_stop
+        assert not dashboard.stop_requested
+        assert not dashboard._bg_event.is_set()
 
     @pytest.mark.asyncio
     async def test_wait_for_stop_resolves(self) -> None:

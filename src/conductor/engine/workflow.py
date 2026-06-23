@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from conductor.duration import parse_duration
-from conductor.engine.checkpoint import CheckpointManager
+from conductor.engine.checkpoint import CheckpointManager, CheckpointTrigger
 from conductor.engine.context import WorkflowContext
 from conductor.engine.limits import LimitEnforcer
 from conductor.engine.pricing import ModelPricing
@@ -28,6 +28,7 @@ from conductor.engine.usage import UsageTracker, WorkflowUsage
 from conductor.events import WorkflowEvent, WorkflowEventEmitter
 from conductor.exceptions import (
     AgentTimeoutError,
+    BudgetExceededError,
     ConductorError,
     ExecutionError,
     InterruptError,
@@ -57,7 +58,7 @@ from conductor.gates.human import (
     MaxIterationsPromptResult,
 )
 from conductor.gates.interrupt import InterruptAction, InterruptHandler, InterruptResult
-from conductor.providers.base import AgentOutput
+from conductor.providers.base import AgentOutput, EventCallback
 
 logger = logging.getLogger(__name__)
 
@@ -365,6 +366,8 @@ class WorkflowEngine:
         self.limits = LimitEnforcer(
             max_iterations=config.workflow.limits.max_iterations,
             timeout_seconds=config.workflow.limits.timeout_seconds,
+            budget_usd=config.workflow.limits.budget_usd,
+            budget_mode=config.workflow.limits.budget_mode,
         )
         self.gate_handler = HumanGateHandler(skip_gates=skip_gates)
         self.max_iterations_handler = MaxIterationsHandler(skip_gates=skip_gates)
@@ -374,6 +377,10 @@ class WorkflowEngine:
         self.usage_tracker = UsageTracker(
             pricing_overrides=self._build_pricing_overrides(),
         )
+
+        # One-time latch so the "budget set but no pricing" degraded warning
+        # is emitted at most once per workflow run (see _check_budget).
+        self._budget_unpriced_warned = False
 
         # Multi-provider support: registry takes precedence
         self._registry = registry
@@ -409,9 +416,11 @@ class WorkflowEngine:
 
         # Dialog mode support
         from conductor.engine.dialog_evaluator import DialogEvaluator
+        from conductor.engine.validator import OutputValidator
         from conductor.gates.dialog import DialogHandler
 
         self._dialog_evaluator = DialogEvaluator()
+        self._output_validator = OutputValidator()
         self._dialog_handler = DialogHandler(
             skip_dialogs=skip_gates,
             emitter=event_emitter,
@@ -421,6 +430,19 @@ class WorkflowEngine:
         # Checkpoint tracking
         self._current_agent_name: str | None = None
         self._last_checkpoint_path: Path | None = None
+        # Idempotency flag for handle_dashboard_stop (issue #245). Tracked
+        # separately from _last_checkpoint_path because periodic checkpoints
+        # (issue #244) also set _last_checkpoint_path, so it can no longer
+        # double as "the dashboard-stop handler already ran".
+        self._dashboard_stop_handled: bool = False
+        # Monotonic timestamp of the last periodic checkpoint (issue #244),
+        # used to evaluate the runtime.checkpoint.every_seconds throttle at
+        # step boundaries. None until the first periodic checkpoint is saved.
+        self._last_periodic_checkpoint_time: float | None = None
+        # Count of consecutive failed periodic checkpoint saves, reset on a
+        # successful save. Surfaced in checkpoint_save_failed events so the run
+        # doesn't silently lose its recovery safety net.
+        self._periodic_checkpoint_failures: int = 0
 
         # Sub-workflow depth tracking
         self._subworkflow_depth = _subworkflow_depth
@@ -489,6 +511,79 @@ class WorkflowEngine:
             data = {**data, "subworkflow_path": list(self._dashboard_context_path)}
         event = WorkflowEvent(type=event_type, timestamp=_time.time(), data=data)
         self._event_emitter.emit(event)
+
+    def _check_budget(self) -> None:
+        """Check whether the workflow cost budget has been exceeded.
+
+        Reads current spend from ``usage_tracker``, delegates the
+        threshold check to ``LimitEnforcer.check_budget()``, and acts
+        according to ``budget_mode``:
+
+        - On first overshoot (and each further budget increment): emit a
+          ``budget_exceeded`` event.
+        - ``enforce`` mode: raise ``BudgetExceededError`` (triggers
+          checkpoint + workflow stop).
+        - ``audit`` mode: log a warning and continue.
+
+        When a budget is configured but token usage carries no pricing
+        (e.g. an unpriced model), cost cannot be computed and the budget
+        cannot be enforced. A one-time degraded warning is emitted so the
+        silent no-op is visible.
+        """
+        if self.limits.budget_usd is None:
+            return
+
+        summary = self.usage_tracker.get_summary()
+        cost = summary.total_cost_usd
+
+        # Degraded path: tokens flowed but no priced model, so cost is None.
+        # ``check_budget`` would see $0 and never trip — warn once instead of
+        # silently disabling the budget.
+        if cost is None:
+            if summary.total_tokens > 0 and not self._budget_unpriced_warned:
+                self._budget_unpriced_warned = True
+                logger.warning(
+                    "Cost budget set ($%.2f) but no pricing is available for the "
+                    "models used (%d tokens spent so far); the budget cannot be "
+                    "enforced. Add limits.budget pricing overrides or use a priced model.",
+                    self.limits.budget_usd,
+                    summary.total_tokens,
+                )
+            return
+
+        result = self.limits.check_budget(cost)
+        if not result.exceeded:
+            return
+
+        budget = result.budget_usd
+        spent = result.spent_usd
+
+        if result.should_emit:
+            self._emit(
+                "budget_exceeded",
+                {
+                    "budget_usd": budget,
+                    "spent_usd": spent,
+                    "budget_mode": self.limits.budget_mode,
+                    "current_agent": self.limits.current_agent,
+                },
+            )
+
+        if self.limits.budget_mode == "enforce":
+            raise BudgetExceededError(
+                f"Workflow exceeded cost budget (${budget:.2f}): spent ${spent:.2f}",
+                budget_usd=budget,  # type: ignore[arg-type]  # non-None when exceeded
+                spent_usd=spent,
+                current_agent=self.limits.current_agent,
+            )
+
+        if result.should_emit:
+            logger.warning(
+                "Budget exceeded (audit mode): spent $%.4f of $%.2f budget%s",
+                spent,
+                budget,
+                f" at agent '{self.limits.current_agent}'" if self.limits.current_agent else "",
+            )
 
     def _yaml_source_field(self) -> dict[str, str]:
         """Return ``{"yaml_source": <text>}`` if the workflow file is readable."""
@@ -584,6 +679,7 @@ class WorkflowEngine:
             self._system_metadata = self._build_system_metadata()
 
         default_effort = self.config.workflow.runtime.default_reasoning_effort
+        default_tier = self.config.workflow.runtime.default_context_tier
         default_provider_name = self.config.workflow.runtime.provider.name
 
         # Resolve the provider per agent (honoring per-agent overrides).
@@ -673,6 +769,9 @@ class WorkflowEngine:
                     "provider_name": _provider_for(a.name),
                     "reasoning_effort": (
                         a.reasoning.effort if a.reasoning is not None else default_effort
+                    ),
+                    "context_tier": (
+                        a.context_tier if a.context_tier is not None else default_tier
                     ),
                 }
                 for a in self.config.agents
@@ -822,7 +921,7 @@ class WorkflowEngine:
             context: Workflow context for template rendering.
 
         Returns:
-            ScriptOutput with stdout, stderr, and exit_code.
+            ScriptOutput with stdout, stderr, exit_code, and stdin_bytes.
 
         Raises:
             ExecutionError: If script fails or times out.
@@ -1345,7 +1444,13 @@ class WorkflowEngine:
             instructions_preamble=child_preamble,
         )
 
-        return await self._run_child_engine(child_engine, sub_inputs, agent)
+        output = await self._run_child_engine(child_engine, sub_inputs, agent)
+        # Roll the child's spend up into the parent tracker so a parent-level
+        # cost budget accounts for sub-workflow delegation. Without this,
+        # type:workflow spend lives only in the child's tracker and bypasses
+        # the parent's enforce-mode budget entirely.
+        self.usage_tracker.merge(child_engine.usage_tracker.get_summary())
+        return output
 
     async def _execute_subworkflow_with_inputs(
         self,
@@ -1459,6 +1564,9 @@ class WorkflowEngine:
 
         output = await self._run_child_engine(child_engine, sub_inputs, agent)
         usage = child_engine.usage_tracker.get_summary()
+        # Roll child spend up into the parent tracker (see _execute_subworkflow)
+        # so a parent-level cost budget accounts for delegated sub-workflow cost.
+        self.usage_tracker.merge(usage)
         return output, usage
 
     async def _run_child_engine(
@@ -1618,7 +1726,10 @@ class WorkflowEngine:
         # Execute on_start hook
         self._execute_hook("on_start")
 
-        return await self._execute_loop(current_agent_name)
+        result = await self._execute_loop(current_agent_name)
+        # Successful completion: this run's periodic checkpoints are now stale.
+        self._cleanup_run_periodic_checkpoints()
+        return result
 
     async def resume(self, current_agent_name: str) -> dict[str, Any]:
         """Resume workflow execution from a specific agent.
@@ -1645,7 +1756,10 @@ class WorkflowEngine:
         # Execute on_start hook (signals resume)
         self._execute_hook("on_start")
 
-        return await self._execute_loop(current_agent_name)
+        result = await self._execute_loop(current_agent_name)
+        # Successful completion: this run's periodic checkpoints are now stale.
+        self._cleanup_run_periodic_checkpoints()
+        return result
 
     def set_context(self, context: WorkflowContext) -> None:
         """Replace the engine's workflow context with a restored one.
@@ -1681,31 +1795,46 @@ class WorkflowEngine:
         """
         self.limits = limits
 
-    def _save_checkpoint_on_failure(self, error: BaseException) -> None:
-        """Attempt to save a checkpoint after a failure.
+    def _write_checkpoint(
+        self, error: BaseException | None, trigger: CheckpointTrigger
+    ) -> Path | None:
+        """Serialize the current workflow state to a checkpoint file.
 
-        This method never raises — on failure it logs a warning so the
-        original error is not masked.
+        Shared by the on-failure and periodic checkpoint paths. Collects
+        provider session IDs (for Copilot session resume) and delegates to
+        :meth:`CheckpointManager.save_checkpoint`, which never raises.
 
         Args:
-            error: The exception that triggered the checkpoint save.
+            error: The exception that triggered the save, or ``None`` for a
+                periodic checkpoint.
+            trigger: ``"failure"`` or ``"periodic"``.
+
+        Returns:
+            Path to the saved checkpoint, or ``None`` when no ``workflow_path``
+            is set or saving failed.
         """
         if self.workflow_path is None:
             logger.debug("No workflow_path set; skipping checkpoint save")
-            return
+            return None
 
-        # Collect session IDs from provider if available
+        # Collect session IDs from provider if available. Best-effort: a
+        # provider raising here must not break the (failure or periodic)
+        # checkpoint save, so the "never raises" contract holds for both paths.
         copilot_session_ids: dict[str, str] | None = None
-        provider = self._single_provider
-        if provider is not None and hasattr(provider, "get_session_ids"):
-            copilot_session_ids = provider.get_session_ids()  # type: ignore[union-attr]
-        elif self._registry is not None:
-            for p in self._registry.get_active_providers().values():
-                if hasattr(p, "get_session_ids"):
-                    copilot_session_ids = p.get_session_ids()  # type: ignore[union-attr]
-                    break
+        try:
+            provider = self._single_provider
+            if provider is not None and hasattr(provider, "get_session_ids"):
+                copilot_session_ids = provider.get_session_ids()  # type: ignore[union-attr]
+            elif self._registry is not None:
+                for p in self._registry.get_active_providers().values():
+                    if hasattr(p, "get_session_ids"):
+                        copilot_session_ids = p.get_session_ids()  # type: ignore[union-attr]
+                        break
+        except Exception:
+            logger.warning("Failed to collect provider session IDs for checkpoint", exc_info=True)
+            copilot_session_ids = None
 
-        checkpoint_path = CheckpointManager.save_checkpoint(
+        return CheckpointManager.save_checkpoint(
             workflow_path=self.workflow_path,
             context=self.context,
             limits=self.limits,
@@ -1717,17 +1846,236 @@ class WorkflowEngine:
             instructions_preamble=self._instructions_preamble,
             run_id=self._run_context.run_id,
             event_log_path=self._run_context.log_file,
+            trigger=trigger,
         )
-        self._last_checkpoint_path = checkpoint_path
+
+    def _save_checkpoint_on_failure(self, error: BaseException) -> None:
+        """Attempt to save a checkpoint after a failure.
+
+        This method never raises — on failure it logs a warning so the
+        original error is not masked.
+
+        Args:
+            error: The exception that triggered the checkpoint save.
+        """
+        checkpoint_path = self._write_checkpoint(error, trigger="failure")
+        # Only overwrite _last_checkpoint_path on a successful save, so a
+        # failed failure-save doesn't discard a still-valid periodic checkpoint
+        # path that resume instructions can point at.
         if checkpoint_path is not None:
+            self._last_checkpoint_path = checkpoint_path
             self._emit(
                 "checkpoint_saved",
                 {
                     "path": str(checkpoint_path),
                     "agent_name": self._current_agent_name,
                     "error_type": type(error).__name__,
+                    "trigger": "failure",
                 },
             )
+
+    @property
+    def _periodic_checkpoints_active(self) -> bool:
+        """True when periodic checkpointing applies: root engine, and opt-in.
+
+        Sub-workflow engines never write periodic checkpoints (their state is
+        re-run from scratch on resume), and the feature is off unless a
+        ``runtime.checkpoint`` trigger is configured.
+        """
+        return self._subworkflow_depth == 0 and self.config.workflow.runtime.checkpoint.is_enabled
+
+    def _periodic_checkpoint_due(self, now: float) -> bool:
+        """Return True if a periodic checkpoint should be saved at *now*.
+
+        ``every_agent`` fires at every boundary; otherwise ``every_seconds`` is
+        a throttle measured from the last periodic save. The first save always
+        fires (``_last_periodic_checkpoint_time`` is ``None``); the interval
+        only throttles subsequent saves. Triggers are OR-combined.
+
+        Args:
+            now: Current ``time.monotonic()`` reading.
+        """
+        cfg = self.config.workflow.runtime.checkpoint
+        if cfg.every_agent:
+            return True
+        if cfg.every_seconds is None:
+            return False
+        last = self._last_periodic_checkpoint_time
+        return last is None or (now - last) >= cfg.every_seconds
+
+    def _maybe_save_periodic_checkpoint(self) -> None:
+        """Save a periodic checkpoint at a step boundary, if configured.
+
+        Called at the top of the execution loop, where all prior step outputs
+        are already committed to ``self.context`` and ``self._current_agent_name``
+        is the step *about to run* — so a resume from this checkpoint re-runs
+        exactly that step with all prior context restored (identical semantics
+        to a failure checkpoint).
+
+        Opt-in via ``runtime.checkpoint`` and **root engine only**: sub-workflow
+        state is not independently resumable (the parent re-runs the child from
+        scratch). The very first boundary of a fresh run is skipped (empty
+        context). Never raises — a failed periodic save must not disrupt the
+        running workflow; it is surfaced via a ``checkpoint_save_failed`` event
+        instead, so a user relying on periodic checkpoints for recovery is not
+        left silently without one. See issue #244.
+        """
+        if not self._periodic_checkpoints_active:
+            return
+        # Skip the first boundary of a fresh run (nothing executed yet). Resume
+        # from a periodic checkpoint enters with current_iteration > 0, so its
+        # first boundary is allowed.
+        if self.limits.current_iteration == 0:
+            return
+
+        now = _time.monotonic()
+        if not self._periodic_checkpoint_due(now):
+            return
+
+        # The whole save (write + emit + rotate) is wrapped so a failure in any
+        # step is contained: a periodic checkpoint must never disrupt the run.
+        try:
+            checkpoint_path = self._write_checkpoint(None, trigger="periodic")
+            if checkpoint_path is None:
+                # save_checkpoint swallowed an error (or no workflow_path) and
+                # returned None — surface it rather than silently continuing.
+                self._record_periodic_checkpoint_failure(None)
+                return
+
+            self._last_checkpoint_path = checkpoint_path
+            self._last_periodic_checkpoint_time = now
+            self._periodic_checkpoint_failures = 0
+            self._emit(
+                "checkpoint_saved",
+                {
+                    "path": str(checkpoint_path),
+                    "agent_name": self._current_agent_name,
+                    "error_type": None,
+                    "trigger": "periodic",
+                },
+            )
+            if self.workflow_path is not None:
+                CheckpointManager.rotate_periodic_checkpoints(
+                    self.workflow_path,
+                    self._run_context.run_id,
+                    self.config.workflow.runtime.checkpoint.keep_last,
+                )
+        except Exception as exc:
+            self._record_periodic_checkpoint_failure(exc)
+
+    def _record_periodic_checkpoint_failure(self, error: Exception | None) -> None:
+        """Record and surface a failed periodic checkpoint save (never raises).
+
+        A failed periodic save is otherwise invisible — the run continues
+        normally — which would silently deprive a recovery-reliant user of the
+        checkpoints they opted into. Emit a structured ``checkpoint_save_failed``
+        event (captured by the JSONL log and the dashboard, and surfaced on the
+        console by the CLI subscriber) carrying a running ``consecutive_failures``
+        count so consumers can escalate.
+
+        Args:
+            error: The exception raised during the save, or ``None`` when the
+                save merely returned no path.
+        """
+        self._periodic_checkpoint_failures += 1
+        logger.warning(
+            "Periodic checkpoint save failed (%d consecutive)",
+            self._periodic_checkpoint_failures,
+            exc_info=error is not None,
+        )
+        self._emit(
+            "checkpoint_save_failed",
+            {
+                "agent_name": self._current_agent_name,
+                "trigger": "periodic",
+                "error_type": type(error).__name__ if error is not None else None,
+                "consecutive_failures": self._periodic_checkpoint_failures,
+            },
+        )
+
+    def _cleanup_run_periodic_checkpoints(self) -> None:
+        """Delete this run's periodic checkpoints at a terminal, non-resumable end.
+
+        Periodic checkpoints are stale recovery points once the run has reached
+        a terminal outcome that should not be resumed: a clean completion, or an
+        explicit ``status: failed`` terminate (documented as non-resumable).
+        Root engine only; best-effort. **Not** called on an unexpected failure,
+        so periodic checkpoints remain alongside the failure checkpoint for
+        diagnosis and resume if the run crashed.
+        """
+        if not self._periodic_checkpoints_active:
+            return
+        if self.workflow_path is None:
+            return
+        CheckpointManager.cleanup_periodic_for_run(self.workflow_path, self._run_context.run_id)
+
+    def handle_dashboard_stop(self, message: str) -> Path | None:
+        """Give a dashboard-cancelled run the same terminal treatment as an
+        in-loop failure (issue #245).
+
+        The web dashboard's Stop/Kill can cancel the engine task from the CLI
+        wrapper (``conductor.cli.run._execute_with_stop_signal``) while an agent
+        is mid-execution. That cancellation unwinds through the engine's
+        ``except asyncio.CancelledError`` arm, which deliberately does *not*
+        emit ``workflow_failed`` or save a checkpoint. Without this method the
+        user would lose all progress with no checkpoint and no failure event.
+
+        Called by the CLI *after* the cancelled engine task has been fully
+        drained, so reading ``self.context`` / ``self._current_agent_name`` /
+        ``self.limits`` is safe. Saves a best-effort checkpoint (resuming
+        re-runs the in-flight agent, identical to the pause -> Kill path) and
+        emits a single ``workflow_failed`` event flagged ``stopped_by_user`` so
+        the dashboard can render a calm "Workflow Stopped" banner. When no
+        checkpoint can be written, the event carries
+        ``checkpoint_unavailable_reason`` instead so the UI/CLI can explain the
+        absence (Expected #2 in the issue).
+
+        Idempotent: the CLI only calls this when the engine task was genuinely
+        *cancelled* (its own terminal ``except`` arms re-raise out of the engine
+        and are handled separately by the wrapper). The ``_dashboard_stop_handled``
+        flag is a defensive backstop against repeat or direct invocation: once
+        this has run, it returns the recorded checkpoint path without emitting
+        duplicate events. (It uses a dedicated flag rather than
+        ``_last_checkpoint_path is not None`` because periodic checkpoints,
+        issue #244, also set ``_last_checkpoint_path``.) Does not raise on the
+        expected failure paths — ``_save_checkpoint_on_failure``, ``_emit`` (per-
+        subscriber guarded), and ``_execute_hook`` all swallow their own errors.
+
+        Args:
+            message: Human-readable reason for the stop. Used as the failure
+                message and the checkpoint error.
+
+        Returns:
+            Path to the saved checkpoint, or ``None`` if none could be written.
+        """
+        if self._dashboard_stop_handled:
+            return self._last_checkpoint_path
+        self._dashboard_stop_handled = True
+
+        error = ExecutionError(message)
+        # Save first so the single ``workflow_failed`` event below reports the
+        # outcome (path, or the reason none was written) atomically. This emits
+        # ``checkpoint_saved`` on success; harmless here since the dashboard
+        # reads the path inline from ``workflow_failed``.
+        self._save_checkpoint_on_failure(error)
+
+        fail_data: dict[str, Any] = {
+            "error_type": type(error).__name__,
+            "message": message,
+            "agent_name": self._current_agent_name,
+            "stopped_by_user": True,
+        }
+        if self._last_checkpoint_path is not None:
+            fail_data["checkpoint_path"] = str(self._last_checkpoint_path)
+        else:
+            fail_data["checkpoint_unavailable_reason"] = (
+                "no workflow file is associated with this run"
+                if self.workflow_path is None
+                else "the checkpoint could not be written"
+            )
+        self._emit("workflow_failed", fail_data)
+        self._execute_hook("on_error", error=error)
+        return self._last_checkpoint_path
 
     def _get_top_level_agent_names(self) -> list[str]:
         """Return names of top-level agents (excluding parallel/for-each nested agents).
@@ -2218,6 +2566,213 @@ class WorkflowEngine:
             if self._keyboard_listener is not None:
                 await self._keyboard_listener.resume()
 
+    async def _apply_validator(
+        self,
+        agent: AgentDef,
+        output: AgentOutput,
+        primary_elapsed: float,
+        agent_context: dict[str, Any],
+        executor: AgentExecutor,
+        guidance_section: str | None,
+        event_callback: EventCallback | None,
+        usage_label: str | None = None,
+    ) -> AgentOutput:
+        """Run an agent's ``validator:`` and, on failure, re-run the primary once.
+
+        Mechanics (issue #220):
+
+        1. Render the primary agent's prompt and run a second LLM call
+           (:class:`OutputValidator`) that grades ``output`` against
+           ``agent.validator.criteria``. The call is bounded by the agent's
+           ``timeout_seconds`` and is cancellable via interrupt; a timeout or
+           error fails open (treated as a pass with ``errored=True``).
+        2. Record the validator call as a separate ``"<agent> (validator)"``
+           usage row and emit ``agent_validator_start`` /
+           ``agent_validator_complete``.
+        3. If it passes, return ``output`` unchanged (no failure event).
+        4. Otherwise emit ``agent_validation_failed`` (always, on every
+           failure — including ``max_retries == 0``). When ``max_retries > 0``,
+           re-run the primary agent exactly once with a ``## Validation
+           feedback`` section appended and take the re-run output as final
+           (no second validation loop). When ``max_retries == 0``, return
+           ``output`` unchanged.
+
+        Validation is fail-open: a validator error never blocks the workflow
+        (the original output flows through). Cost accounting: the
+        ``"<agent> (validator)"`` usage rows capture the grading call and, when
+        a re-run succeeds, the discarded first attempt (two rows sharing that
+        label) — so the primary row reflects the effective output while the
+        validator rows make the feature's extra cost explicit. If the re-run
+        itself fails (or is interrupted), the original output is returned and
+        recorded once by the caller under the primary name — it is *not* also
+        attributed to the validator row.
+
+        Args:
+            agent: The primary agent (must have ``validator`` set).
+            output: The primary agent's output.
+            primary_elapsed: Wall-clock seconds the primary execution took
+                (used to attribute the discarded run's time on re-run).
+            agent_context: Context the primary agent executed against.
+            executor: Executor (and provider) for the primary agent.
+            guidance_section: Any guidance already appended to the primary
+                prompt; the validation feedback is appended after it on re-run.
+            event_callback: Callback used to emit validator events and stream
+                re-run events with the correct agent/item tagging. May be
+                ``None`` when no emitter is configured.
+            usage_label: Base name for the validator usage row(s). Defaults to
+                ``agent.name``; for-each iterations pass the qualified
+                ``"<group>[<key>]"`` label so the validator row matches the
+                primary row's naming convention.
+
+        Returns:
+            The final output (original, or the re-run output on failure).
+        """
+        cfg = agent.validator
+        if cfg is None:  # defensive; callers guard on this
+            return output
+
+        from conductor.engine.validator import ValidationOutcome
+
+        provider = executor.provider
+        validator_row = f"{usage_label or agent.name} (validator)"
+
+        def _emit_v(event_type: str, data: dict[str, Any]) -> None:
+            if event_callback is not None:
+                with contextlib.suppress(Exception):
+                    event_callback(event_type, data)
+
+        try:
+            primary_prompt = executor.render_prompt(agent, agent_context)
+        except Exception:
+            primary_prompt = agent.prompt
+
+        validator_model = cfg.model or agent.model
+        _emit_v(
+            "agent_validator_start",
+            {"model": validator_model, "criteria_preview": cfg.criteria[:200]},
+        )
+
+        _v_start = _time.time()
+        # Bound the grading call by the agent's timeout (when set) and forward
+        # the interrupt signal, so a hung or slow grader can't block the
+        # workflow — failing open on timeout rather than hanging. A direct
+        # ``wait_for`` is used (not ``_execute_with_agent_timeout``) to avoid
+        # emitting a misleading ``agent_timeout`` event for the primary agent.
+        validate_coro = self._output_validator.validate(
+            agent,
+            primary_prompt,
+            output.content,
+            provider,
+            interrupt_signal=self._interrupt_event,
+        )
+        try:
+            if agent.timeout_seconds is not None:
+                outcome = await asyncio.wait_for(validate_coro, timeout=agent.timeout_seconds)
+            else:
+                outcome = await validate_coro
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                "Validator call for '%s' timed out or failed; treating as pass",
+                agent.name,
+                exc_info=True,
+            )
+            outcome = ValidationOutcome(passed=True, errored=True)
+        _v_elapsed = _time.time() - _v_start
+
+        v_cost: float | None = None
+        if outcome.output is not None:
+            v_usage = self.usage_tracker.record(validator_row, outcome.output, _v_elapsed)
+            v_cost = v_usage.cost_usd
+
+        out = outcome.output
+        _emit_v(
+            "agent_validator_complete",
+            {
+                "passed": outcome.passed,
+                "issues": outcome.issues,
+                "errored": outcome.errored,
+                "model": out.model if out else validator_model,
+                "tokens": out.tokens_used if out else None,
+                "input_tokens": out.input_tokens if out else None,
+                "output_tokens": out.output_tokens if out else None,
+                "cost_usd": v_cost,
+                "elapsed": _v_elapsed,
+            },
+        )
+
+        if outcome.passed:
+            return output
+
+        will_retry = cfg.max_retries > 0
+        _emit_v(
+            "agent_validation_failed",
+            {"issues": outcome.issues, "will_retry": will_retry},
+        )
+
+        if not will_retry:
+            return output
+
+        feedback = self._build_validation_feedback(outcome.issues)
+        new_guidance = (guidance_section or "") + feedback
+        try:
+            new_output = await self._execute_with_agent_timeout(
+                agent,
+                executor.execute(
+                    agent,
+                    agent_context,
+                    guidance_section=new_guidance,
+                    interrupt_signal=self._interrupt_event,
+                    event_callback=event_callback,
+                ),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # The re-run hit a real failure (provider error, agent timeout, or
+            # the retried output failed the agent's output schema). Fail open
+            # to the original output, but surface it — otherwise enabling the
+            # validator would silently downgrade a hard failure into a quiet
+            # one. The original is recorded once by the caller under the
+            # primary name; it is NOT also attributed to the validator row.
+            logger.warning(
+                "Validator re-run failed for '%s'; using original output",
+                agent.name,
+                exc_info=True,
+            )
+            _emit_v(
+                "agent_validation_failed",
+                {"issues": outcome.issues, "will_retry": False, "rerun_errored": True},
+            )
+            return output
+
+        # A re-run interrupted mid-flight returns partial output; keep the
+        # original so the caller's partial / pause-resume handling (which ran
+        # against the non-partial original) isn't bypassed.
+        if new_output.partial:
+            return output
+
+        # The re-run succeeded and is now the effective output (recorded under
+        # the primary name by the caller). Attribute the now-discarded first
+        # attempt to the validator row so its cost isn't lost.
+        self.usage_tracker.record(validator_row, output, primary_elapsed)
+        return new_output
+
+    @staticmethod
+    def _build_validation_feedback(issues: list[str]) -> str:
+        """Build the ``## Validation feedback`` section appended on re-run."""
+        if issues:
+            bullets = "\n".join(f"- {issue}" for issue in issues)
+        else:
+            bullets = "- The output did not satisfy the acceptance criteria."
+        return (
+            "\n\n## Validation feedback\n"
+            "Your previous output did not pass validation. Address the following "
+            "and produce a corrected output:\n"
+            f"{bullets}\n"
+        )
+
     async def _execute_loop(self, current_agent_name: str) -> dict[str, Any]:
         """Core execution loop shared by :meth:`run` and :meth:`resume`.
 
@@ -2249,6 +2804,12 @@ class WorkflowEngine:
 
                 while True:
                     self._current_agent_name = current_agent_name
+
+                    # Periodic checkpoint at this step boundary (opt-in,
+                    # root engine only). All prior step outputs are committed
+                    # to context and current_agent_name is the step about to
+                    # run, so a resume re-runs exactly this step. See issue #244.
+                    self._maybe_save_periodic_checkpoint()
 
                     # Try to find agent, parallel group, or for-each group
                     agent = self._find_agent(current_agent_name)
@@ -2305,8 +2866,9 @@ class WorkflowEngine:
                             for_each_group.name, count=for_each_output.count
                         )
 
-                        # Check timeout after for-each group
+                        # Check timeout and budget after for-each group
                         self.limits.check_timeout()
+                        self._check_budget()
 
                         # Evaluate routes from for-each group
                         route_result = self._evaluate_for_each_routes(
@@ -2376,8 +2938,9 @@ class WorkflowEngine:
                         agent_count = len(parallel_group.agents)
                         self.limits.record_execution(parallel_group.name, count=agent_count)
 
-                        # Check timeout after parallel group
+                        # Check timeout and budget after parallel group
                         self.limits.check_timeout()
+                        self._check_budget()
 
                         # Evaluate routes from parallel group
                         route_result = self._evaluate_parallel_routes(
@@ -2543,6 +3106,11 @@ class WorkflowEngine:
                                     **termination_meta,
                                 },
                             )
+                            # Explicit failed terminate is intentionally
+                            # non-resumable, so drop this run's periodic
+                            # checkpoints (the raise below bypasses the
+                            # run()/resume() success cleanup).
+                            self._cleanup_run_periodic_checkpoints()
                             raise WorkflowTerminated(
                                 rendered_reason,
                                 output=output,
@@ -2734,12 +3302,14 @@ class WorkflowEngine:
                                     "stdout": script_output.stdout,
                                     "stderr": script_output.stderr,
                                     "exit_code": script_output.exit_code,
+                                    "stdin_bytes": script_output.stdin_bytes,
                                 },
                             )
 
                             self.context.store(agent.name, output_content)
                             self.limits.record_execution(agent.name)
                             self.limits.check_timeout()
+                            self._check_budget()
 
                             route_result = self._evaluate_routes(agent, output_content)
 
@@ -3028,6 +3598,7 @@ class WorkflowEngine:
                             self.context.store(agent.name, sub_output)
                             self.limits.record_execution(agent.name)
                             self.limits.check_timeout()
+                            self._check_budget()
 
                             route_result = self._evaluate_routes(agent, sub_output)
 
@@ -3126,6 +3697,19 @@ class WorkflowEngine:
                             )
                             _agent_elapsed = _time.time() - _agent_start
 
+                        # Validator: grade output and re-run once on failure
+                        if agent.validator and not output.partial:
+                            output = await self._apply_validator(
+                                agent,
+                                output,
+                                _agent_elapsed,
+                                agent_context,
+                                executor,
+                                guidance_section,
+                                event_callback,
+                            )
+                            _agent_elapsed = _time.time() - _agent_start
+
                         # Record usage and calculate cost
                         usage = self.usage_tracker.record(agent.name, output, _agent_elapsed)
 
@@ -3158,8 +3742,9 @@ class WorkflowEngine:
                         # Record successful execution
                         self.limits.record_execution(agent.name)
 
-                        # Check timeout after each agent
+                        # Check timeout and budget after each agent
                         self.limits.check_timeout()
+                        self._check_budget()
 
                         # Evaluate routes using the Router
                         route_result = self._evaluate_routes(agent, output.content)
@@ -3225,6 +3810,16 @@ class WorkflowEngine:
                 fail_data["elapsed_seconds"] = e.elapsed_seconds
                 fail_data["timeout_seconds"] = e.timeout_seconds
                 fail_data["current_agent"] = e.current_agent
+            elif isinstance(e, BudgetExceededError):
+                fail_data["budget_usd"] = e.budget_usd
+                fail_data["spent_usd"] = e.spent_usd
+                fail_data["current_agent"] = e.current_agent
+            if isinstance(e, InterruptError):
+                # An interactive Stop/Esc or a dashboard pause -> Kill is a
+                # user-initiated stop, not a crash. Flag it so the dashboard
+                # renders a calm "Workflow Stopped" banner, matching the
+                # hard-Kill path handled by ``handle_dashboard_stop``. #245.
+                fail_data["stopped_by_user"] = True
             self._emit("workflow_failed", fail_data)
             # Execute on_error hook with error information
             self._execute_hook("on_error", error=e)
@@ -3245,18 +3840,19 @@ class WorkflowEngine:
             raise
         except asyncio.CancelledError:
             # Normal cancellation path (dashboard stop, parent process exit,
-            # outer ``asyncio.wait_for`` timeout). The caller — typically
-            # ``conductor.cli.run._run_with_stop_signal`` — re-frames the
-            # cancellation as a ConductorError and emits the appropriate
-            # event there. Do NOT emit ``workflow_failed`` here, or the
-            # dashboard would show a spurious "CancelledError" failure
+            # outer ``asyncio.wait_for`` timeout). Do NOT emit
+            # ``workflow_failed`` or save a checkpoint here: the engine can't
+            # tell *why* it was cancelled (a Stop/Kill vs. process teardown),
+            # and emitting here would show a spurious "CancelledError" failure
             # whenever a user clicks Stop.
             #
-            # No checkpoint is saved on cancellation: cancelled workflows
-            # are not resumable from this point — the user explicitly chose
-            # to stop, and the wrapper-issued ConductorError will trigger
-            # checkpoint save through the ``except ConductorError`` arm on
-            # its way out. See issue #116 review.
+            # For a dashboard-initiated Stop/Kill, the CLI wrapper
+            # (``conductor.cli.run._execute_with_stop_signal``) detects that it
+            # cancelled this task and calls ``handle_dashboard_stop`` once the
+            # task is fully drained — that is what emits ``workflow_failed`` and
+            # writes the best-effort checkpoint (issue #245). Other cancellation
+            # sources (process exit, outer timeout) intentionally leave no
+            # checkpoint. See issue #116 review.
             raise
         except BaseException as e:
             # Catch-all for exception classes that don't derive from
@@ -4159,6 +4755,19 @@ class WorkflowEngine:
                 )
                 _agent_elapsed = _time.time() - _agent_start
 
+                # Validator: grade output and re-run once on failure
+                if agent.validator and not output.partial:
+                    output = await self._apply_validator(
+                        agent,
+                        output,
+                        _agent_elapsed,
+                        agent_context,
+                        executor,
+                        None,
+                        event_callback,
+                    )
+                    _agent_elapsed = _time.time() - _agent_start
+
                 # Record usage and calculate cost
                 usage = self.usage_tracker.record(agent.name, output, _agent_elapsed)
 
@@ -4621,6 +5230,20 @@ class WorkflowEngine:
                     ),
                 )
                 _item_elapsed = _time.time() - _item_start
+
+                # Validator: grade output and re-run once on failure
+                if qualified_agent.validator and not output.partial:
+                    output = await self._apply_validator(
+                        qualified_agent,
+                        output,
+                        _item_elapsed,
+                        agent_context,
+                        executor,
+                        None,
+                        event_callback,
+                        usage_label=f"{for_each_group.name}[{key}]",
+                    )
+                    _item_elapsed = _time.time() - _item_start
 
                 # Record usage and calculate cost
                 usage = self.usage_tracker.record(

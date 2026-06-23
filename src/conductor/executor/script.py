@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
+import sys
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -38,11 +40,15 @@ class ScriptOutput:
         stdout: Captured standard output as text.
         stderr: Captured standard error as text.
         exit_code: Process exit code.
+        stdin_bytes: Number of UTF-8 bytes in the stdin payload submitted to
+            the child (the child may read fewer if it exits early), or
+            ``None`` when no ``stdin`` payload was configured (stdin inherited).
     """
 
     stdout: str
     stderr: str
     exit_code: int
+    stdin_bytes: int | None = None
 
 
 class ScriptExecutor:
@@ -68,14 +74,20 @@ class ScriptExecutor:
     ) -> ScriptOutput:
         """Execute a script step.
 
-        Renders command/args with Jinja2, spawns subprocess, captures output.
+        Renders command/args with Jinja2, spawns the subprocess, and captures
+        output. If ``agent.stdin`` is set, the rendered payload is piped to the
+        child's stdin as UTF-8 via ``communicate`` (which streams stdin while
+        draining stdout/stderr, so large payloads can't deadlock the pipe);
+        routing the payload through stdin also keeps it off the command line
+        and clear of OS argv length limits. Otherwise the child inherits the
+        parent's stdin.
 
         Args:
             agent: Agent definition with type="script".
             context: Workflow context for template rendering.
 
         Returns:
-            ScriptOutput with stdout, stderr, and exit_code.
+            ScriptOutput with stdout, stderr, exit_code, and stdin_bytes.
 
         Raises:
             ExecutionError: If the script times out or cannot be started.
@@ -89,6 +101,36 @@ class ScriptExecutor:
             self.renderer.render(agent.working_dir, context) if agent.working_dir else None
         )
 
+        # Render the optional stdin payload. ``None`` means "inherit the
+        # parent's stdin" (the legacy behavior); any string — including an
+        # empty one — means "pipe this to the child", so we check
+        # ``is not None`` rather than truthiness. Routing the payload through
+        # stdin (rather than argv) is what keeps it clear of OS command-line
+        # length limits — Windows caps the command line at ~32 KB; POSIX
+        # ARG_MAX is larger. We write it via ``communicate(input=...)``, which
+        # feeds stdin concurrently with draining stdout/stderr so a large
+        # payload can't deadlock the pipe.
+        stdin_payload: bytes | None = None
+        if agent.stdin is not None:
+            rendered_stdin = self.renderer.render(agent.stdin, context)
+            try:
+                stdin_payload = rendered_stdin.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                # Strict encode (unlike the lenient ``decode(errors="replace")``
+                # on output) — surface a clear, named error instead of a bare
+                # codec traceback. Do NOT use ``errors="replace"`` here: that
+                # would silently corrupt the payload delivered to the child.
+                raise ExecutionError(
+                    f"Script '{agent.name}': stdin payload is not valid UTF-8 ({exc})",
+                    agent_name=agent.name,
+                    suggestion=(
+                        "The rendered stdin contains characters that cannot be "
+                        "UTF-8 encoded (e.g. unpaired surrogates from upstream "
+                        "JSON). Sanitize the value or render it through the "
+                        "'tojson' filter."
+                    ),
+                ) from exc
+
         # Build environment (merge os.environ + agent.env)
         # Note: ${VAR:-default} patterns in agent.env are already resolved
         # by the config loader during YAML parsing.
@@ -98,23 +140,50 @@ class ScriptExecutor:
         base_env = {**os.environ, "PYTHONUTF8": "1"}
         env = {**base_env, **agent.env} if agent.env else base_env
 
+        # Resolve bare command names and absolute paths against PATH so that a
+        # bare name (e.g. "python") finds the executable the shell would, and a
+        # path missing an extension resolves correctly. Resolution uses the
+        # subprocess's own ``PATH`` (``env`` may override it via ``agent.env``),
+        # so the resolved binary matches the one the child would have executed.
+        # Relative paths containing a separator are left untouched so they keep
+        # resolving against ``working_dir``. Resolution is non-destructive: when
+        # ``which`` cannot resolve the command we fall back to the rendered value
+        # and let the FileNotFoundError handler below produce a clear error.
+        has_separator = os.sep in rendered_command or (
+            os.altsep is not None and os.altsep in rendered_command
+        )
+        if os.path.isabs(rendered_command) or not has_separator:
+            rendered_command = (
+                shutil.which(rendered_command, path=env.get("PATH")) or rendered_command
+            )
+
         _verbose_log(f"  Script: {rendered_command} {' '.join(rendered_args)}")
+        if stdin_payload is not None:
+            _verbose_log(f"  Script stdin: {len(stdin_payload)} bytes")
 
         # Create subprocess
         try:
             process = await asyncio.create_subprocess_exec(
                 rendered_command,
                 *rendered_args,
+                stdin=asyncio.subprocess.PIPE if stdin_payload is not None else None,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=rendered_working_dir,
                 env=env,
             )
         except FileNotFoundError as exc:
+            hint = ""
+            if sys.platform == "win32":
+                hint = (
+                    " Hint: on Windows, include the file extension (e.g. .exe) "
+                    "or use an absolute path."
+                )
             raise ExecutionError(
-                f"Script '{agent.name}': command not found: '{rendered_command}'",
+                f"Script '{agent.name}': command not found: '{rendered_command}'"
+                f" (working_dir={rendered_working_dir or 'cwd'}){hint}",
                 agent_name=agent.name,
-                suggestion=f"Ensure '{rendered_command}' is installed and in PATH",
+                suggestion=f"Ensure '{rendered_command}' is installed and on PATH",
             ) from exc
         except OSError as e:
             raise ExecutionError(
@@ -126,7 +195,7 @@ class ScriptExecutor:
         timeout = agent.timeout
         try:
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                process.communicate(), timeout=timeout
+                process.communicate(input=stdin_payload), timeout=timeout
             )
         except TimeoutError:
             process.kill()
@@ -149,4 +218,5 @@ class ScriptExecutor:
             stdout=stdout_text,
             stderr=stderr_text,
             exit_code=process.returncode,
+            stdin_bytes=len(stdin_payload) if stdin_payload is not None else None,
         )

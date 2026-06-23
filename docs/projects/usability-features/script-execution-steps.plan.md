@@ -29,7 +29,7 @@ Adding `type: script` as a first-class workflow step type allows shell commands 
 
 ### Non-Goals
 
-- **NG1:** Interactive/stdin-driven scripts (no stdin piping).
+- **NG1:** Interactive/stdin-driven scripts (no stdin piping). _(Partially superseded by issue #18: a one-shot `stdin:` payload field was later added for cross-platform payload transport. Interactive / streaming stdin remains out of scope.)_
 - **NG2:** Streaming stdout in real-time to the console (captured in bulk after completion).
 - **NG3:** Script steps inside `parallel` groups or `for_each` groups (future work; validation rejects this in v1).
 - **NG4:** Shell expansion / piping (`command` is exec'd directly, not via `sh -c`). Users who need shell features can use `command: sh` with `args: ["-c", "pipeline | here"]`.

@@ -49,8 +49,12 @@ export type EventType =
   | 'dialog_started'
   | 'dialog_message'
   | 'dialog_completed'
+  | 'agent_validator_start'
+  | 'agent_validator_complete'
+  | 'agent_validation_failed'
   | 'iteration_limit_reached'
-  | 'iteration_limit_resolved';
+  | 'iteration_limit_resolved'
+  | 'budget_exceeded';
 
 // --- Workflow lifecycle ---
 
@@ -99,6 +103,12 @@ export interface WorkflowFailedData {
   message?: string;
   /** Slot-key path of the failing engine (present only at depth > 0). */
   subworkflow_path?: string[];
+  /** Issue #245: true when the run ended via a user Stop/Kill from the UI. */
+  stopped_by_user?: boolean;
+  /** Best-effort checkpoint written for a user Stop/Kill (hard-Kill path). */
+  checkpoint_path?: string;
+  /** Why no checkpoint could be written, when one couldn't (Stop/Kill). */
+  checkpoint_unavailable_reason?: string;
 }
 
 // --- Agent lifecycle ---
@@ -385,6 +395,46 @@ export interface DialogCompletedData {
   user_dismissed?: boolean;
   user_declined?: boolean;
   agent_proposed_continue?: boolean;
+}
+
+// --- Validator events (issue #220) ---
+
+export interface AgentValidatorStartData {
+  agent_name: string;
+  /** Present when the validated agent runs inside a for-each loop. */
+  item_key?: string;
+  /** Model used for the validator call (defaults to the agent's model). */
+  model?: string | null;
+  /** First ~200 chars of the validator criteria, for display. */
+  criteria_preview?: string;
+}
+
+export interface AgentValidatorCompleteData {
+  agent_name: string;
+  item_key?: string;
+  /** Whether the output satisfied the criteria. */
+  passed: boolean;
+  /** Concrete issues reported when not passed (empty when passed). */
+  issues: string[];
+  /** True when the validator failed open (call error / unparseable output). */
+  errored?: boolean;
+  model?: string | null;
+  tokens?: number | null;
+  input_tokens?: number | null;
+  output_tokens?: number | null;
+  cost_usd?: number | null;
+  elapsed?: number;
+}
+
+export interface AgentValidationFailedData {
+  agent_name: string;
+  item_key?: string;
+  issues: string[];
+  /** Whether the primary agent will be re-run once with feedback. */
+  will_retry: boolean;
+  /** True on the second emission, when the feedback re-run itself failed and
+   *  the original (failing) output was kept. */
+  rerun_errored?: boolean;
 }
 
 // --- Subworkflow lifecycle ---

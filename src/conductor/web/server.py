@@ -20,14 +20,16 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hmac
 import json
 import logging
+import os
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -84,6 +86,10 @@ class WebDashboard:
         # Gate response channel (web client → engine)
         self._gate_response_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
 
+        # Gate waiting state — set/cleared by the engine so the HTTP API
+        # can report whether a gate is currently waiting for a response.
+        self._gate_waiting_agent: str | None = None
+
         # Dialog response channel (web client → engine)
         self._dialog_response_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
 
@@ -115,6 +121,12 @@ class WebDashboard:
 
         # Interrupt event — shared with engine for POST /api/stop to abort agent
         self._interrupt_event: asyncio.Event | None = None
+
+        # Pending-stop latch — set by POST /api/stop when it arrives during the
+        # startup window before the engine has bound the interrupt event (via
+        # set_interrupt_event). Draining it there honors the Stop gracefully
+        # instead of falling back to a hard cancel that loses progress (#245).
+        self._pending_stop = False
 
         # Server internals
         self._server: Any = None
@@ -211,13 +223,14 @@ class WebDashboard:
             if self._interrupt_event is not None:
                 self._interrupt_event.set()
                 return JSONResponse({"status": "stopping"})
-            # Fallback for the window before engine sets the interrupt event
-            # (e.g., during startup). This triggers _run_with_stop_signal to
-            # cancel the engine task, which may not emit workflow_failed.
-            logger.warning("POST /api/stop: interrupt_event not set; falling back to hard stop")
-            self._stop_event.set()
-            self._bg_event.set()
-            return JSONResponse({"status": "stopping"})
+            # Startup race: the engine hasn't bound the interrupt event yet.
+            # Queue the Stop instead of hard-cancelling — set_interrupt_event
+            # honors it the moment the engine binds the event, so the run takes
+            # the graceful interrupt/pause path and a checkpoint is written
+            # rather than the progress-losing hard stop (issue #245).
+            logger.info("POST /api/stop: interrupt_event not bound yet; queuing stop")
+            self._pending_stop = True
+            return JSONResponse({"status": "stopping", "queued": True})
 
         @app.post("/api/kill")
         async def kill_workflow() -> JSONResponse:
@@ -232,6 +245,67 @@ class WebDashboard:
             """Resume a paused agent after it was interrupted by ``POST /api/stop``."""
             self._resume_event.set()
             return JSONResponse({"status": "resuming"})
+
+        @app.get("/api/gate-status")
+        async def gate_status() -> JSONResponse:
+            """Return whether a human gate is currently waiting for a response."""
+            agent = self._gate_waiting_agent
+            return JSONResponse({"waiting": agent is not None, "agent_name": agent})
+
+        @app.post("/api/gate-respond")
+        async def gate_respond_api(request: Request) -> JSONResponse:
+            """Resolve a parked human gate via HTTP POST.
+
+            Body: ``{"agent_name": str, "selected_value": str,
+            "additional_input": str?}``
+
+            When the ``CONDUCTOR_GATE_TOKEN`` environment variable is set,
+            the request must carry a matching token in the
+            ``Authorization: Bearer <token>`` header.
+            """
+            try:
+                body = await request.json()
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                return JSONResponse({"error": "Invalid JSON body"}, status_code=422)
+            if not isinstance(body, dict):
+                return JSONResponse(
+                    {"error": "Request body must be a JSON object"}, status_code=422
+                )
+
+            # Validate token if CONDUCTOR_GATE_TOKEN is set. The token is read
+            # from the Authorization header (not the JSON body) and compared in
+            # constant time to avoid leaking it via timing or request logs.
+            if not self._gate_token_ok(request.headers.get("authorization")):
+                return JSONResponse({"error": "Invalid or missing token"}, status_code=403)
+
+            # Validate required fields
+            if not body.get("agent_name"):
+                return JSONResponse(
+                    {"error": "Missing required field: agent_name"}, status_code=422
+                )
+            if not body.get("selected_value"):
+                return JSONResponse(
+                    {"error": "Missing required field: selected_value"}, status_code=422
+                )
+
+            # Validate the gate is actually waiting for this agent. Without this
+            # check a mismatched agent_name would be accepted here (200) and then
+            # silently discarded by wait_for_gate_response, parking the workflow
+            # forever while the CLI reports success.
+            target_error = self._validate_gate_target(body["agent_name"])
+            if target_error is not None:
+                return JSONResponse({"error": target_error}, status_code=409)
+
+            # Put onto gate response queue (same path as WebSocket handler)
+            self._gate_response_queue.put_nowait(
+                {
+                    "type": "gate_response",
+                    "agent_name": body["agent_name"],
+                    "selected_value": body["selected_value"],
+                    "additional_input": body.get("additional_input"),
+                }
+            )
+            return JSONResponse({"status": "accepted"})
 
         @app.get("/api/files/{file_path:path}")
         async def get_file(file_path: str) -> JSONResponse:
@@ -324,7 +398,21 @@ class WebDashboard:
                     try:
                         msg = json.loads(raw)
                         if isinstance(msg, dict) and msg.get("type") == "gate_response":
-                            self._gate_response_queue.put_nowait(msg)
+                            # Apply the same auth + waiting-state checks as the
+                            # HTTP endpoint so the WebSocket path cannot bypass
+                            # CONDUCTOR_GATE_TOKEN or resolve a non-waiting gate.
+                            if not self._gate_token_ok(ws.headers.get("authorization")):
+                                logger.warning(
+                                    "Rejecting WS gate_response: invalid or missing token"
+                                )
+                            elif (
+                                target_error := self._validate_gate_target(
+                                    str(msg.get("agent_name", ""))
+                                )
+                            ) is not None:
+                                logger.warning("Rejecting WS gate_response: %s", target_error)
+                            else:
+                                self._gate_response_queue.put_nowait(msg)
                         elif isinstance(msg, dict) and msg.get("type") in (
                             "dialog_message",
                             "dialog_decline",
@@ -401,6 +489,7 @@ class WebDashboard:
             "workflow_completed",
             "workflow_failed",
             "checkpoint_saved",
+            "checkpoint_save_failed",
         }
     )
 
@@ -752,11 +841,51 @@ class WebDashboard:
         """
         return len(self._connections) > 0
 
+    def _gate_token_ok(self, auth_header: str | None) -> bool:
+        """Return True if the gate token requirement is satisfied.
+
+        When ``CONDUCTOR_GATE_TOKEN`` is unset, gate responses are always
+        allowed. Otherwise the header must be ``Authorization: Bearer
+        <token>`` matching the env var, compared in constant time so the
+        token cannot be recovered via timing.
+
+        Args:
+            auth_header: The raw ``Authorization`` header value, or None.
+
+        Returns:
+            True if the token check passes (or no token is configured).
+        """
+        expected_token = os.environ.get("CONDUCTOR_GATE_TOKEN")
+        if not expected_token:
+            return True
+        scheme, _, presented = (auth_header or "").partition(" ")
+        return scheme.lower() == "bearer" and hmac.compare_digest(presented, expected_token)
+
+    def _validate_gate_target(self, agent_name: str) -> str | None:
+        """Validate that a gate response targets the currently-waiting gate.
+
+        Args:
+            agent_name: The agent name the response is addressed to.
+
+        Returns:
+            An error message string if no gate is waiting or the name does
+            not match the waiting gate, otherwise None.
+        """
+        waiting_agent = self._gate_waiting_agent
+        if waiting_agent is None:
+            return "No human gate is currently waiting for a response"
+        if agent_name != waiting_agent:
+            return (
+                f"Gate response targets agent {agent_name!r} but the "
+                f"waiting gate is {waiting_agent!r}"
+            )
+        return None
+
     async def wait_for_gate_response(self, agent_name: str) -> dict[str, Any]:
         """Wait for a gate response from a web client.
 
         Blocks until a ``gate_response`` message is received via WebSocket
-        that matches the given agent name.
+        or HTTP POST that matches the given agent name.
 
         Non-matching messages are discarded with a warning. Because
         conductor only presents one gate at a time, any ``gate_response``
@@ -772,15 +901,31 @@ class WebDashboard:
             The gate response payload dict with keys ``selected_value``
             and optionally ``additional_input``.
         """
-        while True:
-            msg = await self._gate_response_queue.get()
-            if msg.get("agent_name") == agent_name:
-                return msg
-            logger.warning(
-                "Discarding stale gate_response for agent %r while waiting on %r",
-                msg.get("agent_name"),
-                agent_name,
-            )
+        self._gate_waiting_agent = agent_name
+        try:
+            while True:
+                msg = await self._gate_response_queue.get()
+                if msg.get("agent_name") == agent_name:
+                    # Drain any responses still queued on resolution. Two
+                    # concurrent submits for this same gate can both pass the
+                    # waiting-state check and enqueue; we consume one here and
+                    # the duplicate would otherwise linger and auto-resolve the
+                    # next same-named gate reached via loop-back. Clearing it now
+                    # (no ``await`` before the queue is empty) prevents that.
+                    while not self._gate_response_queue.empty():
+                        dup = self._gate_response_queue.get_nowait()
+                        logger.warning(
+                            "Draining duplicate gate_response for agent %r on resolution",
+                            dup.get("agent_name"),
+                        )
+                    return msg
+                logger.warning(
+                    "Discarding stale gate_response for agent %r while waiting on %r",
+                    msg.get("agent_name"),
+                    agent_name,
+                )
+        finally:
+            self._gate_waiting_agent = None
 
     async def wait_for_dialog_message(self, agent_name: str, dialog_id: str) -> dict[str, Any]:
         """Wait for a dialog message or decline from the web client.
@@ -1104,5 +1249,18 @@ class WebDashboard:
 
         Called during engine setup so POST /api/stop can abort the
         current agent via the same event the engine monitors.
+
+        If a Stop request arrived during the startup window before this was
+        called (``_pending_stop``), it is honored immediately by setting the
+        event, so the queued Stop takes the graceful interrupt path (#245).
+
+        Note: at root depth the interrupt only produces a visible pause from
+        *inside* LLM agent execution. If the workflow's first step is a
+        ``script`` / ``set`` / ``wait`` step, a queued startup Stop is consumed
+        by the between-step check without pausing — best-effort, matching
+        steady-state Stop semantics.
         """
         self._interrupt_event = event
+        if self._pending_stop:
+            self._pending_stop = False
+            event.set()

@@ -58,8 +58,8 @@ def _make_provider_with_mcp() -> ClaudeProvider:
     provider._default_max_tokens = 8192
     provider._retry_config = MagicMock()
     provider._retry_config.max_attempts = 1
+    provider._retry_config.max_parse_recovery_attempts = 2
     provider._retry_history = []
-    provider._max_parse_recovery_attempts = 2
     provider._max_schema_depth = 10
     provider._default_max_agent_iterations = 50
     provider._default_max_session_seconds = None
@@ -85,8 +85,8 @@ def _make_bare_provider() -> ClaudeProvider:
     provider._default_max_tokens = 8192
     provider._retry_config = MagicMock()
     provider._retry_config.max_attempts = 1
+    provider._retry_config.max_parse_recovery_attempts = 2
     provider._retry_history = []
-    provider._max_parse_recovery_attempts = 2
     provider._max_schema_depth = 10
     provider._default_max_agent_iterations = 50
     provider._default_max_session_seconds = None
@@ -550,6 +550,8 @@ class TestEventCallbackThreading:
         # Create a minimal agent mock
         agent = MagicMock()
         agent.output = None
+        agent.output_mode = "auto"
+        agent.effective_output_schema.return_value = None
         agent.model = None
         agent.max_agent_iterations = None
         agent.max_session_seconds = None

@@ -75,7 +75,7 @@ class TestClaudeEdgeCases:
         rendered_prompt = "Test prompt"
 
         result = await provider.execute(agent, context, rendered_prompt)
-        assert result.content == {"text": ""}
+        assert result.content == {"result": ""}
 
     @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
     @patch("conductor.providers.claude.AsyncAnthropic")

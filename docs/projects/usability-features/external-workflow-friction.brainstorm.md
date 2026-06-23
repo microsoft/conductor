@@ -1,32 +1,42 @@
 # External Workflow Friction — Findings and Fix Brainstorm
 
-> **Status:** brainstorm — open for discussion before any of the proposals here become a `.plan.md`.
+> **Status:** brainstorm — updated 2026-05-27 with validation evidence against Conductor v0.1.17.
 > **Author:** Lucio Tinoco (external user contributor)
-> **Source of evidence:** real-world execution of the `workiq-coach` Conductor workflow set (Phase A: WorkIQ fan-out → synthesizer → schema validator → save; Phase B: four parallel artifact generators → consistency check → 5 saves). Seven failed runs across May 25–26, 2026, before a successful end-to-end execution was achieved.
+> **Source of evidence:** real-world execution of the `workiq-coach` Conductor workflow set, then a three-phase validation pass against v0.1.17. See *Validation results* below.
 > **Audience:** Conductor maintainers, and any contributor who'd help upstream these fixes.
 
 ---
 
 ## Why this document exists
 
-A single user trying to run two non-trivial workflows against real WorkIQ + Copilot + Anthropic data hit nine distinct rough edges in Conductor v0.1.16. Each one looked like a one-off the first time it appeared; each turned out to be a real bug or design fragility. Most are small fixes. A few are architectural choices worth discussing.
+A single user trying to run two non-trivial workflows against real WorkIQ + Copilot + Anthropic data hit nine distinct rough edges in Conductor v0.1.16. Each one looked like a one-off the first time it appeared; each turned out to be a real bug or design fragility — or, in two cases, an analysis error on my part.
 
 This document records what was learned so the cost of that session pays back across the codebase rather than being a private tale. It is **not** a request to fix everything at once — it's a structured analysis with a phased implementation plan that maintainers can carve into PR-sized work, reshape, reject, or defer.
 
 The unifying theme: each issue produces a **silent or confusing failure mode** that consumes minutes-to-hours of an external user's time before the actual cause becomes diagnosable. The fixes are mostly about **earlier and clearer errors**, **safer defaults**, and **eliminating brittle implicit behaviors**.
 
+Since the first revision of this doc, Conductor v0.1.17 has shipped fixes that **fully address** three of the nine original items (#1 small-case, #7, #8), **partially address** two more (#5, #6), leave **two open** (#2, #3), and turn out to **not be bugs** for two more (#4 and #9 — closer inspection during validation showed I was wrong about both). A **tenth** issue surfaced during validation (#10, agent-level outer retry). Each section below now carries a status badge reflecting the v0.1.17 state.
+
 ---
 
 ## Executive summary
 
-| Tier | Theme | Issues | PR cluster |
-|---|---|---|---|
-| **1** | Silent/confusing failures → clear errors | #4 var expansion, #7 script in parallel, #8 web-bg + gate, parts of #3 | "Better validation + error messages" |
-| **2** | Architectural fragility in JSON envelope extraction | #1 fence regex, #2 `output:` schema default | "Output mode: raw vs envelope" |
-| **3** | Operational reliability | #3 subprocess intermittency, #5 dashboard zombie, #6 retry budget, #9 expansion parity | "Runtime hardening" |
-| **Bonus** | Patterns that look fragile but haven't surfaced in our use yet | event-history unbounded growth, parallel context race, recovery prompt reuses identical schema, no dashboard-startup timeout | Future cleanup |
+| # | Issue | v0.1.17 status |
+|:---:|---|:---|
+| 1 | Fence-extraction regex non-greedy | ⚠️ **PARTIAL** — greedy regex shipped at `output.py:120-122`; works on small responses (Phase 2 ✓), fails on full-scale ~80 KB responses (Phase 3 ✗). Issue #2 still needed. |
+| 2 | `output_mode: raw \| envelope` field on AgentDef | ❌ **STILL OPEN** — Phase 3 empirically validated this as essential, not just nice-to-have. Headline upstream contribution candidate. |
+| 3 | Windows subprocess path normalization | ❌ Still open — workaround: set `$env:PYTHON` with backslash form. |
+| 4 | `${VAR:-DEFAULT}` colon-in-default parser | ❎ **DEBUNKED** — empirical test against v0.1.17 (and v0.1.16) shows the regex correctly parses `${PYTHON:-C:/Python314/python.exe}`. My original analysis was wrong. This issue does not exist; the section is preserved below as a note for future readers. |
+| 5 | Dashboard / gate-resolution resilience | ⚠️ **PARTIAL** — `web/server.py` now handles `gate_response` / `dialog_message` / `iteration_limit_response` messages and has disconnect-event handling; PR #202 brought max-iterations gate resolution into the dashboard. No CLI `conductor gate-respond` command yet. |
+| 6 | Per-agent retry budget config | ⚠️ **PARTIAL** — `max_parse_recovery_attempts` is now on an internal `_retry_config` (configurable in code), but not surfaced in the YAML schema. |
+| 7 | Reject `type: script` in `parallel:` at validate | ✅ **SHIPPED** — `config/validator.py:489-492` rejects with: *"Script steps cannot be used in parallel groups."* |
+| 8 | `--web-bg` + `human_gate` clear error | ✅ **SHIPPED VERBATIM** — `cli/app.py:158-191` defines `_abort_web_bg_if_human_gate` with essentially the brainstorm's proposed error message word-for-word, four-option list intact. |
+| 9 | `command:` and `args:` expansion parity | ❎ **NOT A BUG** — confirmed both use the same `self.renderer.render()` path in `executor/script.py`. No divergence to fix. |
+| 10 | Agent-level outer retry budget (new finding) | ❌ **STILL OPEN** — Phase 3 surfaced this: when parse-recovery 5/5 exhausts, Conductor retries the whole agent 3 more times. Multiplies sunk cost on doomed agents. Should be capped/configurable. |
 
-The single highest-leverage change is **#1 + #2 together** — the JSON envelope extraction + the `output:` schema default. These are responsible for the majority of "Parse Recovery 1/5 → 5/5 → workflow times out" experiences we hit. Tier 1 fixes are individually cheap and add up to a much smoother first-run experience for new external users.
+**Headline remaining upstream priority:** Issue #2 (the `output_mode` field). This is the architectural fix that the regex patch (Issue #1) cannot substitute for. Phase 3 verified empirically.
+
+**Headline upstream wins already in v0.1.17:** Issues #1 (small-case), #5 (partial), #7, #8. Cluster A from the first revision of this doc is largely shipped.
 
 ---
 
@@ -48,11 +58,52 @@ For Phase B (which already used the no-`output:`-schema pattern from the start),
 
 **Net loss to friction across runs #1–#7: roughly 3 hours of wall-clock LLM execution + several hours of human diagnostic time, almost all attributable to issues #1, #2, and #5.**
 
-The other six issues (#3, #4, #6, #7, #8, #9) surfaced in supporting fashion — each cost minutes, and each is independently a real bug.
+The other six issues (#3, #4, #6, #7, #8, #9) surfaced in supporting fashion — each cost minutes, and each is independently a real bug (except #4 and #9, which the validation pass below proved are not actually bugs).
+
+---
+
+## Validation results (2026-05-27, against Conductor v0.1.17)
+
+After v0.1.17 shipped, a three-phase validation pass tested whether the fixes addressed the original failure modes. Summary above; details:
+
+### Phase 1 — Static survey
+
+Grep + read each cited file:line in v0.1.17. Result: the matrix in the executive summary. Five issues had relevant code changes (three full ships, two partials). Two issues turned out to be analysis errors. Two are still open.
+
+Most striking find: `cli/app.py:158-191` contains the **exact error message** I proposed in this brainstorm for Issue #8 — four-option list intact down to the "Wait for CLI gate-resolution support (planned follow-up)" line. Strong signal that the doc was read and acted on.
+
+### Phase 2 — Minimal repro for Issue #1 (greedy regex)
+
+A 5-line repro YAML with one agent declaring `output: { content: string }` and a prompt that asks the model to emit a string containing triple-backticks. Against v0.1.17:
+
+- Workflow completed in **14.35 seconds**
+- **Zero Parse Recovery events**
+- Output verified: `"contains_backticks": "True"` (the test was real, not degenerate)
+- Cost: $0.0053
+
+The greedy regex at `output.py:120-122` works as designed for small-case nested fences. This **confirms Issue #1 was correctly fixed** for the small-response case.
+
+### Phase 3 — End-to-end against the original workiq-coach config
+
+Restored `phase-a.yaml`'s synthesizer to the **original** `output: { observations_json, pillar_summary }` schema — the config that broke 5+ times against v0.1.16 — and ran against v0.1.17 with `budget_usd: 2.00` in `enforce` mode as a safety net.
+
+Result: **synthesizer still parse-loops at full scale.** Same failure mode as v0.1.16 runs #2/#4/#6:
+
+- 8 workiq_runner agents completed cleanly (each with one transient parse recovery, all recovered)
+- Synthesizer step started; first attempt's response hit Parse Recovery 1/5 → 2/5 → 3/5 → 4/5 → 5/5
+- Conductor then surfaced a new behavior I hadn't seen before: an **agent-level outer retry budget** (3 attempts total). After parse recovery 5/5, the message was `Agent 'synthesizer' attempt 1/3 failed: Failed to parse structured output from agent response`, and the inner parse-recovery cycle restarted from 1/5 inside outer attempt 2/3.
+- Killed at ~50 min runtime, mid outer-attempt 2/3
+- Budget enforcement did **not** fire — but only because actual spend stayed under $2 (~$0.70-0.80 estimated). The budget feature is working correctly; haiku is just too cheap for $2 to brake a retry storm of this size.
+
+**Conclusion:** Issue #1's greedy regex fix is verified to work at small scale but **does not address the full-scale failure**. Something else about the synthesizer's ~80KB response trips Conductor's parser — likely model truncation crossing the fence boundary, or prose interleaved with the JSON. Issue #2 (`output_mode: raw | envelope`) remains the architectural fix that this validation pass empirically demands.
+
+Total cost of validation: ~$0.81 across Phase 1 (free), Phase 2 ($0.005), and Phase 3 (~$0.80).
 
 ---
 
 ## Issue 1 — Fence-extraction regex breaks on large or nested JSON
+
+> **Status (v0.1.17):** ⚠️ PARTIAL. Greedy regex shipped at `executor/output.py:120-122` with a comment that quotes this brainstorm's failure mode. Phase 2 verified the fix on a small response. Phase 3 verified the fix is **insufficient** at full scale (~80 KB synthesizer output). Issue #2 below remains the architectural fix.
 
 ### Symptom
 
@@ -88,6 +139,8 @@ The brace-balanced approach is more robust but ~30 LOC of careful code (must han
 
 **Recommendation:** ship the greedy regex first as a quick win; add the brace-balanced extractor as a follow-up for the long tail.
 
+> *Update 2026-05-27 — Upstream shipped the greedy-regex change at `output.py:120-122`. The accompanying code comment reproduces this brainstorm's failure-mode description ("closes at the LAST ` ``` ` in the response, not the first inner ` ``` ` which may appear inside a JSON string field"). Phase 2 confirmed it works on small inputs; Phase 3 showed it does **not** scale (see "Update from Phase 3 validation" below). The brace-balanced extractor may still be worth adding, but the upstream priority should be Issue #2.*
+
 ### Blast radius
 
 - All workflows with `output:` schemas and large structured responses
@@ -97,15 +150,29 @@ The brace-balanced approach is more robust but ~30 LOC of careful code (must han
 ### Validation approach
 
 Add tests under `tests/test_executor/test_output.py`:
-- Fence-wrapped JSON with triple-backticks inside a string field
-- Fence-wrapped JSON ~80 KB in size
+- Fence-wrapped JSON with triple-backticks inside a string field ✅ (Phase 2 confirms this passes)
+- Fence-wrapped JSON ~80 KB in size ❌ (Phase 3 demonstrates this still fails)
 - Fence-wrapped JSON with prose before and after the fence
 - Raw JSON with no fence
 - Malformed JSON (must still fail cleanly)
 
+### Update from Phase 3 validation (2026-05-27)
+
+The 80KB synthesizer case still fails. Possible root causes (not yet root-caused):
+
+1. **Model response truncation**: At ~80KB, models may emit incomplete output where the closing ` ``` ` is missing. Greedy regex can't recover from a truly absent closing fence.
+2. **Prose interleaved with JSON**: When asked to "respond with JSON matching this schema," some models still emit "Here is the synthesized JSON:\n```json\n{...}\n```\nLet me know if..." — prose before AND after the fence. The current extractor handles prose-then-JSON and JSON-then-prose, but not the dual case cleanly.
+3. **Field-shape mismatch inside the envelope**: The model may emit valid JSON whose **shape** doesn't match `{observations_json: string, pillar_summary: string}` — e.g. emitting the full observations object directly at top level instead of nesting it as a string in `observations_json`. Conductor's "Could not extract JSON" message may be misleading; the actual failure might be field validation.
+
+The Conductor error at the parse failure surfaces "Response started with: ..." but truncates to "..." so the actual prefix isn't visible — diagnosis would benefit from a longer prefix in the error message (e.g. first 500 chars).
+
+**Recommendation for upstream:** even with the greedy regex in place, ship Issue #2's `output_mode: raw` field. The greedy regex helps the small case; only `output_mode: raw` addresses the architectural problem at scale.
+
 ---
 
 ## Issue 2 — `output:` schema is the wrong default for prose / large JSON agents
+
+> **Status (v0.1.17):** ❌ STILL OPEN. The `output_mode` field is not in `config/schema.py`. The recent `9d603a1` commit (`feat(script): allow script agents to declare output schemas`) is about *script* agents getting `output:`, which is a different feature. Phase 3 empirically validated that this issue is the **architectural root cause** of the workiq-coach failures. Headline upstream contribution candidate.
 
 ### Symptom
 
@@ -175,6 +242,8 @@ Add an explicit `output_mode` field to `AgentDef`:
 
 ## Issue 3 — Subprocess invocation fails intermittently on Windows forward-slash paths
 
+> **Status (v0.1.17):** ❌ STILL OPEN. No forward-slash → backslash normalization in `executor/script.py`. Did not recur during Phase 3 validation, but workaround remains: set `$env:PYTHON` to a backslash absolute path.
+
 ### Symptom
 
 A `type: script` step with `command: "${PYTHON:-python}"`, with `$env:PYTHON = "C:/Python314/python.exe"`, fails with:
@@ -222,53 +291,31 @@ Normalize separators on Windows. Also improve the error message: when `FileNotFo
 
 ## Issue 4 — `${VAR:-DEFAULT}` regex splits on the first `:` in the default
 
-### Symptom
+> **Status (v0.1.17 and v0.1.16):** ❎ **DEBUNKED — this is not a bug.** The original brainstorm claim was wrong.
+>
+> The regex at `config/loader.py:23` is `r"\$\{([^}:]+)(?::-([^}]*))?\}"`. The variable-name portion `[^}:]+` excludes colons (so it can't accidentally absorb `C:`), and the default-value portion `[^}]*` correctly accepts colons. Empirical test:
+>
+> ```
+> "${PYTHON:-C:/Python314/python.exe}" → VAR='PYTHON', DEFAULT='C:/Python314/python.exe'
+> "${WORKIQ_COACH_ROOT:-Q:/src/workiq-coach}" → VAR='WORKIQ_COACH_ROOT', DEFAULT='Q:/src/workiq-coach'
+> "${VAR:-default:with:colons}" → VAR='VAR', DEFAULT='default:with:colons'
+> ```
+>
+> All cases resolve correctly. My original analysis confused the workiq-coach user's notes ("we tried `${PYTHON:-C:/...}` and it didn't work") with a regex bug. The actual problem at the time was almost certainly something else downstream (possibly the subprocess invocation issue from Issue #3). Leaving this section in place as a warning to future readers: validate empirically before proposing fixes to regex-shaped code.
 
-`${PYTHON:-C:/Python314/python.exe}` fails to expand correctly: the first `:` (after `C`) is misread as the `:-` default separator, producing nonsensical variable resolution. Forces users to either set `$env:PYTHON` to absolute and use `${PYTHON:-python}` (with a colon-free default), or to avoid env-var defaults entirely for Windows paths.
+### What I originally thought
 
-### Location
+That the regex split on the *first* `:` rather than `:-`, mangling `${PYTHON:-C:/path}` into `VAR=PYTHON, DEFAULT=C` (with the rest discarded). This is not what happens; the regex's variable-name class `[^}:]+` correctly stops at the first `:`, but then `(?::-...)?` requires the literal `:-` sequence (colon-dash) to enter the default group. A bare `:` after the var name does not match the optional default group.
 
-- `src/conductor/config/loader.py:23` — env var expansion regex
+### Lesson learned
 
-### Cause
-
-The regex (or equivalent string-split) treats `:` greedily as the var/default separator. Splits on the *first* `:` encountered. Windows drive letters violate this assumption.
-
-### Fix proposal
-
-Replace the regex with a parser that scans the token from `${` to `}` and uses `rfind(":-")` to locate the default separator only at the **last** `:-` occurrence:
-
-```python
-def parse_var_token(token: str) -> tuple[str, str | None]:
-    """Parse ${VAR:-DEFAULT} content (the text between ${ and })."""
-    sep = ":-"
-    idx = token.rfind(sep)
-    if idx == -1:
-        return token, None
-    return token[:idx], token[idx + len(sep):]
-```
-
-Walk the source string for `${...}` blocks and apply this parser.
-
-Alternative: document that defaults can't contain `:` and validate at load time — but the parser fix is small and removes a real footgun.
-
-### Blast radius
-
-- Windows users with absolute-path defaults
-- POSIX users unaffected (`:` is rare in defaults)
-- Backward-compatible (existing defaults without colons still work identically)
-
-### Validation approach
-
-- `tests/test_config/test_loader.py` cases:
-  - `${VAR:-C:/path/with/colons}` resolves to `C:/path/with/colons` when VAR unset
-  - `${VAR:-default}` still works (no colon)
-  - `${VAR}` (no default) still works
-  - Edge: nested `${...}` inside default value
+When proposing a regex fix, run the regex against the exact failure input first. Five minutes with `re.compile().search()` would have caught this.
 
 ---
 
 ## Issue 5 — Dashboard web server dies during long-parked human gates
+
+> **Status (v0.1.17):** ⚠️ PARTIAL. `web/server.py:315-345` now handles `gate_response`, `dialog_message`, and `iteration_limit_response` messages from clients, with `_disconnect_event` and grace timers for connection lifecycle. PR `dc29c2c` (*fix(engine,web): resolve max-iterations gate from dashboard in --web-bg*) brings gate resolution into the dashboard itself. **What's still missing:** a CLI `conductor gate-respond <run-id>` command for resolving gates from outside the browser when the dashboard is unreachable.
 
 ### Symptom
 
@@ -317,6 +364,8 @@ The CLI gate-resolution command is the most impactful single change — it gives
 
 ## Issue 6 — Parse-recovery retry budget hardcoded per provider
 
+> **Status (v0.1.17):** ⚠️ PARTIAL. `max_parse_recovery_attempts` has been moved to an internal `_retry_config` field (visible in `providers/copilot.py:685` and `claude.py:191`), but is **not exposed in the workflow YAML schema**. The internal refactor is half the work; the user-facing knob is what would let workflows fail fast on doomed agents (especially with the new outer-retry budget — see Issue #10).
+
 ### Symptom
 
 When parse recovery is needed, Copilot gets 5 retries, Claude gets 2 (per the user's notes; values from `copilot.py:81` and `claude.py:106`). These are class-level constants. For large outputs prone to parse failure, 5 may be too few; for short, fast outputs in CI/cost-sensitive contexts, 5 may be too many.
@@ -356,6 +405,8 @@ Honors the [Provider Parity](../../AGENTS.md#provider-parity) rule — both prov
 ---
 
 ## Issue 7 — `type: script` agents inside `parallel:` groups silently misbehave
+
+> **Status (v0.1.17):** ✅ **SHIPPED.** `config/validator.py:489-492` rejects with: *"Agent '\<name\>' in parallel group '\<pg\>' is a script step. Script steps cannot be used in parallel groups."* This is Cluster A's quick-win item from the first revision of this brainstorm. Done.
 
 ### Symptom
 
@@ -410,6 +461,8 @@ Then execute concurrently. Requires careful error handling (`continue_on_error` 
 
 **Recommendation:** ship A first (1-day fix, no behavior change for valid workflows), then B as a follow-up if there's demand.
 
+> *Update 2026-05-27 — Upstream shipped Option A at `config/validator.py:489-492`. The error message is essentially as proposed. Done.*
+
 ### Blast radius
 
 - Workflows that put scripts in parallel groups (currently silently broken)
@@ -423,6 +476,8 @@ Then execute concurrently. Requires careful error handling (`continue_on_error` 
 ---
 
 ## Issue 8 — `--web-bg` + `human_gate` crashes with EOFError
+
+> **Status (v0.1.17):** ✅ **SHIPPED — verbatim.** `cli/app.py:158-191` defines `_abort_web_bg_if_human_gate` whose error message reproduces the brainstorm's proposed text essentially word-for-word, including the four-option remediation list ("Use --web (foreground)…", "Add --skip-gates…", "Remove human_gate steps…", "Wait for CLI gate-resolution support (planned follow-up)"). Honors `--skip-gates` as the documented escape hatch. Strong evidence that this brainstorm was read; thank you to whoever picked it up.
 
 ### Symptom
 
@@ -461,6 +516,8 @@ If `not is_interactive` and the workflow contains gates without `--skip-gates`:
    ```
 2. **Runtime fallback** (more complex): when a gate fires in detached mode, route it to the dashboard's `/api/gate-response` endpoint (see Issue #5 fix #2) and poll for the response. Requires the gate-respond endpoint to exist.
 
+> *Update 2026-05-27 — Upstream shipped Option 1 verbatim at `cli/app.py:158-191`. The error message reproduces the proposed text including the four-option remediation list. Done.*
+
 ### Blast radius
 
 - `--web-bg` + gate workflows (currently crash)
@@ -474,41 +531,56 @@ If `not is_interactive` and the workflow contains gates without `--skip-gates`:
 
 ## Issue 9 — Possible expansion-path divergence between `command:` and `args:`
 
+> **Status (v0.1.17 and v0.1.16):** ❎ **NOT A BUG.** Confirmed both fields use `self.renderer.render()` on the same code path in `executor/script.py:86-87`. No divergence to fix. Original brainstorm was speculative; validation pass closed it out.
+>
+> The "anecdotal" observation that motivated this item was confused with Issue #4 (which itself turned out not to be a bug). Both go through the same Jinja2 template rendering. A test verifying parity is still a reasonable defensive addition for `tests/test_executor/test_script.py`, but the issue itself can be closed.
+
+---
+
+## Issue 10 — Agent-level outer retry budget amplifies sunk cost (NEW, from Phase 3)
+
+> **Status (v0.1.17):** ❌ STILL OPEN. New finding from Phase 3 validation.
+
 ### Symptom
 
-Anecdotal: `${VAR:-default}` expansion appears to behave differently in `command:` vs. `args:` fields of a script step. The user's debugging notes for Issue #4 mention this is what led to the colon-in-default workaround being needed for `command:` but not `args:`. Hasn't been root-caused; may be related to Issue #4 or may be a separate code path.
+When an agent's inner parse-recovery cycle (5 attempts) exhausts, Conductor v0.1.17 retries **the whole agent up to 3 more times**. The outer-attempt counter is visible in the log as `Agent 'synthesizer' attempt 1/3 failed: ...`, after which Parse Recovery 1/5 begins again inside outer attempt 2/3.
+
+This was not visible in v0.1.16 (or at least, I didn't observe it). It looks like a hardening pass that adds resilience to transient failures — but for **deterministic** schema-mismatch failures (the workiq-coach synthesizer case), it triples the sunk cost.
 
 ### Location
 
-- `src/conductor/executor/script.py:86-87` — template rendering for both fields
+Likely `providers/copilot.py` or `engine/workflow.py` — not yet root-caused. Visible in v0.1.17 log output as `Agent '<name>' attempt N/3 failed: Failed to parse structured output...`.
 
 ### Cause
 
-Unknown without deeper investigation. Possible candidates:
-1. Different render order (env var resolution at YAML load time vs. Jinja2 template render time)
-2. One field passes through a parser that the other doesn't
-3. The observation was incorrect and both behave identically once Issue #4 is fixed
+Hardening retry logic that doesn't distinguish *transient* failures (worth retrying) from *deterministic* configuration mismatches (won't change on retry). The error message includes `Retryable: True`, but the determination of retryability appears to be based on the failure category, not on whether retrying could actually succeed.
 
 ### Fix proposal
 
-Audit `script.py` to confirm both `command:` and `args:` use the same render path. Add unit tests that verify equivalence:
+Three options, can ship any subset:
 
-```python
-def test_command_and_args_env_var_parity():
-    """Same ${VAR:-default} resolves identically in command: and args: fields."""
-    # ... test that command="${X:-foo}" and args=["${X:-foo}"] both produce "foo"
-```
+1. **Per-agent `max_outer_attempts` config** — let workflow authors opt out of the outer retry for agents known to fail-deterministically:
+   ```yaml
+   - name: synthesizer
+     retry:
+       max_outer_attempts: 1   # don't burn extra attempts on deterministic failures
+       max_parse_recovery_attempts: 2
+   ```
 
-If a divergence exists, unify the paths.
+2. **Smarter retry classifier** — if the same parse error fires twice in a row inside one outer attempt, mark the failure as deterministic and skip remaining outer attempts. Saves cost without requiring user configuration.
+
+3. **Surface a deprecation/warning when the outer retry is triggered** — make the cost visible. Many users (myself included) wouldn't notice the 3× spend amplification until reading the bill.
 
 ### Blast radius
 
-- Probably small — would have surfaced more widely if significant
-- Test coverage improvement is valuable regardless
+- Workflows with deterministically-failing agents (e.g. envelope mismatch on large outputs)
+- Production runs where cost amplification matters
+- Backward-compatible if added as optional config with current behavior as the default
 
 ### Validation approach
 
-- New test in `tests/test_executor/test_script.py`
+- Integration test: agent configured to always fail parse — count outer attempts, verify budget config caps them
+- Cost-tracking test: verify the budget tracker counts outer retries the same as parse recoveries
 
 ---
 
@@ -542,62 +614,69 @@ These are things the analysis surfaced as "this will bite someone eventually" bu
 
 ---
 
-## Implementation plan — three PR clusters
+## Implementation plan — revised after v0.1.17
 
-### Cluster A: "Better validation + error messages" (highest value-to-effort)
+The first revision of this doc proposed three PR clusters. Phase 1/2/3 validation against v0.1.17 changes the picture significantly: **Cluster A is mostly already shipped**, **Cluster B is now the headline priority**, and **Cluster C shrinks**.
 
-**Goal:** turn silent and confusing failures into clear errors at validate time or at the failure site.
+### Cluster A (largely shipped in v0.1.17 — leftover items only)
 
-**Includes:**
-- Issue #4: `${VAR:-DEFAULT}` parser fix
-- Issue #7: reject `type: script` in `parallel:` at validate
-- Issue #8: detect non-interactive stdin + workflow gates at startup
-- Issue #3: normalize Windows path separators + improve subprocess error message
+Original scope included Issues #4, #7, #8, and parts of #3. Updated:
 
-**Estimated size:** ~60 LOC across `config/loader.py`, `config/validator.py`, `executor/script.py`, `gates/human.py`. Plus tests.
+- ✅ **Issue #7** — shipped (`config/validator.py:489-492`)
+- ✅ **Issue #8** — shipped (`cli/app.py:158-191`)
+- ❎ **Issue #4** — debunked (not actually a bug)
+- ❌ **Issue #3** — Windows path normalization not yet shipped. Still a 10-line PR.
 
-**Risk:** very low. All changes are either pure parser fixes or earlier-validation. No behavioral change for valid workflows.
+**Remaining Cluster A scope:** Issue #3 alone (~20 LOC including tests). Trivially mergeable.
 
-**Why ship first:** every one of these is an instance of "user hits a confusing failure, takes 30+ minutes to diagnose, fix is 2 lines of code." Each PR independently improves the new-user experience.
+### Cluster B: "Output mode: raw vs envelope" — NOW THE HEADLINE PRIORITY
 
-### Cluster B: "Output mode: raw vs envelope" (architectural)
-
-**Goal:** make raw-response the explicit, documented, recommended pattern for agents producing prose or large JSON.
+**Goal:** introduce an explicit `output_mode: raw | envelope` field so that prose / large-JSON agents have a documented, first-class way to opt out of the JSON envelope contract that empirically fails at scale.
 
 **Includes:**
-- Issue #1: greedy fence regex (quick fix) + optional brace-balanced extractor (proper fix)
-- Issue #2: add `output_mode: raw | envelope` to AgentDef; warn at validate when `output:` is declared on prose-likely agents; documentation updates
+- Issue #1 (partially shipped) — keep the greedy regex; consider the brace-balanced extractor as a follow-up only if Issue #2 doesn't subsume the need
+- Issue #2 — add `output_mode: raw | envelope` to `AgentDef`; warn at `conductor validate` when `output:` is declared on prose-likely agents (heuristic on prompt content); documentation updates in `docs/workflow-syntax.md` and `docs/configuration.md`
+- Issue #10 (new) — pair with a per-agent `retry.max_outer_attempts` knob. Without this, even with `output_mode: envelope` declared correctly, a transient failure burns 3× the necessary cost.
 
-**Estimated size:** ~100 LOC across `executor/output.py`, `providers/copilot.py`, `providers/claude.py` (parity), `config/schema.py`, `config/validator.py`. Plus docs updates and tests. The fence-regex piece is small; the `output_mode` field + validator warning + doc cohesion is most of the work.
+**Empirical justification:** Phase 3 demonstrated that the greedy regex alone is insufficient for the full-scale workflow that originally motivated this brainstorm. The `output_mode: raw` field is the architectural fix, not a workaround.
 
-**Risk:** medium. Affects the hot path of every workflow with `output:`. Needs careful provider-parity work. Worth a design discussion in this brainstorm before opening a PR.
+**Estimated size:** ~150 LOC across `config/schema.py`, `config/validator.py`, `executor/output.py` (touch only), `providers/copilot.py` + `providers/claude.py` (parity), plus docs updates and tests.
 
-**Why ship together:** the regex fix without the documented `output_mode` field still leaves new users tripping into the bad default. The field without the regex fix doesn't help existing workflows with valid `output:` declarations that happen to contain backticks.
+**Risk:** medium. Affects the hot path of every workflow with `output:`. Backward-compatible if the default behavior is preserved when `output_mode` is unspecified (existing workflows continue to behave as today). Worth a design discussion in this brainstorm before opening a PR — see Open question #1 below.
 
-### Cluster C: "Runtime hardening"
+**Why ship this:** this is the architectural fix the validation pass empirically demands. Every other item on this list is comparatively cosmetic.
 
-**Goal:** improve operational reliability of long-running workflows and dashboard interactions.
+### Cluster C: "Runtime hardening" — shrunk
 
-**Includes:**
-- Issue #5: dashboard WebSocket keepalive + CLI gate-resolution command
-- Issue #6: configurable `max_parse_recovery_attempts`
-- Issue #9: unified expansion path + parity test
-- Bonus: event-history ring buffer, dashboard-startup timeout
+Original scope included Issues #5, #6, #9 + bonus patterns. Updated:
 
-**Estimated size:** ~200 LOC, primarily in `web/server.py`, `cli/`, `providers/`. Plus the new `conductor gate-accept` CLI command.
+- ⚠️ **Issue #5** — partially shipped. Remaining: CLI `conductor gate-respond <run-id>` command for resolving gates outside the browser. ~50 LOC + tests.
+- ⚠️ **Issue #6** — partially shipped (internal refactor). Remaining: expose `max_parse_recovery_attempts` in the YAML schema. ~10 LOC + schema test.
+- ❎ **Issue #9** — confirmed not a bug. Closed.
+- Bonus patterns — still flagged below; out of scope for an immediate PR.
 
-**Risk:** medium-low. The keepalive and ring buffer are additive. The CLI gate-resolution is a net-new feature.
+**Remaining Cluster C scope:** Issue #5 (CLI gate-respond) + Issue #6 (YAML field). ~60 LOC combined.
 
-**Why ship last:** these are quality-of-life improvements rather than fixes for immediately-broken behavior. Maintainers may want to defer until A + B prove the brainstorm's value.
+### What I'd PR if I were doing this myself
+
+In priority order:
+
+1. **Issue #2 + #10** as a single design-discussion-first PR (Cluster B headline). Opens the conversation about the `output_mode` field with empirical Phase 3 evidence. Optionally bundles the `retry.max_outer_attempts` knob.
+2. **Issue #3** as a small, focused Windows path normalization PR. Probably mergeable in a day.
+3. **Issue #6** as a small YAML schema PR exposing the already-internal retry budget knob.
+4. **Issue #5 CLI command** as a small feature PR.
 
 ---
 
 ## Open questions for maintainers
 
-1. **Output mode default.** Cluster B proposes `output_mode` as an additive field with the existing default preserved. Would maintainers consider flipping the default to `raw` in a future v0.2.x, given that the current default produces parse recovery loops on real-world workflows? (Backward-compat strategy: behave as today when `output_mode` is unspecified AND `output:` is specified; warn loudly via deprecation when this combination appears in `conductor validate`.)
-2. **Provider parity for retry budget.** Issue #6 proposes per-agent `retry.max_parse_recovery_attempts`. The current Copilot default is 5; Claude is 2. Should the proposed field be a single value that both providers respect, or should the default per-provider be preserved (5 for Copilot, 2 for Claude) with the per-agent override applying uniformly?
-3. **Gate resolution endpoint security.** Adding `POST /api/gate-response` to the dashboard server creates a new attack surface. Should it require a per-run token (passed via env var or CLI flag) to authorize gate responses? The dashboard is bound to localhost by default, but `--web-bg` users running on shared infrastructure might want explicit token-based auth.
-4. **Issue #8 fix shape.** Validate-time error vs. runtime dashboard fallback for `--web-bg + human_gate`. The dashboard fallback is the better UX but depends on the gate-response endpoint from Issue #5 existing. Order the work?
+1. **Output mode default.** Cluster B proposes `output_mode` as an additive field with the existing default preserved. Phase 3 evidence suggests the current default (envelope-when-`output:`-is-present) produces parse-recovery loops on real-world large-output workflows. Would maintainers consider:
+   (a) shipping `output_mode` additive with current default preserved,
+   (b) shipping additive + warning loudly at `conductor validate` when `output:` is declared on a prose-likely agent, OR
+   (c) flipping the default to `raw` in v0.2.x with a deprecation pass for explicit-envelope workflows?
+2. **Provider parity for retry budget.** Issue #6 proposes per-agent `retry.max_parse_recovery_attempts`. The current Copilot default is 5; Claude is 2. Should the proposed field be a single value that both providers respect, or should the default per-provider be preserved (5 for Copilot, 2 for Claude) with the per-agent override applying uniformly? Phase 3 surfaces a related concern: the **outer** retry budget (Issue #10) is also unconfigurable. Worth bundling.
+3. **Gate resolution endpoint security.** Adding a CLI gate-resolution surface (Cluster C Issue #5) and/or `POST /api/gate-response` to the dashboard server creates a new attack surface. Should it require a per-run token (passed via env var or CLI flag) to authorize gate responses? The dashboard is bound to localhost by default, but `--web-bg` users running on shared infrastructure might want explicit token-based auth.
+4. **Outer retry classifier (Issue #10).** Is there appetite for a smarter classifier that detects deterministic failures (same parse error twice in a row inside one outer attempt) and skips remaining outer attempts? Saves cost without requiring user configuration. The simpler alternative is a user-facing `retry.max_outer_attempts` knob.
 
 ---
 
@@ -608,27 +687,32 @@ For each cluster:
 1. **Unit tests** in the relevant `tests/` subdirectory mirroring source layout (per AGENTS.md).
 2. **Integration tests** in `tests/test_integration/` that reproduce the actual failure mode from this session, then verify the fix.
 3. **Provider parity check** — any change to `providers/copilot.py` mirrored in `providers/claude.py` per [Provider Parity](../../AGENTS.md#provider-parity).
-4. **Documentation updates** — `docs/workflow-syntax.md` for Issue #2; `docs/configuration.md` for Issues #4, #6; `CHANGELOG.md` for all clusters.
-5. **A real-world smoke test**: re-run the workiq-coach Phase A workflow (with the original `output:` schema on the synthesizer) and verify it now completes. This is the canonical "did we fix the actual problem" test.
+4. **Documentation updates** — `docs/workflow-syntax.md` and `docs/configuration.md` for Issue #2 (`output_mode`); `CHANGELOG.md` for all clusters.
+5. **Real-world smoke test (the canonical "did we fix it" test):** re-run the workiq-coach Phase A workflow with the original `output:` schema on the synthesizer, against the fixed Conductor. This is Phase 3 of the validation pass that's already documented above. If it now completes first try, Issue #2 is fixed.
 
 ---
 
 ## References
 
-- Conductor source: `Q:/src/conductor` (this repo, v0.1.16)
+- Conductor source: `Q:/src/conductor` (this repo, v0.1.17 as of 2026-05-27)
 - `AGENTS.md` — architecture overview and contribution guide
 - `docs/projects/usability-features/` — existing brainstorm/plan documents in this convention
 - workiq-coach source: `Q:/src/workiq-coach`
   - `skills/executive-coach-assessor/workflows/phase-a.yaml` — the workflow that surfaced most issues
   - `skills/executive-coach-assessor/workflows/README.md` — contains the early diagnostic comment about output.py:120 fence-extraction bug
-- Conversation context: the analysis was produced collaboratively over a multi-hour debugging session in May 2026. The diagnostic narrative under "Source of evidence" is condensed from that session.
+- **Validation cycle (2026-05-27):**
+  - Phase 1 — static survey, free, ~10 min
+  - Phase 2 — minimal repro of Issue #1, ~$0.005, ~15 sec runtime
+  - Phase 3 — end-to-end against original config, ~$0.80, ~50 min runtime (killed mid outer-attempt 2/3)
+  - Total cost: ~$0.81
+- Conversation context: the original analysis was produced collaboratively over a multi-hour debugging session 2026-05-25/26; the validation pass and this update were produced on 2026-05-27.
 
 ---
 
 ## What would make this brainstorm into a `.plan.md`
 
-- Maintainer agreement that Cluster A is welcome → opens the door to a PR cluster
-- Open question #1 (output mode default) decided → enables a coherent Cluster B
-- Anyone disagrees with any of the nine issues → discussion happens here before any code
+- **For Issue #2 + #10:** maintainer agreement on Open question #1 (additive `output_mode` field with backward-compat default). Then a `.plan.md` for the implementation.
+- **For Issue #3:** trivial enough to skip the `.plan.md` step and just open a PR.
+- **For Issue #5 (CLI gate-respond) + #6 (YAML field):** maintainer agreement they're wanted. Then small focused PRs.
 
-If maintainers want any subset of these implemented, the external contributor (Lucio) is happy to open issues + PRs for them.
+If maintainers want any subset of these implemented, the external contributor (Lucio) is happy to open issues + PRs for them. The Phase 3 validation evidence is reproducible — happy to provide repro workflows on request.

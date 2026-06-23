@@ -225,7 +225,6 @@ class ClaudeProvider(AgentProvider):
         self._sdk_version: str | None = None
         self._retry_config = retry_config or RetryConfig()
         self._retry_history: list[dict[str, Any]] = []  # For testing/debugging retries
-        self._max_parse_recovery_attempts = 2  # Max retry attempts for malformed JSON
         self._max_schema_depth = 10  # Max nesting depth for recursive schema building
         self._default_max_agent_iterations = (
             max_agent_iterations if max_agent_iterations is not None else 50
@@ -719,7 +718,11 @@ class ClaudeProvider(AgentProvider):
             jitter=self._retry_config.jitter,
             backoff=retry.backoff,
             retry_on=list(retry.retry_on),
-            max_parse_recovery_attempts=self._retry_config.max_parse_recovery_attempts,
+            max_parse_recovery_attempts=(
+                retry.max_parse_recovery_attempts
+                if retry.max_parse_recovery_attempts is not None
+                else self._retry_config.max_parse_recovery_attempts
+            ),
         )
 
     @staticmethod
@@ -756,6 +759,13 @@ class ClaudeProvider(AgentProvider):
         Returns:
             True if the error is transient and should be retried.
         """
+        # A ProviderError carries its own retry classification (e.g. parse
+        # exhaustion is raised with is_retryable=False). Honor it directly
+        # rather than falling through to SDK-type heuristics that would never
+        # match it.
+        if isinstance(exception, ProviderError):
+            return exception.is_retryable
+
         if anthropic is None:
             return False
 
@@ -955,9 +965,13 @@ class ClaudeProvider(AgentProvider):
         # Build tools list: emit_output (for structured output) + MCP tools
         all_tools: list[dict[str, Any]] = []
 
-        # Add emit_output tool if agent has output schema
-        if agent.output is not None:
-            all_tools.extend(self._build_tools_for_structured_output(agent.output))
+        # Effective schema check: skip structured output when output_mode is raw
+        output_schema = agent.effective_output_schema()
+        has_output_schema = output_schema is not None
+
+        # Add emit_output tool if agent has effective output schema
+        if output_schema is not None:
+            all_tools.extend(self._build_tools_for_structured_output(output_schema))
             # Append instruction to use the tool
             messages[-1]["content"] += (
                 "\n\nPlease use the 'emit_output' tool to return your response "
@@ -974,9 +988,6 @@ class ClaudeProvider(AgentProvider):
         # Use tools if any are defined
         request_tools: list[dict[str, Any]] | None = all_tools if all_tools else None
 
-        # Track if agent has output schema
-        has_output_schema = agent.output is not None
-
         for attempt in range(1, config.max_attempts + 1):
             try:
                 # Execute with agentic tool loop
@@ -986,13 +997,14 @@ class ClaudeProvider(AgentProvider):
                     temperature=temperature,
                     max_tokens=max_tokens,
                     tools=request_tools,
-                    output_schema=agent.output,
+                    output_schema=output_schema,
                     has_output_schema=has_output_schema,
                     max_iterations=max_agent_iterations,
                     max_session_seconds=max_session_seconds,
                     interrupt_signal=interrupt_signal,
                     event_callback=event_callback,
                     thinking=thinking,
+                    max_parse_recovery_attempts=config.max_parse_recovery_attempts,
                 )
 
                 # Handle partial output from mid-agent interrupt
@@ -1016,11 +1028,11 @@ class ClaudeProvider(AgentProvider):
                     )
 
                 # Extract structured output
-                content = self._extract_output(response, agent.output)
+                content = self._extract_output(response, output_schema)
 
                 # Validate output if schema is defined
-                if agent.output:
-                    validate_output(content, agent.output)
+                if output_schema is not None:
+                    validate_output(content, output_schema)
 
                 # Use total_tokens from the agentic loop (includes all turns)
                 # If available, use it; otherwise fall back to extracting from final response
@@ -1341,6 +1353,7 @@ class ClaudeProvider(AgentProvider):
         interrupt_signal: asyncio.Event | None = None,
         event_callback: EventCallback | None = None,
         thinking: dict[str, Any] | None = None,
+        max_parse_recovery_attempts: int | None = None,
     ) -> tuple[ClaudeResponse, int | None, bool]:
         """Execute an agentic loop that handles MCP tool calls.
 
@@ -1367,6 +1380,8 @@ class ClaudeProvider(AgentProvider):
                 None means no time limit.
             interrupt_signal: Optional event that signals a mid-agent interrupt.
             event_callback: Optional callback for streaming SDK events upstream.
+            max_parse_recovery_attempts: Resolved per-agent parse recovery limit.
+                None means use the provider-level default.
 
         Returns:
             Tuple of (final_response, total_tokens_used, is_partial).
@@ -1441,6 +1456,7 @@ class ClaudeProvider(AgentProvider):
                             tools=tools,
                             output_schema=output_schema,
                             thinking=thinking,
+                            max_parse_recovery_attempts=max_parse_recovery_attempts,
                         )
                     )
                 else:
@@ -1497,6 +1513,7 @@ class ClaudeProvider(AgentProvider):
                     tools=tools,
                     output_schema=output_schema,
                     thinking=thinking,
+                    max_parse_recovery_attempts=max_parse_recovery_attempts,
                 )
             else:
                 response = await self._execute_api_call(
@@ -1776,6 +1793,7 @@ class ClaudeProvider(AgentProvider):
         tools: list[dict[str, Any]] | None,
         output_schema: dict[str, OutputField] | None,
         thinking: dict[str, Any] | None = None,
+        max_parse_recovery_attempts: int | None = None,
     ) -> ClaudeResponse:
         """Execute API call with parse recovery for malformed JSON responses.
 
@@ -1790,6 +1808,8 @@ class ClaudeProvider(AgentProvider):
             max_tokens: Maximum output tokens.
             tools: Tool definitions for structured output.
             output_schema: Expected output schema (None if no schema).
+            max_parse_recovery_attempts: Resolved per-agent parse recovery limit.
+                None means use the provider-level default.
 
         Returns:
             Claude API response.
@@ -1797,6 +1817,11 @@ class ClaudeProvider(AgentProvider):
         Raises:
             ProviderError: If all retry attempts fail with context about attempts.
         """
+        effective_max_recovery = (
+            max_parse_recovery_attempts
+            if max_parse_recovery_attempts is not None
+            else self._retry_config.max_parse_recovery_attempts
+        )
         # Track recovery attempts for error reporting
         recovery_history: list[str] = []
 
@@ -1839,11 +1864,11 @@ class ClaudeProvider(AgentProvider):
         recovery_history.append(f"Attempt 0 (initial): {failure_reason}")
         logger.warning(
             f"Initial JSON extraction failed: {failure_reason}. "
-            f"Starting parse recovery (max {self._max_parse_recovery_attempts} attempts)"
+            f"Starting parse recovery (max {effective_max_recovery} attempts)"
         )
 
-        for attempt in range(1, self._max_parse_recovery_attempts + 1):
-            logger.info(f"Parse recovery attempt {attempt}/{self._max_parse_recovery_attempts}")
+        for attempt in range(1, effective_max_recovery + 1):
+            logger.info(f"Parse recovery attempt {attempt}/{effective_max_recovery}")
 
             # Append recovery message with specific error context
             recovery_messages = messages.copy()
@@ -1904,16 +1929,21 @@ class ClaudeProvider(AgentProvider):
 
         # All recovery attempts exhausted - raise detailed error
         logger.error(
-            f"Parse recovery exhausted after {self._max_parse_recovery_attempts} attempts. "
+            f"Parse recovery exhausted after {effective_max_recovery} attempts. "
             f"History: {'; '.join(recovery_history)}"
         )
+        # is_retryable=False marks this as terminal: _is_retryable_error()
+        # honors the flag directly for ProviderError, so the outer retry loop
+        # will not retry parse exhaustion.
         raise ProviderError(
-            f"Failed to extract valid JSON after {self._max_parse_recovery_attempts} "
-            "recovery attempts",
+            f"Failed to extract valid JSON after {effective_max_recovery} recovery attempts",
             suggestion=(
                 "Claude did not use the emit_output tool and returned invalid JSON. "
-                f"Recovery history: {'; '.join(recovery_history)}"
+                f"Recovery history: {'; '.join(recovery_history)}. "
+                "Tip: if this agent produces large or free-form output, "
+                "add 'output_mode: raw' to skip JSON extraction."
             ),
+            is_retryable=False,
         )
 
     def _diagnose_json_failure(self, text: str) -> str:
@@ -2212,14 +2242,15 @@ class ClaudeProvider(AgentProvider):
             response: Claude API response.
 
         Returns:
-            Dict with 'text' key containing the response text.
+            Dict with 'result' key containing the response text.
+            Uses 'result' (not 'text') to maintain parity with CopilotProvider.
         """
         text_parts = []
         for block in response.content:
             if hasattr(block, "type") and block.type == "text":
                 text_parts.append(block.text)
 
-        return {"text": "\n".join(text_parts)}
+        return {"result": "\n".join(text_parts)}
 
     def _extract_structured_output(self, response: Any) -> dict[str, Any] | None:
         """Extract structured output from tool_use content blocks.

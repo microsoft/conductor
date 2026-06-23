@@ -19,7 +19,15 @@ from pydantic import (
 )
 
 from conductor.duration import parse_duration
+from conductor.providers.context_tier import ContextTier
 from conductor.providers.reasoning import ReasoningEffort
+
+BudgetMode = Literal["audit", "enforce"]
+"""How the engine responds when a workflow cost budget is exceeded.
+
+Shared between :class:`LimitsConfig` and :class:`conductor.engine.limits.LimitEnforcer`
+so the literal type is defined in exactly one place.
+"""
 
 # Maximum allowed wait-step duration (24 hours). Anything longer almost
 # certainly wants ``limits.timeout_seconds`` reconsidered first.
@@ -322,6 +330,27 @@ class LimitsConfig(BaseModel):
     a hard time limit.
     """
 
+    budget_usd: float | None = Field(default=None, gt=0.0)
+    """Maximum cost budget for the workflow in USD.
+
+    When set, the engine tracks cumulative cost and acts according to
+    ``budget_mode`` when the budget is exceeded. Must be strictly positive
+    (a zero budget would trip after the first priced token, which is never
+    a useful limit). Default is None (no budget tracking).
+    """
+
+    budget_mode: BudgetMode = "audit"
+    """How the engine responds when ``budget_usd`` is exceeded.
+
+    - ``audit``: emit a ``budget_exceeded`` event and log a warning,
+      but allow the workflow to continue. Use this to discover cost
+      profiles before applying hard limits.
+    - ``enforce``: emit a ``budget_exceeded`` event, save a checkpoint,
+      and stop the workflow with a ``BudgetExceededError``.
+
+    Only takes effect when ``budget_usd`` is set. Default is ``audit``.
+    """
+
 
 class PricingOverride(BaseModel):
     """Custom pricing for a specific model.
@@ -407,6 +436,18 @@ class RetryPolicy(BaseModel):
     they indicate prompt/schema issues, not transience.
     """
 
+    max_parse_recovery_attempts: int | None = Field(default=None, ge=0, le=10)
+    """Maximum in-session parse-recovery attempts before giving up.
+
+    When an agent's response fails JSON extraction, Conductor sends a correction
+    prompt in the same session. This field controls how many correction prompts
+    to send.
+
+    - ``None`` (default): Use the provider default (Copilot=5, Claude=2).
+    - ``0``: Disable parse recovery entirely (fail immediately on bad JSON).
+    - ``1-10``: Custom limit.
+    """
+
 
 class DialogConfig(BaseModel):
     """Configuration for agent dialog mode.
@@ -433,6 +474,74 @@ class DialogConfig(BaseModel):
     the agent's output. The evaluator decides whether to pause and
     start a conversation with the user.
     """
+
+
+class ValidatorConfig(BaseModel):
+    """Configuration for semantic output validation with retry-once.
+
+    When present on a provider-backed agent, the engine runs a **second
+    LLM call** after the primary agent completes. The validator receives
+    the primary agent's rendered prompt, its output, and the ``criteria``
+    rubric, and must answer whether the output passes
+    (``{"passed": bool, "issues": [str, ...]}``).
+
+    If the validator returns ``passed: false`` and ``max_retries > 0``, the
+    primary agent is re-run **once** with the validator's feedback appended
+    to its prompt. The second output is taken as final — there is no second
+    validation loop.
+
+    This is distinct from ``retry:`` (transient/provider failures, same
+    prompt) and the ``output:`` schema (shape/type, not content quality).
+    It targets structurally valid but semantically wrong, incomplete, or
+    off-rubric output.
+
+    Example YAML::
+
+        validator:
+          model: claude-sonnet-4-5   # optional; defaults to the agent's model
+          criteria: |
+            Verify the review identifies all null-safety issues, every
+            suggestion is actionable, and no function names are fabricated.
+          max_retries: 1
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    criteria: str
+    """User-defined rubric the primary output is checked against.
+
+    Wrapped in the validator's system prompt. Should describe concretely
+    what a *good* output looks like (the checks the validator must perform),
+    not merely restate the agent's task.
+    """
+
+    model: str | None = None
+    """Model for the validator call. Defaults to the primary agent's model.
+
+    Often set to a cheaper or faster model than the primary agent, since
+    grading an output is usually lighter than producing it.
+    """
+
+    max_retries: int = Field(default=1, ge=0, le=1)
+    """Number of times the primary agent is re-run on validation failure.
+
+    Hard-capped at 1 by design — beyond a single feedback-driven retry you
+    are fighting prompt design, not output noise. ``0`` validates and
+    reports (emitting ``agent_validation_failed``) but never re-runs the
+    primary agent.
+    """
+
+    @field_validator("criteria")
+    @classmethod
+    def validate_criteria(cls, v: str) -> str:
+        """Reject criteria that is empty or whitespace-only.
+
+        The original (unstripped) value is returned so multi-line rubric
+        formatting is preserved.
+        """
+        if not v or not v.strip():
+            raise ValueError("validator 'criteria' must be a non-empty string")
+        return v
 
 
 class ReasoningConfig(BaseModel):
@@ -533,6 +642,26 @@ class AgentDef(BaseModel):
     Supports Jinja2 templates: {{ workflow.input.model_name }}
     """
 
+    context_tier: ContextTier | None = None
+    """Context-window tier for models that support it (Copilot provider only).
+
+    Set ``context_tier: long_context`` to pin a heavy-reasoning agent to the
+    model's long-context (e.g. 1M-token) window. ``default`` selects the
+    standard tier; ``None`` sends no value (provider default).
+
+    Falls back to ``runtime.default_context_tier`` when unset. Composes
+    independently with ``reasoning`` — an agent may set both.
+
+    Only the Copilot provider forwards this today (maps to the SDK's
+    ``create_session`` ``context_tier`` param). Other providers ignore it.
+
+    Only applies to provider-backed agents (type='agent' or None).
+
+    Example YAML::
+
+        context_tier: long_context
+    """
+
     input: list[str] = Field(default_factory=list)
     """Context dependencies. Format: 'agent_name.output' or 'workflow.input.param'.
     Suffix with '?' for optional dependencies."""
@@ -548,6 +677,23 @@ class AgentDef(BaseModel):
 
     output: dict[str, OutputField] | None = None
     """Expected output schema for validation."""
+
+    output_mode: Literal["raw", "envelope"] | None = None
+    """Controls how the provider handles this agent's response.
+
+    - ``raw``: The provider skips schema instruction injection and JSON
+      extraction entirely. The model's response is wrapped as
+      ``{"result": "<raw text>"}``. Incompatible with ``output:`` — if
+      both are set, validation raises an error.
+    - ``envelope``: Explicit opt-in to the default structured-output
+      pipeline. Equivalent to the current behavior when ``output:`` is
+      declared.
+    - ``None`` (default): Infer behavior from whether ``output:`` is
+      declared (backward compatible).
+
+    Only valid on provider-backed agents (type is ``None`` / omitted).
+    Script, human_gate, and workflow agents cannot set ``output_mode``.
+    """
 
     routes: list[RouteDef] = Field(default_factory=list)
     """Routing rules evaluated in order after execution."""
@@ -566,6 +712,28 @@ class AgentDef(BaseModel):
 
     working_dir: str | None = None
     """Working directory for script subprocess execution."""
+
+    stdin: str | None = None
+    """Payload written to the script subprocess's stdin (script type only).
+
+    A Jinja2 string template rendered against the workflow context and written
+    to the child process's stdin as UTF-8. Use this to hand large structured
+    payloads to scripts without hitting OS command-line length limits (notably
+    Windows's ~32 KB command-line cap):
+
+    - JSON: ``stdin: "{{ upstream.output.evaluations | tojson }}"`` — the
+      built-in ``tojson`` filter emits valid JSON.
+    - Arbitrary text: ``stdin: "{{ diff }}"``.
+
+    Semantics:
+
+    - Omitted (``None``) — the child inherits the parent's stdin (the
+      unchanged legacy behavior).
+    - Present (any string, including ``""``) — stdin is piped; an explicit
+      empty string sends immediate EOF.
+    - Orthogonal to ``args`` — when both are set, ``args`` are still passed on
+      the command line and ``stdin`` is piped.
+    """
 
     timeout: int | None = None
     """Per-script timeout in seconds."""
@@ -779,6 +947,27 @@ class AgentDef(BaseModel):
           effort: high
     """
 
+    validator: ValidatorConfig | None = None
+    """Optional semantic output validation with retry-once.
+
+    When set, the engine runs a second LLM call after this agent completes,
+    checking the output against ``validator.criteria``. On failure the
+    primary agent is re-run once with the validator's feedback appended.
+
+    Distinct from ``retry:`` (transient failures, same prompt) and
+    ``output:`` (shape validation). Only applies to provider-backed agents
+    (type='agent' or None). Works in the main loop, parallel groups, and
+    for-each loops.
+
+    Example YAML::
+
+        validator:
+          criteria: |
+            Verify every issue has an actionable suggestion and no
+            function names are fabricated.
+          max_retries: 1
+    """
+
     status: Literal["success", "failed"] | None = None
     """Outcome status for ``type: terminate`` steps.
 
@@ -879,6 +1068,19 @@ class AgentDef(BaseModel):
                         "(only 'terminate' agents support this field)"
                     )
 
+        # Field exclusive to ``type: script`` — reject if set on any other
+        # type. No per-type branch below inspects ``stdin``, so this single
+        # guard is the sole rejection path for every non-script type. It
+        # mirrors the terminate-exclusive guard above so the message names the
+        # conflict; being a standalone guard (rather than a per-branch check)
+        # it also covers ``agent`` / ``human_gate``, which have no
+        # ``command``/``args`` branch.
+        if self.type != "script" and self.stdin is not None:
+            raise ValueError(
+                f"'{self.type or 'agent'}' agents cannot have 'stdin' "
+                "(only 'script' agents support this field)"
+            )
+
         if self.type == "human_gate":
             if not self.options:
                 raise ValueError("human_gate agents require 'options'")
@@ -888,10 +1090,14 @@ class AgentDef(BaseModel):
                 raise ValueError("human_gate agents cannot have 'input_mapping'")
             if self.dialog is not None:
                 raise ValueError("human_gate agents cannot have 'dialog'")
+            if self.validator is not None:
+                raise ValueError("human_gate agents cannot have 'validator'")
             if self.max_depth is not None:
                 raise ValueError("human_gate agents cannot have 'max_depth'")
             if self.reasoning is not None:
                 raise ValueError("human_gate agents cannot have 'reasoning'")
+            if self.context_tier is not None:
+                raise ValueError("human_gate agents cannot have 'context_tier'")
             if self.timeout_seconds is not None:
                 raise ValueError("human_gate agents cannot have 'timeout_seconds'")
             if self.value is not None:
@@ -902,6 +1108,8 @@ class AgentDef(BaseModel):
                 raise ValueError(
                     "human_gate agents cannot have 'output_type' (only 'set' agents do)"
                 )
+            if self.output_mode is not None:
+                raise ValueError("human_gate agents cannot have 'output_mode'")
         elif self.type == "script":
             if not self.command:
                 raise ValueError("script agents require 'command'")
@@ -927,10 +1135,14 @@ class AgentDef(BaseModel):
                 raise ValueError("script agents cannot have 'input_mapping'")
             if self.dialog is not None:
                 raise ValueError("script agents cannot have 'dialog'")
+            if self.validator is not None:
+                raise ValueError("script agents cannot have 'validator'")
             if self.max_depth is not None:
                 raise ValueError("script agents cannot have 'max_depth'")
             if self.reasoning is not None:
                 raise ValueError("script agents cannot have 'reasoning'")
+            if self.context_tier is not None:
+                raise ValueError("script agents cannot have 'context_tier'")
             if self.timeout_seconds is not None:
                 raise ValueError(
                     "script agents cannot have 'timeout_seconds' "
@@ -942,6 +1154,8 @@ class AgentDef(BaseModel):
                 raise ValueError("script agents cannot have 'values' (only 'set' agents do)")
             if self.output_type is not None:
                 raise ValueError("script agents cannot have 'output_type' (only 'set' agents do)")
+            if self.output_mode is not None:
+                raise ValueError("script agents cannot have 'output_mode'")
         elif self.type == "workflow":
             if not self.workflow:
                 raise ValueError("workflow agents require 'workflow' path")
@@ -967,6 +1181,8 @@ class AgentDef(BaseModel):
                 raise ValueError("workflow agents cannot have 'retry'")
             if self.dialog is not None:
                 raise ValueError("workflow agents cannot have 'dialog'")
+            if self.validator is not None:
+                raise ValueError("workflow agents cannot have 'validator'")
             if self.timeout_seconds is not None:
                 raise ValueError("workflow agents cannot have 'timeout_seconds'")
             if self.value is not None:
@@ -975,6 +1191,8 @@ class AgentDef(BaseModel):
                 raise ValueError("workflow agents cannot have 'values' (only 'set' agents do)")
             if self.output_type is not None:
                 raise ValueError("workflow agents cannot have 'output_type' (only 'set' agents do)")
+            if self.output_mode is not None:
+                raise ValueError("workflow agents cannot have 'output_mode'")
         elif self.type == "wait":
             if self.duration is None:
                 raise ValueError("wait agents require 'duration'")
@@ -1014,8 +1232,12 @@ class AgentDef(BaseModel):
                 raise ValueError("wait agents cannot have 'retry'")
             if self.dialog is not None:
                 raise ValueError("wait agents cannot have 'dialog'")
+            if self.validator is not None:
+                raise ValueError("wait agents cannot have 'validator'")
             if self.reasoning is not None:
                 raise ValueError("wait agents cannot have 'reasoning'")
+            if self.context_tier is not None:
+                raise ValueError("wait agents cannot have 'context_tier'")
             if self.timeout_seconds is not None:
                 raise ValueError("wait agents cannot have 'timeout_seconds'")
             if self.output is not None:
@@ -1028,6 +1250,8 @@ class AgentDef(BaseModel):
                 raise ValueError("wait agents cannot have 'values' (only 'set' agents do)")
             if self.output_type is not None:
                 raise ValueError("wait agents cannot have 'output_type' (only 'set' agents do)")
+            if self.output_mode is not None:
+                raise ValueError("wait agents cannot have 'output_mode'")
             self._validate_wait_duration()
         elif self.type == "set":
             if (self.value is None) == (self.values is None):
@@ -1073,12 +1297,18 @@ class AgentDef(BaseModel):
                 raise ValueError("set agents cannot have 'retry'")
             if self.dialog is not None:
                 raise ValueError("set agents cannot have 'dialog'")
+            if self.validator is not None:
+                raise ValueError("set agents cannot have 'validator'")
             if self.reasoning is not None:
                 raise ValueError("set agents cannot have 'reasoning'")
+            if self.context_tier is not None:
+                raise ValueError("set agents cannot have 'context_tier'")
             if self.timeout_seconds is not None:
                 raise ValueError("set agents cannot have 'timeout_seconds'")
             if self.duration is not None:
                 raise ValueError("set agents cannot have 'duration' (only 'wait' agents do)")
+            if self.output_mode is not None:
+                raise ValueError("set agents cannot have 'output_mode'")
         elif self.type == "terminate":
             # Required fields
             if self.status is None:
@@ -1131,8 +1361,12 @@ class AgentDef(BaseModel):
                 raise ValueError("terminate agents cannot have 'retry'")
             if self.dialog is not None:
                 raise ValueError("terminate agents cannot have 'dialog'")
+            if self.validator is not None:
+                raise ValueError("terminate agents cannot have 'validator'")
             if self.reasoning is not None:
                 raise ValueError("terminate agents cannot have 'reasoning'")
+            if self.context_tier is not None:
+                raise ValueError("terminate agents cannot have 'context_tier'")
             if self.workflow:
                 raise ValueError("terminate agents cannot have 'workflow'")
             if self.input_mapping is not None:
@@ -1154,6 +1388,8 @@ class AgentDef(BaseModel):
                 )
             if self.duration is not None:
                 raise ValueError("terminate agents cannot have 'duration' (only 'wait' agents do)")
+            if self.output_mode is not None:
+                raise ValueError("terminate agents cannot have 'output_mode'")
         else:
             # Regular agent or human_gate — input_mapping is not valid
             if self.input_mapping is not None:
@@ -1183,6 +1419,8 @@ class AgentDef(BaseModel):
                 )
         if self.type == "workflow" and self.reasoning is not None:
             raise ValueError("workflow agents cannot have 'reasoning'")
+        if self.type == "workflow" and self.context_tier is not None:
+            raise ValueError("workflow agents cannot have 'context_tier'")
 
         # Wait-only fields are forbidden on every other type. ``reason`` is
         # shared with ``type: terminate`` (which has its own required-non-
@@ -1199,7 +1437,26 @@ class AgentDef(BaseModel):
                     f"'{self.type or 'agent'}' agents cannot have 'reason' "
                     "(only 'terminate' and 'wait' agents support this field)"
                 )
+        if self.output_mode == "raw" and self.output:
+            raise ValueError(
+                "output_mode 'raw' is incompatible with output schema; "
+                "remove the output: block or use output_mode: envelope"
+            )
         return self
+
+    def effective_output_schema(self) -> dict[str, OutputField] | None:
+        """Return the structured-output schema providers should enforce, or None.
+
+        Centralizes the rule shared by every provider: an agent has an
+        effective output schema only when ``output:`` is a non-empty mapping
+        *and* ``output_mode`` is not ``raw``. An empty ``output: {}`` is
+        treated as "no schema" so all providers agree (Copilot previously
+        used a truthiness check while Claude used an ``is not None`` check,
+        diverging on the empty-dict case).
+        """
+        if self.output and self.output_mode != "raw":
+            return self.output
+        return None
 
     def _validate_wait_duration(self) -> None:
         """Validate ``duration`` for a ``wait`` agent.
@@ -1458,6 +1715,56 @@ class ProviderSettings(BaseModel):
         return nxt(self)
 
 
+class CheckpointConfig(BaseModel):
+    """Periodic checkpoint configuration (issue #244).
+
+    Opt-in automatic checkpointing at workflow step boundaries so a stalled or
+    hard-killed long-running workflow can be resumed without an exception ever
+    being raised. All triggers default to off — the existing failure-only
+    checkpoint behavior is unchanged unless at least one trigger is set.
+
+    Checkpoints are evaluated at each step boundary (after a step's output is
+    committed to context, before the next step runs). There is no background
+    wall-clock timer: the engine only commits recoverable state at step
+    boundaries, so ``every_seconds`` is enforced as a throttle evaluated at
+    those boundaries.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    every_agent: bool = False
+    """Save a checkpoint at every step boundary (after each agent, parallel
+    group, for-each group, gate, script, set, wait, or sub-workflow step). When
+    true it governs on its own and ``every_seconds`` is ignored (a save already
+    fires at every boundary)."""
+
+    every_seconds: int | None = Field(default=None, ge=1)
+    """Minimum seconds between periodic checkpoints, evaluated at step
+    boundaries.
+
+    A checkpoint is saved at the first boundary reached after this many seconds
+    have elapsed since the last checkpoint. ``None`` disables the time-based
+    trigger. The first periodic checkpoint of a run fires at the first eligible
+    boundary; the interval only throttles subsequent saves.
+
+    Note: if a single step runs longer than this interval, no checkpoint fires
+    during that step — the boundary checkpoint taken *before* the step started
+    is the recovery point.
+    """
+
+    keep_last: int = Field(default=5, ge=1, le=100)
+    """Number of recent periodic checkpoints to retain per run.
+
+    Older periodic checkpoints for the same run are deleted after each save.
+    Failure checkpoints are never rotated.
+    """
+
+    @property
+    def is_enabled(self) -> bool:
+        """Return True if any periodic checkpoint trigger is configured."""
+        return self.every_agent or self.every_seconds is not None
+
+
 class RuntimeConfig(BaseModel):
     """Provider and runtime configuration."""
 
@@ -1563,6 +1870,25 @@ class RuntimeConfig(BaseModel):
     match the supported prefix list; Copilot consults the SDK's advertised
     ``supported_reasoning_efforts`` (when available) and otherwise allows
     the request through to the SDK.
+    """
+
+    checkpoint: CheckpointConfig = Field(default_factory=CheckpointConfig)
+    """Periodic checkpoint configuration.
+
+    Opt-in automatic checkpointing at step boundaries so stalled or killed
+    long-running workflows stay resumable. Defaults to off (failure-only
+    checkpoints). See :class:`CheckpointConfig`.
+    """
+
+    default_context_tier: ContextTier | None = None
+    """Workflow-wide default context-window tier (Copilot provider only).
+
+    Each agent may override with its own ``context_tier``. ``long_context``
+    selects a model's long-context (e.g. 1M-token) window; ``default`` selects
+    the standard tier; ``None`` sends no value.
+
+    Only the Copilot provider forwards this (maps to the SDK's
+    ``create_session`` ``context_tier`` param). Other providers ignore it.
     """
 
 
