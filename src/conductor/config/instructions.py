@@ -27,6 +27,7 @@ import os
 import re
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from enum import Enum, StrEnum, auto
 from pathlib import Path
 
 from ruamel.yaml import YAML
@@ -121,6 +122,19 @@ Convention = ConventionFile | ConventionDirectory
 ALWAYS_ON_SCOPE = "**"
 
 
+class DiscoveryReason(StrEnum):
+    """Stable, machine-readable reason a file was auto-discovered.
+
+    A ``StrEnum`` (mirroring ``RegistryType`` in ``registry/config.py``) so the
+    f-string output and the string equality checks keep working unchanged,
+    while a typo like ``"scope_overlap"`` can no longer construct a record.
+    """
+
+    FILE_CONVENTION = "file-convention"
+    ALWAYS_ON = "always-on"
+    SCOPE_OVERLAP = "scope-overlap"
+
+
 @dataclass(frozen=True)
 class DiscoveredInstruction:
     """A workspace instruction file discovered by ``--workspace-instructions``,
@@ -139,14 +153,14 @@ class DiscoveredInstruction:
     # conventions with no scope concept (single-file conventions; directory
     # conventions without ``extract_scope``).
     scope: str | None
-    # Stable, machine-readable reason for inclusion. One of:
+    # Stable, machine-readable reason for inclusion. See :class:`DiscoveryReason`:
     #
-    # * ``"file-convention"`` — single-file convention, no scope concept.
-    # * ``"always-on"`` — scoped convention but file's scope is
+    # * ``FILE_CONVENTION`` — single-file convention, no scope concept.
+    # * ``ALWAYS_ON`` — scoped convention but file's scope is
     #   :data:`ALWAYS_ON_SCOPE` (or the convention has no ``extract_scope``).
-    # * ``"scope-overlap"`` — scoped convention; file's scope glob overlapped
+    # * ``SCOPE_OVERLAP`` — scoped convention; file's scope glob overlapped
     #   with the user's CWD subtree.
-    reason: str
+    reason: DiscoveryReason
 
 
 # ---------------------------------------------------------------------------
@@ -238,7 +252,32 @@ def _extract_apply_to(path: Path) -> str | None:
     if fm is None:
         return None
     apply_to = fm.get("applyTo")
+    if apply_to is None:
+        # ``applyTo`` genuinely absent → opt out silently, per GitHub's spec
+        # for files "not applied automatically". This is the expected quiet
+        # path, kept distinct from the authoring-slip paths below.
+        return None
     if not isinstance(apply_to, str):
+        # Present but the wrong shape (e.g. a YAML list). That's an authoring
+        # slip, not an intentional opt-out — warn so it isn't a silent drop,
+        # then opt out (we don't guess how to join a list into one glob).
+        logger.warning(
+            "applyTo in %s is a %s, not a string; the convention expects a "
+            "single (optionally ';'/','-separated) glob. Skipping this file "
+            "from auto-discovery.",
+            path,
+            type(apply_to).__name__,
+        )
+        return None
+    if not _MULTI_GLOB_SEP_RE.sub("", apply_to).strip():
+        # Present but empty / whitespace / separators-only → no glob to match
+        # on. Same authoring-slip treatment: warn rather than silently drop.
+        logger.warning(
+            "applyTo in %s is empty or has no usable glob (%r); skipping this "
+            "file from auto-discovery.",
+            path,
+            apply_to,
+        )
         return None
     return apply_to
 
@@ -460,16 +499,28 @@ def _walk_directory_convention(
             yield entry.name, file_path, accepted_scope
 
 
+class _Reject(Enum):
+    """One-member sentinel enum for :func:`_apply_convention_filters`.
+
+    A single-member ``Enum`` (rather than ``object()``) so an ``is _REJECT``
+    guard gives the type checker real narrowing: afterwards the value is back
+    to ``str | None`` instead of a return type widened all the way to
+    ``object``.
+    """
+
+    TOKEN = auto()
+
+
 # Sentinel returned by :func:`_apply_convention_filters` to signal "this file
 # was rejected by one of the filters; skip it." Distinct from ``None``, which
 # is a legitimate ``scope`` value meaning "no scope concept; the convention
 # has no ``extract_scope`` callable."
-_REJECT = object()
+_REJECT = _Reject.TOKEN
 
 
 def _apply_convention_filters(
     convention: ConventionDirectory, file_path: Path, cwd_rel: str
-) -> object:
+) -> str | None | _Reject:
     """Apply :class:`ConventionDirectory`'s filter chain to a candidate file.
 
     Returns either:
@@ -554,10 +605,22 @@ def discover_workspace_instructions_detailed(start_dir: Path) -> list[Discovered
             try:
                 cwd_rel = start_resolved.relative_to(current).as_posix()
             except ValueError:
-                # current is somehow not an ancestor of start_resolved (e.g.,
-                # symlink shenanigans). Fall back to empty CWD which makes
-                # the overlap test permissive — consistent with our
-                # "over-include rather than silently skip" bias.
+                # ``current`` is somehow not an ancestor of ``start_resolved``.
+                # This can't happen today — ``current`` only ever moves up via
+                # ``.parent`` from ``start_resolved`` — so log before the
+                # permissive fallback (mirroring the assert in
+                # ``_discovery_reason``); a future regression then leaves a
+                # trace instead of a silent over-include. Keep the fallback to
+                # empty CWD, which makes the overlap test permissive —
+                # consistent with our "over-include rather than silently skip"
+                # bias.
+                logger.warning(
+                    "Instruction discovery: %s is not an ancestor of %s; "
+                    "falling back to a permissive (empty) CWD for the overlap "
+                    "test. This is unexpected — please report it.",
+                    current,
+                    start_resolved,
+                )
                 cwd_rel = ""
             if cwd_rel == ".":
                 cwd_rel = ""
@@ -591,7 +654,7 @@ def discover_workspace_instructions_detailed(start_dir: Path) -> list[Discovered
                         path=path,
                         source=convention.path,
                         scope=None,
-                        reason="file-convention",
+                        reason=DiscoveryReason.FILE_CONVENTION,
                     )
                 )
         else:  # ConventionDirectory
@@ -610,12 +673,12 @@ def discover_workspace_instructions_detailed(start_dir: Path) -> list[Discovered
     return result
 
 
-def _discovery_reason(convention: ConventionDirectory, scope: str | None) -> str:
-    """Compute the human-readable inclusion reason for a discovered file."""
+def _discovery_reason(convention: ConventionDirectory, scope: str | None) -> DiscoveryReason:
+    """Compute the machine-readable inclusion reason for a discovered file."""
     if convention.extract_scope is None:
         # Convention with no scope concept (or include_file-only); the file
         # passed the eligibility gate and that's all there is to say.
-        return "always-on"
+        return DiscoveryReason.ALWAYS_ON
     # Invariant: when ``extract_scope`` is set, ``_apply_convention_filters``
     # returns ``_REJECT`` rather than a ``None`` scope, so a discovered file
     # always carries a concrete scope string here. Pin this with an assert
@@ -625,8 +688,8 @@ def _discovery_reason(convention: ConventionDirectory, scope: str | None) -> str
         "extract_scope set but scope is None — _apply_convention_filters invariant violated"
     )
     if scope == ALWAYS_ON_SCOPE:
-        return "always-on"
-    return "scope-overlap"
+        return DiscoveryReason.ALWAYS_ON
+    return DiscoveryReason.SCOPE_OVERLAP
 
 
 def load_instruction_files(paths: list[Path]) -> str:

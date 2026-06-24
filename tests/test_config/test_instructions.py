@@ -1403,7 +1403,7 @@ class TestEmitLoadedInstructionsDebug:
 
         _emit_loaded_instructions_debug(tmp_path, enabled=True)
         captured = capsys.readouterr()
-        assert "1 file(s) loaded from CWD" in captured.err
+        assert "1 file(s) discovered from CWD" in captured.err
         assert "AGENTS.md" in captured.err
         # stdout invariant preserved
         assert captured.out == ""
@@ -1431,32 +1431,35 @@ class TestPrintLoadedInstructionsHelper:
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         from conductor.cli.run import _print_loaded_instructions
-        from conductor.config.instructions import DiscoveredInstruction
+        from conductor.config.instructions import (
+            DiscoveredInstruction,
+            DiscoveryReason,
+        )
 
         always_on = DiscoveredInstruction(
             path=tmp_path / "AGENTS.md",
             source="AGENTS.md",
             scope=None,
-            reason="file-convention",
+            reason=DiscoveryReason.FILE_CONVENTION,
         )
         scoped = DiscoveredInstruction(
             path=tmp_path / ".github" / "instructions" / "cs.md",
             source=".github/instructions",
             scope="**/*.cs",
-            reason="scope-overlap",
+            reason=DiscoveryReason.SCOPE_OVERLAP,
         )
         always_on_dir = DiscoveredInstruction(
             path=tmp_path / ".github" / "instructions" / "all.md",
             source=".github/instructions",
             scope="**",
-            reason="always-on",
+            reason=DiscoveryReason.ALWAYS_ON,
         )
 
         _print_loaded_instructions([always_on, scoped, always_on_dir])
         captured = capsys.readouterr()
 
         # Header tracks count
-        assert "3 file(s) loaded from CWD" in captured.err
+        assert "3 file(s) discovered from CWD" in captured.err
         # All three paths emitted
         assert "AGENTS.md" in captured.err
         assert "cs.md" in captured.err
@@ -1597,6 +1600,51 @@ class TestFrontmatterRobustness:
         assert "list.instructions.md" not in names
         assert "empty.instructions.md" not in names
         assert "scalar.instructions.md" not in names
+
+    def test_applyto_list_warns_and_skips(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A list-valued ``applyTo`` is an authoring slip, not an opt-out, so it
+        is skipped *loudly* (the present-but-unusable path warns)."""
+        (tmp_path / ".git").mkdir()
+        f = tmp_path / ".github" / "instructions" / "listapply.instructions.md"
+        f.parent.mkdir(parents=True)
+        f.write_text(
+            "---\napplyTo:\n  - '**/*.cs'\n  - '**/*.ts'\n---\nBody.\n",
+            encoding="utf-8",
+        )
+        with caplog.at_level(logging.WARNING):
+            result = discover_workspace_instructions(tmp_path)
+        assert not any(p.name == "listapply.instructions.md" for p in result)
+        assert "not a string" in caplog.text
+
+    def test_applyto_empty_warns_and_skips(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An empty / separator-only ``applyTo`` has no usable glob, so it is
+        skipped with a warning rather than silently dropped."""
+        (tmp_path / ".git").mkdir()
+        f = tmp_path / ".github" / "instructions" / "emptyapply.instructions.md"
+        f.parent.mkdir(parents=True)
+        f.write_text("---\napplyTo: '  ;  '\n---\nBody.\n", encoding="utf-8")
+        with caplog.at_level(logging.WARNING):
+            result = discover_workspace_instructions(tmp_path)
+        assert not any(p.name == "emptyapply.instructions.md" for p in result)
+        assert "no usable glob" in caplog.text
+
+    def test_applyto_absent_skips_silently(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A genuinely absent ``applyTo`` opts out per the GitHub spec and stays
+        quiet — this is the other half of the absent-vs-unusable split."""
+        (tmp_path / ".git").mkdir()
+        f = tmp_path / ".github" / "instructions" / "noapply.instructions.md"
+        f.parent.mkdir(parents=True)
+        f.write_text("---\ndescription: no applyTo here\n---\nBody.\n", encoding="utf-8")
+        with caplog.at_level(logging.WARNING):
+            result = discover_workspace_instructions(tmp_path)
+        assert not any(p.name == "noapply.instructions.md" for p in result)
+        assert "noapply.instructions.md" not in caplog.text
 
     def test_closing_delimiter_at_eof(self, tmp_path: Path) -> None:
         """Frontmatter with closing `---` at EOF (no trailing newline) parses correctly.

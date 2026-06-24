@@ -30,6 +30,7 @@ from conductor.mcp_auth import resolve_mcp_server_auth
 from conductor.providers.registry import ProviderRegistry
 
 if TYPE_CHECKING:
+    from conductor.config.instructions import DiscoveredInstruction
     from conductor.config.schema import ProviderSettings
     from conductor.events import WorkflowEvent
 
@@ -1397,7 +1398,7 @@ def _emit_loaded_instructions_debug(start_dir: Path | None, enabled: bool) -> No
     _print_loaded_instructions(detailed)
 
 
-def _print_loaded_instructions(detailed: list[Any]) -> None:
+def _print_loaded_instructions(detailed: list[DiscoveredInstruction]) -> None:
     """Emit a human-readable summary of discovered workspace instruction files
     to stderr.
 
@@ -1416,25 +1417,26 @@ def _print_loaded_instructions(detailed: list[Any]) -> None:
     plain-print rather than the rich console so it's reliably available in
     background/non-TTY launchers.
 
-    The parameter is typed as ``list[Any]`` rather than
-    ``list[DiscoveredInstruction]`` to avoid a hard import at module load
-    time — the import is deferred to the call site in
-    :func:`run_workflow_async` so the discovery code path isn't loaded when
-    the flag is unused.
+    ``DiscoveredInstruction`` is imported under ``TYPE_CHECKING`` only: this
+    module has ``from __future__ import annotations``, so the annotation is
+    never evaluated at import time, and the lazy import inside
+    :func:`_emit_loaded_instructions_debug` is what actually keeps the
+    discovery code path out of the module graph when the flag is unused.
     """
     import sys
+
+    from conductor.config.instructions import ALWAYS_ON_SCOPE
 
     if not detailed:
         print("[workspace-instructions] 0 files discovered from CWD.", file=sys.stderr)
         return
     print(
-        f"[workspace-instructions] {len(detailed)} file(s) loaded from CWD:",
+        f"[workspace-instructions] {len(detailed)} file(s) discovered from CWD:",
         file=sys.stderr,
     )
     for d in detailed:
-        # Use repr for the path so Windows paths render unambiguously.
         print(f"  {d.path}", file=sys.stderr)
-        scope_part = f"  applyTo={d.scope!r}" if d.scope and d.scope != "**" else ""
+        scope_part = f"  applyTo={d.scope!r}" if d.scope and d.scope != ALWAYS_ON_SCOPE else ""
         print(
             f"    source={d.source}  reason={d.reason}{scope_part}",
             file=sys.stderr,
