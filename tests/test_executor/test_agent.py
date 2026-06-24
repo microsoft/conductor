@@ -10,7 +10,7 @@ Tests cover:
 
 import pytest
 
-from conductor.config.schema import AgentDef, OutputField
+from conductor.config.schema import AgentDef, OutputField, ReasoningConfig
 from conductor.exceptions import TemplateError, ValidationError
 from conductor.executor.agent import AgentExecutor, resolve_agent_tools
 from conductor.providers.base import AgentOutput
@@ -311,6 +311,280 @@ class TestAgentExecutorModelRendering:
 
         # Original agent should still have the template
         assert agent.model == "{{ workflow.input.model_name }}"
+
+
+class TestAgentExecutorReasoningEffortRendering:
+    """Tests for templated ``reasoning.effort`` rendering (#262)."""
+
+    @pytest.mark.asyncio
+    async def test_templated_effort_is_rendered(self) -> None:
+        """A templated reasoning.effort resolves before the provider runs."""
+        agent = AgentDef(
+            name="test",
+            prompt="Do something",
+            output=None,
+            reasoning=ReasoningConfig(effort="{{ workflow.input.eff }}"),
+        )
+
+        captured: dict[str, object] = {}
+
+        def mock_handler(agent, prompt, context):  # noqa: ANN001, ANN202
+            captured["effort"] = agent.reasoning.effort if agent.reasoning else None
+            return {"result": "ok"}
+
+        provider = CopilotProvider(mock_handler=mock_handler)
+        executor = AgentExecutor(provider)
+
+        context = {"workflow": {"input": {"eff": "xhigh"}}}
+        await executor.execute(agent, context)
+
+        # Provider sees the concrete resolved literal, not the template.
+        assert captured["effort"] == "xhigh"
+
+    @pytest.mark.asyncio
+    async def test_static_effort_is_unchanged(self) -> None:
+        """A literal reasoning.effort passes through untouched."""
+        agent = AgentDef(
+            name="test",
+            prompt="Do something",
+            output=None,
+            reasoning=ReasoningConfig(effort="high"),
+        )
+
+        captured: dict[str, object] = {}
+
+        def mock_handler(agent, prompt, context):  # noqa: ANN001, ANN202
+            captured["effort"] = agent.reasoning.effort if agent.reasoning else None
+            return {"result": "ok"}
+
+        provider = CopilotProvider(mock_handler=mock_handler)
+        executor = AgentExecutor(provider)
+
+        await executor.execute(agent, {})
+        assert captured["effort"] == "high"
+
+    @pytest.mark.asyncio
+    async def test_templated_effort_does_not_mutate_original(self) -> None:
+        """Rendering effort copies the agent, leaving the original template."""
+        agent = AgentDef(
+            name="test",
+            prompt="Do something",
+            output=None,
+            reasoning=ReasoningConfig(effort="{{ workflow.input.eff }}"),
+        )
+
+        provider = CopilotProvider(mock_handler=lambda a, p, c: {"result": "ok"})
+        executor = AgentExecutor(provider)
+
+        await executor.execute(agent, {"workflow": {"input": {"eff": "low"}}})
+
+        assert agent.reasoning is not None
+        assert agent.reasoning.effort == "{{ workflow.input.eff }}"
+
+    @pytest.mark.asyncio
+    async def test_effort_resolving_to_invalid_value_raises(self) -> None:
+        """A template resolving to a non-enum value raises a clear error."""
+        agent = AgentDef(
+            name="test",
+            prompt="Do something",
+            output=None,
+            reasoning=ReasoningConfig(effort="{{ workflow.input.eff }}"),
+        )
+
+        provider = CopilotProvider(mock_handler=lambda a, p, c: {"result": "ok"})
+        executor = AgentExecutor(provider)
+
+        with pytest.raises(ValidationError) as exc_info:
+            await executor.execute(agent, {"workflow": {"input": {"eff": "ultra"}}})
+        assert "reasoning.effort" in str(exc_info.value)
+        assert "ultra" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_effort_template_trailing_newline_is_stripped(self) -> None:
+        """A template that renders trailing whitespace still validates."""
+        agent = AgentDef(
+            name="test",
+            prompt="Do something",
+            output=None,
+            reasoning=ReasoningConfig(effort="{{ workflow.input.eff }}\n"),
+        )
+
+        captured: dict[str, object] = {}
+
+        def mock_handler(agent, prompt, context):  # noqa: ANN001, ANN202
+            captured["effort"] = agent.reasoning.effort if agent.reasoning else None
+            return {"result": "ok"}
+
+        provider = CopilotProvider(mock_handler=mock_handler)
+        executor = AgentExecutor(provider)
+
+        await executor.execute(agent, {"workflow": {"input": {"eff": "medium"}}})
+        assert captured["effort"] == "medium"
+
+    @pytest.mark.asyncio
+    async def test_statement_template_effort_is_rendered(self) -> None:
+        """A ``{% %}`` *statement* template (not just a ``{{ }}`` expression)
+        resolves through the executor.
+
+        Exercises the ``{%`` detection branch end-to-end, which no prior test
+        covered.
+        """
+        agent = AgentDef(
+            name="test",
+            prompt="Do something",
+            output=None,
+            reasoning=ReasoningConfig(
+                effort="{% if workflow.input.deep %}xhigh{% else %}low{% endif %}"
+            ),
+        )
+
+        captured: dict[str, object] = {}
+
+        def mock_handler(agent, prompt, context):  # noqa: ANN001, ANN202
+            captured["effort"] = agent.reasoning.effort if agent.reasoning else None
+            return {"result": "ok"}
+
+        provider = CopilotProvider(mock_handler=mock_handler)
+        executor = AgentExecutor(provider)
+
+        await executor.execute(agent, {"workflow": {"input": {"deep": True}}})
+        assert captured["effort"] == "xhigh"
+
+    @pytest.mark.asyncio
+    async def test_effort_resolving_to_empty_raises(self) -> None:
+        """A conditional template with no matching branch resolves to empty.
+
+        The executor fails closed (rather than silently falling back to the
+        runtime default) with an actionable message — a deliberate behavior
+        choice pinned here.
+        """
+        agent = AgentDef(
+            name="test",
+            prompt="Do something",
+            output=None,
+            reasoning=ReasoningConfig(effort="{% if workflow.input.deep %}xhigh{% endif %}"),
+        )
+
+        provider = CopilotProvider(mock_handler=lambda a, p, c: {"result": "ok"})
+        executor = AgentExecutor(provider)
+
+        with pytest.raises(ValidationError) as exc_info:
+            await executor.execute(agent, {"workflow": {"input": {"deep": False}}})
+        message = str(exc_info.value)
+        assert "reasoning.effort" in message
+        assert "empty" in message
+
+
+class TestAgentExecutorContextTierRendering:
+    """Tests for templated ``context_tier`` rendering (#262)."""
+
+    @pytest.mark.asyncio
+    async def test_templated_context_tier_is_rendered(self) -> None:
+        """A templated context_tier resolves before the provider runs."""
+        agent = AgentDef(
+            name="test",
+            prompt="Do something",
+            output=None,
+            context_tier="{{ workflow.input.tier }}",
+        )
+
+        captured: dict[str, object] = {}
+
+        def mock_handler(agent, prompt, context):  # noqa: ANN001, ANN202
+            captured["tier"] = agent.context_tier
+            return {"result": "ok"}
+
+        provider = CopilotProvider(mock_handler=mock_handler)
+        executor = AgentExecutor(provider)
+
+        context = {"workflow": {"input": {"tier": "long_context"}}}
+        await executor.execute(agent, context)
+
+        assert captured["tier"] == "long_context"
+
+    @pytest.mark.asyncio
+    async def test_static_context_tier_is_unchanged(self) -> None:
+        """A literal context_tier passes through untouched."""
+        agent = AgentDef(
+            name="test",
+            prompt="Do something",
+            output=None,
+            context_tier="default",
+        )
+
+        captured: dict[str, object] = {}
+
+        def mock_handler(agent, prompt, context):  # noqa: ANN001, ANN202
+            captured["tier"] = agent.context_tier
+            return {"result": "ok"}
+
+        provider = CopilotProvider(mock_handler=mock_handler)
+        executor = AgentExecutor(provider)
+
+        await executor.execute(agent, {})
+        assert captured["tier"] == "default"
+
+    @pytest.mark.asyncio
+    async def test_templated_context_tier_does_not_mutate_original(self) -> None:
+        """Rendering context_tier copies the agent, leaving the template."""
+        agent = AgentDef(
+            name="test",
+            prompt="Do something",
+            output=None,
+            context_tier="{{ workflow.input.tier }}",
+        )
+
+        provider = CopilotProvider(mock_handler=lambda a, p, c: {"result": "ok"})
+        executor = AgentExecutor(provider)
+
+        await executor.execute(agent, {"workflow": {"input": {"tier": "default"}}})
+
+        assert agent.context_tier == "{{ workflow.input.tier }}"
+
+    @pytest.mark.asyncio
+    async def test_context_tier_resolving_to_invalid_value_raises(self) -> None:
+        """A template resolving to a non-enum value raises a clear error."""
+        agent = AgentDef(
+            name="test",
+            prompt="Do something",
+            output=None,
+            context_tier="{{ workflow.input.tier }}",
+        )
+
+        provider = CopilotProvider(mock_handler=lambda a, p, c: {"result": "ok"})
+        executor = AgentExecutor(provider)
+
+        with pytest.raises(ValidationError) as exc_info:
+            await executor.execute(agent, {"workflow": {"input": {"tier": "huge"}}})
+        assert "context_tier" in str(exc_info.value)
+        assert "huge" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_statement_template_context_tier_is_rendered(self) -> None:
+        """A ``{% %}`` statement template resolves through the executor for
+        ``context_tier`` too.
+
+        The tier path is the riskier one — Copilot forwards the resolved value
+        to the SDK unvalidated — so its ``{%`` branch is covered explicitly.
+        """
+        agent = AgentDef(
+            name="test",
+            prompt="Do something",
+            output=None,
+            context_tier="{% if workflow.input.big %}long_context{% else %}default{% endif %}",
+        )
+
+        captured: dict[str, object] = {}
+
+        def mock_handler(agent, prompt, context):  # noqa: ANN001, ANN202
+            captured["tier"] = agent.context_tier
+            return {"result": "ok"}
+
+        provider = CopilotProvider(mock_handler=mock_handler)
+        executor = AgentExecutor(provider)
+
+        await executor.execute(agent, {"workflow": {"input": {"big": True}}})
+        assert captured["tier"] == "long_context"
 
 
 class TestAgentExecutorWithTools:

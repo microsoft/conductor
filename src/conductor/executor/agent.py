@@ -8,12 +8,15 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, get_args
 
 from conductor.exceptions import ValidationError
 from conductor.executor.output import parse_json_output, validate_output
 from conductor.executor.template import TemplateRenderer
 from conductor.providers.base import AgentOutput, EventCallback
+from conductor.providers.context_tier import ContextTier
+from conductor.providers.reasoning import ReasoningEffort
+from conductor.templating import is_jinja_template
 
 
 def _verbose_log(message: str, style: str = "dim") -> None:
@@ -112,6 +115,50 @@ class AgentExecutor:
         self.instructions_preamble = instructions_preamble
         self.renderer = TemplateRenderer()
 
+    def _render_enum_field(
+        self,
+        *,
+        value: str,
+        context: dict[str, Any],
+        allowed: tuple[str, ...],
+        field_name: str,
+        agent_name: str,
+    ) -> str:
+        """Render a templated enum field and validate the resolved literal.
+
+        Mirrors the ``model`` rendering above: a ``{{ ... }}`` value is
+        rendered with the full agent context, stripped (the renderer keeps
+        trailing newlines), and checked against ``allowed``. Raises a
+        :class:`~conductor.exceptions.ValidationError` when the resolved
+        value is not one of the permitted literals so the failure is actionable
+        at execute time rather than silently forwarded to the provider/SDK.
+        """
+        resolved = self.renderer.render(value, context).strip()
+        if resolved not in allowed:
+            if not resolved:
+                # An empty resolution is almost always a conditional template
+                # (``{% if ... %}``) with no matching branch. Fail closed — the
+                # same way a non-empty invalid value (below) and the
+                # provider-side resolver guards do — rather than silently
+                # treating empty as "unset": to fall back to the runtime
+                # default, omit the field or add an else-branch emitting the
+                # desired literal.
+                raise ValidationError(
+                    f"Agent '{agent_name}': {field_name} template resolved to an empty value.",
+                    suggestion=(
+                        f"A conditional template with no matching branch "
+                        f"produced nothing. Emit one of {list(allowed)}, add an "
+                        f"else-branch, or omit {field_name} to use the runtime "
+                        f"default."
+                    ),
+                )
+            raise ValidationError(
+                f"Agent '{agent_name}': {field_name} template resolved to "
+                f"{resolved!r}, which is not a valid value.",
+                suggestion=f"Resolved value must be one of {list(allowed)}.",
+            )
+        return resolved
+
     async def execute(
         self,
         agent: AgentDef,
@@ -150,9 +197,46 @@ class AgentExecutor:
             ValidationError: If output doesn't match schema or tools are invalid.
         """
         # Render model field if it contains template expressions
-        if agent.model and ("{{" in agent.model or "{%" in agent.model):
+        if is_jinja_template(agent.model):
             rendered_model = self.renderer.render(agent.model, context)
             agent = agent.model_copy(update={"model": rendered_model})
+
+        # #262: resolve templated reasoning.effort / context_tier the same
+        # way model is handled above. These fields are strict ``Literal``
+        # aliases that the schema deliberately accepts as templates (deferring
+        # literal validation to here); render the value with full context, then
+        # validate the resolved literal so the provider sees a concrete value.
+        # ``is_jinja_template`` both detects templates and narrows the widened
+        # ``ReasoningEffort | str`` / ``ContextTier | str | None`` field types
+        # to ``str`` for the type checker before the value reaches
+        # ``_render_enum_field``. (``ReasoningEffort`` and ``ContextTier`` are
+        # ``Literal`` aliases, not ``Enum`` types — hence the ``get_args``
+        # calls below.)
+        effort = agent.reasoning.effort if agent.reasoning is not None else None
+        if is_jinja_template(effort):
+            resolved_effort = self._render_enum_field(
+                value=effort,
+                context=context,
+                allowed=get_args(ReasoningEffort),
+                field_name="reasoning.effort",
+                agent_name=agent.name,
+            )
+            # ``agent.reasoning`` is not None here (effort came from it).
+            assert agent.reasoning is not None
+            agent = agent.model_copy(
+                update={"reasoning": agent.reasoning.model_copy(update={"effort": resolved_effort})}
+            )
+
+        tier = agent.context_tier
+        if is_jinja_template(tier):
+            resolved_tier = self._render_enum_field(
+                value=tier,
+                context=context,
+                allowed=get_args(ContextTier),
+                field_name="context_tier",
+                agent_name=agent.name,
+            )
+            agent = agent.model_copy(update={"context_tier": resolved_tier})
 
         # Render prompt with context
         rendered_prompt = self.renderer.render(agent.prompt, context)

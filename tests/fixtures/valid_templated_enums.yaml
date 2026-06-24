@@ -1,0 +1,38 @@
+# Valid workflow exercising templated reasoning.effort + context_tier (#262).
+# Both enum fields carry Jinja2 templates that resolve from workflow.input;
+# `conductor validate` must accept this without resolving the templates.
+workflow:
+  name: templated-enums-workflow
+  description: A workflow with templated reasoning.effort and context_tier
+  entry_point: thinker
+
+  input:
+    effort:
+      type: string
+      required: false
+      default: high
+    tier:
+      type: string
+      required: false
+      default: long_context
+    topic:
+      type: string
+      required: false
+      default: "the meaning of life"
+
+agents:
+  - name: thinker
+    model: gpt-4
+    prompt: "Reason about {{ workflow.input.topic }}"
+    reasoning:
+      effort: "{{ workflow.input.effort }}"
+    context_tier: "{{ workflow.input.tier }}"
+    output:
+      answer:
+        type: string
+        description: The reasoned answer
+    routes:
+      - to: $end
+
+output:
+  message: "{{ thinker.output.answer }}"

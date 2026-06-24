@@ -1424,6 +1424,76 @@ class TestAgentDefReasoning:
         assert "workflow agents cannot have 'reasoning'" in str(exc_info.value)
 
 
+class TestAgentDefReasoningTemplating:
+    """Tests for templated ``reasoning.effort`` (#262 — defer to runtime)."""
+
+    def test_templated_effort_deferred(self) -> None:
+        """A ``{{ }}`` effort is accepted at load and preserved verbatim."""
+        agent = AgentDef(
+            name="a",
+            model="gpt-4",
+            prompt="test",
+            reasoning={"effort": "{{ workflow.input.eff }}"},
+        )
+        assert agent.reasoning is not None
+        # Not coerced or rejected at schema time — deferred to runtime.
+        assert agent.reasoning.effort == "{{ workflow.input.eff }}"
+
+    def test_templated_effort_with_surrounding_text_deferred(self) -> None:
+        """A template embedded in other text is still deferred (any ``{{``)."""
+        agent = AgentDef(
+            name="a",
+            model="gpt-4",
+            prompt="test",
+            reasoning={"effort": "{{ workflow.input.eff }}-ish"},
+        )
+        assert agent.reasoning is not None
+        assert agent.reasoning.effort == "{{ workflow.input.eff }}-ish"
+
+    def test_statement_style_effort_template_deferred(self) -> None:
+        """A ``{% %}`` statement template is deferred (matches executor guard).
+
+        The executor renders effort on ``{{`` or ``{%``; the schema must defer
+        the same set so a conditional like ``{% if %}…{% endif %}`` is not
+        rejected at load (dual-RD opus P2-2).
+        """
+        tmpl = "{% if workflow.input.heavy %}xhigh{% else %}low{% endif %}"
+        agent = AgentDef(
+            name="a",
+            model="gpt-4",
+            prompt="test",
+            reasoning={"effort": tmpl},
+        )
+        assert agent.reasoning is not None
+        assert agent.reasoning.effort == tmpl
+
+    @pytest.mark.parametrize("effort", ["ultra", "none", "max"])
+    def test_literal_invalid_effort_still_rejected(self, effort: str) -> None:
+        """A non-templated invalid literal still raises at schema time."""
+        with pytest.raises(ValidationError):
+            AgentDef(
+                name="a",
+                model="gpt-4",
+                prompt="test",
+                reasoning={"effort": effort},  # type: ignore[arg-type]
+            )
+
+    def test_human_gate_with_templated_reasoning_still_raises(self) -> None:
+        """human_gate forbids reasoning even when the effort is templated.
+
+        A template string is still "not None", so the per-type ban applies.
+        """
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(
+                name="gate1",
+                type="human_gate",
+                prompt="Choose:",
+                options=[GateOption(label="Ok", value="ok", route="next")],
+                reasoning={"effort": "{{ workflow.input.eff }}"},
+            )
+        assert "human_gate agents cannot have 'reasoning'" in str(exc_info.value)
+
+
 class TestAgentDefValidator:
     """Tests for the validator field on AgentDef."""
 
@@ -1761,6 +1831,63 @@ class TestAgentDefContextTier:
                 context_tier="long_context",
             )
         assert "terminate agents cannot have 'context_tier'" in str(exc_info.value)
+
+
+class TestAgentDefContextTierTemplating:
+    """Tests for templated ``context_tier`` (#262 — defer to runtime)."""
+
+    def test_templated_context_tier_deferred(self) -> None:
+        """A ``{{ }}`` context_tier is accepted at load and preserved."""
+        agent = AgentDef(
+            name="a",
+            model="gpt-4",
+            prompt="test",
+            context_tier="{{ workflow.input.tier }}",
+        )
+        # Not coerced or rejected at schema time — deferred to runtime.
+        assert agent.context_tier == "{{ workflow.input.tier }}"
+
+    def test_statement_style_context_tier_template_deferred(self) -> None:
+        """A ``{% %}`` statement template is deferred (matches executor guard).
+
+        The executor renders context_tier on ``{{`` or ``{%``; the schema must
+        defer the same set so a conditional is not rejected at load (dual-RD
+        opus P2-2).
+        """
+        tmpl = "{% if workflow.input.heavy %}long_context{% else %}default{% endif %}"
+        agent = AgentDef(
+            name="a",
+            model="gpt-4",
+            prompt="test",
+            context_tier=tmpl,
+        )
+        assert agent.context_tier == tmpl
+
+    @pytest.mark.parametrize("tier", ["1m", "huge", "long-context"])
+    def test_literal_invalid_tier_still_rejected(self, tier: str) -> None:
+        """A non-templated invalid literal still raises at schema time."""
+        with pytest.raises(ValidationError):
+            AgentDef(
+                name="a",
+                model="gpt-4",
+                prompt="test",
+                context_tier=tier,  # type: ignore[arg-type]
+            )
+
+    def test_human_gate_with_templated_context_tier_still_raises(self) -> None:
+        """human_gate forbids context_tier even when it is templated.
+
+        A template string is still "not None", so the per-type ban applies.
+        """
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(
+                name="g",
+                type="human_gate",
+                prompt="Approve?",
+                options=[GateOption(label="Ok", value="ok", route="next")],
+                context_tier="{{ workflow.input.tier }}",
+            )
+        assert "human_gate agents cannot have 'context_tier'" in str(exc_info.value)
 
 
 class TestRuntimeConfigDefaultContextTier:

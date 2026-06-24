@@ -13,7 +13,9 @@ and a per-agent override.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, cast
+
+from conductor.templating import is_jinja_template
 
 if TYPE_CHECKING:
     from conductor.config.schema import AgentDef
@@ -39,5 +41,18 @@ def resolve_context_tier(
         The resolved ``ContextTier``, or ``None`` to send no value.
     """
     if agent.context_tier is not None:
-        return agent.context_tier
+        # #262: AgentDef widens ``context_tier`` to ``ContextTier | str`` so a
+        # ``{{ ... }}`` / ``{% ... %}`` template survives schema validation. By
+        # the time this resolver runs (provider execute, after AgentExecutor
+        # renders + validates the field) the value is a concrete, validated
+        # literal. Guard the invariant so an unrendered template raises here
+        # rather than being cast straight to the SDK. This matters more than for
+        # reasoning.effort: Copilot forwards the tier to the SDK unvalidated
+        # (no advertised supported_context_tiers, so the SDK is the sole
+        # authority — see ``CopilotProvider``), so a leaked template would
+        # otherwise reach the SDK raw.
+        tier = agent.context_tier
+        if is_jinja_template(tier):
+            raise ValueError(f"context_tier reached the provider unresolved: {tier!r}")
+        return cast(ContextTier, tier)
     return runtime_default

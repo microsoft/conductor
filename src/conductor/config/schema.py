@@ -6,7 +6,7 @@ workflow YAML configuration files.
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 
 from pydantic import (
     BaseModel,
@@ -21,6 +21,7 @@ from pydantic import (
 from conductor.duration import parse_duration
 from conductor.providers.context_tier import ContextTier
 from conductor.providers.reasoning import ReasoningEffort
+from conductor.templating import is_jinja_template
 
 BudgetMode = Literal["audit", "enforce"]
 """How the engine responds when a workflow cost budget is exceeded.
@@ -563,10 +564,49 @@ class ReasoningConfig(BaseModel):
 
         reasoning:
           effort: high
+
+    Supports Jinja2 templates::
+
+        reasoning:
+          effort: "{{ workflow.input.effort }}"
+
+    A templated ``effort`` is accepted at load time and resolved + validated
+    at runtime (in :mod:`conductor.executor.agent`), mirroring how ``model``
+    and the ``wait`` step's ``duration`` are handled. A *literal* value must
+    be one of :data:`~conductor.providers.reasoning.ReasoningEffort`.
     """
 
-    effort: ReasoningEffort
-    """Reasoning effort level applied to the agent's model calls."""
+    effort: ReasoningEffort | str
+    """Reasoning effort level applied to the agent's model calls.
+
+    Either a literal level (``low`` / ``medium`` / ``high`` / ``xhigh``) or a
+    ``{{ ... }}`` Jinja2 template resolved at runtime.
+    """
+
+    @model_validator(mode="after")
+    def _validate_effort(self) -> ReasoningConfig:
+        """Accept literal efforts or defer ``{{ }}`` / ``{% %}`` templates.
+
+        A templated value (detected by
+        :func:`~conductor.templating.is_jinja_template`, matching ``{{`` or
+        ``{%``) skips literal validation here and is rendered + validated at
+        execute time (:mod:`conductor.executor.agent`, the same place the
+        ``model`` field is rendered). A non-templated value must be a valid
+        :data:`ReasoningEffort` literal.
+
+        Note: this is a broader check than
+        :meth:`AgentDef._validate_wait_duration`, which intentionally matches
+        only ``{{``.
+        """
+        value = self.effort
+        if is_jinja_template(value):
+            return self
+        if value not in get_args(ReasoningEffort):
+            raise ValueError(
+                f"reasoning.effort must be one of {list(get_args(ReasoningEffort))} "
+                f"or a '{{{{ ... }}}}' template (got {value!r})"
+            )
+        return self
 
 
 class AgentDef(BaseModel):
@@ -643,7 +683,7 @@ class AgentDef(BaseModel):
     Supports Jinja2 templates: {{ workflow.input.model_name }}
     """
 
-    context_tier: ContextTier | None = None
+    context_tier: ContextTier | str | None = None
     """Context-window tier for models that support it (Copilot provider only).
 
     Set ``context_tier: long_context`` to pin a heavy-reasoning agent to the
@@ -658,9 +698,18 @@ class AgentDef(BaseModel):
 
     Only applies to provider-backed agents (type='agent' or None).
 
+    Supports Jinja2 templates: a ``{{ workflow.input.tier }}`` value is
+    accepted at load time and resolved + validated at runtime (mirrors
+    ``model`` and the ``reasoning.effort`` handling). A *literal* value must
+    be one of :data:`~conductor.providers.context_tier.ContextTier`.
+
     Example YAML::
 
         context_tier: long_context
+
+    Templated::
+
+        context_tier: "{{ workflow.input.tier }}"
     """
 
     input: list[str] = Field(default_factory=list)
@@ -1418,6 +1467,10 @@ class AgentDef(BaseModel):
                     f"'{self.type or 'agent'}' agents cannot have 'output_type' "
                     "(only 'set' agents support output_type)"
                 )
+            # #262: regular agents may carry a literal or templated
+            # context_tier; validate the literal here and defer templates to
+            # runtime. (reasoning.effort is validated on ReasoningConfig.)
+            self._validate_context_tier()
         if self.type == "workflow" and self.reasoning is not None:
             raise ValueError("workflow agents cannot have 'reasoning'")
         if self.type == "workflow" and self.context_tier is not None:
@@ -1458,6 +1511,33 @@ class AgentDef(BaseModel):
         if self.output and self.output_mode != "raw":
             return self.output
         return None
+
+    def _validate_context_tier(self) -> None:
+        """Validate ``context_tier`` for a regular (provider-backed) agent.
+
+        An unset (``None``) or templated value (detected by
+        :func:`~conductor.templating.is_jinja_template`, matching ``{{`` or
+        ``{%``) defers all literal validation to runtime (rendered + validated
+        in :mod:`conductor.executor.agent`, alongside ``model``); a
+        non-templated value must be a valid
+        :data:`~conductor.providers.context_tier.ContextTier` literal.
+
+        This differs from :meth:`_validate_wait_duration` on two counts: that
+        method matches only ``{{``, and it does not defer ``None``.
+
+        Non-agent step types reject ``context_tier`` outright via their own
+        ``is not None`` checks in :meth:`validate_agent_type` (a template
+        string is still "not None"), so this helper is only dispatched from
+        the regular-agent branch.
+        """
+        value = self.context_tier
+        if value is None or is_jinja_template(value):
+            return
+        if value not in get_args(ContextTier):
+            raise ValueError(
+                f"context_tier must be one of {list(get_args(ContextTier))} "
+                f"or a '{{{{ ... }}}}' template (got {value!r})"
+            )
 
     def _validate_wait_duration(self) -> None:
         """Validate ``duration`` for a ``wait`` agent.
