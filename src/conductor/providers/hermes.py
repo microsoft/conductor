@@ -78,7 +78,7 @@ class HermesProvider(AgentProvider):
         agent_reasoning_events=True,
         reasoning_effort=("low", "medium", "high", "xhigh"),
         structured_output="prompt_injection",
-        interrupt=True,
+        interrupt=False,
         max_session_seconds=True,
         checkpoint_resume=True,
         usage_tracking=True,
@@ -406,13 +406,14 @@ class HermesProvider(AgentProvider):
             content: dict[str, Any] = {"text": final_response}
         else:
             # Try to parse as JSON with recovery loop (mirrors Copilot pattern)
-            content = self._parse_with_recovery(
+            content = await self._parse_with_recovery(
                 final_response,
                 result.get("messages", []),
                 schema_for_prompt,  # type: ignore[arg-type]
                 agent_kwargs,
                 agent,
                 conversation_history,
+                loop,
             )
 
         # Populate token counts from the result dict when available.
@@ -471,7 +472,7 @@ class HermesProvider(AgentProvider):
     # Structured output: parse with recovery (mirrors Copilot pattern)
     # ------------------------------------------------------------------
 
-    def _parse_with_recovery(
+    async def _parse_with_recovery(
         self,
         response: str,
         messages: list[dict[str, Any]],
@@ -479,6 +480,7 @@ class HermesProvider(AgentProvider):
         agent_kwargs: dict[str, Any],
         agent: AgentDef,
         conversation_history: list[dict[str, Any]] | None,
+        loop: asyncio.AbstractEventLoop,
     ) -> dict[str, Any]:
         """Parse response as JSON, retrying via conversation if parsing fails."""
         last_error: str | None = None
@@ -511,14 +513,43 @@ class HermesProvider(AgentProvider):
                     for k, v in agent_kwargs.items()
                     if k not in ("stream_delta_callback", "reasoning_callback")
                 }
-                hermes_agent = AIAgent(**recovery_kwargs)  # ty: ignore[call-non-callable]
-                recovery_result = hermes_agent.run_conversation(
-                    recovery_prompt,
-                    system_message=agent.system_prompt or None,
-                    conversation_history=history,
-                )
-                response = recovery_result.get("final_response") or ""
-                messages = recovery_result.get("messages", [])
+
+                def _run_recovery(
+                    prompt: str = recovery_prompt,
+                    sys_msg: str | None = agent.system_prompt or None,
+                    hist: list[dict[str, Any]] | None = history,
+                    kwargs: dict[str, Any] = recovery_kwargs,
+                ) -> dict[str, Any]:
+                    _home_token = None
+                    if self._hermes_home:
+                        import hermes_constants  # ty: ignore[unresolved-import]
+
+                        expanded_home = str(Path(self._hermes_home).expanduser())
+                        _home_token = hermes_constants.set_hermes_home_override(expanded_home)
+                    try:
+                        hermes_agent = AIAgent(**kwargs)  # ty: ignore[call-non-callable]
+                        return hermes_agent.run_conversation(
+                            prompt,
+                            system_message=sys_msg,
+                            conversation_history=hist,
+                        )
+                    finally:
+                        if _home_token is not None:
+                            import hermes_constants
+
+                            hermes_constants.reset_hermes_home_override(_home_token)
+
+                try:
+                    recovery_result = await loop.run_in_executor(None, _run_recovery)
+                    response = recovery_result.get("final_response") or ""
+                    messages = recovery_result.get("messages", [])
+                except (json.JSONDecodeError, ValueError, ValidationError):
+                    raise
+                except Exception as e:
+                    raise ProviderError(
+                        f"Hermes recovery call failed for agent '{agent.name}': {e}",
+                        suggestion="Check hermes-agent logs and verify base_url/api_key.",
+                    ) from e
 
         expected_fields = list(agent.output.keys()) if agent.output else []
         raise ProviderError(
