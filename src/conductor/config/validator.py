@@ -16,6 +16,7 @@ from jinja2 import Environment, meta, nodes
 
 from conductor.exceptions import ConfigurationError
 from conductor.providers.capabilities import ProviderCapabilities, get_capabilities
+from conductor.templating import is_jinja_template
 
 if TYPE_CHECKING:
     from conductor.config.schema import AgentDef, WorkflowConfig
@@ -1720,7 +1721,7 @@ def _validate_provider_capabilities(
                     f"but provider '{provider_name}' does not support reasoning "
                     f"effort (capabilities.reasoning_effort=None)."
                 )
-            elif isinstance(requested, str) and ("{{" in requested or "{%" in requested):
+            elif is_jinja_template(requested):
                 pass
             elif requested not in supported:
                 errors.append(

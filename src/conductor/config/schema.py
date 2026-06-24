@@ -21,6 +21,7 @@ from pydantic import (
 from conductor.duration import parse_duration
 from conductor.providers.context_tier import ContextTier
 from conductor.providers.reasoning import ReasoningEffort
+from conductor.templating import is_jinja_template
 
 BudgetMode = Literal["audit", "enforce"]
 """How the engine responds when a workflow cost budget is exceeded.
@@ -584,15 +585,21 @@ class ReasoningConfig(BaseModel):
 
     @model_validator(mode="after")
     def _validate_effort(self) -> ReasoningConfig:
-        """Accept literal efforts or defer ``{{ }}`` templates to runtime.
+        """Accept literal efforts or defer ``{{ }}`` / ``{% %}`` templates.
 
-        Mirrors :meth:`AgentDef._validate_wait_duration`: a templated value
-        (containing ``{{`` or ``{%``) skips literal validation here and is
-        rendered + validated at execute time (:mod:`conductor.executor.agent`).
-        A non-templated value must be a valid :data:`ReasoningEffort` literal.
+        A templated value (detected by
+        :func:`~conductor.templating.is_jinja_template`, matching ``{{`` or
+        ``{%``) skips literal validation here and is rendered + validated at
+        execute time (:mod:`conductor.executor.agent`, the same place the
+        ``model`` field is rendered). A non-templated value must be a valid
+        :data:`ReasoningEffort` literal.
+
+        Note: this is a broader check than
+        :meth:`AgentDef._validate_wait_duration`, which intentionally matches
+        only ``{{``.
         """
         value = self.effort
-        if isinstance(value, str) and ("{{" in value or "{%" in value):
+        if is_jinja_template(value):
             return self
         if value not in get_args(ReasoningEffort):
             raise ValueError(
@@ -1507,11 +1514,15 @@ class AgentDef(BaseModel):
     def _validate_context_tier(self) -> None:
         """Validate ``context_tier`` for a regular (provider-backed) agent.
 
-        Mirrors :meth:`_validate_wait_duration`: an unset (``None``) or
-        templated (containing ``{{`` or ``{%``) value defers all literal
-        validation to runtime (rendered + validated in
-        :mod:`conductor.executor.agent`); a non-templated value must be a
-        valid :data:`~conductor.providers.context_tier.ContextTier` literal.
+        An unset (``None``) or templated value (detected by
+        :func:`~conductor.templating.is_jinja_template`, matching ``{{`` or
+        ``{%``) defers all literal validation to runtime (rendered + validated
+        in :mod:`conductor.executor.agent`, alongside ``model``); a
+        non-templated value must be a valid
+        :data:`~conductor.providers.context_tier.ContextTier` literal.
+
+        This differs from :meth:`_validate_wait_duration` on two counts: that
+        method matches only ``{{``, and it does not defer ``None``.
 
         Non-agent step types reject ``context_tier`` outright via their own
         ``is not None`` checks in :meth:`validate_agent_type` (a template
@@ -1519,7 +1530,7 @@ class AgentDef(BaseModel):
         the regular-agent branch.
         """
         value = self.context_tier
-        if value is None or (isinstance(value, str) and ("{{" in value or "{%" in value)):
+        if value is None or is_jinja_template(value):
             return
         if value not in get_args(ContextTier):
             raise ValueError(

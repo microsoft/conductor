@@ -13,6 +13,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Final, Literal, cast
 
+from conductor.templating import is_jinja_template
+
 if TYPE_CHECKING:
     from conductor.config.schema import AgentDef
 
@@ -87,10 +89,14 @@ def resolve_reasoning_effort(
     set, signalling that no reasoning parameter should be sent to the SDK.
     """
     if agent.reasoning is not None:
-        # #262: AgentDef widens ``effort`` to ``ReasoningEffort | str`` so a
-        # ``{{ ... }}`` template survives schema validation. By the time this
-        # resolver runs (provider execute, after AgentExecutor renders +
-        # validates the field) the value is a concrete, validated literal, so
-        # narrowing back to ReasoningEffort is sound.
-        return cast(ReasoningEffort, agent.reasoning.effort)
+        # #262: ``ReasoningConfig`` widens ``effort`` to ``ReasoningEffort | str``
+        # so a ``{{ ... }}`` / ``{% ... %}`` template survives schema validation.
+        # By the time this resolver runs (provider execute, after AgentExecutor
+        # renders + validates the field) the value is a concrete, validated
+        # literal. Guard the invariant so an unrendered template raises here
+        # rather than being cast straight to the SDK.
+        effort = agent.reasoning.effort
+        if is_jinja_template(effort):
+            raise ValueError(f"reasoning.effort reached the provider unresolved: {effort!r}")
+        return cast(ReasoningEffort, effort)
     return runtime_default

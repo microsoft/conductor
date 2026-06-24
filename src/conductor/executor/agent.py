@@ -16,6 +16,7 @@ from conductor.executor.template import TemplateRenderer
 from conductor.providers.base import AgentOutput, EventCallback
 from conductor.providers.context_tier import ContextTier
 from conductor.providers.reasoning import ReasoningEffort
+from conductor.templating import is_jinja_template
 
 
 def _verbose_log(message: str, style: str = "dim") -> None:
@@ -134,6 +135,23 @@ class AgentExecutor:
         """
         resolved = self.renderer.render(value, context).strip()
         if resolved not in allowed:
+            if not resolved:
+                # An empty resolution is almost always a conditional template
+                # (``{% if ... %}``) with no matching branch. Fail closed — the
+                # same way a non-empty invalid value (below) and the
+                # provider-side resolver guards do — rather than silently
+                # treating empty as "unset": to fall back to the runtime
+                # default, omit the field or add an else-branch emitting the
+                # desired literal.
+                raise ValidationError(
+                    f"Agent '{agent_name}': {field_name} template resolved to an empty value.",
+                    suggestion=(
+                        f"A conditional template with no matching branch "
+                        f"produced nothing. Emit one of {list(allowed)}, add an "
+                        f"else-branch, or omit {field_name} to use the runtime "
+                        f"default."
+                    ),
+                )
             raise ValidationError(
                 f"Agent '{agent_name}': {field_name} template resolved to "
                 f"{resolved!r}, which is not a valid value.",
@@ -179,20 +197,23 @@ class AgentExecutor:
             ValidationError: If output doesn't match schema or tools are invalid.
         """
         # Render model field if it contains template expressions
-        if agent.model and ("{{" in agent.model or "{%" in agent.model):
+        if is_jinja_template(agent.model):
             rendered_model = self.renderer.render(agent.model, context)
             agent = agent.model_copy(update={"model": rendered_model})
 
         # #262: resolve templated reasoning.effort / context_tier the same
-        # way model is handled above. These fields are strict enums that the
-        # schema deliberately accepts as templates (deferring literal
-        # validation to here); render the value with full context, then
-        # validate the resolved literal so the provider sees a concrete enum.
-        # The ``isinstance(..., str)`` guards both detect templates and narrow
-        # the widened ``Enum | str | None`` field types to ``str`` for the
-        # type checker before passing them to ``_render_enum_field``.
+        # way model is handled above. These fields are strict ``Literal``
+        # aliases that the schema deliberately accepts as templates (deferring
+        # literal validation to here); render the value with full context, then
+        # validate the resolved literal so the provider sees a concrete value.
+        # ``is_jinja_template`` both detects templates and narrows the widened
+        # ``ReasoningEffort | str`` / ``ContextTier | str | None`` field types
+        # to ``str`` for the type checker before the value reaches
+        # ``_render_enum_field``. (``ReasoningEffort`` and ``ContextTier`` are
+        # ``Literal`` aliases, not ``Enum`` types — hence the ``get_args``
+        # calls below.)
         effort = agent.reasoning.effort if agent.reasoning is not None else None
-        if isinstance(effort, str) and ("{{" in effort or "{%" in effort):
+        if is_jinja_template(effort):
             resolved_effort = self._render_enum_field(
                 value=effort,
                 context=context,
@@ -207,7 +228,7 @@ class AgentExecutor:
             )
 
         tier = agent.context_tier
-        if isinstance(tier, str) and ("{{" in tier or "{%" in tier):
+        if is_jinja_template(tier):
             resolved_tier = self._render_enum_field(
                 value=tier,
                 context=context,
