@@ -2471,6 +2471,7 @@ class WorkflowEngine:
                     session,
                     interrupt_result.guidance,
                     agent_name=agent.name,
+                    agent_model=agent.model,
                 )
 
         # Fallback: re-execute the agent with guidance appended to prompt

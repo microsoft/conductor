@@ -121,8 +121,9 @@ class SDKResponse:
         cache_read_tokens: Tokens read from cache (if available).
         cache_write_tokens: Tokens written to cache (if available).
         partial: Whether this response is partial (from a mid-agent interrupt).
-        resolved_model: Actual model name reported by the SDK in the assistant.usage
-            event. None if the event was not emitted (e.g., error paths).
+        resolved_model: Model name the SDK reported in the assistant.usage event's
+            model field. None when that event is absent (error or interrupt paths)
+            or carries no usable model name (the model field is missing or empty).
     """
 
     content: str
@@ -576,8 +577,11 @@ class CopilotProvider(AgentProvider):
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
                     cache_read_tokens=cache_read,
-                    cache_write_tokens=cache_write,
-                    model=(sdk_response.resolved_model if sdk_response else None)
+                    model=(
+                        sdk_response.resolved_model
+                        if sdk_response and agent.model in (None, "auto")
+                        else None
+                    )
                     or agent.model
                     or self._default_model,
                     partial=is_partial,
@@ -1240,6 +1244,7 @@ class CopilotProvider(AgentProvider):
         session: Any,
         guidance: str,
         agent_name: str | None = None,
+        agent_model: str | None = None,
     ) -> AgentOutput:
         """Send follow-up guidance to an interrupted session.
 
@@ -1256,6 +1261,8 @@ class CopilotProvider(AgentProvider):
                 interrupts only fire on sequential agents (for-each iterations
                 do not forward ``interrupt_signal`` to the executor), so the
                 tag, when supplied, is the unqualified agent name.
+            agent_model: Optional configured model for the interrupted agent,
+                used when the follow-up response does not report a resolved model.
 
         Returns:
             AgentOutput with the follow-up response content.
@@ -1292,7 +1299,13 @@ class CopilotProvider(AgentProvider):
                 output_tokens=sdk_response.output_tokens,
                 cache_read_tokens=sdk_response.cache_read_tokens,
                 cache_write_tokens=sdk_response.cache_write_tokens,
-                model=sdk_response.resolved_model or self._default_model,
+                model=(
+                    sdk_response.resolved_model
+                    if agent_model in (None, "auto")
+                    else None
+                )
+                or agent_model
+                or self._default_model,
             )
         finally:
             await session.disconnect()
