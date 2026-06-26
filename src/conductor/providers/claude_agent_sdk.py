@@ -87,8 +87,8 @@ def _build_output_format(output: dict[str, OutputField]) -> dict[str, Any]:
 # mirrors the SDK's `claude_code` preset (filesystem, bash, web, etc.) — i.e.
 # the same behavior the user gets when running the `claude` CLI directly. It is
 # selected from the RAW ``agent.tools is None`` signal, NOT from the executor's
-# resolved list: the executor erases the "omitted" distinction by returning an
-# empty list (the workflow tools copy) for an agent that declares no `tools:`.
+# resolved list: for an agent that declares no `tools:`, the executor returns the
+# workflow-tools copy, which is empty only when the workflow declares no `tools:`.
 _DEFAULT_TOOL_PRESET: dict[str, str] = {"type": "preset", "preset": "claude_code"}
 
 # Display-only previews for the verbose CLI pretty-printer (NOT surfaced
