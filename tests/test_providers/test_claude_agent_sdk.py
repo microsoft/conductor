@@ -707,7 +707,12 @@ class TestOmittedToolsDefaultPreset:
     @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
     @patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", Mock)
     async def test_explicit_non_empty_tools_still_raises(self) -> None:
-        """An explicit non-empty per-agent allowlist is still refused loudly."""
+        """An explicit non-empty per-agent allowlist is still refused loudly.
+
+        Captures the exception so both the message AND the ``suggestion`` (also
+        reworded by this fix) are pinned — a regression that drops the
+        "set 'tools: []'" escape hatch from the suggestion is caught here.
+        """
 
         async def fake_query(**kwargs):
             yield _result(result="done")
@@ -715,13 +720,51 @@ class TestOmittedToolsDefaultPreset:
         with patch("conductor.providers.claude_agent_sdk.query", fake_query):
             provider = ClaudeAgentSdkProvider()
             agent = AgentDef(name="my_agent", prompt="hi", tools=["search", "read_file"])
-            with pytest.raises(ProviderError, match="does not support workflow tool allowlists"):
+            with pytest.raises(ProviderError) as exc:
                 await provider.execute(
                     agent=agent,
                     context={},
                     rendered_prompt="hi",
                     tools=["search", "read_file"],
                 )
+
+        assert "does not support workflow tool allowlists" in str(exc.value)
+        assert exc.value.suggestion is not None
+        assert "tools: []" in exc.value.suggestion
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", Mock)
+    async def test_inherited_workflow_tools_raise_with_inheritance_wording(self) -> None:
+        """An omitted ``tools:`` that inherits a non-empty workflow-level list.
+
+        This is the inheritance path: ``agent.tools is None`` (omitted) but the
+        executor resolved a non-empty list from the workflow-level ``tools:`` and
+        handed it to the provider. The refusal must name the workflow-level
+        inheritance — not just "declared on the agent" — so the user knows where
+        the list came from. This guards the new "inherited from the
+        workflow-level" wording the fix introduced.
+        """
+
+        async def fake_query(**kwargs):
+            yield _result(result="done")
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider()
+            # Omitted per-agent tools (None), but the executor resolved a
+            # non-empty list inherited from the workflow-level `tools:`.
+            agent = AgentDef(name="inheritor", prompt="hi")
+            assert agent.tools is None
+            with pytest.raises(ProviderError) as exc:
+                await provider.execute(
+                    agent=agent,
+                    context={},
+                    rendered_prompt="hi",
+                    tools=["search", "read_file"],
+                )
+
+        assert "inherited from the workflow-level" in str(exc.value)
+        assert exc.value.suggestion is not None
+        assert "tools: []" in exc.value.suggestion
 
     @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
     async def test_executor_to_provider_end_to_end_grants_preset(self) -> None:
