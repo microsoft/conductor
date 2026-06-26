@@ -101,7 +101,10 @@ jobs:
         run: uv python install ${{ matrix.python-version }}
 
       - name: Install dependencies
-        run: uv sync --group dev
+        # Include the claude-agent-sdk extra so the provider's regression tests
+        # (gated by `pytest.importorskip("claude_agent_sdk")`) actually run in
+        # CI instead of silently skipping.
+        run: uv sync --group dev --extra claude-agent-sdk
 
       - name: Remove bundled Copilot CLI binary
         run: |
