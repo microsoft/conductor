@@ -1774,8 +1774,8 @@ def _validate_provider_capabilities(
     # agent. The per-agent loop above skips it, so re-run the tools check here —
     # otherwise an inline agent that omits ``tools:`` against a non-passthrough
     # provider slips past ``validate`` and fails mid-iteration with the same
-    # confusing runtime error. (The other per-agent capability checks for inline
-    # agents are a separate, broader follow-up; this closes the tools footgun.)
+    # confusing runtime error. (Extending the remaining per-agent capability
+    # checks to inline agents is tracked in #270.)
     for fe in config.for_each:
         inline_agent = fe.agent
         if not _is_llm_agent(inline_agent):
