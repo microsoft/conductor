@@ -373,6 +373,19 @@ def run(
             help="Path to instruction file(s) to prepend to all agent prompts. Can be repeated.",
         ),
     ] = None,
+    print_loaded_instructions: Annotated[
+        bool,
+        typer.Option(
+            "--print-loaded-instructions",
+            help=(
+                "Print the resolved list of workspace instruction files (with "
+                "their scope and reason for inclusion) to stderr before running "
+                "the workflow. Useful for debugging why an instruction file is "
+                "or isn't being picked up by --workspace-instructions. Has no "
+                "effect unless --workspace-instructions is also set."
+            ),
+        ),
+    ] = False,
 ) -> None:
     """Run a workflow from a YAML file.
 
@@ -477,6 +490,7 @@ def run(
                 metadata=cli_metadata,
                 workspace_instructions=workspace_instructions,
                 cli_instructions=raw_instructions,
+                print_loaded_instructions=print_loaded_instructions,
             )
             if is_verbose():
                 console.print(f"[bold cyan]Dashboard:[/bold cyan] {launch.url}")
@@ -506,6 +520,7 @@ def run(
                 metadata=cli_metadata,
                 workspace_instructions=workspace_instructions,
                 cli_instructions=raw_instructions,
+                print_loaded_instructions=print_loaded_instructions,
             )
         )
 

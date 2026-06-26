@@ -508,6 +508,7 @@ def launch_background(
     metadata: dict[str, str] | None = None,
     workspace_instructions: bool = False,
     cli_instructions: list[str] | None = None,
+    print_loaded_instructions: bool = False,
 ) -> BackgroundLaunch:
     """Fork a detached child process running the workflow with a web dashboard.
 
@@ -527,6 +528,9 @@ def launch_background(
         metadata: Optional CLI metadata key=value pairs.
         workspace_instructions: Whether to auto-discover workspace instruction files.
         cli_instructions: Optional list of instruction file paths.
+        print_loaded_instructions: Whether to forward ``--print-loaded-instructions``
+            to the background child. Output goes to the child's captured stderr
+            log, not to the parent's TTY.
 
     Returns:
         A ``BackgroundLaunch`` describing the launch (dashboard URL,
@@ -581,6 +585,9 @@ def launch_background(
     if cli_instructions:
         for instr_path in cli_instructions:
             cmd.extend(["--instructions", instr_path])
+
+    if print_loaded_instructions:
+        cmd.append("--print-loaded-instructions")
 
     return _spawn_bg_child(cmd=cmd, web_port=web_port, pid_workflow_ref=workflow_path)
 
