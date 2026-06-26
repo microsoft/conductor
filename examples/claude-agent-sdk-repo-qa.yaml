@@ -7,7 +7,7 @@
 # WHY THIS EXAMPLE EXISTS (the bug it guards against):
 #   Before the fix, an agent that omitted `tools:` received NO tools and could
 #   not read the file: the executor's resolve_agent_tools() turned the omitted
-#   `tools:` into an empty list (the workflow had no `runtime` MCP tools to
+#   `tools:` into an empty list (this workflow declares no workflow-level `tools:` to
 #   inherit), and the provider could not tell that empty list apart from an
 #   explicit `tools: []`, so it disabled every tool. The agent came up with
 #   ZERO filesystem tools and failed to read the file.
