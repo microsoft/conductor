@@ -60,6 +60,21 @@ uv run conductor validate examples/simple-qa.yaml
 make validate-examples    # validate all examples
 ```
 
+## Releasing
+
+Releases are tag-triggered: pushing a `v*` tag runs
+[`.github/workflows/release.yml`](.github/workflows/release.yml), which lints,
+typechecks, tests (Python 3.12 + 3.13), builds the package, and creates a GitHub
+Release with artifacts and auto-generated notes. The maintainer prepares a
+release-prep PR (`chore(release): cut X.Y.Z`) that bumps `version` in
+`pyproject.toml`, finalizes `CHANGELOG.md` (Unreleased → versioned section), and
+re-locks `uv.lock` (`uv lock`); after it merges, tag the merge commit on `main`
+and push the tag. The version lives only in `pyproject.toml` (read at runtime via
+`importlib.metadata`); there is no separate `__version__` to edit. The default
+bump is the patch ("build") number. See
+[`docs/release-checklist.md`](docs/release-checklist.md) for the full
+step-by-step checklist.
+
 ## Architecture
 
 ### Core Package Structure (`src/conductor/`)
