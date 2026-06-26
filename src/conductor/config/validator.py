@@ -1607,8 +1607,8 @@ def _validate_provider_capabilities(
           regression.
         * Omitted ``tools:`` + non-empty workflow-level ``tools:`` — the agent
           inherits that list at runtime (``resolve_agent_tools`` returns a copy)
-          and hits the same refusal mid-run with a confusing "declares
-          tools=[...]" error even though it declared none. An explicit
+          and hits the same refusal mid-run (now a ``resolves to tools=[...]``
+          ``ProviderError``) rather than failing fast at validate. An explicit
           ``tools: []`` is the "no tools" opt-out and stays valid.
         """
         if agent.tools and not caps.workflow_tools_passthrough:
