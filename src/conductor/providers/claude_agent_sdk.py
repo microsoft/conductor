@@ -451,8 +451,8 @@ class ClaudeAgentSdkProvider(AgentProvider):
         :func:`conductor.executor.agent.resolve_agent_tools`. That function
         erases the distinction between an omitted ``tools:`` and an explicit
         ``tools: []``: both arrive here as an empty list whenever the
-        workflow declares no ``runtime`` MCP tools (the common case for this
-        provider, which rejects ``runtime.mcp_servers`` at the factory). We
+        workflow declares no workflow-level ``tools:`` (``config.tools`` is
+        empty; a non-empty list makes an omitted agent resolve non-empty). We
         therefore consult the RAW ``agent.tools`` field — the only place the
         omitted-vs-explicit signal survives — to pick the default.
 
