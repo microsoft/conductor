@@ -5,7 +5,9 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.19...HEAD)
+## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.20...HEAD)
+
+## [0.1.20](https://github.com/microsoft/conductor/compare/v0.1.19...v0.1.20) - 2026-06-26
 
 ### Added
 
@@ -21,6 +23,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cooperative interrupt, session-history resume, and `max_session_seconds`.
   See [`docs/providers/hermes.md`](docs/providers/hermes.md).
   ([#235](https://github.com/microsoft/conductor/pull/235))
+- **Cost budget enforcement** — set a USD ceiling for a run with
+  `runtime.budget_usd` and choose how the engine reacts via `runtime.budget_mode`:
+  `audit` (default — track spend and warn as the cap is approached) or `enforce`
+  (stop the run once the projected cost would exceed the cap). Off by default — no
+  budget tracking happens unless `budget_usd` is set.
+  ([#212](https://github.com/microsoft/conductor/pull/212))
+- **External-workflow friction improvements** — four knobs that surfaced while
+  running real-world workflows: per-agent `output_mode` (`raw` | `envelope`) for
+  cross-provider output-shape parity; `retry.max_parse_recovery_attempts` to cap
+  the in-session JSON-correction prompts sent when an agent's output fails to
+  parse; a new `conductor gate-respond --port <port> --choice <value>` command to
+  resolve a human gate from the CLI (handy for `--web` / `--web-bg` runs); and
+  more robust Windows path handling.
+  ([#234](https://github.com/microsoft/conductor/pull/234))
+- **Templated `reasoning.effort` and `context_tier`** — both per-agent fields now
+  accept Jinja2 templates (e.g. `effort: "{{ workflow.input.eff }}"`) resolved at
+  runtime against the workflow context, instead of being rejected at YAML load as
+  invalid enum literals. The rendered value is re-validated against the allowed
+  set. ([#263](https://github.com/microsoft/conductor/pull/263),
+  closes [#262](https://github.com/microsoft/conductor/issues/262))
+- **Scoped `applyTo` instruction loading** — `.github/instructions/*.md` files
+  with a scoped `applyTo` glob (e.g. `**/*.cs`, `services/foo/**`) are now loaded
+  when their scope overlaps the run's working directory, instead of being silently
+  dropped unless `applyTo: "**"`. Multi-glob values separated by `;` or `,` are
+  supported, and the closest-owning convention directory wins for nested
+  instruction files.
+  ([#238](https://github.com/microsoft/conductor/pull/238),
+  closes [#231](https://github.com/microsoft/conductor/issues/231))
+
+### Fixed
+
+- **Copilot model attribution for auto-routed runs** — when an agent uses
+  `model: auto`, `AgentOutput.model` now records the concrete model the Copilot
+  SDK resolved to (captured from the `assistant.usage` event) instead of the
+  literal string `"auto"`, so token usage and cost are attributed to the real
+  model. ([#268](https://github.com/microsoft/conductor/pull/268))
+- **claude-agent-sdk default tool preset** — an agent that omits `tools:` on the
+  `claude-agent-sdk` provider again receives the full `claude_code` preset instead
+  of zero tools. The omitted-vs-empty distinction (`tools:` absent means "all
+  tools"; `tools: []` means "none") was being lost at the executor→provider
+  boundary whenever the workflow declared no MCP tools.
+  ([#269](https://github.com/microsoft/conductor/pull/269))
 
 ## [0.1.19](https://github.com/microsoft/conductor/compare/v0.1.18...v0.1.19) - 2026-06-16
 
