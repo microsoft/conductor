@@ -138,76 +138,74 @@ function ForEachItemRow({ groupName, item }: { groupName: string; item: ForEachI
 
   return (
     <div className="rounded-lg border border-[var(--border)] bg-[var(--surface)] overflow-hidden">
-      {/* Header row: clickable to expand/collapse */}
-      <button
-        onClick={() => hasDetails && setExpanded(!expanded)}
-        className="flex items-center gap-2 w-full px-3 py-2 text-left hover:bg-[var(--node-bg)] transition-colors"
-        disabled={!hasDetails}
-      >
-        {/* Expand/collapse chevron or status indicator */}
-        {hasDetails ? (
-          expanded ? (
-            <ChevronDown className="w-3 h-3 text-[var(--text-muted)] flex-shrink-0" />
-          ) : (
-            <ChevronRight className="w-3 h-3 text-[var(--text-muted)] flex-shrink-0" />
-          )
-        ) : item.status === 'running' ? (
-          <Loader2 className="w-3 h-3 animate-spin flex-shrink-0" style={{ color }} />
-        ) : (
-          <span
-            className="w-2 h-2 rounded-full flex-shrink-0 ml-0.5 mr-0.5"
-            style={{ backgroundColor: color }}
-          />
-        )}
-
-        {/* Item key */}
-        <span className="text-xs font-medium text-[var(--text)] truncate flex-1 min-w-0">
-          {item.key}
-        </span>
-
-        {/* Compact metrics */}
-        {!expanded && (item.elapsed != null || item.tokens != null || item.cost_usd != null) && (
-          <span className="flex items-center gap-2 text-[10px] text-[var(--text-muted)] flex-shrink-0">
-            {item.elapsed != null && <span>{formatElapsed(item.elapsed)}</span>}
-            {item.tokens != null && <span>{formatTokens(item.tokens)}</span>}
-            {item.cost_usd != null && <span>{formatCost(item.cost_usd)}</span>}
-          </span>
-        )}
-
-        {/* Status badge */}
-        <span
-          className="text-[10px] font-bold uppercase tracking-wider flex-shrink-0 px-1.5 py-0.5 rounded"
-          style={{
-            backgroundColor: `${color}20`,
-            color,
-          }}
+      {/* Header row. The expand/collapse toggle and the dive-in control are
+          SIBLINGS, not nested — a disabled <button> suppresses click events
+          across its whole subtree, so nesting the dive-in inside the toggle
+          made it unreachable whenever the toggle was disabled (e.g. a running
+          workflow-type item with no prompt/output/activity/error yet). */}
+      <div className="flex items-center">
+        {/* Expand/collapse toggle: fills the row minus the dive-in control */}
+        <button
+          onClick={() => hasDetails && setExpanded(!expanded)}
+          className="flex items-center gap-2 flex-1 min-w-0 px-3 py-2 text-left hover:bg-[var(--node-bg)] transition-colors"
+          disabled={!hasDetails}
         >
-          {item.status}
-        </span>
+          {/* Expand/collapse chevron or status indicator */}
+          {hasDetails ? (
+            expanded ? (
+              <ChevronDown className="w-3 h-3 text-[var(--text-muted)] flex-shrink-0" />
+            ) : (
+              <ChevronRight className="w-3 h-3 text-[var(--text-muted)] flex-shrink-0" />
+            )
+          ) : item.status === 'running' ? (
+            <Loader2 className="w-3 h-3 animate-spin flex-shrink-0" style={{ color }} />
+          ) : (
+            <span
+              className="w-2 h-2 rounded-full flex-shrink-0 ml-0.5 mr-0.5"
+              style={{ backgroundColor: color }}
+            />
+          )}
 
-        {/* Dive-in button: navigate into this iteration's sub-workflow context */}
-        {canDiveIn && (
+          {/* Item key */}
+          <span className="text-xs font-medium text-[var(--text)] truncate flex-1 min-w-0">
+            {item.key}
+          </span>
+
+          {/* Compact metrics */}
+          {!expanded && (item.elapsed != null || item.tokens != null || item.cost_usd != null) && (
+            <span className="flex items-center gap-2 text-[10px] text-[var(--text-muted)] flex-shrink-0">
+              {item.elapsed != null && <span>{formatElapsed(item.elapsed)}</span>}
+              {item.tokens != null && <span>{formatTokens(item.tokens)}</span>}
+              {item.cost_usd != null && <span>{formatCost(item.cost_usd)}</span>}
+            </span>
+          )}
+
+          {/* Status badge */}
           <span
-            role="button"
-            tabIndex={0}
-            onClick={(e) => {
-              e.stopPropagation();
-              navigateIntoSubworkflow(iterationSlotKey);
+            className="text-[10px] font-bold uppercase tracking-wider flex-shrink-0 px-1.5 py-0.5 rounded"
+            style={{
+              backgroundColor: `${color}20`,
+              color,
             }}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter' || e.key === ' ') {
-                e.stopPropagation();
-                e.preventDefault();
-                navigateIntoSubworkflow(iterationSlotKey);
-              }
-            }}
+          >
+            {item.status}
+          </span>
+        </button>
+
+        {/* Dive-in button: navigate into this iteration's sub-workflow context.
+            Kept outside the toggle button so it stays clickable regardless of
+            the toggle's disabled state. */}
+        {canDiveIn && (
+          <button
+            type="button"
+            onClick={() => navigateIntoSubworkflow(iterationSlotKey)}
             title={`Dive into ${iterationContext?.workflowName ?? iterationSlotKey}`}
-            className="flex-shrink-0 p-1 rounded hover:bg-[var(--accent)]/20 hover:text-[var(--accent)] transition-colors text-[var(--text-muted)] cursor-pointer"
+            className="flex-shrink-0 mr-2 p-1 rounded hover:bg-[var(--accent)]/20 hover:text-[var(--accent)] transition-colors text-[var(--text-muted)] cursor-pointer"
           >
             <Layers className="w-3 h-3" />
-          </span>
+          </button>
         )}
-      </button>
+      </div>
 
       {/* Expanded detail panel */}
       {expanded && hasDetails && (

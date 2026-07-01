@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.20...HEAD)
 
+### Fixed
+
+- **For-each dive-in worked only for finished items** — in the web dashboard's
+  for-each group detail panel, the per-item "Dive into subworkflow" control was
+  nested inside the row's expand/collapse `<button>`, which is `disabled` while
+  an item has no expandable details (a running workflow-type iteration that has
+  not yet produced a prompt/output/activity/error). A disabled button suppresses
+  clicks across its whole subtree, so dive-in only fired once the item had failed
+  or completed. The toggle and the dive-in control are now siblings, so dive-in
+  stays clickable for running items too.
+  ([#273](https://github.com/microsoft/conductor/pull/273))
+
 ## [0.1.20](https://github.com/microsoft/conductor/compare/v0.1.19...v0.1.20) - 2026-06-26
 
 ### Added
