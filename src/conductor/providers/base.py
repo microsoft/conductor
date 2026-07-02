@@ -335,3 +335,29 @@ class AgentProvider(ABC):
             ``model``, otherwise ``None``.
         """
         return None
+
+    async def list_models(self) -> list[str] | None:
+        """Return the model identifiers the provider can enumerate, if any.
+
+        Used by ``conductor doctor --models`` to surface the models a
+        provider exposes. Implementations should query their SDK's
+        model-listing endpoint and return the resulting identifiers.
+
+        Implementations should:
+
+        * Return a list of model id strings on success (possibly empty).
+        * Return ``None`` when the provider cannot enumerate models — either
+          because the SDK is unavailable, the provider has no model-listing
+          concept, or the listing call failed.
+        * Never raise — diagnostics are best-effort and must not interrupt
+          the caller.
+
+        The default implementation returns ``None`` so providers that have no
+        model-enumeration concept (e.g. those delegating to an external CLI)
+        are reported as "n/a" rather than an error.
+
+        Returns:
+            A list of available model identifiers, or ``None`` when the
+            provider does not enumerate models.
+        """
+        return None

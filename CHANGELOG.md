@@ -17,6 +17,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without waiting for a table refresh; providers whose SDK exposes no pricing
   (e.g. the Anthropic API) fall back to the table.
   ([#265](https://github.com/microsoft/conductor/issues/265))
+- **`conductor doctor` — provider & environment diagnostics** — a safe,
+  read-only command that reports which providers are installed, their
+  capability tier (`stable` / `experimental`), which credential environment
+  variables are detected (presence only — values are never printed), plus
+  Conductor version / update status and configured registries. Offline by
+  default; `--check` tests provider connections, `--models` lists available
+  models, `--provider NAME` scopes to one provider, and `--json` emits
+  machine-readable output for CI. Exit code is `1` only when `--check` is set
+  and the scoped provider (default `copilot`) fails to connect. Also adds a
+  public `list_models()` method to the provider interface (implemented for
+  Copilot and Claude). ([#274](https://github.com/microsoft/conductor/issues/274))
 
 ### Fixed
 
