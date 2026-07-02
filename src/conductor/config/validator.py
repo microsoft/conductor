@@ -1579,6 +1579,13 @@ def _validate_provider_capabilities(
 
     default_provider = config.workflow.runtime.provider.name
     workflow_mcp_servers = config.workflow.runtime.mcp_servers
+    # Workflow-wide reasoning-effort / session-timeout defaults. Bound at the
+    # top of the function — above the nested helpers that consume them — so
+    # ``_check_agent_capabilities`` (which reads ``runtime_default_effort`` as a
+    # closure free-variable) can never be invoked before the name is assigned,
+    # no matter where future call sites are added.
+    runtime_default_effort = config.workflow.runtime.default_reasoning_effort
+    runtime_max_session_seconds = config.workflow.runtime.max_session_seconds
 
     # Cache per provider name so we don't re-resolve for every agent.
     cache: dict[str, ProviderCapabilities] = {}
@@ -1643,12 +1650,14 @@ def _validate_provider_capabilities(
         ``AgentDef`` — which is not in ``config.agents`` but runs identically at
         runtime — gets the same treatment as a top-level agent (#270).
 
-        Reads ``runtime_default_effort`` from the enclosing scope; only invoked
-        after it has been assigned.
+        Reads the workflow-wide ``runtime_default_effort`` from the enclosing
+        scope; it is bound at the top of the function, so every call site is safe.
         """
         # Per-agent override against workflow-level mcp_servers: if the
         # workflow declared mcp_servers but this agent's resolved provider
         # is different from the default, the override skips MCP entirely.
+        # (The workflow-level MCP check below only flags agents that resolve to
+        # the DEFAULT provider, so inherit vs. override never double-report.)
         if workflow_mcp_servers and provider_name != default_provider and not caps.mcp_tools:
             errors.append(
                 f"Agent '{agent.name}' overrides provider to '{provider_name}', which "
@@ -1730,7 +1739,9 @@ def _validate_provider_capabilities(
     # workflow-level ``mcp_servers`` / ``max_session_seconds`` and run with
     # ``workflow_tools`` exactly like top-level agents. The workflow-level
     # inheritance checks below iterate this combined list so an inline agent on
-    # an incapable default provider can't silently escape them (#270).
+    # an incapable default provider can't silently escape them (#270). (The
+    # workflow-wide default reasoning effort is inherited too, but it is checked
+    # per-agent inside ``_check_agent_capabilities``, not via this list.)
     all_llm_agents = [a for a in config.agents if _is_llm_agent(a)] + [
         fe.agent for fe in config.for_each if _is_llm_agent(fe.agent)
     ]
@@ -1759,12 +1770,6 @@ def _validate_provider_capabilities(
                     f"MCP support, or use an MCP-capable default provider."
                 )
 
-    # Per-agent default reasoning effort (workflow-wide). Pulled outside
-    # the per-agent loop because it applies to every LLM agent that does
-    # NOT override ``reasoning.effort`` explicitly.
-    runtime_default_effort = config.workflow.runtime.default_reasoning_effort
-    runtime_max_session_seconds = config.workflow.runtime.max_session_seconds
-
     # ----- Workflow-level: max_session_seconds -----
     # When the workflow sets a default session timeout, every LLM agent
     # inherits it. A provider that ignores max_session_seconds would
@@ -1775,7 +1780,8 @@ def _validate_provider_capabilities(
         for agent in all_llm_agents:
             # If the agent overrides max_session_seconds explicitly, the
             # workflow-level value does not reach the provider for this
-            # agent — its per-agent override is handled per-agent below.
+            # agent — its per-agent override is handled by
+            # ``_check_agent_capabilities`` instead.
             if agent.max_session_seconds is not None:
                 continue
             pname = _resolved_provider_name(agent, default_provider)

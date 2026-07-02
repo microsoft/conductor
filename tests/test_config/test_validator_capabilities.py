@@ -886,8 +886,8 @@ class TestForEachInlineCapabilityCrossCheck:
     remaining per-agent checks (reasoning effort, structured output, per-agent
     MCP override, explicit max_session_seconds) so an inline agent gets identical
     treatment to a top-level agent. In each test the entry agent is inert, so the
-    assertion isolates to the inline (``inner``) agent — without the fix the
-    inline agent is skipped and NO error is raised.
+    assertion isolates to the inline (``inner``) agent — without the fix these
+    per-agent checks are skipped for the inline agent and NO error is raised.
     """
 
     def test_inline_reasoning_unsupported_level_errors(self, patch_caps: Any) -> None:
@@ -1098,3 +1098,41 @@ class TestForEachInlineWorkflowLevelInheritance:
             ),
         )
         validate_workflow_config(config)  # no raise
+
+    def test_inline_non_llm_human_gate_skipped(self, patch_caps: Any) -> None:
+        """A non-LLM (human_gate) inline agent must be SKIPPED by the
+        ``_is_llm_agent`` filter — even on an incapable default provider that
+        declares ``mcp_servers``, ``max_session_seconds``, AND
+        ``default_reasoning_effort`` that an LLM inline agent WOULD inherit and
+        fail on. Guards the inline ``_is_llm_agent`` guard (feeding
+        ``all_llm_agents`` and the for_each per-agent loop) against a future
+        refactor that drops it and spuriously fail-validates the workflow.
+        """
+        from conductor.config.schema import GateOption
+
+        patch_caps(
+            {
+                # Default provider is incapable on all three inherited axes;
+                # only a non-skipped LLM agent on it would raise.
+                "copilot": _caps(mcp_tools=False, max_session_seconds=False, reasoning_effort=None),
+                "claude": _caps(),  # entry override → capable, so entry never trips
+            }
+        )
+        config = self._inheritance_config(
+            inline=AgentDef(
+                name="gate",
+                type="human_gate",
+                prompt="Approve {{ item }}?",
+                options=[
+                    GateOption(label="OK", value="ok", route="$end"),
+                    GateOption(label="No", value="no", route="$end"),
+                ],
+            ),
+            runtime=RuntimeConfig(
+                provider="copilot",
+                default_reasoning_effort="high",
+                max_session_seconds=120.0,
+                mcp_servers={"docs": MCPServerDef(command="docs-server")},
+            ),
+        )
+        validate_workflow_config(config)  # must not raise — human_gate is skipped
