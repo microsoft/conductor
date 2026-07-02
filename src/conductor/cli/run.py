@@ -1107,6 +1107,17 @@ def display_usage_summary(usage_data: dict[str, Any], console: Console | None = 
     # Cost breakdown
     total_cost = usage_data.get("total_cost_usd")
     agents = usage_data.get("agents", [])
+    unpriced_count = usage_data.get("unpriced_agent_count", 0)
+    unpriced_models = usage_data.get("unpriced_models", [])
+
+    def _unpriced_suffix() -> str:
+        """Render e.g. ' (2 agents unpriced: gpt-5.5, claude-opus-4.8)'."""
+        if not unpriced_count:
+            return ""
+        noun = "agent" if unpriced_count == 1 else "agents"
+        if unpriced_models:
+            return f" ({unpriced_count} {noun} unpriced: {', '.join(unpriced_models)})"
+        return f" ({unpriced_count} {noun} unpriced)"
 
     if total_cost is not None and total_cost > 0:
         _print()
@@ -1121,10 +1132,19 @@ def display_usage_summary(usage_data: dict[str, Any], console: Console | None = 
                     style="dim",
                 )
 
-        _print(f"  [bold]Total: ${total_cost:.4f}[/bold]")
+        if unpriced_count:
+            # Partial total: flag it so a silently-undercounted number is not
+            # presented as complete (see #265).
+            _print(f"  [bold]Total: ~${total_cost:.4f}[/bold][yellow]{_unpriced_suffix()}[/yellow]")
+            _print("  [dim]Partial total — some agents' models had no available pricing.[/dim]")
+        else:
+            _print(f"  [bold]Total: ${total_cost:.4f}[/bold]")
     elif total_tokens > 0:
         _print()
-        _print("  [dim]Cost data unavailable (unknown model pricing)[/dim]")
+        if unpriced_count:
+            _print(f"  [dim]Cost data unavailable{_unpriced_suffix()}[/dim]")
+        else:
+            _print("  [dim]Cost data unavailable (unknown model pricing)[/dim]")
 
     _print("=" * 60, style="dim")
 

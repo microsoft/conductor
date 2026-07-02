@@ -236,6 +236,8 @@ export interface SubworkflowContext {
   agentsTotal: number;
   totalCost: number;
   totalTokens: number;
+  /** Agents that spent tokens but had no available pricing (see #265) */
+  unpricedCount: number;
   /** Event/activity log scoped to this context */
   eventLog: LogEntry[];
   activityLog: ActivityLogEntry[];
@@ -316,6 +318,8 @@ interface WorkflowState {
   agentsTotal: number;
   totalCost: number;
   totalTokens: number;
+  /** Agents that spent tokens but had no available pricing (see #265) */
+  unpricedCount: number;
 
   // UI state
   selectedNode: string | null;
@@ -470,6 +474,7 @@ function createSubworkflowContext(parentAgent: string, iteration: number, workfl
     agentsTotal: 0,
     totalCost: 0,
     totalTokens: 0,
+    unpricedCount: 0,
     eventLog: [],
     activityLog: [],
     workflowOutput: null,
@@ -571,6 +576,7 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
   agentsTotal: 0,
   totalCost: 0,
   totalTokens: 0,
+  unpricedCount: 0,
   selectedNode: null,
   wsStatus: 'connecting',
   eventLog: [],
@@ -688,6 +694,7 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
         agentsCompleted: 0,
         totalCost: 0,
         totalTokens: 0,
+        unpricedCount: 0,
         nodes: {},
         groupProgress: {},
         highlightedEdges: [],
@@ -738,6 +745,7 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
         agentsCompleted: 0,
         totalCost: 0,
         totalTokens: 0,
+        unpricedCount: 0,
         nodes: {},
         groupProgress: {},
         highlightedEdges: [],
@@ -775,6 +783,7 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
         agentsCompleted: 0,
         totalCost: 0,
         totalTokens: 0,
+        unpricedCount: 0,
         nodes: {},
         groupProgress: {},
         highlightedEdges: [],
@@ -963,6 +972,7 @@ function activeTarget(
   highlightedEdges: HighlightedEdge[];
   addCost: (cost: number) => void;
   addTokens: (tokens: number) => void;
+  addUnpriced: () => void;
   incrCompleted: () => void;
 } {
   let ctx: SubworkflowContext | null = null;
@@ -979,6 +989,7 @@ function activeTarget(
       highlightedEdges: ctxRef.highlightedEdges,
       addCost: (cost: number) => { ctxRef.totalCost += cost; state.totalCost += cost; },
       addTokens: (tokens: number) => { ctxRef.totalTokens += tokens; state.totalTokens += tokens; },
+      addUnpriced: () => { ctxRef.unpricedCount++; state.unpricedCount++; },
       incrCompleted: () => { ctxRef.agentsCompleted++; state.agentsCompleted++; },
     };
   }
@@ -989,6 +1000,7 @@ function activeTarget(
     highlightedEdges: state.highlightedEdges,
     addCost: (cost: number) => { state.totalCost += cost; },
     addTokens: (tokens: number) => { state.totalTokens += tokens; },
+    addUnpriced: () => { state.unpricedCount++; },
     incrCompleted: () => { state.agentsCompleted++; },
   };
 }
@@ -1168,6 +1180,7 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     }
     if (data.cost_usd) t.addCost(data.cost_usd);
     if (data.tokens) t.addTokens(data.tokens);
+    if (data.tokens && data.cost_usd == null) t.addUnpriced();
     // Capture terminate-step metadata when present (issue #219). The engine
     // emits these on agent_completed for `status: success` terminate steps so
     // the TerminateNode can render the rendered reason in its body.
@@ -1439,6 +1452,7 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     }
     if (data.cost_usd) t.addCost(data.cost_usd);
     if (data.tokens) t.addTokens(data.tokens);
+    if (data.tokens && data.cost_usd == null) t.addUnpriced();
     replaceNode(t.nodes, data.agent_name);
     replaceNode(t.nodes, data.group_name);
   },

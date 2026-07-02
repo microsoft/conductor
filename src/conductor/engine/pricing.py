@@ -248,23 +248,36 @@ DEFAULT_PRICING: dict[str, ModelPricing] = {
 def get_pricing(
     model: str,
     overrides: dict[str, ModelPricing] | None = None,
+    provider_pricing: dict[str, ModelPricing] | None = None,
 ) -> ModelPricing | None:
     """Get pricing for a model.
 
-    Checks user-provided overrides first, then falls back to the default
-    pricing table. Supports a narrow form of fuzzy matching for versioned
-    model names — the requested name must equal a known key, or extend it
-    with a ``-`` delimiter (e.g. ``claude-sonnet-4-20250514`` matches
+    Resolution order (see #265):
+
+    **workflow ``cost.pricing`` override → provider hook → ``DEFAULT_PRICING``
+    → ``None``.**
+
+    ``overrides`` (workflow ``cost.pricing``) and ``provider_pricing`` (the
+    :meth:`AgentProvider.get_model_pricing` hook, pre-resolved and cached by
+    the :class:`~conductor.engine.usage.UsageTracker`) are both matched by
+    exact model name and treated as authoritative — they never warn. Only the
+    static ``DEFAULT_PRICING`` fallback supports fuzzy matching for versioned
+    model names — the requested name must equal a known key, or extend it with
+    a ``-`` delimiter (e.g. ``claude-sonnet-4-20250514`` matches
     ``claude-sonnet-4``). Names that share a textual prefix without the
-    delimiter (e.g. ``claude-opus-4.7-high`` against ``claude-opus-4``)
-    are *not* matched and will return ``None``, so callers don't silently
-    inherit metadata from a sibling model family.
+    delimiter (e.g. ``claude-opus-4.7-high`` against ``claude-opus-4``) are
+    *not* matched and will return ``None``, so callers don't silently inherit
+    metadata from a sibling model family.
 
     Non-exact matches log a one-time warning per requested name (see #137).
 
     Args:
         model: The model name to look up.
-        overrides: Optional user-provided pricing overrides.
+        overrides: Optional user-provided pricing overrides (workflow
+            ``cost.pricing``). Highest precedence.
+        provider_pricing: Optional provider-supplied pricing, resolved via the
+            ``get_model_pricing`` hook. Beats the static table so newly-released
+            models are priced without a table update.
 
     Returns:
         ModelPricing if found, None otherwise.
@@ -273,7 +286,13 @@ def get_pricing(
     if overrides and model in overrides:
         return overrides[model]
 
-    # Exact match.
+    # Provider-supplied pricing (the get_model_pricing hook, see #265) beats
+    # the static table so newly-released models are priced without a table
+    # update. Authoritative for the exact model that was resolved — never warn.
+    if provider_pricing and model in provider_pricing:
+        return provider_pricing[model]
+
+    # Exact match in the static table.
     if model in DEFAULT_PRICING:
         return DEFAULT_PRICING[model]
 

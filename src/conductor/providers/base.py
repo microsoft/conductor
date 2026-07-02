@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 if TYPE_CHECKING:
     from conductor.config.schema import AgentDef
+    from conductor.engine.pricing import ModelPricing
     from conductor.providers.capabilities import ProviderCapabilities
 
 # Type alias for event callbacks that receive structured SDK events.
@@ -297,5 +298,40 @@ class AgentProvider(ABC):
 
         Returns:
             The maximum prompt (input) tokens the SDK will accept, or ``None``.
+        """
+        return None
+
+    async def get_model_pricing(self, model: str) -> ModelPricing | None:
+        """Return provider-supplied pricing for ``model``, or ``None``.
+
+        This is the provider hook in the cost-resolution chain (see #265).
+        The :class:`~conductor.engine.usage.UsageTracker` resolves pricing in
+        this order:
+
+        **workflow ``cost.pricing`` override → this hook → ``DEFAULT_PRICING`` →
+        ``None``.**
+
+        A provider that knows its own rates (e.g. the Copilot SDK exposes
+        per-model billing metadata) should return a
+        :class:`~conductor.engine.pricing.ModelPricing` so cost reporting stays
+        current without waiting for the static table to be refreshed on every
+        model release. Providers whose SDK exposes no pricing (e.g. the
+        Anthropic API's ``models.list()``) should return ``None`` and let the
+        static table handle it — which is exactly what this default does.
+
+        Implementations must:
+
+        * Return ``None`` when the model is unknown to the provider, when the
+          SDK exposes no usable pricing, or when the SDK call fails.
+        * Never raise — pricing metadata is best-effort and must not interrupt
+          workflow execution. Cost is always optional.
+
+        Args:
+            model: The model identifier as it would be sent to the SDK
+                (e.g. ``"gpt-5.2"``, ``"claude-sonnet-4-5-20250929"``).
+
+        Returns:
+            A :class:`ModelPricing` when the provider can supply rates for
+            ``model``, otherwise ``None``.
         """
         return None

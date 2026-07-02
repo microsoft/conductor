@@ -77,12 +77,46 @@ class WorkflowUsage:
 
     @property
     def total_cost_usd(self) -> float | None:
-        """Total cost in USD across all agents.
+        """Total cost in USD across priced agents.
 
-        Returns None if no agents have cost data.
+        Sums only agents whose ``cost_usd`` is known. Returns ``None`` when
+        no agent has cost data at all.
+
+        **This is a partial when :attr:`has_unpriced` is true** — agents whose
+        model had no available pricing are excluded from this sum. Callers that
+        present this as "the total" must also surface :attr:`unpriced_agents` /
+        :attr:`unpriced_models` so a silently-undercounted number is not shown
+        as complete (see #265).
         """
         costs = [a.cost_usd for a in self.agents if a.cost_usd is not None]
         return sum(costs) if costs else None
+
+    @property
+    def unpriced_agents(self) -> list[AgentUsage]:
+        """Agents that consumed tokens but have no cost data.
+
+        These executions spent real tokens (``input + output > 0``) yet no
+        pricing was available for the model (``cost_usd is None``), so they are
+        silently excluded from :attr:`total_cost_usd`. Surfacing them lets the
+        CLI / dashboard flag the reported total as a partial (see #265).
+        """
+        return [
+            a for a in self.agents if a.cost_usd is None and (a.input_tokens + a.output_tokens) > 0
+        ]
+
+    @property
+    def unpriced_models(self) -> list[str]:
+        """Sorted distinct model names among :attr:`unpriced_agents`.
+
+        Excludes ``None`` models (unknown model): those still count as unpriced
+        agents but contribute no name to display.
+        """
+        return sorted({a.model for a in self.unpriced_agents if a.model})
+
+    @property
+    def has_unpriced(self) -> bool:
+        """``True`` when at least one agent consumed tokens without cost data."""
+        return bool(self.unpriced_agents)
 
     @property
     def total_elapsed_seconds(self) -> float:
@@ -119,6 +153,26 @@ class UsageTracker:
         """
         self._agents: list[AgentUsage] = []
         self._pricing_overrides = pricing_overrides or {}
+        # Provider-supplied pricing, resolved via AgentProvider.get_model_pricing
+        # and pre-populated by the engine before record() (see #265). Keyed by
+        # the exact model string that record() will look up. Sits between the
+        # workflow override and the static table in get_pricing's precedence.
+        self._provider_pricing: dict[str, ModelPricing] = {}
+
+    def set_provider_pricing(self, model: str, pricing: ModelPricing | None) -> None:
+        """Cache provider-supplied pricing for ``model`` (no-op when ``None``).
+
+        Called by the engine after resolving :meth:`AgentProvider.get_model_pricing`
+        for a model, so the subsequent (synchronous) :meth:`record` can price it
+        without provider access. ``None`` (provider supplies no pricing) is a
+        no-op — ``record`` then falls through to the static table.
+
+        Args:
+            model: The exact model string that ``record`` will look up.
+            pricing: The provider's pricing for ``model``, or ``None``.
+        """
+        if pricing is not None:
+            self._provider_pricing[model] = pricing
 
     def record(
         self,
@@ -167,7 +221,7 @@ class UsageTracker:
                 output_tokens=output_tokens,
                 cache_read_tokens=cache_read,
                 cache_write_tokens=cache_write,
-                pricing=get_pricing(output.model, self._pricing_overrides),
+                pricing=get_pricing(output.model, self._pricing_overrides, self._provider_pricing),
             )
 
         usage = AgentUsage(

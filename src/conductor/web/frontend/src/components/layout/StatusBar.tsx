@@ -10,6 +10,7 @@ export function StatusBar() {
   const agentsTotal = useWorkflowStore((s) => s.agentsTotal);
   const totalCost = useWorkflowStore((s) => s.totalCost);
   const totalTokens = useWorkflowStore((s) => s.totalTokens);
+  const unpricedCount = useWorkflowStore((s) => s.unpricedCount);
   const wsStatus = useWorkflowStore((s) => s.wsStatus);
   const workflowFailure = useWorkflowStore((s) => s.workflowFailure);
   const lastEventTime = useWorkflowStore((s) => s.lastEventTime);
@@ -144,10 +145,26 @@ export function StatusBar() {
           <span className="font-mono">{totalTokens.toLocaleString()}</span>
         </span>
       )}
-      {totalCost > 0 && (
-        <span className={cn('flex items-center gap-1', isFailed ? 'text-red-400/60' : 'text-[var(--text-muted)]')} title="Total cost">
+      {(totalCost > 0 || unpricedCount > 0) && (
+        <span
+          className={cn('flex items-center gap-1', isFailed ? 'text-red-400/60' : 'text-[var(--text-muted)]')}
+          title={
+            unpricedCount > 0
+              ? `Total cost (partial \u2014 ${unpricedCount} agent${unpricedCount === 1 ? '' : 's'} with no available pricing)`
+              : 'Total cost'
+          }
+        >
           <Coins className="w-3 h-3" />
-          <span className="font-mono">${totalCost.toFixed(4)}</span>
+          {totalCost > 0 && (
+            <span className="font-mono">
+              {unpricedCount > 0 ? '~' : ''}${totalCost.toFixed(4)}
+            </span>
+          )}
+          {unpricedCount > 0 && (
+            <span className="text-amber-400">
+              {totalCost > 0 ? `(${unpricedCount} unpriced)` : `${unpricedCount} unpriced`}
+            </span>
+          )}
         </span>
       )}
       {idleSeconds != null && idleSeconds >= 5 && (

@@ -7,8 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.20...HEAD)
 
+### Added
+
+- **Provider-supplied model pricing** — cost reporting now resolves pricing via a
+  new `AgentProvider.get_model_pricing` hook before falling back to the static
+  table. Resolution order is workflow `cost.pricing` → provider hook → built-in
+  `DEFAULT_PRICING` → unpriced. The Copilot provider derives live rates from its
+  SDK billing metadata (AI Credits → USD), so newly-released models are priced
+  without waiting for a table refresh; providers whose SDK exposes no pricing
+  (e.g. the Anthropic API) fall back to the table.
+  ([#265](https://github.com/microsoft/conductor/issues/265))
+
 ### Fixed
 
+- **Cost summary silently undercounted unpriced models** — the run summary summed
+  only the priced subset of agents and presented it as the complete total, so
+  spend on models without available pricing vanished with no signal. Unpriced
+  agents are now surfaced in the CLI summary and the web dashboard status bar
+  (`~$X (N agents unpriced: model-a, model-b)`), so a partial total is never
+  shown as a clean, complete number.
+  ([#265](https://github.com/microsoft/conductor/issues/265))
 - **Missing pricing for current models costed them at $0** — several current
   models had no `DEFAULT_PRICING` entry, so `get_pricing` returned `None` and
   they were silently costed at $0 in the Token Usage Summary / cost breakdown

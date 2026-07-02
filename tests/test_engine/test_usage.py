@@ -7,6 +7,27 @@ from conductor.engine.usage import AgentUsage, UsageTracker, WorkflowUsage
 from conductor.providers.base import AgentOutput
 
 
+def _mk_usage(
+    agent_name: str,
+    model: str | None,
+    cost_usd: float | None,
+    *,
+    input_tokens: int = 100,
+    output_tokens: int = 100,
+) -> AgentUsage:
+    """Compact ``AgentUsage`` builder for the unpriced-surfacing tests."""
+    return AgentUsage(
+        agent_name=agent_name,
+        model=model,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cache_read_tokens=0,
+        cache_write_tokens=0,
+        cost_usd=cost_usd,
+        elapsed_seconds=1.0,
+    )
+
+
 class TestAgentUsage:
     """Tests for the AgentUsage dataclass."""
 
@@ -127,6 +148,51 @@ class TestWorkflowUsage:
         # Should only sum known costs
         assert usage.total_cost_usd == 0.01
 
+    def test_unpriced_agents_flags_token_spenders_without_cost(self) -> None:
+        """unpriced_agents lists token-spending agents that lack cost data (#265)."""
+        usage = WorkflowUsage(
+            agents=[
+                _mk_usage("priced", "claude-sonnet-4", 0.01),
+                _mk_usage("unpriced", "gpt-5.5-future", None),
+            ]
+        )
+        assert usage.has_unpriced is True
+        assert [a.agent_name for a in usage.unpriced_agents] == ["unpriced"]
+        assert usage.unpriced_models == ["gpt-5.5-future"]
+        # Total stays the partial priced sum, not None.
+        assert usage.total_cost_usd == 0.01
+
+    def test_unpriced_ignores_zero_token_agents(self) -> None:
+        """An agent that spent no tokens is not 'unpriced' — it cost $0."""
+        usage = WorkflowUsage(
+            agents=[_mk_usage("zero", "some-model", None, input_tokens=0, output_tokens=0)]
+        )
+        assert usage.unpriced_agents == []
+        assert usage.unpriced_models == []
+        assert usage.has_unpriced is False
+
+    def test_unpriced_models_deduped_sorted_excluding_none(self) -> None:
+        """unpriced_models is sorted + distinct; a None model omits the name only."""
+        usage = WorkflowUsage(
+            agents=[
+                _mk_usage("a", "model-b", None),
+                _mk_usage("b", "model-a", None),
+                _mk_usage("c", "model-b", None),
+                _mk_usage("d", None, None),
+            ]
+        )
+        assert usage.unpriced_models == ["model-a", "model-b"]
+        # The None-model agent still counts as an unpriced spender.
+        assert len(usage.unpriced_agents) == 4
+        assert usage.has_unpriced is True
+
+    def test_no_unpriced_when_all_priced(self) -> None:
+        """has_unpriced is False and the lists are empty when every agent is priced."""
+        usage = WorkflowUsage(agents=[_mk_usage("a", "claude-sonnet-4", 0.005)])
+        assert usage.has_unpriced is False
+        assert usage.unpriced_agents == []
+        assert usage.unpriced_models == []
+
 
 class TestUsageTracker:
     """Tests for the UsageTracker class."""
@@ -210,6 +276,76 @@ class TestUsageTracker:
         usage = tracker.record("test-agent", output, elapsed=1.0)
 
         assert usage.cost_usd is None  # No model = no pricing
+
+    def test_set_provider_pricing_prices_unknown_model(self) -> None:
+        """Provider-supplied pricing lets record() price a model absent from the table."""
+        tracker = UsageTracker()
+        tracker.set_provider_pricing(
+            "brand-new-model",
+            ModelPricing(input_per_mtok=10.0, output_per_mtok=30.0),
+        )
+        output = AgentOutput(
+            content={"r": "x"},
+            raw_response="{}",
+            tokens_used=2_000_000,
+            input_tokens=1_000_000,
+            output_tokens=1_000_000,
+            model="brand-new-model",
+        )
+        usage = tracker.record("a", output, elapsed=1.0)
+        # 1M input @ $10 + 1M output @ $30 = $40
+        assert usage.cost_usd == pytest.approx(40.0)
+
+    def test_provider_pricing_beats_default_table(self) -> None:
+        """Provider pricing takes precedence over the static DEFAULT_PRICING (#265)."""
+        tracker = UsageTracker()
+        tracker.set_provider_pricing(
+            "claude-sonnet-4",
+            ModelPricing(input_per_mtok=1.0, output_per_mtok=1.0),
+        )
+        output = AgentOutput(
+            content={"r": "x"},
+            raw_response="{}",
+            tokens_used=2_000_000,
+            input_tokens=1_000_000,
+            output_tokens=1_000_000,
+            model="claude-sonnet-4",
+        )
+        usage = tracker.record("a", output, elapsed=1.0)
+        # Provider rate $1+$1 = $2, not the table's $3/$15 => $18.
+        assert usage.cost_usd == pytest.approx(2.0)
+
+    def test_workflow_override_beats_provider_pricing(self) -> None:
+        """Workflow cost.pricing override wins over the provider hook (#265)."""
+        tracker = UsageTracker(
+            pricing_overrides={"m": ModelPricing(input_per_mtok=2.0, output_per_mtok=2.0)}
+        )
+        tracker.set_provider_pricing("m", ModelPricing(input_per_mtok=99.0, output_per_mtok=99.0))
+        output = AgentOutput(
+            content={"r": "x"},
+            raw_response="{}",
+            tokens_used=2_000_000,
+            input_tokens=1_000_000,
+            output_tokens=1_000_000,
+            model="m",
+        )
+        usage = tracker.record("a", output, elapsed=1.0)
+        assert usage.cost_usd == pytest.approx(4.0)  # override 2+2
+
+    def test_set_provider_pricing_none_is_noop(self) -> None:
+        """A None result (provider supplies no pricing) leaves the model unpriced."""
+        tracker = UsageTracker()
+        tracker.set_provider_pricing("still-unknown", None)
+        output = AgentOutput(
+            content={"r": "x"},
+            raw_response="{}",
+            tokens_used=1500,
+            input_tokens=1000,
+            output_tokens=500,
+            model="still-unknown",
+        )
+        usage = tracker.record("a", output, elapsed=1.0)
+        assert usage.cost_usd is None
 
     def test_usage_tracker_multiple_agents(self) -> None:
         """Test tracking multiple agent executions."""

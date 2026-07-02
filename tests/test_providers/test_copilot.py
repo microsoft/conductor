@@ -1302,6 +1302,179 @@ class TestGetMaxPromptTokens:
         assert await provider.get_max_prompt_tokens("claude-3-5-sonnet-20241022") == 200_000
 
 
+class TestGetModelPricing:
+    """Tests for CopilotProvider.get_model_pricing (#265)."""
+
+    @staticmethod
+    def _make_model(
+        model_id: str,
+        *,
+        batch_size: int | None = 1_000_000,
+        input_price: float | None = 100.0,
+        output_price: float | None = 300.0,
+        cache_price: float | None = 10.0,
+        billing: bool = True,
+        token_prices: bool = True,
+    ) -> Any:
+        from types import SimpleNamespace
+
+        tp = None
+        if token_prices:
+            tp = SimpleNamespace(
+                batch_size=batch_size,
+                input_price=input_price,
+                output_price=output_price,
+                cache_price=cache_price,
+            )
+        billing_obj = SimpleNamespace(multiplier=1.0, token_prices=tp) if billing else None
+        return SimpleNamespace(
+            id=model_id,
+            capabilities=SimpleNamespace(limits=SimpleNamespace(max_prompt_tokens=128_000)),
+            billing=billing_obj,
+        )
+
+    @staticmethod
+    def _provider_with_list_models(list_models_impl: Any) -> CopilotProvider:
+        from types import SimpleNamespace
+
+        provider = CopilotProvider(mock_handler=stub_handler)
+        provider._mock_handler = None
+        provider._client = SimpleNamespace(list_models=list_models_impl)
+        provider._started = True
+        return provider
+
+    @pytest.mark.asyncio
+    async def test_mock_handler_mode_returns_none(self) -> None:
+        """Mock-handler mode has no SDK to query — must return None."""
+        provider = CopilotProvider(mock_handler=stub_handler)
+        assert await provider.get_model_pricing("gpt-4o") is None
+
+    @pytest.mark.asyncio
+    async def test_derives_usd_pricing_from_token_prices(self) -> None:
+        # batch_size 1M with input=100 credits/batch => 100 credits per 1M tokens
+        # => $1.00 / Mtok at 100 credits = $1; output 300 => $3.00; cache 10 => $0.10.
+        async def list_models() -> list[Any]:
+            return [
+                self._make_model(
+                    "gpt-5.5",
+                    batch_size=1_000_000,
+                    input_price=100.0,
+                    output_price=300.0,
+                    cache_price=10.0,
+                )
+            ]
+
+        provider = self._provider_with_list_models(list_models)
+        pricing = await provider.get_model_pricing("gpt-5.5")
+        assert pricing is not None
+        assert pricing.input_per_mtok == pytest.approx(1.00)
+        assert pricing.output_per_mtok == pytest.approx(3.00)
+        assert pricing.cache_read_per_mtok == pytest.approx(0.10)
+        assert pricing.cache_write_per_mtok == 0.0
+
+    @pytest.mark.asyncio
+    async def test_small_batch_size_scales_correctly(self) -> None:
+        # batch_size 1000, input 1 credit/batch => 1 credit per 1000 tokens
+        # => 1000 credits/Mtok => $10.00 / Mtok.
+        async def list_models() -> list[Any]:
+            return [
+                self._make_model(
+                    "gpt-4o",
+                    batch_size=1000,
+                    input_price=1.0,
+                    output_price=3.0,
+                    cache_price=None,
+                )
+            ]
+
+        provider = self._provider_with_list_models(list_models)
+        pricing = await provider.get_model_pricing("gpt-4o")
+        assert pricing is not None
+        assert pricing.input_per_mtok == pytest.approx(10.0)
+        assert pricing.output_per_mtok == pytest.approx(30.0)
+        assert pricing.cache_read_per_mtok == 0.0
+
+    @pytest.mark.asyncio
+    async def test_no_match_returns_none(self) -> None:
+        async def list_models() -> list[Any]:
+            return [self._make_model("gpt-4o")]
+
+        provider = self._provider_with_list_models(list_models)
+        assert await provider.get_model_pricing("nonexistent") is None
+
+    @pytest.mark.asyncio
+    async def test_missing_billing_returns_none(self) -> None:
+        async def list_models() -> list[Any]:
+            return [self._make_model("gpt-4o", billing=False)]
+
+        provider = self._provider_with_list_models(list_models)
+        assert await provider.get_model_pricing("gpt-4o") is None
+
+    @pytest.mark.asyncio
+    async def test_missing_token_prices_returns_none(self) -> None:
+        async def list_models() -> list[Any]:
+            return [self._make_model("gpt-4o", token_prices=False)]
+
+        provider = self._provider_with_list_models(list_models)
+        assert await provider.get_model_pricing("gpt-4o") is None
+
+    @pytest.mark.asyncio
+    async def test_missing_or_zero_batch_size_returns_none(self) -> None:
+        async def list_none() -> list[Any]:
+            return [self._make_model("gpt-4o", batch_size=None)]
+
+        async def list_zero() -> list[Any]:
+            return [self._make_model("gpt-4o", batch_size=0)]
+
+        assert await self._provider_with_list_models(list_none).get_model_pricing("gpt-4o") is None
+        assert await self._provider_with_list_models(list_zero).get_model_pricing("gpt-4o") is None
+
+    @pytest.mark.asyncio
+    async def test_missing_input_or_output_price_returns_none(self) -> None:
+        async def list_no_input() -> list[Any]:
+            return [self._make_model("gpt-4o", input_price=None)]
+
+        async def list_no_output() -> list[Any]:
+            return [self._make_model("gpt-4o", output_price=None)]
+
+        p1 = self._provider_with_list_models(list_no_input)
+        p2 = self._provider_with_list_models(list_no_output)
+        assert await p1.get_model_pricing("gpt-4o") is None
+        assert await p2.get_model_pricing("gpt-4o") is None
+
+    @pytest.mark.asyncio
+    async def test_missing_cache_price_defaults_to_zero(self) -> None:
+        async def list_models() -> list[Any]:
+            return [self._make_model("gpt-4o", cache_price=None)]
+
+        provider = self._provider_with_list_models(list_models)
+        pricing = await provider.get_model_pricing("gpt-4o")
+        assert pricing is not None
+        assert pricing.cache_read_per_mtok == 0.0
+
+    @pytest.mark.asyncio
+    async def test_list_models_failure_returns_none(self) -> None:
+        """SDK parse/transport failures are soft-swallowed — never raise (#265)."""
+
+        async def list_models() -> list[Any]:
+            raise ValueError("Missing required field 'multiplier' in ModelBilling")
+
+        provider = self._provider_with_list_models(list_models)
+        assert await provider.get_model_pricing("gpt-4o") is None
+
+    @pytest.mark.asyncio
+    async def test_alias_resolves_via_match_model_id(self) -> None:
+        """Versioned-suffix aliases resolve to the SDK's listed ID before pricing."""
+
+        async def list_models() -> list[Any]:
+            return [self._make_model("claude-3-5-sonnet", batch_size=1_000_000, input_price=100.0)]
+
+        provider = self._provider_with_list_models(list_models)
+        pricing = await provider.get_model_pricing("claude-3-5-sonnet-latest")
+        assert pricing is not None
+        assert pricing.input_per_mtok == pytest.approx(1.0)
+
+
 class TestReasoningEffort:
     """Tests for reasoning_effort plumbing into create_session."""
 

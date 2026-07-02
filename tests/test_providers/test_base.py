@@ -1,5 +1,7 @@
 """Unit tests for the AgentProvider ABC and AgentOutput dataclass."""
 
+import pytest
+
 from conductor.providers.base import AgentOutput, match_model_id
 
 
@@ -118,3 +120,24 @@ class TestMatchModelId:
 
     def test_unknown_after_suffix_strip_returns_none(self) -> None:
         assert match_model_id("totally-different-latest", ["gpt-4o"]) is None
+
+
+class TestGetModelPricingDefault:
+    """The base AgentProvider.get_model_pricing default returns None (#265)."""
+
+    @pytest.mark.asyncio
+    async def test_base_default_returns_none(self) -> None:
+        """Providers that don't override the hook fall through to the table."""
+        from conductor.providers.base import AgentProvider
+
+        class _Fake(AgentProvider, abstract=True):
+            async def execute(self, *args: object, **kwargs: object) -> AgentOutput:
+                raise NotImplementedError
+
+            async def validate_connection(self) -> bool:
+                return True
+
+            async def close(self) -> None:
+                return None
+
+        assert await _Fake().get_model_pricing("any-model") is None

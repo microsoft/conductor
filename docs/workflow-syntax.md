@@ -1159,6 +1159,40 @@ See [configuration.md](configuration.md#limits) for the budget
 configuration reference and notes on how budget tracking integrates with the
 provider usage callbacks.
 
+### Model Pricing & Cost Reporting
+
+The end-of-run summary reports per-agent and total cost. Pricing for a model is
+resolved in this order (first hit wins):
+
+1. **Workflow `cost.pricing` override** — per-model rates you supply in the
+   workflow file (highest precedence; treated as intent).
+2. **Provider hook** — a provider that knows its own rates supplies them at
+   runtime. The **Copilot** provider derives live pricing from the SDK's
+   per-model billing metadata, so newly released models are priced without a
+   table update. Providers whose SDK exposes no pricing (e.g. the Anthropic API)
+   skip this step.
+3. **Built-in table** — a static `DEFAULT_PRICING` table of common models.
+4. **Unavailable** — if none of the above match, the agent is **unpriced**.
+
+**Unpriced agents are surfaced, not silently dropped.** When a run mixes priced
+and unpriced agents, the total is shown as a partial (e.g. `Total: ~$0.4200
+(2 agents unpriced: model-a, model-b)`) rather than a clean-looking number that
+hides missing spend. The web dashboard shows the same `~$X (N unpriced)` marker.
+When *no* model can be priced, the summary reads `Cost data unavailable`.
+
+To price an unknown model yourself, add a `cost.pricing` override:
+
+```yaml
+workflow:
+  cost:
+    pricing:
+      my-custom-model:
+        input_per_mtok: 3.00      # USD per million input tokens
+        output_per_mtok: 15.00    # USD per million output tokens
+        cache_read_per_mtok: 0.30 # optional
+        cache_write_per_mtok: 3.75 # optional
+```
+
 ### Periodic Checkpoints
 
 By default Conductor writes a checkpoint **only when a workflow fails** with an

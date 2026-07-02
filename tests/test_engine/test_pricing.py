@@ -99,6 +99,36 @@ class TestGetPricing:
         assert pricing.input_per_mtok == 1.0  # Override, not default
         assert pricing.output_per_mtok == 2.0
 
+    def test_provider_pricing_used_for_unknown_model(self) -> None:
+        """Provider-supplied pricing prices a model absent from the table (#265)."""
+        provider_pricing = {"brand-new": ModelPricing(input_per_mtok=7.0, output_per_mtok=9.0)}
+        pricing = get_pricing("brand-new", provider_pricing=provider_pricing)
+        assert pricing is not None
+        assert pricing.input_per_mtok == 7.0
+        assert pricing.output_per_mtok == 9.0
+
+    def test_provider_pricing_beats_default_table(self) -> None:
+        """Provider pricing takes precedence over the static table (#265)."""
+        provider_pricing = {"gpt-4o": ModelPricing(input_per_mtok=1.0, output_per_mtok=1.0)}
+        pricing = get_pricing("gpt-4o", provider_pricing=provider_pricing)
+        assert pricing is not None
+        assert pricing.input_per_mtok == 1.0  # Provider hook, not the $2.50 default
+
+    def test_override_beats_provider_pricing(self) -> None:
+        """Workflow override outranks the provider hook (#265)."""
+        overrides = {"m": ModelPricing(input_per_mtok=2.0, output_per_mtok=2.0)}
+        provider_pricing = {"m": ModelPricing(input_per_mtok=99.0, output_per_mtok=99.0)}
+        pricing = get_pricing("m", overrides=overrides, provider_pricing=provider_pricing)
+        assert pricing is not None
+        assert pricing.input_per_mtok == 2.0  # Override wins
+
+    def test_provider_pricing_is_exact_match_only(self) -> None:
+        """Provider pricing matches by exact model name — no fuzzy inheritance."""
+        provider_pricing = {"parent": ModelPricing(input_per_mtok=5.0, output_per_mtok=5.0)}
+        # A suffixed name must NOT inherit the provider entry (unlike the static
+        # table's versioned-suffix fuzzy match); it falls through to None here.
+        assert get_pricing("parent-child", provider_pricing=provider_pricing) is None
+
     def test_default_pricing_table_has_expected_models(self) -> None:
         """Test that default pricing table contains expected models."""
         expected_models = [

@@ -1426,6 +1426,68 @@ class TestFileLoggingDualWrite:
         finally:
             verbose_mode.reset(token)
 
+    def test_display_usage_summary_flags_unpriced_partial(self, tmp_path: Path) -> None:
+        """A priced+unpriced mix renders a ~partial total and names unpriced models (#265)."""
+        from conductor.cli.run import close_file_logging, display_usage_summary, init_file_logging
+
+        log_path = tmp_path / "test.log"
+        token = verbose_mode.set(False)
+        try:
+            init_file_logging(log_path)
+            display_usage_summary(
+                {
+                    "total_input_tokens": 3000,
+                    "total_output_tokens": 1500,
+                    "total_tokens": 4500,
+                    "total_cost_usd": 0.01,
+                    "unpriced_agent_count": 2,
+                    "unpriced_models": ["claude-opus-4.9", "gpt-5.9"],
+                    "agents": [
+                        {"agent_name": "priced", "cost_usd": 0.01},
+                        {"agent_name": "u1", "cost_usd": None},
+                        {"agent_name": "u2", "cost_usd": None},
+                    ],
+                }
+            )
+            close_file_logging()
+
+            content = log_path.read_text(encoding="utf-8")
+            assert "~$0.0100" in content  # partial-total marker
+            assert "unpriced" in content
+            assert "claude-opus-4.9" in content
+            assert "gpt-5.9" in content
+            assert "Partial total" in content
+        finally:
+            verbose_mode.reset(token)
+
+    def test_display_usage_summary_all_unpriced(self, tmp_path: Path) -> None:
+        """When nothing is priced, cost is 'unavailable' and unpriced models are named (#265)."""
+        from conductor.cli.run import close_file_logging, display_usage_summary, init_file_logging
+
+        log_path = tmp_path / "test.log"
+        token = verbose_mode.set(False)
+        try:
+            init_file_logging(log_path)
+            display_usage_summary(
+                {
+                    "total_input_tokens": 2000,
+                    "total_output_tokens": 1000,
+                    "total_tokens": 3000,
+                    "total_cost_usd": None,
+                    "unpriced_agent_count": 1,
+                    "unpriced_models": ["mystery-model"],
+                    "agents": [{"agent_name": "a", "cost_usd": None}],
+                }
+            )
+            close_file_logging()
+
+            content = log_path.read_text(encoding="utf-8")
+            assert "Cost data unavailable" in content
+            assert "1 agent unpriced" in content
+            assert "mystery-model" in content
+        finally:
+            verbose_mode.reset(token)
+
     def test_section_writes_full_content_to_file_in_silent_mode(self, tmp_path: Path) -> None:
         """Test that verbose_log_section writes full content to file even in SILENT mode."""
         from conductor.cli.run import close_file_logging, init_file_logging, verbose_log_section
