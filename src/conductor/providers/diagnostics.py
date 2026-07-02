@@ -168,12 +168,17 @@ class RegistryDiagnostic:
 
     default: str | None
     registries: list[RegistryInfo] = field(default_factory=list)
+    error: str | None = None
+    """Set when the registries config could not be loaded (e.g. malformed
+    TOML). Distinguishes a load *failure* from a genuinely empty config so
+    ``doctor`` surfaces the problem instead of reporting "no registries"."""
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-safe representation."""
         return {
             "default": self.default,
             "registries": [r.to_dict() for r in self.registries],
+            "error": self.error,
         }
 
 
@@ -282,7 +287,11 @@ def _check_update() -> tuple[bool, bool | None, str | None]:
             if result is None:
                 return True, None, None
             remote, tag_name, url = result
-            write_cache(remote, tag_name, url)
+            # Persisting the fetched version is best-effort: a non-writable
+            # HOME (common in CI) must NOT discard an already-successful
+            # fetch and misreport "offline".
+            with contextlib.suppress(Exception):
+                write_cache(remote, tag_name, url)
         if not remote:
             return True, None, None
         return True, is_newer(remote, __version__), remote
@@ -309,13 +318,18 @@ def gather_env() -> EnvDiagnostic:
 
 
 def gather_registries() -> RegistryDiagnostic:
-    """Gather configured workflow registries (never raises)."""
+    """Gather configured workflow registries (never raises).
+
+    A load failure (e.g. malformed ``registries.toml``) is captured in the
+    returned ``error`` field rather than swallowed — a corrupt config must be
+    surfaced, not reported as "no registries configured".
+    """
     try:
         from conductor.registry.config import load_config
 
         config = load_config()
-    except Exception:  # noqa: BLE001 - diagnostics must never raise
-        return RegistryDiagnostic(default=None, registries=[])
+    except Exception as e:  # noqa: BLE001 - diagnostics must never raise
+        return RegistryDiagnostic(default=None, registries=[], error=_format_error(e))
 
     registries = [
         RegistryInfo(

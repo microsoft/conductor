@@ -263,6 +263,11 @@ def _models_cell(diag: ProviderDiagnostic) -> str:
 
 def _render_registries(registries: RegistryDiagnostic, console: Console) -> None:
     """Render the registries section."""
+    if registries.error is not None:
+        console.print(
+            f"{_CROSS} [dim]failed to load registries: {escape(registries.error)}[/dim]"
+        )
+        return
     if not registries.registries:
         console.print("[dim]No registries configured.[/dim]")
         return

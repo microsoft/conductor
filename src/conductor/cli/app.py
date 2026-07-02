@@ -251,8 +251,9 @@ def main(
     if console.is_terminal and verbosity != ConsoleVerbosity.SILENT:
         import sys
 
-        # Skip when the subcommand is 'update' or 'doctor' (both run their
-        # own update check, so the startup hint would be redundant noise).
+        # Skip when the subcommand is 'update' or 'doctor' — both surface
+        # update status in their own output (doctor in its env section), so
+        # the startup hint would be redundant noise.
         args = sys.argv[1:]
         subcommand = next((a for a in args if not a.startswith("-")), None)
         if subcommand not in ("update", "doctor"):
@@ -1488,12 +1489,14 @@ def doctor(
     Conductor version / update status and configured registries.
 
     Offline by default — no providers are instantiated and no credentials are
-    required. Use --check to actually test provider connections, and --models
-    to list each provider's available models.
+    required. (The default env section does a cache-first GitHub update check;
+    set CONDUCTOR_NO_UPDATE_CHECK to disable it.) Use --check to actually test
+    provider connections, and --models to list each provider's available
+    models.
 
     \b
     Examples:
-        conductor doctor                     # all sections, offline
+        conductor doctor                     # all sections
         conductor doctor providers           # providers section only
         conductor doctor --check             # test provider connections
         conductor doctor --models -p claude  # list Claude's models

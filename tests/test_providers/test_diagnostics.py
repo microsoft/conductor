@@ -55,6 +55,46 @@ class TestGatherEnv:
         assert env.update_checked is True
         assert env.update_available is None
 
+    def test_cold_cache_fetch_and_up_to_date(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # No cache -> fetch, persist, and report "up to date" for an older remote.
+        monkeypatch.delenv("CONDUCTOR_NO_UPDATE_CHECK", raising=False)
+        monkeypatch.setattr("conductor.cli.update.read_cache", lambda: None)
+        monkeypatch.setattr(
+            "conductor.cli.update.fetch_latest_version",
+            lambda: ("0.0.1", "v0.0.1", "url"),
+        )
+        wrote: list[tuple[str, str, str]] = []
+        monkeypatch.setattr(
+            "conductor.cli.update.write_cache",
+            lambda v, t, u: wrote.append((v, t, u)),
+        )
+        env = d.gather_env()
+        assert env.update_checked is True
+        assert env.update_available is False  # remote 0.0.1 is older than current
+        assert env.latest_version == "0.0.1"
+        assert wrote == [("0.0.1", "v0.0.1", "url")]
+
+    def test_cache_write_failure_does_not_discard_fetch(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A non-writable HOME (common in CI) must NOT collapse a successful
+        # fetch into a misleading "offline" result.
+        monkeypatch.delenv("CONDUCTOR_NO_UPDATE_CHECK", raising=False)
+        monkeypatch.setattr("conductor.cli.update.read_cache", lambda: None)
+        monkeypatch.setattr(
+            "conductor.cli.update.fetch_latest_version",
+            lambda: ("999.0.0", "v999.0.0", "url"),
+        )
+
+        def _boom(*_args: Any) -> None:
+            raise OSError("read-only HOME")
+
+        monkeypatch.setattr("conductor.cli.update.write_cache", _boom)
+        env = d.gather_env()
+        assert env.update_checked is True
+        assert env.update_available is True  # fetch preserved despite write failure
+        assert env.latest_version == "999.0.0"
+
 
 # ---------------------------------------------------------------------------
 # Registries section
@@ -75,19 +115,26 @@ class TestGatherRegistries:
         monkeypatch.setattr("conductor.registry.config.load_config", lambda: fake)
         result = d.gather_registries()
         assert result.default == "team"
+        assert result.error is None
         assert {r.name for r in result.registries} == {"team", "local"}
         team = next(r for r in result.registries if r.name == "team")
         assert team.is_default is True
         assert team.type == "github"
+        local = next(r for r in result.registries if r.name == "local")
+        assert local.is_default is False
 
-    def test_load_failure_returns_empty(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_load_failure_is_surfaced_not_swallowed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # A corrupt config must be reported via ``error`` — NOT collapsed into
+        # an empty result that reads as "no registries configured".
         def _raise() -> Any:
-            raise RuntimeError("bad config")
+            raise RuntimeError("malformed TOML at line 3")
 
         monkeypatch.setattr("conductor.registry.config.load_config", _raise)
         result = d.gather_registries()
         assert result.default is None
         assert result.registries == []
+        assert result.error == "malformed TOML at line 3"
+        assert result.to_dict()["error"] == "malformed TOML at line 3"
 
 
 # ---------------------------------------------------------------------------

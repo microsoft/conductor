@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib
 import json
+from unittest.mock import AsyncMock
 
 import pytest
 import typer.main
@@ -185,6 +186,67 @@ class TestDoctorJson:
         assert creds[0] == {"name": "ANTHROPIC_API_KEY", "present": True}
         assert all(set(c) == {"name", "present"} for c in creds)
 
+    def test_json_with_check_failure_exits_one(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The primary CI use case: emit machine-readable JSON AND signal a
+        # non-zero exit when the scoped provider fails to connect.
+        report = DoctorReport(providers=[_prov("copilot", checked=True, connection_ok=False)])
+        _patch_gather(monkeypatch, report)
+        result = runner.invoke(app, ["doctor", "providers", "--check", "--json"])
+        assert result.exit_code == 1
+        data = json.loads(result.stdout)  # JSON still valid despite exit 1
+        assert data["providers"][0]["connection_ok"] is False
+
+    def test_json_includes_registries_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        report = DoctorReport(registries=RegistryDiagnostic(default=None, error="malformed TOML"))
+        _patch_gather(monkeypatch, report)
+        result = runner.invoke(app, ["doctor", "registries", "--json"])
+        assert result.exit_code == 0
+        data = json.loads(result.stdout)
+        assert data["registries"]["error"] == "malformed TOML"
+
+
+# ---------------------------------------------------------------------------
+# Secret-leak safety (end-to-end, real environment)
+# ---------------------------------------------------------------------------
+
+
+class TestDoctorSecretLeakEndToEnd:
+    """A real secret in the environment must never reach stdout (presence only)."""
+
+    _CANARY = "sk-ant-LEAK-CANARY-DO-NOT-PRINT"
+
+    def test_offline_json_does_not_leak_env_secret(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Real gather (NOT patched) with a real secret env var set.
+        monkeypatch.setenv("ANTHROPIC_API_KEY", self._CANARY)
+        result = runner.invoke(app, ["doctor", "providers", "--json"])
+        assert result.exit_code == 0
+        assert self._CANARY not in result.output
+        data = json.loads(result.stdout)
+        claude = next(p for p in data["providers"] if p["name"] == "claude")
+        present = {c["name"]: c["present"] for c in claude["credential_env_vars"]}
+        assert present["ANTHROPIC_API_KEY"] is True  # detected by presence
+        assert all("value" not in c for c in claude["credential_env_vars"])
+
+    def test_check_json_does_not_leak_env_secret(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # --check must not echo the secret even while probing; patch provider
+        # construction so no real network I/O happens.
+        monkeypatch.setenv("ANTHROPIC_API_KEY", self._CANARY)
+        fake = AsyncMock()
+        fake.validate_connection.return_value = False
+        fake.list_models.return_value = None
+        fake.close.return_value = None
+        monkeypatch.setattr(
+            "conductor.providers.factory.create_provider",
+            AsyncMock(return_value=fake),
+        )
+        result = runner.invoke(
+            app, ["doctor", "providers", "--provider", "claude", "--check", "--json"]
+        )
+        assert result.exit_code == 1  # scoped claude fails to connect
+        assert self._CANARY not in result.output
+        data = json.loads(result.stdout)
+        assert data["providers"][0]["connection_ok"] is False
+
 
 # ---------------------------------------------------------------------------
 # Exit-code semantics
@@ -300,3 +362,17 @@ class TestDoctorMarkupSafety:
         assert result.exception is None
         assert result.exit_code == 0
         assert "weird/path" in result.output
+
+    def test_registries_load_error_renders(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # A corrupt registries config is surfaced (not shown as "no registries")
+        # and bracketed error text does not crash Rich rendering.
+        report = DoctorReport(
+            registries=RegistryDiagnostic(default=None, error="bad TOML at [line 3]")
+        )
+        _patch_gather(monkeypatch, report)
+        result = runner.invoke(app, ["doctor", "registries"])
+        assert result.exception is None
+        assert result.exit_code == 0
+        assert "failed to load registries" in result.output
+        assert "line 3" in result.output
+        assert "No registries configured" not in result.output
