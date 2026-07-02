@@ -7,9 +7,12 @@ flag/exit-code cases; one test runs the real offline path end-to-end.
 
 from __future__ import annotations
 
+import importlib
 import json
 
 import pytest
+import typer.main
+from rich.console import Console
 from typer.testing import CliRunner
 
 from conductor.cli.app import app
@@ -24,11 +27,27 @@ from conductor.providers.diagnostics import (
 
 runner = CliRunner()
 
+# The submodule ``conductor.cli.app`` is shadowed by the ``app`` Typer object
+# it exports (``conductor/cli/__init__.py`` does ``from conductor.cli.app
+# import app``), so the string path / plain import resolves to the Typer, not
+# the module. Grab the real module object explicitly for console patching.
+_app_module = importlib.import_module("conductor.cli.app")
+
 
 @pytest.fixture(autouse=True)
 def _no_update_check(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Keep the CLI offline and quiet across all doctor tests."""
+    """Keep the CLI offline and render at a fixed wide width.
+
+    The doctor command renders through the module-level ``output_console`` /
+    ``console`` in ``conductor.cli.app``, whose width tracks the ambient
+    terminal. CI runs with a narrow non-TTY width that wraps and truncates
+    Rich table cells, which would break substring assertions on the rendered
+    output. Pinning both consoles to a fixed width makes rendering
+    deterministic regardless of the environment.
+    """
     monkeypatch.setenv("CONDUCTOR_NO_UPDATE_CHECK", "1")
+    monkeypatch.setattr(_app_module, "output_console", Console(width=200))
+    monkeypatch.setattr(_app_module, "console", Console(stderr=True, width=200))
 
 
 def _prov(
@@ -81,11 +100,19 @@ def _patch_gather(
 
 
 class TestDoctorHelp:
-    def test_help_lists_options(self) -> None:
+    def test_help_runs(self) -> None:
         result = runner.invoke(app, ["doctor", "--help"])
         assert result.exit_code == 0
+
+    def test_options_are_registered(self) -> None:
+        # Inspect the command's registered parameters rather than parsing the
+        # rendered help text: Rich wraps/truncates the options panel at narrow
+        # (CI non-TTY) widths, so a substring check on the help output is
+        # fragile. Param inspection verifies the flags actually exist.
+        doctor_cmd = typer.main.get_command(app).commands["doctor"]
+        opts = {opt for param in doctor_cmd.params for opt in (*param.opts, *param.secondary_opts)}
         for token in ("--check", "--models", "--provider", "--json"):
-            assert token in result.output
+            assert token in opts
 
 
 # ---------------------------------------------------------------------------
