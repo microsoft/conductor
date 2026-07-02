@@ -283,12 +283,15 @@ async def test_for_each_agents_priced_via_hook() -> None:
 
     async def fake_execute(agent, *_args: object, **_kwargs: object) -> AgentOutput:
         if agent.name == "finder":
+            # Table-priced model (in DEFAULT_PRICING) so finder does NOT resolve
+            # _UNPRICED_MODEL — otherwise it would warm the cache and the for-each
+            # site's resolution would be an untested no-op fast path.
             return AgentOutput(
                 content={"items": ["a", "b"]},
                 raw_response="{}",
                 input_tokens=1_000_000,
                 output_tokens=1_000_000,
-                model=_UNPRICED_MODEL,
+                model="gpt-4o",
             )
         return _make_output()
 
@@ -298,10 +301,12 @@ async def test_for_each_agents_priced_via_hook() -> None:
     await engine.run({})
 
     usage = engine.get_execution_summary()["usage"]
-    # finder + 2 for-each items, all priced via the hook.
+    # finder (table-priced gpt-4o) + 2 for-each items (hook-priced _UNPRICED_MODEL).
     assert usage["unpriced_agent_count"] == 0
-    assert usage["total_cost_usd"] == pytest.approx(120.0)  # 3 agents x $40
-    assert pricing_calls == [_UNPRICED_MODEL]  # resolved once, cached across all
+    # gpt-4o: 1M in @ $2.50 + 1M out @ $10.00 = $12.50; 2 proc items x $40 = $80.
+    assert usage["total_cost_usd"] == pytest.approx(92.5)
+    # The for-each site is the sole resolver of _UNPRICED_MODEL (resolved once).
+    assert pricing_calls.count(_UNPRICED_MODEL) == 1
 
 
 @pytest.mark.asyncio
