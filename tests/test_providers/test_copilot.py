@@ -1504,6 +1504,17 @@ class TestGetModelPricing:
         assert await self._provider_with_list_models(list_inf).get_model_pricing("gpt-4o") is None
 
     @pytest.mark.asyncio
+    async def test_unconvertible_huge_int_price_returns_none(self) -> None:
+        """A price int too large to convert to float is rejected, not raised (#265)."""
+
+        async def list_models() -> list[Any]:
+            return [self._make_model("gpt-4o", input_price=10**400)]
+
+        provider = self._provider_with_list_models(list_models)
+        # Must not raise OverflowError — degrades to None (static-table fallback).
+        assert await provider.get_model_pricing("gpt-4o") is None
+
+    @pytest.mark.asyncio
     async def test_zero_price_is_priced_as_free(self) -> None:
         """A genuine 0.0 rate is a free model (distinct from unpriced) and is kept."""
 

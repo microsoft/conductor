@@ -50,14 +50,16 @@ def _is_finite_nonneg(value: object) -> TypeGuard[float]:
     Rejects ``None``, booleans, non-numeric types, ``NaN`` and ``inf`` — any of
     which would turn a malformed SDK price into a confident-wrong cost. Used to
     validate Copilot ``token_prices`` before deriving a :class:`ModelPricing`.
-    Narrows the value to ``float`` for the caller on success.
+    Narrows the value to ``float`` for the caller on success. Never raises: a
+    pathologically large ``int`` (unconvertible to ``float``) is rejected rather
+    than allowed to raise ``OverflowError``.
     """
-    return (
-        isinstance(value, (int, float))
-        and not isinstance(value, bool)
-        and math.isfinite(value)
-        and value >= 0.0
-    )
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value) and value >= 0.0
+    except OverflowError:
+        return False
 
 
 # Events that should NOT reset the idle-detection clock. These are internal
