@@ -482,6 +482,24 @@ class ClaudeProvider(AgentProvider):
         matched_id = match_model_id(model, cache.keys())
         return cache.get(matched_id) if matched_id is not None else None
 
+    async def list_models(self) -> list[str] | None:
+        """Return the model ids advertised by the Anthropic API.
+
+        Enumerates ``client.models.list()`` and returns each entry's ``id``.
+        Used by ``conductor doctor --models``.
+
+        Returns ``None`` when the SDK is unavailable, the client has not been
+        constructed, or the listing call fails — diagnostics must never raise.
+        """
+        if not ANTHROPIC_SDK_AVAILABLE or self._client is None:
+            return None
+        try:
+            page = await self._client.models.list()
+        except Exception as e:  # noqa: BLE001 - diagnostics must never raise
+            logger.debug("Failed to list Anthropic models: %s", e)
+            return None
+        return [model.id for model in page.data]
+
     async def _ensure_mcp_connected(self) -> None:
         """Connect to MCP servers if configured.
 
