@@ -19,6 +19,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sub-workflow usage under-reporting in the same issue was already fixed in
   [#212](https://github.com/microsoft/conductor/pull/212).)
   ([#266](https://github.com/microsoft/conductor/issues/266))
+- **`for_each` inline agents skipped most provider-capability checks** —
+  `conductor validate`'s provider-capability cross-check applied the full
+  per-agent matrix (reasoning effort, structured output, per-agent MCP provider
+  override, explicit `max_session_seconds`) only to top-level `agents:`. A
+  `for_each` group's inline agent — which runs at runtime exactly like a
+  top-level agent — was checked for tool allowlists only, so it could request a
+  capability its provider doesn't support (e.g. `reasoning.effort: high` on the
+  `claude-agent-sdk` provider), pass validation, then fail or silently degrade
+  mid-iteration. The per-agent checks are now shared and run over inline agents
+  too, and the workflow-level `mcp_servers` / `max_session_seconds` inheritance
+  checks now also account for inline agents on the default provider.
+  ([#270](https://github.com/microsoft/conductor/issues/270))
 - **For-each dive-in worked only for finished items** — in the web dashboard's
   for-each group detail panel, the per-item "Dive into subworkflow" control was
   nested inside the row's expand/collapse `<button>`, which is `disabled` while

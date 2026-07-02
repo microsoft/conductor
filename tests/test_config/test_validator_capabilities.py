@@ -69,6 +69,35 @@ def _build_workflow(
     )
 
 
+def _for_each_workflow(
+    *,
+    inline: AgentDef,
+    tools: list[str] | None = None,
+    mcp_servers: dict[str, MCPServerDef] | None = None,
+) -> WorkflowConfig:
+    """Build a workflow whose only for_each group carries ``inline``.
+
+    The entry agent opts out of tools (``tools: []``) and no workflow-wide
+    defaults are set, so — unless a test says otherwise — only the inline agent
+    can trip a per-agent capability check, isolating the assertion to the
+    for_each path (#270).
+    """
+    return _build_workflow(
+        agents=[AgentDef(name="entry", prompt="hi", tools=[])],
+        tools=tools,
+        mcp_servers=mcp_servers,
+        for_each=[
+            ForEachDef(
+                name="loop",
+                type="for_each",
+                source="entry.output.items",
+                **{"as": "item"},
+                agent=inline,
+            )
+        ],
+    )
+
+
 @pytest.fixture
 def patch_caps(monkeypatch: pytest.MonkeyPatch):
     """Replace ``get_capabilities`` with a controllable mapping.
@@ -848,3 +877,262 @@ class TestMultiErrorAggregation:
         # on the first error.
         assert "agent_a" in msg
         assert "agent_b" in msg
+
+
+class TestForEachInlineCapabilityCrossCheck:
+    """Per-agent capability checks must ALSO cover a for_each group's INLINE agent (#270).
+
+    #269 wired the *tools* check into the for_each inline pass; #270 extends the
+    remaining per-agent checks (reasoning effort, structured output, per-agent
+    MCP override, explicit max_session_seconds) so an inline agent gets identical
+    treatment to a top-level agent. In each test the entry agent is inert, so the
+    assertion isolates to the inline (``inner``) agent — without the fix these
+    per-agent checks are skipped for the inline agent and NO error is raised.
+    """
+
+    def test_inline_reasoning_unsupported_level_errors(self, patch_caps: Any) -> None:
+        patch_caps({"copilot": _caps(reasoning_effort=("low", "medium"))})
+        config = _for_each_workflow(
+            inline=AgentDef(
+                name="inner", prompt="{{ item }}", reasoning=ReasoningConfig(effort="high")
+            ),
+        )
+        with pytest.raises(ConfigurationError, match="Agent 'inner'.*supports only.*low.*medium"):
+            validate_workflow_config(config)
+
+    def test_inline_reasoning_on_no_reasoning_provider_errors(self, patch_caps: Any) -> None:
+        """The confirmed #270 example: inline ``reasoning.effort`` on a provider
+        that ignores reasoning (e.g. claude-agent-sdk) must error, exactly like
+        the identical agent at top level."""
+        patch_caps({"copilot": _caps(reasoning_effort=None)})
+        config = _for_each_workflow(
+            inline=AgentDef(
+                name="inner", prompt="{{ item }}", reasoning=ReasoningConfig(effort="high")
+            ),
+        )
+        with pytest.raises(
+            ConfigurationError, match="Agent 'inner'.*does not support reasoning effort"
+        ):
+            validate_workflow_config(config)
+
+    def test_inline_reasoning_supported_level_passes(self, patch_caps: Any) -> None:
+        patch_caps({"copilot": _caps(reasoning_effort=("low", "medium", "high"))})
+        config = _for_each_workflow(
+            inline=AgentDef(
+                name="inner", prompt="{{ item }}", reasoning=ReasoningConfig(effort="medium")
+            ),
+        )
+        validate_workflow_config(config)  # no raise
+
+    def test_inline_structured_output_no_support_errors(self, patch_caps: Any) -> None:
+        patch_caps({"copilot": _caps(structured_output="none")})
+        config = _for_each_workflow(
+            inline=AgentDef(
+                name="inner", prompt="{{ item }}", output={"x": OutputField(type="string")}
+            ),
+        )
+        with pytest.raises(
+            ConfigurationError, match="Agent 'inner'.*does not support structured output"
+        ):
+            validate_workflow_config(config)
+
+    def test_inline_structured_output_experimental_prompt_injection_warns(
+        self, patch_caps: Any
+    ) -> None:
+        patch_caps({"copilot": _caps(tier="experimental", structured_output="prompt_injection")})
+        config = _for_each_workflow(
+            inline=AgentDef(
+                name="inner", prompt="{{ item }}", output={"x": OutputField(type="string")}
+            ),
+        )
+        warnings = validate_workflow_config(config)
+        assert any("inner" in w and "prompt injection" in w for w in warnings), warnings
+
+    def test_inline_explicit_max_session_seconds_on_unsupported_errors(
+        self, patch_caps: Any
+    ) -> None:
+        patch_caps({"copilot": _caps(max_session_seconds=False)})
+        config = _for_each_workflow(
+            inline=AgentDef(name="inner", prompt="{{ item }}", max_session_seconds=120.0),
+        )
+        with pytest.raises(
+            ConfigurationError, match="Agent 'inner'.*does not enforce session timeouts"
+        ):
+            validate_workflow_config(config)
+
+    def test_inline_provider_override_against_mcp_errors(self, patch_caps: Any) -> None:
+        """An inline agent overriding to a non-MCP provider while the workflow
+        declares mcp_servers must error (the entry agent stays on the MCP-capable
+        default, so only the inline override trips the check)."""
+        patch_caps(
+            {
+                "copilot": _caps(mcp_tools=True),  # default (entry uses this)
+                "claude": _caps(mcp_tools=False),  # inline override
+            }
+        )
+        config = _for_each_workflow(
+            inline=AgentDef(name="inner", prompt="{{ item }}", provider="claude"),
+            mcp_servers={"docs": MCPServerDef(command="docs-server")},
+        )
+        with pytest.raises(ConfigurationError, match="Agent 'inner'.*MCP servers"):
+            validate_workflow_config(config)
+
+    def test_inline_on_fully_capable_default_passes(self, patch_caps: Any) -> None:
+        """A fully-capable provider honors every declared capability → no error.
+
+        Guards against false positives from running the full check over inline
+        agents.
+        """
+        patch_caps({"copilot": _caps()})
+        config = _for_each_workflow(
+            inline=AgentDef(
+                name="inner",
+                prompt="{{ item }}",
+                reasoning=ReasoningConfig(effort="high"),
+                max_session_seconds=60.0,
+                output={"x": OutputField(type="string")},
+            ),
+        )
+        validate_workflow_config(config)  # no raise
+
+
+class TestForEachInlineWorkflowLevelInheritance:
+    """Workflow-level inheritance checks must ALSO cover for_each inline agents (#270).
+
+    When every top-level agent overrides to a capable provider but a for_each
+    inline agent runs on the incapable *default* provider, it INHERITS the
+    workflow-level ``mcp_servers`` / ``max_session_seconds`` / default reasoning
+    effort. Without inline coverage the workflow-level checks (which only scanned
+    ``config.agents``) find no offending agent and the inheritance silently
+    degrades at runtime.
+    """
+
+    def _inheritance_config(
+        self,
+        *,
+        inline: AgentDef,
+        runtime: RuntimeConfig,
+    ) -> WorkflowConfig:
+        # ``entry`` overrides to a capable provider so, WITHOUT the fix, the
+        # workflow-level check finds nothing to flag — the error can only come
+        # from the inline agent inheriting the workflow-level setting.
+        return WorkflowConfig(
+            workflow=WorkflowDef(name="t", entry_point="entry", runtime=runtime),
+            agents=[AgentDef(name="entry", prompt="hi", tools=[], provider="claude")],
+            for_each=[
+                ForEachDef(
+                    name="loop",
+                    type="for_each",
+                    source="entry.output.items",
+                    **{"as": "item"},
+                    agent=inline,
+                )
+            ],
+        )
+
+    def test_inline_inherits_workflow_default_reasoning_effort_on_no_reasoning_provider_errors(
+        self, patch_caps: Any
+    ) -> None:
+        patch_caps(
+            {
+                "copilot": _caps(reasoning_effort=None),  # default (inline inherits here)
+                "claude": _caps(reasoning_effort=("low", "medium", "high")),  # entry override
+            }
+        )
+        config = self._inheritance_config(
+            inline=AgentDef(name="inner", prompt="{{ item }}"),
+            runtime=RuntimeConfig(provider="copilot", default_reasoning_effort="high"),
+        )
+        with pytest.raises(
+            ConfigurationError,
+            match="Agent 'inner'.*runtime.default_reasoning_effort.*does not support reasoning",
+        ):
+            validate_workflow_config(config)
+
+    def test_inline_inherits_workflow_mcp_servers_on_incapable_default_errors(
+        self, patch_caps: Any
+    ) -> None:
+        patch_caps(
+            {
+                "copilot": _caps(mcp_tools=False),  # default (inline inherits here)
+                "claude": _caps(mcp_tools=True),  # entry override
+            }
+        )
+        config = self._inheritance_config(
+            inline=AgentDef(name="inner", prompt="{{ item }}"),
+            runtime=RuntimeConfig(
+                provider="copilot",
+                mcp_servers={"docs": MCPServerDef(command="docs-server")},
+            ),
+        )
+        with pytest.raises(ConfigurationError, match="does not support MCP servers.*inner"):
+            validate_workflow_config(config)
+
+    def test_inline_inherits_workflow_max_session_seconds_on_incapable_default_errors(
+        self, patch_caps: Any
+    ) -> None:
+        patch_caps(
+            {
+                "copilot": _caps(max_session_seconds=False),  # default (inline inherits here)
+                "claude": _caps(max_session_seconds=True),  # entry override
+            }
+        )
+        config = self._inheritance_config(
+            inline=AgentDef(name="inner", prompt="{{ item }}"),
+            runtime=RuntimeConfig(provider="copilot", max_session_seconds=120.0),
+        )
+        with pytest.raises(ConfigurationError, match="does not enforce session timeouts.*inner"):
+            validate_workflow_config(config)
+
+    def test_inline_inherits_capable_default_passes(self, patch_caps: Any) -> None:
+        """A capable default provider honors the inherited workflow-level settings
+        → no error, even though the inline agent overrides nothing."""
+        patch_caps({"copilot": _caps(), "claude": _caps()})
+        config = self._inheritance_config(
+            inline=AgentDef(name="inner", prompt="{{ item }}"),
+            runtime=RuntimeConfig(
+                provider="copilot",
+                default_reasoning_effort="high",
+                max_session_seconds=120.0,
+                mcp_servers={"docs": MCPServerDef(command="docs-server")},
+            ),
+        )
+        validate_workflow_config(config)  # no raise
+
+    def test_inline_non_llm_human_gate_skipped(self, patch_caps: Any) -> None:
+        """A non-LLM (human_gate) inline agent must be SKIPPED by the
+        ``_is_llm_agent`` filter — even on an incapable default provider that
+        declares ``mcp_servers``, ``max_session_seconds``, AND
+        ``default_reasoning_effort`` that an LLM inline agent WOULD inherit and
+        fail on. Guards the inline ``_is_llm_agent`` guard (feeding
+        ``all_llm_agents`` and the for_each per-agent loop) against a future
+        refactor that drops it and spuriously fail-validates the workflow.
+        """
+        from conductor.config.schema import GateOption
+
+        patch_caps(
+            {
+                # Default provider is incapable on all three inherited axes;
+                # only a non-skipped LLM agent on it would raise.
+                "copilot": _caps(mcp_tools=False, max_session_seconds=False, reasoning_effort=None),
+                "claude": _caps(),  # entry override → capable, so entry never trips
+            }
+        )
+        config = self._inheritance_config(
+            inline=AgentDef(
+                name="gate",
+                type="human_gate",
+                prompt="Approve {{ item }}?",
+                options=[
+                    GateOption(label="OK", value="ok", route="$end"),
+                    GateOption(label="No", value="no", route="$end"),
+                ],
+            ),
+            runtime=RuntimeConfig(
+                provider="copilot",
+                default_reasoning_effort="high",
+                max_session_seconds=120.0,
+                mcp_servers={"docs": MCPServerDef(command="docs-server")},
+            ),
+        )
+        validate_workflow_config(config)  # must not raise — human_gate is skipped
