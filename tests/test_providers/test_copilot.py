@@ -1313,6 +1313,7 @@ class TestGetModelPricing:
         input_price: float | None = 100.0,
         output_price: float | None = 300.0,
         cache_price: float | None = 10.0,
+        multiplier: float = 1.0,
         billing: bool = True,
         token_prices: bool = True,
     ) -> Any:
@@ -1326,7 +1327,7 @@ class TestGetModelPricing:
                 output_price=output_price,
                 cache_price=cache_price,
             )
-        billing_obj = SimpleNamespace(multiplier=1.0, token_prices=tp) if billing else None
+        billing_obj = SimpleNamespace(multiplier=multiplier, token_prices=tp) if billing else None
         return SimpleNamespace(
             id=model_id,
             capabilities=SimpleNamespace(limits=SimpleNamespace(max_prompt_tokens=128_000)),
@@ -1473,6 +1474,92 @@ class TestGetModelPricing:
         pricing = await provider.get_model_pricing("claude-3-5-sonnet-latest")
         assert pricing is not None
         assert pricing.input_per_mtok == pytest.approx(1.0)
+
+    @pytest.mark.asyncio
+    async def test_negative_price_returns_none(self) -> None:
+        """A negative price is malformed — fall back to the table, don't emit it (#265)."""
+
+        async def list_neg_input() -> list[Any]:
+            return [self._make_model("gpt-4o", input_price=-5.0)]
+
+        async def list_neg_output() -> list[Any]:
+            return [self._make_model("gpt-4o", output_price=-1.0)]
+
+        p_in = self._provider_with_list_models(list_neg_input)
+        p_out = self._provider_with_list_models(list_neg_output)
+        assert await p_in.get_model_pricing("gpt-4o") is None
+        assert await p_out.get_model_pricing("gpt-4o") is None
+
+    @pytest.mark.asyncio
+    async def test_nan_or_inf_price_returns_none(self) -> None:
+        """NaN / inf prices are rejected rather than propagated as garbage cost (#265)."""
+
+        async def list_nan() -> list[Any]:
+            return [self._make_model("gpt-4o", input_price=float("nan"))]
+
+        async def list_inf() -> list[Any]:
+            return [self._make_model("gpt-4o", output_price=float("inf"))]
+
+        assert await self._provider_with_list_models(list_nan).get_model_pricing("gpt-4o") is None
+        assert await self._provider_with_list_models(list_inf).get_model_pricing("gpt-4o") is None
+
+    @pytest.mark.asyncio
+    async def test_zero_price_is_priced_as_free(self) -> None:
+        """A genuine 0.0 rate is a free model (distinct from unpriced) and is kept."""
+
+        async def list_models() -> list[Any]:
+            return [
+                self._make_model(
+                    "free-model", batch_size=1_000_000, input_price=0.0, output_price=0.0
+                )
+            ]
+
+        provider = self._provider_with_list_models(list_models)
+        pricing = await provider.get_model_pricing("free-model")
+        assert pricing is not None
+        assert pricing.input_per_mtok == 0.0
+        assert pricing.output_per_mtok == 0.0
+
+    @pytest.mark.asyncio
+    async def test_negative_cache_price_falls_back_to_zero(self) -> None:
+        """A malformed cache price degrades to 0.0 rather than a negative cache rate."""
+
+        async def list_models() -> list[Any]:
+            return [self._make_model("gpt-4o", cache_price=-3.0)]
+
+        provider = self._provider_with_list_models(list_models)
+        pricing = await provider.get_model_pricing("gpt-4o")
+        assert pricing is not None
+        assert pricing.cache_read_per_mtok == 0.0
+
+    @pytest.mark.asyncio
+    async def test_billing_multiplier_is_ignored(self) -> None:
+        """Per-request billing.multiplier must NOT scale the per-token price (#265).
+
+        Pins the intentional decision: token cost is billed per token via
+        token_prices; the premium-request multiplier is a separate mechanism.
+        """
+
+        async def list_models() -> list[Any]:
+            return [
+                self._make_model("gpt-5.5", batch_size=1_000_000, input_price=100.0, multiplier=5.0)
+            ]
+
+        provider = self._provider_with_list_models(list_models)
+        pricing = await provider.get_model_pricing("gpt-5.5")
+        assert pricing is not None
+        # $1.00/Mtok regardless of the 5x multiplier.
+        assert pricing.input_per_mtok == pytest.approx(1.0)
+
+    @pytest.mark.asyncio
+    async def test_malformed_models_list_returns_none(self) -> None:
+        """A non-iterable / malformed models payload degrades to None (never raises)."""
+
+        async def list_models() -> Any:
+            return object()  # not iterable — the dict comprehension would raise
+
+        provider = self._provider_with_list_models(list_models)
+        assert await provider.get_model_pricing("gpt-4o") is None
 
 
 class TestReasoningEffort:

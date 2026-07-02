@@ -10,12 +10,13 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 import os
 import random
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeGuard
 
 from conductor.exceptions import ProviderError, ValidationError
 from conductor.providers._event_format import (
@@ -41,6 +42,23 @@ logger = logging.getLogger(__name__)
 # ``get_model_pricing`` returns ``None`` and cost falls back to the static
 # table rather than emitting a confident-wrong number. See #265.
 _COPILOT_USD_PER_CREDIT: float = 0.01
+
+
+def _is_finite_nonneg(value: object) -> TypeGuard[float]:
+    """Return True only for a finite, non-negative real number.
+
+    Rejects ``None``, booleans, non-numeric types, ``NaN`` and ``inf`` — any of
+    which would turn a malformed SDK price into a confident-wrong cost. Used to
+    validate Copilot ``token_prices`` before deriving a :class:`ModelPricing`.
+    Narrows the value to ``float`` for the caller on success.
+    """
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and value >= 0.0
+    )
+
 
 # Events that should NOT reset the idle-detection clock. These are internal
 # bookkeeping / lifecycle events that can fire continuously (e.g. during stuck
@@ -2349,8 +2367,15 @@ class CopilotProvider(AgentProvider):
         Returns ``None`` (so cost falls back to the static table) in mock-handler
         mode, when the SDK is unavailable, when the model can't be matched, when
         the model carries no usable ``token_prices`` (missing ``batch_size`` /
-        input / output price), or when the SDK call fails. Never raises —
-        pricing metadata must not interrupt workflow execution.
+        input / output price, or a negative / non-finite price), or when the SDK
+        call fails. Never raises — pricing metadata must not interrupt workflow
+        execution.
+
+        Uses the model's default-tier ``token_prices`` only: the
+        ``long_context`` tier rate and the per-request ``billing.multiplier``
+        are intentionally ignored, because token cost is billed per token via
+        ``token_prices`` and ``output.model`` is identical across context tiers.
+        A long-context request is therefore priced at the default per-token rate.
 
         Catches ``Exception`` (not ``BaseException``) at the SDK boundary so
         ``asyncio.CancelledError`` / ``KeyboardInterrupt`` / ``SystemExit`` still
@@ -2364,32 +2389,39 @@ class CopilotProvider(AgentProvider):
         try:
             await self._ensure_client_started()
             models = await self._client.list_models()
+            by_id = {info.id: info for info in models}
         except Exception as e:
             logger.debug("Failed to list Copilot models for pricing of %r: %s", model, e)
             return None
-        by_id = {info.id: info for info in models}
         matched_id = match_model_id(model, by_id.keys())
         if matched_id is None:
             return None
-        info = by_id[matched_id]
-        billing = getattr(info, "billing", None)
-        token_prices = getattr(billing, "token_prices", None)
+        # getattr chains never raise, so the derivation below honors the
+        # never-raises contract without a second try/except.
+        token_prices = getattr(getattr(by_id[matched_id], "billing", None), "token_prices", None)
         if token_prices is None:
             return None
         batch_size = getattr(token_prices, "batch_size", None)
         input_price = getattr(token_prices, "input_price", None)
         output_price = getattr(token_prices, "output_price", None)
         cache_price = getattr(token_prices, "cache_price", None)
-        # Require a positive batch size and both input/output prices. Anything
-        # missing means we can't produce a trustworthy cost, so fall back to the
-        # static table rather than emitting a confident-wrong number.
-        if batch_size is None or batch_size <= 0 or input_price is None or output_price is None:
+        # Require a positive batch size and finite, non-negative input/output
+        # prices. Missing or malformed values (None / negative / NaN / inf) mean
+        # we can't produce a trustworthy cost, so fall back to the static table
+        # rather than emitting a confident-wrong number. A genuine 0.0 rate is a
+        # legitimately-free model and passes (ModelPricing(0, 0) encodes "free").
+        if not isinstance(batch_size, int) or isinstance(batch_size, bool) or batch_size <= 0:
+            return None
+        if not _is_finite_nonneg(input_price):
+            return None
+        if not _is_finite_nonneg(output_price):
             return None
 
         from conductor.engine.pricing import ModelPricing
 
         def _per_mtok(credits_per_batch: float) -> float:
-            # credits/batch → credits/token → USD/token → USD per million tokens.
+            # credits/batch → credits/token → credits/Mtok → USD/Mtok
+            # (the code applies ``* 1_000_000`` then ``* USD_PER_CREDIT``).
             return (credits_per_batch / batch_size) * 1_000_000 * _COPILOT_USD_PER_CREDIT
 
         return ModelPricing(
@@ -2397,7 +2429,7 @@ class CopilotProvider(AgentProvider):
             output_per_mtok=_per_mtok(output_price),
             # The SDK exposes a single cached-token price (a read rate); Copilot
             # models have no separate cache-write price.
-            cache_read_per_mtok=_per_mtok(cache_price) if cache_price is not None else 0.0,
+            cache_read_per_mtok=_per_mtok(cache_price) if _is_finite_nonneg(cache_price) else 0.0,
             cache_write_per_mtok=0.0,
         )
 

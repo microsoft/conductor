@@ -82,10 +82,11 @@ class WorkflowUsage:
         Sums only agents whose ``cost_usd`` is known. Returns ``None`` when
         no agent has cost data at all.
 
-        **This is a partial when :attr:`has_unpriced` is true** — agents whose
-        model had no available pricing are excluded from this sum. Callers that
-        present this as "the total" must also surface :attr:`unpriced_agents` /
-        :attr:`unpriced_models` so a silently-undercounted number is not shown
+        **This may be a partial (or ``None``) when :attr:`has_unpriced` is true** —
+        agents whose model had no available pricing are excluded from this sum
+        (and when *every* agent is unpriced it is ``None``, not a number). Callers
+        that present this as "the total" must also surface :attr:`unpriced_agents`
+        / :attr:`unpriced_models` so a silently-undercounted number is not shown
         as complete (see #265).
         """
         costs = [a.cost_usd for a in self.agents if a.cost_usd is not None]
@@ -221,7 +222,11 @@ class UsageTracker:
                 output_tokens=output_tokens,
                 cache_read_tokens=cache_read,
                 cache_write_tokens=cache_write,
-                pricing=get_pricing(output.model, self._pricing_overrides, self._provider_pricing),
+                pricing=get_pricing(
+                    output.model,
+                    self._pricing_overrides,
+                    provider_pricing=self._provider_pricing,
+                ),
             )
 
         usage = AgentUsage(

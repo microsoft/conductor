@@ -14,8 +14,11 @@ import pytest
 
 from conductor.config.schema import (
     AgentDef,
+    ForEachDef,
     LimitsConfig,
     OutputField,
+    ParallelGroup,
+    RouteDef,
     WorkflowConfig,
     WorkflowDef,
 )
@@ -27,6 +30,30 @@ from conductor.providers.copilot import CopilotProvider
 # A model deliberately absent from DEFAULT_PRICING so only the provider hook
 # (or its absence) determines whether cost is computed.
 _UNPRICED_MODEL = "totally-unpriced-model-xyz"
+
+
+def _priced_provider(
+    execute_impl,
+    pricing_calls: list[str] | None = None,
+):
+    """Build a CopilotProvider with patched execute + a hook that prices _UNPRICED_MODEL.
+
+    ``pricing_calls`` (when given) records each model the hook is asked about, so
+    tests can assert the hook is consulted once per distinct model.
+    """
+    provider = CopilotProvider(mock_handler=lambda *_a, **_kw: {})
+
+    async def fake_pricing(model: str) -> ModelPricing | None:
+        if pricing_calls is not None:
+            pricing_calls.append(model)
+        await asyncio.sleep(0)  # yield, mirroring the real hook's await
+        if model == _UNPRICED_MODEL:
+            return ModelPricing(input_per_mtok=10.0, output_per_mtok=30.0)
+        return None
+
+    provider.execute = execute_impl  # type: ignore[assignment]
+    provider.get_model_pricing = fake_pricing  # type: ignore[assignment]
+    return provider
 
 
 def _make_config() -> WorkflowConfig:
@@ -179,3 +206,122 @@ async def test_concurrent_same_model_agents_all_priced() -> None:
     # The hook is still consulted exactly once despite 4 concurrent callers.
     assert calls == 1
     assert engine.get_execution_summary()["usage"]["unpriced_agent_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_parallel_group_agents_priced_via_hook() -> None:
+    """The parallel-group record site resolves provider pricing end-to-end (#265).
+
+    Drives a real parallel group through ``engine.run`` (not a simulated call
+    site), so deleting ``_ensure_pricing_resolved`` from ``_execute_parallel_group``
+    would fail this test.
+    """
+    config = WorkflowConfig(
+        workflow=WorkflowDef(
+            name="parallel-pricing",
+            entry_point="group",
+            limits=LimitsConfig(max_iterations=10),
+        ),
+        agents=[
+            AgentDef(name="a1", prompt="t1", output={"result": OutputField(type="string")}),
+            AgentDef(name="a2", prompt="t2", output={"result": OutputField(type="string")}),
+        ],
+        parallel=[ParallelGroup(name="group", agents=["a1", "a2"], routes=[RouteDef(to="$end")])],
+        output={"done": "true"},
+    )
+
+    async def fake_execute(*_args: object, **_kwargs: object) -> AgentOutput:
+        return _make_output()
+
+    pricing_calls: list[str] = []
+    provider = _priced_provider(fake_execute, pricing_calls)
+    engine = WorkflowEngine(config, provider)
+    await engine.run({})
+
+    usage = engine.get_execution_summary()["usage"]
+    # Both parallel agents priced via the hook; none undercounted.
+    assert usage["unpriced_agent_count"] == 0
+    assert usage["total_cost_usd"] == pytest.approx(80.0)  # 2 agents x $40
+    # Hook consulted once for the shared model despite two concurrent agents.
+    assert pricing_calls == [_UNPRICED_MODEL]
+
+
+@pytest.mark.asyncio
+async def test_for_each_agents_priced_via_hook() -> None:
+    """The for-each record site resolves provider pricing end-to-end (#265)."""
+    config = WorkflowConfig(
+        workflow=WorkflowDef(
+            name="for-each-pricing",
+            entry_point="finder",
+            limits=LimitsConfig(max_iterations=20),
+        ),
+        agents=[
+            AgentDef(
+                name="finder",
+                prompt="find",
+                output={"items": OutputField(type="array")},
+                routes=[RouteDef(to="process")],
+            ),
+        ],
+        for_each=[
+            ForEachDef(
+                name="process",
+                type="for_each",
+                source="finder.output.items",
+                **{"as": "item"},
+                agent=AgentDef(
+                    name="proc",
+                    prompt="process {{ item }}",
+                    output={"result": OutputField(type="string")},
+                ),
+                max_concurrent=2,
+                routes=[RouteDef(to="$end")],
+            ),
+        ],
+        output={"done": "true"},
+    )
+
+    async def fake_execute(agent, *_args: object, **_kwargs: object) -> AgentOutput:
+        if agent.name == "finder":
+            return AgentOutput(
+                content={"items": ["a", "b"]},
+                raw_response="{}",
+                input_tokens=1_000_000,
+                output_tokens=1_000_000,
+                model=_UNPRICED_MODEL,
+            )
+        return _make_output()
+
+    pricing_calls: list[str] = []
+    provider = _priced_provider(fake_execute, pricing_calls)
+    engine = WorkflowEngine(config, provider)
+    await engine.run({})
+
+    usage = engine.get_execution_summary()["usage"]
+    # finder + 2 for-each items, all priced via the hook.
+    assert usage["unpriced_agent_count"] == 0
+    assert usage["total_cost_usd"] == pytest.approx(120.0)  # 3 agents x $40
+    assert pricing_calls == [_UNPRICED_MODEL]  # resolved once, cached across all
+
+
+@pytest.mark.asyncio
+async def test_systemic_hook_failure_warns_once(caplog: pytest.LogCaptureFixture) -> None:
+    """A raising pricing hook surfaces a single once-per-run warning (#265)."""
+    config = _make_config()
+    provider = CopilotProvider(mock_handler=lambda *_a, **_kw: {})
+
+    async def boom(_model: str) -> ModelPricing | None:
+        raise RuntimeError("SDK model listing is down")
+
+    provider.get_model_pricing = boom  # type: ignore[assignment]
+    engine = WorkflowEngine(config, provider)
+    agent = config.agents[0]
+
+    with caplog.at_level("WARNING", logger="conductor.engine.workflow"):
+        await engine._ensure_pricing_resolved(agent, "model-a")
+        await engine._ensure_pricing_resolved(agent, "model-b")
+
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1  # latched — only the first failure warns
+    assert "pricing hook failed" in warnings[0].getMessage()
+    assert engine._pricing_hook_failed_warned is True

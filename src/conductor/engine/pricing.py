@@ -248,6 +248,7 @@ DEFAULT_PRICING: dict[str, ModelPricing] = {
 def get_pricing(
     model: str,
     overrides: dict[str, ModelPricing] | None = None,
+    *,
     provider_pricing: dict[str, ModelPricing] | None = None,
 ) -> ModelPricing | None:
     """Get pricing for a model.

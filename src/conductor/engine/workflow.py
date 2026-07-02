@@ -379,13 +379,19 @@ class WorkflowEngine:
         )
 
         # Models whose provider pricing (the get_model_pricing hook) has been
-        # resolved this run — each distinct model is queried at most once and
-        # the result cached on the tracker. A model is added only after its
-        # price is cached (see _ensure_pricing_resolved). See #265.
+        # resolved this run — each distinct model is queried at most once. A
+        # model is added after the resolution attempt completes, whether a price
+        # was cached or the model was left unpriced (see _ensure_pricing_resolved).
+        # See #265.
         self._pricing_resolved_models: set[str] = set()
         # Per-model locks that serialize concurrent pricing resolution so
         # parallel/for-each siblings sharing a model don't race the cache.
         self._pricing_locks: dict[str, asyncio.Lock] = {}
+        # One-time latch so a systemic pricing-hook failure (e.g. the provider
+        # SDK's model listing breaks) is surfaced once per run instead of only
+        # at debug level — otherwise table-priced models still show a normal
+        # cost and the broken live pricing is invisible (see #265).
+        self._pricing_hook_failed_warned = False
 
         # One-time latch so the "budget set but no pricing" degraded warning
         # is emitted at most once per workflow run (see _check_budget).
@@ -1673,9 +1679,10 @@ class WorkflowEngine:
         Concurrency: parallel groups and for-each batches run several agents that
         usually share the same model. A per-model :class:`asyncio.Lock` serializes
         resolution, and the model is added to ``_pricing_resolved_models`` **only
-        after** the price is cached — so a sibling coroutine that arrives while the
-        first is still awaiting the hook waits on the lock rather than racing ahead
-        to ``record`` and mis-recording the model as unpriced.
+        after** the resolution attempt completes (a price cached, or the model
+        left unpriced) — so a sibling coroutine that arrives while the first is
+        still awaiting the hook waits on the lock rather than racing ahead to
+        ``record`` and mis-recording the model as unpriced.
 
         Never raises: pricing metadata is optional and must not interrupt
         execution. On any failure the model simply stays unpriced (falling
@@ -1692,7 +1699,8 @@ class WorkflowEngine:
         """
         if not model or not isinstance(model, str):
             return
-        # Fast path: already fully resolved (cache populated).
+        # Fast path: this model was already attempted this run (price cached, or
+        # deliberately left unpriced).
         if model in self._pricing_resolved_models:
             return
         # setdefault has no await, so concurrent callers share one lock instance.
@@ -1712,9 +1720,23 @@ class WorkflowEngine:
                         agent.name,
                         e,
                     )
+                    # A raising hook usually means a systemic break (SDK auth /
+                    # model-listing failure), which silently degrades pricing for
+                    # every model — table-priced models still show a normal cost,
+                    # so the breakage is otherwise invisible. Surface it once.
+                    if not self._pricing_hook_failed_warned:
+                        self._pricing_hook_failed_warned = True
+                        logger.warning(
+                            "Provider pricing hook failed for model %r (%s); live "
+                            "pricing is unavailable and costs will use the static "
+                            "table or show as unpriced. Further failures are logged "
+                            "at debug level.",
+                            model,
+                            e,
+                        )
                 else:
                     self.usage_tracker.set_provider_pricing(model, pricing)
-            # Mark resolved only now — after any pricing is cached — even on a
+            # Mark resolved only now — after the attempt completes — even on a
             # provider-None / failure / None result, so it isn't retried on every
             # record and the model stays unpriced via the static-table fallback.
             self._pricing_resolved_models.add(model)

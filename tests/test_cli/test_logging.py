@@ -1488,6 +1488,67 @@ class TestFileLoggingDualWrite:
         finally:
             verbose_mode.reset(token)
 
+    def test_display_usage_summary_unpriced_without_model_names(self, tmp_path: Path) -> None:
+        """Partial total with only None-model unpriced agents omits the ': names' list (#265)."""
+        from conductor.cli.run import close_file_logging, display_usage_summary, init_file_logging
+
+        log_path = tmp_path / "test.log"
+        token = verbose_mode.set(False)
+        try:
+            init_file_logging(log_path)
+            display_usage_summary(
+                {
+                    "total_input_tokens": 3000,
+                    "total_output_tokens": 1500,
+                    "total_tokens": 4500,
+                    "total_cost_usd": 0.01,
+                    "unpriced_agent_count": 2,
+                    "unpriced_models": [],  # every unpriced agent had model=None
+                    "agents": [
+                        {"agent_name": "priced", "cost_usd": 0.01},
+                        {"agent_name": "u1", "cost_usd": None},
+                        {"agent_name": "u2", "cost_usd": None},
+                    ],
+                }
+            )
+            close_file_logging()
+
+            content = log_path.read_text(encoding="utf-8")
+            assert "2 agents unpriced)" in content  # count, no trailing model list
+            assert "unpriced:" not in content  # no ": model-a, ..." suffix
+            assert "~$0.0100" in content
+        finally:
+            verbose_mode.reset(token)
+
+    def test_display_usage_summary_fully_priced_has_no_partial_marker(self, tmp_path: Path) -> None:
+        """A fully-priced run shows a clean total — no '~' or 'Partial total' (#265)."""
+        from conductor.cli.run import close_file_logging, display_usage_summary, init_file_logging
+
+        log_path = tmp_path / "test.log"
+        token = verbose_mode.set(False)
+        try:
+            init_file_logging(log_path)
+            display_usage_summary(
+                {
+                    "total_input_tokens": 1000,
+                    "total_output_tokens": 500,
+                    "total_tokens": 1500,
+                    "total_cost_usd": 0.02,
+                    "unpriced_agent_count": 0,
+                    "unpriced_models": [],
+                    "agents": [{"agent_name": "a", "cost_usd": 0.02}],
+                }
+            )
+            close_file_logging()
+
+            content = log_path.read_text(encoding="utf-8")
+            assert "Total: $0.0200" in content
+            assert "~$" not in content
+            assert "Partial total" not in content
+            assert "unpriced" not in content
+        finally:
+            verbose_mode.reset(token)
+
     def test_section_writes_full_content_to_file_in_silent_mode(self, tmp_path: Path) -> None:
         """Test that verbose_log_section writes full content to file even in SILENT mode."""
         from conductor.cli.run import close_file_logging, init_file_logging, verbose_log_section
