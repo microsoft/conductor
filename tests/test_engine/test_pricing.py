@@ -111,6 +111,37 @@ class TestGetPricing:
         for model in expected_models:
             assert model in DEFAULT_PRICING, f"Expected {model} in DEFAULT_PRICING"
 
+    @pytest.mark.parametrize(
+        ("model", "input_per_mtok", "output_per_mtok"),
+        [
+            # GPT-5.x family (standard rate) and mini variants (#266).
+            ("gpt-5.5", 2.00, 8.00),
+            ("gpt-5.4", 2.00, 8.00),
+            ("gpt-5.3-codex", 2.00, 8.00),
+            ("gpt-5-mini", 0.15, 0.60),
+            ("gpt-5.4-mini", 0.15, 0.60),
+            # Claude families (#266).
+            ("claude-opus-4.8", 5.00, 25.00),
+            ("claude-opus-4.7", 5.00, 25.00),
+            ("claude-sonnet-5", 3.00, 15.00),
+            # Gemini (#266).
+            ("gemini-3.5-flash", 0.30, 2.50),
+        ],
+    )
+    def test_current_models_have_exact_pricing(
+        self, model: str, input_per_mtok: float, output_per_mtok: float
+    ) -> None:
+        """Current models resolve via an exact key, not the $0 None fallback (#266).
+
+        These dotted version suffixes are not bridged by the ``-``-delimited
+        fuzzy fallback, so a missing exact key silently costs $0.
+        """
+        assert model in DEFAULT_PRICING, f"Expected {model} in DEFAULT_PRICING"
+        pricing = get_pricing(model)
+        assert pricing is not None, f"{model} unexpectedly returned None pricing"
+        assert pricing.input_per_mtok == input_per_mtok
+        assert pricing.output_per_mtok == output_per_mtok
+
 
 class TestFuzzyMatchWarnings:
     """Tests for the fuzzy-match warning behavior (#137)."""
@@ -141,15 +172,18 @@ class TestFuzzyMatchWarnings:
         assert caplog.records == []
 
     def test_cross_family_name_returns_none_no_warn(self, caplog: pytest.LogCaptureFixture) -> None:
-        # Repro from #137: these names share a textual prefix with claude-opus-4
-        # but are different model families. The delimiter check should reject
-        # the match entirely (returning None and degrading gracefully) rather
-        # than silently inheriting claude-opus-4's pricing/context-window.
+        # Repro from #137: a dotted version suffix shares a textual prefix with
+        # the dashed base key claude-opus-4 but is a different family. The
+        # delimiter check must reject the match entirely (returning None and
+        # degrading gracefully) rather than silently inheriting claude-opus-4's
+        # pricing/context-window. A deliberately synthetic version (4.123) is
+        # used so this stays absent from DEFAULT_PRICING as real dotted models
+        # (4.6/4.7/4.8/…) get added over time.
         with caplog.at_level("WARNING", logger="conductor.engine.pricing"):
-            assert get_pricing("claude-opus-4.7") is None
-            assert get_pricing("claude-opus-4.7-high") is None
-            assert get_pricing("claude-opus-4.7-xhigh") is None
-            assert get_pricing("claude-opus-4.7-1m-internal") is None
+            assert get_pricing("claude-opus-4.123") is None
+            assert get_pricing("claude-opus-4.123-high") is None
+            assert get_pricing("claude-opus-4.123-xhigh") is None
+            assert get_pricing("claude-opus-4.123-1m-internal") is None
         assert caplog.records == []
 
     def test_versioned_suffix_match_warns(self, caplog: pytest.LogCaptureFixture) -> None:

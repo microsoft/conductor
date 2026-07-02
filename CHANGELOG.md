@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Missing pricing for current models costed them at $0** — several current
+  models had no `DEFAULT_PRICING` entry, so `get_pricing` returned `None` and
+  they were silently costed at $0 in the Token Usage Summary / cost breakdown
+  (dotted version suffixes like `claude-opus-4.8` are not bridged by the
+  `-`-delimited fuzzy fallback). Added entries for `claude-opus-4.7`,
+  `claude-opus-4.8`, `claude-sonnet-5`, `gpt-5.3-codex`, `gpt-5.4`, `gpt-5.5`,
+  `gpt-5-mini`, `gpt-5.4-mini`, and `gemini-3.5-flash`. (The related
+  sub-workflow usage under-reporting in the same issue was already fixed in
+  [#212](https://github.com/microsoft/conductor/pull/212).)
+  ([#266](https://github.com/microsoft/conductor/issues/266))
 - **For-each dive-in worked only for finished items** — in the web dashboard's
   for-each group detail panel, the per-item "Dive into subworkflow" control was
   nested inside the row's expand/collapse `<button>`, which is `disabled` while

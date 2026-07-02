@@ -69,14 +69,27 @@ DEFAULT_PRICING: dict[str, ModelPricing] = {
     "gpt-4.1-mini": ModelPricing(input_per_mtok=0.15, output_per_mtok=0.60),
     "gpt-4": ModelPricing(input_per_mtok=30.00, output_per_mtok=60.00),
     "gpt-3.5-turbo": ModelPricing(input_per_mtok=0.50, output_per_mtok=1.50),
+    # GPT-5.x Series (uniform standard rate; mini variants at the mini tier)
+    "gpt-5.5": ModelPricing(input_per_mtok=2.00, output_per_mtok=8.00),
+    "gpt-5.4": ModelPricing(input_per_mtok=2.00, output_per_mtok=8.00),
+    "gpt-5.3-codex": ModelPricing(input_per_mtok=2.00, output_per_mtok=8.00),
     "gpt-5.2": ModelPricing(input_per_mtok=2.00, output_per_mtok=8.00),
     "gpt-5.1": ModelPricing(input_per_mtok=2.00, output_per_mtok=8.00),
+    "gpt-5.4-mini": ModelPricing(input_per_mtok=0.15, output_per_mtok=0.60),
+    "gpt-5-mini": ModelPricing(input_per_mtok=0.15, output_per_mtok=0.60),
     # O-series
     "o1": ModelPricing(input_per_mtok=15.00, output_per_mtok=60.00),
     "o1-mini": ModelPricing(input_per_mtok=3.00, output_per_mtok=12.00),
     "o1-preview": ModelPricing(input_per_mtok=15.00, output_per_mtok=60.00),
     "o3-mini": ModelPricing(input_per_mtok=1.10, output_per_mtok=4.40),
-    # Claude 4.5 Series (newest)
+    # Claude 5 Series (newest)
+    "claude-sonnet-5": ModelPricing(
+        input_per_mtok=3.00,
+        output_per_mtok=15.00,
+        cache_read_per_mtok=0.30,
+        cache_write_per_mtok=3.75,
+    ),
+    # Claude 4.5 Series
     "claude-opus-4-5": ModelPricing(
         input_per_mtok=5.00,
         output_per_mtok=25.00,
@@ -132,6 +145,19 @@ DEFAULT_PRICING: dict[str, ModelPricing] = {
         output_per_mtok=15.00,
         cache_read_per_mtok=0.30,
         cache_write_per_mtok=3.75,
+    ),
+    # Claude 4.7 / 4.8 Series
+    "claude-opus-4.8": ModelPricing(
+        input_per_mtok=5.00,
+        output_per_mtok=25.00,
+        cache_read_per_mtok=0.50,
+        cache_write_per_mtok=6.25,
+    ),
+    "claude-opus-4.7": ModelPricing(
+        input_per_mtok=5.00,
+        output_per_mtok=25.00,
+        cache_read_per_mtok=0.50,
+        cache_write_per_mtok=6.25,
     ),
     # Claude 4 Series
     "claude-opus-4": ModelPricing(
@@ -211,6 +237,10 @@ DEFAULT_PRICING: dict[str, ModelPricing] = {
     "gemini-3.1-pro-preview": ModelPricing(
         input_per_mtok=1.25,
         output_per_mtok=5.00,
+    ),
+    "gemini-3.5-flash": ModelPricing(
+        input_per_mtok=0.30,
+        output_per_mtok=2.50,
     ),
 }
 
