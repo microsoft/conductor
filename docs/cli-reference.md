@@ -8,6 +8,7 @@ Complete command-line reference for Conductor.
 - [`conductor stop`](#conductor-stop)
 - [`conductor gate-respond`](#conductor-gate-respond)
 - [`conductor validate`](#conductor-validate)
+- [`conductor doctor`](#conductor-doctor)
 - [`conductor registry`](#conductor-registry)
 
 ## `conductor run`
@@ -324,6 +325,88 @@ for f in examples/*.yaml; do conductor validate "$f"; done
 
 **Warnings** (validation passes with notes):
 - **Undeclared dependencies in explicit mode** — agent prompt references `{{ a.output.val }}` but doesn't declare `a.output` in its `input:` list
+
+## `conductor doctor`
+
+Report provider and environment diagnostics — a safe, read-only health check
+for your Conductor setup. Answers "is my setup healthy?" without running a
+workflow: which providers are installed, their stability tier, which
+credential environment variables are detected, plus Conductor version /
+update status and configured registries.
+
+```bash
+conductor doctor [SECTION] [OPTIONS]
+```
+
+`SECTION` (optional positional) limits output to one of `providers`,
+`registries`, or `env`. When omitted, all three sections are shown.
+
+**Offline by default** — no providers are instantiated and no credentials are
+required. The only default network access is the GitHub-releases update check
+in the `env` section (cache-first, short timeout, silent, and skipped when
+`CONDUCTOR_NO_UPDATE_CHECK` is set).
+
+### Options
+
+| Option | Short | Description |
+|--------|-------|-------------|
+| `--check` | | Instantiate each provider and test its connection via `validate_connection()` (performs network I/O). |
+| `--models` | | List each provider's available models (implies `--check`). |
+| `--provider NAME` | `-p` | Scope the providers section to a single provider. |
+| `--json` | | Emit machine-readable JSON instead of Rich tables (for CI). |
+
+### Sections
+
+- **env** — Conductor version, Python version, OS/platform, and update
+  availability.
+- **providers** — for each known provider (`copilot`, `claude`,
+  `claude-agent-sdk`, `hermes`, `openai-agents`): whether the SDK is
+  installed, the capability tier (`stable` / `experimental`), which
+  credential environment variables are **present** (presence only — values
+  are never printed), and — with `--check` / `--models` — connection status
+  and available models. `openai-agents` is surfaced as "not yet implemented".
+- **registries** — configured workflow registries and which is the default
+  (see [`conductor registry`](#conductor-registry)).
+
+### Credential detection
+
+Only the **presence** of credential environment variables is reported —
+values are never read or printed. Detected variables per provider:
+
+| Provider | Environment variables |
+|----------|-----------------------|
+| `copilot` | `GITHUB_TOKEN`, `GH_TOKEN`, `COPILOT_PROVIDER_API_KEY`, `COPILOT_PROVIDER_BEARER_TOKEN` |
+| `claude` | `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` |
+| `claude-agent-sdk` | `ANTHROPIC_API_KEY` |
+| `hermes` | *(none — endpoint / API key are passed explicitly)* |
+
+### Exit codes
+
+- `0` — success (the default for offline runs; missing credentials for an
+  *optional* provider never fail the command).
+- `1` — an invalid `SECTION`/`--provider` was given, **or** `--check` was set
+  and the **scoped** provider failed to connect. The scoped provider is the
+  one named by `--provider`, or `copilot` (the default) when `--provider` is
+  omitted.
+
+### Examples
+
+```bash
+# Full offline report (all sections)
+conductor doctor
+
+# Just the providers section
+conductor doctor providers
+
+# Actually test provider connections (network)
+conductor doctor --check
+
+# List available models for a single provider
+conductor doctor --models --provider claude
+
+# Machine-readable output for CI
+conductor doctor --json
+```
 
 ## `conductor registry`
 

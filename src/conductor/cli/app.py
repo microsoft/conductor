@@ -251,10 +251,12 @@ def main(
     if console.is_terminal and verbosity != ConsoleVerbosity.SILENT:
         import sys
 
-        # Skip when the subcommand is 'update'
+        # Skip when the subcommand is 'update' or 'doctor' — both surface
+        # update status in their own output (doctor in its env section), so
+        # the startup hint would be redundant noise.
         args = sys.argv[1:]
         subcommand = next((a for a in args if not a.startswith("-")), None)
-        if subcommand != "update":
+        if subcommand not in ("update", "doctor"):
             from conductor.cli.update import check_for_update_hint
 
             check_for_update_hint(console)
@@ -1439,3 +1441,82 @@ def update(
     except Exception as e:
         print_error(e)
         raise typer.Exit(code=1) from None
+
+
+@app.command()
+def doctor(
+    section: Annotated[
+        str | None,
+        typer.Argument(
+            help="Section to show: providers | registries | env. Default: all sections.",
+        ),
+    ] = None,
+    check: Annotated[
+        bool,
+        typer.Option(
+            "--check",
+            help="Instantiate providers and test their connections (network).",
+        ),
+    ] = False,
+    models: Annotated[
+        bool,
+        typer.Option(
+            "--models",
+            help="List available models for each provider (implies --check).",
+        ),
+    ] = False,
+    provider: Annotated[
+        str | None,
+        typer.Option(
+            "--provider",
+            "-p",
+            help="Scope the providers section to a single provider.",
+        ),
+    ] = None,
+    as_json: Annotated[
+        bool,
+        typer.Option(
+            "--json",
+            help="Emit machine-readable JSON instead of tables.",
+        ),
+    ] = False,
+) -> None:
+    """Report provider & environment diagnostics.
+
+    A safe, read-only health check for your Conductor setup: which providers
+    are installed, their stability tier, which credential environment
+    variables are detected (presence only — values are never printed), plus
+    Conductor version / update status and configured registries.
+
+    Offline by default — no providers are instantiated and no credentials are
+    required. (The default env section does a cache-first GitHub update check;
+    set CONDUCTOR_NO_UPDATE_CHECK to disable it.) Use --check to actually test
+    provider connections, and --models to list each provider's available
+    models.
+
+    \b
+    Examples:
+        conductor doctor                     # all sections
+        conductor doctor providers           # providers section only
+        conductor doctor --check             # test provider connections
+        conductor doctor --models -p claude  # list Claude's models
+        conductor doctor --json              # machine-readable output
+    """
+    from conductor.cli.doctor import run_doctor
+
+    try:
+        exit_code = run_doctor(
+            section=section,
+            provider=provider,
+            check=check,
+            models=models,
+            as_json=as_json,
+            console=output_console,
+            err_console=console,
+        )
+    except Exception as e:
+        print_error(e)
+        raise typer.Exit(code=1) from None
+
+    if exit_code != 0:
+        raise typer.Exit(code=exit_code)

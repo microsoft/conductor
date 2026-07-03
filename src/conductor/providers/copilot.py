@@ -2435,6 +2435,29 @@ class CopilotProvider(AgentProvider):
             cache_write_per_mtok=0.0,
         )
 
+    async def list_models(self) -> list[str] | None:
+        """Return the model ids advertised by the Copilot SDK.
+
+        Queries ``client.list_models()`` and returns the ``id`` of every
+        entry. Used by ``conductor doctor --models``.
+
+        Returns ``None`` in mock-handler mode, when the SDK is unavailable,
+        or when the SDK call fails — diagnostics must never raise.
+
+        Catches ``Exception`` (not ``BaseException``) at the SDK boundary so
+        ``asyncio.CancelledError``/``KeyboardInterrupt``/``SystemExit`` still
+        propagate, mirroring :meth:`get_max_prompt_tokens`.
+        """
+        if self._mock_handler is not None or not COPILOT_SDK_AVAILABLE:
+            return None
+        try:
+            await self._ensure_client_started()
+            models = await self._client.list_models()
+        except Exception as e:
+            logger.debug("Failed to list Copilot models: %s", e)
+            return None
+        return [info.id for info in models]
+
     async def _validate_reasoning_effort_for_model(
         self, model: str, effort: ReasoningEffort
     ) -> None:
