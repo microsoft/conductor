@@ -308,6 +308,21 @@ class TestDoctorFlags:
         assert result.exit_code == 0
         assert "gpt-5" in result.output
 
+    def test_all_models_shown_no_truncation(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Every model id must appear — no "(+N more)" cap. Use a wide render so
+        # the assertion isn't defeated by cell wrapping mid-identifier.
+        models = [f"model-{i:02d}" for i in range(20)]
+        report = DoctorReport(
+            providers=[_prov("copilot", checked=True, connection_ok=True, models=models)]
+        )
+        _patch_gather(monkeypatch, report)
+        monkeypatch.setattr(_app_module, "output_console", Console(width=1000))
+        result = runner.invoke(app, ["doctor", "--models"])
+        assert result.exit_code == 0
+        assert "more)" not in result.output
+        for model in models:
+            assert model in result.output
+
 
 # ---------------------------------------------------------------------------
 # Error handling

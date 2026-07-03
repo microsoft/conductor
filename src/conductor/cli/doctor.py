@@ -248,16 +248,19 @@ def _connection_cell(diag: ProviderDiagnostic) -> str:
 
 
 def _models_cell(diag: ProviderDiagnostic) -> str:
-    """Format the models cell."""
+    """Format the models cell.
+
+    Lists every model id (comma-separated); Rich wraps the cell to the column
+    width. The leading count makes long lists scannable. ``n/a`` when models
+    is None (not enumerated), ``(none)`` for an empty list.
+    """
     if diag.models_error:
         return f"{_CROSS} [dim]{escape(diag.models_error)}[/dim]"
     if diag.models is None:
         return "[dim]n/a[/dim]"
     if not diag.models:
         return "[dim](none)[/dim]"
-    shown = ", ".join(escape(model) for model in diag.models[:6])
-    if len(diag.models) > 6:
-        shown += f" [dim](+{len(diag.models) - 6} more)[/dim]"
+    shown = ", ".join(escape(model) for model in diag.models)
     return f"[dim]{len(diag.models)}:[/dim] {shown}"
 
 
