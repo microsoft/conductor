@@ -236,7 +236,7 @@ def _try_linkify_path(token: str, base_dir: Path | None) -> str | None:
     if base_dir is not None:
         try:
             resolved_base = base_dir.resolve()
-            candidate = (base_dir / stripped).resolve()
+            candidate = (base_dir / normalized).resolve()
             # Security: must be within base_dir (path-aware containment, not
             # string-prefix — `/foo/bar` must not match `/foo/barbaz/...`).
             if not candidate.is_relative_to(resolved_base):
