@@ -58,6 +58,7 @@ class TestResolveEnvVars:
                 resolve_env_vars("${REQUIRED_VAR}")
             assert "REQUIRED_VAR" in str(exc_info.value)
             assert "not set" in str(exc_info.value)
+            assert "${REQUIRED_VAR:-default_value}" in str(exc_info.value)
 
     def test_resolve_empty_default(self) -> None:
         """Test that empty default is allowed."""
