@@ -17,7 +17,7 @@
 #   conductor run examples/periodic-checkpoints.yaml --input topic="vector databases"
 #
 # If the run stalls, kill it, then:
-#   conductor checkpoints examples/periodic-checkpoints.yaml   # inspect (Trigger column)
+#   conductor checkpoint list examples/periodic-checkpoints.yaml   # inspect (Trigger column)
 #   conductor resume examples/periodic-checkpoints.yaml        # continue from the last step
 
 workflow:

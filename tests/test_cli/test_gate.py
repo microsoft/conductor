@@ -1,4 +1,5 @@
-"""Tests for ``conductor gate-respond`` CLI command.
+"""Tests for ``conductor gate respond`` CLI command (and its hidden
+``gate-respond`` deprecated alias).
 
 Covers:
 - Happy path with mock HTTP server
@@ -34,15 +35,16 @@ def _mock_response(status_code: int = 200, json_data: dict | None = None) -> Mag
 
 
 class TestGateRespondHappyPath:
-    """Happy path: gate-respond with all required args."""
+    """Happy path: gate respond with all required args."""
 
     @patch("httpx.post")
     def test_basic_resolve(self, mock_post: MagicMock) -> None:
-        """gate-respond --port 8080 --choice approve --agent review-gate succeeds."""
+        """gate respond --port 8080 --choice approve --agent review-gate succeeds."""
         mock_post.return_value = _mock_response(200, {"status": "accepted"})
 
         result = runner.invoke(
-            app, ["gate-respond", "--port", "8080", "--choice", "approve", "--agent", "review-gate"]
+            app,
+            ["gate", "respond", "--port", "8080", "--choice", "approve", "--agent", "review-gate"],
         )
         assert result.exit_code == 0
         assert "Gate resolved" in result.output
@@ -62,7 +64,8 @@ class TestGateRespondHappyPath:
         result = runner.invoke(
             app,
             [
-                "gate-respond",
+                "gate",
+                "respond",
                 "--port",
                 "8080",
                 "--choice",
@@ -88,7 +91,7 @@ class TestGateRespondUnreachablePort:
 
         result = runner.invoke(
             app,
-            ["gate-respond", "--port", "9999", "--choice", "approve", "--agent", "g1"],
+            ["gate", "respond", "--port", "9999", "--choice", "approve", "--agent", "g1"],
         )
         assert result.exit_code == 1
         assert "Cannot connect" in result.output
@@ -104,7 +107,8 @@ class TestGateRespondTokenHandling:
         result = runner.invoke(
             app,
             [
-                "gate-respond",
+                "gate",
+                "respond",
                 "--port",
                 "8080",
                 "--choice",
@@ -130,7 +134,7 @@ class TestGateRespondTokenHandling:
         with patch.dict(os.environ, {"CONDUCTOR_GATE_TOKEN": "env-token"}):
             result = runner.invoke(
                 app,
-                ["gate-respond", "--port", "8080", "--choice", "approve", "--agent", "g1"],
+                ["gate", "respond", "--port", "8080", "--choice", "approve", "--agent", "g1"],
             )
         assert result.exit_code == 0
 
@@ -145,7 +149,8 @@ class TestGateRespondTokenHandling:
             result = runner.invoke(
                 app,
                 [
-                    "gate-respond",
+                    "gate",
+                    "respond",
                     "--port",
                     "8080",
                     "--choice",
@@ -169,7 +174,7 @@ class TestGateRespondTokenHandling:
         with patch.dict(os.environ, env, clear=True):
             result = runner.invoke(
                 app,
-                ["gate-respond", "--port", "8080", "--choice", "approve", "--agent", "g1"],
+                ["gate", "respond", "--port", "8080", "--choice", "approve", "--agent", "g1"],
             )
         assert result.exit_code == 0
 
@@ -182,7 +187,7 @@ class TestGateRespondTokenHandling:
 
         result = runner.invoke(
             app,
-            ["gate-respond", "--port", "8080", "--choice", "approve", "--agent", "g1"],
+            ["gate", "respond", "--port", "8080", "--choice", "approve", "--agent", "g1"],
         )
         assert result.exit_code == 1
         assert "Authentication failed" in result.output
@@ -195,7 +200,7 @@ class TestGateRespondTokenHandling:
 
         result = runner.invoke(
             app,
-            ["gate-respond", "--port", "8080", "--choice", "approve", "--agent", "g1"],
+            ["gate", "respond", "--port", "8080", "--choice", "approve", "--agent", "g1"],
         )
         assert result.exit_code == 1
         assert "waiting" in result.output.lower()
@@ -212,7 +217,7 @@ class TestGateRespondAutoDiscovery:
 
         result = runner.invoke(
             app,
-            ["gate-respond", "--port", "8080", "--choice", "approve"],
+            ["gate", "respond", "--port", "8080", "--choice", "approve"],
         )
         assert result.exit_code == 0
         assert "auto-gate" in result.output
@@ -226,7 +231,7 @@ class TestGateRespondAutoDiscovery:
 
         result = runner.invoke(
             app,
-            ["gate-respond", "--port", "8080", "--choice", "approve"],
+            ["gate", "respond", "--port", "8080", "--choice", "approve"],
         )
         assert result.exit_code == 1
         assert "No gate is currently waiting" in result.output
@@ -237,7 +242,7 @@ class TestGateRespondAutoDiscovery:
 
         result = runner.invoke(
             app,
-            ["gate-respond", "--port", "9999", "--choice", "approve"],
+            ["gate", "respond", "--port", "9999", "--choice", "approve"],
         )
         assert result.exit_code == 1
         assert "Cannot connect" in result.output
@@ -249,7 +254,7 @@ class TestGateRespondAutoDiscovery:
 
         result = runner.invoke(
             app,
-            ["gate-respond", "--port", "8080", "--choice", "approve"],
+            ["gate", "respond", "--port", "8080", "--choice", "approve"],
         )
         assert result.exit_code == 1
         assert "Failed to query gate status" in result.output
@@ -265,7 +270,7 @@ class TestGateRespondErrorResponses:
 
         result = runner.invoke(
             app,
-            ["gate-respond", "--port", "8080", "--choice", "approve", "--agent", "g1"],
+            ["gate", "respond", "--port", "8080", "--choice", "approve", "--agent", "g1"],
         )
         assert result.exit_code == 1
         assert "Request failed" in result.output
@@ -276,7 +281,7 @@ class TestGateRespondErrorResponses:
 
         result = runner.invoke(
             app,
-            ["gate-respond", "--port", "8080", "--choice", "approve", "--agent", "g1"],
+            ["gate", "respond", "--port", "8080", "--choice", "approve", "--agent", "g1"],
         )
         assert result.exit_code == 1
         assert "selected_value is required" in result.output
@@ -287,8 +292,59 @@ class TestGateRespondErrorResponses:
 
         result = runner.invoke(
             app,
-            ["gate-respond", "--port", "8080", "--choice", "approve", "--agent", "g1"],
+            ["gate", "respond", "--port", "8080", "--choice", "approve", "--agent", "g1"],
         )
         assert result.exit_code == 1
         assert "Unexpected response" in result.output
         assert "500" in result.output
+
+
+class TestGateRespondDeprecatedAlias:
+    """The hidden ``gate-respond`` alias still works, warns, and forwards."""
+
+    @patch("httpx.post")
+    def test_alias_warns_and_forwards(self, mock_post: MagicMock) -> None:
+        """`gate-respond` emits a deprecation notice and forwards to the impl."""
+        mock_post.return_value = _mock_response(200, {"status": "accepted"})
+
+        result = runner.invoke(
+            app,
+            ["gate-respond", "--port", "8080", "--choice", "approve", "--agent", "g1"],
+        )
+        assert result.exit_code == 0
+        # Collapse Rich line-wrapping before matching the message.
+        normalized = " ".join(result.output.split())
+        assert "deprecated" in normalized
+        assert "removed in a future release" in normalized
+        assert "conductor gate respond" in normalized
+        # Forwarded to the shared impl: the POST still fires and the gate resolves.
+        assert "Gate resolved" in normalized
+        mock_post.assert_called_once()
+
+    @patch("httpx.post")
+    def test_alias_matches_new_command(self, mock_post: MagicMock) -> None:
+        """Alias resolves identically to ``gate respond`` — forwarding parity."""
+        mock_post.return_value = _mock_response(200, {"status": "accepted"})
+        args = ["--port", "8080", "--choice", "approve", "--agent", "g1"]
+
+        alias = runner.invoke(app, ["gate-respond", *args])
+        canonical = runner.invoke(app, ["gate", "respond", *args])
+
+        assert alias.exit_code == canonical.exit_code == 0
+        assert "Gate resolved" in alias.output
+        assert "Gate resolved" in canonical.output
+        # The canonical command does not print the deprecation notice.
+        assert "deprecated" not in canonical.output
+
+    def test_alias_hidden_from_help(self) -> None:
+        """The deprecated alias is registered and invokable, but marked hidden."""
+        import click
+        import typer
+
+        group = typer.main.get_command(app)
+        ctx = click.Context(group)
+        alias = group.get_command(ctx, "gate-respond")
+        assert alias is not None  # still invokable
+        assert alias.hidden is True  # but out of --help
+        # The canonical group stays visible.
+        assert group.get_command(ctx, "gate").hidden is False

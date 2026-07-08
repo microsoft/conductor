@@ -1,13 +1,10 @@
-"""Tests for the resume and checkpoints CLI commands.
+"""Tests for the resume CLI command.
 
 Tests cover:
 - resume command with --from checkpoint path
 - resume command with workflow path (finds latest checkpoint)
 - resume command missing arguments error
 - resume command with nonexistent checkpoint error
-- checkpoints command with no checkpoints
-- checkpoints command with multiple checkpoints
-- checkpoints command filtered by workflow path
 - Workflow hash mismatch warning on resume
 """
 
@@ -22,7 +19,7 @@ import pytest
 from typer.testing import CliRunner
 
 from conductor.cli.app import app
-from conductor.engine.checkpoint import CheckpointData, CheckpointManager
+from conductor.engine.checkpoint import CheckpointManager
 
 runner = CliRunner()
 
@@ -472,142 +469,6 @@ class TestLaunchBackgroundResume:
         assert "--from" in cmd
         from_idx = cmd.index("--from")
         assert cmd[from_idx + 1] == str(cp_path)
-
-
-# ---------------------------------------------------------------------------
-# Checkpoints command tests
-# ---------------------------------------------------------------------------
-
-
-class TestCheckpointsCommand:
-    """Tests for the 'conductor checkpoints' CLI command."""
-
-    def test_checkpoints_help(self) -> None:
-        """Test that checkpoints --help works."""
-        result = runner.invoke(app, ["checkpoints", "--help"])
-        assert result.exit_code == 0
-        assert "List available workflow checkpoints" in result.output
-
-    def test_checkpoints_no_checkpoints(self, tmp_path: Path) -> None:
-        """Test output when no checkpoints exist."""
-        with patch.object(CheckpointManager, "list_checkpoints", return_value=[]):
-            result = runner.invoke(app, ["checkpoints"])
-
-        assert result.exit_code == 0
-        assert "No checkpoints found" in result.output
-
-    def test_checkpoints_with_multiple(self, tmp_path: Path) -> None:
-        """Test listing multiple checkpoints."""
-        checkpoints = [
-            CheckpointData(
-                version=1,
-                workflow_path="/path/to/workflow-a.yaml",
-                workflow_hash="sha256:abc",
-                created_at="2026-02-24T15:30:00+00:00",
-                failure={
-                    "error_type": "ProviderError",
-                    "message": "Network error",
-                    "agent": "researcher",
-                    "iteration": 2,
-                },
-                inputs={"topic": "AI"},
-                current_agent="researcher",
-                context={},
-                limits={},
-                file_path=Path("/tmp/conductor/checkpoints/workflow-a-20260224-153000.json"),
-            ),
-            CheckpointData(
-                version=1,
-                workflow_path="/path/to/workflow-b.yaml",
-                workflow_hash="sha256:def",
-                created_at="2026-02-24T16:00:00+00:00",
-                failure={
-                    "error_type": "TimeoutError",
-                    "message": "Timed out",
-                    "agent": "synthesizer",
-                    "iteration": 5,
-                },
-                inputs={},
-                current_agent="synthesizer",
-                context={},
-                limits={},
-                file_path=Path("/tmp/conductor/checkpoints/workflow-b-20260224-160000.json"),
-            ),
-        ]
-
-        with patch.object(CheckpointManager, "list_checkpoints", return_value=checkpoints):
-            result = runner.invoke(app, ["checkpoints"])
-
-        assert result.exit_code == 0
-        assert "workflow-a" in result.output
-        assert "workflow-b" in result.output
-        assert "researcher" in result.output
-        assert "synthesizer" in result.output
-        assert "ProviderError" in result.output
-        assert "TimeoutError" in result.output
-        assert "2 checkpoint(s)" in result.output
-
-    def test_checkpoints_shows_periodic_trigger(self, tmp_path: Path) -> None:
-        """Periodic checkpoints render a 'periodic' trigger and no error type."""
-        checkpoints = [
-            CheckpointData(
-                version=1,
-                workflow_path="/path/to/workflow-a.yaml",
-                workflow_hash="sha256:abc",
-                created_at="2026-02-24T15:30:00+00:00",
-                failure={
-                    "error_type": None,
-                    "message": None,
-                    "agent": "researcher",
-                    "iteration": 2,
-                },
-                inputs={},
-                current_agent="researcher",
-                context={},
-                limits={},
-                file_path=Path("/tmp/conductor/checkpoints/workflow-a-20260224-153000.json"),
-                trigger="periodic",
-            ),
-        ]
-
-        with patch.object(CheckpointManager, "list_checkpoints", return_value=checkpoints):
-            result = runner.invoke(app, ["checkpoints"])
-
-        assert result.exit_code == 0
-        assert "periodic" in result.output
-        assert "researcher" in result.output
-        # No error type for a periodic checkpoint — rendered as an em dash.
-        assert "—" in result.output
-
-    def test_checkpoints_filtered_by_workflow(self, tmp_path: Path) -> None:
-        """Test filtering checkpoints by workflow path."""
-        wf_path = _write_workflow(tmp_path, "my-workflow")
-
-        with patch.object(CheckpointManager, "list_checkpoints", return_value=[]) as mock_list:
-            result = runner.invoke(app, ["checkpoints", str(wf_path)])
-
-        assert result.exit_code == 0
-        # Verify list_checkpoints was called with the resolved path
-        mock_list.assert_called_once()
-        call_arg = mock_list.call_args[0][0]
-        assert call_arg == wf_path.resolve()
-
-    def test_checkpoints_nonexistent_workflow(self, tmp_path: Path) -> None:
-        """Test error when filtering by nonexistent workflow file."""
-        fake_path = tmp_path / "nonexistent.yaml"
-        result = runner.invoke(app, ["checkpoints", str(fake_path)])
-        assert result.exit_code == 1
-        assert "not found" in result.output
-
-    def test_checkpoints_no_checkpoints_for_workflow(self, tmp_path: Path) -> None:
-        """Test message when no checkpoints exist for a specific workflow."""
-        wf_path = _write_workflow(tmp_path, "specific-workflow")
-
-        with patch.object(CheckpointManager, "list_checkpoints", return_value=[]):
-            result = runner.invoke(app, ["checkpoints", str(wf_path)])
-
-        assert result.exit_code == 0
-        assert "No checkpoints found for workflow" in result.output
 
 
 # ---------------------------------------------------------------------------

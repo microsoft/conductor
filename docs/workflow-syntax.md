@@ -1285,7 +1285,7 @@ Recover a stalled run by killing the process (e.g. `conductor stop` for a
 `--web-bg` run) and then:
 
 ```bash
-conductor checkpoints workflow.yaml     # list checkpoints (Trigger column shows periodic/failure)
+conductor checkpoint list workflow.yaml   # list checkpoints (Trigger column shows periodic/failure)
 conductor resume workflow.yaml          # resume from the latest checkpoint
 ```
 
