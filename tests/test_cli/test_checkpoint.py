@@ -9,12 +9,30 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+from rich.console import Console
 from typer.testing import CliRunner
 
+import conductor.cli.checkpoint as checkpoint_module
 from conductor.cli.app import app
 from conductor.engine.checkpoint import CheckpointData, CheckpointManager
 
 runner = CliRunner()
+
+
+@pytest.fixture(autouse=True)
+def _wide_checkpoint_consoles(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin the checkpoint command's consoles to a fixed wide width.
+
+    ``checkpoint list`` renders its table through the module-level
+    ``output_console`` in ``conductor.cli.checkpoint`` (and errors through
+    ``console``), whose width tracks the ambient terminal. CI runs at a narrow
+    non-TTY width that wraps and truncates Rich cells, which would break
+    substring assertions on the rendered output. Pinning the width keeps
+    rendering deterministic regardless of the environment.
+    """
+    monkeypatch.setattr(checkpoint_module, "output_console", Console(width=200))
+    monkeypatch.setattr(checkpoint_module, "console", Console(stderr=True, width=200))
 
 
 def _write_workflow(tmp_path: Path, name: str = "test-workflow") -> Path:
@@ -209,6 +227,33 @@ class TestCheckpointsDeprecatedAlias:
             assert token in canonical.output
         # The canonical command does not print the deprecation notice.
         assert "deprecated" not in canonical.output
+
+    def test_alias_forwards_workflow_arg_and_failure_exit_code(self, tmp_path: Path) -> None:
+        """Alias forwards a positional workflow arg and propagates a non-zero exit.
+
+        Drives the alias down a failure path (nonexistent workflow -> exit 1),
+        closing the argument-forwarding and failure-parity gaps left open by the
+        success-only parity test above.
+        """
+        fake_path = tmp_path / "nonexistent.yaml"
+        alias = runner.invoke(app, ["checkpoints", str(fake_path)])
+        canonical = runner.invoke(app, ["checkpoint", "list", str(fake_path)])
+
+        assert alias.exit_code == canonical.exit_code == 1
+        assert "not found" in alias.output
+        assert "not found" in canonical.output
+
+    def test_alias_warning_routes_to_stderr(self) -> None:
+        """The deprecation notice goes to stderr; the table data goes to stdout."""
+        with patch.object(CheckpointManager, "list_checkpoints", return_value=[]):
+            result = runner.invoke(app, ["checkpoints"])
+
+        assert result.exit_code == 0
+        # Warning is on stderr so it never pollutes piped stdout data.
+        assert "deprecated" in " ".join(result.stderr.split())
+        # Data is emitted on stdout only.
+        assert "No checkpoints found" in result.stdout
+        assert "No checkpoints found" not in result.stderr
 
     def test_alias_hidden_from_help(self) -> None:
         """The deprecated alias is registered and invokable, but marked hidden."""

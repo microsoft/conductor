@@ -336,6 +336,19 @@ class TestGateRespondDeprecatedAlias:
         # The canonical command does not print the deprecation notice.
         assert "deprecated" not in canonical.output
 
+    @patch("httpx.post")
+    def test_alias_forwards_failure_exit_code(self, mock_post: MagicMock) -> None:
+        """Alias propagates a non-zero exit from a failure path (403), in parity."""
+        mock_post.return_value = _mock_response(403, {"error": "Invalid or missing token"})
+        args = ["--port", "8080", "--choice", "approve", "--agent", "g1"]
+
+        alias = runner.invoke(app, ["gate-respond", *args])
+        canonical = runner.invoke(app, ["gate", "respond", *args])
+
+        assert alias.exit_code == canonical.exit_code == 1
+        assert "Authentication failed" in alias.output
+        assert "Authentication failed" in canonical.output
+
     def test_alias_hidden_from_help(self) -> None:
         """The deprecated alias is registered and invokable, but marked hidden."""
         import click

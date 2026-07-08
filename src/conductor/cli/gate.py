@@ -10,7 +10,6 @@ import typer
 from rich.console import Console
 
 console = Console(stderr=True)
-output_console = Console()
 
 gate_app = typer.Typer(
     name="gate",

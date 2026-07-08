@@ -14,7 +14,7 @@ output_console = Console()
 
 checkpoint_app = typer.Typer(
     name="checkpoint",
-    help="Inspect and manage workflow checkpoints.",
+    help="Inspect workflow checkpoints.",
     no_args_is_help=True,
 )
 
@@ -30,8 +30,9 @@ def list_checkpoints(
 ) -> None:
     """List available workflow checkpoints.
 
-    Shows all checkpoint files with metadata including workflow name,
-    timestamp, failed agent, and error type. Optionally filter by
+    Shows each checkpoint's workflow name, timestamp, trigger (failure or
+    periodic), the agent that was running or about to run, the error type
+    (failure checkpoints only), and file path. Optionally filter by
     workflow file.
 
     \b

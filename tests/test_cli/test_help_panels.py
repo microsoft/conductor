@@ -47,6 +47,33 @@ class TestHelpPanels:
         for group in ("gate", "checkpoint", "registry"):
             assert group in result.output
 
+    def test_commands_mapped_to_correct_panels(self) -> None:
+        """Each command sits under its designated panel (structural check).
+
+        Asserting the ``rich_help_panel`` mapping directly catches a
+        miscategorised command that a presence-only check would miss, and is
+        immune to help-output width wrapping.
+        """
+        group = typer.main.get_command(app)
+        ctx = click.Context(group)
+        expected = {
+            "run": "Run & Recover",
+            "resume": "Run & Recover",
+            "stop": "Run & Recover",
+            "replay": "Run & Recover",
+            "validate": "Author & Inspect",
+            "show": "Author & Inspect",
+            "gate": "Interact",
+            "checkpoint": "State",
+            "registry": "Environment",
+            "update": "Environment",
+            "doctor": "Environment",
+        }
+        for name, panel in expected.items():
+            cmd = group.get_command(ctx, name)
+            assert cmd is not None, f"{name} should be registered"
+            assert cmd.rich_help_panel == panel, f"{name} should be under {panel!r}"
+
 
 class TestDeprecatedAliasesHidden:
     """The deprecated aliases are still invokable but hidden from ``--help``."""
