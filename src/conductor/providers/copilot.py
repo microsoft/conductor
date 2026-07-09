@@ -2091,9 +2091,7 @@ class CopilotProvider(AgentProvider):
             "Connecting to existing Copilot runtime at %s (no nested runtime spawned)",
             url,
         )
-        return CopilotClient(
-            connection=RuntimeConnection.for_uri(url, connection_token=token)
-        )
+        return CopilotClient(connection=RuntimeConnection.for_uri(url, connection_token=token))
 
     def _fix_pipe_blocking_mode(self) -> None:
         """Clear O_NONBLOCK on the Copilot CLI subprocess pipes.

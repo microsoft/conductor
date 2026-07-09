@@ -523,3 +523,70 @@ class TestRegistryForwardsSettings:
 
         # Claude call MUST NOT receive Copilot-shaped settings.
         assert by_type["claude"]["provider_settings"] is None
+
+
+class TestResolveRuntimeConnection:
+    """Unit-tests for ``CopilotProvider._resolve_runtime_connection`` and
+    ``_build_client`` (connecting to an already-running Copilot runtime)."""
+
+    def test_no_settings_no_env_returns_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("COPILOT_PROVIDER_RUNTIME_URL", raising=False)
+        monkeypatch.delenv("COPILOT_PROVIDER_RUNTIME_TOKEN", raising=False)
+        provider = _make_provider()
+        assert provider._resolve_runtime_connection() is None
+
+    def test_yaml_url_and_token(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("COPILOT_PROVIDER_RUNTIME_URL", raising=False)
+        monkeypatch.delenv("COPILOT_PROVIDER_RUNTIME_TOKEN", raising=False)
+        s = ProviderSettings.model_validate(
+            {"name": "copilot", "runtime_url": "localhost:3000", "runtime_token": "sek"}
+        )
+        provider = _make_provider(provider_settings=s)
+        assert provider._resolve_runtime_connection() == ("localhost:3000", "sek")
+
+    def test_env_vars_alone_activate(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The namespaced env vars activate the connection with no YAML — the
+        zero-config path for external orchestrators."""
+        monkeypatch.setenv("COPILOT_PROVIDER_RUNTIME_URL", "host:9000")
+        monkeypatch.setenv("COPILOT_PROVIDER_RUNTIME_TOKEN", "envtok")
+        provider = _make_provider()
+        assert provider._resolve_runtime_connection() == ("host:9000", "envtok")
+
+    def test_yaml_url_beats_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("COPILOT_PROVIDER_RUNTIME_URL", "env:1")
+        monkeypatch.setenv("COPILOT_PROVIDER_RUNTIME_TOKEN", "envtok")
+        s = ProviderSettings(name="copilot", runtime_url="yaml:2")
+        provider = _make_provider(provider_settings=s)
+        # YAML url wins; token falls back to env since YAML has none.
+        assert provider._resolve_runtime_connection() == ("yaml:2", "envtok")
+
+    def test_url_without_token(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("COPILOT_PROVIDER_RUNTIME_URL", "host:1")
+        monkeypatch.delenv("COPILOT_PROVIDER_RUNTIME_TOKEN", raising=False)
+        provider = _make_provider()
+        assert provider._resolve_runtime_connection() == ("host:1", None)
+
+    def test_build_client_default_spawns(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """No runtime connection → default ``CopilotClient()`` (spawns runtime)."""
+        monkeypatch.delenv("COPILOT_PROVIDER_RUNTIME_URL", raising=False)
+        provider = _make_provider()
+        client = provider._build_client()
+        assert client._is_external_server is False
+
+    def test_build_client_connects_to_external_runtime(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With a runtime connection resolved, the client is a URI (external)
+        connection and does not spawn a nested runtime."""
+        from copilot.client import UriRuntimeConnection
+
+        monkeypatch.delenv("COPILOT_PROVIDER_RUNTIME_URL", raising=False)
+        s = ProviderSettings.model_validate(
+            {"name": "copilot", "runtime_url": "localhost:3000", "runtime_token": "sek"}
+        )
+        provider = _make_provider(provider_settings=s)
+        client = provider._build_client()
+        assert client._is_external_server is True
+        assert isinstance(client._connection, UriRuntimeConnection)
+        assert client._connection.url == "localhost:3000"
+        assert client._connection.connection_token == "sek"

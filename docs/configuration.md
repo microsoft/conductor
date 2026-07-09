@@ -233,6 +233,83 @@ worrying about per-call drift.
 demonstrates the full pattern with both Ollama (active) and Azure
 OpenAI (commented variant).
 
+### Connecting to an Existing Copilot Runtime
+
+By default the Copilot provider spawns its own nested `copilot` runtime
+process (one per provider instance) to run agents. Instead, you can point
+Conductor at an **already-running** Copilot runtime that was started in
+server mode by some other process. Conductor then connects to that runtime
+and reuses its single authenticated session for every agent — no nested
+`copilot` process is spawned.
+
+This is the recommended way to run Conductor inside an external
+orchestrator that already owns an authenticated Copilot process. The
+canonical example is Microsoft **Agency**: it launches one authenticated
+`copilot --server` and hands Conductor a connection handle, so all of
+Conductor's agents/models are just new sessions on that shared server.
+Authentication is handled once, at the server — Conductor never needs the
+runtime's credentials.
+
+#### YAML
+
+```yaml
+workflow:
+  runtime:
+    provider:
+      name: copilot
+      runtime_url: localhost:3000          # "port", "host:port", or a full URL
+      runtime_token: ${COPILOT_RUNTIME_TOKEN}   # optional shared secret
+    default_model: gpt-4o
+```
+
+- `runtime_url` — where the running runtime is listening. Accepts a bare
+  `"port"`, `"host:port"`, or a full URL.
+- `runtime_token` — the shared secret the runtime was started with, if
+  any. Stored as a `SecretStr` (redacted in events/checkpoints/dashboard);
+  prefer `${VAR}` interpolation. Requires `runtime_url`.
+
+#### Environment variables (zero-YAML)
+
+The connection also activates from environment variables alone, so an
+orchestrator can enable it without editing the workflow YAML:
+
+| Field | Env var |
+|---|---|
+| `runtime_url` | `COPILOT_PROVIDER_RUNTIME_URL` |
+| `runtime_token` | `COPILOT_PROVIDER_RUNTIME_TOKEN` |
+
+The YAML value takes precedence; the environment variable is used as a
+fallback when the YAML field is unset. These variables are namespaced under `COPILOT_PROVIDER_*` on
+purpose: unlike ambient `OPENAI_*` variables, they can safely activate the
+connection because they are specific to this feature.
+
+```bash
+# Agency (or any orchestrator) side, conceptually:
+copilot --server --port 3000 &            # one authenticated runtime
+export COPILOT_PROVIDER_RUNTIME_URL=localhost:3000
+export COPILOT_PROVIDER_RUNTIME_TOKEN=<connection-token>
+conductor run review.yaml                 # connects; spawns no nested runtime
+```
+
+#### Rules and notes
+
+- `runtime_url` is **mutually exclusive** with custom endpoint routing
+  (`base_url` / `api_key` / `bearer_token` / `type` / `wire_api` /
+  `headers` / `azure`) — the external runtime *is* the endpoint. The schema
+  rejects the combination at config load.
+- `runtime_token` requires `runtime_url` (a token with nowhere to connect
+  is a misconfiguration) and, like the other secrets, may not be empty.
+- Closing the provider does **not** terminate the external runtime — the
+  SDK only shuts down runtimes it spawned itself, so the orchestrator-owned
+  server keeps running.
+- Runtime-spawn-only options (custom CLI path, injected env, etc.) do not
+  apply when connecting to an existing runtime.
+
+#### Example workflow
+
+[`examples/copilot-existing-runtime.yaml`](../examples/copilot-existing-runtime.yaml)
+demonstrates connecting to an already-running Copilot runtime.
+
 ## Common Configuration Options
 
 These options work with both providers:

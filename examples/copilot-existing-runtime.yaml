@@ -1,0 +1,83 @@
+# Connect the Copilot provider to an already-running Copilot runtime
+#
+# By default conductor's Copilot provider spawns its own nested `copilot`
+# runtime process to execute agents. This example instead points conductor
+# at an EXISTING runtime that some other process started in server mode
+# (e.g. `copilot --server --port 3000`). Conductor connects to that runtime
+# via the SDK's `RuntimeConnection.for_uri(...)` and reuses its single
+# authenticated session for every agent — no nested `copilot` process is
+# spawned, and authentication is handled once, at the server.
+#
+# This is the recommended pattern for running conductor inside an external
+# orchestrator that already owns an authenticated Copilot process (for
+# example, Microsoft Agency launches one authenticated `copilot --server`
+# and hands conductor a connection handle).
+#
+# Two ways to configure the connection:
+#
+# 1. YAML (below): set `runtime_url` (and optional `runtime_token`) under
+#    `runtime.provider`.
+#
+# 2. Environment variables (no YAML needed — ideal for orchestrators):
+#
+#      export COPILOT_PROVIDER_RUNTIME_URL=localhost:3000
+#      export COPILOT_PROVIDER_RUNTIME_TOKEN=<connection-token>
+#      conductor run examples/copilot-existing-runtime.yaml \
+#        --input question="What is Python?"
+#
+#    The YAML value takes precedence; the env var is a fallback.
+#
+# Notes:
+# - `runtime_url` accepts a bare "port", "host:port", or a full URL.
+# - `runtime_token` is the shared secret the runtime was started with (if
+#   any). It is stored as a SecretStr and redacted from events/checkpoints;
+#   prefer ${VAR} interpolation so the literal never lands in YAML.
+# - `runtime_url` is mutually exclusive with custom endpoint routing
+#   (base_url / api_key / type / ...): the external runtime IS the endpoint.
+# - Closing conductor does NOT terminate the external runtime — the SDK only
+#   shuts down runtimes it spawned itself.
+
+workflow:
+  name: copilot-existing-runtime
+  description: Connect the Copilot provider to an already-running runtime server
+  version: "1.0.0"
+  entry_point: answerer
+
+  runtime:
+    provider:
+      name: copilot
+      # Where the already-running `copilot --server` is listening.
+      runtime_url: ${COPILOT_PROVIDER_RUNTIME_URL:-localhost:3000}
+    # Optional shared secret the server was started with. Uncomment and set
+    # $COPILOT_RUNTIME_TOKEN if your server requires a connection token
+    # (the SDK rejects an empty token, so keep this commented when unused):
+    #   runtime_token: ${COPILOT_RUNTIME_TOKEN}
+    # Alternatively, set COPILOT_PROVIDER_RUNTIME_TOKEN in the environment.
+
+    default_model: gpt-4o
+
+  input:
+    question:
+      type: string
+      required: true
+      description: The question to answer
+
+agents:
+  - name: answerer
+    description: Answers the user's question via the shared runtime
+    prompt: |
+      You are a helpful assistant. Please answer the following question
+      clearly and concisely:
+
+      Question: {{ workflow.input.question }}
+
+      Provide a direct answer without unnecessary preamble.
+    output:
+      answer:
+        type: string
+        description: The answer to the question
+    routes:
+      - to: $end
+
+output:
+  answer: "{{ answerer.output.answer }}"
