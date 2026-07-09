@@ -1720,7 +1720,7 @@ class ProviderSettings(BaseModel):
     ``RuntimeConnection.for_uri(...)`` — no child ``copilot`` process is
     spawned, so every agent/model reuses the server's single authenticated
     session. This is the recommended way to run Conductor inside an external
-    orchestrator (e.g. Agency) that already owns an authenticated
+    orchestrator that already owns an authenticated
     ``copilot --server`` process.
 
     Falls back to the ``COPILOT_PROVIDER_RUNTIME_URL`` environment variable

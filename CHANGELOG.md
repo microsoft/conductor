@@ -16,7 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   authenticated session. Both fields also resolve from the namespaced
   `COPILOT_PROVIDER_RUNTIME_URL` / `COPILOT_PROVIDER_RUNTIME_TOKEN` environment
   variables, which activate the connection with no YAML — the zero-config path
-  for external orchestrators (e.g. Agency) that already own an authenticated
+  for external orchestrators that already own an authenticated
   Copilot process. Mutually exclusive with custom endpoint routing. See
   `examples/copilot-existing-runtime.yaml` and the "Connecting to an Existing
   Copilot Runtime" section of `docs/configuration.md`.

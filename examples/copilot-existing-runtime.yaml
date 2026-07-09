@@ -10,7 +10,7 @@
 #
 # This is the recommended pattern for running conductor inside an external
 # orchestrator that already owns an authenticated Copilot process (for
-# example, Microsoft Agency launches one authenticated `copilot --server`
+# example, an orchestrator launches one authenticated `copilot --server`
 # and hands conductor a connection handle).
 #
 # Two ways to configure the connection:

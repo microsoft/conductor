@@ -243,9 +243,9 @@ and reuses its single authenticated session for every agent — no nested
 `copilot` process is spawned.
 
 This is the recommended way to run Conductor inside an external
-orchestrator that already owns an authenticated Copilot process. The
-canonical example is Microsoft **Agency**: it launches one authenticated
-`copilot --server` and hands Conductor a connection handle, so all of
+orchestrator that already owns an authenticated Copilot process. For
+example, an orchestrator can launch one authenticated
+`copilot --server` and hand Conductor a connection handle, so all of
 Conductor's agents/models are just new sessions on that shared server.
 Authentication is handled once, at the server — Conductor never needs the
 runtime's credentials.
@@ -284,7 +284,7 @@ purpose: unlike ambient `OPENAI_*` variables, they can safely activate the
 connection because they are specific to this feature.
 
 ```bash
-# Agency (or any orchestrator) side, conceptually:
+# Orchestrator side, conceptually:
 copilot --server --port 3000 &            # one authenticated runtime
 export COPILOT_PROVIDER_RUNTIME_URL=localhost:3000
 export COPILOT_PROVIDER_RUNTIME_TOKEN=<connection-token>

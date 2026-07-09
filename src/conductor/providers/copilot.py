@@ -476,7 +476,7 @@ class CopilotProvider(AgentProvider):
 
         The environment variables activate the connection on their own (no
         YAML required), which is the intended zero-config path for external
-        orchestrators such as Agency: they launch one authenticated
+        orchestrators: they launch one authenticated
         ``copilot --server`` and export these two variables. The variables are
         namespaced (``COPILOT_PROVIDER_*``) specifically so unrelated ambient
         shell state cannot silently divert default Copilot traffic.
