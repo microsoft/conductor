@@ -79,15 +79,22 @@ _IDLE_IGNORED_EVENTS: frozenset[str] = frozenset(
 # Try to import the Copilot SDK
 try:
     from copilot import CopilotClient
-    from copilot.client import RuntimeConnection
     from copilot.session import PermissionHandler
 
     COPILOT_SDK_AVAILABLE = True
 except ImportError:
     COPILOT_SDK_AVAILABLE = False
     CopilotClient = None  # type: ignore[misc, assignment]
-    RuntimeConnection = None  # type: ignore[misc, assignment]
     PermissionHandler = None  # type: ignore[misc, assignment]
+
+# RuntimeConnection was added to the SDK after CopilotClient; import it
+# separately so an older-but-present SDK still enables the default nested-spawn
+# provider. A runtime connection is only required when explicitly requested,
+# and that path raises a clear ProviderError if RuntimeConnection is missing.
+try:
+    from copilot.client import RuntimeConnection
+except ImportError:
+    RuntimeConnection = None  # type: ignore[misc, assignment]
 
 
 @dataclass
@@ -492,9 +499,37 @@ class CopilotProvider(AgentProvider):
         if token is None:
             token = os.environ.get("COPILOT_PROVIDER_RUNTIME_TOKEN")
 
-        if not url:
+        # Values resolved from environment variables are not validated by the
+        # schema, so normalize/validate them here to mirror the YAML rules and
+        # avoid silently falling through to a nested spawn on a typo/unset env.
+        if url is not None:
+            url = url.strip()
+            if not url:
+                raise ProviderError(
+                    "'runtime_url' is empty; remove it or supply a value.",
+                    suggestion=(
+                        "Set runtime.provider.runtime_url or COPILOT_PROVIDER_RUNTIME_URL "
+                        "to a valid port, host:port, or full URL."
+                    ),
+                    is_retryable=False,
+                )
+        # An empty token is the legitimate no-auth / tokenless-runtime case;
+        # normalize it to None rather than erroring.
+        if token is not None:
+            token = token.strip() or None
+        if token is not None and url is None:
+            raise ProviderError(
+                "'runtime_token' requires 'runtime_url' to also be set",
+                suggestion=(
+                    "Set COPILOT_PROVIDER_RUNTIME_URL alongside "
+                    "COPILOT_PROVIDER_RUNTIME_TOKEN, or remove the token."
+                ),
+                is_retryable=False,
+            )
+
+        if url is None:
             return None
-        return (url, token or None)
+        return (url, token)
 
     async def execute(
         self,
@@ -2080,12 +2115,15 @@ class CopilotProvider(AgentProvider):
 
         url, token = connection
         if self._provider_settings is not None and self._provider_settings.has_custom_routing():
-            logger.warning(
-                "Both an external runtime connection (runtime_url=%s) and custom endpoint "
-                "routing are configured; the custom endpoint routing will still be applied "
-                "to sessions on the external runtime. These are usually mutually exclusive — "
-                "verify this is intended.",
-                url,
+            raise ProviderError(
+                "An external runtime connection (runtime_url) cannot be combined with custom "
+                "endpoint routing in runtime.provider; connecting to an existing runtime and "
+                "custom endpoint routing are mutually exclusive (the runtime is the endpoint).",
+                suggestion=(
+                    "Unset COPILOT_PROVIDER_RUNTIME_URL or remove base_url/api_key/"
+                    "bearer_token/type/wire_api/headers/azure from runtime.provider."
+                ),
+                is_retryable=False,
             )
         logger.info(
             "Connecting to existing Copilot runtime at %s (no nested runtime spawned)",

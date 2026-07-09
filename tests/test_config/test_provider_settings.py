@@ -339,6 +339,20 @@ class TestExternalRuntimeConnection:
                 {"name": "copilot", "runtime_url": "x:1", "runtime_token": ""}
             )
 
+    def test_empty_runtime_url_rejected(self) -> None:
+        """An empty ``runtime_url`` must be rejected: otherwise ``""`` is not
+        None, so ``has_external_runtime()`` returns True and the runtime_token
+        guard passes, yet the provider treats ``""`` as falsy and silently
+        spawns a nested runtime while dropping the token."""
+        with pytest.raises(ValidationError, match="'runtime_url' is empty"):
+            ProviderSettings.model_validate({"name": "copilot", "runtime_url": ""})
+
+    def test_empty_runtime_url_with_token_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="'runtime_url' is empty"):
+            ProviderSettings.model_validate(
+                {"name": "copilot", "runtime_url": "", "runtime_token": "tok"}
+            )
+
     @pytest.mark.parametrize(
         "field,value",
         [

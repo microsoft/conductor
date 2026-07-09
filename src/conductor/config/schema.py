@@ -1850,6 +1850,16 @@ class ProviderSettings(BaseModel):
                     "(typo / unset env interpolation?)"
                 )
 
+        # An empty runtime_url must also be rejected: because "" is not None,
+        # has_external_runtime() would return True and the runtime_token guard
+        # (runtime_url is None) would pass, yet the provider treats "" as falsy
+        # and silently falls back to env / a nested spawn while dropping the token.
+        if self.runtime_url is not None and self.runtime_url == "":
+            raise ValueError(
+                "'runtime_url' is empty; remove the key or supply a value "
+                "(typo / unset env interpolation?)"
+            )
+
         # Positive precondition: structured fields that only make sense
         # alongside an endpoint must not be the *only* thing set.
         # ``base_url`` may still come from an env-var fallback, so this

@@ -18,6 +18,7 @@ from conductor.config.schema import (
     ProviderSettings,
     RuntimeConfig,
 )
+from conductor.exceptions import ProviderError
 from conductor.providers.copilot import CopilotProvider
 
 
@@ -590,3 +591,46 @@ class TestResolveRuntimeConnection:
         assert isinstance(client._connection, UriRuntimeConnection)
         assert client._connection.url == "localhost:3000"
         assert client._connection.connection_token == "sek"
+
+    def test_empty_env_url_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An empty ``COPILOT_PROVIDER_RUNTIME_URL`` (e.g. ``${VAR:-}``) must fail
+        loudly rather than silently falling through to a nested spawn."""
+        monkeypatch.setenv("COPILOT_PROVIDER_RUNTIME_URL", "   ")
+        monkeypatch.delenv("COPILOT_PROVIDER_RUNTIME_TOKEN", raising=False)
+        provider = _make_provider()
+        with pytest.raises(ProviderError, match="runtime_url' is empty"):
+            provider._resolve_runtime_connection()
+
+    def test_env_token_only_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A token with no URL must raise, mirroring the YAML rule."""
+        monkeypatch.delenv("COPILOT_PROVIDER_RUNTIME_URL", raising=False)
+        monkeypatch.setenv("COPILOT_PROVIDER_RUNTIME_TOKEN", "envtok")
+        provider = _make_provider()
+        with pytest.raises(ProviderError, match="runtime_token' requires 'runtime_url'"):
+            provider._resolve_runtime_connection()
+
+    def test_empty_env_token_normalizes_to_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An empty token is the legitimate no-auth case → normalize to None."""
+        monkeypatch.setenv("COPILOT_PROVIDER_RUNTIME_URL", "host:1")
+        monkeypatch.setenv("COPILOT_PROVIDER_RUNTIME_TOKEN", "  ")
+        provider = _make_provider()
+        assert provider._resolve_runtime_connection() == ("host:1", None)
+
+    def test_build_client_rejects_runtime_plus_custom_routing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An env-supplied runtime URL combined with YAML custom endpoint routing
+        must fail fast rather than silently connecting to the external runtime."""
+        monkeypatch.setenv("COPILOT_PROVIDER_RUNTIME_URL", "host:9000")
+        monkeypatch.delenv("COPILOT_PROVIDER_RUNTIME_TOKEN", raising=False)
+        s = ProviderSettings.model_validate(
+            {
+                "name": "copilot",
+                "type": "openai",
+                "base_url": "http://localhost:11434/v1",
+                "api_key": "sk-yaml",
+            }
+        )
+        provider = _make_provider(provider_settings=s, model="ollama/llama3")
+        with pytest.raises(ProviderError, match="mutually exclusive"):
+            provider._build_client()
