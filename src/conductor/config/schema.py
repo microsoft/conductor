@@ -1711,6 +1711,40 @@ class ProviderSettings(BaseModel):
     """Azure-specific options (e.g. ``api_version``). Requires
     ``type: azure``. Copilot-only."""
 
+    runtime_url: str | None = None
+    """Connect to an already-running Copilot runtime instead of spawning a
+    nested one. Copilot-only.
+
+    Accepts ``"port"``, ``"host:port"``, or a full URL. When set, the Copilot
+    provider connects to the external runtime via the SDK's
+    ``RuntimeConnection.for_uri(...)`` — no child ``copilot`` process is
+    spawned, so every agent/model reuses the server's single authenticated
+    session. This is the recommended way to run Conductor inside an external
+    orchestrator (e.g. Agency) that already owns an authenticated
+    ``copilot --server`` process.
+
+    Falls back to the ``COPILOT_PROVIDER_RUNTIME_URL`` environment variable
+    when not set in YAML. Mutually exclusive with custom endpoint routing
+    (``base_url`` / ``api_key`` / ``bearer_token`` / ``type`` / ``wire_api`` /
+    ``headers`` / ``azure``): the external runtime *is* the endpoint.
+
+    Example::
+
+        provider:
+          name: copilot
+          runtime_url: localhost:3000
+          runtime_token: ${COPILOT_RUNTIME_TOKEN}
+    """
+
+    runtime_token: SecretStr | None = None
+    """Shared secret authenticating the connection to ``runtime_url``. Copilot-only.
+
+    Required when the server was started with a connection token. Prefer
+    ``${COPILOT_RUNTIME_TOKEN}`` interpolation so the literal value never lands
+    in ``workflow_started`` events or checkpoints. Falls back to the
+    ``COPILOT_PROVIDER_RUNTIME_TOKEN`` environment variable when not set in
+    YAML. Requires ``runtime_url``."""
+
     hermes_home: str | None = None
     """Path to a Hermes home directory (profile). Hermes-only.
 
@@ -1756,6 +1790,8 @@ class ProviderSettings(BaseModel):
             "bearer_token": self.bearer_token,
             "headers": self.headers,
             "azure": self.azure,
+            "runtime_url": self.runtime_url,
+            "runtime_token": self.runtime_token,
         }
         claude_only_fields = {
             "auth_token": self.auth_token,
@@ -1806,6 +1842,7 @@ class ProviderSettings(BaseModel):
             ("api_key", self.api_key),
             ("bearer_token", self.bearer_token),
             ("auth_token", self.auth_token),
+            ("runtime_token", self.runtime_token),
         ):
             if value is not None and value.get_secret_value() == "":
                 raise ValueError(
@@ -1837,6 +1874,35 @@ class ProviderSettings(BaseModel):
                 "'azure' block is empty; either set azure.api_version or remove the block"
             )
 
+        # Connecting to an external runtime (runtime_url) is mutually
+        # exclusive with custom endpoint routing — the runtime *is* the
+        # endpoint, so a base_url / api_key / etc. alongside it is
+        # contradictory and would silently be ignored at the SDK boundary.
+        if self.runtime_url is not None:
+            routing_conflicts = sorted(
+                k
+                for k, v in {
+                    "base_url": self.base_url,
+                    "api_key": self.api_key,
+                    "bearer_token": self.bearer_token,
+                    "type": self.type,
+                    "wire_api": self.wire_api,
+                    "headers": self.headers,
+                    "azure": self.azure,
+                }.items()
+                if v is not None
+            )
+            if routing_conflicts:
+                raise ValueError(
+                    f"'runtime_url' cannot be combined with {routing_conflicts}; connecting "
+                    "to an existing runtime and custom endpoint routing are mutually exclusive "
+                    "(the runtime is the endpoint)."
+                )
+
+        # A connection token is meaningless without a URL to connect to.
+        if self.runtime_token is not None and self.runtime_url is None:
+            raise ValueError("'runtime_token' requires 'runtime_url' to also be set")
+
         return self
 
     def has_custom_routing(self) -> bool:
@@ -1846,6 +1912,11 @@ class ProviderSettings(BaseModel):
         set. We never activate from ambient environment variables alone —
         that would silently divert default Copilot traffic based on
         unrelated shell state.
+
+        Note: this covers only *endpoint* routing (``base_url`` and friends).
+        Connecting to an existing runtime (``runtime_url``) is a separate
+        axis — see :meth:`has_external_runtime` — and is intentionally
+        excluded so it does not activate the endpoint-provider resolver.
         """
         return any(
             value is not None
@@ -1861,6 +1932,16 @@ class ProviderSettings(BaseModel):
             )
         )
 
+    def has_external_runtime(self) -> bool:
+        """Return True when YAML configured connecting to an existing runtime.
+
+        Gated on ``runtime_url`` being set in YAML. As with custom routing,
+        ambient environment variables never activate this on their own here;
+        the ``COPILOT_PROVIDER_RUNTIME_URL`` fallback is resolved at the
+        provider layer.
+        """
+        return self.runtime_url is not None
+
     @model_serializer(mode="wrap")
     def _serialize(self, nxt: Any) -> Any:
         """Collapse to bare string when only ``name`` is set.
@@ -1871,7 +1952,7 @@ class ProviderSettings(BaseModel):
         not as ``{"name": "copilot"}``. Once any structured field is set,
         the full object is emitted.
         """
-        if not self.has_custom_routing():
+        if not self.has_custom_routing() and not self.has_external_runtime():
             return self.name
         return nxt(self)
 

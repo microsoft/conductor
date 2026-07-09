@@ -79,12 +79,14 @@ _IDLE_IGNORED_EVENTS: frozenset[str] = frozenset(
 # Try to import the Copilot SDK
 try:
     from copilot import CopilotClient
+    from copilot.client import RuntimeConnection
     from copilot.session import PermissionHandler
 
     COPILOT_SDK_AVAILABLE = True
 except ImportError:
     COPILOT_SDK_AVAILABLE = False
     CopilotClient = None  # type: ignore[misc, assignment]
+    RuntimeConnection = None  # type: ignore[misc, assignment]
     PermissionHandler = None  # type: ignore[misc, assignment]
 
 
@@ -458,6 +460,41 @@ class CopilotProvider(AgentProvider):
         provider_cfg = self._resolve_sdk_provider_config()
         if provider_cfg is not None:
             session_kwargs["provider"] = provider_cfg
+
+    def _resolve_runtime_connection(self) -> tuple[str, str | None] | None:
+        """Resolve whether to connect to an already-running Copilot runtime.
+
+        Returns ``(url, connection_token)`` when Conductor should connect to
+        an external runtime instead of spawning its own child process, or
+        ``None`` for the default (spawn) behavior.
+
+        Resolution order for each field is YAML (``runtime.provider``) first,
+        then a namespaced environment variable:
+
+        - ``url``: ``runtime_url`` → ``COPILOT_PROVIDER_RUNTIME_URL``
+        - ``token``: ``runtime_token`` → ``COPILOT_PROVIDER_RUNTIME_TOKEN``
+
+        The environment variables activate the connection on their own (no
+        YAML required), which is the intended zero-config path for external
+        orchestrators such as Agency: they launch one authenticated
+        ``copilot --server`` and export these two variables. The variables are
+        namespaced (``COPILOT_PROVIDER_*``) specifically so unrelated ambient
+        shell state cannot silently divert default Copilot traffic.
+        """
+        settings = self._provider_settings
+
+        url = settings.runtime_url if settings is not None else None
+        url = url or os.environ.get("COPILOT_PROVIDER_RUNTIME_URL")
+
+        token: str | None = None
+        if settings is not None and settings.runtime_token is not None:
+            token = settings.runtime_token.get_secret_value()
+        if token is None:
+            token = os.environ.get("COPILOT_PROVIDER_RUNTIME_TOKEN")
+
+        if not url:
+            return None
+        return (url, token or None)
 
     async def execute(
         self,
@@ -2017,7 +2054,7 @@ class CopilotProvider(AgentProvider):
         """
         async with self._start_lock:
             if self._client is None:
-                self._client = CopilotClient()
+                self._client = self._build_client()
             if not self._started:
                 await self._client.start()
                 self._started = True
@@ -2026,6 +2063,37 @@ class CopilotProvider(AgentProvider):
                 # BlockingIOError on large payloads. The asyncio event loop
                 # may set O_NONBLOCK on inherited file descriptors.
                 self._fix_pipe_blocking_mode()
+
+    def _build_client(self) -> Any:
+        """Construct the Copilot SDK client.
+
+        When a runtime connection is resolved (via ``runtime_url`` /
+        ``COPILOT_PROVIDER_RUNTIME_URL``), connect to that already-running
+        runtime instead of spawning a nested ``copilot`` child process. The
+        SDK's ``start()`` skips process spawning for URI connections and its
+        ``stop()`` leaves the externally-owned server running, so Conductor
+        reuses the server's single authenticated session for every agent.
+        """
+        connection = self._resolve_runtime_connection()
+        if connection is None:
+            return CopilotClient()
+
+        url, token = connection
+        if self._provider_settings is not None and self._provider_settings.has_custom_routing():
+            logger.warning(
+                "Both an external runtime connection (runtime_url=%s) and custom endpoint "
+                "routing are configured; the custom endpoint routing will still be applied "
+                "to sessions on the external runtime. These are usually mutually exclusive — "
+                "verify this is intended.",
+                url,
+            )
+        logger.info(
+            "Connecting to existing Copilot runtime at %s (no nested runtime spawned)",
+            url,
+        )
+        return CopilotClient(
+            connection=RuntimeConnection.for_uri(url, connection_token=token)
+        )
 
     def _fix_pipe_blocking_mode(self) -> None:
         """Clear O_NONBLOCK on the Copilot CLI subprocess pipes.
