@@ -4,12 +4,38 @@ Complete command-line reference for Conductor.
 
 ## Table of Contents
 
+- [Global Options](#global-options)
 - [`conductor run`](#conductor-run)
 - [`conductor stop`](#conductor-stop)
 - [`conductor gate-respond`](#conductor-gate-respond)
 - [`conductor validate`](#conductor-validate)
 - [`conductor doctor`](#conductor-doctor)
 - [`conductor registry`](#conductor-registry)
+
+## Global Options
+
+The following options apply to every subcommand and **must appear before the
+subcommand name**:
+
+```bash
+conductor [GLOBAL OPTIONS] <command> [ARGS] [OPTIONS]
+```
+
+| Option | Short | Description |
+|--------|-------|-------------|
+| `--quiet` | `-q` | Minimal output (agent lifecycle and routing only) |
+| `--silent` | `-s` | No progress output (JSON result only) |
+| `--version` | `-v` | Show version and exit |
+
+`--quiet` and `--silent` are mutually exclusive.
+
+```bash
+# Correct: global option before the subcommand
+conductor --quiet run workflow.yaml
+
+# Incorrect: rejected with "No such option: --quiet"
+conductor run workflow.yaml --quiet
+```
 
 ## `conductor run`
 
@@ -31,13 +57,15 @@ conductor run <workflow.yaml> [OPTIONS]
 | `--provider PROVIDER` | `-p` | Override provider (copilot, claude, claude-agent-sdk, hermes) |
 | `--dry-run` | | Show execution plan without running |
 | `--skip-gates` | | Auto-select first option at human gates |
-| `--quiet` | `-q` | Minimal output (agent lifecycle and routing only) |
-| `--silent` | `-s` | No progress output (JSON result only) |
 | `--log-file <auto\|PATH>` | `-l` | Write full debug output to a file |
 | `--web` | | Start a real-time web dashboard |
 | `--web-bg` | | Run in background, print dashboard URL, exit |
 | `--web-port PORT` | | Port for web dashboard (0 = auto-select) |
 | `--no-interactive` | | Disable Esc-to-interrupt capability |
+
+> **Note:** Output verbosity (`--quiet`/`-q`, `--silent`/`-s`) is controlled by
+> [global options](#global-options), which must appear *before* the `run`
+> subcommand: `conductor --quiet run workflow.yaml`.
 
 ### Examples
 
@@ -70,8 +98,9 @@ conductor run workflow.yaml -p copilot
 # Preview execution plan without running
 conductor run workflow.yaml --dry-run
 
-# Quiet output (agent lifecycle only)
-conductor run workflow.yaml --quiet --input question="Test"
+# Quiet output (agent lifecycle only) — note: --quiet is a global option
+# and must come before the run subcommand
+conductor --quiet run workflow.yaml --input question="Test"
 
 # Write full debug log to a file
 conductor run workflow.yaml --log-file debug.log
@@ -122,7 +151,8 @@ Background workflows can be stopped with `conductor stop` (see below) or via the
 conductor run workflow.yaml --skip-gates
 
 # CI/CD pattern: silent console + full file log
-conductor run workflow.yaml --silent --log-file auto --skip-gates --input question="Automated test"
+# (--silent is a global option and must come before the run subcommand)
+conductor --silent run workflow.yaml --log-file auto --skip-gates --input question="Automated test"
 ```
 
 #### Metadata and Instructions
