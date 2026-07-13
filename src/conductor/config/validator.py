@@ -182,10 +182,9 @@ def validate_workflow_config(
             errors.extend(tool_errors)
 
         # Warn when an LLM agent has system_prompt but no (non-empty) prompt.
-        # Even when system_prompt is rendered correctly, omitting `prompt:` sends
-        # an empty user message to the model. That is a provider-neutral authoring
-        # hazard and almost always means dynamic, must-execute content belongs in
-        # `prompt:` alongside the persona/methodology in `system_prompt:`.
+        # Omitting `prompt:` leaves the user-authored task prompt empty, which
+        # almost always means dynamic, must-execute content belongs in `prompt:`
+        # alongside the persona/methodology in `system_prompt:`.
         if (
             agent.type in (None, "agent")
             and agent.system_prompt
@@ -194,8 +193,8 @@ def validate_workflow_config(
             warnings.append(
                 f"Agent '{agent.name}' defines `system_prompt` but no `prompt` "
                 "(or only whitespace). "
-                "This sends an empty user message to the model on every provider, "
-                "which almost always indicates a latent authoring mistake. Move "
+                "The user-authored task prompt is empty, which almost always "
+                "indicates a latent authoring mistake. Move "
                 "the dynamic, must-execute content (input references, instructions) "
                 "into a `prompt:` block; keep the persona and static methodology "
                 "in `system_prompt:`."

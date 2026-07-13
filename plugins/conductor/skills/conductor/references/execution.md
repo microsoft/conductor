@@ -221,7 +221,7 @@ Performs both schema and **semantic** checks:
 - Parallel group agent references
 - For-each `source` format and reserved names
 - Stale agent references and undeclared explicit-mode dependencies in `prompt`, `system_prompt`, `command`, `args`, `working_dir`, `input_mapping`, parallel-group inputs, and workflow `output:` templates
-- Warning when an agent defines `system_prompt` but no `prompt:` (unusual — the user message would be empty)
+- Warning when an agent defines `system_prompt` but no `prompt:` (unusual because the user-authored task prompt would be empty)
 
 The success summary table includes Parallel Groups and For-each Groups counts.
 

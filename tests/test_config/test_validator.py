@@ -66,7 +66,7 @@ class TestValidateWorkflowConfig:
     def test_warns_on_system_prompt_without_prompt(self) -> None:
         """Agent with system_prompt but no prompt: should produce a warning.
 
-        A missing prompt sends an empty user message on every provider, which
+        A missing prompt leaves the user-authored task prompt empty, which
         is almost always a latent authoring mistake even when system_prompt is
         configured correctly.
         """
@@ -87,8 +87,11 @@ class TestValidateWorkflowConfig:
             "lonely" in w and "system_prompt" in w and "no `prompt`" in w for w in warnings
         ), f"expected system_prompt-without-prompt warning; got: {warnings!r}"
         warning_text = "\n".join(warnings).lower()
+        assert "user-authored task prompt is empty" in warning_text
         assert "ignore" not in warning_text
         assert "entirely" not in warning_text
+        assert "empty user message" not in warning_text
+        assert "on every provider" not in warning_text
 
     def test_no_warning_when_prompt_present_alongside_system_prompt(self) -> None:
         """Having both system_prompt and prompt is the expected pattern — no warning."""

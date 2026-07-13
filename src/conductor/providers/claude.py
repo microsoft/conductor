@@ -977,7 +977,13 @@ class ClaudeProvider(AgentProvider):
         # Done before the per-model max_tokens warning so the warning logic
         # accounts for thinking-aware caps.
         thinking = self._resolve_thinking_for_agent(agent, model)
-        system_prompt = (agent.system_prompt or "").strip() or None
+        # Use strip() only as a blank-prompt predicate: the rendered value is
+        # forwarded verbatim for cross-provider parity (Copilot, Claude Agent
+        # SDK, and Hermes all pass agent.system_prompt through unchanged).
+        raw_system_prompt = agent.system_prompt
+        system_prompt = (
+            raw_system_prompt if raw_system_prompt and raw_system_prompt.strip() else None
+        )
 
         # Validate max_tokens against model-specific limits.
         # Skip the warning when extended thinking is enabled — the per-call
