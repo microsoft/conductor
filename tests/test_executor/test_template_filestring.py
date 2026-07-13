@@ -174,3 +174,45 @@ def test_file_string_windows_path_conversion(tmp_path: Path) -> None:
     file_string_existing = FileString(main_file.read_text(), path_obj_existing)
     result_existing = renderer.render(file_string_existing, {})
     assert result_existing == "Hello World!"
+
+
+def test_template_not_found_error_includes_searchpath(tmp_path: Path) -> None:
+    """Requirement: FileString in tmp_path including missing template.md raises TemplateError.
+
+    The TemplateError message must match the exact format:
+    "Template not found: '<name>'. Searched in: <dir1>, <dir2>, ..."
+    and contain the absolute tmp_path directory and the name 'missing template.md'.
+    """
+    main_file = tmp_path / "main.md"
+    main_file.write_text("Hello {% include 'missing template.md' %}")
+    file_string = FileString(main_file.read_text(), main_file)
+    renderer = TemplateRenderer()
+    with pytest.raises(TemplateError) as exc_info:
+        renderer.render(file_string, {})
+    expected_msg = f"Template not found: 'missing template.md'. Searched in: {tmp_path.resolve()}"
+    assert expected_msg in str(exc_info.value)
+
+
+def test_inline_prompt_include_error_is_clear() -> None:
+    """Requirement: inline str with {% include 'x.md' %} raises TemplateError.
+
+    The TemplateError message must explicitly mention that loader-dependent Jinja
+    constructs ({% include %} / {% import %} / {% extends %}) require a file-backed prompt
+    via prompt: !file ...
+    """
+    renderer = TemplateRenderer()
+    with pytest.raises(TemplateError) as exc_info:
+        renderer.render("Hello {% include 'x.md' %}", {})
+    msg = str(exc_info.value)
+    assert "prompt: !file" in msg
+    assert "loader-dependent" in msg or "require a file-backed prompt" in msg
+
+
+def test_non_template_not_found_error_handling_unchanged() -> None:
+    """Requirement: a non-TemplateNotFound error (e.g. StrictUndefined) still maps
+    to the "Undefined variable" TemplateError path unchanged.
+    """
+    renderer = TemplateRenderer()
+    with pytest.raises(TemplateError) as exc_info:
+        renderer.render("Hello {{ undefined_var }}", {})
+    assert "Undefined variable in template: 'undefined_var' is undefined" in str(exc_info.value)

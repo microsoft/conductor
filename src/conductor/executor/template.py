@@ -9,7 +9,14 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from jinja2 import BaseLoader, Environment, FileSystemLoader, StrictUndefined, TemplateSyntaxError
+from jinja2 import (
+    BaseLoader,
+    Environment,
+    FileSystemLoader,
+    StrictUndefined,
+    TemplateNotFound,
+    TemplateSyntaxError,
+)
 from jinja2 import UndefinedError as Jinja2UndefinedError
 
 from conductor.exceptions import TemplateError
@@ -112,10 +119,14 @@ class TemplateRenderer:
         Raises:
             TemplateError: If rendering fails due to missing variables or syntax errors.
         """
+        loader = None
+        is_file_backed = False
         try:
             if isinstance(template, FileString) and template.source_path.exists():
+                is_file_backed = True
+                loader = FileSystemLoader(str(template.source_path.parent))
                 env = _DictSafeEnvironment(
-                    loader=FileSystemLoader(str(template.source_path.parent)),
+                    loader=loader,
                     undefined=StrictUndefined,
                     autoescape=False,
                     keep_trailing_newline=True,
@@ -126,6 +137,20 @@ class TemplateRenderer:
             else:
                 tmpl = self.env.from_string(template)
             return tmpl.render(**context)
+        except TemplateNotFound as e:
+            if is_file_backed and loader is not None:
+                search_paths = ", ".join(str(p) for p in loader.searchpath)
+                raise TemplateError(
+                    f"Template not found: '{e.name}'. Searched in: {search_paths}",
+                    suggestion="Check that the template file exists in the search path",
+                ) from e
+            else:
+                raise TemplateError(
+                    "Template rendering failed: loader-dependent Jinja constructs "
+                    "({% include %}, {% import %}, {% extends %}) require a file-backed prompt "
+                    "via prompt: !file ...",
+                    suggestion="Convert the prompt to a file-backed reference using prompt: !file",
+                ) from e
         except Jinja2UndefinedError as e:
             # Extract the variable name from the error message
             error_msg = str(e)
