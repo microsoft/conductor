@@ -66,10 +66,9 @@ class TestValidateWorkflowConfig:
     def test_warns_on_system_prompt_without_prompt(self) -> None:
         """Agent with system_prompt but no prompt: should produce a warning.
 
-        The Copilot provider concatenates system_prompt with the user prompt,
-        so a missing prompt means an empty user message — almost always a
-        latent author mistake. Other providers (Claude) ignore system_prompt
-        entirely, so the agent would have no instructions at all.
+        A missing prompt sends an empty user message on every provider, which
+        is almost always a latent authoring mistake even when system_prompt is
+        configured correctly.
         """
         config = WorkflowConfig(
             workflow=WorkflowDef(name="test", entry_point="lonely"),
@@ -87,6 +86,9 @@ class TestValidateWorkflowConfig:
         assert any(
             "lonely" in w and "system_prompt" in w and "no `prompt`" in w for w in warnings
         ), f"expected system_prompt-without-prompt warning; got: {warnings!r}"
+        warning_text = "\n".join(warnings).lower()
+        assert "ignore" not in warning_text
+        assert "entirely" not in warning_text
 
     def test_no_warning_when_prompt_present_alongside_system_prompt(self) -> None:
         """Having both system_prompt and prompt is the expected pattern — no warning."""
