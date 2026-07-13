@@ -1439,6 +1439,65 @@ summary:
 A comprehensive summary of the analysis results.
 ```
 
+### Jinja Includes in Prompt Files
+
+When a prompt or system_prompt is loaded via `!file`, the directory of that file becomes the search root for Jinja template loading. This allows statements like `{% include "_shared.md" %}`, `{% import "_macros.md" as m %}`, and `{% extends "_base.md" %}` to resolve relative to the prompt file's directory rather than the workflow's directory or the current working directory.
+
+Only `prompt: !file` and `system_prompt: !file` support this behavior. Other fields that use `!file` (such as command, stdin, value, schemas, or tool lists) don't have include loader support. Inline prompts defined as plain strings don't support loader-dependent Jinja tags. If you attempt to use them inline, the system raises a template rendering error suggesting you switch to a file-backed prompt:
+
+```
+Template rendering failed: loader-dependent Jinja constructs ({% include %}, {% import %}, {% extends %}) require a file-backed prompt via prompt: !file ...
+```
+
+If an include file is missing, the error identifies the missing template name and the searched directory:
+
+```
+Template not found: '<name>'. Searched in: <dir>
+```
+
+Note: Prompts for `human_gate` steps loaded via `!file` also support these include features because they use the same shared renderer.
+
+#### Example
+
+A workflow using a file-backed prompt:
+
+```yaml
+# workflow.yaml
+workflow:
+  name: review-workflow
+  description: A workflow that uses Jinja includes in its prompt
+  entry_point: reviewer
+
+agents:
+  - name: reviewer
+    model: gpt-4
+    prompt: !file prompts/review.md.jinja
+    routes:
+      - to: $end
+```
+
+The prompt file referencing a partial file:
+
+```markdown
+# prompts/review.md.jinja
+You are a code review assistant.
+
+{% include "_checklist.md.jinja" %}
+
+Please review the provided code according to the checklist.
+```
+
+The partial file:
+
+```markdown
+# prompts/_checklist.md.jinja
+Check for:
+1. Proper error handling
+2. Clear variable names
+```
+
+During validation, `conductor validate` doesn't scan inside included files to check template references. It only verifies that the direct `!file` targets exist.
+
 ### Environment Variables
 
 Environment variable references (`${VAR}` or `${VAR:-default}`) inside included files are resolved after inclusion, during the standard environment variable resolution pass. This means you can use env vars in external files just as you would inline:
@@ -1480,6 +1539,7 @@ Only UTF-8 text files are supported. Non-UTF-8 files produce a `ConfigurationErr
 - **No URLs** — Remote references like `!file https://...` are not supported
 - **No conditional includes** — File references cannot be parameterized or conditional
 - **No caching** — Each `!file` reference reads the file independently
+- **Jinja includes search root**: Relative template includes (`{% include %}`, etc.) resolve only against the prompt file's own directory, with no fallback to the workflow directory or current working directory.
 
 ## Hooks
 
