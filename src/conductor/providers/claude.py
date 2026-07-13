@@ -977,6 +977,7 @@ class ClaudeProvider(AgentProvider):
         # Done before the per-model max_tokens warning so the warning logic
         # accounts for thinking-aware caps.
         thinking = self._resolve_thinking_for_agent(agent, model)
+        system_prompt = (agent.system_prompt or "").strip() or None
 
         # Validate max_tokens against model-specific limits.
         # Skip the warning when extended thinking is enabled — the per-call
@@ -1039,6 +1040,7 @@ class ClaudeProvider(AgentProvider):
                     event_callback=event_callback,
                     thinking=thinking,
                     max_parse_recovery_attempts=config.max_parse_recovery_attempts,
+                    system_prompt=system_prompt,
                 )
 
                 # Handle partial output from mid-agent interrupt
@@ -1313,6 +1315,7 @@ class ClaudeProvider(AgentProvider):
         max_tokens: int,
         tools: list[dict[str, Any]] | None = None,
         thinking: dict[str, Any] | None = None,
+        system_prompt: str | None = None,
     ) -> ClaudeResponse:
         """Execute non-streaming Claude API call using AsyncAnthropic.
 
@@ -1329,6 +1332,8 @@ class ClaudeProvider(AgentProvider):
                 supplied, ``temperature`` is forced to 1.0 and ``max_tokens``
                 is bumped to satisfy the API constraint
                 ``max_tokens > budget_tokens``.
+            system_prompt: Optional rendered system prompt passed as the
+                top-level Anthropic ``system`` parameter.
 
         Returns:
             Claude API response object with content blocks and usage metadata.
@@ -1363,6 +1368,9 @@ class ClaudeProvider(AgentProvider):
         if thinking is not None:
             kwargs["thinking"] = thinking
 
+        if system_prompt:
+            kwargs["system"] = system_prompt
+
         # Execute non-streaming API call (async)
         logger.debug(
             f"Executing non-streaming Claude API call: model={model}, "
@@ -1388,6 +1396,7 @@ class ClaudeProvider(AgentProvider):
         event_callback: EventCallback | None = None,
         thinking: dict[str, Any] | None = None,
         max_parse_recovery_attempts: int | None = None,
+        system_prompt: str | None = None,
     ) -> tuple[ClaudeResponse, int | None, bool]:
         """Execute an agentic loop that handles MCP tool calls.
 
@@ -1414,8 +1423,10 @@ class ClaudeProvider(AgentProvider):
                 None means no time limit.
             interrupt_signal: Optional event that signals a mid-agent interrupt.
             event_callback: Optional callback for streaming SDK events upstream.
+            thinking: Optional extended-thinking kwarg forwarded to every API call.
             max_parse_recovery_attempts: Resolved per-agent parse recovery limit.
                 None means use the provider-level default.
+            system_prompt: Optional rendered system prompt forwarded to every API call.
 
         Returns:
             Tuple of (final_response, total_tokens_used, is_partial).
@@ -1464,6 +1475,7 @@ class ClaudeProvider(AgentProvider):
                     tools=tools,
                     has_output_schema=has_output_schema,
                     thinking=thinking,
+                    system_prompt=system_prompt,
                 )
                 total_tokens += interrupt_tokens
                 return interrupt_response, total_tokens, True
@@ -1491,6 +1503,7 @@ class ClaudeProvider(AgentProvider):
                             output_schema=output_schema,
                             thinking=thinking,
                             max_parse_recovery_attempts=max_parse_recovery_attempts,
+                            system_prompt=system_prompt,
                         )
                     )
                 else:
@@ -1502,6 +1515,7 @@ class ClaudeProvider(AgentProvider):
                             max_tokens=max_tokens,
                             tools=tools,
                             thinking=thinking,
+                            system_prompt=system_prompt,
                         )
                     )
                 interrupt_task = asyncio.create_task(interrupt_signal.wait())
@@ -1533,6 +1547,7 @@ class ClaudeProvider(AgentProvider):
                         tools=tools,
                         has_output_schema=has_output_schema,
                         thinking=thinking,
+                        system_prompt=system_prompt,
                     )
                     total_tokens += partial_tokens
                     return partial_resp, total_tokens, True
@@ -1548,6 +1563,7 @@ class ClaudeProvider(AgentProvider):
                     output_schema=output_schema,
                     thinking=thinking,
                     max_parse_recovery_attempts=max_parse_recovery_attempts,
+                    system_prompt=system_prompt,
                 )
             else:
                 response = await self._execute_api_call(
@@ -1557,6 +1573,7 @@ class ClaudeProvider(AgentProvider):
                     max_tokens=max_tokens,
                     tools=tools,
                     thinking=thinking,
+                    system_prompt=system_prompt,
                 )
 
             # Accumulate token usage
@@ -1764,6 +1781,7 @@ class ClaudeProvider(AgentProvider):
         tools: list[dict[str, Any]] | None,
         has_output_schema: bool,
         thinking: dict[str, Any] | None = None,
+        system_prompt: str | None = None,
     ) -> tuple[Any, int]:
         """Send a final API call requesting partial output after interrupt.
 
@@ -1781,6 +1799,8 @@ class ClaudeProvider(AgentProvider):
             max_tokens: Maximum output tokens.
             tools: Tool definitions (may include emit_output).
             has_output_schema: Whether the agent defines an output schema.
+            thinking: Optional extended-thinking kwarg forwarded to the API call.
+            system_prompt: Optional rendered system prompt forwarded to the API call.
 
         Returns:
             Tuple of (response, tokens_used_in_this_call).
@@ -1808,6 +1828,7 @@ class ClaudeProvider(AgentProvider):
             max_tokens=max_tokens,
             tools=tools,
             thinking=thinking,
+            system_prompt=system_prompt,
         )
 
         call_tokens = 0
@@ -1828,6 +1849,7 @@ class ClaudeProvider(AgentProvider):
         output_schema: dict[str, OutputField] | None,
         thinking: dict[str, Any] | None = None,
         max_parse_recovery_attempts: int | None = None,
+        system_prompt: str | None = None,
     ) -> ClaudeResponse:
         """Execute API call with parse recovery for malformed JSON responses.
 
@@ -1842,8 +1864,10 @@ class ClaudeProvider(AgentProvider):
             max_tokens: Maximum output tokens.
             tools: Tool definitions for structured output.
             output_schema: Expected output schema (None if no schema).
+            thinking: Optional extended-thinking kwarg forwarded to every API call.
             max_parse_recovery_attempts: Resolved per-agent parse recovery limit.
                 None means use the provider-level default.
+            system_prompt: Optional rendered system prompt forwarded to every API call.
 
         Returns:
             Claude API response.
@@ -1867,6 +1891,7 @@ class ClaudeProvider(AgentProvider):
             max_tokens=max_tokens,
             tools=tools,
             thinking=thinking,
+            system_prompt=system_prompt,
         )
 
         # If no output schema, return immediately (no recovery needed)
@@ -1932,6 +1957,7 @@ class ClaudeProvider(AgentProvider):
                 max_tokens=max_tokens,
                 tools=tools,
                 thinking=thinking,
+                system_prompt=system_prompt,
             )
 
             # Check if recovery succeeded (tool_use)
