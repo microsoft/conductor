@@ -1457,6 +1457,24 @@ Template not found: '<name>'. Searched in: <dir>
 
 Note: Prompts for `human_gate` steps loaded via `!file` also support these include features because they use the same shared renderer.
 
+#### Environment Variables in Partials
+
+Included, imported, and base template files go through the same environment variable resolution (`${VAR}` / `${VAR:-default}`) as the root prompt file, applied when Jinja loads each partial at render time. An unset **required** variable (no default) inside a partial fails the run with the standard configuration error:
+
+```
+ConfigurationError: Required environment variable 'X' is not set
+  💡 Suggestion: Set the environment variable 'X' or provide a default value using the syntax: ${X:-default_value}
+```
+
+#### Missing Prompt Source File
+
+The prompt file must still exist when the workflow runs — relative includes resolve against its directory. If the file was deleted or became inaccessible after the workflow was loaded, rendering fails immediately with an explicit error instead of silently treating the prompt as inline:
+
+```
+TemplateError: File-backed prompt source is no longer available: '<path>' (loaded via !file).
+  💡 Suggestion: Restore the prompt file or fix the !file reference — relative Jinja includes/imports/extends resolve against that file's directory.
+```
+
 #### Example
 
 A workflow using a file-backed prompt:

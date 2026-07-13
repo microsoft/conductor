@@ -9,7 +9,7 @@ from pathlib import Path, PureWindowsPath
 
 import pytest
 
-from conductor.exceptions import TemplateError
+from conductor.exceptions import ConfigurationError, TemplateError
 from conductor.executor.template import TemplateRenderer
 from conductor.file_string import FileString
 
@@ -153,14 +153,16 @@ def test_file_string_windows_path_conversion(tmp_path: Path) -> None:
     """Requirement: test that constructs FileString with a PureWindowsPath-style string
     converted via Path; keep it platform-safe so it also passes on Linux.
     """
-    # 1. Non-existent Windows path - should fall back to inline render safely
+    # 1. Non-existent Windows path - fails fast with an explicit source-path
+    # error instead of silently rendering inline.
     win_path_str = "C:\\foo\\bar\\main.md"
     path_obj = Path(PureWindowsPath(win_path_str))
 
     file_string = FileString("Hello {{ name }}!", path_obj)
     renderer = TemplateRenderer()
-    result = renderer.render(file_string, {"name": "World"})
-    assert result == "Hello World!"
+    with pytest.raises(TemplateError) as exc_info:
+        renderer.render(file_string, {"name": "World"})
+    assert "no longer available" in str(exc_info.value)
 
     # 2. Existing path converted via PureWindowsPath to ensure FileSystemLoader works
     main_file = tmp_path / "main.md"
@@ -174,6 +176,103 @@ def test_file_string_windows_path_conversion(tmp_path: Path) -> None:
     file_string_existing = FileString(main_file.read_text(), path_obj_existing)
     result_existing = renderer.render(file_string_existing, {})
     assert result_existing == "Hello World!"
+
+
+def test_missing_source_path_raises_explicit_error(tmp_path: Path) -> None:
+    """Requirement: a FileString whose source file was deleted after loading must
+    raise a TemplateError naming the unavailable source path instead of silently
+    rendering as an inline template.
+    """
+    main_file = tmp_path / "main.md"
+    main_file.write_text("Hello {{ name }}!")
+
+    file_string = FileString(main_file.read_text(), main_file)
+    main_file.unlink()
+
+    renderer = TemplateRenderer()
+    with pytest.raises(TemplateError) as exc_info:
+        renderer.render(file_string, {"name": "World"})
+
+    msg = str(exc_info.value)
+    assert str(main_file) in msg
+    assert "no longer available" in msg
+    # Must NOT fall back to the inline "convert to !file" guidance — the user
+    # already uses !file.
+    assert "prompt: !file" not in msg
+    assert "loader-dependent" not in msg
+    # Must NOT be double-wrapped by the generic except-Exception handler —
+    # the error is raised before the try block, so the message is exact.
+    assert "Template rendering failed" not in msg
+    assert "Check template and context for errors" not in msg
+    assert exc_info.value.__cause__ is None
+
+
+def test_partial_env_var_resolved_at_render_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Requirement: ${VAR} inside an included partial is resolved through the
+    same env resolver as the root prompt, at render time — not left literal.
+    """
+    main_file = tmp_path / "main.md"
+    partial_file = tmp_path / "_partial.md"
+
+    main_file.write_text("Main. {% include '_partial.md' %}")
+    partial_file.write_text("Partial says ${CONDUCTOR_TEST_PARTIAL_VAR}.")
+
+    file_string = FileString(main_file.read_text(), main_file)
+    renderer = TemplateRenderer()
+
+    # Set the env var AFTER the FileString was created to prove resolution
+    # happens at render time, not from a load-time snapshot.
+    monkeypatch.setenv("CONDUCTOR_TEST_PARTIAL_VAR", "resolved-value")
+    result = renderer.render(file_string, {})
+    assert result == "Main. Partial says resolved-value."
+
+
+def test_partial_env_var_default_used_when_unset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Requirement: ${VAR:-default} inside a partial reuses the config loader's
+    resolver semantics, falling back to the default when the var is unset.
+    """
+    main_file = tmp_path / "main.md"
+    partial_file = tmp_path / "_partial.md"
+
+    main_file.write_text("{% include '_partial.md' %}")
+    partial_file.write_text("mode=${CONDUCTOR_TEST_UNSET_VAR:-fallback}")
+
+    monkeypatch.delenv("CONDUCTOR_TEST_UNSET_VAR", raising=False)
+
+    file_string = FileString(main_file.read_text(), main_file)
+    renderer = TemplateRenderer()
+
+    result = renderer.render(file_string, {})
+    assert result == "mode=fallback"
+
+
+def test_partial_unset_required_env_var_raises_configuration_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Requirement: an unset required ${VAR} inside a partial raises the normal
+    ConfigurationError (message + suggestion), not a generic TemplateError.
+    """
+    main_file = tmp_path / "main.md"
+    partial_file = tmp_path / "_partial.md"
+
+    main_file.write_text("{% include '_partial.md' %}")
+    partial_file.write_text("key=${CONDUCTOR_TEST_REQUIRED_VAR}")
+
+    monkeypatch.delenv("CONDUCTOR_TEST_REQUIRED_VAR", raising=False)
+
+    file_string = FileString(main_file.read_text(), main_file)
+    renderer = TemplateRenderer()
+
+    with pytest.raises(ConfigurationError) as exc_info:
+        renderer.render(file_string, {})
+
+    msg = str(exc_info.value)
+    assert "Required environment variable 'CONDUCTOR_TEST_REQUIRED_VAR' is not set" in msg
+    assert "Template rendering failed" not in msg
 
 
 def test_template_not_found_error_includes_searchpath(tmp_path: Path) -> None:

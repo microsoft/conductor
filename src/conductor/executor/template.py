@@ -19,7 +19,8 @@ from jinja2 import (
 )
 from jinja2 import UndefinedError as Jinja2UndefinedError
 
-from conductor.exceptions import TemplateError
+from conductor.config.loader import resolve_env_vars
+from conductor.exceptions import ConfigurationError, TemplateError
 from conductor.file_string import FileString
 
 
@@ -45,6 +46,29 @@ class _DictSafeEnvironment(Environment):
                 pass
         # Fall back to the default resolution (getattr → getitem → undefined)
         return super().getattr(obj, attribute)
+
+
+class _EnvResolvingFileSystemLoader(FileSystemLoader):
+    """FileSystemLoader that resolves ``${VAR}`` env placeholders in partials.
+
+    The config loader resolves environment variables in the *root* ``!file``
+    prompt at YAML load time, but Jinja loads ``{% include %}`` /
+    ``{% import %}`` / ``{% extends %}`` targets itself at render time — long
+    after config loading finished.  Without this hook, ``${VAR}`` text inside
+    a partial would reach the model literally, and an unset required variable
+    would silently pass through instead of raising the usual configuration
+    error.
+
+    Each partial source is therefore run through the same
+    :func:`~conductor.config.loader.resolve_env_vars` resolver used by the
+    config loader before Jinja compiles it, so partials behave identically
+    to the root prompt file.
+    """
+
+    def get_source(self, environment: Environment, template: str) -> tuple[str, str, Any]:
+        """Load *template* and resolve env vars in its source before compile."""
+        source, filename, uptodate = super().get_source(environment, template)
+        return resolve_env_vars(source), filename, uptodate
 
 
 class TemplateRenderer:
@@ -121,10 +145,18 @@ class TemplateRenderer:
         """
         loader = None
         is_file_backed = False
+        if isinstance(template, FileString) and not template.source_path.is_file():
+            raise TemplateError(
+                f"File-backed prompt source is no longer available: "
+                f"'{template.source_path}' (loaded via !file).",
+                suggestion="Restore the prompt file or fix the !file reference — "
+                "relative Jinja includes/imports/extends resolve against "
+                "that file's directory.",
+            )
         try:
-            if isinstance(template, FileString) and template.source_path.exists():
+            if isinstance(template, FileString):
                 is_file_backed = True
-                loader = FileSystemLoader(str(template.source_path.parent))
+                loader = _EnvResolvingFileSystemLoader(str(template.source_path.parent))
                 env = _DictSafeEnvironment(
                     loader=loader,
                     undefined=StrictUndefined,
@@ -137,6 +169,11 @@ class TemplateRenderer:
             else:
                 tmpl = self.env.from_string(template)
             return tmpl.render(**context)
+        except ConfigurationError:
+            # Env var resolution failed inside a Jinja partial (e.g. an unset
+            # required ``${VAR}``) — keep the normal configuration error and
+            # its suggestion instead of downgrading it to a template error.
+            raise
         except TemplateNotFound as e:
             if is_file_backed and loader is not None:
                 search_paths = ", ".join(str(p) for p in loader.searchpath)
