@@ -632,6 +632,16 @@ agents:
 - Supports **recursive includes** — included YAML files can use `!file` too
 - Circular references are detected and raise an error
 
+Prompt files loaded via `!file` may also use Jinja loader-dependent tags
+(`{% include %}`, `{% import %}`, `{% extends %}`); relative paths resolve
+against the prompt file's own directory. `${VAR}` / `${VAR:-default}`
+references inside those partials resolve at render time with the same
+semantics as the root prompt file — an unset required variable fails the run
+with a configuration error. The prompt file must still exist at run time:
+if it was deleted after loading, rendering fails with an explicit error
+naming the missing source path (it never silently falls back to inline
+rendering).
+
 ## Parallel Groups
 
 Static parallel groups run a fixed set of agents concurrently:

@@ -13,12 +13,14 @@ from pydantic import (
     ConfigDict,
     Field,
     SecretStr,
+    ValidatorFunctionWrapHandler,
     field_validator,
     model_serializer,
     model_validator,
 )
 
 from conductor.duration import parse_duration
+from conductor.file_string import FileString
 from conductor.providers.context_tier import ContextTier
 from conductor.providers.reasoning import ReasoningEffort
 from conductor.templating import is_jinja_template
@@ -1097,6 +1099,24 @@ class AgentDef(BaseModel):
         if isinstance(v, bool):
             raise ValueError(f"duration must be a number or duration string, not boolean: {v!r}")
         return v
+
+    @field_validator("prompt", mode="wrap")
+    @classmethod
+    def preserve_prompt_file_str(cls, value: Any, handler: ValidatorFunctionWrapHandler) -> Any:
+        """Preserve FileString subclass on validation for the prompt field."""
+        if isinstance(value, FileString):
+            return value
+        return handler(value)
+
+    @field_validator("system_prompt", mode="wrap")
+    @classmethod
+    def preserve_system_prompt_file_str(
+        cls, value: Any, handler: ValidatorFunctionWrapHandler
+    ) -> Any:
+        """Preserve FileString subclass on validation for the system_prompt field."""
+        if isinstance(value, FileString):
+            return value
+        return handler(value)
 
     @model_validator(mode="after")
     def validate_agent_type(self) -> AgentDef:
