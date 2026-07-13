@@ -18,6 +18,7 @@ from ruamel.yaml.error import YAMLError
 
 from conductor.config.schema import WorkflowConfig
 from conductor.exceptions import ConfigurationError
+from conductor.file_string import FileString
 
 # Pattern to match ${VAR} or ${VAR:-default}
 ENV_VAR_PATTERN = re.compile(r"\$\{([^}:]+)(?::-([^}]*))?\}")
@@ -86,6 +87,8 @@ def _resolve_env_vars_recursive(data: Any) -> Any:
         return {k: _resolve_env_vars_recursive(v) for k, v in data.items()}
     elif isinstance(data, list):
         return [_resolve_env_vars_recursive(item) for item in data]
+    elif isinstance(data, FileString):
+        return FileString(resolve_env_vars(data), data.source_path)
     elif isinstance(data, str):
         return resolve_env_vars(data)
     else:
@@ -162,10 +165,10 @@ def _create_file_tag_constructor_class() -> type[RoundTripConstructor]:
                 if isinstance(parsed, (dict, list)):
                     return parsed
                 # Scalar YAML or None → return raw string content
-                return content
+                return FileString(content, source_path=file_path)
             except YAMLError:
                 # Not valid YAML → return as raw string
-                return content
+                return FileString(content, source_path=file_path)
             finally:
                 cls._base_dir = saved_base_dir
                 cls._file_stack.pop()
