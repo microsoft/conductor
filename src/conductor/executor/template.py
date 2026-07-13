@@ -16,6 +16,7 @@ from jinja2 import (
     StrictUndefined,
     TemplateNotFound,
     TemplateSyntaxError,
+    Undefined,
 )
 from jinja2 import UndefinedError as Jinja2UndefinedError
 
@@ -116,16 +117,23 @@ class TemplateRenderer:
         return json.dumps(value, indent=indent, default=str)
 
     @staticmethod
-    def _default_filter(value: Any, default: Any = "") -> Any:
+    def _default_filter(value: Any, default: Any = "", boolean: bool = False) -> Any:
         """Return default if value is None or undefined.
 
         Args:
             value: The value to check.
-            default: Default value to return if value is None.
+            default: Value returned for None, Undefined, or for any falsey value
+                when boolean=True.
+            boolean: If True, return default for any falsey value.
 
         Returns:
-            The value if not None, otherwise the default.
+            The value if not None/Undefined (or not falsey if boolean=True),
+            otherwise the default.
         """
+        if isinstance(value, Undefined):
+            return default
+        if boolean and not value:
+            return default
         if value is None:
             return default
         return value

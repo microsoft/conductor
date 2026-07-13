@@ -3998,8 +3998,8 @@ class WorkflowEngine:
             raise
 
     # Type-appropriate zero values for optional inputs with no declared default.
-    # Using None causes templates to render "None" instead of empty string,
-    # and | default() won't catch None without the boolean=true flag.
+    # Using None causes templates to render the literal "None" instead of a clean
+    # value, so we substitute a type-appropriate zero value up front.
     # Note: mutable types (array, object) return fresh copies via the method below.
     _TYPE_ZERO_VALUES: dict[str, Any] = {
         "string": "",

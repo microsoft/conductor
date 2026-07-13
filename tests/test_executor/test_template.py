@@ -120,6 +120,198 @@ class TestTemplateRendererDefaultFilter:
         )
         assert result == "Value: "
 
+    def test_default_filter_boolean_true_falsey(self) -> None:
+        """Test that default filter with boolean=True returns default for falsey values.
+
+        Requirements:
+        - When boolean=True, falsey values like None, empty string, 0, False,
+          empty list, and empty dict must return the fallback default value.
+        """
+        renderer = TemplateRenderer()
+        falsey_values = [None, "", 0, False, [], {}]
+        for val in falsey_values:
+            result = renderer.render(
+                "Value: {{ value | default('fallback', boolean=True) }}",
+                {"value": val},
+            )
+            assert result == "Value: fallback"
+
+            result_shorthand = renderer.render(
+                "Value: {{ value | default('fallback', true) }}",
+                {"value": val},
+            )
+            assert result_shorthand == "Value: fallback"
+
+    def test_default_filter_boolean_true_truthy(self) -> None:
+        """Test that default filter with boolean=True returns the truthy value.
+
+        Requirements:
+        - When boolean=True, truthy values must be returned unchanged.
+        """
+        renderer = TemplateRenderer()
+        result = renderer.render(
+            "Value: {{ value | default('fallback', boolean=True) }}",
+            {"value": "actual"},
+        )
+        assert result == "Value: actual"
+
+    def test_default_filter_two_arg_none(self) -> None:
+        """Test default filter with two arguments returns default when value is None."""
+        renderer = TemplateRenderer()
+        result = renderer.render(
+            "Value: {{ value | default('fallback') }}",
+            {"value": None},
+        )
+        assert result == "Value: fallback"
+
+    def test_default_filter_two_arg_empty_string_preserved(self) -> None:
+        """Test default filter with two arguments preserves empty string."""
+        renderer = TemplateRenderer()
+        result = renderer.render(
+            "Value: {{ value | default('fallback') }}",
+            {"value": ""},
+        )
+        assert result == "Value: "
+
+    def test_default_filter_two_arg_zero_preserved(self) -> None:
+        """Test default filter with two arguments preserves 0 and returns '0'."""
+        renderer = TemplateRenderer()
+        result = renderer.render(
+            "Value: {{ value | default('fallback') }}",
+            {"value": 0},
+        )
+        assert result == "Value: 0"
+
+    def test_default_filter_two_arg_false_preserved(self) -> None:
+        """Test default filter with two arguments preserves False and returns 'False'."""
+        renderer = TemplateRenderer()
+        result = renderer.render(
+            "Value: {{ value | default('fallback') }}",
+            {"value": False},
+        )
+        assert result == "Value: False"
+
+    def test_default_filter_two_arg_empty_list_preserved(self) -> None:
+        """Test default filter with two arguments preserves empty list and returns '[]'."""
+        renderer = TemplateRenderer()
+        result = renderer.render(
+            "Value: {{ value | default('fallback') }}",
+            {"value": []},
+        )
+        assert result == "Value: []"
+
+    def test_default_filter_two_arg_empty_dict_preserved(self) -> None:
+        """Test default filter with two arguments preserves empty dict and returns '{}'."""
+        renderer = TemplateRenderer()
+        result = renderer.render(
+            "Value: {{ value | default('fallback') }}",
+            {"value": {}},
+        )
+        assert result == "Value: {}"
+
+    def test_default_filter_boolean_false_none(self) -> None:
+        """Test default filter with boolean=False returns default when value is None."""
+        renderer = TemplateRenderer()
+        result = renderer.render(
+            "Value: {{ value | default('fallback', boolean=False) }}",
+            {"value": None},
+        )
+        assert result == "Value: fallback"
+
+    def test_default_filter_boolean_false_empty_string_preserved(self) -> None:
+        """Test default filter with boolean=False preserves empty string."""
+        renderer = TemplateRenderer()
+        result = renderer.render(
+            "Value: {{ value | default('fallback', boolean=False) }}",
+            {"value": ""},
+        )
+        assert result == "Value: "
+
+    def test_default_filter_boolean_false_zero_preserved(self) -> None:
+        """Test default filter with boolean=False preserves 0 and returns '0'."""
+        renderer = TemplateRenderer()
+        result = renderer.render(
+            "Value: {{ value | default('fallback', boolean=False) }}",
+            {"value": 0},
+        )
+        assert result == "Value: 0"
+
+    def test_default_filter_boolean_false_false_preserved(self) -> None:
+        """Test default filter with boolean=False preserves False and returns 'False'."""
+        renderer = TemplateRenderer()
+        result = renderer.render(
+            "Value: {{ value | default('fallback', boolean=False) }}",
+            {"value": False},
+        )
+        assert result == "Value: False"
+
+    def test_default_filter_boolean_false_empty_list_preserved(self) -> None:
+        """Test default filter with boolean=False preserves empty list and returns '[]'."""
+        renderer = TemplateRenderer()
+        result = renderer.render(
+            "Value: {{ value | default('fallback', boolean=False) }}",
+            {"value": []},
+        )
+        assert result == "Value: []"
+
+    def test_default_filter_boolean_false_empty_dict_preserved(self) -> None:
+        """Test default filter with boolean=False preserves empty dict and returns '{}'."""
+        renderer = TemplateRenderer()
+        result = renderer.render(
+            "Value: {{ value | default('fallback', boolean=False) }}",
+            {"value": {}},
+        )
+        assert result == "Value: {}"
+
+    def test_default_filter_missing_variable_returns_default(self) -> None:
+        """Test default filter returns fallback for an undefined variable.
+
+        Requirements:
+        - A missing variable guarded by default() must render the fallback instead
+          of raising TemplateError under StrictUndefined.
+        """
+        renderer = TemplateRenderer()
+        result = renderer.render(
+            "Value: {{ missing | default('fallback') }}",
+            {},
+        )
+        assert result == "Value: fallback"
+
+    def test_default_filter_boolean_true_missing_variable_returns_default(self) -> None:
+        """Test default filter with boolean=True returns fallback for undefined values.
+
+        Requirements:
+        - A missing variable guarded by default(..., boolean=True) or default(..., true)
+          must render the fallback instead of evaluating StrictUndefined truthiness.
+        """
+        renderer = TemplateRenderer()
+
+        result = renderer.render(
+            "Value: {{ missing | default('fallback', boolean=True) }}",
+            {},
+        )
+        assert result == "Value: fallback"
+
+        shorthand_result = renderer.render(
+            "Value: {{ missing | default('fallback', true) }}",
+            {},
+        )
+        assert shorthand_result == "Value: fallback"
+
+    def test_default_filter_missing_nested_key_returns_default(self) -> None:
+        """Test default filter returns fallback for a missing nested dict key.
+
+        Requirements:
+        - A missing key on an existing dict guarded by default() must render the
+          fallback instead of raising TemplateError.
+        """
+        renderer = TemplateRenderer()
+        result = renderer.render(
+            "Value: {{ data.missing | default('fallback') }}",
+            {"data": {}},
+        )
+        assert result == "Value: fallback"
+
 
 class TestTemplateRendererConditionals:
     """Tests for conditional expressions in templates."""
