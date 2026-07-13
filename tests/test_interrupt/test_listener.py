@@ -814,10 +814,7 @@ class TestSigtermHandlerDelegation:
             _, h1 = captured_handler[0]
             h1 = cast(Callable[[int, object], None], h1)
 
-            # Interim shim: typed local keeps ruff/basedpyright green until T5
-            # adds the dataclass field (commit 2 converts to direct access).
-            listener_any: Any = listener
-            listener_any._sigterm_handler = h1
+            listener._sigterm_handler = h1
 
         with (
             patch("signal.getsignal", return_value=h1),
@@ -865,10 +862,7 @@ class TestSigtermHandlerDelegation:
         _, h_a = captured_a[0]
         h_a = cast(Callable[[int, object], None], h_a)
 
-        # Interim shim: typed local keeps ruff/basedpyright green until T5
-        # adds the dataclass field (commit 2 converts to direct access).
-        listener_a_any: Any = listener_a
-        listener_a_any._sigterm_handler = h_a
+        listener_a._sigterm_handler = h_a
 
         captured_b: list[tuple[int, object]] = []
 
@@ -890,10 +884,7 @@ class TestSigtermHandlerDelegation:
         h_b = cast(Callable[[int, object], None], h_b)
         assert h_b is not h_a, "new listener must not reuse the other instance's handler"
 
-        # Interim shim: typed local keeps ruff/basedpyright green until T5
-        # adds the dataclass field (commit 2 converts to direct access).
-        listener_b_any: Any = listener_b
-        assert listener_b_any._sigterm_handler is h_b
+        assert listener_b._sigterm_handler is h_b
 
         call_order: list[str] = []
 
