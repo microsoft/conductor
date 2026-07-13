@@ -8,6 +8,7 @@ The Claude provider enables Conductor workflows to use Anthropic's Claude models
 - [API Key Setup](#api-key-setup)
 - [Model Selection](#model-selection)
 - [Runtime Configuration](#runtime-configuration)
+- [System Prompt](#system-prompt)
 - [Streaming Limitations](#streaming-limitations)
 - [Extended Thinking](#extended-thinking)
 - [Troubleshooting](#troubleshooting)
@@ -239,6 +240,15 @@ agents:
     routes:
       - to: $end
 ```
+
+## System Prompt
+
+When an agent defines a `system_prompt`, the Claude provider forwards this value as the native top-level `system` parameter in the Anthropic Messages API. 
+
+Key details of this integration:
+- **Consistent Application**: The `system_prompt` is sent on every API call in the agent's execution path, including the main loop, tool-use iterations, parse recovery, interrupt partial output requests, and retries.
+- **Empty Prompts**: Any empty or whitespace-only `system_prompt` is normalized to `None` and is not sent to the API.
+- **Caching**: Anthropic `cache_control` support for the `system` parameter is not implemented yet and is planned as a follow-up.
 
 ## Streaming Limitations
 
