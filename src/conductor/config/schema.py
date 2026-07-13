@@ -1102,9 +1102,7 @@ class AgentDef(BaseModel):
 
     @field_validator("prompt", mode="wrap")
     @classmethod
-    def preserve_prompt_filestring(
-        cls, value: Any, handler: ValidatorFunctionWrapHandler
-    ) -> Any:
+    def preserve_prompt_file_str(cls, value: Any, handler: ValidatorFunctionWrapHandler) -> Any:
         """Preserve FileString subclass on validation for the prompt field."""
         if isinstance(value, FileString):
             return value
@@ -1112,7 +1110,7 @@ class AgentDef(BaseModel):
 
     @field_validator("system_prompt", mode="wrap")
     @classmethod
-    def preserve_system_prompt_filestring(
+    def preserve_system_prompt_file_str(
         cls, value: Any, handler: ValidatorFunctionWrapHandler
     ) -> Any:
         """Preserve FileString subclass on validation for the system_prompt field."""
