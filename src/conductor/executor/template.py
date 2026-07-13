@@ -9,10 +9,11 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from jinja2 import BaseLoader, Environment, StrictUndefined, TemplateSyntaxError
+from jinja2 import BaseLoader, Environment, FileSystemLoader, StrictUndefined, TemplateSyntaxError
 from jinja2 import UndefinedError as Jinja2UndefinedError
 
 from conductor.exceptions import TemplateError
+from conductor.file_string import FileString
 
 
 class _DictSafeEnvironment(Environment):
@@ -63,8 +64,12 @@ class TemplateRenderer:
         )
 
         # Register custom filters
-        self.env.filters["json"] = self._json_filter
-        self.env.filters["default"] = self._default_filter
+        self._register_filters(self.env)
+
+    def _register_filters(self, env: Environment) -> None:
+        """Register custom filters on the Jinja2 environment."""
+        env.filters["json"] = self._json_filter
+        env.filters["default"] = self._default_filter
 
     @staticmethod
     def _json_filter(value: Any, indent: int = 2) -> str:
@@ -108,7 +113,18 @@ class TemplateRenderer:
             TemplateError: If rendering fails due to missing variables or syntax errors.
         """
         try:
-            tmpl = self.env.from_string(template)
+            if isinstance(template, FileString) and template.source_path.exists():
+                env = _DictSafeEnvironment(
+                    loader=FileSystemLoader(str(template.source_path.parent)),
+                    undefined=StrictUndefined,
+                    autoescape=False,
+                    keep_trailing_newline=True,
+                )
+                self._register_filters(env)
+                code = env.compile(str(template), filename=str(template.source_path))
+                tmpl = env.template_class.from_code(env, code, env.globals)
+            else:
+                tmpl = self.env.from_string(template)
             return tmpl.render(**context)
         except Jinja2UndefinedError as e:
             # Extract the variable name from the error message
