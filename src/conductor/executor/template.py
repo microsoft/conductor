@@ -80,18 +80,23 @@ class TemplateRenderer:
         return json.dumps(value, indent=indent, default=str)
 
     @staticmethod
-    def _default_filter(value: Any, default: Any = "") -> Any:
+    def _default_filter(value: Any, default: Any = "", boolean: bool = False) -> Any:
         """Return default if value is None or undefined.
 
         Args:
             value: The value to check.
-            default: Default value to return if value is None.
+            default: Default value to return if value is None or falsey.
+            boolean: If True, return default for any falsey value.
 
         Returns:
-            The value if not None, otherwise the default.
+            The value if not None (or not falsey if boolean=True), otherwise the default.
         """
-        if value is None:
-            return default
+        if boolean:
+            if not value:
+                return default
+        else:
+            if value is None:
+                return default
         return value
 
     def render(self, template: str, context: dict[str, Any]) -> str:
