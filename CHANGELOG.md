@@ -5,7 +5,9 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.20...HEAD)
+## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.21...HEAD)
+
+## [0.1.21](https://github.com/microsoft/conductor/compare/v0.1.20...v0.1.21) - 2026-07-13
 
 ### Added
 
@@ -28,6 +30,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the scoped provider (default `copilot`) fails to connect. Also adds a
   public `list_models()` method to the provider interface (implemented for
   Copilot and Claude). ([#274](https://github.com/microsoft/conductor/issues/274))
+- **Jinja `include`/`import`/`extends` in `!file`-loaded prompts** — prompt
+  templates loaded via `prompt: !file ...` (and `system_prompt: !file ...`) now
+  support loader-dependent Jinja constructs, resolved relative to the prompt
+  file's own directory, enabling reusable prompt partials across workflows.
+  Inline prompts that attempt these constructs get a clear error instead of a
+  confusing failure.
+  ([#291](https://github.com/microsoft/conductor/pull/291),
+  closes [#287](https://github.com/microsoft/conductor/issues/287))
 
 ### Fixed
 
@@ -69,6 +79,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or completed. The toggle and the dive-in control are now siblings, so dive-in
   stays clickable for running items too.
   ([#273](https://github.com/microsoft/conductor/pull/273))
+- **Custom `default` Jinja filter rejected the standard `boolean` argument** —
+  Conductor's override of Jinja2's built-in `default` filter only accepted two
+  parameters, so valid templates using the standard third `boolean` argument
+  raised a `TypeError`. The filter now matches Jinja's built-in signature
+  (`default(value, default_value="", boolean=False)`) while preserving
+  Conductor's existing two-argument behavior when `boolean` is omitted.
+  ([#292](https://github.com/microsoft/conductor/pull/292),
+  closes [#288](https://github.com/microsoft/conductor/issues/288))
+- **Claude provider silently dropped `agent.system_prompt`** — the native
+  `claude` provider (Anthropic Messages API) ignored `system_prompt` instead of
+  sending it. It is now passed as the native top-level `system` parameter on
+  every API call in the agent execution path (main loop, tool-use iterations,
+  parse recovery, interrupt partial output, retries), and the validator
+  rubric's system prompt now reaches the model the same way.
+  ([#293](https://github.com/microsoft/conductor/pull/293),
+  closes [#289](https://github.com/microsoft/conductor/issues/289))
 
 ## [0.1.20](https://github.com/microsoft/conductor/compare/v0.1.19...v0.1.20) - 2026-06-26
 
