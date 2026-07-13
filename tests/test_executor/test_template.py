@@ -263,6 +263,55 @@ class TestTemplateRendererDefaultFilter:
         )
         assert result == "Value: {}"
 
+    def test_default_filter_missing_variable_returns_default(self) -> None:
+        """Test default filter returns fallback for an undefined variable.
+
+        Requirements:
+        - A missing variable guarded by default() must render the fallback instead
+          of raising TemplateError under StrictUndefined.
+        """
+        renderer = TemplateRenderer()
+        result = renderer.render(
+            "Value: {{ missing | default('fallback') }}",
+            {},
+        )
+        assert result == "Value: fallback"
+
+    def test_default_filter_boolean_true_missing_variable_returns_default(self) -> None:
+        """Test default filter with boolean=True returns fallback for undefined values.
+
+        Requirements:
+        - A missing variable guarded by default(..., boolean=True) or default(..., true)
+          must render the fallback instead of evaluating StrictUndefined truthiness.
+        """
+        renderer = TemplateRenderer()
+
+        result = renderer.render(
+            "Value: {{ missing | default('fallback', boolean=True) }}",
+            {},
+        )
+        assert result == "Value: fallback"
+
+        shorthand_result = renderer.render(
+            "Value: {{ missing | default('fallback', true) }}",
+            {},
+        )
+        assert shorthand_result == "Value: fallback"
+
+    def test_default_filter_missing_nested_key_returns_default(self) -> None:
+        """Test default filter returns fallback for a missing nested dict key.
+
+        Requirements:
+        - A missing key on an existing dict guarded by default() must render the
+          fallback instead of raising TemplateError.
+        """
+        renderer = TemplateRenderer()
+        result = renderer.render(
+            "Value: {{ data.missing | default('fallback') }}",
+            {"data": {}},
+        )
+        assert result == "Value: fallback"
+
 
 class TestTemplateRendererConditionals:
     """Tests for conditional expressions in templates."""

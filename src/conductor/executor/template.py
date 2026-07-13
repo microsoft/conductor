@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from jinja2 import BaseLoader, Environment, StrictUndefined, TemplateSyntaxError
+from jinja2 import BaseLoader, Environment, StrictUndefined, TemplateSyntaxError, Undefined
 from jinja2 import UndefinedError as Jinja2UndefinedError
 
 from conductor.exceptions import TemplateError
@@ -85,18 +85,20 @@ class TemplateRenderer:
 
         Args:
             value: The value to check.
-            default: Default value to return if value is None or falsey.
+            default: Value returned for None, Undefined, or for any falsey value
+                when boolean=True.
             boolean: If True, return default for any falsey value.
 
         Returns:
-            The value if not None (or not falsey if boolean=True), otherwise the default.
+            The value if not None/Undefined (or not falsey if boolean=True),
+            otherwise the default.
         """
-        if boolean:
-            if not value:
-                return default
-        else:
-            if value is None:
-                return default
+        if isinstance(value, Undefined):
+            return default
+        if boolean and not value:
+            return default
+        if value is None:
+            return default
         return value
 
     def render(self, template: str, context: dict[str, Any]) -> str:
