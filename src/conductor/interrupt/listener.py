@@ -31,6 +31,15 @@ _CTRL_G_BYTE = 0x07
 # Timeout for disambiguating bare Esc from escape sequences (seconds)
 _ESC_DISAMBIGUATE_TIMEOUT = 0.05
 
+_CAPTURED_BASELINE_SETTINGS: Any = None
+"""Process-wide tty baseline captured on the FIRST successful start().
+
+Subsequent KeyboardListener instances reuse this baseline so a second
+listener never re-captures cbreak state as "original". Process-lifetime
+and intentionally never reset by production code: after stop() the tty
+has been restored to exactly this baseline, so reuse is always
+legitimate. Tests reset it via a fixture. See issue #290."""
+
 
 @dataclass
 class KeyboardListener:
@@ -103,9 +112,27 @@ class KeyboardListener:
         self._loop = asyncio.get_running_loop()
         self._stop_flag = False
 
-        # Save original terminal settings
+        # Save original terminal settings. A second listener must never
+        # re-snapshot an already-cbreak terminal as its "original" state, so
+        # the baseline is captured once per process into a module-level cache
+        # (issue #290).
+        global _CAPTURED_BASELINE_SETTINGS
+
+        # Idempotent guard: a start() on a truly-active listener (baseline
+        # held AND reader thread running) is a no-op so it cannot overwrite
+        # the baseline or spawn duplicate threads. After suspend() the thread
+        # is None, so start-after-suspend correctly falls through below.
+        if self._original_settings is not None and self._reader_thread is not None:
+            logger.debug("Keyboard listener already active, start() is a no-op")
+            return
+
         try:
-            self._original_settings = termios.tcgetattr(sys.stdin.fileno())
+            if _CAPTURED_BASELINE_SETTINGS is not None:
+                # Reuse the process-wide pre-listener baseline.
+                self._original_settings = _CAPTURED_BASELINE_SETTINGS
+            else:
+                self._original_settings = termios.tcgetattr(sys.stdin.fileno())
+                _CAPTURED_BASELINE_SETTINGS = self._original_settings  # pyright: ignore[reportConstantRedefinition]
         except termios.error:
             logger.debug("Failed to get terminal settings, listener not started")
             return
@@ -178,7 +205,7 @@ class KeyboardListener:
             try:
                 import termios
 
-                termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, self._original_settings)
+                termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, self._original_settings)
             except (ImportError, termios.error, ValueError, OSError):
                 pass
 
@@ -226,10 +253,12 @@ class KeyboardListener:
             try:
                 import termios
 
-                termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, self._original_settings)
+                termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, self._original_settings)
+                # Clear the baseline only after a successful restore so a
+                # transient failure keeps it for a later retry (issue #290).
+                self._original_settings = None
             except (ImportError, termios.error, ValueError, OSError):
                 pass
-            self._original_settings = None
 
     def _register_cleanup_handlers(self) -> None:
         """Register atexit and SIGTERM handlers for crash safety."""

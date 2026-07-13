@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from collections.abc import Callable
+from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -121,7 +123,7 @@ class TestKeyboardListenerStartStop:
             listener._restore_terminal()
 
             mock_termios.tcsetattr.assert_called_once_with(
-                0, mock_termios.TCSADRAIN, original_settings
+                0, mock_termios.TCSANOW, original_settings
             )
             assert listener._original_settings is None
 
@@ -328,7 +330,7 @@ class TestThreadSafety:
         listener._byte_queue.put_nowait(_CTRL_G_BYTE)
         listener._byte_queue.put_nowait(None)
 
-        threadsafe_args: list[tuple] = []
+        threadsafe_args: list[tuple[Any, ...]] = []
         original_call = loop.call_soon_threadsafe
 
         def tracking_call(*args, **kwargs):  # type: ignore[no-untyped-def]
@@ -424,8 +426,15 @@ class TestRestoreTerminal:
 
         assert listener._original_settings is None
 
-    def test_restore_handles_termios_error_gracefully(self, listener: KeyboardListener) -> None:
-        """Verify restore handles termios errors without raising."""
+    def test_restore_keeps_settings_on_termios_error_for_retry(
+        self, listener: KeyboardListener
+    ) -> None:
+        """Verify a failed restore keeps the baseline so it can be retried.
+
+        Requirement: a transient restore failure must not lose the only
+        correct baseline — the saved settings stay in place so a later
+        atexit/SIGTERM/stop() attempt can retry the restore (issue #290).
+        """
         mock_termios = MagicMock()
         mock_termios.error = OSError
         mock_termios.tcsetattr.side_effect = OSError("terminal gone")
@@ -438,7 +447,9 @@ class TestRestoreTerminal:
             mock_stdin.fileno.return_value = 0
             listener._restore_terminal()  # Should not raise
 
-        assert listener._original_settings is None
+        assert listener._original_settings is not None
+        # Drop the fake baseline so the registered atexit handler is a no-op
+        listener._original_settings = None
 
 
 class TestConstants:
@@ -455,3 +466,464 @@ class TestConstants:
     def test_disambiguate_timeout_value(self) -> None:
         """Verify Esc disambiguation timeout is 50ms."""
         assert _ESC_DISAMBIGUATE_TIMEOUT == 0.05
+
+
+class TestBaselineCacheAndIdempotentStart:
+    """Tests for the module-level baseline cache and idempotent start (issue #290).
+
+    Red phase: the terminal baseline must be captured once per process and
+    cached at module level; repeated ``start()`` calls must not re-read it.
+    """
+
+    @pytest.mark.asyncio
+    async def test_module_baseline_captured_once_per_process(
+        self, interrupt_event: asyncio.Event
+    ) -> None:
+        # Requirement: termios.tcgetattr is called exactly once per process,
+        # no matter how many KeyboardListener instances start (issue #290).
+        mock_termios = MagicMock()
+        mock_tty = MagicMock()
+        mock_termios.tcgetattr.return_value = [1, 2, 3]
+        mock_termios.error = OSError
+
+        with (
+            patch("sys.stdin") as mock_stdin,
+            patch.dict("sys.modules", {"termios": mock_termios, "tty": mock_tty}),
+        ):
+            mock_stdin.isatty.return_value = True
+            mock_stdin.fileno.return_value = 0
+
+            listener_a = KeyboardListener(interrupt_event=interrupt_event)
+            await listener_a.start()
+            mock_termios.tcgetattr.assert_called_once()
+
+            mock_termios.reset_mock()
+
+            listener_b = KeyboardListener(interrupt_event=interrupt_event)
+            await listener_b.start()
+            mock_termios.tcgetattr.assert_not_called()
+
+            await listener_a.stop()
+            await listener_b.stop()
+
+    @pytest.mark.asyncio
+    async def test_idempotent_start_is_noop_when_active(
+        self, interrupt_event: asyncio.Event
+    ) -> None:
+        # Requirement: calling start() on an already-active listener is a no-op
+        # — no tcgetattr/setcbreak, no new reader thread (issue #290).
+        mock_termios = MagicMock()
+        mock_tty = MagicMock()
+        mock_termios.tcgetattr.return_value = [1, 2, 3]
+        mock_termios.error = OSError
+
+        with (
+            patch("sys.stdin") as mock_stdin,
+            patch.dict("sys.modules", {"termios": mock_termios, "tty": mock_tty}),
+        ):
+            mock_stdin.isatty.return_value = True
+            mock_stdin.fileno.return_value = 0
+
+            listener = KeyboardListener(interrupt_event=interrupt_event)
+            await listener.start()
+            first_thread = listener._reader_thread
+
+            mock_termios.reset_mock()
+            mock_tty.reset_mock()
+
+            await listener.start()
+
+            mock_termios.tcgetattr.assert_not_called()
+            mock_tty.setcbreak.assert_not_called()
+            assert listener._reader_thread is first_thread
+
+            await listener.stop()
+
+    @pytest.mark.asyncio
+    async def test_start_after_suspend_restarts_listener(
+        self, interrupt_event: asyncio.Event
+    ) -> None:
+        # Requirement: start() after suspend() re-enters cbreak and spawns a
+        # new reader thread, but reuses the cached baseline — tcgetattr must
+        # NOT be called again (issue #290).
+        mock_termios = MagicMock()
+        mock_tty = MagicMock()
+        mock_termios.tcgetattr.return_value = [1, 2, 3]
+        mock_termios.error = OSError
+
+        with (
+            patch("sys.stdin") as mock_stdin,
+            patch.dict("sys.modules", {"termios": mock_termios, "tty": mock_tty}),
+        ):
+            mock_stdin.isatty.return_value = True
+            mock_stdin.fileno.return_value = 0
+
+            listener = KeyboardListener(interrupt_event=interrupt_event)
+            await listener.start()
+            await listener.suspend()
+
+            mock_termios.reset_mock()
+            mock_tty.reset_mock()
+
+            await listener.start()
+
+            mock_tty.setcbreak.assert_called_once_with(0)
+            assert listener._reader_thread is not None
+            mock_termios.tcgetattr.assert_not_called()
+
+            await listener.stop()
+
+    @pytest.mark.asyncio
+    async def test_suspend_keeps_baseline_for_resume(self, interrupt_event: asyncio.Event) -> None:
+        # Requirement: suspend() keeps _original_settings for resume(), and
+        # resume() re-enters cbreak without re-capturing the baseline
+        # (issue #290; regression guard — passes on current code).
+        mock_termios = MagicMock()
+        mock_tty = MagicMock()
+        mock_termios.tcgetattr.return_value = [1, 2, 3]
+        mock_termios.error = OSError
+
+        with (
+            patch("sys.stdin") as mock_stdin,
+            patch.dict("sys.modules", {"termios": mock_termios, "tty": mock_tty}),
+        ):
+            mock_stdin.isatty.return_value = True
+            mock_stdin.fileno.return_value = 0
+
+            listener = KeyboardListener(interrupt_event=interrupt_event)
+            await listener.start()
+            captured = listener._original_settings
+            assert captured is not None
+
+            await listener.suspend()
+            assert listener._original_settings is captured
+
+            mock_termios.reset_mock()
+
+            await listener.resume()
+            mock_termios.tcgetattr.assert_not_called()
+
+            await listener.stop()
+            # Drop the fake baseline so the registered atexit handler is a no-op
+            listener._original_settings = None
+
+    @pytest.mark.asyncio
+    async def test_suspend_restores_with_tcsanow(self, interrupt_event: asyncio.Event) -> None:
+        # Requirement: suspend() restores the terminal with TCSANOW so the
+        # human gate gets a sane terminal immediately — TCSADRAIN would wait
+        # for pending output and can race with the gate's first read
+        # (issue #290).
+        mock_termios = MagicMock()
+        mock_tty = MagicMock()
+        mock_termios.tcgetattr.return_value = [1, 2, 3]
+        mock_termios.error = OSError
+
+        with (
+            patch("sys.stdin") as mock_stdin,
+            patch.dict("sys.modules", {"termios": mock_termios, "tty": mock_tty}),
+        ):
+            mock_stdin.isatty.return_value = True
+            mock_stdin.fileno.return_value = 0
+
+            listener = KeyboardListener(interrupt_event=interrupt_event)
+            await listener.start()
+            mock_termios.reset_mock()
+
+            await listener.suspend()
+
+            mock_termios.tcsetattr.assert_called_once_with(
+                0, mock_termios.TCSANOW, listener._original_settings
+            )
+
+            await listener.stop()
+
+    def test_restore_clears_baseline_only_on_success(self, interrupt_event: asyncio.Event) -> None:
+        # Requirement: _restore_terminal() clears _original_settings only
+        # after a successful tcsetattr; on termios.error the baseline must be
+        # kept so a later restore can retry (issue #290).
+        mock_termios = MagicMock()
+        mock_termios.error = OSError
+        mock_termios.tcsetattr.side_effect = [OSError("terminal gone"), None]
+        saved_settings = [1, 2, 3]
+
+        listener = KeyboardListener(interrupt_event=interrupt_event)
+        listener._original_settings = saved_settings
+
+        with (
+            patch("sys.stdin") as mock_stdin,
+            patch.dict("sys.modules", {"termios": mock_termios}),
+        ):
+            mock_stdin.fileno.return_value = 0
+
+            listener._restore_terminal()
+            assert listener._original_settings is saved_settings
+
+            listener._restore_terminal()
+            assert listener._original_settings is None
+
+
+class TestSigtermHandlerDelegation:
+    """Tests for SIGTERM handler delegation semantics (issue #290).
+
+    Red phase: the current ``_sigterm_handler`` closure restores the terminal
+    and optionally calls a callable previous handler, but it does NOT re-raise
+    when the previous disposition was ``SIG_DFL`` — the process silently
+    survives SIGTERM, leaving the terminal in cbreak. The fixed implementation
+    must restore, reset to SIG_DFL, and re-raise via ``os.kill``.
+    """
+
+    def test_sigterm_handler_restores_then_re_raises_when_previous_was_dfl(
+        self, listener: KeyboardListener
+    ) -> None:
+        # Requirement: when the previous SIGTERM disposition is SIG_DFL, the
+        # handler must (1) restore the terminal, (2) reset the disposition
+        # back to SIG_DFL, and (3) re-raise SIGTERM to self via os.kill so
+        # the process actually terminates with the default action (issue #290).
+        import os
+        import signal as signal_module
+
+        captured_handler: list[tuple[int, object]] = []
+
+        def fake_signal(signum: int, handler):  # type: ignore[no-untyped-def]
+            captured_handler.append((signum, handler))
+
+        with (
+            patch("signal.getsignal", return_value=signal_module.SIG_DFL),
+            patch("signal.signal", side_effect=fake_signal),
+            patch("os.kill") as mock_kill,
+        ):
+            listener._original_settings = [1, 2, 3]
+            listener._register_cleanup_handlers()
+
+            assert len(captured_handler) == 1
+            registered_signum, registered_handler = captured_handler[0]
+            registered_handler = cast(Callable[[int, object], None], registered_handler)
+            assert registered_signum == signal_module.SIGTERM
+
+            registered_handler(signal_module.SIGTERM, None)
+
+            assert listener._original_settings is None
+
+            reset_calls = [
+                (s, h)
+                for (s, h) in captured_handler[1:]
+                if s == signal_module.SIGTERM and h == signal_module.SIG_DFL
+            ]
+            assert len(reset_calls) == 1, (
+                "handler did not reset SIGTERM disposition to SIG_DFL before re-raising"
+            )
+
+            mock_kill.assert_called_once_with(os.getpid(), signal_module.SIGTERM)
+
+        listener._original_settings = None
+        listener._atexit_registered = False
+
+    def test_sigterm_handler_noop_when_previous_was_ign(self, listener: KeyboardListener) -> None:
+        # Requirement: when the previous SIGTERM disposition is SIG_IGN, the
+        # handler must restore the terminal but must NOT re-raise (the caller
+        # explicitly asked to ignore SIGTERM) and must NOT touch the
+        # disposition again (issue #290).
+        import signal as signal_module
+
+        captured_handler: list[tuple[int, object]] = []
+
+        def fake_signal(signum: int, handler):  # type: ignore[no-untyped-def]
+            captured_handler.append((signum, handler))
+
+        with (
+            patch("signal.getsignal", return_value=signal_module.SIG_IGN),
+            patch("signal.signal", side_effect=fake_signal),
+            patch("os.kill") as mock_kill,
+        ):
+            listener._original_settings = [1, 2, 3]
+            listener._register_cleanup_handlers()
+
+            assert len(captured_handler) == 1
+            registered_signum, registered_handler = captured_handler[0]
+            registered_handler = cast(Callable[[int, object], None], registered_handler)
+            assert registered_signum == signal_module.SIGTERM
+
+            registered_handler(signal_module.SIGTERM, None)
+
+            assert listener._original_settings is None
+
+            mock_kill.assert_not_called()
+            assert len(captured_handler) == 1, (
+                "handler must not modify SIGTERM disposition when previous was SIG_IGN"
+            )
+
+        listener._original_settings = None
+        listener._atexit_registered = False
+
+    def test_sigterm_handler_calls_callable_previous(self, listener: KeyboardListener) -> None:
+        # Requirement: when the previous SIGTERM disposition is a callable,
+        # the handler must restore the terminal first and then delegate to
+        # the callable with the same (signum, frame) arguments (issue #290).
+        import signal as signal_module
+
+        previous = MagicMock()
+        captured_handler: list[tuple[int, object]] = []
+
+        def fake_signal(signum: int, handler):  # type: ignore[no-untyped-def]
+            captured_handler.append((signum, handler))
+
+        with (
+            patch("signal.getsignal", return_value=previous),
+            patch("signal.signal", side_effect=fake_signal),
+            patch("os.kill"),
+        ):
+            listener._original_settings = [1, 2, 3]
+            listener._register_cleanup_handlers()
+
+            assert len(captured_handler) == 1
+            _, registered_handler = captured_handler[0]
+            registered_handler = cast(Callable[[int, object], None], registered_handler)
+
+            registered_handler(signal_module.SIGTERM, None)
+
+            assert listener._original_settings is None
+
+            previous.assert_called_once_with(signal_module.SIGTERM, None)
+
+        listener._original_settings = None
+        listener._atexit_registered = False
+
+    def test_register_cleanup_handlers_does_not_self_recurse(
+        self, listener: KeyboardListener
+    ) -> None:
+        # Requirement: calling ``_register_cleanup_handlers`` twice on the same
+        # instance must NOT re-capture the previously-installed own handler as
+        # ``_previous_sigterm`` (that would produce unbounded self-recursion
+        # when the handler delegates). The second call must detect that our
+        # own handler is still installed and skip re-registration (issue #290).
+        import signal as signal_module
+
+        captured_handler: list[tuple[int, object]] = []
+
+        def fake_signal(signum: int, handler):  # type: ignore[no-untyped-def]
+            captured_handler.append((signum, handler))
+
+        with (
+            patch("signal.getsignal", return_value=signal_module.SIG_DFL),
+            patch("signal.signal", side_effect=fake_signal),
+            patch("os.kill"),
+        ):
+            listener._register_cleanup_handlers()
+
+            assert len(captured_handler) == 1
+            _, h1 = captured_handler[0]
+            h1 = cast(Callable[[int, object], None], h1)
+
+            # Interim shim: typed local keeps ruff/basedpyright green until T5
+            # adds the dataclass field (commit 2 converts to direct access).
+            listener_any: Any = listener
+            listener_any._sigterm_handler = h1
+
+        with (
+            patch("signal.getsignal", return_value=h1),
+            patch("signal.signal", side_effect=fake_signal) as mock_signal,
+            patch("os.kill"),
+        ):
+            listener._register_cleanup_handlers()
+
+            mock_signal.assert_not_called()
+            assert len(captured_handler) == 1, (
+                "second _register_cleanup_handlers call must not re-register "
+                "SIGTERM handler (would self-capture and recurse)"
+            )
+
+        listener._original_settings = None
+        listener._atexit_registered = False
+
+    def test_new_listener_registers_own_handler_after_stopped_listener(
+        self, interrupt_event: asyncio.Event
+    ) -> None:
+        # Requirement: when a second KeyboardListener starts after a first one
+        # was stopped (``stop()`` does not remove signal handlers), the new
+        # listener must install its OWN handler — not skip registration just
+        # because a conductor SIGTERM closure is currently installed. The new
+        # handler must also restore its own terminal before delegating
+        # (issue #290).
+        import signal as signal_module
+
+        listener_a = KeyboardListener(interrupt_event=interrupt_event)
+        listener_b = KeyboardListener(interrupt_event=interrupt_event)
+
+        captured_a: list[tuple[int, object]] = []
+
+        def fake_signal_a(signum: int, handler):  # type: ignore[no-untyped-def]
+            captured_a.append((signum, handler))
+
+        with (
+            patch("signal.getsignal", return_value=signal_module.SIG_DFL),
+            patch("signal.signal", side_effect=fake_signal_a),
+            patch("os.kill"),
+        ):
+            listener_a._register_cleanup_handlers()
+
+        assert len(captured_a) == 1
+        _, h_a = captured_a[0]
+        h_a = cast(Callable[[int, object], None], h_a)
+
+        # Interim shim: typed local keeps ruff/basedpyright green until T5
+        # adds the dataclass field (commit 2 converts to direct access).
+        listener_a_any: Any = listener_a
+        listener_a_any._sigterm_handler = h_a
+
+        captured_b: list[tuple[int, object]] = []
+
+        def fake_signal_b(signum: int, handler):  # type: ignore[no-untyped-def]
+            captured_b.append((signum, handler))
+
+        with (
+            patch("signal.getsignal", return_value=h_a),
+            patch("signal.signal", side_effect=fake_signal_b),
+            patch("os.kill"),
+        ):
+            listener_b._register_cleanup_handlers()
+
+        assert len(captured_b) == 1, (
+            "new listener must install its own SIGTERM handler even when "
+            "a stale conductor handler from another instance is still installed"
+        )
+        _, h_b = captured_b[0]
+        h_b = cast(Callable[[int, object], None], h_b)
+        assert h_b is not h_a, "new listener must not reuse the other instance's handler"
+
+        # Interim shim: typed local keeps ruff/basedpyright green until T5
+        # adds the dataclass field (commit 2 converts to direct access).
+        listener_b_any: Any = listener_b
+        assert listener_b_any._sigterm_handler is h_b
+
+        call_order: list[str] = []
+
+        original_a_restore = listener_a._restore_terminal
+        original_b_restore = listener_b._restore_terminal
+
+        def spy_a() -> None:
+            call_order.append("A")
+            original_a_restore()
+
+        def spy_b() -> None:
+            call_order.append("B")
+            original_b_restore()
+
+        listener_a._original_settings = [1, 1, 1]
+        listener_b._original_settings = [2, 2, 2]
+
+        with (
+            patch.object(listener_a, "_restore_terminal", side_effect=spy_a),
+            patch.object(listener_b, "_restore_terminal", side_effect=spy_b),
+            patch("os.kill"),
+        ):
+            h_b(signal_module.SIGTERM, None)
+
+        assert call_order, "H_B must at minimum restore B's terminal"
+        assert call_order[0] == "B", (
+            f"B's own terminal must be restored before any delegation; got call order {call_order}"
+        )
+
+        listener_a._original_settings = None
+        listener_a._atexit_registered = False
+        listener_b._original_settings = None
+        listener_b._atexit_registered = False
