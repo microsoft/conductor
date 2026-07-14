@@ -406,7 +406,7 @@ def run(
         conductor run workflow.yaml --skip-gates
         conductor run workflow.yaml --log-file auto
         conductor run workflow.yaml --log-file debug.log
-        conductor run workflow.yaml --silent --log-file auto
+        conductor --silent run workflow.yaml --log-file auto
         conductor run workflow.yaml --no-interactive
         conductor run workflow.yaml --web
         conductor run workflow.yaml --web --web-port 8080

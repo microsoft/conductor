@@ -307,7 +307,7 @@ conductor run <workflow.yaml> [OPTIONS]
 | `--web-port PORT` | Port for web dashboard (0 = auto) |
 | `-l, --log-file PATH` | Write logs to file |
 
-Output verbosity is controlled by **global options**, which must appear
+Output verbosity is controlled by **root-level options**, which must appear
 *before* the subcommand:
 
 ```bash

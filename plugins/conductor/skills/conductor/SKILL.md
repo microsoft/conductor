@@ -45,7 +45,7 @@ conductor resume workflow.yaml --web                     # Resume with dashboard
 conductor checkpoints                                    # List available checkpoints
 ```
 
-Full output is shown by default. Use `-q` (quiet) for minimal output or `-s` (silent) for JSON-only — both are global options and must come *before* the subcommand (`conductor -q run ...`, not `conductor run ... -q`).
+Full output is shown by default. Use `-q` (quiet) for minimal output or `-s` (silent) for JSON-only — both are root-level options and must come *before* the subcommand (`conductor -q run ...`, not `conductor run ... -q`).
 
 ## When to Use Each Guide
 

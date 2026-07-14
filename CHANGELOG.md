@@ -73,13 +73,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Documentation
 
 - **`--quiet` / `--silent` documented as `run` options** — both flags are
-  global options defined on the app callback, so they must appear *before* the
-  subcommand (`conductor --quiet run workflow.yaml`); placing them after it is
-  rejected with "No such option". `docs/cli-reference.md` and the README listed
-  them in the `conductor run` options table and showed post-subcommand examples
-  (`conductor run workflow.yaml --quiet`) that fail as written. Moved the flags
-  to a new Global Options section, corrected the examples, and fixed the same
-  mis-ordering in the conductor skill's quick reference.
+  root-level options defined on the app callback, so they must appear *before*
+  the subcommand (`conductor --quiet run workflow.yaml`); placing them after it
+  is rejected with "No such option". `docs/cli-reference.md` and the README
+  listed them in the `conductor run` options table, while `docs/cli-reference.md`
+  also showed post-subcommand examples (`conductor run workflow.yaml --quiet`)
+  that fail as written — as did the `conductor run --help` epilog. Moved the
+  flags to a new Root-Level Options section, corrected the examples (docs and
+  `--help` text), and fixed the same mis-ordering in the conductor skill's
+  quick reference.
 
 ## [0.1.20](https://github.com/microsoft/conductor/compare/v0.1.19...v0.1.20) - 2026-06-26
 

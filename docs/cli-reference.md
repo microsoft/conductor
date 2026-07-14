@@ -4,7 +4,7 @@ Complete command-line reference for Conductor.
 
 ## Table of Contents
 
-- [Global Options](#global-options)
+- [Root-Level Options](#root-level-options)
 - [`conductor run`](#conductor-run)
 - [`conductor stop`](#conductor-stop)
 - [`conductor gate-respond`](#conductor-gate-respond)
@@ -12,13 +12,13 @@ Complete command-line reference for Conductor.
 - [`conductor doctor`](#conductor-doctor)
 - [`conductor registry`](#conductor-registry)
 
-## Global Options
+## Root-Level Options
 
-The following options apply to every subcommand and **must appear before the
+The following root-level options **must appear before the
 subcommand name**:
 
 ```bash
-conductor [GLOBAL OPTIONS] <command> [ARGS] [OPTIONS]
+conductor [ROOT OPTIONS] <command> [ARGS] [OPTIONS]
 ```
 
 | Option | Short | Description |
@@ -27,10 +27,11 @@ conductor [GLOBAL OPTIONS] <command> [ARGS] [OPTIONS]
 | `--silent` | `-s` | No progress output (JSON result only) |
 | `--version` | `-v` | Show version and exit |
 
-`--quiet` and `--silent` are mutually exclusive.
+`--quiet` and `--silent` are mutually exclusive. They control workflow
+progress output (`run` / `resume`); other commands may not be affected.
 
 ```bash
-# Correct: global option before the subcommand
+# Correct: root-level option before the subcommand
 conductor --quiet run workflow.yaml
 
 # Incorrect: rejected with "No such option: --quiet"
@@ -64,8 +65,8 @@ conductor run <workflow.yaml> [OPTIONS]
 | `--no-interactive` | | Disable Esc-to-interrupt capability |
 
 > **Note:** Output verbosity (`--quiet`/`-q`, `--silent`/`-s`) is controlled by
-> [global options](#global-options), which must appear *before* the `run`
-> subcommand: `conductor --quiet run workflow.yaml`.
+> [root-level options](#root-level-options), which must appear *before* the
+> `run` subcommand: `conductor --quiet run workflow.yaml`.
 
 ### Examples
 
@@ -98,7 +99,7 @@ conductor run workflow.yaml -p copilot
 # Preview execution plan without running
 conductor run workflow.yaml --dry-run
 
-# Quiet output (agent lifecycle only) — note: --quiet is a global option
+# Quiet output (agent lifecycle only) — note: --quiet is a root-level option
 # and must come before the run subcommand
 conductor --quiet run workflow.yaml --input question="Test"
 
@@ -151,7 +152,7 @@ Background workflows can be stopped with `conductor stop` (see below) or via the
 conductor run workflow.yaml --skip-gates
 
 # CI/CD pattern: silent console + full file log
-# (--silent is a global option and must come before the run subcommand)
+# (--silent is a root-level option and must come before the run subcommand)
 conductor --silent run workflow.yaml --log-file auto --skip-gates --input question="Automated test"
 ```
 
