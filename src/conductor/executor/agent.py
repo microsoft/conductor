@@ -101,6 +101,7 @@ class AgentExecutor:
         provider: AgentProvider,
         workflow_tools: list[str] | None = None,
         instructions_preamble: str | None = None,
+        workflow_skills: list[str] | None = None,
     ) -> None:
         """Initialize the AgentExecutor.
 
@@ -109,10 +110,15 @@ class AgentExecutor:
             workflow_tools: Tools defined at workflow level. Defaults to empty list.
             instructions_preamble: Optional workspace instructions text to prepend
                 to every agent's rendered prompt.
+            workflow_skills: Workflow-level default skills (from
+                ``runtime.skills``). Agents inherit this list unless they
+                set their own ``skills:`` field — ``[]`` opts out
+                explicitly, ``[name, ...]`` overrides the default.
         """
         self.provider = provider
         self.workflow_tools = workflow_tools or []
         self.instructions_preamble = instructions_preamble
+        self._workflow_skills: list[str] = list(workflow_skills or [])
         self.renderer = TemplateRenderer()
 
     def _render_enum_field(
@@ -241,9 +247,10 @@ class AgentExecutor:
         # Render prompt with context
         rendered_prompt = self.renderer.render(agent.prompt, context)
 
-        # Prepend workspace instructions preamble if available
-        if self.instructions_preamble:
-            rendered_prompt = self.instructions_preamble + rendered_prompt
+        # Prepend prompt prefix (workspace instructions + optional skills)
+        prefix = self._build_prompt_prefix(agent)
+        if prefix:
+            rendered_prompt = prefix + rendered_prompt
 
         # Append user guidance section if provided
         if guidance_section:
@@ -284,6 +291,18 @@ class AgentExecutor:
         if resolved_tools:
             _verbose_log(f"  Tools: {resolved_tools}")
 
+        # Resolve skill directories for providers with native skill support
+        # (Copilot passes these on session_kwargs; Claude has already had
+        # the skill content eager-injected into rendered_prompt above and
+        # ignores this).
+        skill_dirs: list[str] | None = None
+        if getattr(self.provider, "supports_native_skills", False):
+            skill_names = self._resolve_skills_for_agent(agent)
+            if skill_names:
+                from conductor.skills import resolve_skill_directories
+
+                skill_dirs = [str(p) for p in resolve_skill_directories(skill_names)]
+
         # Execute via provider
         output = await self.provider.execute(
             agent=agent,
@@ -292,6 +311,7 @@ class AgentExecutor:
             tools=resolved_tools,
             interrupt_signal=interrupt_signal,
             event_callback=event_callback,
+            skill_directories=skill_dirs,
         )
 
         # Ensure output.content is a dict
@@ -329,12 +349,62 @@ class AgentExecutor:
             context: Context for prompt rendering.
 
         Returns:
-            Rendered prompt string with workspace instructions prepended if configured.
+            Rendered prompt string with workspace instructions and optional
+            skill content prepended if configured.
 
         Raises:
             TemplateError: If prompt rendering fails.
         """
         rendered = self.renderer.render(agent.prompt, context)
-        if self.instructions_preamble:
-            rendered = self.instructions_preamble + rendered
+        prefix = self._build_prompt_prefix(agent)
+        if prefix:
+            rendered = prefix + rendered
         return rendered
+
+    def _resolve_skills_for_agent(self, agent: AgentDef) -> list[str]:
+        """Resolve the effective skill list for an agent.
+
+        Resolution order:
+        - If the agent explicitly sets ``skills`` (including ``[]``),
+          that value wins.
+        - Otherwise, inherit the workflow-level default
+          (``runtime.skills``).
+
+        Returns an empty list when no skills are enabled, or when the
+        agent is not a provider-backed type (script / wait / set /
+        terminate / human_gate / workflow — schema rejects ``skills``
+        on these so this is defensive only).
+        """
+        if agent.type not in (None, "agent"):
+            return []
+        if agent.skills is not None:
+            return list(agent.skills)
+        return list(self._workflow_skills)
+
+    def _build_prompt_prefix(self, agent: AgentDef) -> str:
+        """Build the prefix to prepend before an agent's rendered prompt.
+
+        Combines workspace instructions and (on providers that lack
+        native skill support) eager skill-content injection into a
+        single prefix string. Shared by :meth:`execute` and
+        :meth:`render_prompt` so the rendered prompts match the prompts
+        sent to the provider.
+
+        On providers that support native skill loading
+        (:attr:`AgentProvider.supports_native_skills`), the skill
+        directories are passed to the SDK on the provider side and we
+        skip preamble injection to avoid double-loading.
+        """
+        parts: list[str] = []
+        if self.instructions_preamble:
+            parts.append(self.instructions_preamble)
+        if not getattr(self.provider, "supports_native_skills", False):
+            skill_names = self._resolve_skills_for_agent(agent)
+            if skill_names:
+                from conductor.skills import load_skill_content, resolve_skill_directories
+
+                dirs = resolve_skill_directories(skill_names)
+                content = load_skill_content(list(zip(skill_names, dirs, strict=True)))
+                if content:
+                    parts.append(content)
+        return "".join(parts)

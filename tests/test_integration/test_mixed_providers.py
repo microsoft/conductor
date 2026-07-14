@@ -95,6 +95,7 @@ agents:
             # Periodic checkpoints are off by default (issue #244); every_seconds
             # is None and excluded by exclude_none.
             "checkpoint": {"every_agent": False, "keep_last": 5},
+            "skills": [],
         }
 
     def test_provider_parameter_isolation(self, tmp_path):
@@ -194,6 +195,7 @@ class MockProvider(AgentProvider, abstract=True):
         tools: list[str] | None = None,
         interrupt_signal: asyncio.Event | None = None,
         event_callback=None,
+        skill_directories: list[str] | None = None,
     ) -> AgentOutput:
         self.executed_agents.append(agent.name)
         return AgentOutput(

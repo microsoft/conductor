@@ -170,6 +170,7 @@ class HermesProvider(AgentProvider):
         tools: list[str] | None = None,
         interrupt_signal: asyncio.Event | None = None,
         event_callback: EventCallback | None = None,
+        skill_directories: list[str] | None = None,
     ) -> AgentOutput:
         """Execute an agent via the hermes-agent library.
 
@@ -187,6 +188,10 @@ class HermesProvider(AgentProvider):
             event_callback: Optional callback for streaming events upstream.
                 Emits ``agent_turn_start`` (before call) and ``agent_message``
                 (after response) events.
+            skill_directories: Ignored. Hermes has no native skill surface,
+                so :class:`AgentExecutor` has already eager-injected the
+                skill content into ``rendered_prompt`` for this provider
+                (see :attr:`AgentProvider.supports_native_skills`).
 
         Returns:
             Normalized AgentOutput with structured content.
@@ -196,6 +201,7 @@ class HermesProvider(AgentProvider):
                 error state.
             ValidationError: If output doesn't match the declared schema.
         """
+        del skill_directories  # Hermes relies on eager preamble injection (see docstring).
         # Resolve per-agent overrides
         resolved_model = agent.model or self._default_model
         resolved_max_iter = (

@@ -26,6 +26,7 @@ def _stable_capabilities(**overrides: object) -> ProviderCapabilities:
         "checkpoint_resume": True,
         "usage_tracking": True,
         "concurrent_safe": True,
+        "skills": True,
         "upstream_pin": None,
         "maintainer": None,
     }
@@ -121,6 +122,7 @@ class TestDeclaredLimitations:
             checkpoint_resume=False,
             usage_tracking=False,
             concurrent_safe=False,
+            skills=False,
         )
         lims = caps.declared_limitations()
         # Every "off" capability shows up in the human-readable list.
@@ -135,6 +137,7 @@ class TestDeclaredLimitations:
         assert "no checkpoint resume" in lims
         assert "no usage tracking" in lims
         assert "not safe to run in parallel" in lims
+        assert "no skills support" in lims
 
     def test_prompt_injection_structured_output_listed_as_limitation(self) -> None:
         caps = _stable_capabilities(

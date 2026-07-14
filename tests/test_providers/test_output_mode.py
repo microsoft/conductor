@@ -213,6 +213,7 @@ class TestCopilotParseExhaustionNotRetryable:
             interrupt_signal: Any = None,
             event_callback: Any = None,
             retry_config: Any = None,
+            skill_directories: Any = None,
         ) -> Any:
             nonlocal call_count
             call_count += 1
