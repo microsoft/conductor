@@ -485,27 +485,57 @@ class WorkflowEngine:
         return Path(self.workflow_path).resolve().parent if self.workflow_path else None
 
     def _build_pricing_overrides(self) -> dict[str, ModelPricing] | None:
-        """Build pricing overrides from workflow cost configuration.
+        """Build the merged pricing-override table for this workflow.
 
-        Converts PricingOverride Pydantic models from the workflow config
-        into ModelPricing dataclasses for use by the UsageTracker.
+        Layers two sources, with workflow entries always winning:
+
+            user file (``~/.conductor/pricing.yaml``)  →  workflow ``runtime.cost.pricing``
+
+        The merged dict is then handed to ``UsageTracker``, which passes it
+        to ``get_pricing(overrides=...)`` — and ``get_pricing`` checks
+        overrides before the built-in ``DEFAULT_PRICING`` table, so user
+        and workflow entries also beat the defaults.
+
+        A missing user file is silently OK (steady state for users who
+        haven't opted in). A malformed user file raises ``ConfigurationError``
+        from ``load_user_pricing``.
 
         Returns:
-            Dictionary mapping model names to ModelPricing, or None if no overrides.
+            Mapping of model name to ``ModelPricing``, or ``None`` when
+            neither layer contributes any entries.
         """
-        cost_config = self.config.workflow.cost
-        if not cost_config.pricing:
-            return None
+        from conductor.config.user_pricing import load_user_pricing
 
-        overrides: dict[str, ModelPricing] = {}
+        user_overrides = load_user_pricing()
+
+        cost_config = self.config.workflow.cost
+        workflow_overrides: dict[str, ModelPricing] = {}
         for model_name, pricing_override in cost_config.pricing.items():
-            overrides[model_name] = ModelPricing(
+            workflow_overrides[model_name] = ModelPricing(
                 input_per_mtok=pricing_override.input_per_mtok,
                 output_per_mtok=pricing_override.output_per_mtok,
                 cache_read_per_mtok=pricing_override.cache_read_per_mtok,
                 cache_write_per_mtok=pricing_override.cache_write_per_mtok,
             )
-        return overrides
+
+        if not user_overrides and not workflow_overrides:
+            return None
+
+        # Workflow on top: dict union right-wins, so any model present in
+        # both layers gets the workflow value.
+        merged = {**user_overrides, **workflow_overrides}
+
+        # Surface shadowed user entries at DEBUG so users debugging an
+        # unexpected cost don't have to read source to understand precedence.
+        if user_overrides and workflow_overrides:
+            shadowed = sorted(set(user_overrides) & set(workflow_overrides))
+            for model in shadowed:
+                logger.debug(
+                    "Workflow `runtime.cost.pricing` overrides user pricing for model %r",
+                    model,
+                )
+
+        return merged
 
     def _emit(self, event_type: str, data: dict[str, Any]) -> None:
         """Emit a workflow event if an emitter is configured.

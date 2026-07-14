@@ -336,6 +336,62 @@ conductor validate <workflow.yaml>
 
 **Full CLI documentation:** [docs/cli-reference.md](docs/cli-reference.md)
 
+## Cost Tracking
+
+Conductor estimates per-agent and per-workflow costs from token usage and a
+built-in pricing table (`src/conductor/engine/pricing.py`). When a model is
+absent from the table, that agent's cost rolls up as `$0` rather than failing —
+so for non-public, preview, or newly-released models you'll want to supply
+pricing yourself.
+
+Pricing resolves in this order, highest precedence first:
+
+1. **Exact** match in workflow `runtime.cost.pricing`
+2. **Exact** match in user `~/.conductor/pricing.yaml`
+3. **Exact** match in built-in `DEFAULT_PRICING`
+4. **Fuzzy** (versioned-suffix) match against built-in `DEFAULT_PRICING`
+
+User and workflow overrides are exact-match only. List each concrete model
+name you want to override; family-name entries do not auto-cover descendants.
+
+### Per-workflow overrides
+
+```yaml
+workflow:
+  cost:
+    show_summary: true
+    pricing:
+      claude-opus-4.7-high:
+        input_per_mtok: 15.00
+        output_per_mtok: 75.00
+        cache_read_per_mtok: 1.50
+        cache_write_per_mtok: 18.75
+```
+
+### Machine-wide overrides
+
+For pricing you want to apply to every workflow on a machine — typical for
+preview models without published rates — drop a `~/.conductor/pricing.yaml`:
+
+```yaml
+pricing:
+  claude-opus-4.7-high:
+    input_per_mtok: 15.00
+    output_per_mtok: 75.00
+  gpt-5.4:
+    input_per_mtok: 2.00
+    output_per_mtok: 8.00
+```
+
+* Missing file is silently OK.
+* Malformed file is a hard error with a pointer to the path; bypass a broken
+  file by pointing `CONDUCTOR_PRICING_FILE` at a path that doesn't exist.
+* Workflow entries always win for the same model name.
+* Override entries are exact-match only — list each concrete model name
+  (e.g. `claude-opus-4-20250514`, not just `claude-opus-4`).
+
+Run `conductor pricing path` to print the resolved file location.
+
 ## Workflow Registries
 
 Conductor supports named workflow registries — GitHub repos or local directories
