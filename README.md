@@ -152,7 +152,7 @@ workflow:
 
 agents:
   - name: answerer
-    model: gpt-5.2
+    model: gpt-5.5
     prompt: |
       Answer the following question:
       {{ workflow.input.question }}
@@ -226,7 +226,7 @@ Conductor supports multiple AI providers. Choose based on your needs:
 workflow:
   runtime:
     provider: copilot
-    default_model: gpt-5.2
+    default_model: gpt-5.5
 ```
 
 Copilot is the default provider — `runtime.provider` can be omitted entirely. Requires an active GitHub Copilot subscription and the GitHub CLI authenticated (`gh auth login`).
@@ -237,18 +237,18 @@ Copilot is the default provider — `runtime.provider` can be omitted entirely. 
 workflow:
   runtime:
     provider: claude
-    default_model: claude-sonnet-4.5
+    default_model: claude-sonnet-5
 ```
 
 Set your API key: `export ANTHROPIC_API_KEY=sk-ant-...`
 
-### Using Claude Agent SDK
+### Using Claude Agent SDK (Experimental)
 
 ```yaml
 workflow:
   runtime:
     provider: claude-agent-sdk
-    default_model: claude-sonnet-4-6
+    default_model: claude-sonnet-5
 ```
 
 Requires the `claude` CLI to be installed and authenticated. Install the SDK: `uv add 'claude-agent-sdk>=0.1.0'`
@@ -261,7 +261,7 @@ Requires the `claude` CLI to be installed and authenticated. Install the SDK: `u
 workflow:
   runtime:
     provider: hermes
-    default_model: anthropic/claude-sonnet-4
+    default_model: anthropic/claude-sonnet-5
 ```
 
 Install the library: `pip install hermes-agent`
