@@ -16,7 +16,7 @@ Conductor makes multi-agent workflows — code review pipelines, research-then-s
 ## Features
 
 - **YAML-based workflows** - Define multi-agent workflows in readable YAML
-- **Multiple providers** - GitHub Copilot, Anthropic Claude, Claude Agent SDK, or NousResearch Hermes (experimental) with seamless switching
+- **Multiple providers** - GitHub Copilot, Anthropic Claude, Claude Agent SDK (experimental), or NousResearch Hermes (experimental) with seamless switching
 - **Parallel execution** - Run agents concurrently (static groups or dynamic for-each)
 - **Sub-workflow composition** - Reusable sub-workflows with templated `input_mapping`, usable inside `for_each` groups for dynamic fan-out
 - **Script steps** - Run shell commands and route on exit code or parsed JSON stdout
@@ -214,11 +214,22 @@ Conductor supports multiple AI providers. Choose based on your needs:
 | Feature | Copilot | Claude | Claude Agent SDK | Hermes |
 |---------|---------|--------|------------------|--------|
 | **Tier** | Stable | Stable | Experimental | Experimental |
-| **Pricing** | Subscription ($10-39/mo) | Pay-per-token | Via Claude Code CLI | Pay-per-token (via hermes) |
-| **Context Window** | 8K-128K tokens | 200K tokens | 200K tokens | Per-model |
+| **Pricing** | Subscription | Pay-per-token | Subscription | Pay-per-token (via hermes) |
+| **Context Window** | Per-model | Per-model | Per-model | Per-model |
 | **Tool Support (MCP)** | Yes | Planned | Yes (built-in) | No (hermes internal tools) |
 | **Streaming** | Yes | Planned | Yes | No |
 | **Best For** | Heavy usage, tools | Large context, pay-per-use | Full Claude Code toolset | Multi-provider model access |
+
+### Using Copilot
+
+```yaml
+workflow:
+  runtime:
+    provider: copilot
+    default_model: gpt-5.2
+```
+
+Copilot is the default provider — `runtime.provider` can be omitted entirely. Requires an active GitHub Copilot subscription and the GitHub CLI authenticated (`gh auth login`).
 
 ### Using Claude
 
