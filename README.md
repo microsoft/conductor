@@ -305,9 +305,15 @@ conductor run <workflow.yaml> [OPTIONS]
 | `--web` | Start real-time web dashboard |
 | `--web-bg` | Run in background, print dashboard URL, exit |
 | `--web-port PORT` | Port for web dashboard (0 = auto) |
-| `-q, --quiet` | Suppress progress output |
-| `-s, --silent` | Suppress all output except errors |
 | `-l, --log-file PATH` | Write logs to file |
+
+Output verbosity is controlled by **root-level options**, which must appear
+*before* the subcommand:
+
+```bash
+conductor --quiet run workflow.yaml    # -q: minimal output (agent lifecycle and routing only)
+conductor --silent run workflow.yaml   # -s: no progress output (JSON result only)
+```
 
 ### `conductor validate`
 

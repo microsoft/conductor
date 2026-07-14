@@ -24,8 +24,8 @@ Conductor is installed automatically when needed. If a `conductor` command fails
 
 ```bash
 conductor run workflow.yaml --input question="Hello"     # Execute (full output by default)
-conductor run workflow.yaml -q --input question="Hello"  # Quiet: lifecycle + routing only
-conductor run workflow.yaml -s --input question="Hello"  # Silent: JSON result only
+conductor -q run workflow.yaml --input question="Hello"  # Quiet: lifecycle + routing only
+conductor -s run workflow.yaml --input question="Hello"  # Silent: JSON result only
 conductor run workflow.yaml --log-file auto               # Log full debug output to file
 conductor run workflow.yaml --web --input q="Hello"       # Real-time web dashboard
 conductor run workflow.yaml --web-bg --input q="Hello"    # Background mode (prints URL, exits)
@@ -45,7 +45,7 @@ conductor resume workflow.yaml --web                     # Resume with dashboard
 conductor checkpoints                                    # List available checkpoints
 ```
 
-Full output is shown by default. Use `-q` (quiet) for minimal output or `-s` (silent) for JSON-only.
+Full output is shown by default. Use `-q` (quiet) for minimal output or `-s` (silent) for JSON-only — both are root-level options and must come *before* the subcommand (`conductor -q run ...`, not `conductor run ... -q`).
 
 ## When to Use Each Guide
 
