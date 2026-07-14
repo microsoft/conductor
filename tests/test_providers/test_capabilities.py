@@ -35,7 +35,7 @@ def _stable_capabilities(**overrides: object) -> ProviderCapabilities:
 
 class TestSchemaValidation:
     def test_construct_stable_descriptor(self) -> None:
-        caps = _stable_capabilities()
+        caps = _stable_capabilities(working_dir=True)
         assert caps.tier == "stable"
         assert caps.is_experimental is False
         assert caps.declared_limitations() == []
@@ -100,12 +100,23 @@ class TestSchemaValidation:
         with pytest.raises(ValueError):
             _stable_capabilities(structured_output="json_mode")
 
+    def test_working_dir_defaults_to_false(self) -> None:
+        """Requirement: ``working_dir`` capability defaults to False so existing
+        descriptors built without the field keep the conservative value."""
+        caps = _stable_capabilities()
+        assert caps.working_dir is False
+
+    def test_working_dir_field_accepts_bool(self) -> None:
+        """Requirement: ``working_dir`` is a declared capability field (frozen schema)."""
+        assert _stable_capabilities(working_dir=True).working_dir is True
+        assert _stable_capabilities(working_dir=False).working_dir is False
+
 
 class TestDeclaredLimitations:
     """Auto-generated limitations line for the experimental banner."""
 
     def test_fully_stable_has_no_limitations(self) -> None:
-        assert _stable_capabilities().declared_limitations() == []
+        assert _stable_capabilities(working_dir=True).declared_limitations() == []
 
     def test_each_false_flag_produces_a_limitation(self) -> None:
         caps = _stable_capabilities(
@@ -170,6 +181,34 @@ class TestResolver:
 
         caps = get_capabilities(provider_name)
         assert isinstance(caps, ProviderCapabilities)
+
+    @pytest.mark.parametrize(
+        ("provider_name", "expected"),
+        [
+            # Requirement: copilot and claude honor agent/runtime ``working_dir``
+            # for the SDK session and its MCP servers; hermes and
+            # claude-agent-sdk do not (declared False so validate errors out).
+            ("copilot", True),
+            ("claude", True),
+            ("hermes", False),
+            ("claude-agent-sdk", False),
+        ],
+    )
+    def test_working_dir_capability_matrix(self, provider_name: str, expected: bool) -> None:
+        """Each production provider declares an accurate ``working_dir`` flag."""
+        if provider_name == "claude-agent-sdk":
+            pytest.importorskip("claude_agent_sdk")
+        caps = get_capabilities(provider_name)
+        assert caps.working_dir is expected
+
+    def test_working_dir_false_listed_as_limitation(self) -> None:
+        """Requirement: the experimental banner surfaces working_dir=False."""
+        lims = _stable_capabilities(working_dir=False).declared_limitations()
+        assert "working_dir ignored" in lims
+        assert (
+            "working_dir ignored"
+            not in _stable_capabilities(working_dir=True).declared_limitations()
+        )
 
     def test_resolver_does_not_instantiate_provider(self) -> None:
         """The validator runs without API keys, so resolution MUST be class-only.

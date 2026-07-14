@@ -121,6 +121,14 @@ class ProviderCapabilities(BaseModel):
     :class:`ParallelGroup`, and may only appear in a :class:`ForEachDef`
     whose ``max_concurrent`` is 1."""
 
+    working_dir: bool = False
+    """``True`` when the provider applies an agent's resolved ``working_dir``
+    to the SDK session cwd and the agent's stdio MCP servers. Workflows that
+    set ``working_dir`` (per-agent or via ``runtime.working_dir``) against a
+    provider with ``working_dir=False`` fail validation — silently ignoring
+    the directory would run the agent in the wrong repository. Defaults to
+    ``False`` (conservative)."""
+
     upstream_pin: str | None = None
     """Upstream package pin surfaced in the experimental banner, e.g.
     ``"claude-agent-sdk>=0.1.0"``. ``None`` for providers that have no
@@ -189,6 +197,8 @@ class ProviderCapabilities(BaseModel):
             items.append("no usage tracking")
         if not self.concurrent_safe:
             items.append("not safe to run in parallel")
+        if not self.working_dir:
+            items.append("working_dir ignored")
         return items
 
 
@@ -240,6 +250,7 @@ def _build_unimplemented_placeholder() -> ProviderCapabilities:
         checkpoint_resume=True,
         usage_tracking=True,
         concurrent_safe=True,
+        working_dir=True,
         upstream_pin=None,
         maintainer="(not yet implemented)",
     )

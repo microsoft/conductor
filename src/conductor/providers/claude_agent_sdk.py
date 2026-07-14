@@ -159,6 +159,11 @@ class ClaudeAgentSdkProvider(AgentProvider):
         # No global mutable state shared across calls — the SDK spawns
         # an independent subprocess per query() invocation.
         concurrent_safe=True,
+        # MCP servers are rejected at the factory (mcp_tools=False), so
+        # there is nothing to scope by directory — the SDK CLI manages its
+        # own cwd. Declared False so ``conductor validate`` errors when a
+        # workflow sets ``working_dir`` against this provider.
+        working_dir=False,
         upstream_pin="claude-agent-sdk>=0.1.0",
         maintainer="@lesandiz (best-effort)",
     )

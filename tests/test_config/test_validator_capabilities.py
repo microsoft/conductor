@@ -1136,3 +1136,126 @@ class TestForEachInlineWorkflowLevelInheritance:
             ),
         )
         validate_workflow_config(config)  # must not raise — human_gate is skipped
+
+
+class TestWorkingDirCrossCheck:
+    """Requirement: ``working_dir`` (per-agent or runtime-wide) against a provider
+    declaring ``working_dir=False`` is a hard validate error — the setting would
+    otherwise be silently dropped (agent-mcp-working-dir, todo 1)."""
+
+    def test_agent_working_dir_against_unsupported_provider_errors(self, patch_caps: Any) -> None:
+        patch_caps({"copilot": _caps(working_dir=False)})
+        config = _build_workflow(
+            agents=[AgentDef(name="a", prompt="hi", working_dir="/repo")],
+        )
+        with pytest.raises(ConfigurationError, match="working_dir"):
+            validate_workflow_config(config)
+
+    def test_agent_working_dir_against_supported_provider_passes(self, patch_caps: Any) -> None:
+        patch_caps({"copilot": _caps(working_dir=True)})
+        config = _build_workflow(
+            agents=[AgentDef(name="a", prompt="hi", working_dir="/repo")],
+        )
+        validate_workflow_config(config)  # no raise
+
+    def test_runtime_working_dir_against_unsupported_provider_errors(self, patch_caps: Any) -> None:
+        """runtime.working_dir is inherited by every LLM agent on that provider."""
+        patch_caps({"copilot": _caps(working_dir=False)})
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="test",
+                entry_point="a",
+                runtime=RuntimeConfig(provider="copilot", working_dir="/repo"),
+            ),
+            agents=[AgentDef(name="a", prompt="hi")],
+        )
+        with pytest.raises(ConfigurationError, match="runtime.working_dir"):
+            validate_workflow_config(config)
+
+    def test_runtime_working_dir_all_agents_override_to_capable_provider_passes(
+        self, patch_caps: Any
+    ) -> None:
+        """Default provider incapable but every LLM agent overrides to a capable
+        one → runtime.working_dir never reaches the incapable provider."""
+        patch_caps(
+            {
+                "copilot": _caps(working_dir=False),
+                "claude": _caps(working_dir=True),
+            }
+        )
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="test",
+                entry_point="a",
+                runtime=RuntimeConfig(provider="copilot", working_dir="/repo"),
+            ),
+            agents=[AgentDef(name="a", prompt="hi", provider="claude")],
+        )
+        validate_workflow_config(config)  # no raise
+
+    def test_per_agent_provider_override_against_working_dir_errors(self, patch_caps: Any) -> None:
+        """Agent overriding to a working_dir=False provider errors even when the
+        default provider supports working_dir."""
+        patch_caps(
+            {
+                "copilot": _caps(working_dir=True),
+                "hermes": _caps(working_dir=False),
+            }
+        )
+        config = _build_workflow(
+            agents=[AgentDef(name="a", prompt="hi", provider="hermes", working_dir="/repo")],
+        )
+        with pytest.raises(ConfigurationError, match="hermes"):
+            validate_workflow_config(config)
+
+    def test_for_each_inline_working_dir_against_unsupported_provider_errors(
+        self, patch_caps: Any
+    ) -> None:
+        """for_each inline agents get the same working_dir cross-check (#270 parity)."""
+        patch_caps({"copilot": _caps(working_dir=False)})
+        config = _for_each_workflow(
+            inline=AgentDef(name="inner", prompt="{{ item }}", working_dir="/repo"),
+        )
+        with pytest.raises(ConfigurationError, match="inner.*working_dir"):
+            validate_workflow_config(config)
+
+    def test_for_each_inline_inherits_runtime_working_dir_errors(self, patch_caps: Any) -> None:
+        """An inline agent without its own working_dir still inherits the
+        runtime-wide default → error on a working_dir=False provider."""
+        patch_caps({"copilot": _caps(working_dir=False), "claude": _caps(working_dir=True)})
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="test",
+                entry_point="entry",
+                runtime=RuntimeConfig(provider="copilot", working_dir="/repo"),
+            ),
+            agents=[AgentDef(name="entry", prompt="hi", provider="claude")],
+            for_each=[
+                ForEachDef(
+                    name="loop",
+                    type="for_each",
+                    source="entry.output.items",
+                    **{"as": "item"},
+                    agent=AgentDef(name="inner", prompt="{{ item }}"),
+                )
+            ],
+        )
+        with pytest.raises(ConfigurationError, match="runtime.working_dir.*'inner'"):
+            validate_workflow_config(config)
+
+    def test_no_working_dir_anywhere_against_unsupported_provider_passes(
+        self, patch_caps: Any
+    ) -> None:
+        """working_dir=False capability alone never errors without the setting."""
+        patch_caps({"copilot": _caps(working_dir=False)})
+        config = _build_workflow(agents=[AgentDef(name="a", prompt="hi")])
+        validate_workflow_config(config)  # no raise
+
+    def test_script_agent_working_dir_skipped(self, patch_caps: Any) -> None:
+        """Script steps run a local subprocess (not a provider session) — the
+        capability gate must not fire for them even with working_dir set."""
+        patch_caps({"copilot": _caps(working_dir=False)})
+        config = _build_workflow(
+            agents=[AgentDef(name="s", type="script", command="ls", working_dir="/tmp")],
+        )
+        validate_workflow_config(config)  # no raise

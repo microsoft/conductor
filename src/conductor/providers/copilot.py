@@ -225,6 +225,10 @@ class CopilotProvider(AgentProvider):
         usage_tracking=True,
         # No global mutable state — safe to run N parallel agents.
         concurrent_safe=True,
+        # The resolved ``working_dir`` is applied to the SDK session's
+        # ``working_directory`` and stamped onto each stdio MCP server
+        # config per execution (no shared-dict mutation).
+        working_dir=True,
         upstream_pin=None,
         maintainer="@microsoft/conductor",
     )

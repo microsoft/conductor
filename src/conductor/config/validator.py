@@ -1582,6 +1582,7 @@ def _validate_provider_capabilities(
     # no matter where future call sites are added.
     runtime_default_effort = config.workflow.runtime.default_reasoning_effort
     runtime_max_session_seconds = config.workflow.runtime.max_session_seconds
+    runtime_working_dir = config.workflow.runtime.working_dir
 
     # Cache per provider name so we don't re-resolve for every agent.
     cache: dict[str, ProviderCapabilities] = {}
@@ -1730,6 +1731,17 @@ def _validate_provider_capabilities(
                 f"(capabilities.max_session_seconds=False)."
             )
 
+        # working_dir: a provider that cannot apply the directory would
+        # silently run the agent (and its MCP servers) in the wrong cwd —
+        # the same class of silently-dropped operational intent as
+        # max_session_seconds.
+        if agent.working_dir is not None and not caps.working_dir:
+            errors.append(
+                f"Agent '{agent.name}' sets working_dir={agent.working_dir!r} "
+                f"but provider '{provider_name}' does not apply agent working "
+                f"directories (capabilities.working_dir=False)."
+            )
+
     # All provider-backed agents that run at workflow scope: top-level agents
     # PLUS for_each inline agents (``ForEachDef.agent``), which inherit the
     # workflow-level ``mcp_servers`` / ``max_session_seconds`` and run with
@@ -1793,6 +1805,32 @@ def _validate_provider_capabilities(
                     f"agent(s): {sorted(agent_names)!r}. Override these agents "
                     f"to a timeout-aware provider, or remove the workflow-level "
                     f"max_session_seconds."
+                )
+
+    # ----- Workflow-level: working_dir -----
+    # A runtime-wide working_dir is inherited by every LLM agent that does
+    # not set its own. A provider that cannot apply it would silently run
+    # those agents in the wrong directory — error against every resolved
+    # provider that actually receives the setting.
+    if runtime_working_dir is not None:
+        providers_inheriting_working_dir: dict[str, list[str]] = {}
+        for agent in all_llm_agents:
+            # A per-agent working_dir overrides the runtime default; that
+            # case is checked in ``_check_agent_capabilities`` instead.
+            if agent.working_dir is not None:
+                continue
+            pname = _resolved_provider_name(agent, default_provider)
+            providers_inheriting_working_dir.setdefault(pname, []).append(agent.name)
+        for pname, agent_names in providers_inheriting_working_dir.items():
+            pcaps = _caps_for(pname)
+            if pcaps is not None and not pcaps.working_dir:
+                errors.append(
+                    f"Workflow declares 'runtime.working_dir'={runtime_working_dir!r} "
+                    f"but provider '{pname}' does not apply agent working directories "
+                    f"(capabilities.working_dir=False) and is used by agent(s): "
+                    f"{sorted(agent_names)!r}. Override these agents to a provider "
+                    f"with working-directory support, or remove the workflow-level "
+                    f"working_dir."
                 )
 
     # ----- Per-agent checks -----

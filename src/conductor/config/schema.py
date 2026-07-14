@@ -763,7 +763,16 @@ class AgentDef(BaseModel):
     """Environment variables for script subprocess."""
 
     working_dir: str | None = None
-    """Working directory for script subprocess execution."""
+    """Working directory for the script subprocess OR a provider-backed agent
+    session and its MCP servers.
+
+    On ``type: script`` steps it sets the subprocess cwd. On provider-backed
+    LLM agents it is resolved by the engine (Jinja-rendered, then relative
+    paths resolve against the workflow file's directory) and applied to the
+    provider session cwd and all of the agent's stdio MCP servers. Falls back
+    to ``runtime.working_dir`` when unset on the agent. Rejected on
+    wait/set/terminate/human_gate/workflow step types.
+    """
 
     stdin: str | None = None
     """Payload written to the script subprocess's stdin (script type only).
@@ -1180,6 +1189,8 @@ class AgentDef(BaseModel):
                 )
             if self.output_mode is not None:
                 raise ValueError("human_gate agents cannot have 'output_mode'")
+            if self.working_dir:
+                raise ValueError("human_gate agents cannot have 'working_dir'")
         elif self.type == "script":
             if not self.command:
                 raise ValueError("script agents require 'command'")
@@ -1263,6 +1274,8 @@ class AgentDef(BaseModel):
                 raise ValueError("workflow agents cannot have 'output_type' (only 'set' agents do)")
             if self.output_mode is not None:
                 raise ValueError("workflow agents cannot have 'output_mode'")
+            if self.working_dir:
+                raise ValueError("workflow agents cannot have 'working_dir'")
         elif self.type == "wait":
             if self.duration is None:
                 raise ValueError("wait agents require 'duration'")
@@ -2070,6 +2083,16 @@ class RuntimeConfig(BaseModel):
 
     Only the Copilot provider forwards this (maps to the SDK's
     ``create_session`` ``context_tier`` param). Other providers ignore it.
+    """
+
+    working_dir: str | None = None
+    """Workflow-wide default working directory for provider-backed agents.
+
+    Acts as the fallback for every LLM agent that does not set its own
+    ``working_dir`` (agent value wins). Supports Jinja2 templating and is
+    resolved by the engine against the workflow file's directory before
+    reaching the provider. ``conductor validate`` errors when the resolved
+    provider declares ``capabilities.working_dir=False``.
     """
 
 

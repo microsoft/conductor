@@ -254,3 +254,55 @@ class TestWaitValidationViaWorkflow:
         config = _make_workflow(wait)
         # Should not raise.
         validate_workflow_config(config)
+
+
+class TestWorkingDirTypeMatrix:
+    """Requirement: ``working_dir`` is allowed on provider-backed LLM agents and
+    script steps, and rejected on wait/set/terminate/human_gate/workflow types."""
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"name": "llm", "prompt": "hi"},
+            {"name": "script", "type": "script", "command": "ls"},
+        ],
+        ids=["llm_agent", "script_step"],
+    )
+    def test_working_dir_allowed(self, kwargs: dict) -> None:
+        agent = AgentDef(**kwargs, working_dir="/repo")  # type: ignore[arg-type]
+        assert agent.working_dir == "/repo"
+
+    @pytest.mark.parametrize(
+        "kwargs,match",
+        [
+            (
+                {"name": "w", "type": "wait", "duration": "1s"},
+                "wait agents cannot have 'working_dir'",
+            ),
+            (
+                {"name": "s", "type": "set", "value": "1"},
+                "set agents cannot have 'working_dir'",
+            ),
+            (
+                {"name": "t", "type": "terminate", "status": "success", "reason": "done"},
+                "terminate agents cannot have 'working_dir'",
+            ),
+            (
+                {
+                    "name": "g",
+                    "type": "human_gate",
+                    "prompt": "Pick",
+                    "options": [GateOption(label="Yes", value="yes", route="$end")],
+                },
+                "human_gate agents cannot have 'working_dir'",
+            ),
+            (
+                {"name": "wf", "type": "workflow", "workflow": "./sub.yaml"},
+                "workflow agents cannot have 'working_dir'",
+            ),
+        ],
+        ids=["wait", "set", "terminate", "human_gate", "workflow"],
+    )
+    def test_working_dir_rejected(self, kwargs: dict, match: str) -> None:
+        with pytest.raises(PydanticValidationError, match=match):
+            AgentDef(**kwargs, working_dir="/repo")  # type: ignore[arg-type]

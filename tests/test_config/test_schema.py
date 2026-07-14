@@ -439,6 +439,16 @@ class TestRuntimeConfig:
         assert config.provider.name == "openai-agents"
         assert config.default_model == "gpt-4"
 
+    def test_working_dir_defaults_to_none(self) -> None:
+        """Requirement: runtime.working_dir is an optional workflow-wide default."""
+        assert RuntimeConfig().working_dir is None
+
+    def test_working_dir_accepts_string(self) -> None:
+        """Requirement: runtime.working_dir accepts plain and templated paths."""
+        assert RuntimeConfig(working_dir="/repo").working_dir == "/repo"
+        templated = RuntimeConfig(working_dir="{{ workflow.input.repo }}")
+        assert templated.working_dir == "{{ workflow.input.repo }}"
+
     def test_invalid_provider_raises(self) -> None:
         """Test that invalid provider raises ValidationError."""
         with pytest.raises(ValidationError):

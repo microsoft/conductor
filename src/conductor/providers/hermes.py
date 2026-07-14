@@ -83,6 +83,9 @@ class HermesProvider(AgentProvider):
         checkpoint_resume=True,
         usage_tracking=True,
         concurrent_safe=True,
+        # Hermes runs its own internal toolsets (mcp_tools=False); a
+        # per-agent working directory has no meaning for the session.
+        working_dir=False,
         upstream_pin="hermes-agent",
         maintainer="(community contribution)",
     )

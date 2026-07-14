@@ -156,6 +156,10 @@ class ClaudeProvider(AgentProvider):
         usage_tracking=True,
         # No global mutable state — safe to run N parallel agents.
         concurrent_safe=True,
+        # The resolved ``working_dir`` selects the MCPManager pool key and is
+        # forwarded to ``StdioServerParameters(cwd=...)`` for each stdio MCP
+        # server the agent connects.
+        working_dir=True,
         upstream_pin=None,
         maintainer="@microsoft/conductor",
     )
