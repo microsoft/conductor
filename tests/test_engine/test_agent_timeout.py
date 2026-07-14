@@ -644,7 +644,9 @@ class TestAgentTimeoutForEach:
 
         async def patched_get_executor(agent):
             executor = await original_get_executor(agent)
-            if agent.name == "processor":
+            # for_each qualifies the per-iteration name ("processor[0]") before
+            # resolving the executor, so match the base agent name by prefix.
+            if agent.name.startswith("processor"):
                 original_exec = executor.execute
 
                 async def slow_exec(*args, **kwargs):
@@ -721,7 +723,9 @@ class TestAgentTimeoutForEach:
 
         async def patched_get_executor(agent):
             executor = await original_get_executor(agent)
-            if agent.name == "processor":
+            # for_each qualifies the per-iteration name ("processor[0]") before
+            # resolving the executor, so match the base agent name by prefix.
+            if agent.name.startswith("processor"):
                 original_exec = executor.execute
 
                 async def slow_exec(*args, **kwargs):
