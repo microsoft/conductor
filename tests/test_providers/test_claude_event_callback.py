@@ -69,7 +69,7 @@ def _make_provider_with_mcp() -> ClaudeProvider:
     mock_mcp_manager.has_servers.return_value = True
     mock_mcp_manager.get_all_tools.return_value = []
     mock_mcp_manager.call_tool = AsyncMock(return_value="tool result")
-    provider._mcp_manager = mock_mcp_manager
+    provider._mock_mcp_manager = mock_mcp_manager
 
     return provider
 
@@ -78,7 +78,6 @@ def _make_bare_provider() -> ClaudeProvider:
     """Create a minimal ClaudeProvider without MCP."""
     provider = ClaudeProvider.__new__(ClaudeProvider)
     provider._client = MagicMock()
-    provider._mcp_manager = None
     provider._mcp_servers_config = None
     provider._default_model = "claude-3-5-sonnet-latest"
     provider._default_temperature = None
@@ -120,6 +119,7 @@ class TestAgentTurnStartEvent:
             output_schema=None,
             has_output_schema=False,
             event_callback=lambda t, d: events.append((t, d)),
+            mcp_manager=getattr(provider, "_mock_mcp_manager", None),
         )
 
         turn_events = [(t, d) for t, d in events if t == "agent_turn_start"]
@@ -153,6 +153,7 @@ class TestAgentTurnStartEvent:
             output_schema=None,
             has_output_schema=False,
             event_callback=lambda t, d: events.append((t, d)),
+            mcp_manager=getattr(provider, "_mock_mcp_manager", None),
         )
 
         turn_events = [(t, d) for t, d in events if t == "agent_turn_start"]
@@ -189,6 +190,7 @@ class TestAgentMessageEvent:
             output_schema=None,
             has_output_schema=False,
             event_callback=lambda t, d: events.append((t, d)),
+            mcp_manager=getattr(provider, "_mock_mcp_manager", None),
         )
 
         msg_events = [(t, d) for t, d in events if t == "agent_message"]
@@ -218,6 +220,7 @@ class TestAgentMessageEvent:
             output_schema=None,
             has_output_schema=False,
             event_callback=lambda t, d: events.append((t, d)),
+            mcp_manager=getattr(provider, "_mock_mcp_manager", None),
         )
 
         msg_events = [(t, d) for t, d in events if t == "agent_message"]
@@ -243,6 +246,7 @@ class TestAgentMessageEvent:
             output_schema=None,
             has_output_schema=False,
             event_callback=lambda t, d: events.append((t, d)),
+            mcp_manager=getattr(provider, "_mock_mcp_manager", None),
         )
 
         msg_events = [(t, d) for t, d in events if t == "agent_message"]
@@ -270,7 +274,7 @@ class TestAgentToolEvents:
         )
         text_response = _make_response([_make_text_block("Done")])
         provider._execute_api_call = AsyncMock(side_effect=[mcp_response, text_response])
-        provider._mcp_manager.call_tool = AsyncMock(return_value="file content here")
+        provider._mock_mcp_manager.call_tool = AsyncMock(return_value="file content here")
 
         await provider._execute_agentic_loop(
             messages=[{"role": "user", "content": "test"}],
@@ -281,6 +285,7 @@ class TestAgentToolEvents:
             output_schema=None,
             has_output_schema=False,
             event_callback=lambda t, d: events.append((t, d)),
+            mcp_manager=getattr(provider, "_mock_mcp_manager", None),
         )
 
         start_events = [(t, d) for t, d in events if t == "agent_tool_start"]
@@ -306,7 +311,7 @@ class TestAgentToolEvents:
         )
         text_response = _make_response([_make_text_block("Error handled")])
         provider._execute_api_call = AsyncMock(side_effect=[mcp_response, text_response])
-        provider._mcp_manager.call_tool = AsyncMock(side_effect=RuntimeError("File not found"))
+        provider._mock_mcp_manager.call_tool = AsyncMock(side_effect=RuntimeError("File not found"))
 
         await provider._execute_agentic_loop(
             messages=[{"role": "user", "content": "test"}],
@@ -317,6 +322,7 @@ class TestAgentToolEvents:
             output_schema=None,
             has_output_schema=False,
             event_callback=lambda t, d: events.append((t, d)),
+            mcp_manager=getattr(provider, "_mock_mcp_manager", None),
         )
 
         start_events = [(t, d) for t, d in events if t == "agent_tool_start"]
@@ -343,7 +349,7 @@ class TestAgentToolEvents:
         )
         text_response = _make_response([_make_text_block("Done")])
         provider._execute_api_call = AsyncMock(side_effect=[mcp_response, text_response])
-        provider._mcp_manager.call_tool = AsyncMock(return_value="result")
+        provider._mock_mcp_manager.call_tool = AsyncMock(return_value="result")
 
         await provider._execute_agentic_loop(
             messages=[{"role": "user", "content": "test"}],
@@ -354,6 +360,7 @@ class TestAgentToolEvents:
             output_schema=None,
             has_output_schema=False,
             event_callback=lambda t, d: events.append((t, d)),
+            mcp_manager=getattr(provider, "_mock_mcp_manager", None),
         )
 
         start_events = [(t, d) for t, d in events if t == "agent_tool_start"]
@@ -388,6 +395,7 @@ class TestAgentToolEvents:
             output_schema=None,
             has_output_schema=False,
             event_callback=lambda t, d: events.append((t, d)),
+            mcp_manager=getattr(provider, "_mock_mcp_manager", None),
         )
 
         start_events = [(t, d) for t, d in events if t == "agent_tool_start"]
@@ -409,7 +417,7 @@ class TestAgentToolEvents:
         )
         text_response = _make_response([_make_text_block("Done")])
         provider._execute_api_call = AsyncMock(side_effect=[mcp_response, text_response])
-        provider._mcp_manager.call_tool = AsyncMock(return_value="y" * 600)
+        provider._mock_mcp_manager.call_tool = AsyncMock(return_value="y" * 600)
 
         await provider._execute_agentic_loop(
             messages=[{"role": "user", "content": "test"}],
@@ -420,6 +428,7 @@ class TestAgentToolEvents:
             output_schema=None,
             has_output_schema=False,
             event_callback=lambda t, d: events.append((t, d)),
+            mcp_manager=getattr(provider, "_mock_mcp_manager", None),
         )
 
         complete_events = [(t, d) for t, d in events if t == "agent_tool_complete"]
@@ -454,6 +463,7 @@ class TestNoEventsWhenCallbackIsNone:
             output_schema=None,
             has_output_schema=False,
             event_callback=None,
+            mcp_manager=getattr(provider, "_mock_mcp_manager", None),
         )
 
         assert response is text_response
@@ -481,6 +491,7 @@ class TestNoEventsWhenCallbackIsNone:
             output_schema=None,
             has_output_schema=False,
             event_callback=None,
+            mcp_manager=getattr(provider, "_mock_mcp_manager", None),
         )
 
         assert response is text_response
@@ -520,6 +531,7 @@ class TestCallbackErrorsSwallowed:
             output_schema=None,
             has_output_schema=False,
             event_callback=bad_callback,
+            mcp_manager=getattr(provider, "_mock_mcp_manager", None),
         )
 
         # Should still return normally despite callback errors
@@ -544,8 +556,8 @@ class TestEventCallbackThreading:
         text_response = _make_response([_make_text_block("Hello")])
         provider._execute_api_call = AsyncMock(return_value=text_response)
 
-        # Mock _ensure_mcp_connected since we're calling _execute_with_retry directly
-        provider._ensure_mcp_connected = AsyncMock()
+        # Mock the cwd-pool lookup since we're calling _execute_with_retry directly
+        provider._get_mcp_manager_for_cwd = AsyncMock(return_value=None)
 
         # Create a minimal agent mock
         agent = MagicMock()
@@ -607,7 +619,7 @@ class TestFullEventSequence:
         )
 
         provider._execute_api_call = AsyncMock(side_effect=[turn1_response, turn2_response])
-        provider._mcp_manager.call_tool = AsyncMock(return_value="hello")
+        provider._mock_mcp_manager.call_tool = AsyncMock(return_value="hello")
 
         await provider._execute_agentic_loop(
             messages=[{"role": "user", "content": "read /tmp/test.txt"}],
@@ -618,6 +630,7 @@ class TestFullEventSequence:
             output_schema=None,
             has_output_schema=False,
             event_callback=lambda t, d: events.append((t, d)),
+            mcp_manager=getattr(provider, "_mock_mcp_manager", None),
         )
 
         event_types = [t for t, _ in events]

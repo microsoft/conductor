@@ -77,6 +77,7 @@ class MCPManager:
         args: list[str] | None = None,
         env: dict[str, str] | None = None,
         timeout: int | None = None,
+        cwd: str | None = None,
     ) -> list[dict[str, Any]]:
         """Connect to an MCP server and return its tools.
 
@@ -89,6 +90,9 @@ class MCPManager:
             args: Command arguments.
             env: Environment variables for the server process.
             timeout: Connection timeout in seconds (not currently used).
+            cwd: Working directory for the spawned server process. When None,
+                the server inherits the conductor process's current working
+                directory (pre-pool legacy behavior).
 
         Returns:
             List of tool definitions from this server. Each tool dict contains:
@@ -111,6 +115,7 @@ class MCPManager:
             command=command,
             args=args or [],
             env=env,
+            cwd=cwd,
         )
 
         try:

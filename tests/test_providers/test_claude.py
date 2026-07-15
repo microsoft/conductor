@@ -9,6 +9,8 @@ Tests cover:
 - Error handling and wrapping
 """
 
+import asyncio
+import os
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -2955,10 +2957,12 @@ class TestClaudeReasoningEffortRegressions:
 
         # Stub MCP manager so the tool_use is actually executed and the loop
         # advances to iteration 2 (without an MCP manager the loop bails out).
+        # Injected into the cwd pool under the current process cwd, which is
+        # what the agent (working_dir=None) resolves to.
         mock_mcp = Mock()
         mock_mcp.has_servers = Mock(return_value=False)  # don't add tools to the request
         mock_mcp.call_tool = AsyncMock(return_value="sunny")
-        provider._mcp_manager = mock_mcp
+        provider._mcp_managers[os.getcwd()] = mock_mcp
 
         agent = AgentDef(
             name="t",
@@ -3040,7 +3044,7 @@ class TestClaudeReasoningEffortRegressions:
         mock_mcp = Mock()
         mock_mcp.has_servers = Mock(return_value=False)
         mock_mcp.call_tool = AsyncMock(return_value="ok")
-        provider._mcp_manager = mock_mcp
+        provider._mcp_managers[os.getcwd()] = mock_mcp
 
         agent = AgentDef(
             name="t",
@@ -3188,3 +3192,279 @@ class TestClaudeReasoningEffortRegressions:
     # is a fourth messages.create site reachable only via mid-agent interrupt
     # and partial-output flow; mocking complexity is prohibitive for a unit
     # test (would need a full asyncio interrupt fixture).
+
+
+class TestClaudeMCPManagerPool:
+    """Requirement: agents with different working_dirs must get isolated MCP servers.
+
+    Covers the MCPManager pool keyed by resolved cwd (agent-mcp-working-dir
+    todo 4): two cwds → two managers, repeated cwd → reuse, close() closes
+    all, parallel agents with different cwds never share a manager, a
+    connect failure for one cwd does not break another (fail-open), and the
+    resolved cwd is forwarded to ``MCPManager.connect_server(cwd=...)``.
+    """
+
+    @staticmethod
+    def _build_provider(
+        mock_anthropic_module: Mock,
+        mock_anthropic_class: Mock,
+        mcp_servers: dict[str, dict[str, str]],
+    ) -> ClaudeProvider:
+        """Build a ClaudeProvider with a mocked Anthropic client and MCP config."""
+        mock_anthropic_module.__version__ = "0.77.0"
+        mock_client = Mock()
+        mock_client.models.list = AsyncMock(return_value=Mock(data=[]))
+        mock_client.messages.create = AsyncMock(return_value=Mock(content=[]))
+        mock_client.close = AsyncMock()
+        mock_anthropic_class.return_value = mock_client
+        return ClaudeProvider(mcp_servers=mcp_servers)
+
+    @staticmethod
+    def _manager_factory(instances: list[Mock]) -> type:
+        """Return a fake MCPManager class whose instances are tracked in ``instances``."""
+
+        class _FakeMCPManager:
+            def __init__(self) -> None:
+                self.connected: list[dict[str, object]] = []
+                self.closed = False
+                instances.append(self)  # type: ignore[arg-type]
+
+            async def connect_server(self, **kwargs: object) -> list[dict[str, object]]:
+                self.connected.append(kwargs)
+                return []
+
+            def has_servers(self) -> bool:
+                return True
+
+            def get_all_tools(self) -> list[dict[str, object]]:
+                return []
+
+            async def call_tool(self, name: str, arguments: dict[str, object]) -> str:
+                return "ok"
+
+            async def close(self) -> None:
+                self.closed = True
+
+        return _FakeMCPManager  # type: ignore[return-value]
+
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    @pytest.mark.asyncio
+    async def test_mcp_pool_two_cwds_create_two_managers(
+        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
+    ) -> None:
+        """Requirement: two distinct resolved cwds → two distinct pool entries.
+
+        Each cwd needs its own MCPManager because stdio MCP servers are
+        spawned per-manager with that manager's cwd; sharing one manager
+        across cwds would silently run tools in the wrong directory.
+        """
+        servers = {"fs": {"command": "npx", "args": []}}
+        provider = self._build_provider(mock_anthropic_module, mock_anthropic_class, servers)
+
+        instances: list[Mock] = []
+        fake_cls = self._manager_factory(instances)
+        with (
+            patch("conductor.mcp.manager.MCP_SDK_AVAILABLE", True),
+            patch("conductor.mcp.manager.MCPManager", fake_cls),
+        ):
+            manager_a = await provider._get_mcp_manager_for_cwd("/repo/a")
+            manager_b = await provider._get_mcp_manager_for_cwd("/repo/b")
+
+        assert manager_a is not manager_b
+        assert len(instances) == 2
+        # The cwd must be forwarded to connect_server for each pool entry.
+        assert instances[0].connected[0]["cwd"] == "/repo/a"
+        assert instances[1].connected[0]["cwd"] == "/repo/b"
+
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    @pytest.mark.asyncio
+    async def test_mcp_pool_repeated_cwd_reuses_manager(
+        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
+    ) -> None:
+        """Requirement: repeated resolution of the same cwd reuses the manager.
+
+        Spawning a fresh MCP server process per agent execution would be
+        prohibitively expensive; the pool must return the already-connected
+        manager for a cwd seen before (no per-agent spawn/teardown).
+        """
+        servers = {"fs": {"command": "npx", "args": []}}
+        provider = self._build_provider(mock_anthropic_module, mock_anthropic_class, servers)
+
+        instances: list[Mock] = []
+        fake_cls = self._manager_factory(instances)
+        with (
+            patch("conductor.mcp.manager.MCP_SDK_AVAILABLE", True),
+            patch("conductor.mcp.manager.MCPManager", fake_cls),
+        ):
+            first = await provider._get_mcp_manager_for_cwd("/repo/a")
+            second = await provider._get_mcp_manager_for_cwd("/repo/a")
+
+        assert first is second
+        assert len(instances) == 1
+        # connect_server ran exactly once per configured server (no reconnect).
+        assert len(instances[0].connected) == 1
+
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    @pytest.mark.asyncio
+    async def test_mcp_pool_close_closes_all_managers(
+        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
+    ) -> None:
+        """Requirement: provider.close() closes every pooled manager (idempotent).
+
+        MCP server subprocesses are tied to the provider lifetime; close()
+        must iterate the whole pool and shut down each manager, and a second
+        close() must be a safe no-op.
+        """
+        servers = {"fs": {"command": "npx", "args": []}}
+        provider = self._build_provider(mock_anthropic_module, mock_anthropic_class, servers)
+
+        instances: list[Mock] = []
+        fake_cls = self._manager_factory(instances)
+        with (
+            patch("conductor.mcp.manager.MCP_SDK_AVAILABLE", True),
+            patch("conductor.mcp.manager.MCPManager", fake_cls),
+        ):
+            await provider._get_mcp_manager_for_cwd("/repo/a")
+            await provider._get_mcp_manager_for_cwd("/repo/b")
+            await provider.close()
+            await provider.close()  # idempotent: must not raise
+
+        assert len(instances) == 2
+        assert all(inst.closed for inst in instances)
+
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    @pytest.mark.asyncio
+    async def test_mcp_pool_parallel_agents_no_race(
+        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
+    ) -> None:
+        """Requirement: parallel agents with different cwds never share a manager.
+
+        Concurrent first-use of the pool must not race: each cwd ends up with
+        exactly one manager, and two agents resolving the same cwd observe the
+        same instance (lock-guarded lazy connect).
+        """
+        servers = {"fs": {"command": "npx", "args": []}}
+        provider = self._build_provider(mock_anthropic_module, mock_anthropic_class, servers)
+
+        instances: list[Mock] = []
+        fake_cls = self._manager_factory(instances)
+        with (
+            patch("conductor.mcp.manager.MCP_SDK_AVAILABLE", True),
+            patch("conductor.mcp.manager.MCPManager", fake_cls),
+        ):
+            results = await asyncio.gather(
+                provider._get_mcp_manager_for_cwd("/repo/a"),
+                provider._get_mcp_manager_for_cwd("/repo/b"),
+                provider._get_mcp_manager_for_cwd("/repo/a"),
+                provider._get_mcp_manager_for_cwd("/repo/b"),
+            )
+
+        # Exactly two managers total — one per cwd — despite concurrent access.
+        assert len(instances) == 2
+        assert results[0] is results[2]
+        assert results[1] is results[3]
+        assert results[0] is not results[1]
+
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    @pytest.mark.asyncio
+    async def test_mcp_pool_connect_failure_fail_open_per_cwd(
+        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
+    ) -> None:
+        """Requirement: a connect failure for one cwd must not break another cwd.
+
+        Fail-open per-server connect is existing behavior (the error is
+        logged and remaining servers still connect). The pool must preserve
+        it across pool keys: cwd A failing to connect leaves cwd B fully
+        functional, and the failed key is not cached so a later retry can
+        succeed.
+        """
+        servers = {"fs": {"command": "npx", "args": []}}
+        provider = self._build_provider(mock_anthropic_module, mock_anthropic_class, servers)
+
+        instances: list[Mock] = []
+        fake_cls = self._manager_factory(instances)
+
+        async def failing_connect(self: Mock, **kwargs: object) -> list[dict[str, object]]:
+            if kwargs.get("cwd") == "/repo/bad":
+                raise RuntimeError("spawn failed")
+            self.connected.append(kwargs)
+            return []
+
+        with (
+            patch("conductor.mcp.manager.MCP_SDK_AVAILABLE", True),
+            patch("conductor.mcp.manager.MCPManager", fake_cls),
+            patch.object(fake_cls, "connect_server", failing_connect),
+        ):
+            manager_bad = await provider._get_mcp_manager_for_cwd("/repo/bad")
+            manager_good = await provider._get_mcp_manager_for_cwd("/repo/good")
+
+        # Both keys resolve to *some* manager object (the helper never raises),
+        # but the good cwd actually connected while the bad one did not.
+        assert manager_bad is not manager_good
+        assert instances[0].connected == []  # /repo/bad: connect raised
+        assert instances[1].connected[0]["cwd"] == "/repo/good"
+
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    @pytest.mark.asyncio
+    async def test_mcp_pool_no_config_returns_none(
+        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
+    ) -> None:
+        """Requirement: no runtime.mcp_servers configured → no pool entries.
+
+        When the workflow declares no MCP servers the helper must return None
+        and never construct an MCPManager, regardless of the agent's cwd.
+        """
+        provider = self._build_provider(mock_anthropic_module, mock_anthropic_class, {})
+
+        with patch("conductor.mcp.manager.MCP_SDK_AVAILABLE", True):
+            result = await provider._get_mcp_manager_for_cwd("/repo/a")
+
+        assert result is None
+
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    @pytest.mark.asyncio
+    async def test_mcp_pool_agent_without_working_dir_uses_process_cwd(
+        self,
+        mock_anthropic_module: Mock,
+        mock_anthropic_class: Mock,
+        tmp_path: object,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Requirement: agent.working_dir=None falls back to os.getcwd() as pool key.
+
+        Agents that do not declare working_dir must behave exactly as before
+        the pool existed: their MCP servers spawn in the conductor process's
+        current working directory (precedence agent > runtime > cwd).
+        """
+        workdir = str(tmp_path)
+        monkeypatch.chdir(workdir)
+
+        servers = {"fs": {"command": "npx", "args": []}}
+        provider = self._build_provider(mock_anthropic_module, mock_anthropic_class, servers)
+
+        instances: list[Mock] = []
+        fake_cls = self._manager_factory(instances)
+        with (
+            patch("conductor.mcp.manager.MCP_SDK_AVAILABLE", True),
+            patch("conductor.mcp.manager.MCPManager", fake_cls),
+        ):
+            agent = AgentDef(name="a", prompt="p")  # working_dir=None
+            resolved_cwd = agent.working_dir or os.getcwd()
+            manager = await provider._get_mcp_manager_for_cwd(resolved_cwd)
+
+        assert manager is not None
+        assert instances[0].connected[0]["cwd"] == os.getcwd()

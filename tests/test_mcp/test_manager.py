@@ -277,3 +277,97 @@ class TestMCPManagerConnectServer:
         assert "web-search" in manager.sessions
         assert "web-search" in manager.tools
         assert manager.tool_to_server["web-search__search"] == "web-search"
+
+    async def test_connect_server_forwards_cwd(self, manager: Any) -> None:
+        """Requirement: agent working_dir must reach the MCP server subprocess.
+
+        ``connect_server(cwd=...)`` must forward the value to
+        ``StdioServerParameters(cwd=...)`` so the stdio MCP server process
+        is spawned in the agent's working directory (issue:
+        agent-mcp-working-dir todo 4).
+        """
+        mock_list_tools_response = MagicMock()
+        mock_list_tools_response.tools = []
+
+        mock_session = AsyncMock()
+        mock_session.initialize = AsyncMock()
+        mock_session.list_tools = AsyncMock(return_value=mock_list_tools_response)
+
+        mock_read_stream = MagicMock()
+        mock_write_stream = MagicMock()
+        mock_stdio_context = MagicMock()
+        mock_client_session = MagicMock()
+
+        with (
+            patch("conductor.mcp.manager.MCP_SDK_AVAILABLE", True),
+            patch("conductor.mcp.manager.StdioServerParameters") as mock_params_cls,
+            patch(
+                "conductor.mcp.manager.stdio_client",
+                return_value=mock_stdio_context,
+            ),
+            patch(
+                "conductor.mcp.manager.ClientSession",
+                return_value=mock_client_session,
+            ),
+        ):
+            manager._exit_stack.enter_async_context = AsyncMock(
+                side_effect=[
+                    (mock_read_stream, mock_write_stream),
+                    mock_session,
+                ]
+            )
+
+            await manager.connect_server(
+                name="fs",
+                command="npx",
+                args=["-y", "@modelcontextprotocol/server-filesystem"],
+                cwd="/repo/worktree-a",
+            )
+
+        # StdioServerParameters must receive the cwd so the child process
+        # starts in that directory.
+        mock_params_cls.assert_called_once()
+        assert mock_params_cls.call_args.kwargs["cwd"] == "/repo/worktree-a"
+
+    async def test_connect_server_cwd_defaults_to_none(self, manager: Any) -> None:
+        """Requirement: omitting cwd keeps legacy behavior (spawn in process cwd).
+
+        When no cwd is given, ``StdioServerParameters`` must still be built
+        with ``cwd=None`` so the MCP SDK spawns the server in the conductor
+        process's own working directory (backward compatible).
+        """
+        mock_list_tools_response = MagicMock()
+        mock_list_tools_response.tools = []
+
+        mock_session = AsyncMock()
+        mock_session.initialize = AsyncMock()
+        mock_session.list_tools = AsyncMock(return_value=mock_list_tools_response)
+
+        mock_read_stream = MagicMock()
+        mock_write_stream = MagicMock()
+        mock_stdio_context = MagicMock()
+        mock_client_session = MagicMock()
+
+        with (
+            patch("conductor.mcp.manager.MCP_SDK_AVAILABLE", True),
+            patch("conductor.mcp.manager.StdioServerParameters") as mock_params_cls,
+            patch(
+                "conductor.mcp.manager.stdio_client",
+                return_value=mock_stdio_context,
+            ),
+            patch(
+                "conductor.mcp.manager.ClientSession",
+                return_value=mock_client_session,
+            ),
+        ):
+            manager._exit_stack.enter_async_context = AsyncMock(
+                side_effect=[
+                    (mock_read_stream, mock_write_stream),
+                    mock_session,
+                ]
+            )
+
+            await manager.connect_server(name="fs", command="npx")
+
+        mock_params_cls.assert_called_once()
+        assert mock_params_cls.call_args.kwargs["cwd"] is None

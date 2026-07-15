@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, Mock, patch
@@ -104,7 +105,7 @@ class TestClaudeSystemPromptForwarding:
             }
         ]
         mock_mcp.call_tool = AsyncMock(return_value="tool result")
-        provider._mcp_manager = mock_mcp
+        provider._mcp_managers[os.getcwd()] = mock_mcp
 
         agent = AgentDef.model_validate(
             {

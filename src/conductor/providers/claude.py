@@ -22,6 +22,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import random
 import time
 from typing import TYPE_CHECKING, Any, Protocol
@@ -248,9 +249,20 @@ class ClaudeProvider(AgentProvider):
         self._default_max_session_seconds = max_session_seconds
         self._default_reasoning_effort: ReasoningEffort | None = default_reasoning_effort
 
-        # MCP server configuration for tool support
+        # MCP server configuration for tool support.
+        # Managers are pooled by resolved working directory: each distinct
+        # cwd gets its own MCPManager because stdio MCP servers are spawned
+        # with the manager's cwd. The pool lifecycle is bounded by the
+        # provider lifetime — close() shuts down every pooled manager. v1
+        # intentionally has no eviction/LRU: the number of distinct cwds in
+        # a workflow run is expected to be small, and evicting a live
+        # manager would kill in-flight tool calls.
         self._mcp_servers_config = mcp_servers
-        self._mcp_manager: MCPManager | None = None
+        self._mcp_managers: dict[str, MCPManager] = {}
+        self._mcp_manager_locks: dict[str, asyncio.Lock] = {}
+        # Guards creation of per-cwd locks so concurrent first-callers cannot
+        # race on dict insertion (asyncio.gather of parallel agents).
+        self._mcp_manager_locks_guard = asyncio.Lock()
 
         # Cache of model_id -> max_input_tokens populated lazily on first
         # get_max_prompt_tokens() call. Guarded by an asyncio.Lock to avoid
@@ -504,18 +516,38 @@ class ClaudeProvider(AgentProvider):
             return None
         return [model.id for model in page.data]
 
-    async def _ensure_mcp_connected(self) -> None:
-        """Connect to MCP servers if configured.
+    async def _get_mcp_manager_for_cwd(self, resolved_cwd: str) -> MCPManager | None:
+        """Return the pooled MCPManager for ``resolved_cwd``, connecting on first use.
 
-        This method lazily initializes MCP connections on first use.
-        It creates an MCPManager instance and connects to all configured
-        MCP servers.
+        Each distinct working directory gets its own MCPManager so stdio MCP
+        servers are spawned with that directory as their ``cwd``. The lazy
+        connect is guarded by a per-cwd ``asyncio.Lock`` so parallel agents
+        resolving the same cwd observe exactly one manager (no duplicate
+        spawns), while agents with different cwds proceed concurrently.
+
+        Per-server connect is fail-open: a server that fails to connect is
+        logged and skipped, and the manager is still pooled so subsequent
+        agents reuse whatever servers did connect.
+
+        Pool lifecycle is bounded by the provider lifetime — ``close()``
+        shuts down every pooled manager. v1 intentionally has no
+        eviction/LRU.
+
+        Args:
+            resolved_cwd: Absolute, normalized working directory that keys
+                the pool (``agent.working_dir or os.getcwd()`` at the call
+                site; the engine has already resolved ``agent.working_dir``
+                to an absolute normpath).
+
+        Returns:
+            The pooled manager, or None when no MCP servers are configured
+            or the MCP SDK is not installed.
         """
-        # Skip if already initialized or no servers configured
-        if self._mcp_manager is not None:
-            return
+        # Fast path: already pooled.
+        if resolved_cwd in self._mcp_managers:
+            return self._mcp_managers[resolved_cwd]
         if not self._mcp_servers_config:
-            return
+            return None
 
         from conductor.mcp.manager import MCP_SDK_AVAILABLE, MCPManager
 
@@ -524,49 +556,66 @@ class ClaudeProvider(AgentProvider):
                 "MCP servers configured but MCP SDK not installed. "
                 "Install with: uv add 'mcp>=1.0.0'"
             )
-            return
+            return None
 
-        self._mcp_manager = MCPManager()
+        async with self._mcp_manager_locks_guard:
+            lock = self._mcp_manager_locks.setdefault(resolved_cwd, asyncio.Lock())
 
-        for name, config in self._mcp_servers_config.items():
-            server_type = config.get("type", "stdio")
-            if server_type == "stdio":
-                try:
-                    await self._mcp_manager.connect_server(
-                        name=name,
-                        command=config["command"],
-                        args=config.get("args", []),
-                        env=config.get("env"),
-                        timeout=config.get("timeout"),
+        async with lock:
+            # Re-check under the per-cwd lock: a concurrent agent may have
+            # connected while we were waiting.
+            if resolved_cwd in self._mcp_managers:
+                return self._mcp_managers[resolved_cwd]
+
+            manager = MCPManager()
+            for name, config in self._mcp_servers_config.items():
+                server_type = config.get("type", "stdio")
+                if server_type == "stdio":
+                    try:
+                        await manager.connect_server(
+                            name=name,
+                            command=config["command"],
+                            args=config.get("args", []),
+                            env=config.get("env"),
+                            timeout=config.get("timeout"),
+                            cwd=resolved_cwd,
+                        )
+                        logger.info(f"Connected to MCP server '{name}' (cwd={resolved_cwd})")
+                    except Exception as e:
+                        logger.error(f"Failed to connect to MCP server '{name}': {e}")
+                        # Continue with other servers (fail-open per server)
+                else:
+                    logger.warning(
+                        f"MCP server '{name}' has unsupported type '{server_type}' "
+                        "(Claude provider only supports 'stdio')"
                     )
-                    logger.info(f"Connected to MCP server '{name}'")
-                except Exception as e:
-                    logger.error(f"Failed to connect to MCP server '{name}': {e}")
-                    # Continue with other servers
-            else:
-                logger.warning(
-                    f"MCP server '{name}' has unsupported type '{server_type}' "
-                    "(Claude provider only supports 'stdio')"
-                )
+
+            self._mcp_managers[resolved_cwd] = manager
+            return manager
 
     def _convert_mcp_tools_to_claude(
         self,
         tool_filter: list[str] | None = None,
+        manager: MCPManager | None = None,
     ) -> list[dict[str, Any]]:
         """Convert MCP tools to Claude tool format.
 
         Args:
             tool_filter: Optional list of tool names to include (prefixed names).
                 If None, all tools are included.
+            manager: The pooled MCPManager for this agent's working directory.
+                The manager is passed explicitly (never read from shared
+                mutable provider state) so parallel agents with different
+                cwds cannot observe each other's tools.
 
         Returns:
             List of tool definitions in Claude's expected format.
         """
-        if not self._mcp_manager:
+        if not manager:
             return []
 
         claude_tools: list[dict[str, Any]] = []
-        for tool in self._mcp_manager.get_all_tools():
+        for tool in manager.get_all_tools():
             # Apply filter if specified
             if tool_filter and tool["name"] not in tool_filter:
                 continue
@@ -582,12 +631,21 @@ class ClaudeProvider(AgentProvider):
         return claude_tools
 
     async def close(self) -> None:
-        """Release provider resources and close connections."""
-        # Close MCP connections first
-        if self._mcp_manager is not None:
-            await self._mcp_manager.close()
-            self._mcp_manager = None
-            logger.debug("MCP manager closed")
+        """Release provider resources and close connections.
+
+        Shuts down every pooled MCPManager (one per distinct working
+        directory). Idempotent: a second call is a no-op.
+        """
+        # Close MCP connections first (all pool entries).
+        if self._mcp_managers:
+            for cwd, manager in self._mcp_managers.items():
+                try:
+                    await manager.close()
+                except Exception as e:
+                    logger.warning(f"Error closing MCP manager for cwd={cwd}: {e}")
+            self._mcp_managers.clear()
+            self._mcp_manager_locks.clear()
+            logger.debug("All pooled MCP managers closed")
 
         if self._client is not None:
             # Drop the client reference *before* awaiting close() so any
@@ -951,8 +1009,12 @@ class ClaudeProvider(AgentProvider):
         if self._client is None:
             raise ProviderError("Claude client not initialized")
 
-        # Connect to MCP servers if configured (lazy initialization)
-        await self._ensure_mcp_connected()
+        # Resolve this agent's MCP manager from the cwd pool (lazy connect).
+        # The manager is a LOCAL variable threaded through the whole agentic
+        # loop — never stored as shared mutable provider state — so parallel
+        # agents with different working directories stay isolated.
+        resolved_cwd = agent.working_dir or os.getcwd()
+        mcp_manager = await self._get_mcp_manager_for_cwd(resolved_cwd)
 
         last_error: Exception | None = None
         config = self._resolve_retry_config(agent)
@@ -1024,8 +1086,8 @@ class ClaudeProvider(AgentProvider):
             )
 
         # Add MCP tools if available
-        if self._mcp_manager and self._mcp_manager.has_servers():
-            mcp_tools = self._convert_mcp_tools_to_claude(tools)  # tools is the filter
+        if mcp_manager and mcp_manager.has_servers():
+            mcp_tools = self._convert_mcp_tools_to_claude(tools, mcp_manager)  # tools is the filter
             all_tools.extend(mcp_tools)
             if mcp_tools:
                 logger.debug(f"Added {len(mcp_tools)} MCP tools to request")
@@ -1051,6 +1113,7 @@ class ClaudeProvider(AgentProvider):
                     thinking=thinking,
                     max_parse_recovery_attempts=config.max_parse_recovery_attempts,
                     system_prompt=system_prompt,
+                    mcp_manager=mcp_manager,
                 )
 
                 # Handle partial output from mid-agent interrupt
@@ -1407,6 +1470,7 @@ class ClaudeProvider(AgentProvider):
         thinking: dict[str, Any] | None = None,
         max_parse_recovery_attempts: int | None = None,
         system_prompt: str | None = None,
+        mcp_manager: MCPManager | None = None,
     ) -> tuple[ClaudeResponse, int | None, bool]:
         """Execute an agentic loop that handles MCP tool calls.
 
@@ -1437,6 +1501,10 @@ class ClaudeProvider(AgentProvider):
             max_parse_recovery_attempts: Resolved per-agent parse recovery limit.
                 None means use the provider-level default.
             system_prompt: Optional rendered system prompt forwarded to every API call.
+            mcp_manager: Pooled MCPManager for this agent's working directory.
+                Passed explicitly (never read from shared provider state) so
+                parallel agents with different cwds execute their tool calls
+                against the correct per-cwd connection pool.
 
         Returns:
             Tuple of (final_response, total_tokens_used, is_partial).
@@ -1639,7 +1707,7 @@ class ClaudeProvider(AgentProvider):
                 # No MCP tools to execute
                 return response, total_tokens, False
 
-            if not self._mcp_manager:
+            if not mcp_manager:
                 logger.warning(
                     f"Claude called MCP tools but no MCP manager available: "
                     f"{[t.name for t in mcp_tool_uses]}"
@@ -1670,7 +1738,7 @@ class ClaudeProvider(AgentProvider):
                         logger.debug("Error in event_callback for agent_tool_start", exc_info=True)
 
                 try:
-                    result = await self._mcp_manager.call_tool(
+                    result = await mcp_manager.call_tool(
                         tool_use.name, dict(tool_use.input) if hasattr(tool_use, "input") else {}
                     )
                     tool_results.append(

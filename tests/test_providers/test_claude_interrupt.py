@@ -26,7 +26,7 @@ def _make_provider() -> ClaudeProvider:
     """Create a ClaudeProvider with essential attributes for testing."""
     provider = ClaudeProvider.__new__(ClaudeProvider)
     provider._client = MagicMock()
-    provider._mcp_manager = None
+    provider._mcp_managers = {}
     provider._mcp_servers_config = None
     provider._default_model = "claude-3-5-sonnet-latest"
     provider._default_temperature = None
@@ -187,8 +187,8 @@ class TestAgenticLoopInterrupt:
     async def test_interrupt_on_second_iteration(self) -> None:
         """Interrupt is detected after the first iteration's tool call completes."""
         provider = _make_provider()
-        provider._mcp_manager = MagicMock()
-        provider._mcp_manager.call_tool = AsyncMock(return_value="tool result")
+        mock_mcp_manager = MagicMock()
+        mock_mcp_manager.call_tool = AsyncMock(return_value="tool result")
 
         interrupt = asyncio.Event()
 
@@ -224,6 +224,7 @@ class TestAgenticLoopInterrupt:
             output_schema={"result": OutputField(type="string")},
             has_output_schema=True,
             interrupt_signal=interrupt,
+            mcp_manager=mock_mcp_manager,
         )
 
         assert is_partial is True
