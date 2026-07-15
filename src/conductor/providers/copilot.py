@@ -206,7 +206,7 @@ class CopilotProvider(AgentProvider):
         # Copilot accepts the full reasoning-effort vocabulary; the SDK
         # validates per-model support against ``supported_reasoning_efforts``
         # at session creation and raises a clear error for unsupported levels.
-        reasoning_effort=("low", "medium", "high", "xhigh"),
+        reasoning_effort=("low", "medium", "high", "xhigh", "max"),
         # Copilot has no native JSON-mode; structured ``output:`` schemas
         # are appended to the prompt and the model is asked to comply.
         # Stable providers using prompt_injection do not trigger the
@@ -261,7 +261,7 @@ class CopilotProvider(AgentProvider):
             default_reasoning_effort: Workflow-wide default ``reasoning_effort``
                 applied to ``create_session`` when an agent does not specify
                 its own ``reasoning.effort``. One of ``low``, ``medium``,
-                ``high``, ``xhigh``, or ``None`` to send no value.
+                ``high``, ``xhigh``, ``max``, or ``None`` to send no value.
             default_context_tier: Workflow-wide default ``context_tier`` applied
                 to ``create_session`` when an agent does not specify its own
                 ``context_tier``. One of ``default``, ``long_context``, or

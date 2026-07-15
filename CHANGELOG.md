@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.21...HEAD)
 
+### Added
+
+- **`max` reasoning-effort level** — the unified reasoning scale is now
+  `low | medium | high | xhigh | max`, unifying it with the GitHub Copilot CLI.
+  On the Copilot provider `max` is forwarded to the SDK and still validated
+  per-model against the model's advertised `supported_reasoning_efforts`. On
+  the Claude provider `max` maps to a `59904`-token extended-thinking budget
+  (`64000 − 4096`, the largest budget that keeps the default answer headroom
+  under the 64000-token output cap). The experimental Hermes provider keeps the
+  original four levels, so `conductor validate` cleanly rejects `max` there.
+  ([#299](https://github.com/microsoft/conductor/issues/299))
+
 ### Fixed
 
 - **Install-script tests no longer pollute the developer's shell profile** — the

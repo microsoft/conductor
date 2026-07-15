@@ -61,8 +61,8 @@ async def create_provider(
         max_session_seconds: Maximum wall-clock duration for agent sessions.
         max_agent_iterations: Maximum tool-use iterations per agent execution.
         default_reasoning_effort: Workflow-wide default reasoning effort
-            (``low`` / ``medium`` / ``high`` / ``xhigh``) applied when an agent
-            does not specify its own ``reasoning.effort``.
+            (``low`` / ``medium`` / ``high`` / ``xhigh`` / ``max``) applied
+            when an agent does not specify its own ``reasoning.effort``.
         default_context_tier: Workflow-wide default context-window tier
             (``default`` / ``long_context``) applied when an agent does not
             specify its own ``context_tier``. Only the Copilot provider

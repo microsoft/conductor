@@ -9,7 +9,7 @@
 # Reasoning effort is mapped natively per provider:
 # - Copilot SDK: passes `reasoning_effort` to `create_session`
 # - Anthropic SDK: enables extended thinking with a budget mapped from
-#   the effort level (low=2k, medium=8k, high=16k, xhigh=32k tokens)
+#   the effort level (low=2k, medium=8k, high=16k, xhigh=32k, max=59904 tokens)
 #
 # Validation is strict — execution fails if the chosen model does not
 # support the requested effort.
@@ -66,12 +66,14 @@ agents:
       - to: $end
 
   - name: architect
-    description: Designs a small system around the topic (uses high reasoning effort)
+    description: Designs a small system around the topic (uses max reasoning effort)
     model: gpt-5.2
-    # Per-agent override: this agent always runs at `high` effort,
-    # regardless of the workflow-wide default.
+    # Per-agent override: this agent always runs at `max` effort — the
+    # highest level on Conductor's unified scale — regardless of the
+    # workflow-wide default. On Copilot this is forwarded to the SDK and
+    # validated against the model's advertised `supported_reasoning_efforts`.
     reasoning:
-      effort: high
+      effort: max
     input:
       - workflow.input.topic
       - explainer.output.explanation

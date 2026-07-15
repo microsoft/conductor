@@ -138,9 +138,9 @@ class ClaudeProvider(AgentProvider):
         # when the model returns it.
         agent_reasoning_events=True,
         # Extended-thinking effort mapped to Anthropic budgets (low=2048,
-        # medium=8192, high=16384, xhigh=32768 tokens — see
+        # medium=8192, high=16384, xhigh=32768, max=59904 tokens — see
         # providers/reasoning.py).
-        reasoning_effort=("low", "medium", "high", "xhigh"),
+        reasoning_effort=("low", "medium", "high", "xhigh", "max"),
         # Tool-based structured output: schema is enforced via a forced
         # tool call rather than prompt injection.
         structured_output="native",

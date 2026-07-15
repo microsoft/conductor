@@ -2637,7 +2637,13 @@ class TestClaudeReasoningEffort:
 
     @pytest.mark.parametrize(
         "effort,expected",
-        [("low", 2048), ("medium", 8192), ("high", 16384), ("xhigh", 32768)],
+        [
+            ("low", 2048),
+            ("medium", 8192),
+            ("high", 16384),
+            ("xhigh", 32768),
+            ("max", 59904),
+        ],
     )
     @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
     @patch("conductor.providers.claude.AsyncAnthropic")
@@ -2712,6 +2718,36 @@ class TestClaudeReasoningEffort:
 
         kwargs = mock_client.messages.create.call_args[1]
         assert kwargs["max_tokens"] >= 32768 + 4096
+        assert kwargs["max_tokens"] > kwargs["thinking"]["budget_tokens"]
+
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    @pytest.mark.asyncio
+    async def test_max_effort_lands_on_output_cap(
+        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
+    ) -> None:
+        """`max` (budget=59904) bumps max_tokens to exactly the 64000 cap.
+
+        Boundary check for #299: required = 59904 + 4096 = 64000, which equals
+        the extended-thinking per-model output cap. The value must not be
+        clamped below the budget (which would raise) and must land exactly on
+        the cap.
+        """
+        from conductor.config.schema import ReasoningConfig
+
+        provider, mock_client = self._build_provider(mock_anthropic_module, mock_anthropic_class)
+        agent = AgentDef(
+            name="t",
+            prompt="p",
+            model="claude-opus-4-20250514",
+            reasoning=ReasoningConfig(effort="max"),
+        )
+        await provider.execute(agent=agent, context={}, rendered_prompt="p")
+
+        kwargs = mock_client.messages.create.call_args[1]
+        assert kwargs["thinking"]["budget_tokens"] == 59904
+        assert kwargs["max_tokens"] == 64000
         assert kwargs["max_tokens"] > kwargs["thinking"]["budget_tokens"]
 
     @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)

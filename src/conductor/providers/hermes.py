@@ -76,6 +76,9 @@ class HermesProvider(AgentProvider):
         workflow_tools_passthrough=False,
         streaming_events=True,
         agent_reasoning_events=True,
+        # ``max`` is intentionally omitted: the hermes upstream's acceptance
+        # of ``{"effort": "max"}`` in ``reasoning_config`` is unverified, so
+        # the validator rejects ``max`` on this provider (see #299).
         reasoning_effort=("low", "medium", "high", "xhigh"),
         structured_output="prompt_injection",
         interrupt=False,

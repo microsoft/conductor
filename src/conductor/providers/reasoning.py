@@ -18,18 +18,22 @@ from conductor.templating import is_jinja_template
 if TYPE_CHECKING:
     from conductor.config.schema import AgentDef
 
-ReasoningEffort = Literal["low", "medium", "high", "xhigh"]
+ReasoningEffort = Literal["low", "medium", "high", "xhigh", "max"]
 
 EFFORT_TO_BUDGET_TOKENS: Final[Mapping[ReasoningEffort, int]] = {
     "low": 2048,
     "medium": 8192,
     "high": 16384,
     "xhigh": 32768,
+    "max": 59904,
 }
 """Mapping from Conductor effort level to Claude ``budget_tokens`` value.
 
 The minimum supported by the Anthropic API is 1024; all values above sit
-comfortably above that floor.
+comfortably above that floor. ``max`` is pinned to ``59904 = 64000 - 4096``:
+the largest budget that still leaves the default answer headroom under the
+64000-token extended-thinking output cap enforced by
+:meth:`ClaudeProvider._coerce_for_thinking`.
 """
 
 _CLAUDE_THINKING_MODEL_PREFIXES: tuple[str, ...] = (
@@ -49,7 +53,7 @@ def effort_to_budget_tokens(effort: ReasoningEffort) -> int:
     """Translate a Conductor effort level into a Claude ``budget_tokens`` value.
 
     Args:
-        effort: One of ``low``, ``medium``, ``high``, ``xhigh``.
+        effort: One of ``low``, ``medium``, ``high``, ``xhigh``, ``max``.
 
     Returns:
         The number of thinking-budget tokens to allocate.

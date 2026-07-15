@@ -40,7 +40,7 @@ StructuredOutputMode = Literal["native", "prompt_injection", "none"]
 # Vocabulary of reasoning effort levels recognized across providers. The
 # capability descriptor lists which subset the provider supports; ``None``
 # means the provider has no reasoning-effort concept at all.
-ReasoningEffortLevel = Literal["low", "medium", "high", "xhigh"]
+ReasoningEffortLevel = Literal["low", "medium", "high", "xhigh", "max"]
 
 
 class ProviderCapabilities(BaseModel):
@@ -233,7 +233,7 @@ def _build_unimplemented_placeholder() -> ProviderCapabilities:
         workflow_tools_passthrough=True,
         streaming_events=True,
         agent_reasoning_events=True,
-        reasoning_effort=("low", "medium", "high", "xhigh"),
+        reasoning_effort=("low", "medium", "high", "xhigh", "max"),
         structured_output="native",
         interrupt=True,
         max_session_seconds=True,
