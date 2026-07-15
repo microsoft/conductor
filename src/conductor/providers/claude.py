@@ -37,6 +37,8 @@ from conductor.providers._event_format import (
 from conductor.providers.base import AgentOutput, AgentProvider, EventCallback, match_model_id
 from conductor.providers.capabilities import ProviderCapabilities
 from conductor.providers.reasoning import (
+    CLAUDE_ANSWER_HEADROOM_TOKENS,
+    CLAUDE_EXTENDED_THINKING_OUTPUT_CAP,
     ReasoningEffort,
     effort_to_budget_tokens,
     is_claude_thinking_model,
@@ -138,9 +140,9 @@ class ClaudeProvider(AgentProvider):
         # when the model returns it.
         agent_reasoning_events=True,
         # Extended-thinking effort mapped to Anthropic budgets (low=2048,
-        # medium=8192, high=16384, xhigh=32768 tokens — see
+        # medium=8192, high=16384, xhigh=32768, max=59904 tokens — see
         # providers/reasoning.py).
-        reasoning_effort=("low", "medium", "high", "xhigh"),
+        reasoning_effort=("low", "medium", "high", "xhigh", "max"),
         # Tool-based structured output: schema is enforced via a forced
         # tool call rather than prompt injection.
         structured_output="native",
@@ -665,9 +667,22 @@ class ClaudeProvider(AgentProvider):
                         ),
                     )
                 budget = effort_to_budget_tokens(self._default_reasoning_effort)
-                kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
-                # Thinking requires temperature=1.0 and max_tokens > budget.
-                kwargs["max_tokens"] = max(kwargs["max_tokens"], budget + 4096)
+                thinking = {"type": "enabled", "budget_tokens": budget}
+                kwargs["thinking"] = thinking
+                # Reuse the same clamp/validate logic as the main agentic-loop
+                # path (_coerce_for_thinking) instead of duplicating the
+                # budget + headroom arithmetic here — this keeps dialog turns
+                # subject to the same 64000-token per-model cap and the same
+                # defensive raise if a future budget ever collapses below it.
+                # No temperature kwarg is sent for dialog turns (omitting it
+                # satisfies the Anthropic "1.0 or omitted" requirement), so
+                # only the max_tokens half of the returned tuple is used.
+                _, kwargs["max_tokens"] = self._coerce_for_thinking(
+                    temperature=None,
+                    max_tokens=kwargs["max_tokens"],
+                    model=resolved_model,
+                    thinking=thinking,
+                )
 
             response = await self._client.messages.create(**kwargs)
 
@@ -1279,9 +1294,9 @@ class ClaudeProvider(AgentProvider):
 
         budget = int(thinking.get("budget_tokens", 0))
         # Per-model cap when thinking is enabled. Extended-thinking models
-        # accept up to 64000 output tokens.
-        per_model_cap = 64_000
-        required = budget + 4096
+        # accept up to CLAUDE_EXTENDED_THINKING_OUTPUT_CAP output tokens.
+        per_model_cap = CLAUDE_EXTENDED_THINKING_OUTPUT_CAP
+        required = budget + CLAUDE_ANSWER_HEADROOM_TOKENS
         effective_max_tokens = max(max_tokens, required)
         if effective_max_tokens > per_model_cap:
             logger.info(

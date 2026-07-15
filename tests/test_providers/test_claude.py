@@ -2637,7 +2637,13 @@ class TestClaudeReasoningEffort:
 
     @pytest.mark.parametrize(
         "effort,expected",
-        [("low", 2048), ("medium", 8192), ("high", 16384), ("xhigh", 32768)],
+        [
+            ("low", 2048),
+            ("medium", 8192),
+            ("high", 16384),
+            ("xhigh", 32768),
+            ("max", 59904),
+        ],
     )
     @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
     @patch("conductor.providers.claude.AsyncAnthropic")
@@ -2713,6 +2719,66 @@ class TestClaudeReasoningEffort:
         kwargs = mock_client.messages.create.call_args[1]
         assert kwargs["max_tokens"] >= 32768 + 4096
         assert kwargs["max_tokens"] > kwargs["thinking"]["budget_tokens"]
+
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    @pytest.mark.asyncio
+    async def test_max_effort_lands_on_output_cap(
+        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
+    ) -> None:
+        """`max` (budget=59904) bumps max_tokens to exactly the 64000 cap.
+
+        Boundary check for #299: required = 59904 + 4096 = 64000, which equals
+        the extended-thinking per-model output cap. The value must not be
+        clamped below the budget (which would raise) and must land exactly on
+        the cap.
+        """
+        from conductor.config.schema import ReasoningConfig
+
+        provider, mock_client = self._build_provider(mock_anthropic_module, mock_anthropic_class)
+        agent = AgentDef(
+            name="t",
+            prompt="p",
+            model="claude-opus-4-20250514",
+            reasoning=ReasoningConfig(effort="max"),
+        )
+        await provider.execute(agent=agent, context={}, rendered_prompt="p")
+
+        kwargs = mock_client.messages.create.call_args[1]
+        assert kwargs["thinking"]["budget_tokens"] == 59904
+        assert kwargs["max_tokens"] == 64000
+        assert kwargs["max_tokens"] > kwargs["thinking"]["budget_tokens"]
+
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    def test_coerce_for_thinking_clamps_when_over_cap(
+        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
+    ) -> None:
+        """No current effort level exceeds the 64000-token cap (``max`` lands
+        exactly on it), so the clamping branch in ``_coerce_for_thinking`` is
+        otherwise untested. Exercise it directly with a synthetic
+        over-budget ``thinking`` kwarg — e.g. a hypothetical future effort
+        level, or a caller passing an oversized budget directly.
+        """
+        from conductor.providers.reasoning import CLAUDE_EXTENDED_THINKING_OUTPUT_CAP
+
+        mock_anthropic_module.__version__ = "0.77.0"
+        mock_anthropic_class.return_value = Mock()
+        provider = ClaudeProvider()
+
+        effective_temperature, effective_max_tokens = provider._coerce_for_thinking(
+            temperature=0.5,
+            max_tokens=1024,
+            model="claude-opus-4-20250514",
+            # budget + 4096 = 64096 > cap (64000), so this must clamp DOWN to
+            # the cap; 64000 is still > budget (60000), so no defensive raise.
+            thinking={"type": "enabled", "budget_tokens": 60_000},
+        )
+
+        assert effective_temperature == 1.0
+        assert effective_max_tokens == CLAUDE_EXTENDED_THINKING_OUTPUT_CAP
 
     @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
     @patch("conductor.providers.claude.AsyncAnthropic")
@@ -3133,6 +3199,52 @@ class TestClaudeReasoningEffortRegressions:
         assert kwargs["thinking"] == {"type": "enabled", "budget_tokens": 8192}
         # max_tokens must accommodate the thinking budget.
         assert kwargs["max_tokens"] >= 8192 + 4096
+
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    @pytest.mark.asyncio
+    async def test_dialog_turn_max_effort_shares_coerce_for_thinking_clamp(
+        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
+    ) -> None:
+        """#299: ``execute_dialog_turn`` must route the ``max`` budget through
+        the same ``_coerce_for_thinking`` helper as the main agentic-loop
+        path, rather than duplicating the ``budget + 4096`` arithmetic.
+
+        Regression guard: if a future change reintroduces the old inline
+        ``max(kwargs["max_tokens"], budget + 4096)`` computation, this test
+        still passes today (both land on 64000) but will start failing the
+        moment the shared cap or headroom constant changes in only one of
+        the two places, since only the helper is patched here.
+        """
+        mock_anthropic_module.__version__ = "0.77.0"
+        mock_client = Mock()
+        mock_client.models.list = AsyncMock(return_value=Mock(data=[]))
+
+        text_block = Mock(spec=["type", "text"])
+        text_block.type = "text"
+        text_block.text = "hello"
+        response = Mock()
+        response.content = [text_block]
+        mock_client.messages.create = AsyncMock(return_value=response)
+        mock_anthropic_class.return_value = mock_client
+
+        provider = ClaudeProvider(default_reasoning_effort="max")  # type: ignore[arg-type]
+
+        with patch.object(
+            provider, "_coerce_for_thinking", wraps=provider._coerce_for_thinking
+        ) as spy:
+            result = await provider.execute_dialog_turn(
+                system_prompt="sys",
+                user_message="hi",
+                model="claude-opus-4-20250514",
+            )
+
+        assert result == "hello"
+        spy.assert_called_once()
+        kwargs = mock_client.messages.create.call_args.kwargs
+        assert kwargs["thinking"] == {"type": "enabled", "budget_tokens": 59904}
+        assert kwargs["max_tokens"] == 64000
 
     @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
     @patch("conductor.providers.claude.AsyncAnthropic")

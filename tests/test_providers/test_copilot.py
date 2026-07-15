@@ -1712,6 +1712,51 @@ class TestReasoningEffort:
             await provider.execute(agent=agent, context={}, rendered_prompt="Plan")
 
     @pytest.mark.asyncio
+    async def test_max_effort_forwarded_when_model_supports_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#299: ``max`` is forwarded to ``create_session`` on a model that
+        advertises it in ``supported_reasoning_efforts``."""
+        from conductor.config.schema import ReasoningConfig
+
+        async def list_models() -> list[Any]:
+            return [self._make_model("gpt-4o", supported=["low", "medium", "high", "xhigh", "max"])]
+
+        captured: dict[str, Any] = {}
+        provider = await self._build_provider(captured, monkeypatch, list_models_impl=list_models)
+        agent = AgentDef(
+            name="planner",
+            model="gpt-4o",
+            prompt="Plan",
+            reasoning=ReasoningConfig(effort="max"),
+        )
+        await provider.execute(agent=agent, context={}, rendered_prompt="Plan")
+        assert captured["create_session_kwargs"]["reasoning_effort"] == "max"
+
+    @pytest.mark.asyncio
+    async def test_max_effort_rejected_when_model_lacks_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#299: ``max`` still errors cleanly for a model whose advertised
+        ``supported_reasoning_efforts`` excludes it."""
+        from conductor.config.schema import ReasoningConfig
+        from conductor.exceptions import ValidationError
+
+        async def list_models() -> list[Any]:
+            return [self._make_model("gpt-4o", supported=["low", "medium", "high", "xhigh"])]
+
+        captured: dict[str, Any] = {}
+        provider = await self._build_provider(captured, monkeypatch, list_models_impl=list_models)
+        agent = AgentDef(
+            name="planner",
+            model="gpt-4o",
+            prompt="Plan",
+            reasoning=ReasoningConfig(effort="max"),
+        )
+        with pytest.raises(ValidationError, match="does not support reasoning_effort"):
+            await provider.execute(agent=agent, context={}, rendered_prompt="Plan")
+
+    @pytest.mark.asyncio
     async def test_validation_skipped_in_mock_handler_mode(self) -> None:
         """Mock-handler mode must skip capability validation entirely."""
         provider = CopilotProvider(mock_handler=stub_handler)
