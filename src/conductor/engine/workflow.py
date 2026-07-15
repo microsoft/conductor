@@ -4881,6 +4881,18 @@ class WorkflowEngine:
                 # returned above; other types in a parallel group are LLM agents.
                 resolved_agent = self._resolve_agent_working_dir(agent, agent_context)
 
+                # LLM-only per-member start event: emitted only here (after the
+                # per-agent resolution) so ``working_dir`` is the resolved value;
+                # the pre-context envelope ``parallel_started`` stays unchanged.
+                self._emit(
+                    "parallel_agent_started",
+                    {
+                        "group_name": parallel_group.name,
+                        "agent_name": agent.name,
+                        "working_dir": resolved_agent.working_dir,
+                    },
+                )
+
                 # Execute agent (get executor for multi-provider support)
                 executor = await self._get_executor_for_agent(resolved_agent)
                 event_callback = self._make_event_callback(agent.name)
@@ -5351,6 +5363,20 @@ class WorkflowEngine:
                 # agent_context so a `{{ item }}` (or `{{ <as_> }}`) template in
                 # the path resolves to this iteration's value.
                 qualified_agent = self._resolve_agent_working_dir(qualified_agent, agent_context)
+
+                # LLM-only per-item start event: emitted only here (after the
+                # per-item resolution) so ``working_dir`` is the resolved value;
+                # the pre-context envelope ``for_each_item_started`` stays
+                # unchanged.
+                self._emit(
+                    "for_each_agent_started",
+                    {
+                        "group_name": for_each_group.name,
+                        "agent_name": qualified_agent.name,
+                        "item_key": key,
+                        "working_dir": qualified_agent.working_dir,
+                    },
+                )
 
                 executor = await self._get_executor_for_agent(qualified_agent)
 

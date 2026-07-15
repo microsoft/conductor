@@ -4019,3 +4019,403 @@ class TestAgentWorkingDirResolution:
         assert started[0].data["working_dir"] == os.path.normpath(str(target))
         assert "context_window_max" in started[0].data
         assert provider.seen[-1][0] == "second"
+
+
+class TestWorkingDirEvents:
+    """Observability events carrying the engine-resolved ``working_dir``.
+
+    The linear path is covered by ``agent_started`` (todo 2, commit 075436b);
+    this class pins the two additive LLM-only events —
+    ``parallel_agent_started`` and ``for_each_agent_started`` — emitted right
+    after each per-agent/per-item ``working_dir`` resolution, plus regression
+    guards that the pre-existing envelope events keep their exact payloads.
+    """
+
+    @pytest.mark.asyncio
+    async def test_parallel_agent_started_carries_resolved_working_dir(
+        self, tmp_path: Path
+    ) -> None:
+        """Requirement: ``parallel_agent_started`` fires per LLM member AFTER its
+        own resolution and carries ``group_name``, ``agent_name`` and the
+        resolved ``working_dir`` (agent-level beats the runtime default)."""
+        dir_a = tmp_path / "a"
+        runtime_dir = tmp_path / "runtime"
+        dir_a.mkdir()
+        runtime_dir.mkdir()
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="wd-ev-parallel",
+                entry_point="fan",
+                runtime=RuntimeConfig(provider="copilot", working_dir=str(runtime_dir)),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="explicit_a",
+                    model="gpt-4",
+                    prompt="A",
+                    working_dir=str(dir_a),
+                    output={"r": OutputField(type="string")},
+                ),
+                AgentDef(
+                    name="inherit_b",
+                    model="gpt-4",
+                    prompt="B",
+                    output={"r": OutputField(type="string")},
+                ),
+            ],
+            parallel=[
+                ParallelGroup(
+                    name="fan",
+                    agents=["explicit_a", "inherit_b"],
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={},
+        )
+        provider = _RecordingWorkingDirProvider()
+        events: list = []
+        emitter = WorkflowEventEmitter()
+        emitter.subscribe(events.append)
+        engine = WorkflowEngine(
+            config, provider, event_emitter=emitter, workflow_path=_workflow_file(tmp_path)
+        )
+
+        await engine.run({})
+
+        started = sorted(
+            (e for e in events if e.type == "parallel_agent_started"),
+            key=lambda e: e.data["agent_name"],
+        )
+        observed = [
+            (e.data["group_name"], e.data["agent_name"], e.data["working_dir"]) for e in started
+        ]
+        assert observed == [
+            ("fan", "explicit_a", os.path.normpath(str(dir_a))),
+            ("fan", "inherit_b", os.path.normpath(str(runtime_dir))),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_parallel_agent_started_working_dir_none_when_unset(self, tmp_path: Path) -> None:
+        """Requirement: without any ``working_dir`` the event stays valid and
+        carries ``working_dir=None`` (the provider falls back to its own cwd)."""
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="wd-ev-parallel-none",
+                entry_point="fan",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="solo",
+                    model="gpt-4",
+                    prompt="Solo",
+                    output={"r": OutputField(type="string")},
+                ),
+                AgentDef(
+                    name="other",
+                    model="gpt-4",
+                    prompt="Other",
+                    output={"r": OutputField(type="string")},
+                ),
+            ],
+            parallel=[
+                ParallelGroup(name="fan", agents=["solo", "other"], routes=[RouteDef(to="$end")]),
+            ],
+            output={},
+        )
+        provider = _RecordingWorkingDirProvider()
+        events: list = []
+        emitter = WorkflowEventEmitter()
+        emitter.subscribe(events.append)
+        engine = WorkflowEngine(
+            config, provider, event_emitter=emitter, workflow_path=_workflow_file(tmp_path)
+        )
+
+        await engine.run({})
+
+        started = [e for e in events if e.type == "parallel_agent_started"]
+        assert len(started) == 2
+        solo = next(e for e in started if e.data["agent_name"] == "solo")
+        assert solo.data["group_name"] == "fan"
+        assert solo.data["working_dir"] is None
+
+    @pytest.mark.asyncio
+    async def test_parallel_started_payload_unchanged_regression(self, tmp_path: Path) -> None:
+        """Requirement (regression): the existing ``parallel_started`` envelope
+        event keeps its exact pre-change payload (``group_name`` + ``agents``
+        only) — ``working_dir`` observability is strictly additive."""
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="wd-ev-parallel-reg",
+                entry_point="fan",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="solo",
+                    model="gpt-4",
+                    prompt="Solo",
+                    output={"r": OutputField(type="string")},
+                ),
+                AgentDef(
+                    name="other",
+                    model="gpt-4",
+                    prompt="Other",
+                    output={"r": OutputField(type="string")},
+                ),
+            ],
+            parallel=[
+                ParallelGroup(name="fan", agents=["solo", "other"], routes=[RouteDef(to="$end")]),
+            ],
+            output={},
+        )
+        provider = _RecordingWorkingDirProvider()
+        events: list = []
+        emitter = WorkflowEventEmitter()
+        emitter.subscribe(events.append)
+        engine = WorkflowEngine(
+            config, provider, event_emitter=emitter, workflow_path=_workflow_file(tmp_path)
+        )
+
+        await engine.run({})
+
+        envelope = [e for e in events if e.type == "parallel_started"]
+        assert len(envelope) == 1
+        assert envelope[0].data == {"group_name": "fan", "agents": ["solo", "other"]}
+
+    @pytest.mark.asyncio
+    async def test_for_each_agent_started_carries_resolved_working_dir_per_item(
+        self, tmp_path: Path
+    ) -> None:
+        """Requirement: ``for_each_agent_started`` fires per item AFTER the
+        ``{{ item }}`` template resolves and carries ``group_name``, the
+        qualified ``agent_name`` (``name[key]``), ``item_key`` and the resolved
+        per-iteration ``working_dir``."""
+        for name in ("one", "two"):
+            (tmp_path / name).mkdir()
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="wd-ev-for-each",
+                entry_point="lister",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="lister",
+                    model="gpt-4",
+                    prompt="List",
+                    output={"repos": OutputField(type="array")},
+                    routes=[RouteDef(to="fans")],
+                ),
+            ],
+            for_each=[
+                ForEachDef(
+                    name="fans",
+                    type="for_each",
+                    source="lister.output.repos",
+                    **{"as": "repo"},
+                    agent=AgentDef(
+                        name="fan_agent",
+                        model="gpt-4",
+                        prompt="Work {{ repo }}",
+                        working_dir=str(tmp_path / "{{ repo }}"),
+                        output={"r": OutputField(type="string")},
+                    ),
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={},
+        )
+        provider = _RecordingWorkingDirProvider()
+
+        async def _execute(agent, context, rendered_prompt, tools=None, **kwargs):
+            if agent.name == "lister":
+                return AgentOutput(
+                    content={"repos": ["one", "two"]},
+                    raw_response=None,
+                    model=agent.model,
+                    input_tokens=1,
+                    output_tokens=1,
+                )
+            return AgentOutput(
+                content={"r": "ok"},
+                raw_response=None,
+                model=agent.model,
+                input_tokens=1,
+                output_tokens=1,
+            )
+
+        provider.execute = _execute  # type: ignore[method-assign]
+        events: list = []
+        emitter = WorkflowEventEmitter()
+        emitter.subscribe(events.append)
+        engine = WorkflowEngine(
+            config, provider, event_emitter=emitter, workflow_path=_workflow_file(tmp_path)
+        )
+
+        await engine.run({})
+
+        started = sorted(
+            (e for e in events if e.type == "for_each_agent_started"),
+            key=lambda e: e.data["item_key"],
+        )
+        assert [
+            (e.data["group_name"], e.data["agent_name"], e.data["item_key"], e.data["working_dir"])
+            for e in started
+        ] == [
+            ("fans", "fan_agent[0]", "0", os.path.normpath(str(tmp_path / "one"))),
+            ("fans", "fan_agent[1]", "1", os.path.normpath(str(tmp_path / "two"))),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_for_each_agent_started_working_dir_none_when_unset(self, tmp_path: Path) -> None:
+        """Requirement: without any ``working_dir`` the per-item event stays
+        valid and carries ``working_dir=None``."""
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="wd-ev-for-each-none",
+                entry_point="lister",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="lister",
+                    model="gpt-4",
+                    prompt="List",
+                    output={"repos": OutputField(type="array")},
+                    routes=[RouteDef(to="fans")],
+                ),
+            ],
+            for_each=[
+                ForEachDef(
+                    name="fans",
+                    type="for_each",
+                    source="lister.output.repos",
+                    **{"as": "repo"},
+                    agent=AgentDef(
+                        name="fan_agent",
+                        model="gpt-4",
+                        prompt="Work {{ repo }}",
+                        output={"r": OutputField(type="string")},
+                    ),
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={},
+        )
+        provider = _RecordingWorkingDirProvider()
+
+        async def _execute(agent, context, rendered_prompt, tools=None, **kwargs):
+            if agent.name == "lister":
+                return AgentOutput(
+                    content={"repos": ["one"]},
+                    raw_response=None,
+                    model=agent.model,
+                    input_tokens=1,
+                    output_tokens=1,
+                )
+            return AgentOutput(
+                content={"r": "ok"},
+                raw_response=None,
+                model=agent.model,
+                input_tokens=1,
+                output_tokens=1,
+            )
+
+        provider.execute = _execute  # type: ignore[method-assign]
+        events: list = []
+        emitter = WorkflowEventEmitter()
+        emitter.subscribe(events.append)
+        engine = WorkflowEngine(
+            config, provider, event_emitter=emitter, workflow_path=_workflow_file(tmp_path)
+        )
+
+        await engine.run({})
+
+        started = [e for e in events if e.type == "for_each_agent_started"]
+        assert len(started) == 1
+        assert started[0].data["agent_name"] == "fan_agent[0]"
+        assert started[0].data["item_key"] == "0"
+        assert started[0].data["working_dir"] is None
+
+    @pytest.mark.asyncio
+    async def test_for_each_item_started_payload_unchanged_regression(self, tmp_path: Path) -> None:
+        """Requirement (regression): the existing ``for_each_item_started``
+        envelope event keeps its exact pre-change payload (``group_name`` +
+        ``item_key`` + ``index``) — the new event is strictly additive."""
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="wd-ev-for-each-reg",
+                entry_point="lister",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="lister",
+                    model="gpt-4",
+                    prompt="List",
+                    output={"repos": OutputField(type="array")},
+                    routes=[RouteDef(to="fans")],
+                ),
+            ],
+            for_each=[
+                ForEachDef(
+                    name="fans",
+                    type="for_each",
+                    source="lister.output.repos",
+                    **{"as": "repo"},
+                    agent=AgentDef(
+                        name="fan_agent",
+                        model="gpt-4",
+                        prompt="Work {{ repo }}",
+                        output={"r": OutputField(type="string")},
+                    ),
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={},
+        )
+        provider = _RecordingWorkingDirProvider()
+
+        async def _execute(agent, context, rendered_prompt, tools=None, **kwargs):
+            if agent.name == "lister":
+                return AgentOutput(
+                    content={"repos": ["one"]},
+                    raw_response=None,
+                    model=agent.model,
+                    input_tokens=1,
+                    output_tokens=1,
+                )
+            return AgentOutput(
+                content={"r": "ok"},
+                raw_response=None,
+                model=agent.model,
+                input_tokens=1,
+                output_tokens=1,
+            )
+
+        provider.execute = _execute  # type: ignore[method-assign]
+        events: list = []
+        emitter = WorkflowEventEmitter()
+        emitter.subscribe(events.append)
+        engine = WorkflowEngine(
+            config, provider, event_emitter=emitter, workflow_path=_workflow_file(tmp_path)
+        )
+
+        await engine.run({})
+
+        envelope = [e for e in events if e.type == "for_each_item_started"]
+        assert len(envelope) == 1
+        assert envelope[0].data == {"group_name": "fans", "item_key": "0", "index": 0}

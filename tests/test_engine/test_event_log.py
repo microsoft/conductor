@@ -266,3 +266,47 @@ class TestEventLogSubscriber:
             assert sub.path.exists()
         finally:
             sub.close()
+
+    def test_records_working_dir_on_agent_start_events(self, tmp_path, monkeypatch):
+        """Requirement: the JSONL log preserves the resolved ``working_dir``
+        carried by the additive ``parallel_agent_started`` /
+        ``for_each_agent_started`` events, including an explicit ``None`` when
+        no working directory was configured."""
+        monkeypatch.setenv("TMPDIR", str(tmp_path))
+        sub = EventLogSubscriber("working-dir-events")
+
+        sub.on_event(
+            WorkflowEvent(
+                type="parallel_agent_started",
+                timestamp=time.time(),
+                data={
+                    "group_name": "fan",
+                    "agent_name": "explicit_a",
+                    "working_dir": "/repo/a",
+                },
+            )
+        )
+        sub.on_event(
+            WorkflowEvent(
+                type="for_each_agent_started",
+                timestamp=time.time(),
+                data={
+                    "group_name": "fans",
+                    "agent_name": "fan_agent[0]",
+                    "item_key": "0",
+                    "working_dir": None,
+                },
+            )
+        )
+        sub.close()
+
+        lines = sub.path.read_text().strip().split("\n")
+        assert len(lines) == 2
+        parallel = json.loads(lines[0])
+        assert parallel["type"] == "parallel_agent_started"
+        assert parallel["data"]["working_dir"] == "/repo/a"
+        for_each = json.loads(lines[1])
+        assert for_each["type"] == "for_each_agent_started"
+        assert for_each["data"]["agent_name"] == "fan_agent[0]"
+        assert for_each["data"]["item_key"] == "0"
+        assert for_each["data"]["working_dir"] is None
