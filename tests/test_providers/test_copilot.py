@@ -1577,14 +1577,29 @@ class TestReasoningEffort:
     """Tests for reasoning_effort plumbing into create_session."""
 
     @staticmethod
-    def _make_model(model_id: str, supported: list[str] | None) -> Any:
+    def _make_model(
+        model_id: str,
+        supported: list[str] | None,
+        *,
+        default_effort: str | None = None,
+        max_output_tokens: int | None = None,
+        max_context_window_tokens: int | None = None,
+    ) -> Any:
         from types import SimpleNamespace
 
+        # Mirrors the real github-copilot-sdk ``Model`` shape: reasoning-effort
+        # fields are top level on ``Model``, NOT nested under ``capabilities``
+        # (see the fix for the #301 validation-read bug).
         return SimpleNamespace(
             id=model_id,
+            supported_reasoning_efforts=supported,
+            default_reasoning_effort=default_effort,
             capabilities=SimpleNamespace(
-                limits=SimpleNamespace(max_prompt_tokens=128_000),
-                supported_reasoning_efforts=supported,
+                limits=SimpleNamespace(
+                    max_prompt_tokens=128_000,
+                    max_output_tokens=max_output_tokens,
+                    max_context_window_tokens=max_context_window_tokens,
+                ),
             ),
         )
 
@@ -1949,6 +1964,124 @@ class TestReasoningEffort:
         assert len(provider.get_retry_history()) == 3
         # Two backoff sleeps between three attempts.
         assert len(sleep_calls) == 2
+
+
+class TestGetModelCapabilities:
+    """Tests for CopilotProvider.get_model_capabilities (#301)."""
+
+    @staticmethod
+    def _make_model(
+        model_id: str,
+        supported: list[str] | None,
+        *,
+        default_effort: str | None = None,
+        max_prompt_tokens: int | None = 128_000,
+        max_output_tokens: int | None = None,
+        max_context_window_tokens: int | None = None,
+    ) -> Any:
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            id=model_id,
+            supported_reasoning_efforts=supported,
+            default_reasoning_effort=default_effort,
+            capabilities=SimpleNamespace(
+                limits=SimpleNamespace(
+                    max_prompt_tokens=max_prompt_tokens,
+                    max_output_tokens=max_output_tokens,
+                    max_context_window_tokens=max_context_window_tokens,
+                ),
+            ),
+        )
+
+    @staticmethod
+    def _provider_with_list_models(list_models_impl: Any) -> CopilotProvider:
+        class _FakeClient:
+            async def list_models(self) -> Any:
+                return await list_models_impl()
+
+        provider = CopilotProvider(mock_handler=stub_handler)
+        provider._mock_handler = None
+        provider._client = _FakeClient()
+        provider._started = True
+
+        async def _noop() -> None:
+            return None
+
+        provider._ensure_client_started = _noop  # type: ignore[method-assign]
+        return provider
+
+    @pytest.mark.asyncio
+    async def test_full_capabilities_reported(self) -> None:
+        async def list_models() -> list[Any]:
+            return [
+                self._make_model(
+                    "gpt-5.5",
+                    supported=["low", "medium", "high", "xhigh"],
+                    default_effort="medium",
+                    max_prompt_tokens=128_000,
+                    max_output_tokens=64_000,
+                    max_context_window_tokens=192_000,
+                )
+            ]
+
+        provider = self._provider_with_list_models(list_models)
+        caps = await provider.get_model_capabilities("gpt-5.5")
+        assert caps is not None
+        assert caps.supported_reasoning_efforts == ["low", "medium", "high", "xhigh"]
+        assert caps.default_reasoning_effort == "medium"
+        assert caps.max_prompt_tokens == 128_000
+        assert caps.max_output_tokens == 64_000
+        assert caps.max_context_window_tokens == 192_000
+
+    @pytest.mark.asyncio
+    async def test_no_reasoning_support_reports_none_supported(self) -> None:
+        async def list_models() -> list[Any]:
+            return [self._make_model("gpt-4o", supported=None, max_prompt_tokens=128_000)]
+
+        provider = self._provider_with_list_models(list_models)
+        caps = await provider.get_model_capabilities("gpt-4o")
+        assert caps is not None
+        assert caps.supported_reasoning_efforts is None
+        assert caps.default_reasoning_effort is None
+        assert caps.max_prompt_tokens == 128_000
+
+    @pytest.mark.asyncio
+    async def test_unmatched_model_returns_none(self) -> None:
+        async def list_models() -> list[Any]:
+            return [self._make_model("gpt-4o", supported=["low"])]
+
+        provider = self._provider_with_list_models(list_models)
+        assert await provider.get_model_capabilities("totally-different") is None
+
+    @pytest.mark.asyncio
+    async def test_list_models_failure_returns_none(self) -> None:
+        async def list_models() -> list[Any]:
+            raise RuntimeError("boom")
+
+        provider = self._provider_with_list_models(list_models)
+        assert await provider.get_model_capabilities("gpt-4o") is None
+
+    @pytest.mark.asyncio
+    async def test_mock_handler_mode_returns_none(self) -> None:
+        provider = CopilotProvider(mock_handler=stub_handler)
+        assert await provider.get_model_capabilities("gpt-4o") is None
+
+    @pytest.mark.asyncio
+    async def test_alias_resolution_via_match_model_id(self) -> None:
+        """A dated/aliased requested name resolves against the SDK's base id."""
+
+        async def list_models() -> list[Any]:
+            return [
+                self._make_model(
+                    "claude-3-5-sonnet", supported=["low", "medium"], default_effort="low"
+                )
+            ]
+
+        provider = self._provider_with_list_models(list_models)
+        caps = await provider.get_model_capabilities("claude-3-5-sonnet-20241022")
+        assert caps is not None
+        assert caps.supported_reasoning_efforts == ["low", "medium"]
 
 
 class TestContextTier:

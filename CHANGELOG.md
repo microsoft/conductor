@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`conductor doctor --models` surfaces per-model reasoning-effort support and
+  context-window limits** — a new optional `AgentProvider.get_model_capabilities`
+  hook (alongside the existing `get_max_prompt_tokens` / `get_model_pricing`
+  hooks) reports, per model: which `reasoning.effort` levels it accepts, its
+  default effort, and its prompt/output/context-window token limits. `--models`
+  now renders a separate per-provider **Models** detail table with this data
+  (the Providers table's Models column shows a count); the JSON `models` field
+  is now a list of capability objects rather than plain id strings. The Copilot
+  provider implements the hook fully via `client.list_models()`; the Claude
+  provider derives reasoning-effort support from the existing thinking-model
+  heuristic and reports prompt tokens only (the Anthropic SDK exposes no
+  output/total-context split); other providers degrade to `n/a`/`—` for every
+  field. See the "Per-model capabilities" section in
+  [`docs/cli-reference.md`](docs/cli-reference.md#per-model-capabilities---models).
+  ([#301](https://github.com/microsoft/conductor/issues/301))
+
 - **`max` reasoning-effort level** — the unified reasoning scale is now
   `low | medium | high | xhigh | max`, unifying it with the GitHub Copilot CLI.
   On the Copilot provider `max` is forwarded to the SDK and still validated
@@ -24,6 +40,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ([#299](https://github.com/microsoft/conductor/issues/299))
 
 ### Fixed
+
+- **Copilot per-model `reasoning_effort` validation was a silent no-op** —
+  `_validate_reasoning_effort_for_model` read
+  `capabilities.supported_reasoning_efforts`, but the installed
+  `github-copilot-sdk` (>=1.0.0) exposes that field (and
+  `default_reasoning_effort`) at the top level of the `Model` object, not
+  nested under `capabilities`. The lookup always returned `None`, so the
+  per-model check (including the `max`-rejection behavior from #299) never
+  fired against the real SDK — a model without `max` support would only be
+  caught by the backend, not by Conductor's own validation. Fixed to read the
+  correct field; discovered and corrected while implementing #301, which
+  needed the same field for `doctor --models`.
 
 - **Install-script tests no longer pollute the developer's shell profile** — the
   install scripts ran `uv tool update-shell` unconditionally, so the

@@ -23,7 +23,13 @@ from conductor.providers._event_format import (
     extract_tool_result_text,
     format_tool_arguments,
 )
-from conductor.providers.base import AgentOutput, AgentProvider, EventCallback, match_model_id
+from conductor.providers.base import (
+    AgentOutput,
+    AgentProvider,
+    EventCallback,
+    ModelCapabilityInfo,
+    match_model_id,
+)
 from conductor.providers.capabilities import ProviderCapabilities
 from conductor.providers.context_tier import ContextTier, resolve_context_tier
 from conductor.providers.reasoning import ReasoningEffort, resolve_reasoning_effort
@@ -2464,9 +2470,11 @@ class CopilotProvider(AgentProvider):
         """Validate ``effort`` against the model's advertised capabilities.
 
         Looks up the model via ``client.list_models()`` (resolving aliases via
-        :func:`match_model_id`) and inspects
-        ``capabilities.supported_reasoning_efforts``. When that list is
-        present and ``effort`` is not in it, raises :class:`ValidationError`.
+        :func:`match_model_id`) and inspects the matched ``Model``'s
+        ``supported_reasoning_efforts`` (a top-level field on ``Model``, not
+        nested under ``capabilities`` — see :meth:`get_model_capabilities`).
+        When that list is present and ``effort`` is not in it, raises
+        :class:`ValidationError`.
 
         When the field is missing/``None`` (capability unknown), or when the
         model can't be matched, or when listing fails, validation is skipped
@@ -2502,7 +2510,7 @@ class CopilotProvider(AgentProvider):
         if matched_id is None:
             return
         info = by_id[matched_id]
-        supported = getattr(info.capabilities, "supported_reasoning_efforts", None)
+        supported = getattr(info, "supported_reasoning_efforts", None)
         if supported is None:
             return
         if effort not in supported:
@@ -2514,6 +2522,50 @@ class CopilotProvider(AgentProvider):
                     "or pick a different model."
                 ),
             )
+
+    async def get_model_capabilities(self, model: str) -> ModelCapabilityInfo | None:
+        """Return reasoning-effort support and context-window limits for ``model``.
+
+        Implements the :meth:`AgentProvider.get_model_capabilities` hook (see
+        #301). Queries ``client.list_models()`` (cached internally by the SDK),
+        resolves aliases via :func:`match_model_id`, and reads:
+
+        * ``supported_reasoning_efforts`` / ``default_reasoning_effort`` — both
+          top-level fields on the matched ``Model`` (not nested under
+          ``capabilities`` — see the fix in
+          :meth:`_validate_reasoning_effort_for_model`).
+        * ``capabilities.limits.max_prompt_tokens`` / ``max_output_tokens`` /
+          ``max_context_window_tokens``.
+
+        Returns ``None`` in mock-handler mode, when the SDK is unavailable,
+        when no match is found, or when the SDK call fails — capability
+        metadata must never block ``doctor`` or workflow execution.
+
+        Catches ``Exception`` (not ``BaseException``) at the SDK boundary so
+        ``asyncio.CancelledError``/``KeyboardInterrupt``/``SystemExit`` still
+        propagate, mirroring :meth:`get_max_prompt_tokens`.
+        """
+        if self._mock_handler is not None or not COPILOT_SDK_AVAILABLE:
+            return None
+        try:
+            await self._ensure_client_started()
+            models = await self._client.list_models()
+        except Exception as e:
+            logger.debug("Failed to list Copilot models for capabilities of %r: %s", model, e)
+            return None
+        by_id = {info.id: info for info in models}
+        matched_id = match_model_id(model, by_id.keys())
+        if matched_id is None:
+            return None
+        info = by_id[matched_id]
+        limits = getattr(info.capabilities, "limits", None)
+        return ModelCapabilityInfo(
+            supported_reasoning_efforts=getattr(info, "supported_reasoning_efforts", None),
+            default_reasoning_effort=getattr(info, "default_reasoning_effort", None),
+            max_prompt_tokens=getattr(limits, "max_prompt_tokens", None),
+            max_output_tokens=getattr(limits, "max_output_tokens", None),
+            max_context_window_tokens=getattr(limits, "max_context_window_tokens", None),
+        )
 
     def get_session_ids(self) -> dict[str, str]:
         """Get tracked session IDs for all executed agents.

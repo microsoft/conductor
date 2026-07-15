@@ -206,8 +206,15 @@ def _fake_provider(
     validate_error: Exception | None = None,
     models: list[str] | None = None,
     models_error: Exception | None = None,
+    capabilities: dict[str, Any] | None = None,
 ) -> Any:
-    """Build an AsyncMock provider for check/model probes."""
+    """Build an AsyncMock provider for check/model probes.
+
+    ``capabilities`` maps model id -> a ``ModelCapabilityInfo``-like object
+    (or ``None``) returned by ``get_model_capabilities`` for that id. Ids not
+    present in the mapping (or when ``capabilities`` is omitted) resolve to
+    ``None``, matching the base-hook default.
+    """
     provider = AsyncMock()
     if validate_error is not None:
         provider.validate_connection.side_effect = validate_error
@@ -218,6 +225,8 @@ def _fake_provider(
     else:
         provider.list_models.return_value = models
     provider.close.return_value = None
+    caps_map = capabilities or {}
+    provider.get_model_capabilities.side_effect = lambda model_id: caps_map.get(model_id)
     return provider
 
 
@@ -287,7 +296,8 @@ class TestGatherProviderCheck:
         )
         diag = await d.gather_provider("copilot", list_models=True)
         assert diag.checked is True
-        assert diag.models == ["gpt-5", "gpt-4"]
+        assert diag.models is not None
+        assert [m.id for m in diag.models] == ["gpt-5", "gpt-4"]
 
     async def test_models_none_is_na(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr("conductor.providers.copilot.COPILOT_SDK_AVAILABLE", True)
@@ -309,6 +319,60 @@ class TestGatherProviderCheck:
         diag = await d.gather_provider("copilot", list_models=True)
         assert diag.models is None
         assert "list boom" in (diag.models_error or "")
+
+    async def test_model_capabilities_populated_per_model(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Each listed model's capabilities are resolved via get_model_capabilities."""
+        from conductor.providers.base import ModelCapabilityInfo
+
+        monkeypatch.setattr("conductor.providers.copilot.COPILOT_SDK_AVAILABLE", True)
+        provider = _fake_provider(
+            ok=True,
+            models=["gpt-5", "gpt-4"],
+            capabilities={
+                "gpt-5": ModelCapabilityInfo(
+                    supported_reasoning_efforts=["low", "medium"],
+                    default_reasoning_effort="low",
+                    max_prompt_tokens=128_000,
+                    max_output_tokens=64_000,
+                    max_context_window_tokens=192_000,
+                ),
+                # "gpt-4" intentionally omitted -> None (unknown capabilities).
+            },
+        )
+        monkeypatch.setattr(
+            "conductor.providers.factory.create_provider",
+            AsyncMock(return_value=provider),
+        )
+        diag = await d.gather_provider("copilot", list_models=True)
+        assert diag.models is not None
+        by_id = {m.id: m for m in diag.models}
+        assert by_id["gpt-5"].supported_reasoning_efforts == ["low", "medium"]
+        assert by_id["gpt-5"].default_reasoning_effort == "low"
+        assert by_id["gpt-5"].max_prompt_tokens == 128_000
+        assert by_id["gpt-5"].max_output_tokens == 64_000
+        assert by_id["gpt-5"].max_context_window_tokens == 192_000
+        # Unknown capabilities degrade to id-only, not a dropped entry.
+        assert by_id["gpt-4"].supported_reasoning_efforts is None
+        assert by_id["gpt-4"].max_prompt_tokens is None
+
+    async def test_model_capabilities_failure_degrades_to_id_only(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A per-model get_model_capabilities exception must not drop the
+        model or fail the whole --models probe."""
+        monkeypatch.setattr("conductor.providers.copilot.COPILOT_SDK_AVAILABLE", True)
+        provider = _fake_provider(ok=True, models=["gpt-5", "gpt-4"])
+        provider.get_model_capabilities.side_effect = RuntimeError("capabilities boom")
+        monkeypatch.setattr(
+            "conductor.providers.factory.create_provider",
+            AsyncMock(return_value=provider),
+        )
+        diag = await d.gather_provider("copilot", list_models=True)
+        assert diag.models is not None
+        assert [m.id for m in diag.models] == ["gpt-5", "gpt-4"]
+        assert all(m.supported_reasoning_efforts is None for m in diag.models)
 
 
 # ---------------------------------------------------------------------------
