@@ -14,7 +14,6 @@ of "no filter — include all MCP tools".
 
 from __future__ import annotations
 
-import asyncio
 import os
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -96,7 +95,6 @@ def _make_provider_with_mcp() -> ClaudeProvider:
     }
     provider._mcp_managers = {os.getcwd(): mock_mcp}
     provider._mcp_manager_locks = {}
-    provider._mcp_manager_locks_guard = asyncio.Lock()
 
     return provider
 

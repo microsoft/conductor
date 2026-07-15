@@ -260,9 +260,6 @@ class ClaudeProvider(AgentProvider):
         self._mcp_servers_config = mcp_servers
         self._mcp_managers: dict[str, MCPManager] = {}
         self._mcp_manager_locks: dict[str, asyncio.Lock] = {}
-        # Guards creation of per-cwd locks so concurrent first-callers cannot
-        # race on dict insertion (asyncio.gather of parallel agents).
-        self._mcp_manager_locks_guard = asyncio.Lock()
 
         # Cache of model_id -> max_input_tokens populated lazily on first
         # get_max_prompt_tokens() call. Guarded by an asyncio.Lock to avoid
@@ -526,8 +523,10 @@ class ClaudeProvider(AgentProvider):
         spawns), while agents with different cwds proceed concurrently.
 
         Per-server connect is fail-open: a server that fails to connect is
-        logged and skipped, and the manager is still pooled so subsequent
-        agents reuse whatever servers did connect.
+        logged and skipped, and the manager is still pooled as long as at
+        least one server connected. When NO servers connect the manager is
+        returned but not pooled, so the next agent for the same cwd retries
+        the connect (a transient spawn failure does not become permanent).
 
         Pool lifecycle is bounded by the provider lifetime — ``close()``
         shuts down every pooled manager. v1 intentionally has no
@@ -558,8 +557,13 @@ class ClaudeProvider(AgentProvider):
             )
             return None
 
-        async with self._mcp_manager_locks_guard:
-            lock = self._mcp_manager_locks.setdefault(resolved_cwd, asyncio.Lock())
+        # No guard needed around lock creation: there is no await between the
+        # fast-path check above and the per-cwd lock acquisition below, so
+        # concurrent coroutines cannot interleave here.
+        lock = self._mcp_manager_locks.get(resolved_cwd)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._mcp_manager_locks[resolved_cwd] = lock
 
         async with lock:
             # Re-check under the per-cwd lock: a concurrent agent may have
@@ -590,7 +594,14 @@ class ClaudeProvider(AgentProvider):
                         "(Claude provider only supports 'stdio')"
                     )
 
-            self._mcp_managers[resolved_cwd] = manager
+            if manager.has_servers():
+                self._mcp_managers[resolved_cwd] = manager
+            else:
+                logger.warning(
+                    "No MCP servers connected for cwd=%s; manager not pooled so "
+                    "the next agent for this cwd will retry the connect.",
+                    resolved_cwd,
+                )
             return manager
 
     def _convert_mcp_tools_to_claude(

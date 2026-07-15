@@ -3230,11 +3230,15 @@ class TestClaudeMCPManagerPool:
                 instances.append(self)  # type: ignore[arg-type]
 
             async def connect_server(self, **kwargs: object) -> list[dict[str, object]]:
+                # Yield so concurrent first-callers genuinely interleave inside
+                # the critical section — without this the gather runs them
+                # sequentially and the double-checked locking is never exercised.
+                await asyncio.sleep(0)
                 self.connected.append(kwargs)
                 return []
 
             def has_servers(self) -> bool:
-                return True
+                return len(self.connected) > 0
 
             def get_all_tools(self) -> list[dict[str, object]]:
                 return []
@@ -3372,6 +3376,10 @@ class TestClaudeMCPManagerPool:
         assert results[0] is results[2]
         assert results[1] is results[3]
         assert results[0] is not results[1]
+        # The lock serialized the lazy connect: exactly one connect per cwd
+        # (the second caller for each cwd hit the re-check under the lock).
+        per_cwd_connects = sorted(kwargs["cwd"] for i in instances for kwargs in i.connected)
+        assert per_cwd_connects == ["/repo/a", "/repo/b"]
 
     @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
     @patch("conductor.providers.claude.AsyncAnthropic")
@@ -3385,17 +3393,22 @@ class TestClaudeMCPManagerPool:
         Fail-open per-server connect is existing behavior (the error is
         logged and remaining servers still connect). The pool must preserve
         it across pool keys: cwd A failing to connect leaves cwd B fully
-        functional, and the failed key is not cached so a later retry can
-        succeed.
+        functional. A cwd where EVERY server failed is not pooled, so a
+        later call for that same cwd retries the connect and can succeed.
         """
         servers = {"fs": {"command": "npx", "args": []}}
         provider = self._build_provider(mock_anthropic_module, mock_anthropic_class, servers)
 
         instances: list[Mock] = []
         fake_cls = self._manager_factory(instances)
+        attempts: dict[str, int] = {}
 
         async def failing_connect(self: Mock, **kwargs: object) -> list[dict[str, object]]:
-            if kwargs.get("cwd") == "/repo/bad":
+            cwd = kwargs.get("cwd")
+            assert isinstance(cwd, str)
+            attempts[cwd] = attempts.get(cwd, 0) + 1
+            # Fail only the FIRST attempt for /repo/bad; the retry succeeds.
+            if cwd == "/repo/bad" and attempts[cwd] == 1:
                 raise RuntimeError("spawn failed")
             self.connected.append(kwargs)
             return []
@@ -3407,12 +3420,19 @@ class TestClaudeMCPManagerPool:
         ):
             manager_bad = await provider._get_mcp_manager_for_cwd("/repo/bad")
             manager_good = await provider._get_mcp_manager_for_cwd("/repo/good")
+            manager_bad_retry = await provider._get_mcp_manager_for_cwd("/repo/bad")
 
-        # Both keys resolve to *some* manager object (the helper never raises),
-        # but the good cwd actually connected while the bad one did not.
+        # The failed first attempt left cwd /repo/bad with zero connections,
+        # so it was NOT pooled; the good cwd connected and was pooled.
         assert manager_bad is not manager_good
-        assert instances[0].connected == []  # /repo/bad: connect raised
+        assert instances[0].connected == []  # /repo/bad, first attempt: connect raised
         assert instances[1].connected[0]["cwd"] == "/repo/good"
+        # The retry for /repo/bad built a NEW manager (the first was not
+        # cached) and re-ran the connect, which succeeded this time.
+        assert manager_bad_retry is not manager_bad
+        assert len(instances) == 3
+        assert instances[2].connected[0]["cwd"] == "/repo/bad"
+        assert attempts["/repo/bad"] == 2
 
     @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
     @patch("conductor.providers.claude.AsyncAnthropic")
