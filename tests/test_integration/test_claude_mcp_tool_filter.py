@@ -14,6 +14,8 @@ of "no filter — include all MCP tools".
 
 from __future__ import annotations
 
+import asyncio
+import os
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -86,14 +88,15 @@ def _make_provider_with_mcp() -> ClaudeProvider:
     provider._default_max_session_seconds = None
     provider._default_reasoning_effort = None
 
-    # Pre-wire a mock MCP manager so _ensure_mcp_connected is a no-op
     mock_mcp = MagicMock()
     mock_mcp.get_all_tools.return_value = FAKE_MCP_TOOLS
     mock_mcp.has_servers.return_value = True
-    provider._mcp_manager = mock_mcp
     provider._mcp_servers_config = {
         "filesystem": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem"]},
     }
+    provider._mcp_managers = {os.getcwd(): mock_mcp}
+    provider._mcp_manager_locks = {}
+    provider._mcp_manager_locks_guard = asyncio.Lock()
 
     return provider
 
