@@ -527,19 +527,26 @@ class ClaudeProvider(AgentProvider):
         ``max_context_window_tokens`` are always ``None`` — the Anthropic
         SDK's ``models.list()`` exposes no output/total-context split.
 
-        Unlike :meth:`get_max_prompt_tokens` (which deliberately lets
-        non-SDK exceptions bubble up for its dashboard use case), this hook
-        upholds the base class's stricter "never raise" contract: any
-        exception from the delegated call — SDK or otherwise — is swallowed
-        and treated as "prompt tokens unknown". The reasoning-effort fields
-        are populated even when the SDK is unavailable or ``model`` can't be
-        resolved (the heuristic is a pure name match), so this never returns
-        ``None`` outright.
+        Unlike :meth:`get_max_prompt_tokens` (which only catches its
+        documented ``(TimeoutError, AnthropicError, OSError)`` tuple and lets
+        anything else propagate, by design, for its own caller), this hook
+        upholds the base class's stricter "never raise" contract on its own:
+        each field is resolved behind its own guard, so a failure in one
+        (e.g. an unexpected exception from the delegated
+        ``get_max_prompt_tokens`` call, or a non-string ``model``) degrades
+        only that field rather than the whole result or the caller. The
+        reasoning-effort fields are populated even when the SDK is
+        unavailable, ``model`` can't be resolved, or the token-limit lookup
+        fails (the heuristic is a pure name match independent of the SDK
+        call), so this never returns ``None`` outright.
         """
-        if is_claude_thinking_model(model):
-            supported_reasoning_efforts = list(get_args(ReasoningEffort))
-        else:
-            supported_reasoning_efforts = []
+        try:
+            supported_reasoning_efforts = (
+                list(get_args(ReasoningEffort)) if is_claude_thinking_model(model) else []
+            )
+        except Exception as e:  # noqa: BLE001 - diagnostics must never raise
+            logger.debug("Failed to resolve reasoning-effort support for %r: %s", model, e)
+            supported_reasoning_efforts = None
         try:
             max_prompt_tokens = await self.get_max_prompt_tokens(model)
         except Exception as e:  # noqa: BLE001 - diagnostics must never raise

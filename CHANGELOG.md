@@ -20,8 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provider implements the hook fully via `client.list_models()`; the Claude
   provider derives reasoning-effort support from the existing thinking-model
   heuristic and reports prompt tokens only (the Anthropic SDK exposes no
-  output/total-context split); other providers degrade to `n/a`/`—` for every
-  field. See the "Per-model capabilities" section in
+  output/total-context split); other providers (`claude-agent-sdk`, `hermes`,
+  `openai-agents`) don't implement model enumeration at all, so they show
+  `n/a` in the Providers table and get no Models detail table. See the
+  "Per-model capabilities" section in
   [`docs/cli-reference.md`](docs/cli-reference.md#per-model-capabilities---models).
   ([#301](https://github.com/microsoft/conductor/issues/301))
 

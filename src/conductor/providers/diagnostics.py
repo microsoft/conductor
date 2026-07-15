@@ -90,10 +90,15 @@ class CredentialEnvVar:
         return {"name": self.name, "present": self.present}
 
 
-@dataclass
+@dataclass(frozen=True)
 class ModelDiagnostic:
     """Diagnostic snapshot of a single model's reasoning-effort and
     context-window capabilities (issue #301).
+
+    Frozen to match its sibling value objects (:class:`CredentialEnvVar`,
+    :class:`~conductor.providers.base.ModelCapabilityInfo`) — every instance
+    is fully constructed in one step by :func:`_build_model_diagnostics` and
+    never mutated afterward.
 
     Every capability field mirrors :class:`~conductor.providers.base.ModelCapabilityInfo`
     and is independently optional — a provider may know a model's token
@@ -385,27 +390,27 @@ async def _build_model_diagnostics(provider: Any, model_ids: list[str]) -> list[
     per-model failure degrades that model to id-only (all capability fields
     ``None``) rather than dropping it from the list or failing the whole
     ``--models`` probe — one bad model must not hide the rest.
+
+    The ``try`` wraps both the call *and* the read of its result: a
+    misbehaving provider that returns something other than a genuine
+    ``ModelCapabilityInfo`` (or ``None``) must degrade only that one model,
+    not raise out of the loop and silently discard every already-built
+    entry for models processed earlier in this same list.
     """
     result: list[ModelDiagnostic] = []
     for model_id in model_ids:
-        caps = None
         try:
             caps = await provider.get_model_capabilities(model_id)
+            # ModelCapabilityInfo.to_dict() keys mirror ModelDiagnostic's
+            # capability fields exactly, so it doubles as the kwargs for
+            # constructing this model's diagnostic. A misbehaving provider
+            # whose return value lacks to_dict() (or isn't None) is caught
+            # below and degrades to id-only, same as any other failure.
+            fields = caps.to_dict() if caps is not None else {}
+            result.append(ModelDiagnostic(id=model_id, **fields))
         except Exception as e:  # noqa: BLE001 - diagnostics must never raise
             logger.debug("Failed to get model capabilities for %r: %s", model_id, e)
-        if caps is None:
             result.append(ModelDiagnostic(id=model_id))
-        else:
-            result.append(
-                ModelDiagnostic(
-                    id=model_id,
-                    supported_reasoning_efforts=caps.supported_reasoning_efforts,
-                    default_reasoning_effort=caps.default_reasoning_effort,
-                    max_prompt_tokens=caps.max_prompt_tokens,
-                    max_output_tokens=caps.max_output_tokens,
-                    max_context_window_tokens=caps.max_context_window_tokens,
-                )
-            )
     return result
 
 

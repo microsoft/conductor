@@ -415,15 +415,18 @@ support and context-window limits:
 Coverage varies by provider — every field degrades independently to `n/a` /
 `—` rather than failing the command:
 
-- **Copilot** reports all fields (reasoning-effort levels + default, and all
-  three token limits) from the SDK's per-model metadata.
+- **Copilot** reports reasoning-effort levels + default, and prompt/context
+  token limits, from the SDK's per-model metadata (`Output` is frequently
+  `—` — the live API does not currently populate it for most models).
 - **Claude** derives reasoning-effort support from a static heuristic
   (Claude 3.7+ / 4.x models support all five levels; older models support
   none) and reports only `Prompt` (via the Anthropic API's
   `max_input_tokens`) — `Output` and `Context` are always `—` and `Default`
   is always `—` (Anthropic has no per-model default-effort concept).
-- **`claude-agent-sdk`**, **`hermes`**, and **`openai-agents`** report every
-  field as `n/a` / `—` (no capability hook implemented).
+- **`claude-agent-sdk`**, **`hermes`**, and **`openai-agents`** don't
+  implement model enumeration (`list_models`) at all, so `--models` shows
+  `n/a` for them in the Providers table and they get **no** Models detail
+  table — there is nothing to detail.
 
 In `--json`, each provider's `models` field is a list of objects (not plain
 id strings):

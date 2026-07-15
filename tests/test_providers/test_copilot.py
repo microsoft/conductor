@@ -1577,14 +1577,7 @@ class TestReasoningEffort:
     """Tests for reasoning_effort plumbing into create_session."""
 
     @staticmethod
-    def _make_model(
-        model_id: str,
-        supported: list[str] | None,
-        *,
-        default_effort: str | None = None,
-        max_output_tokens: int | None = None,
-        max_context_window_tokens: int | None = None,
-    ) -> Any:
+    def _make_model(model_id: str, supported: list[str] | None) -> Any:
         from types import SimpleNamespace
 
         # Mirrors the real github-copilot-sdk ``Model`` shape: reasoning-effort
@@ -1593,13 +1586,8 @@ class TestReasoningEffort:
         return SimpleNamespace(
             id=model_id,
             supported_reasoning_efforts=supported,
-            default_reasoning_effort=default_effort,
             capabilities=SimpleNamespace(
-                limits=SimpleNamespace(
-                    max_prompt_tokens=128_000,
-                    max_output_tokens=max_output_tokens,
-                    max_context_window_tokens=max_context_window_tokens,
-                ),
+                limits=SimpleNamespace(max_prompt_tokens=128_000),
             ),
         )
 

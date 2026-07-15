@@ -374,6 +374,75 @@ class TestGatherProviderCheck:
         assert [m.id for m in diag.models] == ["gpt-5", "gpt-4"]
         assert all(m.supported_reasoning_efforts is None for m in diag.models)
 
+    async def test_mixed_success_and_failure_isolates_the_failing_model(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A failure on one model (not first/only) must not discard results
+        already built for other models in the same list — regression guard
+        for a bug where an unguarded attribute read on a malformed
+        capabilities object escaped the per-model try/except and wiped the
+        whole batch."""
+        from conductor.providers.base import ModelCapabilityInfo
+
+        monkeypatch.setattr("conductor.providers.copilot.COPILOT_SDK_AVAILABLE", True)
+        provider = _fake_provider(ok=True, models=["gpt-5", "gpt-4", "gpt-3"])
+
+        good_caps = ModelCapabilityInfo(
+            supported_reasoning_efforts=["low", "medium"],
+            max_prompt_tokens=128_000,
+        )
+
+        def _capabilities_for(model_id: str) -> ModelCapabilityInfo | None:
+            if model_id == "gpt-4":
+                raise RuntimeError("capabilities boom for gpt-4 only")
+            return good_caps
+
+        provider.get_model_capabilities.side_effect = _capabilities_for
+        monkeypatch.setattr(
+            "conductor.providers.factory.create_provider",
+            AsyncMock(return_value=provider),
+        )
+        diag = await d.gather_provider("copilot", list_models=True)
+        assert diag.models is not None
+        by_id = {m.id: m for m in diag.models}
+        # Model before AND after the failing one must retain full data.
+        assert by_id["gpt-5"].supported_reasoning_efforts == ["low", "medium"]
+        assert by_id["gpt-5"].max_prompt_tokens == 128_000
+        assert by_id["gpt-3"].supported_reasoning_efforts == ["low", "medium"]
+        assert by_id["gpt-3"].max_prompt_tokens == 128_000
+        # The failing model degrades to id-only, isolated from its neighbors.
+        assert by_id["gpt-4"].supported_reasoning_efforts is None
+        assert by_id["gpt-4"].max_prompt_tokens is None
+
+    async def test_malformed_capabilities_object_degrades_to_id_only(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A get_model_capabilities call that *succeeds* but returns an
+        object missing the expected attributes must degrade that model to
+        id-only rather than raising out of the per-model try/except and
+        discarding every other model already built in this list."""
+        from types import SimpleNamespace
+
+        monkeypatch.setattr("conductor.providers.copilot.COPILOT_SDK_AVAILABLE", True)
+        provider = _fake_provider(ok=True, models=["gpt-5", "gpt-4"])
+        malformed = SimpleNamespace()  # no capability attributes at all
+
+        def _capabilities_for(model_id: str) -> Any:
+            if model_id == "gpt-4":
+                return malformed
+            return None
+
+        provider.get_model_capabilities.side_effect = _capabilities_for
+        monkeypatch.setattr(
+            "conductor.providers.factory.create_provider",
+            AsyncMock(return_value=provider),
+        )
+        diag = await d.gather_provider("copilot", list_models=True)
+        assert diag.models is not None
+        assert [m.id for m in diag.models] == ["gpt-5", "gpt-4"]
+        by_id = {m.id: m for m in diag.models}
+        assert by_id["gpt-4"].supported_reasoning_efforts is None
+
 
 # ---------------------------------------------------------------------------
 # Top-level gather

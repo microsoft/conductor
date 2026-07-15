@@ -401,8 +401,37 @@ class TestDoctorFlags:
         _patch_gather(monkeypatch, report)
         result = runner.invoke(app, ["doctor", "--models"])
         assert result.exit_code == 0
-        assert "claude-3-opus-20240229" in result.output
-        assert "n/a" in result.output  # unknown reasoning-effort support
+        # Target the model's own row, not just "n/a" anywhere in the output.
+        model_lines = [line for line in result.output.splitlines() if "claude-3-opus" in line]
+        assert model_lines, "model row not found in output"
+        assert "n/a" in model_lines[0]
+
+    def test_empty_reasoning_efforts_renders_as_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An empty list (definitively 'supports none') renders as 'none',
+        distinct from the 'n/a' shown for unknown (None) support."""
+        report = DoctorReport(
+            providers=[
+                _prov(
+                    "claude",
+                    checked=True,
+                    connection_ok=True,
+                    models=[
+                        ModelDiagnostic(
+                            id="claude-3-5-sonnet-20241022",
+                            supported_reasoning_efforts=[],
+                            max_prompt_tokens=200_000,
+                        )
+                    ],
+                )
+            ]
+        )
+        _patch_gather(monkeypatch, report)
+        result = runner.invoke(app, ["doctor", "--models"])
+        assert result.exit_code == 0
+        model_lines = [line for line in result.output.splitlines() if "claude-3-5-sonnet" in line]
+        assert model_lines, "model row not found in output"
+        assert "none" in model_lines[0]
+        assert "n/a" not in model_lines[0]
 
     def test_no_detail_table_when_models_empty_or_none(
         self, monkeypatch: pytest.MonkeyPatch
