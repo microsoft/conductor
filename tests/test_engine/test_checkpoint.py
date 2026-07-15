@@ -275,6 +275,49 @@ class TestSaveCheckpoint:
         data = json.loads(path.read_text())
         assert data["copilot_session_ids"] == {"agent_a": "sid-123"}
 
+    def test_copilot_session_cwds_round_trip(self, tmp_path: Path) -> None:
+        """Requirement: copilot_session_cwds persists through save+load (Persistent field)."""
+        wf = _write_workflow(tmp_path)
+        ctx = _make_context()
+        limits = _make_limits()
+        error = RuntimeError("err")
+
+        with patch.object(CheckpointManager, "get_checkpoints_dir", return_value=tmp_path):
+            path = CheckpointManager.save_checkpoint(
+                wf,
+                ctx,
+                limits,
+                "a",
+                error,
+                {},
+                copilot_session_ids={"agent_a": "sid-123"},
+                copilot_session_cwds={"agent_a": "/repo/a"},
+            )
+
+        assert path is not None
+        data = json.loads(path.read_text())
+        assert data["copilot_session_cwds"] == {"agent_a": "/repo/a"}
+
+        cp = CheckpointManager.load_checkpoint(path)
+        assert cp.copilot_session_cwds == {"agent_a": "/repo/a"}
+
+    def test_copilot_session_cwds_defaults_to_empty(self, tmp_path: Path) -> None:
+        """Requirement: checkpoints saved without cwds load with an empty mapping."""
+        wf = _write_workflow(tmp_path)
+        ctx = _make_context()
+        limits = _make_limits()
+        error = RuntimeError("err")
+
+        with patch.object(CheckpointManager, "get_checkpoints_dir", return_value=tmp_path):
+            path = CheckpointManager.save_checkpoint(wf, ctx, limits, "a", error, {})
+
+        assert path is not None
+        data = json.loads(path.read_text())
+        assert data["copilot_session_cwds"] == {}
+
+        cp = CheckpointManager.load_checkpoint(path)
+        assert cp.copilot_session_cwds == {}
+
     def test_run_id_and_event_log_path_included(self, tmp_path: Path) -> None:
         """``run_id`` and ``event_log_path`` round-trip through save+load.
 
@@ -426,6 +469,36 @@ class TestLoadCheckpoint:
         cp = CheckpointManager.load_checkpoint(legacy)
         assert cp.run_id == ""
         assert cp.event_log_path == ""
+
+    def test_loads_legacy_checkpoint_without_copilot_session_cwds(self, tmp_path: Path) -> None:
+        """Requirement: pre-cwd checkpoints (no copilot_session_cwds key) load with default.
+
+        Backward compatibility: ``load_checkpoint`` must default the mapping
+        to ``{}`` without raising so resume falls back to the legacy
+        resume-by-session-id behavior.
+        """
+        legacy = tmp_path / "legacy-no-cwds.json"
+        legacy.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "workflow_path": "/x.yaml",
+                    "workflow_hash": "sha256:abc",
+                    "created_at": "2026-01-01T00:00:00+00:00",
+                    "failure": {"error_type": "X", "message": "m", "agent": "a", "iteration": 0},
+                    "inputs": {},
+                    "current_agent": "a",
+                    "context": {"workflow_inputs": {}, "agent_outputs": {}},
+                    "limits": {"current_iteration": 0, "max_iterations": 10},
+                    "copilot_session_ids": {"a": "sid-1"},
+                    # No copilot_session_cwds — pre-cwd shape.
+                }
+            )
+        )
+
+        cp = CheckpointManager.load_checkpoint(legacy)
+        assert cp.copilot_session_ids == {"a": "sid-1"}
+        assert cp.copilot_session_cwds == {}
 
 
 # ---------------------------------------------------------------------------

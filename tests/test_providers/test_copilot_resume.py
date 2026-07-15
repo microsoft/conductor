@@ -9,6 +9,7 @@ Tests cover:
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -164,6 +165,7 @@ class TestSessionResumeFallback:
         mock_client.resume_session.assert_called_once_with(
             resumed_sid,
             on_permission_request=CopilotProvider._default_permission_handler,
+            working_directory=os.getcwd(),
         )
         mock_client.create_session.assert_not_called()
 
@@ -207,6 +209,7 @@ class TestSessionResumeFallback:
         mock_client.resume_session.assert_called_once_with(
             "stale-sid",
             on_permission_request=CopilotProvider._default_permission_handler,
+            working_directory=os.getcwd(),
         )
         mock_client.create_session.assert_called_once()
         # Session ID should now reflect the new session

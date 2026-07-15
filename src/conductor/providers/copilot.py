@@ -303,6 +303,8 @@ class CopilotProvider(AgentProvider):
         self._max_schema_depth = 10  # Max nesting depth for recursive schema building
         self._session_ids: dict[str, str] = {}
         self._resume_session_ids: dict[str, str] = {}
+        self._session_cwds: dict[str, str] = {}
+        self._resume_session_cwds: dict[str, str] = {}
         self._interrupted_session: Any = None
         self._abort_supported: bool | None = None
         self._provider_settings = provider_settings
@@ -788,6 +790,12 @@ class CopilotProvider(AgentProvider):
             )
 
         try:
+            # Resolve the session working directory: the engine resolves
+            # ``agent.working_dir`` (Jinja render, absolutize, is_dir check)
+            # before dispatching to the provider; ``None`` keeps the legacy
+            # process-cwd behavior.
+            resolved_cwd = agent.working_dir or os.getcwd()
+
             # Build session kwargs for the SDK.
             #
             # ``streaming=True`` is required: in non-streaming mode the model
@@ -804,7 +812,7 @@ class CopilotProvider(AgentProvider):
             session_kwargs: dict[str, Any] = {
                 "model": model,
                 "on_permission_request": self._default_permission_handler,
-                "working_directory": os.getcwd(),
+                "working_directory": resolved_cwd,
                 "streaming": True,
             }
 
@@ -818,9 +826,12 @@ class CopilotProvider(AgentProvider):
                     self._temperature,
                 )
 
-            # Add MCP servers if configured
+            # Add MCP servers if configured. Stdio/local servers get a
+            # per-execution copy stamped with the resolved working directory;
+            # the shared ``self._mcp_servers`` mapping is never mutated and
+            # remote (http/sse) servers are left untouched.
             if self._mcp_servers:
-                session_kwargs["mcp_servers"] = self._mcp_servers
+                session_kwargs["mcp_servers"] = self._mcp_servers_for_cwd(resolved_cwd)
 
             # Apply custom provider routing (Ollama / vLLM / Azure / etc.)
             # when runtime.provider opted into it.
@@ -855,15 +866,36 @@ class CopilotProvider(AgentProvider):
                     model,
                 )
 
-            # Attempt to resume a previous session if one exists for this agent
+            # Attempt to resume a previous session if one exists for this agent.
+            # Resume is only valid when the session was originally created with
+            # the same working directory: the SDK bakes cwd into the session's
+            # workspace, so resuming under a different cwd would silently run
+            # the agent in the wrong directory. When the recorded cwd differs
+            # (or is unknown for pre-cwd checkpoints, where we keep the legacy
+            # resume-by-id behavior), fall through to ``create_session``.
             session: Any = None
             resume_sid = self._resume_session_ids.get(agent.name)
             if resume_sid is not None:
-                try:
-                    session = await self._client.resume_session(
+                recorded_cwd = self._resume_session_cwds.get(agent.name)
+                if recorded_cwd is not None and recorded_cwd != resolved_cwd:
+                    logger.warning(
+                        "Skipping resume of Copilot session %s for agent '%s': "
+                        "working directory changed from %s to %s. Creating a new session.",
                         resume_sid,
-                        on_permission_request=self._default_permission_handler,
+                        agent.name,
+                        recorded_cwd,
+                        resolved_cwd,
                     )
+                    resume_sid = None
+            if resume_sid is not None:
+                try:
+                    resume_kwargs: dict[str, Any] = {
+                        "on_permission_request": self._default_permission_handler,
+                        "working_directory": resolved_cwd,
+                    }
+                    if self._mcp_servers:
+                        resume_kwargs["mcp_servers"] = self._mcp_servers_for_cwd(resolved_cwd)
+                    session = await self._client.resume_session(resume_sid, **resume_kwargs)
                     logger.info(f"Resumed Copilot session {resume_sid} for agent '{agent.name}'")
                 except Exception as exc:
                     logger.warning(
@@ -876,10 +908,11 @@ class CopilotProvider(AgentProvider):
             if session is None:
                 session = await self._client.create_session(**session_kwargs)
 
-            # Track session ID for checkpoint persistence
+            # Track session ID and resolved cwd for checkpoint persistence
             sid = getattr(session, "session_id", None)
             if sid is not None:
                 self._session_ids[agent.name] = sid
+                self._session_cwds[agent.name] = resolved_cwd
 
             # Capture verbose state before callback (contextvars don't propagate to sync callbacks)
             from conductor.cli.app import is_full, is_verbose
@@ -2519,6 +2552,33 @@ class CopilotProvider(AgentProvider):
                 ),
             )
 
+    def _mcp_servers_for_cwd(self, resolved_cwd: str) -> dict[str, Any]:
+        """Build a per-execution MCP server mapping stamped with ``resolved_cwd``.
+
+        Stdio/local servers get a shallow-copied config with
+        ``working_directory`` set (the SDK translates it to the spawned
+        server's cwd). Remote (``http``/``sse``) servers are returned as-is —
+        a working directory is meaningless for a remote process. The shared
+        ``self._mcp_servers`` mapping and its nested dicts are never mutated,
+        so parallel agents with different cwds cannot race each other.
+
+        Args:
+            resolved_cwd: Absolute working directory resolved by the engine
+                (or ``os.getcwd()`` when the agent declares no working_dir).
+
+        Returns:
+            A new mapping of server name to config dict.
+        """
+        stamped: dict[str, Any] = {}
+        for name, config in self._mcp_servers.items():
+            if isinstance(config, dict) and config.get("type") in ("stdio", "local", None):
+                server_copy = dict(config)
+                server_copy["working_directory"] = resolved_cwd
+                stamped[name] = server_copy
+            else:
+                stamped[name] = config
+        return stamped
+
     def get_session_ids(self) -> dict[str, str]:
         """Get tracked session IDs for all executed agents.
 
@@ -2542,6 +2602,30 @@ class CopilotProvider(AgentProvider):
             ids: Mapping of agent names to session IDs from a checkpoint.
         """
         self._resume_session_ids = dict(ids)
+
+    def get_session_cwds(self) -> dict[str, str]:
+        """Get the resolved working directory per executed agent.
+
+        Mirrors :meth:`get_session_ids` — the engine persists this mapping in
+        the checkpoint (``copilot_session_cwds``) so a later resume can detect
+        when the resolved cwd changed since session creation and start a fresh
+        session instead of resuming into the wrong directory.
+
+        Returns:
+            Dict mapping agent names to their session's working directory.
+        """
+        return self._session_cwds.copy()
+
+    def set_resume_session_cwds(self, cwds: dict[str, str]) -> None:
+        """Set session working directories restored from a checkpoint.
+
+        Args:
+            cwds: Mapping of agent names to the working directory their
+                stored session was created with. Agents missing from this
+                mapping (pre-cwd checkpoints) keep the legacy resume-by-id
+                behavior.
+        """
+        self._resume_session_cwds = dict(cwds)
 
     def get_interrupted_session(self) -> Any | None:
         """Get the session handle kept alive after a mid-agent interrupt.

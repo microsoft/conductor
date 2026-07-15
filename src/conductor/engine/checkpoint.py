@@ -89,6 +89,11 @@ class CheckpointData:
         context: Serialized ``WorkflowContext`` state.
         limits: Serialized ``LimitEnforcer`` state.
         copilot_session_ids: Mapping of agent names to Copilot session IDs.
+        copilot_session_cwds: Mapping of agent names to the working directory
+            their Copilot session was created with. Persisted so resume can
+            detect a changed cwd and start a fresh session instead of
+            resuming into the wrong directory. Empty for checkpoints written
+            by a version of Conductor that predated this field.
         file_path: Path where the checkpoint file is stored.
         instructions_preamble: Workspace instructions preamble that was
             active during the original run, or ``None``.
@@ -116,6 +121,7 @@ class CheckpointData:
     context: dict[str, Any]
     limits: dict[str, Any]
     copilot_session_ids: dict[str, str] = field(default_factory=dict)
+    copilot_session_cwds: dict[str, str] = field(default_factory=dict)
     file_path: Path = field(default_factory=lambda: Path())
     instructions_preamble: str | None = None
     """Workspace instructions preamble that was active during the original run."""
@@ -176,6 +182,7 @@ class CheckpointManager:
         error: BaseException | None,
         inputs: dict[str, Any],
         copilot_session_ids: dict[str, str] | None = None,
+        copilot_session_cwds: dict[str, str] | None = None,
         system_metadata: dict[str, Any] | None = None,
         instructions_preamble: str | None = None,
         run_id: str = "",
@@ -201,6 +208,10 @@ class CheckpointManager:
                 for a periodic / non-failure checkpoint.
             inputs: Workflow inputs.
             copilot_session_ids: Optional mapping of agent names to session IDs.
+            copilot_session_cwds: Optional mapping of agent names to the
+                working directory their session was created with. Persisted
+                alongside the session IDs so resume can skip stale sessions
+                whose cwd no longer matches the agent's resolved cwd.
             system_metadata: Optional system metadata captured at workflow start.
             instructions_preamble: Optional workspace instructions preamble to persist.
             run_id: Original run identifier (from ``EventLogSubscriber``).
@@ -255,6 +266,7 @@ class CheckpointManager:
                 "context": _make_json_serializable(context.to_dict()),
                 "limits": _make_json_serializable(limits.to_dict()),
                 "copilot_session_ids": copilot_session_ids or {},
+                "copilot_session_cwds": copilot_session_cwds or {},
                 "system": system_metadata or {},
                 "instructions_preamble": instructions_preamble,
                 "run_id": run_id,
@@ -373,6 +385,9 @@ class CheckpointManager:
             context=data["context"],
             limits=data["limits"],
             copilot_session_ids=data.get("copilot_session_ids", {}),
+            # Backward compatible: pre-cwd checkpoints have no such key and
+            # load with an empty mapping (legacy resume-by-id behavior).
+            copilot_session_cwds=data.get("copilot_session_cwds", {}),
             file_path=checkpoint_path,
             instructions_preamble=data.get("instructions_preamble"),
             run_id=data.get("run_id", "") or "",

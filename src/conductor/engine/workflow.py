@@ -1954,18 +1954,24 @@ class WorkflowEngine:
         # provider raising here must not break the (failure or periodic)
         # checkpoint save, so the "never raises" contract holds for both paths.
         copilot_session_ids: dict[str, str] | None = None
+        copilot_session_cwds: dict[str, str] | None = None
         try:
             provider = self._single_provider
             if provider is not None and hasattr(provider, "get_session_ids"):
                 copilot_session_ids = provider.get_session_ids()  # type: ignore[union-attr]
+                if hasattr(provider, "get_session_cwds"):
+                    copilot_session_cwds = provider.get_session_cwds()  # type: ignore[union-attr]
             elif self._registry is not None:
                 for p in self._registry.get_active_providers().values():
                     if hasattr(p, "get_session_ids"):
                         copilot_session_ids = p.get_session_ids()  # type: ignore[union-attr]
+                        if hasattr(p, "get_session_cwds"):
+                            copilot_session_cwds = p.get_session_cwds()  # type: ignore[union-attr]
                         break
         except Exception:
             logger.warning("Failed to collect provider session IDs for checkpoint", exc_info=True)
             copilot_session_ids = None
+            copilot_session_cwds = None
 
         return CheckpointManager.save_checkpoint(
             workflow_path=self.workflow_path,
@@ -1975,6 +1981,7 @@ class WorkflowEngine:
             error=error,
             inputs=self.context.workflow_inputs,
             copilot_session_ids=copilot_session_ids,
+            copilot_session_cwds=copilot_session_cwds,
             system_metadata=self._system_metadata,
             instructions_preamble=self._instructions_preamble,
             run_id=self._run_context.run_id,

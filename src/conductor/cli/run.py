@@ -2220,6 +2220,11 @@ async def resume_workflow_async(
             # Pass stored session IDs to registry for Copilot session resume
             if cp.copilot_session_ids:
                 registry.set_resume_session_ids(cp.copilot_session_ids)
+            # Pass the sessions' original working directories so the provider
+            # can skip resuming a session whose cwd changed since creation.
+            # Pre-cwd checkpoints carry an empty mapping (legacy behavior).
+            if cp.copilot_session_cwds:
+                registry.set_resume_session_cwds(cp.copilot_session_cwds)
 
             # Set up interrupt listener if interactive mode is enabled
             # Disabled in --web mode since the CLI isn't used for interaction

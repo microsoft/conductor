@@ -53,6 +53,7 @@ class ProviderRegistry:
         self._providers: dict[ProviderType, AgentProvider] = {}
         self._default_provider_type: ProviderType = config.workflow.runtime.provider.name
         self._resume_session_ids: dict[str, str] = {}
+        self._resume_session_cwds: dict[str, str] = {}
 
     @property
     def default_provider_type(self) -> ProviderType:
@@ -129,6 +130,8 @@ class ProviderRegistry:
         # Pass stored resume session IDs to newly created providers
         if self._resume_session_ids and hasattr(provider, "set_resume_session_ids"):
             provider.set_resume_session_ids(self._resume_session_ids)  # type: ignore[union-attr]
+        if self._resume_session_cwds and hasattr(provider, "set_resume_session_cwds"):
+            provider.set_resume_session_cwds(self._resume_session_cwds)  # type: ignore[union-attr]
 
         self._providers[provider_type] = provider
         return provider
@@ -194,3 +197,19 @@ class ProviderRegistry:
         for provider in self._providers.values():
             if hasattr(provider, "set_resume_session_ids"):
                 provider.set_resume_session_ids(ids)  # type: ignore[union-attr]
+
+    def set_resume_session_cwds(self, cwds: dict[str, str]) -> None:
+        """Store session working directories restored from a checkpoint.
+
+        Forwarded to providers that support ``set_resume_session_cwds`` —
+        both already-active providers and providers created lazily in the
+        future. The mapping lets a provider skip resuming a session whose
+        working directory no longer matches the agent's resolved cwd.
+
+        Args:
+            cwds: Mapping of agent names to session working directories.
+        """
+        self._resume_session_cwds = dict(cwds)
+        for provider in self._providers.values():
+            if hasattr(provider, "set_resume_session_cwds"):
+                provider.set_resume_session_cwds(cwds)  # type: ignore[union-attr]
