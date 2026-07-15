@@ -3146,9 +3146,12 @@ class WorkflowEngine:
                         # (type None/"agent"). wait/set/terminate/human_gate/
                         # workflow are schema-rejected from declaring one, and
                         # script resolves its own in ScriptExecutor.
-                        resolved_agent = agent
-                        if agent.type in (None, "agent"):
-                            resolved_agent = self._resolve_agent_working_dir(agent, agent_context)
+                        is_llm_agent = agent.type in (None, "agent")
+                        resolved_agent = (
+                            self._resolve_agent_working_dir(agent, agent_context)
+                            if is_llm_agent
+                            else agent
+                        )
 
                         started_payload: dict[str, Any] = {
                             "agent_name": agent.name,
@@ -3158,7 +3161,7 @@ class WorkflowEngine:
                                 resolved_agent
                             ),
                         }
-                        if agent.type in (None, "agent"):
+                        if is_llm_agent:
                             started_payload["working_dir"] = resolved_agent.working_dir
                         self._emit("agent_started", started_payload)
 
