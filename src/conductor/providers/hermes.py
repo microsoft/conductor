@@ -76,9 +76,15 @@ class HermesProvider(AgentProvider):
         workflow_tools_passthrough=False,
         streaming_events=True,
         agent_reasoning_events=True,
-        # ``max`` is intentionally omitted: the hermes upstream's acceptance
-        # of ``{"effort": "max"}`` in ``reasoning_config`` is unverified, so
-        # the validator rejects ``max`` on this provider (see #299).
+        # ``max`` is intentionally omitted from this tuple: the hermes
+        # upstream's acceptance of ``{"effort": "max"}`` in
+        # ``reasoning_config`` is unverified. Two layers enforce the
+        # exclusion — ``conductor validate``'s static capability
+        # cross-check (config/validator.py) rejects a literal
+        # ``effort: max`` before any agent runs, and ``execute()`` below
+        # re-checks the *resolved* effort against this same tuple at
+        # runtime, which also catches a Jinja-templated ``effort`` that
+        # only resolves to ``"max"`` after rendering (see #299).
         reasoning_effort=("low", "medium", "high", "xhigh"),
         structured_output="prompt_injection",
         interrupt=False,
@@ -251,9 +257,26 @@ class HermesProvider(AgentProvider):
         if self._api_key:
             agent_kwargs["api_key"] = self._api_key
 
-        # Resolve reasoning effort (per-agent override → workflow default)
+        # Resolve reasoning effort (per-agent override → workflow default).
+        # Re-validate the resolved value against CAPABILITIES.reasoning_effort
+        # here (rather than relying solely on the static `conductor validate`
+        # cross-check) so a Jinja-templated `reasoning.effort` that only
+        # resolves to an unsupported level (e.g. "max") at runtime is still
+        # caught, and so running without validation doesn't silently forward
+        # an unsupported level to the hermes-agent SDK (#299).
         effort = resolve_reasoning_effort(agent, self._default_reasoning_effort)
         if effort is not None:
+            supported = self.CAPABILITIES.reasoning_effort
+            if supported is None or effort not in supported:
+                raise ValidationError(
+                    f"Agent {agent.name!r} resolves to reasoning.effort={effort!r}, "
+                    f"but the Hermes provider supports only "
+                    f"{sorted(supported) if supported else []}.",
+                    suggestion=(
+                        "Choose a supported reasoning effort level, or use the "
+                        "Copilot or Claude provider for 'max'."
+                    ),
+                )
             agent_kwargs["reasoning_config"] = {"effort": effort}
 
         # Resolve enabled_toolsets. Conductor's per-agent tools: field

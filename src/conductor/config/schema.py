@@ -555,7 +555,7 @@ class ReasoningConfig(BaseModel):
 
     - **Copilot SDK** sets ``reasoning_effort`` on the session.
     - **Anthropic SDK** enables extended thinking with a budget mapped from
-      the effort level (low=2k, medium=8k, high=16k, xhigh=32k, max≈60k tokens).
+      the effort level (low=2k, medium=8k, high=16k, xhigh=32k, max=59904 tokens).
 
     Validation happens at execute time. Claude rejects models that don't
     match the supported prefix list; Copilot consults the SDK's advertised
@@ -987,7 +987,7 @@ class AgentDef(BaseModel):
 
     - Copilot: passes ``reasoning_effort`` to ``create_session``.
     - Claude: enables ``thinking`` with a budget mapped from the effort
-      level (low=2k, medium=8k, high=16k, xhigh=32k, max≈60k tokens).
+      level (low=2k, medium=8k, high=16k, xhigh=32k, max=59904 tokens).
 
     Falls back to ``runtime.default_reasoning_effort`` when unset.
 

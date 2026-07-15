@@ -15,8 +15,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per-model against the model's advertised `supported_reasoning_efforts`. On
   the Claude provider `max` maps to a `59904`-token extended-thinking budget
   (`64000 − 4096`, the largest budget that keeps the default answer headroom
-  under the 64000-token output cap). The experimental Hermes provider keeps the
-  original four levels, so `conductor validate` cleanly rejects `max` there.
+  under the 64000-token output cap); both the main agentic-loop and dialog-turn
+  code paths share the same clamping helper, so the cap is enforced
+  consistently. The experimental Hermes provider keeps the original four
+  levels — `max` is rejected both statically (`conductor validate`) and at
+  execute time (including when a Jinja-templated `reasoning.effort` only
+  resolves to `max` after rendering).
   ([#299](https://github.com/microsoft/conductor/issues/299))
 
 ### Fixed

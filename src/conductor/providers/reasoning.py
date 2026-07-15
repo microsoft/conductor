@@ -11,7 +11,7 @@ discrete ``reasoning.effort`` levels and each SDK's native parameter shape:
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Final, Literal, cast
+from typing import TYPE_CHECKING, Final, Literal, cast, get_args
 
 from conductor.templating import is_jinja_template
 
@@ -20,21 +20,45 @@ if TYPE_CHECKING:
 
 ReasoningEffort = Literal["low", "medium", "high", "xhigh", "max"]
 
+CLAUDE_EXTENDED_THINKING_OUTPUT_CAP: Final[int] = 64_000
+"""Per-request output-token cap when Anthropic extended thinking is enabled.
+
+Extended-thinking-capable Claude models accept up to this many total output
+tokens (thinking + visible response) per request. Shared with
+:meth:`ClaudeProvider._coerce_for_thinking`, which clamps ``max_tokens`` to
+this value, and :meth:`ClaudeProvider.execute_dialog_turn`, which reuses
+that same clamping helper for dialog turns.
+"""
+
+CLAUDE_ANSWER_HEADROOM_TOKENS: Final[int] = 4096
+"""Minimum visible-answer headroom reserved above the thinking budget.
+
+The Anthropic API requires ``max_tokens > budget_tokens``; this is the
+margin :meth:`ClaudeProvider._coerce_for_thinking` adds on top of the
+resolved thinking budget when computing the effective ``max_tokens``.
+"""
+
 EFFORT_TO_BUDGET_TOKENS: Final[Mapping[ReasoningEffort, int]] = {
     "low": 2048,
     "medium": 8192,
     "high": 16384,
     "xhigh": 32768,
-    "max": 59904,
+    "max": CLAUDE_EXTENDED_THINKING_OUTPUT_CAP - CLAUDE_ANSWER_HEADROOM_TOKENS,
 }
 """Mapping from Conductor effort level to Claude ``budget_tokens`` value.
 
 The minimum supported by the Anthropic API is 1024; all values above sit
-comfortably above that floor. ``max`` is pinned to ``59904 = 64000 - 4096``:
-the largest budget that still leaves the default answer headroom under the
-64000-token extended-thinking output cap enforced by
-:meth:`ClaudeProvider._coerce_for_thinking`.
+comfortably above that floor. ``max`` is derived from the two constants
+above (``64000 - 4096 = 59904``): the largest budget that still leaves the
+default answer headroom under the extended-thinking output cap enforced by
+:meth:`ClaudeProvider._coerce_for_thinking` (and, via that same helper, by
+:meth:`ClaudeProvider.execute_dialog_turn`).
 """
+
+assert set(EFFORT_TO_BUDGET_TOKENS) == set(get_args(ReasoningEffort)), (
+    "EFFORT_TO_BUDGET_TOKENS is missing an entry for a ReasoningEffort level; "
+    "add a budget for every level in the Literal."
+)
 
 _CLAUDE_THINKING_MODEL_PREFIXES: tuple[str, ...] = (
     "claude-3-7-",

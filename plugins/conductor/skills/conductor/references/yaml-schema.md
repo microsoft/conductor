@@ -213,7 +213,7 @@ agents:
 
 - **Copilot**: forwards `reasoning_effort` to the session. Validated against the model's advertised `supported_reasoning_efforts` (when available); raises `ValidationError` for unsupported combinations.
 - **Claude**: enables extended thinking via `thinking={"type":"enabled","budget_tokens":N}` with mapping low=2048, medium=8192, high=16384, xhigh=32768, max=59904. Auto-coerces `temperature=1.0` (Anthropic API requirement) and bumps `max_tokens` to fit `budget+4096` (capped at 64000). Only valid on thinking-capable models (Claude 3.7+, Opus/Sonnet/Haiku 4.x); raises `ValidationError` otherwise.
-- **Hermes**: forwarded to hermes-agent via `reasoning_config={"effort": value}`. Support depends on the underlying model and hermes version. `max` is **not** offered on Hermes, so `conductor validate` rejects it on this provider.
+- **Hermes**: forwarded to hermes-agent via `reasoning_config={"effort": value}`. Support depends on the underlying model and hermes version. `max` is **not** offered on Hermes; the provider re-checks the resolved effort against its capability tuple at execute time in addition to the static `conductor validate` cross-check, so `max` is rejected both statically and at runtime on this provider.
 
 All three providers surface reasoning content via `agent_reasoning` events visible in the dashboard, JSONL logs, and console at `-vv`.
 
