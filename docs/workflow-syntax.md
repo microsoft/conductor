@@ -69,6 +69,10 @@ workflow:
                                       # provider-backed agent unless it declares
                                       # its own `context_tier`.
                                       # See docs/configuration.md#context-tier.
+
+    working_dir: "/path/to/cwd"       # Optional: global default working directory for LLM agents
+                                      # and their MCP servers. Relative paths resolve against the
+                                      # parent directory of the workflow YAML file.
 ```
 
 **Workflow metadata** is included verbatim in the `workflow_started` event and lets downstream consumers (dashboards, queue runners, observability tools) adapt without parsing the YAML. CLI `--metadata key=value` flags merge on top of YAML metadata (CLI wins on conflicts).
@@ -271,6 +275,42 @@ agents:
 ```
 
 `output_mode` is only valid on provider-backed agents (the default type). It cannot be set on `script`, `human_gate`, or `workflow` agents.
+
+### Working Directory
+
+Regular LLM agents (provider-backed agents) and their MCP servers run in a specific working directory:
+
+```yaml
+agents:
+  - name: repository_analyst
+    working_dir: "./my-project-repo"     # Optional: working directory (Jinja2 template)
+    prompt: |
+      Examine the repository files and list any issues.
+```
+
+The `working_dir` field can be defined globally in `workflow.runtime.working_dir` or overridden on individual agents.
+
+#### Precedence and Path Resolution
+
+1. **Precedence:** The agent-level `working_dir` overrides the global `workflow.runtime.working_dir`. If neither is configured, the current directory of the parent process (`os.getcwd()`) is used.
+2. **Jinja2 Rendering:** Both agent-level and runtime-level configurations support Jinja2 template rendering. This allows dynamic paths, such as directories derived from previous steps: `working_dir: "{{ find_repo.output.path }}"`.
+3. **Relative Paths:** Relative paths are resolved against the directory containing the workflow YAML file. When the workflow file location is unknown, relative paths resolve against the current process directory.
+4. **Lexical Normalization:** Paths are normalized lexically using `os.path.normpath`. The engine does not resolve symlinks dynamically.
+
+#### Symlink Semantics
+
+Because paths are normalized lexically instead of resolving to their real paths:
+- Different symlink aliases pointing to the same folder are treated as distinct paths.
+- For the Claude provider, distinct paths trigger separate MCP manager connections. This spawns separate MCP server subprocesses for each unique path alias.
+
+#### Key Restrictions and Exclusions
+
+- **Rejected Step Types:** The `working_dir` field is strictly rejected on `wait`, `set`, `terminate`, `human_gate`, and `workflow` (sub-workflow) step types. Defining `working_dir` on these steps raises a `ValidationError` at load time.
+- **Dialog Turns:** The working directory isn't applied to dialog turns in the current version. Multi-turn interactions run in the process default directory.
+- **Sub-Workflows:** A sub-workflow doesn't inherit the parent's working directory configuration. Instead, any relative paths in the child workflow resolve against the child workflow's own file directory.
+
+> ⚠️ **Warning: Working directory is NOT a sandbox**
+> Setting `working_dir` doesn't restrict the model's filesystem access. The model can still read and write files outside this directory if it uses absolute paths or parent directory traversals (e.g., `../`). Avoid relying on this configuration to sandbox untrusted model execution.
 
 ### Human Gates
 

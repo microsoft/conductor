@@ -1,0 +1,48 @@
+# Working Directory Example
+#
+# Demonstrates dynamically setting the working directory for an agent and its
+# MCP servers using the outputs of a set step.
+#
+# The workflow:
+#   1. set_step  - a set step that calculates the target directory path.
+#   2. llm_agent - an LLM agent running with its `working_dir` bound to the
+#                  path output of the set step, using an MCP tool in that directory.
+#
+# Usage:
+#   conductor run examples/working-dir.yaml
+
+workflow:
+  name: working-dir-demo
+  description: "Demonstrates dynamic working directory configuration for agents and MCP servers"
+  version: "1.0.0"
+  entry_point: set_step
+
+  runtime:
+    provider: copilot
+    mcp_servers:
+      mock-search:
+        command: npx
+        args: ["-y", "open-websearch@latest"]
+        tools: ["*"]
+
+agents:
+  - name: set_step
+    type: set
+    description: Calculate the directory path for the LLM agent
+    values:
+      path: "." # Resolves to the directory containing the workflow YAML (examples/)
+    routes:
+      - to: llm_agent
+
+  - name: llm_agent
+    description: Runs in the dynamically calculated working directory
+    model: claude-haiku-4.5
+    working_dir: "{{ set_step.output.path }}"
+    prompt: |
+      You are running in the working directory: {{ set_step.output.path }}.
+      Please analyze the files in this directory.
+    routes:
+      - to: $end
+
+output:
+  resolved_path: "{{ set_step.output.path }}"

@@ -2510,3 +2510,80 @@ class TestSubWorkflowTerminate:
         assert "iteration x failed" in message or "iteration y failed" in message, (
             f"expected child reason in error chain; got: {message}"
         )
+
+
+class TestSubWorkflowWorkingDir:
+    @pytest.mark.asyncio
+    async def test_subworkflow_no_working_dir_inheritance(self, tmp_workflow_dir: Path) -> None:
+        """Requirement: a sub-workflow does not inherit the parent's runtime.working_dir;
+
+        the child's own relative working_dir resolves against the child workflow file's directory.
+        """
+        child_dir = tmp_workflow_dir / "child_subdir"
+        child_dir.mkdir()
+
+        target_dir = child_dir / "x"
+        target_dir.mkdir()
+
+        _write_yaml(
+            child_dir / "child.yaml",
+            """\
+            workflow:
+              name: child-workflow
+              entry_point: child_agent
+              runtime:
+                provider: copilot
+                working_dir: "./x"
+              limits:
+                max_iterations: 5
+            agents:
+              - name: child_agent
+                prompt: "Child prompt"
+                routes:
+                  - to: "$end"
+            output:
+              result: "{{ child_agent.output.result }}"
+            """,
+        )
+
+        parent_path = tmp_workflow_dir / "parent.yaml"
+        parent_path.write_text("dummy", encoding="utf-8")
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="parent-workflow",
+                entry_point="sub_wf",
+                runtime=RuntimeConfig(
+                    provider="copilot",
+                    working_dir="/some/parent/dir",
+                ),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="sub_wf",
+                    type="workflow",
+                    workflow="child_subdir/child.yaml",
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={
+                "result": "{{ sub_wf.output.result }}",
+            },
+        )
+
+        resolved_cwds = []
+
+        def mock_handler(agent, prompt, context):
+            resolved_cwds.append(agent.working_dir)
+            return {"result": "ok"}
+
+        provider = CopilotProvider(mock_handler=mock_handler)
+        engine = WorkflowEngine(config, provider, workflow_path=parent_path)
+
+        result = await engine.run({})
+
+        assert result["result"] == "ok"
+        assert len(resolved_cwds) == 1
+        assert resolved_cwds[0] == str(target_dir.resolve())

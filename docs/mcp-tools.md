@@ -215,6 +215,52 @@ uv run conductor run workflow.yaml --input.question="test"
 > ```
 > See [copilot-sdk#163](https://github.com/github/copilot-sdk/issues/163) for status.
 
+## Working Directory
+
+You can specify a default directory where stdio-based MCP servers and agent sessions execute. This is useful for workflows interacting with local repositories or specific folders.
+
+The working directory is configured in the workflow `runtime` block or on individual agents:
+
+```yaml
+workflow:
+  runtime:
+    working_dir: "/path/to/default/workspace" # Global default
+```
+
+Or on a specific agent:
+
+```yaml
+agents:
+  - name: code_expert
+    working_dir: "/path/to/specific/repo"
+```
+
+### Precedence and Resolution
+
+When determining the active working directory, Conductor follows this precedence:
+
+1. **Agent level:** The agent's own `working_dir` configuration.
+2. **Runtime level:** The global `workflow.runtime.working_dir` default.
+3. **Fallback:** If neither is set, Conductor falls back to the current directory of the parent process (`os.getcwd()`).
+
+Both levels support dynamic values using Jinja2 templates. You can resolve the path at runtime using outputs from previous steps:
+
+```yaml
+agents:
+  - name: find_repo
+    type: set
+    value: "/repositories/my-project"
+
+  - name: git_agent
+    working_dir: "{{ find_repo.output }}"
+    prompt: "List the last commits in the repository."
+```
+
+Relative paths in `working_dir` resolve against the parent directory of the workflow YAML file. If the workflow has no path (e.g. constructed dynamically in memory), they resolve against the current process directory. Conductor lexically normalizes the resolved path. A missing target directory causes Conductor to raise an execution error before any provider call.
+
+> ⚠️ **Warning: Working directory is NOT a sandbox**
+> Setting the working directory doesn't restrict filesystem access. It only sets the default path where the agent session and stdio MCP subprocesses run. The model can still read or write files outside this directory if it uses absolute paths or parent directory traversals (e.g., `../`). Avoid relying on this setting to sandbox untrusted model execution.
+
 ## OAuth Authentication (HTTP/SSE)
 
 For HTTP and SSE servers that require OAuth, Conductor can automatically discover OAuth requirements and fetch Azure AD tokens.
