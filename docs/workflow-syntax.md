@@ -306,6 +306,7 @@ Because paths are normalized lexically instead of resolving to their real paths:
 #### Key Restrictions and Exclusions
 
 - **Rejected Step Types:** The `working_dir` field is strictly rejected on `wait`, `set`, `terminate`, `human_gate`, and `workflow` (sub-workflow) step types. Defining `working_dir` on these steps raises a `ValidationError` at load time.
+- **Script Steps:** `script` steps honor only their own `working_dir` field, rendered as a Jinja2 template. `workflow.runtime.working_dir` is not applied; relative paths are passed to the subprocess as-is and therefore resolve against the Conductor process cwd, not the workflow file directory; missing directories surface as subprocess startup `ExecutionError`s rather than the LLM-agent pre-provider working-dir check.
 - **Dialog Turns:** The working directory isn't applied to dialog turns in the current version. Multi-turn interactions run in the process default directory.
 - **Sub-Workflows:** A sub-workflow doesn't inherit the parent's working directory configuration. Instead, any relative paths in the child workflow resolve against the child workflow's own file directory.
 
