@@ -146,6 +146,8 @@ agents:
     routes:                         # Optional: Routing logic
       - to: next_agent              # Agent name or $end
         when: "{{ condition }}"     # Optional: Route condition
+      - to: recovery_agent          # Script steps only in Phase 1
+        on_error: external.git.drift
 ```
 
 ### Retry Policy
@@ -441,7 +443,74 @@ routes:
   - to: $end
 ```
 
-**Restrictions** — script steps cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, `options`, or `validator`. Script steps also cannot be used inside `parallel` groups or `for_each` groups.
+**Typed script failures** — scripts may intentionally publish a language-neutral
+error envelope through the path in `CONDUCTOR_ERROR_OUT`:
+
+```json
+{
+  "kind": "external.git.drift",
+  "message": "remote changed while preparing the update",
+  "details": {"branch": "main"}
+}
+```
+
+`CONDUCTOR_ERROR_OUT` is a file path, not JSON stored in an environment variable.
+Conductor creates a private temporary directory for each script process, injects
+the path only into that subprocess, reads the file after the process exits, and
+then removes the directory. The script may use any language capable of writing
+UTF-8 JSON; no Conductor helper library is required or shipped.
+
+The file is intentionally out-of-band because script stdout already carries the
+step's output contract. File presence means the script intended to raise a typed
+failure, regardless of its exit code. A missing file means no typed failure:
+ordinary nonzero exits, `exit_code` conditions, stdout parsing, and existing
+routes retain their previous behavior.
+
+When a typed envelope is present, error routing takes precedence over validating
+the script's success `output:` schema, so handlers can inspect partial stdout and
+stderr that do not satisfy the success contract.
+
+Malformed JSON, invalid UTF-8, an invalid envelope, or a read failure becomes the
+engine-owned `internal.script_error_transport` envelope. This fail-safe behavior
+prevents an intended typed failure from silently becoming success.
+Scripts cannot publish kinds under the engine-owned `internal.`, `provider.`,
+`subworkflow.`, or `retry.` namespaces; attempts are treated as invalid
+transport envelopes.
+
+```yaml
+agents:
+  - name: fetch
+    type: script
+    command: python
+    args: ["scripts/fetch.py"]
+    raises:                         # Optional documentation/load-time validation
+      - external.git.drift
+    routes:
+      - to: continue_pipeline       # Success bucket
+      - to: recover_drift           # Exact error-kind match
+        on_error: external.git.drift
+      - to: diagnose_unknown        # Catch-all; must be the last error route
+        on_error: true
+```
+
+`raises:` is optional documentation and validation metadata. When present,
+specific `on_error` kinds must be declared (engine-owned kinds such as
+`internal.script_error_transport` are exempt). It does not opt a script into
+error synthesis, does not rewrite undeclared runtime kinds, and does not limit
+`on_error: true`; the catch-all receives the original runtime kind.
+
+Error handlers can inspect both the script's partial output and its envelope:
+
+```yaml
+prompt: |
+  {{ fetch.error.kind }}: {{ fetch.error.message }}
+  stderr: {{ fetch.output.stderr }}
+```
+
+In `context.mode: explicit`, declare `fetch.error` (or a nested field such as
+`fetch.error.kind`) in the handler's `input:` list, just as for `fetch.output`.
+
+**Restrictions** — script steps cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, `options`, `validator`, or `retry`. Script steps also cannot be used inside `parallel` groups or `for_each` groups. `CONDUCTOR_ERROR_OUT` is engine-owned and overrides a value with the same name in `env:`.
 
 **Environment variable note** — values in `env` are passed as-is to the subprocess (they are not rendered as Jinja2 templates). Use `${VAR}` syntax in the workflow YAML loader if you need environment variable substitution in env values.
 
@@ -988,6 +1057,59 @@ Structure:
 
 Routes define workflow control flow. Routes are evaluated in order, and the first matching route is taken.
 
+Routes are separated into success and typed-error buckets. A route without
+`on_error` is considered only after successful execution. A route with
+`on_error` is considered only when a script publishes a typed envelope. Within
+the selected bucket, declaration order and `when:` behavior are unchanged.
+
+`on_error` accepts an exact kind, a list of exact kinds, or `true` as a catch-all:
+
+```yaml
+routes:
+  - to: continue_pipeline
+  - to: recover
+    on_error:
+      - external.git.drift
+      - external.git.fetch_failed
+    when: "{{ output.exit_code == 0 and error.details.branch == 'main' }}"
+  - to: diagnose
+    on_error: true
+```
+
+For error-route conditions, both `output` and `error` are in scope. A script
+with error routes must also define at least one success route, and a catch-all
+error route must be last among error routes. Phase 1 supports `on_error` and
+`raises` only on top-level `type: script` steps; provider agents, workflow
+steps, terminate steps, parallel groups, and for-each groups are rejected at
+validation rather than accepted as handlers that never run.
+
+Jinja2 conditions use `error.kind`, `error.message`, and `error.details`.
+Arithmetic-style conditions use the router's flattened names such as
+`error_kind` and `error_message`.
+
+### Error precedence and checkpoints
+
+- **Retry before routing:** existing provider-agent `retry:` behavior completes
+  inside the provider before the workflow engine observes a failure. Provider
+  failures are not routable in Phase 1. Script steps cannot configure `retry`,
+  so typed script failures are never retried implicitly.
+- **Explicit terminate:** `type: terminate, status: failed` remains a terminal
+  control-flow signal. It is not converted to an error envelope, does not run
+  `on_error` routes, and does not create a failure checkpoint.
+- **Sub-workflow terminate:** a child's failed terminate remains
+  `SubworkflowTerminatedError` at the parent seam. `type: workflow` cannot use
+  `on_error` in Phase 1, so existing parent hook and checkpoint behavior is
+  unchanged.
+- **Routed failure:** the failing script's output and envelope are committed to
+  context before its handler runs. The routed failure is handled control flow,
+  so it creates no failure checkpoint. If the handler later fails, the normal
+  failure checkpoint points at the handler and includes the earlier envelope.
+- **Unhandled failure:** if no error route matches, Conductor raises
+  `UnhandledNodeError` before committing the failing step's output/error or
+  execution count. The normal failure checkpoint points at the script so
+  `conductor resume` re-runs it. Any periodic boundary checkpoint taken before
+  the script remains valid.
+
 ### Basic Route
 
 ```yaml
@@ -1236,6 +1358,9 @@ How it works:
   the run reaches a terminal, non-resumable outcome** (clean completion or an
   explicit `status: failed` terminate). On an unexpected failure they are kept
   alongside the on-failure checkpoint.
+- A typed script failure that is successfully routed is not a workflow failure,
+  so it does not create an on-failure checkpoint. An unhandled typed failure
+  follows the normal failure path and checkpoints the failing script for replay.
 - If a periodic save itself fails (e.g. the disk fills), the run is not
   interrupted; the failure is surfaced via a `checkpoint_save_failed` event and
   a console warning so you know recovery may be unavailable.

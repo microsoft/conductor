@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, NamedTuple
 import jinja2
 from jinja2 import Environment, meta, nodes
 
+from conductor.error_kinds import is_reserved_error_kind
 from conductor.exceptions import ConfigurationError
 from conductor.providers.capabilities import ProviderCapabilities, get_capabilities
 from conductor.templating import is_jinja_template
@@ -67,8 +68,8 @@ _JINJA_ENV.tests = _TolerantNameMap(_JINJA_ENV.tests)
 _BUILTIN_NAMES = frozenset({"workflow", "context", "item", "_index", "_key", "loop"})
 
 # Attribute names that mark a Getattr chain as an "output reference":
-#   agent.output.field, group.outputs.member, group.errors.member
-_OUTPUT_ATTRS = frozenset({"output", "outputs", "errors"})
+#   agent.output.field, agent.error.kind, group.outputs.member, group.errors.member
+_OUTPUT_ATTRS = frozenset({"output", "error", "outputs", "errors"})
 
 # Attribute names that look like fields on an output but are actually built-in
 # dict methods. We avoid emitting field-precision warnings for these because
@@ -84,14 +85,14 @@ _DICT_METHOD_NAMES = frozenset({"items", "keys", "values", "get"})
 _MAX_ENUMERATED_PATHS = 100
 
 # Pattern for input references:
-# - agent.output[.field[.subfield...]]
+# - agent.output|error[.field[.subfield...]]
 # - parallel_group.outputs|errors[.agent[.field]]  (parallel depth unchanged)
 # - workflow.input.param
 # - agent.field[.subfield...]  (shorthand; excludes workflow.*)
 # All with optional ? suffix
 INPUT_REF_PATTERN = re.compile(
     r"^(?:"
-    r"(?P<agent>[a-zA-Z_][a-zA-Z0-9_]*)\.output(?:\.(?P<field>[a-zA-Z_][a-zA-Z0-9_]*)(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*)?|"
+    r"(?P<agent>[a-zA-Z_][a-zA-Z0-9_]*)\.(?P<agent_kind>output|error)(?:\.(?P<field>[a-zA-Z_][a-zA-Z0-9_]*)(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*)?|"
     r"(?P<parallel>[a-zA-Z_][a-zA-Z0-9_]*)\.(?P<pg_kind>outputs|errors)(?:\.(?P<pg_agent>[a-zA-Z_][a-zA-Z0-9_]*)(?:\.(?P<pg_field>[a-zA-Z_][a-zA-Z0-9_]*))?)?|"
     r"workflow\.input\.(?P<input>[a-zA-Z_][a-zA-Z0-9_]*)|"
     r"(?!workflow\b)(?![a-zA-Z_][a-zA-Z0-9_]*\.(?:outputs|errors)(?:\.|$))"
@@ -150,6 +151,7 @@ def validate_workflow_config(
         # Validate route targets - allow routing to agents and parallel groups
         agent_errors = _validate_agent_routes(agent.name, agent.routes, all_names)
         errors.extend(agent_errors)
+        errors.extend(_validate_error_routes(agent.name, agent.type, agent.routes, agent.raises))
 
         # Validate human_gate has options
         if agent.type == "human_gate":
@@ -204,9 +206,28 @@ def validate_workflow_config(
     if config.parallel:
         parallel_errors = _validate_parallel_groups(config)
         errors.extend(parallel_errors)
+        for group in config.parallel:
+            if any(route.on_error is not None for route in group.routes):
+                errors.append(
+                    f"Parallel group '{group.name}' uses on_error routes, "
+                    "which are not supported in Phase 1"
+                )
 
     # Validate for_each groups: reject step types that can't be used inline
     for for_each_group in config.for_each:
+        if any(route.on_error is not None for route in for_each_group.routes):
+            errors.append(
+                f"For-each group '{for_each_group.name}' uses on_error routes, "
+                "which are not supported in Phase 1"
+            )
+        errors.extend(
+            _validate_error_routes(
+                f"{for_each_group.name}.agent",
+                for_each_group.agent.type,
+                for_each_group.agent.routes,
+                for_each_group.agent.raises,
+            )
+        )
         if for_each_group.agent.type == "script":
             errors.append(
                 f"For-each group '{for_each_group.name}' uses a script step as its "
@@ -295,6 +316,55 @@ def _validate_agent_routes(
                 f"{', '.join(sorted(valid_targets))}"
             )
 
+    return errors
+
+
+def _validate_error_routes(
+    agent_name: str,
+    agent_type: str | None,
+    routes: list,
+    raises: list[str] | None,
+) -> list[str]:
+    """Validate the Phase 1 typed-error routing surface."""
+    error_routes = [route for route in routes if route.on_error is not None]
+    errors: list[str] = []
+    if raises is not None and agent_type != "script":
+        errors.append(
+            f"Agent '{agent_name}' declares raises, but Phase 1 supports "
+            "typed error declarations only for script steps"
+        )
+    if not error_routes:
+        return errors
+
+    if agent_type != "script":
+        errors.append(
+            f"Agent '{agent_name}' uses on_error routes, but Phase 1 supports "
+            "typed error routing only for script steps"
+        )
+    if not any(route.on_error is None for route in routes):
+        errors.append(
+            f"Agent '{agent_name}' has on_error routes but no success route. "
+            "Add a route without on_error for successful execution."
+        )
+    for index, route in enumerate(error_routes[:-1]):
+        if route.on_error is True:
+            errors.append(
+                f"Agent '{agent_name}' catch-all on_error route must be last "
+                f"among error routes (error route index {index})"
+            )
+    if raises is not None:
+        declared = set(raises)
+        for route in error_routes:
+            selector = route.on_error
+            kinds = [selector] if isinstance(selector, str) else selector
+            if not isinstance(kinds, list):
+                continue
+            for kind in kinds:
+                if kind not in declared and not is_reserved_error_kind(kind):
+                    errors.append(
+                        f"Agent '{agent_name}' routes error kind '{kind}', "
+                        "but it is not declared in raises"
+                    )
     return errors
 
 
@@ -689,7 +759,7 @@ class TemplateRefs(NamedTuple):
     (enables explicit-mode field-precision warnings).
 
     Attributes:
-        agent_refs: Root names referenced via ``<name>.output``,
+        agent_refs: Root names referenced via ``<name>.output``, ``<name>.error``,
             ``<name>.outputs``, or ``<name>.errors`` (deduped). Used for
             unknown-agent checks and undeclared-agent warnings.
         workflow_inputs: Names referenced via ``workflow.input.<name>``.
@@ -700,6 +770,8 @@ class TemplateRefs(NamedTuple):
             ``{{ a.output }}`` from ``{{ a.output.foo }}`` for field-precision
             analysis. Absence from this dict means no ``<name>.output*`` ref
             was seen (only ``.outputs`` / ``.errors`` perhaps).
+        agent_error_fields: Maps each agent name to fields referenced through
+            ``<name>.error``. ``None`` means the whole envelope was referenced.
         group_member_fields: Maps each ``(group, member)`` pair to the set of
             fields referenced via ``<group>.outputs.<member>.<field>``.
             ``None`` in the set indicates a bare
@@ -716,6 +788,7 @@ class TemplateRefs(NamedTuple):
     agent_refs: set[str]
     workflow_inputs: set[str]
     agent_output_fields: dict[str, set[str | None]]
+    agent_error_fields: dict[str, set[str | None]]
     group_member_fields: dict[tuple[str, str | None], set[str | None]]
     group_error_refs: set[str]
 
@@ -767,6 +840,7 @@ def _extract_template_refs(template: str) -> TemplateRefs:
         agent_refs=set(),
         workflow_inputs=set(),
         agent_output_fields={},
+        agent_error_fields={},
         group_member_fields={},
         group_error_refs=set(),
     )
@@ -811,6 +885,7 @@ def _extract_template_refs(template: str) -> TemplateRefs:
     group_error_refs: set[str] = set()
     # Output / outputs chains, accumulated as the structured maps directly.
     agent_output_fields: dict[str, set[str | None]] = {}
+    agent_error_fields: dict[str, set[str | None]] = {}
     group_member_fields: dict[tuple[str, str | None], set[str | None]] = {}
     agent_refs: set[str] = set()
 
@@ -874,6 +949,9 @@ def _extract_template_refs(template: str) -> TemplateRefs:
             # checks compare declared first-level fields.
             field: str | None = attrs[1] if len(attrs) >= 2 else None
             agent_output_fields.setdefault(root, set()).add(field)
+        elif kind == "error":
+            field = attrs[1] if len(attrs) >= 2 else None
+            agent_error_fields.setdefault(root, set()).add(field)
         else:  # kind == "outputs"
             # attrs is ["outputs"] or ["outputs", "<member>", ...]
             if len(attrs) == 1:
@@ -888,6 +966,7 @@ def _extract_template_refs(template: str) -> TemplateRefs:
         agent_refs=agent_refs,
         workflow_inputs=workflow_inputs,
         agent_output_fields=agent_output_fields,
+        agent_error_fields=agent_error_fields,
         group_member_fields=group_member_fields,
         group_error_refs=group_error_refs,
     )
@@ -1280,6 +1359,11 @@ def _validate_template_references(
     parallel_names = {pg.name for pg in config.parallel}
     for_each_names = {fe.name for fe in config.for_each}
     all_names = agent_names | parallel_names | for_each_names
+    typed_error_sources = {
+        agent.name
+        for agent in config.agents
+        if agent.type == "script" and any(route.on_error is not None for route in agent.routes)
+    }
     workflow_input_names = set(config.workflow.input.keys())
     is_explicit = config.workflow.context.mode == "explicit"
 
@@ -1310,6 +1394,7 @@ def _validate_template_references(
         #     fail at runtime.
         declared_workflow_inputs: set[str] = set()
         declared_agent_output_fields: dict[str, set[str | None]] = {}
+        declared_agent_error_fields: dict[str, set[str | None]] = {}
         # Per (group, member) — only populated for ``.outputs`` declarations.
         # Member is ``None`` for the bare-group form ``g.outputs``.
         declared_group_output_member_fields: dict[tuple[str, str | None], set[str | None]] = {}
@@ -1334,7 +1419,12 @@ def _validate_template_references(
                 # name. Nested paths intentionally degrade to first-level
                 # advisory precision.
                 field = match.group("field") if match.group("agent") else match.group("sh_field")
-                declared_agent_output_fields.setdefault(ref_agent, set()).add(field)
+                if match.group("agent_kind") == "error" and ref_agent in typed_error_sources:
+                    declared_agent_error_fields.setdefault(ref_agent, set()).add(field)
+                elif match.group("agent_kind") == "error":
+                    declared_agent_output_fields.setdefault(ref_agent, set()).add("error")
+                else:
+                    declared_agent_output_fields.setdefault(ref_agent, set()).add(field)
             ref_parallel = match.group("parallel")
             if ref_parallel:
                 pg_kind = match.group("pg_kind")
@@ -1416,6 +1506,47 @@ def _validate_template_references(
                             f"{source} references '{ref_root}.output.{ref_field}' but "
                             f"agent '{agent.name}' only declares "
                             f"{declared_list} "
+                            f"in its input: list (explicit context mode)"
+                        )
+
+            # --- Agent-error references (``a.error[.field]``) ---
+            for ref_root, ref_fields in refs.agent_error_fields.items():
+                if ref_root not in valid_names:
+                    errors.append(
+                        f"{source} references unknown agent '{ref_root}'. "
+                        f"Available: {', '.join(sorted(valid_names))}"
+                    )
+                    continue
+                if agent_output_warning_allowed and ref_root not in declared_agent_error_fields:
+                    warnings.append(
+                        f"{source} references '{ref_root}.error' but "
+                        f"agent '{agent.name}' does not declare '{ref_root}.error' "
+                        f"in its input: list (explicit context mode)"
+                    )
+                    continue
+                if not agent_output_warning_allowed:
+                    continue
+                declared_fields = declared_agent_error_fields[ref_root]
+                if None in declared_fields:
+                    continue
+                declared_field_names = sorted(f for f in declared_fields if f)
+                declared_list = ", ".join(f"{ref_root}.error.{f}" for f in declared_field_names)
+                for ref_field in ref_fields:
+                    if ref_field is None:
+                        warnings.append(
+                            f"{source} references the whole '{ref_root}.error' "
+                            f"object but agent '{agent.name}' only declares "
+                            f"specific fields ({', '.join(declared_field_names)}) "
+                            f"in its input: list. Declare '{ref_root}.error' (without "
+                            f"a field) to access the whole envelope (explicit context mode)"
+                        )
+                        continue
+                    if ref_field in _DICT_METHOD_NAMES:
+                        continue
+                    if ref_field not in declared_fields:
+                        warnings.append(
+                            f"{source} references '{ref_root}.error.{ref_field}' but "
+                            f"agent '{agent.name}' only declares {declared_list} "
                             f"in its input: list (explicit context mode)"
                         )
 

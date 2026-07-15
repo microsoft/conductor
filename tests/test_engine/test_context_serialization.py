@@ -32,6 +32,7 @@ class TestWorkflowContextToDict:
         assert d == {
             "workflow_inputs": {},
             "agent_outputs": {},
+            "step_errors": {},
             "current_iteration": 0,
             "execution_history": [],
             "user_guidance": [],

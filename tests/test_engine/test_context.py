@@ -17,6 +17,7 @@ from conductor.engine.context import (
     estimate_dict_tokens,
     estimate_tokens,
 )
+from conductor.error_envelope import ErrorEnvelope
 
 
 class TestWorkflowContextBasic:
@@ -70,6 +71,60 @@ class TestWorkflowContextBasic:
         assert ctx.agent_outputs["agent1"]["result"] == "first"
         assert ctx.agent_outputs["agent2"]["result"] == "second"
         assert ctx.agent_outputs["agent3"]["result"] == "third"
+
+    def test_typed_error_is_available_in_explicit_context_and_checkpoint_round_trip(
+        self,
+    ) -> None:
+        """Handled failures survive explicit projection and serialization."""
+        ctx = WorkflowContext()
+        error = ErrorEnvelope(
+            kind="external.git.drift",
+            message="remote changed",
+            details={"branch": "main"},
+        )
+        ctx.store("checker", {"stdout": "partial"})
+        ctx.store_error("checker", error)
+
+        restored = WorkflowContext.from_dict(ctx.to_dict())
+        explicit = restored.build_for_agent(
+            "recovery",
+            ["checker.output", "checker.error"],
+            mode="explicit",
+        )
+
+        assert explicit["checker"]["output"] == {"stdout": "partial"}
+        assert explicit["checker"]["error"] == error.to_dict()
+
+    def test_new_output_clears_previous_typed_error(self) -> None:
+        """A later successful execution cannot expose a stale handled failure."""
+        ctx = WorkflowContext()
+        ctx.store("checker", {"stdout": "partial"})
+        ctx.store_error(
+            "checker",
+            ErrorEnvelope(
+                kind="external.git.drift",
+                message="remote changed",
+                details={},
+            ),
+        )
+
+        ctx.store("checker", {"stdout": "current"})
+
+        assert "checker" not in ctx.step_errors
+        assert ctx.get_for_template()["checker"] == {"output": {"stdout": "current"}}
+
+    def test_error_shorthand_still_projects_legacy_output_field(self) -> None:
+        """Typed errors do not steal the existing agent.field shorthand."""
+        ctx = WorkflowContext()
+        ctx.store("producer", {"error": {"code": "legacy"}})
+
+        explicit = ctx.build_for_agent(
+            "consumer",
+            ["producer.error"],
+            mode="explicit",
+        )
+
+        assert explicit["producer"]["output"] == {"error": {"code": "legacy"}}
 
     def test_get_latest_output(self) -> None:
         """Test getting the latest output."""

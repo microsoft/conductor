@@ -1,0 +1,82 @@
+# Typed Script Error Routing
+#
+# Usage:
+#   conductor run examples/error-routing.yaml --input failure=none
+#   conductor run examples/error-routing.yaml --input failure=drift
+#   conductor run examples/error-routing.yaml --input failure=unexpected
+
+workflow:
+  name: typed-script-error-routing
+  description: Typed script failures with exact and catch-all error routes
+  version: "1.0.0"
+  entry_point: check_remote
+
+  input:
+    failure:
+      type: string
+      required: false
+      default: none
+
+agents:
+  - name: check_remote
+    type: script
+    command: python
+    args:
+      - -c
+      - |
+        import json
+        import os
+        import sys
+
+        failure = sys.argv[1]
+        if failure != "none":
+            kind = (
+                "external.git.drift"
+                if failure == "drift"
+                else "external.git.unexpected"
+            )
+            envelope = {
+                "kind": kind,
+                "message": f"simulated {failure} failure",
+                "details": {"branch": "main"},
+            }
+            with open(os.environ["CONDUCTOR_ERROR_OUT"], "w", encoding="utf-8") as stream:
+                json.dump(envelope, stream)
+
+        print(json.dumps({"checked": True, "failure": failure}))
+      - "{{ workflow.input.failure }}"
+    raises:
+      - external.git.drift
+    routes:
+      - to: success
+      - to: recover_drift
+        on_error: external.git.drift
+      - to: recover_unexpected
+        on_error: true
+
+  - name: success
+    type: set
+    value: "remote is current"
+    output_type: string
+    routes:
+      - to: $end
+
+  - name: recover_drift
+    type: set
+    value: "recovering {{ check_remote.error.kind }} on {{ check_remote.error.details.branch }}"
+    output_type: string
+    routes:
+      - to: $end
+
+  - name: recover_unexpected
+    type: set
+    value: "caught undeclared kind {{ check_remote.error.kind }}"
+    output_type: string
+    routes:
+      - to: $end
+
+output:
+  result: >-
+    {% if success is defined %}{{ success.output }}
+    {% elif recover_drift is defined %}{{ recover_drift.output }}
+    {% else %}{{ recover_unexpected.output }}{% endif %}

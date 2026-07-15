@@ -243,6 +243,22 @@ Demonstrates:
 conductor run examples/script-step.yaml
 ```
 
+### error-routing.yaml
+
+Typed script failures using the language-neutral `CONDUCTOR_ERROR_OUT` file
+contract. Demonstrates:
+
+- Exact-kind and catch-all `on_error` routes
+- Optional documentation-only `raises:`
+- Handler access to both `step.error` and partial `step.output`
+- Backward-compatible success behavior without helper libraries
+
+```bash
+conductor run examples/error-routing.yaml --input failure=none
+conductor run examples/error-routing.yaml --input failure=drift
+conductor run examples/error-routing.yaml --input failure=unexpected
+```
+
 ### script-stdin.yaml
 
 Hand a structured payload to a script step via **stdin** instead of

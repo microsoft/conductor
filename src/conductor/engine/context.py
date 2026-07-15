@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
+    from conductor.error_envelope import ErrorEnvelope
     from conductor.providers.base import AgentProvider
 
 logger = logging.getLogger(__name__)
@@ -106,6 +107,9 @@ class WorkflowContext:
     agent_outputs: dict[str, dict[str, Any]] = field(default_factory=dict)
     """Outputs from executed agents, keyed by agent name."""
 
+    step_errors: dict[str, ErrorEnvelope] = field(default_factory=dict)
+    """Handled typed failures, keyed by the step that raised them."""
+
     current_iteration: int = 0
     """Current execution iteration count."""
 
@@ -162,8 +166,13 @@ class WorkflowContext:
                 store a scalar, list, or any JSON-safe value directly.
         """
         self.agent_outputs[agent_name] = output
+        self.step_errors.pop(agent_name, None)
         self.execution_history.append(agent_name)
         self.current_iteration += 1
+
+    def store_error(self, agent_name: str, error: ErrorEnvelope) -> None:
+        """Store a handled typed failure without recording another execution."""
+        self.step_errors[agent_name] = error
 
     def build_for_agent(
         self,
@@ -247,6 +256,8 @@ class WorkflowContext:
                     else:
                         # Regular agents wrap output in {"output": ...}
                         ctx[agent] = {"output": output}
+                        if agent in self.step_errors:
+                            ctx[agent]["error"] = self.step_errors[agent].to_dict()
 
             elif mode == "last_only" and self.execution_history:
                 # Only the most recent agent's output
@@ -264,6 +275,8 @@ class WorkflowContext:
                     ctx[last_agent] = last_output
                 else:
                     ctx[last_agent] = {"output": last_output}
+                    if last_agent in self.step_errors:
+                        ctx[last_agent]["error"] = self.step_errors[last_agent].to_dict()
 
         return ctx
 
@@ -326,6 +339,10 @@ class WorkflowContext:
             if entity_name in self.agent_outputs:
                 agent_output = self.agent_outputs[entity_name]
 
+                if parts[1] == "error" and entity_name in self.step_errors:
+                    self._add_agent_error_input(ctx, entity_name, parts[1:], is_optional)
+                    return
+
                 # Check if this is a parallel group (has 'outputs' and 'errors' keys)
                 is_parallel_group = (
                     isinstance(agent_output, dict)
@@ -339,8 +356,49 @@ class WorkflowContext:
                 else:
                     # Handle regular agent references
                     self._add_agent_input(ctx, entity_name, parts[1:], is_optional)
+            elif entity_name in self.step_errors:
+                self._add_agent_error_input(ctx, entity_name, parts[1:], is_optional)
             elif not is_optional:
                 raise KeyError(f"Missing required agent output: {entity_name}")
+
+    def _add_agent_error_input(
+        self,
+        ctx: dict[str, Any],
+        agent_name: str,
+        remaining_parts: list[str],
+        is_optional: bool,
+    ) -> None:
+        """Add an explicit ``agent.error`` reference to context."""
+        if not remaining_parts or remaining_parts[0] != "error":
+            if not is_optional:
+                raise KeyError(f"Missing required agent output: {agent_name}")
+            return
+
+        error = self.step_errors.get(agent_name)
+        if error is None:
+            if not is_optional:
+                raise KeyError(f"Missing typed error from agent '{agent_name}'")
+            return
+
+        value: Any = error.to_dict()
+        path = remaining_parts[1:]
+        for key in path:
+            if isinstance(value, dict) and key in value:
+                value = value[key]
+                continue
+            if not is_optional:
+                raise KeyError(f"Missing error field '{'.'.join(path)}' from agent '{agent_name}'")
+            return
+
+        ctx.setdefault(agent_name, {"output": None})
+        if not path:
+            ctx[agent_name]["error"] = error.to_dict()
+            return
+
+        target = ctx[agent_name].setdefault("error", {})
+        for key in path[:-1]:
+            target = target.setdefault(key, {})
+        target[path[-1]] = copy.deepcopy(value)
 
     def _add_agent_input(
         self, ctx: dict[str, Any], agent_name: str, remaining_parts: list[str], is_optional: bool
@@ -560,6 +618,7 @@ class WorkflowContext:
         return {
             "workflow_inputs": copy.deepcopy(self.workflow_inputs),
             "agent_outputs": copy.deepcopy(self.agent_outputs),
+            "step_errors": {name: error.to_dict() for name, error in self.step_errors.items()},
             "current_iteration": self.current_iteration,
             "execution_history": list(self.execution_history),
             "user_guidance": list(self.user_guidance),
@@ -580,6 +639,12 @@ class WorkflowContext:
         ctx = cls()
         ctx.workflow_inputs = copy.deepcopy(data.get("workflow_inputs", {}))
         ctx.agent_outputs = copy.deepcopy(data.get("agent_outputs", {}))
+        from conductor.error_envelope import ErrorEnvelope
+
+        ctx.step_errors = {
+            name: ErrorEnvelope.from_dict(value)
+            for name, value in data.get("step_errors", {}).items()
+        }
         ctx.current_iteration = data.get("current_iteration", 0)
         ctx.execution_history = list(data.get("execution_history", []))
         ctx.user_guidance = list(data.get("user_guidance", []))
@@ -683,6 +748,7 @@ class WorkflowContext:
 
             if agent_name in self.agent_outputs:
                 del self.agent_outputs[agent_name]
+                self.step_errors.pop(agent_name, None)
 
         return self.estimate_context_tokens()
 
@@ -815,6 +881,7 @@ class WorkflowContext:
                         )
                     summary_parts.append(summary.strip())
                     del self.agent_outputs[agent_name]
+                    self.step_errors.pop(agent_name, None)
 
             # Store summary as a special context entry
             if summary_parts:
