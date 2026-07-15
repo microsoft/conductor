@@ -5,7 +5,9 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.21...HEAD)
+## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.22...HEAD)
+
+## [0.1.22](https://github.com/microsoft/conductor/compare/v0.1.21...v0.1.22) - 2026-07-15
 
 ### Added
 
@@ -66,6 +68,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--skip-path-update` / `-SkipPathUpdate` flag) — set by default in the test
   harness — and a regression test asserts the scripts never touch shell
   profiles.
+
+### Documentation
+
+- **README provider comparison table corrected** — set Context Window to
+  "Per-model" across all providers, set Pricing to "Subscription" for Copilot
+  and Claude Agent SDK, labeled Claude Agent SDK as experimental in the
+  top-level Features list (matching the Providers table's Tier column), and
+  added a "Using Copilot" section with a config example and auth notes.
+  ([#296](https://github.com/microsoft/conductor/pull/296))
 
 ## [0.1.21](https://github.com/microsoft/conductor/compare/v0.1.20...v0.1.21) - 2026-07-13
 
