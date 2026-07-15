@@ -3190,7 +3190,7 @@ class TestWorkflowEngineTerminate:
         config = self._config_with_terminate("failed", reason="halt")
         provider = CopilotProvider(mock_handler=lambda *_a, **_kw: {"value": "v"})
 
-        wf_file = tmp_path / "wf.yaml"
+        wf_file = tmp_path / "failed_terminate_checkpoint_test.yaml"
         wf_file.write_text("name: t\n")
         engine = WorkflowEngine(config, provider, workflow_path=wf_file)
 

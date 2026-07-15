@@ -524,3 +524,89 @@ class TestValidatorCostAndFailurePaths:
 
         # Grader timed out → fail open (treated as pass) → original returned, no re-run.
         assert result is original
+
+
+class TestValidatorWorkingDirectoryInheritance:
+    """Verify that the synthetic validator agent inherits the primary agent's working directory."""
+
+    @pytest.mark.asyncio
+    async def test_validator_working_dir_inheritance(self) -> None:
+        # Requirement: The synthetic validator agent must inherit the working directory of
+        # the primary agent.
+        captured_validator_agent: AgentDef | None = None
+
+        async def exec_fn(*, agent: AgentDef, rendered_prompt: str, **kw: Any) -> AgentOutput:
+            nonlocal captured_validator_agent
+            captured_validator_agent = agent
+            return AgentOutput(
+                content={"passed": True, "issues": []},
+                raw_response="",
+                model="judge",
+            )
+
+        primary_agent = AgentDef(
+            name="reviewer",
+            model="gpt-4",
+            prompt="Review",
+            output={"summary": OutputField(type="string")},
+            validator=ValidatorConfig(criteria="check"),
+            routes=[RouteDef(to="$end")],
+            working_dir="/path/to/resolved/working_dir",
+        )
+        provider = CopilotProvider(mock_handler=lambda a, p, c: {})
+        provider.execute = exec_fn  # type: ignore[method-assign]
+
+        from conductor.engine.validator import OutputValidator
+
+        validator = OutputValidator()
+
+        await validator.validate(
+            agent=primary_agent,
+            primary_prompt="Review",
+            primary_output={"summary": "orig"},
+            provider=provider,
+        )
+
+        assert captured_validator_agent is not None
+        assert captured_validator_agent.working_dir == "/path/to/resolved/working_dir"
+
+    @pytest.mark.asyncio
+    async def test_validator_working_dir_none(self) -> None:
+        # Requirement: If the primary agent has no working directory set, the validator's
+        # working directory is None.
+        captured_validator_agent: AgentDef | None = None
+
+        async def exec_fn(*, agent: AgentDef, rendered_prompt: str, **kw: Any) -> AgentOutput:
+            nonlocal captured_validator_agent
+            captured_validator_agent = agent
+            return AgentOutput(
+                content={"passed": True, "issues": []},
+                raw_response="",
+                model="judge",
+            )
+
+        primary_agent = AgentDef(
+            name="reviewer",
+            model="gpt-4",
+            prompt="Review",
+            output={"summary": OutputField(type="string")},
+            validator=ValidatorConfig(criteria="check"),
+            routes=[RouteDef(to="$end")],
+            working_dir=None,
+        )
+        provider = CopilotProvider(mock_handler=lambda a, p, c: {})
+        provider.execute = exec_fn  # type: ignore[method-assign]
+
+        from conductor.engine.validator import OutputValidator
+
+        validator = OutputValidator()
+
+        await validator.validate(
+            agent=primary_agent,
+            primary_prompt="Review",
+            primary_output={"summary": "orig"},
+            provider=provider,
+        )
+
+        assert captured_validator_agent is not None
+        assert captured_validator_agent.working_dir is None

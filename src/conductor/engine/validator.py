@@ -218,6 +218,7 @@ class OutputValidator:
             system_prompt=VALIDATOR_SYSTEM_PROMPT.format(criteria=agent.validator.criteria),
             tools=[],
             output=_VALIDATOR_OUTPUT_SCHEMA,
+            working_dir=agent.working_dir,
         )
 
     def _parse(self, content: Any) -> tuple[bool, list[str], bool]:
