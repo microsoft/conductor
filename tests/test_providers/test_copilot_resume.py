@@ -170,6 +170,68 @@ class TestSessionResumeFallback:
         mock_client.create_session.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_legacy_checkpoint_resume_logs_info(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Legacy checkpoint (no recorded cwd) resumes by ID and logs an INFO.
+
+        Requirement: a checkpoint saved before working_dir tracking was
+        introduced has no recorded cwd. Resuming it must preserve the legacy
+        resume-by-id behavior (resume_session called with the resolved cwd,
+        no create_session fallback) and emit an INFO log explaining that the
+        checkpoint predates working_dir tracking.
+        """
+        resumed_sid = "sess-old"
+
+        mock_session = AsyncMock()
+        mock_session.session_id = "sess-resumed"
+        mock_session.disconnect = AsyncMock()
+
+        def _fake_on(callback: Any) -> None:
+            mock_session._callback = callback
+
+        mock_session.on = _fake_on
+
+        async def _fake_send(msg: Any) -> None:
+            evt = MagicMock()
+            evt.type = MagicMock()
+            evt.type.value = "session.idle"
+            mock_session._callback(evt)
+
+        mock_session.send = _fake_send
+
+        mock_client = AsyncMock()
+        mock_client.resume_session = AsyncMock(return_value=mock_session)
+        mock_client.create_session = AsyncMock()  # Should NOT be called
+
+        provider = CopilotProvider()
+        provider._client = mock_client
+        provider._started = True
+        # Resume ID set, but NO recorded cwd — simulates a pre-cwd checkpoint.
+        provider.set_resume_session_ids({"researcher": resumed_sid})
+
+        agent = _make_agent("researcher")
+
+        with (
+            caplog.at_level(logging.INFO, logger="conductor.providers.copilot"),
+            patch("conductor.cli.app.is_verbose", return_value=False),
+            patch("conductor.cli.app.is_full", return_value=False),
+        ):
+            await provider.execute(agent, {}, "Continue research")
+
+        mock_client.resume_session.assert_called_once_with(
+            resumed_sid,
+            on_permission_request=CopilotProvider._default_permission_handler,
+            working_directory=os.getcwd(),
+        )
+        mock_client.create_session.assert_not_called()
+        assert any(
+            "without a recorded working directory" in r.message
+            and "predates working_dir tracking" in r.message
+            for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
     async def test_fallback_to_create_on_resume_runtime_error(self) -> None:
         """When resume_session raises RuntimeError, falls back to create_session."""
         mock_new_session = AsyncMock()

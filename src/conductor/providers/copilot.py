@@ -877,7 +877,18 @@ class CopilotProvider(AgentProvider):
             resume_sid = self._resume_session_ids.get(agent.name)
             if resume_sid is not None:
                 recorded_cwd = self._resume_session_cwds.get(agent.name)
-                if recorded_cwd is not None and recorded_cwd != resolved_cwd:
+                should_resume = True
+                if recorded_cwd is None:
+                    logger.info(
+                        "Resuming Copilot session %s for agent '%s' without a "
+                        "recorded working directory; checkpoint predates "
+                        "working_dir tracking, preserving legacy resume-by-id "
+                        "behavior with resolved cwd %s.",
+                        resume_sid,
+                        agent.name,
+                        resolved_cwd,
+                    )
+                elif recorded_cwd != resolved_cwd:
                     logger.warning(
                         "Skipping resume of Copilot session %s for agent '%s': "
                         "working directory changed from %s to %s. Creating a new session.",
@@ -886,23 +897,26 @@ class CopilotProvider(AgentProvider):
                         recorded_cwd,
                         resolved_cwd,
                     )
-                    resume_sid = None
-            if resume_sid is not None:
-                try:
-                    resume_kwargs: dict[str, Any] = {
-                        "on_permission_request": self._default_permission_handler,
-                        "working_directory": resolved_cwd,
-                    }
-                    if self._mcp_servers:
-                        resume_kwargs["mcp_servers"] = self._mcp_servers_for_cwd(resolved_cwd)
-                    session = await self._client.resume_session(resume_sid, **resume_kwargs)
-                    logger.info(f"Resumed Copilot session {resume_sid} for agent '{agent.name}'")
-                except Exception as exc:
-                    logger.warning(
-                        f"Could not resume session {resume_sid} for agent "
-                        f"'{agent.name}': {exc}. Falling back to new session."
-                    )
-                    session = None
+                    should_resume = False
+
+                if should_resume:
+                    try:
+                        resume_kwargs: dict[str, Any] = {
+                            "on_permission_request": self._default_permission_handler,
+                            "working_directory": resolved_cwd,
+                        }
+                        if self._mcp_servers:
+                            resume_kwargs["mcp_servers"] = self._mcp_servers_for_cwd(resolved_cwd)
+                        session = await self._client.resume_session(resume_sid, **resume_kwargs)
+                        logger.info(
+                            f"Resumed Copilot session {resume_sid} for agent '{agent.name}'"
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            f"Could not resume session {resume_sid} for agent "
+                            f"'{agent.name}': {exc}. Falling back to new session."
+                        )
+                        session = None
 
             # Fall back to creating a new session
             if session is None:
