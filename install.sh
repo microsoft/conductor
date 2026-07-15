@@ -18,6 +18,12 @@
 #       is available, or aborts when running non-interactively.
 #   --force                   OR   $CONDUCTOR_INSTALL_FORCE=1
 #       Skip the running-process check entirely.
+#   --skip-path-update        OR   $CONDUCTOR_INSTALL_SKIP_PATH_UPDATE=1
+#       Skip the `uv tool update-shell` step so the install never edits the
+#       user's shell profiles (.zshenv/.bashrc/…). The install-script tests
+#       install into a throwaway UV_TOOL_BIN_DIR that must never leak into the
+#       real environment (note: `uv tool update-shell` intentionally modifies
+#       the shell and so ignores UV_NO_MODIFY_PATH).
 
 set -eu
 
@@ -32,13 +38,15 @@ GITHUB_DL="https://github.com/${REPO}/releases/download"
 SOURCE="${CONDUCTOR_INSTALL_SOURCE:-}"
 AUTO_STOP="${CONDUCTOR_INSTALL_AUTO_STOP:-0}"
 FORCE_FLAG="${CONDUCTOR_INSTALL_FORCE:-0}"
+SKIP_PATH_UPDATE="${CONDUCTOR_INSTALL_SKIP_PATH_UPDATE:-0}"
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --source)        SOURCE="$2"; shift 2 ;;
-        --source=*)      SOURCE="${1#--source=}"; shift ;;
-        --auto-stop)     AUTO_STOP=1; shift ;;
-        --force)         FORCE_FLAG=1; shift ;;
+        --source)           SOURCE="$2"; shift 2 ;;
+        --source=*)         SOURCE="${1#--source=}"; shift ;;
+        --auto-stop)        AUTO_STOP=1; shift ;;
+        --force)            FORCE_FLAG=1; shift ;;
+        --skip-path-update) SKIP_PATH_UPDATE=1; shift ;;
         *) shift ;;
     esac
 done
@@ -310,11 +318,15 @@ main() {
     success "Conductor ${display_version} installed"
 
     # --- Update shell PATH ---
-    info "Ensuring conductor is on PATH for new shells…"
-    if uv tool update-shell >/dev/null 2>&1; then
-        success "PATH updated (restart your shell to pick up the change)"
+    if [ "$SKIP_PATH_UPDATE" = "1" ]; then
+        info "Skipping shell PATH update (CONDUCTOR_INSTALL_SKIP_PATH_UPDATE=1)."
     else
-        warn "Could not update shell PATH automatically. Run 'uv tool update-shell' manually."
+        info "Ensuring conductor is on PATH for new shells…"
+        if uv tool update-shell >/dev/null 2>&1; then
+            success "PATH updated (restart your shell to pick up the change)"
+        else
+            warn "Could not update shell PATH automatically. Run 'uv tool update-shell' manually."
+        fi
     fi
 
     # --- Verify ---

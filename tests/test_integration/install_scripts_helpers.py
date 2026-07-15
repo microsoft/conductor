@@ -188,9 +188,12 @@ def run_install_script(
     leaves behind gets reaped automatically.
     """
     extra_env = dict(extra_env or {})
-    # Optional belt-and-braces: tests can opt-out of `uv tool update-shell`
-    # to avoid touching the user's profile. The script itself respects
-    # UV_NO_MODIFY_PATH=1 set in Sandbox.env(), but we also support a hook.
+    # Prevent the install scripts from running `uv tool update-shell`, which
+    # would append this test's throwaway UV_TOOL_BIN_DIR to the *real* user
+    # shell profiles (.zshenv/.bashrc/…) and shadow the user's actual install.
+    # `uv tool update-shell` deliberately edits the shell and so ignores
+    # UV_NO_MODIFY_PATH; install.sh / install.ps1 honor
+    # CONDUCTOR_INSTALL_SKIP_PATH_UPDATE=1 to skip that step under test.
     extra_env.setdefault("CONDUCTOR_INSTALL_SKIP_PATH_UPDATE", "1")
 
     if IS_WINDOWS:

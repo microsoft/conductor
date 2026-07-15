@@ -26,12 +26,19 @@
 #       available, or aborts when running non-interactively.
 #   -Force                    OR   $env:CONDUCTOR_INSTALL_FORCE = '1'
 #       Skip the running-process check entirely.
+#   -SkipPathUpdate           OR   $env:CONDUCTOR_INSTALL_SKIP_PATH_UPDATE = '1'
+#       Skip the `uv tool update-shell` step so the install never edits the
+#       user's PATH registry / profiles. The install-script tests install into
+#       a throwaway UV_TOOL_BIN_DIR that must never leak into the real
+#       environment (note: `uv tool update-shell` intentionally modifies the
+#       shell and so ignores UV_NO_MODIFY_PATH).
 
 [CmdletBinding()]
 param(
     [string]$Source,
     [switch]$AutoStop,
-    [switch]$Force
+    [switch]$Force,
+    [switch]$SkipPathUpdate
 )
 
 $ErrorActionPreference = 'Stop'
@@ -44,6 +51,7 @@ $GitHubDL  = "https://github.com/$Repo/releases/download"
 if (-not $Source   -and $env:CONDUCTOR_INSTALL_SOURCE)               { $Source   = $env:CONDUCTOR_INSTALL_SOURCE }
 if (-not $AutoStop -and $env:CONDUCTOR_INSTALL_AUTO_STOP -eq '1')    { $AutoStop = $true }
 if (-not $Force    -and $env:CONDUCTOR_INSTALL_FORCE     -eq '1')    { $Force    = $true }
+if (-not $SkipPathUpdate -and $env:CONDUCTOR_INSTALL_SKIP_PATH_UPDATE -eq '1') { $SkipPathUpdate = $true }
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -424,16 +432,20 @@ try {
     Write-Ok "Conductor $displayVersion installed"
 
     # --- Update PATH for new shells ---
-    Write-Info "Ensuring conductor is on PATH for new shells..."
-    try {
-        & uv tool update-shell 2>&1 | Out-Null
-        if ($LASTEXITCODE -eq 0) {
-            Write-Ok "PATH updated (restart your terminal to pick up the change)"
-        } else {
+    if ($SkipPathUpdate) {
+        Write-Info "Skipping shell PATH update (CONDUCTOR_INSTALL_SKIP_PATH_UPDATE=1)."
+    } else {
+        Write-Info "Ensuring conductor is on PATH for new shells..."
+        try {
+            & uv tool update-shell 2>&1 | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                Write-Ok "PATH updated (restart your terminal to pick up the change)"
+            } else {
+                Write-Warn "Could not update user PATH automatically. Run 'uv tool update-shell' manually."
+            }
+        } catch {
             Write-Warn "Could not update user PATH automatically. Run 'uv tool update-shell' manually."
         }
-    } catch {
-        Write-Warn "Could not update user PATH automatically. Run 'uv tool update-shell' manually."
     }
 
     # --- Verify ---

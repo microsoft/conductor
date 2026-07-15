@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.21...HEAD)
 
+### Fixed
+
+- **Install-script tests no longer pollute the developer's shell profile** — the
+  install scripts ran `uv tool update-shell` unconditionally, so the
+  `-m install_scripts` integration tests appended each run's throwaway
+  `UV_TOOL_BIN_DIR` to the real `~/.zshenv` (and shell equivalents). Those stale
+  entries shadowed the user's actual `conductor` install with an old `v0.0.2`
+  test fixture, so `conductor` reported the wrong version and `conductor update`
+  appeared to do nothing. `install.sh` / `install.ps1` now honor
+  `CONDUCTOR_INSTALL_SKIP_PATH_UPDATE=1` (and a matching
+  `--skip-path-update` / `-SkipPathUpdate` flag) — set by default in the test
+  harness — and a regression test asserts the scripts never touch shell
+  profiles.
+
 ## [0.1.21](https://github.com/microsoft/conductor/compare/v0.1.20...v0.1.21) - 2026-07-13
 
 ### Added
