@@ -49,6 +49,7 @@ validator so the operator can plan accordingly.
 | `interrupt` | Provider does not monitor `interrupt_signal`. Esc/Ctrl+G still aborts at iteration boundaries but cannot return partial output mid-call. |
 | `max_session_seconds` | Provider does not enforce a wall-clock session timeout. Agents that set `max_session_seconds` fail validation. |
 | `checkpoint_resume` | Provider session state does not survive `conductor resume` (re-runs the agent from scratch). |
+| `working_dir` | Provider does not apply the resolved working directory to its session/subprocess cwd. Workflows that set `working_dir` against this provider fail validation. |
 
 ## Non-negotiable rules
 
@@ -97,8 +98,8 @@ adopting one does not inflate the install surface for others.
 
 | Provider | Upstream pin | Maintainer | Capability carve-outs |
 |---|---|---|---|
-| `claude-agent-sdk` | `claude-agent-sdk>=0.1.0` | `@lesandiz (best-effort)` | no `mcp_tools`, no `workflow_tools_passthrough`, no `reasoning_effort`, `prompt_injection` structured output, no `checkpoint_resume` |
-| `hermes` | `hermes-agent` | `(community contribution)` | no `mcp_tools`, `prompt_injection` structured output |
+| `claude-agent-sdk` | `claude-agent-sdk>=0.1.0` | `@lesandiz (best-effort)` | no `mcp_tools`, no `workflow_tools_passthrough`, no `reasoning_effort`, `prompt_injection` structured output, no `checkpoint_resume`, no `working_dir` |
+| `hermes` | `hermes-agent` | `(community contribution)` | no `mcp_tools`, `prompt_injection` structured output, no `working_dir` |
 
 ## See also
 
