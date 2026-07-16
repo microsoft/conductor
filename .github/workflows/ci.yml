@@ -10,6 +10,7 @@
 # - test: Runs pytest with coverage on Python 3.12 and 3.13
 # - validate-examples: Validates all example workflow YAML files
 # - build: Verifies the package builds correctly
+# - frontend: Type-checks, tests (Vitest), and builds the web dashboard
 # - install-scripts: End-to-end exercise of install.ps1 / install.sh on
 #                    Windows + Ubuntu (opt-in pytest marker; ~90s)
 
@@ -27,6 +28,7 @@ concurrency:
 
 env:
   PYTHON_VERSION: "3.12"
+  NODE_VERSION: "20"
 
 jobs:
   lint:
@@ -160,6 +162,33 @@ jobs:
             echo "Validating $file..."
             uv run conductor validate "$file"
           done
+
+  frontend:
+    name: Frontend (typecheck, test, build)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "npm"
+          cache-dependency-path: src/conductor/web/frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: src/conductor/web/frontend
+        run: npm ci
+
+      - name: Run Vitest
+        working-directory: src/conductor/web/frontend
+        run: npm run test
+
+      - name: Type-check and build
+        working-directory: src/conductor/web/frontend
+        run: npm run build
 
   build:
     name: Build Package
