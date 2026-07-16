@@ -1170,11 +1170,16 @@ class ClaudeProvider(AgentProvider):
             )
 
         # Add MCP tools if available
+        mcp_tools: list[dict[str, Any]] = []
         if mcp_manager and mcp_manager.has_servers():
             mcp_tools = self._convert_mcp_tools_to_claude(tools, mcp_manager)  # tools is the filter
             all_tools.extend(mcp_tools)
             if mcp_tools:
                 logger.debug(f"Added {len(mcp_tools)} MCP tools to request")
+
+        # Force the emit_output tool call when the request carries no MCP
+        # tools; with MCP tools present the model must stay free to call them.
+        force_emit_output = has_output_schema and not mcp_tools
 
         # Use tools if any are defined
         request_tools: list[dict[str, Any]] | None = all_tools if all_tools else None
@@ -1198,6 +1203,7 @@ class ClaudeProvider(AgentProvider):
                     max_parse_recovery_attempts=config.max_parse_recovery_attempts,
                     system_prompt=system_prompt,
                     mcp_manager=mcp_manager,
+                    force_emit_output=force_emit_output,
                 )
 
                 # Handle partial output from mid-agent interrupt
@@ -1268,14 +1274,35 @@ class ClaudeProvider(AgentProvider):
                     try:
                         has_attr = hasattr(anthropic, "BadRequestError")
                         is_bad_request = has_attr and isinstance(e, anthropic.BadRequestError)
-                        if is_bad_request and "temperature" in str(e).lower():
-                            raise ValidationError(
-                                f"Temperature validation failed: {e}",
-                                suggestion=(
-                                    "Temperature must be between 0.0 and 1.0 "
-                                    "(enforced by Claude SDK)"
-                                ),
-                            ) from e
+                        if is_bad_request:
+                            error_text = str(e).lower()
+                            if "temperature" in error_text:
+                                raise ValidationError(
+                                    f"Temperature validation failed: {e}",
+                                    suggestion=(
+                                        "Temperature must be between 0.0 and 1.0 "
+                                        "(enforced by Claude SDK)"
+                                    ),
+                                ) from e
+                            # A 400 rejecting the forced emit_output tool_choice
+                            # (e.g. forced tool use is incompatible with extended
+                            # thinking on the selected model) only applies when
+                            # the flag actually sent tool_choice. Match both the
+                            # "tool_choice" and "tool choice" phrasings.
+                            if force_emit_output and (
+                                "tool_choice" in error_text or "tool choice" in error_text
+                            ):
+                                raise ValidationError(
+                                    f"The model rejected the forced tool_choice "
+                                    f"('emit_output'): {e}",
+                                    suggestion=(
+                                        "The selected model does not support forced "
+                                        "tool choice (possibly because extended "
+                                        "thinking is enabled). Remove "
+                                        "reasoning.effort or switch to a model that "
+                                        "supports forced tool_choice."
+                                    ),
+                                ) from e
                     except TypeError:
                         # isinstance can fail if BadRequestError is not a proper type
                         pass
@@ -1473,6 +1500,7 @@ class ClaudeProvider(AgentProvider):
         tools: list[dict[str, Any]] | None = None,
         thinking: dict[str, Any] | None = None,
         system_prompt: str | None = None,
+        force_emit_output: bool = False,
     ) -> ClaudeResponse:
         """Execute non-streaming Claude API call using AsyncAnthropic.
 
@@ -1491,6 +1519,11 @@ class ClaudeProvider(AgentProvider):
                 ``max_tokens > budget_tokens``.
             system_prompt: Optional rendered system prompt passed as the
                 top-level Anthropic ``system`` parameter.
+            force_emit_output: When True, force the model to call the
+                ``emit_output`` tool by sending
+                ``tool_choice={"type": "tool", "name": "emit_output",
+                "disable_parallel_tool_use": True}``. Used when the request
+                carries no MCP tools.
 
         Returns:
             Claude API response object with content blocks and usage metadata.
@@ -1528,6 +1561,13 @@ class ClaudeProvider(AgentProvider):
         if system_prompt:
             kwargs["system"] = system_prompt
 
+        if force_emit_output:
+            kwargs["tool_choice"] = {
+                "type": "tool",
+                "name": "emit_output",
+                "disable_parallel_tool_use": True,
+            }
+
         # Execute non-streaming API call (async)
         logger.debug(
             f"Executing non-streaming Claude API call: model={model}, "
@@ -1555,6 +1595,7 @@ class ClaudeProvider(AgentProvider):
         max_parse_recovery_attempts: int | None = None,
         system_prompt: str | None = None,
         mcp_manager: MCPManager | None = None,
+        force_emit_output: bool = False,
     ) -> tuple[ClaudeResponse, int | None, bool]:
         """Execute an agentic loop that handles MCP tool calls.
 
@@ -1589,6 +1630,9 @@ class ClaudeProvider(AgentProvider):
                 Passed explicitly (never read from shared provider state) so
                 parallel agents with different cwds execute their tool calls
                 against the correct per-cwd connection pool.
+            force_emit_output: When True, force the model to call the
+                ``emit_output`` tool via the Anthropic ``tool_choice``
+                parameter. Forwarded to every API call in the loop.
 
         Returns:
             Tuple of (final_response, total_tokens_used, is_partial).
@@ -1638,6 +1682,7 @@ class ClaudeProvider(AgentProvider):
                     has_output_schema=has_output_schema,
                     thinking=thinking,
                     system_prompt=system_prompt,
+                    force_emit_output=force_emit_output,
                 )
                 total_tokens += interrupt_tokens
                 return interrupt_response, total_tokens, True
@@ -1666,6 +1711,7 @@ class ClaudeProvider(AgentProvider):
                             thinking=thinking,
                             max_parse_recovery_attempts=max_parse_recovery_attempts,
                             system_prompt=system_prompt,
+                            force_emit_output=force_emit_output,
                         )
                     )
                 else:
@@ -1678,6 +1724,7 @@ class ClaudeProvider(AgentProvider):
                             tools=tools,
                             thinking=thinking,
                             system_prompt=system_prompt,
+                            force_emit_output=force_emit_output,
                         )
                     )
                 interrupt_task = asyncio.create_task(interrupt_signal.wait())
@@ -1710,6 +1757,7 @@ class ClaudeProvider(AgentProvider):
                         has_output_schema=has_output_schema,
                         thinking=thinking,
                         system_prompt=system_prompt,
+                        force_emit_output=force_emit_output,
                     )
                     total_tokens += partial_tokens
                     return partial_resp, total_tokens, True
@@ -1726,6 +1774,7 @@ class ClaudeProvider(AgentProvider):
                     thinking=thinking,
                     max_parse_recovery_attempts=max_parse_recovery_attempts,
                     system_prompt=system_prompt,
+                    force_emit_output=force_emit_output,
                 )
             else:
                 response = await self._execute_api_call(
@@ -1736,6 +1785,7 @@ class ClaudeProvider(AgentProvider):
                     tools=tools,
                     thinking=thinking,
                     system_prompt=system_prompt,
+                    force_emit_output=force_emit_output,
                 )
 
             # Accumulate token usage
@@ -1944,6 +1994,7 @@ class ClaudeProvider(AgentProvider):
         has_output_schema: bool,
         thinking: dict[str, Any] | None = None,
         system_prompt: str | None = None,
+        force_emit_output: bool = False,
     ) -> tuple[Any, int]:
         """Send a final API call requesting partial output after interrupt.
 
@@ -1963,6 +2014,9 @@ class ClaudeProvider(AgentProvider):
             has_output_schema: Whether the agent defines an output schema.
             thinking: Optional extended-thinking kwarg forwarded to the API call.
             system_prompt: Optional rendered system prompt forwarded to the API call.
+            force_emit_output: When True, force the ``emit_output`` tool call
+                via the Anthropic ``tool_choice`` parameter on the partial
+                output request.
 
         Returns:
             Tuple of (response, tokens_used_in_this_call).
@@ -1991,6 +2045,7 @@ class ClaudeProvider(AgentProvider):
             tools=tools,
             thinking=thinking,
             system_prompt=system_prompt,
+            force_emit_output=force_emit_output,
         )
 
         call_tokens = 0
@@ -2012,6 +2067,7 @@ class ClaudeProvider(AgentProvider):
         thinking: dict[str, Any] | None = None,
         max_parse_recovery_attempts: int | None = None,
         system_prompt: str | None = None,
+        force_emit_output: bool = False,
     ) -> ClaudeResponse:
         """Execute API call with parse recovery for malformed JSON responses.
 
@@ -2030,6 +2086,9 @@ class ClaudeProvider(AgentProvider):
             max_parse_recovery_attempts: Resolved per-agent parse recovery limit.
                 None means use the provider-level default.
             system_prompt: Optional rendered system prompt forwarded to every API call.
+            force_emit_output: When True, force the ``emit_output`` tool call
+                via the Anthropic ``tool_choice`` parameter on every attempt
+                (initial call and each recovery retry).
 
         Returns:
             Claude API response.
@@ -2054,6 +2113,7 @@ class ClaudeProvider(AgentProvider):
             tools=tools,
             thinking=thinking,
             system_prompt=system_prompt,
+            force_emit_output=force_emit_output,
         )
 
         # If no output schema, return immediately (no recovery needed)
@@ -2120,6 +2180,7 @@ class ClaudeProvider(AgentProvider):
                 tools=tools,
                 thinking=thinking,
                 system_prompt=system_prompt,
+                force_emit_output=force_emit_output,
             )
 
             # Check if recovery succeeded (tool_use)

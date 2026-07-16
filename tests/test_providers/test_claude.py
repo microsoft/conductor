@@ -3703,3 +3703,543 @@ class TestClaudeMCPManagerPool:
 
         assert manager is not None
         assert instances[0].connected[0]["cwd"] == os.getcwd()
+class TestClaudeToolChoice:
+    """Tests for forced ``tool_choice`` on the ``emit_output`` synthetic tool.
+
+    When an agent has an ``output:`` schema and the request carries no MCP
+    tools, the provider must force the model to call ``emit_output`` by
+    sending ``tool_choice={"type": "tool", "name": "emit_output",
+    "disable_parallel_tool_use": True}`` on every ``messages.create`` call.
+    This eliminates an entire failure class where the model answers in prose
+    and the provider falls into the expensive parse-recovery loop.
+
+    Negative guards (``test_tool_choice_absent_*``) already pass on current
+    code (which never sends ``tool_choice``) and act as regression guards
+    for the MCP-tools path.
+    """
+
+    @staticmethod
+    def _build_provider(
+        mock_anthropic_module: Mock,
+        mock_anthropic_class: Mock,
+        create_side_effect: list[object] | None = None,
+        create_return_value: Mock | None = None,
+    ) -> tuple[ClaudeProvider, Mock]:
+        """Build a ClaudeProvider with a mocked AsyncAnthropic client.
+
+        Mirrors the ``_build_provider_with_responses`` helper used by the
+        reasoning-effort regression suite.
+        """
+        mock_anthropic_module.__version__ = "0.77.0"
+        mock_client = Mock()
+        mock_client.models.list = AsyncMock(return_value=Mock(data=[]))
+        if create_side_effect is not None:
+            mock_client.messages.create = AsyncMock(side_effect=create_side_effect)
+        else:
+            mock_client.messages.create = AsyncMock(return_value=create_return_value)
+        mock_anthropic_class.return_value = mock_client
+        provider = ClaudeProvider()
+        return provider, mock_client
+
+    @staticmethod
+    def _make_emit_output_response(input_payload: dict[str, object]) -> Mock:
+        """Build a mock messages.create response carrying an emit_output tool_use."""
+        emit_block = Mock(spec=["type", "name", "input", "id"])
+        emit_block.type = "tool_use"
+        emit_block.name = "emit_output"
+        emit_block.id = "toolu_emit"
+        emit_block.input = input_payload
+
+        response = Mock()
+        response.content = [emit_block]
+        response.usage = Mock(input_tokens=5, output_tokens=5)
+        return response
+
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    @pytest.mark.asyncio
+    async def test_tool_choice_forced_on_emit_output_happy_path(
+        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
+    ) -> None:
+        # Requirement: forced tool_choice is sent when only emit_output is present.
+        """Happy path: agent with output schema and no MCP servers must send
+        tool_choice forcing the emit_output tool, and must NOT burn extra
+        parse-recovery API calls (call_count == 1)."""
+        response = self._make_emit_output_response({"answer": "42"})
+        provider, mock_client = self._build_provider(
+            mock_anthropic_module, mock_anthropic_class, create_return_value=response
+        )
+
+        agent = AgentDef(
+            name="t",
+            prompt="p",
+            output={"answer": OutputField(type="string")},
+        )
+        result = await provider.execute(agent=agent, context={}, rendered_prompt="p")
+
+        assert result.content == {"answer": "42"}
+        assert mock_client.messages.create.await_count == 1
+        kwargs = mock_client.messages.create.call_args.kwargs
+        assert kwargs["tool_choice"] == {
+            "type": "tool",
+            "name": "emit_output",
+            "disable_parallel_tool_use": True,
+        }
+
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    @pytest.mark.asyncio
+    async def test_tool_choice_absent_when_mcp_tools_present(
+        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
+    ) -> None:
+        # Requirement: forced tool_choice is NOT sent when MCP tools are
+        # available (model must be able to call them).
+        """Negative guard: when MCP servers yield at least one tool, the
+        request must NOT carry tool_choice — the model needs the freedom to
+        call the MCP tool first."""
+        response = self._make_emit_output_response({"answer": "42"})
+        provider, mock_client = self._build_provider(
+            mock_anthropic_module, mock_anthropic_class, create_return_value=response
+        )
+
+        # Stub MCP manager: has_servers() True and get_all_tools() yields one tool.
+        mock_mcp = Mock()
+        mock_mcp.has_servers = Mock(return_value=True)
+        mock_mcp.get_all_tools = Mock(
+            return_value=[
+                {
+                    "name": "search",
+                    "description": "web search",
+                    "input_schema": {"type": "object", "properties": {}},
+                }
+            ]
+        )
+        provider._get_mcp_manager_for_cwd = AsyncMock(return_value=mock_mcp)
+
+        agent = AgentDef(
+            name="t",
+            prompt="p",
+            output={"answer": OutputField(type="string")},
+        )
+        await provider.execute(agent=agent, context={}, rendered_prompt="p")
+
+        kwargs = mock_client.messages.create.call_args.kwargs
+        assert "tool_choice" not in kwargs
+        # Sanity: the MCP tool was actually added alongside emit_output.
+        tool_names = [t["name"] for t in kwargs["tools"]]
+        assert "emit_output" in tool_names
+        assert "search" in tool_names
+
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    @pytest.mark.asyncio
+    async def test_tool_choice_forced_when_mcp_filter_yields_no_tools(
+        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
+    ) -> None:
+        # Requirement: when MCP servers exist but yield no tools, forced
+        # tool_choice applies.
+        """Edge case: has_servers() is True but the agent's tool filter
+        excludes every MCP tool, so ``_convert_mcp_tools_to_claude`` returns
+        []. Forced tool_choice must still apply because the request carries
+        only emit_output."""
+        response = self._make_emit_output_response({"answer": "42"})
+        provider, mock_client = self._build_provider(
+            mock_anthropic_module, mock_anthropic_class, create_return_value=response
+        )
+
+        # MCP manager has a server and exposes one tool, but the agent's
+        # tools filter does not match it → converted list is empty.
+        mock_mcp = Mock()
+        mock_mcp.has_servers = Mock(return_value=True)
+        mock_mcp.get_all_tools = Mock(
+            return_value=[
+                {
+                    "name": "search",
+                    "description": "web search",
+                    "input_schema": {"type": "object", "properties": {}},
+                }
+            ]
+        )
+        provider._get_mcp_manager_for_cwd = AsyncMock(return_value=mock_mcp)
+
+        agent = AgentDef(
+            name="t",
+            prompt="p",
+            output={"answer": OutputField(type="string")},
+        )
+        # Pass a filter that matches nothing → mcp_tools == [] after conversion.
+        await provider.execute(
+            agent=agent, context={}, rendered_prompt="p", tools=["not-the-mcp-tool"]
+        )
+
+        kwargs = mock_client.messages.create.call_args.kwargs
+        tool_names = [t["name"] for t in kwargs["tools"]]
+        assert tool_names == ["emit_output"]
+        assert kwargs["tool_choice"] == {
+            "type": "tool",
+            "name": "emit_output",
+            "disable_parallel_tool_use": True,
+        }
+
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    @pytest.mark.asyncio
+    async def test_tool_choice_absent_in_raw_output_mode(
+        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
+    ) -> None:
+        # Requirement: raw output mode never triggers forced tool_choice.
+        """Negative guard: agents with ``output_mode="raw"`` skip structured
+        output entirely — no emit_output tool, no tool_choice."""
+        text_block = Mock(spec=["type", "text"])
+        text_block.type = "text"
+        text_block.text = "raw prose answer"
+
+        response = Mock()
+        response.content = [text_block]
+        response.usage = Mock(input_tokens=5, output_tokens=5)
+
+        provider, mock_client = self._build_provider(
+            mock_anthropic_module, mock_anthropic_class, create_return_value=response
+        )
+
+        agent = AgentDef(
+            name="t",
+            prompt="p",
+            output_mode="raw",
+        )
+        await provider.execute(agent=agent, context={}, rendered_prompt="p")
+
+        kwargs = mock_client.messages.create.call_args.kwargs
+        assert "tool_choice" not in kwargs
+        assert "tools" not in kwargs or kwargs["tools"] is None
+
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    @pytest.mark.asyncio
+    async def test_tool_choice_forced_on_interrupt_partial_output_path(
+        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
+    ) -> None:
+        # Requirement: forced tool_choice reaches the interrupt partial-output
+        # path.
+        """When an interrupt fires on the first iteration, the partial-output
+        recovery call (``_request_partial_output`` → ``_execute_api_call``)
+        must also carry the forced tool_choice."""
+        import asyncio
+
+        response = self._make_emit_output_response({"result": "partial data"})
+        provider, mock_client = self._build_provider(
+            mock_anthropic_module, mock_anthropic_class, create_return_value=response
+        )
+
+        interrupt = asyncio.Event()
+        interrupt.set()
+
+        tools = [
+            {
+                "name": "emit_output",
+                "description": "Emit output",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"result": {"type": "string"}},
+                },
+            }
+        ]
+
+        response_obj, _tokens, is_partial = await provider._execute_agentic_loop(
+            messages=[{"role": "user", "content": "test"}],
+            model="claude-3-5-sonnet-latest",
+            temperature=None,
+            max_tokens=8192,
+            tools=tools,
+            output_schema={"result": OutputField(type="string")},
+            has_output_schema=True,
+            interrupt_signal=interrupt,
+            force_emit_output=True,
+        )
+
+        assert is_partial is True
+        # _request_partial_output calls _execute_api_call once.
+        assert mock_client.messages.create.await_count == 1
+        kwargs = mock_client.messages.create.call_args.kwargs
+        assert kwargs["tool_choice"] == {
+            "type": "tool",
+            "name": "emit_output",
+            "disable_parallel_tool_use": True,
+        }
+
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    @pytest.mark.asyncio
+    async def test_tool_choice_forced_alongside_thinking_kwargs(
+        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
+    ) -> None:
+        # Requirement: forced tool_choice coexists with extended thinking
+        # kwargs.
+        """Combo test: with ``reasoning.effort`` set AND an output schema,
+        the API call must carry BOTH the ``thinking`` kwarg AND the forced
+        ``tool_choice`` kwarg."""
+        from conductor.config.schema import ReasoningConfig
+
+        response = self._make_emit_output_response({"answer": "42"})
+        provider, mock_client = self._build_provider(
+            mock_anthropic_module, mock_anthropic_class, create_return_value=response
+        )
+
+        agent = AgentDef(
+            name="t",
+            prompt="p",
+            model="claude-opus-4-20250514",
+            reasoning=ReasoningConfig(effort="medium"),
+            output={"answer": OutputField(type="string")},
+        )
+        await provider.execute(agent=agent, context={}, rendered_prompt="p")
+
+        kwargs = mock_client.messages.create.call_args.kwargs
+        assert kwargs["thinking"] == {"type": "enabled", "budget_tokens": 8192}
+        assert kwargs["tool_choice"] == {
+            "type": "tool",
+            "name": "emit_output",
+            "disable_parallel_tool_use": True,
+        }
+
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    @pytest.mark.asyncio
+    async def test_tool_choice_present_on_both_calls_across_retry(
+        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
+    ) -> None:
+        # Requirement: the flag survives retries (computed before the retry
+        # loop).
+        """Retry test: when the first attempt raises a retryable error and
+        the second succeeds, BOTH messages.create calls must include the
+        forced tool_choice — the flag is computed once before the retry
+        loop, not per attempt."""
+        mock_anthropic_module.__version__ = "0.77.0"
+
+        class MockRateLimitError(Exception):
+            def __init__(self) -> None:
+                self.response = Mock()
+                self.response.headers = {}
+                super().__init__("Rate limit exceeded")
+
+        mock_anthropic_module.RateLimitError = MockRateLimitError
+        mock_anthropic_module.BadRequestError = type("BadRequestError", (Exception,), {})
+
+        success_response = self._make_emit_output_response({"answer": "42"})
+        provider, mock_client = self._build_provider(
+            mock_anthropic_module,
+            mock_anthropic_class,
+            create_side_effect=[MockRateLimitError(), success_response],
+        )
+
+        from conductor.providers.claude import RetryConfig
+
+        # Re-bind provider with a fast retry config to keep the test snappy.
+        provider = ClaudeProvider(retry_config=RetryConfig(base_delay=0.01, max_delay=0.1))
+
+        agent = AgentDef(
+            name="t",
+            prompt="p",
+            output={"answer": OutputField(type="string")},
+        )
+        result = await provider.execute(agent=agent, context={}, rendered_prompt="p")
+
+        assert result.content == {"answer": "42"}
+        assert mock_client.messages.create.await_count == 2
+        expected_tool_choice = {
+            "type": "tool",
+            "name": "emit_output",
+            "disable_parallel_tool_use": True,
+        }
+        first_kwargs = mock_client.messages.create.call_args_list[0].kwargs
+        second_kwargs = mock_client.messages.create.call_args_list[1].kwargs
+        assert first_kwargs["tool_choice"] == expected_tool_choice
+        assert second_kwargs["tool_choice"] == expected_tool_choice
+
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    @pytest.mark.asyncio
+    async def test_tool_choice_forced_when_no_mcp_manager_at_all(
+        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
+    ) -> None:
+        # Requirement: forced tool_choice works when no MCP manager exists at
+        # all (catches the uninitialized mcp_tools regression).
+        """Regression: ``_mcp_manager is None`` (not just ``has_servers() ==
+        False``) must still produce forced tool_choice without raising
+        ``UnboundLocalError`` on an uninitialized ``mcp_tools`` local."""
+        response = self._make_emit_output_response({"answer": "42"})
+        provider, mock_client = self._build_provider(
+            mock_anthropic_module, mock_anthropic_class, create_return_value=response
+        )
+        # Explicitly guarantee the no-MCP-manager state.
+        provider._get_mcp_manager_for_cwd = AsyncMock(return_value=None)
+
+        agent = AgentDef(
+            name="t",
+            prompt="p",
+            output={"answer": OutputField(type="string")},
+        )
+        result = await provider.execute(agent=agent, context={}, rendered_prompt="p")
+
+        assert result.content == {"answer": "42"}
+        kwargs = mock_client.messages.create.call_args.kwargs
+        assert kwargs["tool_choice"] == {
+            "type": "tool",
+            "name": "emit_output",
+            "disable_parallel_tool_use": True,
+        }
+
+
+class TestClaudeBadRequestToolChoice:
+    """Tests for the BadRequestError branch handling API rejections of forced
+    ``tool_choice``.
+
+    When the provider forces ``emit_output`` via ``tool_choice`` and the
+    Anthropic API rejects it (e.g. forced tool use is incompatible with
+    extended thinking on the selected model), the user must get a targeted
+    ``ValidationError`` naming the feature and suggesting the fix — not a
+    generic ``ProviderError``.
+    """
+
+    @staticmethod
+    def _build_provider(
+        mock_anthropic_module: Mock,
+        mock_anthropic_class: Mock,
+        create_side_effect: list[object],
+    ) -> tuple[ClaudeProvider, Mock]:
+        """Build a ClaudeProvider whose messages.create raises via side_effect."""
+        mock_anthropic_module.__version__ = "0.77.0"
+        mock_client = Mock()
+        mock_client.models.list = AsyncMock(return_value=Mock(data=[]))
+        mock_client.messages.create = AsyncMock(side_effect=create_side_effect)
+        mock_anthropic_class.return_value = mock_client
+        provider = ClaudeProvider()
+        return provider, mock_client
+
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    @pytest.mark.asyncio
+    async def test_tool_choice_rejection_raises_targeted_validation_error(
+        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
+    ) -> None:
+        # Requirement: an API rejection of forced tool_choice surfaces as a
+        # targeted ValidationError (not a generic ProviderError).
+        """Agent with output schema + reasoning effort → forced tool_choice is
+        sent → API answers 400 "tool_choice ... extended thinking" → the
+        provider must raise ValidationError whose message names both the
+        feature ("tool_choice") and the likely cause ("thinking")."""
+        mock_anthropic_module.BadRequestError = type("BadRequestError", (Exception,), {})
+        rejection = mock_anthropic_module.BadRequestError(
+            "tool_choice is not supported with extended thinking"
+        )
+        provider, _ = self._build_provider(
+            mock_anthropic_module, mock_anthropic_class, create_side_effect=[rejection]
+        )
+
+        from conductor.config.schema import ReasoningConfig
+
+        agent = AgentDef(
+            name="t",
+            prompt="p",
+            model="claude-opus-4-20250514",
+            reasoning=ReasoningConfig(effort="medium"),
+            output={"answer": OutputField(type="string")},
+        )
+
+        with pytest.raises(ValidationError) as exc_info:
+            await provider.execute(agent=agent, context={}, rendered_prompt="p")
+
+        assert "tool_choice" in str(exc_info.value)
+        assert "thinking" in str(exc_info.value)
+
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    @pytest.mark.asyncio
+    async def test_tool_choice_rejection_space_variant_also_matches(
+        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
+    ) -> None:
+        # Requirement: the "tool choice" wording variant (space instead of
+        # underscore) is also recognized as a forced-tool_choice rejection.
+        """Anthropic may phrase the rejection without the underscore
+        ("tool choice ... thinking"). The normalized substring check must
+        catch both spellings."""
+        mock_anthropic_module.BadRequestError = type("BadRequestError", (Exception,), {})
+        rejection = mock_anthropic_module.BadRequestError(
+            "Forced tool choice is not compatible with thinking on this model"
+        )
+        provider, _ = self._build_provider(
+            mock_anthropic_module, mock_anthropic_class, create_side_effect=[rejection]
+        )
+
+        from conductor.config.schema import ReasoningConfig
+
+        agent = AgentDef(
+            name="t",
+            prompt="p",
+            model="claude-opus-4-20250514",
+            reasoning=ReasoningConfig(effort="medium"),
+            output={"answer": OutputField(type="string")},
+        )
+
+        with pytest.raises(ValidationError) as exc_info:
+            await provider.execute(agent=agent, context={}, rendered_prompt="p")
+
+        assert "tool_choice" in str(exc_info.value)
+        assert "thinking" in str(exc_info.value)
+
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    @pytest.mark.asyncio
+    async def test_tool_choice_rejection_not_raised_without_forced_choice(
+        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
+    ) -> None:
+        # Requirement: a BadRequestError mentioning tool_choice must NOT be
+        # reclassified when forced tool_choice was never sent (MCP path).
+        """Negative guard: when MCP tools are present, no tool_choice is sent,
+        so a tool_choice-flavored 400 cannot be attributed to the forced
+        emit_output — the error must keep the generic ProviderError path."""
+        mock_anthropic_module.BadRequestError = type("BadRequestError", (Exception,), {})
+        rejection = mock_anthropic_module.BadRequestError(
+            "tool_choice is not supported with extended thinking"
+        )
+        provider, _ = self._build_provider(
+            mock_anthropic_module, mock_anthropic_class, create_side_effect=[rejection]
+        )
+
+        # MCP manager yields a tool → force_emit_output is False.
+        mock_mcp = Mock()
+        mock_mcp.has_servers = Mock(return_value=True)
+        mock_mcp.get_all_tools = Mock(
+            return_value=[
+                {
+                    "name": "search",
+                    "description": "web search",
+                    "input_schema": {"type": "object", "properties": {}},
+                }
+            ]
+        )
+        provider._get_mcp_manager_for_cwd = AsyncMock(return_value=mock_mcp)
+
+        from conductor.config.schema import ReasoningConfig
+
+        agent = AgentDef(
+            name="t",
+            prompt="p",
+            model="claude-opus-4-20250514",
+            reasoning=ReasoningConfig(effort="medium"),
+            output={"answer": OutputField(type="string")},
+        )
+
+        with pytest.raises(ProviderError):
+            await provider.execute(agent=agent, context={}, rendered_prompt="p")
