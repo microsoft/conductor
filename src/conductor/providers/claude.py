@@ -35,6 +35,11 @@ from conductor.providers._event_format import (
     extract_tool_result_text,
     format_tool_arguments,
 )
+from conductor.providers._schema import (
+    SchemaDepthError,
+    build_json_schema_field,
+    build_json_schema_properties,
+)
 from conductor.providers.base import (
     AgentOutput,
     AgentProvider,
@@ -2316,8 +2321,6 @@ class ClaudeProvider(AgentProvider):
     ) -> dict[str, Any]:
         """Build JSON Schema properties from OutputField definitions.
 
-        Recursively handles nested objects and arrays with depth limiting.
-
         Args:
             schema: Dictionary mapping field names to OutputField definitions.
             depth: Current nesting depth (for recursion safety).
@@ -2328,39 +2331,15 @@ class ClaudeProvider(AgentProvider):
         Raises:
             ValidationError: If schema nesting exceeds max depth.
         """
-        if depth > self._max_schema_depth:
+        try:
+            return build_json_schema_properties(
+                schema, depth=depth, max_depth=self._max_schema_depth
+            )
+        except SchemaDepthError as exc:
             raise ValidationError(
                 f"Schema nesting depth exceeds maximum of {self._max_schema_depth} levels",
                 suggestion="Simplify your output schema to reduce nesting depth",
-            )
-
-        properties: dict[str, Any] = {}
-
-        for field_name, field_def in schema.items():
-            prop: dict[str, Any] = {
-                "type": self._map_type_to_json_schema(field_def.type),
-            }
-
-            if field_def.description:
-                prop["description"] = field_def.description
-
-            # Handle nested object schemas
-            if field_def.type == "object" and field_def.properties:
-                prop["properties"] = self._build_json_schema_properties(
-                    field_def.properties, depth=depth + 1
-                )
-                # All properties in OutputField schemas are required
-                # (OutputField has no 'required' attribute, all fields are mandatory)
-                prop["required"] = list(field_def.properties.keys())
-
-            # Handle array schemas with item definitions
-            if field_def.type == "array" and field_def.items:
-                items_schema = self._build_single_field_schema(field_def.items, depth=depth + 1)
-                prop["items"] = items_schema
-
-            properties[field_name] = prop
-
-        return properties
+            ) from exc
 
     def _build_single_field_schema(self, field: OutputField, depth: int = 0) -> dict[str, Any]:
         """Build JSON Schema for a single field (used for array items).
@@ -2375,50 +2354,13 @@ class ClaudeProvider(AgentProvider):
         Raises:
             ValidationError: If schema nesting exceeds max depth.
         """
-        if depth > self._max_schema_depth:
+        try:
+            return build_json_schema_field(field, depth=depth, max_depth=self._max_schema_depth)
+        except SchemaDepthError as exc:
             raise ValidationError(
                 f"Schema nesting depth exceeds maximum of {self._max_schema_depth} levels",
                 suggestion="Simplify your output schema to reduce nesting depth",
-            )
-
-        schema: dict[str, Any] = {
-            "type": self._map_type_to_json_schema(field.type),
-        }
-
-        if field.description:
-            schema["description"] = field.description
-
-        # Handle nested objects in array items
-        if field.type == "object" and field.properties:
-            schema["properties"] = self._build_json_schema_properties(
-                field.properties, depth=depth + 1
-            )
-            # All properties are required
-            schema["required"] = list(field.properties.keys())
-
-        # Handle nested arrays (array of arrays)
-        if field.type == "array" and field.items:
-            schema["items"] = self._build_single_field_schema(field.items, depth=depth + 1)
-
-        return schema
-
-    def _map_type_to_json_schema(self, field_type: str) -> str:
-        """Map OutputField type to JSON Schema type.
-
-        Args:
-            field_type: The OutputField type string.
-
-        Returns:
-            Corresponding JSON Schema type.
-        """
-        type_mapping = {
-            "string": "string",
-            "number": "number",
-            "boolean": "boolean",
-            "array": "array",
-            "object": "object",
-        }
-        return type_mapping.get(field_type, "string")
+            ) from exc
 
     def _extract_output(
         self, response: Any, output_schema: dict[str, OutputField] | None
