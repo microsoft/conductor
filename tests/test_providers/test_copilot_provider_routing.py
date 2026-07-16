@@ -634,3 +634,21 @@ class TestResolveRuntimeConnection:
         provider = _make_provider(provider_settings=s, model="ollama/llama3")
         with pytest.raises(ProviderError, match="mutually exclusive"):
             provider._build_client()
+
+    def test_build_client_raises_when_runtime_connection_unavailable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An older-but-present SDK imports ``RuntimeConnection`` as ``None``.
+        With a configured ``runtime_url`` the client build must raise a clear
+        ProviderError rather than an opaque ``AttributeError`` on ``for_uri``."""
+        import conductor.providers.copilot as copilot_mod
+
+        monkeypatch.setattr(copilot_mod, "RuntimeConnection", None)
+        monkeypatch.delenv("COPILOT_PROVIDER_RUNTIME_URL", raising=False)
+        monkeypatch.delenv("COPILOT_PROVIDER_RUNTIME_TOKEN", raising=False)
+        s = ProviderSettings.model_validate(
+            {"name": "copilot", "runtime_url": "localhost:3000"}
+        )
+        provider = _make_provider(provider_settings=s)
+        with pytest.raises(ProviderError, match="requires a .*RuntimeConnection"):
+            provider._build_client()

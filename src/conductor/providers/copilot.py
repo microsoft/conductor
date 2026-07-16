@@ -2125,6 +2125,17 @@ class CopilotProvider(AgentProvider):
                 ),
                 is_retryable=False,
             )
+        if RuntimeConnection is None:
+            raise ProviderError(
+                "Connecting to an existing Copilot runtime (runtime_url) requires a "
+                "Copilot SDK that provides RuntimeConnection, which is unavailable in "
+                "the installed SDK version.",
+                suggestion=(
+                    "Upgrade the copilot SDK, or unset runtime_url / "
+                    "COPILOT_PROVIDER_RUNTIME_URL to spawn a nested runtime instead."
+                ),
+                is_retryable=False,
+            )
         logger.info(
             "Connecting to existing Copilot runtime at %s (no nested runtime spawned)",
             url,

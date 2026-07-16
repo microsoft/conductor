@@ -353,6 +353,26 @@ class TestExternalRuntimeConnection:
                 {"name": "copilot", "runtime_url": "", "runtime_token": "tok"}
             )
 
+    def test_whitespace_runtime_url_rejected(self) -> None:
+        """A whitespace-only ``runtime_url`` is stripped to empty by the provider
+        resolver, so ``conductor validate`` must reject it at schema time too."""
+        with pytest.raises(ValidationError, match="'runtime_url' is empty"):
+            ProviderSettings.model_validate({"name": "copilot", "runtime_url": "   "})
+
+    def test_whitespace_runtime_token_rejected(self) -> None:
+        """A whitespace-only ``runtime_token`` normalizes to None at runtime
+        (silently changing auth mode); reject it at schema time."""
+        with pytest.raises(ValidationError, match="'runtime_token' is empty"):
+            ProviderSettings.model_validate(
+                {"name": "copilot", "runtime_url": "x:1", "runtime_token": "   "}
+            )
+
+    def test_whitespace_api_key_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="'api_key' is empty"):
+            ProviderSettings.model_validate(
+                {"name": "copilot", "base_url": "http://x/v1", "api_key": "   "}
+            )
+
     @pytest.mark.parametrize(
         "field,value",
         [

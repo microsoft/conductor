@@ -1830,10 +1830,12 @@ class ProviderSettings(BaseModel):
         if self.azure is not None and self.type != "azure":
             raise ValueError("'azure' options require type='azure'")
 
-        # Reject empty containers and empty SecretStr — they activate
-        # custom routing via has_custom_routing() but resolve to falsy
-        # values in the resolver and would silently drop the entire
-        # SDK provider kwarg.
+        # Reject empty containers and empty/whitespace-only SecretStr — they
+        # activate custom routing via has_custom_routing() but resolve to falsy
+        # values in the resolver and would silently drop the entire SDK provider
+        # kwarg. The provider strips these values at runtime, so a whitespace-only
+        # secret would silently normalize to None; reject it here (non-mutating
+        # .strip() check) so `conductor validate` matches the resolver.
         if self.headers is not None and len(self.headers) == 0:
             raise ValueError(
                 "'headers' must contain at least one entry; remove the key to omit headers"
@@ -1844,17 +1846,18 @@ class ProviderSettings(BaseModel):
             ("auth_token", self.auth_token),
             ("runtime_token", self.runtime_token),
         ):
-            if value is not None and value.get_secret_value() == "":
+            if value is not None and value.get_secret_value().strip() == "":
                 raise ValueError(
                     f"'{secret_field}' is empty; remove the key or supply a value "
                     "(typo / unset env interpolation?)"
                 )
 
-        # An empty runtime_url must also be rejected: because "" is not None,
-        # has_external_runtime() would return True and the runtime_token guard
-        # (runtime_url is None) would pass, yet the provider treats "" as falsy
-        # and silently falls back to env / a nested spawn while dropping the token.
-        if self.runtime_url is not None and self.runtime_url == "":
+        # An empty (or whitespace-only) runtime_url must also be rejected: because
+        # "" is not None, has_external_runtime() would return True and the
+        # runtime_token guard (runtime_url is None) would pass, yet the provider
+        # treats "" as falsy and silently falls back to env / a nested spawn while
+        # dropping the token.
+        if self.runtime_url is not None and self.runtime_url.strip() == "":
             raise ValueError(
                 "'runtime_url' is empty; remove the key or supply a value "
                 "(typo / unset env interpolation?)"
