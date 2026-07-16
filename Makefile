@@ -1,4 +1,4 @@
-.PHONY: install install-cli dev test test-cov lint format typecheck check clean build all build-frontend dev-frontend
+.PHONY: install install-cli dev test test-cov lint format typecheck check clean build all build-frontend dev-frontend test-frontend
 
 # Default target
 all: check test
@@ -73,3 +73,7 @@ build-frontend:
 # Run frontend dev server (with proxy to FastAPI backend)
 dev-frontend:
 	cd src/conductor/web/frontend && npm run dev
+
+# Run frontend unit tests (Vitest)
+test-frontend:
+	cd src/conductor/web/frontend && npm install && npm run test

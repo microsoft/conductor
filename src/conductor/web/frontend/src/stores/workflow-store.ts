@@ -482,6 +482,38 @@ function createSubworkflowContext(parentAgent: string, iteration: number, workfl
   };
 }
 
+/**
+ * Deep-clone a SubworkflowContext tree, producing new object/array
+ * references for every context and its own mutable containers (`nodes`,
+ * `groupProgress`, `routes`, `highlightedEdges`, `children`, `agents`,
+ * `parallelGroups`, `forEachGroups`, `eventLog`, `activityLog`).
+ *
+ * `processEvent` clones root-level `nodes`/`groupProgress`/`eventLog`/
+ * `activityLog` on every event so React/Zustand reference-equality checks
+ * pick up changes (see `replaceNode`'s doc comment). Event handlers reached
+ * through `activeTarget()`/`resolveContext()`/`resolveSlotPath()` mutate the
+ * equivalent containers *inside* `subworkflowContexts` in place — without
+ * this clone, those mutations never produce a new reference anywhere in the
+ * tree, so any selector/`useMemo` keyed on `subworkflowContexts` (directly or
+ * transitively, e.g. `useViewedNodes`/`useViewedGraphData`) can miss the
+ * update. See issue #307.
+ */
+function cloneSubworkflowContexts(contexts: SubworkflowContext[]): SubworkflowContext[] {
+  return contexts.map((ctx) => ({
+    ...ctx,
+    agents: [...ctx.agents],
+    routes: [...ctx.routes],
+    parallelGroups: [...ctx.parallelGroups],
+    forEachGroups: [...ctx.forEachGroups],
+    nodes: { ...ctx.nodes },
+    groupProgress: { ...ctx.groupProgress },
+    highlightedEdges: [...ctx.highlightedEdges],
+    eventLog: [...ctx.eventLog],
+    activityLog: [...ctx.activityLog],
+    children: cloneSubworkflowContexts(ctx.children),
+  }));
+}
+
 /** Resolve a SubworkflowContext from a path of indices (e.g. [0, 2] = first child's third child). */
 function resolveContext(contexts: SubworkflowContext[], path: number[]): SubworkflowContext | null {
   if (path.length === 0) return null;
@@ -671,7 +703,15 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
   processEvent: (event: WorkflowEvent) => {
     const handler = eventHandlers[event.type];
     set((state) => {
-      const newState = { ...state, nodes: { ...state.nodes }, groupProgress: { ...state.groupProgress }, eventLog: [...state.eventLog], activityLog: [...state.activityLog], lastEventTime: event.timestamp };
+      const newState = {
+        ...state,
+        nodes: { ...state.nodes },
+        groupProgress: { ...state.groupProgress },
+        eventLog: [...state.eventLog],
+        activityLog: [...state.activityLog],
+        subworkflowContexts: cloneSubworkflowContexts(state.subworkflowContexts),
+        lastEventTime: event.timestamp,
+      };
       if (handler) {
         handler(newState, event.data, event.timestamp);
       }
