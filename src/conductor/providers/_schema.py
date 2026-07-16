@@ -279,8 +279,11 @@ def _build_hermes_legacy_item_schema(
         item_schema["description"] = field.description
 
     if field.type == "object" and field.properties:
+        # Pinned legacy counting: the array itself advanced depth by one when
+        # calling this helper, so the item's properties must recurse at the
+        # same depth (not depth + 1) to match pre-refactor Hermes behavior.
         item_schema["properties"] = build_hermes_legacy_prompt_schema(
-            field.properties, depth=depth + 1, max_depth=max_depth
+            field.properties, depth=depth, max_depth=max_depth
         )
 
     return item_schema
