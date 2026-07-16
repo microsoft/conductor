@@ -15,7 +15,7 @@ workflow:
     default_model: gpt-5.2
     temperature: 0.7
     max_tokens: 4096
-    default_reasoning_effort: medium  # low | medium | high | xhigh (optional)
+    default_reasoning_effort: medium  # low | medium | high | xhigh | max (optional)
     default_context_tier: default  # default | long_context (optional, Copilot only)
     # Provider-specific settings...
 ```
@@ -297,7 +297,7 @@ workflow:
 
 Conductor exposes a single, unified `reasoning.effort` knob that controls how
 much "thinking" budget the underlying model uses, and translates it to each
-provider's native API. Allowed values: `low`, `medium`, `high`, `xhigh`.
+provider's native API. Allowed values: `low`, `medium`, `high`, `xhigh`, `max`.
 
 Set a workflow-wide default and/or override per agent:
 
@@ -342,6 +342,11 @@ agents (none of which call a model).
   | `medium` | 8 192         |
   | `high`   | 16 384        |
   | `xhigh`  | 32 768        |
+  | `max`    | 59 904        |
+
+  `max` is pinned to `64000 − 4096` — the largest budget that still leaves the
+  default answer headroom under the 64000-token extended-thinking output cap
+  (at `max`, `max_tokens` lands exactly on the cap).
 
   Extended thinking is only valid on thinking-capable models
   (`claude-3-7-*`, `claude-opus-4*`, `claude-sonnet-4*`, `claude-haiku-4*`); a

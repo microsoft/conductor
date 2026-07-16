@@ -2,7 +2,7 @@
 
 import pytest
 
-from conductor.providers.base import AgentOutput, match_model_id
+from conductor.providers.base import AgentOutput, ModelCapabilityInfo, match_model_id
 
 
 class TestAgentOutput:
@@ -141,3 +141,59 @@ class TestGetModelPricingDefault:
                 return None
 
         assert await _Fake().get_model_pricing("any-model") is None
+
+
+class TestGetModelCapabilitiesDefault:
+    """The base AgentProvider.get_model_capabilities default returns None (#301)."""
+
+    @pytest.mark.asyncio
+    async def test_base_default_returns_none(self) -> None:
+        """Providers that don't override the hook render every column as n/a."""
+        from conductor.providers.base import AgentProvider
+
+        class _Fake(AgentProvider, abstract=True):
+            async def execute(self, *args: object, **kwargs: object) -> AgentOutput:
+                raise NotImplementedError
+
+            async def validate_connection(self) -> bool:
+                return True
+
+            async def close(self) -> None:
+                return None
+
+        assert await _Fake().get_model_capabilities("any-model") is None
+
+
+class TestModelCapabilityInfo:
+    """Tests for the ModelCapabilityInfo dataclass's to_dict()."""
+
+    def test_to_dict_all_fields(self) -> None:
+        info = ModelCapabilityInfo(
+            supported_reasoning_efforts=["low", "medium"],
+            default_reasoning_effort="low",
+            max_prompt_tokens=128_000,
+            max_output_tokens=8_192,
+            max_context_window_tokens=136_192,
+        )
+        assert info.to_dict() == {
+            "supported_reasoning_efforts": ["low", "medium"],
+            "default_reasoning_effort": "low",
+            "max_prompt_tokens": 128_000,
+            "max_output_tokens": 8_192,
+            "max_context_window_tokens": 136_192,
+        }
+
+    def test_to_dict_all_none_defaults(self) -> None:
+        assert ModelCapabilityInfo().to_dict() == {
+            "supported_reasoning_efforts": None,
+            "default_reasoning_effort": None,
+            "max_prompt_tokens": None,
+            "max_output_tokens": None,
+            "max_context_window_tokens": None,
+        }
+
+    def test_empty_reasoning_efforts_list_is_distinct_from_none(self) -> None:
+        """An empty list means 'known to support none', distinct from unknown."""
+        info = ModelCapabilityInfo(supported_reasoning_efforts=[])
+        assert info.supported_reasoning_efforts == []
+        assert info.to_dict()["supported_reasoning_efforts"] == []

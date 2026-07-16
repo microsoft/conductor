@@ -5,7 +5,78 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.21...HEAD)
+## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.22...HEAD)
+
+## [0.1.22](https://github.com/microsoft/conductor/compare/v0.1.21...v0.1.22) - 2026-07-15
+
+### Added
+
+- **`conductor doctor --models` surfaces per-model reasoning-effort support and
+  context-window limits** — a new optional `AgentProvider.get_model_capabilities`
+  hook (alongside the existing `get_max_prompt_tokens` / `get_model_pricing`
+  hooks) reports, per model: which `reasoning.effort` levels it accepts, its
+  default effort, and its prompt/output/context-window token limits. `--models`
+  now renders a separate per-provider **Models** detail table with this data
+  (the Providers table's Models column shows a count); the JSON `models` field
+  is now a list of capability objects rather than plain id strings. The Copilot
+  provider implements the hook fully via `client.list_models()`; the Claude
+  provider derives reasoning-effort support from the existing thinking-model
+  heuristic and reports prompt tokens only (the Anthropic SDK exposes no
+  output/total-context split); other providers (`claude-agent-sdk`, `hermes`,
+  `openai-agents`) don't implement model enumeration at all, so they show
+  `n/a` in the Providers table and get no Models detail table. See the
+  "Per-model capabilities" section in
+  [`docs/cli-reference.md`](docs/cli-reference.md#per-model-capabilities---models).
+  ([#301](https://github.com/microsoft/conductor/issues/301))
+
+- **`max` reasoning-effort level** — the unified reasoning scale is now
+  `low | medium | high | xhigh | max`, unifying it with the GitHub Copilot CLI.
+  On the Copilot provider `max` is forwarded to the SDK and still validated
+  per-model against the model's advertised `supported_reasoning_efforts`. On
+  the Claude provider `max` maps to a `59904`-token extended-thinking budget
+  (`64000 − 4096`, the largest budget that keeps the default answer headroom
+  under the 64000-token output cap); both the main agentic-loop and dialog-turn
+  code paths share the same clamping helper, so the cap is enforced
+  consistently. The experimental Hermes provider keeps the original four
+  levels — `max` is rejected both statically (`conductor validate`) and at
+  execute time (including when a Jinja-templated `reasoning.effort` only
+  resolves to `max` after rendering).
+  ([#299](https://github.com/microsoft/conductor/issues/299))
+
+### Fixed
+
+- **Copilot per-model `reasoning_effort` validation was a silent no-op** —
+  `_validate_reasoning_effort_for_model` read
+  `capabilities.supported_reasoning_efforts`, but the installed
+  `github-copilot-sdk` (>=1.0.0) exposes that field (and
+  `default_reasoning_effort`) at the top level of the `Model` object, not
+  nested under `capabilities`. The lookup always returned `None`, so the
+  per-model check (including the `max`-rejection behavior from #299) never
+  fired against the real SDK — a model without `max` support would only be
+  caught by the backend, not by Conductor's own validation. Fixed to read the
+  correct field; discovered and corrected while implementing #301, which
+  needed the same field for `doctor --models`.
+
+- **Install-script tests no longer pollute the developer's shell profile** — the
+  install scripts ran `uv tool update-shell` unconditionally, so the
+  `-m install_scripts` integration tests appended each run's throwaway
+  `UV_TOOL_BIN_DIR` to the real `~/.zshenv` (and shell equivalents). Those stale
+  entries shadowed the user's actual `conductor` install with an old `v0.0.2`
+  test fixture, so `conductor` reported the wrong version and `conductor update`
+  appeared to do nothing. `install.sh` / `install.ps1` now honor
+  `CONDUCTOR_INSTALL_SKIP_PATH_UPDATE=1` (and a matching
+  `--skip-path-update` / `-SkipPathUpdate` flag) — set by default in the test
+  harness — and a regression test asserts the scripts never touch shell
+  profiles.
+
+### Documentation
+
+- **README provider comparison table corrected** — set Context Window to
+  "Per-model" across all providers, set Pricing to "Subscription" for Copilot
+  and Claude Agent SDK, labeled Claude Agent SDK as experimental in the
+  top-level Features list (matching the Providers table's Tier column), and
+  added a "Using Copilot" section with a config example and auth notes.
+  ([#296](https://github.com/microsoft/conductor/pull/296))
 
 ## [0.1.21](https://github.com/microsoft/conductor/compare/v0.1.20...v0.1.21) - 2026-07-13
 

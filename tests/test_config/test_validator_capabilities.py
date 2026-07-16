@@ -396,6 +396,46 @@ class TestReasoningEffortCrossCheck:
         with pytest.raises(ConfigurationError, match="does not support reasoning effort"):
             validate_workflow_config(config)
 
+    def test_max_effort_rejected_against_real_hermes_capabilities(self, patch_caps: Any) -> None:
+        """#299: exercise the cross-check against the REAL ``HermesProvider``
+        capability descriptor (not a synthetic mock), so an accidental future
+        widening of ``HermesProvider.CAPABILITIES.reasoning_effort`` to
+        include ``"max"`` is caught here rather than passing silently.
+        """
+        from conductor.providers.hermes import HermesProvider
+
+        patch_caps({"hermes": HermesProvider.CAPABILITIES})
+        config = _build_workflow(
+            agents=[
+                AgentDef(
+                    name="a",
+                    prompt="hi",
+                    provider="hermes",
+                    reasoning=ReasoningConfig(effort="max"),
+                ),
+            ],
+        )
+        with pytest.raises(ConfigurationError, match="supports only.*low.*medium.*high.*xhigh"):
+            validate_workflow_config(config)
+
+    def test_xhigh_effort_passes_against_real_hermes_capabilities(self, patch_caps: Any) -> None:
+        """Companion to the above: confirm the real Hermes tuple still
+        accepts every level it's supposed to (positive control)."""
+        from conductor.providers.hermes import HermesProvider
+
+        patch_caps({"hermes": HermesProvider.CAPABILITIES})
+        config = _build_workflow(
+            agents=[
+                AgentDef(
+                    name="a",
+                    prompt="hi",
+                    provider="hermes",
+                    reasoning=ReasoningConfig(effort="xhigh"),
+                ),
+            ],
+        )
+        validate_workflow_config(config)  # must not raise
+
 
 class TestStructuredOutputCrossCheck:
     def test_schema_against_no_support_errors(self, patch_caps: Any) -> None:

@@ -330,6 +330,12 @@ The unified effort level is translated into Anthropic's
 | `medium` | 8 192         |
 | `high`   | 16 384        |
 | `xhigh`  | 32 768        |
+| `max`    | 59 904        |
+
+`max` is pinned to `64000 − 4096` — the largest budget that still fits the
+default `+ 4096` answer headroom under the 64000-token cap (see
+[auto-coercion](#auto-coercion-of-temperature-and-max_tokens) below). At `max`,
+the effective `max_tokens` lands exactly on the 64000-token cap.
 
 ### Supported models
 

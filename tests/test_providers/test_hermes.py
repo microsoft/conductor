@@ -8,8 +8,8 @@ from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 
-from conductor.config.schema import AgentDef, OutputField
-from conductor.exceptions import ProviderError
+from conductor.config.schema import AgentDef, OutputField, ReasoningConfig
+from conductor.exceptions import ProviderError, ValidationError
 from conductor.providers.hermes import HermesProvider
 
 
@@ -21,6 +21,7 @@ def _make_agent(
     max_session_seconds: float | None = None,
     tools: list[str] | None = None,
     system_prompt: str | None = None,
+    reasoning: ReasoningConfig | None = None,
 ) -> AgentDef:
     return AgentDef(
         name=name,
@@ -30,6 +31,7 @@ def _make_agent(
         max_session_seconds=max_session_seconds,
         tools=tools,
         system_prompt=system_prompt,
+        reasoning=reasoning,
     )
 
 
@@ -750,3 +752,85 @@ class TestHermesClose:
     def test_close_is_noop(self) -> None:
         p = HermesProvider()
         asyncio.run(p.close())  # should not raise
+
+
+class TestHermesReasoningEffort:
+    """#299: HermesProvider.execute() re-checks the resolved reasoning.effort
+    against CAPABILITIES.reasoning_effort at runtime, closing the gap where
+    only the opt-in `conductor validate` static cross-check guarded against
+    an unsupported level (and that check is skipped for templated effort)."""
+
+    @pytest.fixture()
+    def provider(self) -> HermesProvider:
+        with (
+            patch("conductor.providers.hermes.HERMES_SDK_AVAILABLE", True),
+            patch("conductor.providers.hermes.AIAgent"),
+        ):
+            return HermesProvider(model="anthropic/claude-sonnet-4")
+
+    def test_supported_effort_forwarded(self, provider: HermesProvider) -> None:
+        agent = _make_agent(reasoning=ReasoningConfig(effort="high"))
+
+        with patch("conductor.providers.hermes.AIAgent") as mock_cls:
+            mock_instance = Mock()
+            mock_instance.run_conversation.return_value = _make_result()
+            mock_cls.return_value = mock_instance
+
+            asyncio.run(provider.execute(agent, {}, "hello"))
+
+        _, kwargs = mock_cls.call_args
+        assert kwargs["reasoning_config"] == {"effort": "high"}
+
+    def test_max_effort_rejected_at_execute_time(self, provider: HermesProvider) -> None:
+        """A literal `effort: max` is rejected by execute() itself, not just
+        by the opt-in `conductor validate` command."""
+        agent = _make_agent(reasoning=ReasoningConfig(effort="max"))
+
+        with pytest.raises(ValidationError, match="supports only"):
+            asyncio.run(provider.execute(agent, {}, "hello"))
+
+    def test_max_effort_via_runtime_default_rejected(self) -> None:
+        """`runtime.default_reasoning_effort: max` is rejected the same way
+        as a per-agent override."""
+        with (
+            patch("conductor.providers.hermes.HERMES_SDK_AVAILABLE", True),
+            patch("conductor.providers.hermes.AIAgent"),
+        ):
+            provider = HermesProvider(
+                model="anthropic/claude-sonnet-4", default_reasoning_effort="max"
+            )
+        agent = _make_agent()
+
+        with pytest.raises(ValidationError, match="supports only"):
+            asyncio.run(provider.execute(agent, {}, "hello"))
+
+    def test_max_effort_from_rendered_template_rejected(self, provider: HermesProvider) -> None:
+        """A Jinja-templated `reasoning.effort` that only resolves to `max`
+        after rendering is still caught here — the static validator's
+        membership check is skipped for templates, so this runtime re-check
+        is the only guard for this case."""
+        # By the time `execute()` runs, AgentExecutor has already rendered
+        # the template to a concrete literal (mirrors resolve_reasoning_effort's
+        # own documented invariant in providers/reasoning.py).
+        agent = _make_agent(reasoning=ReasoningConfig(effort="max"))
+
+        with pytest.raises(ValidationError, match="supports only"):
+            asyncio.run(provider.execute(agent, {}, "hello"))
+
+    def test_no_effort_set_omits_reasoning_config(self, provider: HermesProvider) -> None:
+        agent = _make_agent()
+
+        with patch("conductor.providers.hermes.AIAgent") as mock_cls:
+            mock_instance = Mock()
+            mock_instance.run_conversation.return_value = _make_result()
+            mock_cls.return_value = mock_instance
+
+            asyncio.run(provider.execute(agent, {}, "hello"))
+
+        _, kwargs = mock_cls.call_args
+        assert "reasoning_config" not in kwargs
+
+    def test_real_capabilities_tuple_excludes_max(self) -> None:
+        """Guard against an accidental future widening of the real
+        CAPABILITIES declaration (as opposed to a test mock)."""
+        assert "max" not in HermesProvider.CAPABILITIES.reasoning_effort

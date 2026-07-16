@@ -109,6 +109,52 @@ class AgentOutput:
     """Whether this output is partial (from a mid-agent interrupt)."""
 
 
+@dataclass(frozen=True)
+class ModelCapabilityInfo:
+    """Provider-reported reasoning-effort and context-window metadata for a model.
+
+    Returned by the optional :meth:`AgentProvider.get_model_capabilities` hook
+    (see issue #301) and surfaced by ``conductor doctor --models``. Every field
+    is best-effort and independently optional — a provider that can report
+    token limits but not reasoning-effort support (or vice versa) should
+    leave the unknown fields at their ``None`` default rather than omit the
+    whole object.
+    """
+
+    supported_reasoning_efforts: list[str] | None = None
+    """Reasoning-effort levels the model accepts, or ``None`` when unknown.
+
+    An empty list is a meaningful, distinct value: it means the provider
+    positively knows the model supports *no* reasoning-effort levels
+    (e.g. a non-thinking Claude model), whereas ``None`` means the provider
+    could not determine support either way.
+    """
+
+    default_reasoning_effort: str | None = None
+    """The model's default reasoning-effort level, or ``None`` when unknown
+    or not applicable."""
+
+    max_prompt_tokens: int | None = None
+    """Maximum prompt (input) tokens, or ``None`` when unknown."""
+
+    max_output_tokens: int | None = None
+    """Maximum output (completion) tokens, or ``None`` when unknown."""
+
+    max_context_window_tokens: int | None = None
+    """Maximum total context window (prompt + output) tokens, or ``None``
+    when unknown."""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-safe representation."""
+        return {
+            "supported_reasoning_efforts": self.supported_reasoning_efforts,
+            "default_reasoning_effort": self.default_reasoning_effort,
+            "max_prompt_tokens": self.max_prompt_tokens,
+            "max_output_tokens": self.max_output_tokens,
+            "max_context_window_tokens": self.max_context_window_tokens,
+        }
+
+
 class AgentProvider(ABC):
     """Abstract base class for SDK providers.
 
@@ -359,5 +405,38 @@ class AgentProvider(ABC):
         Returns:
             A list of available model identifiers, or ``None`` when the
             provider does not enumerate models.
+        """
+        return None
+
+    async def get_model_capabilities(self, model: str) -> ModelCapabilityInfo | None:
+        """Return provider-supplied reasoning-effort and context-window metadata.
+
+        This is the provider hook behind ``conductor doctor --models`` (see
+        issue #301), alongside :meth:`get_max_prompt_tokens` and
+        :meth:`get_model_pricing`. A provider that knows which
+        ``reasoning.effort`` levels a model accepts (and its default), plus
+        its prompt/output/context token limits, should return a
+        :class:`ModelCapabilityInfo` populating whichever fields it can
+        determine — fields the provider can't determine should stay at their
+        ``None`` default rather than causing the whole call to fail.
+
+        Implementations must:
+
+        * Return ``None`` when the model is unknown to the provider, the SDK
+          exposes no usable capability metadata, or the SDK call fails.
+        * Never raise — capability metadata is best-effort and must not
+          interrupt workflow execution or the ``doctor`` command.
+
+        The default implementation returns ``None``, which causes ``doctor``
+        to render every capability column as "n/a" for this provider — a
+        safe degradation matching the sibling hooks above.
+
+        Args:
+            model: The model identifier as it would be sent to the SDK
+                (e.g. ``"gpt-5.2"``, ``"claude-sonnet-4-5-20250929"``).
+
+        Returns:
+            A :class:`ModelCapabilityInfo` when the provider can supply
+            capability metadata for ``model``, otherwise ``None``.
         """
         return None

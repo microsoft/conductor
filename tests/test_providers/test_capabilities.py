@@ -86,6 +86,24 @@ class TestSchemaValidation:
         with pytest.raises(ValueError):
             _stable_capabilities(reasoning_effort=("ultra",))
 
+    def test_max_reasoning_level_accepted(self) -> None:
+        """#299: ``max`` is a valid reasoning-effort capability level."""
+        caps = _stable_capabilities(reasoning_effort=("low", "medium", "high", "xhigh", "max"))
+        assert caps.reasoning_effort == ("low", "medium", "high", "xhigh", "max")
+
+    def test_reasoning_effort_level_is_single_source_of_truth(self) -> None:
+        """#299: ``ReasoningEffortLevel`` must be the same Literal as
+        ``ReasoningEffort`` (re-exported, not re-declared) so the two
+        vocabularies can never drift out of sync — the failure mode this PR
+        was reviewed for."""
+        from typing import get_args
+
+        from conductor.providers.capabilities import ReasoningEffortLevel
+        from conductor.providers.reasoning import ReasoningEffort
+
+        assert ReasoningEffortLevel is ReasoningEffort
+        assert get_args(ReasoningEffortLevel) == get_args(ReasoningEffort)
+
     def test_empty_reasoning_effort_tuple_rejected(self) -> None:
         """Empty tuple is meaningless — None says 'no support', tuple says 'these levels'.
 

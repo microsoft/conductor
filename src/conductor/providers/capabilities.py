@@ -6,11 +6,16 @@ validate`` can statically cross-check workflow features against what the
 provider actually supports. See issue #241 for design rationale.
 
 The schema is intentionally **declarative and provider-agnostic** — no
-top-level Conductor imports here so it can be referenced from anywhere
-without risking circular imports at module load time. The lazy
-:func:`get_capabilities` resolver performs deferred ``importlib`` imports
-of provider modules so callers don't need to instantiate providers (i.e.
-no API keys required for ``validate``).
+top-level imports of provider SDK modules or heavy engine modules here, so
+it can be referenced from anywhere without risking circular imports at
+module load time. The one exception is :data:`ReasoningEffortLevel`, which
+re-exports :data:`conductor.providers.reasoning.ReasoningEffort` as the
+single source of truth for the reasoning-effort vocabulary (#299) —
+``reasoning`` is a narrow leaf module (it depends only on
+``conductor.templating``) so importing it here introduces no cycle. The
+lazy :func:`get_capabilities` resolver performs deferred ``importlib``
+imports of provider modules so callers don't need to instantiate providers
+(i.e. no API keys required for ``validate``).
 """
 
 from __future__ import annotations
@@ -18,6 +23,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Final, Literal
 
 from pydantic import BaseModel, ConfigDict, field_validator
+
+from conductor.providers.reasoning import ReasoningEffort
 
 if TYPE_CHECKING:
     from conductor.providers.base import AgentProvider
@@ -39,8 +46,10 @@ StructuredOutputMode = Literal["native", "prompt_injection", "none"]
 
 # Vocabulary of reasoning effort levels recognized across providers. The
 # capability descriptor lists which subset the provider supports; ``None``
-# means the provider has no reasoning-effort concept at all.
-ReasoningEffortLevel = Literal["low", "medium", "high", "xhigh"]
+# means the provider has no reasoning-effort concept at all. Re-exported
+# from ``providers.reasoning`` (rather than re-declared) so the two Literals
+# can never drift out of sync — see the module docstring above.
+ReasoningEffortLevel = ReasoningEffort
 
 
 class ProviderCapabilities(BaseModel):
@@ -243,7 +252,7 @@ def _build_unimplemented_placeholder() -> ProviderCapabilities:
         workflow_tools_passthrough=True,
         streaming_events=True,
         agent_reasoning_events=True,
-        reasoning_effort=("low", "medium", "high", "xhigh"),
+        reasoning_effort=("low", "medium", "high", "xhigh", "max"),
         structured_output="native",
         interrupt=True,
         max_session_seconds=True,

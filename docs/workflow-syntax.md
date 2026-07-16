@@ -51,7 +51,7 @@ workflow:
     default_model: gpt-5.2
     temperature: 0.7
     max_tokens: 4096
-    default_reasoning_effort: medium  # Optional: low | medium | high | xhigh
+    default_reasoning_effort: medium  # Optional: low | medium | high | xhigh | max
                                       # Workflow-wide default for reasoning /
                                       # extended-thinking effort. Inherited by
                                       # every provider-backed agent unless it
@@ -124,7 +124,7 @@ agents:
       - tool_name
 
     reasoning:                      # Optional: per-agent reasoning override
-      effort: high                  # low | medium | high | xhigh
+      effort: high                  # low | medium | high | xhigh | max
                                     # Overrides runtime.default_reasoning_effort.
                                     # Only valid on type=agent (rejected on
                                     # script, human_gate, workflow).

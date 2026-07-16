@@ -25,7 +25,7 @@ import logging
 import os
 import random
 import time
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol, get_args
 
 from pydantic import BaseModel
 
@@ -35,9 +35,17 @@ from conductor.providers._event_format import (
     extract_tool_result_text,
     format_tool_arguments,
 )
-from conductor.providers.base import AgentOutput, AgentProvider, EventCallback, match_model_id
+from conductor.providers.base import (
+    AgentOutput,
+    AgentProvider,
+    EventCallback,
+    ModelCapabilityInfo,
+    match_model_id,
+)
 from conductor.providers.capabilities import ProviderCapabilities
 from conductor.providers.reasoning import (
+    CLAUDE_ANSWER_HEADROOM_TOKENS,
+    CLAUDE_EXTENDED_THINKING_OUTPUT_CAP,
     ReasoningEffort,
     effort_to_budget_tokens,
     is_claude_thinking_model,
@@ -139,9 +147,9 @@ class ClaudeProvider(AgentProvider):
         # when the model returns it.
         agent_reasoning_events=True,
         # Extended-thinking effort mapped to Anthropic budgets (low=2048,
-        # medium=8192, high=16384, xhigh=32768 tokens — see
+        # medium=8192, high=16384, xhigh=32768, max=59904 tokens — see
         # providers/reasoning.py).
-        reasoning_effort=("low", "medium", "high", "xhigh"),
+        reasoning_effort=("low", "medium", "high", "xhigh", "max"),
         # Tool-based structured output: schema is enforced via a forced
         # tool call rather than prompt injection.
         structured_output="native",
@@ -513,6 +521,58 @@ class ClaudeProvider(AgentProvider):
             return None
         return [model.id for model in page.data]
 
+    async def get_model_capabilities(self, model: str) -> ModelCapabilityInfo | None:
+        """Return reasoning-effort support and prompt-token limits for ``model``.
+
+        Implements the :meth:`AgentProvider.get_model_capabilities` hook (see
+        #301).
+
+        Reasoning-effort support is derived from the same static heuristic
+        used to gate extended thinking (:func:`is_claude_thinking_model`):
+        thinking-capable models (Claude 3.7+ / 4.x) advertise all five
+        :data:`ReasoningEffort` levels; other models advertise an empty list
+        — a definitive "supports none", not "unknown". Anthropic has no
+        notion of a model-specific *default* effort (unlike the Copilot SDK),
+        so ``default_reasoning_effort`` is always ``None``.
+
+        ``max_prompt_tokens`` reuses :meth:`get_max_prompt_tokens` (the
+        Anthropic SDK's ``max_input_tokens``). ``max_output_tokens`` and
+        ``max_context_window_tokens`` are always ``None`` — the Anthropic
+        SDK's ``models.list()`` exposes no output/total-context split.
+
+        Unlike :meth:`get_max_prompt_tokens` (which only catches its
+        documented ``(TimeoutError, AnthropicError, OSError)`` tuple and lets
+        anything else propagate, by design, for its own caller), this hook
+        upholds the base class's stricter "never raise" contract on its own:
+        each field is resolved behind its own guard, so a failure in one
+        (e.g. an unexpected exception from the delegated
+        ``get_max_prompt_tokens`` call, or a non-string ``model``) degrades
+        only that field rather than the whole result or the caller. The
+        reasoning-effort fields are populated even when the SDK is
+        unavailable, ``model`` can't be resolved, or the token-limit lookup
+        fails (the heuristic is a pure name match independent of the SDK
+        call), so this never returns ``None`` outright.
+        """
+        try:
+            supported_reasoning_efforts = (
+                list(get_args(ReasoningEffort)) if is_claude_thinking_model(model) else []
+            )
+        except Exception as e:  # noqa: BLE001 - diagnostics must never raise
+            logger.debug("Failed to resolve reasoning-effort support for %r: %s", model, e)
+            supported_reasoning_efforts = None
+        try:
+            max_prompt_tokens = await self.get_max_prompt_tokens(model)
+        except Exception as e:  # noqa: BLE001 - diagnostics must never raise
+            logger.debug("Failed to resolve max_prompt_tokens for %r: %s", model, e)
+            max_prompt_tokens = None
+        return ModelCapabilityInfo(
+            supported_reasoning_efforts=supported_reasoning_efforts,
+            default_reasoning_effort=None,
+            max_prompt_tokens=max_prompt_tokens,
+            max_output_tokens=None,
+            max_context_window_tokens=None,
+        )
+
     async def _get_mcp_manager_for_cwd(self, resolved_cwd: str) -> MCPManager | None:
         """Return the pooled MCPManager for ``resolved_cwd``, connecting on first use.
 
@@ -738,9 +798,22 @@ class ClaudeProvider(AgentProvider):
                         ),
                     )
                 budget = effort_to_budget_tokens(self._default_reasoning_effort)
-                kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
-                # Thinking requires temperature=1.0 and max_tokens > budget.
-                kwargs["max_tokens"] = max(kwargs["max_tokens"], budget + 4096)
+                thinking = {"type": "enabled", "budget_tokens": budget}
+                kwargs["thinking"] = thinking
+                # Reuse the same clamp/validate logic as the main agentic-loop
+                # path (_coerce_for_thinking) instead of duplicating the
+                # budget + headroom arithmetic here — this keeps dialog turns
+                # subject to the same 64000-token per-model cap and the same
+                # defensive raise if a future budget ever collapses below it.
+                # No temperature kwarg is sent for dialog turns (omitting it
+                # satisfies the Anthropic "1.0 or omitted" requirement), so
+                # only the max_tokens half of the returned tuple is used.
+                _, kwargs["max_tokens"] = self._coerce_for_thinking(
+                    temperature=None,
+                    max_tokens=kwargs["max_tokens"],
+                    model=resolved_model,
+                    thinking=thinking,
+                )
 
             response = await self._client.messages.create(**kwargs)
 
@@ -1357,9 +1430,9 @@ class ClaudeProvider(AgentProvider):
 
         budget = int(thinking.get("budget_tokens", 0))
         # Per-model cap when thinking is enabled. Extended-thinking models
-        # accept up to 64000 output tokens.
-        per_model_cap = 64_000
-        required = budget + 4096
+        # accept up to CLAUDE_EXTENDED_THINKING_OUTPUT_CAP output tokens.
+        per_model_cap = CLAUDE_EXTENDED_THINKING_OUTPUT_CAP
+        required = budget + CLAUDE_ANSWER_HEADROOM_TOKENS
         effective_max_tokens = max(max_tokens, required)
         if effective_max_tokens > per_model_cap:
             logger.info(

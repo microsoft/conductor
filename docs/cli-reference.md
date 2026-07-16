@@ -395,9 +395,52 @@ in the `env` section (cache-first, short timeout, silent, and skipped when
   installed, the capability tier (`stable` / `experimental`), which
   credential environment variables are **present** (presence only — values
   are never printed), and — with `--check` / `--models` — connection status
-  and available models. `openai-agents` is surfaced as "not yet implemented".
+  and a model count. `openai-agents` is surfaced as "not yet implemented".
 - **registries** — configured workflow registries and which is the default
   (see [`conductor registry`](#conductor-registry)).
+
+### Per-model capabilities (`--models`)
+
+Beyond a model count in the Providers table, `--models` renders a separate
+**Models** detail table per provider with each model's reasoning-effort
+support and context-window limits:
+
+| Column | Description |
+|--------|--------------|
+| Model | The model identifier. |
+| Reasoning efforts | `reasoning.effort` levels the model accepts (e.g. `low, medium, high, xhigh`), `none` when the model definitively supports none (e.g. a non-thinking Claude model), or `n/a` when the provider can't determine support. |
+| Default | The model's default reasoning-effort level, or `—` when unknown/not applicable. |
+| Prompt / Output / Context | Maximum prompt (input), output (completion), and total context-window tokens, or `—` when the provider doesn't expose that limit. |
+
+Coverage varies by provider — every field degrades independently to `n/a` /
+`—` rather than failing the command:
+
+- **Copilot** reports reasoning-effort levels + default, and prompt/context
+  token limits, from the SDK's per-model metadata (`Output` is frequently
+  `—` — the live API does not currently populate it for most models).
+- **Claude** derives reasoning-effort support from a static heuristic
+  (Claude 3.7+ / 4.x models support all five levels; older models support
+  none) and reports only `Prompt` (via the Anthropic API's
+  `max_input_tokens`) — `Output` and `Context` are always `—` and `Default`
+  is always `—` (Anthropic has no per-model default-effort concept).
+- **`claude-agent-sdk`**, **`hermes`**, and **`openai-agents`** don't
+  implement model enumeration (`list_models`) at all, so `--models` shows
+  `n/a` for them in the Providers table and they get **no** Models detail
+  table — there is nothing to detail.
+
+In `--json`, each provider's `models` field is a list of objects (not plain
+id strings):
+
+```json
+{
+  "id": "gpt-5.5",
+  "supported_reasoning_efforts": ["low", "medium", "high", "xhigh"],
+  "default_reasoning_effort": "medium",
+  "max_prompt_tokens": 128000,
+  "max_output_tokens": 64000,
+  "max_context_window_tokens": 192000
+}
+```
 
 ### Credential detection
 

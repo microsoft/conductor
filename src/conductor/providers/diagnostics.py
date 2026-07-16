@@ -23,6 +23,7 @@ Design contract:
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
 import platform
 from dataclasses import dataclass, field
@@ -33,6 +34,8 @@ from conductor.providers.capabilities import get_capabilities, known_provider_na
 
 if TYPE_CHECKING:
     from conductor.providers.factory import ProviderType
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -87,6 +90,43 @@ class CredentialEnvVar:
         return {"name": self.name, "present": self.present}
 
 
+@dataclass(frozen=True)
+class ModelDiagnostic:
+    """Diagnostic snapshot of a single model's reasoning-effort and
+    context-window capabilities (issue #301).
+
+    Frozen to match its sibling value objects (:class:`CredentialEnvVar`,
+    :class:`~conductor.providers.base.ModelCapabilityInfo`) — every instance
+    is fully constructed in one step by :func:`_build_model_diagnostics` and
+    never mutated afterward.
+
+    Every capability field mirrors :class:`~conductor.providers.base.ModelCapabilityInfo`
+    and is independently optional — a provider may know a model's token
+    limits but not its reasoning-effort support, or vice versa. ``None``
+    means "unknown"; an empty ``supported_reasoning_efforts`` list means
+    "known to support none" (e.g. a non-thinking Claude model) — the two
+    are deliberately distinct.
+    """
+
+    id: str
+    supported_reasoning_efforts: list[str] | None = None
+    default_reasoning_effort: str | None = None
+    max_prompt_tokens: int | None = None
+    max_output_tokens: int | None = None
+    max_context_window_tokens: int | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-safe representation."""
+        return {
+            "id": self.id,
+            "supported_reasoning_efforts": self.supported_reasoning_efforts,
+            "default_reasoning_effort": self.default_reasoning_effort,
+            "max_prompt_tokens": self.max_prompt_tokens,
+            "max_output_tokens": self.max_output_tokens,
+            "max_context_window_tokens": self.max_context_window_tokens,
+        }
+
+
 @dataclass
 class ProviderDiagnostic:
     """Diagnostic snapshot for a single provider."""
@@ -99,7 +139,7 @@ class ProviderDiagnostic:
     checked: bool = False
     connection_ok: bool | None = None
     connection_error: str | None = None
-    models: list[str] | None = None
+    models: list[ModelDiagnostic] | None = None
     models_error: str | None = None
     note: str | None = None
 
@@ -114,7 +154,7 @@ class ProviderDiagnostic:
             "checked": self.checked,
             "connection_ok": self.connection_ok,
             "connection_error": self.connection_error,
-            "models": self.models,
+            "models": [m.to_dict() for m in self.models] if self.models is not None else None,
             "models_error": self.models_error,
             "note": self.note,
         }
@@ -343,6 +383,37 @@ def gather_registries() -> RegistryDiagnostic:
     return RegistryDiagnostic(default=config.default, registries=registries)
 
 
+async def _build_model_diagnostics(provider: Any, model_ids: list[str]) -> list[ModelDiagnostic]:
+    """Build a :class:`ModelDiagnostic` per model id (never raises).
+
+    Calls ``provider.get_model_capabilities(model_id)`` for each id. A
+    per-model failure degrades that model to id-only (all capability fields
+    ``None``) rather than dropping it from the list or failing the whole
+    ``--models`` probe — one bad model must not hide the rest.
+
+    The ``try`` wraps both the call *and* the read of its result: a
+    misbehaving provider that returns something other than a genuine
+    ``ModelCapabilityInfo`` (or ``None``) must degrade only that one model,
+    not raise out of the loop and silently discard every already-built
+    entry for models processed earlier in this same list.
+    """
+    result: list[ModelDiagnostic] = []
+    for model_id in model_ids:
+        try:
+            caps = await provider.get_model_capabilities(model_id)
+            # ModelCapabilityInfo.to_dict() keys mirror ModelDiagnostic's
+            # capability fields exactly, so it doubles as the kwargs for
+            # constructing this model's diagnostic. A misbehaving provider
+            # whose return value lacks to_dict() (or isn't None) is caught
+            # below and degrades to id-only, same as any other failure.
+            fields = caps.to_dict() if caps is not None else {}
+            result.append(ModelDiagnostic(id=model_id, **fields))
+        except Exception as e:  # noqa: BLE001 - diagnostics must never raise
+            logger.debug("Failed to get model capabilities for %r: %s", model_id, e)
+            result.append(ModelDiagnostic(id=model_id))
+    return result
+
+
 async def gather_provider(
     name: str,
     *,
@@ -406,8 +477,12 @@ async def gather_provider(
 
         if list_models and diag.connection_ok:
             try:
-                models = await provider.list_models()
-                diag.models = list(models) if models is not None else None
+                model_ids = await provider.list_models()
+                diag.models = (
+                    await _build_model_diagnostics(provider, model_ids)
+                    if model_ids is not None
+                    else None
+                )
             except Exception as e:  # noqa: BLE001 - diagnostics must never raise
                 diag.models_error = _format_error(e)
     finally:
@@ -457,6 +532,7 @@ __all__ = [
     "CredentialEnvVar",
     "DoctorReport",
     "EnvDiagnostic",
+    "ModelDiagnostic",
     "ProviderDiagnostic",
     "RegistryDiagnostic",
     "RegistryInfo",

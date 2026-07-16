@@ -21,6 +21,7 @@ from conductor.providers.diagnostics import (
     CredentialEnvVar,
     DoctorReport,
     EnvDiagnostic,
+    ModelDiagnostic,
     ProviderDiagnostic,
     RegistryDiagnostic,
     RegistryInfo,
@@ -61,10 +62,23 @@ def _prov(
     checked: bool = False,
     connection_ok: bool | None = None,
     connection_error: str | None = None,
-    models: list[str] | None = None,
+    models: list[str] | list[ModelDiagnostic] | None = None,
     models_error: str | None = None,
     note: str | None = None,
 ) -> ProviderDiagnostic:
+    """Build a ``ProviderDiagnostic`` for tests.
+
+    ``models`` accepts either plain model-id strings (wrapped into id-only
+    ``ModelDiagnostic`` entries — the common case for tests that don't care
+    about per-model capability fields) or fully-populated ``ModelDiagnostic``
+    instances (for tests exercising reasoning-effort / token-limit
+    rendering).
+    """
+    model_diagnostics = None
+    if models is not None:
+        model_diagnostics = [
+            m if isinstance(m, ModelDiagnostic) else ModelDiagnostic(id=m) for m in models
+        ]
     return ProviderDiagnostic(
         name=name,
         installed=installed,
@@ -74,7 +88,7 @@ def _prov(
         checked=checked,
         connection_ok=connection_ok,
         connection_error=connection_error,
-        models=models,
+        models=model_diagnostics,
         models_error=models_error,
         note=note,
     )
@@ -322,6 +336,153 @@ class TestDoctorFlags:
         assert "more)" not in result.output
         for model in models:
             assert model in result.output
+
+    def test_models_summary_cell_shows_count(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The Providers table's Models column shows a count, not raw ids."""
+        report = DoctorReport(
+            providers=[
+                _prov("copilot", checked=True, connection_ok=True, models=["gpt-5", "gpt-4"])
+            ]
+        )
+        _patch_gather(monkeypatch, report)
+        result = runner.invoke(app, ["doctor", "--models"])
+        assert result.exit_code == 0
+        assert "2 models" in result.output
+
+    def test_model_capabilities_rendered_in_detail_table(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Per-model reasoning-effort and token-limit fields render in the
+        separate Models detail table (#301)."""
+        report = DoctorReport(
+            providers=[
+                _prov(
+                    "copilot",
+                    checked=True,
+                    connection_ok=True,
+                    models=[
+                        ModelDiagnostic(
+                            id="gpt-5.5",
+                            supported_reasoning_efforts=["low", "medium", "high", "xhigh"],
+                            default_reasoning_effort="medium",
+                            max_prompt_tokens=128_000,
+                            max_output_tokens=64_000,
+                            max_context_window_tokens=192_000,
+                        )
+                    ],
+                )
+            ]
+        )
+        _patch_gather(monkeypatch, report)
+        monkeypatch.setattr(_app_module, "output_console", Console(width=200))
+        result = runner.invoke(app, ["doctor", "--models"])
+        assert result.exit_code == 0
+        assert "Models — copilot" in result.output
+        assert "low, medium, high, xhigh" in result.output
+        assert "medium" in result.output
+        assert "128,000" in result.output
+        assert "64,000" in result.output
+        assert "192,000" in result.output
+
+    def test_unknown_model_capabilities_render_as_dash(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Unknown capability fields degrade to n/a / — rather than crashing."""
+        report = DoctorReport(
+            providers=[
+                _prov(
+                    "claude",
+                    checked=True,
+                    connection_ok=True,
+                    models=[ModelDiagnostic(id="claude-3-opus-20240229")],
+                )
+            ]
+        )
+        _patch_gather(monkeypatch, report)
+        result = runner.invoke(app, ["doctor", "--models"])
+        assert result.exit_code == 0
+        # Target the model's own row, not just "n/a" anywhere in the output.
+        model_lines = [line for line in result.output.splitlines() if "claude-3-opus" in line]
+        assert model_lines, "model row not found in output"
+        assert "n/a" in model_lines[0]
+
+    def test_empty_reasoning_efforts_renders_as_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An empty list (definitively 'supports none') renders as 'none',
+        distinct from the 'n/a' shown for unknown (None) support."""
+        report = DoctorReport(
+            providers=[
+                _prov(
+                    "claude",
+                    checked=True,
+                    connection_ok=True,
+                    models=[
+                        ModelDiagnostic(
+                            id="claude-3-5-sonnet-20241022",
+                            supported_reasoning_efforts=[],
+                            max_prompt_tokens=200_000,
+                        )
+                    ],
+                )
+            ]
+        )
+        _patch_gather(monkeypatch, report)
+        result = runner.invoke(app, ["doctor", "--models"])
+        assert result.exit_code == 0
+        model_lines = [line for line in result.output.splitlines() if "claude-3-5-sonnet" in line]
+        assert model_lines, "model row not found in output"
+        assert "none" in model_lines[0]
+        assert "n/a" not in model_lines[0]
+
+    def test_no_detail_table_when_models_empty_or_none(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Providers with no enumerated models don't get an empty detail table."""
+        report = DoctorReport(
+            providers=[
+                _prov("copilot", checked=True, connection_ok=True, models=[]),
+                _prov("claude", checked=True, connection_ok=True, models=None),
+            ]
+        )
+        _patch_gather(monkeypatch, report)
+        result = runner.invoke(app, ["doctor", "--models"])
+        assert result.exit_code == 0
+        assert "Models — copilot" not in result.output
+        assert "Models — claude" not in result.output
+
+    def test_json_includes_model_capability_fields(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The JSON ``models`` field is a list of capability objects, not ids."""
+        report = DoctorReport(
+            providers=[
+                _prov(
+                    "copilot",
+                    checked=True,
+                    connection_ok=True,
+                    models=[
+                        ModelDiagnostic(
+                            id="gpt-5.5",
+                            supported_reasoning_efforts=["low", "medium"],
+                            default_reasoning_effort="low",
+                            max_prompt_tokens=128_000,
+                            max_output_tokens=64_000,
+                            max_context_window_tokens=192_000,
+                        )
+                    ],
+                )
+            ]
+        )
+        _patch_gather(monkeypatch, report)
+        result = runner.invoke(app, ["doctor", "--models", "--json"])
+        assert result.exit_code == 0
+        data = json.loads(result.stdout)
+        model = data["providers"][0]["models"][0]
+        assert model == {
+            "id": "gpt-5.5",
+            "supported_reasoning_efforts": ["low", "medium"],
+            "default_reasoning_effort": "low",
+            "max_prompt_tokens": 128_000,
+            "max_output_tokens": 64_000,
+            "max_context_window_tokens": 192_000,
+        }
 
 
 # ---------------------------------------------------------------------------

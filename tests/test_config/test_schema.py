@@ -1341,14 +1341,14 @@ class TestWorkflowConfigWithForEach:
 class TestAgentDefReasoning:
     """Tests for the reasoning field on AgentDef."""
 
-    @pytest.mark.parametrize("effort", ["low", "medium", "high", "xhigh"])
+    @pytest.mark.parametrize("effort", ["low", "medium", "high", "xhigh", "max"])
     def test_accepts_valid_effort(self, effort: str) -> None:
         """Test that AgentDef accepts each valid effort level."""
         agent = AgentDef(name="a", model="gpt-4", prompt="test", reasoning={"effort": effort})
         assert agent.reasoning is not None
         assert agent.reasoning.effort == effort
 
-    @pytest.mark.parametrize("effort", ["none", "max", 42])
+    @pytest.mark.parametrize("effort", ["none", "ultra", 42])
     def test_rejects_invalid_effort(self, effort: object) -> None:
         """Test that invalid effort values raise ValidationError."""
         with pytest.raises(ValidationError):
@@ -1477,7 +1477,7 @@ class TestAgentDefReasoningTemplating:
         assert agent.reasoning is not None
         assert agent.reasoning.effort == tmpl
 
-    @pytest.mark.parametrize("effort", ["ultra", "none", "max"])
+    @pytest.mark.parametrize("effort", ["ultra", "none", "extreme"])
     def test_literal_invalid_effort_still_rejected(self, effort: str) -> None:
         """A non-templated invalid literal still raises at schema time."""
         with pytest.raises(ValidationError):
@@ -1694,13 +1694,13 @@ class TestRuntimeConfigDefaultReasoningEffort:
         config = RuntimeConfig(default_reasoning_effort=None)
         assert config.default_reasoning_effort is None
 
-    @pytest.mark.parametrize("effort", ["low", "medium", "high", "xhigh"])
+    @pytest.mark.parametrize("effort", ["low", "medium", "high", "xhigh", "max"])
     def test_accepts_valid_effort(self, effort: str) -> None:
         """Test that each valid effort level is accepted."""
         config = RuntimeConfig(default_reasoning_effort=effort)  # type: ignore[arg-type]
         assert config.default_reasoning_effort == effort
 
-    @pytest.mark.parametrize("effort", ["none", "max", "extreme", 42, ""])
+    @pytest.mark.parametrize("effort", ["none", "extreme", 42, ""])
     def test_rejects_invalid_effort(self, effort: object) -> None:
         """Test that invalid effort values raise ValidationError."""
         with pytest.raises(ValidationError):

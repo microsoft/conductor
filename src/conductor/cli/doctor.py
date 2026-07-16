@@ -22,6 +22,7 @@ from conductor.providers.diagnostics import (
     ALL_SECTIONS,
     DoctorReport,
     EnvDiagnostic,
+    ModelDiagnostic,
     ProviderDiagnostic,
     RegistryDiagnostic,
     gather,
@@ -94,6 +95,8 @@ def run_doctor(
         _render_env(report.env, console)
     if report.providers is not None:
         _render_providers(report.providers, console, check=check, models=models)
+        if models:
+            _render_models(report.providers, console)
     if report.registries is not None:
         _render_registries(report.registries, console)
 
@@ -248,20 +251,80 @@ def _connection_cell(diag: ProviderDiagnostic) -> str:
 
 
 def _models_cell(diag: ProviderDiagnostic) -> str:
-    """Format the models cell.
+    """Format the models cell in the Providers summary table.
 
-    Lists every model id (comma-separated); Rich wraps the cell to the column
-    width. The leading count makes long lists scannable. ``n/a`` when models
-    is None (not enumerated), ``(none)`` for an empty list.
+    Shows a count/status only — per-model reasoning-effort and
+    context-window details are rendered in the separate Models detail table
+    (see :func:`_render_models`) below the Providers table. ``n/a`` when
+    models is ``None`` (not enumerated), ``(none)`` for an empty list.
     """
     if diag.models_error:
         return f"{_CROSS} [dim]{escape(diag.models_error)}[/dim]"
     if diag.models is None:
         return "[dim]n/a[/dim]"
-    if not diag.models:
+    count = len(diag.models)
+    if not count:
         return "[dim](none)[/dim]"
-    shown = ", ".join(escape(model) for model in diag.models)
-    return f"[dim]{len(diag.models)}:[/dim] {shown}"
+    return f"{_CHECK} {count} model{'s' if count != 1 else ''}"
+
+
+def _format_tokens(value: int | None) -> str:
+    """Format a token-limit value with grouped digits, or ``—`` when unknown."""
+    if value is None:
+        return _DASH
+    return f"{value:,}"
+
+
+def _efforts_cell(model: ModelDiagnostic) -> str:
+    """Format the supported-reasoning-efforts cell.
+
+    ``n/a`` when unknown (``None``), ``none`` for a definitive empty list
+    (e.g. a non-thinking Claude model), otherwise a comma-separated list.
+    """
+    if model.supported_reasoning_efforts is None:
+        return "[dim]n/a[/dim]"
+    if not model.supported_reasoning_efforts:
+        return "[dim]none[/dim]"
+    return ", ".join(escape(effort) for effort in model.supported_reasoning_efforts)
+
+
+def _default_effort_cell(model: ModelDiagnostic) -> str:
+    """Format the default-reasoning-effort cell."""
+    if model.default_reasoning_effort is None:
+        return _DASH
+    return escape(model.default_reasoning_effort)
+
+
+def _render_models(providers: list[ProviderDiagnostic], console: Console) -> None:
+    """Render a per-provider Models detail table (``--models`` only).
+
+    One table per provider that returned at least one model, with columns
+    for reasoning-effort support and prompt/output/context token limits.
+    Providers with no models (``None``/empty/error) are already summarized
+    in the Providers table and are skipped here — there is nothing to detail.
+    """
+    for diag in providers:
+        if not diag.models:
+            continue
+        table = Table(title=f"Models — {diag.name}", show_lines=True)
+        table.add_column("Model", style="cyan", no_wrap=True)
+        table.add_column("Reasoning efforts")
+        table.add_column("Default")
+        table.add_column("Prompt", justify="right")
+        table.add_column("Output", justify="right")
+        table.add_column("Context", justify="right")
+
+        for model in diag.models:
+            table.add_row(
+                escape(model.id),
+                _efforts_cell(model),
+                _default_effort_cell(model),
+                _format_tokens(model.max_prompt_tokens),
+                _format_tokens(model.max_output_tokens),
+                _format_tokens(model.max_context_window_tokens),
+            )
+
+        console.print(table)
 
 
 def _render_registries(registries: RegistryDiagnostic, console: Console) -> None:

@@ -162,6 +162,38 @@ def test_fresh_install(sandbox: Sandbox, wheels: WheelPair) -> None:
     assert version == "0.0.2", f"expected 0.0.2, got {version!r}\n{result.combined}"
 
 
+@pytest.mark.skipif(IS_WINDOWS, reason="POSIX shell-profile isolation check")
+def test_install_does_not_touch_shell_profiles(
+    sandbox: Sandbox, wheels: WheelPair, tmp_path: Path
+) -> None:
+    """The install script must not edit the user's shell profiles under test.
+
+    Regression guard: ``install.sh`` once ran ``uv tool update-shell``
+    unconditionally, which appended each test's throwaway
+    ``UV_TOOL_BIN_DIR`` to the developer's real ``~/.zshenv`` and shadowed
+    their actual conductor install with a stale ``v0.0.2`` test fixture
+    (``uv tool update-shell`` deliberately edits the shell and ignores
+    ``UV_NO_MODIFY_PATH``). The install scripts now honor
+    ``CONDUCTOR_INSTALL_SKIP_PATH_UPDATE=1`` — set by default in
+    :func:`run_install_script` — to skip that step.
+    """
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+
+    result = run_install_script(sandbox, source=wheels.new, extra_env={"HOME": str(fake_home)})
+    _assert_install_ok(result, "0.0.2")
+
+    assert "Skipping shell PATH update" in result.combined, (
+        f"install script did not honor CONDUCTOR_INSTALL_SKIP_PATH_UPDATE:\n{result.combined}"
+    )
+
+    profiles = (".zshenv", ".zshrc", ".zprofile", ".bashrc", ".bash_profile", ".profile")
+    touched = [name for name in profiles if (fake_home / name).exists()]
+    assert not touched, (
+        f"install script modified shell profiles {touched} despite skip hook:\n{result.combined}"
+    )
+
+
 def test_upgrade_clean(sandbox: Sandbox, wheels: WheelPair) -> None:
     """Seed an old install; upgrade via the install script; verify new version."""
     seed_install(sandbox, wheels.old)
