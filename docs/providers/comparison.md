@@ -20,7 +20,7 @@ This guide helps you choose between GitHub Copilot, Anthropic Claude, Claude Age
 | **Cost Predictability** | High (flat rate) | Variable (usage-based) | Variable | Variable (usage-based) |
 | **Multi-provider** | No | Yes (via Conductor) | No | Yes (native) |
 | **Agentic Loop** | SDK-managed | Manual (provider code) | SDK-managed (delegated to CLI) | SDK-managed (delegated to hermes) |
-| **Structured Output** | Prompt injection | Native | Prompt injection | Prompt injection |
+| **Structured Output** | Prompt injection | Native (forced tool call) | Prompt injection | Prompt injection |
 | **Session Resume** | Yes | No | No | Yes |
 
 > **About the experimental tier.** `claude-agent-sdk` and `hermes` declare
@@ -78,7 +78,7 @@ agents:
 2. **You want fine-grained cost control** — Pay only for what you use; scale to zero when idle
 3. **You value reasoning quality** — Claude excels at analysis, synthesis, and following complex instructions
 4. **Light/intermittent usage** — Pay-per-use is cheaper than a subscription at low volumes
-5. **You need reliable structured output** — Native schema enforcement more robust than prompt injection
+5. **You need reliable structured output**: Conductor enforces native schemas via a forced tool call, making it more reliable than prompt injection.
 
 ### Example Claude Workflow
 

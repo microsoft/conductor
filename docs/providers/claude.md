@@ -11,6 +11,7 @@ The Claude provider enables Conductor workflows to use Anthropic's Claude models
 - [System Prompt](#system-prompt)
 - [Streaming Limitations](#streaming-limitations)
 - [Extended Thinking](#extended-thinking)
+- [Structured Output](#structured-output)
 - [Troubleshooting](#troubleshooting)
 - [Cost Optimization](#cost-optimization)
 
@@ -374,6 +375,34 @@ emits the same event shape so workflows that mix providers render consistently.
 
 See [`examples/reasoning-effort.yaml`](../../examples/reasoning-effort.yaml) for
 a runnable end-to-end example.
+
+## Structured Output
+
+The Claude provider enforces structured outputs natively by converting the `output` schema into an Anthropic tool definition.
+
+### Forced Tool Choice
+
+When you configure an agent with a defined `output` schema and don't declare any MCP tools, Conductor uses Anthropic's forced tool choice parameter. It sends the following configuration in the API request:
+
+```json
+{
+  "tool_choice": {
+    "type": "tool",
+    "name": "emit_output",
+    "disable_parallel_tool_use": true
+  }
+}
+```
+
+This forces the model to call the synthetic `emit_output` tool, which prevents the model from returning unstructured prose. Such enforcement aligns with the provider's capability contract declared as `CAPABILITIES.structured_output = "native"`.
+
+### Coexistence with MCP Tools
+
+If the agent has registered MCP tools, forced tool choice is disabled. The model needs to remain free to call any of the available MCP tools multiple times before concluding. In this case, Conductor instructs the model to return its final answer through the `emit_output` tool, but doesn't enforce it at the API parameter level.
+
+### Interaction with Extended Thinking
+
+Combining forced tool choice with Anthropic's extended thinking is not fully verified across all models. API support depends on Anthropic's backend validation rules. If the API rejects the request with a `400 BadRequestError` due to this combination, Conductor catches the error and raises a clear `ValidationError`. The error message will suggest adjusting the `reasoning.effort` setting or using a different model.
 
 ## Troubleshooting
 

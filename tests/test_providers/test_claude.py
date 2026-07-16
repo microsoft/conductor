@@ -3703,6 +3703,8 @@ class TestClaudeMCPManagerPool:
 
         assert manager is not None
         assert instances[0].connected[0]["cwd"] == os.getcwd()
+
+
 class TestClaudeToolChoice:
     """Tests for forced ``tool_choice`` on the ``emit_output`` synthetic tool.
 
