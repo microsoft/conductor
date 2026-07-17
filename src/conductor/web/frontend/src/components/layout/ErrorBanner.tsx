@@ -3,6 +3,7 @@ import { AlertTriangle, CheckCircle2, X, Eye, Square } from 'lucide-react';
 import { useWorkflowStore } from '@/stores/workflow-store';
 import { formatCost, formatTokens, cn } from '@/lib/utils';
 import { useElapsedTimer } from '@/hooks/use-elapsed-timer';
+import { nodeKey } from '@/lib/node-id';
 
 export function WorkflowErrorBanner() {
   const workflowStatus = useWorkflowStore((s) => s.workflowStatus);
@@ -59,7 +60,7 @@ export function WorkflowErrorBanner() {
           </div>
           {workflowFailedAgent && (
             <button
-              onClick={() => selectNode(workflowFailedAgent)}
+              onClick={() => selectNode(nodeKey([], workflowFailedAgent))}
               className="flex items-center gap-1 px-2 py-1 rounded text-[10px] font-medium text-slate-200 bg-slate-500/20 hover:bg-slate-500/30 transition-colors flex-shrink-0 ml-1"
             >
               <Eye className="w-3 h-3" />
@@ -113,7 +114,7 @@ export function WorkflowErrorBanner() {
         </div>
         {workflowFailedAgent && (
           <button
-            onClick={() => selectNode(workflowFailedAgent)}
+            onClick={() => selectNode(nodeKey([], workflowFailedAgent))}
             className="flex items-center gap-1 px-2 py-1 rounded text-[10px] font-medium text-red-300 bg-red-500/20 hover:bg-red-500/30 transition-colors flex-shrink-0 ml-1"
           >
             <Eye className="w-3 h-3" />

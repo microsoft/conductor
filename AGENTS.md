@@ -124,7 +124,8 @@ step-by-step checklist.
 
 - **web/**: Real-time web dashboard for workflow visualization
   - `server.py` - FastAPI + uvicorn server with WebSocket broadcasting, late-joiner state replay, and `POST /api/stop` + `POST /api/kill` endpoints. `/api/stop` interrupts/pauses the current agent (a user can then Resume or Kill); if it arrives before the engine binds its interrupt event, it is latched via `_pending_stop` and drained by `set_interrupt_event` so the startup window takes the graceful pause path instead of a progress-losing hard stop. `/api/kill` hard-stops the run. Whenever a stop/kill actually *terminates* the run (cancels the engine task), it routes through `handle_dashboard_stop` so a best-effort checkpoint is written (or its absence explained) — see `handle_dashboard_stop` above (issue #245).
-  - `static/index.html` - Single-file Cytoscape.js frontend with DAG graph, agent detail panel, and streaming activity
+  - `frontend/` - React 19 + TypeScript dashboard source (Vite + Tailwind). Renders the workflow DAG with **React Flow** (`@xyflow/react`) laid out via dagre, a Zustand store (`stores/workflow-store.ts`), an agent detail panel, and streaming activity. Build with `make build-frontend` (outputs to `static/`); unit tests via `make test-frontend` (Vitest). Subworkflow nodes support inline expand/collapse (nested React Flow containers, collapsed by default) in addition to double-click drill-down — see issue #314.
+  - `static/` - Built dashboard assets served by `server.py` (generated from `frontend/` by `make build-frontend`; committed to the repo). Not edited by hand.
 
 - **events.py**: Pub/sub event system decoupling workflow execution from rendering (console, web dashboard)
 
