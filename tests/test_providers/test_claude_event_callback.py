@@ -13,11 +13,29 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from conductor.mcp.manager import _GENERIC_HINT, _TRUNCATION_MARKER_PREFIX
 from conductor.providers.claude import ClaudeProvider
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _truncated_tool_result(
+    original: int = 2000,
+    kept: int = 1000,
+    spill_path: str | None = None,
+    hint: str = _GENERIC_HINT,
+) -> str:
+    """Build a result that looks like a truncated MCP tool output."""
+    base = "x" * kept
+    if spill_path:
+        return (
+            f"{base}\n\n[{_TRUNCATION_MARKER_PREFIX[1:]} "
+            f"{original} chars -> {kept} kept; "
+            f"full output saved to: {spill_path}. {hint}]"
+        )
+    return f"{base}\n\n[{_TRUNCATION_MARKER_PREFIX[1:]} {original} chars -> {kept} kept. {hint}]"
 
 
 def _make_tool_use_block(name: str, input_data: dict[str, Any] | None = None) -> MagicMock:
@@ -405,19 +423,22 @@ class TestAgentToolEvents:
         assert start_events[0][1]["arguments"].endswith("…")
 
     @pytest.mark.asyncio
-    async def test_tool_result_truncated(self) -> None:
-        """Tool results longer than 500 chars should be truncated."""
+    async def test_truncation_event_with_spill_path(self) -> None:
+        """Truncated result with spill emits agent_tool_output_truncated with path."""
         provider = _make_provider_with_mcp()
         events: list[tuple[str, dict[str, Any]]] = []
 
         mcp_response = _make_response(
             [
-                _make_tool_use_block("my_tool", {"key": "val"}),
+                _make_tool_use_block("filesystem__read_file", {"path": "/tmp/test.txt"}),
             ]
         )
         text_response = _make_response([_make_text_block("Done")])
         provider._execute_api_call = AsyncMock(side_effect=[mcp_response, text_response])
-        provider._mock_mcp_manager.call_tool = AsyncMock(return_value="y" * 600)
+        truncated_result = _truncated_tool_result(
+            original=2000, kept=1000, spill_path="/tmp/spill.txt"
+        )
+        provider._mock_mcp_manager.call_tool = AsyncMock(return_value=truncated_result)
 
         await provider._execute_agentic_loop(
             messages=[{"role": "user", "content": "test"}],
@@ -431,11 +452,109 @@ class TestAgentToolEvents:
             mcp_manager=getattr(provider, "_mock_mcp_manager", None),
         )
 
-        complete_events = [(t, d) for t, d in events if t == "agent_tool_complete"]
-        assert len(complete_events) == 1
-        # Truncated to 500 chars + a single-char "…" ellipsis when long.
-        assert len(complete_events[0][1]["result"]) <= 501
-        assert complete_events[0][1]["result"].endswith("…")
+        truncation_events = [(t, d) for t, d in events if t == "agent_tool_output_truncated"]
+        assert len(truncation_events) == 1
+        assert truncation_events[0][1]["tool_name"] == "filesystem__read_file"
+        assert truncation_events[0][1]["original_chars"] == 2000
+        assert truncation_events[0][1]["kept_chars"] == 1000
+        assert truncation_events[0][1]["spill_path"] == "/tmp/spill.txt"
+
+    @pytest.mark.asyncio
+    async def test_truncation_event_without_spill_path(self) -> None:
+        """Truncated result without spill emits agent_tool_output_truncated with None path."""
+        provider = _make_provider_with_mcp()
+        events: list[tuple[str, dict[str, Any]]] = []
+
+        mcp_response = _make_response(
+            [
+                _make_tool_use_block("web_search__search", {"query": "test"}),
+            ]
+        )
+        text_response = _make_response([_make_text_block("Done")])
+        provider._execute_api_call = AsyncMock(side_effect=[mcp_response, text_response])
+        truncated_result = _truncated_tool_result(original=1500, kept=1000, spill_path=None)
+        provider._mock_mcp_manager.call_tool = AsyncMock(return_value=truncated_result)
+
+        await provider._execute_agentic_loop(
+            messages=[{"role": "user", "content": "test"}],
+            model="claude-3-5-sonnet-latest",
+            temperature=None,
+            max_tokens=8192,
+            tools=None,
+            output_schema=None,
+            has_output_schema=False,
+            event_callback=lambda t, d: events.append((t, d)),
+            mcp_manager=getattr(provider, "_mock_mcp_manager", None),
+        )
+
+        truncation_events = [(t, d) for t, d in events if t == "agent_tool_output_truncated"]
+        assert len(truncation_events) == 1
+        assert truncation_events[0][1]["tool_name"] == "web_search__search"
+        assert truncation_events[0][1]["original_chars"] == 1500
+        assert truncation_events[0][1]["kept_chars"] == 1000
+        assert truncation_events[0][1]["spill_path"] is None
+
+    @pytest.mark.asyncio
+    async def test_no_truncation_event_for_non_truncated_result(self) -> None:
+        """Non-truncated results should not emit agent_tool_output_truncated."""
+        provider = _make_provider_with_mcp()
+        events: list[tuple[str, dict[str, Any]]] = []
+
+        mcp_response = _make_response(
+            [
+                _make_tool_use_block("filesystem__read_file", {"path": "/tmp/test.txt"}),
+            ]
+        )
+        text_response = _make_response([_make_text_block("Done")])
+        provider._execute_api_call = AsyncMock(side_effect=[mcp_response, text_response])
+        provider._mock_mcp_manager.call_tool = AsyncMock(return_value="file content here")
+
+        await provider._execute_agentic_loop(
+            messages=[{"role": "user", "content": "test"}],
+            model="claude-3-5-sonnet-latest",
+            temperature=None,
+            max_tokens=8192,
+            tools=None,
+            output_schema=None,
+            has_output_schema=False,
+            event_callback=lambda t, d: events.append((t, d)),
+            mcp_manager=getattr(provider, "_mock_mcp_manager", None),
+        )
+
+        truncation_events = [(t, d) for t, d in events if t == "agent_tool_output_truncated"]
+        assert len(truncation_events) == 0
+
+    @pytest.mark.asyncio
+    async def test_truncation_event_no_callback(self) -> None:
+        """Truncated result with no callback should not raise."""
+        provider = _make_provider_with_mcp()
+
+        mcp_response = _make_response(
+            [
+                _make_tool_use_block("filesystem__read_file", {"path": "/tmp/test.txt"}),
+            ]
+        )
+        text_response = _make_response([_make_text_block("Done")])
+        provider._execute_api_call = AsyncMock(side_effect=[mcp_response, text_response])
+        truncated_result = _truncated_tool_result(
+            original=2000, kept=1000, spill_path="/tmp/spill.txt"
+        )
+        provider._mock_mcp_manager.call_tool = AsyncMock(return_value=truncated_result)
+
+        response, tokens, partial = await provider._execute_agentic_loop(
+            messages=[{"role": "user", "content": "test"}],
+            model="claude-3-5-sonnet-latest",
+            temperature=None,
+            max_tokens=8192,
+            tools=None,
+            output_schema=None,
+            has_output_schema=False,
+            event_callback=None,
+            mcp_manager=getattr(provider, "_mock_mcp_manager", None),
+        )
+
+        assert response is text_response
+        assert partial is False
 
 
 # ---------------------------------------------------------------------------

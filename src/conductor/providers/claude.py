@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import random
+import re
 import time
 from typing import Any, Protocol, get_args
 
@@ -1829,6 +1830,25 @@ class ClaudeProvider(AgentProvider):
                         tool_use.name, dict(tool_use.input) if hasattr(tool_use, "input") else {}
                     )
                     result = self._maybe_rewrite_truncation_hint(result, tools)
+
+                    truncation_info = self._parse_truncation_marker(result)
+                    if truncation_info is not None and event_callback:
+                        try:
+                            event_callback(
+                                "agent_tool_output_truncated",
+                                {
+                                    "tool_name": tool_use.name,
+                                    "original_chars": truncation_info["original_chars"],
+                                    "kept_chars": truncation_info["kept_chars"],
+                                    "spill_path": truncation_info["spill_path"],
+                                },
+                            )
+                        except Exception:
+                            logger.debug(
+                                "Error in event_callback for agent_tool_output_truncated",
+                                exc_info=True,
+                            )
+
                     tool_results.append(
                         {
                             "type": "tool_result",
@@ -2506,6 +2526,53 @@ class ClaudeProvider(AgentProvider):
             return result
 
         return result.replace(_GENERIC_HINT, _FS_HINT)
+
+    def _parse_truncation_marker(
+        self,
+        result: str,
+    ) -> dict[str, Any] | None:
+        """Parse truncation metadata from the marker appended to a result.
+
+        The marker is generated in ``MCPManager._maybe_truncate_response`` and
+        always has the form::
+
+            [output truncated: {original} chars -> {kept} kept{; optional path}. {HINT}]
+
+        This method detects the marker only in the trailing 400 characters of
+        ``result`` to avoid matching unrelated text. The marker is parsed from
+        the local string so no shared mutable state is needed, which keeps the
+        parser safe when the same MCP manager is reused across parallel agents.
+
+        Args:
+            result: The possibly truncated MCP tool result string.
+
+        Returns:
+            A dict with ``original_chars``, ``kept_chars``, and ``spill_path``
+            (``None`` when the marker omits a path), or ``None`` when the
+            result is not truncated.
+        """
+        if not result or _TRUNCATION_MARKER_PREFIX not in result[-400:]:
+            return None
+
+        tail = result[-400:]
+        match = re.search(
+            re.escape(_TRUNCATION_MARKER_PREFIX) + r"\s*(\d+)\s*chars\s*-\u003e\s*(\d+)\s*kept"
+            r"(?:;\s*full output saved to:\s*(.+?))?(?=\.\s)",
+            tail,
+        )
+
+        if not match:
+            return None
+
+        original_chars = int(match.group(1))
+        kept_chars = int(match.group(2))
+        spill_path = match.group(3).strip() if match.group(3) else None
+
+        return {
+            "original_chars": original_chars,
+            "kept_chars": kept_chars,
+            "spill_path": spill_path,
+        }
 
     def _has_fs_like_tool(self, tools: list[dict[str, Any]] | None) -> bool:
         """Return True if any tool looks like a filesystem/shell tool.
