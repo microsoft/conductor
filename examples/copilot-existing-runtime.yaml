@@ -3,14 +3,14 @@
 # By default conductor's Copilot provider spawns its own nested `copilot`
 # runtime process to execute agents. This example instead points conductor
 # at an EXISTING runtime that some other process started in server mode
-# (e.g. `copilot --server --port 3000`). Conductor connects to that runtime
-# via the SDK's `RuntimeConnection.for_uri(...)` and reuses its single
-# authenticated session for every agent — no nested `copilot` process is
-# spawned, and authentication is handled once, at the server.
+# (e.g. `copilot --headless --port 3000`). Conductor connects to that runtime
+# via the SDK's `RuntimeConnection.for_uri(...)`. Agents share the authenticated
+# runtime process but keep separate SDK sessions; no nested `copilot` process
+# is spawned.
 #
 # This is the recommended pattern for running conductor inside an external
 # orchestrator that already owns an authenticated Copilot process (for
-# example, an orchestrator launches one authenticated `copilot --server`
+# example, an orchestrator launches one authenticated `copilot --headless`
 # and hands conductor a connection handle).
 #
 # Two ways to configure the connection:
@@ -20,20 +20,24 @@
 #
 # 2. Environment variables (no YAML needed — ideal for orchestrators):
 #
+#      export COPILOT_CONNECTION_TOKEN=<connection-token>
+#      copilot --headless --port 3000 &
 #      export COPILOT_PROVIDER_RUNTIME_URL=localhost:3000
-#      export COPILOT_PROVIDER_RUNTIME_TOKEN=<connection-token>
+#      export COPILOT_PROVIDER_RUNTIME_TOKEN="$COPILOT_CONNECTION_TOKEN"
 #      conductor run examples/copilot-existing-runtime.yaml \
 #        --input question="What is Python?"
 #
 #    The YAML value takes precedence; the env var is a fallback.
 #
 # Notes:
-# - `runtime_url` accepts a bare "port", "host:port", or a full URL.
+# - `runtime_url` accepts a bare "port", "host:port", or a full URL. URL
+#   schemes do not add TLS; the SDK transport is raw TCP.
 # - `runtime_token` is the shared secret the runtime was started with (if
 #   any). It is stored as a SecretStr and redacted from events/checkpoints;
 #   prefer ${VAR} interpolation so the literal never lands in YAML.
-# - `runtime_url` is mutually exclusive with custom endpoint routing
-#   (base_url / api_key / type / ...): the external runtime IS the endpoint.
+# - `runtime_url` can be combined with custom model-provider routing. It selects
+#   the CLI transport, while base_url / api_key / type configure model calls.
+# - A remote/container runtime must see the workspace at the same working path.
 # - Closing conductor does NOT terminate the external runtime — the SDK only
 #   shuts down runtimes it spawned itself.
 
@@ -46,7 +50,7 @@ workflow:
   runtime:
     provider:
       name: copilot
-      # Where the already-running `copilot --server` is listening.
+      # Where the already-running `copilot --headless` process is listening.
       runtime_url: ${COPILOT_PROVIDER_RUNTIME_URL:-localhost:3000}
     # Optional shared secret the server was started with. Uncomment and set
     # $COPILOT_RUNTIME_TOKEN if your server requires a connection token

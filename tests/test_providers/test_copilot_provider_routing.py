@@ -8,7 +8,7 @@ main agent session and dialog turns.
 from __future__ import annotations
 
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from pydantic import SecretStr
@@ -426,6 +426,47 @@ class TestDescribeProviderRedaction:
 
         assert _describe_provider(ProviderSettings(name="copilot")) == "copilot"
 
+    def test_external_runtime_is_rendered_with_redacted_token(self) -> None:
+        from conductor.cli.run import _describe_provider
+
+        secret = "runtime-secret"
+        settings = ProviderSettings(
+            name="copilot",
+            runtime_url="localhost:3000",
+            runtime_token=secret,
+        )
+        rendered = _describe_provider(settings)
+
+        assert rendered == "copilot runtime_url=localhost:3000 runtime_token=***"
+        assert secret not in rendered
+
+
+class TestProviderOverride:
+    """Structured provider settings must be visibly discarded by CLI overrides."""
+
+    def test_external_runtime_override_logs_discard_warning(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import importlib
+        from types import SimpleNamespace
+
+        run_mod = importlib.import_module("conductor.cli.run")
+        runtime = RuntimeConfig(
+            provider=ProviderSettings(name="copilot", runtime_url="localhost:3000")
+        )
+        config = SimpleNamespace(workflow=SimpleNamespace(runtime=runtime))
+        messages: list[str] = []
+        monkeypatch.setattr(
+            run_mod,
+            "verbose_log",
+            lambda message, style="dim": messages.append(message),
+        )
+
+        run_mod._apply_provider_override(config, "copilot")
+
+        assert runtime.provider == ProviderSettings(name="copilot")
+        assert any("discards structured runtime.provider settings" in msg for msg in messages)
+
 
 class TestRegistryForwardsSettings:
     """``ProviderRegistry`` forwards ``ProviderSettings`` only to the matching provider."""
@@ -569,10 +610,15 @@ class TestResolveRuntimeConnection:
 
     def test_build_client_default_spawns(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """No runtime connection → default ``CopilotClient()`` (spawns runtime)."""
+        import conductor.providers.copilot as copilot_mod
+
         monkeypatch.delenv("COPILOT_PROVIDER_RUNTIME_URL", raising=False)
+        client = object()
+        client_factory = MagicMock(return_value=client)
+        monkeypatch.setattr(copilot_mod, "CopilotClient", client_factory)
         provider = _make_provider()
-        client = provider._build_client()
-        assert client._is_external_server is False
+        assert provider._build_client() is client
+        client_factory.assert_called_once_with()
 
     def test_build_client_connects_to_external_runtime(
         self, monkeypatch: pytest.MonkeyPatch
@@ -616,13 +662,21 @@ class TestResolveRuntimeConnection:
         provider = _make_provider()
         assert provider._resolve_runtime_connection() == ("host:1", None)
 
-    def test_build_client_rejects_runtime_plus_custom_routing(
+    def test_build_client_allows_runtime_plus_custom_routing(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """An env-supplied runtime URL combined with YAML custom endpoint routing
-        must fail fast rather than silently connecting to the external runtime."""
+        """Runtime transport and per-session model routing are independent."""
+        import conductor.providers.copilot as copilot_mod
+
         monkeypatch.setenv("COPILOT_PROVIDER_RUNTIME_URL", "host:9000")
         monkeypatch.delenv("COPILOT_PROVIDER_RUNTIME_TOKEN", raising=False)
+        connection = object()
+        runtime_connection = MagicMock()
+        runtime_connection.for_uri.return_value = connection
+        client = object()
+        client_factory = MagicMock(return_value=client)
+        monkeypatch.setattr(copilot_mod, "RuntimeConnection", runtime_connection)
+        monkeypatch.setattr(copilot_mod, "CopilotClient", client_factory)
         s = ProviderSettings.model_validate(
             {
                 "name": "copilot",
@@ -632,8 +686,17 @@ class TestResolveRuntimeConnection:
             }
         )
         provider = _make_provider(provider_settings=s, model="ollama/llama3")
-        with pytest.raises(ProviderError, match="mutually exclusive"):
-            provider._build_client()
+        assert provider._build_client() is client
+        runtime_connection.for_uri.assert_called_once_with("host:9000", connection_token=None)
+        client_factory.assert_called_once_with(connection=connection)
+
+        session_kwargs: dict[str, Any] = {}
+        provider._apply_provider_config(session_kwargs)
+        assert session_kwargs["provider"] == {
+            "type": "openai",
+            "base_url": "http://localhost:11434/v1",
+            "api_key": "sk-yaml",
+        }
 
     def test_build_client_raises_when_runtime_connection_unavailable(
         self, monkeypatch: pytest.MonkeyPatch

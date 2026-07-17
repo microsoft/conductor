@@ -58,6 +58,7 @@ _CREDENTIAL_ENV_VARS: dict[str, tuple[str, ...]] = {
         "GH_TOKEN",
         "COPILOT_PROVIDER_API_KEY",
         "COPILOT_PROVIDER_BEARER_TOKEN",
+        "COPILOT_PROVIDER_RUNTIME_TOKEN",
     ),
     "claude": ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"),
     "claude-agent-sdk": ("ANTHROPIC_API_KEY",),

@@ -373,31 +373,15 @@ class TestExternalRuntimeConnection:
                 {"name": "copilot", "base_url": "http://x/v1", "api_key": "   "}
             )
 
-    @pytest.mark.parametrize(
-        "field,value",
-        [
-            ("base_url", "http://x/v1"),
-            ("api_key", "k"),
-            ("bearer_token", "t"),
-            ("type", "openai"),
-            ("wire_api", "completions"),
-            ("headers", {"X-Foo": "1"}),
-        ],
-    )
-    def test_runtime_url_mutually_exclusive_with_custom_routing(
-        self, field: str, value: object
-    ) -> None:
-        # Anchor fields (base_url/api_key/bearer_token) trip the dedicated
-        # mutual-exclusion check; non-anchor routing fields (type/wire_api/
-        # headers) trip the pre-existing "cannot stand alone" rule first.
-        # Either way the combination is rejected at config load.
-        with pytest.raises(ValidationError, match="cannot be combined with|cannot stand alone"):
-            ProviderSettings(  # type: ignore[arg-type]
-                name="copilot", runtime_url="localhost:3000", **{field: value}
-            )
-
-    def test_runtime_url_with_anchor_field_reports_mutual_exclusion(self) -> None:
-        """An anchor routing field alongside ``runtime_url`` reports the
-        dedicated mutual-exclusion error (not the anchorless one)."""
-        with pytest.raises(ValidationError, match="cannot be combined with"):
-            ProviderSettings(name="copilot", runtime_url="localhost:3000", base_url="http://x/v1")
+    def test_runtime_url_combines_with_custom_routing(self) -> None:
+        s = ProviderSettings(
+            name="copilot",
+            runtime_url="localhost:3000",
+            type="openai",
+            wire_api="completions",
+            base_url="http://localhost:11434/v1",
+            api_key="local",
+        )
+        assert s.has_external_runtime()
+        assert s.has_custom_routing()
+        assert s.has_structured_config()

@@ -280,7 +280,8 @@ class CopilotProvider(AgentProvider):
                 the resolved SDK ``ProviderConfig`` is attached to every
                 ``create_session`` call (both agent execution and dialog
                 turns), enabling custom OpenAI-compatible / Azure / Anthropic
-                endpoints. Env-var fallbacks
+                endpoints. ``runtime_url`` instead selects an existing Copilot
+                CLI process and can be combined with that routing. Env-var fallbacks
                 (``COPILOT_PROVIDER_BASE_URL`` → ``OPENAI_BASE_URL``,
                 ``COPILOT_PROVIDER_API_KEY`` → ``OPENAI_API_KEY``,
                 ``COPILOT_PROVIDER_BEARER_TOKEN``) fill missing fields once
@@ -484,9 +485,10 @@ class CopilotProvider(AgentProvider):
         The environment variables activate the connection on their own (no
         YAML required), which is the intended zero-config path for external
         orchestrators: they launch one authenticated
-        ``copilot --server`` and export these two variables. The variables are
-        namespaced (``COPILOT_PROVIDER_*``) specifically so unrelated ambient
-        shell state cannot silently divert default Copilot traffic.
+        ``copilot --headless`` process and export these two variables. The
+        variables are namespaced (``COPILOT_PROVIDER_*``) specifically so
+        unrelated ambient shell state cannot silently divert default Copilot
+        traffic.
         """
         settings = self._provider_settings
 
@@ -2107,24 +2109,14 @@ class CopilotProvider(AgentProvider):
         runtime instead of spawning a nested ``copilot`` child process. The
         SDK's ``start()`` skips process spawning for URI connections and its
         ``stop()`` leaves the externally-owned server running, so Conductor
-        reuses the server's single authenticated session for every agent.
+        reuses the authenticated runtime process while creating a separate SDK
+        session for each agent.
         """
         connection = self._resolve_runtime_connection()
         if connection is None:
             return CopilotClient()
 
         url, token = connection
-        if self._provider_settings is not None and self._provider_settings.has_custom_routing():
-            raise ProviderError(
-                "An external runtime connection (runtime_url) cannot be combined with custom "
-                "endpoint routing in runtime.provider; connecting to an existing runtime and "
-                "custom endpoint routing are mutually exclusive (the runtime is the endpoint).",
-                suggestion=(
-                    "Unset COPILOT_PROVIDER_RUNTIME_URL or remove base_url/api_key/"
-                    "bearer_token/type/wire_api/headers/azure from runtime.provider."
-                ),
-                is_retryable=False,
-            )
         if RuntimeConnection is None:
             raise ProviderError(
                 "Connecting to an existing Copilot runtime (runtime_url) requires a "
@@ -2285,17 +2277,29 @@ class CopilotProvider(AgentProvider):
                 is_retryable=False,
             )
 
+        external_runtime = False
         try:
+            external_runtime = self._resolve_runtime_connection() is not None
             await self._ensure_client_started()
             return True
+        except ProviderError:
+            raise
         except Exception as e:
-            raise ProviderError(
-                f"Failed to connect to Copilot SDK: {e}",
-                suggestion=(
+            if external_runtime:
+                suggestion = (
+                    "Verify the external Copilot runtime is running and reachable at "
+                    "runtime.provider.runtime_url / COPILOT_PROVIDER_RUNTIME_URL, and that "
+                    "COPILOT_PROVIDER_RUNTIME_TOKEN matches COPILOT_CONNECTION_TOKEN."
+                )
+            else:
+                suggestion = (
                     "Ensure the Copilot CLI is installed and you have an active "
                     "GitHub Copilot subscription. Install CLI: "
                     "https://docs.github.com/en/copilot/how-tos/set-up/install-copilot-cli"
-                ),
+                )
+            raise ProviderError(
+                f"Failed to connect to Copilot SDK: {e}",
+                suggestion=suggestion,
                 is_retryable=False,
             ) from e
 

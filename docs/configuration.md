@@ -239,16 +239,17 @@ By default the Copilot provider spawns its own nested `copilot` runtime
 process (one per provider instance) to run agents. Instead, you can point
 Conductor at an **already-running** Copilot runtime that was started in
 server mode by some other process. Conductor then connects to that runtime
-and reuses its single authenticated session for every agent — no nested
-`copilot` process is spawned.
+and reuses the authenticated runtime process for every agent. Each agent
+still gets its own SDK session, and no nested `copilot` process is spawned.
 
 This is the recommended way to run Conductor inside an external
 orchestrator that already owns an authenticated Copilot process. For
 example, an orchestrator can launch one authenticated
-`copilot --server` and hand Conductor a connection handle, so all of
+`copilot --headless` process and hand Conductor a connection handle, so all of
 Conductor's agents/models are just new sessions on that shared server.
 Authentication is handled once, at the server — Conductor never needs the
-runtime's credentials.
+runtime's GitHub credentials. The optional runtime connection token only
+authenticates access to the server socket.
 
 #### YAML
 
@@ -263,7 +264,8 @@ workflow:
 ```
 
 - `runtime_url` — where the running runtime is listening. Accepts a bare
-  `"port"`, `"host:port"`, or a full URL.
+  `"port"`, `"host:port"`, or a full URL. URL schemes are parsing syntax only:
+  the SDK opens a raw TCP connection and does not provide TLS.
 - `runtime_token` — the shared secret the runtime was started with, if
   any. Stored as a `SecretStr` (redacted in events/checkpoints/dashboard);
   prefer `${VAR}` interpolation. Requires `runtime_url`.
@@ -285,23 +287,31 @@ connection because they are specific to this feature.
 
 ```bash
 # Orchestrator side, conceptually:
-copilot --server --port 3000 &            # one authenticated runtime
+export COPILOT_CONNECTION_TOKEN=<connection-token>
+copilot --headless --port 3000 &          # one authenticated runtime
 export COPILOT_PROVIDER_RUNTIME_URL=localhost:3000
-export COPILOT_PROVIDER_RUNTIME_TOKEN=<connection-token>
+export COPILOT_PROVIDER_RUNTIME_TOKEN="$COPILOT_CONNECTION_TOKEN"
 conductor run review.yaml                 # connects; spawns no nested runtime
 ```
 
 #### Rules and notes
 
-- `runtime_url` is **mutually exclusive** with custom endpoint routing
-  (`base_url` / `api_key` / `bearer_token` / `type` / `wire_api` /
-  `headers` / `azure`) — the external runtime *is* the endpoint. The schema
-  rejects the combination at config load.
+- `runtime_url` may be combined with custom model-provider routing. The runtime
+  URL selects the CLI transport; `base_url` / `api_key` / related fields are
+  forwarded on each SDK session to select the model endpoint.
 - `runtime_token` requires `runtime_url` (a token with nowhere to connect
   is a misconfiguration) and, like the other secrets, may not be empty.
+- The connection token authenticates the socket but does not encrypt it. Keep
+  the default loopback binding where possible. Remote runtimes require
+  `copilot --headless --host ...` plus a trusted private network, firewall, or
+  TLS tunnel.
+- The external runtime executes against its own host environment. If it runs in
+  another container or machine, make the Conductor workspace available at the
+  same working-directory path.
 - Closing the provider does **not** terminate the external runtime — the
   SDK only shuts down runtimes it spawned itself, so the orchestrator-owned
-  server keeps running.
+  server keeps running. The orchestrator is also responsible for runtime
+  health checks and restarts.
 - Runtime-spawn-only options (custom CLI path, injected env, etc.) do not
   apply when connecting to an existing runtime.
 

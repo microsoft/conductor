@@ -375,7 +375,7 @@ values are never read or printed. Detected variables per provider:
 
 | Provider | Environment variables |
 |----------|-----------------------|
-| `copilot` | `GITHUB_TOKEN`, `GH_TOKEN`, `COPILOT_PROVIDER_API_KEY`, `COPILOT_PROVIDER_BEARER_TOKEN` |
+| `copilot` | `GITHUB_TOKEN`, `GH_TOKEN`, `COPILOT_PROVIDER_API_KEY`, `COPILOT_PROVIDER_BEARER_TOKEN`, `COPILOT_PROVIDER_RUNTIME_TOKEN` |
 | `claude` | `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` |
 | `claude-agent-sdk` | `ANTHROPIC_API_KEY` |
 | `hermes` | *(none — endpoint / API key are passed explicitly)* |

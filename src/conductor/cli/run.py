@@ -31,7 +31,7 @@ from conductor.providers.registry import ProviderRegistry
 
 if TYPE_CHECKING:
     from conductor.config.instructions import DiscoveredInstruction
-    from conductor.config.schema import ProviderSettings
+    from conductor.config.schema import ProviderSettings, WorkflowConfig
     from conductor.events import WorkflowEvent
 
 
@@ -197,10 +197,10 @@ def verbose_log(message: str, style: str = "dim") -> None:
 def _describe_provider(provider: ProviderSettings) -> str:
     """Render a redacted single-line description of provider settings.
 
-    Used in verbose logs to surface custom routing without leaking
-    ``api_key`` or ``bearer_token`` values from ``SecretStr`` fields.
+    Used in verbose logs to surface structured provider settings without
+    leaking values from ``SecretStr`` fields.
     """
-    if not provider.has_custom_routing():
+    if not provider.has_structured_config():
         return provider.name
     parts: list[str] = [provider.name]
     if provider.type:
@@ -217,7 +217,27 @@ def _describe_provider(provider: ProviderSettings) -> str:
         parts.append(f"headers={sorted(provider.headers)}")
     if provider.azure is not None and provider.azure.api_version:
         parts.append(f"azure.api_version={provider.azure.api_version}")
+    if provider.runtime_url:
+        parts.append(f"runtime_url={provider.runtime_url}")
+    if provider.runtime_token is not None:
+        parts.append("runtime_token=***")
     return " ".join(parts)
+
+
+def _apply_provider_override(config: WorkflowConfig, provider_override: str | None) -> None:
+    """Replace runtime provider settings, warning when structured config is dropped."""
+    if not provider_override:
+        return
+
+    had_structured = config.workflow.runtime.provider.has_structured_config()
+    verbose_log(f"Provider override: {provider_override}", style="yellow")
+    if had_structured:
+        verbose_log(
+            "Provider override discards structured runtime.provider settings "
+            "(routing/runtime connection/etc.) from YAML; using SDK defaults.",
+            style="yellow",
+        )
+    config.workflow.runtime.provider = provider_override  # type: ignore[assignment]
 
 
 def verbose_log_agent_start(agent_name: str, iteration: int) -> None:
@@ -1630,17 +1650,8 @@ async def run_workflow_async(
         # Reassigning ``runtime.provider`` to a string re-triggers the
         # before-validator on ``RuntimeConfig`` and coerces it back to a
         # ``ProviderSettings`` with default fields, intentionally
-        # discarding any structured custom-routing config from YAML.
-        if provider_override:
-            had_custom = config.workflow.runtime.provider.has_custom_routing()
-            verbose_log(f"Provider override: {provider_override}", style="yellow")
-            if had_custom:
-                verbose_log(
-                    "Provider override discards structured runtime.provider settings "
-                    "(base_url/type/etc.) from YAML; using SDK defaults.",
-                    style="yellow",
-                )
-            config.workflow.runtime.provider = provider_override  # type: ignore[assignment]
+        # discarding any structured provider config from YAML.
+        _apply_provider_override(config, provider_override)
 
         # Build workspace instructions preamble
         instructions_preamble: str | None = None
@@ -2156,16 +2167,7 @@ async def resume_workflow_async(
 
         # Apply provider override if specified (parity with run).
         # See ``run_workflow_async`` for why we re-validate via assignment.
-        if provider_override:
-            had_custom = config.workflow.runtime.provider.has_custom_routing()
-            verbose_log(f"Provider override: {provider_override}", style="yellow")
-            if had_custom:
-                verbose_log(
-                    "Provider override discards structured runtime.provider settings "
-                    "(base_url/type/etc.) from YAML; using SDK defaults.",
-                    style="yellow",
-                )
-            config.workflow.runtime.provider = provider_override  # type: ignore[assignment]
+        _apply_provider_override(config, provider_override)
 
         # Verify the current_agent exists in the workflow
         agent_names = {a.name for a in config.agents}

@@ -2,10 +2,11 @@
 
 import contextlib
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
-from conductor.config.schema import AgentDef
+from conductor.config.schema import AgentDef, ProviderSettings
 from conductor.exceptions import ProviderError
 from conductor.providers.copilot import CopilotProvider, RetryConfig, SDKResponse
 
@@ -24,6 +25,22 @@ class TestCopilotProvider:
         provider = CopilotProvider(mock_handler=stub_handler)
         result = await provider.validate_connection()
         assert result is True
+
+    @pytest.mark.asyncio
+    async def test_validate_external_runtime_connection_error(self) -> None:
+        """External runtime failures should not recommend installing a local CLI."""
+        provider = CopilotProvider(
+            provider_settings=ProviderSettings(name="copilot", runtime_url="localhost:3000")
+        )
+        provider._ensure_client_started = AsyncMock(  # type: ignore[method-assign]
+            side_effect=ConnectionRefusedError("connection refused")
+        )
+
+        with pytest.raises(ProviderError) as exc_info:
+            await provider.validate_connection()
+
+        assert "external Copilot runtime" in (exc_info.value.suggestion or "")
+        assert "COPILOT_PROVIDER_RUNTIME_TOKEN" in (exc_info.value.suggestion or "")
 
     @pytest.mark.asyncio
     async def test_close(self) -> None:

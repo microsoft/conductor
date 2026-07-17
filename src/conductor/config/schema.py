@@ -1638,18 +1638,17 @@ class ProviderSettings(BaseModel):
 
     - String shorthand: ``provider: copilot`` (equivalent to
       ``provider: {name: copilot}``).
-    - Object form: enables routing the Copilot SDK at custom endpoints
-      such as Azure OpenAI, Ollama, vLLM, LM Studio, or any other
-      OpenAI-compatible server. Object fields beyond ``name`` are
-      currently supported only for ``name: copilot``; they are forwarded
-      verbatim to ``copilot.client.create_session(provider=...)``.
+    - Object form: configures custom model-provider routing, an existing
+      Copilot runtime connection, or both. Copilot routing fields are forwarded
+      to ``copilot.client.create_session(provider=...)``; runtime fields select
+      how the SDK reaches the Copilot CLI process.
 
-    When any field beyond ``name`` is set, the Copilot provider activates
-    "custom routing" mode and fills any missing field from environment
-    variables (see :meth:`has_custom_routing`).
+    Custom routing activates only when a routing field is set and fills missing
+    values from environment variables (see :meth:`has_custom_routing`). Runtime
+    connection settings are tracked separately by :meth:`has_external_runtime`.
 
     The model is frozen after construction (``frozen=True``) because
-    custom routing is set-once at config load. This avoids the
+    structured provider settings are set once at config load. This avoids the
     Pydantic gotcha where ``model_validator(mode="after")``
     cross-field invariants do not re-fire on per-attribute assignment
     even with ``validate_assignment=True``.
@@ -1718,15 +1717,15 @@ class ProviderSettings(BaseModel):
     Accepts ``"port"``, ``"host:port"``, or a full URL. When set, the Copilot
     provider connects to the external runtime via the SDK's
     ``RuntimeConnection.for_uri(...)`` — no child ``copilot`` process is
-    spawned, so every agent/model reuses the server's single authenticated
-    session. This is the recommended way to run Conductor inside an external
-    orchestrator that already owns an authenticated
-    ``copilot --server`` process.
+    spawned. Agents share the authenticated runtime process while retaining
+    separate SDK sessions. This is the recommended way to run Conductor inside
+    an external orchestrator that already owns an authenticated
+    ``copilot --headless`` process.
 
     Falls back to the ``COPILOT_PROVIDER_RUNTIME_URL`` environment variable
-    when not set in YAML. Mutually exclusive with custom endpoint routing
-    (``base_url`` / ``api_key`` / ``bearer_token`` / ``type`` / ``wire_api`` /
-    ``headers`` / ``azure``): the external runtime *is* the endpoint.
+    when not set in YAML. May be combined with custom model-provider routing:
+    the runtime URL selects the CLI transport, while ``base_url`` / ``api_key``
+    and related fields configure the model endpoint for each SDK session.
 
     Example::
 
@@ -1887,31 +1886,6 @@ class ProviderSettings(BaseModel):
                 "'azure' block is empty; either set azure.api_version or remove the block"
             )
 
-        # Connecting to an external runtime (runtime_url) is mutually
-        # exclusive with custom endpoint routing — the runtime *is* the
-        # endpoint, so a base_url / api_key / etc. alongside it is
-        # contradictory and would silently be ignored at the SDK boundary.
-        if self.runtime_url is not None:
-            routing_conflicts = sorted(
-                k
-                for k, v in {
-                    "base_url": self.base_url,
-                    "api_key": self.api_key,
-                    "bearer_token": self.bearer_token,
-                    "type": self.type,
-                    "wire_api": self.wire_api,
-                    "headers": self.headers,
-                    "azure": self.azure,
-                }.items()
-                if v is not None
-            )
-            if routing_conflicts:
-                raise ValueError(
-                    f"'runtime_url' cannot be combined with {routing_conflicts}; connecting "
-                    "to an existing runtime and custom endpoint routing are mutually exclusive "
-                    "(the runtime is the endpoint)."
-                )
-
         # A connection token is meaningless without a URL to connect to.
         if self.runtime_token is not None and self.runtime_url is None:
             raise ValueError("'runtime_token' requires 'runtime_url' to also be set")
@@ -1955,6 +1929,10 @@ class ProviderSettings(BaseModel):
         """
         return self.runtime_url is not None
 
+    def has_structured_config(self) -> bool:
+        """Return True when the provider has any non-default structured settings."""
+        return self.has_custom_routing() or self.has_external_runtime()
+
     @model_serializer(mode="wrap")
     def _serialize(self, nxt: Any) -> Any:
         """Collapse to bare string when only ``name`` is set.
@@ -1965,7 +1943,7 @@ class ProviderSettings(BaseModel):
         not as ``{"name": "copilot"}``. Once any structured field is set,
         the full object is emitted.
         """
-        if not self.has_custom_routing() and not self.has_external_runtime():
+        if not self.has_structured_config():
             return self.name
         return nxt(self)
 
