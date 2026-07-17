@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Literal
 
+from conductor.config.schema import ToolOutputConfig
 from conductor.exceptions import ProviderError
 from conductor.providers.base import AgentProvider
 from conductor.providers.claude import ANTHROPIC_SDK_AVAILABLE, ClaudeProvider
@@ -40,6 +41,7 @@ async def create_provider(
     default_reasoning_effort: ReasoningEffort | None = None,
     default_context_tier: ContextTier | None = None,
     provider_settings: ProviderSettings | None = None,
+    tool_output: ToolOutputConfig | None = None,
 ) -> AgentProvider:
     """Factory function to create the appropriate provider.
 
@@ -70,6 +72,9 @@ async def create_provider(
         provider_settings: Structured ``runtime.provider`` settings for custom
             model routing and/or an external runtime connection. Forwarded only
             to the matching provider type.
+        tool_output: MCP tool result output-size configuration. Defines the
+            per-result character limit and spill-to-file behavior for MCP
+            tool outputs. ``None`` means the provider uses its defaults.
 
     Returns:
         Configured AgentProvider instance.
@@ -98,6 +103,7 @@ async def create_provider(
                 default_reasoning_effort=default_reasoning_effort,
                 default_context_tier=default_context_tier,
                 provider_settings=provider_settings,
+                tool_output=tool_output,
             )
         case "openai-agents":
             raise ProviderError(
@@ -127,6 +133,7 @@ async def create_provider(
                 default_reasoning_effort=default_reasoning_effort,
                 auth_token=claude_auth_token,
                 base_url=claude_base_url,
+                tool_output=tool_output,
             )
         case "hermes":
             if not HERMES_SDK_AVAILABLE:
@@ -269,6 +276,7 @@ class ProviderFactory:
         max_agent_iterations = getattr(runtime_config, "max_agent_iterations", None)
         default_reasoning_effort = getattr(runtime_config, "default_reasoning_effort", None)
         default_context_tier = getattr(runtime_config, "default_context_tier", None)
+        tool_output = getattr(runtime_config, "tool_output", None)
 
         return await create_provider(
             provider_type=provider_type,
@@ -282,4 +290,5 @@ class ProviderFactory:
             default_reasoning_effort=default_reasoning_effort,
             default_context_tier=default_context_tier,
             provider_settings=provider_settings,
+            tool_output=tool_output,
         )

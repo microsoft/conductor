@@ -18,6 +18,7 @@ from conductor.config.schema import (
     ReasoningConfig,
     RouteDef,
     RuntimeConfig,
+    ToolOutputConfig,
     ValidatorConfig,
     WorkflowConfig,
     WorkflowDef,
@@ -276,6 +277,71 @@ class TestCheckpointConfig:
         assert runtime.checkpoint.every_seconds == 120
         assert runtime.checkpoint.keep_last == 3
         assert runtime.checkpoint.is_enabled is True
+
+
+class TestToolOutputConfig:
+    """Tests for ToolOutputConfig model (MCP tool result size limits)."""
+
+    def test_default_values(self) -> None:
+        """ToolOutputConfig defaults to enabled with 50000-char limit."""
+        config = ToolOutputConfig()
+        assert config.enabled is True
+        assert config.max_chars == 50000
+        assert config.spill_to_file is True
+        assert config.spill_dir is None
+
+    def test_max_chars_bound(self) -> None:
+        """max_chars must be at least 1000."""
+        with pytest.raises(ValidationError):
+            ToolOutputConfig(max_chars=999)
+        with pytest.raises(ValidationError):
+            ToolOutputConfig(max_chars=0)
+        assert ToolOutputConfig(max_chars=1000).max_chars == 1000
+
+    def test_disabled_config(self) -> None:
+        """ToolOutputConfig can be explicitly disabled."""
+        config = ToolOutputConfig(enabled=False)
+        assert config.enabled is False
+        assert config.max_chars == 50000
+
+    def test_spill_to_file_false(self) -> None:
+        """ToolOutputConfig can disable spill-to-file."""
+        config = ToolOutputConfig(spill_to_file=False)
+        assert config.spill_to_file is False
+
+    def test_spill_dir_explicit(self) -> None:
+        """ToolOutputConfig accepts an explicit spill directory."""
+        config = ToolOutputConfig(spill_dir="/tmp/custom")
+        assert config.spill_dir == "/tmp/custom"
+
+    def test_extra_fields_forbidden(self) -> None:
+        """Typos like max_char should be rejected, not silently ignored."""
+        with pytest.raises(ValidationError):
+            ToolOutputConfig(max_char=1000)  # type: ignore[call-arg]
+
+    def test_runtime_config_default_tool_output(self) -> None:
+        """RuntimeConfig exposes a default ToolOutputConfig by default."""
+        runtime = RuntimeConfig()
+        assert isinstance(runtime.tool_output, ToolOutputConfig)
+        assert runtime.tool_output.enabled is True
+        assert runtime.tool_output.max_chars == 50000
+        assert runtime.tool_output.spill_to_file is True
+        assert runtime.tool_output.spill_dir is None
+
+    def test_runtime_config_parses_tool_output_block(self) -> None:
+        """RuntimeConfig parses a structured tool_output block."""
+        runtime = RuntimeConfig(
+            tool_output={
+                "enabled": False,
+                "max_chars": 2000,
+                "spill_to_file": False,
+                "spill_dir": "./tool-output",
+            }
+        )
+        assert runtime.tool_output.enabled is False
+        assert runtime.tool_output.max_chars == 2000
+        assert runtime.tool_output.spill_to_file is False
+        assert runtime.tool_output.spill_dir == "./tool-output"
 
 
 class TestHooksConfig:

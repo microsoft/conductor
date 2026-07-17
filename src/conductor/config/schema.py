@@ -2031,6 +2031,51 @@ class CheckpointConfig(BaseModel):
         return self.every_agent or self.every_seconds is not None
 
 
+class ToolOutputConfig(BaseModel):
+    """MCP tool result output-size configuration.
+
+    Controls how the result of each individual MCP tool call is handled when it
+    exceeds a per-result character limit. This is a per-result cap, not a
+    cumulative context-window budget: each tool result is evaluated
+    independently against ``max_chars``.
+
+    When ``spill_to_file`` is enabled, the full oversized result is written to
+    a process-private temporary file and the model receives a truncated prefix
+    plus a marker pointing to that file. When disabled, the result is simply
+    truncated to the limit (provider-specific behavior may differ, e.g. the
+    Copilot SDK disables large-output handling entirely).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    """Whether per-result MCP tool output size limiting is active."""
+
+    max_chars: int = Field(default=50000, ge=1000)
+    """Maximum number of characters to retain from each individual tool result.
+
+    Results longer than this are truncated; the kept prefix is delivered to
+    the model and the remainder is either spilled to a file or discarded
+    according to ``spill_to_file``.
+    """
+
+    spill_to_file: bool = True
+    """Whether oversized results should be written to a temporary file.
+
+    When ``True``, the full result is persisted to disk and a marker containing
+    the file path is appended to the truncated prefix. When ``False``, no file is
+    created and truncation is applied in-place.
+    """
+
+    spill_dir: str | None = None
+    """Directory used for spilled tool output files.
+
+    ``None`` (the default) resolves to ``<tempfile.gettempdir()>/conductor/tool-output``.
+    Relative paths are resolved against the current working directory of the
+    process. Parent directories are created automatically if needed.
+    """
+
+
 class RuntimeConfig(BaseModel):
     """Provider and runtime configuration."""
 
@@ -2144,6 +2189,14 @@ class RuntimeConfig(BaseModel):
     Opt-in automatic checkpointing at step boundaries so stalled or killed
     long-running workflows stay resumable. Defaults to off (failure-only
     checkpoints). See :class:`CheckpointConfig`.
+    """
+
+    tool_output: ToolOutputConfig = Field(default_factory=ToolOutputConfig)
+    """MCP tool result output-size configuration.
+
+    Controls per-result truncation and spill-to-file behavior for MCP tool
+    outputs. Defaults to enabled with a 50000-character limit and spill-to-file
+    active. See :class:`ToolOutputConfig`.
     """
 
     default_context_tier: ContextTier | None = None

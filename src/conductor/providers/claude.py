@@ -25,12 +25,14 @@ import logging
 import os
 import random
 import time
-from typing import TYPE_CHECKING, Any, Protocol, get_args
+from typing import Any, Protocol, get_args
 
 from pydantic import BaseModel
 
+from conductor.config.schema import AgentDef, OutputField, ToolOutputConfig
 from conductor.exceptions import ProviderError, ValidationError
 from conductor.executor.output import validate_output
+from conductor.mcp.manager import MCPManager
 from conductor.providers._event_format import (
     extract_tool_result_text,
     format_tool_arguments,
@@ -51,10 +53,6 @@ from conductor.providers.reasoning import (
     is_claude_thinking_model,
     resolve_reasoning_effort,
 )
-
-if TYPE_CHECKING:
-    from conductor.config.schema import AgentDef, OutputField
-    from conductor.mcp.manager import MCPManager
 
 # Try to import the Anthropic SDK
 try:
@@ -187,6 +185,7 @@ class ClaudeProvider(AgentProvider):
         max_agent_iterations: int | None = None,
         max_session_seconds: float | None = None,
         default_reasoning_effort: ReasoningEffort | None = None,
+        tool_output: ToolOutputConfig | None = None,
     ) -> None:
         """Initialize the Claude provider.
 
@@ -220,6 +219,9 @@ class ClaudeProvider(AgentProvider):
                 value. Only valid on extended-thinking models — a per-agent
                 model that does not support thinking will raise
                 ``ValidationError`` at execute time.
+            tool_output: MCP tool result output-size configuration. Defines the
+                per-result character limit and spill-to-file behavior for MCP
+                tool outputs. ``None`` means the default configuration is used.
 
         Raises:
             ProviderError: If SDK is not installed.
@@ -256,6 +258,7 @@ class ClaudeProvider(AgentProvider):
         )
         self._default_max_session_seconds = max_session_seconds
         self._default_reasoning_effort: ReasoningEffort | None = default_reasoning_effort
+        self._tool_output_config = tool_output or ToolOutputConfig()
 
         # MCP server configuration for tool support.
         # Managers are pooled by resolved working directory: each distinct

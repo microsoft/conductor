@@ -18,6 +18,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, TypeGuard
 
+from conductor.config.schema import ToolOutputConfig
 from conductor.exceptions import ProviderError, ValidationError
 from conductor.providers._event_format import (
     extract_tool_result_text,
@@ -260,6 +261,7 @@ class CopilotProvider(AgentProvider):
         default_reasoning_effort: ReasoningEffort | None = None,
         default_context_tier: ContextTier | None = None,
         provider_settings: ProviderSettings | None = None,
+        tool_output: ToolOutputConfig | None = None,
     ) -> None:
         """Initialize the Copilot provider.
 
@@ -297,6 +299,9 @@ class CopilotProvider(AgentProvider):
                 ``COPILOT_PROVIDER_BEARER_TOKEN``) fill missing fields once
                 custom routing is activated; ambient OpenAI env vars never
                 activate custom routing on their own.
+            tool_output: MCP tool result output-size configuration. Defines the
+                per-result character limit and spill-to-file behavior for MCP
+                tool outputs. ``None`` means the default configuration is used.
         """
         self._client: Any = None  # Will hold Copilot SDK client
         self._mock_handler = mock_handler
@@ -324,6 +329,7 @@ class CopilotProvider(AgentProvider):
         self._interrupted_session: Any = None
         self._abort_supported: bool | None = None
         self._provider_settings = provider_settings
+        self._tool_output_config = tool_output or ToolOutputConfig()
         self._warn_custom_routing_default_model()
 
     @staticmethod
