@@ -15,6 +15,7 @@ export type EventType =
   | 'agent_reasoning'
   | 'agent_tool_start'
   | 'agent_tool_complete'
+  | 'agent_tool_output_truncated'
   | 'agent_turn_start'
   | 'agent_message'
   | 'script_started'
@@ -163,6 +164,14 @@ export interface AgentToolCompleteData {
   agent_name: string;
   tool_name?: string;
   result?: string;
+}
+
+export interface AgentToolOutputTruncatedData {
+  agent_name: string;
+  tool_name?: string;
+  original_chars?: number;
+  kept_chars?: number;
+  spill_path?: string;
 }
 
 export interface AgentTurnStartData {
