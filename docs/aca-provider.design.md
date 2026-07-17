@@ -3,6 +3,8 @@
 > Source issue: [microsoft/conductor#284](https://github.com/microsoft/conductor/issues/284)
 > — *Idea: run agents inside Azure Container Apps sandboxes via a remote `aca`
 > provider (Agent-in-Sandbox)*. Status: `idea` (speculative, not yet committed).
+> The blocking Phase 0 transport spike ([#312](https://github.com/microsoft/conductor/issues/312),
+> closed) has run; see DD3 and Open Questions for the resolved outcome (Branch S).
 >
 > This document is a **solution design** for engineering and architecture
 > review. It covers *what* and *why*; the epic/task breakdown and file-by-file
@@ -35,16 +37,17 @@ remote `aca` `AgentProvider` that delegates `execute()` to an in-sandbox runner,
 orchestrator on the host); the **credential-boundary approach** (a host-side
 gateway so the model key never enters the sandbox); and the **sequencing** (a
 blocking Phase 0 transport spike gates the build; Alternative B may land first).
-The transport branch and the two capability values that depend on it are
-**deferred to Phase 0** and are *not* being approved here.
+The Phase 0 transport spike has **run and resolved** (Branch S; see DD3) — the
+transport branch and its two dependent capability values are no longer open and
+are included below for approval alongside everything else.
 
 | Item | Status | Notes |
 |---|---|---|
 | `AgentProvider` at `execute()` granularity (DD1) | Proposed | Engine, routing, context, checkpoints stay on host |
 | Runner wraps the real `CopilotProvider` (DD2) | Proposed | Event/output parity comes "for free" |
 | Credential boundary = host-side gateway (DD4) | Proposed | Recommended; timing below |
-| Transport: streaming vs submit+poll (DD3) | **Blocking unknown** | Phase 0 picks Branch S or Branch P |
-| `streaming_events` / `interrupt` capability values | **Blocking unknown** | Follow directly from the DD3 branch |
+| Transport: streaming vs submit+poll (DD3) | **Resolved — Branch S** | Phase 0 spike (#312) measured a ~30-min per-request cap; streaming chosen |
+| `streaming_events` / `interrupt` capability values | **Resolved — both `True`** | Follow directly from the DD3 outcome |
 | `concurrent_safe = True` via concurrency discriminator (DD5) | Proposed | Mechanism in Data Flow |
 | Bring-your-own pool (DD6) | Proposed | No infra provisioning in v1 |
 | `checkpoint_resume = False` | Accepted | Platform constraint (ephemeral sessions, no volume mount) |
@@ -53,7 +56,8 @@ The transport branch and the two capability values that depend on it are
 | Sandbox-as-MCP-tool (loop-outside / exec-inside) | Deferred | Alternative B — separate issue; may precede this work |
 
 Statuses: **Accepted** (settled), **Proposed** (up for approval now),
-**Blocking unknown** (Phase 0 decides), **Deferred** (out of scope or later).
+**Resolved** (Phase 0 spike outcome, now settled), **Deferred** (out of scope or
+later).
 
 **Is the credential gateway a release requirement?** No — not for the Phase 1
 MVP, which may run with a short-lived-token stopgap for *trusted* use. The
@@ -286,30 +290,48 @@ premises the rest of the design builds on.
   come "for free" because the same tested code runs; the host forwards its events
   verbatim.
 
-- **DD3 — Transport is one of two branches; Phase 0 picks.** *(Blocking unknown —
-  not settled here.)* Two ACA limits bear on a multi-minute turn and must not be
+- **DD3 — Transport is Branch S (single streaming request); resolved by Phase 0
+  spike #312.** Two ACA limits bear on a multi-minute turn and must not be
   conflated: the **per-request forwarded-duration cap** (how long one request may
   stay open — undocumented for sessions; general ACA ingress idle-timeout defaults
   to 4 min, premium max 30 min; this is the real cut-off risk) and the
   **inter-request `Timed` cooldown** (300–3600 s; how long an *idle* session
   survives *between* requests, reset each time the session API is *called*). The
   runner API is therefore **not** one blocking request per turn. Two candidate
-  branches, with identical event/result semantics:
+  branches were evaluated, with identical event/result semantics:
 
-  - **Branch S (preferred) — single streaming request.** One `POST /execute`
+  - **Branch S (chosen) — single streaming request.** One `POST /execute`
     streams NDJSON event frames until a terminal `result` frame. Simplest; gives
-    true incremental events and mid-call partials. Viable only if a single request
-    can stay open for the whole turn.
-  - **Branch P (fallback) — submit + poll.** `POST /execute` returns a job id
-    immediately; the host polls for event batches until a terminal frame. Each
-    poll is a fresh request that stays under the per-request cap and resets the
-    cooldown. Survives a short cap at the cost of coarser streaming and interrupt.
+    true incremental events and mid-call partials.
+  - **Branch P (not needed, but scaffolded and verified working) — submit + poll.**
+    `POST /execute` returns a job id immediately; the host polls for event batches
+    until a terminal frame. Each poll is a fresh request that stays under the
+    per-request cap and resets the cooldown. Survives a short cap at the cost of
+    coarser streaming and interrupt.
 
-  **Phase 0 decides the branch** by measuring the true per-request cap and whether
-  chunked streaming survives the sessions endpoint for ≥10 minutes. The branch
-  fixes the conditional `streaming_events` / `interrupt` capability values.
-  Resuming a dropped stream mid-agent (`Last-Event-ID` + a replayable server event
-  log, per AG-UI) is an open question tied to this choice.
+  **Phase 0 spike results (issue #312, closed).** Against a real ACA
+  custom-container session pool (default, non-premium ingress), a single held
+  streaming request was cut off at **~1801 seconds (~30 minutes)**. A
+  disambiguation run — requesting a 2400s (40 min) turn — was cut off at the
+  *same* ~1801s mark, ruling out the cutoff being an artifact of the first run's
+  own requested duration and confirming a real, reproducible per-request cap of
+  ~30 minutes, reached **without needing premium ingress**. Separately, a single
+  stream was confirmed durable for ≥10 minutes (900s, steady ~1s inter-frame
+  gaps, clean terminal frame), and a dropped stream resumed cleanly from a
+  `Last-Event-ID` cursor with no gap or duplicate. Branch P (submit + poll) was
+  also exercised end-to-end and completed with zero missing frames, so it remains
+  available as a fallback mechanism if a future workload needs it.
+
+  **Decision: Branch S**, because ~30 minutes is comfortably above the expected
+  length of a single agent turn (NFR4: "a single step runs for minutes"). This
+  fixes `streaming_events=True` and `interrupt=True` (real, via the in-flight
+  stream) rather than the conditional values previously carried here. **Caveat:**
+  a turn that runs longer than ~30 minutes wall-clock will still hit this cap:
+  the recommended mitigation is automatic reconnect-and-resume over
+  `Last-Event-ID` (backed by a *bounded* server-side event log, unlike the
+  spike's unbounded in-memory log) rather than falling back to Branch P by
+  default. Whether to build that resume path for v1 or defer it is now a Pre-MVP
+  open question (see Open Questions).
 
 - **DD4 — Credential gateway is the recommended boundary.** Route the in-sandbox
   SDK's inference through a host-side gateway that injects the real upstream key,
@@ -346,11 +368,11 @@ lives in the DD noted.
 | `tier` | `experimental` | Delegates the loop to a remote runtime. |
 | `mcp_tools` | `True` | Full `mcp_servers` forwarded; runner-image contract (API Contracts). |
 | `workflow_tools_passthrough` | `True` | Per-agent `tools:` allowlist forwarded and enforced by the inner SDK. |
-| `streaming_events` | `True` if Branch S, else `False` | Follows the DD3 branch. |
+| `streaming_events` | `True` | Resolved by Phase 0 spike #312 — Branch S chosen (DD3). |
 | `agent_reasoning_events` | `True` | Runner forwards reasoning frames. |
 | `reasoning_effort` | Copilot's tuple | Inner provider translates effort natively. |
 | `structured_output` | `prompt_injection` | Inherits the real `CopilotProvider` (`copilot.py:220`); DD2. |
-| `interrupt` | `True` if Branch S, else hard-abort only | Follows the DD3 branch; `stopSession` always available. |
+| `interrupt` | `True` | Real, via the in-flight stream (Branch S, DD3); `stopSession` remains available as a hard-abort. |
 | `max_session_seconds` | `True` | Runner-side guard (Timed lifecycle ignores pool `maxAlivePeriodInSeconds`; see note). |
 | `checkpoint_resume` | **`False`** | Ephemeral sessions, no volume mount; DD7. |
 | `usage_tracking` | `True` | Runner returns token counts on the result frame. |
@@ -446,10 +468,10 @@ same event/result semantics, delivered in polled batches):**
    `{pool_endpoint}/execute?identifier=<id>&api-version=<v>`; ACA routes to the
    session for `<id>` (auto-allocating from the warm pool if none) and forwards the
    body to the container's `<TARGET_PORT>/execute`.
-4. The runner runs `CopilotProvider.execute()`, relaying each SDK event as a frame.
-   Under **Branch S** this is one long-lived request bounded by the per-request
-   cap (DD3); under **Branch P** the host polls fresh requests that also reset the
-   cooldown. Either way the session stays alive through the multi-minute turn.
+4. The runner runs `CopilotProvider.execute()`, relaying each SDK event as a frame
+   over one long-lived streaming request (Branch S, DD3), bounded by the measured
+   ~30-minute per-request cap. The session stays alive through the multi-minute
+   turn.
 5. The host relays each frame to `event_callback(type, data)` — dashboard, JSONL,
    and console render exactly as for on-host providers.
 6. The terminal `result` frame carries the structured `AgentOutput`; the host
@@ -606,9 +628,10 @@ exclusive — B and A are the lighter, more defensive plays and can land first.
 
 ### Sequencing constraints
 
-- **Phase 0 transport spike is a gating prerequisite** (DD3): confirm the
-  per-request/idle cap and whether streaming survives ≥10 min, then pick Branch S
-  or P. Everything else is buildable; this is the true unknown.
+- **Phase 0 transport spike is resolved** (DD3, issue #312 closed): a ~30-minute
+  per-request cap was measured and confirmed reproducible; **Branch S** is
+  chosen. Everything else is buildable; this was the true unknown and no longer
+  blocks the build.
 - **Credential gateway** (DD4) is required before untrusted workloads (Phase 2);
   the MVP may start with the short-lived-token stopgap for trusted use.
 - **Alternative B** is recommended to precede this work if the immediate goal is
@@ -696,46 +719,71 @@ the architecture; it follows directly from ACA's documented model.
 
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
-| Sessions endpoint drops long/streamed requests (the #1 unknown) | High | High | Blocking Phase 0 spike (DD3); pick Branch S or fall back to Branch P; set `streaming_events`/`interrupt` honestly. |
+| Sessions endpoint drops long/streamed requests (the #1 unknown) | ~~High~~ Resolved | ~~High~~ Low | Phase 0 spike (#312, closed) measured a reproducible ~30-min per-request cap on default ingress; Branch S chosen (DD3); `streaming_events=True`/`interrupt=True` set honestly. Residual risk: a turn exceeding ~30 min still hits the cap (see DD3 caveat / Open Questions). |
 | Credential leak from a compromised session | Medium | High | Real key never enters the sandbox (DD4 gateway); short-lived scoped tokens; never bake pool secrets. |
 | Cost surprise (E16 nodes; idle warm pool) | Medium | Medium | Distinct session-seconds row; right-size `readySessionInstances`; modest per-session `--cpu/--memory`. |
 | Required MCP stdio binary / egress absent (runner-image contract) | Medium | Medium | Bake stdio binaries into the image; enable egress for remote MCP; fail loudly at execute time. |
 | Ephemeral FS loses artifacts (no volume mount) | High | Medium | Seed inputs at start; push artifacts out before cooldown; `checkpoint_resume=False`. |
 | `conductor resume` can't restore in-sandbox state | High | Low | `checkpoint_resume=False`; resume re-runs the agent; blob-persisted workspace is an open question. |
 | Runner ↔ Conductor version skew | Medium | Medium | Pin the image to a Conductor version; check on `validate_connection`; document the contract. |
-| Interrupt weaker than on-host | Medium | Low | `stopSession` hard-abort always available; partial via accumulated stream (Branch S); declare per DD3. |
+| Interrupt weaker than on-host | Low | Low | Resolved to real interrupt via the in-flight stream (Branch S, DD3); `stopSession` hard-abort remains available as a fallback. |
 | Provider-parity erosion (experimental) | Low | Medium | Reuse the real `CopilotProvider` (parity for free); mocked-runner smoke test; accurate capabilities. |
+| Agent turn exceeds the measured ~30-min per-request cap | Low | Medium | Turns are expected to run "minutes" (NFR4), well under the cap; long-term mitigation is automatic reconnect-and-resume over `Last-Event-ID` (Open Questions); until built, an over-cap turn fails and must be retried. |
 
 ## Open Questions
 
-Classified by when they must resolve: **Blocking** (Phase 0 gates the build),
-**Pre-MVP** (affects the v1 contract — resolve within Phase 1), **Future**
-(post-MVP / v2).
+Classified by when they must resolve: **Blocking** (Phase 0 gates the build, now
+resolved — kept for record), **Pre-MVP** (affects the v1 contract — resolve within
+Phase 1), **Future** (post-MVP / v2).
 
-**Blocking (Phase 0):**
+**Blocking (Phase 0) — resolved:**
 
 - **Runner API branch.** Streaming (S) vs submit+poll (P) vs both, per the measured
   per-request/idle cap? How to resume a dropped stream mid-agent (`Last-Event-ID` +
   replayable server event log)? Fixes `streaming_events` / `interrupt`.
 
-  **Answer — resolve with a dedicated Phase 0 spike (stays Blocking).** Before any
-  provider code lands, stand up a throwaway custom-container pool (DD6 two-step
-  deploy) running a trivial "heartbeat" runner that emits one NDJSON frame per
-  second and then a terminal `result` frame. The spike measures three things:
-  (a) the **true per-request forwarded-duration cap** — hold a single chunked
-  response open and record when the sessions endpoint cuts it off, repeating with
-  premium ingress and its request idle-timeout raised toward the 30-min max;
-  (b) whether steady chunked streaming **survives ≥10 min** without a drop; and
-  (c) whether a dropped stream can be **resumed** by replaying from a
-  `Last-Event-ID` cursor. Decision rule: if one request reliably survives a full
-  multi-minute turn → **Branch S** (`streaming_events=True`, real `interrupt`); if
-  it is capped short → **Branch P** (`streaming_events=False`, hard-abort-only
-  `interrupt` via `stopSession`). The spike is a standalone probe script with no
-  Conductor dependency; its only deliverables are the measured cap and the chosen
-  branch, which gate the build and fix the two conditional capabilities. Tracked
-  separately in #312 (sub-issue of #284).
+  **Resolved — Branch S, via the Phase 0 spike (issue #312, closed).** A throwaway
+  custom-container pool ran a heartbeat runner (one NDJSON frame/sec, then a
+  terminal `result` frame) against real ACA infrastructure, on **default (not
+  premium) ingress**. Measured results:
+
+  - **True per-request forwarded-duration cap ≈ 1801 seconds (~30 minutes).** A
+    first run requesting a 1800s turn was cut off at 1801.18s; a disambiguation
+    run requesting **2400s (40 min)** was cut off at the *same* ~1801s mark,
+    ruling out coincidence with the first run's own requested duration and
+    confirming a real, reproducible platform cap.
+  - **≥10-minute streaming durability: confirmed.** A 900s stream completed
+    cleanly with steady ~1s inter-frame gaps (no buffering/batching) and reached
+    its terminal frame.
+  - **`Last-Event-ID` resume: confirmed viable.** A stream dropped at 60s and
+    resumed from `Last-Event-ID` continued with no gap and no duplicate frame.
+  - **Branch P (submit + poll): also confirmed working**, end to end, with zero
+    missing frames — kept as an available fallback mechanism, not required for
+    the MVP.
+
+  **Decision: Branch S.** ~30 minutes is well above the expected length of a
+  single agent turn (NFR4), so `streaming_events=True` and `interrupt=True`
+  (real, via the in-flight stream) replace the conditional values this question
+  previously carried (see DD3, the capabilities table, and the Risks table).
+  **Residual item carried to Pre-MVP:** whether v1 needs to *build*
+  reconnect-and-resume for turns that exceed the ~30-minute cap, or defer it (see
+  below) — the spike showed resume is *mechanically* viable, but a production
+  server-side event log needs to be bounded, unlike the spike's unbounded
+  in-memory one.
 
 **Pre-MVP (v1 contract):**
+
+- **Reconnect-and-resume for turns exceeding the ~30-minute cap.** Build automatic
+  reconnect via `Last-Event-ID` for v1, or defer and let an over-cap turn simply
+  fail/retry? The Phase 0 spike confirmed resume is mechanically viable (no
+  gap/duplicate on a clean reconnect), but the spike's in-memory, unbounded
+  per-stream event log is not production-shaped — a v1 implementation needs a
+  *bounded* server-side log (oldest frames evicted once acknowledged/replayed) so
+  a long-idle or never-reconnected session cannot grow its event log unboundedly.
+  Given turns are expected to run "minutes" (NFR4) and ~30 min is a generous
+  margin, deferring this and treating an over-cap turn as a hard failure is a
+  reasonable MVP scope cut — revisit if real usage shows turns routinely
+  approaching the cap.
 
 - **Identifier scoping.** Per-agent (default) vs per-run; exact naming scheme
   (parallel-safe, unpredictable, ≤128 chars); final shape of the per-agent
@@ -839,6 +887,14 @@ Classified by when they must resolve: **Blocking** (Phase 0 gates the build),
   provider (event/output parity while delegating the loop).
 - `docs/providers/experimental.md` — experimental tier policy;
   `pyproject.toml` `[project.optional-dependencies]` — extras pattern.
+
+**Phase 0 transport spike (resolved DD3):**
+
+- [Issue #312](https://github.com/microsoft/conductor/issues/312) (closed) — spike
+  tracking issue, decision rule, and acceptance criteria.
+- `spikes/aca-transport/` (branch `feature/312-aca-transport-spike`) — the
+  heartbeat runner, probe client, provisioning/teardown scripts, and
+  `RESULTS.md` with the full measured data (raw JSON under `results/`).
 
 **Azure Container Apps (Microsoft Learn — verified):**
 
