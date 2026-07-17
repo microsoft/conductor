@@ -2,7 +2,14 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { useWorkflowStore } from '@/stores/workflow-store';
 import type { WorkflowEvent } from '@/types/events';
 import { buildGraphElements, collectExpandableContextKeys, type GraphContextInput } from './graph-layout';
-import { contextKey, nodeKey, parseNodeKey } from '@/lib/node-id';
+import {
+  contextKey,
+  nodeKey,
+  parseNodeKey,
+  forEachGroupKey,
+  parseForEachSlotKey,
+  isGroupExpansionKey,
+} from '@/lib/node-id';
 
 function event(
   type: WorkflowEvent['type'],
@@ -150,6 +157,58 @@ function seedNestedSubworkflows(): void {
       subworkflow_path: ['sub_agent', 'deep_sub'],
     }),
   );
+}
+
+/**
+ * Dispatch a root workflow with a `for_each`-of-workflow group (`batch`) that
+ * has fanned out into `count` started iterations, each its own child
+ * subworkflow with an inner DAG (`childA → childB`). Mirrors the engine's
+ * slot-keyed events (`slot_key` / `item_key` / `subworkflow_path`).
+ */
+function seedForEachSubworkflows(count = 2): void {
+  const { processEvent } = useWorkflowStore.getState();
+
+  processEvent(
+    event('workflow_started', {
+      name: 'root',
+      agents: [{ name: 'finder' }, { name: 'aggregator' }],
+      routes: [
+        { from: 'finder', to: 'batch' },
+        { from: 'batch', to: 'aggregator' },
+        { from: 'aggregator', to: '$end' },
+      ],
+      parallel_groups: [],
+      for_each_groups: [{ name: 'batch' }],
+      entry_point: 'finder',
+    }),
+  );
+
+  for (let i = 0; i < count; i++) {
+    processEvent(
+      event('subworkflow_started', {
+        agent_name: 'batch',
+        workflow: 'sub.yaml',
+        iteration: i + 1,
+        slot_key: `batch[${i}]`,
+        item_key: String(i),
+        parent_path: [],
+      }),
+    );
+    processEvent(
+      event('workflow_started', {
+        name: 'child-workflow',
+        agents: [{ name: 'childA' }, { name: 'childB' }],
+        routes: [
+          { from: 'childA', to: 'childB' },
+          { from: 'childB', to: '$end' },
+        ],
+        parallel_groups: [],
+        for_each_groups: [],
+        entry_point: 'childA',
+        subworkflow_path: [`batch[${i}]`],
+      }),
+    );
+  }
 }
 
 beforeEach(() => {
@@ -364,5 +423,129 @@ describe('bulk expand/collapse store actions', () => {
     useWorkflowStore.getState().collapseContexts([]);
     // Same set reference is retained when nothing changes.
     expect(useWorkflowStore.getState().expandedContexts).toBe(before);
+  });
+});
+
+describe('for_each slot/group key helpers', () => {
+  it('parses for_each iteration slot keys and rejects sequential ones', () => {
+    expect(parseForEachSlotKey('batch[0]')).toEqual({ group: 'batch', key: '0' });
+    expect(parseForEachSlotKey('deep_dive_items[alpha]')).toEqual({
+      group: 'deep_dive_items',
+      key: 'alpha',
+    });
+    // A sequential subworkflow slot key equals the bare agent name.
+    expect(parseForEachSlotKey('sub_agent')).toBeNull();
+    // Leading bracket has no group name.
+    expect(parseForEachSlotKey('[0]')).toBeNull();
+  });
+
+  it('builds group keys that are distinguishable from context keys', () => {
+    expect(forEachGroupKey([], 'batch')).toBe('::batch');
+    expect(forEachGroupKey([0, 1], 'batch')).toBe('0.1::batch');
+    expect(isGroupExpansionKey(forEachGroupKey([0], 'batch'))).toBe(true);
+    // Pure context keys never contain `::`, so they never look like group keys.
+    expect(isGroupExpansionKey(contextKey([0, 2]))).toBe(false);
+  });
+});
+
+describe('buildGraphElements — for_each-of-workflow inline expansion', () => {
+  it('marks a started for_each-of-workflow group expandable but renders no members collapsed', () => {
+    seedForEachSubworkflows(2);
+    const { nodes } = buildGraphElements(rootBase(), [], new Set());
+
+    const group = nodes.find((n) => n.id === nodeKey([], 'batch'));
+    expect(group).toBeDefined();
+    expect(group!.type).toBe('groupNode');
+    expect(group!.data.type).toBe('for_each_group');
+    expect(group!.data.canExpand).toBe(true);
+    expect(group!.data.expanded).toBe(false);
+    expect(group!.data.groupExpansionKey).toBe(forEachGroupKey([], 'batch'));
+
+    // No iteration members while collapsed.
+    expect(nodes.some((n) => n.id === nodeKey([], 'batch[0]'))).toBe(false);
+  });
+
+  it('is not expandable before any iteration has started', () => {
+    // A for_each group declared but not yet fanned out (no child contexts).
+    useWorkflowStore.getState().processEvent(
+      event('workflow_started', {
+        name: 'root',
+        agents: [{ name: 'finder' }, { name: 'aggregator' }],
+        routes: [
+          { from: 'finder', to: 'batch' },
+          { from: 'batch', to: 'aggregator' },
+          { from: 'aggregator', to: '$end' },
+        ],
+        parallel_groups: [],
+        for_each_groups: [{ name: 'batch' }],
+        entry_point: 'finder',
+      }),
+    );
+    const { nodes } = buildGraphElements(rootBase(), [], new Set());
+    const group = nodes.find((n) => n.id === nodeKey([], 'batch'));
+    expect(group!.data.canExpand).toBe(false);
+    expect(group!.data.groupExpansionKey).toBeUndefined();
+  });
+
+  it('renders each iteration as a collapsed pill parented to the group container when expanded', () => {
+    seedForEachSubworkflows(2);
+    const expanded = new Set([forEachGroupKey([], 'batch')]);
+    const { nodes } = buildGraphElements(rootBase(), [], expanded);
+
+    const group = nodes.find((n) => n.id === nodeKey([], 'batch'));
+    expect(group!.data.expanded).toBe(true);
+    expect(typeof group!.style?.width).toBe('number');
+    expect((group!.style!.width as number) > 0).toBe(true);
+    expect((group!.style!.height as number) > 0).toBe(true);
+
+    for (const key of ['batch[0]', 'batch[1]']) {
+      const pill = nodes.find((n) => n.id === nodeKey([], key));
+      expect(pill, key).toBeDefined();
+      expect(pill!.type).toBe('workflowNode');
+      expect(pill!.parentId).toBe(nodeKey([], 'batch'));
+      expect(pill!.data.type).toBe('workflow');
+      expect(pill!.data.isForEachIteration).toBe(true);
+      expect(pill!.data.canExpand).toBe(true);
+      expect(pill!.data.expanded).toBe(false);
+    }
+    // batch[0] is the parent's children[0], so its own context key is "0".
+    const pill0 = nodes.find((n) => n.id === nodeKey([], 'batch[0]'))!;
+    expect(pill0.data.childContextKey).toBe(contextKey([0]));
+    expect(pill0.data.iterationContextPath).toEqual([0]);
+
+    // Iteration inner DAGs stay hidden while the pills are collapsed.
+    expect(nodes.some((n) => n.id === nodeKey([0], 'childA'))).toBe(false);
+  });
+
+  it('embeds an individual iteration inner DAG when that iteration is expanded', () => {
+    seedForEachSubworkflows(2);
+    const expanded = new Set([forEachGroupKey([], 'batch'), contextKey([0])]);
+    const { nodes, edges } = buildGraphElements(rootBase(), [], expanded);
+
+    const pill0 = nodes.find((n) => n.id === nodeKey([], 'batch[0]'))!;
+    expect(pill0.data.expanded).toBe(true);
+    expect((pill0.style!.width as number) > 0).toBe(true);
+
+    // childA/childB render inside iteration 0, namespaced to its context [0]
+    // and parented to the iteration pill.
+    const childA = nodes.find((n) => n.id === nodeKey([0], 'childA'));
+    expect(childA).toBeDefined();
+    expect(childA!.parentId).toBe(nodeKey([], 'batch[0]'));
+    expect(childA!.data.contextPath).toEqual([0]);
+    const internal = edges.find(
+      (e) => e.source === nodeKey([0], 'childA') && e.target === nodeKey([0], 'childB'),
+    );
+    expect(internal).toBeDefined();
+
+    // The other iteration stays a collapsed pill (no inner nodes).
+    expect(nodes.some((n) => n.id === nodeKey([1], 'childA'))).toBe(false);
+  });
+
+  it('collectExpandableContextKeys returns the group key, not per-iteration keys', () => {
+    seedForEachSubworkflows(3);
+    const s = useWorkflowStore.getState();
+    expect(collectExpandableContextKeys(s.agents, s.subworkflowContexts, [])).toEqual([
+      forEachGroupKey([], 'batch'),
+    ]);
   });
 });

@@ -47,3 +47,33 @@ export function parseNodeKey(id: string): { contextPath: number[]; name: string 
   const contextPath = keyPart === '' ? [] : keyPart.split('.').map((s) => Number(s));
   return { contextPath, name };
 }
+
+/**
+ * Expansion key for an inline-expanded `for_each`-of-workflow group container.
+ *
+ * A `for_each` group has *N* iteration child contexts rather than a single one,
+ * so it can't be keyed by a child context path the way a sequential
+ * subworkflow step is. Instead the group container is keyed by its own graph
+ * node id (`${contextKey}::${groupName}`). Because this contains `::` it never
+ * collides with the pure digit/dot context keys that gate individual iteration
+ * inner-DAG expansion — both kinds live in the same `expandedContexts` set.
+ */
+export function forEachGroupKey(basePath: number[], groupName: string): string {
+  return nodeKey(basePath, groupName);
+}
+
+/** True for a {@link forEachGroupKey}-style expansion key (vs. a context key). */
+export function isGroupExpansionKey(key: string): boolean {
+  return key.includes('::');
+}
+
+/**
+ * Parse a `for_each` iteration slot key (`"${group}[${itemKey}]"`) into its
+ * group name and item key. Returns `null` for anything that isn't bracketed,
+ * i.e. a sequential subworkflow slot key (which equals the bare agent name).
+ */
+export function parseForEachSlotKey(slotKey: string): { group: string; key: string } | null {
+  const open = slotKey.indexOf('[');
+  if (open <= 0 || !slotKey.endsWith(']')) return null;
+  return { group: slotKey.slice(0, open), key: slotKey.slice(open + 1, -1) };
+}

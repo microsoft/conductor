@@ -1,0 +1,88 @@
+# Inline For-Each Subworkflow Demo
+#
+# A parent workflow whose middle step is a `for_each` group that runs a
+# `type: workflow` sub-workflow (examples/simple-qa.yaml) once per sub-topic.
+# Its purpose is to exercise the dashboard's inline expand/collapse for
+# for_each-of-workflow (issue #314, Phase 2): run it with `--web`, then click
+# the chevron on the "deep_dives" group to expand its iterations in place; each
+# iteration is a collapsed sub-workflow pill you can expand to see its own DAG,
+# or double-click to drill in (focus) as before.
+#
+# Usage:
+#   uv run conductor run examples/subworkflow-foreach-inline.yaml --web \
+#     --input topic="programming languages"
+
+workflow:
+  name: subworkflow-foreach-inline-demo
+  description: Parent whose for_each step fans out simple-qa as inline sub-workflows
+  version: "1.0.0"
+  entry_point: topic_finder
+
+  runtime:
+    provider: copilot
+
+  input:
+    topic:
+      type: string
+      required: true
+      description: The umbrella topic to break into sub-questions
+
+  limits:
+    max_iterations: 20
+
+# For-each-of-workflow: each sub-topic runs the simple-qa sub-workflow.
+for_each:
+  - name: deep_dives
+    type: for_each
+    description: Answer each sub-topic by running the simple-qa sub-workflow
+    source: topic_finder.output.subtopics
+    as: subtopic
+    max_concurrent: 3
+    failure_mode: continue_on_error
+    agent:
+      name: qa_runner
+      type: workflow
+      workflow: ./simple-qa.yaml
+      input_mapping:
+        question: "What is {{ subtopic }}?"
+    routes:
+      - to: summarize
+
+agents:
+  - name: topic_finder
+    description: Splits the umbrella topic into three concise sub-topics
+    model: claude-haiku-4.5
+    prompt: |
+      Break the topic "{{ workflow.input.topic }}" into exactly 3 short,
+      distinct sub-topics worth researching. Return them as an array of
+      short strings (2-4 words each).
+    output:
+      subtopics:
+        type: array
+        description: Three sub-topics to research
+    routes:
+      - to: deep_dives
+
+  - name: summarize
+    description: Condenses each sub-workflow answer into a final digest
+    model: claude-haiku-4.5
+    input:
+      - topic_finder.output
+      - deep_dives.outputs
+    prompt: |
+      Combine these sub-topic answers about "{{ workflow.input.topic }}" into a
+      short digest — one sentence per sub-topic:
+
+      {% for r in deep_dives.outputs %}
+      - {{ r.answer }}
+      {% endfor %}
+    output:
+      digest:
+        type: string
+        description: Final digest across all sub-topics
+    routes:
+      - to: $end
+
+output:
+  digest: "{{ summarize.output.digest }}"
+  count: "{{ deep_dives.outputs | length }}"

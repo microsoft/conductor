@@ -10,7 +10,7 @@ import type {
   SubworkflowContext,
 } from '@/stores/workflow-store';
 import type { NodeType } from '@/lib/constants';
-import { contextKey, nodeKey } from '@/lib/node-id';
+import { contextKey, nodeKey, forEachGroupKey, parseForEachSlotKey } from '@/lib/node-id';
 
 export interface GraphNodeData {
   label: string;
@@ -27,6 +27,27 @@ export interface GraphNodeData {
   contextPath?: number[];
   /** Bare node name (agent/group/`$start`) without the context namespace. */
   name?: string;
+  /** Whether an inline-expandable node (subworkflow / for_each group) is expanded. */
+  expanded?: boolean;
+  /** Whether this node can be expanded inline (child DAG / iterations exist). */
+  canExpand?: boolean;
+  /** Context key toggled by a subworkflow / iteration node's expand chevron. */
+  childContextKey?: string;
+  /** Resolved child workflow name, shown as a subtitle on subworkflow nodes. */
+  childName?: string;
+  /**
+   * Expansion key toggled by a `for_each`-of-workflow group's chevron (its own
+   * node id — see `forEachGroupKey`). Present only on expandable group nodes.
+   */
+  groupExpansionKey?: string;
+  /**
+   * Absolute index path of the `for_each` iteration this node *is* (a group
+   * member). Its live status comes from that child context's own `.status`,
+   * not the parent's `nodes[name]`. Undefined for non-iteration nodes.
+   */
+  iterationContextPath?: number[];
+  /** True for a `for_each` iteration member pill inside an expanded group. */
+  isForEachIteration?: boolean;
   [key: string]: unknown;
 }
 
@@ -42,6 +63,12 @@ const GROUP_CHILD_GAP = 12;
 const SUBFLOW_PADDING_X = 16;
 const SUBFLOW_HEADER = 46;
 const SUBFLOW_PADDING_BOTTOM = 16;
+
+// A collapsed for_each iteration pill occupies a fixed slot when stacked inside
+// an expanded group container; expanded iterations size to their own DAG.
+const ITER_PILL_WIDTH = NODE_WIDTH;
+const ITER_PILL_HEIGHT = NODE_HEIGHT;
+const ITER_GAP = 14;
 
 /** Normalized single-context graph input for {@link buildGraphElements}. */
 export interface GraphContextInput {
@@ -88,15 +115,17 @@ export function buildGraphElements(
 }
 
 /**
- * Collect the context keys of every inline-expandable subworkflow reachable
+ * Collect the expansion keys of every inline-expandable subworkflow reachable
  * from a viewed context, walking the full context subtree (not just what is
  * currently expanded). Used by the graph's Expand/Collapse-all control.
  *
- * Only sequential `type: workflow` steps are inline-expandable in this phase:
- * their child context's `slotKey` equals the agent name and the child must have
- * at least one agent (mirrors `canExpand` in {@link layoutContext}). `for_each`
- * subworkflow iterations are intentionally excluded — their child contexts are
- * keyed `group[key]`, never match an agent name, and render only via drill-down.
+ * Two kinds of keys are returned: a sequential `type: workflow` step yields its
+ * child context key (`slotKey` equals the agent name, child must have ≥1 agent;
+ * mirrors `canExpand` in {@link layoutContext}), and a `for_each`-of-workflow
+ * group yields its group container key (see {@link forEachGroupKey}). Expanding
+ * a group reveals its iterations as collapsed pills; individual iteration inner
+ * DAGs are expanded manually, so this does not descend into them (keeping
+ * Expand-all bounded on a wide fan-out).
  *
  * @param agents The viewed context's agents.
  * @param children The viewed context's child subworkflow contexts.
@@ -123,10 +152,128 @@ export function collectExpandableContextKeys(
       keys.push(contextKey([...absPath, childIdx]));
       walk(child.agents, child.children, [...absPath, childIdx]);
     }
+
+    // for_each-of-workflow group containers. Expanding a group reveals its
+    // iterations as collapsed pills; the individual iteration inner DAGs are
+    // expanded manually (per-iteration), so Expand-all does not descend into
+    // them and can't blow up on a wide fan-out.
+    const seenGroups = new Set<string>();
+    for (const c of ctxChildren) {
+      const parsed = parseForEachSlotKey(c.slotKey);
+      if (!parsed || seenGroups.has(parsed.group)) continue;
+      seenGroups.add(parsed.group);
+      keys.push(forEachGroupKey(absPath, parsed.group));
+    }
   };
 
   walk(agents, children, basePath);
   return keys;
+}
+
+/**
+ * Iteration child contexts belonging to a `for_each`-of-workflow group, paired
+ * with their index in the parent's `children`. A for_each iteration's `slotKey`
+ * is `${group}[${itemKey}]`; sequential subworkflow slot keys (bare agent
+ * names) parse to `null` and are skipped.
+ */
+function forEachIterationContexts(
+  children: SubworkflowContext[],
+  groupName: string,
+): { ctx: SubworkflowContext; idx: number }[] {
+  const out: { ctx: SubworkflowContext; idx: number }[] = [];
+  for (let idx = 0; idx < children.length; idx++) {
+    const c = children[idx]!;
+    const parsed = parseForEachSlotKey(c.slotKey);
+    if (parsed && parsed.group === groupName) out.push({ ctx: c, idx });
+  }
+  return out;
+}
+
+/**
+ * Lay out the iteration members of an expanded `for_each`-of-workflow group as
+ * a vertical stack inside the group container. Each iteration is a
+ * `workflowNode` — a collapsed pill by default, or (when its own context key is
+ * in `expandedContexts`) an inline container embedding the iteration's DAG,
+ * recursively laid out. Returned nodes/edges carry final `parentId` +
+ * container-relative positions and bypass the caller's dagre pass.
+ */
+function layoutForEachIterations(
+  iterations: { ctx: SubworkflowContext; idx: number }[],
+  absPath: number[],
+  groupKey: string,
+  expandedContexts: Set<string>,
+): { nodes: Node<GraphNodeData>[]; edges: Edge[]; width: number; height: number } {
+  const nodes: Node<GraphNodeData>[] = [];
+  const edges: Edge[] = [];
+  let cursorY = SUBFLOW_HEADER;
+  let maxWidth = ITER_PILL_WIDTH;
+
+  for (const { ctx: iterCtx, idx } of iterations) {
+    const iterPath = [...absPath, idx];
+    const iterKey = contextKey(iterPath);
+    const iterId = nodeKey(absPath, iterCtx.slotKey);
+    const parsed = parseForEachSlotKey(iterCtx.slotKey);
+    const canExpand = iterCtx.agents.length > 0;
+    const isExpanded = canExpand && expandedContexts.has(iterKey);
+
+    const data: GraphNodeData = {
+      label: parsed ? parsed.key : iterCtx.slotKey,
+      name: iterCtx.slotKey,
+      contextPath: absPath,
+      type: 'workflow',
+      status: iterCtx.status || 'pending',
+      canExpand,
+      expanded: isExpanded,
+      childContextKey: iterKey,
+      childName: iterCtx.workflowName || undefined,
+      iterationContextPath: iterPath,
+      isForEachIteration: true,
+    };
+
+    if (isExpanded) {
+      const sub = layoutContext(contextToInput(iterCtx), iterPath, expandedContexts, true);
+      const w = sub.width + SUBFLOW_PADDING_X * 2;
+      const h = sub.height + SUBFLOW_HEADER + SUBFLOW_PADDING_BOTTOM;
+      nodes.push({
+        id: iterId,
+        type: 'workflowNode',
+        position: { x: SUBFLOW_PADDING_X, y: cursorY },
+        parentId: groupKey,
+        extent: 'parent' as const,
+        data,
+        style: { width: w, height: h },
+      });
+      for (const cn of sub.nodes) {
+        if (!cn.parentId) {
+          cn.parentId = iterId;
+          cn.extent = 'parent';
+          cn.position = {
+            x: cn.position.x + SUBFLOW_PADDING_X,
+            y: cn.position.y + SUBFLOW_HEADER,
+          };
+        }
+        nodes.push(cn);
+      }
+      for (const ce of sub.edges) edges.push(ce);
+      cursorY += h + ITER_GAP;
+      maxWidth = Math.max(maxWidth, w);
+    } else {
+      nodes.push({
+        id: iterId,
+        type: 'workflowNode',
+        position: { x: SUBFLOW_PADDING_X, y: cursorY },
+        parentId: groupKey,
+        extent: 'parent' as const,
+        data,
+      });
+      cursorY += ITER_PILL_HEIGHT + ITER_GAP;
+    }
+  }
+
+  const width = maxWidth + SUBFLOW_PADDING_X * 2;
+  const stacked = iterations.length > 0 ? cursorY - ITER_GAP : SUBFLOW_HEADER;
+  const height = stacked + SUBFLOW_PADDING_BOTTOM;
+  return { nodes, edges, width, height };
 }
 
 interface ContextLayout {
@@ -162,6 +309,12 @@ function layoutContext(
 
   // Expanded subworkflow child layouts, embedded after this context's dagre.
   const embeds: { containerId: string; sub: ContextLayout }[] = [];
+
+  // Fully-positioned nested nodes/edges (expanded for_each group members and
+  // their inner DAGs) appended after this context's dagre pass. They already
+  // carry final `parentId` + container-relative positions, so they bypass dagre.
+  const deferredNodes: Node<GraphNodeData>[] = [];
+  const deferredEdges: Edge[] = [];
 
   const agentToGroup = new Map<string, string>();
   for (const pg of ctx.parallelGroups) {
@@ -222,23 +375,59 @@ function layoutContext(
     agentNames.add(pg.name);
   }
 
-  // For-each group nodes.
+  // For-each group nodes. A for_each-of-workflow group (its inline agent is a
+  // `type: workflow` step) spawns one subworkflow child context per iteration,
+  // slot-keyed `${group}[${itemKey}]`. When such a group is expanded it becomes
+  // a container stacking each iteration as a collapsible subworkflow pill;
+  // otherwise (and for for_each-of-agent groups) it stays a leaf progress node.
   for (const fg of ctx.forEachGroups) {
     const nd = ctx.nodes[fg.name];
-    flowNodes.push({
-      id: nid(fg.name),
-      type: 'groupNode',
-      position: { x: 0, y: 0 },
-      data: {
-        label: fg.name,
-        name: fg.name,
-        contextPath: absPath,
-        type: 'for_each_group',
-        status: nd?.status || 'pending',
-        groupName: fg.name,
-        progress: ctx.groupProgress[fg.name],
-      },
-    });
+    const iterations = forEachIterationContexts(ctx.children, fg.name);
+    const canExpandGroup = iterations.length > 0;
+    const groupKey = forEachGroupKey(absPath, fg.name);
+    const isGroupExpanded = canExpandGroup && expandedContexts.has(groupKey);
+
+    if (isGroupExpanded) {
+      const built = layoutForEachIterations(iterations, absPath, groupKey, expandedContexts);
+      flowNodes.push({
+        id: nid(fg.name),
+        type: 'groupNode',
+        position: { x: 0, y: 0 },
+        data: {
+          label: fg.name,
+          name: fg.name,
+          contextPath: absPath,
+          type: 'for_each_group',
+          status: nd?.status || 'pending',
+          groupName: fg.name,
+          progress: ctx.groupProgress[fg.name],
+          expanded: true,
+          canExpand: true,
+          groupExpansionKey: groupKey,
+        },
+        style: { width: built.width, height: built.height },
+      });
+      for (const mn of built.nodes) deferredNodes.push(mn);
+      for (const me of built.edges) deferredEdges.push(me);
+    } else {
+      flowNodes.push({
+        id: nid(fg.name),
+        type: 'groupNode',
+        position: { x: 0, y: 0 },
+        data: {
+          label: fg.name,
+          name: fg.name,
+          contextPath: absPath,
+          type: 'for_each_group',
+          status: nd?.status || 'pending',
+          groupName: fg.name,
+          progress: ctx.groupProgress[fg.name],
+          expanded: false,
+          canExpand: canExpandGroup,
+          groupExpansionKey: canExpandGroup ? groupKey : undefined,
+        },
+      });
+    }
     agentNames.add(fg.name);
   }
 
@@ -440,6 +629,12 @@ function layoutContext(
     }
     for (const ce of sub.edges) flowEdges.push(ce);
   }
+
+  // Append expanded for_each members/inner DAGs. Their group container is
+  // already in `flowNodes` (pushed above, sized for dagre), and each member is
+  // parented to it, so ordering (parent-before-child) holds.
+  for (const dn of deferredNodes) flowNodes.push(dn);
+  for (const de of deferredEdges) flowEdges.push(de);
 
   return { nodes: flowNodes, edges: flowEdges, width, height };
 }

@@ -19,7 +19,7 @@ import { useWorkflowStore, type SubworkflowContext } from '@/stores/workflow-sto
 import { useViewedGraphData } from '@/hooks/use-viewed-context';
 import { useDeepLink } from '@/hooks/use-deep-link';
 import { buildGraphElements, collectExpandableContextKeys, type GraphNodeData, type GraphContextInput } from './graph-layout';
-import { nodeKey, parseNodeKey } from '@/lib/node-id';
+import { nodeKey, parseNodeKey, isGroupExpansionKey, parseForEachSlotKey } from '@/lib/node-id';
 import { AgentNode } from './AgentNode';
 import { ScriptNode } from './ScriptNode';
 import { SetNode } from './SetNode';
@@ -146,6 +146,23 @@ export function WorkflowGraph() {
   const structureKey = useMemo(() => {
     const parts = [`${viewPathKey}#${agents.map((a) => a.name).join(',')}`];
     for (const key of [...expandedContexts].sort()) {
+      if (isGroupExpansionKey(key)) {
+        // Expanded for_each-of-workflow group: its rendered iteration pills come
+        // from the owning context's children, so re-layout when that set (or an
+        // iteration's own agents → chevron affordance) changes.
+        const { contextPath, name } = parseNodeKey(key);
+        const owner =
+          contextPath.length === 0 ? null : resolveContextByPath(rootSubContexts, contextPath);
+        const children = contextPath.length === 0 ? rootSubContexts : (owner?.children ?? []);
+        const iters = children
+          .filter((c) => {
+            const p = parseForEachSlotKey(c.slotKey);
+            return p != null && p.group === name;
+          })
+          .map((c) => `${c.slotKey}:${c.entryPoint ?? ''}:${c.agents.map((a) => a.name).join(',')}`);
+        parts.push(`${key}=>${iters.join('|')}`);
+        continue;
+      }
       const path = key.split('.').filter(Boolean).map(Number);
       const ctx = resolveContextByPath(rootSubContexts, path);
       parts.push(`${key}:${ctx?.entryPoint ?? ''}:${ctx?.agents.map((a) => a.name).join(',') ?? ''}`);
@@ -205,6 +222,17 @@ export function WorkflowGraph() {
     setFlowNodes((nds) =>
       nds.map((node) => {
         const gd = node.data as GraphNodeData;
+
+        // for_each iteration member: its live status is the child context's own
+        // `.status` (there is no `nodes[slotKey]` entry in the parent context).
+        const iterPath = gd.iterationContextPath;
+        if (iterPath && iterPath.length > 0) {
+          const iterCtx = resolveContextByPath(rootSubContexts, iterPath);
+          const newStatus = iterCtx?.status;
+          if (!newStatus || newStatus === gd.status) return node;
+          return { ...node, data: { ...gd, status: newStatus } };
+        }
+
         const path = gd.contextPath ?? [];
         const ctx = path.length === 0 ? null : resolveContextByPath(rootSubContexts, path);
         const ctxNodes = path.length === 0 ? rootNodes : ctx?.nodes;
