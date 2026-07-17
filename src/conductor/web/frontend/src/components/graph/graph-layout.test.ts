@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { useWorkflowStore } from '@/stores/workflow-store';
 import type { WorkflowEvent } from '@/types/events';
-import { buildGraphElements, collectExpandableContextKeys, type GraphContextInput } from './graph-layout';
+import { buildGraphElements, collectExpandableContextKeys, expansionKeysForContextPath, type GraphContextInput } from './graph-layout';
 import {
   contextKey,
   nodeKey,
@@ -394,6 +394,64 @@ describe('collectExpandableContextKeys', () => {
     expect(collectExpandableContextKeys(child.agents, child.children, [0])).toEqual([
       contextKey([0, 0]),
     ]);
+  });
+});
+
+describe('expansionKeysForContextPath', () => {
+  it('returns no keys for a root-level target', () => {
+    seedNestedSubworkflows();
+    const s = useWorkflowStore.getState();
+    expect(expansionKeysForContextPath(s.subworkflowContexts, [])).toEqual([]);
+  });
+
+  it('expands each sequential ancestor and the target context itself', () => {
+    seedNestedSubworkflows();
+    const s = useWorkflowStore.getState();
+    // Target a grandchild agent's context [0, 0]: reveal sub_agent then deep_sub.
+    expect(expansionKeysForContextPath(s.subworkflowContexts, [0, 0])).toEqual([
+      contextKey([0]),
+      contextKey([0, 0]),
+    ]);
+    // Target the intermediate subworkflow only: just its own context key.
+    expect(expansionKeysForContextPath(s.subworkflowContexts, [0])).toEqual([contextKey([0])]);
+  });
+
+  it('emits BOTH the group key and the context key for a for_each iteration', () => {
+    seedForEachSubworkflows(2);
+    const s = useWorkflowStore.getState();
+    expect(expansionKeysForContextPath(s.subworkflowContexts, [0])).toEqual([
+      forEachGroupKey([], 'batch'),
+      contextKey([0]),
+    ]);
+    expect(expansionKeysForContextPath(s.subworkflowContexts, [1])).toEqual([
+      forEachGroupKey([], 'batch'),
+      contextKey([1]),
+    ]);
+  });
+
+  it('stops early when the path points past a materialized context', () => {
+    seedNestedSubworkflows();
+    const s = useWorkflowStore.getState();
+    // [0, 5] — index 5 doesn't exist under sub_agent; only [0] resolves.
+    expect(expansionKeysForContextPath(s.subworkflowContexts, [0, 5])).toEqual([contextKey([0])]);
+  });
+
+  it('produces keys that actually reveal a nested sequential agent', () => {
+    seedNestedSubworkflows();
+    const s = useWorkflowStore.getState();
+    const keys = expansionKeysForContextPath(s.subworkflowContexts, [0, 0]);
+    const { nodes } = buildGraphElements(rootBase(), [], new Set(keys));
+    // The grandchild agent g1 renders only when both ancestors are expanded.
+    expect(nodes.some((n) => n.id === nodeKey([0, 0], 'g1'))).toBe(true);
+  });
+
+  it('produces keys that actually reveal a for_each iteration agent', () => {
+    seedForEachSubworkflows(2);
+    const s = useWorkflowStore.getState();
+    const keys = expansionKeysForContextPath(s.subworkflowContexts, [1]);
+    const { nodes } = buildGraphElements(rootBase(), [], new Set(keys));
+    // childA inside iteration batch[1] renders only with group + context keys.
+    expect(nodes.some((n) => n.id === nodeKey([1], 'childA'))).toBe(true);
   });
 });
 

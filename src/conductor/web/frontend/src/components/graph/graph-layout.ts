@@ -171,6 +171,47 @@ export function collectExpandableContextKeys(
 }
 
 /**
+ * Compute the expansion keys needed to reveal a target context inline, walking
+ * from the root of `contexts` along `path` (the target context's absolute index
+ * path). Every ancestor — and the target context itself — is expanded so its
+ * inner DAG (and any deeper container it holds) renders:
+ *
+ *   - a sequential subworkflow step yields its context key
+ *     (`contextKey(prefix)`), the same key its expand chevron toggles;
+ *   - a `for_each` iteration yields BOTH its group container key
+ *     (`forEachGroupKey(parentPath, group)`, so the iteration pill is revealed)
+ *     AND its own context key (so the iteration's inner DAG renders).
+ *
+ * Used by expansion-aware deep-links: expanding this bounded set (only the
+ * target's ancestor chain, never siblings) surfaces a nested agent /
+ * subworkflow in the root graph without drilling in. Returns `[]` for a
+ * root-level target. Walk stops early if `path` points past a materialized
+ * context (nothing to expand for an unresolved tail).
+ *
+ * @param contexts Root subworkflow contexts (`store.subworkflowContexts`).
+ * @param path Absolute numeric index path of the target context (root = `[]`).
+ */
+export function expansionKeysForContextPath(
+  contexts: SubworkflowContext[],
+  path: number[],
+): string[] {
+  const keys: string[] = [];
+  let current = contexts;
+  const prefix: number[] = [];
+  for (const idx of path) {
+    const ctx = current[idx];
+    if (!ctx) break;
+    const parentPath = [...prefix];
+    prefix.push(idx);
+    const parsed = parseForEachSlotKey(ctx.slotKey);
+    if (parsed) keys.push(forEachGroupKey(parentPath, parsed.group));
+    keys.push(contextKey(prefix));
+    current = ctx.children;
+  }
+  return keys;
+}
+
+/**
  * Iteration child contexts belonging to a `for_each`-of-workflow group, paired
  * with their index in the parent's `children`. A for_each iteration's `slotKey`
  * is `${group}[${itemKey}]`; sequential subworkflow slot keys (bare agent

@@ -3,6 +3,7 @@ import { useReactFlow } from '@xyflow/react';
 import { useWorkflowStore } from '@/stores/workflow-store';
 import type { SubworkflowContext } from '@/stores/workflow-store';
 import { nodeKey } from '@/lib/node-id';
+import { expansionKeysForContextPath } from '@/components/graph/graph-layout';
 
 /** Parse deep-link params from the current URL. */
 function getDeepLinkParams(): { subworkflowPath: string | null; agent: string | null } {
@@ -60,6 +61,21 @@ function resolveSubworkflowPath(
   }
 
   return { path, failedSegment: null };
+}
+
+/** Resolve a {@link SubworkflowContext} from its absolute index path (root = `[]` → null). */
+function contextAtPath(
+  contexts: SubworkflowContext[],
+  path: number[],
+): SubworkflowContext | null {
+  let current: SubworkflowContext[] = contexts;
+  let ctx: SubworkflowContext | null = null;
+  for (const idx of path) {
+    ctx = current[idx] ?? null;
+    if (!ctx) return null;
+    current = ctx.children;
+  }
+  return ctx;
 }
 
 interface AgentMatch {
@@ -137,18 +153,26 @@ export interface DeepLinkError {
 
 /**
  * Reads `?agent=` and `?subworkflow=` query params on initial load
- * and auto-selects / navigates to the matching node once the workflow
- * state has been replayed.
+ * and reveals the matching node inline once the workflow state has been
+ * replayed.
+ *
+ * Rather than drilling the view into the target's context, the target's
+ * ancestor containers are expanded in place (root frame) so the node surfaces
+ * within the full graph, then it is selected and centered. Drill-down stays
+ * available via double-click / breadcrumb navigation. Expansion touches only
+ * the target's ancestor chain (a sequential subworkflow contributes its context
+ * key; a `for_each` iteration contributes its group key plus its own context
+ * key), so a wide fan-out never auto-expands unrelated siblings.
  *
  * Subworkflow paths support slash-separated nesting. Each segment matches
  * the child context's `slotKey` first, then falls back to `parentAgent`:
- *   ?subworkflow=planning/design                    → root→planning→design
- *   ?subworkflow=plan_children_group[item-7]/build  → into a specific
+ *   ?subworkflow=planning/design                    → reveal root→planning→design
+ *   ?subworkflow=plan_children_group[item-7]/build  → reveal a specific
  *                                                     for_each iteration
  *
  * Agent-only links (?agent=foo, no ?subworkflow=) search transitively:
  * root agents first, then every sub-workflow context. If the agent is
- * found in exactly one place, we navigate there. If it's found in many
+ * found in exactly one place, we reveal it there. If it's found in many
  * places (e.g. the same agent ran in every for_each iteration), the
  * running > deepest > newest match wins.
  *
@@ -170,6 +194,24 @@ export function useDeepLink(): DeepLinkError | null {
     let hardTimeout: ReturnType<typeof setTimeout> | null = null;
     let unsubscribe: (() => void) | null = null;
 
+    // Expand the target's ancestor chain inline (keeping the root frame) and
+    // select it, instead of re-rooting the view into the child context.
+    const revealContext = (targetPath: number[], selectedId: string | null): void => {
+      const keys = expansionKeysForContextPath(
+        useWorkflowStore.getState().subworkflowContexts,
+        targetPath,
+      );
+      useWorkflowStore.getState().expandContexts(keys);
+      useWorkflowStore.setState({ viewContextPath: [], selectedNode: selectedId });
+    };
+
+    // Center the view on a node after React Flow rebuilds the expanded graph.
+    const centerOn = (fitId: string): void => {
+      setTimeout(() => {
+        fitView({ nodes: [{ id: fitId }], padding: 0.5, duration: 400 });
+      }, 200);
+    };
+
     const apply = () => {
       if (applied.current) return;
       applied.current = true;
@@ -190,6 +232,8 @@ export function useDeepLink(): DeepLinkError | null {
         const result = resolveSubworkflowPath(state.subworkflowContexts, segments);
         if (result.failedSegment) {
           const resolved = segments.slice(0, result.path.length).join('/');
+          // Reveal as far as resolution got so the user sees where it stopped.
+          revealContext(result.path, null);
           setError({
             message: `Subworkflow "${result.failedSegment}" not found${resolved ? ` (resolved: ${resolved})` : ''}. It may not have started yet.`,
           });
@@ -203,87 +247,59 @@ export function useDeepLink(): DeepLinkError | null {
         const agentsAtTarget =
           resolvedPath.length === 0
             ? state.agents
-            : (() => {
-                let ctx: SubworkflowContext | undefined;
-                let contexts = state.subworkflowContexts;
-                for (const idx of resolvedPath) {
-                  ctx = contexts[idx];
-                  if (!ctx) break;
-                  contexts = ctx.children;
-                }
-                return ctx?.agents ?? [];
-              })();
+            : (contextAtPath(state.subworkflowContexts, resolvedPath)?.agents ?? []);
 
-        let fitId: string | null = null;
         if (agentsAtTarget.some((a) => a.name === agent)) {
-          // Agent is at the requested (or root) location
+          // Agent is at the requested (or root) location.
           const selectedId = nodeKey(resolvedPath, agent);
-          useWorkflowStore.setState({
-            viewContextPath: resolvedPath,
-            selectedNode: selectedId,
-          });
-          fitId = selectedId;
-        } else {
-          // Not at the requested location. Search transitively.
-          const matches = findAgentMatches(state.subworkflowContexts, agent);
-
-          if (matches.length === 0) {
-            const where = subworkflowPath || 'root workflow';
-            // Even on failure, honour any explicit subworkflow nav, otherwise
-            // pin to root so sticky-follow doesn't strand the user inside a
-            // stale for_each iteration during replay.
-            useWorkflowStore.setState({
-              viewContextPath: resolvedPath,
-              selectedNode: null,
-            });
-            setError({
-              message: `Agent "${agent}" not found in ${where}.`,
-            });
-            return;
-          }
-
-          if (subworkflowPath) {
-            // User asked for a specific path, agent isn't there but is
-            // elsewhere — surface the discovered locations so the next
-            // click is obvious.
-            const locations = matches
-              .slice(0, 5)
-              .map((m) => describeLocation(state.subworkflowContexts, m.path))
-              .join(', ');
-            const more = matches.length > 5 ? `, and ${matches.length - 5} more` : '';
-            useWorkflowStore.setState({
-              viewContextPath: resolvedPath,
-              selectedNode: null,
-            });
-            setError({
-              message: `Agent "${agent}" not found in ${subworkflowPath}. Found in: ${locations}${more}`,
-            });
-            return;
-          }
-
-          // Agent-only link: pick the best transitive match and navigate there.
-          const best = pickBestAgentMatch(matches)!;
-          const selectedId = nodeKey(best.path, agent);
-          useWorkflowStore.setState({
-            viewContextPath: best.path,
-            selectedNode: selectedId,
-          });
-          fitId = selectedId;
+          revealContext(resolvedPath, selectedId);
+          centerOn(selectedId);
+          return;
         }
 
-        // Center the view on the node after React Flow rebuilds the graph
-        if (fitId) {
-          const idForFit = fitId;
-          setTimeout(() => {
-            fitView({ nodes: [{ id: idForFit }], padding: 0.5, duration: 400 });
-          }, 200);
+        // Not at the requested location. Search transitively.
+        const matches = findAgentMatches(state.subworkflowContexts, agent);
+
+        if (matches.length === 0) {
+          const where = subworkflowPath || 'root workflow';
+          // Even on failure, reveal any explicit subworkflow nav, otherwise
+          // stay at root so sticky-follow doesn't strand the user inside a
+          // stale for_each iteration during replay.
+          revealContext(resolvedPath, null);
+          setError({ message: `Agent "${agent}" not found in ${where}.` });
+          return;
         }
-      } else if (subworkflowPath) {
-        // Subworkflow nav only, no agent
-        useWorkflowStore.setState({
-          viewContextPath: resolvedPath,
-          selectedNode: null,
-        });
+
+        if (subworkflowPath) {
+          // User asked for a specific path, agent isn't there but is
+          // elsewhere — reveal the requested subworkflow and surface the
+          // discovered locations so the next click is obvious.
+          const locations = matches
+            .slice(0, 5)
+            .map((m) => describeLocation(state.subworkflowContexts, m.path))
+            .join(', ');
+          const more = matches.length > 5 ? `, and ${matches.length - 5} more` : '';
+          revealContext(resolvedPath, null);
+          setError({
+            message: `Agent "${agent}" not found in ${subworkflowPath}. Found in: ${locations}${more}`,
+          });
+          return;
+        }
+
+        // Agent-only link: pick the best transitive match and reveal it.
+        const best = pickBestAgentMatch(matches)!;
+        const selectedId = nodeKey(best.path, agent);
+        revealContext(best.path, selectedId);
+        centerOn(selectedId);
+        return;
+      }
+
+      // Subworkflow nav only, no agent: reveal it inline and center on its
+      // container node (the subworkflow's node lives in its parent context).
+      revealContext(resolvedPath, null);
+      if (resolvedPath.length > 0) {
+        const ctx = contextAtPath(state.subworkflowContexts, resolvedPath);
+        if (ctx) centerOn(nodeKey(resolvedPath.slice(0, -1), ctx.slotKey));
       }
     };
 
