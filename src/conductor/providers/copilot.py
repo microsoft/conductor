@@ -351,9 +351,10 @@ class CopilotProvider(AgentProvider):
     def _large_output_config(self) -> dict[str, Any] | None:
         """Build the SDK ``large_output`` config for session creation.
 
-        Returns ``None`` when the provider's tool output limiter is disabled,
-        which causes the ``large_output`` key to be omitted from SDK kwargs so
-        the default SDK behavior applies.
+        The Copilot SDK enables ``large_output`` by default. Conductor therefore
+        forwards ``enabled=False`` explicitly when the provider's tool output
+        limiter is disabled, so the user's config is honored instead of being
+        silently overridden by the SDK default.
 
         When enabled, the value is forwarded to the SDK as-is. The Copilot SDK
         expects ``max_size_bytes``; Conductor forwards ``ToolOutputConfig.max_chars``
@@ -371,7 +372,7 @@ class CopilotProvider(AgentProvider):
         directory.
         """
         if not self._tool_output_config.enabled:
-            return None
+            return {"enabled": False}
         if self._tool_output_config.spill_to_file is False:
             return {"enabled": False}
         cfg: dict[str, Any] = {

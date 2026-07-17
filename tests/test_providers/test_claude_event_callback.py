@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from conductor.mcp.manager import _GENERIC_HINT, _TRUNCATION_MARKER_PREFIX
+from conductor.mcp.manager import _FS_HINT, _GENERIC_HINT, _TRUNCATION_MARKER_PREFIX
 from conductor.providers.claude import ClaudeProvider
 
 # ---------------------------------------------------------------------------
@@ -423,6 +423,48 @@ class TestAgentToolEvents:
         assert start_events[0][1]["arguments"].endswith("…")
 
     @pytest.mark.asyncio
+    async def test_truncation_event_with_fs_tools_after_hint_rewrite(self) -> None:
+        """Truncation event fires even after the generic hint is rewritten to fs hint."""
+        provider = _make_provider_with_mcp()
+        events: list[tuple[str, dict[str, Any]]] = []
+
+        mcp_response = _make_response(
+            [
+                _make_tool_use_block("filesystem__read_file", {"path": "/tmp/test.txt"}),
+            ]
+        )
+        text_response = _make_response([_make_text_block("Done")])
+        provider._execute_api_call = AsyncMock(side_effect=[mcp_response, text_response])
+        truncated_result = _truncated_tool_result(
+            original=2000, kept=100, spill_path="/tmp/spill.txt"
+        )
+        provider._mock_mcp_manager.call_tool = AsyncMock(return_value=truncated_result)
+
+        await provider._execute_agentic_loop(
+            messages=[{"role": "user", "content": "test"}],
+            model="claude-3-5-sonnet-latest",
+            temperature=None,
+            max_tokens=8192,
+            tools=[{"name": "filesystem__read_file"}],
+            output_schema=None,
+            has_output_schema=False,
+            event_callback=lambda t, d: events.append((t, d)),
+            mcp_manager=getattr(provider, "_mock_mcp_manager", None),
+        )
+
+        truncation_events = [(t, d) for t, d in events if t == "agent_tool_output_truncated"]
+        assert len(truncation_events) == 1
+        assert truncation_events[0][1]["tool_name"] == "filesystem__read_file"
+        assert truncation_events[0][1]["original_chars"] == 2000
+        assert truncation_events[0][1]["kept_chars"] == 100
+        assert truncation_events[0][1]["spill_path"] == "/tmp/spill.txt"
+
+        complete_events = [(t, d) for t, d in events if t == "agent_tool_complete"]
+        assert len(complete_events) == 1
+        assert _FS_HINT in complete_events[0][1]["result"]
+        assert _GENERIC_HINT not in complete_events[0][1]["result"]
+
+    @pytest.mark.asyncio
     async def test_truncation_event_with_spill_path(self) -> None:
         """Truncated result with spill emits agent_tool_output_truncated with path."""
         provider = _make_provider_with_mcp()
@@ -458,6 +500,75 @@ class TestAgentToolEvents:
         assert truncation_events[0][1]["original_chars"] == 2000
         assert truncation_events[0][1]["kept_chars"] == 1000
         assert truncation_events[0][1]["spill_path"] == "/tmp/spill.txt"
+
+    @pytest.mark.asyncio
+    async def test_truncation_event_with_long_spill_path(self) -> None:
+        """A very long spill path is still parsed correctly from the marker."""
+        provider = _make_provider_with_mcp()
+        events: list[tuple[str, dict[str, Any]]] = []
+
+        mcp_response = _make_response(
+            [
+                _make_tool_use_block("filesystem__read_file", {"path": "/tmp/test.txt"}),
+            ]
+        )
+        text_response = _make_response([_make_text_block("Done")])
+        provider._execute_api_call = AsyncMock(side_effect=[mcp_response, text_response])
+        long_dir = "/tmp/" + "a" * 600
+        long_path = f"{long_dir}/spill.txt"
+        truncated_result = _truncated_tool_result(original=2000, kept=1000, spill_path=long_path)
+        provider._mock_mcp_manager.call_tool = AsyncMock(return_value=truncated_result)
+
+        await provider._execute_agentic_loop(
+            messages=[{"role": "user", "content": "test"}],
+            model="claude-3-5-sonnet-latest",
+            temperature=None,
+            max_tokens=8192,
+            tools=None,
+            output_schema=None,
+            has_output_schema=False,
+            event_callback=lambda t, d: events.append((t, d)),
+            mcp_manager=getattr(provider, "_mock_mcp_manager", None),
+        )
+
+        truncation_events = [(t, d) for t, d in events if t == "agent_tool_output_truncated"]
+        assert len(truncation_events) == 1
+        assert truncation_events[0][1]["spill_path"] == long_path
+
+    @pytest.mark.asyncio
+    async def test_truncation_event_with_dot_space_in_path(self) -> None:
+        """A spill path containing '. ' is captured fully, not truncated at the dot."""
+        provider = _make_provider_with_mcp()
+        events: list[tuple[str, dict[str, Any]]] = []
+
+        mcp_response = _make_response(
+            [
+                _make_tool_use_block("filesystem__read_file", {"path": "/tmp/test.txt"}),
+            ]
+        )
+        text_response = _make_response([_make_text_block("Done")])
+        provider._execute_api_call = AsyncMock(side_effect=[mcp_response, text_response])
+        dot_space_path = "/tmp/my dir. with/dots.txt"
+        truncated_result = _truncated_tool_result(
+            original=2000, kept=1000, spill_path=dot_space_path
+        )
+        provider._mock_mcp_manager.call_tool = AsyncMock(return_value=truncated_result)
+
+        await provider._execute_agentic_loop(
+            messages=[{"role": "user", "content": "test"}],
+            model="claude-3-5-sonnet-latest",
+            temperature=None,
+            max_tokens=8192,
+            tools=None,
+            output_schema=None,
+            has_output_schema=False,
+            event_callback=lambda t, d: events.append((t, d)),
+            mcp_manager=getattr(provider, "_mock_mcp_manager", None),
+        )
+
+        truncation_events = [(t, d) for t, d in events if t == "agent_tool_output_truncated"]
+        assert len(truncation_events) == 1
+        assert truncation_events[0][1]["spill_path"] == dot_space_path
 
     @pytest.mark.asyncio
     async def test_truncation_event_without_spill_path(self) -> None:

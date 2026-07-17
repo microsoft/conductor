@@ -29,7 +29,7 @@ workflow:
       spill_to_file: true
       # Custom spill directory. When null, resolves to OS temp directory.
       spill_dir: null
-    
+
     mcp_servers:
       web-search:
         command: sh

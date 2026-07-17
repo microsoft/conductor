@@ -33,7 +33,13 @@ from pydantic import BaseModel
 from conductor.config.schema import AgentDef, OutputField, ToolOutputConfig
 from conductor.exceptions import ProviderError, ValidationError
 from conductor.executor.output import validate_output
-from conductor.mcp.manager import _FS_HINT, _GENERIC_HINT, _TRUNCATION_MARKER_PREFIX, MCPManager
+from conductor.mcp.manager import (
+    _FS_HINT,
+    _GENERIC_HINT,
+    _TAIL_WINDOW,
+    _TRUNCATION_MARKER_PREFIX,
+    MCPManager,
+)
 from conductor.providers._event_format import (
     extract_tool_result_text,
     format_tool_arguments,
@@ -2506,11 +2512,13 @@ class ClaudeProvider(AgentProvider):
         """Replace the generic truncation hint with an fs hint when applicable.
 
         Truncation is detected by the presence of the ``[output truncated:``
-        marker in the trailing part of the result string. When the agent has
-        filesystem-like tools available, the embedded generic hint is replaced
-        with a hint that points the model at its filesystem tools. The
-        replacement is an exact string substitution so no shared mutable state
-        or placeholder mechanism is required.
+        marker in the trailing part of the result string. The generic hint is
+        only replaced when the marker also advertises a spill file (i.e. the
+        marker contains the ``full output saved to:`` text), so the model is not
+        told to read a file that does not exist.
+
+        The replacement is an exact string substitution so no shared mutable
+        state or placeholder mechanism is required.
 
         Args:
             result: The possibly truncated MCP tool result string.
@@ -2519,10 +2527,13 @@ class ClaudeProvider(AgentProvider):
         Returns:
             The result string, possibly with the hint rewritten.
         """
-        if not result or _TRUNCATION_MARKER_PREFIX not in result[-400:]:
+        if not result or _TRUNCATION_MARKER_PREFIX not in result[-_TAIL_WINDOW:]:
             return result
 
         if not self._has_fs_like_tool(tools):
+            return result
+
+        if "full output saved to:" not in result[-_TAIL_WINDOW:]:
             return result
 
         return result.replace(_GENERIC_HINT, _FS_HINT)
@@ -2538,10 +2549,11 @@ class ClaudeProvider(AgentProvider):
 
             [output truncated: {original} chars -> {kept} kept{; optional path}. {HINT}]
 
-        This method detects the marker only in the trailing 400 characters of
-        ``result`` to avoid matching unrelated text. The marker is parsed from
-        the local string so no shared mutable state is needed, which keeps the
-        parser safe when the same MCP manager is reused across parallel agents.
+        This method detects the marker only in the trailing 2000 characters of
+        ``result`` to avoid matching unrelated text while still accommodating
+        long spill file paths. The marker is parsed from the local string so no
+        shared mutable state is needed, which keeps the parser safe when the same
+        MCP manager is reused across parallel agents.
 
         Args:
             result: The possibly truncated MCP tool result string.
@@ -2551,14 +2563,23 @@ class ClaudeProvider(AgentProvider):
             (``None`` when the marker omits a path), or ``None`` when the
             result is not truncated.
         """
-        if not result or _TRUNCATION_MARKER_PREFIX not in result[-400:]:
+        if not result or _TRUNCATION_MARKER_PREFIX not in result[-_TAIL_WINDOW:]:
             return None
 
-        tail = result[-400:]
+        tail = result[-_TAIL_WINDOW:]
         match = re.search(
-            re.escape(_TRUNCATION_MARKER_PREFIX) + r"\s*(\d+)\s*chars\s*-\u003e\s*(\d+)\s*kept"
-            r"(?:;\s*full output saved to:\s*(.+?))?(?=\.\s)",
+            re.escape(_TRUNCATION_MARKER_PREFIX)
+            + r"\s*(\d+)\s*chars\s*-\u003e\s*(\d+)\s*kept"
+            + r"(?:;\s*full output saved to:\s*(.+?))?\."
+            + r"\s*"
+            + r"(?:"
+            + re.escape(_GENERIC_HINT)
+            + r"|"
+            + re.escape(_FS_HINT)
+            + r")"
+            + r"\]\s*$",
             tail,
+            re.DOTALL,
         )
 
         if not match:

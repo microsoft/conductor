@@ -240,3 +240,123 @@ async def test_spill_directory_is_created_when_spill_dir_is_relative(
     assert "full output saved to:" in result
     assert relative_dir.exists()
     assert any(relative_dir.glob("*.txt"))
+
+    # Marker path must be absolute so agents with a different cwd can find it.
+    marker_start = result.index("full output saved to: ") + len("full output saved to: ")
+    marker_end = result.index(". The full output was truncated")
+    spill_path = result[marker_start:marker_end]
+    assert Path(spill_path).is_absolute()
+
+
+@pytest.mark.asyncio
+async def test_relative_spill_dir_resolves_against_cwd(
+    fixture: _TruncationManagerFixture, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A relative spill_dir string is resolved to an absolute path via cwd."""
+    full_text = "x" * 1500
+    monkeypatch.chdir(tmp_path)
+    config = ToolOutputConfig(
+        enabled=True, max_chars=1000, spill_to_file=True, spill_dir="tool-output"
+    )
+    manager = fixture.make_manager(config)
+    fixture.set_result(full_text)
+
+    result = await manager.call_tool("server__tool", {})
+
+    assert "full output saved to:" in result
+    resolved_dir = tmp_path / "tool-output"
+    assert resolved_dir.exists()
+    assert any(resolved_dir.glob("*.txt"))
+
+    marker_start = result.index("full output saved to: ") + len("full output saved to: ")
+    marker_end = result.index(". The full output was truncated")
+    spill_path = result[marker_start:marker_end]
+    assert Path(spill_path).is_absolute()
+    assert Path(spill_path).parent == resolved_dir
+
+
+@pytest.mark.asyncio
+async def test_spill_dir_symlink_is_rejected(
+    fixture: _TruncationManagerFixture, tmp_path: Path
+) -> None:
+    """A pre-existing symlink as spill_dir is rejected; no file is written."""
+    full_text = "x" * 1500
+    real_dir = tmp_path / "real"
+    symlink_dir = tmp_path / "link"
+    real_dir.mkdir()
+    symlink_dir.symlink_to(real_dir)
+    config = ToolOutputConfig(
+        enabled=True, max_chars=1000, spill_to_file=True, spill_dir=str(symlink_dir)
+    )
+    manager = fixture.make_manager(config)
+    fixture.set_result(full_text)
+
+    result = await manager.call_tool("server__tool", {})
+
+    assert "full output saved to:" not in result
+    assert "[output truncated: 1500 chars -> 1000 kept." in result
+    assert not any(real_dir.glob("*.txt"))
+
+
+@pytest.mark.asyncio
+async def test_spill_dir_loose_permissions_are_tightened(
+    fixture: _TruncationManagerFixture, tmp_path: Path
+) -> None:
+    """A pre-existing loose-permission spill_dir is chmod to 0o700 and used."""
+    full_text = "x" * 1500
+    loose_dir = tmp_path / "loose"
+    loose_dir.mkdir(mode=0o777)
+    config = ToolOutputConfig(
+        enabled=True, max_chars=1000, spill_to_file=True, spill_dir=str(loose_dir)
+    )
+    manager = fixture.make_manager(config)
+    fixture.set_result(full_text)
+
+    result = await manager.call_tool("server__tool", {})
+
+    assert "full output saved to:" in result
+    assert stat.S_IMODE(loose_dir.stat().st_mode) == 0o700
+    assert any(loose_dir.glob("*.txt"))
+
+
+@pytest.mark.asyncio
+async def test_spill_dir_chmod_failure_is_rejected(
+    fixture: _TruncationManagerFixture, tmp_path: Path
+) -> None:
+    """If chmod on a loose spill_dir fails, no file is written."""
+    full_text = "x" * 1500
+    loose_dir = tmp_path / "loose"
+    loose_dir.mkdir(mode=0o777)
+    config = ToolOutputConfig(
+        enabled=True, max_chars=1000, spill_to_file=True, spill_dir=str(loose_dir)
+    )
+    manager = fixture.make_manager(config)
+    fixture.set_result(full_text)
+
+    with patch("conductor.mcp.manager.os.chmod", side_effect=PermissionError("no")):
+        result = await manager.call_tool("server__tool", {})
+
+    assert "full output saved to:" not in result
+    assert "[output truncated: 1500 chars -> 1000 kept." in result
+    assert not any(loose_dir.glob("*.txt"))
+
+
+@pytest.mark.asyncio
+async def test_fdopen_failure_does_not_double_close(
+    fixture: _TruncationManagerFixture, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """If os.fdopen fails after os.open, the error is logged once and no double-close occurs."""
+    full_text = "x" * 1500
+    config = ToolOutputConfig(
+        enabled=True, max_chars=1000, spill_to_file=True, spill_dir=str(tmp_path)
+    )
+    manager = fixture.make_manager(config)
+    fixture.set_result(full_text)
+
+    with patch("conductor.mcp.manager.os.fdopen", side_effect=OSError("bad fd")):
+        result = await manager.call_tool("server__tool", {})
+
+    assert "full output saved to:" not in result
+    assert "[output truncated: 1500 chars -> 1000 kept." in result
+    assert "Failed to spill full MCP tool output" in caplog.text
+    assert not list(tmp_path.glob("*.txt"))

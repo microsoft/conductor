@@ -134,10 +134,10 @@ class TestMaybeRewriteTruncationHint:
             )
         return f"{base}\n\n[output truncated: 2000 chars -> 1000 kept. {hint}]"
 
-    def test_rewrites_generic_hint_when_fs_tool_present(self) -> None:
-        """Generic hint is replaced with fs hint when fs-like tools are available."""
+    def test_rewrites_generic_hint_when_fs_tool_and_spill_path_present(self) -> None:
+        """Generic hint is replaced with fs hint when fs tools exist and a spill path is present."""
         provider = _make_provider_with_tool_output()
-        result = self._truncated_result()
+        result = self._truncated_result(path="/tmp/spill.txt")
         tools = [{"name": "fs__read_file"}]
 
         rewritten = provider._maybe_rewrite_truncation_hint(result, tools)
@@ -188,11 +188,22 @@ class TestMaybeRewriteTruncationHint:
         assert _GENERIC_HINT in rewritten
         assert _FS_HINT not in rewritten
 
+    def test_keeps_generic_hint_when_truncated_but_no_spill_path(self) -> None:
+        """Generic hint is kept when the marker has no path, even with fs tools."""
+        provider = _make_provider_with_tool_output()
+        result = self._truncated_result()  # no spill path
+        tools = [{"name": "fs__read_file"}]
+
+        rewritten = provider._maybe_rewrite_truncation_hint(result, tools)
+
+        assert _GENERIC_HINT in rewritten
+        assert _FS_HINT not in rewritten
+
     def test_rewrites_only_when_marker_is_in_tail(self) -> None:
-        """Marker detection looks at the trailing ~400 characters of the result."""
+        """Marker detection looks at the trailing 2000 characters of the result."""
         provider = _make_provider_with_tool_output()
         prefix = "y" * 500
-        result = f"{prefix}{self._truncated_result()[-500:]}"
+        result = f"{prefix}{self._truncated_result(path='/tmp/spill.txt')[-500:]}"
         tools = [{"name": "fs__read_file"}]
 
         rewritten = provider._maybe_rewrite_truncation_hint(result, tools)
@@ -249,6 +260,39 @@ class TestAgenticLoopHintReplacement:
         assert len(complete_events) == 1
         assert _FS_HINT in complete_events[0]["result"]
         assert _GENERIC_HINT not in complete_events[0]["result"]
+
+    @pytest.mark.asyncio
+    async def test_loop_keeps_generic_hint_when_no_spill_path(self) -> None:
+        """The agentic loop keeps the generic hint when the marker omits a path."""
+        provider = _make_provider_with_tool_output()
+        events: list[tuple[str, dict[str, Any]]] = []
+        truncated_result = "x" * 100 + (
+            f"\n\n[output truncated: 200 chars -> 100 kept. {_GENERIC_HINT}]"
+        )
+
+        mcp_response = _make_response(
+            [_make_tool_use_block("filesystem__read_file", {"path": "/tmp/test.txt"})]
+        )
+        text_response = _make_response([_make_text_block("Done")])
+        provider._execute_api_call = AsyncMock(side_effect=[mcp_response, text_response])
+        provider._mock_mcp_manager.call_tool = AsyncMock(return_value=truncated_result)
+
+        await provider._execute_agentic_loop(
+            messages=[{"role": "user", "content": "test"}],
+            model="claude-3-5-sonnet-latest",
+            temperature=None,
+            max_tokens=8192,
+            tools=[{"name": "filesystem__read_file"}],
+            output_schema=None,
+            has_output_schema=False,
+            event_callback=lambda t, d: events.append((t, d)),
+            mcp_manager=getattr(provider, "_mock_mcp_manager", None),
+        )
+
+        complete_events = [d for t, d in events if t == "agent_tool_complete"]
+        assert len(complete_events) == 1
+        assert _GENERIC_HINT in complete_events[0]["result"]
+        assert _FS_HINT not in complete_events[0]["result"]
 
     @pytest.mark.asyncio
     async def test_loop_keeps_generic_hint_when_no_fs_tool(self) -> None:
@@ -315,3 +359,52 @@ class TestAgenticLoopHintReplacement:
         assert len(complete_events) == 1
         assert _GENERIC_HINT in complete_events[0]["result"]
         assert _FS_HINT not in complete_events[0]["result"]
+
+
+class TestParseTruncationMarker:
+    """Direct unit tests for _parse_truncation_marker parsing."""
+
+    def test_parses_generic_hint(self) -> None:
+        """A marker using the generic hint parses correctly."""
+        provider = _make_provider_with_tool_output()
+        result = "x" * 100 + (
+            f"\n\n[output truncated: 200 chars -> 100 kept; "
+            f"full output saved to: /tmp/s.txt. {_GENERIC_HINT}]"
+        )
+
+        parsed = provider._parse_truncation_marker(result)
+
+        assert parsed == {
+            "original_chars": 200,
+            "kept_chars": 100,
+            "spill_path": "/tmp/s.txt",
+        }
+
+    def test_parses_fs_hint(self) -> None:
+        """A marker using the fs hint (after rewrite) parses correctly."""
+        provider = _make_provider_with_tool_output()
+        result = "x" * 100 + (
+            f"\n\n[output truncated: 200 chars -> 100 kept; "
+            f"full output saved to: /tmp/s.txt. {_FS_HINT}]"
+        )
+
+        parsed = provider._parse_truncation_marker(result)
+
+        assert parsed == {
+            "original_chars": 200,
+            "kept_chars": 100,
+            "spill_path": "/tmp/s.txt",
+        }
+
+    def test_parses_no_path(self) -> None:
+        """A marker without a spill path parses with None path."""
+        provider = _make_provider_with_tool_output()
+        result = "x" * 100 + (f"\n\n[output truncated: 200 chars -> 100 kept. {_GENERIC_HINT}]")
+
+        parsed = provider._parse_truncation_marker(result)
+
+        assert parsed == {
+            "original_chars": 200,
+            "kept_chars": 100,
+            "spill_path": None,
+        }

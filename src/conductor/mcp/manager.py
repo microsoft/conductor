@@ -18,9 +18,10 @@ from __future__ import annotations
 import logging
 import os
 import re
+import stat
 import tempfile
 import uuid
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, suppress
 from pathlib import Path
 from typing import Any
 
@@ -52,6 +53,7 @@ _GENERIC_HINT = "The full output was truncated; refine the tool arguments to ret
 _FS_HINT = (
     "The full output was saved to a file; read it with your filesystem tools if you need more."
 )
+_TAIL_WINDOW = 2000
 
 
 def _sanitize_for_filename(value: str) -> str:
@@ -344,12 +346,34 @@ class MCPManager:
         """
         spill_dir_str = self._tool_output.spill_dir
         if spill_dir_str:
-            spill_dir = Path(spill_dir_str)
+            spill_dir_input = Path(spill_dir_str)
+            if spill_dir_input.is_symlink():
+                logger.warning(
+                    "Spill dir %s is a symlink; refusing to write tool output spill.",
+                    spill_dir_input,
+                )
+                return None
+            spill_dir = spill_dir_input.resolve()
         else:
-            spill_dir = Path(tempfile.gettempdir()) / "conductor" / "tool-output"
+            spill_dir = Path(tempfile.gettempdir()).resolve() / "conductor" / "tool-output"
 
         try:
             spill_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            # If the leaf directory already existed, harden it before writing
+            # potentially sensitive tool output into it.
+            current_mode = stat.S_IMODE(spill_dir.stat().st_mode)
+            if current_mode & 0o077:
+                try:
+                    os.chmod(spill_dir, 0o700)
+                except OSError as chmod_err:
+                    logger.warning(
+                        "Spill dir %s has permissions %04o and chmod failed: %s; "
+                        "refusing to write tool output spill.",
+                        spill_dir,
+                        current_mode,
+                        chmod_err,
+                    )
+                    return None
             safe_server = _sanitize_for_filename(server_name)
             safe_tool = _sanitize_for_filename(original_name)
             unique = uuid.uuid4().hex[:8]
@@ -360,8 +384,11 @@ class MCPManager:
             try:
                 with os.fdopen(fd, "w") as f:
                     f.write(full_text)
-            except Exception:
-                os.close(fd)
+            except OSError:
+                # fd is closed by the context manager (or was never wrapped);
+                # the outer OSError handler will log and degrade gracefully.
+                with suppress(OSError):
+                    os.remove(path)
                 raise
             return str(path)
         except OSError as e:

@@ -1306,11 +1306,11 @@ class TestCopilotProviderLargeOutput:
         captured = self._captured_create_session(provider)
         assert captured["large_output"] == {"enabled": True, "max_size_bytes": 50000}
 
-    def test_disabled_config_omits_large_output_key(self) -> None:
-        """enabled=False means the large_output key is absent from create_session."""
+    def test_disabled_config_forwards_enabled_false(self) -> None:
+        """enabled=False is forwarded as enabled=False because the SDK defaults to enabled."""
         provider = CopilotProvider(tool_output=ToolOutputConfig(enabled=False))
         captured = self._captured_create_session(provider)
-        assert "large_output" not in captured
+        assert captured["large_output"] == {"enabled": False}
 
     def test_spill_to_file_false_maps_to_enabled_false(self) -> None:
         """spill_to_file=False disables large_output handling entirely (SDK limitation)."""
@@ -1336,11 +1336,11 @@ class TestCopilotProviderLargeOutput:
         captured = self._captured_dialog_session(provider)
         assert captured["large_output"] == {"enabled": True, "max_size_bytes": 50000}
 
-    def test_large_output_disabled_omits_key_for_dialog_session(self) -> None:
-        """enabled=False omits large_output from dialog create_session kwargs."""
+    def test_large_output_disabled_forwards_enabled_false_for_dialog_session(self) -> None:
+        """enabled=False is forwarded as enabled=False in dialog create_session kwargs."""
         provider = CopilotProvider(tool_output=ToolOutputConfig(enabled=False))
         captured = self._captured_dialog_session(provider)
-        assert "large_output" not in captured
+        assert captured["large_output"] == {"enabled": False}
 
 
 class TestGetMaxPromptTokens:
