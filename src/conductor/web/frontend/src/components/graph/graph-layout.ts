@@ -87,6 +87,48 @@ export function buildGraphElements(
   return { nodes, edges };
 }
 
+/**
+ * Collect the context keys of every inline-expandable subworkflow reachable
+ * from a viewed context, walking the full context subtree (not just what is
+ * currently expanded). Used by the graph's Expand/Collapse-all control.
+ *
+ * Only sequential `type: workflow` steps are inline-expandable in this phase:
+ * their child context's `slotKey` equals the agent name and the child must have
+ * at least one agent (mirrors `canExpand` in {@link layoutContext}). `for_each`
+ * subworkflow iterations are intentionally excluded — their child contexts are
+ * keyed `group[key]`, never match an agent name, and render only via drill-down.
+ *
+ * @param agents The viewed context's agents.
+ * @param children The viewed context's child subworkflow contexts.
+ * @param basePath Absolute numeric index path of the viewed context (root = `[]`).
+ */
+export function collectExpandableContextKeys(
+  agents: WorkflowAgent[],
+  children: SubworkflowContext[],
+  basePath: number[],
+): string[] {
+  const keys: string[] = [];
+
+  const walk = (
+    ctxAgents: WorkflowAgent[],
+    ctxChildren: SubworkflowContext[],
+    absPath: number[],
+  ): void => {
+    for (const a of ctxAgents) {
+      if ((a.type || 'agent') !== 'workflow') continue;
+      const childIdx = ctxChildren.findIndex((c) => c.slotKey === a.name);
+      if (childIdx < 0) continue;
+      const child = ctxChildren[childIdx]!;
+      if (child.agents.length === 0) continue;
+      keys.push(contextKey([...absPath, childIdx]));
+      walk(child.agents, child.children, [...absPath, childIdx]);
+    }
+  };
+
+  walk(agents, children, basePath);
+  return keys;
+}
+
 interface ContextLayout {
   nodes: Node<GraphNodeData>[];
   edges: Edge[];

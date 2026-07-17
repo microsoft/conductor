@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { useWorkflowStore } from '@/stores/workflow-store';
 import type { WorkflowEvent } from '@/types/events';
-import { buildGraphElements, type GraphContextInput } from './graph-layout';
+import { buildGraphElements, collectExpandableContextKeys, type GraphContextInput } from './graph-layout';
 import { contextKey, nodeKey, parseNodeKey } from '@/lib/node-id';
 
 function event(
@@ -75,6 +75,79 @@ function seedRootWithStartedSubworkflow(): void {
       for_each_groups: [],
       entry_point: 'childA',
       subworkflow_path: ['sub_agent'],
+    }),
+  );
+}
+
+/**
+ * Like {@link seedRootWithStartedSubworkflow} but the child subworkflow itself
+ * contains a started `type: workflow` step (`deep_sub`), producing a two-level
+ * nesting: root → sub_agent → deep_sub.
+ */
+function seedNestedSubworkflows(): void {
+  const { processEvent } = useWorkflowStore.getState();
+
+  processEvent(
+    event('workflow_started', {
+      name: 'root',
+      agents: [{ name: 'planner' }, { name: 'sub_agent', type: 'workflow' }],
+      routes: [
+        { from: 'planner', to: 'sub_agent' },
+        { from: 'sub_agent', to: '$end' },
+      ],
+      parallel_groups: [],
+      for_each_groups: [],
+      entry_point: 'planner',
+    }),
+  );
+
+  processEvent(
+    event('subworkflow_started', {
+      agent_name: 'sub_agent',
+      workflow: 'sub.yaml',
+      iteration: 1,
+      slot_key: 'sub_agent',
+      parent_path: [],
+    }),
+  );
+
+  processEvent(
+    event('workflow_started', {
+      name: 'child-workflow',
+      agents: [{ name: 'childA' }, { name: 'deep_sub', type: 'workflow' }],
+      routes: [
+        { from: 'childA', to: 'deep_sub' },
+        { from: 'deep_sub', to: '$end' },
+      ],
+      parallel_groups: [],
+      for_each_groups: [],
+      entry_point: 'childA',
+      subworkflow_path: ['sub_agent'],
+    }),
+  );
+
+  processEvent(
+    event('subworkflow_started', {
+      agent_name: 'deep_sub',
+      workflow: 'deep.yaml',
+      iteration: 1,
+      slot_key: 'deep_sub',
+      parent_path: ['sub_agent'],
+    }),
+  );
+
+  processEvent(
+    event('workflow_started', {
+      name: 'grandchild-workflow',
+      agents: [{ name: 'g1' }, { name: 'g2' }],
+      routes: [
+        { from: 'g1', to: 'g2' },
+        { from: 'g2', to: '$end' },
+      ],
+      parallel_groups: [],
+      for_each_groups: [],
+      entry_point: 'g1',
+      subworkflow_path: ['sub_agent', 'deep_sub'],
     }),
   );
 }
@@ -192,5 +265,104 @@ describe('buildGraphElements — inline subworkflow expansion', () => {
     const ingress = nodes.find((n) => n.id === nodeKey([0], '$start'));
     expect(ingress?.type).toBe('ingressNode');
     expect(ingress?.data.parentAgent).toBe('sub_agent');
+  });
+});
+
+describe('collectExpandableContextKeys', () => {
+  it('returns nothing for a plain workflow with no subworkflows', () => {
+    const { processEvent } = useWorkflowStore.getState();
+    processEvent(
+      event('workflow_started', {
+        name: 'root',
+        agents: [{ name: 'a' }, { name: 'b' }],
+        routes: [
+          { from: 'a', to: 'b' },
+          { from: 'b', to: '$end' },
+        ],
+        parallel_groups: [],
+        for_each_groups: [],
+        entry_point: 'a',
+      }),
+    );
+    const s = useWorkflowStore.getState();
+    expect(collectExpandableContextKeys(s.agents, s.subworkflowContexts, [])).toEqual([]);
+  });
+
+  it('excludes a subworkflow step whose child DAG has not started yet', () => {
+    const { processEvent } = useWorkflowStore.getState();
+    // A `type: workflow` step exists, but no subworkflow_started/child
+    // workflow_started has populated its inner DAG — nothing to expand.
+    processEvent(
+      event('workflow_started', {
+        name: 'root',
+        agents: [{ name: 'planner' }, { name: 'sub_agent', type: 'workflow' }],
+        routes: [
+          { from: 'planner', to: 'sub_agent' },
+          { from: 'sub_agent', to: '$end' },
+        ],
+        parallel_groups: [],
+        for_each_groups: [],
+        entry_point: 'planner',
+      }),
+    );
+    const s = useWorkflowStore.getState();
+    expect(collectExpandableContextKeys(s.agents, s.subworkflowContexts, [])).toEqual([]);
+  });
+
+  it('collects a started sequential subworkflow regardless of expansion state', () => {
+    seedRootWithStartedSubworkflow();
+    const s = useWorkflowStore.getState();
+    // Enumerates the data subtree, not the currently-expanded set.
+    expect(s.expandedContexts.size).toBe(0);
+    expect(collectExpandableContextKeys(s.agents, s.subworkflowContexts, [])).toEqual([
+      contextKey([0]),
+    ]);
+  });
+
+  it('recurses into nested subworkflows, returning every expandable key', () => {
+    seedNestedSubworkflows();
+    const s = useWorkflowStore.getState();
+    expect(collectExpandableContextKeys(s.agents, s.subworkflowContexts, [])).toEqual([
+      contextKey([0]),
+      contextKey([0, 0]),
+    ]);
+  });
+
+  it('namespaces keys relative to the provided basePath (drilled-in view)', () => {
+    seedNestedSubworkflows();
+    const child = useWorkflowStore.getState().subworkflowContexts[0]!;
+    // Viewed as if drilled into sub_agent (basePath [0]); only deep_sub remains.
+    expect(collectExpandableContextKeys(child.agents, child.children, [0])).toEqual([
+      contextKey([0, 0]),
+    ]);
+  });
+});
+
+describe('bulk expand/collapse store actions', () => {
+  it('unions keys on expand and removes them on collapse', () => {
+    useWorkflowStore.getState().expandContexts(['0', '0.0']);
+    expect(useWorkflowStore.getState().expandedContexts).toEqual(new Set(['0', '0.0']));
+
+    // Union is idempotent — re-adding an existing key is a no-op.
+    useWorkflowStore.getState().expandContexts(['0']);
+    expect(useWorkflowStore.getState().expandedContexts).toEqual(new Set(['0', '0.0']));
+
+    useWorkflowStore.getState().collapseContexts(['0']);
+    expect(useWorkflowStore.getState().expandedContexts).toEqual(new Set(['0.0']));
+  });
+
+  it('collapse is scoped to the provided keys, preserving others', () => {
+    useWorkflowStore.getState().expandContexts(['a', 'b', 'c']);
+    useWorkflowStore.getState().collapseContexts(['b']);
+    expect(useWorkflowStore.getState().expandedContexts).toEqual(new Set(['a', 'c']));
+  });
+
+  it('ignores empty key lists', () => {
+    useWorkflowStore.getState().expandContexts(['x']);
+    const before = useWorkflowStore.getState().expandedContexts;
+    useWorkflowStore.getState().expandContexts([]);
+    useWorkflowStore.getState().collapseContexts([]);
+    // Same set reference is retained when nothing changes.
+    expect(useWorkflowStore.getState().expandedContexts).toBe(before);
   });
 });

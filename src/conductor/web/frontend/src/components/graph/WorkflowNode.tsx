@@ -45,7 +45,7 @@ export const WorkflowNode = memo(function WorkflowNode({ data, selected }: NodeP
         <Handle type="target" position={Position.Top} className="!bg-[var(--border)] !border-none !w-2 !h-2" />
         <div
           className={cn(
-            'w-full h-full rounded-xl border-2 border-dashed bg-[var(--surface)]/40 transition-all duration-300',
+            'w-full h-full rounded-xl border-2 border-dashed bg-[var(--surface)]/40 transition-all duration-300 animate-[subflow-expand-in_200ms_ease-out]',
             selected && 'ring-2 ring-[var(--accent)] ring-offset-1 ring-offset-[var(--bg)]',
             status === 'running' && 'shadow-[0_0_16px_var(--running-glow)]',
           )}
@@ -108,8 +108,10 @@ export const WorkflowNode = memo(function WorkflowNode({ data, selected }: NodeP
         >
           {/* Expand-inline chevron on the LEFT, matching the collapse chevron's
               position in the expanded header so it doesn't jump sides on toggle.
-              Only shown once the child DAG is available. */}
-          {canExpand && (
+              Once the child DAG is available it becomes an interactive button;
+              before then a dimmed placeholder keeps the pill width stable and
+              hints that the subworkflow will be expandable once it starts. */}
+          {canExpand ? (
             <button
               onClick={onToggle}
               className="nodrag flex items-center justify-center w-5 h-5 rounded hover:bg-[var(--surface-hover)] text-[var(--text-muted)] hover:text-[var(--text)] transition-colors flex-shrink-0"
@@ -117,6 +119,14 @@ export const WorkflowNode = memo(function WorkflowNode({ data, selected }: NodeP
             >
               <ChevronRight className="w-3.5 h-3.5" />
             </button>
+          ) : (
+            <div
+              className="flex items-center justify-center w-5 h-5 flex-shrink-0 text-[var(--text-muted)] opacity-25"
+              title="Subworkflow not started yet"
+              aria-hidden="true"
+            >
+              <ChevronRight className="w-3.5 h-3.5" />
+            </div>
           )}
 
           {/* Stacked layers icon */}

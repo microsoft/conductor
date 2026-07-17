@@ -377,6 +377,12 @@ interface WorkflowState {
   /** Toggle inline expansion of a subworkflow context by its context key. */
   toggleContextExpanded: (contextKey: string) => void;
 
+  /** Mark a set of subworkflow context keys as expanded inline (union). */
+  expandContexts: (contextKeys: string[]) => void;
+
+  /** Collapse a set of subworkflow context keys (difference). */
+  collapseContexts: (contextKeys: string[]) => void;
+
   // Computed: get the currently viewed context's data
   getViewedContext: () => {
     workflowName: string;
@@ -843,6 +849,33 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
         next.add(contextKey);
       }
       return { expandedContexts: next };
+    });
+  },
+
+  expandContexts: (contextKeys: string[]) => {
+    if (contextKeys.length === 0) return;
+    set((state) => {
+      const next = new Set(state.expandedContexts);
+      let changed = false;
+      for (const key of contextKeys) {
+        if (!next.has(key)) {
+          next.add(key);
+          changed = true;
+        }
+      }
+      return changed ? { expandedContexts: next } : {};
+    });
+  },
+
+  collapseContexts: (contextKeys: string[]) => {
+    if (contextKeys.length === 0) return;
+    set((state) => {
+      const next = new Set(state.expandedContexts);
+      let changed = false;
+      for (const key of contextKeys) {
+        if (next.delete(key)) changed = true;
+      }
+      return changed ? { expandedContexts: next } : {};
     });
   },
 

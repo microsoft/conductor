@@ -18,7 +18,7 @@ import '@xyflow/react/dist/style.css';
 import { useWorkflowStore, type SubworkflowContext } from '@/stores/workflow-store';
 import { useViewedGraphData } from '@/hooks/use-viewed-context';
 import { useDeepLink } from '@/hooks/use-deep-link';
-import { buildGraphElements, type GraphNodeData, type GraphContextInput } from './graph-layout';
+import { buildGraphElements, collectExpandableContextKeys, type GraphNodeData, type GraphContextInput } from './graph-layout';
 import { nodeKey, parseNodeKey } from '@/lib/node-id';
 import { AgentNode } from './AgentNode';
 import { ScriptNode } from './ScriptNode';
@@ -36,7 +36,7 @@ import { AnimatedEdge } from './AnimatedEdge';
 import { WorkflowErrorBanner, WorkflowSuccessBanner } from '@/components/layout/ErrorBanner';
 import { NODE_STATUS_HEX } from '@/lib/constants';
 import type { NodeStatus } from '@/lib/constants';
-import { Loader2, Maximize, Zap } from 'lucide-react';
+import { Loader2, Maximize, Zap, ChevronsUpDown, ChevronsDownUp } from 'lucide-react';
 
 const nodeTypes: NodeTypes = {
   agentNode: AgentNode,
@@ -380,6 +380,7 @@ export function WorkflowGraph() {
           zoomable
         />
         <Controls showInteractive={false}>
+          <ExpandCollapseAllButton />
           <FitViewButton />
         </Controls>
         <FitViewKeyboardShortcut />
@@ -406,6 +407,65 @@ function FitViewButton() {
       style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}
     >
       <Maximize className="w-3.5 h-3.5" />
+    </button>
+  );
+}
+
+/**
+ * Toolbar control that expands or collapses every inline-expandable
+ * subworkflow in the viewed context at once. Hidden when the viewed context
+ * has no expandable subworkflows, so plain workflows don't see it. Toggles to
+ * "collapse all" whenever at least one is expanded. Mirrors the Fit-view
+ * button's `E` keyboard shortcut.
+ */
+function ExpandCollapseAllButton() {
+  const { agents, subworkflowContexts, basePath } = useViewedGraphData();
+  const expandedContexts = useWorkflowStore((s) => s.expandedContexts);
+  const expandContexts = useWorkflowStore((s) => s.expandContexts);
+  const collapseContexts = useWorkflowStore((s) => s.collapseContexts);
+
+  const expandableKeys = useMemo(
+    () => collectExpandableContextKeys(agents, subworkflowContexts, basePath),
+    [agents, subworkflowContexts, basePath],
+  );
+
+  const anyExpanded = useMemo(
+    () => expandableKeys.some((k) => expandedContexts.has(k)),
+    [expandableKeys, expandedContexts],
+  );
+
+  const toggleAll = useCallback(() => {
+    if (expandableKeys.length === 0) return;
+    if (anyExpanded) collapseContexts(expandableKeys);
+    else expandContexts(expandableKeys);
+  }, [expandableKeys, anyExpanded, collapseContexts, expandContexts]);
+
+  // Keyboard shortcut: E toggles expand/collapse-all (mirrors F for fit-view).
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      const tag = (e.target as HTMLElement)?.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+      if (e.key === 'e' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        toggleAll();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [toggleAll]);
+
+  if (expandableKeys.length === 0) return null;
+
+  const label = anyExpanded ? 'Collapse all subworkflows' : 'Expand all subworkflows';
+
+  return (
+    <button
+      onClick={toggleAll}
+      className="react-flow__controls-button"
+      title={`${label} (E)`}
+      aria-label={label}
+      style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+    >
+      {anyExpanded ? <ChevronsDownUp className="w-3.5 h-3.5" /> : <ChevronsUpDown className="w-3.5 h-3.5" />}
     </button>
   );
 }
