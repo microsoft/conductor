@@ -2,6 +2,7 @@ import { useRef, useEffect, useState, useCallback, useMemo } from 'react';
 import { TerminalSquare, FileOutput, Activity, ChevronDown, ChevronUp, Copy, Check, Search, X } from 'lucide-react';
 import { useWorkflowStore, type LogEntry, type ActivityLogEntry } from '@/stores/workflow-store';
 import { formatOutput, cn } from '@/lib/utils';
+import { nodeKey } from '@/lib/node-id';
 
 type Tab = 'log' | 'activity' | 'output';
 
@@ -268,7 +269,7 @@ function ActivityView({ entries }: { entries: ActivityLogEntry[] }) {
                 <span className="text-[var(--text-muted)] flex-shrink-0 select-none tabular-nums">{time}</span>
                 <span className={cn('flex-shrink-0 w-[5ch] text-[10px] font-semibold tabular-nums select-none', style!.labelColor)}>{style!.label}</span>
                 <button
-                  onClick={() => selectNode(entry.source)}
+                  onClick={() => selectNode(nodeKey([], entry.source))}
                   className="text-[var(--text-secondary)] flex-shrink-0 min-w-[8ch] max-w-[16ch] truncate hover:text-[var(--accent)] hover:underline transition-colors text-left"
                   title={`Select ${entry.source}`}
                 >
@@ -349,7 +350,7 @@ function LogView({ entries }: { entries: LogEntry[] }) {
             <span className="text-[var(--text-muted)] flex-shrink-0 select-none tabular-nums">{time}</span>
             <span className={cn('flex-shrink-0 w-3 text-center select-none', style!.color)}>{style!.icon}</span>
             <button
-              onClick={() => selectNode(entry.source)}
+              onClick={() => selectNode(nodeKey([], entry.source))}
               className="text-[var(--text-secondary)] flex-shrink-0 min-w-[8ch] max-w-[16ch] truncate hover:text-[var(--accent)] hover:underline transition-colors text-left"
               title={`Select ${entry.source}`}
             >

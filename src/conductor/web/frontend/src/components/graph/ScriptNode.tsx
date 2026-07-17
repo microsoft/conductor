@@ -4,26 +4,25 @@ import { Terminal } from 'lucide-react';
 import { cn, formatElapsed } from '@/lib/utils';
 import { NODE_STATUS_HEX } from '@/lib/constants';
 import { useWorkflowStore } from '@/stores/workflow-store';
-import { useViewedNodes } from '@/hooks/use-viewed-context';
+import { useNodeLiveData } from '@/hooks/use-viewed-context';
 import { NodeTooltip } from './NodeTooltip';
 import type { GraphNodeData } from './graph-layout';
 import type { NodeStatus } from '@/lib/constants';
 
-export const ScriptNode = memo(function ScriptNode({ data, id, selected }: NodeProps) {
+export const ScriptNode = memo(function ScriptNode({ data, selected }: NodeProps) {
   const nodeData = data as unknown as GraphNodeData;
-  const viewedNodes = useViewedNodes();
-  const storeStatus = viewedNodes[id]?.status;
+  const nd = useNodeLiveData(nodeData);
+  const storeStatus = nd?.status;
   const status = (storeStatus || nodeData.status || 'pending') as NodeStatus;
   const borderColor = NODE_STATUS_HEX[status] || NODE_STATUS_HEX.pending;
 
-  const nd = viewedNodes[id];
   const elapsed = nd?.elapsed;
   const exitCode = nd?.exit_code;
   const errorType = nd?.error_type;
   const errorMessage = nd?.error_message;
 
   // Live elapsed timer
-  const liveElapsed = useLiveElapsed(id, status);
+  const liveElapsed = useLiveElapsed(nd?.startedAt, status);
 
   // Status transition animation
   const transitionClass = useStatusTransition(status);
@@ -91,8 +90,7 @@ export const ScriptNode = memo(function ScriptNode({ data, id, selected }: NodeP
   );
 });
 
-function useLiveElapsed(id: string, status: NodeStatus): string {
-  const startedAt = useViewedNodes()[id]?.startedAt;
+function useLiveElapsed(startedAt: number | undefined, status: NodeStatus): string {
   const replayMode = useWorkflowStore((s) => s.replayMode);
   const lastEventTime = useWorkflowStore((s) => s.lastEventTime);
   const [display, setDisplay] = useState('0.0s');

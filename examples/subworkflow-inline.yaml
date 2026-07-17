@@ -1,0 +1,53 @@
+# Inline Subworkflow Demo
+#
+# A tiny parent workflow whose middle step is a `type: workflow` sub-workflow
+# (it calls examples/simple-qa.yaml as a black box). Its purpose is to exercise
+# the dashboard's inline subworkflow expand/collapse (issue #314): run it with
+# `--web`, then click the chevron on the "research" node to expand the child
+# DAG in place, or double-click it to drill in (focus) as before.
+#
+# Usage:
+#   uv run conductor run examples/subworkflow-inline.yaml --web \
+#     --input topic="the Python GIL"
+
+workflow:
+  name: subworkflow-inline-demo
+  description: Parent workflow that runs simple-qa as an inline sub-workflow
+  version: "1.0.0"
+  entry_point: research
+
+  runtime:
+    provider: copilot
+
+  input:
+    topic:
+      type: string
+      required: true
+      description: The topic to research via the sub-workflow
+
+agents:
+  - name: research
+    type: workflow
+    description: Runs the simple-qa sub-workflow as a black-box step
+    workflow: ./simple-qa.yaml
+    input_mapping:
+      question: "What is {{ workflow.input.topic }}?"
+    routes:
+      - to: summarize
+
+  - name: summarize
+    description: Condenses the sub-workflow's answer into a single sentence
+    model: claude-haiku-4.5
+    prompt: |
+      Summarize the following answer in exactly one sentence:
+
+      {{ research.output.answer }}
+    output:
+      summary:
+        type: string
+        description: One-sentence summary of the sub-workflow's answer
+    routes:
+      - to: $end
+
+output:
+  summary: "{{ summarize.output.summary }}"

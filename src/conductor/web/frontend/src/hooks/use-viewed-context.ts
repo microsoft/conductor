@@ -8,6 +8,7 @@
 import { useMemo } from 'react';
 import { useWorkflowStore } from '@/stores/workflow-store';
 import type { NodeData, GroupProgress, HighlightedEdge, SubworkflowContext } from '@/stores/workflow-store';
+import { parseNodeKey } from '@/lib/node-id';
 
 /** Resolve a SubworkflowContext from a path of indices. */
 function resolveCtx(contexts: SubworkflowContext[], path: number[]): SubworkflowContext | null {
@@ -17,6 +18,52 @@ function resolveCtx(contexts: SubworkflowContext[], path: number[]): Subworkflow
     ctx = ctx.children[path[i]!];
   }
   return ctx ?? null;
+}
+
+/**
+ * Resolve a graph node's live store `NodeData` from its absolute context path
+ * and bare name (both stamped onto `GraphNodeData` by `buildGraphElements`).
+ *
+ * Node ids are namespaced by context (see `lib/node-id`) so a bare
+ * `useViewedNodes()[id]` lookup no longer works once inline-expanded children
+ * render alongside the base context — this resolves the owning context instead.
+ */
+export function useNodeLiveData(
+  data: { contextPath?: number[]; name?: string } | undefined,
+): NodeData | undefined {
+  const rootNodes = useWorkflowStore((s) => s.nodes);
+  const subContexts = useWorkflowStore((s) => s.subworkflowContexts);
+  const path = data?.contextPath ?? [];
+  const name = data?.name;
+  const key = `${path.join('.')}::${name ?? ''}`;
+  return useMemo(() => {
+    if (!name) return undefined;
+    if (path.length === 0) return rootNodes[name];
+    const ctx = resolveCtx(subContexts, path);
+    return ctx?.nodes[name];
+    // `key` encodes path + name; depending on it keeps the array-typed
+    // `path`/`name` out of the dependency list without staleness.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [key, rootNodes, subContexts]);
+}
+
+/**
+ * Resolve the currently selected node's live `NodeData` from its namespaced id
+ * (`selectedNode`), regardless of which context is being viewed. Node ids are
+ * namespaced by context, so the selection can point into an inline-expanded
+ * child or a different level than the current view.
+ */
+export function useSelectedNodeData(): NodeData | undefined {
+  const selectedNode = useWorkflowStore((s) => s.selectedNode);
+  const rootNodes = useWorkflowStore((s) => s.nodes);
+  const subContexts = useWorkflowStore((s) => s.subworkflowContexts);
+  return useMemo(() => {
+    if (!selectedNode) return undefined;
+    const { contextPath, name } = parseNodeKey(selectedNode);
+    if (contextPath.length === 0) return rootNodes[name];
+    const ctx = resolveCtx(subContexts, contextPath);
+    return ctx?.nodes[name];
+  }, [selectedNode, rootNodes, subContexts]);
 }
 
 /** Get the nodes map for the currently viewed context. */
@@ -86,6 +133,7 @@ export function useViewedGraphData() {
         entryPoint: rootEntry,
         subworkflowContexts: subContexts,
         parentAgent: null as string | null,
+        basePath: [] as number[],
       };
     }
     const ctx = resolveCtx(subContexts, viewPath);
@@ -100,6 +148,7 @@ export function useViewedGraphData() {
         entryPoint: rootEntry,
         subworkflowContexts: subContexts,
         parentAgent: null as string | null,
+        basePath: [] as number[],
       };
     }
     return {
@@ -112,6 +161,7 @@ export function useViewedGraphData() {
       entryPoint: ctx.entryPoint,
       subworkflowContexts: ctx.children,
       parentAgent: ctx.parentAgent,
+      basePath: viewPath,
     };
   }, [viewPath, rootAgents, rootRoutes, rootParallel, rootForEach, rootNodes, rootProgress, rootEntry, subContexts]);
 }

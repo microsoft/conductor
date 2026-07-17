@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { useReactFlow } from '@xyflow/react';
 import { useWorkflowStore } from '@/stores/workflow-store';
 import type { SubworkflowContext } from '@/stores/workflow-store';
+import { nodeKey } from '@/lib/node-id';
 
 /** Parse deep-link params from the current URL. */
 function getDeepLinkParams(): { subworkflowPath: string | null; agent: string | null } {
@@ -213,12 +214,15 @@ export function useDeepLink(): DeepLinkError | null {
                 return ctx?.agents ?? [];
               })();
 
+        let fitId: string | null = null;
         if (agentsAtTarget.some((a) => a.name === agent)) {
           // Agent is at the requested (or root) location
+          const selectedId = nodeKey(resolvedPath, agent);
           useWorkflowStore.setState({
             viewContextPath: resolvedPath,
-            selectedNode: agent,
+            selectedNode: selectedId,
           });
+          fitId = selectedId;
         } else {
           // Not at the requested location. Search transitively.
           const matches = findAgentMatches(state.subworkflowContexts, agent);
@@ -259,16 +263,21 @@ export function useDeepLink(): DeepLinkError | null {
 
           // Agent-only link: pick the best transitive match and navigate there.
           const best = pickBestAgentMatch(matches)!;
+          const selectedId = nodeKey(best.path, agent);
           useWorkflowStore.setState({
             viewContextPath: best.path,
-            selectedNode: agent,
+            selectedNode: selectedId,
           });
+          fitId = selectedId;
         }
 
         // Center the view on the node after React Flow rebuilds the graph
-        setTimeout(() => {
-          fitView({ nodes: [{ id: agent }], padding: 0.5, duration: 400 });
-        }, 200);
+        if (fitId) {
+          const idForFit = fitId;
+          setTimeout(() => {
+            fitView({ nodes: [{ id: idForFit }], padding: 0.5, duration: 400 });
+          }, 200);
+        }
       } else if (subworkflowPath) {
         // Subworkflow nav only, no agent
         useWorkflowStore.setState({

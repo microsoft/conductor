@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react';
 import { X } from 'lucide-react';
 import { useWorkflowStore } from '@/stores/workflow-store';
-import { useViewedNodes } from '@/hooks/use-viewed-context';
+import { useSelectedNodeData } from '@/hooks/use-viewed-context';
+import { parseNodeKey } from '@/lib/node-id';
 import { AgentDetail } from './AgentDetail';
 import { ScriptDetail } from './ScriptDetail';
 import { SetDetail } from './SetDetail';
@@ -14,7 +15,7 @@ import { cn } from '@/lib/utils';
 
 export function DetailPanel() {
   const selectedNode = useWorkflowStore((s) => s.selectedNode);
-  const viewedNodes = useViewedNodes();
+  const selectedNodeData = useSelectedNodeData();
   const selectNode = useWorkflowStore((s) => s.selectNode);
   const dialogEngaged = useWorkflowStore((s) => s.dialogEngaged);
 
@@ -26,7 +27,7 @@ export function DetailPanel() {
     return () => setMounted(false);
   }, [selectedNode]);
 
-  const node = selectedNode ? viewedNodes[selectedNode] : null;
+  const node = selectedNode ? (selectedNodeData ?? null) : null;
 
   if (!selectedNode || !node) {
     return (
@@ -74,7 +75,9 @@ export function DetailPanel() {
     >
       {/* Header */}
       <div className="flex items-center justify-between px-4 py-3 border-b border-[var(--border)] flex-shrink-0">
-        <h2 className="text-sm font-semibold text-[var(--text)] truncate">{selectedNode}</h2>
+        <h2 className="text-sm font-semibold text-[var(--text)] truncate">
+          {selectedNode ? parseNodeKey(selectedNode).name : ''}
+        </h2>
         <button
           onClick={() => selectNode(null)}
           className="p-1 rounded hover:bg-[var(--surface-hover)] text-[var(--text-muted)] hover:text-[var(--text)] transition-colors"
