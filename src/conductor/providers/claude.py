@@ -2527,15 +2527,13 @@ class ClaudeProvider(AgentProvider):
         Returns:
             The result string, possibly with the hint rewritten.
         """
-        if not result or _TRUNCATION_MARKER_PREFIX not in result[-_TAIL_WINDOW:]:
+        truncation_info = self._parse_truncation_marker(result)
+        if truncation_info is None:
             return result
-
         if not self._has_fs_like_tool(tools):
             return result
-
-        if "full output saved to:" not in result[-_TAIL_WINDOW:]:
+        if not truncation_info.get("spill_path"):
             return result
-
         return result.replace(_GENERIC_HINT, _FS_HINT)
 
     def _parse_truncation_marker(
@@ -2568,7 +2566,8 @@ class ClaudeProvider(AgentProvider):
 
         tail = result[-_TAIL_WINDOW:]
         match = re.search(
-            re.escape(_TRUNCATION_MARKER_PREFIX)
+            r".*"
+            + re.escape(_TRUNCATION_MARKER_PREFIX)
             + r"\s*(\d+)\s*chars\s*-\u003e\s*(\d+)\s*kept"
             + r"(?:;\s*full output saved to:\s*(.+?))?\."
             + r"\s*"

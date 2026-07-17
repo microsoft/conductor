@@ -56,6 +56,19 @@ _FS_HINT = (
 _TAIL_WINDOW = 2000
 
 
+def _contains_symlink(path: Path, stop_at: Path | None = None) -> bool:
+    current: Path | None = path
+    while current is not None:
+        if stop_at is not None and current == stop_at:
+            break
+        if current.is_symlink():
+            return True
+        if current == current.parent:
+            break
+        current = current.parent
+    return False
+
+
 def _sanitize_for_filename(value: str) -> str:
     """Replace characters that are unsafe in filenames with an underscore."""
     return re.sub(r"[^A-Za-z0-9._-]", "_", value)
@@ -346,16 +359,24 @@ class MCPManager:
         """
         spill_dir_str = self._tool_output.spill_dir
         if spill_dir_str:
-            spill_dir_input = Path(spill_dir_str)
-            if spill_dir_input.is_symlink():
+            spill_dir = Path(spill_dir_str)
+            if _contains_symlink(spill_dir):
                 logger.warning(
-                    "Spill dir %s is a symlink; refusing to write tool output spill.",
-                    spill_dir_input,
+                    "Spill dir %s contains a symlink; refusing to write tool output spill.",
+                    spill_dir,
                 )
                 return None
-            spill_dir = spill_dir_input.resolve()
         else:
-            spill_dir = Path(tempfile.gettempdir()).resolve() / "conductor" / "tool-output"
+            temp_parent = Path(tempfile.gettempdir()).resolve()
+            spill_dir = temp_parent / "conductor" / "tool-output"
+            if _contains_symlink(spill_dir, stop_at=temp_parent):
+                logger.warning(
+                    "Default spill dir %s contains a symlink; refusing to write tool output spill.",
+                    spill_dir,
+                )
+                return None
+
+        spill_dir = spill_dir.resolve()
 
         try:
             spill_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -382,14 +403,24 @@ class MCPManager:
 
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             try:
-                with os.fdopen(fd, "w") as f:
-                    f.write(full_text)
+                f = os.fdopen(fd, "w", encoding="utf-8")
             except OSError:
-                # fd is closed by the context manager (or was never wrapped);
-                # the outer OSError handler will log and degrade gracefully.
+                os.close(fd)
                 with suppress(OSError):
                     os.remove(path)
                 raise
+            try:
+                with f:
+                    f.write(full_text)
+            except Exception:
+                # Any write failure (including UnicodeEncodeError) leaves a partial
+                # file; clean it up and degrade gracefully.
+                with suppress(OSError):
+                    os.remove(path)
+                logger.warning(
+                    "Failed to write full MCP tool output spill to disk; continuing without it.",
+                )
+                return None
             return str(path)
         except OSError as e:
             logger.warning(
