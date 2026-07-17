@@ -550,11 +550,14 @@ result.
 {"type":"result","data":{"content":{...},"model":"...","input_tokens":N,"output_tokens":M,"partial":false}}
 ```
 
-**Fallback (Branch P) variant.** `POST /execute` returns `{"job_id": "..."}`
-immediately; the host polls `GET /execute/<job_id>/events?since=<cursor>`, each
-response returning a batch of the same NDJSON frames until the terminal `result`
-frame. Identical event vocabulary and `AgentOutput` shape; only the delivery
-differs. Phase 0 (DD3) determines which branch ships.
+**Fallback (Branch P) variant, not required for v1.** `POST /execute` returns
+`{"job_id": "..."}` immediately; the host polls
+`GET /execute/<job_id>/events?since=<cursor>`, each response returning a batch of
+the same NDJSON frames until the terminal `result` frame. Identical event
+vocabulary and `AgentOutput` shape; only the delivery differs. The Phase 0 spike
+(#312) confirmed Branch P works end to end, so this contract stays documented as
+a fallback the runner *could* expose later, without being required for the MVP
+(DD3: Branch S ships).
 
 **On-host `AgentProvider` contract (unchanged).** `AcaRuntimeProvider` conforms to
 `execute()/validate_connection()/close()` and returns `AgentOutput`; no change to
