@@ -8,7 +8,7 @@ main agent session and dialog turns.
 from __future__ import annotations
 
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from pydantic import SecretStr
@@ -18,6 +18,7 @@ from conductor.config.schema import (
     ProviderSettings,
     RuntimeConfig,
 )
+from conductor.exceptions import ProviderError
 from conductor.providers.copilot import CopilotProvider
 
 
@@ -425,6 +426,47 @@ class TestDescribeProviderRedaction:
 
         assert _describe_provider(ProviderSettings(name="copilot")) == "copilot"
 
+    def test_external_runtime_is_rendered_with_redacted_token(self) -> None:
+        from conductor.cli.run import _describe_provider
+
+        secret = "runtime-secret"
+        settings = ProviderSettings(
+            name="copilot",
+            runtime_url="localhost:3000",
+            runtime_token=secret,
+        )
+        rendered = _describe_provider(settings)
+
+        assert rendered == "copilot runtime_url=localhost:3000 runtime_token=***"
+        assert secret not in rendered
+
+
+class TestProviderOverride:
+    """Structured provider settings must be visibly discarded by CLI overrides."""
+
+    def test_external_runtime_override_logs_discard_warning(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import importlib
+        from types import SimpleNamespace
+
+        run_mod = importlib.import_module("conductor.cli.run")
+        runtime = RuntimeConfig(
+            provider=ProviderSettings(name="copilot", runtime_url="localhost:3000")
+        )
+        config = SimpleNamespace(workflow=SimpleNamespace(runtime=runtime))
+        messages: list[str] = []
+        monkeypatch.setattr(
+            run_mod,
+            "verbose_log",
+            lambda message, style="dim": messages.append(message),
+        )
+
+        run_mod._apply_provider_override(config, "copilot")
+
+        assert runtime.provider == ProviderSettings(name="copilot")
+        assert any("discards structured runtime.provider settings" in msg for msg in messages)
+
 
 class TestRegistryForwardsSettings:
     """``ProviderRegistry`` forwards ``ProviderSettings`` only to the matching provider."""
@@ -523,3 +565,151 @@ class TestRegistryForwardsSettings:
 
         # Claude call MUST NOT receive Copilot-shaped settings.
         assert by_type["claude"]["provider_settings"] is None
+
+
+class TestResolveRuntimeConnection:
+    """Unit-tests for ``CopilotProvider._resolve_runtime_connection`` and
+    ``_build_client`` (connecting to an already-running Copilot runtime)."""
+
+    def test_no_settings_no_env_returns_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("COPILOT_PROVIDER_RUNTIME_URL", raising=False)
+        monkeypatch.delenv("COPILOT_PROVIDER_RUNTIME_TOKEN", raising=False)
+        provider = _make_provider()
+        assert provider._resolve_runtime_connection() is None
+
+    def test_yaml_url_and_token(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("COPILOT_PROVIDER_RUNTIME_URL", raising=False)
+        monkeypatch.delenv("COPILOT_PROVIDER_RUNTIME_TOKEN", raising=False)
+        s = ProviderSettings.model_validate(
+            {"name": "copilot", "runtime_url": "localhost:3000", "runtime_token": "sek"}
+        )
+        provider = _make_provider(provider_settings=s)
+        assert provider._resolve_runtime_connection() == ("localhost:3000", "sek")
+
+    def test_env_vars_alone_activate(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The namespaced env vars activate the connection with no YAML — the
+        zero-config path for external orchestrators."""
+        monkeypatch.setenv("COPILOT_PROVIDER_RUNTIME_URL", "host:9000")
+        monkeypatch.setenv("COPILOT_PROVIDER_RUNTIME_TOKEN", "envtok")
+        provider = _make_provider()
+        assert provider._resolve_runtime_connection() == ("host:9000", "envtok")
+
+    def test_yaml_url_beats_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("COPILOT_PROVIDER_RUNTIME_URL", "env:1")
+        monkeypatch.setenv("COPILOT_PROVIDER_RUNTIME_TOKEN", "envtok")
+        s = ProviderSettings(name="copilot", runtime_url="yaml:2")
+        provider = _make_provider(provider_settings=s)
+        # YAML url wins; token falls back to env since YAML has none.
+        assert provider._resolve_runtime_connection() == ("yaml:2", "envtok")
+
+    def test_url_without_token(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("COPILOT_PROVIDER_RUNTIME_URL", "host:1")
+        monkeypatch.delenv("COPILOT_PROVIDER_RUNTIME_TOKEN", raising=False)
+        provider = _make_provider()
+        assert provider._resolve_runtime_connection() == ("host:1", None)
+
+    def test_build_client_default_spawns(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """No runtime connection → default ``CopilotClient()`` (spawns runtime)."""
+        import conductor.providers.copilot as copilot_mod
+
+        monkeypatch.delenv("COPILOT_PROVIDER_RUNTIME_URL", raising=False)
+        client = object()
+        client_factory = MagicMock(return_value=client)
+        monkeypatch.setattr(copilot_mod, "CopilotClient", client_factory)
+        provider = _make_provider()
+        assert provider._build_client() is client
+        client_factory.assert_called_once_with()
+
+    def test_build_client_connects_to_external_runtime(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With a runtime connection resolved, the client is a URI (external)
+        connection and does not spawn a nested runtime."""
+        from copilot.client import UriRuntimeConnection
+
+        monkeypatch.delenv("COPILOT_PROVIDER_RUNTIME_URL", raising=False)
+        s = ProviderSettings.model_validate(
+            {"name": "copilot", "runtime_url": "localhost:3000", "runtime_token": "sek"}
+        )
+        provider = _make_provider(provider_settings=s)
+        client = provider._build_client()
+        assert client._is_external_server is True
+        assert isinstance(client._connection, UriRuntimeConnection)
+        assert client._connection.url == "localhost:3000"
+        assert client._connection.connection_token == "sek"
+
+    def test_empty_env_url_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An empty ``COPILOT_PROVIDER_RUNTIME_URL`` (e.g. ``${VAR:-}``) must fail
+        loudly rather than silently falling through to a nested spawn."""
+        monkeypatch.setenv("COPILOT_PROVIDER_RUNTIME_URL", "   ")
+        monkeypatch.delenv("COPILOT_PROVIDER_RUNTIME_TOKEN", raising=False)
+        provider = _make_provider()
+        with pytest.raises(ProviderError, match="runtime_url' is empty"):
+            provider._resolve_runtime_connection()
+
+    def test_env_token_only_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A token with no URL must raise, mirroring the YAML rule."""
+        monkeypatch.delenv("COPILOT_PROVIDER_RUNTIME_URL", raising=False)
+        monkeypatch.setenv("COPILOT_PROVIDER_RUNTIME_TOKEN", "envtok")
+        provider = _make_provider()
+        with pytest.raises(ProviderError, match="runtime_token' requires 'runtime_url'"):
+            provider._resolve_runtime_connection()
+
+    def test_empty_env_token_normalizes_to_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An empty token is the legitimate no-auth case → normalize to None."""
+        monkeypatch.setenv("COPILOT_PROVIDER_RUNTIME_URL", "host:1")
+        monkeypatch.setenv("COPILOT_PROVIDER_RUNTIME_TOKEN", "  ")
+        provider = _make_provider()
+        assert provider._resolve_runtime_connection() == ("host:1", None)
+
+    def test_build_client_allows_runtime_plus_custom_routing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Runtime transport and per-session model routing are independent."""
+        import conductor.providers.copilot as copilot_mod
+
+        monkeypatch.setenv("COPILOT_PROVIDER_RUNTIME_URL", "host:9000")
+        monkeypatch.delenv("COPILOT_PROVIDER_RUNTIME_TOKEN", raising=False)
+        connection = object()
+        runtime_connection = MagicMock()
+        runtime_connection.for_uri.return_value = connection
+        client = object()
+        client_factory = MagicMock(return_value=client)
+        monkeypatch.setattr(copilot_mod, "RuntimeConnection", runtime_connection)
+        monkeypatch.setattr(copilot_mod, "CopilotClient", client_factory)
+        s = ProviderSettings.model_validate(
+            {
+                "name": "copilot",
+                "type": "openai",
+                "base_url": "http://localhost:11434/v1",
+                "api_key": "sk-yaml",
+            }
+        )
+        provider = _make_provider(provider_settings=s, model="ollama/llama3")
+        assert provider._build_client() is client
+        runtime_connection.for_uri.assert_called_once_with("host:9000", connection_token=None)
+        client_factory.assert_called_once_with(connection=connection)
+
+        session_kwargs: dict[str, Any] = {}
+        provider._apply_provider_config(session_kwargs)
+        assert session_kwargs["provider"] == {
+            "type": "openai",
+            "base_url": "http://localhost:11434/v1",
+            "api_key": "sk-yaml",
+        }
+
+    def test_build_client_raises_when_runtime_connection_unavailable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An older-but-present SDK imports ``RuntimeConnection`` as ``None``.
+        With a configured ``runtime_url`` the client build must raise a clear
+        ProviderError rather than an opaque ``AttributeError`` on ``for_uri``."""
+        import conductor.providers.copilot as copilot_mod
+
+        monkeypatch.setattr(copilot_mod, "RuntimeConnection", None)
+        monkeypatch.delenv("COPILOT_PROVIDER_RUNTIME_URL", raising=False)
+        monkeypatch.delenv("COPILOT_PROVIDER_RUNTIME_TOKEN", raising=False)
+        s = ProviderSettings.model_validate({"name": "copilot", "runtime_url": "localhost:3000"})
+        provider = _make_provider(provider_settings=s)
+        with pytest.raises(ProviderError, match="requires a .*RuntimeConnection"):
+            provider._build_client()

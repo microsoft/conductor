@@ -287,3 +287,101 @@ class TestHasCustomRouting:
             azure=AzureProviderOptions(api_version="2024-10-21"),
         )
         assert s.has_custom_routing()
+
+
+class TestExternalRuntimeConnection:
+    """``runtime_url`` / ``runtime_token`` connect to an existing runtime."""
+
+    def test_runtime_url_only(self) -> None:
+        s = ProviderSettings(name="copilot", runtime_url="localhost:3000")
+        assert s.runtime_url == "localhost:3000"
+        assert s.runtime_token is None
+        assert s.has_external_runtime()
+        # A runtime connection is a separate axis from endpoint routing.
+        assert not s.has_custom_routing()
+
+    def test_runtime_url_and_token(self) -> None:
+        s = ProviderSettings.model_validate(
+            {"name": "copilot", "runtime_url": "host:9000", "runtime_token": "sekret"}
+        )
+        assert s.runtime_url == "host:9000"
+        assert isinstance(s.runtime_token, SecretStr)
+        assert s.runtime_token.get_secret_value() == "sekret"
+        assert s.has_external_runtime()
+
+    def test_runtime_fields_prevent_bare_string_collapse(self) -> None:
+        """A runtime connection must survive round-trip serialization (it would
+        be lost if the object collapsed to the bare ``"copilot"`` string)."""
+        s = ProviderSettings(name="copilot", runtime_url="localhost:3000")
+        dumped = s.model_dump()
+        assert isinstance(dumped, dict)
+        assert dumped["runtime_url"] == "localhost:3000"
+
+    def test_runtime_token_redacted_in_json_dump(self) -> None:
+        s = ProviderSettings.model_validate(
+            {"name": "copilot", "runtime_url": "x:1", "runtime_token": "topsecret"}
+        )
+        dumped = s.model_dump(mode="json")
+        assert dumped["runtime_token"] == "**********"
+        assert "topsecret" not in str(dumped)
+
+    def test_runtime_url_rejected_for_non_copilot(self) -> None:
+        with pytest.raises(ValidationError, match="only supported when name='copilot'"):
+            ProviderSettings(name="claude", runtime_url="x:1")
+
+    def test_runtime_token_requires_runtime_url(self) -> None:
+        with pytest.raises(ValidationError, match="'runtime_token' requires 'runtime_url'"):
+            ProviderSettings(name="copilot", runtime_token="tok")
+
+    def test_empty_runtime_token_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="'runtime_token' is empty"):
+            ProviderSettings.model_validate(
+                {"name": "copilot", "runtime_url": "x:1", "runtime_token": ""}
+            )
+
+    def test_empty_runtime_url_rejected(self) -> None:
+        """An empty ``runtime_url`` must be rejected: otherwise ``""`` is not
+        None, so ``has_external_runtime()`` returns True and the runtime_token
+        guard passes, yet the provider treats ``""`` as falsy and silently
+        spawns a nested runtime while dropping the token."""
+        with pytest.raises(ValidationError, match="'runtime_url' is empty"):
+            ProviderSettings.model_validate({"name": "copilot", "runtime_url": ""})
+
+    def test_empty_runtime_url_with_token_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="'runtime_url' is empty"):
+            ProviderSettings.model_validate(
+                {"name": "copilot", "runtime_url": "", "runtime_token": "tok"}
+            )
+
+    def test_whitespace_runtime_url_rejected(self) -> None:
+        """A whitespace-only ``runtime_url`` is stripped to empty by the provider
+        resolver, so ``conductor validate`` must reject it at schema time too."""
+        with pytest.raises(ValidationError, match="'runtime_url' is empty"):
+            ProviderSettings.model_validate({"name": "copilot", "runtime_url": "   "})
+
+    def test_whitespace_runtime_token_rejected(self) -> None:
+        """A whitespace-only ``runtime_token`` normalizes to None at runtime
+        (silently changing auth mode); reject it at schema time."""
+        with pytest.raises(ValidationError, match="'runtime_token' is empty"):
+            ProviderSettings.model_validate(
+                {"name": "copilot", "runtime_url": "x:1", "runtime_token": "   "}
+            )
+
+    def test_whitespace_api_key_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="'api_key' is empty"):
+            ProviderSettings.model_validate(
+                {"name": "copilot", "base_url": "http://x/v1", "api_key": "   "}
+            )
+
+    def test_runtime_url_combines_with_custom_routing(self) -> None:
+        s = ProviderSettings(
+            name="copilot",
+            runtime_url="localhost:3000",
+            type="openai",
+            wire_api="completions",
+            base_url="http://localhost:11434/v1",
+            api_key="local",
+        )
+        assert s.has_external_runtime()
+        assert s.has_custom_routing()
+        assert s.has_structured_config()

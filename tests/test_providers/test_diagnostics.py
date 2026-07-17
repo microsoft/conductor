@@ -172,6 +172,12 @@ class TestGatherProviderOffline:
         by_name = {c.name: c.present for c in diag.credential_env_vars}
         assert by_name == {"ANTHROPIC_API_KEY": True, "ANTHROPIC_AUTH_TOKEN": False}
 
+    async def test_copilot_runtime_token_presence(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("COPILOT_PROVIDER_RUNTIME_TOKEN", "runtime-secret")
+        diag = await d.gather_provider("copilot")
+        by_name = {c.name: c.present for c in diag.credential_env_vars}
+        assert by_name["COPILOT_PROVIDER_RUNTIME_TOKEN"] is True
+
     async def test_credential_values_never_stored(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-super-secret")
         diag = await d.gather_provider("claude")

@@ -82,6 +82,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Connect the Copilot provider to an existing runtime** — `runtime.provider`
+  gains a Copilot-only `runtime_url` (plus optional `runtime_token`) that points
+  Conductor at an already-running `copilot --headless` process instead of
+  spawning its own nested one. Agents share the authenticated runtime process
+  while retaining separate SDK sessions. Both fields also resolve from the namespaced
+  `COPILOT_PROVIDER_RUNTIME_URL` / `COPILOT_PROVIDER_RUNTIME_TOKEN` environment
+  variables, which activate the connection with no YAML — the zero-config path
+  for external orchestrators that already own an authenticated
+  Copilot process. Runtime transport can be combined with custom model-provider
+  routing. See
+  `examples/copilot-existing-runtime.yaml` and the "Connecting to an Existing
+  Copilot Runtime" section of `docs/configuration.md`.
 - **Provider-supplied model pricing** — cost reporting now resolves pricing via a
   new `AgentProvider.get_model_pricing` hook before falling back to the static
   table. Resolution order is workflow `cost.pricing` → provider hook → built-in

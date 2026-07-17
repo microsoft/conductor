@@ -67,10 +67,9 @@ async def create_provider(
             (``default`` / ``long_context``) applied when an agent does not
             specify its own ``context_tier``. Only the Copilot provider
             forwards this; ignored for all other providers.
-        provider_settings: Structured ``runtime.provider`` settings. Only
-            applied when ``provider_type == "copilot"`` and the settings
-            opted into custom routing; ignored for all other providers
-            (structured config for those providers is not yet implemented).
+        provider_settings: Structured ``runtime.provider`` settings for custom
+            model routing and/or an external runtime connection. Forwarded only
+            to the matching provider type.
 
     Returns:
         Configured AgentProvider instance.

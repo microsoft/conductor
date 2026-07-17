@@ -93,6 +93,15 @@ except ImportError:
     CopilotClient = None  # type: ignore[misc, assignment]
     PermissionHandler = None  # type: ignore[misc, assignment]
 
+# RuntimeConnection was added to the SDK after CopilotClient; import it
+# separately so an older-but-present SDK still enables the default nested-spawn
+# provider. A runtime connection is only required when explicitly requested,
+# and that path raises a clear ProviderError if RuntimeConnection is missing.
+try:
+    from copilot.client import RuntimeConnection
+except ImportError:
+    RuntimeConnection = None  # type: ignore[misc, assignment]
+
 
 @dataclass
 class RetryConfig:
@@ -281,7 +290,8 @@ class CopilotProvider(AgentProvider):
                 the resolved SDK ``ProviderConfig`` is attached to every
                 ``create_session`` call (both agent execution and dialog
                 turns), enabling custom OpenAI-compatible / Azure / Anthropic
-                endpoints. Env-var fallbacks
+                endpoints. ``runtime_url`` instead selects an existing Copilot
+                CLI process and can be combined with that routing. Env-var fallbacks
                 (``COPILOT_PROVIDER_BASE_URL`` → ``OPENAI_BASE_URL``,
                 ``COPILOT_PROVIDER_API_KEY`` → ``OPENAI_API_KEY``,
                 ``COPILOT_PROVIDER_BEARER_TOKEN``) fill missing fields once
@@ -470,6 +480,70 @@ class CopilotProvider(AgentProvider):
         provider_cfg = self._resolve_sdk_provider_config()
         if provider_cfg is not None:
             session_kwargs["provider"] = provider_cfg
+
+    def _resolve_runtime_connection(self) -> tuple[str, str | None] | None:
+        """Resolve whether to connect to an already-running Copilot runtime.
+
+        Returns ``(url, connection_token)`` when Conductor should connect to
+        an external runtime instead of spawning its own child process, or
+        ``None`` for the default (spawn) behavior.
+
+        Resolution order for each field is YAML (``runtime.provider``) first,
+        then a namespaced environment variable:
+
+        - ``url``: ``runtime_url`` → ``COPILOT_PROVIDER_RUNTIME_URL``
+        - ``token``: ``runtime_token`` → ``COPILOT_PROVIDER_RUNTIME_TOKEN``
+
+        The environment variables activate the connection on their own (no
+        YAML required), which is the intended zero-config path for external
+        orchestrators: they launch one authenticated
+        ``copilot --headless`` process and export these two variables. The
+        variables are namespaced (``COPILOT_PROVIDER_*``) specifically so
+        unrelated ambient shell state cannot silently divert default Copilot
+        traffic.
+        """
+        settings = self._provider_settings
+
+        url = settings.runtime_url if settings is not None else None
+        url = url or os.environ.get("COPILOT_PROVIDER_RUNTIME_URL")
+
+        token: str | None = None
+        if settings is not None and settings.runtime_token is not None:
+            token = settings.runtime_token.get_secret_value()
+        if token is None:
+            token = os.environ.get("COPILOT_PROVIDER_RUNTIME_TOKEN")
+
+        # Values resolved from environment variables are not validated by the
+        # schema, so normalize/validate them here to mirror the YAML rules and
+        # avoid silently falling through to a nested spawn on a typo/unset env.
+        if url is not None:
+            url = url.strip()
+            if not url:
+                raise ProviderError(
+                    "'runtime_url' is empty; remove it or supply a value.",
+                    suggestion=(
+                        "Set runtime.provider.runtime_url or COPILOT_PROVIDER_RUNTIME_URL "
+                        "to a valid port, host:port, or full URL."
+                    ),
+                    is_retryable=False,
+                )
+        # An empty token is the legitimate no-auth / tokenless-runtime case;
+        # normalize it to None rather than erroring.
+        if token is not None:
+            token = token.strip() or None
+        if token is not None and url is None:
+            raise ProviderError(
+                "'runtime_token' requires 'runtime_url' to also be set",
+                suggestion=(
+                    "Set COPILOT_PROVIDER_RUNTIME_URL alongside "
+                    "COPILOT_PROVIDER_RUNTIME_TOKEN, or remove the token."
+                ),
+                is_retryable=False,
+            )
+
+        if url is None:
+            return None
+        return (url, token)
 
     async def execute(
         self,
@@ -2074,7 +2148,7 @@ class CopilotProvider(AgentProvider):
         """
         async with self._start_lock:
             if self._client is None:
-                self._client = CopilotClient()
+                self._client = self._build_client()
             if not self._started:
                 await self._client.start()
                 self._started = True
@@ -2083,6 +2157,39 @@ class CopilotProvider(AgentProvider):
                 # BlockingIOError on large payloads. The asyncio event loop
                 # may set O_NONBLOCK on inherited file descriptors.
                 self._fix_pipe_blocking_mode()
+
+    def _build_client(self) -> Any:
+        """Construct the Copilot SDK client.
+
+        When a runtime connection is resolved (via ``runtime_url`` /
+        ``COPILOT_PROVIDER_RUNTIME_URL``), connect to that already-running
+        runtime instead of spawning a nested ``copilot`` child process. The
+        SDK's ``start()`` skips process spawning for URI connections and its
+        ``stop()`` leaves the externally-owned server running, so Conductor
+        reuses the authenticated runtime process while creating a separate SDK
+        session for each agent.
+        """
+        connection = self._resolve_runtime_connection()
+        if connection is None:
+            return CopilotClient()
+
+        url, token = connection
+        if RuntimeConnection is None:
+            raise ProviderError(
+                "Connecting to an existing Copilot runtime (runtime_url) requires a "
+                "Copilot SDK that provides RuntimeConnection, which is unavailable in "
+                "the installed SDK version.",
+                suggestion=(
+                    "Upgrade the copilot SDK, or unset runtime_url / "
+                    "COPILOT_PROVIDER_RUNTIME_URL to spawn a nested runtime instead."
+                ),
+                is_retryable=False,
+            )
+        logger.info(
+            "Connecting to existing Copilot runtime at %s (no nested runtime spawned)",
+            url,
+        )
+        return CopilotClient(connection=RuntimeConnection.for_uri(url, connection_token=token))
 
     def _fix_pipe_blocking_mode(self) -> None:
         """Clear O_NONBLOCK on the Copilot CLI subprocess pipes.
@@ -2227,17 +2334,29 @@ class CopilotProvider(AgentProvider):
                 is_retryable=False,
             )
 
+        external_runtime = False
         try:
+            external_runtime = self._resolve_runtime_connection() is not None
             await self._ensure_client_started()
             return True
+        except ProviderError:
+            raise
         except Exception as e:
-            raise ProviderError(
-                f"Failed to connect to Copilot SDK: {e}",
-                suggestion=(
+            if external_runtime:
+                suggestion = (
+                    "Verify the external Copilot runtime is running and reachable at "
+                    "runtime.provider.runtime_url / COPILOT_PROVIDER_RUNTIME_URL, and that "
+                    "COPILOT_PROVIDER_RUNTIME_TOKEN matches COPILOT_CONNECTION_TOKEN."
+                )
+            else:
+                suggestion = (
                     "Ensure the Copilot CLI is installed and you have an active "
                     "GitHub Copilot subscription. Install CLI: "
                     "https://docs.github.com/en/copilot/how-tos/set-up/install-copilot-cli"
-                ),
+                )
+            raise ProviderError(
+                f"Failed to connect to Copilot SDK: {e}",
+                suggestion=suggestion,
                 is_retryable=False,
             ) from e
 
