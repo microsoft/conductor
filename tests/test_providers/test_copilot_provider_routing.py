@@ -646,9 +646,7 @@ class TestResolveRuntimeConnection:
         monkeypatch.setattr(copilot_mod, "RuntimeConnection", None)
         monkeypatch.delenv("COPILOT_PROVIDER_RUNTIME_URL", raising=False)
         monkeypatch.delenv("COPILOT_PROVIDER_RUNTIME_TOKEN", raising=False)
-        s = ProviderSettings.model_validate(
-            {"name": "copilot", "runtime_url": "localhost:3000"}
-        )
+        s = ProviderSettings.model_validate({"name": "copilot", "runtime_url": "localhost:3000"})
         provider = _make_provider(provider_settings=s)
         with pytest.raises(ProviderError, match="requires a .*RuntimeConnection"):
             provider._build_client()
