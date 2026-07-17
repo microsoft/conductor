@@ -5,13 +5,26 @@ This module provides the MCPManager class that handles:
 - Collecting tools from connected servers
 - Executing tool calls and returning results
 - Managing server lifecycle (connect, close)
+
+Oversized tool results can be truncated to a per-result character limit. The full
+text is optionally spilled to a temporary file so no data is lost. The
+resulting marker is generated entirely inside this manager; callers detect
+truncation by looking for the ``[output truncated:`` prefix in the trailing
+part of the returned string.
 """
 
 from __future__ import annotations
 
 import logging
+import os
+import re
+import tempfile
+import uuid
 from contextlib import AsyncExitStack
+from pathlib import Path
 from typing import Any
+
+from conductor.config.schema import ToolOutputConfig
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +43,22 @@ except ImportError:
     TextContent = None  # type: ignore[misc, assignment]
 
 
+# Marker constants. The generic hint is embedded by the manager and replaced
+# with the fs hint by Claude's agentic loop when filesystem-like tools are
+# available. No placeholder mechanism is used; callers replace the exact
+# generic-hint constant string.
+_TRUNCATION_MARKER_PREFIX = "[output truncated:"
+_GENERIC_HINT = "The full output was truncated; refine the tool arguments to return less data."
+_FS_HINT = (
+    "The full output was saved to a file; read it with your filesystem tools if you need more."
+)
+
+
+def _sanitize_for_filename(value: str) -> str:
+    """Replace characters that are unsafe in filenames with an underscore."""
+    return re.sub(r"[^A-Za-z0-9._-]", "_", value)
+
+
 class MCPManager:
     """Manages MCP server connections and tool execution.
 
@@ -38,6 +67,7 @@ class MCPManager:
     - Collecting available tools from servers
     - Routing tool calls to the appropriate server
     - Cleaning up connections on close
+    - Optionally truncating oversized tool results and spilling the full text to disk
 
     Tool names are prefixed with the server name to avoid collisions:
     `{server_name}__{tool_name}` (e.g., "web-search__search")
@@ -55,8 +85,12 @@ class MCPManager:
         >>> await manager.close()
     """
 
-    def __init__(self) -> None:
+    def __init__(self, tool_output: ToolOutputConfig | None = None) -> None:
         """Initialize the MCP manager.
+
+        Args:
+            tool_output: MCP tool result output-size configuration. When None,
+                the default configuration is used.
 
         Raises:
             ImportError: If MCP SDK is not installed.
@@ -69,6 +103,7 @@ class MCPManager:
         self.tool_to_server: dict[str, str] = {}  # prefixed_name -> server
         self._exit_stack = AsyncExitStack()
         self._initialized = False
+        self._tool_output = tool_output or ToolOutputConfig()
 
     async def connect_server(
         self,
@@ -206,7 +241,7 @@ class MCPManager:
             # The result.content is a list of content items
             text_parts: list[str] = []
             for content in result.content:
-                if isinstance(content, TextContent):
+                if TextContent is not None and isinstance(content, TextContent):
                     text_parts.append(content.text)
                 elif hasattr(content, "text"):
                     # Fallback for other text-like content
@@ -221,12 +256,120 @@ class MCPManager:
             if not response_text and result.structuredContent:
                 response_text = str(result.structuredContent)
 
+            response_text = self._maybe_truncate_response(
+                response_text,
+                server_name=server_name,
+                original_name=original_name,
+            )
+
             logger.debug(f"MCP tool '{original_name}' returned: {response_text[:200]}...")
             return response_text
 
         except Exception as e:
             logger.error(f"MCP tool call failed: {prefixed_name}: {e}")
             raise RuntimeError(f"MCP tool call failed: {prefixed_name}: {e}") from e
+
+    def _maybe_truncate_response(
+        self,
+        response_text: str,
+        server_name: str,
+        original_name: str,
+    ) -> str:
+        """Cap oversized tool results and optionally spill the full text to disk.
+
+        The marker is generated entirely here. Callers detect truncation by
+        looking for ``[output truncated:`` in the trailing part of the returned
+        string and may replace the embedded generic hint with a filesystem hint
+        when the agent has filesystem-like tools available.
+
+        Args:
+            response_text: The full assembled tool result text.
+            server_name: Name of the MCP server that handled the tool.
+            original_name: Original tool name without the server prefix.
+
+        Returns:
+            The (possibly truncated) result string with a plain-text marker at the end.
+        """
+        if not self._tool_output.enabled:
+            return response_text
+
+        max_chars = self._tool_output.max_chars
+        if len(response_text) <= max_chars:
+            return response_text
+
+        original = len(response_text)
+        kept = max_chars
+        truncated = response_text[:kept]
+
+        spill_path: str | None = None
+        if self._tool_output.spill_to_file:
+            spill_path = self._spill_full_output(
+                full_text=response_text,
+                server_name=server_name,
+                original_name=original_name,
+            )
+
+        if spill_path:
+            marker = (
+                f"\n\n[{_TRUNCATION_MARKER_PREFIX[1:]} "
+                f"{original} chars -> {kept} kept; "
+                f"full output saved to: {spill_path}. {_GENERIC_HINT}]"
+            )
+        else:
+            marker = (
+                f"\n\n[{_TRUNCATION_MARKER_PREFIX[1:]} "
+                f"{original} chars -> {kept} kept. {_GENERIC_HINT}]"
+            )
+
+        return f"{truncated}{marker}"
+
+    def _spill_full_output(
+        self,
+        full_text: str,
+        server_name: str,
+        original_name: str,
+    ) -> str | None:
+        """Write the full tool result to a process-private temporary file.
+
+        Files are created with mode 0o600 and may contain raw tool output
+        (possibly including secrets). The caller is responsible for lifecycle.
+
+        Args:
+            full_text: The full tool result text to persist.
+            server_name: Name of the MCP server that produced the result.
+            original_name: Original tool name without the server prefix.
+
+        Returns:
+            The absolute path of the spill file, or None if writing failed.
+        """
+        spill_dir_str = self._tool_output.spill_dir
+        if spill_dir_str:
+            spill_dir = Path(spill_dir_str)
+        else:
+            spill_dir = Path(tempfile.gettempdir()) / "conductor" / "tool-output"
+
+        try:
+            spill_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            safe_server = _sanitize_for_filename(server_name)
+            safe_tool = _sanitize_for_filename(original_name)
+            unique = uuid.uuid4().hex[:8]
+            filename = f"mcp-{safe_server}-{safe_tool}-{unique}.txt"
+            path = spill_dir / filename
+
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                with os.fdopen(fd, "w") as f:
+                    f.write(full_text)
+            except Exception:
+                os.close(fd)
+                raise
+            return str(path)
+        except OSError as e:
+            logger.warning(
+                "Failed to spill full MCP tool output to disk: %s",
+                e,
+            )
+            return None
 
     def get_all_tools(self) -> list[dict[str, Any]]:
         """Get all tools from all connected servers.

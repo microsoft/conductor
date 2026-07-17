@@ -11,6 +11,7 @@ Tests cover:
 
 import asyncio
 import os
+from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -3439,7 +3440,7 @@ class TestClaudeMCPManagerPool:
         """Return a fake MCPManager class whose instances are tracked in ``instances``."""
 
         class _FakeMCPManager:
-            def __init__(self) -> None:
+            def __init__(self, tool_output: Any | None = None) -> None:
                 self.connected: list[dict[str, object]] = []
                 self.closed = False
                 instances.append(self)  # type: ignore[arg-type]

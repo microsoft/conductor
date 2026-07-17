@@ -32,7 +32,7 @@ from pydantic import BaseModel
 from conductor.config.schema import AgentDef, OutputField, ToolOutputConfig
 from conductor.exceptions import ProviderError, ValidationError
 from conductor.executor.output import validate_output
-from conductor.mcp.manager import MCPManager
+from conductor.mcp.manager import _FS_HINT, _GENERIC_HINT, _TRUNCATION_MARKER_PREFIX, MCPManager
 from conductor.providers._event_format import (
     extract_tool_result_text,
     format_tool_arguments,
@@ -634,7 +634,7 @@ class ClaudeProvider(AgentProvider):
             if resolved_cwd in self._mcp_managers:
                 return self._mcp_managers[resolved_cwd]
 
-            manager = MCPManager()
+            manager = MCPManager(tool_output=self._tool_output_config)
             for name, config in self._mcp_servers_config.items():
                 server_type = config.get("type", "stdio")
                 if server_type == "stdio":
@@ -1828,6 +1828,7 @@ class ClaudeProvider(AgentProvider):
                     result = await mcp_manager.call_tool(
                         tool_use.name, dict(tool_use.input) if hasattr(tool_use, "input") else {}
                     )
+                    result = self._maybe_rewrite_truncation_hint(result, tools)
                     tool_results.append(
                         {
                             "type": "tool_result",
@@ -2476,6 +2477,68 @@ class ClaudeProvider(AgentProvider):
                 text_parts.append(block.text)
 
         return {"result": "\n".join(text_parts)}
+
+    def _maybe_rewrite_truncation_hint(
+        self,
+        result: str,
+        tools: list[dict[str, Any]] | None,
+    ) -> str:
+        """Replace the generic truncation hint with an fs hint when applicable.
+
+        Truncation is detected by the presence of the ``[output truncated:``
+        marker in the trailing part of the result string. When the agent has
+        filesystem-like tools available, the embedded generic hint is replaced
+        with a hint that points the model at its filesystem tools. The
+        replacement is an exact string substitution so no shared mutable state
+        or placeholder mechanism is required.
+
+        Args:
+            result: The possibly truncated MCP tool result string.
+            tools: The tool definitions sent to the model (may be None).
+
+        Returns:
+            The result string, possibly with the hint rewritten.
+        """
+        if not result or _TRUNCATION_MARKER_PREFIX not in result[-400:]:
+            return result
+
+        if not self._has_fs_like_tool(tools):
+            return result
+
+        return result.replace(_GENERIC_HINT, _FS_HINT)
+
+    def _has_fs_like_tool(self, tools: list[dict[str, Any]] | None) -> bool:
+        """Return True if any tool looks like a filesystem/shell tool.
+
+        The check is heuristic: after stripping the ``server__`` prefix, the
+        lowercase tool name is matched for common filesystem/shell substrings.
+        A None tool list means no tools were allowed, so filesystem-like tools
+        are not available.
+        """
+        if not tools:
+            return False
+
+        fs_names = (
+            "read",
+            "grep",
+            "glob",
+            "bash",
+            "shell",
+            "file",
+            "filesystem",
+            "ls",
+            "find",
+            "view",
+            "edit",
+        )
+        for tool in tools:
+            name = tool.get("name", "")
+            if "__" in name:
+                name = name.split("__", 1)[1]
+            lower = name.lower()
+            if any(fs in lower for fs in fs_names):
+                return True
+        return False
 
     def _extract_structured_output(self, response: Any) -> dict[str, Any] | None:
         """Extract structured output from tool_use content blocks.
