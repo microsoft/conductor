@@ -1,0 +1,136 @@
+# PREVIEW — illustrates the planned `aca` provider (not yet implemented)
+#
+# This workflow shows what a workflow YAML would look like once the
+# experimental `aca` provider ships (issue #284, solution design at
+# docs/aca-provider.design.md). It is NOT runnable and will NOT currently
+# pass `conductor validate` — `aca` is not yet a recognized provider name.
+# This file exists purely to visualize the design before implementation
+# starts. Once the provider ships, an updated/verified version of this
+# workflow becomes the "one runnable examples/ workflow" required by the
+# design's Goals (#6), living at examples/ instead of docs/.
+#
+# What this previews:
+#   - `runtime.provider: { name: aca, ... }` — the structured ProviderSettings
+#     extension for aca (design doc: "Key Components" #3).
+#   - A coding-agent pattern (clone -> edit -> test -> loop back on failure)
+#     that stays in the SAME ACA session across loop-back re-executions,
+#     because `identifier_scope: agent` (the default) persists a session for
+#     an agent's *sequential* re-executions (DD5) — so the cloned repo and
+#     any edits survive between attempts without re-cloning.
+#   - The per-agent `sandbox:` override block (Open Questions: identifier
+#     scoping / working_dir) carrying a container-relative `working_dir`.
+#   - `max_session_seconds` kept comfortably under the Phase 0 spike's
+#     measured ~30-minute per-request cap (issue #312) so a single attempt
+#     can't silently exceed the transport's streaming window (DD3).
+#   - stdio MCP tools baked into the runner image (the "runner-image
+#     contract" — API Contracts), not something Conductor provisions.
+#
+# Once implemented, this would run as:
+#   conductor run examples/aca-coding-agent.yaml \
+#     --input repo_url="https://github.com/octocat/Hello-World" \
+#     --input task="Add a CONTRIBUTING.md with a one-paragraph guide"
+
+workflow:
+  name: aca-coding-agent-preview
+  description: >
+    Preview of a coding agent (clone -> implement -> test -> loop back on
+    failure) running entirely inside an ACA dynamic-session sandbox instead
+    of the host.
+  version: "0.1.0-preview"
+  entry_point: implement
+
+  runtime:
+    provider:
+      name: aca
+      # Operator-provisioned pool (DD6, bring-your-own — Conductor does not
+      # provision ACA infrastructure). See spikes/aca-transport/scripts/ for
+      # a throwaway provisioning example.
+      pool_endpoint: https://my-agent-pool.gentleflower-67aec8ae.westus2.azurecontainerapps.io
+      api_version: "2025-07-01"
+      # MVP: the in-container runner drives a real CopilotProvider only.
+      inner_provider: copilot
+      # Default granularity for *sequential* session reuse; concurrent units
+      # (parallel / for_each) always diverge via the mandatory concurrency
+      # discriminator regardless of this setting (DD5).
+      identifier_scope: agent
+      # Advisory mirrors of the pool's own settings (the pool governs).
+      egress: disabled
+      lifecycle: timed
+      auth: azure_default
+    default_model: gpt-4.1
+    mcp_servers:
+      # Baked into the conductor-agent-runner image (or an image extending
+      # it) — stdio MCP servers cannot be provisioned by Conductor itself
+      # once execution has moved into the sandbox.
+      git:
+        command: git-mcp-server
+        tools: ["*"]
+
+  input:
+    repo_url:
+      type: string
+      required: true
+      description: Repository to clone inside the sandbox
+    task:
+      type: string
+      required: true
+      description: The change to implement
+
+  limits:
+    max_iterations: 5 # caps the implement <-> self loop-back below
+
+agents:
+  - name: implement
+    description: >
+      Clones the repo on first run, implements the task, and runs the test
+      suite — all inside the sandbox. On failure, loops back into itself:
+      identifier_scope: agent means this re-execution reuses the SAME ACA
+      session, so the clone and any partial edits are still there.
+    model: gpt-4.1
+    # Per-agent sandbox override block (shape from Open Questions). Field
+    # NAMES here follow the design doc's answers; whether/how these values
+    # get exposed back into prompt templates (e.g. a `{{ sandbox.* }}`
+    # variable) is NOT yet decided — the prompt below states the path
+    # literally rather than assume an unconfirmed template binding.
+    sandbox:
+      working_dir: /workspace/repo # container-relative — see Open Questions
+      identifier_scope: agent # explicit here for clarity; matches the default
+    # Comfortably under the ~30-min measured per-request cap (issue #312) so
+    # one attempt can't outrun the streaming transport (DD3).
+    max_session_seconds: 900
+    prompt: |
+      Working directory: /workspace/repo
+
+      If the repository has not been cloned yet, clone {{ workflow.input.repo_url }}
+      into the working directory. Then implement the following change:
+
+      {{ workflow.input.task }}
+
+      {% if implement is defined and implement.output and implement.output.tests_passed == false %}
+      Your previous attempt failed:
+      {{ implement.output.failure_notes }}
+
+      Fix the issue (the repo and your prior edits are still present in this
+      same sandbox session) and try again.
+      {% endif %}
+
+      Run the test suite and report the outcome.
+    output:
+      summary:
+        type: string
+        description: What changed in this attempt
+      tests_passed:
+        type: boolean
+        description: Whether the test suite passed
+      failure_notes:
+        type: string
+        description: Populated only when tests_passed is false
+    routes:
+      - to: implement
+        when: "{{ not output.tests_passed }}"
+      - to: $end
+
+output:
+  summary: "{{ implement.output.summary }}"
+  tests_passed: "{{ implement.output.tests_passed }}"
+  attempts: "{{ context.iteration }}"
