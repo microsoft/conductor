@@ -287,16 +287,52 @@ mcp_servers:
       Authorization: Bearer ${MY_TOKEN}
 ```
 
+## Tool Output Limits
+
+To prevent large tool outputs from consuming the entire context window or causing API errors, Conductor supports limiting the size of individual MCP tool results. This behavior is configured globally under the `workflow.runtime.tool_output` block:
+
+```yaml
+workflow:
+  runtime:
+    tool_output:
+      enabled: true          # Default: true
+      max_chars: 50000       # Default: 50000 (minimum: 1000)
+      spill_to_file: true    # Default: true
+      spill_dir: null        # Default: null (resolves to OS temp dir /conductor/tool-output)
+```
+
+### Configuration Fields
+
+* **`enabled`** (boolean): Controls whether per-result MCP tool output size limiting is active. Defaults to `true`.
+* **`max_chars`** (integer): The maximum number of characters to retain from each individual tool result. Defaults to `50000`. Must be at least `1000`.
+* **`spill_to_file`** (boolean): When enabled, the full, raw tool output is saved to disk and a marker containing the file path is appended to the truncated prefix delivered to the model. When disabled, the output is truncated in-place without saving a copy. Defaults to `true`.
+* **`spill_dir`** (string or null): Custom directory for spill files. If `null`, it defaults to the process's temporary directory (`<tempfile.gettempdir()>/conductor/tool-output`). Relative paths are resolved against the current working directory of the process. Parent directories are created automatically.
+
+### Important Notes and Constraints
+
+* **Per-Result Cap:** The limit is a **per-result** cap applied to each tool result independently, not a cumulative context window budget. Multiple truncated tool results, combined with the agent's prompt and conversation history, can still exceed the model's context window. Tuning should be done via `max_chars` or `max_agent_iterations` to keep context consumption in check; cumulative context budgeting is out of scope.
+* **Spill File Security and Lifecycle:** Spill files contain the **raw** tool output, which may include secrets, API keys, or sensitive data. Conductor doesn't delete these files after execution. They are left in the operating system's temporary directory (or the custom `spill_dir`) and are cleaned up only by ambient OS temp cleanup processes or manual operator action.
+* **Multibyte Truncation (Copilot):** For the Copilot provider, `max_chars` is forwarded to the native SDK as bytes. This means multibyte UTF-8 characters (such as CJK characters or emojis) may be truncated earlier than `max_chars` characters.
+* **Truncation Event:** The `agent_tool_output_truncated` event is **Claude-only**. Because the Copilot SDK doesn't expose a hook for tool output truncation, this event is never emitted when using the Copilot provider.
+
+### Provider-Specific Behavior
+
+* **Claude Provider:** Truncation is handled conductor-side. If a tool result exceeds `max_chars`, Conductor truncates it and, if `spill_to_file` is true, writes the raw output to a spill file. For standard file-system tools (like `file_reader` or `grep`), Conductor appends a hint instructing the model that it can access the full contents using file-system tools directly.
+* **Copilot Provider:** Execution is delegated to the native Copilot SDK's `large_output` capability. If not configured, the SDK uses its default limit of `51200` bytes. The Conductor-configured `max_chars` is mapped to this byte limit.
+* **Claude Agent SDK Provider:** Handles tool execution via the native `claude` CLI. Configuration in `runtime.tool_output` is ignored. Truncation and token budgets for tool results are managed by the CLI's native `MAX_MCP_OUTPUT_TOKENS` environment variable.
+* **Hermes Provider:** Doesn't support MCP tools. The `runtime.tool_output` configuration is not applicable.
+
 ## Provider Support
 
-| Feature | Copilot | Claude |
-|---|---|---|
-| stdio servers | ✅ | ✅ |
-| http servers | ✅ | ❌ |
-| sse servers | ✅ | ❌ |
-| Tool filtering | ✅ | ✅ |
-| OAuth auto-auth | ✅ | N/A |
-| env var passing | ⚠️ Bug ([#163](https://github.com/github/copilot-sdk/issues/163)) | ✅ |
+| Feature | Copilot | Claude | Claude Agent SDK | Hermes |
+|---|---|---|---|---|
+| stdio servers | ✅ | ✅ | ❌ | ❌ |
+| http servers | ✅ | ❌ | ❌ | ❌ |
+| sse servers | ✅ | ❌ | ❌ | ❌ |
+| Tool filtering | ✅ | ✅ | ❌ | ❌ |
+| OAuth auto-auth | ✅ | N/A | ❌ | ❌ |
+| env var passing | ⚠️ Bug ([#163](https://github.com/github/copilot-sdk/issues/163)) | ✅ | ❌ | ❌ |
+| Tool output limits | ✅ (native SDK) | ✅ (conductor-side) | ✅ (native CLI env var) | N/A |
 
 ### Copilot Provider
 

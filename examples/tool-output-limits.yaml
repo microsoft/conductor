@@ -1,0 +1,60 @@
+# MCP Tool Output Limits
+#
+# This example demonstrates configuring tool output limits to prevent large tool
+# results from consuming the entire context window or causing API errors.
+#
+# Conductor supports per-result truncation and spill-to-file behavior for MCP tool
+# outputs. The `runtime.tool_output` block below sets these global limits.
+#
+# Usage:
+#   conductor run examples/tool-output-limits.yaml --input query="Python async tutorial"
+#
+# To validate this workflow without running it:
+#   conductor validate examples/tool-output-limits.yaml
+
+workflow:
+  name: tool-output-limits
+  description: Example workflow demonstrating MCP tool output limits configuration
+  version: "1.0.0"
+  entry_point: researcher
+
+  runtime:
+    provider: copilot
+    tool_output:
+      # Enable or disable tool output limiting
+      enabled: true
+      # Retain up to 20000 characters from each tool result (minimum: 1000)
+      max_chars: 20000
+      # When true, write the full raw tool result to a temporary file
+      spill_to_file: true
+      # Custom spill directory. When null, resolves to OS temp directory.
+      spill_dir: null
+    
+    mcp_servers:
+      web-search:
+        command: sh
+        args: ["-c", "MODE=stdio DEFAULT_SEARCH_ENGINE=bing exec npx -y open-websearch@latest"]
+        tools: ["search"]
+
+  input:
+    query:
+      type: string
+      required: true
+      description: The search query to run
+
+agents:
+  - name: researcher
+    description: Gathers search results and synthesizes them
+    model: gpt-5.2
+    prompt: |
+      Search the web for the query and summarize the findings:
+      Query: {{ workflow.input.query }}
+    output:
+      summary:
+        type: string
+        description: Synthesized summary of the search results
+    routes:
+      - to: $end
+
+output:
+  summary: "{{ researcher.output.summary }}"
