@@ -348,6 +348,40 @@ class CopilotProvider(AgentProvider):
         logger.debug("auto-approved permission request: %s", request)
         return PermissionHandler.approve_all(request, invocation)
 
+    def _large_output_config(self) -> dict[str, Any] | None:
+        """Build the SDK ``large_output`` config for session creation.
+
+        Returns ``None`` when the provider's tool output limiter is disabled,
+        which causes the ``large_output`` key to be omitted from SDK kwargs so
+        the default SDK behavior applies.
+
+        When enabled, the value is forwarded to the SDK as-is. The Copilot SDK
+        expects ``max_size_bytes``; Conductor forwards ``ToolOutputConfig.max_chars``
+        as bytes on a 1:1 basis by design. This means multibyte UTF-8 characters
+        (CJK, emoji, etc.) will be cut off by the SDK earlier than
+        ``max_chars`` characters of text. Conductor intentionally does not perform
+        its own truncation for Copilot because the SDK owns the tool loop.
+
+        The SDK has no "truncate in-place without spilling" mode. Therefore
+        ``spill_to_file=False`` is mapped to ``{"enabled": False}``, which
+        disables large-output handling entirely for the session.
+
+        ``output_directory`` is only included when ``spill_dir`` is explicitly
+        configured; otherwise the SDK uses its own OS-level temporary
+        directory.
+        """
+        if not self._tool_output_config.enabled:
+            return None
+        if self._tool_output_config.spill_to_file is False:
+            return {"enabled": False}
+        cfg: dict[str, Any] = {
+            "enabled": True,
+            "max_size_bytes": self._tool_output_config.max_chars,
+        }
+        if self._tool_output_config.spill_dir is not None:
+            cfg["output_directory"] = self._tool_output_config.spill_dir
+        return cfg
+
     def _warn_custom_routing_default_model(self) -> None:
         """Warn if custom routing is active but no default model is set.
 
@@ -923,6 +957,11 @@ class CopilotProvider(AgentProvider):
             # when runtime.provider opted into it.
             self._apply_provider_config(session_kwargs)
 
+            # Forward large-output handling configuration to the SDK.
+            large_output_cfg = self._large_output_config()
+            if large_output_cfg is not None:
+                session_kwargs["large_output"] = large_output_cfg
+
             # Resolve reasoning effort: per-agent override wins over runtime default.
             # When set, validate against the model's advertised capabilities
             # before forwarding to the SDK.
@@ -993,6 +1032,9 @@ class CopilotProvider(AgentProvider):
                         }
                         if self._mcp_servers:
                             resume_kwargs["mcp_servers"] = self._mcp_servers_for_cwd(resolved_cwd)
+                        large_output_cfg = self._large_output_config()
+                        if large_output_cfg is not None:
+                            resume_kwargs["large_output"] = large_output_cfg
                         session = await self._client.resume_session(resume_sid, **resume_kwargs)
                         logger.info(
                             f"Resumed Copilot session {resume_sid} for agent '{agent.name}'"
@@ -2414,6 +2456,11 @@ class CopilotProvider(AgentProvider):
             # Honor the same custom provider routing as agent sessions so
             # dialog turns hit the same endpoint as agent execution.
             self._apply_provider_config(dialog_kwargs)
+
+            # Forward large-output handling configuration to the SDK.
+            large_output_cfg = self._large_output_config()
+            if large_output_cfg is not None:
+                dialog_kwargs["large_output"] = large_output_cfg
 
             # Dialog turns honor the workflow-wide default reasoning effort
             # only — there's no agent-scoped override at this layer.
