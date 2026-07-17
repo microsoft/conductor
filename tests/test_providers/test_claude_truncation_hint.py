@@ -236,6 +236,115 @@ class TestMaybeRewriteTruncationHint:
         assert _FS_HINT not in rewritten
 
 
+class TestParseTruncationMarker:
+    """Direct unit tests for _parse_truncation_marker parsing."""
+
+    def test_parses_generic_hint(self) -> None:
+        """A marker using the generic hint parses correctly."""
+        provider = _make_provider_with_tool_output()
+        result = "x" * 100 + (
+            f"\n\n[output truncated: 200 chars -> 100 kept; "
+            f"full output saved to: /tmp/s.txt. {_GENERIC_HINT}]"
+        )
+
+        parsed = provider._parse_truncation_marker(result)
+
+        assert parsed == {
+            "original_chars": 200,
+            "kept_chars": 100,
+            "spill_path": "/tmp/s.txt",
+        }
+
+    def test_parses_fs_hint(self) -> None:
+        """A marker using the fs hint (after rewrite) parses correctly."""
+        provider = _make_provider_with_tool_output()
+        result = "x" * 100 + (
+            f"\n\n[output truncated: 200 chars -> 100 kept; "
+            f"full output saved to: /tmp/s.txt. {_FS_HINT}]"
+        )
+
+        parsed = provider._parse_truncation_marker(result)
+
+        assert parsed == {
+            "original_chars": 200,
+            "kept_chars": 100,
+            "spill_path": "/tmp/s.txt",
+        }
+
+    def test_parses_no_path(self) -> None:
+        """A marker without a spill path parses with None path."""
+        provider = _make_provider_with_tool_output()
+        result = "x" * 100 + (f"\n\n[output truncated: 200 chars -> 100 kept. {_GENERIC_HINT}]")
+
+        parsed = provider._parse_truncation_marker(result)
+
+        assert parsed == {
+            "original_chars": 200,
+            "kept_chars": 100,
+            "spill_path": None,
+        }
+
+    def test_parses_last_marker_when_payload_contains_spoof(self) -> None:
+        """A fake marker earlier in the payload is ignored; the real trailing marker wins."""
+        provider = _make_provider_with_tool_output()
+        fake = "[output truncated: 9999 chars -> 1 kept; full output saved to: /tmp/fake.txt."
+        real = (
+            "\n\n[output truncated: 2000 chars -> 1000 kept; "
+            f"full output saved to: /tmp/real.txt. {_GENERIC_HINT}]"
+        )
+        result = "x" * 500 + fake + "y" * 500 + real
+
+        parsed = provider._parse_truncation_marker(result)
+
+        assert parsed == {
+            "original_chars": 2000,
+            "kept_chars": 1000,
+            "spill_path": "/tmp/real.txt",
+        }
+
+    def test_parses_long_spill_path_exceeding_old_window(self) -> None:
+        """A ~4000-char spill path is parsed and the fs hint is applied."""
+        provider = _make_provider_with_tool_output()
+        long_path = "/tmp/" + "a" * 4000 + "/spill.txt"
+        result = "x" * 1000 + (
+            f"\n\n[output truncated: 2000 chars -> 1000 kept; "
+            f"full output saved to: {long_path}. {_GENERIC_HINT}]"
+        )
+        tools = [{"name": "fs__read_file"}]
+
+        parsed = provider._parse_truncation_marker(result)
+        assert parsed == {
+            "original_chars": 2000,
+            "kept_chars": 1000,
+            "spill_path": long_path,
+        }
+
+        rewritten = provider._maybe_rewrite_truncation_hint(result, tools)
+        assert _FS_HINT in rewritten
+        assert _GENERIC_HINT not in rewritten
+        assert long_path in rewritten
+
+    def test_payload_generic_hint_literal_is_not_corrupted(self) -> None:
+        """A generic hint literal inside the payload is unchanged; only the marker
+        hint is rewritten."""
+        provider = _make_provider_with_tool_output()
+        payload = "x" * 100 + _GENERIC_HINT + "y" * 100
+        marker = (
+            "\n\n[output truncated: 2000 chars -> 1000 kept; "
+            "full output saved to: /tmp/spill.txt. " + _GENERIC_HINT + "]"
+        )
+        result = payload + marker
+        tools = [{"name": "fs__read_file"}]
+
+        rewritten = provider._maybe_rewrite_truncation_hint(result, tools)
+
+        # Payload occurrence stays generic; marker occurrence becomes fs hint.
+        assert payload in rewritten
+        assert rewritten.count(_GENERIC_HINT) == 1
+        assert rewritten.count(_FS_HINT) == 1
+        assert rewritten.endswith("]")
+
+
 class TestAgenticLoopHintReplacement:
     """Tests for hint replacement via the full _execute_agentic_loop."""
 
@@ -373,68 +482,47 @@ class TestAgenticLoopHintReplacement:
         assert _FS_HINT not in complete_events[0]["result"]
 
 
-class TestParseTruncationMarker:
-    """Direct unit tests for _parse_truncation_marker parsing."""
+class TestFullLoopEventAndRewrite:
+    """Tests for event emission and fs-hint rewrite in the full agentic loop."""
 
-    def test_parses_generic_hint(self) -> None:
-        """A marker using the generic hint parses correctly."""
+    @pytest.mark.asyncio
+    async def test_truncation_event_with_fs_tools_after_hint_rewrite(self) -> None:
+        """Truncation event fires even after the generic hint is rewritten to fs hint."""
         provider = _make_provider_with_tool_output()
-        result = "x" * 100 + (
-            f"\n\n[output truncated: 200 chars -> 100 kept; "
-            f"full output saved to: /tmp/s.txt. {_GENERIC_HINT}]"
+        events: list[tuple[str, dict[str, Any]]] = []
+
+        mcp_response = _make_response(
+            [_make_tool_use_block("filesystem__read_file", {"path": "/tmp/test.txt"})]
+        )
+        text_response = _make_response([_make_text_block("Done")])
+        provider._execute_api_call = AsyncMock(side_effect=[mcp_response, text_response])
+        truncated_result = (
+            "x" * 100
+            + "\n\n[output truncated: 200 chars -> 100 kept; "
+            + f"full output saved to: /tmp/spill.txt. {_GENERIC_HINT}]"
+        )
+        provider._mock_mcp_manager.call_tool = AsyncMock(return_value=truncated_result)
+
+        await provider._execute_agentic_loop(
+            messages=[{"role": "user", "content": "test"}],
+            model="claude-3-5-sonnet-latest",
+            temperature=None,
+            max_tokens=8192,
+            tools=[{"name": "filesystem__read_file"}],
+            output_schema=None,
+            has_output_schema=False,
+            event_callback=lambda t, d: events.append((t, d)),
+            mcp_manager=getattr(provider, "_mock_mcp_manager", None),
         )
 
-        parsed = provider._parse_truncation_marker(result)
+        truncation_events = [d for t, d in events if t == "agent_tool_output_truncated"]
+        assert len(truncation_events) == 1
+        assert truncation_events[0]["tool_name"] == "filesystem__read_file"
+        assert truncation_events[0]["original_chars"] == 200
+        assert truncation_events[0]["kept_chars"] == 100
+        assert truncation_events[0]["spill_path"] == "/tmp/spill.txt"
 
-        assert parsed == {
-            "original_chars": 200,
-            "kept_chars": 100,
-            "spill_path": "/tmp/s.txt",
-        }
-
-    def test_parses_fs_hint(self) -> None:
-        """A marker using the fs hint (after rewrite) parses correctly."""
-        provider = _make_provider_with_tool_output()
-        result = "x" * 100 + (
-            f"\n\n[output truncated: 200 chars -> 100 kept; "
-            f"full output saved to: /tmp/s.txt. {_FS_HINT}]"
-        )
-
-        parsed = provider._parse_truncation_marker(result)
-
-        assert parsed == {
-            "original_chars": 200,
-            "kept_chars": 100,
-            "spill_path": "/tmp/s.txt",
-        }
-
-    def test_parses_no_path(self) -> None:
-        """A marker without a spill path parses with None path."""
-        provider = _make_provider_with_tool_output()
-        result = "x" * 100 + (f"\n\n[output truncated: 200 chars -> 100 kept. {_GENERIC_HINT}]")
-
-        parsed = provider._parse_truncation_marker(result)
-
-        assert parsed == {
-            "original_chars": 200,
-            "kept_chars": 100,
-            "spill_path": None,
-        }
-
-    def test_parses_last_marker_when_payload_contains_spoof(self) -> None:
-        """A fake marker earlier in the payload is ignored; the real trailing marker wins."""
-        provider = _make_provider_with_tool_output()
-        fake = "[output truncated: 9999 chars -> 1 kept; full output saved to: /tmp/fake.txt."
-        real = (
-            "\n\n[output truncated: 2000 chars -> 1000 kept; "
-            f"full output saved to: /tmp/real.txt. {_GENERIC_HINT}]"
-        )
-        result = "x" * 500 + fake + "y" * 500 + real
-
-        parsed = provider._parse_truncation_marker(result)
-
-        assert parsed == {
-            "original_chars": 2000,
-            "kept_chars": 1000,
-            "spill_path": "/tmp/real.txt",
-        }
+        complete_events = [d for t, d in events if t == "agent_tool_complete"]
+        assert len(complete_events) == 1
+        assert _FS_HINT in complete_events[0]["result"]
+        assert _GENERIC_HINT not in complete_events[0]["result"]

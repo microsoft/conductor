@@ -2534,7 +2534,10 @@ class ClaudeProvider(AgentProvider):
             return result
         if not truncation_info.get("spill_path"):
             return result
-        return result.replace(_GENERIC_HINT, _FS_HINT)
+        idx = result.rfind(_GENERIC_HINT)
+        if idx == -1:
+            return result
+        return result[:idx] + _FS_HINT + result[idx + len(_GENERIC_HINT) :]
 
     def _parse_truncation_marker(
         self,
@@ -2547,11 +2550,12 @@ class ClaudeProvider(AgentProvider):
 
             [output truncated: {original} chars -> {kept} kept{; optional path}. {HINT}]
 
-        This method detects the marker only in the trailing 2000 characters of
+        This method detects the marker only in the trailing 8192 characters of
         ``result`` to avoid matching unrelated text while still accommodating
-        long spill file paths. The marker is parsed from the local string so no
-        shared mutable state is needed, which keeps the parser safe when the same
-        MCP manager is reused across parallel agents.
+        long POSIX spill file paths (PATH_MAX ~4096 + marker overhead). The
+        marker is parsed from the local string so no shared mutable state is
+        needed, which keeps the parser safe when the same MCP manager is reused
+        across parallel agents.
 
         Args:
             result: The possibly truncated MCP tool result string.

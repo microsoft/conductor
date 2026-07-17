@@ -53,7 +53,11 @@ _GENERIC_HINT = "The full output was truncated; refine the tool arguments to ret
 _FS_HINT = (
     "The full output was saved to a file; read it with your filesystem tools if you need more."
 )
-_TAIL_WINDOW = 2000
+# Window used by ClaudeProvider._parse_truncation_marker to look at the trailing
+# portion of a tool result. It must exceed the maximum realistic marker length
+# (PATH_MAX ~4096 chars + fixed marker/hint overhead) so that a valid long
+# POSIX spill path is never cut off.
+_TAIL_WINDOW = 8192
 
 
 def _contains_symlink(path: Path, stop_at: Path | None = None) -> bool:
@@ -349,6 +353,10 @@ class MCPManager:
         Files are created with mode 0o600 and may contain raw tool output
         (possibly including secrets). The caller is responsible for lifecycle.
 
+        This method is best-effort and must never raise. Any failure (invalid
+        path, symlink, permission, I/O, encoding) is logged as a warning and
+        returns None so the caller can fall back to a marker without a path.
+
         Args:
             full_text: The full tool result text to persist.
             server_name: Name of the MCP server that produced the result.
@@ -357,28 +365,28 @@ class MCPManager:
         Returns:
             The absolute path of the spill file, or None if writing failed.
         """
-        spill_dir_str = self._tool_output.spill_dir
-        if spill_dir_str:
-            spill_dir = Path(spill_dir_str)
-            if _contains_symlink(spill_dir):
-                logger.warning(
-                    "Spill dir %s contains a symlink; refusing to write tool output spill.",
-                    spill_dir,
-                )
-                return None
-        else:
-            temp_parent = Path(tempfile.gettempdir()).resolve()
-            spill_dir = temp_parent / "conductor" / "tool-output"
-            if _contains_symlink(spill_dir, stop_at=temp_parent):
-                logger.warning(
-                    "Default spill dir %s contains a symlink; refusing to write tool output spill.",
-                    spill_dir,
-                )
-                return None
-
-        spill_dir = spill_dir.resolve()
-
         try:
+            spill_dir_str = self._tool_output.spill_dir
+            if spill_dir_str:
+                spill_dir = Path(spill_dir_str)
+                if _contains_symlink(spill_dir):
+                    logger.warning(
+                        "Spill dir %s contains a symlink; refusing to write tool output spill.",
+                        spill_dir,
+                    )
+                    return None
+            else:
+                temp_parent = Path(tempfile.gettempdir()).resolve()
+                spill_dir = temp_parent / "conductor" / "tool-output"
+                if _contains_symlink(spill_dir, stop_at=temp_parent):
+                    logger.warning(
+                        "Default spill dir %s contains a symlink; "
+                        "refusing to write tool output spill.",
+                        spill_dir,
+                    )
+                    return None
+
+            spill_dir = spill_dir.resolve()
             spill_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
             # If the leaf directory already existed, harden it before writing
             # potentially sensitive tool output into it.
@@ -422,7 +430,7 @@ class MCPManager:
                 )
                 return None
             return str(path)
-        except OSError as e:
+        except (OSError, ValueError) as e:
             logger.warning(
                 "Failed to spill full MCP tool output to disk: %s",
                 e,

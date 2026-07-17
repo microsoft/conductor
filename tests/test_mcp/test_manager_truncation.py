@@ -536,18 +536,71 @@ async def test_explicit_spill_dir_ancestor_symlink_is_rejected(
 
 
 @pytest.mark.asyncio
-async def test_explicit_spill_dir_without_symlink_spills_normally(
-    fixture: _TruncationManagerFixture, tmp_path: Path
+async def test_spill_dir_with_null_byte_does_not_raise(
+    fixture: _TruncationManagerFixture,
 ) -> None:
-    """A normal explicit spill_dir path (no symlinks) still spills correctly."""
+    """A spill_dir containing a NUL byte degrades gracefully; tool call still
+    returns truncated result."""
     full_text = "x" * 1500
     config = ToolOutputConfig(
-        enabled=True, max_chars=1000, spill_to_file=True, spill_dir=str(tmp_path)
+        enabled=True,
+        max_chars=1000,
+        spill_to_file=True,
+        spill_dir="/tmp/foo\x00bar",
     )
     manager = fixture.make_manager(config)
     fixture.set_result(full_text)
 
     result = await manager.call_tool("server__tool", {})
 
-    assert "full output saved to:" in result
-    assert any(tmp_path.glob("*.txt"))
+    assert result.startswith("x" * 1000)
+    assert "[output truncated: 1500 chars -> 1000 kept." in result
+    assert "full output saved to:" not in result
+
+
+@pytest.mark.asyncio
+async def test_spill_dir_too_long_does_not_raise(
+    fixture: _TruncationManagerFixture,
+) -> None:
+    """An over-long spill_dir path degrades gracefully; tool call still returns
+    truncated result."""
+    full_text = "x" * 1500
+    config = ToolOutputConfig(
+        enabled=True,
+        max_chars=1000,
+        spill_to_file=True,
+        spill_dir="a" * 10000,
+    )
+    manager = fixture.make_manager(config)
+    fixture.set_result(full_text)
+
+    result = await manager.call_tool("server__tool", {})
+
+    assert result.startswith("x" * 1000)
+    assert "[output truncated: 1500 chars -> 1000 kept." in result
+    assert "full output saved to:" not in result
+
+
+@pytest.mark.asyncio
+async def test_spill_dir_resolve_oserror_does_not_raise(
+    fixture: _TruncationManagerFixture,
+    tmp_path: Path,
+) -> None:
+    """If Path.resolve() raises OSError during spill setup, tool call still
+    returns truncated result."""
+    full_text = "x" * 1500
+    config = ToolOutputConfig(
+        enabled=True,
+        max_chars=1000,
+        spill_to_file=True,
+        spill_dir=str(tmp_path),
+    )
+    manager = fixture.make_manager(config)
+    fixture.set_result(full_text)
+
+    with patch("conductor.mcp.manager.Path.resolve", side_effect=OSError("too many links")):
+        result = await manager.call_tool("server__tool", {})
+
+    assert result.startswith("x" * 1000)
+    assert "[output truncated: 1500 chars -> 1000 kept." in result
+    assert "full output saved to:" not in result
