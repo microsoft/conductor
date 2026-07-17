@@ -433,7 +433,7 @@ container filesystem is the agent's workspace.
   runner drives. **MVP: `copilot` only.** Claude-inside requires
   `claude-agent-sdk` (the containerizable `claude` CLI); the bare `claude`
   (Anthropic-API) provider has no in-process tool runtime and is not valid here.
-- `identifier_scope: Literal["run","agent","item","step"] = "agent"` — default
+- `identifier_scope: Literal["workflow","agent","item","none"] = "agent"` — default
   granularity for *sequential* reuse (concurrent units always diverge; DD5).
 - `egress: Literal["enabled","disabled"]` — advisory mirror of the pool's
   `sessionNetworkConfiguration.status` (the pool governs).
@@ -488,10 +488,10 @@ concurrent unit (empty otherwise):
 
 | `identifier_scope` | `scope_key` | Reuse across *sequential* re-executions |
 |---|---|---|
-| `run` | constant per run | one shared workspace for the whole run |
+| `workflow` | constant per run | one shared workspace for the whole workflow run |
 | `agent` (default) | agent name | one workspace per agent (loop-backs / retries reuse it) |
 | `item` | for-each item key | one workspace per for-each item |
-| `step` | agent name + step index | fresh workspace per execution |
+| `none` | agent name + execution index | fresh workspace every execution, including retries (no reuse) |
 
 The concurrency discriminator is what makes `concurrent_safe=True` honest.
 `scope_key` alone is insufficient: the default `agent` scope derives one key from
@@ -788,7 +788,7 @@ Phase 1), **Future** (post-MVP / v2).
   reasonable MVP scope cut — revisit if real usage shows turns routinely
   approaching the cap.
 
-- **Identifier scoping.** Per-agent (default) vs per-run; exact naming scheme
+- **Identifier scoping.** Per-agent (default) vs per-workflow; exact naming scheme
   (parallel-safe, unpredictable, ≤128 chars); final shape of the per-agent
   `sandbox:` override block.
 
@@ -797,7 +797,7 @@ Phase 1), **Future** (post-MVP / v2).
   re-executions (loop-backs) so a coding agent keeps its workspace between turns,
   while the **mandatory concurrency discriminator (DD5)** always diverges the
   identifier per concurrent unit so parallel / for-each runs stay isolated and
-  `concurrent_safe=True` stays truthful. `run`, `item`, and `step` remain opt-in
+  `concurrent_safe=True` stays truthful. `workflow`, `item`, and `none` remain opt-in
   overrides. Naming scheme: a slugified `<workflow>-<agent>` prefix + the
   concurrency discriminator + an unpredictable random suffix, truncated to the ACA
   ≤128-char limit. The per-agent `sandbox:` block carries the `identifier_scope`
