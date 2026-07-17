@@ -182,7 +182,7 @@ export interface DeepLinkError {
 export function useDeepLink(): DeepLinkError | null {
   const [error, setError] = useState<DeepLinkError | null>(null);
   const applied = useRef(false);
-  const { fitView } = useReactFlow();
+  const { fitView, getInternalNode } = useReactFlow();
 
   const { subworkflowPath, agent } = getDeepLinkParams();
   const hasParams = !!(subworkflowPath || agent);
@@ -192,27 +192,64 @@ export function useDeepLink(): DeepLinkError | null {
 
     let debounceTimer: ReturnType<typeof setTimeout> | null = null;
     let hardTimeout: ReturnType<typeof setTimeout> | null = null;
+    let centerRaf: number | null = null;
     let unsubscribe: (() => void) | null = null;
 
     // Expand the target's ancestor chain inline (keeping the root frame) and
     // select it, instead of re-rooting the view into the child context.
     const revealContext = (targetPath: number[], selectedId: string | null): void => {
-      const keys = expansionKeysForContextPath(
-        useWorkflowStore.getState().subworkflowContexts,
-        targetPath,
-      );
-      useWorkflowStore.getState().expandContexts(keys);
+      const store = useWorkflowStore.getState();
+      const contexts = store.subworkflowContexts;
+      // Defensive breadcrumb: every caller passes a path walked from this same
+      // context tree, so a path that runs past a live context means a future
+      // caller passed something unvalidated. `expansionKeysForContextPath`
+      // would then expand only the resolved prefix and we'd select a node that
+      // never renders — surface that instead of silently revealing a partial
+      // target. (The failed-segment branch passes its already-resolved prefix,
+      // which stays fully materialized, so it does not trip this.)
+      if (targetPath.length > 0 && !contextAtPath(contexts, targetPath)) {
+        console.warn(
+          '[use-deep-link] reveal target path is not fully materialized; ' +
+            'expanding only the resolved prefix',
+          targetPath,
+        );
+      }
+      store.expandContexts(expansionKeysForContextPath(contexts, targetPath));
       useWorkflowStore.setState({ viewContextPath: [], selectedNode: selectedId });
     };
 
-    // Center the view on a node after React Flow rebuilds the expanded graph.
+    // Center the view on a node once React Flow has laid out the rebuilt graph.
+    // The inline reveal rebuilds the entire root graph plus the expanded
+    // ancestor chain, so the target may not be measured for several frames.
+    // Poll requestAnimationFrame until it is, then fit; if it never
+    // materializes within the budget, fall back to a whole-graph fit rather
+    // than letting a node-targeted fitView divide by a zero-size bounding box
+    // and yank the viewport to the origin at max zoom.
     const centerOn = (fitId: string): void => {
-      setTimeout(() => {
-        fitView({ nodes: [{ id: fitId }], padding: 0.5, duration: 400 });
-      }, 200);
+      let attempts = 0;
+      const maxAttempts = 40; // ~40 frames (~0.6s) before giving up
+      const tick = () => {
+        centerRaf = null;
+        const measured = getInternalNode(fitId)?.measured;
+        if (measured?.width && measured?.height) {
+          fitView({ nodes: [{ id: fitId }], padding: 0.5, duration: 400 });
+        } else if (attempts++ < maxAttempts) {
+          centerRaf = requestAnimationFrame(tick);
+        } else {
+          // Target never measured within the budget (e.g. a genuinely missing
+          // id). Degrade to a whole-graph fit — which can't divide by a
+          // zero-size bbox — rather than centering on nothing.
+          console.warn(
+            `[use-deep-link] node "${fitId}" was not measured in time; ` +
+              'fitting the whole graph instead',
+          );
+          fitView({ padding: 0.2, duration: 400 });
+        }
+      };
+      centerRaf = requestAnimationFrame(tick);
     };
 
-    const apply = () => {
+    const runApply = () => {
       if (applied.current) return;
       applied.current = true;
       if (debounceTimer) clearTimeout(debounceTimer);
@@ -303,6 +340,18 @@ export function useDeepLink(): DeepLinkError | null {
       }
     };
 
+    // Run the resolution once, converting any unexpected throw into a visible
+    // error banner so a deep-link always ends in either a reveal or an error
+    // (never a silent hung/blank state).
+    const apply = () => {
+      try {
+        runApply();
+      } catch (err) {
+        console.warn('[use-deep-link] failed to apply deep-link target', err);
+        setError({ message: 'Could not resolve the deep-link target.' });
+      }
+    };
+
     /**
      * Decide whether the current state is "ready enough" to apply the deep
      * link, or if we should keep waiting for more replayed events. Returns
@@ -367,9 +416,10 @@ export function useDeepLink(): DeepLinkError | null {
     return () => {
       if (debounceTimer) clearTimeout(debounceTimer);
       if (hardTimeout) clearTimeout(hardTimeout);
+      if (centerRaf != null) cancelAnimationFrame(centerRaf);
       if (unsubscribe) unsubscribe();
     };
-  }, [hasParams, subworkflowPath, agent, fitView]);
+  }, [hasParams, subworkflowPath, agent, fitView, getInternalNode]);
 
   return error;
 }

@@ -211,6 +211,148 @@ function seedForEachSubworkflows(count = 2): void {
   }
 }
 
+/**
+ * Two-level MIXED nesting: root → `sub_agent` (sequential subworkflow, context
+ * [0]) → `inner_batch` (a `for_each`-of-workflow group) whose first iteration
+ * `inner_batch[0]` (context [0, 0]) runs a child DAG (`gcA → gcB`). This is the
+ * only shape that produces a `for_each` group key at a NON-root parent path
+ * (`forEachGroupKey([0], 'inner_batch')`).
+ */
+function seedSeqThenForEach(): void {
+  const { processEvent } = useWorkflowStore.getState();
+
+  processEvent(
+    event('workflow_started', {
+      name: 'root',
+      agents: [{ name: 'planner' }, { name: 'sub_agent', type: 'workflow' }],
+      routes: [
+        { from: 'planner', to: 'sub_agent' },
+        { from: 'sub_agent', to: '$end' },
+      ],
+      parallel_groups: [],
+      for_each_groups: [],
+      entry_point: 'planner',
+    }),
+  );
+  processEvent(
+    event('subworkflow_started', {
+      agent_name: 'sub_agent',
+      workflow: 'sub.yaml',
+      iteration: 1,
+      slot_key: 'sub_agent',
+      parent_path: [],
+    }),
+  );
+  processEvent(
+    event('workflow_started', {
+      name: 'child-workflow',
+      agents: [{ name: 'childRoot' }],
+      routes: [
+        { from: 'childRoot', to: 'inner_batch' },
+        { from: 'inner_batch', to: '$end' },
+      ],
+      parallel_groups: [],
+      for_each_groups: [{ name: 'inner_batch' }],
+      entry_point: 'childRoot',
+      subworkflow_path: ['sub_agent'],
+    }),
+  );
+  processEvent(
+    event('subworkflow_started', {
+      agent_name: 'inner_batch',
+      workflow: 'gc.yaml',
+      iteration: 1,
+      slot_key: 'inner_batch[0]',
+      item_key: '0',
+      parent_path: ['sub_agent'],
+    }),
+  );
+  processEvent(
+    event('workflow_started', {
+      name: 'grandchild-workflow',
+      agents: [{ name: 'gcA' }, { name: 'gcB' }],
+      routes: [
+        { from: 'gcA', to: 'gcB' },
+        { from: 'gcB', to: '$end' },
+      ],
+      parallel_groups: [],
+      for_each_groups: [],
+      entry_point: 'gcA',
+      subworkflow_path: ['sub_agent', 'inner_batch[0]'],
+    }),
+  );
+}
+
+/**
+ * Two-level MIXED nesting the other way: root → `batch` (`for_each`-of-workflow
+ * group) whose first iteration `batch[0]` (context [0]) runs a child DAG that
+ * itself contains a sequential subworkflow `leaf_sub` (context [0, 0]) →
+ * `deepAgent`. Exercises the walk continuing with a context key AFTER a
+ * `for_each` ancestor.
+ */
+function seedForEachThenSeq(): void {
+  const { processEvent } = useWorkflowStore.getState();
+
+  processEvent(
+    event('workflow_started', {
+      name: 'root',
+      agents: [{ name: 'finder' }, { name: 'aggregator' }],
+      routes: [
+        { from: 'finder', to: 'batch' },
+        { from: 'batch', to: 'aggregator' },
+        { from: 'aggregator', to: '$end' },
+      ],
+      parallel_groups: [],
+      for_each_groups: [{ name: 'batch' }],
+      entry_point: 'finder',
+    }),
+  );
+  processEvent(
+    event('subworkflow_started', {
+      agent_name: 'batch',
+      workflow: 'sub.yaml',
+      iteration: 1,
+      slot_key: 'batch[0]',
+      item_key: '0',
+      parent_path: [],
+    }),
+  );
+  processEvent(
+    event('workflow_started', {
+      name: 'child-workflow',
+      agents: [{ name: 'childRoot' }, { name: 'leaf_sub', type: 'workflow' }],
+      routes: [
+        { from: 'childRoot', to: 'leaf_sub' },
+        { from: 'leaf_sub', to: '$end' },
+      ],
+      parallel_groups: [],
+      for_each_groups: [],
+      entry_point: 'childRoot',
+      subworkflow_path: ['batch[0]'],
+    }),
+  );
+  processEvent(
+    event('subworkflow_started', {
+      agent_name: 'leaf_sub',
+      workflow: 'leaf.yaml',
+      iteration: 1,
+      slot_key: 'leaf_sub',
+      parent_path: ['batch[0]'],
+    }),
+  );
+  processEvent(
+    event('workflow_started', {
+      name: 'grandchild-workflow',
+      agents: [{ name: 'deepAgent' }],
+      routes: [{ from: 'deepAgent', to: '$end' }],
+      parallel_groups: [],
+      for_each_groups: [],
+      entry_point: 'deepAgent',
+      subworkflow_path: ['batch[0]', 'leaf_sub'],
+    }),
+  );
+}
+
 beforeEach(() => {
   useWorkflowStore.setState(useWorkflowStore.getInitialState(), true);
 });
@@ -452,6 +594,37 @@ describe('expansionKeysForContextPath', () => {
     const { nodes } = buildGraphElements(rootBase(), [], new Set(keys));
     // childA inside iteration batch[1] renders only with group + context keys.
     expect(nodes.some((n) => n.id === nodeKey([1], 'childA'))).toBe(true);
+  });
+
+  it('emits a for_each group key relative to its non-root parent path', () => {
+    // root → sub_agent(seq, [0]) → inner_batch[0](for_each iter, [0,0]).
+    seedSeqThenForEach();
+    const s = useWorkflowStore.getState();
+    const keys = expansionKeysForContextPath(s.subworkflowContexts, [0, 0]);
+    // The group key must be namespaced to the parent context [0], NOT root —
+    // this is the branch every root-level for_each test misses.
+    expect(keys).toEqual([
+      contextKey([0]),
+      forEachGroupKey([0], 'inner_batch'),
+      contextKey([0, 0]),
+    ]);
+    const { nodes } = buildGraphElements(rootBase(), [], new Set(keys));
+    expect(nodes.some((n) => n.id === nodeKey([0, 0], 'gcA'))).toBe(true);
+  });
+
+  it('reveals a sequential subworkflow nested inside a for_each iteration', () => {
+    // root → batch[0](for_each iter, [0]) → leaf_sub(seq, [0,0]).
+    seedForEachThenSeq();
+    const s = useWorkflowStore.getState();
+    const keys = expansionKeysForContextPath(s.subworkflowContexts, [0, 0]);
+    // The walk continues with a plain context key after the for_each ancestor.
+    expect(keys).toEqual([
+      forEachGroupKey([], 'batch'),
+      contextKey([0]),
+      contextKey([0, 0]),
+    ]);
+    const { nodes } = buildGraphElements(rootBase(), [], new Set(keys));
+    expect(nodes.some((n) => n.id === nodeKey([0, 0], 'deepAgent'))).toBe(true);
   });
 });
 

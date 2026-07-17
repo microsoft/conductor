@@ -201,10 +201,11 @@ export function expansionKeysForContextPath(
   for (const idx of path) {
     const ctx = current[idx];
     if (!ctx) break;
-    const parentPath = [...prefix];
-    prefix.push(idx);
+    // `prefix` is the parent path here; `forEachGroupKey` reads it synchronously
+    // (before the push below advances it to this context's own path).
     const parsed = parseForEachSlotKey(ctx.slotKey);
-    if (parsed) keys.push(forEachGroupKey(parentPath, parsed.group));
+    if (parsed) keys.push(forEachGroupKey(prefix, parsed.group));
+    prefix.push(idx);
     keys.push(contextKey(prefix));
     current = ctx.children;
   }
