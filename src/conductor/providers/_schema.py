@@ -59,7 +59,7 @@ def build_json_schema_field(
         A JSON-Schema fragment dictionary.
 
     Raises:
-        _SchemaDepthError: When the depth limit is exceeded.
+        SchemaDepthError: When the depth limit is exceeded.
     """
     _check_depth(depth, max_depth)
 
@@ -94,7 +94,7 @@ def build_json_schema_properties(
         A JSON-Schema ``properties`` object.
 
     Raises:
-        _SchemaDepthError: When the depth limit is exceeded.
+        SchemaDepthError: When the depth limit is exceeded.
     """
     _check_depth(depth, max_depth)
 
@@ -132,7 +132,7 @@ def build_prompt_schema_field(
         A prompt-facing schema fragment dictionary.
 
     Raises:
-        _SchemaDepthError: When the depth limit is exceeded.
+        SchemaDepthError: When the depth limit is exceeded.
     """
     _check_depth(depth, max_depth)
 
@@ -185,7 +185,7 @@ def build_prompt_schema_properties(
         A prompt-facing schema mapping.
 
     Raises:
-        _SchemaDepthError: When the depth limit is exceeded.
+        SchemaDepthError: When the depth limit is exceeded.
     """
     _check_depth(depth, max_depth)
 
@@ -211,7 +211,7 @@ def build_hermes_legacy_prompt_schema(
     receive a fallback description. Unlike the generic prompt builder, object
     items inside arrays are emitted with ``properties`` but no ``required``
     key, and array-of-array items collapse to ``{"type": "array"}`` without
-    further recursion or description.
+    further recursion (an explicit item description is still kept).
 
     Args:
         fields: Mapping from field name to output field definition.
@@ -222,7 +222,7 @@ def build_hermes_legacy_prompt_schema(
         The Hermes legacy prompt-facing schema mapping.
 
     Raises:
-        _SchemaDepthError: When the depth limit is exceeded.
+        SchemaDepthError: When the depth limit is exceeded.
     """
     _check_depth(depth, max_depth)
 
@@ -258,7 +258,7 @@ def _build_hermes_legacy_item_schema(
 
     Object items include ``properties`` but no ``required``. Array items of
     any kind collapse to the bare ``{"type": "array"}`` shape with no
-    inner recursion or description.
+    inner recursion (an explicit item description is still kept).
 
     Args:
         field: The array item output field definition.
@@ -271,14 +271,13 @@ def _build_hermes_legacy_item_schema(
     Raises:
         SchemaDepthError: When the depth limit is exceeded.
     """
-    _check_depth(depth, max_depth)
-
     item_schema: dict[str, Any] = {"type": field.type}
 
     if field.description:
         item_schema["description"] = field.description
 
     if field.type == "object" and field.properties:
+        _check_depth(depth, max_depth)
         # Pinned legacy counting: the array itself advanced depth by one when
         # calling this helper, so the item's properties must recurse at the
         # same depth (not depth + 1) to match pre-refactor Hermes behavior.

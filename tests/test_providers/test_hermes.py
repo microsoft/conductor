@@ -925,3 +925,28 @@ class TestHermesBuildPromptSchema:
         # _chain_schema(10) reaches depth 11: one level too deep.
         with pytest.raises(ValidationError, match="exceeds maximum"):
             _build_prompt_schema(chain_in_array_item(10))
+
+    def test_build_prompt_schema_non_object_array_item_at_boundary_accepted(self) -> None:
+        """Non-object array items must not consume a depth level.
+
+        Requirement: legacy Hermes checked depth only when recursing into object
+        properties, so a chain reaching exactly _MAX_SCHEMA_DEPTH whose leaf is an
+        array of scalars (or an array of arrays) was accepted pre-refactor. The
+        shared builder must preserve that boundary: no error at depth 10, while a
+        chain one object level deeper still raises.
+        """
+        # 10 nested objects (depths 0..9) ending in non-object array fields at depth 10.
+        inner: dict[str, OutputField] = {
+            "tags": OutputField(type="array", items=OutputField(type="string")),
+            "matrix": OutputField(
+                type="array", items=OutputField(type="array", items=OutputField(type="number"))
+            ),
+        }
+        for _ in range(_MAX_SCHEMA_DEPTH):
+            inner = {"nested": OutputField(type="object", properties=inner)}
+        _build_prompt_schema(inner)
+
+        # One more object level pushes the object chain to depth 11: must raise.
+        too_deep = {"nested": OutputField(type="object", properties=inner)}
+        with pytest.raises(ValidationError, match="exceeds maximum"):
+            _build_prompt_schema(too_deep)
