@@ -444,9 +444,9 @@ class TestPromptSchemaGeneration:
     def test_build_prompt_schema_depth_limit_enforced(self) -> None:
         """Excessively nested schemas raise ValidationError with the pinned message.
 
-        This is a targeted regression guard for PR-2a: the Copilot provider
-        must convert the shared core's SchemaDepthError into the exact existing
-        ValidationError message and suggestion so callers see stable behavior.
+        The Copilot provider must convert the shared core's SchemaDepthError
+        into the exact existing ValidationError message and suggestion so
+        callers see stable behavior.
         """
         from conductor.config.schema import OutputField
         from conductor.exceptions import ValidationError

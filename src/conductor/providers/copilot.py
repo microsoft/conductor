@@ -1540,53 +1540,6 @@ class CopilotProvider(AgentProvider):
                 suggestion="Simplify your output schema to reduce nesting depth",
             ) from exc
 
-    def _build_prompt_field_schema(
-        self,
-        field_name: str,
-        field_def: OutputField,
-        depth: int = 0,
-    ) -> dict[str, Any]:
-        """Build a prompt-facing schema description for a named field.
-
-        Kept as a thin wrapper for tests that call it directly.
-        """
-        from conductor.providers._schema import build_prompt_schema_field
-
-        try:
-            return build_prompt_schema_field(
-                field_def,
-                field_name=field_name,
-                depth=depth,
-                max_depth=self._max_schema_depth,
-                description_fallback=True,
-            )
-        except SchemaDepthError as exc:
-            raise ValidationError(
-                f"Schema nesting depth exceeds maximum of {self._max_schema_depth} levels",
-                suggestion="Simplify your output schema to reduce nesting depth",
-            ) from exc
-
-    def _build_prompt_item_schema(self, field_def: OutputField, depth: int = 0) -> dict[str, Any]:
-        """Build a prompt-facing schema description for an array item.
-
-        Kept as a thin wrapper for tests that call it directly.
-        """
-        from conductor.providers._schema import build_prompt_schema_field
-
-        try:
-            return build_prompt_schema_field(
-                field_def,
-                field_name=None,
-                depth=depth,
-                max_depth=self._max_schema_depth,
-                description_fallback=True,
-            )
-        except SchemaDepthError as exc:
-            raise ValidationError(
-                f"Schema nesting depth exceeds maximum of {self._max_schema_depth} levels",
-                suggestion="Simplify your output schema to reduce nesting depth",
-            ) from exc
-
     def _log_event_verbose(
         self,
         event_type: str,

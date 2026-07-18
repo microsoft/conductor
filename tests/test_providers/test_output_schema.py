@@ -1,7 +1,7 @@
 """Golden regression tests for provider output-schema wrappers.
 
 These tests pin the exact full-wrapper output of each provider's schema builder
-against pre-refactor literals captured in Task 0. Any behavioral change in the
+against pre-refactor literals. Any behavioral change in the
 shared schema builder or a provider wrapper that alters the serialized JSON will
 cause these tests to fail.
 """
@@ -18,7 +18,7 @@ from conductor.providers.claude_agent_sdk import _build_output_format
 from conductor.providers.copilot import CopilotProvider
 from conductor.providers.hermes import _build_prompt_schema
 
-# Shared schema definitions copied from .omo/scripts/capture_schema_baseline.py.
+# Shared schema definitions used by every provider baseline below.
 rich_schema = {
     "string_scalar": OutputField(
         type="string",

@@ -35,11 +35,7 @@ from conductor.providers._event_format import (
     extract_tool_result_text,
     format_tool_arguments,
 )
-from conductor.providers._schema import (
-    SchemaDepthError,
-    build_json_schema_field,
-    build_json_schema_properties,
-)
+from conductor.providers._schema import SchemaDepthError, build_json_schema_properties
 from conductor.providers.base import (
     AgentOutput,
     AgentProvider,
@@ -2335,27 +2331,6 @@ class ClaudeProvider(AgentProvider):
             return build_json_schema_properties(
                 schema, depth=depth, max_depth=self._max_schema_depth
             )
-        except SchemaDepthError as exc:
-            raise ValidationError(
-                f"Schema nesting depth exceeds maximum of {self._max_schema_depth} levels",
-                suggestion="Simplify your output schema to reduce nesting depth",
-            ) from exc
-
-    def _build_single_field_schema(self, field: OutputField, depth: int = 0) -> dict[str, Any]:
-        """Build JSON Schema for a single field (used for array items).
-
-        Args:
-            field: The OutputField definition.
-            depth: Current nesting depth (for recursion safety).
-
-        Returns:
-            JSON Schema definition for the field.
-
-        Raises:
-            ValidationError: If schema nesting exceeds max depth.
-        """
-        try:
-            return build_json_schema_field(field, depth=depth, max_depth=self._max_schema_depth)
         except SchemaDepthError as exc:
             raise ValidationError(
                 f"Schema nesting depth exceeds maximum of {self._max_schema_depth} levels",
