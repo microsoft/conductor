@@ -2075,6 +2075,21 @@ class ToolOutputConfig(BaseModel):
     process. Parent directories are created automatically if needed.
     """
 
+    @field_validator("spill_dir")
+    @classmethod
+    def _normalize_spill_dir(cls, v: str | None) -> str | None:
+        """Normalize an empty/whitespace ``spill_dir`` to ``None``.
+
+        Without this, consumers disagree on what ``""`` means: the MCP manager
+        treats it as falsy and falls back to the default temp dir, while the
+        Copilot provider checks ``is not None`` and forwards an empty
+        ``output_directory`` to the SDK. One normalization point keeps the
+        behavior identical across providers.
+        """
+        if v is None:
+            return None
+        return v.strip() or None
+
 
 class RuntimeConfig(BaseModel):
     """Provider and runtime configuration."""

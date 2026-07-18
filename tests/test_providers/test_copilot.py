@@ -1318,6 +1318,22 @@ class TestCopilotProviderLargeOutput:
         captured = self._captured_create_session(provider)
         assert captured["large_output"] == {"enabled": False}
 
+    def test_spill_to_file_false_logs_a_warning(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Requirement: disabling spill on Copilot silently uncaps tool output.
+
+        Unlike Claude (which still truncates to max_chars and only skips the
+        file write), the Copilot SDK has no truncate-without-spill mode, so
+        spill_to_file=False disables size limiting entirely. That divergence
+        must be surfaced at runtime, not just in a docstring.
+        """
+        provider = CopilotProvider(tool_output=ToolOutputConfig(spill_to_file=False))
+        with caplog.at_level("WARNING"):
+            self._captured_create_session(provider)
+        assert any(
+            "spill_to_file=False disables tool output size limiting" in record.message
+            for record in caplog.records
+        )
+
     def test_spill_dir_is_forwarded_when_set(self) -> None:
         """An explicit spill_dir becomes output_directory in SDK config."""
         provider = CopilotProvider(

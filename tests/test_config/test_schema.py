@@ -314,6 +314,18 @@ class TestToolOutputConfig:
         config = ToolOutputConfig(spill_dir="/tmp/custom")
         assert config.spill_dir == "/tmp/custom"
 
+    def test_spill_dir_empty_string_normalizes_to_none(self) -> None:
+        """Requirement: empty/whitespace spill_dir must behave like an unset spill_dir.
+
+        Both consumers must agree on the meaning of ``""``: MCPManager treats it
+        as falsy and falls back to the default temp dir, while the Copilot
+        provider checks ``is not None`` and would forward ``output_directory=""``
+        to the SDK. Normalizing here keeps one behavior across providers.
+        """
+        assert ToolOutputConfig(spill_dir="").spill_dir is None
+        assert ToolOutputConfig(spill_dir="   ").spill_dir is None
+        assert ToolOutputConfig(spill_dir=None).spill_dir is None
+
     def test_extra_fields_forbidden(self) -> None:
         """Typos like max_char should be rejected, not silently ignored."""
         with pytest.raises(ValidationError):
