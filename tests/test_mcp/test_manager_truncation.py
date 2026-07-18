@@ -108,6 +108,34 @@ async def test_disabled_config_does_not_truncate(fixture: _TruncationManagerFixt
 
 
 @pytest.mark.asyncio
+async def test_truncation_failure_does_not_fail_successful_tool_call(
+    fixture: _TruncationManagerFixture, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Requirement: a bug in the truncation path must not fail an otherwise
+    successful tool call.
+
+    ``_maybe_truncate_response`` is documented as best-effort/never-raise, but
+    it runs inside ``call_tool``'s outer ``except Exception``. If it ever
+    raises, the failure must be logged as a truncation warning and the
+    untruncated result returned — not re-raised as a tool call failure.
+    """
+    full_text = "x" * 1500
+    config = ToolOutputConfig(enabled=True, max_chars=1000, spill_to_file=True)
+    manager = fixture.make_manager(config)
+    fixture.set_result(full_text)
+
+    def _boom(*args: object, **kwargs: object) -> str:
+        raise ValueError("truncation bug")
+
+    manager._maybe_truncate_response = _boom  # type: ignore[method-assign]
+
+    result = await manager.call_tool("server__tool", {})
+
+    assert result == full_text
+    assert "Failed to apply output truncation" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_no_truncation_when_result_fits(fixture: _TruncationManagerFixture) -> None:
     """Results within the limit are returned without any marker."""
     full_text = "x" * 100
@@ -283,6 +311,11 @@ async def test_spill_dir_symlink_is_rejected(
 ) -> None:
     """A pre-existing symlink as spill_dir is rejected; no file is written."""
     full_text = "x" * 1500
+    # The symlink lives outside the system temp root: a symlink that resolves
+    # inside the temp root is platform-owned (macOS /tmp) and legitimately
+    # allowed, so the attack being rejected here must point elsewhere.
+    temp_root = tmp_path / "temp-root"
+    temp_root.mkdir()
     real_dir = tmp_path / "real"
     symlink_dir = tmp_path / "link"
     real_dir.mkdir()
@@ -293,7 +326,8 @@ async def test_spill_dir_symlink_is_rejected(
     manager = fixture.make_manager(config)
     fixture.set_result(full_text)
 
-    result = await manager.call_tool("server__tool", {})
+    with patch("conductor.mcp.manager.tempfile.gettempdir", return_value=str(temp_root)):
+        result = await manager.call_tool("server__tool", {})
 
     assert "full output saved to:" not in result
     assert "[output truncated: 1500 chars -> 1000 kept." in result
@@ -514,6 +548,10 @@ async def test_explicit_spill_dir_ancestor_symlink_is_rejected(
 ) -> None:
     """A symlink in the middle of an explicit spill_dir path is rejected."""
     full_text = "x" * 1500
+    # The symlink resolves outside the system temp root; only symlinks that
+    # stay inside the temp root (macOS /tmp -> /private/tmp) are allowed.
+    temp_root = tmp_path / "temp-root"
+    temp_root.mkdir()
     target_dir = tmp_path / "target"
     target_dir.mkdir()
     middle_dir = tmp_path / "middle"
@@ -527,12 +565,44 @@ async def test_explicit_spill_dir_ancestor_symlink_is_rejected(
     manager = fixture.make_manager(config)
     fixture.set_result(full_text)
 
-    result = await manager.call_tool("server__tool", {})
+    with patch("conductor.mcp.manager.tempfile.gettempdir", return_value=str(temp_root)):
+        result = await manager.call_tool("server__tool", {})
 
     assert "full output saved to:" not in result
     assert "[output truncated: 1500 chars -> 1000 kept." in result
     assert "contains a symlink" in caplog.text
     assert not list(target_dir.rglob("*.txt"))
+
+
+@pytest.mark.asyncio
+async def test_explicit_spill_dir_under_symlinked_parent_is_allowed(
+    fixture: _TruncationManagerFixture, tmp_path: Path
+) -> None:
+    """Requirement: an explicit spill_dir beneath a platform symlinked parent works.
+
+    On macOS ``/tmp`` is itself a symlink to ``/private/tmp``, so walking the
+    raw unresolved path would reject every ordinary ``/tmp/...`` spill dir.
+    Resolving before the ancestor walk (mirroring the default-dir branch) keeps
+    platform symlink parents from silently disabling the spill.
+    """
+    full_text = "x" * 1500
+    real_parent = tmp_path / "real-parent"
+    real_parent.mkdir()
+    symlink_parent = tmp_path / "symlink-parent"
+    symlink_parent.symlink_to(real_parent)
+    spill_dir = symlink_parent / "tool-output"
+    config = ToolOutputConfig(
+        enabled=True, max_chars=1000, spill_to_file=True, spill_dir=str(spill_dir)
+    )
+    manager = fixture.make_manager(config)
+    fixture.set_result(full_text)
+
+    result = await manager.call_tool("server__tool", {})
+
+    assert "full output saved to:" in result
+    spilled = list(real_parent.rglob("*.txt"))
+    assert len(spilled) == 1
+    assert spilled[0].read_text() == full_text
 
 
 @pytest.mark.asyncio

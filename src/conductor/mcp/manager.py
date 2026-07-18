@@ -47,17 +47,19 @@ except ImportError:
 # Marker constants. The generic hint is embedded by the manager and replaced
 # with the fs hint by Claude's agentic loop when filesystem-like tools are
 # available. No placeholder mechanism is used; callers replace the exact
-# generic-hint constant string.
-_TRUNCATION_MARKER_PREFIX = "[output truncated:"
-_GENERIC_HINT = "The full output was truncated; refine the tool arguments to return less data."
-_FS_HINT = (
+# generic-hint constant string. These names are the public contract shared
+# with ClaudeProvider's truncation-marker parser, so they are intentionally
+# not underscore-prefixed.
+TRUNCATION_MARKER_PREFIX = "[output truncated:"
+GENERIC_HINT = "The full output was truncated; refine the tool arguments to return less data."
+FS_HINT = (
     "The full output was saved to a file; read it with your filesystem tools if you need more."
 )
 # Window used by ClaudeProvider._parse_truncation_marker to look at the trailing
 # portion of a tool result. It must exceed the maximum realistic marker length
 # (PATH_MAX ~4096 chars + fixed marker/hint overhead) so that a valid long
 # POSIX spill path is never cut off.
-_TAIL_WINDOW = 8192
+TAIL_WINDOW = 8192
 
 
 def _contains_symlink(path: Path, stop_at: Path | None = None) -> bool:
@@ -275,11 +277,22 @@ class MCPManager:
             if not response_text and result.structuredContent:
                 response_text = str(result.structuredContent)
 
-            response_text = self._maybe_truncate_response(
-                response_text,
-                server_name=server_name,
-                original_name=original_name,
-            )
+            try:
+                response_text = self._maybe_truncate_response(
+                    response_text,
+                    server_name=server_name,
+                    original_name=original_name,
+                )
+            except Exception as truncation_err:
+                # Truncation is best-effort: a bug here must not fail an
+                # otherwise successful tool call or masquerade as a tool
+                # error, so it is logged separately and the untruncated
+                # result is returned.
+                logger.warning(
+                    "Failed to apply output truncation for %s; returning untruncated result: %s",
+                    prefixed_name,
+                    truncation_err,
+                )
 
             logger.debug(f"MCP tool '{original_name}' returned: {response_text[:200]}...")
             return response_text
@@ -330,14 +343,14 @@ class MCPManager:
 
         if spill_path:
             marker = (
-                f"\n\n[{_TRUNCATION_MARKER_PREFIX[1:]} "
+                f"\n\n[{TRUNCATION_MARKER_PREFIX[1:]} "
                 f"{original} chars -> {kept} kept; "
-                f"full output saved to: {spill_path}. {_GENERIC_HINT}]"
+                f"full output saved to: {spill_path}. {GENERIC_HINT}]"
             )
         else:
             marker = (
-                f"\n\n[{_TRUNCATION_MARKER_PREFIX[1:]} "
-                f"{original} chars -> {kept} kept. {_GENERIC_HINT}]"
+                f"\n\n[{TRUNCATION_MARKER_PREFIX[1:]} "
+                f"{original} chars -> {kept} kept. {GENERIC_HINT}]"
             )
 
         return f"{truncated}{marker}"
@@ -368,8 +381,18 @@ class MCPManager:
         try:
             spill_dir_str = self._tool_output.spill_dir
             if spill_dir_str:
-                spill_dir = Path(spill_dir_str)
-                if _contains_symlink(spill_dir):
+                # Symlink policy for an explicit spill dir: a symlink is only
+                # allowed when it resolves to a location inside the system temp
+                # root. That keeps platform layout working (on macOS /tmp and
+                # /var/tmp are themselves symlinks into /private/...) while a
+                # symlink pointing elsewhere is rejected, so a world-writable
+                # sticky directory cannot redirect spilled output into an
+                # attacker-chosen location outside the temp root.
+                spill_dir = Path(spill_dir_str).resolve()
+                temp_root = Path(tempfile.gettempdir()).resolve()
+                if not spill_dir.is_relative_to(temp_root) and _contains_symlink(
+                    Path(spill_dir_str)
+                ):
                     logger.warning(
                         "Spill dir %s contains a symlink; refusing to write tool output spill.",
                         spill_dir,
