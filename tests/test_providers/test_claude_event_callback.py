@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from conductor.mcp.manager import _FS_HINT, _GENERIC_HINT, _TRUNCATION_MARKER_PREFIX
+from conductor.mcp.manager import FS_HINT, GENERIC_HINT, TRUNCATION_MARKER_PREFIX
 from conductor.providers.claude import ClaudeProvider
 
 # ---------------------------------------------------------------------------
@@ -25,17 +25,17 @@ def _truncated_tool_result(
     original: int = 2000,
     kept: int = 1000,
     spill_path: str | None = None,
-    hint: str = _GENERIC_HINT,
+    hint: str = GENERIC_HINT,
 ) -> str:
     """Build a result that looks like a truncated MCP tool output."""
     base = "x" * kept
     if spill_path:
         return (
-            f"{base}\n\n[{_TRUNCATION_MARKER_PREFIX[1:]} "
+            f"{base}\n\n[{TRUNCATION_MARKER_PREFIX[1:]} "
             f"{original} chars -> {kept} kept; "
             f"full output saved to: {spill_path}. {hint}]"
         )
-    return f"{base}\n\n[{_TRUNCATION_MARKER_PREFIX[1:]} {original} chars -> {kept} kept. {hint}]"
+    return f"{base}\n\n[{TRUNCATION_MARKER_PREFIX[1:]} {original} chars -> {kept} kept. {hint}]"
 
 
 def _make_tool_use_block(name: str, input_data: dict[str, Any] | None = None) -> MagicMock:
@@ -461,8 +461,8 @@ class TestAgentToolEvents:
 
         complete_events = [(t, d) for t, d in events if t == "agent_tool_complete"]
         assert len(complete_events) == 1
-        assert _FS_HINT in complete_events[0][1]["result"]
-        assert _GENERIC_HINT not in complete_events[0][1]["result"]
+        assert FS_HINT in complete_events[0][1]["result"]
+        assert GENERIC_HINT not in complete_events[0][1]["result"]
 
     @pytest.mark.asyncio
     async def test_truncation_event_with_spill_path(self) -> None:

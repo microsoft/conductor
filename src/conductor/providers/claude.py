@@ -34,10 +34,10 @@ from conductor.config.schema import AgentDef, OutputField, ToolOutputConfig
 from conductor.exceptions import ProviderError, ValidationError
 from conductor.executor.output import validate_output
 from conductor.mcp.manager import (
-    _FS_HINT,
-    _GENERIC_HINT,
-    _TAIL_WINDOW,
-    _TRUNCATION_MARKER_PREFIX,
+    FS_HINT,
+    GENERIC_HINT,
+    TAIL_WINDOW,
+    TRUNCATION_MARKER_PREFIX,
     MCPManager,
 )
 from conductor.providers._event_format import (
@@ -2534,10 +2534,10 @@ class ClaudeProvider(AgentProvider):
             return result
         if not truncation_info.get("spill_path"):
             return result
-        idx = result.rfind(_GENERIC_HINT)
+        idx = result.rfind(GENERIC_HINT)
         if idx == -1:
             return result
-        return result[:idx] + _FS_HINT + result[idx + len(_GENERIC_HINT) :]
+        return result[:idx] + FS_HINT + result[idx + len(GENERIC_HINT) :]
 
     def _parse_truncation_marker(
         self,
@@ -2565,20 +2565,20 @@ class ClaudeProvider(AgentProvider):
             (``None`` when the marker omits a path), or ``None`` when the
             result is not truncated.
         """
-        if not result or _TRUNCATION_MARKER_PREFIX not in result[-_TAIL_WINDOW:]:
+        if not result or TRUNCATION_MARKER_PREFIX not in result[-TAIL_WINDOW:]:
             return None
 
-        tail = result[-_TAIL_WINDOW:]
+        tail = result[-TAIL_WINDOW:]
         match = re.search(
             r".*"
-            + re.escape(_TRUNCATION_MARKER_PREFIX)
+            + re.escape(TRUNCATION_MARKER_PREFIX)
             + r"\s*(\d+)\s*chars\s*-\u003e\s*(\d+)\s*kept"
             + r"(?:;\s*full output saved to:\s*(.+?))?\."
             + r"\s*"
             + r"(?:"
-            + re.escape(_GENERIC_HINT)
+            + re.escape(GENERIC_HINT)
             + r"|"
-            + re.escape(_FS_HINT)
+            + re.escape(FS_HINT)
             + r")"
             + r"\]\s*$",
             tail,
@@ -2598,36 +2598,48 @@ class ClaudeProvider(AgentProvider):
             "spill_path": spill_path,
         }
 
+    # Keywords marking a tool that can read a file's contents from a known
+    # path. The agent already has the exact spill path from the marker, so the
+    # only capability it needs is reading/grepping by path — not searching for
+    # files (find/ls/glob) or writing them (edit/write). Whole-name substring
+    # containment would trip on any tool whose name merely contains "ls" or
+    # "file" (e.g. "translate", "fileupload"), rewriting the hint to advertise
+    # filesystem tools the agent does not actually have, so a keyword must
+    # equal a complete underscore/dash segment ("read_file" -> "read").
+    _FS_TOOL_KEYWORDS = frozenset(
+        {
+            "read",
+            "grep",
+            "view",
+            "cat",
+            "open",
+            "load",
+            "file",
+            "bash",
+            "shell",
+        }
+    )
+
     def _has_fs_like_tool(self, tools: list[dict[str, Any]] | None) -> bool:
         """Return True if any tool looks like a filesystem/shell tool.
 
         The check is heuristic: after stripping the ``server__`` prefix, the
-        lowercase tool name is matched for common filesystem/shell substrings.
-        A None tool list means no tools were allowed, so filesystem-like tools
-        are not available.
+        tool name is split on non-alphanumeric characters and each resulting
+        segment is compared (case-insensitively) against common
+        filesystem/shell keywords. A keyword must equal an entire segment, so
+        "translate" or "fileupload" do not match while "ls", "read_file" and
+        "view_code" still do. A None tool list means no tools were allowed,
+        so filesystem-like tools are not available.
         """
         if not tools:
             return False
 
-        fs_names = (
-            "read",
-            "grep",
-            "glob",
-            "bash",
-            "shell",
-            "file",
-            "filesystem",
-            "ls",
-            "find",
-            "view",
-            "edit",
-        )
         for tool in tools:
             name = tool.get("name", "")
             if "__" in name:
                 name = name.split("__", 1)[1]
-            lower = name.lower()
-            if any(fs in lower for fs in fs_names):
+            segments = re.split(r"[^A-Za-z0-9]+", name.lower())
+            if any(segment in self._FS_TOOL_KEYWORDS for segment in segments):
                 return True
         return False
 

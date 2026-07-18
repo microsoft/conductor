@@ -9,9 +9,9 @@ import pytest
 
 from conductor.config.schema import ToolOutputConfig
 from conductor.providers.claude import (
-    _FS_HINT,
-    _GENERIC_HINT,
-    _TRUNCATION_MARKER_PREFIX,
+    FS_HINT,
+    GENERIC_HINT,
+    TRUNCATION_MARKER_PREFIX,
     ClaudeProvider,
 )
 
@@ -115,16 +115,73 @@ class TestHasFsLikeTool:
         assert provider._has_fs_like_tool(tools) is True
 
     def test_matches_substring_case_insensitive(self) -> None:
-        """Matching is substring-based and case-insensitive."""
+        """Matching is case-insensitive on word boundaries."""
         provider = _make_provider_with_tool_output()
-        tools = [{"name": "fs__ViewCode"}]
+        tools = [{"name": "fs__Grep"}]
         assert provider._has_fs_like_tool(tools) is True
+
+    def test_rejects_ls_as_substring_of_longer_word(self) -> None:
+        """Requirement: 'ls' embedded in a longer word must not count as a shell tool.
+
+        Whole-name substring containment trips on any tool whose name merely
+        contains 'ls' or 'file', rewriting the hint to advertise filesystem
+        tools the agent does not actually have and sending the model down a
+        dead end.
+        """
+        provider = _make_provider_with_tool_output()
+        # 'ls' only appears inside the longer word 'translate' — not a shell tool.
+        assert provider._has_fs_like_tool([{"name": "i18n__translate"}]) is False
+        assert provider._has_fs_like_tool([{"name": "bells_tool"}]) is False
+
+    def test_rejects_file_as_substring_of_longer_word(self) -> None:
+        """'file' embedded in a longer word (e.g. fileupload) is not a fs tool."""
+        provider = _make_provider_with_tool_output()
+        assert provider._has_fs_like_tool([{"name": "media__fileupload"}]) is False
+
+    def test_rejects_shell_as_substring_of_longer_word(self) -> None:
+        """'shell' embedded in a longer word (e.g. toolshell) is not a shell tool."""
+        provider = _make_provider_with_tool_output()
+        assert provider._has_fs_like_tool([{"name": "winshell_bridge"}]) is False
+
+    def test_rejects_search_and_listing_tools(self) -> None:
+        """File-search tools (ls/find/list) are not read-by-path tools.
+
+        The agent already has the exact spill path, so a directory lister or
+        file finder cannot help it read that file — the hint must not be
+        rewritten to advertise filesystem reading for them.
+        """
+        provider = _make_provider_with_tool_output()
+        assert provider._has_fs_like_tool([{"name": "core__ls"}]) is False
+        assert provider._has_fs_like_tool([{"name": "core__find"}]) is False
+        assert provider._has_fs_like_tool([{"name": "fs__list_directory"}]) is False
+
+    def test_rejects_bare_edit_tool(self) -> None:
+        """A bare 'edit' tool (no 'file' segment) is not treated as a read tool."""
+        provider = _make_provider_with_tool_output()
+        assert provider._has_fs_like_tool([{"name": "editor__edit"}]) is False
+
+    def test_accepts_read_and_view_segments(self) -> None:
+        """read_file and view_code keep matching (keyword is a full segment)."""
+        provider = _make_provider_with_tool_output()
+        assert provider._has_fs_like_tool([{"name": "fs__read_file"}]) is True
+        assert provider._has_fs_like_tool([{"name": "fs__view_code"}]) is True
+
+    def test_accepts_read_multiple_files_via_read_segment(self) -> None:
+        """read_multiple_files matches via the 'read' segment (official fs server)."""
+        provider = _make_provider_with_tool_output()
+        assert provider._has_fs_like_tool([{"name": "filesystem__read_multiple_files"}]) is True
+
+    def test_rejects_diff_and_search_files(self) -> None:
+        """diff_files/search_files are not plain read-by-path tools (no read segment)."""
+        provider = _make_provider_with_tool_output()
+        assert provider._has_fs_like_tool([{"name": "filesystem__diff_files"}]) is False
+        assert provider._has_fs_like_tool([{"name": "filesystem__search_files"}]) is False
 
 
 class TestMaybeRewriteTruncationHint:
     """Tests for the _maybe_rewrite_truncation_hint helper."""
 
-    def _truncated_result(self, hint: str = _GENERIC_HINT, path: str | None = None) -> str:
+    def _truncated_result(self, hint: str = GENERIC_HINT, path: str | None = None) -> str:
         """Build a result that looks like a truncated MCP tool output."""
         base = "x" * 1000
         if path:
@@ -142,9 +199,9 @@ class TestMaybeRewriteTruncationHint:
 
         rewritten = provider._maybe_rewrite_truncation_hint(result, tools)
 
-        assert _FS_HINT in rewritten
-        assert _GENERIC_HINT not in rewritten
-        assert _TRUNCATION_MARKER_PREFIX in rewritten
+        assert FS_HINT in rewritten
+        assert GENERIC_HINT not in rewritten
+        assert TRUNCATION_MARKER_PREFIX in rewritten
 
     def test_keeps_generic_hint_when_no_fs_tool(self) -> None:
         """Generic hint is retained when no filesystem-like tools are available."""
@@ -154,8 +211,8 @@ class TestMaybeRewriteTruncationHint:
 
         rewritten = provider._maybe_rewrite_truncation_hint(result, tools)
 
-        assert _GENERIC_HINT in rewritten
-        assert _FS_HINT not in rewritten
+        assert GENERIC_HINT in rewritten
+        assert FS_HINT not in rewritten
 
     def test_returns_unchanged_when_no_truncation_marker(self) -> None:
         """Non-truncated results are returned unchanged."""
@@ -170,13 +227,13 @@ class TestMaybeRewriteTruncationHint:
     def test_returns_unchanged_when_generic_hint_literal_without_truncation(self) -> None:
         """A literal generic hint in a non-truncated result must not be mutated."""
         provider = _make_provider_with_tool_output()
-        result = f"The agent said: {_GENERIC_HINT}"
+        result = f"The agent said: {GENERIC_HINT}"
         tools = [{"name": "fs__read_file"}]
 
         rewritten = provider._maybe_rewrite_truncation_hint(result, tools)
 
         assert rewritten == result
-        assert _FS_HINT not in rewritten
+        assert FS_HINT not in rewritten
 
     def test_returns_unchanged_for_none_tools(self) -> None:
         """Truncated result with tools=None stays generic."""
@@ -185,8 +242,8 @@ class TestMaybeRewriteTruncationHint:
 
         rewritten = provider._maybe_rewrite_truncation_hint(result, None)
 
-        assert _GENERIC_HINT in rewritten
-        assert _FS_HINT not in rewritten
+        assert GENERIC_HINT in rewritten
+        assert FS_HINT not in rewritten
 
     def test_keeps_generic_hint_when_truncated_but_no_spill_path(self) -> None:
         """Generic hint is kept when the marker has no path, even with fs tools."""
@@ -196,20 +253,20 @@ class TestMaybeRewriteTruncationHint:
 
         rewritten = provider._maybe_rewrite_truncation_hint(result, tools)
 
-        assert _GENERIC_HINT in rewritten
-        assert _FS_HINT not in rewritten
+        assert GENERIC_HINT in rewritten
+        assert FS_HINT not in rewritten
 
     def test_payload_literal_does_not_trigger_false_fs_rewrite(self) -> None:
         """Payload containing the literal 'full output saved to:' must not trigger rewrite."""
         provider = _make_provider_with_tool_output()
         payload = "x" * 800 + " full output saved to: /tmp/evil.txt " + "x" * 100
-        result = f"{payload}\n\n[output truncated: 2000 chars -> 1000 kept. {_GENERIC_HINT}]"
+        result = f"{payload}\n\n[output truncated: 2000 chars -> 1000 kept. {GENERIC_HINT}]"
         tools = [{"name": "fs__read_file"}]
 
         rewritten = provider._maybe_rewrite_truncation_hint(result, tools)
 
-        assert _GENERIC_HINT in rewritten
-        assert _FS_HINT not in rewritten
+        assert GENERIC_HINT in rewritten
+        assert FS_HINT not in rewritten
 
     def test_rewrites_only_when_marker_is_in_tail(self) -> None:
         """Marker detection looks at the trailing 2000 characters of the result."""
@@ -220,8 +277,8 @@ class TestMaybeRewriteTruncationHint:
 
         rewritten = provider._maybe_rewrite_truncation_hint(result, tools)
 
-        assert _FS_HINT in rewritten
-        assert _GENERIC_HINT not in rewritten
+        assert FS_HINT in rewritten
+        assert GENERIC_HINT not in rewritten
 
     def test_no_rewrite_when_marker_is_not_in_tail(self) -> None:
         """A marker too far from the end is ignored."""
@@ -232,8 +289,8 @@ class TestMaybeRewriteTruncationHint:
 
         rewritten = provider._maybe_rewrite_truncation_hint(result, tools)
 
-        assert _GENERIC_HINT in rewritten
-        assert _FS_HINT not in rewritten
+        assert GENERIC_HINT in rewritten
+        assert FS_HINT not in rewritten
 
 
 class TestParseTruncationMarker:
@@ -244,7 +301,7 @@ class TestParseTruncationMarker:
         provider = _make_provider_with_tool_output()
         result = "x" * 100 + (
             f"\n\n[output truncated: 200 chars -> 100 kept; "
-            f"full output saved to: /tmp/s.txt. {_GENERIC_HINT}]"
+            f"full output saved to: /tmp/s.txt. {GENERIC_HINT}]"
         )
 
         parsed = provider._parse_truncation_marker(result)
@@ -260,7 +317,7 @@ class TestParseTruncationMarker:
         provider = _make_provider_with_tool_output()
         result = "x" * 100 + (
             f"\n\n[output truncated: 200 chars -> 100 kept; "
-            f"full output saved to: /tmp/s.txt. {_FS_HINT}]"
+            f"full output saved to: /tmp/s.txt. {FS_HINT}]"
         )
 
         parsed = provider._parse_truncation_marker(result)
@@ -274,7 +331,7 @@ class TestParseTruncationMarker:
     def test_parses_no_path(self) -> None:
         """A marker without a spill path parses with None path."""
         provider = _make_provider_with_tool_output()
-        result = "x" * 100 + (f"\n\n[output truncated: 200 chars -> 100 kept. {_GENERIC_HINT}]")
+        result = "x" * 100 + (f"\n\n[output truncated: 200 chars -> 100 kept. {GENERIC_HINT}]")
 
         parsed = provider._parse_truncation_marker(result)
 
@@ -290,7 +347,7 @@ class TestParseTruncationMarker:
         fake = "[output truncated: 9999 chars -> 1 kept; full output saved to: /tmp/fake.txt."
         real = (
             "\n\n[output truncated: 2000 chars -> 1000 kept; "
-            f"full output saved to: /tmp/real.txt. {_GENERIC_HINT}]"
+            f"full output saved to: /tmp/real.txt. {GENERIC_HINT}]"
         )
         result = "x" * 500 + fake + "y" * 500 + real
 
@@ -308,7 +365,7 @@ class TestParseTruncationMarker:
         long_path = "/tmp/" + "a" * 4000 + "/spill.txt"
         result = "x" * 1000 + (
             f"\n\n[output truncated: 2000 chars -> 1000 kept; "
-            f"full output saved to: {long_path}. {_GENERIC_HINT}]"
+            f"full output saved to: {long_path}. {GENERIC_HINT}]"
         )
         tools = [{"name": "fs__read_file"}]
 
@@ -320,18 +377,18 @@ class TestParseTruncationMarker:
         }
 
         rewritten = provider._maybe_rewrite_truncation_hint(result, tools)
-        assert _FS_HINT in rewritten
-        assert _GENERIC_HINT not in rewritten
+        assert FS_HINT in rewritten
+        assert GENERIC_HINT not in rewritten
         assert long_path in rewritten
 
     def test_payload_generic_hint_literal_is_not_corrupted(self) -> None:
         """A generic hint literal inside the payload is unchanged; only the marker
         hint is rewritten."""
         provider = _make_provider_with_tool_output()
-        payload = "x" * 100 + _GENERIC_HINT + "y" * 100
+        payload = "x" * 100 + GENERIC_HINT + "y" * 100
         marker = (
             "\n\n[output truncated: 2000 chars -> 1000 kept; "
-            "full output saved to: /tmp/spill.txt. " + _GENERIC_HINT + "]"
+            "full output saved to: /tmp/spill.txt. " + GENERIC_HINT + "]"
         )
         result = payload + marker
         tools = [{"name": "fs__read_file"}]
@@ -340,8 +397,8 @@ class TestParseTruncationMarker:
 
         # Payload occurrence stays generic; marker occurrence becomes fs hint.
         assert payload in rewritten
-        assert rewritten.count(_GENERIC_HINT) == 1
-        assert rewritten.count(_FS_HINT) == 1
+        assert rewritten.count(GENERIC_HINT) == 1
+        assert rewritten.count(FS_HINT) == 1
         assert rewritten.endswith("]")
 
 
@@ -355,7 +412,7 @@ class TestAgenticLoopHintReplacement:
         events: list[tuple[str, dict[str, Any]]] = []
         truncated_result = "x" * 100 + (
             "\n\n[output truncated: 200 chars -> 100 kept; "
-            f"full output saved to: /tmp/spill.txt. {_GENERIC_HINT}]"
+            f"full output saved to: /tmp/spill.txt. {GENERIC_HINT}]"
         )
 
         mcp_response = _make_response(
@@ -379,8 +436,8 @@ class TestAgenticLoopHintReplacement:
 
         complete_events = [d for t, d in events if t == "agent_tool_complete"]
         assert len(complete_events) == 1
-        assert _FS_HINT in complete_events[0]["result"]
-        assert _GENERIC_HINT not in complete_events[0]["result"]
+        assert FS_HINT in complete_events[0]["result"]
+        assert GENERIC_HINT not in complete_events[0]["result"]
 
     @pytest.mark.asyncio
     async def test_loop_keeps_generic_hint_when_no_spill_path(self) -> None:
@@ -388,7 +445,7 @@ class TestAgenticLoopHintReplacement:
         provider = _make_provider_with_tool_output()
         events: list[tuple[str, dict[str, Any]]] = []
         truncated_result = "x" * 100 + (
-            f"\n\n[output truncated: 200 chars -> 100 kept. {_GENERIC_HINT}]"
+            f"\n\n[output truncated: 200 chars -> 100 kept. {GENERIC_HINT}]"
         )
 
         mcp_response = _make_response(
@@ -412,8 +469,8 @@ class TestAgenticLoopHintReplacement:
 
         complete_events = [d for t, d in events if t == "agent_tool_complete"]
         assert len(complete_events) == 1
-        assert _GENERIC_HINT in complete_events[0]["result"]
-        assert _FS_HINT not in complete_events[0]["result"]
+        assert GENERIC_HINT in complete_events[0]["result"]
+        assert FS_HINT not in complete_events[0]["result"]
 
     @pytest.mark.asyncio
     async def test_loop_keeps_generic_hint_when_no_fs_tool(self) -> None:
@@ -421,7 +478,7 @@ class TestAgenticLoopHintReplacement:
         provider = _make_provider_with_tool_output()
         events: list[tuple[str, dict[str, Any]]] = []
         truncated_result = "x" * 100 + (
-            f"\n\n[output truncated: 200 chars -> 100 kept. {_GENERIC_HINT}]"
+            f"\n\n[output truncated: 200 chars -> 100 kept. {GENERIC_HINT}]"
         )
 
         mcp_response = _make_response(
@@ -445,8 +502,8 @@ class TestAgenticLoopHintReplacement:
 
         complete_events = [d for t, d in events if t == "agent_tool_complete"]
         assert len(complete_events) == 1
-        assert _GENERIC_HINT in complete_events[0]["result"]
-        assert _FS_HINT not in complete_events[0]["result"]
+        assert GENERIC_HINT in complete_events[0]["result"]
+        assert FS_HINT not in complete_events[0]["result"]
 
     @pytest.mark.asyncio
     async def test_loop_with_tools_none_keeps_generic_hint(self) -> None:
@@ -454,7 +511,7 @@ class TestAgenticLoopHintReplacement:
         provider = _make_provider_with_tool_output()
         events: list[tuple[str, dict[str, Any]]] = []
         truncated_result = "x" * 100 + (
-            f"\n\n[output truncated: 200 chars -> 100 kept. {_GENERIC_HINT}]"
+            f"\n\n[output truncated: 200 chars -> 100 kept. {GENERIC_HINT}]"
         )
 
         mcp_response = _make_response(
@@ -478,8 +535,8 @@ class TestAgenticLoopHintReplacement:
 
         complete_events = [d for t, d in events if t == "agent_tool_complete"]
         assert len(complete_events) == 1
-        assert _GENERIC_HINT in complete_events[0]["result"]
-        assert _FS_HINT not in complete_events[0]["result"]
+        assert GENERIC_HINT in complete_events[0]["result"]
+        assert FS_HINT not in complete_events[0]["result"]
 
 
 class TestFullLoopEventAndRewrite:
@@ -499,7 +556,7 @@ class TestFullLoopEventAndRewrite:
         truncated_result = (
             "x" * 100
             + "\n\n[output truncated: 200 chars -> 100 kept; "
-            + f"full output saved to: /tmp/spill.txt. {_GENERIC_HINT}]"
+            + f"full output saved to: /tmp/spill.txt. {GENERIC_HINT}]"
         )
         provider._mock_mcp_manager.call_tool = AsyncMock(return_value=truncated_result)
 
@@ -524,5 +581,5 @@ class TestFullLoopEventAndRewrite:
 
         complete_events = [d for t, d in events if t == "agent_tool_complete"]
         assert len(complete_events) == 1
-        assert _FS_HINT in complete_events[0]["result"]
-        assert _GENERIC_HINT not in complete_events[0]["result"]
+        assert FS_HINT in complete_events[0]["result"]
+        assert GENERIC_HINT not in complete_events[0]["result"]
