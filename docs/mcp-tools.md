@@ -305,7 +305,7 @@ workflow:
 
 * **`enabled`** (boolean): Controls whether per-result MCP tool output size limiting is active. Defaults to `true`.
 * **`max_chars`** (integer): The maximum number of characters to retain from each individual tool result. Defaults to `50000`. Must be at least `1000`.
-* **`spill_to_file`** (boolean): When enabled, the full, raw tool output is saved to disk and a marker containing the file path is appended to the truncated prefix delivered to the model. When disabled, the output is truncated in-place without saving a copy. Defaults to `true`.
+* **`spill_to_file`** (boolean): When enabled, the full, raw tool output is saved to disk and a marker containing the file path is appended to the truncated prefix delivered to the model. Defaults to `true`. When disabled, behavior is provider-specific: the **Claude** provider truncates the output in-place to `max_chars` without saving a copy, while the **Copilot** provider disables SDK large-output handling entirely (the SDK has no truncate-without-spill mode) and logs a warning that tool output will not be capped.
 * **`spill_dir`** (string or null): Custom directory for spill files. If `null`, it defaults to the process's temporary directory (`<tempfile.gettempdir()>/conductor/tool-output`). Relative paths are resolved against the current working directory of the process. Parent directories are created automatically.
 
 ### Important Notes and Constraints
