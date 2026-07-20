@@ -649,9 +649,7 @@ def _build_prompt_schema(schema: dict[str, OutputField], depth: int = 0) -> dict
     the provider's ValidationError with the exact message and suggestion.
     """
     try:
-        return build_prompt_schema_properties(
-            schema, depth=depth, max_depth=_MAX_SCHEMA_DEPTH
-        )
+        return build_prompt_schema_properties(schema, depth=depth, max_depth=_MAX_SCHEMA_DEPTH)
     except SchemaDepthError as exc:
         raise ValidationError(
             f"Schema nesting depth exceeds maximum of {_MAX_SCHEMA_DEPTH} levels",
