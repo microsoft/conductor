@@ -10,6 +10,7 @@ import type {
   AgentReasoningData,
   AgentToolStartData,
   AgentToolCompleteData,
+  AgentToolOutputTruncatedData,
   AgentTurnStartData,
   AgentMessageData,
   ScriptCompletedData,
@@ -1417,6 +1418,16 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     replaceNode(t.nodes, data.agent_name);
   },
 
+  agent_tool_output_truncated: (state, _data) => {
+    const data = _data as unknown as AgentToolOutputTruncatedData;
+    const itemKey = (_data as Record<string, unknown>).item_key as string | undefined;
+    const t = activeTarget(state, _data);
+    const entry: ActivityEntry = { type: 'tool-complete', icon: '✂', label: 'truncated', text: data.tool_name || 'tool', detail: `${data.original_chars}→${data.kept_chars} chars${data.spill_path ? ' · full: ' + data.spill_path : ''}` };
+    addActivity(t.nodes, data.agent_name, entry);
+    if (itemKey) addForEachItemActivity(t.nodes, data.agent_name, itemKey, entry);
+    replaceNode(t.nodes, data.agent_name);
+  },
+
   agent_turn_start: (state, _data) => {
     const data = _data as unknown as AgentTurnStartData;
     const itemKey = (_data as Record<string, unknown>).item_key as string | undefined;
@@ -2439,6 +2450,13 @@ function buildActivityLogEntry(event: WorkflowEvent): ActivityLogEntry | null {
         timestamp: ts, source: String(d.agent_name), type: 'tool-complete',
         message: `← ${d.tool_name || 'done'}`,
         detail: d.result ? truncate(String(d.result), 300) : null,
+      };
+
+    case 'agent_tool_output_truncated':
+      return {
+        timestamp: ts, source: String(d.agent_name), type: 'tool-complete',
+        message: `✂ ${d.tool_name || 'tool'} truncated`,
+        detail: `${d.original_chars}→${d.kept_chars} chars${d.spill_path ? ' · full: ' + d.spill_path : ''}`,
       };
 
     case 'agent_turn_start':

@@ -22,6 +22,7 @@ This guide helps you choose between GitHub Copilot, Anthropic Claude, Claude Age
 | **Agentic Loop** | SDK-managed | Manual (provider code) | SDK-managed (delegated to CLI) | SDK-managed (delegated to hermes) |
 | **Structured Output** | Prompt injection | Native | Prompt injection | Prompt injection |
 | **Session Resume** | Yes | No | No | Yes |
+| **Tool Output Limits** | native SDK spill (large_output) | conductor-side truncation+spill | native CLI env var | N/A |
 
 > **About the experimental tier.** `claude-agent-sdk` and `hermes` declare
 > specific capability carve-outs (e.g. no MCP servers). `conductor validate`

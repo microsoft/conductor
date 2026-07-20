@@ -1074,6 +1074,21 @@ class ConsoleEventSubscriber:
                     style="yellow",
                 )
 
+        elif t == "agent_tool_output_truncated":
+            tool_name = d.get("tool_name", "?")
+            original = d.get("original_chars", "?")
+            kept = d.get("kept_chars", "?")
+            spill_path = d.get("spill_path")
+            if spill_path:
+                extra = f"; full output saved at: {spill_path}"
+            else:
+                extra = "; full output not spilled to disk"
+            verbose_log(
+                f"  WARNING: tool output truncated for '{tool_name}' "
+                f"({original} chars -> {kept} kept{extra})",
+                style="yellow",
+            )
+
 
 def _validator_label(data: dict[str, Any]) -> str:
     """Build an agent label including a for-each ``item_key`` when present."""

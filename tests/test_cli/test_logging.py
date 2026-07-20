@@ -1835,6 +1835,85 @@ output:
             verbose_mode.reset(token_verbose)
 
 
+class TestConsoleEventSubscriberAgentToolOutputTruncated:
+    """Test ConsoleEventSubscriber handling of agent_tool_output_truncated event."""
+
+    def test_agent_tool_output_truncated_event_triggers_log(self) -> None:
+        """ConsoleEventSubscriber dispatches truncation to verbose_log warning."""
+        import time
+        from io import StringIO
+
+        from rich.console import Console
+
+        from conductor.cli.run import ConsoleEventSubscriber
+        from conductor.events import WorkflowEvent
+
+        subscriber = ConsoleEventSubscriber()
+
+        output = StringIO()
+        token = verbose_mode.set(True)
+        try:
+            with patch(
+                "conductor.cli.run._verbose_console",
+                Console(file=output, force_terminal=True, no_color=True),
+            ):
+                event = WorkflowEvent(
+                    type="agent_tool_output_truncated",
+                    timestamp=time.time(),
+                    data={
+                        "tool_name": "filesystem__read_file",
+                        "original_chars": 2000,
+                        "kept_chars": 1000,
+                        "spill_path": "/tmp/spill.txt",
+                    },
+                )
+                subscriber.on_event(event)
+                output_text = output.getvalue()
+                assert "filesystem__read_file" in output_text
+                assert "2000" in output_text
+                assert "1000" in output_text
+                assert "/tmp/spill.txt" in output_text
+        finally:
+            verbose_mode.reset(token)
+
+    def test_agent_tool_output_truncated_no_spill_path(self) -> None:
+        """ConsoleEventSubscriber handles truncation event without spill path."""
+        import time
+        from io import StringIO
+
+        from rich.console import Console
+
+        from conductor.cli.run import ConsoleEventSubscriber
+        from conductor.events import WorkflowEvent
+
+        subscriber = ConsoleEventSubscriber()
+
+        output = StringIO()
+        token = verbose_mode.set(True)
+        try:
+            with patch(
+                "conductor.cli.run._verbose_console",
+                Console(file=output, force_terminal=True, no_color=True),
+            ):
+                event = WorkflowEvent(
+                    type="agent_tool_output_truncated",
+                    timestamp=time.time(),
+                    data={
+                        "tool_name": "web_search__search",
+                        "original_chars": 1500,
+                        "kept_chars": 1000,
+                    },
+                )
+                subscriber.on_event(event)
+                output_text = output.getvalue()
+                assert "web_search__search" in output_text
+                assert "1500" in output_text
+                assert "1000" in output_text
+                assert "not spilled" in output_text
+        finally:
+            verbose_mode.reset(token)
+
+
 class TestConsoleEventSubscriberAgentTimeout:
     """Test ConsoleEventSubscriber handling of agent_timeout event."""
 

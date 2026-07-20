@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from conductor.config.schema import AgentDef, ProviderSettings
+from conductor.config.schema import AgentDef, ProviderSettings, ToolOutputConfig
 from conductor.exceptions import ProviderError
 from conductor.providers.copilot import CopilotProvider, RetryConfig, SDKResponse
 
@@ -1241,6 +1241,145 @@ class TestCopilotExecuteDialogTurn:
                 user_message="hi",
                 history=[],
             )
+
+
+class TestCopilotProviderLargeOutput:
+    """Tests for ``large_output`` forwarding to the Copilot SDK."""
+
+    @staticmethod
+    def _captured_create_session(provider: CopilotProvider) -> dict[str, Any]:
+        """Execute with a fake client and return captured create_session kwargs."""
+        captured: dict[str, Any] = {}
+
+        class _FakeSession:
+            session_id = "sess-large-output"
+
+            async def disconnect(self) -> None:
+                return None
+
+        class _FakeClient:
+            async def create_session(self, **kwargs: Any) -> _FakeSession:
+                captured.update(kwargs)
+                return _FakeSession()
+
+        provider._client = _FakeClient()
+        provider._mock_handler = None
+        provider._started = True
+
+        import asyncio
+
+        async def _noop() -> None:
+            return None
+
+        async def _fake_send_and_wait(*args: Any, **kwargs: Any) -> SDKResponse:
+            return SDKResponse(content='{"ok":true}')
+
+        provider._ensure_client_started = _noop  # type: ignore[method-assign]
+        provider._send_and_wait = _fake_send_and_wait  # type: ignore[method-assign]
+
+        agent = AgentDef(name="agent", model="gpt-4o", prompt="p")
+        asyncio.run(provider.execute(agent, {}, "p"))
+        return captured
+
+    def _captured_dialog_session(self, provider: CopilotProvider) -> dict[str, Any]:
+        """Run a dialog turn and return the create_session kwargs it used."""
+        captured: dict[str, Any] = {}
+
+        class _AsyncMockSession:
+            def __init__(self) -> None:
+                self._callback: Any = None
+
+            def on(self, callback: Any) -> None:
+                self._callback = callback
+
+            async def send(self, prompt: str) -> None:
+                self._callback(_AsyncMockEvent("assistant.message", "ok"))
+                self._callback(_AsyncMockEvent("session.idle"))
+
+        class _AsyncMockEvent:
+            def __init__(self, event_type: str, content: str = "") -> None:
+                self.type = _AsyncMockType(event_type)
+                self.data = _AsyncMockData(content)
+
+        class _AsyncMockType:
+            def __init__(self, value: str) -> None:
+                self.value = value
+
+        class _AsyncMockData:
+            def __init__(self, content: str) -> None:
+                self.content = content
+                self.message = content
+
+        class _Client:
+            async def create_session(self, **kwargs: Any) -> Any:
+                captured.update(kwargs)
+                return _AsyncMockSession()
+
+        provider._client = _Client()
+        provider._started = True
+
+        import asyncio
+
+        asyncio.run(provider.execute_dialog_turn("sys", "hi", []))
+        return captured
+
+    def test_default_config_forwards_large_output_to_create_session(self) -> None:
+        """Default ToolOutputConfig produces enabled=True and default max_size_bytes."""
+        provider = CopilotProvider()
+        captured = self._captured_create_session(provider)
+        assert captured["large_output"] == {"enabled": True, "max_size_bytes": 50000}
+
+    def test_disabled_config_forwards_enabled_false(self) -> None:
+        """enabled=False is forwarded as enabled=False because the SDK defaults to enabled."""
+        provider = CopilotProvider(tool_output=ToolOutputConfig(enabled=False))
+        captured = self._captured_create_session(provider)
+        assert captured["large_output"] == {"enabled": False}
+
+    def test_spill_to_file_false_maps_to_enabled_false(self) -> None:
+        """spill_to_file=False disables large_output handling entirely (SDK limitation)."""
+        provider = CopilotProvider(tool_output=ToolOutputConfig(spill_to_file=False))
+        captured = self._captured_create_session(provider)
+        assert captured["large_output"] == {"enabled": False}
+
+    def test_spill_to_file_false_logs_a_warning(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Requirement: disabling spill on Copilot silently uncaps tool output.
+
+        Unlike Claude (which still truncates to max_chars and only skips the
+        file write), the Copilot SDK has no truncate-without-spill mode, so
+        spill_to_file=False disables size limiting entirely. That divergence
+        must be surfaced at runtime, not just in a docstring.
+        """
+        provider = CopilotProvider(tool_output=ToolOutputConfig(spill_to_file=False))
+        with caplog.at_level("WARNING"):
+            self._captured_create_session(provider)
+        assert any(
+            "spill_to_file=False disables tool output size limiting" in record.message
+            for record in caplog.records
+        )
+
+    def test_spill_dir_is_forwarded_when_set(self) -> None:
+        """An explicit spill_dir becomes output_directory in SDK config."""
+        provider = CopilotProvider(
+            tool_output=ToolOutputConfig(spill_dir="/tmp/custom-tool-output")
+        )
+        captured = self._captured_create_session(provider)
+        assert captured["large_output"] == {
+            "enabled": True,
+            "max_size_bytes": 50000,
+            "output_directory": "/tmp/custom-tool-output",
+        }
+
+    def test_large_output_forwarded_to_dialog_session(self) -> None:
+        """Dialog turns also receive the large_output config."""
+        provider = CopilotProvider()
+        captured = self._captured_dialog_session(provider)
+        assert captured["large_output"] == {"enabled": True, "max_size_bytes": 50000}
+
+    def test_large_output_disabled_forwards_enabled_false_for_dialog_session(self) -> None:
+        """enabled=False is forwarded as enabled=False in dialog create_session kwargs."""
+        provider = CopilotProvider(tool_output=ToolOutputConfig(enabled=False))
+        captured = self._captured_dialog_session(provider)
+        assert captured["large_output"] == {"enabled": False}
 
 
 class TestGetMaxPromptTokens:

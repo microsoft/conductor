@@ -5,13 +5,27 @@ This module provides the MCPManager class that handles:
 - Collecting tools from connected servers
 - Executing tool calls and returning results
 - Managing server lifecycle (connect, close)
+
+Oversized tool results can be truncated to a per-result character limit. The full
+text is optionally spilled to a temporary file so no data is lost. The
+resulting marker is generated entirely inside this manager; callers detect
+truncation by looking for the ``[output truncated:`` prefix in the trailing
+part of the returned string.
 """
 
 from __future__ import annotations
 
 import logging
-from contextlib import AsyncExitStack
+import os
+import re
+import stat
+import tempfile
+import uuid
+from contextlib import AsyncExitStack, suppress
+from pathlib import Path
 from typing import Any
+
+from conductor.config.schema import ToolOutputConfig
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +44,42 @@ except ImportError:
     TextContent = None  # type: ignore[misc, assignment]
 
 
+# Marker constants. The generic hint is embedded by the manager and replaced
+# with the fs hint by Claude's agentic loop when filesystem-like tools are
+# available. No placeholder mechanism is used; callers replace the exact
+# generic-hint constant string. These names are the public contract shared
+# with ClaudeProvider's truncation-marker parser, so they are intentionally
+# not underscore-prefixed.
+TRUNCATION_MARKER_PREFIX = "[output truncated:"
+GENERIC_HINT = "The full output was truncated; refine the tool arguments to return less data."
+FS_HINT = (
+    "The full output was saved to a file; read it with your filesystem tools if you need more."
+)
+# Window used by ClaudeProvider._parse_truncation_marker to look at the trailing
+# portion of a tool result. It must exceed the maximum realistic marker length
+# (PATH_MAX ~4096 chars + fixed marker/hint overhead) so that a valid long
+# POSIX spill path is never cut off.
+TAIL_WINDOW = 8192
+
+
+def _contains_symlink(path: Path, stop_at: Path | None = None) -> bool:
+    current: Path | None = path
+    while current is not None:
+        if stop_at is not None and current == stop_at:
+            break
+        if current.is_symlink():
+            return True
+        if current == current.parent:
+            break
+        current = current.parent
+    return False
+
+
+def _sanitize_for_filename(value: str) -> str:
+    """Replace characters that are unsafe in filenames with an underscore."""
+    return re.sub(r"[^A-Za-z0-9._-]", "_", value)
+
+
 class MCPManager:
     """Manages MCP server connections and tool execution.
 
@@ -38,6 +88,7 @@ class MCPManager:
     - Collecting available tools from servers
     - Routing tool calls to the appropriate server
     - Cleaning up connections on close
+    - Optionally truncating oversized tool results and spilling the full text to disk
 
     Tool names are prefixed with the server name to avoid collisions:
     `{server_name}__{tool_name}` (e.g., "web-search__search")
@@ -55,8 +106,12 @@ class MCPManager:
         >>> await manager.close()
     """
 
-    def __init__(self) -> None:
+    def __init__(self, tool_output: ToolOutputConfig | None = None) -> None:
         """Initialize the MCP manager.
+
+        Args:
+            tool_output: MCP tool result output-size configuration. When None,
+                the default configuration is used.
 
         Raises:
             ImportError: If MCP SDK is not installed.
@@ -69,6 +124,7 @@ class MCPManager:
         self.tool_to_server: dict[str, str] = {}  # prefixed_name -> server
         self._exit_stack = AsyncExitStack()
         self._initialized = False
+        self._tool_output = tool_output or ToolOutputConfig()
 
     async def connect_server(
         self,
@@ -206,7 +262,7 @@ class MCPManager:
             # The result.content is a list of content items
             text_parts: list[str] = []
             for content in result.content:
-                if isinstance(content, TextContent):
+                if TextContent is not None and isinstance(content, TextContent):
                     text_parts.append(content.text)
                 elif hasattr(content, "text"):
                     # Fallback for other text-like content
@@ -221,12 +277,188 @@ class MCPManager:
             if not response_text and result.structuredContent:
                 response_text = str(result.structuredContent)
 
+            try:
+                response_text = self._maybe_truncate_response(
+                    response_text,
+                    server_name=server_name,
+                    original_name=original_name,
+                )
+            except Exception as truncation_err:
+                # Truncation is best-effort: a bug here must not fail an
+                # otherwise successful tool call or masquerade as a tool
+                # error, so it is logged separately and the untruncated
+                # result is returned.
+                logger.warning(
+                    "Failed to apply output truncation for %s; returning untruncated result: %s",
+                    prefixed_name,
+                    truncation_err,
+                )
+
             logger.debug(f"MCP tool '{original_name}' returned: {response_text[:200]}...")
             return response_text
 
         except Exception as e:
             logger.error(f"MCP tool call failed: {prefixed_name}: {e}")
             raise RuntimeError(f"MCP tool call failed: {prefixed_name}: {e}") from e
+
+    def _maybe_truncate_response(
+        self,
+        response_text: str,
+        server_name: str,
+        original_name: str,
+    ) -> str:
+        """Cap oversized tool results and optionally spill the full text to disk.
+
+        The marker is generated entirely here. Callers detect truncation by
+        looking for ``[output truncated:`` in the trailing part of the returned
+        string and may replace the embedded generic hint with a filesystem hint
+        when the agent has filesystem-like tools available.
+
+        Args:
+            response_text: The full assembled tool result text.
+            server_name: Name of the MCP server that handled the tool.
+            original_name: Original tool name without the server prefix.
+
+        Returns:
+            The (possibly truncated) result string with a plain-text marker at the end.
+        """
+        if not self._tool_output.enabled:
+            return response_text
+
+        max_chars = self._tool_output.max_chars
+        if len(response_text) <= max_chars:
+            return response_text
+
+        original = len(response_text)
+        kept = max_chars
+        truncated = response_text[:kept]
+
+        spill_path: str | None = None
+        if self._tool_output.spill_to_file:
+            spill_path = self._spill_full_output(
+                full_text=response_text,
+                server_name=server_name,
+                original_name=original_name,
+            )
+
+        if spill_path:
+            marker = (
+                f"\n\n[{TRUNCATION_MARKER_PREFIX[1:]} "
+                f"{original} chars -> {kept} kept; "
+                f"full output saved to: {spill_path}. {GENERIC_HINT}]"
+            )
+        else:
+            marker = (
+                f"\n\n[{TRUNCATION_MARKER_PREFIX[1:]} "
+                f"{original} chars -> {kept} kept. {GENERIC_HINT}]"
+            )
+
+        return f"{truncated}{marker}"
+
+    def _spill_full_output(
+        self,
+        full_text: str,
+        server_name: str,
+        original_name: str,
+    ) -> str | None:
+        """Write the full tool result to a process-private temporary file.
+
+        Files are created with mode 0o600 and may contain raw tool output
+        (possibly including secrets). The caller is responsible for lifecycle.
+
+        This method is best-effort and must never raise. Any failure (invalid
+        path, symlink, permission, I/O, encoding) is logged as a warning and
+        returns None so the caller can fall back to a marker without a path.
+
+        Args:
+            full_text: The full tool result text to persist.
+            server_name: Name of the MCP server that produced the result.
+            original_name: Original tool name without the server prefix.
+
+        Returns:
+            The absolute path of the spill file, or None if writing failed.
+        """
+        try:
+            spill_dir_str = self._tool_output.spill_dir
+            if spill_dir_str:
+                # Symlink policy for an explicit spill dir: a symlink is only
+                # allowed when it resolves to a location inside the system temp
+                # root. That keeps platform layout working (on macOS /tmp and
+                # /var/tmp are themselves symlinks into /private/...) while a
+                # symlink pointing elsewhere is rejected, so a world-writable
+                # sticky directory cannot redirect spilled output into an
+                # attacker-chosen location outside the temp root.
+                spill_dir = Path(spill_dir_str).resolve()
+                temp_root = Path(tempfile.gettempdir()).resolve()
+                if not spill_dir.is_relative_to(temp_root) and _contains_symlink(
+                    Path(spill_dir_str)
+                ):
+                    logger.warning(
+                        "Spill dir %s contains a symlink; refusing to write tool output spill.",
+                        spill_dir,
+                    )
+                    return None
+            else:
+                temp_parent = Path(tempfile.gettempdir()).resolve()
+                spill_dir = temp_parent / "conductor" / "tool-output"
+                if _contains_symlink(spill_dir, stop_at=temp_parent):
+                    logger.warning(
+                        "Default spill dir %s contains a symlink; "
+                        "refusing to write tool output spill.",
+                        spill_dir,
+                    )
+                    return None
+
+            spill_dir = spill_dir.resolve()
+            spill_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            # If the leaf directory already existed, harden it before writing
+            # potentially sensitive tool output into it.
+            current_mode = stat.S_IMODE(spill_dir.stat().st_mode)
+            if current_mode & 0o077:
+                try:
+                    os.chmod(spill_dir, 0o700)
+                except OSError as chmod_err:
+                    logger.warning(
+                        "Spill dir %s has permissions %04o and chmod failed: %s; "
+                        "refusing to write tool output spill.",
+                        spill_dir,
+                        current_mode,
+                        chmod_err,
+                    )
+                    return None
+            safe_server = _sanitize_for_filename(server_name)
+            safe_tool = _sanitize_for_filename(original_name)
+            unique = uuid.uuid4().hex[:8]
+            filename = f"mcp-{safe_server}-{safe_tool}-{unique}.txt"
+            path = spill_dir / filename
+
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                f = os.fdopen(fd, "w", encoding="utf-8")
+            except OSError:
+                os.close(fd)
+                with suppress(OSError):
+                    os.remove(path)
+                raise
+            try:
+                with f:
+                    f.write(full_text)
+            except Exception:
+                # Any write failure (including UnicodeEncodeError) leaves a partial
+                # file; clean it up and degrade gracefully.
+                with suppress(OSError):
+                    os.remove(path)
+                logger.warning(
+                    "Failed to write full MCP tool output spill to disk; continuing without it.",
+                )
+                return None
+            return str(path)
+        except (OSError, ValueError) as e:
+            logger.warning(
+                "Failed to spill full MCP tool output to disk: %s",
+                e,
+            )
+            return None
 
     def get_all_tools(self) -> list[dict[str, Any]]:
         """Get all tools from all connected servers.

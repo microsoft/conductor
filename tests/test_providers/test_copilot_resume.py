@@ -166,7 +166,9 @@ class TestSessionResumeFallback:
             resumed_sid,
             on_permission_request=CopilotProvider._default_permission_handler,
             working_directory=os.getcwd(),
+            large_output={"enabled": True, "max_size_bytes": 50000},
         )
+
         mock_client.create_session.assert_not_called()
 
     @pytest.mark.asyncio
@@ -223,6 +225,7 @@ class TestSessionResumeFallback:
             resumed_sid,
             on_permission_request=CopilotProvider._default_permission_handler,
             working_directory=os.getcwd(),
+            large_output={"enabled": True, "max_size_bytes": 50000},
         )
         mock_client.create_session.assert_not_called()
         assert any(
@@ -272,6 +275,7 @@ class TestSessionResumeFallback:
             "stale-sid",
             on_permission_request=CopilotProvider._default_permission_handler,
             working_directory=os.getcwd(),
+            large_output={"enabled": True, "max_size_bytes": 50000},
         )
         mock_client.create_session.assert_called_once()
         # Session ID should now reflect the new session
