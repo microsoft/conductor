@@ -854,7 +854,7 @@ class TestHermesBuildPromptSchema:
             schema = {"nested": OutputField(type="object", properties=schema)}
         return schema
 
-    def test_build_prompt_schema_no_description_fallback(self) -> None:
+    def test_build_prompt_schema_omits_missing_description(self) -> None:
         """Top-level fields without explicit descriptions must not synthesize a description."""
         schema = {"answer": OutputField(type="string")}
         result = _build_prompt_schema(schema)
