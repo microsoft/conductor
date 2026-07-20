@@ -25,14 +25,14 @@ from conductor.exceptions import ProviderError, ValidationError
 from conductor.executor.output import parse_json_output, validate_output
 from conductor.providers._schema import (
     SchemaDepthError,
-    build_hermes_legacy_prompt_schema,
+    build_prompt_schema_properties,
 )
 from conductor.providers.base import AgentOutput, AgentProvider, EventCallback
 from conductor.providers.capabilities import ProviderCapabilities
 from conductor.providers.reasoning import ReasoningEffort, resolve_reasoning_effort
 
 if TYPE_CHECKING:
-    from conductor.config.schema import AgentDef
+    from conductor.config.schema import AgentDef, OutputField
 
 # The hermes-agent package ships its public API under the top-level module
 # name "run_agent" (not "hermes_agent"). Catch only ModuleNotFoundError so
@@ -642,14 +642,16 @@ async def _wait_for_event(event: asyncio.Event) -> None:
     await event.wait()
 
 
-def _build_prompt_schema(schema: dict[str, Any], depth: int = 0) -> dict[str, Any]:
+def _build_prompt_schema(schema: dict[str, OutputField], depth: int = 0) -> dict[str, Any]:
     """Build a prompt-facing schema description from OutputField definitions.
 
-    Wraps the shared Hermes legacy builder, converting core depth errors into
-    the provider's ValidationError with the exact legacy message and suggestion.
+    Wraps the shared recursive prompt builder, converting core depth errors into
+    the provider's ValidationError with the exact message and suggestion.
     """
     try:
-        return build_hermes_legacy_prompt_schema(schema, depth=depth, max_depth=_MAX_SCHEMA_DEPTH)
+        return build_prompt_schema_properties(
+            schema, depth=depth, max_depth=_MAX_SCHEMA_DEPTH
+        )
     except SchemaDepthError as exc:
         raise ValidationError(
             f"Schema nesting depth exceeds maximum of {_MAX_SCHEMA_DEPTH} levels",

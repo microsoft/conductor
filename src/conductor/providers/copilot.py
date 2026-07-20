@@ -1659,7 +1659,6 @@ class CopilotProvider(AgentProvider):
                 schema,
                 depth=depth,
                 max_depth=self._max_schema_depth,
-                description_fallback=True,
             )
         except SchemaDepthError as exc:
             raise ValidationError(
