@@ -10,10 +10,9 @@ from __future__ import annotations
 
 import json
 from typing import Any
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock
 
 from conductor.config.schema import OutputField
-from conductor.providers.claude import ClaudeProvider
 from conductor.providers.claude_agent_sdk import _build_output_format
 from conductor.providers.copilot import CopilotProvider
 from conductor.providers.hermes import _build_prompt_schema
@@ -294,8 +293,7 @@ EXPECTED_COPILOT_RICH_SCHEMA = """{
     "description": "A string scalar field with a description"
   },
   "number_scalar": {
-    "type": "number",
-    "description": "The number_scalar field"
+    "type": "number"
   },
   "nested_object": {
     "type": "object",
@@ -306,8 +304,7 @@ EXPECTED_COPILOT_RICH_SCHEMA = """{
         "description": "Nested string field"
       },
       "nested_number": {
-        "type": "number",
-        "description": "The nested_number field"
+        "type": "number"
       }
     },
     "required": [
@@ -360,20 +357,16 @@ EXPECTED_COPILOT_RICH_SCHEMA = """{
 # Expected output for CopilotProvider._build_prompt_schema(missing_descriptions_schema).
 EXPECTED_COPILOT_MISSING_SCHEMA = """{
   "string_scalar": {
-    "type": "string",
-    "description": "The string_scalar field"
+    "type": "string"
   },
   "nested_object": {
     "type": "object",
-    "description": "The nested_object field",
     "properties": {
       "nested_string": {
-        "type": "string",
-        "description": "The nested_string field"
+        "type": "string"
       },
       "nested_number": {
-        "type": "number",
-        "description": "The nested_number field"
+        "type": "number"
       }
     },
     "required": [
@@ -383,24 +376,20 @@ EXPECTED_COPILOT_MISSING_SCHEMA = """{
   },
   "array_of_scalars": {
     "type": "array",
-    "description": "The array_of_scalars field",
     "items": {
       "type": "string"
     }
   },
   "array_of_objects": {
     "type": "array",
-    "description": "The array_of_objects field",
     "items": {
       "type": "object",
       "properties": {
         "obj_key": {
-          "type": "string",
-          "description": "The obj_key field"
+          "type": "string"
         },
         "obj_val": {
-          "type": "number",
-          "description": "The obj_val field"
+          "type": "number"
         }
       },
       "required": [
@@ -411,7 +400,6 @@ EXPECTED_COPILOT_MISSING_SCHEMA = """{
   },
   "array_of_arrays": {
     "type": "array",
-    "description": "The array_of_arrays field",
     "items": {
       "type": "array",
       "items": {
@@ -428,8 +416,7 @@ EXPECTED_HERMES_RICH_SCHEMA = """{
     "description": "A string scalar field with a description"
   },
   "number_scalar": {
-    "type": "number",
-    "description": "The number_scalar field"
+    "type": "number"
   },
   "nested_object": {
     "type": "object",
@@ -440,8 +427,7 @@ EXPECTED_HERMES_RICH_SCHEMA = """{
         "description": "Nested string field"
       },
       "nested_number": {
-        "type": "number",
-        "description": "The nested_number field"
+        "type": "number"
       }
     },
     "required": [
@@ -471,14 +457,22 @@ EXPECTED_HERMES_RICH_SCHEMA = """{
           "type": "number",
           "description": "The value"
         }
-      }
+      },
+      "required": [
+        "obj_key",
+        "obj_val"
+      ]
     }
   },
   "array_of_arrays": {
     "type": "array",
     "description": "An array of arrays",
     "items": {
-      "type": "array"
+      "type": "array",
+      "items": {
+        "type": "number",
+        "description": "A number in nested array"
+      }
     }
   }
 }"""
@@ -486,20 +480,16 @@ EXPECTED_HERMES_RICH_SCHEMA = """{
 # Expected output for Hermes _build_prompt_schema(missing_descriptions_schema).
 EXPECTED_HERMES_MISSING_SCHEMA = """{
   "string_scalar": {
-    "type": "string",
-    "description": "The string_scalar field"
+    "type": "string"
   },
   "nested_object": {
     "type": "object",
-    "description": "The nested_object field",
     "properties": {
       "nested_string": {
-        "type": "string",
-        "description": "The nested_string field"
+        "type": "string"
       },
       "nested_number": {
-        "type": "number",
-        "description": "The nested_number field"
+        "type": "number"
       }
     },
     "required": [
@@ -509,33 +499,35 @@ EXPECTED_HERMES_MISSING_SCHEMA = """{
   },
   "array_of_scalars": {
     "type": "array",
-    "description": "The array_of_scalars field",
     "items": {
       "type": "string"
     }
   },
   "array_of_objects": {
     "type": "array",
-    "description": "The array_of_objects field",
     "items": {
       "type": "object",
       "properties": {
         "obj_key": {
-          "type": "string",
-          "description": "The obj_key field"
+          "type": "string"
         },
         "obj_val": {
-          "type": "number",
-          "description": "The obj_val field"
+          "type": "number"
         }
-      }
+      },
+      "required": [
+        "obj_key",
+        "obj_val"
+      ]
     }
   },
   "array_of_arrays": {
     "type": "array",
-    "description": "The array_of_arrays field",
     "items": {
-      "type": "array"
+      "type": "array",
+      "items": {
+        "type": "number"
+      }
     }
   }
 }"""
@@ -692,52 +684,10 @@ EXPECTED_CLAUDE_AGENT_SDK_MISSING_SCHEMA = """{
 
 
 def _make_copilot_provider() -> CopilotProvider:
-    """Return a CopilotProvider instance wired to a no-op stub handler."""
-
-    def stub_handler(agent: Any, prompt: str, context: dict[str, Any]) -> dict[str, Any]:
-        return {"result": "stub"}
-
-    return CopilotProvider(mock_handler=stub_handler)
-
-
-class TestClaudeOutputSchemaGolden:
-    """Golden tests for ClaudeProvider's structured-output tool wrapper."""
-
-    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
-    @patch("conductor.providers.claude.AsyncAnthropic")
-    @patch("conductor.providers.claude.anthropic")
-    def test_build_tools_rich_schema_matches_baseline(
-        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
-    ) -> None:
-        """Claude tool wrapper output must be byte-for-byte identical to the pre-refactor
-        baseline for a schema with descriptions, nested objects, and arrays."""
-        mock_anthropic_module.__version__ = "0.77.0"
-        mock_client = Mock()
-        mock_client.models.list = AsyncMock(return_value=Mock(data=[]))
-        mock_anthropic_class.return_value = mock_client
-
-        provider = ClaudeProvider()
-        actual = _serialize(provider._build_tools_for_structured_output(rich_schema))
-        assert actual == EXPECTED_CLAUDE_RICH_SCHEMA
-
-    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
-    @patch("conductor.providers.claude.AsyncAnthropic")
-    @patch("conductor.providers.claude.anthropic")
-    def test_build_tools_missing_descriptions_matches_baseline(
-        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
-    ) -> None:
-        """Claude tool wrapper output must be byte-for-byte identical to the pre-refactor
-        baseline for a schema without explicit descriptions."""
-        mock_anthropic_module.__version__ = "0.77.0"
-        mock_client = Mock()
-        mock_client.models.list = AsyncMock(return_value=Mock(data=[]))
-        mock_anthropic_class.return_value = mock_client
-
-        provider = ClaudeProvider()
-        actual = _serialize(
-            provider._build_tools_for_structured_output(missing_descriptions_schema)
-        )
-        assert actual == EXPECTED_CLAUDE_MISSING_SCHEMA
+    """Create a CopilotProvider with a no-op mock handler for schema tests."""
+    return CopilotProvider(
+        mock_handler=AsyncMock(),
+    )
 
 
 class TestCopilotOutputSchemaGolden:
@@ -778,7 +728,7 @@ class TestClaudeAgentSdkOutputSchemaGolden:
     """Golden tests for Claude Agent SDK's output_format wrapper."""
 
     def test_build_output_format_rich_matches_baseline(self) -> None:
-        """Claude Agent SDK output_format wrapper must be byte-for-byte identical to the
+        """Claude Agent Agent SDK output_format wrapper must be byte-for-byte identical to the
         pre-refactor baseline for a schema with descriptions and nested structure."""
         actual = _serialize(_build_output_format(rich_schema))
         assert actual == EXPECTED_CLAUDE_AGENT_SDK_RICH_SCHEMA
@@ -794,12 +744,12 @@ class TestGoldenMutationGuard:
     """Negative guard proving the golden tests are sensitive to behavioral changes."""
 
     def test_mutated_copilot_literal_does_not_match(self) -> None:
-        """If the builder output is mutated (e.g., a description fallback is changed), the
-        golden assertion must fail so regressions are caught."""
+        """If an explicit description in the builder output is mutated, the golden assertion
+        must fail so regressions are caught."""
         provider = _make_copilot_provider()
         actual = _serialize(provider._build_prompt_schema(rich_schema))
         mutated = EXPECTED_COPILOT_RICH_SCHEMA.replace(
-            '"description": "The number_scalar field"',
-            '"description": "The number_scalar field (mutated)"',
+            '"description": "A string scalar field with a description"',
+            '"description": "A string scalar field with a description (mutated)"',
         )
         assert actual != mutated

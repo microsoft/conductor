@@ -456,7 +456,24 @@ class TestPromptSchemaGeneration:
             == "string"
         )
         assert schema["plan"]["required"] == ["questions", "areas", "sources"]
-        assert schema["summary"]["description"] == "The summary field"
+        assert "description" not in schema["summary"]
+
+    def test_no_fallback_description(self) -> None:
+        """A field without an explicit description must not have a synthesized description key."""
+        provider = CopilotProvider(mock_handler=stub_handler)
+        agent = AgentDef(
+            name="summarizer",
+            model="gpt-4",
+            prompt="Summarize",
+            output={
+                "summary": {"type": "string"},
+            },
+        )
+
+        schema = provider._build_prompt_schema(agent.output or {})
+
+        assert schema["summary"]["type"] == "string"
+        assert "description" not in schema["summary"]
 
     def test_build_prompt_schema_depth_limit_enforced(self) -> None:
         """Excessively nested schemas raise ValidationError with the pinned message.
@@ -600,6 +617,33 @@ class TestParseRecoveryPrompt:
         assert '"name"' in prompt
         assert '"value"' in prompt
         assert "ONLY a valid JSON object" in prompt
+
+    def test_build_parse_recovery_prompt_has_no_fallback_descriptions(self) -> None:
+        """The schema embedded in a parse recovery prompt must be built from OutputField
+        definitions so it contains no synthesized fallback descriptions."""
+        provider = CopilotProvider(mock_handler=stub_handler)
+        agent = AgentDef(
+            name="parser",
+            model="gpt-4",
+            prompt="Parse",
+            output={
+                "name": {"type": "string"},
+                "value": {"type": "number"},
+            },
+        )
+
+        schema = provider._build_prompt_schema(agent.output or {})
+        prompt = provider._build_parse_recovery_prompt(
+            parse_error="missing quotes",
+            original_response='{"name": "x}',
+            schema=schema,
+        )
+
+        assert '"name"' in prompt
+        assert '"value"' in prompt
+        assert '"The name field"' not in prompt
+        assert '"The value field"' not in prompt
+        assert "```json" in prompt
 
     def test_build_parse_recovery_prompt_truncates_long_response(self) -> None:
         """Test that long responses are truncated in recovery prompt."""
