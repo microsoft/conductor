@@ -23,6 +23,7 @@ from conductor.providers._event_format import (
     extract_tool_result_text,
     format_tool_arguments,
 )
+from conductor.providers._schema import SchemaDepthError, build_prompt_schema_properties
 from conductor.providers.base import (
     AgentOutput,
     AgentProvider,
@@ -1600,59 +1601,18 @@ class CopilotProvider(AgentProvider):
         self, schema: dict[str, OutputField], depth: int = 0
     ) -> dict[str, Any]:
         """Build a prompt-facing schema description from OutputField definitions."""
-        if depth > self._max_schema_depth:
+        try:
+            return build_prompt_schema_properties(
+                schema,
+                depth=depth,
+                max_depth=self._max_schema_depth,
+                description_fallback=True,
+            )
+        except SchemaDepthError as exc:
             raise ValidationError(
                 f"Schema nesting depth exceeds maximum of {self._max_schema_depth} levels",
                 suggestion="Simplify your output schema to reduce nesting depth",
-            )
-        return {
-            field_name: self._build_prompt_field_schema(field_name, field_def, depth=depth)
-            for field_name, field_def in schema.items()
-        }
-
-    def _build_prompt_field_schema(
-        self,
-        field_name: str,
-        field_def: OutputField,
-        depth: int = 0,
-    ) -> dict[str, Any]:
-        """Build a prompt-facing schema description for a named field."""
-        schema: dict[str, Any] = {
-            "type": field_def.type,
-            "description": field_def.description or f"The {field_name} field",
-        }
-
-        if field_def.type == "object" and field_def.properties:
-            schema["properties"] = self._build_prompt_schema(field_def.properties, depth=depth + 1)
-            schema["required"] = list(field_def.properties.keys())
-
-        if field_def.type == "array" and field_def.items:
-            schema["items"] = self._build_prompt_item_schema(field_def.items, depth=depth + 1)
-
-        return schema
-
-    def _build_prompt_item_schema(self, field_def: OutputField, depth: int = 0) -> dict[str, Any]:
-        """Build a prompt-facing schema description for an array item."""
-        if depth > self._max_schema_depth:
-            raise ValidationError(
-                f"Schema nesting depth exceeds maximum of {self._max_schema_depth} levels",
-                suggestion="Simplify your output schema to reduce nesting depth",
-            )
-        schema: dict[str, Any] = {
-            "type": field_def.type,
-        }
-
-        if field_def.description:
-            schema["description"] = field_def.description
-
-        if field_def.type == "object" and field_def.properties:
-            schema["properties"] = self._build_prompt_schema(field_def.properties, depth=depth + 1)
-            schema["required"] = list(field_def.properties.keys())
-
-        if field_def.type == "array" and field_def.items:
-            schema["items"] = self._build_prompt_item_schema(field_def.items, depth=depth + 1)
-
-        return schema
+            ) from exc
 
     def _log_event_verbose(
         self,

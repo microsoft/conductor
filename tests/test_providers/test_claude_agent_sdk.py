@@ -408,6 +408,8 @@ class TestSchemaBuilding:
     def test_depth_limit_raises(self) -> None:
         from conductor.providers.claude_agent_sdk import _build_field_schema
 
+        # Pinned requirement: the exact ProviderError message must stay
+        # "nesting exceeds 10" because the downstream contract is fixed.
         field_def = OutputField(type="string")
         for _ in range(12):
             field_def = OutputField(type="object", properties={"nested": field_def})

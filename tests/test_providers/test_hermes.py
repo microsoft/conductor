@@ -10,7 +10,7 @@ import pytest
 
 from conductor.config.schema import AgentDef, OutputField, ReasoningConfig
 from conductor.exceptions import ProviderError, ValidationError
-from conductor.providers.hermes import HermesProvider
+from conductor.providers.hermes import _MAX_SCHEMA_DEPTH, HermesProvider, _build_prompt_schema
 
 
 def _make_agent(
@@ -834,3 +834,119 @@ class TestHermesReasoningEffort:
         """Guard against an accidental future widening of the real
         CAPABILITIES declaration (as opposed to a test mock)."""
         assert "max" not in HermesProvider.CAPABILITIES.reasoning_effort
+
+
+class TestHermesBuildPromptSchema:
+    """Tests for the Hermes prompt-schema builder wrapper.
+
+    The wrapper delegates to conductor.providers._schema.build_hermes_legacy_prompt_schema
+    and converts SchemaDepthError into ValidationError with the exact legacy message and
+    suggestion. These tests pin the legacy behavior (description fallback, no required
+    inside array-item objects, collapsed array-of-array items) and the depth boundary.
+    """
+
+    def _chain_schema(self, levels: int) -> dict[str, OutputField]:
+        """Build a chain of nested objects `levels` deep."""
+        schema: dict[str, OutputField] = {"leaf": OutputField(type="string")}
+        for _ in range(levels):
+            schema = {"nested": OutputField(type="object", properties=schema)}
+        return schema
+
+    def test_build_prompt_schema_top_level_description_fallback(self) -> None:
+        """Top-level fields without explicit descriptions get the legacy fallback."""
+        schema = {"answer": OutputField(type="string")}
+        result = _build_prompt_schema(schema)
+        assert result == {"answer": {"type": "string", "description": "The answer field"}}
+
+    def test_build_prompt_schema_array_item_object_has_no_required(self) -> None:
+        """Legacy Hermes: array object items include properties but no required."""
+        schema = {
+            "items": OutputField(
+                type="array",
+                items=OutputField(
+                    type="object",
+                    properties={
+                        "key": OutputField(type="string"),
+                        "value": OutputField(type="number"),
+                    },
+                ),
+            )
+        }
+        result = _build_prompt_schema(schema)
+        assert "required" not in result["items"]["items"]
+        assert "properties" in result["items"]["items"]
+
+    def test_build_prompt_schema_array_of_arrays_collapsed(self) -> None:
+        """Legacy Hermes behavior: array-of-array items collapse to bare {type: array}."""
+        schema = {
+            "matrix": OutputField(
+                type="array",
+                items=OutputField(type="array", items=OutputField(type="number")),
+            )
+        }
+        result = _build_prompt_schema(schema)
+        assert result["matrix"]["items"] == {"type": "array"}
+
+    def test_build_prompt_schema_exceeds_max_depth(self) -> None:
+        """Depths above _MAX_SCHEMA_DEPTH raise ValidationError with the exact
+        legacy message and suggestion."""
+        # A 12-level object chain reaches depth 11, which exceeds the default max depth of 10.
+        overly_nested = self._chain_schema(_MAX_SCHEMA_DEPTH + 2)
+        with pytest.raises(ValidationError) as exc_info:
+            _build_prompt_schema(overly_nested)
+
+        error = exc_info.value
+        expected = f"Schema nesting depth exceeds maximum of {_MAX_SCHEMA_DEPTH} levels"
+        assert error.args[0] == expected
+        assert error.suggestion == "Simplify your output schema to reduce nesting depth"
+
+    def test_build_prompt_schema_array_item_depth_parity(self) -> None:
+        """Array object items must not consume an extra depth level.
+
+        Legacy Hermes passed the item's properties recursion the same depth as the
+        array field itself (depth+1 total). This pins that a chain reaching depth 10
+        inside an array item is accepted, while a chain reaching depth 11 raises.
+        """
+
+        def chain_in_array_item(levels: int) -> dict[str, OutputField]:
+            return {
+                "arr": OutputField(
+                    type="array",
+                    items=OutputField(
+                        type="object",
+                        properties=self._chain_schema(levels),
+                    ),
+                )
+            }
+
+        # _chain_schema(9) reaches depth 10 inside the array item: accepted.
+        _build_prompt_schema(chain_in_array_item(9))
+
+        # _chain_schema(10) reaches depth 11: one level too deep.
+        with pytest.raises(ValidationError, match="exceeds maximum"):
+            _build_prompt_schema(chain_in_array_item(10))
+
+    def test_build_prompt_schema_non_object_array_item_at_boundary_accepted(self) -> None:
+        """Non-object array items must not consume a depth level.
+
+        Requirement: legacy Hermes checked depth only when recursing into object
+        properties, so a chain reaching exactly _MAX_SCHEMA_DEPTH whose leaf is an
+        array of scalars (or an array of arrays) was accepted pre-refactor. The
+        shared builder must preserve that boundary: no error at depth 10, while a
+        chain one object level deeper still raises.
+        """
+        # 10 nested objects (depths 0..9) ending in non-object array fields at depth 10.
+        inner: dict[str, OutputField] = {
+            "tags": OutputField(type="array", items=OutputField(type="string")),
+            "matrix": OutputField(
+                type="array", items=OutputField(type="array", items=OutputField(type="number"))
+            ),
+        }
+        for _ in range(_MAX_SCHEMA_DEPTH):
+            inner = {"nested": OutputField(type="object", properties=inner)}
+        _build_prompt_schema(inner)
+
+        # One more object level pushes the object chain to depth 11: must raise.
+        too_deep = {"nested": OutputField(type="object", properties=inner)}
+        with pytest.raises(ValidationError, match="exceeds maximum"):
+            _build_prompt_schema(too_deep)

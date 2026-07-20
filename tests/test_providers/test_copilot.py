@@ -458,6 +458,29 @@ class TestPromptSchemaGeneration:
         assert schema["plan"]["required"] == ["questions", "areas", "sources"]
         assert schema["summary"]["description"] == "The summary field"
 
+    def test_build_prompt_schema_depth_limit_enforced(self) -> None:
+        """Excessively nested schemas raise ValidationError with the pinned message.
+
+        The Copilot provider must convert the shared core's SchemaDepthError
+        into the exact existing ValidationError message and suggestion so
+        callers see stable behavior.
+        """
+        from conductor.config.schema import OutputField
+        from conductor.exceptions import ValidationError
+
+        provider = CopilotProvider(mock_handler=stub_handler)
+
+        # Build an 11-level nested object chain to exceed the default depth limit of 10.
+        inner: OutputField = OutputField(type="string")
+        for _ in range(11):
+            inner = OutputField(type="object", properties={"nested": inner})
+
+        with pytest.raises(ValidationError) as exc_info:
+            provider._build_prompt_schema({"root": inner})
+
+        assert "Schema nesting depth exceeds maximum of 10 levels" in str(exc_info.value)
+        assert exc_info.value.suggestion == "Simplify your output schema to reduce nesting depth"
+
     @pytest.mark.asyncio
     async def test_execute_appends_nested_schema_to_prompt(
         self, monkeypatch: pytest.MonkeyPatch
