@@ -10,9 +10,10 @@ from __future__ import annotations
 
 import json
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock, patch
 
 from conductor.config.schema import OutputField
+from conductor.providers.claude import ClaudeProvider
 from conductor.providers.claude_agent_sdk import _build_output_format
 from conductor.providers.copilot import CopilotProvider
 from conductor.providers.hermes import _build_prompt_schema
@@ -690,6 +691,46 @@ def _make_copilot_provider() -> CopilotProvider:
     )
 
 
+class TestClaudeOutputSchemaGolden:
+    """Golden tests for ClaudeProvider's structured-output tool wrapper."""
+
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    def test_build_tools_rich_schema_matches_baseline(
+        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
+    ) -> None:
+        """Claude tool wrapper output must be byte-for-byte identical to the pre-refactor
+        baseline for a schema with descriptions, nested objects, and arrays."""
+        mock_anthropic_module.__version__ = "0.77.0"
+        mock_client = Mock()
+        mock_client.models.list = AsyncMock(return_value=Mock(data=[]))
+        mock_anthropic_class.return_value = mock_client
+
+        provider = ClaudeProvider()
+        actual = _serialize(provider._build_tools_for_structured_output(rich_schema))
+        assert actual == EXPECTED_CLAUDE_RICH_SCHEMA
+
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    def test_build_tools_missing_descriptions_matches_baseline(
+        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
+    ) -> None:
+        """Claude tool wrapper output must be byte-for-byte identical to the pre-refactor
+        baseline for a schema without explicit descriptions."""
+        mock_anthropic_module.__version__ = "0.77.0"
+        mock_client = Mock()
+        mock_client.models.list = AsyncMock(return_value=Mock(data=[]))
+        mock_anthropic_class.return_value = mock_client
+
+        provider = ClaudeProvider()
+        actual = _serialize(
+            provider._build_tools_for_structured_output(missing_descriptions_schema)
+        )
+        assert actual == EXPECTED_CLAUDE_MISSING_SCHEMA
+
+
 class TestCopilotOutputSchemaGolden:
     """Golden tests for CopilotProvider's prompt schema wrapper."""
 
@@ -702,7 +743,8 @@ class TestCopilotOutputSchemaGolden:
 
     def test_build_prompt_schema_missing_descriptions_matches_baseline(self) -> None:
         """Copilot prompt schema wrapper must be byte-for-byte identical to the pre-refactor
-        baseline for a schema without descriptions, including description fallbacks."""
+        baseline for a schema without descriptions; fields without explicit descriptions emit no
+        description key."""
         provider = _make_copilot_provider()
         actual = _serialize(provider._build_prompt_schema(missing_descriptions_schema))
         assert actual == EXPECTED_COPILOT_MISSING_SCHEMA
@@ -713,13 +755,14 @@ class TestHermesOutputSchemaGolden:
 
     def test_build_prompt_schema_rich_matches_baseline(self) -> None:
         """Hermes prompt schema wrapper must be byte-for-byte identical to the pre-refactor
-        baseline for a schema with descriptions, including legacy collapsed array-of-arrays."""
+        baseline for a schema with descriptions and fully recursive array items."""
         actual = _serialize(_build_prompt_schema(rich_schema))
         assert actual == EXPECTED_HERMES_RICH_SCHEMA
 
     def test_build_prompt_schema_missing_descriptions_matches_baseline(self) -> None:
         """Hermes prompt schema wrapper must be byte-for-byte identical to the pre-refactor
-        baseline for a schema without descriptions, including description fallbacks."""
+        baseline for a schema without descriptions; fields without explicit descriptions emit no
+        description key."""
         actual = _serialize(_build_prompt_schema(missing_descriptions_schema))
         assert actual == EXPECTED_HERMES_MISSING_SCHEMA
 
@@ -728,7 +771,7 @@ class TestClaudeAgentSdkOutputSchemaGolden:
     """Golden tests for Claude Agent SDK's output_format wrapper."""
 
     def test_build_output_format_rich_matches_baseline(self) -> None:
-        """Claude Agent Agent SDK output_format wrapper must be byte-for-byte identical to the
+        """Claude Agent SDK output_format wrapper must be byte-for-byte identical to the
         pre-refactor baseline for a schema with descriptions and nested structure."""
         actual = _serialize(_build_output_format(rich_schema))
         assert actual == EXPECTED_CLAUDE_AGENT_SDK_RICH_SCHEMA
