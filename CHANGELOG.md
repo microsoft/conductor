@@ -5,7 +5,51 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.22...HEAD)
+## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.23...HEAD)
+
+## [0.1.23](https://github.com/microsoft/conductor/compare/v0.1.22...v0.1.23) - 2026-07-20
+
+### Added
+
+- **`working_dir` for LLM agents and their MCP servers** — agents gain an
+  optional `working_dir` (with a workflow-wide `runtime.working_dir` default) so
+  an agent and its MCP servers run in a chosen directory. It is resolved with
+  precedence agent > runtime > `os.getcwd()` and accepts static values or Jinja
+  templates. The Copilot and Claude providers stamp the resolved directory onto
+  the agent session and each MCP server; `conductor validate` rejects
+  `working_dir` on providers that don't support it (`hermes`,
+  `claude-agent-sdk`) and on `wait` / `set` / `terminate` / `human_gate` /
+  `workflow` step types. See the "Working Directory" section of
+  [`docs/mcp-tools.md`](docs/mcp-tools.md).
+  ([#297](https://github.com/microsoft/conductor/pull/297))
+- **`runtime.tool_output` limits for oversized MCP tool results** — a
+  configurable per-result cap stops a single large MCP tool result from
+  overflowing the model's context window with a fatal token-limit error.
+  Oversized results are truncated (`max_chars`, default `50000`) and the full
+  text is spilled to a temp file the agent can page through, with a notice
+  surfaced in the console, event log, and dashboard. Claude truncates
+  conductor-side; Copilot forwards the limit to its native SDK spill feature;
+  the setting is ignored by `claude-agent-sdk` (managed via the native
+  `MAX_MCP_OUTPUT_TOKENS`) and is N/A for `hermes`. See
+  [`examples/tool-output-limits.yaml`](examples/tool-output-limits.yaml) and the
+  "Tool output limits" section of [`docs/mcp-tools.md`](docs/mcp-tools.md).
+  ([#313](https://github.com/microsoft/conductor/pull/313))
+- **Inline expand/collapse for subworkflows in the dashboard graph** —
+  subworkflow nodes now expand inline (collapsed by default) to reveal their
+  internal DAG without leaving the current view, alongside the existing
+  double-click drill-down "focus mode." Adds an Expand/Collapse-all toolbar
+  control and an `E` keyboard shortcut, and expands `for_each`-of-workflow
+  groups into inline sub-containers.
+  ([#316](https://github.com/microsoft/conductor/pull/316))
+
+### Fixed
+
+- **Subworkflow-adjacent agent node could appear stuck "running" in the
+  dashboard** — the graph store now clones the `subworkflowContexts` tree on
+  every event, so selectors keyed on it reliably observe nested status updates.
+  An agent node next to a `type: workflow` step no longer renders as "running"
+  after its underlying data is already `completed` (a pure rendering desync, not
+  an engine data bug). ([#308](https://github.com/microsoft/conductor/pull/308))
 
 ## [0.1.22](https://github.com/microsoft/conductor/compare/v0.1.21...v0.1.22) - 2026-07-15
 
