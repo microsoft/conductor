@@ -8,7 +8,12 @@ import pytest
 
 from conductor.config.schema import AgentDef, ProviderSettings, ToolOutputConfig
 from conductor.exceptions import ProviderError
-from conductor.providers.copilot import CopilotProvider, RetryConfig, SDKResponse
+from conductor.providers.copilot import (
+    CopilotProvider,
+    IdleRecoveryConfig,
+    RetryConfig,
+    SDKResponse,
+)
 
 
 def stub_handler(agent: AgentDef, prompt: str, context: dict[str, Any]) -> dict[str, Any]:
@@ -1241,6 +1246,36 @@ class TestCopilotExecuteDialogTurn:
                 user_message="hi",
                 history=[],
             )
+
+    @pytest.mark.asyncio
+    async def test_dialog_turn_honors_configured_session_timeout(self) -> None:
+        """Dialog turns use the configured session limit, not a fixed 120s cap."""
+        from unittest.mock import AsyncMock as _AsyncMock
+
+        provider = CopilotProvider(
+            mock_handler=stub_handler,
+            idle_recovery_config=IdleRecoveryConfig(max_session_seconds=0.01),
+        )
+        provider._started = True
+
+        session = _AsyncMock()
+        session.on = lambda callback: None
+        session.send = _AsyncMock()
+        session.destroy = _AsyncMock()
+
+        client = _AsyncMock()
+        client.create_session = _AsyncMock(return_value=session)
+        provider._client = client
+
+        with pytest.raises(ProviderError, match="timed out after 0.01s") as exc_info:
+            await provider.execute_dialog_turn(
+                system_prompt="sys",
+                user_message="hi",
+                history=[],
+            )
+
+        assert exc_info.value.is_retryable is True
+        session.destroy.assert_awaited_once()
 
 
 class TestCopilotProviderLargeOutput:

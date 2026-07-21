@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.23...HEAD)
 
+### Fixed
+
+- **Copilot dialog turns no longer fail after a hidden 120-second deadline** —
+  lightweight dialog sessions now honor `runtime.max_session_seconds` (or the
+  Copilot provider's 1800-second default), and timeout errors are classified as
+  retryable so console and web dialogs can continue without losing history.
+
 ## [0.1.23](https://github.com/microsoft/conductor/compare/v0.1.22...v0.1.23) - 2026-07-20
 
 ### Added

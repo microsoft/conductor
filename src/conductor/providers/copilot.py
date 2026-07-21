@@ -2468,12 +2468,13 @@ class CopilotProvider(AgentProvider):
             session.on(on_event)
             await session.send(full_prompt)
 
+            dialog_timeout = self._idle_recovery_config.max_session_seconds
             try:
-                await asyncio.wait_for(done.wait(), timeout=120.0)
+                await asyncio.wait_for(done.wait(), timeout=dialog_timeout)
             except TimeoutError as exc:
                 raise ProviderError(
-                    "Dialog turn timed out after 120s",
-                    is_retryable=False,
+                    f"Dialog turn timed out after {dialog_timeout:g}s",
+                    is_retryable=True,
                 ) from exc
 
             if error_message:
