@@ -178,6 +178,33 @@ class TestGatherProviderOffline:
         by_name = {c.name: c.present for c in diag.credential_env_vars}
         assert by_name["COPILOT_PROVIDER_RUNTIME_TOKEN"] is True
 
+    async def test_copilot_credentials_optional_with_note(self) -> None:
+        # copilot authenticates via the GitHub/Copilot CLI login on disk, so
+        # its env vars are optional overrides — flagged for a neutral render
+        # plus an explanatory note (issue #319).
+        diag = await d.gather_provider("copilot")
+        assert diag.credentials_optional is True
+        assert diag.note is not None
+        assert "optional" in diag.note.lower()
+
+    async def test_claude_agent_sdk_credentials_optional_with_note(self) -> None:
+        # claude-agent-sdk delegates to the `claude` CLI, which authenticates
+        # via `claude login`, so ANTHROPIC_API_KEY is likewise optional.
+        diag = await d.gather_provider("claude-agent-sdk")
+        assert diag.credentials_optional is True
+        assert diag.note is not None
+        assert "optional" in diag.note.lower()
+
+    async def test_claude_credentials_required_no_note(self) -> None:
+        # The direct Anthropic API has no on-disk login — its key is required.
+        diag = await d.gather_provider("claude")
+        assert diag.credentials_optional is False
+        assert diag.note is None
+
+    async def test_credentials_optional_serialized_in_to_dict(self) -> None:
+        diag = await d.gather_provider("copilot")
+        assert diag.to_dict()["credentials_optional"] is True
+
     async def test_credential_values_never_stored(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-super-secret")
         diag = await d.gather_provider("claude")

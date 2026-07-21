@@ -447,12 +447,22 @@ id strings):
 Only the **presence** of credential environment variables is reported —
 values are never read or printed. Detected variables per provider:
 
-| Provider | Environment variables |
-|----------|-----------------------|
-| `copilot` | `GITHUB_TOKEN`, `GH_TOKEN`, `COPILOT_PROVIDER_API_KEY`, `COPILOT_PROVIDER_BEARER_TOKEN`, `COPILOT_PROVIDER_RUNTIME_TOKEN` |
-| `claude` | `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` |
-| `claude-agent-sdk` | `ANTHROPIC_API_KEY` |
-| `hermes` | *(none — endpoint / API key are passed explicitly)* |
+| Provider | Environment variables | Requirement |
+|----------|-----------------------|-------------|
+| `copilot` | `GITHUB_TOKEN`, `GH_TOKEN`, `COPILOT_PROVIDER_API_KEY`, `COPILOT_PROVIDER_BEARER_TOKEN`, `COPILOT_PROVIDER_RUNTIME_TOKEN` | optional overrides — authenticates via the GitHub/Copilot CLI login on disk |
+| `claude` | `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` | required (direct Anthropic API) |
+| `claude-agent-sdk` | `ANTHROPIC_API_KEY` | optional override — authenticates via `claude login` |
+| `hermes` | *(none — endpoint / API key are passed explicitly)* | — |
+
+For **`copilot`** and **`claude-agent-sdk`**, these env vars are *optional
+overrides*: both providers authenticate primarily via an on-disk CLI login
+(the GitHub/Copilot CLI and `claude login`, respectively), so an all-absent
+credentials cell for them is expected — **not** a misconfiguration. Each
+absent optional variable renders as a neutral `○` (with a short note in the
+**Notes** column) rather than the red `✗` used for a genuinely missing
+*required* credential. To confirm a provider is actually ready, run a live
+connection probe with `--check` — the offline credentials view alone does
+not determine readiness for CLI-login providers.
 
 ### Exit codes
 

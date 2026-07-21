@@ -59,6 +59,7 @@ def _prov(
     implemented: bool = True,
     tier: str | None = "stable",
     creds: list[CredentialEnvVar] | None = None,
+    credentials_optional: bool = False,
     checked: bool = False,
     connection_ok: bool | None = None,
     connection_error: str | None = None,
@@ -85,6 +86,7 @@ def _prov(
         implemented=implemented,
         tier=tier,
         credential_env_vars=creds or [],
+        credentials_optional=credentials_optional,
         checked=checked,
         connection_ok=connection_ok,
         connection_error=connection_error,
@@ -152,6 +154,70 @@ class TestDoctorOffline:
         result = runner.invoke(app, ["doctor", "registries"])
         assert result.exit_code == 0
         assert captured["sections"] == ("registries",)
+
+
+# ---------------------------------------------------------------------------
+# Credential rendering — optional vs. required (issue #319)
+# ---------------------------------------------------------------------------
+
+
+class TestDoctorCredentialRendering:
+    """Absent *optional* credentials render neutrally, not as an alarming ✗."""
+
+    def test_optional_absent_credentials_render_neutral_with_note(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # copilot authenticates via the CLI login on disk, so an all-absent
+        # credentials cell must NOT read as a misconfiguration.
+        report = DoctorReport(
+            providers=[
+                _prov(
+                    "copilot",
+                    creds=[
+                        CredentialEnvVar("GITHUB_TOKEN", True),
+                        CredentialEnvVar("GH_TOKEN", False),
+                        CredentialEnvVar("COPILOT_PROVIDER_API_KEY", False),
+                    ],
+                    credentials_optional=True,
+                    note="CLI login; env vars optional",
+                )
+            ]
+        )
+        _patch_gather(monkeypatch, report)
+        result = runner.invoke(app, ["doctor", "providers"])
+        assert result.exit_code == 0
+        # A present credential is still a ✓ regardless of optionality.
+        assert "✓ GITHUB_TOKEN" in result.output
+        # Absent optional credentials use the neutral ○, never the red ✗.
+        assert "○ GH_TOKEN" in result.output
+        assert "○ COPILOT_PROVIDER_API_KEY" in result.output
+        assert "✗ GH_TOKEN" not in result.output
+        assert "✗ COPILOT_PROVIDER_API_KEY" not in result.output
+        # The auth-path note explains why an all-absent cell is expected.
+        assert "optional" in result.output
+
+    def test_required_absent_credentials_still_render_cross(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # claude (direct API) genuinely requires a key — an absent required
+        # credential must keep the ✗ so a real misconfiguration stays visible.
+        report = DoctorReport(
+            providers=[
+                _prov(
+                    "claude",
+                    creds=[
+                        CredentialEnvVar("ANTHROPIC_API_KEY", False),
+                        CredentialEnvVar("ANTHROPIC_AUTH_TOKEN", False),
+                    ],
+                    credentials_optional=False,
+                )
+            ]
+        )
+        _patch_gather(monkeypatch, report)
+        result = runner.invoke(app, ["doctor", "providers"])
+        assert result.exit_code == 0
+        assert "✗ ANTHROPIC_API_KEY" in result.output
+        assert "○ ANTHROPIC_API_KEY" not in result.output
 
 
 # ---------------------------------------------------------------------------
