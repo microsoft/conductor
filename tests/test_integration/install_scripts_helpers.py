@@ -6,7 +6,11 @@ isolated ``UV_TOOL_DIR`` sandboxes so the user's real install is never
 touched.
 
 Tests using these fixtures are gated behind ``-m install_scripts`` (see
-``pyproject.toml``) and excluded from the default ``make test`` run.
+``pyproject.toml``) and are auto-skipped by default (not just excluded from
+``make test``) by the ``tests/conftest.py`` collection hook — see issue
+#331. ``run_install_script()`` also defaults to ``auto_stop=False`` so it
+never drives the install scripts' host-wide process-killing ``--auto-stop``
+path unless a test explicitly opts in.
 """
 
 from __future__ import annotations
@@ -176,16 +180,24 @@ def run_install_script(
     sandbox: Sandbox,
     *,
     source: Path | str,
-    auto_stop: bool = True,
+    auto_stop: bool = False,
     force: bool = False,
     extra_env: dict | None = None,
     timeout: int = 600,
 ) -> InstallResult:
     """Drive install.ps1 (Windows) or install.sh (POSIX) against the sandbox.
 
-    Always passes the source via ``--source`` / ``-Source`` and runs in
-    ``--auto-stop`` mode unless overridden so any conductor process the test
-    leaves behind gets reaped automatically.
+    Always passes the source via ``--source`` / ``-Source``. ``auto_stop``
+    defaults to ``False`` (issue #331): the install scripts'
+    ``--auto-stop``/``-AutoStop`` flag makes ``find_running_conductor()``
+    scan and ``kill`` every matching conductor process on the *whole host*,
+    not just ones the test itself spawned — passing it by default here would
+    make every call site in this suite capable of SIGTERM-killing an
+    unrelated live ``conductor run``/``--web-bg`` workflow on the developer's
+    (or agent's) machine. Tests that specifically need to exercise the
+    kill-and-continue behavior (e.g.
+    ``test_running_process_auto_stop_kills_and_continues``) must opt in
+    explicitly with ``auto_stop=True``.
     """
     extra_env = dict(extra_env or {})
     # Prevent the install scripts from running `uv tool update-shell`, which

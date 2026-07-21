@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { useWorkflowStore } from './workflow-store';
 import type { WorkflowEvent } from '@/types/events';
 
@@ -288,5 +288,192 @@ describe('workflow-store processEvent — subworkflowContexts reactivity (#307)'
     expect(afterMutation?.workflowFile).toBe('document_review.yaml');
     expect(afterMutation?.iteration).toBe(3);
     expect(afterMutation?.parentAgent).toBe('document_review');
+  });
+});
+
+/**
+ * Regression coverage for issue #330: a dashboard whose WebSocket keeps
+ * failing to reconnect should eventually warn the user rather than leaving
+ * `workflowStatus` looking `'running'` forever. The store tracks
+ * `wsDisconnectedSince` as the timestamp of the *first* drop from
+ * `'connected'`, preserved through the connecting/reconnecting backoff
+ * churn (since `wsStatus` itself oscillates and can't be timed directly),
+ * and cleared once reconnected.
+ */
+describe('workflow-store setWsStatus — wsDisconnectedSince tracking (#330)', () => {
+  it('stays null through the initial connecting state before any connection has ever succeeded', () => {
+    const { setWsStatus } = useWorkflowStore.getState();
+    setWsStatus('connecting');
+    expect(useWorkflowStore.getState().wsDisconnectedSince).toBeNull();
+  });
+
+  it('stays null across connecting -> disconnected -> reconnecting when the socket has never once reached connected (e.g. the page loaded while the backend was already down)', () => {
+    const { setWsStatus } = useWorkflowStore.getState();
+    setWsStatus('connecting');
+    setWsStatus('disconnected');
+    setWsStatus('reconnecting');
+    expect(useWorkflowStore.getState().wsDisconnectedSince).toBeNull();
+  });
+
+  it('sets a timestamp on a fresh drop from connected, preserves it through connecting/reconnecting churn, and clears it on reconnect', () => {
+    const { setWsStatus } = useWorkflowStore.getState();
+
+    setWsStatus('connected');
+    expect(useWorkflowStore.getState().wsDisconnectedSince).toBeNull();
+
+    setWsStatus('disconnected');
+    const firstDrop = useWorkflowStore.getState().wsDisconnectedSince;
+    expect(firstDrop).not.toBeNull();
+
+    setWsStatus('reconnecting');
+    expect(useWorkflowStore.getState().wsDisconnectedSince).toBe(firstDrop);
+
+    setWsStatus('connecting');
+    expect(useWorkflowStore.getState().wsDisconnectedSince).toBe(firstDrop);
+
+    // A failed retry attempt cycles back through disconnected/reconnecting
+    // without ever having reached 'connected' again — the original
+    // timestamp must NOT be reset by this churn.
+    setWsStatus('disconnected');
+    setWsStatus('reconnecting');
+    expect(useWorkflowStore.getState().wsDisconnectedSince).toBe(firstDrop);
+
+    setWsStatus('connected');
+    expect(useWorkflowStore.getState().wsDisconnectedSince).toBeNull();
+  });
+
+  it('starts a new timestamp for a second, later disconnect', () => {
+    vi.useFakeTimers();
+    try {
+      const { setWsStatus } = useWorkflowStore.getState();
+
+      setWsStatus('connected');
+      setWsStatus('disconnected');
+      const firstDrop = useWorkflowStore.getState().wsDisconnectedSince;
+      setWsStatus('connected');
+      expect(useWorkflowStore.getState().wsDisconnectedSince).toBeNull();
+
+      vi.advanceTimersByTime(5_000);
+
+      setWsStatus('disconnected');
+      const secondDrop = useWorkflowStore.getState().wsDisconnectedSince;
+      expect(secondDrop).not.toBeNull();
+      expect(secondDrop).not.toBe(firstDrop);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe('workflow-store processEvent — system log metadata capture (#330)', () => {
+  it('captures bg_stderr_log/bg_stdout_log/log_file from the root workflow_started event', () => {
+    const { processEvent } = useWorkflowStore.getState();
+
+    processEvent(event('workflow_started', {
+      name: 'root',
+      agents: [],
+      routes: [],
+      parallel_groups: [],
+      for_each_groups: [],
+      entry_point: 'agent',
+      system: {
+        // The always-on structured JSONL event log path (EventLogSubscriber),
+        // not the separate --log-file debug-output flag.
+        log_file: '/tmp/conductor/conductor-root-20260101-120000-abcd1234.events.jsonl',
+        bg_stderr_log: '/tmp/conductor/conductor-root-123.bg.stderr.log',
+        bg_stdout_log: '/tmp/conductor/conductor-root-123.bg.stdout.log',
+      },
+    }));
+
+    const state = useWorkflowStore.getState();
+    expect(state.systemLogFile).toBe('/tmp/conductor/conductor-root-20260101-120000-abcd1234.events.jsonl');
+    expect(state.bgStderrLog).toBe('/tmp/conductor/conductor-root-123.bg.stderr.log');
+    expect(state.bgStdoutLog).toBe('/tmp/conductor/conductor-root-123.bg.stdout.log');
+  });
+
+  it('normalizes an empty log_file (the real backend default when unset) to null, and defaults bg log fields to null when absent, e.g. plain --web runs not launched via --web-bg', () => {
+    const { processEvent } = useWorkflowStore.getState();
+
+    processEvent(event('workflow_started', {
+      name: 'root',
+      agents: [],
+      routes: [],
+      parallel_groups: [],
+      for_each_groups: [],
+      entry_point: 'agent',
+      // The backend's `RunContext.log_file` always sends a string,
+      // defaulting to "" when unset — never `null` — so this is the
+      // realistic "no log file" shape on the wire.
+      system: { log_file: '' },
+    }));
+
+    const state = useWorkflowStore.getState();
+    expect(state.systemLogFile).toBeNull();
+    expect(state.bgStderrLog).toBeNull();
+    expect(state.bgStdoutLog).toBeNull();
+  });
+
+  it('defaults all log fields to null when the system block is missing entirely', () => {
+    const { processEvent } = useWorkflowStore.getState();
+
+    processEvent(event('workflow_started', {
+      name: 'root',
+      agents: [],
+      routes: [],
+      parallel_groups: [],
+      for_each_groups: [],
+      entry_point: 'agent',
+    }));
+
+    const state = useWorkflowStore.getState();
+    expect(state.systemLogFile).toBeNull();
+    expect(state.bgStderrLog).toBeNull();
+    expect(state.bgStdoutLog).toBeNull();
+  });
+
+  it('does not let a nested subworkflow_started event clobber the root workflow\'s captured log paths', () => {
+    const { processEvent } = useWorkflowStore.getState();
+
+    processEvent(event('workflow_started', {
+      name: 'root',
+      agents: [{ name: 'document_review' }],
+      routes: [],
+      parallel_groups: [],
+      for_each_groups: [],
+      entry_point: 'document_review',
+      system: {
+        log_file: '/tmp/conductor/conductor-root-20260101-120000-abcd1234.events.jsonl',
+        bg_stderr_log: '/tmp/conductor/conductor-root-123.bg.stderr.log',
+        bg_stdout_log: '/tmp/conductor/conductor-root-123.bg.stdout.log',
+      },
+    }));
+
+    processEvent(event('subworkflow_started', {
+      agent_name: 'document_review',
+      workflow: 'document_review.yaml',
+      iteration: 1,
+    }));
+
+    // A nested workflow_started (wfDepth > 0) carries its own (irrelevant)
+    // system metadata — it must not overwrite the root's log paths, which
+    // are what the reconnect-warning banner actually needs to point at.
+    processEvent(event('workflow_started', {
+      name: 'document_review',
+      agents: [],
+      routes: [],
+      parallel_groups: [],
+      for_each_groups: [],
+      entry_point: 'reviewer',
+      system: {
+        log_file: '/tmp/conductor/conductor-document_review-20260101-120005-deadbeef.events.jsonl',
+        bg_stderr_log: '/tmp/conductor/conductor-document_review-456.bg.stderr.log',
+        bg_stdout_log: '/tmp/conductor/conductor-document_review-456.bg.stdout.log',
+      },
+    }));
+
+    const state = useWorkflowStore.getState();
+    expect(state.systemLogFile).toBe('/tmp/conductor/conductor-root-20260101-120000-abcd1234.events.jsonl');
+    expect(state.bgStderrLog).toBe('/tmp/conductor/conductor-root-123.bg.stderr.log');
+    expect(state.bgStdoutLog).toBe('/tmp/conductor/conductor-root-123.bg.stdout.log');
   });
 });
