@@ -58,7 +58,7 @@ Full output is shown by default. Use `-q` (quiet) for minimal output or `-s` (si
 - Cost tracking configuration
 
 **Running or debugging workflows?** → See [references/execution.md](references/execution.md)
-- CLI options and flags (run, resume, checkpoints, stop, update)
+- CLI options and flags (run, resume, checkpoint list, stop, update)
 - Debugging techniques
 - Error troubleshooting
 - Checkpoint/resume after failures

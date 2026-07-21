@@ -75,6 +75,36 @@ class TestHelpPanels:
             assert cmd.rich_help_panel == panel, f"{name} should be under {panel!r}"
 
 
+class TestNounGroupBareInvocation:
+    """Invoking a noun group with no subcommand shows usage, not a crash."""
+
+    def test_gate_bare_invocation_shows_usage(self) -> None:
+        result = runner.invoke(app, ["gate"], env=_WIDE)
+        assert result.exit_code == 2
+        assert "Usage" in result.output
+
+    def test_checkpoint_bare_invocation_shows_usage(self) -> None:
+        result = runner.invoke(app, ["checkpoint"], env=_WIDE)
+        assert result.exit_code == 2
+        assert "Usage" in result.output
+
+
+class TestNounGroupHelp:
+    """Each noun group's own ``--help`` renders its description and subcommands."""
+
+    def test_gate_group_help(self) -> None:
+        result = runner.invoke(app, ["gate", "--help"], env=_WIDE)
+        assert result.exit_code == 0
+        assert "Interact with human gates in running workflows." in result.output
+        assert "respond" in result.output
+
+    def test_checkpoint_group_help(self) -> None:
+        result = runner.invoke(app, ["checkpoint", "--help"], env=_WIDE)
+        assert result.exit_code == 0
+        assert "Inspect workflow checkpoints." in result.output
+        assert "list" in result.output
+
+
 class TestDeprecatedAliasesHidden:
     """The deprecated aliases are still invokable but hidden from ``--help``."""
 
