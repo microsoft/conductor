@@ -179,6 +179,7 @@ def _workflow_has_human_gate(workflow_path: Path) -> bool:
         getattr(getattr(fe, "agent", None), "type", None) == "human_gate" for fe in config.for_each
     )
 
+
 def _print_web_bg_human_gate_notice(url: str) -> None:
     """Tell the user how to resolve human gates in a ``--web-bg`` run.
 
@@ -203,7 +204,6 @@ def _print_web_bg_human_gate_notice(url: str) -> None:
         "the dashboard above, or run "
         f"[bold]conductor gate respond --port {port_hint} --choice <value>[/bold]."
     )
-
 
 
 def version_callback(value: bool) -> None:
