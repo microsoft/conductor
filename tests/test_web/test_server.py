@@ -95,6 +95,19 @@ class TestGetIndex:
             assert "text/html" in resp.headers["content-type"]
             assert "Conductor" in resp.text
 
+    def test_index_sent_with_no_cache(self) -> None:
+        """GET / sets Cache-Control: no-cache so browsers revalidate index.html.
+
+        index.html points at version-hashed asset bundles; if a browser keeps
+        serving a stale index.html after an upgrade, the dashboard is pinned to
+        the previous build's bundle (the failure mode this guards against).
+        """
+        emitter, dashboard = _make_dashboard()
+        with TestClient(dashboard.app) as client:
+            resp = client.get("/")
+            assert resp.status_code == 200
+            assert resp.headers.get("cache-control") == "no-cache"
+
 
 class TestWebSocket:
     """Tests for WS /ws endpoint."""
