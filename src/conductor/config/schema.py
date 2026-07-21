@@ -611,6 +611,40 @@ class ReasoningConfig(BaseModel):
         return self
 
 
+class SandboxConfig(BaseModel):
+    """Per-agent override block for the ``aca`` (Azure Container Apps) sandbox
+    provider.
+
+    Only meaningful when the agent's effective provider is ``aca``; the
+    fields validate structurally regardless of provider (Literal
+    enforcement, ``extra="forbid"``) but are consumed only by
+    :class:`~conductor.providers.aca.AcaRuntimeProvider` at runtime.
+
+    Example YAML::
+
+        sandbox:
+          identifier_scope: item
+          working_dir: /workspace/repo
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    identifier_scope: Literal["workflow", "agent", "item", "none"] | None = None
+    """Override ``runtime.provider.identifier_scope`` for this agent's session
+    identifier. ``None`` (default) inherits the workflow-wide setting."""
+
+    working_dir: str | None = None
+    """Working directory inside the sandbox session filesystem.
+
+    Unlike :attr:`AgentDef.working_dir` (a *host* path resolved against the
+    workflow file's directory), this is interpreted **container-relative** —
+    a path inside the remote session filesystem (e.g. ``/workspace/repo``) —
+    because a host path is meaningless in a remote container. Defaults to the
+    runner's working directory when unset. A path that does not exist in the
+    container is a runtime error, never a silent host fallback.
+    """
+
+
 class AgentDef(BaseModel):
     """Definition for a single agent in the workflow.
 
@@ -1029,6 +1063,20 @@ class AgentDef(BaseModel):
           max_retries: 1
     """
 
+    sandbox: SandboxConfig | None = None
+    """Optional per-agent override block for the ``aca`` sandbox provider.
+
+    Only meaningful when this agent's effective provider is ``aca``; see
+    :class:`SandboxConfig`. Only applies to provider-backed agents (type is
+    ``None`` / omitted).
+
+    Example YAML::
+
+        sandbox:
+          identifier_scope: item
+          working_dir: /workspace/repo
+    """
+
     status: Literal["success", "failed"] | None = None
     """Outcome status for ``type: terminate`` steps.
 
@@ -1171,6 +1219,8 @@ class AgentDef(BaseModel):
                 raise ValueError("human_gate agents cannot have 'dialog'")
             if self.validator is not None:
                 raise ValueError("human_gate agents cannot have 'validator'")
+            if self.sandbox is not None:
+                raise ValueError("human_gate agents cannot have 'sandbox'")
             if self.max_depth is not None:
                 raise ValueError("human_gate agents cannot have 'max_depth'")
             if self.reasoning is not None:
@@ -1218,6 +1268,8 @@ class AgentDef(BaseModel):
                 raise ValueError("script agents cannot have 'dialog'")
             if self.validator is not None:
                 raise ValueError("script agents cannot have 'validator'")
+            if self.sandbox is not None:
+                raise ValueError("script agents cannot have 'sandbox'")
             if self.max_depth is not None:
                 raise ValueError("script agents cannot have 'max_depth'")
             if self.reasoning is not None:
@@ -1264,6 +1316,8 @@ class AgentDef(BaseModel):
                 raise ValueError("workflow agents cannot have 'dialog'")
             if self.validator is not None:
                 raise ValueError("workflow agents cannot have 'validator'")
+            if self.sandbox is not None:
+                raise ValueError("workflow agents cannot have 'sandbox'")
             if self.timeout_seconds is not None:
                 raise ValueError("workflow agents cannot have 'timeout_seconds'")
             if self.value is not None:
@@ -1317,6 +1371,8 @@ class AgentDef(BaseModel):
                 raise ValueError("wait agents cannot have 'dialog'")
             if self.validator is not None:
                 raise ValueError("wait agents cannot have 'validator'")
+            if self.sandbox is not None:
+                raise ValueError("wait agents cannot have 'sandbox'")
             if self.reasoning is not None:
                 raise ValueError("wait agents cannot have 'reasoning'")
             if self.context_tier is not None:
@@ -1382,6 +1438,8 @@ class AgentDef(BaseModel):
                 raise ValueError("set agents cannot have 'dialog'")
             if self.validator is not None:
                 raise ValueError("set agents cannot have 'validator'")
+            if self.sandbox is not None:
+                raise ValueError("set agents cannot have 'sandbox'")
             if self.reasoning is not None:
                 raise ValueError("set agents cannot have 'reasoning'")
             if self.context_tier is not None:
@@ -1446,6 +1504,8 @@ class AgentDef(BaseModel):
                 raise ValueError("terminate agents cannot have 'dialog'")
             if self.validator is not None:
                 raise ValueError("terminate agents cannot have 'validator'")
+            if self.sandbox is not None:
+                raise ValueError("terminate agents cannot have 'sandbox'")
             if self.reasoning is not None:
                 raise ValueError("terminate agents cannot have 'reasoning'")
             if self.context_tier is not None:
@@ -1689,7 +1749,9 @@ class ProviderSettings(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    name: Literal["copilot", "openai-agents", "claude", "claude-agent-sdk", "hermes"] = "copilot"
+    name: Literal["copilot", "openai-agents", "claude", "claude-agent-sdk", "hermes", "aca"] = (
+        "copilot"
+    )
     """SDK provider to use for agent execution."""
 
     type: Literal["openai", "azure", "anthropic"] | None = None
@@ -1814,6 +1876,54 @@ class ProviderSettings(BaseModel):
     Set to ``True`` to explicitly disable context file loading.
     """
 
+    pool_endpoint: str | None = None
+    """Azure Container Apps dynamic-sessions pool management endpoint. Aca-only.
+
+    Required when ``name: aca``. The host issues requests to
+    ``{pool_endpoint}/execute?identifier=<id>&api-version=<v>`` to run the
+    agent inside a pool session.
+    """
+
+    api_version: str | None = None
+    """ACA management API version (e.g. ``"2025-07-01"``). Aca-only."""
+
+    inner_provider: Literal["copilot", "claude-agent-sdk"] | None = None
+    """SDK the in-sandbox runner drives. Aca-only.
+
+    Defaults to ``"copilot"`` when ``name: aca`` and unset. **MVP: ``copilot``
+    only.** Claude-inside requires the containerizable ``claude-agent-sdk``
+    CLI; the bare ``claude`` (Anthropic-API) provider has no in-process tool
+    runtime and is not a valid inner provider.
+    """
+
+    identifier_scope: Literal["workflow", "agent", "item", "none"] | None = None
+    """Default granularity for *sequential* session-identifier reuse. Aca-only.
+
+    Defaults to ``"agent"`` when ``name: aca`` and unset: one session per
+    agent, reused across that agent's sequential re-executions (loop-backs).
+    Concurrent units (parallel members, for-each iterations) always diverge
+    the identifier regardless of scope, so ``concurrent_safe`` stays honest.
+    Overridable per-agent via the ``sandbox:`` block (:class:`SandboxConfig`).
+    """
+
+    egress: Literal["enabled", "disabled"] | None = None
+    """Advisory mirror of the pool's ``sessionNetworkConfiguration.status``. Aca-only.
+
+    The pool itself governs actual network egress; this field only informs
+    ``conductor validate`` / dashboards of the expected posture.
+    """
+
+    lifecycle: Literal["timed", "on_container_exit"] | None = None
+    """Advisory mirror of the pool's session lifecycle mode. Aca-only."""
+
+    auth: Literal["azure_default"] | None = None
+    """Session Executor authentication strategy. Aca-only.
+
+    Defaults to ``"azure_default"`` when ``name: aca`` and unset, meaning the
+    host acquires a ``dynamicsessions.io`` bearer token via
+    ``DefaultAzureCredential``. Currently the only supported strategy.
+    """
+
     @model_validator(mode="after")
     def _check_field_compatibility(self) -> ProviderSettings:
         copilot_only_fields = {
@@ -1827,6 +1937,15 @@ class ProviderSettings(BaseModel):
         }
         claude_only_fields = {
             "auth_token": self.auth_token,
+        }
+        aca_only_fields = {
+            "pool_endpoint": self.pool_endpoint,
+            "api_version": self.api_version,
+            "inner_provider": self.inner_provider,
+            "identifier_scope": self.identifier_scope,
+            "egress": self.egress,
+            "lifecycle": self.lifecycle,
+            "auth": self.auth,
         }
         if self.name != "copilot":
             extras = sorted(k for k, v in copilot_only_fields.items() if v is not None)
@@ -1846,6 +1965,10 @@ class ProviderSettings(BaseModel):
             extras = sorted(k for k, v in claude_only_fields.items() if v is not None)
             if extras:
                 raise ValueError(f"Provider fields {extras} are only supported when name='claude'.")
+        if self.name != "aca":
+            extras = sorted(k for k, v in aca_only_fields.items() if v is not None)
+            if extras:
+                raise ValueError(f"Provider fields {extras} are only supported when name='aca'.")
 
         if self.hermes_home is not None and self.name != "hermes":
             raise ValueError("'hermes_home' is only supported when name='hermes'.")
@@ -1923,6 +2046,30 @@ class ProviderSettings(BaseModel):
         if self.runtime_token is not None and self.runtime_url is None:
             raise ValueError("'runtime_token' requires 'runtime_url' to also be set")
 
+        # 'aca' has no equivalent of the copilot/claude anchor fields — the
+        # pool endpoint IS the anchor. Reject empty/whitespace the same way
+        # runtime_url is rejected above, so a typo'd or unset env
+        # interpolation fails at config time rather than at the first
+        # dynamic-sessions request.
+        if self.name == "aca" and (self.pool_endpoint is None or self.pool_endpoint.strip() == ""):
+            raise ValueError("'pool_endpoint' is required when name='aca'")
+
+        # Apply 'aca' defaults for fields left unset in YAML. These can't be
+        # ordinary Pydantic field defaults because the gating checks above
+        # (and the copilot/claude branches) rely on `None` meaning "not set
+        # in YAML" regardless of `name`. `object.__setattr__` bypasses the
+        # model's `frozen=True` (a deliberate, narrow escape hatch — see the
+        # class docstring for why the model is frozen at all) so these
+        # defaults are applied exactly once, after validation, without
+        # re-triggering `model_validator`.
+        if self.name == "aca":
+            if self.inner_provider is None:
+                object.__setattr__(self, "inner_provider", "copilot")
+            if self.identifier_scope is None:
+                object.__setattr__(self, "identifier_scope", "agent")
+            if self.auth is None:
+                object.__setattr__(self, "auth", "azure_default")
+
         return self
 
     def has_custom_routing(self) -> bool:
@@ -1962,9 +2109,20 @@ class ProviderSettings(BaseModel):
         """
         return self.runtime_url is not None
 
+    def has_aca_config(self) -> bool:
+        """Return True when YAML configured the ``aca`` sandbox provider.
+
+        Gated on ``name == "aca"`` — ``pool_endpoint`` (and any other
+        ``aca``-only field) is required whenever ``name == "aca"`` (enforced
+        by :meth:`_check_field_compatibility`), so this is equivalent to
+        checking ``pool_endpoint is not None`` but reads clearer at call
+        sites and stays correct even if that requirement is ever relaxed.
+        """
+        return self.name == "aca"
+
     def has_structured_config(self) -> bool:
         """Return True when the provider has any non-default structured settings."""
-        return self.has_custom_routing() or self.has_external_runtime()
+        return self.has_custom_routing() or self.has_external_runtime() or self.has_aca_config()
 
     @model_serializer(mode="wrap")
     def _serialize(self, nxt: Any) -> Any:

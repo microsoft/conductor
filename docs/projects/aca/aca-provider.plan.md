@@ -55,7 +55,8 @@ before the epic they tag reaches "done".
    this *how*; the exact CLI-summary / dashboard rendering is already a design
    *Future* open question ("Cost model surfacing").
 
-3. **`sandbox.working_dir` vs. existing `agent.working_dir` (blocks E1 · schema).**
+3. **`sandbox.working_dir` vs. existing `agent.working_dir` (blocks E1 · schema)
+   — RESOLVED.**
    The *Open Questions → working_dir* answer maps `working_dir` to the existing
    `working_dir` capability (`capabilities.py:133`, flipped to `True`). But the
    codebase already has a top-level `AgentDef.working_dir` (`schema.py:765`) that
@@ -69,6 +70,20 @@ before the epic they tag reaches "done".
    or introduce `sandbox.working_dir` and define how it interacts with the
    `working_dir` capability check. This changes the schema shape (E1), the
    engine's path-resolution branch, and the validator.
+
+   **Answer (E1) — introduce `sandbox.working_dir` as a distinct,
+   container-relative field.** `AgentDef.working_dir` keeps its existing host-path
+   semantics unchanged (still resolved against the workflow file's directory for
+   every provider, still rejected on wait/set/terminate/human_gate/workflow).
+   `SandboxConfig.working_dir` (new, `schema.py`) is a *separate* field, only
+   reachable via the per-agent `sandbox:` block, and is documented as
+   container-relative — a path inside the remote session filesystem, never
+   resolved against the host workflow directory. This avoids overloading one
+   field with two incompatible path semantics (host vs. container) and keeps the
+   existing `working_dir` capability check meaningful for every other provider
+   unchanged. The engine's path-resolution branch and the `aca` provider's
+   consumption of `sandbox.working_dir` (skipping host resolution entirely) are
+   E3 work — E1 only carries the schema shape.
 
 4. **`conductor-agent-runner` location & packaging (blocks E4/E5).** *DD2* says
    "the runner imports Conductor and calls `CopilotProvider.execute()`
@@ -203,7 +218,7 @@ Copilot custom routing. Covers Epic **E8**.
 
 ## Implementation Plan
 
-### E1 — `aca` configuration surface (schema + validation)
+### E1 — `aca` configuration surface (schema + validation) — **DONE**
 - **Goal:** Parse and validate `runtime.provider: {name: aca, …}` and the per-agent
   `sandbox:` block; reject incoherent field combinations, mirroring the existing
   `ProviderSettings` guardrails (FR1; *Key Components §3*).
@@ -211,15 +226,15 @@ Copilot custom routing. Covers Epic **E8**.
 
 | Task ID | Type | Description | Files | Status |
 |---|---|---|---|---|
-| E1-T1 | IMPL | Add `"aca"` to `ProviderSettings.name` Literal; add `pool_endpoint` (required for `aca`), `api_version`, `inner_provider` (`Literal["copilot","claude-agent-sdk"]="copilot"`), `identifier_scope` (`Literal["workflow","agent","item","none"]="agent"`), `egress`, `lifecycle`, `auth`. | `src/conductor/config/schema.py` | TO DO |
-| E1-T2 | IMPL | Extend `_check_field_compatibility` to gate the new fields to `name=="aca"` and require `pool_endpoint` when `name=="aca"` (reject copilot/claude/hermes fields alongside `aca`, and vice-versa), following the existing per-name gating pattern. | `src/conductor/config/schema.py` | TO DO |
-| E1-T3 | IMPL | Add a `SandboxConfig` model (`identifier_scope` override + `working_dir` per OQ#3) and `sandbox: SandboxConfig \| None` on `AgentDef`; forbid `sandbox` on non-provider step types in `validate_agent_type` (script/human_gate/set/wait/terminate/workflow). | `src/conductor/config/schema.py` | TO DO |
-| E1-T4 | TEST | Valid `aca` config round-trips; missing `pool_endpoint` fails; `aca` fields under a non-`aca` name fail; copilot/claude fields under `aca` fail; `sandbox:` accepted on `agent`, rejected on other types; `SecretStr` fields (if any) redact in `model_dump`. | `tests/test_config/test_provider_settings_aca.py` | TO DO |
+| E1-T1 | IMPL | Add `"aca"` to `ProviderSettings.name` Literal; add `pool_endpoint` (required for `aca`), `api_version`, `inner_provider` (`Literal["copilot","claude-agent-sdk"]="copilot"`), `identifier_scope` (`Literal["workflow","agent","item","none"]="agent"`), `egress`, `lifecycle`, `auth`. | `src/conductor/config/schema.py` | DONE |
+| E1-T2 | IMPL | Extend `_check_field_compatibility` to gate the new fields to `name=="aca"` and require `pool_endpoint` when `name=="aca"` (reject copilot/claude/hermes fields alongside `aca`, and vice-versa), following the existing per-name gating pattern. | `src/conductor/config/schema.py` | DONE |
+| E1-T3 | IMPL | Add a `SandboxConfig` model (`identifier_scope` override + `working_dir` per OQ#3) and `sandbox: SandboxConfig \| None` on `AgentDef`; forbid `sandbox` on non-provider step types in `validate_agent_type` (script/human_gate/set/wait/terminate/workflow). | `src/conductor/config/schema.py` | DONE |
+| E1-T4 | TEST | Valid `aca` config round-trips; missing `pool_endpoint` fails; `aca` fields under a non-`aca` name fail; copilot/claude fields under `aca` fail; `sandbox:` accepted on `agent`, rejected on other types; `SecretStr` fields (if any) redact in `model_dump`. | `tests/test_config/test_provider_settings_aca.py` | DONE |
 
 - **Acceptance Criteria:**
-  - [ ] `aca` config parses; guardrails reject every incoherent combination (FR1).
-  - [ ] `sandbox:` block validates only on provider-backed agents.
-  - [ ] OQ#3 resolved and reflected in the `working_dir` handling.
+  - [x] `aca` config parses; guardrails reject every incoherent combination (FR1).
+  - [x] `sandbox:` block validates only on provider-backed agents.
+  - [x] OQ#3 resolved and reflected in the `working_dir` handling.
 
 ### E2 — Factory, capability registration, and optional extra
 - **Goal:** Instantiate `AcaRuntimeProvider` through `create_provider()` and make its
