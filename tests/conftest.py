@@ -19,13 +19,8 @@ pytest_plugins = ["pytester"]
 
 # Marker names that are opt-in by default: unless the caller's `-m`
 # expression explicitly references one of these (by name, as a whole word),
-# tests carrying it are skipped rather than executed. Both markers gate tests
-# that can reach out and disrupt the *host* environment — real_api spawns
-# real Copilot/Claude subprocesses (issue #326); install_scripts drives
-# install.sh/install.ps1's `--auto-stop`, which SIGTERM-kills every live
-# `conductor` process on the machine (issue #331) — so both must be excluded
-# from a plain `pytest` / `pytest -m "not performance"` run, not just from
-# `make test`.
+# tests carrying it are skipped rather than executed. See the function
+# docstring below for the full rationale and per-invocation behavior.
 _OPT_IN_MARKER_NAMES = ("real_api", "install_scripts")
 
 
@@ -33,13 +28,21 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     """Make opt-in markers (``real_api``, ``install_scripts``) skip by default.
 
     Without this hook, nothing deselects tests carrying one of
-    ``_OPT_IN_MARKER_NAMES`` unless the caller passes an explicit ``-m``
-    expression (as CI/release workflows do). A plain ``pytest``,
-    ``pytest -m "not performance"``, or ``make test`` would otherwise run
-    them — spawning real Copilot/Claude subprocesses (``real_api``, issue
-    #326) or driving the install scripts' host-wide process-killing
-    ``--auto-stop`` path (``install_scripts``, issue #331). Either can
-    collide with and kill a live ``conductor run --web-bg`` session.
+    ``_OPT_IN_MARKER_NAMES`` unless the caller's ``-m`` expression already
+    references that marker name (as CI/release workflows do). Both markers
+    gate tests that can reach out and disrupt the *host* environment:
+    ``real_api`` spawns real Copilot/Claude subprocesses (issue #326);
+    ``install_scripts`` drives the install scripts' host-wide
+    process-killing ``--auto-stop`` path (issue #331). Either can collide
+    with and kill a live ``conductor run --web-bg`` session.
+
+    This hook is load-bearing to different degrees per marker and per
+    invocation: a plain ``pytest`` or ``pytest -m "not performance"`` never
+    mentions either marker, so both are only caught by this hook. ``make
+    test``'s own ``-m "not install_scripts"`` (see ``Makefile``) already
+    deselects ``install_scripts`` independently via pytest's native
+    marker-expression evaluation — but it never mentions ``real_api``, so
+    that marker still relies on this hook there too.
 
     For each marker name, if the caller's ``-m`` expression already
     references it (e.g. ``-m real_api`` / ``-m install_scripts`` to opt in,
