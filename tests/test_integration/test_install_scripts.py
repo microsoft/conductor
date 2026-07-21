@@ -8,7 +8,14 @@ Run with::
 
     uv run pytest -m install_scripts -v
 
-Excluded from the default ``make test`` run.
+Excluded from the default ``make test`` run, and auto-skipped by plain
+``pytest`` / ``pytest -m "not performance"`` invocations (and CI's main test
+job) via the ``tests/conftest.py`` collection hook — see issue #331. Without
+that hook, these tests would run under any of those invocations; combined
+with ``install.sh``'s ``find_running_conductor()`` scanning the whole *host*
+process table, a test that opts into ``--auto-stop`` could SIGTERM-kill an
+unrelated live ``conductor run --web-bg`` process. ``run_install_script()``
+now defaults to ``auto_stop=False`` for the same reason.
 
 The tests are deliberately Windows-focused because the upgrade reliability
 problems they exercise are Windows-specific (file locking on a venv whose

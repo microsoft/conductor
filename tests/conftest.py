@@ -2,8 +2,9 @@
 
 This module contains fixtures used across multiple test modules. It also
 defines a collection hook (``pytest_collection_modifyitems``) that auto-skips
-``@pytest.mark.real_api`` tests unless explicitly selected via ``-m`` — see
-its docstring and issue #326 for the full rationale.
+``@pytest.mark.real_api`` and ``@pytest.mark.install_scripts`` tests unless
+explicitly selected via ``-m`` — see its docstring and issues #326 / #331 for
+the full rationale.
 """
 
 import re
@@ -12,37 +13,56 @@ from pathlib import Path
 import pytest
 
 # Enables the `pytester` fixture used by tests/test_config/test_real_api_marker.py
-# to exercise this file's collection hook via an inner pytest run.
+# and tests/test_config/test_install_scripts_marker.py to exercise this file's
+# collection hook via an inner pytest run.
 pytest_plugins = ["pytester"]
 
-# Matches "real_api" as a whole marker name (not merely a substring) inside a
-# `-m` expression, e.g. "real_api", "not real_api", "not real_api and not
-# performance" all match; "real_api_other" does not.
-_REAL_API_IN_MARKEXPR = re.compile(r"\breal_api\b")
+# Marker names that are opt-in by default: unless the caller's `-m`
+# expression explicitly references one of these (by name, as a whole word),
+# tests carrying it are skipped rather than executed. See the function
+# docstring below for the full rationale and per-invocation behavior.
+_OPT_IN_MARKER_NAMES = ("real_api", "install_scripts")
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
-    """Make ``@pytest.mark.real_api`` tests opt-in by default.
+    """Make opt-in markers (``real_api``, ``install_scripts``) skip by default.
 
-    Without this hook, nothing deselects ``real_api``-marked tests unless the
-    caller passes an explicit ``-m`` expression (as CI/release workflows do).
-    A plain ``pytest``, ``pytest -m "not performance"``, or ``make test`` would
-    otherwise spawn real Copilot/Claude subprocesses (see issue #326) — which
-    can collide with and kill a live ``conductor run --web-bg`` session.
+    Without this hook, nothing deselects tests carrying one of
+    ``_OPT_IN_MARKER_NAMES`` unless the caller's ``-m`` expression already
+    references that marker name (as CI/release workflows do). Both markers
+    gate tests that can reach out and disrupt the *host* environment:
+    ``real_api`` spawns real Copilot/Claude subprocesses (issue #326);
+    ``install_scripts`` drives the install scripts' host-wide
+    process-killing ``--auto-stop`` path (issue #331). Either can collide
+    with and kill a live ``conductor run --web-bg`` session.
 
-    If the caller's ``-m`` expression already references ``real_api`` (e.g.
-    ``-m real_api`` to opt in, or CI's ``-m "not real_api and not
-    performance"``), pytest's own marker-expression evaluation already
-    produces the correct selection/deselection, so this hook steps aside.
+    This hook is load-bearing to different degrees per marker and per
+    invocation: a plain ``pytest`` or ``pytest -m "not performance"`` never
+    mentions either marker, so both are only caught by this hook. ``make
+    test``'s own ``-m "not install_scripts"`` (see ``Makefile``) already
+    deselects ``install_scripts`` independently via pytest's native
+    marker-expression evaluation — but it never mentions ``real_api``, so
+    that marker still relies on this hook there too.
+
+    For each marker name, if the caller's ``-m`` expression already
+    references it (e.g. ``-m real_api`` / ``-m install_scripts`` to opt in,
+    or CI's ``-m "not real_api and not performance"``), pytest's own
+    marker-expression evaluation already produces the correct
+    selection/deselection, so this hook steps aside for that marker.
     """
     marker_expr = config.getoption("markexpr")
-    if _REAL_API_IN_MARKEXPR.search(marker_expr):
-        return
+    for mark_name in _OPT_IN_MARKER_NAMES:
+        # Matches the marker name as a whole word (not merely a substring)
+        # inside the `-m` expression, e.g. "install_scripts", "not
+        # install_scripts", "not real_api and not performance" all match for
+        # their respective marker; "install_scripts_other" does not.
+        if re.search(rf"\b{re.escape(mark_name)}\b", marker_expr):
+            continue  # explicitly referenced; pytest's own evaluation handles it
 
-    skip_real_api = pytest.mark.skip(reason="real_api test: opt in with -m real_api")
-    for item in items:
-        if "real_api" in item.keywords:
-            item.add_marker(skip_real_api)
+        skip = pytest.mark.skip(reason=f"{mark_name} test: opt in with -m {mark_name}")
+        for item in items:
+            if mark_name in item.keywords:
+                item.add_marker(skip)
 
 
 @pytest.fixture
