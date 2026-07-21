@@ -1,6 +1,9 @@
 """Pytest configuration and shared fixtures for Conductor tests.
 
-This module contains fixtures used across multiple test modules.
+This module contains fixtures used across multiple test modules. It also
+defines a collection hook (``pytest_collection_modifyitems``) that auto-skips
+``@pytest.mark.real_api`` tests unless explicitly selected via ``-m`` — see
+its docstring and issue #326 for the full rationale.
 """
 
 import re
@@ -32,7 +35,7 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     performance"``), pytest's own marker-expression evaluation already
     produces the correct selection/deselection, so this hook steps aside.
     """
-    marker_expr = config.getoption("-m") or ""
+    marker_expr = config.getoption("markexpr")
     if _REAL_API_IN_MARKEXPR.search(marker_expr):
         return
 

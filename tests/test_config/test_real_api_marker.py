@@ -1,10 +1,7 @@
 """Regression tests for the ``real_api`` marker auto-skip hook (issue #326).
 
-Without ``tests/conftest.py::pytest_collection_modifyitems``, nothing
-deselects ``@pytest.mark.real_api`` tests by default. A plain ``pytest``,
-``pytest -m "not performance"``, or ``make test`` would run them, spawning
-real Copilot/Claude subprocesses that can collide with (and kill) a live
-``conductor run --web-bg`` session.
+See ``tests/conftest.py::pytest_collection_modifyitems`` for the full
+rationale behind the hook this suite exercises.
 
 These tests use pytest's built-in ``pytester`` fixture to run an isolated
 inner pytest session whose sandbox ``conftest.py`` delegates to the *actual*
@@ -75,8 +72,25 @@ def test_real_api_runs_when_explicitly_selected(real_api_sandbox: pytest.Pyteste
     result.assert_outcomes(passed=1, deselected=1)
 
 
+def test_regex_does_not_match_unrelated_marker_name(real_api_sandbox: pytest.Pytester) -> None:
+    """A substring match on an unrelated marker must not be treated as opt-in.
+
+    ``-m "not real_api_other"`` references a different (nonexistent) marker
+    that merely contains "real_api" as a substring. It must not be confused
+    with an explicit ``real_api`` reference, so the hook should still
+    auto-skip the real_api test (proving the ``\\breal_api\\b`` word-boundary
+    regex, not a plain substring check, drives the opt-in detection).
+    """
+    result = real_api_sandbox.runpytest("-m", "not real_api_other")
+    result.assert_outcomes(passed=1, skipped=1)
+
+
 def test_ci_marker_expression_still_deselects(real_api_sandbox: pytest.Pytester) -> None:
-    """CI's exact ``-m "not real_api and not performance"`` must keep deselecting it."""
+    """CI's exact ``-m "not real_api and not performance"`` must keep deselecting it.
+
+    This expression is duplicated in ``.github/workflows/ci.yml`` and
+    ``release.yml`` — keep this test's ``-m`` string in sync if those change.
+    """
     result = real_api_sandbox.runpytest("-m", "not real_api and not performance")
     result.assert_outcomes(passed=1, deselected=1)
 
