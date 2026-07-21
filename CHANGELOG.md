@@ -5,7 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.24...HEAD)
+## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.25...HEAD)
+
+## [0.1.25](https://github.com/microsoft/conductor/compare/v0.1.24...v0.1.25) - 2026-07-21
+
+### Fixed
+
+- **Web dashboard warns when stuck reconnecting after a silent crash** — a
+  new amber banner appears if the dashboard's WebSocket client has been
+  disconnected and retrying for more than 60 seconds while a workflow is
+  still marked "running", pointing at the best available log
+  (`--web-bg`'s captured stderr/stdout log, the `--log-file` debug log, or
+  the launching terminal) so a silently crashed `--web-bg` process is no
+  longer indistinguishable from a healthy, still-running workflow.
+  ([#332](https://github.com/microsoft/conductor/pull/332))
 
 ## [0.1.24](https://github.com/microsoft/conductor/compare/v0.1.23...v0.1.24) - 2026-07-21
 
