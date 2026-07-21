@@ -272,6 +272,59 @@ class TestAutoShutdown:
             with pytest.raises(asyncio.CancelledError):
                 await first
 
+    @pytest.mark.asyncio
+    async def test_unwatched_run_arms_grace_timer_on_completion(self) -> None:
+        """Root completion arms the grace timer even if no client ever connected.
+
+        Regression for issue #318: previously the grace timer was armed only from
+        WebSocket-disconnect paths, so an unwatched ``--web-bg`` run (nobody opens
+        the dashboard) blocked forever in ``wait_for_clients_disconnect()`` after
+        the workflow had already finished.
+        """
+        emitter, dashboard = _make_dashboard(bg=True)
+        assert dashboard._grace_task is None
+        assert not dashboard._connections
+
+        # No client ever connects; the root workflow simply finishes.
+        emitter.emit(_make_event("workflow_completed", elapsed=1.0))
+
+        assert dashboard._workflow_completed is True
+        assert dashboard._grace_task is not None  # armed without any disconnect
+
+        # Swap in a short grace so the post-run wait actually resolves.
+        dashboard._grace_task.cancel()
+        dashboard._grace_task = asyncio.create_task(_short_grace(dashboard._bg_event, 0.05))
+        await asyncio.wait_for(dashboard.wait_for_clients_disconnect(), timeout=1.0)
+        assert dashboard._bg_event.is_set()
+
+    @pytest.mark.asyncio
+    async def test_subworkflow_completion_does_not_arm_or_set_flag(self) -> None:
+        """Nested sub-workflow terminal events must not arm the timer or set the flag.
+
+        Regression for issue #318: the completion check is gated on the *root*
+        event (sub-workflow events carry a non-empty ``subworkflow_path``) so a
+        sub-workflow finishing mid-run cannot trigger a premature auto-shutdown.
+        """
+        emitter, dashboard = _make_dashboard(bg=True)
+
+        # A nested sub-workflow finishes while the root run is still executing.
+        emitter.emit(
+            _make_event("workflow_completed", subworkflow_path=["parent", "child"], elapsed=1.0)
+        )
+        assert dashboard._workflow_completed is False
+        assert dashboard._grace_task is None
+
+        # The root terminal event still arms the timer.
+        emitter.emit(_make_event("workflow_completed", elapsed=1.0))
+        assert dashboard._workflow_completed is True
+        assert dashboard._grace_task is not None
+
+        # Clean up the armed grace task.
+        task = dashboard._grace_task
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
 
 class TestBroadcastErrorIsolation:
     """Tests that broadcast errors don't crash the broadcaster."""
