@@ -130,18 +130,20 @@ The `--web-bg` flag is a convenience shortcut: it forks a background process run
 
 `--web` and `--web-bg` are mutually exclusive.
 
-**`--web-bg` and `human_gate`** — `--web-bg` is incompatible with workflows
-that contain `human_gate` agents (unless `--skip-gates` is also passed),
-because the detached background process has no stdin to prompt on and the
-child would crash with `EOFError` mid-run. Conductor detects this at
-load time and aborts before forking, with a message listing the options:
+**`--web-bg` and `human_gate`** — background runs support human gates through
+the dashboard. When the workflow reaches a `human_gate`, the detached process
+waits for a response from the web dashboard (the gate modal) or the
+`conductor gate-respond` CLI, rather than trying to prompt on the (absent)
+stdin. At launch, when the workflow contains a `human_gate` (and `--skip-gates`
+is not set), Conductor prints a notice with the dashboard URL and the
+`conductor gate-respond` command so a parked run doesn't look stuck:
 
-1. Use `--web` (foreground) instead of `--web-bg`
-2. Add `--skip-gates` to auto-select the first option at every gate
-3. Remove `human_gate` steps from the workflow
-4. Use `conductor gate-respond --port <port> --choice <value>` to resolve from CLI
+- Resolve each gate from the dashboard's decision modal, or
+- Run `conductor gate-respond --port <port> --choice <value>` (optionally
+  `--agent <name>` and `--input "<text>"`), or
+- Pass `--skip-gates` to auto-select the first option at every gate.
 
-The same check applies to `conductor resume --web-bg`.
+The same behavior applies to `conductor resume --web-bg`.
 
 Background workflows can be stopped with `conductor stop` (see below) or via the stop button in the web dashboard.
 
