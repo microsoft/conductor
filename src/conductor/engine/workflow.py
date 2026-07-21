@@ -2243,12 +2243,23 @@ class WorkflowEngine:
         agent: AgentDef,
         agent_context: dict[str, Any],
     ) -> GateResult:
-        """Handle a human gate, racing CLI input against web dashboard input.
+        """Handle a human gate, choosing CLI / web / race per environment.
 
-        When a web dashboard is connected, both the CLI prompt and the web
-        dashboard wait concurrently.  The first response wins and the other
-        is cancelled.  When no web dashboard is available, falls back to
-        CLI-only input.
+        Resolution policy (issue #286, extending the #198/#202 max-iterations
+        gate fix in ``_resolve_max_iterations_gate``):
+
+        - No web dashboard attached: existing CLI-only prompt path.
+        - Web dashboard + (bg mode or non-TTY stdin): **web-only** wait. The
+          CLI prompt is deliberately NOT invoked because ``Prompt.ask`` would
+          synchronously raise ``EOFError`` (stdin=DEVNULL in ``--web-bg``),
+          race-win ``FIRST_COMPLETED``, cancel the web arm, and crash the
+          workflow — the original ``--web-bg`` + ``human_gate`` bug. A parked
+          web-only gate is ended by the outer ``_execute_with_stop_signal``
+          kill path (which cancels this await and checkpoints via
+          ``handle_dashboard_stop``, issue #245), so no inner
+          ``wait_for_stop()`` race is needed here.
+        - Web dashboard + TTY foreground (``--web`` from a real terminal):
+          race the CLI prompt against the web response; first wins.
 
         Args:
             agent: The human_gate agent definition.
@@ -2262,6 +2273,13 @@ class WorkflowEngine:
             return await self.gate_handler.handle_gate(
                 agent, agent_context, base_dir=self._workflow_dir
             )
+
+        # Web dashboard + bg or non-TTY → web-only wait (skip the CLI arm; it
+        # would EOFError-and-crash on a DEVNULL stdin, cancelling the web arm
+        # before a dashboard user could respond).
+        cli_usable = not self._bg_mode and sys.stdin.isatty()
+        if not cli_usable:
+            return await self._wait_for_web_gate(agent)
 
         # Race CLI vs web input. We start the web task unconditionally (not only
         # when a client is currently connected), because the human often opens

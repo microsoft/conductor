@@ -511,6 +511,17 @@ conductor run workflow.yaml --skip-gates
 
 Auto-selects the first option at each gate.
 
+### Resolving Gates in the Dashboard
+
+With `--web` or `--web-bg`, gates are also resolvable from the browser
+dashboard's decision modal or the `conductor gate-respond` CLI — no terminal
+prompt required. This makes `--web-bg` (detached background) fully compatible
+with `human_gate` workflows: the launch prints the dashboard URL plus a
+`conductor gate-respond --port <port> --choice <value>` hint, and the run waits
+for a web/CLI response instead of aborting. Foreground `--web` from a real
+terminal still accepts either the terminal prompt or the dashboard, whichever
+responds first.
+
 ## Interactive Interrupt
 
 During execution, press **Esc** or **Ctrl+G** to pause the workflow. An interactive menu appears with these actions:

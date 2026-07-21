@@ -156,46 +156,44 @@ def print_error(error: Exception) -> None:
         console.print(panel)
 
 
-def _abort_web_bg_if_human_gate(workflow_path: Path, *, skip_gates: bool) -> None:
-    """Reject ``--web-bg`` when the workflow has a ``human_gate`` agent.
+def _workflow_has_human_gate(workflow_path: Path) -> bool:
+    """Return True if the workflow defines any ``human_gate`` agent.
 
-    Without this check, ``--web-bg`` forks a detached child whose stdin is
-    redirected to ``DEVNULL``; ``Prompt.ask`` then raises ``EOFError`` and
-    the parent only reports ``"Background process exited immediately"``,
-    which never mentions ``human_gate`` or ``--skip-gates``. Failing fast
-    in the parent process produces a single visible error on the user's
-    terminal. ``--skip-gates`` is a documented escape hatch and is honored.
+    Used to decide whether to print the ``--web-bg`` gate-resolution notice
+    after forking the background child (issue #286). Config-load failures
+    return ``False`` so the normal run path surfaces the real error instead
+    of this best-effort probe.
     """
-    if skip_gates:
-        return
     try:
         from conductor.config.loader import load_config
 
         config = load_config(workflow_path)
     except Exception:  # noqa: BLE001 — defer real validation to the loader path
-        # If config fails to load, let the normal run path surface the error.
-        return
-    has_gate = any(getattr(a, "type", None) == "human_gate" for a in config.agents) or any(
+        return False
+    return any(getattr(a, "type", None) == "human_gate" for a in config.agents) or any(
         getattr(getattr(fe, "agent", None), "type", None) == "human_gate" for fe in config.for_each
     )
-    if not has_gate:
-        return
-    # Emit via plain typer.echo (not typer.BadParameter) so the message renders
-    # verbatim — BadParameter is rendered as a Rich panel whose text wrapping
-    # can split long flag names like ``--skip-gates`` across border lines in
-    # narrow terminals (e.g. CI runners), hiding the remediation hint.
-    message = (
-        "Error: --web-bg is incompatible with workflows that contain human_gate "
-        "steps because the detached process has no stdin to prompt on.\n"
-        "\n"
-        "Options:\n"
-        "  1. Use --web (foreground) instead of --web-bg\n"
-        "  2. Add --skip-gates to auto-accept the first option\n"
-        "  3. Remove human_gate steps from the workflow\n"
-        "  4. Use `conductor gate-respond --port <port> --choice <value>` to resolve from CLI"
+
+
+def _print_web_bg_human_gate_notice(url: str) -> None:
+    """Tell the user how to resolve human gates in a ``--web-bg`` run.
+
+    Background human gates used to abort the launch (the detached child has
+    no stdin to prompt on). They are now resolvable from the dashboard or the
+    ``conductor gate-respond`` CLI (issue #286), so instead of blocking we
+    point at both so a parked run doesn't look stuck. Printed only in verbose
+    mode — ``--silent`` suppresses all bg output, including the dashboard URL
+    on the line above this notice.
+    """
+    from urllib.parse import urlparse
+
+    port = urlparse(url).port
+    port_hint = str(port) if port is not None else "<port>"
+    console.print(
+        "[yellow]This workflow contains human_gate steps.[/yellow] Resolve them from "
+        "the dashboard above, or run "
+        f"[bold]conductor gate-respond --port {port_hint} --choice <value>[/bold]."
     )
-    typer.echo(message, err=True)
-    raise typer.Exit(code=2)
 
 
 def version_callback(value: bool) -> None:
@@ -477,7 +475,10 @@ def run(
 
     # Handle --web-bg: fork a background process and exit immediately
     if web_bg:
-        _abort_web_bg_if_human_gate(workflow_path, skip_gates=skip_gates)
+        # Background human gates are now resolvable from the dashboard /
+        # ``conductor gate-respond`` (issue #286), so we no longer abort the
+        # launch — we just note how to resolve them once the URL is known.
+        notify_gate = not skip_gates and _workflow_has_human_gate(workflow_path)
         from conductor.cli.bg_runner import launch_background
 
         try:
@@ -501,6 +502,8 @@ def run(
                     "[dim]Workflow running in background. Dashboard auto-shuts down after "
                     "workflow completes and all clients disconnect.[/dim]"
                 )
+                if notify_gate:
+                    _print_web_bg_human_gate_notice(launch.url)
         except Exception as e:
             print_error(e)
             raise typer.Exit(code=1) from None
@@ -917,9 +920,8 @@ def resume(
     if web_bg:
         # When the user resumes via --from <checkpoint> alone (no workflow
         # argument), resolved_workflow is None but the checkpoint records the
-        # original workflow path. Read it so the human_gate guard still fires
-        # and the user gets a single visible error instead of a silent crash
-        # in the detached child.
+        # original workflow path. Read it so the human_gate notice can still
+        # fire for the detached child (issue #286).
         gate_check_workflow: Path | None = resolved_workflow
         if gate_check_workflow is None and resolved_checkpoint is not None:
             try:
@@ -932,8 +934,13 @@ def resume(
             except (OSError, json.JSONDecodeError):
                 # Checkpoint unreadable — let the normal resume path surface it.
                 pass
-        if gate_check_workflow is not None:
-            _abort_web_bg_if_human_gate(gate_check_workflow, skip_gates=skip_gates)
+        # Background human gates are now resolvable from the dashboard /
+        # ``conductor gate-respond`` (issue #286); note how instead of aborting.
+        notify_gate = (
+            not skip_gates
+            and gate_check_workflow is not None
+            and _workflow_has_human_gate(gate_check_workflow)
+        )
         from conductor.cli.bg_runner import launch_background_resume
 
         try:
@@ -953,6 +960,8 @@ def resume(
                     "[dim]Resumed workflow running in background. Dashboard auto-shuts down "
                     "after workflow completes and all clients disconnect.[/dim]"
                 )
+                if notify_gate:
+                    _print_web_bg_human_gate_notice(launch.url)
         except Exception as e:
             print_error(e)
             raise typer.Exit(code=1) from None

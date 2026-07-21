@@ -1604,6 +1604,135 @@ class TestWorkflowEngineHumanGates:
         assert rendered_prompts, "echo agent's mock_handler was never invoked"
         assert "User said: README.md" in rendered_prompts[0]
 
+    @pytest.mark.asyncio
+    async def test_human_gate_bg_mode_waits_web_only_and_skips_cli_prompt(self) -> None:
+        """In ``--web-bg`` (bg_mode), the gate must wait web-only (issue #286).
+
+        Before the fix, ``_handle_gate_with_web`` raced the CLI prompt against
+        the web arm unconditionally. With ``stdin`` not a TTY (as in the
+        detached ``--web-bg`` child), ``Prompt.ask`` raises ``EOFError``
+        instantly, race-winning and crashing the workflow before a dashboard
+        user could respond. This test asserts the CLI handler is never even
+        invoked when ``_bg_mode`` is set — only the web dashboard is awaited.
+        """
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from conductor.engine.workflow import RunContext
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(name="gate-bg", entry_point="approval_gate"),
+            agents=[
+                AgentDef(
+                    name="approval_gate",
+                    type="human_gate",
+                    prompt="Approve?",
+                    options=[
+                        GateOption(label="Approve", value="approved", route="next"),
+                    ],
+                ),
+                AgentDef(
+                    name="next",
+                    model="gpt-4",
+                    prompt="next",
+                    output={"received": OutputField(type="string")},
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"received": "{{ next.output.received }}"},
+        )
+
+        mock_dashboard = MagicMock()
+        mock_dashboard.wait_for_gate_response = AsyncMock(
+            return_value={"selected_value": "approved", "additional_input": {}}
+        )
+
+        def mock_handler(agent, prompt, context):
+            return {"received": "ok"}
+
+        provider = CopilotProvider(mock_handler=mock_handler)
+        engine = WorkflowEngine(
+            config,
+            provider,
+            skip_gates=False,
+            web_dashboard=mock_dashboard,
+            run_context=RunContext(bg_mode=True),
+        )
+
+        with patch.object(engine.gate_handler, "handle_gate") as mock_cli_handle:
+            result = await engine.run({})
+
+        assert result["received"] == "ok"
+        mock_dashboard.wait_for_gate_response.assert_awaited_once_with("approval_gate")
+        mock_cli_handle.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_human_gate_foreground_tty_still_races_cli_and_web(self) -> None:
+        """Foreground ``--web`` from a real terminal still races CLI vs web.
+
+        Confirms the #286 web-only tier is scoped to bg/non-TTY only — an
+        interactive terminal keeps the pre-existing race behavior, letting
+        whichever of the CLI prompt or the dashboard responds first win.
+        """
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from conductor.engine.workflow import RunContext
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(name="gate-tty", entry_point="approval_gate"),
+            agents=[
+                AgentDef(
+                    name="approval_gate",
+                    type="human_gate",
+                    prompt="Approve?",
+                    options=[
+                        GateOption(label="Approve", value="approved", route="next"),
+                        GateOption(label="Reject", value="rejected", route="next"),
+                    ],
+                ),
+                AgentDef(
+                    name="next",
+                    model="gpt-4",
+                    prompt="next",
+                    output={"received": OutputField(type="string")},
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"received": "{{ next.output.received }}"},
+        )
+
+        mock_dashboard = MagicMock()
+        mock_dashboard.wait_for_gate_response = AsyncMock(
+            return_value={"selected_value": "approved", "additional_input": {}}
+        )
+
+        def mock_handler(agent, prompt, context):
+            return {"received": "ok"}
+
+        provider = CopilotProvider(mock_handler=mock_handler)
+        engine = WorkflowEngine(
+            config,
+            provider,
+            skip_gates=False,
+            web_dashboard=mock_dashboard,
+            run_context=RunContext(bg_mode=False),
+        )
+
+        # Foreground TTY: stdin.isatty() True, and the CLI prompt never
+        # returns so the web task deterministically wins the race (mirrors
+        # the existing test_human_gate_web_response_nests_additional_input
+        # pattern above).
+        async def _never_returns(*_args, **_kwargs):
+            await asyncio.Event().wait()
+
+        with (
+            patch("sys.stdin.isatty", return_value=True),
+            patch.object(engine.gate_handler, "handle_gate", side_effect=_never_returns),
+        ):
+            result = await engine.run({})
+
+        assert result["received"] == "ok"
+        mock_dashboard.wait_for_gate_response.assert_awaited_once_with("approval_gate")
+
 
 class TestWorkflowEngineLifecycleHooks:
     """Tests for lifecycle hooks execution."""
