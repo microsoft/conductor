@@ -205,6 +205,23 @@ class TestGatherProviderOffline:
         diag = await d.gather_provider("copilot")
         assert diag.to_dict()["credentials_optional"] is True
 
+    async def test_required_credentials_optional_false_in_to_dict(self) -> None:
+        # Symmetric check: a required provider's dataclass default must also
+        # come through the JSON boundary, not just the optional-True case.
+        diag = await d.gather_provider("claude")
+        assert diag.to_dict()["credentials_optional"] is False
+
+    async def test_unregistered_provider_name_never_raises(self) -> None:
+        # Defends the null-object fallback (`_CREDENTIAL_SPECS.get(name,
+        # _CredentialSpec())`) for a name present in known_provider_names()
+        # but not yet given a _CREDENTIAL_SPECS entry — a realistic
+        # future-onboarding mistake this fallback specifically guards
+        # against (diagnostics.py never raises).
+        diag = await d.gather_provider("not-a-real-provider")
+        assert diag.credential_env_vars == []
+        assert diag.credentials_optional is False
+        assert diag.note is None
+
     async def test_credential_values_never_stored(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-super-secret")
         diag = await d.gather_provider("claude")

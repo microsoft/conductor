@@ -155,6 +155,26 @@ class TestDoctorOffline:
         assert result.exit_code == 0
         assert captured["sections"] == ("registries",)
 
+    def test_copilot_absent_creds_render_neutral_end_to_end(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Real gather (NOT patched) reproducing issue #319 exactly as filed:
+        # with every copilot credential env var cleared, the offline view
+        # must render the neutral ○ (never the alarming ✗) plus its note.
+        for var in (
+            "GITHUB_TOKEN",
+            "GH_TOKEN",
+            "COPILOT_PROVIDER_API_KEY",
+            "COPILOT_PROVIDER_BEARER_TOKEN",
+            "COPILOT_PROVIDER_RUNTIME_TOKEN",
+        ):
+            monkeypatch.delenv(var, raising=False)
+        result = runner.invoke(app, ["doctor", "providers", "--provider", "copilot"])
+        assert result.exit_code == 0
+        assert "✗" not in result.output
+        assert "○ GITHUB_TOKEN" in result.output
+        assert "optional" in result.output
+
 
 # ---------------------------------------------------------------------------
 # Credential rendering — optional vs. required (issue #319)
@@ -194,7 +214,7 @@ class TestDoctorCredentialRendering:
         assert "✗ GH_TOKEN" not in result.output
         assert "✗ COPILOT_PROVIDER_API_KEY" not in result.output
         # The auth-path note explains why an all-absent cell is expected.
-        assert "optional" in result.output
+        assert "CLI login; env vars optional" in result.output
 
     def test_required_absent_credentials_still_render_cross(
         self, monkeypatch: pytest.MonkeyPatch
@@ -244,6 +264,22 @@ class TestDoctorJson:
         data = json.loads(result.stdout)
         assert data["env"]["conductor_version"] == "1.2.3"
         assert data["providers"][0]["name"] == "copilot"
+
+    def test_json_includes_credentials_optional(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # credentials_optional must survive the full report -> to_dict ->
+        # print_json round trip, not just direct-construct unit tests.
+        report = DoctorReport(
+            providers=[
+                _prov("copilot", credentials_optional=True),
+                _prov("claude", credentials_optional=False),
+            ]
+        )
+        _patch_gather(monkeypatch, report)
+        result = runner.invoke(app, ["doctor", "--json"])
+        assert result.exit_code == 0
+        data = json.loads(result.stdout)
+        by_name = {p["name"]: p["credentials_optional"] for p in data["providers"]}
+        assert by_name == {"copilot": True, "claude": False}
 
     def test_json_never_leaks_secret_values(self, monkeypatch: pytest.MonkeyPatch) -> None:
         report = DoctorReport(

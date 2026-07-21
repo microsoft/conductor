@@ -57,24 +57,28 @@ class _CredentialSpec:
     """Static credential metadata for a provider's offline diagnostic.
 
     Only the *presence* of each var in ``env_vars`` is ever reported (never
-    its value). ``optional`` marks providers that authenticate primarily via
-    an on-disk CLI login — the GitHub/Copilot CLI for ``copilot`` and
-    ``claude login`` for ``claude-agent-sdk`` — so their env vars are
-    best-effort overrides rather than hard requirements: an all-absent
-    credentials cell for them is expected, not a misconfiguration. ``note``
-    surfaces that auth path in the rendered report so the absence of every
-    credential does not read as "provider is broken" (issue #319).
+    its value). ``optional_auth_note`` collapses two related facts into one
+    field so they can't drift apart: ``None`` means the provider genuinely
+    requires one of ``env_vars``; a non-``None`` string means the provider
+    has a credential path outside these env vars (e.g. an on-disk CLI
+    login), so an all-absent credentials cell for it is expected — not a
+    misconfiguration — and the string is that path, surfaced in the
+    rendered report so the absence doesn't read as "provider is broken"
+    (issue #319). See ``optional`` for the derived boolean.
     """
 
     env_vars: tuple[str, ...] = ()
-    optional: bool = False
-    note: str | None = None
+    optional_auth_note: str | None = None
+
+    @property
+    def optional(self) -> bool:
+        """Whether every var in ``env_vars`` is an optional override."""
+        return self.optional_auth_note is not None
 
 
 # Per-provider credential environment variables and their offline-diagnostic
-# semantics. Copilot and claude-agent-sdk authenticate via a CLI login on
-# disk, so their tokens are optional overrides; claude (direct API) genuinely
-# requires one of its keys.
+# semantics. See each entry's ``optional_auth_note`` for *why* that provider's
+# vars are optional overrides rather than hard requirements.
 _CREDENTIAL_SPECS: dict[str, _CredentialSpec] = {
     "copilot": _CredentialSpec(
         env_vars=(
@@ -84,14 +88,16 @@ _CREDENTIAL_SPECS: dict[str, _CredentialSpec] = {
             "COPILOT_PROVIDER_BEARER_TOKEN",
             "COPILOT_PROVIDER_RUNTIME_TOKEN",
         ),
-        optional=True,
-        note="authenticates via GitHub/Copilot CLI login; env vars are optional overrides",
+        optional_auth_note=(
+            "authenticates via GitHub/Copilot CLI login; env vars are optional overrides"
+        ),
     ),
     "claude": _CredentialSpec(env_vars=("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")),
     "claude-agent-sdk": _CredentialSpec(
         env_vars=("ANTHROPIC_API_KEY",),
-        optional=True,
-        note="authenticates via `claude login`; ANTHROPIC_API_KEY is an optional override",
+        optional_auth_note=(
+            "authenticates via `claude login`; ANTHROPIC_API_KEY is an optional override"
+        ),
     ),
     "hermes": _CredentialSpec(),
     "openai-agents": _CredentialSpec(),
@@ -316,11 +322,8 @@ def _provider_tier(name: str) -> str | None:
         return None
 
 
-def _credential_env_vars(name: str) -> list[CredentialEnvVar]:
+def _credential_env_vars(spec: _CredentialSpec) -> list[CredentialEnvVar]:
     """Return presence flags for the provider's credential env vars."""
-    spec = _CREDENTIAL_SPECS.get(name)
-    if spec is None:
-        return []
     return [CredentialEnvVar(var, bool(os.environ.get(var))) for var in spec.env_vars]
 
 
@@ -476,9 +479,12 @@ async def gather_provider(
         installed=installed,
         implemented=implemented,
         tier=_provider_tier(name),
-        credential_env_vars=_credential_env_vars(name),
+        credential_env_vars=_credential_env_vars(spec),
         credentials_optional=spec.optional,
-        note="not yet implemented" if not implemented else spec.note,
+        # "not yet implemented" always wins over a provider's own credential
+        # note — there is nothing useful to say about a provider's auth path
+        # when it can't be instantiated at all.
+        note="not yet implemented" if not implemented else spec.optional_auth_note,
     )
 
     do_check = check or list_models

@@ -453,6 +453,7 @@ values are never read or printed. Detected variables per provider:
 | `claude` | `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` | required (direct Anthropic API) |
 | `claude-agent-sdk` | `ANTHROPIC_API_KEY` | optional override — authenticates via `claude login` |
 | `hermes` | *(none — endpoint / API key are passed explicitly)* | — |
+| `openai-agents` | *(none — not yet implemented)* | — |
 
 For **`copilot`** and **`claude-agent-sdk`**, these env vars are *optional
 overrides*: both providers authenticate primarily via an on-disk CLI login
@@ -460,9 +461,9 @@ overrides*: both providers authenticate primarily via an on-disk CLI login
 credentials cell for them is expected — **not** a misconfiguration. Each
 absent optional variable renders as a neutral `○` (with a short note in the
 **Notes** column) rather than the red `✗` used for a genuinely missing
-*required* credential. To confirm a provider is actually ready, run a live
-connection probe with `--check` — the offline credentials view alone does
-not determine readiness for CLI-login providers.
+*required* credential. The offline view only ever reports env-var
+*presence*, never validity, for **any** provider — run a live connection
+probe with `--check` to confirm a provider is actually ready.
 
 ### Exit codes
 
