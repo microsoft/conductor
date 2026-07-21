@@ -2289,7 +2289,7 @@ class WorkflowEngine:
                     "available and stdin cannot be prompted in background mode.",
                     suggestion=(
                         "Restart with --web in the foreground, or resolve the gate "
-                        "with `conductor gate-respond` once the dashboard is reachable."
+                        "with `conductor gate respond` once the dashboard is reachable."
                     ),
                     gate_name=agent.name,
                 )

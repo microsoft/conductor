@@ -224,7 +224,7 @@ class CheckpointManager:
                 saved when the engine catches an exception or cancellation) or
                 ``"periodic"`` (milestone/time-based save at a step boundary).
                 Persisted under the top-level ``"trigger"`` key and used by
-                ``conductor checkpoints`` and rotation.
+                ``conductor checkpoint list`` and rotation.
 
         Returns:
             Path to the saved checkpoint file, or ``None`` if saving failed.
