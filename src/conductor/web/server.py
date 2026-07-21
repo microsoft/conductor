@@ -173,9 +173,22 @@ class WebDashboard:
 
         @app.get("/")
         async def index() -> FileResponse:
+            # Serve index.html with `no-cache` so browsers always revalidate
+            # it with the server before reusing a cached copy (this is a
+            # plain FileResponse, not StaticFiles, so it doesn't honor
+            # conditional requests -> every load is a fresh 200, not a cheap
+            # 304). index.html references version-hashed /assets/* bundles;
+            # without this, a browser can keep serving a stale index.html
+            # after a `conductor update`, pinning the dashboard to the
+            # previous build's bundle. The hashed asset files under /assets
+            # are unaffected by this header and get no explicit Cache-Control
+            # here; that's safe because a content change always produces a
+            # new filename, so a browser holding onto a stale hash is
+            # harmless.
             return FileResponse(
                 _STATIC_DIR / "index.html",
                 media_type="text/html",
+                headers={"Cache-Control": "no-cache"},
             )
 
         @app.get("/favicon.svg")

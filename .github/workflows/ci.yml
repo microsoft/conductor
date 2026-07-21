@@ -190,6 +190,21 @@ jobs:
         working-directory: src/conductor/web/frontend
         run: npm run build
 
+      - name: Verify committed dashboard bundle is up to date
+        # The built dashboard in src/conductor/web/static is committed to the
+        # repo and shipped in the package (server.py serves it directly). If a
+        # frontend source change lands without a matching `make build-frontend`,
+        # the stale bundle ships silently. Fail the build when a fresh `npm run
+        # build` produces any change under static/ that isn't committed.
+        run: |
+          if [ -n "$(git status --porcelain -- src/conductor/web/static)" ]; then
+            echo "::error::src/conductor/web/static is out of date with the frontend source. Run 'make build-frontend' and commit the regenerated static/ assets."
+            git status --porcelain -- src/conductor/web/static
+            git diff -- src/conductor/web/static | head -n 200
+            exit 1
+          fi
+          echo "Dashboard bundle is up to date."
+
   build:
     name: Build Package
     runs-on: ubuntu-latest

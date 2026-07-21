@@ -11,6 +11,7 @@ Tests cover:
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 import traceback
 from pathlib import Path
@@ -20,7 +21,7 @@ import pytest
 from starlette.testclient import TestClient
 
 from conductor.events import WorkflowEvent, WorkflowEventEmitter
-from conductor.web.server import WebDashboard
+from conductor.web.server import _STATIC_DIR, WebDashboard
 
 
 def _make_dashboard(
@@ -94,6 +95,46 @@ class TestGetIndex:
             assert resp.status_code == 200
             assert "text/html" in resp.headers["content-type"]
             assert "Conductor" in resp.text
+
+    def test_index_sent_with_no_cache(self) -> None:
+        """GET / sets Cache-Control: no-cache so browsers always revalidate index.html.
+
+        index.html points at version-hashed asset bundles; if a browser keeps
+        serving a stale index.html after an upgrade, the dashboard is pinned to
+        the previous build's bundle (the failure mode this guards against).
+        """
+        emitter, dashboard = _make_dashboard()
+        with TestClient(dashboard.app) as client:
+            resp = client.get("/")
+            assert resp.status_code == 200
+            assert resp.headers.get("cache-control") == "no-cache"
+
+    def test_favicon_not_sent_with_no_cache(self) -> None:
+        """GET /favicon.svg must not inherit index.html's no-cache header.
+
+        Guards against the fix accidentally widening to a blanket
+        Cache-Control policy that would also defeat asset caching.
+        """
+        emitter, dashboard = _make_dashboard()
+        with TestClient(dashboard.app) as client:
+            resp = client.get("/favicon.svg")
+            assert resp.status_code == 200
+            assert resp.headers.get("cache-control") != "no-cache"
+
+    def test_hashed_assets_not_sent_with_no_cache(self) -> None:
+        """GET /assets/<hashed-file> must not inherit index.html's no-cache header.
+
+        Hashed bundles are safe to cache long-term (a content change always
+        produces a new filename); this pins that they stay unaffected by the
+        no-cache header added to the index route.
+        """
+        emitter, dashboard = _make_dashboard()
+        with TestClient(dashboard.app) as client:
+            index_html = (_STATIC_DIR / "index.html").read_text()
+            asset_path = re.findall(r'/assets/[^"\']+', index_html)[0]
+            resp = client.get(asset_path)
+            assert resp.status_code == 200
+            assert resp.headers.get("cache-control") != "no-cache"
 
 
 class TestWebSocket:
