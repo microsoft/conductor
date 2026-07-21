@@ -89,6 +89,26 @@ export interface WorkflowStartedData {
   for_each_groups?: Array<{ name: string }>;
   /** Per-provider tier/capability metadata keyed by provider name (#241). */
   providers?: Record<string, ProviderMetadata>;
+  /**
+   * Runtime diagnostics captured at process start (see
+   * `WorkflowEngine._build_system_metadata()`). Used by the dashboard to
+   * point at relevant logs when the WebSocket connection is stuck
+   * reconnecting for a long time (issue #330).
+   */
+  system?: {
+    /**
+     * Path to the always-on structured JSONL event log
+     * (`*.events.jsonl`, written by `EventLogSubscriber` for every run —
+     * no CLI flag required, and unrelated to the separate `--log-file`
+     * debug-output flag). Always a string (defaults to `""` when unset)
+     * on the wire, never `null`; callers should use a truthy check.
+     */
+    log_file?: string;
+    /** Only present for `--web-bg` runs (issue #116). */
+    bg_stderr_log?: string;
+    bg_stdout_log?: string;
+    [key: string]: unknown;
+  };
 }
 
 export interface WorkflowCompletedData {

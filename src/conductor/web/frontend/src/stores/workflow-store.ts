@@ -325,6 +325,20 @@ interface WorkflowState {
   // UI state
   selectedNode: string | null;
   wsStatus: WsStatus;
+  /**
+   * Timestamp (ms) of when the WebSocket last dropped from `'connected'`.
+   * Set on a fresh disconnect, preserved through the connecting/reconnecting
+   * retry churn (so backoff cycling doesn't reset it), and cleared back to
+   * `null` once reconnected. Used to detect a dashboard stuck reconnecting
+   * for too long after the underlying process silently died (issue #330).
+   */
+  wsDisconnectedSince: number | null;
+  /** `system.log_file` (the always-on `*.events.jsonl` structured event log, unrelated to `--log-file`) from the root `workflow_started` event, when non-empty (issue #330). */
+  systemLogFile: string | null;
+  /** `system.bg_stderr_log` from the root `workflow_started` event, only present for `--web-bg` runs (issue #330). */
+  bgStderrLog: string | null;
+  /** `system.bg_stdout_log` from the root `workflow_started` event, only present for `--web-bg` runs (issue #330). */
+  bgStdoutLog: string | null;
 
   // Event log (terminal-like output)
   eventLog: LogEntry[];
@@ -680,6 +694,10 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
   unpricedCount: 0,
   selectedNode: null,
   wsStatus: 'connecting',
+  wsDisconnectedSince: null,
+  systemLogFile: null,
+  bgStderrLog: null,
+  bgStdoutLog: null,
   eventLog: [],
   activityLog: [],
   workflowOutput: null,
@@ -981,7 +999,21 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
   },
 
   setWsStatus: (status: WsStatus) => {
-    set({ wsStatus: status });
+    set((prev) => {
+      // Track when the connection last dropped from a healthy state so a
+      // "stuck reconnecting" banner (#330) can measure elapsed time across
+      // the connecting/reconnecting backoff churn, rather than resetting
+      // every retry cycle. Only start the clock on a *fresh* disconnect
+      // (previous status was 'connected'); once set, preserve it through
+      // subsequent non-connected statuses; clear it once reconnected.
+      let wsDisconnectedSince = prev.wsDisconnectedSince;
+      if (status === 'connected') {
+        wsDisconnectedSince = null;
+      } else if (prev.wsStatus === 'connected') {
+        wsDisconnectedSince = Date.now();
+      }
+      return { wsStatus: status, wsDisconnectedSince };
+    });
   },
 
   setEdgeHighlight: (from: string, to: string, state: 'highlighted' | 'taken' | 'failed') => {
@@ -1165,6 +1197,15 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
       state.workflowYaml = (_data as Record<string, unknown>).yaml_source as string ?? null;
       state.conductorVersion = (_data as Record<string, unknown>).version as string ?? null;
       state.entryPoint = data.entry_point || null;
+      // Runtime diagnostics for the "stuck reconnecting" warning (#330) —
+      // captured here (root workflow only) so the banner can point at the
+      // right log file(s) if the WebSocket later drops and never recovers.
+      // `log_file` is always a string on the wire (defaults to `""` when
+      // unset), never `null`, so `||` (not `??`) normalizes the empty
+      // string to `null` here too.
+      state.systemLogFile = data.system?.log_file || null;
+      state.bgStderrLog = data.system?.bg_stderr_log ?? null;
+      state.bgStdoutLog = data.system?.bg_stdout_log ?? null;
       state.agents = data.agents || [];
       state.routes = data.routes || [];
       state.parallelGroups = data.parallel_groups || [];
