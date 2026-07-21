@@ -5,7 +5,9 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.23...HEAD)
+## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.24...HEAD)
+
+## [0.1.24](https://github.com/microsoft/conductor/compare/v0.1.23...v0.1.24) - 2026-07-21
 
 ### Added
 
@@ -25,6 +27,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   names still work and forward to the new commands, but print a one-line stderr
   deprecation warning, are hidden from `--help`, and will be removed in a future
   release. ([#275](https://github.com/microsoft/conductor/issues/275))
+
+### Fixed
+
+- **`--web-bg` no longer aborts when a workflow contains a `human_gate`** — the
+  dashboard already supported resolving gates (modal, WebSocket
+  `gate_response`, `POST /api/gate-respond`, `conductor gate-respond`), but the
+  detached background process raced a CLI prompt against it and crashed with
+  `EOFError` on its closed stdin. The gate now waits web-only when running in
+  `--web-bg` (or any non-TTY context), and the CLI prints a notice pointing at
+  the dashboard URL and `conductor gate-respond` instead of aborting the launch.
+  ([#286](https://github.com/microsoft/conductor/issues/286))
+- **`--web-bg` could hang forever if no dashboard client ever connected** — the
+  auto-shutdown grace timer was only armed from WebSocket-disconnect code
+  paths, so an unwatched run that finished before anyone opened the dashboard
+  never started its grace countdown and the detached process became a zombie
+  holding its port and PID file. The timer now also arms on the workflow's root
+  completion event. ([#318](https://github.com/microsoft/conductor/issues/318))
+- **`conductor doctor` showed the `copilot` provider as red/unconfigured even
+  when fully authenticated** — credential env vars are now modeled as optional
+  per provider; an absent optional credential (e.g. `copilot`'s GitHub/Copilot
+  CLI login) renders as a neutral `○` with an explanatory note instead of a red
+  `✗`, while genuinely required credentials (e.g. `claude`'s
+  `ANTHROPIC_API_KEY`) still flag as missing.
+  ([#319](https://github.com/microsoft/conductor/issues/319))
+- **Web dashboard could keep showing a stale UI after `conductor update`** —
+  `index.html` is now served with `Cache-Control: no-cache` so the browser
+  revalidates it on every load and always picks up the current build's
+  version-hashed asset bundle. CI also now fails the Frontend job if the
+  committed `static/` bundle doesn't match a fresh `make build-frontend`, so a
+  frontend change can no longer merge without its built assets.
+  ([#321](https://github.com/microsoft/conductor/pull/321))
 
 ## [0.1.23](https://github.com/microsoft/conductor/compare/v0.1.22...v0.1.23) - 2026-07-20
 
