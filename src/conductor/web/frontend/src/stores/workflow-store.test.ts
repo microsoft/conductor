@@ -307,6 +307,14 @@ describe('workflow-store setWsStatus — wsDisconnectedSince tracking (#330)', (
     expect(useWorkflowStore.getState().wsDisconnectedSince).toBeNull();
   });
 
+  it('stays null across connecting -> disconnected -> reconnecting when the socket has never once reached connected (e.g. the page loaded while the backend was already down)', () => {
+    const { setWsStatus } = useWorkflowStore.getState();
+    setWsStatus('connecting');
+    setWsStatus('disconnected');
+    setWsStatus('reconnecting');
+    expect(useWorkflowStore.getState().wsDisconnectedSince).toBeNull();
+  });
+
   it('sets a timestamp on a fresh drop from connected, preserves it through connecting/reconnecting churn, and clears it on reconnect', () => {
     const { setWsStatus } = useWorkflowStore.getState();
 
@@ -369,19 +377,21 @@ describe('workflow-store processEvent — system log metadata capture (#330)', (
       for_each_groups: [],
       entry_point: 'agent',
       system: {
-        log_file: '/tmp/conductor/debug.log',
+        // The always-on structured JSONL event log path (EventLogSubscriber),
+        // not the separate --log-file debug-output flag.
+        log_file: '/tmp/conductor/conductor-root-20260101-120000-abcd1234.events.jsonl',
         bg_stderr_log: '/tmp/conductor/conductor-root-123.bg.stderr.log',
         bg_stdout_log: '/tmp/conductor/conductor-root-123.bg.stdout.log',
       },
     }));
 
     const state = useWorkflowStore.getState();
-    expect(state.systemLogFile).toBe('/tmp/conductor/debug.log');
+    expect(state.systemLogFile).toBe('/tmp/conductor/conductor-root-20260101-120000-abcd1234.events.jsonl');
     expect(state.bgStderrLog).toBe('/tmp/conductor/conductor-root-123.bg.stderr.log');
     expect(state.bgStdoutLog).toBe('/tmp/conductor/conductor-root-123.bg.stdout.log');
   });
 
-  it('defaults log fields to null when system metadata (or its fields) are absent, e.g. plain --web runs with no --log-file', () => {
+  it('normalizes an empty log_file (the real backend default when unset) to null, and defaults bg log fields to null when absent, e.g. plain --web runs not launched via --web-bg', () => {
     const { processEvent } = useWorkflowStore.getState();
 
     processEvent(event('workflow_started', {
@@ -391,12 +401,79 @@ describe('workflow-store processEvent — system log metadata capture (#330)', (
       parallel_groups: [],
       for_each_groups: [],
       entry_point: 'agent',
-      system: { log_file: null },
+      // The backend's `RunContext.log_file` always sends a string,
+      // defaulting to "" when unset — never `null` — so this is the
+      // realistic "no log file" shape on the wire.
+      system: { log_file: '' },
     }));
 
     const state = useWorkflowStore.getState();
     expect(state.systemLogFile).toBeNull();
     expect(state.bgStderrLog).toBeNull();
     expect(state.bgStdoutLog).toBeNull();
+  });
+
+  it('defaults all log fields to null when the system block is missing entirely', () => {
+    const { processEvent } = useWorkflowStore.getState();
+
+    processEvent(event('workflow_started', {
+      name: 'root',
+      agents: [],
+      routes: [],
+      parallel_groups: [],
+      for_each_groups: [],
+      entry_point: 'agent',
+    }));
+
+    const state = useWorkflowStore.getState();
+    expect(state.systemLogFile).toBeNull();
+    expect(state.bgStderrLog).toBeNull();
+    expect(state.bgStdoutLog).toBeNull();
+  });
+
+  it('does not let a nested subworkflow_started event clobber the root workflow\'s captured log paths', () => {
+    const { processEvent } = useWorkflowStore.getState();
+
+    processEvent(event('workflow_started', {
+      name: 'root',
+      agents: [{ name: 'document_review' }],
+      routes: [],
+      parallel_groups: [],
+      for_each_groups: [],
+      entry_point: 'document_review',
+      system: {
+        log_file: '/tmp/conductor/conductor-root-20260101-120000-abcd1234.events.jsonl',
+        bg_stderr_log: '/tmp/conductor/conductor-root-123.bg.stderr.log',
+        bg_stdout_log: '/tmp/conductor/conductor-root-123.bg.stdout.log',
+      },
+    }));
+
+    processEvent(event('subworkflow_started', {
+      agent_name: 'document_review',
+      workflow: 'document_review.yaml',
+      iteration: 1,
+    }));
+
+    // A nested workflow_started (wfDepth > 0) carries its own (irrelevant)
+    // system metadata — it must not overwrite the root's log paths, which
+    // are what the reconnect-warning banner actually needs to point at.
+    processEvent(event('workflow_started', {
+      name: 'document_review',
+      agents: [],
+      routes: [],
+      parallel_groups: [],
+      for_each_groups: [],
+      entry_point: 'reviewer',
+      system: {
+        log_file: '/tmp/conductor/conductor-document_review-20260101-120005-deadbeef.events.jsonl',
+        bg_stderr_log: '/tmp/conductor/conductor-document_review-456.bg.stderr.log',
+        bg_stdout_log: '/tmp/conductor/conductor-document_review-456.bg.stdout.log',
+      },
+    }));
+
+    const state = useWorkflowStore.getState();
+    expect(state.systemLogFile).toBe('/tmp/conductor/conductor-root-20260101-120000-abcd1234.events.jsonl');
+    expect(state.bgStderrLog).toBe('/tmp/conductor/conductor-root-123.bg.stderr.log');
+    expect(state.bgStdoutLog).toBe('/tmp/conductor/conductor-root-123.bg.stdout.log');
   });
 });

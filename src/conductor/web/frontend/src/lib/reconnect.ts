@@ -2,12 +2,13 @@
  * Pure logic for detecting a dashboard WebSocket that's been failing to
  * reconnect for "too long" (issue #330).
  *
- * `wsStatus` oscillates between `'reconnecting'` (waiting out backoff) and
- * `'connecting'` (attempting) on every retry cycle — it never sits
- * continuously in `'reconnecting'`. So rather than timing the raw status,
- * the store tracks `wsDisconnectedSince`: a timestamp set on the *first*
- * drop from `'connected'` and preserved across the connecting/reconnecting
- * churn until the socket is `'connected'` again (see
+ * `wsStatus` drops through `'disconnected'` momentarily on the first
+ * failure, then oscillates between `'connecting'` (attempting) and
+ * `'reconnecting'` (waiting out backoff) on every subsequent retry cycle —
+ * it never sits continuously in any single non-connected status. So rather
+ * than timing the raw status, the store tracks `wsDisconnectedSince`: a
+ * timestamp set on the *first* drop from `'connected'` and preserved
+ * across that churn until the socket is `'connected'` again (see
  * `workflow-store.ts`'s `setWsStatus`). This module just compares that
  * timestamp against a threshold.
  */
@@ -34,8 +35,8 @@ export interface ReconnectStuckInput {
  *
  * Deliberately does *not* fire when:
  * - already connected, or never yet disconnected (`wsDisconnectedSince == null`)
- * - the workflow already reached a terminal status (`completed`/`failed`) —
- *   those cases have their own dedicated banners
+ * - the workflow isn't `'running'` — `'pending'` hasn't started yet, and
+ *   `'completed'`/`'failed'` already have their own dedicated banners
  * - viewing a replay (there is no live process to have crashed)
  */
 export function isReconnectStuck({

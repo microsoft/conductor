@@ -333,7 +333,7 @@ interface WorkflowState {
    * for too long after the underlying process silently died (issue #330).
    */
   wsDisconnectedSince: number | null;
-  /** `system.log_file` from the root `workflow_started` event, when set via `--log-file` (issue #330). */
+  /** `system.log_file` (the always-on `*.events.jsonl` structured event log, unrelated to `--log-file`) from the root `workflow_started` event, when non-empty (issue #330). */
   systemLogFile: string | null;
   /** `system.bg_stderr_log` from the root `workflow_started` event, only present for `--web-bg` runs (issue #330). */
   bgStderrLog: string | null;
@@ -1200,7 +1200,10 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
       // Runtime diagnostics for the "stuck reconnecting" warning (#330) —
       // captured here (root workflow only) so the banner can point at the
       // right log file(s) if the WebSocket later drops and never recovers.
-      state.systemLogFile = data.system?.log_file ?? null;
+      // `log_file` is always a string on the wire (defaults to `""` when
+      // unset), never `null`, so `||` (not `??`) normalizes the empty
+      // string to `null` here too.
+      state.systemLogFile = data.system?.log_file || null;
       state.bgStderrLog = data.system?.bg_stderr_log ?? null;
       state.bgStdoutLog = data.system?.bg_stdout_log ?? null;
       state.agents = data.agents || [];

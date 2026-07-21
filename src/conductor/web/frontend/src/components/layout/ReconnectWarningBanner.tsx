@@ -12,10 +12,12 @@ import { cn, formatElapsed } from '@/lib/utils';
  * spinner in the status bar.
  *
  * Points at the best available log location: the `--web-bg` child's
- * captured stderr/stdout logs when present, else the `--log-file` debug
- * log, else a generic hint to check the terminal that launched
- * `conductor run` (see the "Debugging --web-bg failures" section of
- * AGENTS.md).
+ * captured stderr/stdout logs when present, else the always-on structured
+ * JSONL event log (`*.events.jsonl`, written by `EventLogSubscriber` for
+ * every run regardless of flags — unrelated to the separate `--log-file`
+ * debug-output flag), else a generic hint to check the terminal that
+ * launched `conductor run` (see the "Debugging --web-bg failures" section
+ * of AGENTS.md).
  *
  * Only clears when the connection actually recovers (`wsDisconnectedSince`
  * resets in the store) — not on a timer — so a refresh isn't the only way
@@ -34,7 +36,7 @@ export function ReconnectWarningBanner() {
       return `Check the captured logs: ${bgStderrLog}${bgStdoutLog ? ` (and ${bgStdoutLog})` : ''}`;
     }
     if (systemLogFile) {
-      return `Check the debug log: ${systemLogFile}`;
+      return `Check the event log: ${systemLogFile}`;
     }
     return 'Check the terminal where `conductor run` was launched, or re-run with --log-file to capture one.';
   })();
