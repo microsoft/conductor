@@ -37,6 +37,9 @@ if TYPE_CHECKING:
 _CHECK = "[green]✓[/green]"
 _CROSS = "[red]✗[/red]"
 _DASH = "[dim]—[/dim]"
+_OPTIONAL_MARK = "○"
+"""Neutral glyph for an absent *optional* credential — deliberately not the
+red ``✗`` used for a genuinely missing required credential (issue #319)."""
 
 
 def run_doctor(
@@ -229,13 +232,25 @@ def _tier_cell(tier: str | None) -> str:
 
 
 def _credentials_cell(diag: ProviderDiagnostic) -> str:
-    """Format credential env-var presence (presence only, never values)."""
+    """Format credential env-var presence (presence only, never values).
+
+    A present credential is a green ``✓``. An absent credential renders as a
+    red ``✗`` only when it is a genuine requirement; for providers whose env
+    vars are optional overrides (they authenticate via a CLI login on disk —
+    ``diag.credentials_optional``), an absent credential renders as a neutral
+    dim ``○`` instead, so an all-absent cell does not read as "broken". The
+    accompanying auth-path note is surfaced in the Notes column (issue #319).
+    """
     if not diag.credential_env_vars:
         return _DASH
-    lines = [
-        f"{_CHECK} {cred.name}" if cred.present else f"[dim]{_CROSS} {cred.name}[/dim]"
-        for cred in diag.credential_env_vars
-    ]
+    lines: list[str] = []
+    for cred in diag.credential_env_vars:
+        if cred.present:
+            lines.append(f"{_CHECK} {cred.name}")
+        elif diag.credentials_optional:
+            lines.append(f"[dim]{_OPTIONAL_MARK} {cred.name}[/dim]")
+        else:
+            lines.append(f"[dim]{_CROSS} {cred.name}[/dim]")
     return "\n".join(lines)
 
 
