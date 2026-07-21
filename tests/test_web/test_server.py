@@ -11,6 +11,7 @@ Tests cover:
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import time
 import traceback
@@ -192,18 +193,38 @@ class TestLateJoiner:
 class TestAutoShutdown:
     """Tests for --web-bg auto-shutdown logic."""
 
-    def test_workflow_completed_sets_flag(self) -> None:
-        """Emitting workflow_completed sets the internal flag."""
+    def test_workflow_completed_sets_flag(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Emitting workflow_completed sets the internal flag.
+
+        Also asserts the grace timer stays unarmed *without* an exception
+        being swallowed by ``WorkflowEventEmitter.emit()``'s subscriber
+        catch-all: this synchronous ``emit()`` runs with no running event
+        loop, exercising the loop-safety guard in ``_maybe_start_grace_timer``
+        (issue #318). A bare ``_grace_task is None`` assertion alone can't
+        tell a guarded no-op apart from an unguarded ``RuntimeError`` from
+        ``asyncio.create_task()`` getting silently caught and logged by
+        ``emit()`` — so this also asserts nothing was logged there.
+        """
         emitter, dashboard = _make_dashboard(bg=True)
         assert dashboard._workflow_completed is False
-        emitter.emit(_make_event("workflow_completed", elapsed=5.0))
+        with caplog.at_level(logging.ERROR, logger="conductor.events"):
+            emitter.emit(_make_event("workflow_completed", elapsed=5.0))
         assert dashboard._workflow_completed is True
+        assert dashboard._grace_task is None
+        assert "Event subscriber raised an exception" not in caplog.text
 
-    def test_workflow_failed_sets_flag(self) -> None:
-        """Emitting workflow_failed sets the internal flag."""
+    def test_workflow_failed_sets_flag(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Emitting workflow_failed sets the internal flag.
+
+        Also asserts the grace timer stays unarmed with no swallowed exception
+        (see ``test_workflow_completed_sets_flag`` for why this matters).
+        """
         emitter, dashboard = _make_dashboard(bg=True)
-        emitter.emit(_make_event("workflow_failed", error_type="Error", message="boom"))
+        with caplog.at_level(logging.ERROR, logger="conductor.events"):
+            emitter.emit(_make_event("workflow_failed", error_type="Error", message="boom"))
         assert dashboard._workflow_completed is True
+        assert dashboard._grace_task is None
+        assert "Event subscriber raised an exception" not in caplog.text
 
     @pytest.mark.asyncio
     async def test_wait_for_clients_disconnect_resolves(self) -> None:
@@ -324,6 +345,51 @@ class TestAutoShutdown:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
+
+    @pytest.mark.asyncio
+    async def test_unwatched_run_arms_grace_timer_on_failure(self) -> None:
+        """Root workflow_failed also arms the grace timer when unwatched.
+
+        Regression for issue #318: the arming call in ``_on_event`` covers both
+        terminal event types via one shared ``if``, but nothing previously
+        verified ``workflow_failed`` specifically — a future change that split
+        the conditional and only wired arming for ``workflow_completed`` would
+        otherwise go undetected.
+        """
+        emitter, dashboard = _make_dashboard(bg=True)
+        assert dashboard._grace_task is None
+
+        emitter.emit(_make_event("workflow_failed", error_type="Error", message="boom"))
+
+        assert dashboard._workflow_completed is True
+        assert dashboard._grace_task is not None
+
+        dashboard._grace_task.cancel()
+        dashboard._grace_task = asyncio.create_task(_short_grace(dashboard._bg_event, 0.05))
+        await asyncio.wait_for(dashboard.wait_for_clients_disconnect(), timeout=1.0)
+        assert dashboard._bg_event.is_set()
+
+    @pytest.mark.asyncio
+    async def test_connected_client_keeps_grace_timer_unarmed_on_completion(self) -> None:
+        """Root completion while a client is connected must not arm the timer.
+
+        Regression guard for issue #318: ``_on_event`` now calls
+        ``_maybe_start_grace_timer()`` unconditionally on the root terminal
+        event, relying entirely on the pre-existing ``if self._connections:
+        return`` guard to avoid cutting a *watched* run's post-run dashboard
+        window short. Nothing previously combined a connected client with a
+        completion event to prove that guard is actually exercised from this
+        new call site. This must run with a live event loop (``async def``)
+        so the connections check — not the loop-safety no-op — is what's
+        actually under test.
+        """
+        emitter, dashboard = _make_dashboard(bg=True)
+        dashboard._connections.add(MagicMock())
+
+        emitter.emit(_make_event("workflow_completed", elapsed=1.0))
+
+        assert dashboard._workflow_completed is True
+        assert dashboard._grace_task is None
 
 
 class TestBroadcastErrorIsolation:

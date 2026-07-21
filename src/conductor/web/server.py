@@ -473,18 +473,13 @@ class WebDashboard:
         self._event_history.append(event_dict)
         self._queue.put_nowait(event_dict)
 
-        # Arm the --web-bg auto-shutdown grace timer when the *root* workflow
-        # reaches a terminal event. Gating on the root event (sub-workflow
-        # terminal events carry a non-empty ``data.subworkflow_path``) avoids a
-        # premature shutdown while the root run is still executing. Arming here —
-        # not only from the WebSocket-disconnect paths — ensures an unwatched run
-        # (zero clients ever connected) still shuts down instead of blocking
-        # forever in ``wait_for_clients_disconnect()`` (issue #318).
-        # ``_maybe_start_grace_timer`` no-ops while clients are connected and
-        # when there is no running event loop (synchronous ``emit()`` in tests).
-        if event.type in ("workflow_completed", "workflow_failed") and self._is_root_event(
-            event_dict
-        ):
+        # Also arm the grace timer here (not only from the WebSocket-disconnect
+        # paths) so an unwatched run — zero clients ever connected — still
+        # shuts down instead of blocking forever in
+        # ``wait_for_clients_disconnect()`` (issue #318). See ``_is_root_event``
+        # and ``_maybe_start_grace_timer`` for the gating/no-op details.
+        is_terminal_event = event.type in ("workflow_completed", "workflow_failed")
+        if is_terminal_event and self._is_root_event(event_dict):
             self._workflow_completed = True
             self._maybe_start_grace_timer()
 
@@ -1039,8 +1034,12 @@ class WebDashboard:
         try:
             asyncio.get_running_loop()
         except RuntimeError:
-            # No running event loop — there is no server loop to shut down,
-            # so there is nothing to arm (and ``create_task`` would raise).
+            # No running loop to shut down; create_task() would raise. Log so
+            # an unexpected occurrence outside tests (which would silently
+            # reproduce the #318 hang) leaves a trace.
+            logger.debug(
+                "_maybe_start_grace_timer: no running event loop; skipping grace-timer arm"
+            )
             return
         self._grace_task = asyncio.create_task(self._grace_countdown())
 
