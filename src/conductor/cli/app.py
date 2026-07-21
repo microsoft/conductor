@@ -169,6 +169,7 @@ def _workflow_has_human_gate(workflow_path: Path) -> bool:
 
         config = load_config(workflow_path)
     except Exception:  # noqa: BLE001 — defer real validation to the loader path
+        logger.debug("Best-effort human_gate probe failed to load %s", workflow_path, exc_info=True)
         return False
     return any(getattr(a, "type", None) == "human_gate" for a in config.agents) or any(
         getattr(getattr(fe, "agent", None), "type", None) == "human_gate" for fe in config.for_each
@@ -187,6 +188,11 @@ def _print_web_bg_human_gate_notice(url: str) -> None:
     """
     from urllib.parse import urlparse
 
+    # ``url`` is always a live, bound ``http://127.0.0.1:<port>`` by the time
+    # this runs — ``_finalize_background_launch`` in bg_runner.py confirms the
+    # child is listening on that exact port before returning it — so ``.port``
+    # is always a valid 1-65535 int and this can't raise. Fall back to a
+    # placeholder anyway in case that invariant is ever relaxed.
     port = urlparse(url).port
     port_hint = str(port) if port is not None else "<port>"
     console.print(
@@ -935,7 +941,8 @@ def resume(
                 # Checkpoint unreadable — let the normal resume path surface it.
                 pass
         # Background human gates are now resolvable from the dashboard /
-        # ``conductor gate-respond`` (issue #286); note how instead of aborting.
+        # ``conductor gate-respond`` (issue #286); compute the notice flag
+        # here instead of aborting.
         notify_gate = (
             not skip_gates
             and gate_check_workflow is not None

@@ -1726,12 +1726,70 @@ class TestWorkflowEngineHumanGates:
 
         with (
             patch("sys.stdin.isatty", return_value=True),
-            patch.object(engine.gate_handler, "handle_gate", side_effect=_never_returns),
+            patch.object(
+                engine.gate_handler, "handle_gate", side_effect=_never_returns
+            ) as mock_cli_handle,
         ):
             result = await engine.run({})
 
         assert result["received"] == "ok"
         mock_dashboard.wait_for_gate_response.assert_awaited_once_with("approval_gate")
+        # Prove the CLI arm was actually started (not just that the web
+        # dashboard eventually won) — this is what distinguishes "raced" from
+        # "took the web-only shortcut," which would also produce this result.
+        mock_cli_handle.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_human_gate_bg_mode_without_dashboard_raises_clear_error(self) -> None:
+        """bg_mode + no dashboard must raise, not silently crash with EOFError.
+
+        Covers the case where the dashboard failed to start in a ``--web-bg``
+        child (``web_dashboard=None``) while ``_bg_mode`` is still True. Before
+        this fix, ``_handle_gate_with_web`` fell through unconditionally to
+        the CLI prompt handler whenever no dashboard was attached, regardless
+        of ``cli_usable`` — reproducing the original #286 ``EOFError`` crash
+        via a narrower trigger. The CLI handler must never be invoked here;
+        instead a ``HumanGateError`` with an actionable message must surface.
+        """
+        from unittest.mock import patch
+
+        from conductor.engine.workflow import RunContext
+        from conductor.exceptions import HumanGateError
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(name="gate-bg-no-dashboard", entry_point="approval_gate"),
+            agents=[
+                AgentDef(
+                    name="approval_gate",
+                    type="human_gate",
+                    prompt="Approve?",
+                    options=[
+                        GateOption(label="Approve", value="approved", route="$end"),
+                    ],
+                ),
+            ],
+            output={"result": "done"},
+        )
+
+        def mock_handler(agent, prompt, context):
+            return {"received": "ok"}
+
+        provider = CopilotProvider(mock_handler=mock_handler)
+        engine = WorkflowEngine(
+            config,
+            provider,
+            skip_gates=False,
+            web_dashboard=None,
+            run_context=RunContext(bg_mode=True),
+        )
+
+        with (
+            patch.object(engine.gate_handler, "handle_gate") as mock_cli_handle,
+            pytest.raises(HumanGateError, match="approval_gate"),
+        ):
+            await engine.run({})
+
+        mock_cli_handle.assert_not_called()
 
 
 class TestWorkflowEngineLifecycleHooks:
