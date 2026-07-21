@@ -323,82 +323,99 @@ def gate_workflow_file(tmp_path: Path) -> Path:
     return f
 
 
-class TestWebBgHumanGateValidation:
-    """``--web-bg`` must abort pre-fork when the workflow has a ``human_gate``.
+def _fake_bg_launch(url: str = "http://127.0.0.1:9999") -> object:
+    """Build a ``BackgroundLaunch`` stand-in for a mocked ``--web-bg`` fork."""
+    from conductor.cli.bg_runner import BackgroundLaunch
 
-    Without this check, ``--web-bg`` forks a detached child whose stdin is
-    redirected to ``DEVNULL``; ``Prompt.ask`` then raises ``EOFError`` and
-    the parent only sees ``"Background process exited immediately"``, with
-    no mention of ``human_gate`` or ``--skip-gates``. See
-    ``docs/projects/usability-features/external-workflow-friction.plan.md``
-    §4.4.
+    return BackgroundLaunch(
+        url=url,
+        stderr_log=Path("/tmp/conductor-test-deadbeef.bg.stderr.log"),
+        stdout_log=Path("/tmp/conductor-test-deadbeef.bg.stdout.log"),
+        run_id="deadbeef",
+    )
+
+
+# Pin a wide console so the Rich-rendered gate notice never wraps mid-token on
+# CI's narrow non-TTY width (see repo memory on width-sensitive CLI tests).
+_WIDE = {"COLUMNS": "200"}
+
+
+class TestWebBgHumanGateNotice:
+    """``--web-bg`` + ``human_gate`` now forks and points at gate resolution.
+
+    Background human gates are resolvable from the dashboard modal or the
+    ``conductor gate respond`` CLI (issue #286), so ``--web-bg`` no longer
+    aborts pre-fork. Instead the launch proceeds and prints a notice naming
+    the dashboard URL / port and ``conductor gate respond``. ``--skip-gates``
+    still auto-selects the first option, so no notice is shown in that mode.
     """
 
-    def test_run_web_bg_with_human_gate_aborts_before_fork(self, gate_workflow_file: Path) -> None:
-        """``run --web-bg`` + ``human_gate`` (no ``--skip-gates``) → no fork."""
-        with patch("conductor.cli.bg_runner.launch_background") as mock_launch:
-            result = runner.invoke(app, ["run", str(gate_workflow_file), "--web-bg"])
-
-        assert result.exit_code != 0
-        assert not mock_launch.called
-        # The error must name the actual problem and at least one remedy.
-        # Include stderr because Click 8.3+ separates streams and the abort
-        # message is intentionally emitted to stderr.
-        combined = (
-            (result.output or "")
-            + (result.stderr or "")
-            + (str(result.exception) if result.exception else "")
-        )
-        assert "human_gate" in combined
-        assert "--skip-gates" in combined
-
-    def test_run_web_bg_with_human_gate_and_skip_gates_proceeds(
+    def test_run_web_bg_with_human_gate_proceeds_with_notice(
         self, gate_workflow_file: Path
     ) -> None:
-        """``--skip-gates`` removes the incompatibility; fork proceeds."""
-        from pathlib import Path as _Path
-
-        from conductor.cli.bg_runner import BackgroundLaunch
-
+        """``run --web-bg`` + ``human_gate`` (no ``--skip-gates``) → fork + notice."""
         with patch("conductor.cli.bg_runner.launch_background") as mock_launch:
-            mock_launch.return_value = BackgroundLaunch(
-                url="http://127.0.0.1:9999",
-                stderr_log=_Path("/tmp/conductor-test-deadbeef.bg.stderr.log"),
-                stdout_log=_Path("/tmp/conductor-test-deadbeef.bg.stdout.log"),
-                run_id="deadbeef",
-            )
+            mock_launch.return_value = _fake_bg_launch()
+            result = runner.invoke(app, ["run", str(gate_workflow_file), "--web-bg"], env=_WIDE)
 
+        assert result.exit_code == 0
+        assert mock_launch.called
+        # The notice must name the problem and how to resolve it. It is emitted
+        # to stderr (Console(stderr=True)); Click 8.3+ separates the streams.
+        combined = (result.output or "") + (result.stderr or "")
+        assert "human_gate" in combined
+        assert "gate respond" in combined
+        assert "9999" in combined  # port extracted from the dashboard URL
+
+    def test_run_web_bg_with_human_gate_and_skip_gates_proceeds_without_notice(
+        self, gate_workflow_file: Path
+    ) -> None:
+        """``--skip-gates`` auto-selects; fork proceeds and no gate notice is shown."""
+        with patch("conductor.cli.bg_runner.launch_background") as mock_launch:
+            mock_launch.return_value = _fake_bg_launch()
             result = runner.invoke(
-                app, ["run", str(gate_workflow_file), "--web-bg", "--skip-gates"]
+                app, ["run", str(gate_workflow_file), "--web-bg", "--skip-gates"], env=_WIDE
             )
 
         assert result.exit_code == 0
         assert mock_launch.called
+        combined = (result.output or "") + (result.stderr or "")
+        assert "gate respond" not in combined
 
-    def test_resume_web_bg_with_human_gate_aborts_before_fork(
+    def test_run_web_bg_without_gate_shows_no_notice(self, tmp_path: Path) -> None:
+        """A gate-free workflow forks without any gate notice."""
+        f = tmp_path / "plain.yaml"
+        f.write_text(_WORKFLOW_YAML)
+        with patch("conductor.cli.bg_runner.launch_background") as mock_launch:
+            mock_launch.return_value = _fake_bg_launch()
+            result = runner.invoke(app, ["run", str(f), "--web-bg"], env=_WIDE)
+
+        assert result.exit_code == 0
+        assert mock_launch.called
+        combined = (result.output or "") + (result.stderr or "")
+        assert "gate respond" not in combined
+
+    def test_resume_web_bg_with_human_gate_proceeds_with_notice(
         self, gate_workflow_file: Path
     ) -> None:
-        """Same check applies to ``resume --web-bg`` (run/resume parity)."""
+        """Same behavior applies to ``resume --web-bg`` (run/resume parity)."""
         with patch("conductor.cli.bg_runner.launch_background_resume") as mock_launch:
-            result = runner.invoke(app, ["resume", str(gate_workflow_file), "--web-bg"])
+            mock_launch.return_value = _fake_bg_launch()
+            result = runner.invoke(app, ["resume", str(gate_workflow_file), "--web-bg"], env=_WIDE)
 
-        assert result.exit_code != 0
-        assert not mock_launch.called
-        combined = (
-            (result.output or "")
-            + (result.stderr or "")
-            + (str(result.exception) if result.exception else "")
-        )
+        assert result.exit_code == 0
+        assert mock_launch.called
+        combined = (result.output or "") + (result.stderr or "")
         assert "human_gate" in combined
-        assert "--skip-gates" in combined
+        assert "gate respond" in combined
 
-    def test_run_web_bg_with_human_gate_inside_for_each_aborts(self, tmp_path: Path) -> None:
-        """``human_gate`` nested in a ``for_each.agent`` must also abort the fork.
+    def test_run_web_bg_with_human_gate_inside_for_each_proceeds_with_notice(
+        self, tmp_path: Path
+    ) -> None:
+        """``human_gate`` nested in a ``for_each.agent`` also triggers the notice.
 
-        The top-level walk over ``config.agents`` misses inline agents
-        declared inside ``for_each`` groups. Without the extra check,
-        ``--web-bg`` still silent-crashes when the gate prompt eventually
-        fires inside the loop.
+        The top-level walk over ``config.agents`` misses inline agents declared
+        inside ``for_each`` groups, so the notice check must scan those too.
         """
         for_each_yaml = """\
 workflow:
@@ -440,27 +457,22 @@ output:
         f.write_text(for_each_yaml)
 
         with patch("conductor.cli.bg_runner.launch_background") as mock_launch:
-            result = runner.invoke(app, ["run", str(f), "--web-bg"])
+            mock_launch.return_value = _fake_bg_launch()
+            result = runner.invoke(app, ["run", str(f), "--web-bg"], env=_WIDE)
 
-        assert result.exit_code != 0
-        assert not mock_launch.called
-        combined = (
-            (result.output or "")
-            + (result.stderr or "")
-            + (str(result.exception) if result.exception else "")
-        )
+        assert result.exit_code == 0
+        assert mock_launch.called
+        combined = (result.output or "") + (result.stderr or "")
         assert "human_gate" in combined
-        assert "--skip-gates" in combined
+        assert "gate respond" in combined
 
-    def test_resume_web_bg_from_checkpoint_only_aborts(
+    def test_resume_web_bg_from_checkpoint_only_proceeds_with_notice(
         self, gate_workflow_file: Path, tmp_path: Path
     ) -> None:
-        """``resume --from <checkpoint> --web-bg`` (no workflow arg) must still
-        abort when the checkpoint's workflow contains a ``human_gate``.
+        """``resume --from <checkpoint> --web-bg`` (no workflow arg) still notices.
 
-        Previously the abort check was skipped because ``resolved_workflow``
-        is ``None`` in this code path; the workflow path is now recovered from
-        the checkpoint JSON so the same guard fires.
+        ``resolved_workflow`` is ``None`` in this code path; the workflow path
+        is recovered from the checkpoint JSON so the gate notice still fires.
         """
         import json as _json
 
@@ -481,14 +493,13 @@ output:
         )
 
         with patch("conductor.cli.bg_runner.launch_background_resume") as mock_launch:
-            result = runner.invoke(app, ["resume", "--from", str(checkpoint), "--web-bg"])
+            mock_launch.return_value = _fake_bg_launch()
+            result = runner.invoke(
+                app, ["resume", "--from", str(checkpoint), "--web-bg"], env=_WIDE
+            )
 
-        assert result.exit_code != 0
-        assert not mock_launch.called
-        combined = (
-            (result.output or "")
-            + (result.stderr or "")
-            + (str(result.exception) if result.exception else "")
-        )
+        assert result.exit_code == 0
+        assert mock_launch.called
+        combined = (result.output or "") + (result.stderr or "")
         assert "human_gate" in combined
-        assert "--skip-gates" in combined
+        assert "gate respond" in combined

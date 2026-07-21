@@ -1,11 +1,10 @@
-import { memo, useMemo } from 'react';
+import { memo } from 'react';
 import {
   BaseEdge,
   EdgeLabelRenderer,
   getBezierPath,
   type EdgeProps,
 } from '@xyflow/react';
-import { useViewedHighlightedEdges } from '@/hooks/use-viewed-context';
 
 export const AnimatedEdge = memo(function AnimatedEdge({
   id,
@@ -15,16 +14,8 @@ export const AnimatedEdge = memo(function AnimatedEdge({
   targetY,
   sourcePosition,
   targetPosition,
-  source,
-  target,
   data,
 }: EdgeProps) {
-  const highlightedEdges = useViewedHighlightedEdges();
-
-  const edgeHighlight = useMemo(() => {
-    return highlightedEdges.find((e) => e.from === source && e.to === target);
-  }, [highlightedEdges, source, target]);
-
   const [edgePath, labelX, labelY] = getBezierPath({
     sourceX,
     sourceY,
@@ -35,10 +26,18 @@ export const AnimatedEdge = memo(function AnimatedEdge({
   });
 
   const whenExpr = (data as Record<string, unknown> | undefined)?.when as string | undefined;
+  // Highlight state is resolved per context and stamped onto edge.data by
+  // WorkflowGraph, since a single viewed-context lookup can't disambiguate
+  // edges rendered inside inline-expanded subworkflows.
+  const highlightState = (data as Record<string, unknown> | undefined)?.highlightState as
+    | 'highlighted'
+    | 'taken'
+    | 'failed'
+    | undefined;
   const hasWhen = !!whenExpr;
-  const isTaken = edgeHighlight?.state === 'taken';
-  const isHighlighted = edgeHighlight?.state === 'highlighted';
-  const isFailed = edgeHighlight?.state === 'failed';
+  const isTaken = highlightState === 'taken';
+  const isHighlighted = highlightState === 'highlighted';
+  const isFailed = highlightState === 'failed';
 
   let strokeColor = 'var(--edge-color)';
   let strokeWidth = 2;

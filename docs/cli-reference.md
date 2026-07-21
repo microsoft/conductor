@@ -7,10 +7,12 @@ Complete command-line reference for Conductor.
 - [Root-Level Options](#root-level-options)
 - [`conductor run`](#conductor-run)
 - [`conductor stop`](#conductor-stop)
-- [`conductor gate-respond`](#conductor-gate-respond)
+- [`conductor gate respond`](#conductor-gate-respond)
+- [`conductor checkpoint list`](#conductor-checkpoint-list)
 - [`conductor validate`](#conductor-validate)
 - [`conductor doctor`](#conductor-doctor)
 - [`conductor registry`](#conductor-registry)
+- [Deprecated command aliases](#deprecated-command-aliases)
 
 ## Root-Level Options
 
@@ -130,18 +132,20 @@ The `--web-bg` flag is a convenience shortcut: it forks a background process run
 
 `--web` and `--web-bg` are mutually exclusive.
 
-**`--web-bg` and `human_gate`** — `--web-bg` is incompatible with workflows
-that contain `human_gate` agents (unless `--skip-gates` is also passed),
-because the detached background process has no stdin to prompt on and the
-child would crash with `EOFError` mid-run. Conductor detects this at
-load time and aborts before forking, with a message listing the options:
+**`--web-bg` and `human_gate`** — background runs support human gates through
+the dashboard. When the workflow reaches a `human_gate`, the detached process
+waits for a response from the web dashboard (the gate modal) or the
+`conductor gate respond` CLI, rather than trying to prompt on the (absent)
+stdin. At launch, when the workflow contains a `human_gate` (and `--skip-gates`
+is not set), Conductor prints a notice with the dashboard URL and the
+`conductor gate respond` command so a parked run doesn't look stuck:
 
-1. Use `--web` (foreground) instead of `--web-bg`
-2. Add `--skip-gates` to auto-select the first option at every gate
-3. Remove `human_gate` steps from the workflow
-4. Use `conductor gate-respond --port <port> --choice <value>` to resolve from CLI
+- Resolve each gate from the dashboard's decision modal, or
+- Run `conductor gate respond --port <port> --choice <value>` (optionally
+  `--agent <name>` and `--input "<text>"`), or
+- Pass `--skip-gates` to auto-select the first option at every gate.
 
-The same check applies to `conductor resume --web-bg`.
+The same behavior applies to `conductor resume --web-bg`.
 
 Background workflows can be stopped with `conductor stop` (see below) or via the stop button in the web dashboard.
 
@@ -267,12 +271,12 @@ conductor stop --port 8080
 conductor stop --all
 ```
 
-## `conductor gate-respond`
+## `conductor gate respond`
 
 Resolve a parked `human_gate` step from the command line without opening a browser. Sends a gate response to a running workflow's web dashboard via HTTP — useful for SSH sessions or headless environments where the dashboard UI is unreachable.
 
 ```bash
-conductor gate-respond [OPTIONS]
+conductor gate respond [OPTIONS]
 ```
 
 ### Options
@@ -291,26 +295,30 @@ If the running workflow was launched with a gate token configured, requests with
 
 ### Auto-Discovery
 
-When `--agent` is omitted, `conductor gate-respond` queries `GET /api/gate-status` on the specified port. If a gate is currently waiting, its agent name is used automatically and printed to the console. If no gate is waiting, the command exits with code 1.
+When `--agent` is omitted, `conductor gate respond` queries `GET /api/gate-status` on the specified port. If a gate is currently waiting, its agent name is used automatically and printed to the console. If no gate is waiting, the command exits with code 1.
 
 ### Examples
 
 ```bash
 # Resolve the only waiting gate (agent auto-discovered)
-conductor gate-respond --port 8080 --choice approve
+conductor gate respond --port 8080 --choice approve
 
 # Resolve a specific named gate
-conductor gate-respond -p 8080 -c reject --agent review-gate
+conductor gate respond -p 8080 -c reject --agent review-gate
 
 # Pass additional free-text input
-conductor gate-respond -p 8080 -c approve --input "Looks good, ship it"
+conductor gate respond -p 8080 -c approve --input "Looks good, ship it"
 
 # Provide auth token via flag
-conductor gate-respond -p 8080 -c approve --token my-secret
+conductor gate respond -p 8080 -c approve --token my-secret
 
 # Provide auth token via environment variable
-CONDUCTOR_GATE_TOKEN=my-secret conductor gate-respond -p 8080 -c approve
+CONDUCTOR_GATE_TOKEN=my-secret conductor gate respond -p 8080 -c approve
 ```
+
+> **Deprecated alias:** `conductor gate-respond` still works but prints a
+> deprecation warning and will be removed in a future release. Use
+> `conductor gate respond` instead.
 
 ### Exit Codes
 
@@ -318,6 +326,36 @@ CONDUCTOR_GATE_TOKEN=my-secret conductor gate-respond -p 8080 -c approve
 |------|---------|
 | 0 | Gate resolved successfully |
 | 1 | Connection error, auth failure, validation error, or no gate waiting |
+
+## `conductor checkpoint list`
+
+List saved workflow checkpoints (failure and periodic), newest first. Each row shows the workflow name, timestamp, trigger, the agent that was running (or about to run), the error type for failure checkpoints, and the checkpoint file path.
+
+```bash
+conductor checkpoint list [WORKFLOW]
+```
+
+### Arguments
+
+| Argument | Description |
+|----------|-------------|
+| `WORKFLOW` | Optional workflow YAML path; filters the list to that workflow only |
+
+### Examples
+
+```bash
+# List all checkpoints across every workflow
+conductor checkpoint list
+
+# List checkpoints for a single workflow
+conductor checkpoint list workflow.yaml
+```
+
+Resume a failed run from its latest checkpoint with `conductor resume`.
+
+> **Deprecated alias:** `conductor checkpoints` still works but prints a
+> deprecation warning and will be removed in a future release. Use
+> `conductor checkpoint list` instead.
 
 ## `conductor validate`
 
@@ -447,12 +485,23 @@ id strings):
 Only the **presence** of credential environment variables is reported —
 values are never read or printed. Detected variables per provider:
 
-| Provider | Environment variables |
-|----------|-----------------------|
-| `copilot` | `GITHUB_TOKEN`, `GH_TOKEN`, `COPILOT_PROVIDER_API_KEY`, `COPILOT_PROVIDER_BEARER_TOKEN` |
-| `claude` | `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` |
-| `claude-agent-sdk` | `ANTHROPIC_API_KEY` |
-| `hermes` | *(none — endpoint / API key are passed explicitly)* |
+| Provider | Environment variables | Requirement |
+|----------|-----------------------|-------------|
+| `copilot` | `GITHUB_TOKEN`, `GH_TOKEN`, `COPILOT_PROVIDER_API_KEY`, `COPILOT_PROVIDER_BEARER_TOKEN`, `COPILOT_PROVIDER_RUNTIME_TOKEN` | optional overrides — authenticates via the GitHub/Copilot CLI login on disk |
+| `claude` | `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` | required (direct Anthropic API) |
+| `claude-agent-sdk` | `ANTHROPIC_API_KEY` | optional override — authenticates via `claude login` |
+| `hermes` | *(none — endpoint / API key are passed explicitly)* | — |
+| `openai-agents` | *(none — not yet implemented)* | — |
+
+For **`copilot`** and **`claude-agent-sdk`**, these env vars are *optional
+overrides*: both providers authenticate primarily via an on-disk CLI login
+(the GitHub/Copilot CLI and `claude login`, respectively), so an all-absent
+credentials cell for them is expected — **not** a misconfiguration. Each
+absent optional variable renders as a neutral `○` (with a short note in the
+**Notes** column) rather than the red `✗` used for a genuinely missing
+*required* credential. The offline view only ever reports env-var
+*presence*, never validity, for **any** provider — run a live connection
+probe with `--check` to confirm a provider is actually ready.
 
 ### Exit codes
 
@@ -567,6 +616,19 @@ that includes one.
 
 See [design/registry.md](./design/registry.md) for the full design.
 
+## Deprecated command aliases
+
+The command surface groups related subcommands under nouns (`checkpoint`,
+`gate`, `registry`). Two older flat commands are retained as **deprecated
+aliases** so existing scripts keep working. Each still runs, but prints a
+one-line deprecation warning to stderr and forwards to its replacement. They
+are hidden from `--help` and are slated for removal in a future release.
+
+| Deprecated alias | Use instead |
+|------------------|-------------|
+| `conductor checkpoints [WORKFLOW]` | `conductor checkpoint list [WORKFLOW]` |
+| `conductor gate-respond [OPTIONS]` | `conductor gate respond [OPTIONS]` |
+
 ## Environment Variables
 
 | Variable | Description |
@@ -574,7 +636,7 @@ See [design/registry.md](./design/registry.md) for the full design.
 | `ANTHROPIC_API_KEY` | API key for Claude provider |
 | `GITHUB_TOKEN` | Token for Copilot provider (if not using GitHub CLI auth) |
 | `CONDUCTOR_LOG_LEVEL` | Logging level: DEBUG, INFO, WARNING, ERROR |
-| `CONDUCTOR_GATE_TOKEN` | Auth token required by `conductor gate-respond` (and checked by `POST /api/gate-respond`) when the workflow dashboard is started with a gate token |
+| `CONDUCTOR_GATE_TOKEN` | Auth token required by `conductor gate respond` (and checked by `POST /api/gate-respond`) when the workflow dashboard is started with a gate token |
 
 ## Exit Codes
 

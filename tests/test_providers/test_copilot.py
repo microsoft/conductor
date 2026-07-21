@@ -2,10 +2,11 @@
 
 import contextlib
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
-from conductor.config.schema import AgentDef
+from conductor.config.schema import AgentDef, ProviderSettings, ToolOutputConfig
 from conductor.exceptions import ProviderError
 from conductor.providers.copilot import CopilotProvider, RetryConfig, SDKResponse
 
@@ -24,6 +25,22 @@ class TestCopilotProvider:
         provider = CopilotProvider(mock_handler=stub_handler)
         result = await provider.validate_connection()
         assert result is True
+
+    @pytest.mark.asyncio
+    async def test_validate_external_runtime_connection_error(self) -> None:
+        """External runtime failures should not recommend installing a local CLI."""
+        provider = CopilotProvider(
+            provider_settings=ProviderSettings(name="copilot", runtime_url="localhost:3000")
+        )
+        provider._ensure_client_started = AsyncMock(  # type: ignore[method-assign]
+            side_effect=ConnectionRefusedError("connection refused")
+        )
+
+        with pytest.raises(ProviderError) as exc_info:
+            await provider.validate_connection()
+
+        assert "external Copilot runtime" in (exc_info.value.suggestion or "")
+        assert "COPILOT_PROVIDER_RUNTIME_TOKEN" in (exc_info.value.suggestion or "")
 
     @pytest.mark.asyncio
     async def test_close(self) -> None:
@@ -440,6 +457,29 @@ class TestPromptSchemaGeneration:
         )
         assert schema["plan"]["required"] == ["questions", "areas", "sources"]
         assert schema["summary"]["description"] == "The summary field"
+
+    def test_build_prompt_schema_depth_limit_enforced(self) -> None:
+        """Excessively nested schemas raise ValidationError with the pinned message.
+
+        The Copilot provider must convert the shared core's SchemaDepthError
+        into the exact existing ValidationError message and suggestion so
+        callers see stable behavior.
+        """
+        from conductor.config.schema import OutputField
+        from conductor.exceptions import ValidationError
+
+        provider = CopilotProvider(mock_handler=stub_handler)
+
+        # Build an 11-level nested object chain to exceed the default depth limit of 10.
+        inner: OutputField = OutputField(type="string")
+        for _ in range(11):
+            inner = OutputField(type="object", properties={"nested": inner})
+
+        with pytest.raises(ValidationError) as exc_info:
+            provider._build_prompt_schema({"root": inner})
+
+        assert "Schema nesting depth exceeds maximum of 10 levels" in str(exc_info.value)
+        assert exc_info.value.suggestion == "Simplify your output schema to reduce nesting depth"
 
     @pytest.mark.asyncio
     async def test_execute_appends_nested_schema_to_prompt(
@@ -1201,6 +1241,145 @@ class TestCopilotExecuteDialogTurn:
                 user_message="hi",
                 history=[],
             )
+
+
+class TestCopilotProviderLargeOutput:
+    """Tests for ``large_output`` forwarding to the Copilot SDK."""
+
+    @staticmethod
+    def _captured_create_session(provider: CopilotProvider) -> dict[str, Any]:
+        """Execute with a fake client and return captured create_session kwargs."""
+        captured: dict[str, Any] = {}
+
+        class _FakeSession:
+            session_id = "sess-large-output"
+
+            async def disconnect(self) -> None:
+                return None
+
+        class _FakeClient:
+            async def create_session(self, **kwargs: Any) -> _FakeSession:
+                captured.update(kwargs)
+                return _FakeSession()
+
+        provider._client = _FakeClient()
+        provider._mock_handler = None
+        provider._started = True
+
+        import asyncio
+
+        async def _noop() -> None:
+            return None
+
+        async def _fake_send_and_wait(*args: Any, **kwargs: Any) -> SDKResponse:
+            return SDKResponse(content='{"ok":true}')
+
+        provider._ensure_client_started = _noop  # type: ignore[method-assign]
+        provider._send_and_wait = _fake_send_and_wait  # type: ignore[method-assign]
+
+        agent = AgentDef(name="agent", model="gpt-4o", prompt="p")
+        asyncio.run(provider.execute(agent, {}, "p"))
+        return captured
+
+    def _captured_dialog_session(self, provider: CopilotProvider) -> dict[str, Any]:
+        """Run a dialog turn and return the create_session kwargs it used."""
+        captured: dict[str, Any] = {}
+
+        class _AsyncMockSession:
+            def __init__(self) -> None:
+                self._callback: Any = None
+
+            def on(self, callback: Any) -> None:
+                self._callback = callback
+
+            async def send(self, prompt: str) -> None:
+                self._callback(_AsyncMockEvent("assistant.message", "ok"))
+                self._callback(_AsyncMockEvent("session.idle"))
+
+        class _AsyncMockEvent:
+            def __init__(self, event_type: str, content: str = "") -> None:
+                self.type = _AsyncMockType(event_type)
+                self.data = _AsyncMockData(content)
+
+        class _AsyncMockType:
+            def __init__(self, value: str) -> None:
+                self.value = value
+
+        class _AsyncMockData:
+            def __init__(self, content: str) -> None:
+                self.content = content
+                self.message = content
+
+        class _Client:
+            async def create_session(self, **kwargs: Any) -> Any:
+                captured.update(kwargs)
+                return _AsyncMockSession()
+
+        provider._client = _Client()
+        provider._started = True
+
+        import asyncio
+
+        asyncio.run(provider.execute_dialog_turn("sys", "hi", []))
+        return captured
+
+    def test_default_config_forwards_large_output_to_create_session(self) -> None:
+        """Default ToolOutputConfig produces enabled=True and default max_size_bytes."""
+        provider = CopilotProvider()
+        captured = self._captured_create_session(provider)
+        assert captured["large_output"] == {"enabled": True, "max_size_bytes": 50000}
+
+    def test_disabled_config_forwards_enabled_false(self) -> None:
+        """enabled=False is forwarded as enabled=False because the SDK defaults to enabled."""
+        provider = CopilotProvider(tool_output=ToolOutputConfig(enabled=False))
+        captured = self._captured_create_session(provider)
+        assert captured["large_output"] == {"enabled": False}
+
+    def test_spill_to_file_false_maps_to_enabled_false(self) -> None:
+        """spill_to_file=False disables large_output handling entirely (SDK limitation)."""
+        provider = CopilotProvider(tool_output=ToolOutputConfig(spill_to_file=False))
+        captured = self._captured_create_session(provider)
+        assert captured["large_output"] == {"enabled": False}
+
+    def test_spill_to_file_false_logs_a_warning(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Requirement: disabling spill on Copilot silently uncaps tool output.
+
+        Unlike Claude (which still truncates to max_chars and only skips the
+        file write), the Copilot SDK has no truncate-without-spill mode, so
+        spill_to_file=False disables size limiting entirely. That divergence
+        must be surfaced at runtime, not just in a docstring.
+        """
+        provider = CopilotProvider(tool_output=ToolOutputConfig(spill_to_file=False))
+        with caplog.at_level("WARNING"):
+            self._captured_create_session(provider)
+        assert any(
+            "spill_to_file=False disables tool output size limiting" in record.message
+            for record in caplog.records
+        )
+
+    def test_spill_dir_is_forwarded_when_set(self) -> None:
+        """An explicit spill_dir becomes output_directory in SDK config."""
+        provider = CopilotProvider(
+            tool_output=ToolOutputConfig(spill_dir="/tmp/custom-tool-output")
+        )
+        captured = self._captured_create_session(provider)
+        assert captured["large_output"] == {
+            "enabled": True,
+            "max_size_bytes": 50000,
+            "output_directory": "/tmp/custom-tool-output",
+        }
+
+    def test_large_output_forwarded_to_dialog_session(self) -> None:
+        """Dialog turns also receive the large_output config."""
+        provider = CopilotProvider()
+        captured = self._captured_dialog_session(provider)
+        assert captured["large_output"] == {"enabled": True, "max_size_bytes": 50000}
+
+    def test_large_output_disabled_forwards_enabled_false_for_dialog_session(self) -> None:
+        """enabled=False is forwarded as enabled=False in dialog create_session kwargs."""
+        provider = CopilotProvider(tool_output=ToolOutputConfig(enabled=False))
+        captured = self._captured_dialog_session(provider)
+        assert captured["large_output"] == {"enabled": False}
 
 
 class TestGetMaxPromptTokens:

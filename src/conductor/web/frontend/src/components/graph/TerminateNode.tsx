@@ -3,7 +3,7 @@ import { Handle, Position, type NodeProps } from '@xyflow/react';
 import { Octagon } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { NODE_STATUS_HEX } from '@/lib/constants';
-import { useViewedNodes } from '@/hooks/use-viewed-context';
+import { useNodeLiveData } from '@/hooks/use-viewed-context';
 import { NodeTooltip } from './NodeTooltip';
 import type { GraphNodeData } from './graph-layout';
 import type { NodeStatus } from '@/lib/constants';
@@ -26,14 +26,13 @@ import type { NodeStatus } from '@/lib/constants';
  * responsible for the workflow-wide red/green message — this node is just
  * about identifying the terminate step in the DAG graph.
  */
-export const TerminateNode = memo(function TerminateNode({ data, id, selected }: NodeProps) {
+export const TerminateNode = memo(function TerminateNode({ data, selected }: NodeProps) {
   const nodeData = data as unknown as GraphNodeData;
-  const viewedNodes = useViewedNodes();
-  const storeStatus = viewedNodes[id]?.status;
+  const nd = useNodeLiveData(nodeData);
+  const storeStatus = nd?.status;
   const status = (storeStatus || nodeData.status || 'pending') as NodeStatus;
   const borderColor = NODE_STATUS_HEX[status] || NODE_STATUS_HEX.pending;
 
-  const nd = viewedNodes[id];
   const reason = nd?.termination_reason;
   const terminationStatus = nd?.termination_status;
   const errorMessage = nd?.error_message;

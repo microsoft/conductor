@@ -51,21 +51,56 @@ ALL_SECTIONS: tuple[Section, ...] = ("env", "providers", "registries")
 # Surfaced as an informational note, not an error.
 _NOT_IMPLEMENTED: frozenset[str] = frozenset({"openai-agents"})
 
-# Per-provider credential environment variables whose *presence* (never
-# value) is reported in the offline diagnostic. Copilot authenticates via
-# the GitHub/Copilot CLI login on disk, so its GitHub-token vars are
-# best-effort hints rather than hard requirements.
-_CREDENTIAL_ENV_VARS: dict[str, tuple[str, ...]] = {
-    "copilot": (
-        "GITHUB_TOKEN",
-        "GH_TOKEN",
-        "COPILOT_PROVIDER_API_KEY",
-        "COPILOT_PROVIDER_BEARER_TOKEN",
+
+@dataclass(frozen=True)
+class _CredentialSpec:
+    """Static credential metadata for a provider's offline diagnostic.
+
+    Only the *presence* of each var in ``env_vars`` is ever reported (never
+    its value). ``optional_auth_note`` collapses two related facts into one
+    field so they can't drift apart: ``None`` means the provider genuinely
+    requires one of ``env_vars``; a non-``None`` string means the provider
+    has a credential path outside these env vars (e.g. an on-disk CLI
+    login), so an all-absent credentials cell for it is expected — not a
+    misconfiguration — and the string is that path, surfaced in the
+    rendered report so the absence doesn't read as "provider is broken"
+    (issue #319). See ``optional`` for the derived boolean.
+    """
+
+    env_vars: tuple[str, ...] = ()
+    optional_auth_note: str | None = None
+
+    @property
+    def optional(self) -> bool:
+        """Whether every var in ``env_vars`` is an optional override."""
+        return self.optional_auth_note is not None
+
+
+# Per-provider credential environment variables and their offline-diagnostic
+# semantics. See each entry's ``optional_auth_note`` for *why* that provider's
+# vars are optional overrides rather than hard requirements.
+_CREDENTIAL_SPECS: dict[str, _CredentialSpec] = {
+    "copilot": _CredentialSpec(
+        env_vars=(
+            "GITHUB_TOKEN",
+            "GH_TOKEN",
+            "COPILOT_PROVIDER_API_KEY",
+            "COPILOT_PROVIDER_BEARER_TOKEN",
+            "COPILOT_PROVIDER_RUNTIME_TOKEN",
+        ),
+        optional_auth_note=(
+            "authenticates via GitHub/Copilot CLI login; env vars are optional overrides"
+        ),
     ),
-    "claude": ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"),
-    "claude-agent-sdk": ("ANTHROPIC_API_KEY",),
-    "hermes": (),
-    "openai-agents": (),
+    "claude": _CredentialSpec(env_vars=("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")),
+    "claude-agent-sdk": _CredentialSpec(
+        env_vars=("ANTHROPIC_API_KEY",),
+        optional_auth_note=(
+            "authenticates via `claude login`; ANTHROPIC_API_KEY is an optional override"
+        ),
+    ),
+    "hermes": _CredentialSpec(),
+    "openai-agents": _CredentialSpec(),
 }
 
 # Update-check opt-out env var (mirrors cli/update.py so diagnostics does not
@@ -136,6 +171,7 @@ class ProviderDiagnostic:
     implemented: bool
     tier: str | None
     credential_env_vars: list[CredentialEnvVar] = field(default_factory=list)
+    credentials_optional: bool = False
     checked: bool = False
     connection_ok: bool | None = None
     connection_error: str | None = None
@@ -151,6 +187,7 @@ class ProviderDiagnostic:
             "implemented": self.implemented,
             "tier": self.tier,
             "credential_env_vars": [c.to_dict() for c in self.credential_env_vars],
+            "credentials_optional": self.credentials_optional,
             "checked": self.checked,
             "connection_ok": self.connection_ok,
             "connection_error": self.connection_error,
@@ -285,12 +322,9 @@ def _provider_tier(name: str) -> str | None:
         return None
 
 
-def _credential_env_vars(name: str) -> list[CredentialEnvVar]:
+def _credential_env_vars(spec: _CredentialSpec) -> list[CredentialEnvVar]:
     """Return presence flags for the provider's credential env vars."""
-    return [
-        CredentialEnvVar(var, bool(os.environ.get(var)))
-        for var in _CREDENTIAL_ENV_VARS.get(name, ())
-    ]
+    return [CredentialEnvVar(var, bool(os.environ.get(var))) for var in spec.env_vars]
 
 
 def _update_check_disabled() -> bool:
@@ -438,14 +472,19 @@ async def gather_provider(
     """
     implemented = name not in _NOT_IMPLEMENTED
     installed = _sdk_available(name) if implemented else False
+    spec = _CREDENTIAL_SPECS.get(name, _CredentialSpec())
 
     diag = ProviderDiagnostic(
         name=name,
         installed=installed,
         implemented=implemented,
         tier=_provider_tier(name),
-        credential_env_vars=_credential_env_vars(name),
-        note=None if implemented else "not yet implemented",
+        credential_env_vars=_credential_env_vars(spec),
+        credentials_optional=spec.optional,
+        # "not yet implemented" always wins over a provider's own credential
+        # note — there is nothing useful to say about a provider's auth path
+        # when it can't be instantiated at all.
+        note="not yet implemented" if not implemented else spec.optional_auth_note,
     )
 
     do_check = check or list_models

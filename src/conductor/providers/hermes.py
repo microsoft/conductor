@@ -23,6 +23,10 @@ from typing import TYPE_CHECKING, Any
 
 from conductor.exceptions import ProviderError, ValidationError
 from conductor.executor.output import parse_json_output, validate_output
+from conductor.providers._schema import (
+    SchemaDepthError,
+    build_hermes_legacy_prompt_schema,
+)
 from conductor.providers.base import AgentOutput, AgentProvider, EventCallback
 from conductor.providers.capabilities import ProviderCapabilities
 from conductor.providers.reasoning import ReasoningEffort, resolve_reasoning_effort
@@ -639,33 +643,18 @@ async def _wait_for_event(event: asyncio.Event) -> None:
 
 
 def _build_prompt_schema(schema: dict[str, Any], depth: int = 0) -> dict[str, Any]:
-    """Build a prompt-facing schema description from OutputField definitions."""
-    if depth > _MAX_SCHEMA_DEPTH:
+    """Build a prompt-facing schema description from OutputField definitions.
+
+    Wraps the shared Hermes legacy builder, converting core depth errors into
+    the provider's ValidationError with the exact legacy message and suggestion.
+    """
+    try:
+        return build_hermes_legacy_prompt_schema(schema, depth=depth, max_depth=_MAX_SCHEMA_DEPTH)
+    except SchemaDepthError as exc:
         raise ValidationError(
             f"Schema nesting depth exceeds maximum of {_MAX_SCHEMA_DEPTH} levels",
             suggestion="Simplify your output schema to reduce nesting depth",
-        )
-    result: dict[str, Any] = {}
-    for field_name, field_def in schema.items():
-        field_schema: dict[str, Any] = {"type": field_def.type}
-        if field_def.description:
-            field_schema["description"] = field_def.description
-        else:
-            field_schema["description"] = f"The {field_name} field"
-        if field_def.type == "object" and field_def.properties:
-            field_schema["properties"] = _build_prompt_schema(field_def.properties, depth + 1)
-            field_schema["required"] = list(field_def.properties.keys())
-        if field_def.type == "array" and field_def.items:
-            item_schema: dict[str, Any] = {"type": field_def.items.type}
-            if field_def.items.description:
-                item_schema["description"] = field_def.items.description
-            if field_def.items.type == "object" and field_def.items.properties:
-                item_schema["properties"] = _build_prompt_schema(
-                    field_def.items.properties, depth + 1
-                )
-            field_schema["items"] = item_schema
-        result[field_name] = field_schema
-    return result
+        ) from exc
 
 
 def _build_recovery_prompt(parse_error: str, original_response: str, schema: dict[str, Any]) -> str:

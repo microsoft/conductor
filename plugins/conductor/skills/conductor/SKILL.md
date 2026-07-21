@@ -42,7 +42,7 @@ conductor update                                         # Check + print install
 conductor update --apply                                 # Check + launch installer (then exit)
 conductor resume workflow.yaml                           # Resume from last checkpoint
 conductor resume workflow.yaml --web                     # Resume with dashboard (run-flag parity)
-conductor checkpoints                                    # List available checkpoints
+conductor checkpoint list                                # List available checkpoints
 ```
 
 Full output is shown by default. Use `-q` (quiet) for minimal output or `-s` (silent) for JSON-only — both are root-level options and must come *before* the subcommand (`conductor -q run ...`, not `conductor run ... -q`).
@@ -58,7 +58,7 @@ Full output is shown by default. Use `-q` (quiet) for minimal output or `-s` (si
 - Cost tracking configuration
 
 **Running or debugging workflows?** → See [references/execution.md](references/execution.md)
-- CLI options and flags (run, resume, checkpoints, stop, update)
+- CLI options and flags (run, resume, checkpoint list, stop, update)
 - Debugging techniques
 - Error troubleshooting
 - Checkpoint/resume after failures

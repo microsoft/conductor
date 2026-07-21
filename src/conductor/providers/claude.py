@@ -24,17 +24,27 @@ import json
 import logging
 import os
 import random
+import re
 import time
-from typing import TYPE_CHECKING, Any, Protocol, get_args
+from typing import Any, Protocol, get_args
 
 from pydantic import BaseModel
 
+from conductor.config.schema import AgentDef, OutputField, ToolOutputConfig
 from conductor.exceptions import ProviderError, ValidationError
 from conductor.executor.output import validate_output
+from conductor.mcp.manager import (
+    FS_HINT,
+    GENERIC_HINT,
+    TAIL_WINDOW,
+    TRUNCATION_MARKER_PREFIX,
+    MCPManager,
+)
 from conductor.providers._event_format import (
     extract_tool_result_text,
     format_tool_arguments,
 )
+from conductor.providers._schema import SchemaDepthError, build_json_schema_properties
 from conductor.providers.base import (
     AgentOutput,
     AgentProvider,
@@ -51,10 +61,6 @@ from conductor.providers.reasoning import (
     is_claude_thinking_model,
     resolve_reasoning_effort,
 )
-
-if TYPE_CHECKING:
-    from conductor.config.schema import AgentDef, OutputField
-    from conductor.mcp.manager import MCPManager
 
 # Try to import the Anthropic SDK
 try:
@@ -187,6 +193,7 @@ class ClaudeProvider(AgentProvider):
         max_agent_iterations: int | None = None,
         max_session_seconds: float | None = None,
         default_reasoning_effort: ReasoningEffort | None = None,
+        tool_output: ToolOutputConfig | None = None,
     ) -> None:
         """Initialize the Claude provider.
 
@@ -220,6 +227,9 @@ class ClaudeProvider(AgentProvider):
                 value. Only valid on extended-thinking models — a per-agent
                 model that does not support thinking will raise
                 ``ValidationError`` at execute time.
+            tool_output: MCP tool result output-size configuration. Defines the
+                per-result character limit and spill-to-file behavior for MCP
+                tool outputs. ``None`` means the default configuration is used.
 
         Raises:
             ProviderError: If SDK is not installed.
@@ -256,6 +266,7 @@ class ClaudeProvider(AgentProvider):
         )
         self._default_max_session_seconds = max_session_seconds
         self._default_reasoning_effort: ReasoningEffort | None = default_reasoning_effort
+        self._tool_output_config = tool_output or ToolOutputConfig()
 
         # MCP server configuration for tool support.
         # Managers are pooled by resolved working directory: each distinct
@@ -631,7 +642,7 @@ class ClaudeProvider(AgentProvider):
             if resolved_cwd in self._mcp_managers:
                 return self._mcp_managers[resolved_cwd]
 
-            manager = MCPManager()
+            manager = MCPManager(tool_output=self._tool_output_config)
             for name, config in self._mcp_servers_config.items():
                 server_type = config.get("type", "stdio")
                 if server_type == "stdio":
@@ -1825,6 +1836,26 @@ class ClaudeProvider(AgentProvider):
                     result = await mcp_manager.call_tool(
                         tool_use.name, dict(tool_use.input) if hasattr(tool_use, "input") else {}
                     )
+                    result = self._maybe_rewrite_truncation_hint(result, tools)
+
+                    truncation_info = self._parse_truncation_marker(result)
+                    if truncation_info is not None and event_callback:
+                        try:
+                            event_callback(
+                                "agent_tool_output_truncated",
+                                {
+                                    "tool_name": tool_use.name,
+                                    "original_chars": truncation_info["original_chars"],
+                                    "kept_chars": truncation_info["kept_chars"],
+                                    "spill_path": truncation_info["spill_path"],
+                                },
+                            )
+                        except Exception:
+                            logger.debug(
+                                "Error in event_callback for agent_tool_output_truncated",
+                                exc_info=True,
+                            )
+
                     tool_results.append(
                         {
                             "type": "tool_result",
@@ -2316,8 +2347,6 @@ class ClaudeProvider(AgentProvider):
     ) -> dict[str, Any]:
         """Build JSON Schema properties from OutputField definitions.
 
-        Recursively handles nested objects and arrays with depth limiting.
-
         Args:
             schema: Dictionary mapping field names to OutputField definitions.
             depth: Current nesting depth (for recursion safety).
@@ -2328,97 +2357,15 @@ class ClaudeProvider(AgentProvider):
         Raises:
             ValidationError: If schema nesting exceeds max depth.
         """
-        if depth > self._max_schema_depth:
+        try:
+            return build_json_schema_properties(
+                schema, depth=depth, max_depth=self._max_schema_depth
+            )
+        except SchemaDepthError as exc:
             raise ValidationError(
                 f"Schema nesting depth exceeds maximum of {self._max_schema_depth} levels",
                 suggestion="Simplify your output schema to reduce nesting depth",
-            )
-
-        properties: dict[str, Any] = {}
-
-        for field_name, field_def in schema.items():
-            prop: dict[str, Any] = {
-                "type": self._map_type_to_json_schema(field_def.type),
-            }
-
-            if field_def.description:
-                prop["description"] = field_def.description
-
-            # Handle nested object schemas
-            if field_def.type == "object" and field_def.properties:
-                prop["properties"] = self._build_json_schema_properties(
-                    field_def.properties, depth=depth + 1
-                )
-                # All properties in OutputField schemas are required
-                # (OutputField has no 'required' attribute, all fields are mandatory)
-                prop["required"] = list(field_def.properties.keys())
-
-            # Handle array schemas with item definitions
-            if field_def.type == "array" and field_def.items:
-                items_schema = self._build_single_field_schema(field_def.items, depth=depth + 1)
-                prop["items"] = items_schema
-
-            properties[field_name] = prop
-
-        return properties
-
-    def _build_single_field_schema(self, field: OutputField, depth: int = 0) -> dict[str, Any]:
-        """Build JSON Schema for a single field (used for array items).
-
-        Args:
-            field: The OutputField definition.
-            depth: Current nesting depth (for recursion safety).
-
-        Returns:
-            JSON Schema definition for the field.
-
-        Raises:
-            ValidationError: If schema nesting exceeds max depth.
-        """
-        if depth > self._max_schema_depth:
-            raise ValidationError(
-                f"Schema nesting depth exceeds maximum of {self._max_schema_depth} levels",
-                suggestion="Simplify your output schema to reduce nesting depth",
-            )
-
-        schema: dict[str, Any] = {
-            "type": self._map_type_to_json_schema(field.type),
-        }
-
-        if field.description:
-            schema["description"] = field.description
-
-        # Handle nested objects in array items
-        if field.type == "object" and field.properties:
-            schema["properties"] = self._build_json_schema_properties(
-                field.properties, depth=depth + 1
-            )
-            # All properties are required
-            schema["required"] = list(field.properties.keys())
-
-        # Handle nested arrays (array of arrays)
-        if field.type == "array" and field.items:
-            schema["items"] = self._build_single_field_schema(field.items, depth=depth + 1)
-
-        return schema
-
-    def _map_type_to_json_schema(self, field_type: str) -> str:
-        """Map OutputField type to JSON Schema type.
-
-        Args:
-            field_type: The OutputField type string.
-
-        Returns:
-            Corresponding JSON Schema type.
-        """
-        type_mapping = {
-            "string": "string",
-            "number": "number",
-            "boolean": "boolean",
-            "array": "array",
-            "object": "object",
-        }
-        return type_mapping.get(field_type, "string")
+            ) from exc
 
     def _extract_output(
         self, response: Any, output_schema: dict[str, OutputField] | None
@@ -2473,6 +2420,145 @@ class ClaudeProvider(AgentProvider):
                 text_parts.append(block.text)
 
         return {"result": "\n".join(text_parts)}
+
+    def _maybe_rewrite_truncation_hint(
+        self,
+        result: str,
+        tools: list[dict[str, Any]] | None,
+    ) -> str:
+        """Replace the generic truncation hint with an fs hint when applicable.
+
+        Truncation is detected by the presence of the ``[output truncated:``
+        marker in the trailing part of the result string. The generic hint is
+        only replaced when the marker also advertises a spill file (i.e. the
+        marker contains the ``full output saved to:`` text), so the model is not
+        told to read a file that does not exist.
+
+        The replacement is an exact string substitution so no shared mutable
+        state or placeholder mechanism is required.
+
+        Args:
+            result: The possibly truncated MCP tool result string.
+            tools: The tool definitions sent to the model (may be None).
+
+        Returns:
+            The result string, possibly with the hint rewritten.
+        """
+        truncation_info = self._parse_truncation_marker(result)
+        if truncation_info is None:
+            return result
+        if not self._has_fs_like_tool(tools):
+            return result
+        if not truncation_info.get("spill_path"):
+            return result
+        idx = result.rfind(GENERIC_HINT)
+        if idx == -1:
+            return result
+        return result[:idx] + FS_HINT + result[idx + len(GENERIC_HINT) :]
+
+    def _parse_truncation_marker(
+        self,
+        result: str,
+    ) -> dict[str, Any] | None:
+        """Parse truncation metadata from the marker appended to a result.
+
+        The marker is generated in ``MCPManager._maybe_truncate_response`` and
+        always has the form::
+
+            [output truncated: {original} chars -> {kept} kept{; optional path}. {HINT}]
+
+        This method detects the marker only in the trailing 8192 characters of
+        ``result`` to avoid matching unrelated text while still accommodating
+        long POSIX spill file paths (PATH_MAX ~4096 + marker overhead). The
+        marker is parsed from the local string so no shared mutable state is
+        needed, which keeps the parser safe when the same MCP manager is reused
+        across parallel agents.
+
+        Args:
+            result: The possibly truncated MCP tool result string.
+
+        Returns:
+            A dict with ``original_chars``, ``kept_chars``, and ``spill_path``
+            (``None`` when the marker omits a path), or ``None`` when the
+            result is not truncated.
+        """
+        if not result or TRUNCATION_MARKER_PREFIX not in result[-TAIL_WINDOW:]:
+            return None
+
+        tail = result[-TAIL_WINDOW:]
+        match = re.search(
+            r".*"
+            + re.escape(TRUNCATION_MARKER_PREFIX)
+            + r"\s*(\d+)\s*chars\s*-\u003e\s*(\d+)\s*kept"
+            + r"(?:;\s*full output saved to:\s*(.+?))?\."
+            + r"\s*"
+            + r"(?:"
+            + re.escape(GENERIC_HINT)
+            + r"|"
+            + re.escape(FS_HINT)
+            + r")"
+            + r"\]\s*$",
+            tail,
+            re.DOTALL,
+        )
+
+        if not match:
+            return None
+
+        original_chars = int(match.group(1))
+        kept_chars = int(match.group(2))
+        spill_path = match.group(3).strip() if match.group(3) else None
+
+        return {
+            "original_chars": original_chars,
+            "kept_chars": kept_chars,
+            "spill_path": spill_path,
+        }
+
+    # Keywords marking a tool that can read a file's contents from a known
+    # path. The agent already has the exact spill path from the marker, so the
+    # only capability it needs is reading/grepping by path — not searching for
+    # files (find/ls/glob) or writing them (edit/write). Whole-name substring
+    # containment would trip on any tool whose name merely contains "ls" or
+    # "file" (e.g. "translate", "fileupload"), rewriting the hint to advertise
+    # filesystem tools the agent does not actually have, so a keyword must
+    # equal a complete underscore/dash segment ("read_file" -> "read").
+    _FS_TOOL_KEYWORDS = frozenset(
+        {
+            "read",
+            "grep",
+            "view",
+            "cat",
+            "open",
+            "load",
+            "file",
+            "bash",
+            "shell",
+        }
+    )
+
+    def _has_fs_like_tool(self, tools: list[dict[str, Any]] | None) -> bool:
+        """Return True if any tool looks like a filesystem/shell tool.
+
+        The check is heuristic: after stripping the ``server__`` prefix, the
+        tool name is split on non-alphanumeric characters and each resulting
+        segment is compared (case-insensitively) against common
+        filesystem/shell keywords. A keyword must equal an entire segment, so
+        "translate" or "fileupload" do not match while "ls", "read_file" and
+        "view_code" still do. A None tool list means no tools were allowed,
+        so filesystem-like tools are not available.
+        """
+        if not tools:
+            return False
+
+        for tool in tools:
+            name = tool.get("name", "")
+            if "__" in name:
+                name = name.split("__", 1)[1]
+            segments = re.split(r"[^A-Za-z0-9]+", name.lower())
+            if any(segment in self._FS_TOOL_KEYWORDS for segment in segments):
+                return True
+        return False
 
     def _extract_structured_output(self, response: Any) -> dict[str, Any] | None:
         """Extract structured output from tool_use content blocks.

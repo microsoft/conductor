@@ -10,6 +10,7 @@ import type {
   AgentReasoningData,
   AgentToolStartData,
   AgentToolCompleteData,
+  AgentToolOutputTruncatedData,
   AgentTurnStartData,
   AgentMessageData,
   ScriptCompletedData,
@@ -346,6 +347,13 @@ interface WorkflowState {
   /** Path to the currently *viewed* context ([] = root) */
   viewContextPath: number[];
 
+  /**
+   * Context keys (see `lib/node-id.ts` `contextKey`) whose subworkflow DAG is
+   * expanded inline in the graph. Empty = everything collapsed (default), which
+   * renders identically to the pre-inline single-context view.
+   */
+  expandedContexts: Set<string>;
+
   // Replay mode state
   replayMode: boolean;
   replayEvents: WorkflowEvent[];
@@ -366,6 +374,15 @@ interface WorkflowState {
   navigateToContext: (path: number[]) => void;
   navigateUp: () => void;
   navigateIntoSubworkflow: (slotKey: string) => void;
+
+  /** Toggle inline expansion of a subworkflow context by its context key. */
+  toggleContextExpanded: (contextKey: string) => void;
+
+  /** Mark a set of subworkflow context keys as expanded inline (union). */
+  expandContexts: (contextKeys: string[]) => void;
+
+  /** Collapse a set of subworkflow context keys (difference). */
+  collapseContexts: (contextKeys: string[]) => void;
 
   // Computed: get the currently viewed context's data
   getViewedContext: () => {
@@ -673,6 +690,7 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
   subworkflowContexts: [],
   activeContextPath: [],
   viewContextPath: [],
+  expandedContexts: new Set<string>(),
   replayMode: false,
   replayEvents: [],
   replayPosition: 0,
@@ -821,6 +839,45 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
 
   selectNode: (name: string | null) => {
     set({ selectedNode: name });
+  },
+
+  toggleContextExpanded: (contextKey: string) => {
+    set((state) => {
+      const next = new Set(state.expandedContexts);
+      if (next.has(contextKey)) {
+        next.delete(contextKey);
+      } else {
+        next.add(contextKey);
+      }
+      return { expandedContexts: next };
+    });
+  },
+
+  expandContexts: (contextKeys: string[]) => {
+    if (contextKeys.length === 0) return;
+    set((state) => {
+      const next = new Set(state.expandedContexts);
+      let changed = false;
+      for (const key of contextKeys) {
+        if (!next.has(key)) {
+          next.add(key);
+          changed = true;
+        }
+      }
+      return changed ? { expandedContexts: next } : {};
+    });
+  },
+
+  collapseContexts: (contextKeys: string[]) => {
+    if (contextKeys.length === 0) return;
+    set((state) => {
+      const next = new Set(state.expandedContexts);
+      let changed = false;
+      for (const key of contextKeys) {
+        if (next.delete(key)) changed = true;
+      }
+      return changed ? { expandedContexts: next } : {};
+    });
   },
 
   setReplayMode: (events: WorkflowEvent[]) => {
@@ -1356,6 +1413,16 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     const itemKey = (_data as Record<string, unknown>).item_key as string | undefined;
     const t = activeTarget(state, _data);
     const entry: ActivityEntry = { type: 'tool-complete', icon: '✓', label: 'result', text: data.tool_name || 'done', detail: data.result || null };
+    addActivity(t.nodes, data.agent_name, entry);
+    if (itemKey) addForEachItemActivity(t.nodes, data.agent_name, itemKey, entry);
+    replaceNode(t.nodes, data.agent_name);
+  },
+
+  agent_tool_output_truncated: (state, _data) => {
+    const data = _data as unknown as AgentToolOutputTruncatedData;
+    const itemKey = (_data as Record<string, unknown>).item_key as string | undefined;
+    const t = activeTarget(state, _data);
+    const entry: ActivityEntry = { type: 'tool-complete', icon: '✂', label: 'truncated', text: data.tool_name || 'tool', detail: `${data.original_chars}→${data.kept_chars} chars${data.spill_path ? ' · full: ' + data.spill_path : ''}` };
     addActivity(t.nodes, data.agent_name, entry);
     if (itemKey) addForEachItemActivity(t.nodes, data.agent_name, itemKey, entry);
     replaceNode(t.nodes, data.agent_name);
@@ -2383,6 +2450,13 @@ function buildActivityLogEntry(event: WorkflowEvent): ActivityLogEntry | null {
         timestamp: ts, source: String(d.agent_name), type: 'tool-complete',
         message: `← ${d.tool_name || 'done'}`,
         detail: d.result ? truncate(String(d.result), 300) : null,
+      };
+
+    case 'agent_tool_output_truncated':
+      return {
+        timestamp: ts, source: String(d.agent_name), type: 'tool-complete',
+        message: `✂ ${d.tool_name || 'tool'} truncated`,
+        detail: `${d.original_chars}→${d.kept_chars} chars${d.spill_path ? ' · full: ' + d.spill_path : ''}`,
       };
 
     case 'agent_turn_start':

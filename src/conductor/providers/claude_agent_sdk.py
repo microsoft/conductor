@@ -9,6 +9,11 @@ import time
 from typing import TYPE_CHECKING, Any, Final, cast
 
 from conductor.exceptions import ProviderError
+from conductor.providers._schema import (
+    SchemaDepthError,
+    build_json_schema_field,
+    build_json_schema_properties,
+)
 from conductor.providers.base import AgentOutput, AgentProvider, EventCallback
 from conductor.providers.capabilities import ProviderCapabilities
 
@@ -28,39 +33,26 @@ logger = logging.getLogger(__name__)
 
 
 def _build_field_schema(field: OutputField, depth: int = 0) -> dict[str, Any]:
-    """Translate a single ``OutputField`` into a JSON-Schema fragment.
+    """Thin delegate to the shared JSON-Schema field builder.
 
-    Recursively descends into object properties and array items. The depth
-    cap (10) protects against pathological YAML that would otherwise blow
-    the Python recursion limit during schema construction.
-
-    Args:
-        field: The output field definition from the workflow YAML.
-        depth: Current recursion depth (internal — do not pass).
-
-    Returns:
-        A JSON-Schema fragment matching the field's type and constraints.
-
-    Raises:
-        ProviderError: If recursion exceeds 10 nested levels.
+    Keep this entry point intact because tests import it directly. Depth
+    errors from the core are translated to the historical ProviderError
+    message so downstream assertions stay stable.
     """
-    if depth > 10:
-        raise ProviderError("Output schema nesting exceeds 10 levels")
-
-    schema: dict[str, Any] = {"type": field.type}
-    if field.description:
-        schema["description"] = field.description
-    if field.type == "object" and field.properties:
-        schema["properties"] = _build_properties(field.properties, depth + 1)
-        schema["required"] = list(field.properties.keys())
-    if field.type == "array" and field.items:
-        schema["items"] = _build_field_schema(field.items, depth + 1)
-    return schema
+    try:
+        return build_json_schema_field(field, depth=depth, max_depth=10)
+    except SchemaDepthError as exc:
+        # Pinned message: downstream tests assert the exact text.
+        raise ProviderError("Output schema nesting exceeds 10 levels") from exc
 
 
 def _build_properties(fields: dict[str, OutputField], depth: int = 0) -> dict[str, Any]:
-    """Translate a mapping of named ``OutputField`` definitions into JSON-Schema properties."""
-    return {name: _build_field_schema(field, depth) for name, field in fields.items()}
+    """Thin delegate to the shared JSON-Schema properties builder."""
+    try:
+        return build_json_schema_properties(fields, depth=depth, max_depth=10)
+    except SchemaDepthError as exc:
+        # Pinned message: downstream tests assert the exact text.
+        raise ProviderError("Output schema nesting exceeds 10 levels") from exc
 
 
 def _build_output_format(output: dict[str, OutputField]) -> dict[str, Any]:

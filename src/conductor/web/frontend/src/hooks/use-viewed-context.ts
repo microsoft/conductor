@@ -8,6 +8,7 @@
 import { useMemo } from 'react';
 import { useWorkflowStore } from '@/stores/workflow-store';
 import type { NodeData, GroupProgress, HighlightedEdge, SubworkflowContext } from '@/stores/workflow-store';
+import { parseNodeKey, parseForEachSlotKey } from '@/lib/node-id';
 
 /** Resolve a SubworkflowContext from a path of indices. */
 function resolveCtx(contexts: SubworkflowContext[], path: number[]): SubworkflowContext | null {
@@ -17,6 +18,101 @@ function resolveCtx(contexts: SubworkflowContext[], path: number[]): Subworkflow
     ctx = ctx.children[path[i]!];
   }
   return ctx ?? null;
+}
+
+/**
+ * Resolve a graph node's live store `NodeData` from its absolute context path
+ * and bare name (both stamped onto `GraphNodeData` by `buildGraphElements`).
+ *
+ * Node ids are namespaced by context (see `lib/node-id`) so a bare
+ * `useViewedNodes()[id]` lookup no longer works once inline-expanded children
+ * render alongside the base context — this resolves the owning context instead.
+ */
+export function useNodeLiveData(
+  data: { contextPath?: number[]; name?: string; iterationContextPath?: number[] } | undefined,
+): NodeData | undefined {
+  const rootNodes = useWorkflowStore((s) => s.nodes);
+  const subContexts = useWorkflowStore((s) => s.subworkflowContexts);
+  const iterPath = data?.iterationContextPath;
+  const path = data?.contextPath ?? [];
+  const name = data?.name;
+  const iterKey = iterPath ? iterPath.join('.') : '';
+  const key = `${path.join('.')}::${name ?? ''}`;
+  return useMemo(() => {
+    // A for_each iteration member *is* a child context: there is no
+    // `nodes[slotKey]` entry in the parent, so surface the child context's own
+    // status (and failure message) as a synthetic NodeData for the pill.
+    if (iterPath && iterPath.length > 0) {
+      const ctx = resolveCtx(subContexts, iterPath);
+      if (!ctx) return undefined;
+      return {
+        name: name ?? '',
+        status: ctx.status,
+        type: 'workflow',
+        activity: [],
+        error_message: ctx.workflowFailure?.message,
+        error_type: ctx.workflowFailure?.error_type,
+      } as NodeData;
+    }
+    if (!name) return undefined;
+    if (path.length === 0) return rootNodes[name];
+    const ctx = resolveCtx(subContexts, path);
+    return ctx?.nodes[name];
+    // `key`/`iterKey` encode path + name; depending on them keeps the
+    // array-typed `path`/`iterPath`/`name` out of the dependency list without
+    // staleness.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [key, iterKey, rootNodes, subContexts]);
+}
+
+/**
+ * Resolve the currently selected node's live `NodeData` from its namespaced id
+ * (`selectedNode`), regardless of which context is being viewed. Node ids are
+ * namespaced by context, so the selection can point into an inline-expanded
+ * child or a different level than the current view.
+ */
+export function useSelectedNodeData(): NodeData | undefined {
+  const selectedNode = useWorkflowStore((s) => s.selectedNode);
+  const rootNodes = useWorkflowStore((s) => s.nodes);
+  const subContexts = useWorkflowStore((s) => s.subworkflowContexts);
+  return useMemo(() => {
+    if (!selectedNode) return undefined;
+    const { contextPath, name } = parseNodeKey(selectedNode);
+    const ownerNodes =
+      contextPath.length === 0 ? rootNodes : resolveCtx(subContexts, contextPath)?.nodes;
+    const direct = ownerNodes?.[name];
+    if (direct) return direct;
+
+    // A for_each iteration member has no `nodes[slotKey]` entry — it *is* a
+    // child context. Synthesize NodeData from that context so the detail panel
+    // renders the iteration (status, cost/tokens) instead of an empty state.
+    if (parseForEachSlotKey(name)) {
+      const siblings =
+        contextPath.length === 0
+          ? subContexts
+          : (resolveCtx(subContexts, contextPath)?.children ?? []);
+      let iter: SubworkflowContext | undefined;
+      for (let i = siblings.length - 1; i >= 0; i--) {
+        if (siblings[i]!.slotKey === name) {
+          iter = siblings[i];
+          break;
+        }
+      }
+      if (iter) {
+        return {
+          name,
+          status: iter.status,
+          type: 'workflow',
+          activity: [],
+          tokens: iter.totalTokens || undefined,
+          cost_usd: iter.totalCost || undefined,
+          error_message: iter.workflowFailure?.message,
+          error_type: iter.workflowFailure?.error_type,
+        } as NodeData;
+      }
+    }
+    return undefined;
+  }, [selectedNode, rootNodes, subContexts]);
 }
 
 /** Get the nodes map for the currently viewed context. */
@@ -86,6 +182,7 @@ export function useViewedGraphData() {
         entryPoint: rootEntry,
         subworkflowContexts: subContexts,
         parentAgent: null as string | null,
+        basePath: [] as number[],
       };
     }
     const ctx = resolveCtx(subContexts, viewPath);
@@ -100,6 +197,7 @@ export function useViewedGraphData() {
         entryPoint: rootEntry,
         subworkflowContexts: subContexts,
         parentAgent: null as string | null,
+        basePath: [] as number[],
       };
     }
     return {
@@ -112,6 +210,7 @@ export function useViewedGraphData() {
       entryPoint: ctx.entryPoint,
       subworkflowContexts: ctx.children,
       parentAgent: ctx.parentAgent,
+      basePath: viewPath,
     };
   }, [viewPath, rootAgents, rootRoutes, rootParallel, rootForEach, rootNodes, rootProgress, rootEntry, subContexts]);
 }

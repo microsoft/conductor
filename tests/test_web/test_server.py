@@ -11,6 +11,8 @@ Tests cover:
 from __future__ import annotations
 
 import asyncio
+import logging
+import re
 import time
 import traceback
 from pathlib import Path
@@ -20,7 +22,7 @@ import pytest
 from starlette.testclient import TestClient
 
 from conductor.events import WorkflowEvent, WorkflowEventEmitter
-from conductor.web.server import WebDashboard
+from conductor.web.server import _STATIC_DIR, WebDashboard
 
 
 def _make_dashboard(
@@ -95,6 +97,46 @@ class TestGetIndex:
             assert "text/html" in resp.headers["content-type"]
             assert "Conductor" in resp.text
 
+    def test_index_sent_with_no_cache(self) -> None:
+        """GET / sets Cache-Control: no-cache so browsers always revalidate index.html.
+
+        index.html points at version-hashed asset bundles; if a browser keeps
+        serving a stale index.html after an upgrade, the dashboard is pinned to
+        the previous build's bundle (the failure mode this guards against).
+        """
+        emitter, dashboard = _make_dashboard()
+        with TestClient(dashboard.app) as client:
+            resp = client.get("/")
+            assert resp.status_code == 200
+            assert resp.headers.get("cache-control") == "no-cache"
+
+    def test_favicon_not_sent_with_no_cache(self) -> None:
+        """GET /favicon.svg must not inherit index.html's no-cache header.
+
+        Guards against the fix accidentally widening to a blanket
+        Cache-Control policy that would also defeat asset caching.
+        """
+        emitter, dashboard = _make_dashboard()
+        with TestClient(dashboard.app) as client:
+            resp = client.get("/favicon.svg")
+            assert resp.status_code == 200
+            assert resp.headers.get("cache-control") != "no-cache"
+
+    def test_hashed_assets_not_sent_with_no_cache(self) -> None:
+        """GET /assets/<hashed-file> must not inherit index.html's no-cache header.
+
+        Hashed bundles are safe to cache long-term (a content change always
+        produces a new filename); this pins that they stay unaffected by the
+        no-cache header added to the index route.
+        """
+        emitter, dashboard = _make_dashboard()
+        with TestClient(dashboard.app) as client:
+            index_html = (_STATIC_DIR / "index.html").read_text()
+            asset_path = re.findall(r'/assets/[^"\']+', index_html)[0]
+            resp = client.get(asset_path)
+            assert resp.status_code == 200
+            assert resp.headers.get("cache-control") != "no-cache"
+
 
 class TestWebSocket:
     """Tests for WS /ws endpoint."""
@@ -151,18 +193,38 @@ class TestLateJoiner:
 class TestAutoShutdown:
     """Tests for --web-bg auto-shutdown logic."""
 
-    def test_workflow_completed_sets_flag(self) -> None:
-        """Emitting workflow_completed sets the internal flag."""
+    def test_workflow_completed_sets_flag(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Emitting workflow_completed sets the internal flag.
+
+        Also asserts the grace timer stays unarmed *without* an exception
+        being swallowed by ``WorkflowEventEmitter.emit()``'s subscriber
+        catch-all: this synchronous ``emit()`` runs with no running event
+        loop, exercising the loop-safety guard in ``_maybe_start_grace_timer``
+        (issue #318). A bare ``_grace_task is None`` assertion alone can't
+        tell a guarded no-op apart from an unguarded ``RuntimeError`` from
+        ``asyncio.create_task()`` getting silently caught and logged by
+        ``emit()`` — so this also asserts nothing was logged there.
+        """
         emitter, dashboard = _make_dashboard(bg=True)
         assert dashboard._workflow_completed is False
-        emitter.emit(_make_event("workflow_completed", elapsed=5.0))
+        with caplog.at_level(logging.ERROR, logger="conductor.events"):
+            emitter.emit(_make_event("workflow_completed", elapsed=5.0))
         assert dashboard._workflow_completed is True
+        assert dashboard._grace_task is None
+        assert "Event subscriber raised an exception" not in caplog.text
 
-    def test_workflow_failed_sets_flag(self) -> None:
-        """Emitting workflow_failed sets the internal flag."""
+    def test_workflow_failed_sets_flag(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Emitting workflow_failed sets the internal flag.
+
+        Also asserts the grace timer stays unarmed with no swallowed exception
+        (see ``test_workflow_completed_sets_flag`` for why this matters).
+        """
         emitter, dashboard = _make_dashboard(bg=True)
-        emitter.emit(_make_event("workflow_failed", error_type="Error", message="boom"))
+        with caplog.at_level(logging.ERROR, logger="conductor.events"):
+            emitter.emit(_make_event("workflow_failed", error_type="Error", message="boom"))
         assert dashboard._workflow_completed is True
+        assert dashboard._grace_task is None
+        assert "Event subscriber raised an exception" not in caplog.text
 
     @pytest.mark.asyncio
     async def test_wait_for_clients_disconnect_resolves(self) -> None:
@@ -230,6 +292,104 @@ class TestAutoShutdown:
             first.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await first
+
+    @pytest.mark.asyncio
+    async def test_unwatched_run_arms_grace_timer_on_completion(self) -> None:
+        """Root completion arms the grace timer even if no client ever connected.
+
+        Regression for issue #318: previously the grace timer was armed only from
+        WebSocket-disconnect paths, so an unwatched ``--web-bg`` run (nobody opens
+        the dashboard) blocked forever in ``wait_for_clients_disconnect()`` after
+        the workflow had already finished.
+        """
+        emitter, dashboard = _make_dashboard(bg=True)
+        assert dashboard._grace_task is None
+        assert not dashboard._connections
+
+        # No client ever connects; the root workflow simply finishes.
+        emitter.emit(_make_event("workflow_completed", elapsed=1.0))
+
+        assert dashboard._workflow_completed is True
+        assert dashboard._grace_task is not None  # armed without any disconnect
+
+        # Swap in a short grace so the post-run wait actually resolves.
+        dashboard._grace_task.cancel()
+        dashboard._grace_task = asyncio.create_task(_short_grace(dashboard._bg_event, 0.05))
+        await asyncio.wait_for(dashboard.wait_for_clients_disconnect(), timeout=1.0)
+        assert dashboard._bg_event.is_set()
+
+    @pytest.mark.asyncio
+    async def test_subworkflow_completion_does_not_arm_or_set_flag(self) -> None:
+        """Nested sub-workflow terminal events must not arm the timer or set the flag.
+
+        Regression for issue #318: the completion check is gated on the *root*
+        event (sub-workflow events carry a non-empty ``subworkflow_path``) so a
+        sub-workflow finishing mid-run cannot trigger a premature auto-shutdown.
+        """
+        emitter, dashboard = _make_dashboard(bg=True)
+
+        # A nested sub-workflow finishes while the root run is still executing.
+        emitter.emit(
+            _make_event("workflow_completed", subworkflow_path=["parent", "child"], elapsed=1.0)
+        )
+        assert dashboard._workflow_completed is False
+        assert dashboard._grace_task is None
+
+        # The root terminal event still arms the timer.
+        emitter.emit(_make_event("workflow_completed", elapsed=1.0))
+        assert dashboard._workflow_completed is True
+        assert dashboard._grace_task is not None
+
+        # Clean up the armed grace task.
+        task = dashboard._grace_task
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    @pytest.mark.asyncio
+    async def test_unwatched_run_arms_grace_timer_on_failure(self) -> None:
+        """Root workflow_failed also arms the grace timer when unwatched.
+
+        Regression for issue #318: the arming call in ``_on_event`` covers both
+        terminal event types via one shared ``if``, but nothing previously
+        verified ``workflow_failed`` specifically — a future change that split
+        the conditional and only wired arming for ``workflow_completed`` would
+        otherwise go undetected.
+        """
+        emitter, dashboard = _make_dashboard(bg=True)
+        assert dashboard._grace_task is None
+
+        emitter.emit(_make_event("workflow_failed", error_type="Error", message="boom"))
+
+        assert dashboard._workflow_completed is True
+        assert dashboard._grace_task is not None
+
+        dashboard._grace_task.cancel()
+        dashboard._grace_task = asyncio.create_task(_short_grace(dashboard._bg_event, 0.05))
+        await asyncio.wait_for(dashboard.wait_for_clients_disconnect(), timeout=1.0)
+        assert dashboard._bg_event.is_set()
+
+    @pytest.mark.asyncio
+    async def test_connected_client_keeps_grace_timer_unarmed_on_completion(self) -> None:
+        """Root completion while a client is connected must not arm the timer.
+
+        Regression guard for issue #318: ``_on_event`` now calls
+        ``_maybe_start_grace_timer()`` unconditionally on the root terminal
+        event, relying entirely on the pre-existing ``if self._connections:
+        return`` guard to avoid cutting a *watched* run's post-run dashboard
+        window short. Nothing previously combined a connected client with a
+        completion event to prove that guard is actually exercised from this
+        new call site. This must run with a live event loop (``async def``)
+        so the connections check — not the loop-safety no-op — is what's
+        actually under test.
+        """
+        emitter, dashboard = _make_dashboard(bg=True)
+        dashboard._connections.add(MagicMock())
+
+        emitter.emit(_make_event("workflow_completed", elapsed=1.0))
+
+        assert dashboard._workflow_completed is True
+        assert dashboard._grace_task is None
 
 
 class TestBroadcastErrorIsolation:

@@ -183,12 +183,12 @@ conductor resume workflow.yaml --log-file auto
 - Execution resumes from the exact agent that failed
 - All prior agent outputs and the workspace `instructions_preamble` are restored from the checkpoint
 
-### conductor checkpoints
+### conductor checkpoint list
 
 List available workflow checkpoints:
 
 ```bash
-conductor checkpoints [workflow.yaml]
+conductor checkpoint list [workflow.yaml]
 ```
 
 Shows all checkpoint files with metadata: workflow name, timestamp, failed agent, and error type. Optionally filter by workflow file.
@@ -197,11 +197,15 @@ Shows all checkpoint files with metadata: workflow name, timestamp, failed agent
 
 ```bash
 # List all checkpoints
-conductor checkpoints
+conductor checkpoint list
 
 # List checkpoints for a specific workflow
-conductor checkpoints workflow.yaml
+conductor checkpoint list workflow.yaml
 ```
+
+> The flat `conductor checkpoints` command is a deprecated alias for
+> `conductor checkpoint list`; it still works but warns and will be removed in
+> a future release.
 
 ### conductor validate
 
@@ -511,6 +515,19 @@ conductor run workflow.yaml --skip-gates
 
 Auto-selects the first option at each gate.
 
+### Resolving Gates in the Dashboard
+
+With `--web` or `--web-bg`, gates are also resolvable from the browser
+dashboard's decision modal or the `conductor gate respond` CLI — no terminal
+prompt required. This makes `--web-bg` (detached background) compatible with
+`human_gate` workflows whenever the dashboard starts successfully: the launch
+prints the dashboard URL plus a `conductor gate respond --port <port> --choice
+<value>` hint, and the run waits for a web/CLI response instead of aborting.
+If the dashboard itself fails to start (e.g. a port conflict), a gate reached
+in background mode raises a clear error rather than silently hanging or
+crashing. Foreground `--web` from a real terminal still accepts either the
+terminal prompt or the dashboard, whichever responds first.
+
 ## Interactive Interrupt
 
 During execution, press **Esc** or **Ctrl+G** to pause the workflow. An interactive menu appears with these actions:
@@ -538,7 +555,7 @@ Checkpoints are stored in `$TMPDIR/conductor/checkpoints/`.
 
 ```bash
 # List available checkpoints
-conductor checkpoints
+conductor checkpoint list
 
 # Resume from latest checkpoint for a workflow
 conductor resume workflow.yaml

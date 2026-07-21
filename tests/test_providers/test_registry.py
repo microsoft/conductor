@@ -6,7 +6,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from conductor.config.schema import AgentDef, RuntimeConfig, WorkflowConfig, WorkflowDef
+from conductor.config.schema import (
+    AgentDef,
+    RuntimeConfig,
+    WorkflowConfig,
+    WorkflowDef,
+)
 from conductor.providers.base import AgentOutput, AgentProvider
 from conductor.providers.registry import ProviderRegistry
 
@@ -332,6 +337,7 @@ class TestConfigPassing:
             max_session_seconds=None,
             max_agent_iterations=None,
             provider_settings=config.workflow.runtime.provider,
+            tool_output=config.workflow.runtime.tool_output,
         )
 
     @patch("conductor.providers.registry.create_provider")

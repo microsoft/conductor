@@ -50,6 +50,7 @@ class TestClaudeParameterPassing:
             default_reasoning_effort=None,
             auth_token=None,
             base_url=None,
+            tool_output=None,
         )
 
     @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)

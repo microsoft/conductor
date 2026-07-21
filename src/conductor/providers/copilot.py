@@ -18,11 +18,13 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, TypeGuard
 
+from conductor.config.schema import ToolOutputConfig
 from conductor.exceptions import ProviderError, ValidationError
 from conductor.providers._event_format import (
     extract_tool_result_text,
     format_tool_arguments,
 )
+from conductor.providers._schema import SchemaDepthError, build_prompt_schema_properties
 from conductor.providers.base import (
     AgentOutput,
     AgentProvider,
@@ -92,6 +94,15 @@ except ImportError:
     COPILOT_SDK_AVAILABLE = False
     CopilotClient = None  # type: ignore[misc, assignment]
     PermissionHandler = None  # type: ignore[misc, assignment]
+
+# RuntimeConnection was added to the SDK after CopilotClient; import it
+# separately so an older-but-present SDK still enables the default nested-spawn
+# provider. A runtime connection is only required when explicitly requested,
+# and that path raises a clear ProviderError if RuntimeConnection is missing.
+try:
+    from copilot.client import RuntimeConnection
+except ImportError:
+    RuntimeConnection = None  # type: ignore[misc, assignment]
 
 
 @dataclass
@@ -251,6 +262,7 @@ class CopilotProvider(AgentProvider):
         default_reasoning_effort: ReasoningEffort | None = None,
         default_context_tier: ContextTier | None = None,
         provider_settings: ProviderSettings | None = None,
+        tool_output: ToolOutputConfig | None = None,
     ) -> None:
         """Initialize the Copilot provider.
 
@@ -281,12 +293,16 @@ class CopilotProvider(AgentProvider):
                 the resolved SDK ``ProviderConfig`` is attached to every
                 ``create_session`` call (both agent execution and dialog
                 turns), enabling custom OpenAI-compatible / Azure / Anthropic
-                endpoints. Env-var fallbacks
+                endpoints. ``runtime_url`` instead selects an existing Copilot
+                CLI process and can be combined with that routing. Env-var fallbacks
                 (``COPILOT_PROVIDER_BASE_URL`` → ``OPENAI_BASE_URL``,
                 ``COPILOT_PROVIDER_API_KEY`` → ``OPENAI_API_KEY``,
                 ``COPILOT_PROVIDER_BEARER_TOKEN``) fill missing fields once
                 custom routing is activated; ambient OpenAI env vars never
                 activate custom routing on their own.
+            tool_output: MCP tool result output-size configuration. Defines the
+                per-result character limit and spill-to-file behavior for MCP
+                tool outputs. ``None`` means the default configuration is used.
         """
         self._client: Any = None  # Will hold Copilot SDK client
         self._mock_handler = mock_handler
@@ -314,6 +330,7 @@ class CopilotProvider(AgentProvider):
         self._interrupted_session: Any = None
         self._abort_supported: bool | None = None
         self._provider_settings = provider_settings
+        self._tool_output_config = tool_output or ToolOutputConfig()
         self._warn_custom_routing_default_model()
 
     @staticmethod
@@ -331,6 +348,49 @@ class CopilotProvider(AgentProvider):
         """
         logger.debug("auto-approved permission request: %s", request)
         return PermissionHandler.approve_all(request, invocation)
+
+    def _large_output_config(self) -> dict[str, Any]:
+        """Build the SDK ``large_output`` config for session creation.
+
+        The Copilot SDK enables ``large_output`` by default. Conductor therefore
+        forwards ``enabled=False`` explicitly when the provider's tool output
+        limiter is disabled, so the user's config is honored instead of being
+        silently overridden by the SDK default.
+
+        When enabled, the value is forwarded to the SDK as-is. The Copilot SDK
+        expects ``max_size_bytes``; Conductor forwards ``ToolOutputConfig.max_chars``
+        as bytes on a 1:1 basis by design. This means multibyte UTF-8 characters
+        (CJK, emoji, etc.) will be cut off by the SDK earlier than
+        ``max_chars`` characters of text. Conductor intentionally does not perform
+        its own truncation for Copilot because the SDK owns the tool loop.
+
+        The SDK has no "truncate in-place without spilling" mode. Therefore
+        ``spill_to_file=False`` is mapped to ``{"enabled": False}``, which
+        disables large-output handling entirely for the session — unlike the
+        Claude provider, where the same setting still truncates to
+        ``max_chars`` and only skips the file write.
+
+        ``output_directory`` is only included when ``spill_dir`` is explicitly
+        configured; otherwise the SDK uses its own OS-level temporary
+        directory.
+        """
+        if not self._tool_output_config.enabled:
+            return {"enabled": False}
+        if self._tool_output_config.spill_to_file is False:
+            logger.warning(
+                "Copilot: spill_to_file=False disables tool output size limiting "
+                "entirely (the SDK has no truncate-without-spill mode); tool "
+                "output will not be capped at max_chars=%d.",
+                self._tool_output_config.max_chars,
+            )
+            return {"enabled": False}
+        cfg: dict[str, Any] = {
+            "enabled": True,
+            "max_size_bytes": self._tool_output_config.max_chars,
+        }
+        if self._tool_output_config.spill_dir is not None:
+            cfg["output_directory"] = self._tool_output_config.spill_dir
+        return cfg
 
     def _warn_custom_routing_default_model(self) -> None:
         """Warn if custom routing is active but no default model is set.
@@ -470,6 +530,70 @@ class CopilotProvider(AgentProvider):
         provider_cfg = self._resolve_sdk_provider_config()
         if provider_cfg is not None:
             session_kwargs["provider"] = provider_cfg
+
+    def _resolve_runtime_connection(self) -> tuple[str, str | None] | None:
+        """Resolve whether to connect to an already-running Copilot runtime.
+
+        Returns ``(url, connection_token)`` when Conductor should connect to
+        an external runtime instead of spawning its own child process, or
+        ``None`` for the default (spawn) behavior.
+
+        Resolution order for each field is YAML (``runtime.provider``) first,
+        then a namespaced environment variable:
+
+        - ``url``: ``runtime_url`` → ``COPILOT_PROVIDER_RUNTIME_URL``
+        - ``token``: ``runtime_token`` → ``COPILOT_PROVIDER_RUNTIME_TOKEN``
+
+        The environment variables activate the connection on their own (no
+        YAML required), which is the intended zero-config path for external
+        orchestrators: they launch one authenticated
+        ``copilot --headless`` process and export these two variables. The
+        variables are namespaced (``COPILOT_PROVIDER_*``) specifically so
+        unrelated ambient shell state cannot silently divert default Copilot
+        traffic.
+        """
+        settings = self._provider_settings
+
+        url = settings.runtime_url if settings is not None else None
+        url = url or os.environ.get("COPILOT_PROVIDER_RUNTIME_URL")
+
+        token: str | None = None
+        if settings is not None and settings.runtime_token is not None:
+            token = settings.runtime_token.get_secret_value()
+        if token is None:
+            token = os.environ.get("COPILOT_PROVIDER_RUNTIME_TOKEN")
+
+        # Values resolved from environment variables are not validated by the
+        # schema, so normalize/validate them here to mirror the YAML rules and
+        # avoid silently falling through to a nested spawn on a typo/unset env.
+        if url is not None:
+            url = url.strip()
+            if not url:
+                raise ProviderError(
+                    "'runtime_url' is empty; remove it or supply a value.",
+                    suggestion=(
+                        "Set runtime.provider.runtime_url or COPILOT_PROVIDER_RUNTIME_URL "
+                        "to a valid port, host:port, or full URL."
+                    ),
+                    is_retryable=False,
+                )
+        # An empty token is the legitimate no-auth / tokenless-runtime case;
+        # normalize it to None rather than erroring.
+        if token is not None:
+            token = token.strip() or None
+        if token is not None and url is None:
+            raise ProviderError(
+                "'runtime_token' requires 'runtime_url' to also be set",
+                suggestion=(
+                    "Set COPILOT_PROVIDER_RUNTIME_URL alongside "
+                    "COPILOT_PROVIDER_RUNTIME_TOKEN, or remove the token."
+                ),
+                is_retryable=False,
+            )
+
+        if url is None:
+            return None
+        return (url, token)
 
     async def execute(
         self,
@@ -843,6 +967,9 @@ class CopilotProvider(AgentProvider):
             # when runtime.provider opted into it.
             self._apply_provider_config(session_kwargs)
 
+            # Forward large-output handling configuration to the SDK.
+            session_kwargs["large_output"] = self._large_output_config()
+
             # Resolve reasoning effort: per-agent override wins over runtime default.
             # When set, validate against the model's advertised capabilities
             # before forwarding to the SDK.
@@ -913,6 +1040,7 @@ class CopilotProvider(AgentProvider):
                         }
                         if self._mcp_servers:
                             resume_kwargs["mcp_servers"] = self._mcp_servers_for_cwd(resolved_cwd)
+                        resume_kwargs["large_output"] = self._large_output_config()
                         session = await self._client.resume_session(resume_sid, **resume_kwargs)
                         logger.info(
                             f"Resumed Copilot session {resume_sid} for agent '{agent.name}'"
@@ -1526,59 +1654,18 @@ class CopilotProvider(AgentProvider):
         self, schema: dict[str, OutputField], depth: int = 0
     ) -> dict[str, Any]:
         """Build a prompt-facing schema description from OutputField definitions."""
-        if depth > self._max_schema_depth:
+        try:
+            return build_prompt_schema_properties(
+                schema,
+                depth=depth,
+                max_depth=self._max_schema_depth,
+                description_fallback=True,
+            )
+        except SchemaDepthError as exc:
             raise ValidationError(
                 f"Schema nesting depth exceeds maximum of {self._max_schema_depth} levels",
                 suggestion="Simplify your output schema to reduce nesting depth",
-            )
-        return {
-            field_name: self._build_prompt_field_schema(field_name, field_def, depth=depth)
-            for field_name, field_def in schema.items()
-        }
-
-    def _build_prompt_field_schema(
-        self,
-        field_name: str,
-        field_def: OutputField,
-        depth: int = 0,
-    ) -> dict[str, Any]:
-        """Build a prompt-facing schema description for a named field."""
-        schema: dict[str, Any] = {
-            "type": field_def.type,
-            "description": field_def.description or f"The {field_name} field",
-        }
-
-        if field_def.type == "object" and field_def.properties:
-            schema["properties"] = self._build_prompt_schema(field_def.properties, depth=depth + 1)
-            schema["required"] = list(field_def.properties.keys())
-
-        if field_def.type == "array" and field_def.items:
-            schema["items"] = self._build_prompt_item_schema(field_def.items, depth=depth + 1)
-
-        return schema
-
-    def _build_prompt_item_schema(self, field_def: OutputField, depth: int = 0) -> dict[str, Any]:
-        """Build a prompt-facing schema description for an array item."""
-        if depth > self._max_schema_depth:
-            raise ValidationError(
-                f"Schema nesting depth exceeds maximum of {self._max_schema_depth} levels",
-                suggestion="Simplify your output schema to reduce nesting depth",
-            )
-        schema: dict[str, Any] = {
-            "type": field_def.type,
-        }
-
-        if field_def.description:
-            schema["description"] = field_def.description
-
-        if field_def.type == "object" and field_def.properties:
-            schema["properties"] = self._build_prompt_schema(field_def.properties, depth=depth + 1)
-            schema["required"] = list(field_def.properties.keys())
-
-        if field_def.type == "array" and field_def.items:
-            schema["items"] = self._build_prompt_item_schema(field_def.items, depth=depth + 1)
-
-        return schema
+            ) from exc
 
     def _log_event_verbose(
         self,
@@ -2074,7 +2161,7 @@ class CopilotProvider(AgentProvider):
         """
         async with self._start_lock:
             if self._client is None:
-                self._client = CopilotClient()
+                self._client = self._build_client()
             if not self._started:
                 await self._client.start()
                 self._started = True
@@ -2083,6 +2170,39 @@ class CopilotProvider(AgentProvider):
                 # BlockingIOError on large payloads. The asyncio event loop
                 # may set O_NONBLOCK on inherited file descriptors.
                 self._fix_pipe_blocking_mode()
+
+    def _build_client(self) -> Any:
+        """Construct the Copilot SDK client.
+
+        When a runtime connection is resolved (via ``runtime_url`` /
+        ``COPILOT_PROVIDER_RUNTIME_URL``), connect to that already-running
+        runtime instead of spawning a nested ``copilot`` child process. The
+        SDK's ``start()`` skips process spawning for URI connections and its
+        ``stop()`` leaves the externally-owned server running, so Conductor
+        reuses the authenticated runtime process while creating a separate SDK
+        session for each agent.
+        """
+        connection = self._resolve_runtime_connection()
+        if connection is None:
+            return CopilotClient()
+
+        url, token = connection
+        if RuntimeConnection is None:
+            raise ProviderError(
+                "Connecting to an existing Copilot runtime (runtime_url) requires a "
+                "Copilot SDK that provides RuntimeConnection, which is unavailable in "
+                "the installed SDK version.",
+                suggestion=(
+                    "Upgrade the copilot SDK, or unset runtime_url / "
+                    "COPILOT_PROVIDER_RUNTIME_URL to spawn a nested runtime instead."
+                ),
+                is_retryable=False,
+            )
+        logger.info(
+            "Connecting to existing Copilot runtime at %s (no nested runtime spawned)",
+            url,
+        )
+        return CopilotClient(connection=RuntimeConnection.for_uri(url, connection_token=token))
 
     def _fix_pipe_blocking_mode(self) -> None:
         """Clear O_NONBLOCK on the Copilot CLI subprocess pipes.
@@ -2227,17 +2347,29 @@ class CopilotProvider(AgentProvider):
                 is_retryable=False,
             )
 
+        external_runtime = False
         try:
+            external_runtime = self._resolve_runtime_connection() is not None
             await self._ensure_client_started()
             return True
+        except ProviderError:
+            raise
         except Exception as e:
-            raise ProviderError(
-                f"Failed to connect to Copilot SDK: {e}",
-                suggestion=(
+            if external_runtime:
+                suggestion = (
+                    "Verify the external Copilot runtime is running and reachable at "
+                    "runtime.provider.runtime_url / COPILOT_PROVIDER_RUNTIME_URL, and that "
+                    "COPILOT_PROVIDER_RUNTIME_TOKEN matches COPILOT_CONNECTION_TOKEN."
+                )
+            else:
+                suggestion = (
                     "Ensure the Copilot CLI is installed and you have an active "
                     "GitHub Copilot subscription. Install CLI: "
                     "https://docs.github.com/en/copilot/how-tos/set-up/install-copilot-cli"
-                ),
+                )
+            raise ProviderError(
+                f"Failed to connect to Copilot SDK: {e}",
+                suggestion=suggestion,
                 is_retryable=False,
             ) from e
 
@@ -2289,6 +2421,9 @@ class CopilotProvider(AgentProvider):
             # Honor the same custom provider routing as agent sessions so
             # dialog turns hit the same endpoint as agent execution.
             self._apply_provider_config(dialog_kwargs)
+
+            # Forward large-output handling configuration to the SDK.
+            dialog_kwargs["large_output"] = self._large_output_config()
 
             # Dialog turns honor the workflow-wide default reasoning effort
             # only — there's no agent-scoped override at this layer.

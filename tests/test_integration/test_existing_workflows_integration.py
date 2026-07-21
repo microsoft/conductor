@@ -184,6 +184,12 @@ async def test_schema_changes_dont_affect_copilot_provider():
     assert dumped == {
         "provider": "copilot",
         "mcp_servers": {},
+        # Tool output limits are on by default (issue #F1).
+        "tool_output": {
+            "enabled": True,
+            "max_chars": 50000,
+            "spill_to_file": True,
+        },
         # Periodic checkpoints are off by default (issue #244); every_seconds is
         # None and excluded by exclude_none.
         "checkpoint": {"every_agent": False, "keep_last": 5},

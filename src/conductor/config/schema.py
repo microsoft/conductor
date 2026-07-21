@@ -1671,18 +1671,17 @@ class ProviderSettings(BaseModel):
 
     - String shorthand: ``provider: copilot`` (equivalent to
       ``provider: {name: copilot}``).
-    - Object form: enables routing the Copilot SDK at custom endpoints
-      such as Azure OpenAI, Ollama, vLLM, LM Studio, or any other
-      OpenAI-compatible server. Object fields beyond ``name`` are
-      currently supported only for ``name: copilot``; they are forwarded
-      verbatim to ``copilot.client.create_session(provider=...)``.
+    - Object form: configures custom model-provider routing, an existing
+      Copilot runtime connection, or both. Copilot routing fields are forwarded
+      to ``copilot.client.create_session(provider=...)``; runtime fields select
+      how the SDK reaches the Copilot CLI process.
 
-    When any field beyond ``name`` is set, the Copilot provider activates
-    "custom routing" mode and fills any missing field from environment
-    variables (see :meth:`has_custom_routing`).
+    Custom routing activates only when a routing field is set and fills missing
+    values from environment variables (see :meth:`has_custom_routing`). Runtime
+    connection settings are tracked separately by :meth:`has_external_runtime`.
 
     The model is frozen after construction (``frozen=True``) because
-    custom routing is set-once at config load. This avoids the
+    structured provider settings are set once at config load. This avoids the
     Pydantic gotcha where ``model_validator(mode="after")``
     cross-field invariants do not re-fire on per-attribute assignment
     even with ``validate_assignment=True``.
@@ -1744,6 +1743,40 @@ class ProviderSettings(BaseModel):
     """Azure-specific options (e.g. ``api_version``). Requires
     ``type: azure``. Copilot-only."""
 
+    runtime_url: str | None = None
+    """Connect to an already-running Copilot runtime instead of spawning a
+    nested one. Copilot-only.
+
+    Accepts ``"port"``, ``"host:port"``, or a full URL. When set, the Copilot
+    provider connects to the external runtime via the SDK's
+    ``RuntimeConnection.for_uri(...)`` — no child ``copilot`` process is
+    spawned. Agents share the authenticated runtime process while retaining
+    separate SDK sessions. This is the recommended way to run Conductor inside
+    an external orchestrator that already owns an authenticated
+    ``copilot --headless`` process.
+
+    Falls back to the ``COPILOT_PROVIDER_RUNTIME_URL`` environment variable
+    when not set in YAML. May be combined with custom model-provider routing:
+    the runtime URL selects the CLI transport, while ``base_url`` / ``api_key``
+    and related fields configure the model endpoint for each SDK session.
+
+    Example::
+
+        provider:
+          name: copilot
+          runtime_url: localhost:3000
+          runtime_token: ${COPILOT_RUNTIME_TOKEN}
+    """
+
+    runtime_token: SecretStr | None = None
+    """Shared secret authenticating the connection to ``runtime_url``. Copilot-only.
+
+    Required when the server was started with a connection token. Prefer
+    ``${COPILOT_RUNTIME_TOKEN}`` interpolation so the literal value never lands
+    in ``workflow_started`` events or checkpoints. Falls back to the
+    ``COPILOT_PROVIDER_RUNTIME_TOKEN`` environment variable when not set in
+    YAML. Requires ``runtime_url``."""
+
     hermes_home: str | None = None
     """Path to a Hermes home directory (profile). Hermes-only.
 
@@ -1789,6 +1822,8 @@ class ProviderSettings(BaseModel):
             "bearer_token": self.bearer_token,
             "headers": self.headers,
             "azure": self.azure,
+            "runtime_url": self.runtime_url,
+            "runtime_token": self.runtime_token,
         }
         claude_only_fields = {
             "auth_token": self.auth_token,
@@ -1827,10 +1862,12 @@ class ProviderSettings(BaseModel):
         if self.azure is not None and self.type != "azure":
             raise ValueError("'azure' options require type='azure'")
 
-        # Reject empty containers and empty SecretStr — they activate
-        # custom routing via has_custom_routing() but resolve to falsy
-        # values in the resolver and would silently drop the entire
-        # SDK provider kwarg.
+        # Reject empty containers and empty/whitespace-only SecretStr — they
+        # activate custom routing via has_custom_routing() but resolve to falsy
+        # values in the resolver and would silently drop the entire SDK provider
+        # kwarg. The provider strips these values at runtime, so a whitespace-only
+        # secret would silently normalize to None; reject it here (non-mutating
+        # .strip() check) so `conductor validate` matches the resolver.
         if self.headers is not None and len(self.headers) == 0:
             raise ValueError(
                 "'headers' must contain at least one entry; remove the key to omit headers"
@@ -1839,12 +1876,24 @@ class ProviderSettings(BaseModel):
             ("api_key", self.api_key),
             ("bearer_token", self.bearer_token),
             ("auth_token", self.auth_token),
+            ("runtime_token", self.runtime_token),
         ):
-            if value is not None and value.get_secret_value() == "":
+            if value is not None and value.get_secret_value().strip() == "":
                 raise ValueError(
                     f"'{secret_field}' is empty; remove the key or supply a value "
                     "(typo / unset env interpolation?)"
                 )
+
+        # An empty (or whitespace-only) runtime_url must also be rejected: because
+        # "" is not None, has_external_runtime() would return True and the
+        # runtime_token guard (runtime_url is None) would pass, yet the provider
+        # treats "" as falsy and silently falls back to env / a nested spawn while
+        # dropping the token.
+        if self.runtime_url is not None and self.runtime_url.strip() == "":
+            raise ValueError(
+                "'runtime_url' is empty; remove the key or supply a value "
+                "(typo / unset env interpolation?)"
+            )
 
         # Positive precondition: structured fields that only make sense
         # alongside an endpoint must not be the *only* thing set.
@@ -1870,6 +1919,10 @@ class ProviderSettings(BaseModel):
                 "'azure' block is empty; either set azure.api_version or remove the block"
             )
 
+        # A connection token is meaningless without a URL to connect to.
+        if self.runtime_token is not None and self.runtime_url is None:
+            raise ValueError("'runtime_token' requires 'runtime_url' to also be set")
+
         return self
 
     def has_custom_routing(self) -> bool:
@@ -1879,6 +1932,11 @@ class ProviderSettings(BaseModel):
         set. We never activate from ambient environment variables alone —
         that would silently divert default Copilot traffic based on
         unrelated shell state.
+
+        Note: this covers only *endpoint* routing (``base_url`` and friends).
+        Connecting to an existing runtime (``runtime_url``) is a separate
+        axis — see :meth:`has_external_runtime` — and is intentionally
+        excluded so it does not activate the endpoint-provider resolver.
         """
         return any(
             value is not None
@@ -1894,6 +1952,20 @@ class ProviderSettings(BaseModel):
             )
         )
 
+    def has_external_runtime(self) -> bool:
+        """Return True when YAML configured connecting to an existing runtime.
+
+        Gated on ``runtime_url`` being set in YAML. As with custom routing,
+        ambient environment variables never activate this on their own here;
+        the ``COPILOT_PROVIDER_RUNTIME_URL`` fallback is resolved at the
+        provider layer.
+        """
+        return self.runtime_url is not None
+
+    def has_structured_config(self) -> bool:
+        """Return True when the provider has any non-default structured settings."""
+        return self.has_custom_routing() or self.has_external_runtime()
+
     @model_serializer(mode="wrap")
     def _serialize(self, nxt: Any) -> Any:
         """Collapse to bare string when only ``name`` is set.
@@ -1904,7 +1976,7 @@ class ProviderSettings(BaseModel):
         not as ``{"name": "copilot"}``. Once any structured field is set,
         the full object is emitted.
         """
-        if not self.has_custom_routing():
+        if not self.has_structured_config():
             return self.name
         return nxt(self)
 
@@ -1957,6 +2029,66 @@ class CheckpointConfig(BaseModel):
     def is_enabled(self) -> bool:
         """Return True if any periodic checkpoint trigger is configured."""
         return self.every_agent or self.every_seconds is not None
+
+
+class ToolOutputConfig(BaseModel):
+    """MCP tool result output-size configuration.
+
+    Controls how the result of each individual MCP tool call is handled when it
+    exceeds a per-result character limit. This is a per-result cap, not a
+    cumulative context-window budget: each tool result is evaluated
+    independently against ``max_chars``.
+
+    When ``spill_to_file`` is enabled, the full oversized result is written to
+    a process-private temporary file and the model receives a truncated prefix
+    plus a marker pointing to that file. When disabled, the result is simply
+    truncated to the limit (provider-specific behavior may differ, e.g. the
+    Copilot SDK disables large-output handling entirely).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    """Whether per-result MCP tool output size limiting is active."""
+
+    max_chars: int = Field(default=50000, ge=1000)
+    """Maximum number of characters to retain from each individual tool result.
+
+    Results longer than this are truncated; the kept prefix is delivered to
+    the model and the remainder is either spilled to a file or discarded
+    according to ``spill_to_file``.
+    """
+
+    spill_to_file: bool = True
+    """Whether oversized results should be written to a temporary file.
+
+    When ``True``, the full result is persisted to disk and a marker containing
+    the file path is appended to the truncated prefix. When ``False``, no file is
+    created and truncation is applied in-place.
+    """
+
+    spill_dir: str | None = None
+    """Directory used for spilled tool output files.
+
+    ``None`` (the default) resolves to ``<tempfile.gettempdir()>/conductor/tool-output``.
+    Relative paths are resolved against the current working directory of the
+    process. Parent directories are created automatically if needed.
+    """
+
+    @field_validator("spill_dir")
+    @classmethod
+    def _normalize_spill_dir(cls, v: str | None) -> str | None:
+        """Normalize an empty/whitespace ``spill_dir`` to ``None``.
+
+        Without this, consumers disagree on what ``""`` means: the MCP manager
+        treats it as falsy and falls back to the default temp dir, while the
+        Copilot provider checks ``is not None`` and forwards an empty
+        ``output_directory`` to the SDK. One normalization point keeps the
+        behavior identical across providers.
+        """
+        if v is None:
+            return None
+        return v.strip() or None
 
 
 class RuntimeConfig(BaseModel):
@@ -2072,6 +2204,14 @@ class RuntimeConfig(BaseModel):
     Opt-in automatic checkpointing at step boundaries so stalled or killed
     long-running workflows stay resumable. Defaults to off (failure-only
     checkpoints). See :class:`CheckpointConfig`.
+    """
+
+    tool_output: ToolOutputConfig = Field(default_factory=ToolOutputConfig)
+    """MCP tool result output-size configuration.
+
+    Controls per-result truncation and spill-to-file behavior for MCP tool
+    outputs. Defaults to enabled with a 50000-character limit and spill-to-file
+    active. See :class:`ToolOutputConfig`.
     """
 
     default_context_tier: ContextTier | None = None

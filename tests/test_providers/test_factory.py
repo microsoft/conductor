@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from pydantic import SecretStr
 
-from conductor.config.schema import ProviderSettings
+from conductor.config.schema import ProviderSettings, ToolOutputConfig
 from conductor.exceptions import ProviderError
 from conductor.providers.copilot import CopilotProvider
 from conductor.providers.factory import create_provider
@@ -67,6 +67,30 @@ class TestCreateProvider:
         assert provider._default_context_tier is None
         await provider.close()
 
+    @pytest.mark.asyncio
+    async def test_copilot_provider_receives_tool_output_config(self) -> None:
+        """tool_output config is threaded into the Copilot provider."""
+        config = ToolOutputConfig(max_chars=2000, spill_to_file=False, spill_dir="/tmp/out")
+        provider = await create_provider(
+            "copilot",
+            validate=False,
+            tool_output=config,
+        )
+        assert isinstance(provider, CopilotProvider)
+        assert provider._tool_output_config.max_chars == 2000
+        assert provider._tool_output_config.spill_to_file is False
+        assert provider._tool_output_config.spill_dir == "/tmp/out"
+        await provider.close()
+
+    @pytest.mark.asyncio
+    async def test_copilot_provider_tool_output_config_defaults_when_none(self) -> None:
+        """tool_output defaults to a ToolOutputConfig instance when not supplied."""
+        provider = await create_provider("copilot", validate=False)
+        assert isinstance(provider, CopilotProvider)
+        assert provider._tool_output_config.max_chars == 50000
+        assert provider._tool_output_config.enabled is True
+        await provider.close()
+
     @patch("conductor.providers.factory.ANTHROPIC_SDK_AVAILABLE", False)
     @pytest.mark.asyncio
     async def test_create_claude_provider_raises_when_sdk_not_available(self) -> None:
@@ -94,6 +118,7 @@ class TestCreateProvider:
         provider = await create_provider("claude", validate=False)
         assert provider is not None
         assert provider.__class__.__name__ == "ClaudeProvider"
+        assert provider._tool_output_config.max_chars == 50000
 
     @patch("conductor.providers.factory.ANTHROPIC_SDK_AVAILABLE", True)
     @patch("conductor.providers.claude.AsyncAnthropic")
@@ -110,6 +135,7 @@ class TestCreateProvider:
         mock_client.models.list = AsyncMock(return_value=MagicMock(data=[]))
         mock_anthropic_class.return_value = mock_client
 
+        tool_output = ToolOutputConfig(max_chars=2500, spill_dir="/tmp/claude-out")
         provider = await create_provider(
             "claude",
             validate=False,
@@ -117,6 +143,7 @@ class TestCreateProvider:
             temperature=0.7,
             max_tokens=4096,
             timeout=300.0,
+            tool_output=tool_output,
         )
         assert provider is not None
         assert provider.__class__.__name__ == "ClaudeProvider"
@@ -125,6 +152,8 @@ class TestCreateProvider:
         assert provider._default_temperature == 0.7
         assert provider._default_max_tokens == 4096
         assert provider._timeout == 300.0
+        assert provider._tool_output_config.max_chars == 2500
+        assert provider._tool_output_config.spill_dir == "/tmp/claude-out"
 
     @patch("conductor.providers.factory.ANTHROPIC_SDK_AVAILABLE", True)
     @patch("conductor.providers.claude.AsyncAnthropic")

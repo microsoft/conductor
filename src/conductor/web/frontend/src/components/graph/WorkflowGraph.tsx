@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef } from 'react';
+import { useCallback, useEffect, useMemo, useRef } from 'react';
 import {
   ReactFlow,
   MiniMap,
@@ -15,10 +15,11 @@ import {
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 
-import { useWorkflowStore } from '@/stores/workflow-store';
+import { useWorkflowStore, type SubworkflowContext } from '@/stores/workflow-store';
 import { useViewedGraphData } from '@/hooks/use-viewed-context';
 import { useDeepLink } from '@/hooks/use-deep-link';
-import { buildGraphElements, type GraphNodeData } from './graph-layout';
+import { buildGraphElements, collectExpandableContextKeys, type GraphNodeData, type GraphContextInput } from './graph-layout';
+import { nodeKey, parseNodeKey, isGroupExpansionKey, parseForEachSlotKey } from '@/lib/node-id';
 import { AgentNode } from './AgentNode';
 import { ScriptNode } from './ScriptNode';
 import { SetNode } from './SetNode';
@@ -35,7 +36,7 @@ import { AnimatedEdge } from './AnimatedEdge';
 import { WorkflowErrorBanner, WorkflowSuccessBanner } from '@/components/layout/ErrorBanner';
 import { NODE_STATUS_HEX } from '@/lib/constants';
 import type { NodeStatus } from '@/lib/constants';
-import { Loader2, Maximize, Zap } from 'lucide-react';
+import { Loader2, Maximize, Zap, ChevronsUpDown, ChevronsDownUp } from 'lucide-react';
 
 const nodeTypes: NodeTypes = {
   agentNode: AgentNode,
@@ -82,6 +83,22 @@ function EdgeMarkers() {
   );
 }
 
+/**
+ * Resolve a `SubworkflowContext` from its absolute numeric index path. Returns
+ * `null` for the root path (`[]`) — callers use the root store fields there.
+ */
+function resolveContextByPath(
+  contexts: SubworkflowContext[],
+  path: number[],
+): SubworkflowContext | null {
+  if (path.length === 0) return null;
+  let ctx: SubworkflowContext | undefined = contexts[path[0]!];
+  for (let i = 1; i < path.length && ctx; i++) {
+    ctx = ctx.children[path[i]!];
+  }
+  return ctx ?? null;
+}
+
 export function WorkflowGraph() {
   const viewCtx = useViewedGraphData();
   const viewContextPath = useWorkflowStore((s) => s.viewContextPath);
@@ -93,83 +110,183 @@ export function WorkflowGraph() {
   const navigateIntoSubworkflow = useWorkflowStore((s) => s.navigateIntoSubworkflow);
 
   // Get the data for the currently viewed context
-  const { agents, routes, parallelGroups, forEachGroups, nodes: storeNodes, groupProgress, entryPoint, subworkflowContexts, parentAgent } = viewCtx;
+  const {
+    agents,
+    routes,
+    parallelGroups,
+    forEachGroups,
+    nodes: storeNodes,
+    groupProgress,
+    entryPoint,
+    subworkflowContexts,
+    parentAgent,
+    basePath,
+  } = viewCtx;
+
+  // Root-level store slices, used to resolve an absolute-namespaced flow-node id
+  // back to the store context that owns its live state (status/progress), and to
+  // detect when an inline-expanded child DAG first materializes.
+  const expandedContexts = useWorkflowStore((s) => s.expandedContexts);
+  const rootNodes = useWorkflowStore((s) => s.nodes);
+  const rootGroupProgress = useWorkflowStore((s) => s.groupProgress);
+  const rootSubContexts = useWorkflowStore((s) => s.subworkflowContexts);
+  const rootHighlightedEdges = useWorkflowStore((s) => s.highlightedEdges);
 
   const [flowNodes, setFlowNodes, onNodesChange] = useNodesState<Node<GraphNodeData>>([]);
   const [flowEdges, setFlowEdges, onEdgesChange] = useEdgesState<Edge>([]);
 
-  const graphBuilt = useRef(false);
-  const prevViewPath = useRef<string>('');
+  const prevBuildKey = useRef<string>('');
 
-  // Rebuild graph when context changes (breadcrumb navigation) or when agents first appear
   const viewPathKey = JSON.stringify(viewContextPath);
+
+  // Topology signature: a full rebuild (re-layout) fires only when the set of
+  // rendered nodes could change — context switch, expansion toggle, or a
+  // newly-arrived expanded child DAG. Status-only updates leave this stable so
+  // the layout doesn't jitter; those are applied incrementally below.
+  const structureKey = useMemo(() => {
+    const parts = [`${viewPathKey}#${agents.map((a) => a.name).join(',')}`];
+    for (const key of [...expandedContexts].sort()) {
+      if (isGroupExpansionKey(key)) {
+        // Expanded for_each-of-workflow group: its rendered iteration pills come
+        // from the owning context's children, so re-layout when that set (or an
+        // iteration's own agents → chevron affordance) changes.
+        const { contextPath, name } = parseNodeKey(key);
+        const owner =
+          contextPath.length === 0 ? null : resolveContextByPath(rootSubContexts, contextPath);
+        const children = contextPath.length === 0 ? rootSubContexts : (owner?.children ?? []);
+        const iters = children
+          .filter((c) => {
+            const p = parseForEachSlotKey(c.slotKey);
+            return p != null && p.group === name;
+          })
+          .map((c) => `${c.slotKey}:${c.entryPoint ?? ''}:${c.agents.map((a) => a.name).join(',')}`);
+        parts.push(`${key}=>${iters.join('|')}`);
+        continue;
+      }
+      const path = key.split('.').filter(Boolean).map(Number);
+      const ctx = resolveContextByPath(rootSubContexts, path);
+      parts.push(`${key}:${ctx?.entryPoint ?? ''}:${ctx?.agents.map((a) => a.name).join(',') ?? ''}`);
+    }
+    return parts.join('||');
+  }, [viewPathKey, agents, expandedContexts, rootSubContexts]);
+
   useEffect(() => {
     if (agents.length === 0) {
       // Clear stale graph elements when navigated to an empty context
-      if (prevViewPath.current !== viewPathKey) {
-        graphBuilt.current = false;
-        prevViewPath.current = viewPathKey;
+      if (prevBuildKey.current !== structureKey) {
+        prevBuildKey.current = structureKey;
         setFlowNodes([]);
         setFlowEdges([]);
       }
       return;
     }
 
-    // Force rebuild on context switch
-    if (prevViewPath.current !== viewPathKey) {
-      graphBuilt.current = false;
-      prevViewPath.current = viewPathKey;
-    }
+    if (prevBuildKey.current === structureKey) return;
+    prevBuildKey.current = structureKey;
 
-    if (graphBuilt.current) return;
-    graphBuilt.current = true;
-
-    const { nodes, edges } = buildGraphElements(
-      agents, routes, parallelGroups, forEachGroups, storeNodes, groupProgress, entryPoint, parentAgent
-    );
+    const base: GraphContextInput = {
+      agents,
+      routes,
+      parallelGroups,
+      forEachGroups,
+      nodes: storeNodes,
+      groupProgress,
+      entryPoint,
+      parentAgent,
+      children: subworkflowContexts,
+    };
+    const { nodes, edges } = buildGraphElements(base, basePath, expandedContexts);
     setFlowNodes(nodes);
     setFlowEdges(edges);
-  }, [agents, routes, parallelGroups, forEachGroups, storeNodes, groupProgress, entryPoint, setFlowNodes, setFlowEdges, viewPathKey, parentAgent]);
+  }, [
+    structureKey,
+    agents,
+    routes,
+    parallelGroups,
+    forEachGroups,
+    storeNodes,
+    groupProgress,
+    entryPoint,
+    parentAgent,
+    subworkflowContexts,
+    basePath,
+    expandedContexts,
+    setFlowNodes,
+    setFlowEdges,
+  ]);
 
-  // Update node data when store nodes change (status, progress, etc.)
+  // Update node data when store nodes change (status, progress, etc.). Each
+  // flow node carries its absolute `contextPath` + bare `name`, so we resolve
+  // live state from the owning context — including inline-expanded children.
   useEffect(() => {
-    if (!graphBuilt.current) return;
-
     setFlowNodes((nds) =>
       nds.map((node) => {
-        const storeNode = storeNodes[node.id];
-        if (!storeNode) return node;
+        const gd = node.data as GraphNodeData;
 
-        const newStatus = storeNode.status || 'pending';
-        const currentStatus = (node.data as GraphNodeData).status;
-
-        if (newStatus !== currentStatus) {
-          const newData = { ...node.data, status: newStatus } as GraphNodeData;
-          // Update group progress
-          if (node.data.groupName && groupProgress[node.data.groupName]) {
-            newData.progress = groupProgress[node.data.groupName];
-          }
-          return { ...node, data: newData };
+        // for_each iteration member: its live status is the child context's own
+        // `.status` (there is no `nodes[slotKey]` entry in the parent context).
+        const iterPath = gd.iterationContextPath;
+        if (iterPath && iterPath.length > 0) {
+          const iterCtx = resolveContextByPath(rootSubContexts, iterPath);
+          const newStatus = iterCtx?.status;
+          if (!newStatus || newStatus === gd.status) return node;
+          return { ...node, data: { ...gd, status: newStatus } };
         }
 
-        // Check group progress updates
-        if (node.data.groupName && groupProgress[node.data.groupName]) {
-          const currentProgress = (node.data as GraphNodeData).progress;
-          const newProgress = groupProgress[node.data.groupName];
+        const path = gd.contextPath ?? [];
+        const ctx = path.length === 0 ? null : resolveContextByPath(rootSubContexts, path);
+        const ctxNodes = path.length === 0 ? rootNodes : ctx?.nodes;
+        const ctxProgress = path.length === 0 ? rootGroupProgress : ctx?.groupProgress;
+        const name = gd.name ?? node.id;
+        const storeNode = ctxNodes ? ctxNodes[name] : undefined;
+        if (!storeNode) return node;
+
+        let newData = gd;
+        let changed = false;
+
+        const newStatus = storeNode.status || 'pending';
+        if (newStatus !== gd.status) {
+          newData = { ...newData, status: newStatus };
+          changed = true;
+        }
+
+        if (gd.groupName && ctxProgress && ctxProgress[gd.groupName]) {
+          const newProgress = ctxProgress[gd.groupName];
+          const currentProgress = newData.progress;
           if (
             newProgress &&
             (!currentProgress ||
               currentProgress.completed !== newProgress.completed ||
               currentProgress.failed !== newProgress.failed)
           ) {
-            return { ...node, data: { ...node.data, progress: newProgress } as GraphNodeData };
+            newData = { ...newData, progress: newProgress };
+            changed = true;
           }
         }
 
-        return node;
-      })
+        return changed ? { ...node, data: newData } : node;
+      }),
     );
-  }, [storeNodes, groupProgress, setFlowNodes]);
+  }, [rootNodes, rootGroupProgress, rootSubContexts, setFlowNodes]);
+
+  // Resolve edge highlight state per context and stamp it into edge.data. Edges
+  // never cross a context boundary (both endpoints share a contextPath), so the
+  // source id determines which context's highlightedEdges to consult.
+  useEffect(() => {
+    setFlowEdges((eds) =>
+      eds.map((edge) => {
+        const { contextPath, name: fromName } = parseNodeKey(edge.source);
+        const toName = parseNodeKey(edge.target).name;
+        const ctx = contextPath.length === 0 ? null : resolveContextByPath(rootSubContexts, contextPath);
+        const highlights = contextPath.length === 0 ? rootHighlightedEdges : (ctx?.highlightedEdges ?? []);
+        const match = highlights.find((h) => h.from === fromName && h.to === toName);
+        const newState = match?.state;
+        const cur = (edge.data as Record<string, unknown> | undefined)?.highlightState;
+        if (cur === newState) return edge;
+        return { ...edge, data: { ...edge.data, highlightState: newState } };
+      }),
+    );
+  }, [rootHighlightedEdges, rootSubContexts, setFlowEdges]);
 
   // Handle node selection
   const onNodeClick = useCallback(
@@ -185,16 +302,21 @@ export function WorkflowGraph() {
     [selectNode],
   );
 
-  // Double-click on workflow agent nodes to navigate into subworkflow
+  // Double-click on a workflow node to drill into (focus) its subworkflow.
+  // Restricted to nodes in the currently viewed context; inline-expanded
+  // children are explored in place, not by focus-navigation.
   const onNodeDoubleClick = useCallback(
     (_: React.MouseEvent, node: Node) => {
-      // Check if this node has a subworkflow context
-      const hasSubworkflow = subworkflowContexts.some((c) => c.parentAgent === node.id);
-      if (hasSubworkflow) {
-        navigateIntoSubworkflow(node.id);
+      const gd = node.data as GraphNodeData;
+      if (gd.type !== 'workflow') return;
+      const path = gd.contextPath ?? [];
+      if (path.join('.') !== viewContextPath.join('.')) return;
+      const name = gd.name;
+      if (name && subworkflowContexts.some((c) => c.slotKey === name || c.parentAgent === name)) {
+        navigateIntoSubworkflow(name);
       }
     },
-    [subworkflowContexts, navigateIntoSubworkflow],
+    [subworkflowContexts, navigateIntoSubworkflow, viewContextPath],
   );
 
   const onPaneClick = useCallback(() => {
@@ -217,10 +339,10 @@ export function WorkflowGraph() {
     );
   }, [selectedNode, setFlowNodes]);
 
-  // Auto-select failed agent when workflow fails
+  // Auto-select failed agent when workflow fails (root-level failing agent).
   useEffect(() => {
     if (workflowStatus === 'failed' && workflowFailedAgent) {
-      selectNode(workflowFailedAgent);
+      selectNode(nodeKey([], workflowFailedAgent));
     }
   }, [workflowStatus, workflowFailedAgent, selectNode]);
 
@@ -286,6 +408,7 @@ export function WorkflowGraph() {
           zoomable
         />
         <Controls showInteractive={false}>
+          <ExpandCollapseAllButton />
           <FitViewButton />
         </Controls>
         <FitViewKeyboardShortcut />
@@ -312,6 +435,65 @@ function FitViewButton() {
       style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}
     >
       <Maximize className="w-3.5 h-3.5" />
+    </button>
+  );
+}
+
+/**
+ * Toolbar control that expands or collapses every inline-expandable
+ * subworkflow in the viewed context at once. Hidden when the viewed context
+ * has no expandable subworkflows, so plain workflows don't see it. Toggles to
+ * "collapse all" whenever at least one is expanded. Mirrors the Fit-view
+ * button's `E` keyboard shortcut.
+ */
+function ExpandCollapseAllButton() {
+  const { agents, subworkflowContexts, basePath } = useViewedGraphData();
+  const expandedContexts = useWorkflowStore((s) => s.expandedContexts);
+  const expandContexts = useWorkflowStore((s) => s.expandContexts);
+  const collapseContexts = useWorkflowStore((s) => s.collapseContexts);
+
+  const expandableKeys = useMemo(
+    () => collectExpandableContextKeys(agents, subworkflowContexts, basePath),
+    [agents, subworkflowContexts, basePath],
+  );
+
+  const anyExpanded = useMemo(
+    () => expandableKeys.some((k) => expandedContexts.has(k)),
+    [expandableKeys, expandedContexts],
+  );
+
+  const toggleAll = useCallback(() => {
+    if (expandableKeys.length === 0) return;
+    if (anyExpanded) collapseContexts(expandableKeys);
+    else expandContexts(expandableKeys);
+  }, [expandableKeys, anyExpanded, collapseContexts, expandContexts]);
+
+  // Keyboard shortcut: E toggles expand/collapse-all (mirrors F for fit-view).
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      const tag = (e.target as HTMLElement)?.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+      if (e.key === 'e' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        toggleAll();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [toggleAll]);
+
+  if (expandableKeys.length === 0) return null;
+
+  const label = anyExpanded ? 'Collapse all subworkflows' : 'Expand all subworkflows';
+
+  return (
+    <button
+      onClick={toggleAll}
+      className="react-flow__controls-button"
+      title={`${label} (E)`}
+      aria-label={label}
+      style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+    >
+      {anyExpanded ? <ChevronsDownUp className="w-3.5 h-3.5" /> : <ChevronsUpDown className="w-3.5 h-3.5" />}
     </button>
   );
 }

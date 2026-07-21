@@ -5,7 +5,103 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.22...HEAD)
+## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.24...HEAD)
+
+## [0.1.24](https://github.com/microsoft/conductor/compare/v0.1.23...v0.1.24) - 2026-07-21
+
+### Added
+
+- **Grouped CLI command surface** — related subcommands are now organised under
+  noun groups: `conductor checkpoint list` (was `conductor checkpoints`) and
+  `conductor gate respond` (was `conductor gate-respond`), alongside the
+  existing `registry` group. The root `--help` groups commands into
+  *Run & Recover*, *Author & Inspect*, *Environment*, *Interact*, and *State*
+  panels, while the hot-path verbs (`run`, `resume`, `validate`, `show`,
+  `stop`, `replay`, `update`, `doctor`) stay flat.
+  ([#275](https://github.com/microsoft/conductor/issues/275))
+
+### Deprecated
+
+- **`conductor checkpoints` and `conductor gate-respond`** — replaced by
+  `conductor checkpoint list` and `conductor gate respond` respectively. The old
+  names still work and forward to the new commands, but print a one-line stderr
+  deprecation warning, are hidden from `--help`, and will be removed in a future
+  release. ([#275](https://github.com/microsoft/conductor/issues/275))
+
+### Fixed
+
+- **`--web-bg` no longer aborts when a workflow contains a `human_gate`** — the
+  dashboard already supported resolving gates (modal, WebSocket
+  `gate_response`, `POST /api/gate-respond`, `conductor gate-respond`), but the
+  detached background process raced a CLI prompt against it and crashed with
+  `EOFError` on its closed stdin. The gate now waits web-only when running in
+  `--web-bg` (or any non-TTY context), and the CLI prints a notice pointing at
+  the dashboard URL and `conductor gate-respond` instead of aborting the launch.
+  ([#286](https://github.com/microsoft/conductor/issues/286))
+- **`--web-bg` could hang forever if no dashboard client ever connected** — the
+  auto-shutdown grace timer was only armed from WebSocket-disconnect code
+  paths, so an unwatched run that finished before anyone opened the dashboard
+  never started its grace countdown and the detached process became a zombie
+  holding its port and PID file. The timer now also arms on the workflow's root
+  completion event. ([#318](https://github.com/microsoft/conductor/issues/318))
+- **`conductor doctor` showed the `copilot` provider as red/unconfigured even
+  when fully authenticated** — credential env vars are now modeled as optional
+  per provider; an absent optional credential (e.g. `copilot`'s GitHub/Copilot
+  CLI login) renders as a neutral `○` with an explanatory note instead of a red
+  `✗`, while genuinely required credentials (e.g. `claude`'s
+  `ANTHROPIC_API_KEY`) still flag as missing.
+  ([#319](https://github.com/microsoft/conductor/issues/319))
+- **Web dashboard could keep showing a stale UI after `conductor update`** —
+  `index.html` is now served with `Cache-Control: no-cache` so the browser
+  revalidates it on every load and always picks up the current build's
+  version-hashed asset bundle. CI also now fails the Frontend job if the
+  committed `static/` bundle doesn't match a fresh `make build-frontend`, so a
+  frontend change can no longer merge without its built assets.
+  ([#321](https://github.com/microsoft/conductor/pull/321))
+
+## [0.1.23](https://github.com/microsoft/conductor/compare/v0.1.22...v0.1.23) - 2026-07-20
+
+### Added
+
+- **`working_dir` for LLM agents and their MCP servers** — agents gain an
+  optional `working_dir` (with a workflow-wide `runtime.working_dir` default) so
+  an agent and its MCP servers run in a chosen directory. It is resolved with
+  precedence agent > runtime > `os.getcwd()` and accepts static values or Jinja
+  templates. The Copilot and Claude providers stamp the resolved directory onto
+  the agent session and each MCP server; `conductor validate` rejects
+  `working_dir` on providers that don't support it (`hermes`,
+  `claude-agent-sdk`) and on `wait` / `set` / `terminate` / `human_gate` /
+  `workflow` step types. See the "Working Directory" section of
+  [`docs/mcp-tools.md`](docs/mcp-tools.md).
+  ([#297](https://github.com/microsoft/conductor/pull/297))
+- **`runtime.tool_output` limits for oversized MCP tool results** — a
+  configurable per-result cap stops a single large MCP tool result from
+  overflowing the model's context window with a fatal token-limit error.
+  Oversized results are truncated (`max_chars`, default `50000`) and the full
+  text is spilled to a temp file the agent can page through, with a notice
+  surfaced in the console, event log, and dashboard. Claude truncates
+  conductor-side; Copilot forwards the limit to its native SDK spill feature;
+  the setting is ignored by `claude-agent-sdk` (managed via the native
+  `MAX_MCP_OUTPUT_TOKENS`) and is N/A for `hermes`. See
+  [`examples/tool-output-limits.yaml`](examples/tool-output-limits.yaml) and the
+  "Tool output limits" section of [`docs/mcp-tools.md`](docs/mcp-tools.md).
+  ([#313](https://github.com/microsoft/conductor/pull/313))
+- **Inline expand/collapse for subworkflows in the dashboard graph** —
+  subworkflow nodes now expand inline (collapsed by default) to reveal their
+  internal DAG without leaving the current view, alongside the existing
+  double-click drill-down "focus mode." Adds an Expand/Collapse-all toolbar
+  control and an `E` keyboard shortcut, and expands `for_each`-of-workflow
+  groups into inline sub-containers.
+  ([#316](https://github.com/microsoft/conductor/pull/316))
+
+### Fixed
+
+- **Subworkflow-adjacent agent node could appear stuck "running" in the
+  dashboard** — the graph store now clones the `subworkflowContexts` tree on
+  every event, so selectors keyed on it reliably observe nested status updates.
+  An agent node next to a `type: workflow` step no longer renders as "running"
+  after its underlying data is already `completed` (a pure rendering desync, not
+  an engine data bug). ([#308](https://github.com/microsoft/conductor/pull/308))
 
 ## [0.1.22](https://github.com/microsoft/conductor/compare/v0.1.21...v0.1.22) - 2026-07-15
 
@@ -82,6 +178,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Connect the Copilot provider to an existing runtime** — `runtime.provider`
+  gains a Copilot-only `runtime_url` (plus optional `runtime_token`) that points
+  Conductor at an already-running `copilot --headless` process instead of
+  spawning its own nested one. Agents share the authenticated runtime process
+  while retaining separate SDK sessions. Both fields also resolve from the namespaced
+  `COPILOT_PROVIDER_RUNTIME_URL` / `COPILOT_PROVIDER_RUNTIME_TOKEN` environment
+  variables, which activate the connection with no YAML — the zero-config path
+  for external orchestrators that already own an authenticated
+  Copilot process. Runtime transport can be combined with custom model-provider
+  routing. See
+  `examples/copilot-existing-runtime.yaml` and the "Connecting to an Existing
+  Copilot Runtime" section of `docs/configuration.md`.
 - **Provider-supplied model pricing** — cost reporting now resolves pricing via a
   new `AgentProvider.get_model_pricing` hook before falling back to the static
   table. Resolution order is workflow `cost.pricing` → provider hook → built-in

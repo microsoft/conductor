@@ -1285,11 +1285,31 @@ Recover a stalled run by killing the process (e.g. `conductor stop` for a
 `--web-bg` run) and then:
 
 ```bash
-conductor checkpoints workflow.yaml     # list checkpoints (Trigger column shows periodic/failure)
+conductor checkpoint list workflow.yaml   # list checkpoints (Trigger column shows periodic/failure)
 conductor resume workflow.yaml          # resume from the latest checkpoint
 ```
 
 See `examples/periodic-checkpoints.yaml` for a complete example.
+
+### Tool Output Limits
+
+To prevent large tool results from overloading the context window, Conductor supports limiting the character size of individual MCP tool responses:
+
+```yaml
+workflow:
+  runtime:
+    tool_output:
+      enabled: true          # Default: true. Set false to disable output limiting.
+      max_chars: 50000       # Default: 50000. Retained character count (minimum: 1000).
+      spill_to_file: true    # Default: true. Write full raw output to a temp file.
+      spill_dir: null        # Default: null. Custom spill directory (defaults to OS temp dir).
+```
+
+* **Per-Result Cap:** The `max_chars` limit is a **per-result** cap applied to each tool result independently, not a cumulative context window budget. Multiple truncated tool results, combined with prompt and conversation history, can still exceed the model's context window. Users should tune this via `max_chars` or `max_agent_iterations` if needed.
+* **Spill files:** Spill files are written to the directory specified by `spill_dir` (resolving to `<tempfile.gettempdir()>/conductor/tool-output` if `null`). These files contain raw tool output (which may include secrets) and are not deleted by Conductor.
+* **Provider Support:** The Copilot provider maps this limit directly to bytes in the native SDK's `large_output` configuration. For Claude, the provider handles truncation conductor-side. This option is ignored by `claude-agent-sdk` (managed via native CLI `MAX_MCP_OUTPUT_TOKENS`) and is not applicable to `hermes` (no MCP tools).
+
+See `examples/tool-output-limits.yaml` for a complete example.
 
 ## Tools
 

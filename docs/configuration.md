@@ -233,6 +233,93 @@ worrying about per-call drift.
 demonstrates the full pattern with both Ollama (active) and Azure
 OpenAI (commented variant).
 
+### Connecting to an Existing Copilot Runtime
+
+By default the Copilot provider spawns its own nested `copilot` runtime
+process (one per provider instance) to run agents. Instead, you can point
+Conductor at an **already-running** Copilot runtime that was started in
+server mode by some other process. Conductor then connects to that runtime
+and reuses the authenticated runtime process for every agent. Each agent
+still gets its own SDK session, and no nested `copilot` process is spawned.
+
+This is the recommended way to run Conductor inside an external
+orchestrator that already owns an authenticated Copilot process. For
+example, an orchestrator can launch one authenticated
+`copilot --headless` process and hand Conductor a connection handle, so all of
+Conductor's agents/models are just new sessions on that shared server.
+Authentication is handled once, at the server — Conductor never needs the
+runtime's GitHub credentials. The optional runtime connection token only
+authenticates access to the server socket.
+
+#### YAML
+
+```yaml
+workflow:
+  runtime:
+    provider:
+      name: copilot
+      runtime_url: localhost:3000          # "port", "host:port", or a full URL
+      runtime_token: ${COPILOT_RUNTIME_TOKEN}   # optional shared secret
+    default_model: gpt-4o
+```
+
+- `runtime_url` — where the running runtime is listening. Accepts a bare
+  `"port"`, `"host:port"`, or a full URL. URL schemes are parsing syntax only:
+  the SDK opens a raw TCP connection and does not provide TLS.
+- `runtime_token` — the shared secret the runtime was started with, if
+  any. Stored as a `SecretStr` (redacted in events/checkpoints/dashboard);
+  prefer `${VAR}` interpolation. Requires `runtime_url`.
+
+#### Environment variables (zero-YAML)
+
+The connection also activates from environment variables alone, so an
+orchestrator can enable it without editing the workflow YAML:
+
+| Field | Env var |
+|---|---|
+| `runtime_url` | `COPILOT_PROVIDER_RUNTIME_URL` |
+| `runtime_token` | `COPILOT_PROVIDER_RUNTIME_TOKEN` |
+
+The YAML value takes precedence; the environment variable is used as a
+fallback when the YAML field is unset. These variables are namespaced under `COPILOT_PROVIDER_*` on
+purpose: unlike ambient `OPENAI_*` variables, they can safely activate the
+connection because they are specific to this feature.
+
+```bash
+# Orchestrator side, conceptually:
+export COPILOT_CONNECTION_TOKEN=<connection-token>
+copilot --headless --port 3000 &          # one authenticated runtime
+export COPILOT_PROVIDER_RUNTIME_URL=localhost:3000
+export COPILOT_PROVIDER_RUNTIME_TOKEN="$COPILOT_CONNECTION_TOKEN"
+conductor run review.yaml                 # connects; spawns no nested runtime
+```
+
+#### Rules and notes
+
+- `runtime_url` may be combined with custom model-provider routing. The runtime
+  URL selects the CLI transport; `base_url` / `api_key` / related fields are
+  forwarded on each SDK session to select the model endpoint.
+- `runtime_token` requires `runtime_url` (a token with nowhere to connect
+  is a misconfiguration) and, like the other secrets, may not be empty.
+- The connection token authenticates the socket but does not encrypt it. Keep
+  the default loopback binding where possible. Remote runtimes require
+  `copilot --headless --host ...` plus a trusted private network, firewall, or
+  TLS tunnel.
+- The external runtime executes against its own host environment. If it runs in
+  another container or machine, make the Conductor workspace available at the
+  same working-directory path.
+- Closing the provider does **not** terminate the external runtime — the
+  SDK only shuts down runtimes it spawned itself, so the orchestrator-owned
+  server keeps running. The orchestrator is also responsible for runtime
+  health checks and restarts.
+- Runtime-spawn-only options (custom CLI path, injected env, etc.) do not
+  apply when connecting to an existing runtime.
+
+#### Example workflow
+
+[`examples/copilot-existing-runtime.yaml`](../examples/copilot-existing-runtime.yaml)
+demonstrates connecting to an already-running Copilot runtime.
+
 ## Common Configuration Options
 
 These options work with both providers:

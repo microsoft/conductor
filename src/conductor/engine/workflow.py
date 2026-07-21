@@ -2243,12 +2243,31 @@ class WorkflowEngine:
         agent: AgentDef,
         agent_context: dict[str, Any],
     ) -> GateResult:
-        """Handle a human gate, racing CLI input against web dashboard input.
+        """Handle a human gate, choosing CLI / web / race per environment.
 
-        When a web dashboard is connected, both the CLI prompt and the web
-        dashboard wait concurrently.  The first response wins and the other
-        is cancelled.  When no web dashboard is available, falls back to
-        CLI-only input.
+        Resolution policy (issue #286, extending the #198/#202 max-iterations
+        gate fix in ``_resolve_max_iterations_gate``):
+
+        - No web dashboard + not bg mode: existing CLI-only prompt path,
+          unchanged. This covers plain foreground runs and non-TTY stdin
+          without a dashboard (e.g. piped input, tests) — a pre-existing,
+          already-safe combination that must not be newly restricted here.
+        - No web dashboard + bg mode (the dashboard failed to start in a
+          ``--web-bg`` child): neither input source can be used safely — the
+          CLI prompt would still hit the ``EOFError`` crash below. Raise
+          ``HumanGateError`` instead of falling through to it.
+        - Web dashboard attached + CLI usable (foreground TTY, not bg mode):
+          race the CLI prompt against the web response; first wins.
+        - Web dashboard attached + CLI NOT usable (bg mode or non-TTY
+          stdin): **web-only** wait. The CLI prompt is deliberately NOT
+          invoked because ``Prompt.ask`` would synchronously raise
+          ``EOFError`` (stdin=DEVNULL in ``--web-bg``), race-win
+          ``FIRST_COMPLETED``, cancel the web arm, and crash the workflow —
+          the original ``--web-bg`` + ``human_gate`` bug. A parked web-only
+          gate is ended by the outer ``_execute_with_stop_signal`` kill path
+          (which cancels this await and checkpoints via
+          ``handle_dashboard_stop``, issue #245), so no inner
+          ``wait_for_stop()`` race is needed here.
 
         Args:
             agent: The human_gate agent definition.
@@ -2256,12 +2275,36 @@ class WorkflowEngine:
 
         Returns:
             GateResult from whichever input source responded first.
+
+        Raises:
+            HumanGateError: If bg mode is active and no web dashboard is
+                attached (the dashboard failed to start in ``--web-bg``).
         """
-        # If no web dashboard at all, use CLI only.
         if self._web_dashboard is None:
+            if self._bg_mode:
+                from conductor.exceptions import HumanGateError
+
+                raise HumanGateError(
+                    f"Cannot resolve human_gate '{agent.name}': no web dashboard is "
+                    "available and stdin cannot be prompted in background mode.",
+                    suggestion=(
+                        "Restart with --web in the foreground, or resolve the gate "
+                        "with `conductor gate respond` once the dashboard is reachable."
+                    ),
+                    gate_name=agent.name,
+                )
+            # Not bg mode: use CLI only (foreground, or non-TTY without a
+            # dashboard — e.g. piped stdin, tests).
             return await self.gate_handler.handle_gate(
                 agent, agent_context, base_dir=self._workflow_dir
             )
+
+        # Web dashboard + bg or non-TTY → web-only wait (skip the CLI arm; it
+        # would EOFError-and-crash on a DEVNULL stdin, cancelling the web arm
+        # before a dashboard user could respond).
+        cli_usable = not self._bg_mode and sys.stdin.isatty()
+        if not cli_usable:
+            return await self._wait_for_web_gate(agent)
 
         # Race CLI vs web input. We start the web task unconditionally (not only
         # when a client is currently connected), because the human often opens

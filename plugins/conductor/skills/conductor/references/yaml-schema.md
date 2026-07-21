@@ -707,6 +707,8 @@ runtime:
     headers: {string: string}     # Extra HTTP headers (Copilot-only)
     azure:                        # Azure-specific options (requires type: azure)
       api_version: string         # e.g. "2024-10-21"
+    runtime_url: string           # Existing Copilot headless runtime (Copilot-only)
+    runtime_token: string         # SecretStr; requires runtime_url (Copilot-only)
     hermes_home: string           # Path to Hermes home directory/profile (Hermes-only)
     hermes_toolsets: [string]     # Hermes toolset names to enable (Hermes-only; null=all, []=none)
 ```
@@ -768,6 +770,20 @@ The schema rejects these misconfigurations at config-load time:
 When custom routing activates but every resolved field ends up empty,
 the Copilot provider raises `ProviderError` rather than silently
 falling back to default routing.
+
+### Existing Copilot runtime
+
+Set `runtime_url` to connect to an existing `copilot --headless` process
+instead of spawning one. `runtime_token` must match the server's
+`COPILOT_CONNECTION_TOKEN` when socket authentication is enabled. YAML values
+fall back to `COPILOT_PROVIDER_RUNTIME_URL` and
+`COPILOT_PROVIDER_RUNTIME_TOKEN`.
+
+Runtime transport and model-provider routing are independent, so
+`runtime_url` can be combined with `base_url`, `api_key`, `type`, and related
+fields. The runtime URL selects the CLI process; routing fields configure each
+model session. The transport is raw TCP, even when the URL includes an HTTP(S)
+scheme.
 
 ## Validation Rules
 

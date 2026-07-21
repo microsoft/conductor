@@ -11,6 +11,7 @@ Tests cover:
 
 import asyncio
 import os
+from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -647,6 +648,39 @@ class TestToolSchemaGeneration:
         assert tools[0]["input_schema"]["properties"]["result"]["type"] == "string"
         assert tools[0]["input_schema"]["properties"]["score"]["type"] == "number"
         assert set(tools[0]["input_schema"]["required"]) == {"result", "score"}
+
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    def test_build_tools_schema_depth_limit_direct(
+        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
+    ) -> None:
+        """Directly assert the private builder raises ValidationError at 11-deep nesting.
+
+        Requirement: schema nesting beyond the configured max depth (10 levels) must
+        surface a ValidationError with the exact message "Schema nesting depth exceeds
+        maximum of 10 levels" so callers cannot construct unbounded recursive schemas.
+        """
+        mock_anthropic_module.__version__ = "0.77.0"
+        mock_client = Mock()
+        mock_client.models.list = AsyncMock(return_value=Mock(data=[]))
+        mock_anthropic_class.return_value = mock_client
+
+        provider = ClaudeProvider()
+
+        def nested(level: int) -> OutputField:
+            if level == 0:
+                return OutputField(type="string")
+            return OutputField(
+                type="object",
+                properties={"nested": nested(level - 1)},
+            )
+
+        with pytest.raises(
+            ValidationError,
+            match="Schema nesting depth exceeds maximum of 10 levels",
+        ):
+            provider._build_json_schema_properties({"root": nested(11)})
 
 
 class TestConcurrentExecution:
@@ -3439,7 +3473,7 @@ class TestClaudeMCPManagerPool:
         """Return a fake MCPManager class whose instances are tracked in ``instances``."""
 
         class _FakeMCPManager:
-            def __init__(self) -> None:
+            def __init__(self, tool_output: Any | None = None) -> None:
                 self.connected: list[dict[str, object]] = []
                 self.closed = False
                 instances.append(self)  # type: ignore[arg-type]
