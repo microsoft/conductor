@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { useWorkflowStore } from './workflow-store';
 import type { WorkflowEvent } from '@/types/events';
 
@@ -288,5 +288,115 @@ describe('workflow-store processEvent — subworkflowContexts reactivity (#307)'
     expect(afterMutation?.workflowFile).toBe('document_review.yaml');
     expect(afterMutation?.iteration).toBe(3);
     expect(afterMutation?.parentAgent).toBe('document_review');
+  });
+});
+
+/**
+ * Regression coverage for issue #330: a dashboard whose WebSocket keeps
+ * failing to reconnect should eventually warn the user rather than leaving
+ * `workflowStatus` looking `'running'` forever. The store tracks
+ * `wsDisconnectedSince` as the timestamp of the *first* drop from
+ * `'connected'`, preserved through the connecting/reconnecting backoff
+ * churn (since `wsStatus` itself oscillates and can't be timed directly),
+ * and cleared once reconnected.
+ */
+describe('workflow-store setWsStatus — wsDisconnectedSince tracking (#330)', () => {
+  it('stays null through the initial connecting state before any connection has ever succeeded', () => {
+    const { setWsStatus } = useWorkflowStore.getState();
+    setWsStatus('connecting');
+    expect(useWorkflowStore.getState().wsDisconnectedSince).toBeNull();
+  });
+
+  it('sets a timestamp on a fresh drop from connected, preserves it through connecting/reconnecting churn, and clears it on reconnect', () => {
+    const { setWsStatus } = useWorkflowStore.getState();
+
+    setWsStatus('connected');
+    expect(useWorkflowStore.getState().wsDisconnectedSince).toBeNull();
+
+    setWsStatus('disconnected');
+    const firstDrop = useWorkflowStore.getState().wsDisconnectedSince;
+    expect(firstDrop).not.toBeNull();
+
+    setWsStatus('reconnecting');
+    expect(useWorkflowStore.getState().wsDisconnectedSince).toBe(firstDrop);
+
+    setWsStatus('connecting');
+    expect(useWorkflowStore.getState().wsDisconnectedSince).toBe(firstDrop);
+
+    // A failed retry attempt cycles back through disconnected/reconnecting
+    // without ever having reached 'connected' again — the original
+    // timestamp must NOT be reset by this churn.
+    setWsStatus('disconnected');
+    setWsStatus('reconnecting');
+    expect(useWorkflowStore.getState().wsDisconnectedSince).toBe(firstDrop);
+
+    setWsStatus('connected');
+    expect(useWorkflowStore.getState().wsDisconnectedSince).toBeNull();
+  });
+
+  it('starts a new timestamp for a second, later disconnect', () => {
+    vi.useFakeTimers();
+    try {
+      const { setWsStatus } = useWorkflowStore.getState();
+
+      setWsStatus('connected');
+      setWsStatus('disconnected');
+      const firstDrop = useWorkflowStore.getState().wsDisconnectedSince;
+      setWsStatus('connected');
+      expect(useWorkflowStore.getState().wsDisconnectedSince).toBeNull();
+
+      vi.advanceTimersByTime(5_000);
+
+      setWsStatus('disconnected');
+      const secondDrop = useWorkflowStore.getState().wsDisconnectedSince;
+      expect(secondDrop).not.toBeNull();
+      expect(secondDrop).not.toBe(firstDrop);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe('workflow-store processEvent — system log metadata capture (#330)', () => {
+  it('captures bg_stderr_log/bg_stdout_log/log_file from the root workflow_started event', () => {
+    const { processEvent } = useWorkflowStore.getState();
+
+    processEvent(event('workflow_started', {
+      name: 'root',
+      agents: [],
+      routes: [],
+      parallel_groups: [],
+      for_each_groups: [],
+      entry_point: 'agent',
+      system: {
+        log_file: '/tmp/conductor/debug.log',
+        bg_stderr_log: '/tmp/conductor/conductor-root-123.bg.stderr.log',
+        bg_stdout_log: '/tmp/conductor/conductor-root-123.bg.stdout.log',
+      },
+    }));
+
+    const state = useWorkflowStore.getState();
+    expect(state.systemLogFile).toBe('/tmp/conductor/debug.log');
+    expect(state.bgStderrLog).toBe('/tmp/conductor/conductor-root-123.bg.stderr.log');
+    expect(state.bgStdoutLog).toBe('/tmp/conductor/conductor-root-123.bg.stdout.log');
+  });
+
+  it('defaults log fields to null when system metadata (or its fields) are absent, e.g. plain --web runs with no --log-file', () => {
+    const { processEvent } = useWorkflowStore.getState();
+
+    processEvent(event('workflow_started', {
+      name: 'root',
+      agents: [],
+      routes: [],
+      parallel_groups: [],
+      for_each_groups: [],
+      entry_point: 'agent',
+      system: { log_file: null },
+    }));
+
+    const state = useWorkflowStore.getState();
+    expect(state.systemLogFile).toBeNull();
+    expect(state.bgStderrLog).toBeNull();
+    expect(state.bgStdoutLog).toBeNull();
   });
 });
