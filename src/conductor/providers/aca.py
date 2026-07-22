@@ -510,6 +510,8 @@ class AcaRuntimeProvider(AgentProvider):
             max_session_seconds=agent.max_session_seconds or self._default_max_session_seconds,
             reasoning_effort=reasoning_effort,
             working_dir=working_dir,
+            retry=agent.retry.model_dump(mode="json") if agent.retry is not None else None,
+            context_tier=agent.context_tier,
         )
         return AcaExecuteRequest(
             agent=agent_payload,

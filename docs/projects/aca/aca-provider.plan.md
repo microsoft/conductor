@@ -437,6 +437,25 @@ Copilot custom routing. Covers Epic **E8**.
   gaps for a follow-up task rather than scope-crept into E4. See the
   `aca_runner/server.py` module docstring.
 
+  **Review fixes applied:**
+  - Agent reconstruction (`_build_agent`, via `_validate_execute_request`) now
+    runs *before* `StreamingResponse` is constructed in `execute_endpoint`, so
+    an invalid agent payload (e.g. a bad `context_tier` literal) surfaces as
+    a clean 400 JSON body instead of a broken mid-stream frame after a 200
+    has already been sent.
+  - `_InnerProviderCache.get()`/`close()` are now guarded by an `asyncio.Lock`
+    so concurrent `/execute` requests racing on a settings change (different
+    `mcp_servers`/`inner_provider_settings`/`tool_output`) can no longer
+    double-close the stale provider or leak an untracked instance.
+  - `AcaAgentPayload` gained `retry` / `context_tier` fields (and
+    `AcaRuntimeProvider._build_request` / the runner's `_build_agent` forward
+    them) — both are read directly off `AgentDef` by the inner
+    `CopilotProvider.execute()`, so they were previously silently dropped for
+    every `aca`-backed agent.
+  - Added tests for a terminal `error` frame on inner-provider failure and
+    for `_InnerProviderCache` concurrency safety (verified to fail without
+    the lock).
+
 ### E5 — Runner image + bring-your-own pool
 - **Goal:** A buildable official base image and a documented two-step provisioning
   path (DD6; *Open Questions → Image ownership*).

@@ -34,6 +34,7 @@ from typing import TYPE_CHECKING, Any
 
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from pydantic import ValidationError as PydanticValidationError
 
 from conductor import __version__ as _conductor_version
 from conductor.config.schema import (
@@ -41,6 +42,7 @@ from conductor.config.schema import (
     OutputField,
     ProviderSettings,
     ReasoningConfig,
+    RetryPolicy,
     ToolOutputConfig,
 )
 from conductor.exceptions import ProviderError
@@ -81,6 +83,13 @@ def _build_agent(payload: AcaAgentPayload) -> AgentDef:
     already container-relative (the `sandbox.working_dir` semantics, not
     `agent.working_dir`'s host-path resolution), so no path resolution
     happens here — the container filesystem *is* the working directory.
+
+    Raises:
+        pydantic.ValidationError: If the payload carries a value `AgentDef`
+            itself rejects (e.g. an invalid `context_tier` literal). Callers
+            must validate this *before* opening the response stream so a
+            malformed request surfaces as a clean 4xx rather than a broken
+            mid-stream frame (review fix).
     """
     output = (
         {name: OutputField.model_validate(field) for name, field in payload.output.items()}
@@ -90,6 +99,7 @@ def _build_agent(payload: AcaAgentPayload) -> AgentDef:
     reasoning = (
         ReasoningConfig(effort=payload.reasoning_effort) if payload.reasoning_effort else None
     )
+    retry = RetryPolicy.model_validate(payload.retry) if payload.retry else None
     return AgentDef(
         name=payload.name,
         model=payload.model,
@@ -99,6 +109,8 @@ def _build_agent(payload: AcaAgentPayload) -> AgentDef:
         max_session_seconds=payload.max_session_seconds,
         reasoning=reasoning,
         working_dir=payload.working_dir,
+        retry=retry,
+        context_tier=payload.context_tier,
     )
 
 
@@ -134,14 +146,19 @@ def _check_stdio_binaries(mcp_servers: dict[str, Any] | None) -> None:
         )
 
 
-def _validate_execute_request(request: AcaExecuteRequest) -> None:
+def _validate_execute_request(request: AcaExecuteRequest) -> AgentDef:
     """Pre-flight checks run before the streaming response is opened.
 
     Anything detectable synchronously (unsupported inner provider, a missing
-    stdio binary) is surfaced as a non-2xx JSON response — mirroring
-    ``AcaRuntimeProvider._error_from_response`` on the host side — rather
-    than as a mid-stream ``error`` frame, since neither failure depends on
-    actually starting the inner SDK call.
+    stdio binary, an invalid agent payload) is surfaced as a non-2xx JSON
+    response — mirroring ``AcaRuntimeProvider._error_from_response`` on the
+    host side — rather than as a mid-stream ``error`` frame, since none of
+    these failures depend on actually starting the inner SDK call.
+
+    Returns the reconstructed `AgentDef` (review fix) so the caller can reuse
+    it in `_stream_execute` instead of re-running (and re-risking a
+    mid-stream failure from) `_build_agent` a second time after the response
+    has already started streaming.
     """
     if request.inner_provider != "copilot":
         raise ProviderError(
@@ -151,6 +168,7 @@ def _validate_execute_request(request: AcaExecuteRequest) -> None:
             is_retryable=False,
         )
     _check_stdio_binaries(request.mcp_servers)
+    return _build_agent(request.agent)
 
 
 def _result_frame_data(output: AgentOutput, session_seconds: float) -> dict[str, Any]:
@@ -183,11 +201,22 @@ class _InnerProviderCache:
     `tools:`, which `execute()` takes per-call), so this caches by those three
     fields and only rebuilds the provider when one of them actually changes
     between requests — closing the stale instance first.
+
+    `get()` is guarded by an `asyncio.Lock` (review fix): concurrent
+    `/execute` requests that land while the cached settings are changing
+    would otherwise race on the read-check-close-rebuild sequence below —
+    each concurrent caller sees the same stale `self._provider`/`self._key`,
+    so more than one would call `close()` on the same instance (a double
+    close) and/or construct a provider that never gets tracked (and thus
+    never closed). The lock serializes the whole check-and-maybe-rebuild
+    critical section so only one coroutine at a time can decide whether a
+    rebuild is needed and perform it.
     """
 
     def __init__(self) -> None:
         self._provider: CopilotProvider | None = None
         self._key: str | None = None
+        self._lock = asyncio.Lock()
 
     @staticmethod
     def _key_for(
@@ -213,49 +242,55 @@ class _InnerProviderCache:
         tool_output: dict[str, Any] | None,
     ) -> CopilotProvider:
         key = self._key_for(mcp_servers, inner_provider_settings, tool_output)
-        if self._provider is not None and key == self._key:
-            return self._provider
-        if self._provider is not None:
-            await self._provider.close()
+        async with self._lock:
+            if self._provider is not None and key == self._key:
+                return self._provider
+            if self._provider is not None:
+                await self._provider.close()
 
-        # OQ#6 Phase 1 credential stopgap: `inner_provider_settings` carries
-        # the plaintext bearer_token/api_key/base_url forwarded by the host's
-        # `AcaRuntimeProvider._resolve_inner_provider_settings` (reusing the
-        # existing Copilot custom-routing `bearer_token` path). Phase 2 (E8)
-        # replaces this whole branch with a call to the credential gateway —
-        # this is the seam that change would touch.
-        provider_settings = (
-            ProviderSettings(name="copilot", **inner_provider_settings)
-            if inner_provider_settings
-            else None
-        )
-        tool_output_config = ToolOutputConfig(**tool_output) if tool_output else None
-        self._provider = CopilotProvider(
-            mcp_servers=mcp_servers,
-            provider_settings=provider_settings,
-            tool_output=tool_output_config,
-        )
-        self._key = key
-        return self._provider
+            # OQ#6 Phase 1 credential stopgap: `inner_provider_settings` carries
+            # the plaintext bearer_token/api_key/base_url forwarded by the host's
+            # `AcaRuntimeProvider._resolve_inner_provider_settings` (reusing the
+            # existing Copilot custom-routing `bearer_token` path). Phase 2 (E8)
+            # replaces this whole branch with a call to the credential gateway —
+            # this is the seam that change would touch.
+            provider_settings = (
+                ProviderSettings(name="copilot", **inner_provider_settings)
+                if inner_provider_settings
+                else None
+            )
+            tool_output_config = ToolOutputConfig(**tool_output) if tool_output else None
+            self._provider = CopilotProvider(
+                mcp_servers=mcp_servers,
+                provider_settings=provider_settings,
+                tool_output=tool_output_config,
+            )
+            self._key = key
+            return self._provider
 
     async def close(self) -> None:
-        if self._provider is not None:
-            await self._provider.close()
-            self._provider = None
-            self._key = None
+        async with self._lock:
+            if self._provider is not None:
+                await self._provider.close()
+                self._provider = None
+                self._key = None
 
 
 async def _stream_execute(
-    provider: CopilotProvider, request: AcaExecuteRequest
+    provider: CopilotProvider, agent: AgentDef, request: AcaExecuteRequest
 ) -> AsyncIterator[bytes]:
     """Run the inner `execute()` call, yielding NDJSON frames as they arrive.
+
+    `agent` is pre-built (and thus pre-validated) by the caller — see
+    `_validate_execute_request` — so the only way this generator can fail is
+    inside the inner SDK call itself, which is always caught and turned into
+    a terminal ``error`` frame rather than propagating out of the stream.
 
     Event frames from `event_callback` and the terminal frame share one
     `asyncio.Queue` (FIFO, single event loop — no thread-safety concerns) so
     they are yielded in the exact order the inner provider produced them,
     ending in exactly one terminal ``result`` or ``error`` frame.
     """
-    agent = _build_agent(request.agent)
     queue: asyncio.Queue[Any] = asyncio.Queue()
     sentinel = object()
 
@@ -335,19 +370,28 @@ def create_app() -> FastAPI:
         identifier: str | None = None,
         api_version: str | None = Query(default=None, alias="api-version"),
     ) -> Response:
-        """Run one agent turn, streaming NDJSON event frames (E4-T2/T3/T4)."""
+        """Run one agent turn, streaming NDJSON event frames (E4-T2/T3/T4).
+
+        Review fix: agent reconstruction (`_build_agent`, via
+        `_validate_execute_request`) and the provider-cache lookup both run
+        *before* `StreamingResponse` is constructed, so a malformed agent
+        payload (e.g. an invalid `context_tier` literal) or an unavailable
+        inner provider surfaces as a clean 400 JSON body — the HTTP status
+        line and headers are not sent until this block returns successfully,
+        so nothing here can corrupt an already-started NDJSON stream.
+        """
         try:
-            _validate_execute_request(request)
+            agent = _validate_execute_request(request)
             provider = await provider_cache.get(
                 mcp_servers=request.mcp_servers,
                 inner_provider_settings=request.inner_provider_settings,
                 tool_output=request.tool_output,
             )
-        except ProviderError as exc:
+        except (ProviderError, PydanticValidationError) as exc:
             return JSONResponse(status_code=400, content={"error": {"message": str(exc)}})
 
         return StreamingResponse(
-            _stream_execute(provider, request), media_type="application/x-ndjson"
+            _stream_execute(provider, agent, request), media_type="application/x-ndjson"
         )
 
     return app

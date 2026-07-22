@@ -29,6 +29,16 @@ open questions the design left for this epic:
   and any cache-token counts the inner SDK reported were silently dropped
   instead of reaching ``AgentOutput.cache_read_tokens`` /
   ``cache_write_tokens``.
+- ``AcaAgentPayload.retry`` / ``AcaAgentPayload.context_tier`` — review fix:
+  the per-agent ``RetryPolicy`` and resolved ``context_tier`` literal are
+  read directly off ``AgentDef`` by the inner ``CopilotProvider.execute()``
+  (not passed as separate provider constructor args, unlike
+  ``reasoning_effort``), so dropping them from the payload silently
+  disabled per-agent retry and long-context routing for every ``aca``-backed
+  agent. Both travel as already-resolved plain values (a dumped
+  ``RetryPolicy`` dict / a concrete ``ContextTier`` literal) — the host has
+  already rendered any ``{{ ... }}`` template by the time ``execute()`` is
+  called (see ``conductor.providers.context_tier``).
 """
 
 from __future__ import annotations
@@ -78,6 +88,18 @@ class AcaAgentPayload(BaseModel):
     """Container-relative working directory (``SandboxConfig.working_dir``).
     Never a host path — interpreted by the runner as a path inside the
     session filesystem."""
+
+    retry: dict[str, Any] | None = None
+    """Per-agent ``RetryPolicy`` (``agent.retry``), dumped to a plain dict.
+
+    ``None`` when the agent has no ``retry:`` block, in which case the inner
+    ``CopilotProvider`` falls back to its own default retry config — the
+    same behavior as an on-host ``copilot`` agent with no ``retry:``."""
+
+    context_tier: str | None = None
+    """Resolved ``context_tier`` literal (``agent.context_tier``), already
+    rendered from any ``{{ ... }}`` template on the host. ``None`` means no
+    per-agent override — the inner provider uses its own default."""
 
 
 class AcaExecuteRequest(BaseModel):
