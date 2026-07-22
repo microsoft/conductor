@@ -7,6 +7,7 @@ workflow YAML configuration files.
 from __future__ import annotations
 
 from typing import Any, Literal, get_args
+from urllib.parse import urlparse
 
 from pydantic import (
     BaseModel,
@@ -2060,17 +2061,27 @@ class ProviderSettings(BaseModel):
         # forwarded provider credentials (inner_provider_settings) are sent
         # to this endpoint on every request — plain HTTP would leak both in
         # transit. Require HTTPS explicitly since pool_endpoint has no other
-        # transport-security guardrail.
-        if (
-            self.name == "aca"
-            and self.pool_endpoint is not None
-            and not self.pool_endpoint.strip().lower().startswith("https://")
-        ):
-            raise ValueError(
-                "'pool_endpoint' must use https:// — AAD bearer tokens and "
-                "forwarded provider credentials are sent to this endpoint "
-                "and must not travel over an unencrypted connection"
-            )
+        # transport-security guardrail. Parse the full URL (not just the
+        # scheme prefix): a missing hostname (``https://``) or a query/
+        # fragment (``https://host?x=1``) both produce a malformed request
+        # URL once `_build_url` appends `/execute` and the `identifier` /
+        # `api-version` query params (aca.py).
+        if self.name == "aca" and self.pool_endpoint is not None:
+            parsed = urlparse(self.pool_endpoint.strip())
+            if parsed.scheme != "https":
+                raise ValueError(
+                    "'pool_endpoint' must use https:// — AAD bearer tokens and "
+                    "forwarded provider credentials are sent to this endpoint "
+                    "and must not travel over an unencrypted connection"
+                )
+            if not parsed.hostname:
+                raise ValueError("'pool_endpoint' must include a hostname (e.g. https://<pool>)")
+            if parsed.query or parsed.fragment:
+                raise ValueError(
+                    "'pool_endpoint' must not include a query string or fragment — it is "
+                    "a base URL that 'identifier' and 'api-version' are appended to "
+                    "(e.g. https://<pool-management-endpoint>, not one with '?' or '#')"
+                )
 
         # Apply 'aca' defaults for fields left unset in YAML. These can't be
         # ordinary Pydantic field defaults because the gating checks above

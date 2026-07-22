@@ -267,12 +267,17 @@ Runs one agent turn and streams the result back as
 }
 ```
 
-- `tools` — the per-agent allowlist is forwarded (`null` = all workflow
-  tools, `[]` = none) but **not enforced**: the in-container
+- `tools` — the per-agent allowlist would be forwarded (`null` = all
+  workflow tools) but is **not enforced**: the in-container
   `CopilotProvider` records it but never applies it to the SDK session, so
-  every tool/MCP server available to that session is callable regardless of
-  the declared allowlist (`workflow_tools_passthrough=False` — see
-  [Capability Carve-outs](#capability-carve-outs)).
+  every tool/MCP server available to that session is callable regardless
+  of the declared allowlist (`workflow_tools_passthrough=False` — see
+  [Capability Carve-outs](#capability-carve-outs)). Because `aca` also
+  forwards the *full* configured `mcp_servers` set unconditionally
+  (`mcp_tools=True`), there is no allowlist value — including `tools: []`
+  — that the runner can honor today; `conductor validate` rejects any
+  explicit `tools:` on an `aca`-backed agent for this reason. Omit
+  `tools:` entirely to run with the provider's default tool preset.
 - `mcp_servers` — the **full** `runtime.mcp_servers` definitions (not just
   tool names), so the in-container `CopilotProvider` can make the declared
   tools executable. This is the **runner-image contract**: stdio MCP
@@ -404,7 +409,7 @@ multi-tenant workloads — see [Security](#security).
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `name` | `"aca"` | — | Selects the ACA provider. |
-| `pool_endpoint` | `str` | *(required)* | ACA dynamic-sessions pool management endpoint. **Must be `https://`** — AAD bearer tokens and forwarded provider credentials (`inner_provider_settings`) are sent to this endpoint on every request; `conductor validate` rejects a plain-`http://` value. |
+| `pool_endpoint` | `str` | *(required)* | ACA dynamic-sessions pool management endpoint. **Must be `https://`** with a hostname and no query string / fragment — AAD bearer tokens and forwarded provider credentials (`inner_provider_settings`) are sent to this endpoint on every request, and `identifier` / `api-version` / the request path are appended to it; `conductor validate` rejects a plain-`http://` value, a bare `https://` with no host, or one that already carries `?query` / `#fragment`. |
 | `api_version` | `str` | `"2025-07-01"` | ACA management API version. |
 | `inner_provider` | `"copilot"` | `copilot` | SDK the in-sandbox runner drives. **MVP: `copilot` only** — `claude-agent-sdk` inside is a future extension; the bare `claude` (Anthropic-API) provider has no in-process tool runtime and is not valid here. |
 | `identifier_scope` | `workflow \| agent \| item \| none` | `agent` | Default granularity for *sequential* session reuse (see [Architecture](#architecture)). Concurrent units always diverge regardless. |
@@ -437,7 +442,7 @@ agents:
 | Capability | Value | Notes |
 |---|---|---|
 | `mcp_tools` | ✅ `True` | Full `mcp_servers` forwarded — runner-image contract. |
-| `workflow_tools_passthrough` | ❌ **`False`** | The per-agent `tools:` allowlist is forwarded to the runner in the request body, but the in-container `CopilotProvider` it wraps never applies that list to the SDK session — every tool/MCP server available to the session is callable regardless of the declared allowlist. This is a known, allowed experimental carve-out (the same gap `claude_agent_sdk` and `hermes` already declare). |
+| `workflow_tools_passthrough` | ❌ **`False`** | The per-agent `tools:` allowlist is forwarded to the runner in the request body, but the in-container `CopilotProvider` it wraps never applies that list to the SDK session — every tool/MCP server available to the session is callable regardless of the declared allowlist. Combined with `mcp_tools=True` (below), there is no allowlist value the runner can honor — not even `tools: []` — so `conductor validate` rejects any explicit `tools:` on an `aca`-backed agent. This is a known, allowed experimental carve-out (the same gap `claude_agent_sdk` and `hermes` already declare, though those declare `mcp_tools=False` so `tools: []` stays valid for them). |
 | `streaming_events` | ✅ `True` | Single streaming request relays event frames incrementally. |
 | `agent_reasoning_events` | ✅ `True` | Runner forwards reasoning frames from the inner provider. |
 | `reasoning_effort` | ✅ Copilot's full tuple | Inner provider (Copilot) translates reasoning effort natively. |
@@ -556,6 +561,28 @@ AAD bearer tokens and forwarded provider credentials
 printed by `scripts/aca/provision-pool.sh` (or `az containerapp
 sessionpool show`) verbatim — ACA dynamic-sessions management endpoints
 are always `https://`.
+
+### `'pool_endpoint' must include a hostname` / `must not include a query string or fragment`
+
+`pool_endpoint` is a **base** URL: the runner transport appends
+`/execute`, `/session`, `/interrupt`, and `/health` paths plus
+`identifier` / `api-version` query params to it (see [NDJSON Event Frame
+Schema](#ndjson-event-frame-schema)). A bare scheme with no host
+(`https://`) or a URL that already carries a `?query` / `#fragment`
+produces a malformed request URL, so `conductor validate` rejects both.
+Set it to the pool's management endpoint alone, e.g.
+`https://my-agent-pool.<region>.azurecontainerapps.io`.
+
+### `there is no way to disable tools for this provider`
+
+An `aca`-backed agent declared an explicit `tools:` value (including
+`tools: []`). The runner forwards every configured `mcp_servers` entry to
+the in-container `CopilotProvider` unconditionally and never applies a
+per-agent allowlist (`workflow_tools_passthrough=False`), so there is no
+list — empty or not — it can currently honor. Remove the agent's
+`tools:` key (it will run with the provider's default tool preset) or
+remove the workflow's `mcp_servers:` entirely if you want no tools
+available.
 
 ### Requests failing with a 401/403
 

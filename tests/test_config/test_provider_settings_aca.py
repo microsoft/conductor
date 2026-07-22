@@ -97,6 +97,29 @@ class TestAcaProviderSettings:
         s = ProviderSettings(name="aca", pool_endpoint="https://my-pool.example.com")
         assert s.pool_endpoint == "https://my-pool.example.com"
 
+    def test_https_scheme_with_no_hostname_rejected(self) -> None:
+        """``https://`` parses with an https scheme but no hostname — the
+        stale prefix-only check let this through and `_build_url` would
+        then produce a hostless request URL."""
+        with pytest.raises(PydanticValidationError, match="must include a hostname"):
+            ProviderSettings(name="aca", pool_endpoint="https://")
+
+    def test_pool_endpoint_with_query_string_rejected(self) -> None:
+        """``pool_endpoint`` is a base URL that ``identifier`` and
+        ``api-version`` are appended to as query params (aca.py
+        ``_build_url``) — a pre-existing query string produces an
+        ambiguous / malformed request URL."""
+        with pytest.raises(
+            PydanticValidationError, match="must not include a query string or fragment"
+        ):
+            ProviderSettings(name="aca", pool_endpoint="https://my-pool.example.com?x=1")
+
+    def test_pool_endpoint_with_fragment_rejected(self) -> None:
+        with pytest.raises(
+            PydanticValidationError, match="must not include a query string or fragment"
+        ):
+            ProviderSettings(name="aca", pool_endpoint="https://my-pool.example.com#frag")
+
     def test_invalid_inner_provider_literal_rejected(self) -> None:
         with pytest.raises(PydanticValidationError):
             ProviderSettings(

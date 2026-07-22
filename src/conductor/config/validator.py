@@ -1605,24 +1605,43 @@ def _validate_provider_capabilities(
     def _check_agent_tools(agent: AgentDef, provider_name: str, caps: ProviderCapabilities) -> None:
         """Tools-capability cross-check shared by top-level and for_each agents.
 
-        Two failure modes against a non-passthrough provider:
+        Three failure modes against a non-passthrough provider:
 
         * Explicit non-empty ``tools:`` — a declared allowlist the provider
           cannot honor; silently granting different tools is a security
           regression.
+        * Explicit ``tools: []`` against a provider that still forwards the
+          full workflow-level MCP server set regardless of the per-agent list
+          (``capabilities.mcp_tools=True`` alongside
+          ``workflow_tools_passthrough=False``, e.g. ``aca`` — the in-container
+          runner attaches every configured MCP server unconditionally). There
+          is no allowlist value, empty or not, that provider can honor, so
+          ``tools: []`` would misleadingly pass validation while every tool
+          stays attached. When ``mcp_tools=False`` there is nothing to
+          forward regardless of the list, so ``tools: []`` genuinely disables
+          all tools and stays valid.
         * Omitted ``tools:`` + non-empty workflow-level ``tools:`` — the agent
           inherits that list at runtime (``resolve_agent_tools`` returns a copy)
           and hits the same refusal mid-run (now a ``resolves to tools=[...]``
-          ``ProviderError``) rather than failing fast at validate. An explicit
-          ``tools: []`` is the "no tools" opt-out and stays valid.
+          ``ProviderError``) rather than failing fast at validate.
         """
-        if agent.tools and not caps.workflow_tools_passthrough:
-            errors.append(
-                f"Agent '{agent.name}' declares tools={agent.tools!r} but provider "
-                f"'{provider_name}' does not honor per-agent tool allowlists "
-                f"(capabilities.workflow_tools_passthrough=False). Silently "
-                f"granting different tools than declared is a security regression."
-            )
+        if agent.tools is not None and not caps.workflow_tools_passthrough:
+            if agent.tools:
+                errors.append(
+                    f"Agent '{agent.name}' declares tools={agent.tools!r} but provider "
+                    f"'{provider_name}' does not honor per-agent tool allowlists "
+                    f"(capabilities.workflow_tools_passthrough=False). Silently "
+                    f"granting different tools than declared is a security regression."
+                )
+            elif caps.mcp_tools:
+                errors.append(
+                    f"Agent '{agent.name}' declares 'tools: []' to disable all tools, but "
+                    f"provider '{provider_name}' forwards the full configured MCP server "
+                    f"set unconditionally (capabilities.mcp_tools=True, "
+                    f"workflow_tools_passthrough=False) — there is no way to disable "
+                    f"tools for this provider yet. Remove 'tools: []' or the workflow's "
+                    f"'mcp_servers:' entirely."
+                )
         elif agent.tools is None and config.tools and not caps.workflow_tools_passthrough:
             errors.append(
                 f"Agent '{agent.name}' omits 'tools:' and would inherit the "

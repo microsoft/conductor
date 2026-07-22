@@ -276,8 +276,15 @@ parity** (`mcp_tools`, `streaming_events`, `agent_reasoning_events`, and
   is forwarded to the runner in the request body, but the in-container
   `CopilotProvider` it wraps never applies that list to the SDK session —
   every tool/MCP server available to the session is callable regardless of
-  the declared allowlist. This mirrors the same declared carve-out on
-  `claude_agent_sdk.py` and `hermes.py`.
+  the declared allowlist. Combined with `mcp_tools=True` (the full
+  configured `mcp_servers` set is always forwarded), there is no allowlist
+  value the runner can honor — not even `tools: []` — so
+  `config/validator.py` rejects **any** explicit `tools:` on an
+  `aca`-backed agent, not just a non-empty one (review follow-up, #284
+  E7). This mirrors the same declared carve-out on `claude_agent_sdk.py`
+  and `hermes.py`, except those declare `mcp_tools=False` (nothing is ever
+  forwarded regardless of the list), so `tools: []` genuinely disables all
+  tools and stays valid for them.
 - **`working_dir=False`**: this capability field means "applies the
   generic, host-resolved `agent.working_dir` / `runtime.working_dir`" — a
   host filesystem path the engine resolves against the workflow file's

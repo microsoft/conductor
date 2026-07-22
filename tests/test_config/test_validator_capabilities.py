@@ -158,12 +158,27 @@ class TestMcpToolsCrossCheck:
 
 class TestToolsAllowlistCrossCheck:
     def test_empty_tools_list_against_no_passthrough_does_not_error(self, patch_caps: Any) -> None:
-        """``tools: []`` is a 'no tools' request; provider can honor that."""
-        patch_caps({"copilot": _caps(workflow_tools_passthrough=False)})
+        """``tools: []`` is a 'no tools' request; a provider with nothing to
+        forward regardless of the list (``mcp_tools=False``) can honor that."""
+        patch_caps({"copilot": _caps(workflow_tools_passthrough=False, mcp_tools=False)})
         config = _build_workflow(
             agents=[AgentDef(name="a", prompt="hi", tools=[])],
         )
         validate_workflow_config(config)  # no raise
+
+    def test_empty_tools_list_against_no_passthrough_with_mcp_tools_errors(
+        self, patch_caps: Any
+    ) -> None:
+        """``tools: []`` cannot be honored by a provider that forwards the full
+        configured MCP server set unconditionally (``mcp_tools=True`` +
+        ``workflow_tools_passthrough=False``, e.g. ``aca``) — every tool stays
+        attached regardless of the empty allowlist."""
+        patch_caps({"copilot": _caps(workflow_tools_passthrough=False, mcp_tools=True)})
+        config = _build_workflow(
+            agents=[AgentDef(name="a", prompt="hi", tools=[])],
+        )
+        with pytest.raises(ConfigurationError, match="there is no way to disable tools"):
+            validate_workflow_config(config)
 
     def test_non_empty_tools_list_against_no_passthrough_errors(self, patch_caps: Any) -> None:
         patch_caps({"copilot": _caps(workflow_tools_passthrough=False)})
@@ -199,8 +214,9 @@ class TestToolsAllowlistCrossCheck:
     def test_explicit_empty_tools_with_workflow_tools_no_passthrough_passes(
         self, patch_caps: Any
     ) -> None:
-        """Explicit ``tools: []`` opts out of inheritance, so it stays valid."""
-        patch_caps({"copilot": _caps(workflow_tools_passthrough=False)})
+        """Explicit ``tools: []`` opts out of inheritance, so it stays valid —
+        for a provider with nothing to forward regardless of the list."""
+        patch_caps({"copilot": _caps(workflow_tools_passthrough=False, mcp_tools=False)})
         config = _build_workflow(
             agents=[AgentDef(name="a", prompt="hi", tools=[])],
             tools=["search"],
@@ -252,7 +268,7 @@ class TestForEachInlineToolsCrossCheck:
 
     def test_inline_omitted_tools_inherits_workflow_tools_errors(self, patch_caps: Any) -> None:
         """Inline agent omits ``tools:`` + non-empty workflow ``tools:`` -> error."""
-        patch_caps({"copilot": _caps(workflow_tools_passthrough=False)})
+        patch_caps({"copilot": _caps(workflow_tools_passthrough=False, mcp_tools=False)})
         config = self._for_each_config(
             inline=AgentDef(name="inner", prompt="{{ item }}"),
             tools=["search"],
@@ -263,8 +279,9 @@ class TestForEachInlineToolsCrossCheck:
             validate_workflow_config(config)
 
     def test_inline_explicit_empty_tools_passes(self, patch_caps: Any) -> None:
-        """Inline ``tools: []`` opts out of inheritance, so it stays valid."""
-        patch_caps({"copilot": _caps(workflow_tools_passthrough=False)})
+        """Inline ``tools: []`` opts out of inheritance, so it stays valid — for
+        a provider with nothing to forward regardless of the list."""
+        patch_caps({"copilot": _caps(workflow_tools_passthrough=False, mcp_tools=False)})
         config = self._for_each_config(
             inline=AgentDef(name="inner", prompt="{{ item }}", tools=[]),
             tools=["search"],
@@ -273,7 +290,7 @@ class TestForEachInlineToolsCrossCheck:
 
     def test_inline_explicit_nonempty_tools_errors(self, patch_caps: Any) -> None:
         """An explicit non-empty inline allowlist against a non-passthrough provider errors."""
-        patch_caps({"copilot": _caps(workflow_tools_passthrough=False)})
+        patch_caps({"copilot": _caps(workflow_tools_passthrough=False, mcp_tools=False)})
         config = self._for_each_config(
             inline=AgentDef(name="inner", prompt="{{ item }}", tools=["search"]),
         )
@@ -1342,6 +1359,24 @@ class TestAcaRealCapabilitiesCrossCheck:
             agents=[AgentDef(name="a", prompt="hi", tools=["git"])],
         )
         with pytest.raises(ConfigurationError, match="workflow_tools_passthrough=False"):
+            validate_workflow_config(config)
+
+    def test_empty_tools_rejected_against_real_aca_capabilities(self, patch_caps: Any) -> None:
+        """``aca`` declares ``mcp_tools=True`` (the runner forwards every
+        configured MCP server to the in-container ``CopilotProvider``
+        unconditionally) alongside ``workflow_tools_passthrough=False``, so
+        an explicit ``tools: []`` cannot be honored either — every configured
+        MCP server stays attached regardless. Review follow-up (#284 E7):
+        the runner does not implement end-to-end tool filtering, so this
+        combination must fail fast at validate time rather than silently
+        leaving every tool available."""
+        from conductor.providers.aca import AcaRuntimeProvider
+
+        patch_caps({"aca": AcaRuntimeProvider.CAPABILITIES})
+        config = self._aca_workflow(
+            agents=[AgentDef(name="a", prompt="hi", tools=[])],
+        )
+        with pytest.raises(ConfigurationError, match="there is no way to disable tools"):
             validate_workflow_config(config)
 
     def test_no_tools_against_real_aca_capabilities_passes(self, patch_caps: Any) -> None:
