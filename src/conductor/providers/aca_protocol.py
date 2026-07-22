@@ -166,6 +166,11 @@ class AcaResultData(BaseModel):
     """Tokens written to cache (Claude-style prompt caching), when the inner
     provider reports it."""
 
+    session_seconds: float | None = None
+    """Sandbox wall-clock time for this execution, as measured by the runner
+    (issue #284, FR7). Parsed into ``AgentOutput.session_seconds`` so the host
+    engine can record it as a distinct usage row, separate from token cost."""
+
     partial: bool = False
 
 

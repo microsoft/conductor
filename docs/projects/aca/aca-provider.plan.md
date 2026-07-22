@@ -40,8 +40,8 @@ before the epic they tag reaches "done".
    which sacrifices cross-item workspace reuse for a *serial* `for_each` under
    the default `agent` scope. The design asserts the outcome but not the seam.
 
-2. **Session-seconds → usage mechanism (blocks E6 · FR7).** *FR7* / *Key
-   Components §5* require sandbox time as a **distinct usage row** ("as the
+2. **Session-seconds → usage mechanism (blocks E6 · FR7) — RESOLVED.** *FR7* /
+   *Key Components §5* require sandbox time as a **distinct usage row** ("as the
    validator feature records `\"<agent> (validator)\"`"), separate from token
    cost. But `AgentOutput` (`providers/base.py:66`) has no session-seconds field,
    and `UsageTracker.record()` (`engine/usage.py:178`) derives everything from
@@ -54,6 +54,22 @@ before the epic they tag reaches "done".
    (`engine/workflow.py:2778`). The design names the *what* (distinct row) but not
    this *how*; the exact CLI-summary / dashboard rendering is already a design
    *Future* open question ("Cost model surfacing").
+
+   **Answer (E6) — implemented exactly as recommended, plus one added wire
+   field.** `AgentOutput.session_seconds: float | None = None` (`providers/base.py`)
+   and a matching `AcaResultData.session_seconds` field (`providers/aca_protocol.py`
+   — needed so the host actually has something typed to parse *from*; E3-T5
+   left it off pending this epic and relied on `extra="ignore"` to pass it
+   through untyped in `raw_response` only). `AcaRuntimeProvider._agent_output_from_result`
+   now forwards `result.session_seconds` into `AgentOutput`. The engine adds a
+   new `UsageTracker.record_sandbox(agent_name, session_seconds)` method
+   (deliberately separate from `record()`, which always derives cost from an
+   `AgentOutput`'s token/model fields) so the sandbox row is unconditionally
+   token-free and `cost_usd=None`. Wired at the main-loop, parallel-group, and
+   for-each `record()` call sites, gated on `output.session_seconds is not None`
+   — non-`aca` providers never populate the field, so no row is ever added for
+   them. CLI-summary / dashboard rendering of the new row remains the
+   already-flagged design *Future* item and is not addressed by E6.
 
 3. **`sandbox.working_dir` vs. existing `agent.working_dir` (blocks E1 · schema)
    — RESOLVED.**
@@ -588,7 +604,7 @@ Copilot custom routing. Covers Epic **E8**.
     behavior that was already correct (closing coverage gaps flagged in the
     third review, not fixing additional bugs).
 
-### E6 — Session-seconds usage surfacing (FR7)
+### E6 — Session-seconds usage surfacing (FR7) — **DONE**
 - **Goal:** Surface sandbox time as a distinct usage dimension, separate from token
   cost (FR7; *Key Components §5*).
 - **Prerequisites:** E3 (transport shim; `AcaResultData`'s wire frame already
@@ -598,12 +614,12 @@ Copilot custom routing. Covers Epic **E8**.
 
 | Task ID | Type | Description | Files | Status |
 |---|---|---|---|---|
-| E6-T1 | IMPL | Add `session_seconds: float \| None = None` to `AgentOutput`; populate it in `AcaRuntimeProvider` from the terminal `result` frame. | `src/conductor/providers/base.py`, `src/conductor/providers/aca.py` | TO DO |
-| E6-T2 | IMPL | In the engine, when `output.session_seconds` is set, record a distinct `"<agent> (sandbox)"` usage row (cost `None`, `elapsed_seconds = session_seconds`) at the main-loop / parallel / for-each `record()` sites — mirroring the `"(validator)"` row pattern. | `src/conductor/engine/workflow.py`, `src/conductor/engine/usage.py` | TO DO |
-| E6-T3 | TEST | A run where the provider returns `session_seconds` produces a separate `"(sandbox)"` row with no token cost, without disturbing the primary row's tokens/cost. | `tests/test_engine/test_aca_usage.py` | TO DO |
+| E6-T1 | IMPL | Add `session_seconds: float \| None = None` to `AgentOutput`; populate it in `AcaRuntimeProvider` from the terminal `result` frame. | `src/conductor/providers/base.py`, `src/conductor/providers/aca.py` | DONE — per OQ#2's recommended seam. Also added the matching `session_seconds` field to `AcaResultData` (`src/conductor/providers/aca_protocol.py`), since a host-side field to parse into requires a wire field to parse *from* — E3-T5 deliberately left this off `AcaResultData` pending this epic; without it `AcaResultData.model_validate` would drop the runner's `session_seconds` key via `extra="ignore"` before `_agent_output_from_result` ever saw it. Updated the runner's `_result_frame_data` (`src/conductor/aca_runner/server.py`, E4 code) to pass `session_seconds` straight into the now-existing `AcaResultData` field instead of injecting it as an extra dict key after `model_dump`, and refreshed its docstring/comment that explicitly said "E6 (not this epic)". |
+| E6-T2 | IMPL | In the engine, when `output.session_seconds` is set, record a distinct `"<agent> (sandbox)"` usage row (cost `None`, `elapsed_seconds = session_seconds`) at the main-loop / parallel / for-each `record()` sites — mirroring the `"(validator)"` row pattern. | `src/conductor/engine/workflow.py`, `src/conductor/engine/usage.py` | DONE — added `UsageTracker.record_sandbox(agent_name, session_seconds)` (distinct from `record()`, which derives cost/tokens from an `AgentOutput`) so the row is always token-free and `cost_usd=None` regardless of what the primary output's token fields happen to be. Wired at all three primary `record()` call sites with the label `f"{<name>} (sandbox)"` (main loop: `agent.name`; parallel: `agent.name`; for-each: `f"{for_each_group.name}[{key}]"`), guarded by `output.session_seconds is not None` — non-`aca` providers leave the field `None` so no row is ever added. The validator's internal discarded-first-attempt re-record (`_apply_validator`, line ~2945) is untouched — out of scope; the retried/final output flowing back to the caller still gets a sandbox row via the caller's own call site. |
+| E6-T3 | TEST | A run where the provider returns `session_seconds` produces a separate `"(sandbox)"` row with no token cost, without disturbing the primary row's tokens/cost. | `tests/test_engine/test_aca_usage.py` | DONE — new file with `UsageTracker.record_sandbox` unit tests plus end-to-end `WorkflowEngine` coverage (main loop, parallel group, for-each) driving `provider.execute` directly (mirrors `test_pricing_hook.py`'s pattern, since `CopilotProvider`'s `mock_handler` only controls output content, not the full `AgentOutput`). Also added provider-level tests to `tests/test_providers/test_aca.py` confirming `AcaRuntimeProvider.execute` parses `session_seconds` from the terminal `result` frame into `AgentOutput.session_seconds`, and that it stays `None` when the runner omits it. All new tests were confirmed to fail before the E6-T1/T2 implementation (missing `session_seconds` field / `record_sandbox` method) and pass after. Full suite run: 4327 passed (1 pre-existing, unrelated failure in `test_event_log.py`'s filename-uniqueness test, confirmed to fail identically on the pre-E6 tree).
 
 - **Acceptance Criteria:**
-  - [ ] Session-seconds appear as a distinct, non-billing row separate from token
+  - [x] Session-seconds appear as a distinct, non-billing row separate from token
     cost; non-`aca` providers are unaffected (`session_seconds` stays `None`).
 
 ### E7 — Docs, example, experimental registration, parity notes

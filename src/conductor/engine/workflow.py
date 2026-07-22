@@ -3892,6 +3892,10 @@ class WorkflowEngine:
                         # Record usage and calculate cost
                         await self._ensure_pricing_resolved(resolved_agent, output.model)
                         usage = self.usage_tracker.record(agent.name, output, _agent_elapsed)
+                        if output.session_seconds is not None:
+                            self.usage_tracker.record_sandbox(
+                                f"{agent.name} (sandbox)", output.session_seconds
+                            )
 
                         output_keys = (
                             list(output.content.keys()) if isinstance(output.content, dict) else []
@@ -4968,6 +4972,10 @@ class WorkflowEngine:
                 # Record usage and calculate cost
                 await self._ensure_pricing_resolved(resolved_agent, output.model)
                 usage = self.usage_tracker.record(agent.name, output, _agent_elapsed)
+                if output.session_seconds is not None:
+                    self.usage_tracker.record_sandbox(
+                        f"{agent.name} (sandbox)", output.session_seconds
+                    )
 
                 self._emit(
                     "parallel_agent_completed",
@@ -5467,6 +5475,10 @@ class WorkflowEngine:
                 usage = self.usage_tracker.record(
                     f"{for_each_group.name}[{key}]", output, _item_elapsed
                 )
+                if output.session_seconds is not None:
+                    self.usage_tracker.record_sandbox(
+                        f"{for_each_group.name}[{key}] (sandbox)", output.session_seconds
+                    )
 
                 self._emit(
                     "for_each_item_completed",

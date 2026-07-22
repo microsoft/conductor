@@ -242,6 +242,38 @@ class UsageTracker:
         self._agents.append(usage)
         return usage
 
+    def record_sandbox(self, agent_name: str, session_seconds: float) -> AgentUsage:
+        """Record sandbox wall-clock time as a distinct, non-billing usage row.
+
+        Mirrors the ``"<agent> (validator)"`` row pattern (issue #220): a
+        remote-runtime provider (e.g. ``aca``) reports sandbox time separate
+        from token cost (issue #284, FR7), so it is recorded here as its own
+        row rather than folded into the primary agent's token-derived
+        ``record()`` call. Always token-free and unpriced — ``cost_usd`` is
+        ``None`` (not ``0.0``) so it is never mistaken for a priced-but-free
+        execution.
+
+        Args:
+            agent_name: Usage-row label, typically ``"<agent> (sandbox)"``.
+            session_seconds: Sandbox wall-clock duration reported by the
+                provider.
+
+        Returns:
+            The recorded ``AgentUsage`` row.
+        """
+        usage = AgentUsage(
+            agent_name=agent_name,
+            model=None,
+            input_tokens=0,
+            output_tokens=0,
+            cache_read_tokens=0,
+            cache_write_tokens=0,
+            cost_usd=None,
+            elapsed_seconds=session_seconds,
+        )
+        self._agents.append(usage)
+        return usage
+
     def get_summary(self) -> WorkflowUsage:
         """Get aggregated workflow usage.
 

@@ -79,6 +79,10 @@ class AgentOutput:
         cache_read_tokens: Tokens read from cache (Claude prompt caching).
         cache_write_tokens: Tokens written to cache (Claude prompt caching).
         model: Actual model used (may differ from requested if aliased).
+        session_seconds: Sandbox wall-clock time reported by a remote-runtime
+            provider (e.g. ``aca``), separate from token cost (FR7). ``None``
+            for providers that execute on-host and have no distinct sandbox
+            time to report.
     """
 
     content: dict[str, Any]
@@ -107,6 +111,10 @@ class AgentOutput:
 
     partial: bool = False
     """Whether this output is partial (from a mid-agent interrupt)."""
+
+    session_seconds: float | None = None
+    """Sandbox wall-clock time reported by a remote-runtime provider (issue #284,
+    FR7). ``None`` for providers with no distinct sandbox time to report."""
 
 
 @dataclass(frozen=True)

@@ -174,10 +174,8 @@ def _validate_execute_request(request: AcaExecuteRequest) -> AgentDef:
 def _result_frame_data(output: AgentOutput, session_seconds: float) -> dict[str, Any]:
     """Build the terminal `result` frame payload (E4-T2, incl. `session_seconds`).
 
-    `session_seconds` is deliberately not a field on `AcaResultData` yet —
-    E6 (not this epic) adds host-side parsing into `AgentOutput`. Sending it
-    as an extra key is safe today because the host's `AcaResultData` uses
-    `extra="ignore"`.
+    `session_seconds` is a field on `AcaResultData` (added by E6, which parses
+    it into `AgentOutput.session_seconds` on the host side).
     """
     payload = AcaResultData(
         content=output.content,
@@ -187,8 +185,8 @@ def _result_frame_data(output: AgentOutput, session_seconds: float) -> dict[str,
         cache_read_tokens=output.cache_read_tokens,
         cache_write_tokens=output.cache_write_tokens,
         partial=output.partial,
+        session_seconds=session_seconds,
     ).model_dump(mode="json")
-    payload["session_seconds"] = session_seconds
     return payload
 
 

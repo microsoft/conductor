@@ -665,6 +665,51 @@ class TestAcaExecuteStreaming:
         assert output.cache_write_tokens == 3
 
     @pytest.mark.asyncio
+    async def test_execute_parses_session_seconds_from_result(self) -> None:
+        """E6-T1: `AcaResultData.session_seconds` reaches `AgentOutput`, distinct
+        from token cost (FR7)."""
+        frames = [
+            {
+                "type": "result",
+                "data": {
+                    "content": {"summary": "done"},
+                    "input_tokens": 10,
+                    "output_tokens": 5,
+                    "session_seconds": 12.5,
+                },
+            },
+        ]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, content=_ndjson_body(frames))
+
+        provider = _make_provider()
+        provider._http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        with patch("conductor.providers.aca._AsyncDefaultAzureCredential", _FakeAsyncCredential):
+            output = await provider.execute(agent=_agent(), context={}, rendered_prompt="x")
+
+        assert output.session_seconds == 12.5
+        # Token fields are unaffected by the presence of session_seconds.
+        assert output.input_tokens == 10
+        assert output.output_tokens == 5
+
+    @pytest.mark.asyncio
+    async def test_execute_session_seconds_none_when_absent(self) -> None:
+        """When the runner omits `session_seconds`, `AgentOutput.session_seconds`
+        stays `None` (matches every non-`aca` provider's default)."""
+        frames = [{"type": "result", "data": {"content": {"summary": "done"}}}]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, content=_ndjson_body(frames))
+
+        provider = _make_provider()
+        provider._http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        with patch("conductor.providers.aca._AsyncDefaultAzureCredential", _FakeAsyncCredential):
+            output = await provider.execute(agent=_agent(), context={}, rendered_prompt="x")
+
+        assert output.session_seconds is None
+
+    @pytest.mark.asyncio
     async def test_execute_forwards_tool_output_config(self) -> None:
         """Review fix: `runtime.tool_output` must be forwarded so the runner's
         inner provider applies the same per-result MCP tool-output limit."""

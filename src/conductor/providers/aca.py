@@ -594,6 +594,7 @@ class AcaRuntimeProvider(AgentProvider):
             cache_write_tokens=result.cache_write_tokens,
             model=result.model,
             partial=result.partial or interrupted,
+            session_seconds=result.session_seconds,
         )
 
     # ------------------------------------------------------------------
