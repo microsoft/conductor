@@ -26,6 +26,7 @@ from conductor.engine.limits import LimitEnforcer
 from conductor.engine.pricing import ModelPricing
 from conductor.engine.router import Router, RouteResult
 from conductor.engine.usage import UsageTracker, WorkflowUsage
+from conductor.error_envelope import ErrorEnvelope
 from conductor.events import WorkflowEvent, WorkflowEventEmitter
 from conductor.exceptions import (
     AgentTimeoutError,
@@ -35,6 +36,7 @@ from conductor.exceptions import (
     InterruptError,
     MaxIterationsError,
     SubworkflowTerminatedError,
+    UnhandledNodeError,
     ValidationError,
     WorkflowTerminated,
 )
@@ -3472,7 +3474,7 @@ class WorkflowEngine:
                             # into strict JSON-object mode with zero declared
                             # fields. See `_validate_script_output_schema` for
                             # the validation rules and wrapping rationale.
-                            if agent.output is not None:
+                            if agent.output is not None and script_output.error is None:
                                 try:
                                     self._validate_script_output_schema(
                                         agent,
@@ -3495,24 +3497,55 @@ class WorkflowEngine:
                                     )
                                     raise
 
-                            self._emit(
-                                "script_completed",
-                                {
-                                    "agent_name": agent.name,
-                                    "elapsed": _script_elapsed,
-                                    "stdout": script_output.stdout,
-                                    "stderr": script_output.stderr,
-                                    "exit_code": script_output.exit_code,
-                                    "stdin_bytes": script_output.stdin_bytes,
-                                },
-                            )
+                            route_result: RouteResult | None = None
+                            if script_output.error is not None:
+                                self._emit(
+                                    "script_failed",
+                                    {
+                                        "agent_name": agent.name,
+                                        "elapsed": _script_elapsed,
+                                        "error_type": "TypedScriptError",
+                                        "message": script_output.error.message,
+                                        "error": script_output.error.to_dict(),
+                                        "stdout": script_output.stdout,
+                                        "stderr": script_output.stderr,
+                                        "exit_code": script_output.exit_code,
+                                    },
+                                )
+                                try:
+                                    route_result = self._evaluate_routes(
+                                        agent,
+                                        output_content,
+                                        error=script_output.error,
+                                    )
+                                except ValueError as exc:
+                                    raise UnhandledNodeError(
+                                        agent_name=agent.name,
+                                        error=script_output.error,
+                                        output=output_content,
+                                    ) from exc
+                            else:
+                                self._emit(
+                                    "script_completed",
+                                    {
+                                        "agent_name": agent.name,
+                                        "elapsed": _script_elapsed,
+                                        "stdout": script_output.stdout,
+                                        "stderr": script_output.stderr,
+                                        "exit_code": script_output.exit_code,
+                                        "stdin_bytes": script_output.stdin_bytes,
+                                    },
+                                )
 
                             self.context.store(agent.name, output_content)
+                            if script_output.error is not None:
+                                self.context.store_error(agent.name, script_output.error)
                             self.limits.record_execution(agent.name)
                             self.limits.check_timeout()
                             self._check_budget()
 
-                            route_result = self._evaluate_routes(agent, output_content)
+                            if route_result is None:
+                                route_result = self._evaluate_routes(agent, output_content)
 
                             self._emit(
                                 "route_taken",
@@ -5680,6 +5713,7 @@ class WorkflowEngine:
         Args:
             agent: The current agent definition.
             output: The agent's output content.
+            error: Typed failure envelope, when evaluating the error bucket.
 
         Returns:
             The name of the next agent or "$end".
@@ -5687,7 +5721,13 @@ class WorkflowEngine:
         result = self._evaluate_routes(agent, output)
         return result.target
 
-    def _evaluate_routes(self, agent: AgentDef, output: dict[str, Any]) -> RouteResult:
+    def _evaluate_routes(
+        self,
+        agent: AgentDef,
+        output: dict[str, Any],
+        *,
+        error: ErrorEnvelope | None = None,
+    ) -> RouteResult:
         """Evaluate routes using the Router.
 
         Uses the Router to evaluate routing rules and determine the next agent.
@@ -5701,13 +5741,15 @@ class WorkflowEngine:
             RouteResult with target and optional output transform.
         """
         if not agent.routes:
+            if error is not None:
+                raise ValueError("No error routes are defined")
             # No routes defined - default to $end
             return RouteResult(target="$end")
 
         # Build context for condition evaluation
         eval_context = self.context.get_for_template()
 
-        return self.router.evaluate(agent.routes, output, eval_context)
+        return self.router.evaluate(agent.routes, output, eval_context, error=error)
 
     def _evaluate_parallel_routes(
         self, parallel_group: ParallelGroup, output: dict[str, Any]

@@ -138,6 +138,22 @@ class TestRouteDef:
         route = RouteDef(to="$end")
         assert route.to == "$end"
 
+    def test_error_route_accepts_specific_and_catch_all_kinds(self) -> None:
+        """Error routes declare exact kinds, kind lists, or a catch-all."""
+        exact = RouteDef(to="recover", on_error="external.git.drift")
+        several = RouteDef(
+            to="recover",
+            on_error=["external.git.drift", "external.git.fetch_failed"],
+        )
+        catch_all = RouteDef(to="halt", on_error=True)
+
+        assert exact.on_error == "external.git.drift"
+        assert several.on_error == [
+            "external.git.drift",
+            "external.git.fetch_failed",
+        ]
+        assert catch_all.on_error is True
+
     def test_empty_target_raises(self) -> None:
         """Test that empty route target raises ValidationError."""
         with pytest.raises(ValidationError):
@@ -389,6 +405,17 @@ class TestAgentDef:
         assert agent.type is None
         assert agent.routes == []
         assert agent.input == []
+
+    def test_script_may_document_raised_error_kinds(self) -> None:
+        """The optional raises declaration is documentation and validation metadata."""
+        agent = AgentDef(
+            name="script",
+            type="script",
+            command="echo",
+            raises=["external.git.drift"],
+        )
+
+        assert agent.raises == ["external.git.drift"]
 
     def test_agent_with_all_fields(self) -> None:
         """Test agent with all fields populated."""

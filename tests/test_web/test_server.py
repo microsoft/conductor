@@ -1333,6 +1333,63 @@ class TestReplaySyntheticFromContext:
         assert types == ["script_started", "script_completed"]
         assert dashboard._event_history[1]["data"]["stdout"] == "hi"
 
+    def test_emits_script_failed_for_handled_typed_error(self) -> None:
+        from conductor.engine.context import WorkflowContext
+        from conductor.error_envelope import ErrorEnvelope
+
+        emitter, dashboard = _make_dashboard()
+        ctx = WorkflowContext()
+        ctx.store("s", {"stdout": "partial", "stderr": "", "exit_code": 0})
+        ctx.store_error(
+            "s",
+            ErrorEnvelope(
+                kind="external.git.drift",
+                message="remote changed",
+                details={"branch": "main"},
+            ),
+        )
+
+        count = dashboard.replay_synthetic_from_context(ctx, self._build_config())
+
+        assert count == 2
+        types = [ev["type"] for ev in dashboard._event_history]
+        assert types == ["script_started", "script_failed"]
+        failed = dashboard._event_history[1]["data"]
+        assert failed["error"] == {
+            "kind": "external.git.drift",
+            "message": "remote changed",
+            "details": {"branch": "main"},
+        }
+        assert failed["stdout"] == "partial"
+        assert failed["synthetic"] is True
+
+    def test_repeated_script_marks_only_latest_execution_with_current_error(self) -> None:
+        from conductor.engine.context import WorkflowContext
+        from conductor.error_envelope import ErrorEnvelope
+
+        emitter, dashboard = _make_dashboard()
+        ctx = WorkflowContext()
+        ctx.store("s", {"stdout": "first", "stderr": "", "exit_code": 0})
+        ctx.store("s", {"stdout": "second", "stderr": "", "exit_code": 0})
+        ctx.store_error(
+            "s",
+            ErrorEnvelope(
+                kind="external.git.drift",
+                message="remote changed",
+                details={},
+            ),
+        )
+
+        dashboard.replay_synthetic_from_context(ctx, self._build_config())
+
+        types = [ev["type"] for ev in dashboard._event_history]
+        assert types == [
+            "script_started",
+            "script_completed",
+            "script_started",
+            "script_failed",
+        ]
+
     def test_emits_wait_events_for_wait_type(self) -> None:
         """Wait steps replay via _synth_agent_or_script's wait branch
         (issue #218). The synthetic event pair must use the

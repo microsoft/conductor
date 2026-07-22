@@ -20,6 +20,7 @@ from pydantic import (
 )
 
 from conductor.duration import parse_duration
+from conductor.error_kinds import is_reserved_error_kind, validate_error_kind
 from conductor.file_string import FileString
 from conductor.providers.context_tier import ContextTier
 from conductor.providers.reasoning import ReasoningEffort
@@ -123,6 +124,9 @@ class RouteDef(BaseModel):
     output: dict[str, str] | None = None
     """Optional output transformation (template expressions)."""
 
+    on_error: bool | str | list[str] | None = None
+    """Select typed failures for this route; omitted routes handle success."""
+
     @field_validator("to")
     @classmethod
     def validate_target(cls, v: str) -> str:
@@ -130,6 +134,24 @@ class RouteDef(BaseModel):
         if not v:
             raise ValueError("Route target cannot be empty")
         return v
+
+    @field_validator("on_error", mode="before")
+    @classmethod
+    def validate_on_error(cls, value: Any) -> bool | str | list[str] | None:
+        """Validate exact, list, and catch-all typed failure selectors."""
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            if not value:
+                raise ValueError("on_error: false is invalid; omit on_error for success routes")
+            return True
+        if isinstance(value, str):
+            return validate_error_kind(value)
+        if isinstance(value, list):
+            if not value:
+                raise ValueError("on_error kind list cannot be empty")
+            return [validate_error_kind(kind) for kind in value]
+        raise ValueError("on_error must be true, an error kind, or a list of error kinds")
 
 
 class ParallelGroup(BaseModel):
@@ -750,6 +772,9 @@ class AgentDef(BaseModel):
     routes: list[RouteDef] = Field(default_factory=list)
     """Routing rules evaluated in order after execution."""
 
+    raises: list[str] | None = None
+    """Optional documentation and load-time validation for script error kinds."""
+
     options: list[GateOption] | None = None
     """Options for human_gate type agents."""
 
@@ -1126,6 +1151,25 @@ class AgentDef(BaseModel):
         if isinstance(value, FileString):
             return value
         return handler(value)
+
+    @field_validator("raises")
+    @classmethod
+    def validate_raises(cls, value: list[str] | None) -> list[str] | None:
+        """Validate optional author-owned error-kind declarations."""
+        if value is None:
+            return None
+        if not value:
+            raise ValueError("raises cannot be empty; omit the field instead")
+
+        validated: list[str] = []
+        for kind in value:
+            validate_error_kind(kind)
+            if is_reserved_error_kind(kind):
+                raise ValueError(f"raises kind '{kind}' uses an engine-owned namespace")
+            if kind in validated:
+                raise ValueError(f"raises kind '{kind}' is declared more than once")
+            validated.append(kind)
+        return validated
 
     @model_validator(mode="after")
     def validate_agent_type(self) -> AgentDef:

@@ -653,9 +653,11 @@ class WebDashboard:
 
         execution_history = list(getattr(context, "execution_history", []) or [])
         agent_outputs = getattr(context, "agent_outputs", {}) or {}
+        step_errors = getattr(context, "step_errors", {}) or {}
+        last_execution_index = {name: index for index, name in enumerate(execution_history)}
 
         count = 0
-        for name in execution_history:
+        for index, name in enumerate(execution_history):
             output = agent_outputs.get(name, {})
             if name in parallel_groups:
                 started_type, started_data, completed_type, completed_data = self._synth_parallel(
@@ -667,7 +669,12 @@ class WebDashboard:
                 )
             else:
                 started_type, started_data, completed_type, completed_data = (
-                    self._synth_agent_or_script(name, agent_defs.get(name), output)
+                    self._synth_agent_or_script(
+                        name,
+                        agent_defs.get(name),
+                        output,
+                        step_errors.get(name) if last_execution_index[name] == index else None,
+                    )
                 )
 
             self._event_history.append(
@@ -746,7 +753,7 @@ class WebDashboard:
 
     @staticmethod
     def _synth_agent_or_script(
-        name: str, agent_def: Any, output: Any
+        name: str, agent_def: Any, output: Any, error: Any = None
     ) -> tuple[str, dict[str, Any], str, dict[str, Any]]:
         """Build synthetic (started, completed) event payloads for an agent/script/wait."""
         agent_type = getattr(agent_def, "type", None) or "agent"
@@ -766,6 +773,16 @@ class WebDashboard:
                 "exit_code": output_dict.get("exit_code", 0),
                 "synthetic": True,
             }
+            if error is not None:
+                error_dict = error.to_dict() if hasattr(error, "to_dict") else error
+                completed_data.update(
+                    {
+                        "error_type": "TypedScriptError",
+                        "message": error_dict.get("message", ""),
+                        "error": error_dict,
+                    }
+                )
+                return "script_started", started_data, "script_failed", completed_data
             return "script_started", started_data, "script_completed", completed_data
 
         if agent_type == "wait":
