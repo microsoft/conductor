@@ -71,11 +71,28 @@ IMAGE_NAME="${IMAGE_NAME:-conductor-agent-runner}"
 # against a mutable tag risks the session pool (or a layer-caching registry)
 # keeping the *old* image around instead of picking up a rebuilt one. A UTC
 # timestamp alone is only second-resolution, so two runs kicked off within
-# the same second (e.g. concurrent CI jobs) could collide; append this
-# script's PID and bash's $RANDOM (0-32767) so concurrent runs get distinct
-# tags even when the timestamp matches. Set IMAGE_TAG explicitly to
+# the same second (e.g. concurrent, isolated CI jobs) could collide; append a
+# 128-bit random nonce (not the script's PID + bash's $RANDOM, which together
+# offer well under 32 bits and can still collide when two isolated jobs
+# happen to share both a timestamp and a PID) so concurrent runs get
+# distinct tags even when the timestamp matches. Set IMAGE_TAG explicitly to
 # pin/reuse a specific build.
-IMAGE_TAG="${IMAGE_TAG:-$(date -u +%Y%m%dT%H%M%SZ)-$$-${RANDOM}}"
+_random_nonce() {
+    # Prefer the kernel's UUID generator (no extra binary required on most
+    # Linux hosts/containers), then `uuidgen`, then `openssl rand`, falling
+    # back to reading raw bytes from /dev/urandom directly so this works even
+    # on a minimal image missing all three.
+    if [ -r /proc/sys/kernel/random/uuid ]; then
+        tr -d '-' < /proc/sys/kernel/random/uuid
+    elif command -v uuidgen >/dev/null 2>&1; then
+        uuidgen | tr -d '-' | tr '[:upper:]' '[:lower:]'
+    elif command -v openssl >/dev/null 2>&1; then
+        openssl rand -hex 16
+    else
+        od -An -tx1 -N16 /dev/urandom | tr -d ' \n'
+    fi
+}
+IMAGE_TAG="${IMAGE_TAG:-$(date -u +%Y%m%dT%H%M%SZ)-$(_random_nonce)}"
 DOCKERFILE_DIR="${DOCKERFILE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../docker/aca-runner" && pwd)}"
 # Conductor release tag baked into the image (docker/aca-runner/Dockerfile's
 # CONDUCTOR_VERSION build arg). Empty = use the Dockerfile's own default.
@@ -114,6 +131,11 @@ MAX_ALIVE_PERIOD="${MAX_ALIVE_PERIOD:-3600}"
 # service principal or managed identity's object ID for non-interactive use
 # (e.g. a CI pipeline that will later call the pool on Conductor's behalf).
 ASSIGNEE="${ASSIGNEE:-}"
+# Principal type for an explicit $ASSIGNEE override (User | ServicePrincipal
+# | Group) — see Step 4 below for why this matters. Left empty when ASSIGNEE
+# is left to default to the signed-in user, since that case's type is known
+# without asking.
+ASSIGNEE_PRINCIPAL_TYPE="${ASSIGNEE_PRINCIPAL_TYPE:-}"
 
 # ---------------------------------------------------------------------------
 # Validate configuration before making ANY Azure CLI call (including the
@@ -275,6 +297,11 @@ success "Session pool '${POOL_NAME}' created."
 if [ -z "$ASSIGNEE" ]; then
     info "ASSIGNEE not set; defaulting to the signed-in user (az ad signed-in-user show)."
     ASSIGNEE="$(az ad signed-in-user show --query id --output tsv)"
+    # `az ad signed-in-user show` only succeeds for an interactive/user
+    # sign-in (it has no meaning under `az login --service-principal`), so
+    # the resulting principal is always of type User — known without asking,
+    # so default ASSIGNEE_PRINCIPAL_TYPE here rather than leaving it empty.
+    ASSIGNEE_PRINCIPAL_TYPE="${ASSIGNEE_PRINCIPAL_TYPE:-User}"
 fi
 
 session_pool_resource_id="$(az containerapp sessionpool show \
@@ -284,10 +311,26 @@ session_pool_resource_id="$(az containerapp sessionpool show \
     --output tsv)"
 
 info "Granting 'Azure ContainerApps Session Executor' on the pool to ${ASSIGNEE}..."
-az role assignment create \
-    --role "Azure ContainerApps Session Executor" \
-    --assignee "$ASSIGNEE" \
+# --assignee-object-id (rather than the graph-lookup-based --assignee) skips
+# resolving $ASSIGNEE to a principal via Microsoft Graph — it's already an
+# object ID. That is a SEPARATE lookup, though, from the one Azure CLI (as of
+# 2.88.0) performs to infer the principal *type* whenever
+# --assignee-principal-type is omitted: --assignee-object-id alone does not
+# avoid Graph, only passing --assignee-principal-type does. We know the type
+# for free in the default case (signed-in user, above) and pass it. For an
+# explicit $ASSIGNEE without $ASSIGNEE_PRINCIPAL_TYPE set (e.g. a CI service
+# principal or a group object ID) this falls back to that Graph lookup — set
+# ASSIGNEE_PRINCIPAL_TYPE explicitly (User|ServicePrincipal|Group) to avoid
+# it if your identity lacks Microsoft Graph directory-read permission.
+session_executor_args=(
+    --role "Azure ContainerApps Session Executor"
+    --assignee-object-id "$ASSIGNEE"
     --scope "$session_pool_resource_id"
+)
+if [ -n "$ASSIGNEE_PRINCIPAL_TYPE" ]; then
+    session_executor_args+=(--assignee-principal-type "$ASSIGNEE_PRINCIPAL_TYPE")
+fi
+az role assignment create "${session_executor_args[@]}"
 success "Session Executor role granted."
 
 # ---------------------------------------------------------------------------

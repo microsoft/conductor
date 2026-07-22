@@ -464,8 +464,8 @@ Copilot custom routing. Covers Epic **E8**.
 | Task ID | Type | Description | Files | Status |
 |---|---|---|---|---|
 | E5-T1 | IMPL | `Dockerfile` for `conductor-agent-runner`: install a pinned Conductor + the runner + common stdio MCP binaries; expose the runner `TARGET_PORT`; `CMD python -m conductor.aca_runner`. | `docker/aca-runner/Dockerfile`, `docker/aca-runner/.dockerignore` | DONE — second review pass fixes: pushed this branch to `origin` so the pinned `CONDUCTOR_VERSION` commit is reachable from a real `microsoft/conductor` ref (previously only existed on the local sandbox clone, so the documented default GitHub install had nothing to resolve); baked in a pinned `git-mcp-server` npm binary (`@cyanheads/git-mcp-server@2.15.1`) so the example workflow's `mcp_servers.git.command: git-mcp-server` works with runtime egress disabled. |
-| E5-T2 | IMPL | Provisioning example script: push image to ACR, then `az containerapp sessionpool create --container-type CustomContainer …` (advisory `egress`/`lifecycle` mirrors). | `scripts/aca/provision-pool.sh` | DONE — third review pass fixes: (1) `EGRESS`/`LIFECYCLE` validation now runs *before* the `az upgrade`/`az extension add` preflight (previously ran after, so a typo'd value still burned two Azure CLI calls before failing); (2) `IMAGE_TAG`'s default now appends the script's PID and bash's `$RANDOM` to the UTC timestamp, so two runs landing in the same wall-clock second (e.g. concurrent CI jobs) still get distinct tags — the prior timestamp-only default was reproducibly demonstrated to collide within the same test run. Carried over from the second review pass (still true): the registry role grant uses `--assignee-object-id` + `--assignee-principal-type ServicePrincipal` instead of `--assignee <principalId>`, avoiding the Entra replication race where a just-created identity's principal ID isn't always resolvable by object-ID-less `--assignee` graph lookup yet; the registry role is selected based on the ACR's `roleAssignmentMode` (`Container Registry Repository Reader` for ABAC-enabled registries, `AcrPull` otherwise — including an empty/unrecognized mode, now test-covered); a preflight step runs `az upgrade` + `az extension add --name containerapp --upgrade --allow-preview true -y` before any session-pool-specific calls. The Session Executor grant (on the pool, for a human/CI principal) deliberately still uses the plain `--assignee` form — it is not racing a just-created identity, so the object-ID workaround doesn't apply there; a prior version of this row's notes incorrectly implied both grants used the object-ID form. |
-| E5-T3 | TEST | CI lint/build check for the Dockerfile (e.g. `hadolint` if already available, else a build smoke in a marked/optional job) and a shellcheck of the provisioning script. Only add if such tooling already exists in the repo. | `docker/aca-runner/Dockerfile`, `scripts/aca/provision-pool.sh` | DONE — still no hadolint/shellcheck/docker job exists anywhere in `.github/workflows/` or the `Makefile`, so per the task's own "only add if already exists" condition nothing is wired into CI. Added instead: `tests/test_integration/test_aca_provision_pool.py`, a `pytest` integration test that runs `provision-pool.sh` end-to-end against a scripted mock `az` binary (records every invocation's argv) and asserts on: `--target-port`/`TARGET_PORT` propagation into `az acr build`; `--cooldown-period` vs `--max-alive-period` mutual exclusivity per `LIFECYCLE`; the registry grant's `--assignee-object-id`/`--assignee-principal-type ServicePrincipal` shape and the Session Executor grant's plain `--assignee` shape (two separate, distinctly-asserted tests — not the same shape, see E5-T2); ABAC-vs-legacy-vs-unrecognized registry role selection (three cases, including the empty/unrecognized-mode fallback to `AcrPull`); the collision-resistant `IMAGE_TAG` default (asserts two runs' tags actually differ, not just "not `latest`"); the `az upgrade --yes` / `az extension add --upgrade --allow-preview true --yes` preflight's exact flags; and that an invalid `EGRESS` or `LIFECYCLE` value is rejected with the mock `az` call log left empty (validation now runs before the preflight — see E5-T2). Of these, 3 tests are regression tests that fail against the pre-third-pass script and pass after it: the two invalid-`EGRESS`/`LIFECYCLE`-rejected-before-any-az-call tests, and the tag-uniqueness test (which reproducibly failed with an identical timestamp-only tag before the PID+`$RANDOM` fix). The remaining tests assert pre-existing behavior carried over from the second review pass, or add coverage for previously-untested-but-already-correct behavior (the preflight's `--allow-preview`/`--yes` flags, the unrecognized-role-mode fallback, and the Session Executor grant's `--assignee` shape). |
+| E5-T2 | IMPL | Provisioning example script: push image to ACR, then `az containerapp sessionpool create --container-type CustomContainer …` (advisory `egress`/`lifecycle` mirrors). | `scripts/aca/provision-pool.sh` | DONE — fifth review pass fix: the fourth pass's claim that `--assignee-principal-type` "isn't needed" for the Session Executor grant was wrong — Azure CLI (2.88.0) still performs a *separate* Microsoft Graph lookup to infer the principal type whenever that flag is omitted, regardless of `--assignee-object-id`. Added an `ASSIGNEE_PRINCIPAL_TYPE` env var: the default-ASSIGNEE branch (signed-in user) now sets it to `User` (that type is known without asking, since `az ad signed-in-user show` only resolves for a real interactive/user sign-in) and passes `--assignee-principal-type`; an explicit `$ASSIGNEE` override honors an explicit `$ASSIGNEE_PRINCIPAL_TYPE` the same way, and otherwise documents (rather than silently claims away) the Graph-lookup fallback. Carried over from the fourth review pass (still true): the 128-bit random `IMAGE_TAG` nonce. Carried over from the third review pass (still true): `EGRESS`/`LIFECYCLE` validation before the preflight; the registry role grant's `--assignee-object-id` + `--assignee-principal-type ServicePrincipal`; ACR `roleAssignmentMode`-based role selection; the `az upgrade`/`az extension add` preflight. |
+| E5-T3 | TEST | CI lint/build check for the Dockerfile (e.g. `hadolint` if already available, else a build smoke in a marked/optional job) and a shellcheck of the provisioning script. Only add if such tooling already exists in the repo. | `docker/aca-runner/Dockerfile`, `scripts/aca/provision-pool.sh` | DONE — still no hadolint/shellcheck/docker job exists anywhere in `.github/workflows/` or the `Makefile`, so per the task's own "only add if already exists" condition nothing is wired into CI. `tests/test_integration/test_aca_provision_pool.py` updated for the fifth review pass: `test_defaults_assignee_to_signed_in_user` now asserts `--assignee-principal-type User` is passed; added `test_explicit_assignee_principal_type_is_honored` covering the `$ASSIGNEE_PRINCIPAL_TYPE` override path; the nonce-uniqueness test now asserts an exact `^[0-9a-f]{32}$` match (not just a `>=32`-character length floor) so a regression to, say, uppercase or non-hex output is caught. All three were verified to fail against the pre-fifth-pass script/test pairing and pass after it. |
 
 - **Acceptance Criteria:**
   - [x] The image builds and starts the runner; `/health` responds. Docker itself
@@ -511,40 +511,47 @@ Copilot custom routing. Covers Epic **E8**.
     --upgrade` → `az acr build` → create + role-grant a user-assigned identity
     → `az containerapp sessionpool create --container-type CustomContainer
     --registry-identity <identity-id>` → `az role assignment create --role
-    "Azure ContainerApps Session Executor"`). Third review-pass fixes, each
-    covered by a new automated test in
+    "Azure ContainerApps Session Executor"`). Fifth review-pass fix, covered
+    by a new/updated automated test in
     `tests/test_integration/test_aca_provision_pool.py` (see E5-T3):
-    - `EGRESS`/`LIFECYCLE` validation now runs before the preflight (and
-      before any other Azure CLI call) instead of after it — an invalid value
-      previously still triggered `az upgrade` + `az extension add` before
-      failing, contradicting the "reject bad config before touching Azure"
-      intent. Verified with a test that asserts the mock `az` call log is
-      empty when `LIFECYCLE`/`EGRESS` is invalid.
-    - `IMAGE_TAG`'s default now appends this script's PID and bash's
-      `$RANDOM` to the UTC timestamp (e.g. `20260722T045806Z-12345-8172`)
-      instead of the timestamp alone, so concurrent runs landing in the same
-      wall-clock second get distinct tags. The previous timestamp-only
-      default was reproducibly demonstrated (in this pass's test run) to
-      produce the *same* tag for two sequential invocations within one
-      second.
-    - Corrected an inaccurate claim from the second review pass: the Session
-      Executor role grant (Step 4, on the pool, for a human/CI principal)
-      uses the plain `--assignee` form, not `--assignee-object-id` +
-      `--assignee-principal-type` — only the registry grant (Step 2, on a
-      just-created identity) needs the object-ID workaround, because only
-      that principal is new enough to race Entra ID replication. Both shapes
-      are now separately asserted by tests.
-    - Added a test asserting the preflight's exact flags (`az upgrade --yes`;
-      `az extension add --name containerapp --upgrade --allow-preview true
-      --yes`), and a test asserting an empty/unrecognized ACR
-      `roleAssignmentMode` falls back to `AcrPull` (behavior already
-      correct — this closes a coverage gap, not a bug).
-    - (Carried over from the second review pass, still true and test-covered):
-      the registry role grant's `--assignee-object-id`/
-      `--assignee-principal-type ServicePrincipal` shape; ABAC-vs-legacy
-      registry role selection; `TARGET_PORT` forwarded to `az acr build
-      --build-arg`; `--cooldown-period`/`--max-alive-period` mutual
-      exclusivity by `LIFECYCLE`; the dedicated user-assigned identity
+    - The fourth review pass's claim that the Session Executor grant (Step 4,
+      on the pool) doesn't need `--assignee-principal-type` was **wrong**:
+      `--assignee-object-id` only skips resolving `$ASSIGNEE` to a principal
+      via Microsoft Graph — Azure CLI (2.88.0) still performs a *separate*
+      Graph lookup to infer the principal *type* whenever
+      `--assignee-principal-type` is omitted, regardless of
+      `--assignee-object-id`. Added an `ASSIGNEE_PRINCIPAL_TYPE` env var: the
+      default-ASSIGNEE branch (signed-in user) now sets it to `User` and
+      passes `--assignee-principal-type User` — that type is knowable without
+      a lookup, since `az ad signed-in-user show` only resolves for a real
+      interactive/user sign-in. An explicit `$ASSIGNEE` override honors an
+      explicit `$ASSIGNEE_PRINCIPAL_TYPE` (e.g. `ServicePrincipal` for a CI
+      identity) the same way; if neither is known, the script now documents
+      (in a comment, and here) that it falls back to the Graph-lookup
+      behavior rather than incorrectly claiming to avoid it. Verified with
+      `test_defaults_assignee_to_signed_in_user` (asserts
+      `--assignee-principal-type User` is passed by default) and
+      `test_explicit_assignee_principal_type_is_honored` (asserts an explicit
+      override is forwarded verbatim).
+    - (Carried over from the fourth review pass, still true and test-covered):
+      the default `IMAGE_TAG` nonce is a 128-bit random value (kernel
+      `/proc/sys/kernel/random/uuid`, falling back to `uuidgen`, `openssl
+      rand -hex 16`, then raw `/dev/urandom` bytes) — the nonce-uniqueness
+      test now also asserts an exact `^[0-9a-f]{32}$` match (not just a
+      `>=32`-character floor), closing a gap where a regression to
+      uppercase or non-hex output would have gone undetected; the Session
+      Executor grant uses `--assignee-object-id` (not the graph-lookup-based
+      `--assignee`).
+    - (Carried over from the third review pass, still true and test-covered):
+      `EGRESS`/`LIFECYCLE` validation runs before the preflight (and before
+      any other Azure CLI call); the preflight's exact flags (`az upgrade
+      --yes`; `az extension add --name containerapp --upgrade
+      --allow-preview true --yes`); an empty/unrecognized ACR
+      `roleAssignmentMode` falls back to `AcrPull`; the registry role grant's
+      `--assignee-object-id`/`--assignee-principal-type ServicePrincipal`
+      shape; ABAC-vs-legacy registry role selection; `TARGET_PORT` forwarded
+      to `az acr build --build-arg`; `--cooldown-period`/`--max-alive-period`
+      mutual exclusivity by `LIFECYCLE`; the dedicated user-assigned identity
       created and role-granted *before* the pool references it; no
       `|| true` swallowing authorization failures.
 

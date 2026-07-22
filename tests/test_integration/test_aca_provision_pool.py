@@ -16,8 +16,10 @@ behaviors flagged in review:
   identity).
 - ABAC-vs-legacy registry role selection (``Container Registry Repository
   Reader`` vs ``AcrPull``).
-- The default ``IMAGE_TAG`` is unique across runs (not ``latest``), and an
-  explicit override is honored.
+- The default ``IMAGE_TAG`` is unique across runs (not ``latest``) even when
+  the timestamp component is frozen (proving uniqueness comes from a
+  high-entropy nonce, not incidental timestamp/PID differences between
+  subprocess invocations), and an explicit override is honored.
 - The az CLI / ``containerapp`` extension preflight (``az upgrade --yes``,
   ``az extension add --name containerapp --upgrade --allow-preview true
   --yes``) runs before any session-pool-specific calls.
@@ -26,15 +28,22 @@ behaviors flagged in review:
 - An empty/unrecognized ACR ``roleAssignmentMode`` falls back to the legacy
   ``AcrPull`` role.
 - The Session Executor role grant (on the pool, for a human/CI principal)
-  uses the simple ``--assignee`` form — unlike the registry grant, it is not
-  racing a just-created identity's Entra ID replication, so it doesn't need
-  ``--assignee-object-id``/``--assignee-principal-type``.
+  uses ``--assignee-object-id`` (not the graph-lookup-based ``--assignee``,
+  which a least-privileged CI identity may lack permission to resolve).
+  ``--assignee-object-id`` alone does not stop Azure CLI from separately
+  querying Microsoft Graph to infer the principal *type* — only
+  ``--assignee-principal-type`` does that. The default case (signed-in user)
+  passes ``--assignee-principal-type User`` since that type is known without
+  asking; an explicit ``$ASSIGNEE`` override honors an explicit
+  ``$ASSIGNEE_PRINCIPAL_TYPE`` the same way, and otherwise falls back to the
+  Graph lookup (documented, not silently assumed away).
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -59,9 +68,24 @@ def _install_mock_az(bin_dir: Path) -> None:
     az_path.chmod(az_path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
 
 
+def _install_mock_date(bin_dir: Path, fixed_value: str) -> None:
+    """Install a ``date`` shim (ahead of the real one on ``PATH``) that always
+    prints ``fixed_value``, regardless of arguments.
+
+    Used only to freeze the timestamp component of the default ``IMAGE_TAG``
+    so a test can deterministically prove uniqueness comes from the
+    high-entropy nonce rather than from an incidental (non-deterministic)
+    timestamp/PID difference between two subprocess invocations.
+    """
+    date_path = bin_dir / "date"
+    date_path.write_text(f"#!/usr/bin/env bash\necho '{fixed_value}'\n")
+    date_path.chmod(date_path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+
 def run_provision_script_raw(
     tmp_path: Path,
     extra_env: dict[str, str] | None = None,
+    freeze_date: str | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], list[list[str]]]:
     """Run ``provision-pool.sh`` against the mock ``az`` without asserting success.
 
@@ -69,10 +93,15 @@ def run_provision_script_raw(
     log of every ``az`` invocation actually made, in call order. Used both by
     ``run_provision_script`` (the happy-path helper) and by tests that expect
     the script to fail validation before making any Azure CLI call.
+
+    ``freeze_date``, if given, installs a ``date`` shim that always prints
+    that fixed value (see ``_install_mock_date``).
     """
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(parents=True)
     _install_mock_az(bin_dir)
+    if freeze_date is not None:
+        _install_mock_date(bin_dir, freeze_date)
 
     log_path = tmp_path / "az_calls.jsonl"
 
@@ -103,6 +132,7 @@ def run_provision_script_raw(
 def run_provision_script(
     tmp_path: Path,
     extra_env: dict[str, str] | None = None,
+    freeze_date: str | None = None,
 ) -> list[list[str]]:
     """Run ``provision-pool.sh`` against the mock ``az`` and return its argv log.
 
@@ -110,7 +140,7 @@ def run_provision_script(
     Asserts the script exits successfully; use ``run_provision_script_raw``
     directly for the failure paths (e.g. invalid ``EGRESS``/``LIFECYCLE``).
     """
-    proc, calls = run_provision_script_raw(tmp_path, extra_env)
+    proc, calls = run_provision_script_raw(tmp_path, extra_env, freeze_date=freeze_date)
     assert proc.returncode == 0, (
         f"provision-pool.sh failed (exit {proc.returncode}):\n"
         f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
@@ -228,12 +258,16 @@ class TestRegistryRoleAssignment:
 
 
 class TestSessionExecutorRoleAssignment:
-    def test_uses_plain_assignee_not_object_id(self, tmp_path: Path) -> None:
-        # Unlike the registry grant (which targets a just-created identity
-        # and must avoid the Entra ID replication race), the Session
-        # Executor grant targets an already-existing principal (the signed-in
-        # user, or an explicit $ASSIGNEE) — the simple `--assignee` graph
-        # lookup is fine here.
+    def test_uses_assignee_object_id_not_plain_assignee(self, tmp_path: Path) -> None:
+        # The plain `--assignee` form performs a Microsoft Graph lookup to
+        # resolve the value to a principal, which a least-privileged CI
+        # identity may not have permission to do. ASSIGNEE is documented as
+        # an object ID, so --assignee-object-id skips that lookup entirely.
+        # Without an explicit ASSIGNEE_PRINCIPAL_TYPE, Azure CLI still infers
+        # the principal type via a *separate* Graph lookup (documented
+        # best-effort fallback, not avoided here) — see
+        # test_explicit_assignee_principal_type_is_honored below for the
+        # Graph-free path.
         calls = run_provision_script(tmp_path, {"ASSIGNEE": "33333333-3333-3333-3333-333333333333"})
 
         role_calls = _find_calls(calls, "role", "assignment", "create")
@@ -243,10 +277,10 @@ class TestSessionExecutorRoleAssignment:
         assert _flag_value(session_executor_call, "--role") == (
             "Azure ContainerApps Session Executor"
         )
-        assert _flag_value(session_executor_call, "--assignee") == (
+        assert _flag_value(session_executor_call, "--assignee-object-id") == (
             "33333333-3333-3333-3333-333333333333"
         )
-        assert "--assignee-object-id" not in session_executor_call
+        assert "--assignee" not in session_executor_call
         assert "--assignee-principal-type" not in session_executor_call
 
     def test_defaults_assignee_to_signed_in_user(self, tmp_path: Path) -> None:
@@ -257,8 +291,33 @@ class TestSessionExecutorRoleAssignment:
 
         role_calls = _find_calls(calls, "role", "assignment", "create")
         session_executor_call = role_calls[1]
-        assert _flag_value(session_executor_call, "--assignee") == (
+        assert _flag_value(session_executor_call, "--assignee-object-id") == (
             "22222222-2222-2222-2222-222222222222"
+        )
+        # `az ad signed-in-user show` only resolves for a real interactive/
+        # user sign-in, so this principal's type is known to be User without
+        # a Graph lookup — passed explicitly to avoid one.
+        assert _flag_value(session_executor_call, "--assignee-principal-type") == "User"
+
+    def test_explicit_assignee_principal_type_is_honored(self, tmp_path: Path) -> None:
+        # A CI pipeline authenticating as a service principal can set
+        # ASSIGNEE_PRINCIPAL_TYPE explicitly to avoid the Graph lookup
+        # entirely, even though the default (unset) case falls back to it.
+        calls = run_provision_script(
+            tmp_path,
+            {
+                "ASSIGNEE": "44444444-4444-4444-4444-444444444444",
+                "ASSIGNEE_PRINCIPAL_TYPE": "ServicePrincipal",
+            },
+        )
+
+        role_calls = _find_calls(calls, "role", "assignment", "create")
+        session_executor_call = role_calls[1]
+        assert _flag_value(session_executor_call, "--assignee-object-id") == (
+            "44444444-4444-4444-4444-444444444444"
+        )
+        assert _flag_value(session_executor_call, "--assignee-principal-type") == (
+            "ServicePrincipal"
         )
 
 
@@ -278,6 +337,39 @@ class TestImageTag:
         # resolution wall-clock time), so two runs never collide even when
         # they land in the same wall-clock second.
         assert image_a != image_b
+
+    def test_default_tag_is_unique_with_frozen_timestamp(self, tmp_path: Path) -> None:
+        # A real subprocess-per-run test can't reliably force two invocations
+        # into the *same* wall-clock second (or the same PID) by chance, so a
+        # naive "run twice and compare" assertion could pass purely from
+        # incidental timestamp/PID differences without the fix actually
+        # working. Freeze `date` so both runs get the identical timestamp
+        # component deterministically, isolating the nonce as the only
+        # possible source of uniqueness.
+        fixed_timestamp = "20990101T000000Z"
+        proc_a, calls_a = run_provision_script_raw(tmp_path / "a", freeze_date=fixed_timestamp)
+        proc_b, calls_b = run_provision_script_raw(tmp_path / "b", freeze_date=fixed_timestamp)
+        assert proc_a.returncode == 0, proc_a.stderr
+        assert proc_b.returncode == 0, proc_b.stderr
+
+        image_a = _flag_value(_find_calls(calls_a, "acr", "build")[0], "--image")
+        image_b = _flag_value(_find_calls(calls_b, "acr", "build")[0], "--image")
+        assert image_a is not None and image_b is not None
+
+        prefix = f"conductor-agent-runner:{fixed_timestamp}-"
+        assert image_a.startswith(prefix)
+        assert image_b.startswith(prefix)
+
+        nonce_a = image_a[len(prefix) :]
+        nonce_b = image_b[len(prefix) :]
+        # 128 bits of entropy hex-encoded is exactly 32 lowercase hex
+        # characters — well beyond the ~15 bits a bare `$RANDOM` (0-32767)
+        # suffix offered. Match the format exactly (not just a length floor)
+        # so a regression to, say, an uppercase or non-hex nonce is caught.
+        hex32 = re.compile(r"^[0-9a-f]{32}$")
+        assert hex32.match(nonce_a), f"nonce_a not a 32-char lowercase hex string: {nonce_a!r}"
+        assert hex32.match(nonce_b), f"nonce_b not a 32-char lowercase hex string: {nonce_b!r}"
+        assert nonce_a != nonce_b
 
     def test_explicit_image_tag_is_honored(self, tmp_path: Path) -> None:
         calls = run_provision_script(tmp_path, {"IMAGE_TAG": "v1.2.3"})
