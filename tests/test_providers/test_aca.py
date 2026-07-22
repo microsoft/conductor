@@ -987,3 +987,39 @@ class TestAcaClose:
         provider = _make_provider()
         await provider.close()
         await provider.close()
+
+
+# ---------------------------------------------------------------------------
+# E4-T5 — dialog turns (#284, OQ#5): the MVP runner exposes no dialog
+# endpoint, so `AcaRuntimeProvider` overrides `execute_dialog_turn` to raise a
+# clear, documented error rather than silently falling back to an on-host
+# call (which would bypass the sandbox boundary). See
+# docs/projects/aca/aca-provider.plan.md, epic E4.
+# ---------------------------------------------------------------------------
+
+
+class TestAcaDialogTurns:
+    """`execute_dialog_turn()` is disabled with a clear error (OQ#5 fallback)."""
+
+    @pytest.mark.asyncio
+    async def test_execute_dialog_turn_raises_clear_provider_error(self) -> None:
+        provider = _make_provider()
+        with pytest.raises(ProviderError, match="dialog turn"):
+            await provider.execute_dialog_turn(
+                system_prompt="You are a helpful assistant.",
+                user_message="hello",
+            )
+
+    @pytest.mark.asyncio
+    async def test_execute_dialog_turn_error_is_not_retryable(self) -> None:
+        """A missing runner dialog endpoint is a config-time fact, not transient."""
+        provider = _make_provider()
+        try:
+            await provider.execute_dialog_turn(
+                system_prompt="You are a helpful assistant.",
+                user_message="hello",
+            )
+        except ProviderError as exc:
+            assert exc.is_retryable is False
+        else:
+            pytest.fail("expected ProviderError")

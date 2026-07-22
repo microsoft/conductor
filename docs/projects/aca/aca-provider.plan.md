@@ -96,6 +96,15 @@ before the epic they tag reaches "done".
    `[tool.hatch.build.targets.wheel] exclude` (as the frontend already is,
    `pyproject.toml:71`).
 
+   **Answer (E4) — in-package, wheel-inclusion left as-is.** Built as
+   `src/conductor/aca_runner/` (package with `server.py` + `__main__.py`,
+   `python -m conductor.aca_runner` entrypoint), mirroring
+   `src/conductor/web/server.py`'s pattern. `pyproject.toml`'s
+   `[tool.hatch.build.targets.wheel] exclude` was **not** touched — the runner
+   ships in the wheel like every other subpackage; excluding it (E2-T3's
+   deferred packaging question) is left for a follow-up if the wheel-size
+   tradeoff turns out to matter in practice.
+
 5. **Dialog-turn scope for v1 (blocks E4).** *Open Questions → Dialog turns*
    says `execute_dialog_turn()` should route through the same in-sandbox runner +
    gateway, **with a fallback** to disable dialog turns under `aca` with a clear
@@ -104,6 +113,18 @@ before the epic they tag reaches "done".
    plumbing), or ship the disable-with-clear-error fallback? This sets E4's scope
    and whether `AcaRuntimeProvider` overrides `execute_dialog_turn`
    (`base.py:270`).
+
+   **Answer (E4) — disable-with-clear-error fallback; no runner dialog endpoint.**
+   `AcaRuntimeProvider.execute_dialog_turn` now overrides the base class and
+   raises a `ProviderError` naming the sandbox-boundary reason (rather than
+   inheriting the generic `NotImplementedError`). Every existing caller
+   (`gates/dialog.py`, `engine/dialog_evaluator.py`, `engine/validator.py`)
+   already catches `Exception` around this call and degrades gracefully (skip
+   dialog / log a warning), so this fails safely without new engine plumbing.
+   Building a real runner dialog endpoint is deferred — the identity/session
+   continuity a dialog turn would need (`execute_dialog_turn`'s signature has
+   no `agent`/`identifier` parameter to key a session lookup on) is a bigger
+   seam than this epic's scope.
 
 6. **MVP credential stopgap shape (affects E3/E4 request contract & Security).**
    *DD4* permits a "short-lived scoped token in the request body" for the
@@ -115,6 +136,14 @@ before the epic they tag reaches "done".
    constructs `CopilotProvider(provider_settings=…)` with it (reusing the custom-
    routing `bearer_token` path, `copilot.py:360`) — so the request contract and
    `SecretStr` redaction are settled before the runner is built.
+
+   **Answer (E4) — runner side confirms the E3 shape.** The runner's
+   `_InnerProviderCache` builds `ProviderSettings(name="copilot",
+   **inner_provider_settings)` from the plaintext dict the host forwards in
+   `AcaExecuteRequest.inner_provider_settings` (`bearer_token`/`api_key`/
+   `base_url`), exactly the shape E3 assumed. The Phase 2 gateway seam is a
+   single call site (`_InnerProviderCache.get`, inline comment) — replacing it
+   with a gateway lookup does not touch the wire contract.
 
 7. **Per-agent `provider: aca` override (scope confirmation, affects E1).** The
    preview drives `aca` at `runtime.provider` (workflow-wide); every agent
@@ -378,7 +407,7 @@ Copilot custom routing. Covers Epic **E8**.
     tracks reserved slot *numbers* rather than a count so out-of-order release
     never collides with a still-active sibling — review fix).
 
-### E4 — `conductor-agent-runner` in-container server
+### E4 — `conductor-agent-runner` in-container server — **DONE**
 - **Goal:** The in-sandbox HTTP server that wraps the real `CopilotProvider` and
   streams event frames back, honoring the tools/MCP runner-image contract (*Key
   Components §2*, *API Contracts*, *DD2*).
@@ -387,19 +416,26 @@ Copilot custom routing. Covers Epic **E8**.
 
 | Task ID | Type | Description | Files | Status |
 |---|---|---|---|---|
-| E4-T1 | IMPL | FastAPI app + `python -m conductor.aca_runner` entrypoint; `GET /health` returns readiness + Conductor/runner version for `validate_connection` skew checks. | `src/conductor/aca_runner/__init__.py`, `server.py`, `__main__.py` | TO DO |
-| E4-T2 | IMPL | `POST /execute`: deserialize the request, construct/reuse a `CopilotProvider` (inner provider = `copilot` for the MVP), run `execute()` with an `event_callback` that streams NDJSON frames, terminating with the `AgentOutput` `result` frame (incl. `session_seconds`). | `src/conductor/aca_runner/server.py` | TO DO |
-| E4-T3 | IMPL | Tools/MCP: reconstruct the inner provider with the full `mcp_servers` definitions + per-agent `tools:` allowlist; a declared-but-absent stdio binary fails loudly at execute time (runner-image contract; *Open Questions → MCP*). | `src/conductor/aca_runner/server.py` | TO DO |
-| E4-T4 | IMPL | Auth: point the inner `CopilotProvider` at the credential source per OQ#6 (Phase 1 stopgap token from the request body via the custom-routing `bearer_token` path); leave a seam for the Phase 2 gateway. | `src/conductor/aca_runner/server.py` | TO DO |
-| E4-T5 | IMPL | Dialog turns per OQ#5: either a runner dialog endpoint or a documented disable-with-clear-error under `aca`. | `src/conductor/aca_runner/server.py`, `src/conductor/providers/aca.py` | TO DO |
-| E4-T6 | TEST | Mocked-`CopilotProvider` server tests: `/execute` streams the expected frame sequence and terminal `result`; `/health` reports version; a missing stdio MCP binary surfaces as a runner error; tools/MCP passthrough is forwarded. | `tests/test_aca_runner/test_server.py` | TO DO |
+| E4-T1 | IMPL | FastAPI app + `python -m conductor.aca_runner` entrypoint; `GET /health` returns readiness + Conductor/runner version for `validate_connection` skew checks. | `src/conductor/aca_runner/__init__.py`, `server.py`, `__main__.py` | DONE |
+| E4-T2 | IMPL | `POST /execute`: deserialize the request, construct/reuse a `CopilotProvider` (inner provider = `copilot` for the MVP), run `execute()` with an `event_callback` that streams NDJSON frames, terminating with the `AgentOutput` `result` frame (incl. `session_seconds`). | `src/conductor/aca_runner/server.py` | DONE |
+| E4-T3 | IMPL | Tools/MCP: reconstruct the inner provider with the full `mcp_servers` definitions + per-agent `tools:` allowlist; a declared-but-absent stdio binary fails loudly at execute time (runner-image contract; *Open Questions → MCP*). | `src/conductor/aca_runner/server.py` | DONE |
+| E4-T4 | IMPL | Auth: point the inner `CopilotProvider` at the credential source per OQ#6 (Phase 1 stopgap token from the request body via the custom-routing `bearer_token` path); leave a seam for the Phase 2 gateway. | `src/conductor/aca_runner/server.py` | DONE |
+| E4-T5 | IMPL | Dialog turns per OQ#5: either a runner dialog endpoint or a documented disable-with-clear-error under `aca`. | `src/conductor/aca_runner/server.py`, `src/conductor/providers/aca.py` | DONE — chose the disable-with-clear-error fallback (`AcaRuntimeProvider.execute_dialog_turn` raises `ProviderError`); no runner dialog endpoint was built |
+| E4-T6 | TEST | Mocked-`CopilotProvider` server tests: `/execute` streams the expected frame sequence and terminal `result`; `/health` reports version; a missing stdio MCP binary surfaces as a runner error; tools/MCP passthrough is forwarded. | `tests/test_aca_runner/test_server.py` | DONE |
 
 - **Acceptance Criteria:**
-  - [ ] Event/output parity comes "for free" from the wrapped `CopilotProvider`
+  - [x] Event/output parity comes "for free" from the wrapped `CopilotProvider`
     (DD2); frames use Conductor's own event vocabulary.
-  - [ ] Runner-image contract holds: full `mcp_servers` forwarded; absent binary
+  - [x] Runner-image contract holds: full `mcp_servers` forwarded; absent binary
     fails loudly (not silently dropped).
-  - [ ] Dialog-turn behavior matches the OQ#5 decision.
+  - [x] Dialog-turn behavior matches the OQ#5 decision.
+
+  **Note:** two behaviors implied elsewhere in the design (a runner-side
+  `max_session_seconds` wall-clock guard, and a `/interrupt` endpoint for the
+  host's in-stream interrupt to land on) were **not** built by this epic — no
+  E4 task or acceptance criterion assigns either, so they are left as explicit
+  gaps for a follow-up task rather than scope-crept into E4. See the
+  `aca_runner/server.py` module docstring.
 
 ### E5 — Runner image + bring-your-own pool
 - **Goal:** A buildable official base image and a documented two-step provisioning

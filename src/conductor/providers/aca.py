@@ -813,6 +813,50 @@ class AcaRuntimeProvider(AgentProvider):
             self._release_wire_identifier(logical_id, slot)
 
     # ------------------------------------------------------------------
+    # Dialog turns (E4-T5, OQ#5)
+    # ------------------------------------------------------------------
+
+    async def execute_dialog_turn(
+        self,
+        system_prompt: str,
+        user_message: str,
+        history: list[dict[str, str]] | None = None,
+        model: str | None = None,
+    ) -> str:
+        """Disabled for v1 with a clear error (OQ#5 fallback decision).
+
+        The design's *Open Questions → Dialog turns* answer prefers routing
+        dialog turns through the same in-sandbox runner + gateway `execute()`
+        already uses, for the same isolation/credential boundary — but
+        explicitly permits disabling dialog turns under `aca` with a clear
+        error when the runner exposes no dialog endpoint in the MVP. Epic E4
+        did not build a runner dialog endpoint (see
+        `conductor.aca_runner.server`'s module docstring), so this overrides
+        the generic `AgentProvider.execute_dialog_turn` `NotImplementedError`
+        with a message that names the sandbox-boundary reason: silently
+        falling back to an on-host dialog call (the only alternative) would
+        run outside the sandbox this provider exists to enforce, leaking to
+        the host filesystem and bypassing the gateway.
+
+        Raises:
+            ProviderError: Always — dialog turns are unsupported under `aca`.
+        """
+        raise ProviderError(
+            "aca: dialog turns are not supported by the aca provider in this "
+            "release (the in-sandbox runner exposes no dialog endpoint); "
+            "running the turn on-host instead would bypass the sandbox "
+            "boundary this provider enforces.",
+            suggestion=(
+                "Avoid workflow features that issue dialog turns (human-gate "
+                "dialog refinement, dialog-based validators) on aca-backed "
+                "agents, or route the affected agent through a different "
+                "provider."
+            ),
+            provider_name="aca",
+            is_retryable=False,
+        )
+
+    # ------------------------------------------------------------------
     # validate_connection() / close() (E3-T6, E3-T1)
     # ------------------------------------------------------------------
 
