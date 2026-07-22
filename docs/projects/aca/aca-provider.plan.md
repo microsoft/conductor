@@ -264,12 +264,86 @@ Copilot custom routing. Covers Epic **E8**.
   `conductor-agent-runner` package (`src/conductor/aca_runner/`) does not exist
   yet (E4 scope), so there is nothing to exclude from the wheel at this time.
 
-### E3 — `AcaRuntimeProvider` host transport shim *(core)*
+### E3 — `AcaRuntimeProvider` host transport shim *(core)* — **DONE**
 - **Goal:** Implement the `AgentProvider` that delegates `execute()` to the in-sandbox
   runner over a single streaming request, relays events verbatim, and returns
   `AgentOutput` (FR2–FR4, FR6; NFR3; *Key Components §1*, *Data Flow*, *DD1/DD3/DD5*).
 - **Prerequisites:** E1 (schema fields). Resolve OQ#1 (concurrency seam) and OQ#6
   (stopgap token) before "done".
+
+  **Review fixes (this pass).** A prior implementation pass of this epic failed
+  review on two points: (1) the in-flight identifier registry tracked only a
+  *count* of concurrent callers sharing a logical identifier, which is unsafe
+  under out-of-order completion — e.g. call A gets the base identifier, call B
+  gets `-conc1`, A finishes and releases first, and a third call C arriving
+  while B is still active would be handed `-conc1` again (colliding with B,
+  which never released it); and (2) `AgentOutput.session_seconds` (plus the
+  matching `AcaResultData.session_seconds` wire field) had been added to this
+  epic's change set, but that field and its usage-row plumbing are E6's
+  responsibility (OQ#2 explicitly blocks E6, not E3), not part of the six
+  transport-shim fixes this pass. Both are fixed here: `_acquire_wire_identifier`/
+  `_release_wire_identifier` now track the *set* of reserved slot numbers per
+  logical identifier (not a count), so a release always frees the exact slot a
+  call acquired and a subsequent caller reuses the smallest free slot — never
+  the slot of another call still in flight; `AgentOutput.session_seconds` and
+  the `AcaResultData.session_seconds` field are removed from this pass entirely
+  (deferred to E6, which will add them together with the usage-row wiring).
+
+  **Prior review fixes.** A pass before that failed review for a different set
+  of six issues: concurrent siblings sharing a constant `scope_key` (e.g. a
+  parallel group under `identifier_scope: workflow`) could collide on
+  identifier; the charset-normalization regex could collapse two distinct raw
+  identifiers onto the same normalized string; the interrupt/hard-abort
+  endpoints didn't match the real ACA data-plane contract (verified against
+  Microsoft Learn); the `/health` probe omitted the `identifier` query
+  parameter the container-path-forwarding proxy requires on every request; a
+  non-2xx streamed `/execute` response could raise `httpx.ResponseNotRead`
+  before its ACA diagnostics were parsed, discarding `code`/`message`/`traceId`;
+  and the `tool_output` config / `cache_read_tokens` / `cache_write_tokens` were
+  captured host-side but never forwarded to the runner or read back from the
+  result frame. All six were fixed in that pass (see the updated OQ#1
+  resolution below, `_normalize_and_truncate`, `_send_interrupt`/
+  `_stop_session`, `validate_connection`, `_error_from_response`, and
+  `AcaExecuteRequest.tool_output` / `AcaResultData.cache_*_tokens`).
+
+  **OQ#1 resolution (taken by this epic).** No `execute()` signature change — the
+  acceptance criteria require the call site (`executor/agent.py:288`) to stay
+  untouched, which rules out option (a). Option (b) alone (diverging only when a
+  for-each loop signal is present in `context`) turned out to be insufficient: a
+  `parallel` group carries no `_key`/`_index` at all, and under a non-default
+  `identifier_scope` (`workflow`/`none`) `scope_key` doesn't already vary by
+  agent name either, so concurrent parallel-group siblings could resolve to the
+  *same* identifier — a real, deterministic collision, not just a race. The fix
+  layers a provider-local, in-memory "in-flight" registry on top of the loop-key
+  divergence: `execute()` acquires a wire identifier for the call's `scope_key`
+  base (via `_acquire_wire_identifier`/`_release_wire_identifier`), and only
+  appends a numeric discriminator when another call for that *same* base is
+  already in flight. The registry tracks the *set* of currently-reserved slot
+  numbers per logical identifier (not a count), so a release always frees the
+  exact slot that call acquired and a later caller reuses the smallest free
+  slot — never a slot a still-active sibling holds, even under out-of-order
+  completion (review fix; see `TestAcaConcurrencyIsolation.
+  test_out_of_order_release_does_not_collide_with_still_active_slot`). Two
+  calls that never overlap in time (including sequential `for_each` iterations
+  and sequential different agents under `identifier_scope: workflow`) reuse
+  the identical identifier, matching the *Data Flow* reuse table; two calls
+  racing concurrently for the same base always diverge, matching the *Data
+  Flow* concurrency-safety guarantee — all without any `execute()`/engine
+  signal, since `identifier_for()` (the pure scope/loop-key function exercised
+  by `TestIdentifierDerivation`) is unchanged and the registry wraps only the
+  actual wire call in `execute()`.
+
+  **OQ#6 resolution (taken by this epic).** The `aca`-scoped `ProviderSettings`
+  fields intentionally exclude `bearer_token`/`api_key`/`base_url` (those remain
+  copilot-only per `_check_field_compatibility`), so the stopgap credential is
+  sourced from the same environment variables the Copilot custom-routing resolver
+  already reads (`COPILOT_PROVIDER_BEARER_TOKEN`, `COPILOT_PROVIDER_API_KEY`,
+  `COPILOT_PROVIDER_BASE_URL` — `copilot.py:_resolve_sdk_provider_config`) and
+  forwarded verbatim as the request's `inner_provider_settings` field so the
+  runner can construct `ProviderSettings(name=inner_provider,
+  **inner_provider_settings)` for its inner `CopilotProvider`. `None` when no env
+  var is set — an accepted Phase 1 gap (DD4); the Phase 2 gateway (E8) removes the
+  need for this field.
 
   Note (from E2): a **minimal skeleton** of `AcaRuntimeProvider` already exists in
   `src/conductor/providers/aca.py` — the class, the `CAPABILITIES` descriptor (matches
@@ -282,21 +356,27 @@ Copilot custom routing. Covers Epic **E8**.
 
 | Task ID | Type | Description | Files | Status |
 |---|---|---|---|---|
-| E3-T1 | IMPL | Provider skeleton: `AcaRuntimeProvider(AgentProvider)` with the experimental `CAPABILITIES` descriptor matching the design's table exactly (`tier=experimental`, `checkpoint_resume=False`, `structured_output="prompt_injection"`, `concurrent_safe=True`, `working_dir=True`, etc.); `__init__` storing `ProviderSettings` + a per-run `run_salt`; `close()` releasing the httpx client. | `src/conductor/providers/aca.py` | PARTIAL (class/CAPABILITIES/init exist; run_salt + httpx client still TO DO) |
-| E3-T2 | IMPL | Define the shared request/frame Pydantic models (`agent`, `rendered_prompt`, `tools`, `mcp_servers`, `context`; NDJSON event frame; terminal `result` frame). | `src/conductor/providers/aca_protocol.py` | TO DO |
-| E3-T3 | IMPL | `identifier_for(scope)` per *Data Flow*: `cond-{run_salt}-{scope_key}{concurrency_suffix}`, charset-normalized, ≤128 chars with hash suffix; scope from `identifier_scope`; concurrency discriminator per OQ#1. | `src/conductor/providers/aca.py` | TO DO |
-| E3-T4 | IMPL | AAD auth: acquire + cache a `dynamicsessions.io` bearer token via `DefaultAzureCredential` (Session Executor role); attach to `POST {pool_endpoint}/execute?identifier=…&api-version=…`. | `src/conductor/providers/aca.py` | TO DO |
-| E3-T5 | IMPL | Streaming transport (Branch S): read `application/x-ndjson` line-by-line, call `event_callback(type, data)` verbatim, parse the terminal `result` frame into `AgentOutput` (incl. `session_seconds` per OQ#2); classify runner/ACA errors into `ProviderError` with the ACA `code`/`message`/`traceId` attached. | `src/conductor/providers/aca.py` | TO DO |
-| E3-T6 | IMPL | Interrupt: on `interrupt_signal`, send an in-stream interrupt frame (Branch S) and fall back to `stopSession` as a hard-abort; `validate_connection()` does a lightweight management-plane + `/health` version probe (skew check). | `src/conductor/providers/aca.py` | TO DO |
-| E3-T7 | TEST | Mocked-runner smoke test: patch the httpx stream + `DefaultAzureCredential`; assert event frames relay 1:1 to `event_callback`, `AgentOutput` parses from `result`, identifier derivation is parallel-safe/≤128 chars, interrupt path fires, and errors surface as `ProviderError`. | `tests/test_providers/test_aca.py` | TO DO |
+| E3-T1 | IMPL | Provider skeleton: `AcaRuntimeProvider(AgentProvider)` with the experimental `CAPABILITIES` descriptor matching the design's table exactly (`tier=experimental`, `checkpoint_resume=False`, `structured_output="prompt_injection"`, `concurrent_safe=True`, `working_dir=True`, etc.); `__init__` storing `ProviderSettings` + a per-run `run_salt`; `close()` releasing the httpx client. | `src/conductor/providers/aca.py` | DONE |
+| E3-T2 | IMPL | Define the shared request/frame Pydantic models (`agent`, `rendered_prompt`, `tools`, `mcp_servers`, `context`; NDJSON event frame; terminal `result` frame). | `src/conductor/providers/aca_protocol.py` | DONE — includes the `tool_output` request field + `cache_read_tokens`/`cache_write_tokens` result fields (review fix) |
+| E3-T3 | IMPL | `identifier_for(scope)` per *Data Flow*: `cond-{run_salt}-{scope_key}{concurrency_suffix}`, charset-normalized, ≤128 chars with hash suffix; scope from `identifier_scope`; concurrency discriminator per OQ#1. | `src/conductor/providers/aca.py` | DONE — includes the in-flight acquire/release registry (slot-set tracking, not a count — review fix) + unconditional hash suffix |
+| E3-T4 | IMPL | AAD auth: acquire + cache a `dynamicsessions.io` bearer token via `DefaultAzureCredential` (Session Executor role); attach to `POST {pool_endpoint}/execute?identifier=…&api-version=…`. | `src/conductor/providers/aca.py` | DONE |
+| E3-T5 | IMPL | Streaming transport (Branch S): read `application/x-ndjson` line-by-line, call `event_callback(type, data)` verbatim, parse the terminal `result` frame into `AgentOutput`; classify runner/ACA errors into `ProviderError` with the ACA `code`/`message`/`traceId` attached. | `src/conductor/providers/aca.py` | DONE — `_error_from_response` now `await response.aread()`s before parsing a streamed error body (review fix). `session_seconds` deliberately **not** parsed into `AgentOutput` here — that field and its usage-row wiring are E6's scope (OQ#2 blocks E6, not E3); a review fix removed it from this pass. |
+| E3-T6 | IMPL | Interrupt: on `interrupt_signal`, send an in-stream interrupt frame (Branch S) and fall back to a best-effort session delete as a hard-abort; `validate_connection()` does a lightweight management-plane + `/health` version probe (skew check). | `src/conductor/providers/aca.py` | DONE — interrupt/hard-abort endpoints now match the real ACA data-plane contract; `/health` includes `identifier` (review fixes) |
+| E3-T7 | TEST | Mocked-runner smoke test: patch the httpx stream + `DefaultAzureCredential`; assert event frames relay 1:1 to `event_callback`, `AgentOutput` parses from `result`, identifier derivation is parallel-safe/≤128 chars, interrupt path fires, and errors surface as `ProviderError`. | `tests/test_providers/test_aca.py` | DONE — includes concurrency-isolation (incl. a three-call out-of-order-release regression), normalization-collision, corrected-endpoint, and dropped-field regression tests |
 
 - **Acceptance Criteria:**
-  - [ ] Full lifecycle (`execute`/`validate_connection`/`close`) implemented; no
+  - [x] Full lifecycle (`execute`/`validate_connection`/`close`) implemented; no
     change to the `provider.execute()` call site (`executor/agent.py:288`).
-  - [ ] Event types/emit points and `AgentOutput` shape match on-host providers
-    (NFR3); secrets are `SecretStr`-redacted (NFR2).
-  - [ ] Concurrency discriminator yields distinct identifiers for concurrent
-    siblings and reuse for sequential re-executions (per the OQ#1 decision).
+  - [x] Event types/emit points and `AgentOutput` shape match on-host providers
+    (NFR3); secrets are `SecretStr`-redacted (NFR2) — the only plaintext secret on
+    the wire is the OQ#6 stopgap credential, which is a deliberate, documented
+    Phase 1 trusted-use exception (DD4) and is never logged or included in
+    exception messages.
+  - [x] Concurrency discriminator yields distinct identifiers for concurrent
+    siblings and reuse for sequential re-executions (per the OQ#1 decision;
+    enforced at runtime by the `execute()`-level in-flight registry, which
+    tracks reserved slot *numbers* rather than a count so out-of-order release
+    never collides with a still-active sibling — review fix).
 
 ### E4 — `conductor-agent-runner` in-container server
 - **Goal:** The in-sandbox HTTP server that wraps the real `CopilotProvider` and
@@ -340,7 +420,10 @@ Copilot custom routing. Covers Epic **E8**.
 ### E6 — Session-seconds usage surfacing (FR7)
 - **Goal:** Surface sandbox time as a distinct usage dimension, separate from token
   cost (FR7; *Key Components §5*).
-- **Prerequisites:** E3 (provider returns session-seconds). Resolve OQ#2 first.
+- **Prerequisites:** E3 (transport shim; `AcaResultData`'s wire frame already
+  carries the runner's `session_seconds` in `raw_response` via `extra="ignore"`,
+  but E3 deliberately does not parse it into `AgentOutput` — see E3-T5). Resolve
+  OQ#2 first.
 
 | Task ID | Type | Description | Files | Status |
 |---|---|---|---|---|
