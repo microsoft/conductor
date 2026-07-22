@@ -100,6 +100,13 @@ class TestFilePathLinking:
         result = linkify_markdown("Plan at docs/projects/plan.md", base_dir=tmp_path)
         assert "[docs/projects/plan.md](docs/projects/plan.md)" in result
 
+    def test_windows_relative_path_separator(self, tmp_path: Path) -> None:
+        (tmp_path / "docs").mkdir()
+        (tmp_path / "docs" / "readme.md").write_text("hello")
+
+        result = linkify_markdown(r"See docs\readme.md for details", base_dir=tmp_path)
+        assert r"[docs\readme.md](docs/readme.md)" in result
+
     def test_nonexistent_file_not_linked(self, tmp_path: Path) -> None:
         result = linkify_markdown("See docs/missing.md for details", base_dir=tmp_path)
         assert "[docs/missing.md]" not in result
