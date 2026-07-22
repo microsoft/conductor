@@ -16,10 +16,19 @@ behaviors flagged in review:
   identity).
 - ABAC-vs-legacy registry role selection (``Container Registry Repository
   Reader`` vs ``AcrPull``).
-- The default ``IMAGE_TAG`` is unique (not ``latest``), and an explicit
-  override is honored.
-- The az CLI / ``containerapp`` extension preflight runs before any
-  session-pool-specific calls.
+- The default ``IMAGE_TAG`` is unique across runs (not ``latest``), and an
+  explicit override is honored.
+- The az CLI / ``containerapp`` extension preflight (``az upgrade --yes``,
+  ``az extension add --name containerapp --upgrade --allow-preview true
+  --yes``) runs before any session-pool-specific calls.
+- Invalid ``EGRESS``/``LIFECYCLE`` values are rejected *before* the preflight
+  or any other Azure CLI call is made (the mock ``az`` log stays empty).
+- An empty/unrecognized ACR ``roleAssignmentMode`` falls back to the legacy
+  ``AcrPull`` role.
+- The Session Executor role grant (on the pool, for a human/CI principal)
+  uses the simple ``--assignee`` form — unlike the registry grant, it is not
+  racing a just-created identity's Entra ID replication, so it doesn't need
+  ``--assignee-object-id``/``--assignee-principal-type``.
 """
 
 from __future__ import annotations
@@ -50,13 +59,16 @@ def _install_mock_az(bin_dir: Path) -> None:
     az_path.chmod(az_path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
 
 
-def run_provision_script(
+def run_provision_script_raw(
     tmp_path: Path,
     extra_env: dict[str, str] | None = None,
-) -> list[list[str]]:
-    """Run ``provision-pool.sh`` against the mock ``az`` and return its argv log.
+) -> tuple[subprocess.CompletedProcess[str], list[list[str]]]:
+    """Run ``provision-pool.sh`` against the mock ``az`` without asserting success.
 
-    Returns a list of argv lists, one per ``az`` invocation, in call order.
+    Returns the completed process (whatever its exit code) alongside the argv
+    log of every ``az`` invocation actually made, in call order. Used both by
+    ``run_provision_script`` (the happy-path helper) and by tests that expect
+    the script to fail validation before making any Azure CLI call.
     """
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(parents=True)
@@ -80,14 +92,29 @@ def run_provision_script(
         text=True,
         check=False,
     )
+
+    if not log_path.exists():
+        calls: list[list[str]] = []
+    else:
+        calls = [json.loads(line) for line in log_path.read_text().splitlines() if line.strip()]
+    return proc, calls
+
+
+def run_provision_script(
+    tmp_path: Path,
+    extra_env: dict[str, str] | None = None,
+) -> list[list[str]]:
+    """Run ``provision-pool.sh`` against the mock ``az`` and return its argv log.
+
+    Returns a list of argv lists, one per ``az`` invocation, in call order.
+    Asserts the script exits successfully; use ``run_provision_script_raw``
+    directly for the failure paths (e.g. invalid ``EGRESS``/``LIFECYCLE``).
+    """
+    proc, calls = run_provision_script_raw(tmp_path, extra_env)
     assert proc.returncode == 0, (
         f"provision-pool.sh failed (exit {proc.returncode}):\n"
         f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
     )
-
-    if not log_path.exists():
-        return []
-    calls = [json.loads(line) for line in log_path.read_text().splitlines() if line.strip()]
     return calls
 
 
@@ -135,9 +162,22 @@ class TestLifecycleFlagExclusivity:
         assert "--max-alive-period" in pool_create
         assert "--cooldown-period" not in pool_create
 
-    def test_invalid_lifecycle_rejected(self, tmp_path: Path) -> None:
-        with pytest.raises(AssertionError):
-            run_provision_script(tmp_path, {"LIFECYCLE": "bogus"})
+    def test_invalid_lifecycle_rejected_before_any_az_call(self, tmp_path: Path) -> None:
+        proc, calls = run_provision_script_raw(tmp_path, {"LIFECYCLE": "bogus"})
+
+        assert proc.returncode != 0
+        # Validation must reject the bad value before the preflight (or any
+        # other) Azure CLI call is made — otherwise a bogus config still
+        # burns an `az upgrade`/`az extension add` round-trip before failing.
+        assert calls == []
+
+
+class TestEgressValidation:
+    def test_invalid_egress_rejected_before_any_az_call(self, tmp_path: Path) -> None:
+        proc, calls = run_provision_script_raw(tmp_path, {"EGRESS": "bogus"})
+
+        assert proc.returncode != 0
+        assert calls == []
 
 
 class TestRegistryRoleAssignment:
@@ -171,9 +211,59 @@ class TestRegistryRoleAssignment:
         role_calls = _find_calls(calls, "role", "assignment", "create")
         assert _flag_value(role_calls[0], "--role") == "Container Registry Repository Reader"
 
+    def test_unrecognized_role_assignment_mode_falls_back_to_acrpull(self, tmp_path: Path) -> None:
+        # An empty or unrecognized `roleAssignmentMode` (e.g. an older `az
+        # acr` API version that predates ABAC) must fall back to the legacy
+        # `AcrPull` role rather than erroring or silently granting nothing.
+        calls = run_provision_script(
+            tmp_path, {"MOCK_ACR_ROLE_ASSIGNMENT_MODE": "SomeFutureUnknownMode"}
+        )
+        role_calls = _find_calls(calls, "role", "assignment", "create")
+        assert _flag_value(role_calls[0], "--role") == "AcrPull"
+
+    def test_empty_role_assignment_mode_falls_back_to_acrpull(self, tmp_path: Path) -> None:
+        calls = run_provision_script(tmp_path, {"MOCK_ACR_ROLE_ASSIGNMENT_MODE": ""})
+        role_calls = _find_calls(calls, "role", "assignment", "create")
+        assert _flag_value(role_calls[0], "--role") == "AcrPull"
+
+
+class TestSessionExecutorRoleAssignment:
+    def test_uses_plain_assignee_not_object_id(self, tmp_path: Path) -> None:
+        # Unlike the registry grant (which targets a just-created identity
+        # and must avoid the Entra ID replication race), the Session
+        # Executor grant targets an already-existing principal (the signed-in
+        # user, or an explicit $ASSIGNEE) — the simple `--assignee` graph
+        # lookup is fine here.
+        calls = run_provision_script(tmp_path, {"ASSIGNEE": "33333333-3333-3333-3333-333333333333"})
+
+        role_calls = _find_calls(calls, "role", "assignment", "create")
+        assert len(role_calls) == 2
+        session_executor_call = role_calls[1]
+
+        assert _flag_value(session_executor_call, "--role") == (
+            "Azure ContainerApps Session Executor"
+        )
+        assert _flag_value(session_executor_call, "--assignee") == (
+            "33333333-3333-3333-3333-333333333333"
+        )
+        assert "--assignee-object-id" not in session_executor_call
+        assert "--assignee-principal-type" not in session_executor_call
+
+    def test_defaults_assignee_to_signed_in_user(self, tmp_path: Path) -> None:
+        calls = run_provision_script(tmp_path)
+
+        signed_in_user_calls = _find_calls(calls, "ad", "signed-in-user", "show")
+        assert len(signed_in_user_calls) == 1
+
+        role_calls = _find_calls(calls, "role", "assignment", "create")
+        session_executor_call = role_calls[1]
+        assert _flag_value(session_executor_call, "--assignee") == (
+            "22222222-2222-2222-2222-222222222222"
+        )
+
 
 class TestImageTag:
-    def test_default_tag_is_unique_not_latest(self, tmp_path: Path) -> None:
+    def test_default_tag_is_unique_across_runs(self, tmp_path: Path) -> None:
         calls_a = run_provision_script(tmp_path / "a")
         calls_b = run_provision_script(tmp_path / "b")
 
@@ -183,11 +273,11 @@ class TestImageTag:
         image_b = _flag_value(build_b, "--image")
 
         assert image_a is not None and ":latest" not in image_a
-        assert image_b is not None
-        # Timestamps could theoretically collide at second resolution across
-        # two fast sequential runs; the important behavioral guarantee is
-        # "not the mutable 'latest' tag", checked above for both.
-        assert ":latest" not in image_b
+        assert image_b is not None and ":latest" not in image_b
+        # The default tag must be collision-resistant (not just second-
+        # resolution wall-clock time), so two runs never collide even when
+        # they land in the same wall-clock second.
+        assert image_a != image_b
 
     def test_explicit_image_tag_is_honored(self, tmp_path: Path) -> None:
         calls = run_provision_script(tmp_path, {"IMAGE_TAG": "v1.2.3"})
@@ -205,8 +295,14 @@ class TestPreflight:
         extension_calls = _find_calls(calls, "extension", "add")
         assert len(upgrade_calls) == 1
         assert len(extension_calls) == 1
+        assert "--yes" in upgrade_calls[0]
         assert _flag_value(extension_calls[0], "--name") == "containerapp"
         assert "--upgrade" in extension_calls[0]
+        # `--allow-preview true` and `--yes` are both required for a
+        # non-interactive install of the (at time of writing) preview
+        # `containerapp` extension — either missing would hang/fail in CI.
+        assert _flag_value(extension_calls[0], "--allow-preview") == "true"
+        assert "--yes" in extension_calls[0]
 
         first_sessionpool_idx = next(
             i for i, c in enumerate(calls) if c[:2] == ["containerapp", "sessionpool"]

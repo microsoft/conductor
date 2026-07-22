@@ -67,12 +67,15 @@ CONTAINERAPP_ENVIRONMENT="${CONTAINERAPP_ENVIRONMENT:?CONTAINERAPP_ENVIRONMENT i
 # Pre-existing Azure Container Registry (BYO).
 ACR_NAME="${ACR_NAME:?ACR_NAME is required, e.g. ACR_NAME=myacr}"
 IMAGE_NAME="${IMAGE_NAME:-conductor-agent-runner}"
-# Default to a unique, immutable tag (UTC build timestamp) rather than
-# `latest` — reprovisioning against a mutable tag risks the session pool (or
-# a layer-caching registry) keeping the *old* image around instead of
-# picking up a rebuilt one. Set IMAGE_TAG explicitly to pin/reuse a specific
-# build.
-IMAGE_TAG="${IMAGE_TAG:-$(date -u +%Y%m%dT%H%M%SZ)}"
+# Default to a unique, immutable tag rather than `latest` — reprovisioning
+# against a mutable tag risks the session pool (or a layer-caching registry)
+# keeping the *old* image around instead of picking up a rebuilt one. A UTC
+# timestamp alone is only second-resolution, so two runs kicked off within
+# the same second (e.g. concurrent CI jobs) could collide; append this
+# script's PID and bash's $RANDOM (0-32767) so concurrent runs get distinct
+# tags even when the timestamp matches. Set IMAGE_TAG explicitly to
+# pin/reuse a specific build.
+IMAGE_TAG="${IMAGE_TAG:-$(date -u +%Y%m%dT%H%M%SZ)-$$-${RANDOM}}"
 DOCKERFILE_DIR="${DOCKERFILE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../docker/aca-runner" && pwd)}"
 # Conductor release tag baked into the image (docker/aca-runner/Dockerfile's
 # CONDUCTOR_VERSION build arg). Empty = use the Dockerfile's own default.
@@ -113,25 +116,10 @@ MAX_ALIVE_PERIOD="${MAX_ALIVE_PERIOD:-3600}"
 ASSIGNEE="${ASSIGNEE:-}"
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Validate configuration before making ANY Azure CLI call (including the
+# preflight below) — a typo'd EGRESS/LIFECYCLE value should fail fast, not
+# after already burning an `az upgrade`/`az extension add` round-trip.
 # ---------------------------------------------------------------------------
-
-info() { printf '  \033[1;34m->\033[0m %s\n' "$1"; }
-success() { printf '  \033[1;32m OK\033[0m %s\n' "$1"; }
-
-# ---------------------------------------------------------------------------
-# Preflight: session-pool commands live behind the `containerapp` extension
-# and need a recent Azure CLI — an out-of-date install can be missing the
-# lifecycle flags (`--lifecycle-type`, `--cooldown-period`,
-# `--max-alive-period`) this script relies on. This mirrors the official
-# minimum-tooling guidance for session pools (Microsoft Learn, "Use session
-# pools in Azure Container Apps").
-# ---------------------------------------------------------------------------
-
-info "Ensuring the Azure CLI and 'containerapp' extension are up to date..."
-az upgrade --yes --only-show-errors --output none
-az extension add --name containerapp --upgrade --allow-preview true --yes --only-show-errors --output none
-success "Azure CLI and 'containerapp' extension are up to date."
 
 case "$EGRESS" in
     disabled) network_status="EgressDisabled" ;;
@@ -161,6 +149,27 @@ if [ "$lifecycle_type" = "Timed" ]; then
 else
     lifecycle_args+=(--max-alive-period "$MAX_ALIVE_PERIOD")
 fi
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+info() { printf '  \033[1;34m->\033[0m %s\n' "$1"; }
+success() { printf '  \033[1;32m OK\033[0m %s\n' "$1"; }
+
+# ---------------------------------------------------------------------------
+# Preflight: session-pool commands live behind the `containerapp` extension
+# and need a recent Azure CLI — an out-of-date install can be missing the
+# lifecycle flags (`--lifecycle-type`, `--cooldown-period`,
+# `--max-alive-period`) this script relies on. This mirrors the official
+# minimum-tooling guidance for session pools (Microsoft Learn, "Use session
+# pools in Azure Container Apps").
+# ---------------------------------------------------------------------------
+
+info "Ensuring the Azure CLI and 'containerapp' extension are up to date..."
+az upgrade --yes --only-show-errors --output none
+az extension add --name containerapp --upgrade --allow-preview true --yes --only-show-errors --output none
+success "Azure CLI and 'containerapp' extension are up to date."
 
 # ---------------------------------------------------------------------------
 # Step 1: build + push the runner image to ACR
