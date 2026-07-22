@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from conductor.config.schema import ToolOutputConfig
 from conductor.exceptions import ProviderError
+from conductor.providers.aca import AZURE_IDENTITY_AVAILABLE, AcaRuntimeProvider
 from conductor.providers.base import AgentProvider
 from conductor.providers.claude import ANTHROPIC_SDK_AVAILABLE, ClaudeProvider
 from conductor.providers.claude_agent_sdk import (
@@ -25,7 +26,7 @@ if TYPE_CHECKING:
     from conductor.config.schema import ProviderSettings
 
 
-ProviderType = Literal["copilot", "openai-agents", "claude", "claude-agent-sdk", "hermes"]
+ProviderType = Literal["copilot", "openai-agents", "claude", "claude-agent-sdk", "hermes", "aca"]
 
 
 async def create_provider(
@@ -211,11 +212,35 @@ async def create_provider(
                 max_turns=max_agent_iterations,
                 max_session_seconds=max_session_seconds,
             )
+        case "aca":
+            if not AZURE_IDENTITY_AVAILABLE:
+                raise ProviderError(
+                    "aca provider requires the azure-identity package",
+                    suggestion="Install with: uv add 'conductor-cli[aca]'",
+                )
+            if provider_settings is None or provider_settings.name != "aca":
+                raise ProviderError(
+                    "aca provider requires structured `runtime.provider` settings",
+                    suggestion=(
+                        "Set `runtime.provider: {name: aca, pool_endpoint: <pool-endpoint>}` "
+                        "in the workflow YAML."
+                    ),
+                )
+            provider = AcaRuntimeProvider(
+                provider_settings=provider_settings,
+                mcp_servers=mcp_servers,
+                default_model=default_model,
+                max_agent_iterations=max_agent_iterations,
+                default_reasoning_effort=default_reasoning_effort,
+                max_session_seconds=max_session_seconds,
+                tool_output=tool_output,
+            )
         case _:
             raise ProviderError(
                 f"Unknown provider: {provider_type}",
                 suggestion=(
-                    "Valid providers are: copilot, openai-agents, claude, claude-agent-sdk, hermes"
+                    "Valid providers are: copilot, openai-agents, claude, "
+                    "claude-agent-sdk, hermes, aca"
                 ),
             )
 

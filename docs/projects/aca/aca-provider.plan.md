@@ -236,25 +236,33 @@ Copilot custom routing. Covers Epic **E8**.
   - [x] `sandbox:` block validates only on provider-backed agents.
   - [x] OQ#3 resolved and reflected in the `working_dir` handling.
 
-### E2 — Factory, capability registration, and optional extra
+### E2 — Factory, capability registration, and optional extra — **DONE**
 - **Goal:** Instantiate `AcaRuntimeProvider` through `create_provider()` and make its
   capabilities resolvable at `validate` time; isolate `azure-identity` behind an
   `aca` extra (*Key Components §4*; FR5).
 - **Prerequisites:** E3-T1 (the `AcaRuntimeProvider` class + `CAPABILITIES` must be
-  importable for `_PROVIDER_CLASS_PATHS` resolution and the factory arm).
+  importable for `_PROVIDER_CLASS_PATHS` resolution and the factory arm). E3 had not
+  started; a minimal `AcaRuntimeProvider` skeleton (class + `CAPABILITIES`, `execute`/
+  `validate_connection`/`close` stubs raising `NotImplementedError` pending E3) was
+  added as a byproduct so E2's factory/capability wiring has something real to
+  resolve against. The full transport shim remains E3's scope.
 
 | Task ID | Type | Description | Files | Status |
 |---|---|---|---|---|
-| E2-T1 | IMPL | Add `"aca"` to `ProviderType`; add an `aca` arm to `create_provider()` that raises a clear `ProviderError` when `azure-identity` is absent (mirroring the claude/hermes availability guards) and constructs `AcaRuntimeProvider` from `provider_settings`. | `src/conductor/providers/factory.py` | TO DO |
-| E2-T2 | IMPL | Register `"aca": "conductor.providers.aca:AcaRuntimeProvider"` in `_PROVIDER_CLASS_PATHS`. | `src/conductor/providers/capabilities.py` | TO DO |
-| E2-T3 | IMPL | Add `[project.optional-dependencies] aca = ["azure-identity>=…"]`; decide wheel packaging of the runner (OQ#4). | `pyproject.toml` | TO DO |
-| E2-T4 | TEST | `get_capabilities("aca")` returns the declared descriptor without instantiation; factory raises a helpful error when `azure-identity` is missing and succeeds when present (mocked). | `tests/test_providers/test_aca.py` | TO DO |
+| E2-T1 | IMPL | Add `"aca"` to `ProviderType`; add an `aca` arm to `create_provider()` that raises a clear `ProviderError` when `azure-identity` is absent (mirroring the claude/hermes availability guards) and constructs `AcaRuntimeProvider` from `provider_settings`. | `src/conductor/providers/factory.py` | DONE |
+| E2-T2 | IMPL | Register `"aca": "conductor.providers.aca:AcaRuntimeProvider"` in `_PROVIDER_CLASS_PATHS`. | `src/conductor/providers/capabilities.py` | DONE |
+| E2-T3 | IMPL | Add `[project.optional-dependencies] aca = ["azure-identity>=…"]`; decide wheel packaging of the runner (OQ#4). | `pyproject.toml` | DONE |
+| E2-T4 | TEST | `get_capabilities("aca")` returns the declared descriptor without instantiation; factory raises a helpful error when `azure-identity` is missing and succeeds when present (mocked). | `tests/test_providers/test_aca.py` | DONE |
 
 - **Acceptance Criteria:**
-  - [ ] `create_provider("aca", …)` returns an `AcaRuntimeProvider` (or a clear
+  - [x] `create_provider("aca", …)` returns an `AcaRuntimeProvider` (or a clear
     install error).
-  - [ ] `conductor validate` resolves `aca` capabilities with no API keys/network.
-  - [ ] `azure-identity` is only required when the `aca` extra is installed.
+  - [x] `conductor validate` resolves `aca` capabilities with no API keys/network.
+  - [x] `azure-identity` is only required when the `aca` extra is installed.
+
+  Note on E2-T3 / OQ#4: the runner's wheel-packaging decision is deferred — the
+  `conductor-agent-runner` package (`src/conductor/aca_runner/`) does not exist
+  yet (E4 scope), so there is nothing to exclude from the wheel at this time.
 
 ### E3 — `AcaRuntimeProvider` host transport shim *(core)*
 - **Goal:** Implement the `AgentProvider` that delegates `execute()` to the in-sandbox
@@ -263,9 +271,18 @@ Copilot custom routing. Covers Epic **E8**.
 - **Prerequisites:** E1 (schema fields). Resolve OQ#1 (concurrency seam) and OQ#6
   (stopgap token) before "done".
 
+  Note (from E2): a **minimal skeleton** of `AcaRuntimeProvider` already exists in
+  `src/conductor/providers/aca.py` — the class, the `CAPABILITIES` descriptor (matches
+  the design's table), and a constructor that stores `provider_settings` and raises
+  `ProviderError` when `azure-identity` is absent. `execute()`, `validate_connection()`,
+  and `close()` are still stubs that raise `NotImplementedError`. E3-T1 is not fully
+  "done" — the `run_salt` and httpx-client-owning `close()` remain outstanding — but
+  E2 needed *something* real to resolve via `_PROVIDER_CLASS_PATHS`, so the skeleton
+  was pulled forward. E3 should extend, not replace, this file.
+
 | Task ID | Type | Description | Files | Status |
 |---|---|---|---|---|
-| E3-T1 | IMPL | Provider skeleton: `AcaRuntimeProvider(AgentProvider)` with the experimental `CAPABILITIES` descriptor matching the design's table exactly (`tier=experimental`, `checkpoint_resume=False`, `structured_output="prompt_injection"`, `concurrent_safe=True`, `working_dir=True`, etc.); `__init__` storing `ProviderSettings` + a per-run `run_salt`; `close()` releasing the httpx client. | `src/conductor/providers/aca.py` | TO DO |
+| E3-T1 | IMPL | Provider skeleton: `AcaRuntimeProvider(AgentProvider)` with the experimental `CAPABILITIES` descriptor matching the design's table exactly (`tier=experimental`, `checkpoint_resume=False`, `structured_output="prompt_injection"`, `concurrent_safe=True`, `working_dir=True`, etc.); `__init__` storing `ProviderSettings` + a per-run `run_salt`; `close()` releasing the httpx client. | `src/conductor/providers/aca.py` | PARTIAL (class/CAPABILITIES/init exist; run_salt + httpx client still TO DO) |
 | E3-T2 | IMPL | Define the shared request/frame Pydantic models (`agent`, `rendered_prompt`, `tools`, `mcp_servers`, `context`; NDJSON event frame; terminal `result` frame). | `src/conductor/providers/aca_protocol.py` | TO DO |
 | E3-T3 | IMPL | `identifier_for(scope)` per *Data Flow*: `cond-{run_salt}-{scope_key}{concurrency_suffix}`, charset-normalized, ≤128 chars with hash suffix; scope from `identifier_scope`; concurrency discriminator per OQ#1. | `src/conductor/providers/aca.py` | TO DO |
 | E3-T4 | IMPL | AAD auth: acquire + cache a `dynamicsessions.io` bearer token via `DefaultAzureCredential` (Session Executor role); attach to `POST {pool_endpoint}/execute?identifier=…&api-version=…`. | `src/conductor/providers/aca.py` | TO DO |
