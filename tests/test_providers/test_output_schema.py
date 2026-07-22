@@ -1,9 +1,9 @@
 """Golden regression tests for provider output-schema wrappers.
 
 These tests pin the exact full-wrapper output of each provider's schema builder
-against pre-refactor literals. Any behavioral change in the
-shared schema builder or a provider wrapper that alters the serialized JSON will
-cause these tests to fail.
+against golden literals capturing the current expected behavior. Any behavioral
+change in the shared schema builder or a provider wrapper that alters the
+serialized JSON will cause these tests to fail.
 """
 
 from __future__ import annotations
@@ -735,15 +735,15 @@ class TestCopilotOutputSchemaGolden:
     """Golden tests for CopilotProvider's prompt schema wrapper."""
 
     def test_build_prompt_schema_rich_matches_baseline(self) -> None:
-        """Copilot prompt schema wrapper must be byte-for-byte identical to the pre-refactor
-        baseline for a schema with descriptions and nested structure."""
+        """Copilot prompt schema wrapper must match the shared recursive builder output for
+        a schema with descriptions and nested structure; explicit descriptions are preserved."""
         provider = _make_copilot_provider()
         actual = _serialize(provider._build_prompt_schema(rich_schema))
         assert actual == EXPECTED_COPILOT_RICH_SCHEMA
 
     def test_build_prompt_schema_missing_descriptions_matches_baseline(self) -> None:
-        """Copilot prompt schema wrapper must be byte-for-byte identical to the pre-refactor
-        baseline for a schema without descriptions; fields without explicit descriptions emit no
+        """Copilot prompt schema wrapper must match the current prompt schema output for a
+        schema without descriptions - fields without an explicit description emit no
         description key."""
         provider = _make_copilot_provider()
         actual = _serialize(provider._build_prompt_schema(missing_descriptions_schema))
@@ -754,14 +754,15 @@ class TestHermesOutputSchemaGolden:
     """Golden tests for Hermes' module-level prompt schema wrapper."""
 
     def test_build_prompt_schema_rich_matches_baseline(self) -> None:
-        """Hermes prompt schema wrapper must be byte-for-byte identical to the pre-refactor
-        baseline for a schema with descriptions and fully recursive array items."""
+        """Hermes prompt schema wrapper must match the shared recursive builder output for
+        a schema with descriptions and fully recursive array items; explicit descriptions
+        survive at every nesting level."""
         actual = _serialize(_build_prompt_schema(rich_schema))
         assert actual == EXPECTED_HERMES_RICH_SCHEMA
 
     def test_build_prompt_schema_missing_descriptions_matches_baseline(self) -> None:
-        """Hermes prompt schema wrapper must be byte-for-byte identical to the pre-refactor
-        baseline for a schema without descriptions; fields without explicit descriptions emit no
+        """Hermes prompt schema wrapper must match the current prompt schema output for a
+        schema without descriptions - fields without an explicit description emit no
         description key."""
         actual = _serialize(_build_prompt_schema(missing_descriptions_schema))
         assert actual == EXPECTED_HERMES_MISSING_SCHEMA
@@ -786,13 +787,13 @@ class TestClaudeAgentSdkOutputSchemaGolden:
 class TestGoldenMutationGuard:
     """Negative guard proving the golden tests are sensitive to behavioral changes."""
 
-    def test_mutated_copilot_literal_does_not_match(self) -> None:
-        """If an explicit description in the builder output is mutated, the golden assertion
-        must fail so regressions are caught."""
+    def test_golden_assertion_detects_missing_description(self) -> None:
+        """A schema whose only difference from `rich_schema` is a dropped description
+        must not satisfy the rich-schema golden assertion."""
         provider = _make_copilot_provider()
-        actual = _serialize(provider._build_prompt_schema(rich_schema))
-        mutated = EXPECTED_COPILOT_RICH_SCHEMA.replace(
-            '"description": "A string scalar field with a description"',
-            '"description": "A string scalar field with a description (mutated)"',
-        )
-        assert actual != mutated
+        schema_without_description = {
+            **rich_schema,
+            "string_scalar": OutputField(type="string"),
+        }
+        actual = _serialize(provider._build_prompt_schema(schema_without_description))
+        assert actual != EXPECTED_COPILOT_RICH_SCHEMA

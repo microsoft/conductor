@@ -841,10 +841,9 @@ class TestHermesBuildPromptSchema:
 
     The wrapper delegates to the shared recursive builder in
     conductor.providers._schema and converts SchemaDepthError into ValidationError
-    with the exact legacy message and suggestion. These tests pin the shared
+    with the exact message and suggestion. These tests pin the shared
     semantics (no description fallback, required inside array-item objects,
-    recursive array-of-array items) and the depth boundary, complementing the
-    focused TestHermesSharedPromptSchema suite below.
+    recursive array-of-array items) and the depth boundary.
     """
 
     def _chain_schema(self, levels: int) -> dict[str, OutputField]:
@@ -892,7 +891,7 @@ class TestHermesBuildPromptSchema:
 
     def test_build_prompt_schema_exceeds_max_depth(self) -> None:
         """Depths above _MAX_SCHEMA_DEPTH raise ValidationError with the exact
-        legacy message and suggestion."""
+        shared message and suggestion."""
         # A 12-level object chain reaches depth 11, which exceeds the default max depth of 10.
         overly_nested = self._chain_schema(_MAX_SCHEMA_DEPTH + 2)
         with pytest.raises(ValidationError) as exc_info:
@@ -902,6 +901,46 @@ class TestHermesBuildPromptSchema:
         expected = f"Schema nesting depth exceeds maximum of {_MAX_SCHEMA_DEPTH} levels"
         assert error.args[0] == expected
         assert error.suggestion == "Simplify your output schema to reduce nesting depth"
+
+    def test_nested_array_object_descriptions_preserved(self) -> None:
+        """Explicit descriptions must survive at every level of nested array<object> schemas."""
+        schema = {
+            "outer": OutputField(
+                type="array",
+                description="Outer array",
+                items=OutputField(
+                    type="object",
+                    description="Object item",
+                    properties={
+                        "inner": OutputField(
+                            type="array",
+                            description="Inner array",
+                            items=OutputField(
+                                type="object",
+                                description="Inner object",
+                                properties={
+                                    "name": OutputField(type="string", description="Name field"),
+                                },
+                            ),
+                        ),
+                    },
+                ),
+            )
+        }
+        result = _build_prompt_schema(schema)
+        assert result["outer"]["description"] == "Outer array"
+        assert result["outer"]["items"]["description"] == "Object item"
+        assert result["outer"]["items"]["properties"]["inner"]["description"] == "Inner array"
+        assert (
+            result["outer"]["items"]["properties"]["inner"]["items"]["description"]
+            == "Inner object"
+        )
+        assert (
+            result["outer"]["items"]["properties"]["inner"]["items"]["properties"]["name"][
+                "description"
+            ]
+            == "Name field"
+        )
 
     def test_build_prompt_schema_array_item_depth_parity(self) -> None:
         """Shared depth counting: for array<object>, properties inside the item start at depth 2.
@@ -959,131 +998,3 @@ class TestHermesBuildPromptSchema:
         _build_prompt_schema({"matrix": nested_array_chain(_MAX_SCHEMA_DEPTH)})
         with pytest.raises(ValidationError, match="exceeds maximum"):
             _build_prompt_schema({"matrix": nested_array_chain(_MAX_SCHEMA_DEPTH + 1)})
-
-
-class TestHermesSharedPromptSchema:
-    """Focused semantic tests for the unified recursive prompt-schema builder."""
-
-    def _chain_schema(self, levels: int) -> dict[str, OutputField]:
-        """Build a chain of nested objects `levels` deep."""
-        schema: dict[str, OutputField] = {"leaf": OutputField(type="string")}
-        for _ in range(levels):
-            schema = {"nested": OutputField(type="object", properties=schema)}
-        return schema
-
-    def test_no_fallback_description(self) -> None:
-        """A top-level field without an explicit description must not synthesize a description."""
-        schema = {"answer": OutputField(type="string")}
-        result = _build_prompt_schema(schema)
-        assert result["answer"] == {"type": "string"}
-
-    def test_array_item_object_has_required(self) -> None:
-        """Array<object> item schemas must include the required property names."""
-        schema = {
-            "items": OutputField(
-                type="array",
-                items=OutputField(
-                    type="object",
-                    properties={
-                        "key": OutputField(type="string"),
-                        "value": OutputField(type="number"),
-                    },
-                ),
-            )
-        }
-        result = _build_prompt_schema(schema)
-        assert result["items"]["items"]["required"] == ["key", "value"]
-
-    def test_array_of_arrays_recurses(self) -> None:
-        """Array<array> items must recurse and expose the inner item type, not collapse."""
-        schema = {
-            "matrix": OutputField(
-                type="array",
-                items=OutputField(type="array", items=OutputField(type="number")),
-            )
-        }
-        result = _build_prompt_schema(schema)
-        assert result["matrix"]["items"]["type"] == "array"
-        assert result["matrix"]["items"]["items"]["type"] == "number"
-
-    def test_nested_array_object_descriptions_preserved(self) -> None:
-        """Explicit descriptions must survive at every level of nested array<object> schemas."""
-        schema = {
-            "outer": OutputField(
-                type="array",
-                description="Outer array",
-                items=OutputField(
-                    type="object",
-                    description="Object item",
-                    properties={
-                        "inner": OutputField(
-                            type="array",
-                            description="Inner array",
-                            items=OutputField(
-                                type="object",
-                                description="Inner object",
-                                properties={
-                                    "name": OutputField(type="string", description="Name field"),
-                                },
-                            ),
-                        ),
-                    },
-                ),
-            )
-        }
-        result = _build_prompt_schema(schema)
-        assert result["outer"]["description"] == "Outer array"
-        assert result["outer"]["items"]["description"] == "Object item"
-        assert result["outer"]["items"]["properties"]["inner"]["description"] == "Inner array"
-        assert (
-            result["outer"]["items"]["properties"]["inner"]["items"]["description"]
-            == "Inner object"
-        )
-        assert (
-            result["outer"]["items"]["properties"]["inner"]["items"]["properties"]["name"][
-                "description"
-            ]
-            == "Name field"
-        )
-
-    def test_depth_boundary_array_object_items(self) -> None:
-        """Shared depth counting: for array<object>, properties inside the item start at depth 2.
-
-        An internal chain of 8 object levels (leaf at depth 10) is accepted; a chain of 9
-        (leaf at depth 11) raises ValidationError.
-        """
-
-        def chain_in_array_item(levels: int) -> dict[str, OutputField]:
-            return {
-                "arr": OutputField(
-                    type="array",
-                    items=OutputField(
-                        type="object",
-                        properties=self._chain_schema(levels),
-                    ),
-                )
-            }
-
-        _build_prompt_schema(chain_in_array_item(8))
-        with pytest.raises(ValidationError, match="exceeds maximum"):
-            _build_prompt_schema(chain_in_array_item(9))
-
-    def test_depth_boundary_scalar_array_items(self) -> None:
-        """Shared depth counting checks every array item, including scalar items.
-
-        A chain of 10 nested arrays with a scalar leaf (leaf at depth 10) is accepted;
-        11 nested arrays (leaf at depth 11) raises ValidationError.
-        """
-
-        def nested_array_chain(levels: int) -> OutputField:
-            inner: OutputField = OutputField(type="string")
-            for _ in range(levels):
-                inner = OutputField(type="array", items=inner)
-            return inner
-
-        schema_accepted = {"matrix": nested_array_chain(_MAX_SCHEMA_DEPTH)}
-        _build_prompt_schema(schema_accepted)
-
-        schema_too_deep = {"matrix": nested_array_chain(_MAX_SCHEMA_DEPTH + 1)}
-        with pytest.raises(ValidationError, match="exceeds maximum"):
-            _build_prompt_schema(schema_too_deep)
