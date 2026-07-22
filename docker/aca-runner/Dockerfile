@@ -34,7 +34,11 @@
 # below is pinned to the immutable commit SHA that introduced it rather than
 # a floating tag — a floating default here would silently produce a
 # `ModuleNotFoundError: No module named 'conductor.aca_runner'` container that
-# builds cleanly but crashes on `CMD`. Verified: `pip install "conductor-cli @
+# builds cleanly but crashes on `CMD`. This SHA is pushed to the
+# `docs/284-aca-provider-design` branch on `microsoft/conductor` (reachable
+# by `pip install`'s `git+https` fetch — a commit that only exists on a local
+# clone is NOT a usable pin, since the default GitHub install has nothing to
+# resolve). Verified: `pip install "conductor-cli @
 # git+https://github.com/microsoft/conductor.git@d6db5c817f5c0ae8146fdb7a1e8d3d48b486ef3d"`
 # installs a package exposing `python -m conductor.aca_runner`, and running it
 # answers `GET /health`. Once a real release tag ships with the runner,
@@ -70,6 +74,15 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends nodejs \
     && apt-get purge -y --auto-remove gnupg \
     && rm -rf /var/lib/apt/lists/*
+
+# git-mcp-server: the stdio MCP binary docs/projects/aca/aca-provider-example.yaml
+# declares (`mcp_servers.git.command: git-mcp-server`) — bake it in so that
+# example (and any workflow relying on the same binary name) works out of the
+# box even with pool egress disabled, per the runner-image contract's "common
+# stdio MCP binaries" promise. Pinned (not `@latest`) for reproducible builds;
+# `git-mcp-server` is the npm package's own `bin` name
+# (https://www.npmjs.com/package/@cyanheads/git-mcp-server).
+RUN npm install -g --no-fund --no-audit @cyanheads/git-mcp-server@2.15.1
 
 ARG CONDUCTOR_VERSION
 # The runner ships in-package with conductor-cli (epic E4 decision — no

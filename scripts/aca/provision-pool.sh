@@ -27,10 +27,13 @@
 # This script DOES create one piece of supporting infrastructure: a
 # user-assigned managed identity dedicated to ACR pulls
 # ($REGISTRY_IDENTITY_NAME), because `az containerapp sessionpool create
-# --registry-identity <id>` requires that identity to already have `acrpull`
-# on the registry *before* the pool is created (the identity can't grant
-# itself the role after the fact) — see
-# https://learn.microsoft.com/en-us/cli/azure/containerapp/sessionpool.
+# --registry-identity <id>` requires that identity to already have the
+# appropriate pull role on the registry *before* the pool is created (the
+# identity can't grant itself the role after the fact) — see
+# https://learn.microsoft.com/en-us/cli/azure/containerapp/sessionpool. The
+# role granted is `AcrPull`, or `Container Registry Repository Reader` if
+# $ACR_NAME has Azure ABAC repository permissions enabled (`AcrPull` is not
+# honored on ABAC-enabled registries) — detected automatically below.
 #
 # Usage:
 #   az login
@@ -64,7 +67,12 @@ CONTAINERAPP_ENVIRONMENT="${CONTAINERAPP_ENVIRONMENT:?CONTAINERAPP_ENVIRONMENT i
 # Pre-existing Azure Container Registry (BYO).
 ACR_NAME="${ACR_NAME:?ACR_NAME is required, e.g. ACR_NAME=myacr}"
 IMAGE_NAME="${IMAGE_NAME:-conductor-agent-runner}"
-IMAGE_TAG="${IMAGE_TAG:-latest}"
+# Default to a unique, immutable tag (UTC build timestamp) rather than
+# `latest` — reprovisioning against a mutable tag risks the session pool (or
+# a layer-caching registry) keeping the *old* image around instead of
+# picking up a rebuilt one. Set IMAGE_TAG explicitly to pin/reuse a specific
+# build.
+IMAGE_TAG="${IMAGE_TAG:-$(date -u +%Y%m%dT%H%M%SZ)}"
 DOCKERFILE_DIR="${DOCKERFILE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../docker/aca-runner" && pwd)}"
 # Conductor release tag baked into the image (docker/aca-runner/Dockerfile's
 # CONDUCTOR_VERSION build arg). Empty = use the Dockerfile's own default.
@@ -110,6 +118,20 @@ ASSIGNEE="${ASSIGNEE:-}"
 
 info() { printf '  \033[1;34m->\033[0m %s\n' "$1"; }
 success() { printf '  \033[1;32m OK\033[0m %s\n' "$1"; }
+
+# ---------------------------------------------------------------------------
+# Preflight: session-pool commands live behind the `containerapp` extension
+# and need a recent Azure CLI — an out-of-date install can be missing the
+# lifecycle flags (`--lifecycle-type`, `--cooldown-period`,
+# `--max-alive-period`) this script relies on. This mirrors the official
+# minimum-tooling guidance for session pools (Microsoft Learn, "Use session
+# pools in Azure Container Apps").
+# ---------------------------------------------------------------------------
+
+info "Ensuring the Azure CLI and 'containerapp' extension are up to date..."
+az upgrade --yes --only-show-errors --output none
+az extension add --name containerapp --upgrade --allow-preview true --yes --only-show-errors --output none
+success "Azure CLI and 'containerapp' extension are up to date."
 
 case "$EGRESS" in
     disabled) network_status="EgressDisabled" ;;
@@ -160,11 +182,12 @@ az acr build "${acr_build_args[@]}" "$DOCKERFILE_DIR"
 success "Image pushed to ${ACR_NAME}.azurecr.io/${IMAGE_NAME}:${IMAGE_TAG}"
 
 # ---------------------------------------------------------------------------
-# Step 2: create the user-assigned identity and grant it acrpull BEFORE the
-# pool is created — `--registry-identity` must already have `acrpull` on the
-# registry at pool-creation time (Azure does not retroactively grant it), and
-# a user-assigned identity (rather than the pool's own system-assigned
-# identity) lets it be provisioned ahead of the pool that will reference it.
+# Step 2: create the user-assigned identity and grant it the registry pull
+# role BEFORE the pool is created — `--registry-identity` must already have
+# that role on the registry at pool-creation time (Azure does not
+# retroactively grant it), and a user-assigned identity (rather than the
+# pool's own system-assigned identity) lets it be provisioned ahead of the
+# pool that will reference it.
 # ---------------------------------------------------------------------------
 
 info "Ensuring user-assigned identity '${REGISTRY_IDENTITY_NAME}' exists..."
@@ -185,14 +208,32 @@ registry_identity_principal_id="$(az identity show \
     --output tsv)"
 success "Identity ready: ${registry_identity_id}"
 
-info "Granting '${REGISTRY_IDENTITY_NAME}' the 'acrpull' role on ${ACR_NAME}..."
+# Reused (bring-your-own) registries may have Azure ABAC repository
+# permissions enabled (`az acr update --role-assignment-mode rbac-abac`), in
+# which case the classic `AcrPull` role is not honored — pulls require
+# `Container Registry Repository Reader` instead. Detect the registry's mode
+# and grant whichever role it actually understands.
 acr_resource_id="$(az acr show --name "$ACR_NAME" --query id --output tsv)"
+acr_role_assignment_mode="$(az acr show --name "$ACR_NAME" --query roleAssignmentMode --output tsv)"
+if [ "$acr_role_assignment_mode" = "AbacRepositoryPermissions" ]; then
+    registry_role="Container Registry Repository Reader"
+else
+    registry_role="AcrPull"
+fi
+
+info "Granting '${REGISTRY_IDENTITY_NAME}' the '${registry_role}' role on ${ACR_NAME}..."
+# --assignee-object-id + --assignee-principal-type (rather than the
+# graph-lookup-based --assignee) avoids an Entra ID replication race: the
+# identity's service principal was JUST created above and may not yet be
+# resolvable by the directory lookup --assignee performs, even though its
+# object ID (returned directly by `az identity show`) is already known.
 az role assignment create \
-    --role "acrpull" \
-    --assignee "$registry_identity_principal_id" \
+    --role "$registry_role" \
+    --assignee-object-id "$registry_identity_principal_id" \
+    --assignee-principal-type ServicePrincipal \
     --scope "$acr_resource_id" \
     --output none
-success "acrpull granted."
+success "${registry_role} granted."
 
 # ---------------------------------------------------------------------------
 # Step 3: create the custom-container session pool from that image
