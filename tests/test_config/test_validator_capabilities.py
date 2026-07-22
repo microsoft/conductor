@@ -1299,3 +1299,90 @@ class TestWorkingDirCrossCheck:
             agents=[AgentDef(name="s", type="script", command="ls", working_dir="/tmp")],
         )
         validate_workflow_config(config)  # no raise
+
+
+class TestAcaRealCapabilitiesCrossCheck:
+    """Cross-checks against the REAL ``AcaRuntimeProvider`` capability
+    descriptor (not a synthetic mock), mirroring
+    ``test_max_effort_rejected_against_real_hermes_capabilities`` — so an
+    accidental future widening of ``AcaRuntimeProvider.CAPABILITIES`` is
+    caught here rather than passing silently (#284 review: E7 fix-round).
+
+    ``aca`` is workflow-level only — unlike ``claude``/``hermes``,
+    ``AgentDef.provider`` has no ``"aca"`` literal (the per-agent override is
+    a bare name and can't carry the required ``pool_endpoint``), so these
+    tests set it via ``runtime.provider`` and rely on every agent inheriting
+    it as the workflow default.
+    """
+
+    def _aca_workflow(self, *, agents: list[AgentDef]) -> WorkflowConfig:
+        from conductor.config.schema import ProviderSettings
+
+        return WorkflowConfig(
+            workflow=WorkflowDef(
+                name="test",
+                entry_point=agents[0].name,
+                runtime=RuntimeConfig(
+                    provider=ProviderSettings(name="aca", pool_endpoint="https://pool.example.com")
+                ),
+            ),
+            agents=agents,
+        )
+
+    def test_tools_allowlist_rejected_against_real_aca_capabilities(self, patch_caps: Any) -> None:
+        """The in-container ``CopilotProvider`` never applies the ``tools:``
+        allowlist to the SDK session, so ``aca`` declares
+        ``workflow_tools_passthrough=False``. An agent that declares an
+        explicit allowlist against it must fail fast at validate time
+        rather than silently granting a different tool set at runtime."""
+        from conductor.providers.aca import AcaRuntimeProvider
+
+        patch_caps({"aca": AcaRuntimeProvider.CAPABILITIES})
+        config = self._aca_workflow(
+            agents=[AgentDef(name="a", prompt="hi", tools=["git"])],
+        )
+        with pytest.raises(ConfigurationError, match="workflow_tools_passthrough=False"):
+            validate_workflow_config(config)
+
+    def test_no_tools_against_real_aca_capabilities_passes(self, patch_caps: Any) -> None:
+        """Positive control: omitting ``tools:`` (agent gets the provider's
+        default preset) never trips the passthrough gate."""
+        from conductor.providers.aca import AcaRuntimeProvider
+
+        patch_caps({"aca": AcaRuntimeProvider.CAPABILITIES})
+        config = self._aca_workflow(agents=[AgentDef(name="a", prompt="hi")])
+        validate_workflow_config(config)  # no raise
+
+    def test_generic_working_dir_rejected_against_real_aca_capabilities(
+        self, patch_caps: Any
+    ) -> None:
+        """``aca`` never reads the generic, host-resolved ``working_dir`` —
+        only the separate, container-relative ``sandbox.working_dir`` field
+        — so it declares ``working_dir=False``. Setting the generic field
+        on an aca-backed agent must fail validation rather than silently
+        running the agent in the wrong (or no) directory."""
+        from conductor.providers.aca import AcaRuntimeProvider
+
+        patch_caps({"aca": AcaRuntimeProvider.CAPABILITIES})
+        config = self._aca_workflow(
+            agents=[AgentDef(name="a", prompt="hi", working_dir="/host/repo")],
+        )
+        with pytest.raises(ConfigurationError, match="capabilities.working_dir=False"):
+            validate_workflow_config(config)
+
+    def test_sandbox_working_dir_against_real_aca_capabilities_passes(
+        self, patch_caps: Any
+    ) -> None:
+        """Positive control: the aca-specific ``sandbox.working_dir`` block
+        is a structurally separate field from the generic ``working_dir``
+        cross-check and must not trip it."""
+        from conductor.config.schema import SandboxConfig
+        from conductor.providers.aca import AcaRuntimeProvider
+
+        patch_caps({"aca": AcaRuntimeProvider.CAPABILITIES})
+        config = self._aca_workflow(
+            agents=[
+                AgentDef(name="a", prompt="hi", sandbox=SandboxConfig(working_dir="/workspace")),
+            ],
+        )
+        validate_workflow_config(config)  # no raise

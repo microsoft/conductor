@@ -269,10 +269,22 @@ in-container `conductor-agent-runner` (which itself wraps a real
 `CopilotProvider`) verbatim to `event_callback`. Because the runner
 re-emits Conductor's own event vocabulary and forwards a real
 `CopilotProvider`'s output, this achieves **full event and output
-parity** (`mcp_tools`, `workflow_tools_passthrough`, `streaming_events`,
-`agent_reasoning_events`, and `reasoning_effort` are all declared
-`True`) — with two caveats and one deliberate carve-out:
+parity** (`mcp_tools`, `streaming_events`, `agent_reasoning_events`, and
+`reasoning_effort` are all declared `True`) — with the following carve-outs:
 
+- **`workflow_tools_passthrough=False`**: the per-agent `tools:` allowlist
+  is forwarded to the runner in the request body, but the in-container
+  `CopilotProvider` it wraps never applies that list to the SDK session —
+  every tool/MCP server available to the session is callable regardless of
+  the declared allowlist. This mirrors the same declared carve-out on
+  `claude_agent_sdk.py` and `hermes.py`.
+- **`working_dir=False`**: this capability field means "applies the
+  generic, host-resolved `agent.working_dir` / `runtime.working_dir`" — a
+  host filesystem path the engine resolves against the workflow file's
+  directory. `aca` never reads that field; it only honors the separate,
+  container-relative `sandbox.working_dir` block (documented in
+  `docs/providers/aca.md#workflow-configuration`), which has no meaning as
+  a host path and is not gated by this capability.
 - **`interrupt`/`max_session_seconds` are declared `True` host-side but
   not fully backed by the shipped runner MVP (epic E4)**: the runner has
   no `/interrupt` endpoint yet (the host's in-stream interrupt POST has

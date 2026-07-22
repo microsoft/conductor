@@ -7,8 +7,9 @@ process running inside an Azure Container Apps dynamic-sessions pool.
 
 The library is an optional dependency — install with:
     pip install 'conductor-cli[aca]'
-(pins ``azure-identity``, used to acquire a ``dynamicsessions.io`` bearer
-token via ``DefaultAzureCredential``.)
+(pins ``azure-identity`` plus ``azure-core[aio]`` — the latter supplies the
+``aiohttp``-based async transport the async ``DefaultAzureCredential`` in
+this module requires; ``azure-identity`` alone does not include one.)
 
 The transport shim (epic E3, issue #284) derives a session ``identifier``
 from ``identifier_scope`` (DD5), acquires a cached AAD bearer token, issues a
@@ -114,9 +115,15 @@ class AcaRuntimeProvider(AgentProvider):
         # Full `runtime.mcp_servers` is forwarded to the runner, which wraps
         # a real `CopilotProvider` in-container (runner-image contract).
         mcp_tools=True,
-        # Per-agent `tools:` allowlist is forwarded and enforced by the
-        # inner SDK running inside the sandbox.
-        workflow_tools_passthrough=True,
+        # The per-agent `tools:` allowlist is forwarded to the runner in the
+        # request body, but the in-container `CopilotProvider` it wraps
+        # never applies that list to the SDK session (no filtering of which
+        # MCP servers/tools the model can call) — the same gap exists for
+        # every host-side `CopilotProvider` execution today. Declaring this
+        # `False` matches the actual, observed behavior rather than the
+        # aspirational runner-image contract; this is one of the allowed
+        # experimental carve-outs (see the Experimental Providers policy).
+        workflow_tools_passthrough=False,
         # Branch S (single streaming request, #312) relays event frames
         # incrementally as the runner emits them.
         streaming_events=True,
@@ -141,9 +148,16 @@ class AcaRuntimeProvider(AgentProvider):
         # Honest via the mandatory concurrency discriminator in the
         # identifier derivation (DD5).
         concurrent_safe=True,
-        # Interpreted container-relative: a path inside the session
-        # filesystem, never resolved against the host workflow directory.
-        working_dir=True,
+        # This capability field means "applies the generic, host-resolved
+        # `agent.working_dir` / `runtime.working_dir`" (see
+        # ProviderCapabilities.working_dir) — a host filesystem path the
+        # engine resolves against the workflow file's directory. `aca`
+        # never reads that field: `_build_request` only forwards the
+        # separate, container-relative `sandbox.working_dir` (see the
+        # `sandbox:` block docs). Mixing the two would be actively wrong —
+        # a host path has no meaning inside the sandbox filesystem — so
+        # this is declared `False` rather than pretending to honor it.
+        working_dir=False,
         upstream_pin="azure-identity>=1.19.0",
         maintainer=None,
     )

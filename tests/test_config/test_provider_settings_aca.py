@@ -78,6 +78,25 @@ class TestAcaProviderSettings:
         with pytest.raises(PydanticValidationError, match="'pool_endpoint' is required"):
             ProviderSettings(name="aca", pool_endpoint="   ")
 
+    def test_http_pool_endpoint_rejected(self) -> None:
+        """AAD bearer tokens and forwarded provider credentials
+        (``inner_provider_settings``) are sent to ``pool_endpoint`` on every
+        request — plain HTTP would leak both in transit."""
+        with pytest.raises(PydanticValidationError, match="must use https://"):
+            ProviderSettings(name="aca", pool_endpoint="http://my-pool.example.com")
+
+    def test_http_pool_endpoint_rejected_case_insensitive_scheme(self) -> None:
+        with pytest.raises(PydanticValidationError, match="must use https://"):
+            ProviderSettings(name="aca", pool_endpoint="HTTP://my-pool.example.com")
+
+    def test_non_http_scheme_pool_endpoint_rejected(self) -> None:
+        with pytest.raises(PydanticValidationError, match="must use https://"):
+            ProviderSettings(name="aca", pool_endpoint="ftp://my-pool.example.com")
+
+    def test_https_pool_endpoint_accepted(self) -> None:
+        s = ProviderSettings(name="aca", pool_endpoint="https://my-pool.example.com")
+        assert s.pool_endpoint == "https://my-pool.example.com"
+
     def test_invalid_inner_provider_literal_rejected(self) -> None:
         with pytest.raises(PydanticValidationError):
             ProviderSettings(

@@ -1881,7 +1881,9 @@ class ProviderSettings(BaseModel):
 
     Required when ``name: aca``. The host issues requests to
     ``{pool_endpoint}/execute?identifier=<id>&api-version=<v>`` to run the
-    agent inside a pool session.
+    agent inside a pool session. Must be ``https://`` — AAD bearer tokens and
+    forwarded provider credentials (``inner_provider_settings``) are sent to
+    this endpoint on every request.
     """
 
     api_version: str | None = None
@@ -2053,6 +2055,22 @@ class ProviderSettings(BaseModel):
         # dynamic-sessions request.
         if self.name == "aca" and (self.pool_endpoint is None or self.pool_endpoint.strip() == ""):
             raise ValueError("'pool_endpoint' is required when name='aca'")
+
+        # AAD bearer tokens (DefaultAzureCredential) and, in Phase 1,
+        # forwarded provider credentials (inner_provider_settings) are sent
+        # to this endpoint on every request — plain HTTP would leak both in
+        # transit. Require HTTPS explicitly since pool_endpoint has no other
+        # transport-security guardrail.
+        if (
+            self.name == "aca"
+            and self.pool_endpoint is not None
+            and not self.pool_endpoint.strip().lower().startswith("https://")
+        ):
+            raise ValueError(
+                "'pool_endpoint' must use https:// — AAD bearer tokens and "
+                "forwarded provider credentials are sent to this endpoint "
+                "and must not travel over an unencrypted connection"
+            )
 
         # Apply 'aca' defaults for fields left unset in YAML. These can't be
         # ordinary Pydantic field defaults because the gating checks above

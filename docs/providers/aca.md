@@ -49,9 +49,12 @@ uv add 'conductor-cli[aca]'
 pip install 'conductor-cli[aca]'
 ```
 
-This pins `azure-identity`, used to acquire a `dynamicsessions.io` bearer
-token via `DefaultAzureCredential` for the *Session Executor* role.
-`httpx` (the host→runner client) is already a base dependency.
+This pins `azure-identity` plus `azure-core[aio]` (which pulls in `aiohttp`),
+used to acquire a `dynamicsessions.io` bearer token via the async
+`DefaultAzureCredential` for the *Session Executor* role — `azure-identity`
+alone does not include an async HTTP transport, so `azure-core[aio]` is
+required for the credential to construct without an `ImportError`. `httpx`
+(the host→runner client) is already a base dependency.
 
 ### 2. Authenticate to the pool
 
@@ -147,7 +150,7 @@ loop-backs.
 │                                                                        │
 │ AcaRuntimeProvider(AgentProvider)             ← experimental tier      │
 │   execute(agent, ctx, prompt, tools, event_callback, interrupt):       │
-│     id  = identifier_for(scope)               # run | agent | item     │
+│     id  = identifier_for(scope)      # workflow | agent | item | none  │
 │     tok = DefaultAzureCredential()            # aud dynamicsessions.io  │
 │     POST {pool}/execute?identifier=id         # AAD token, exec role    │
 │     for line in ndjson(resp): event_callback(line.type, line.data)     │
@@ -264,8 +267,12 @@ Runs one agent turn and streams the result back as
 }
 ```
 
-- `tools` — per-agent allowlist. `null` = all workflow tools, `[]` = none
-  (`workflow_tools_passthrough`).
+- `tools` — the per-agent allowlist is forwarded (`null` = all workflow
+  tools, `[]` = none) but **not enforced**: the in-container
+  `CopilotProvider` records it but never applies it to the SDK session, so
+  every tool/MCP server available to that session is callable regardless of
+  the declared allowlist (`workflow_tools_passthrough=False` — see
+  [Capability Carve-outs](#capability-carve-outs)).
 - `mcp_servers` — the **full** `runtime.mcp_servers` definitions (not just
   tool names), so the in-container `CopilotProvider` can make the declared
   tools executable. This is the **runner-image contract**: stdio MCP
@@ -397,7 +404,7 @@ multi-tenant workloads — see [Security](#security).
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `name` | `"aca"` | — | Selects the ACA provider. |
-| `pool_endpoint` | `str` | *(required)* | ACA dynamic-sessions pool management endpoint. |
+| `pool_endpoint` | `str` | *(required)* | ACA dynamic-sessions pool management endpoint. **Must be `https://`** — AAD bearer tokens and forwarded provider credentials (`inner_provider_settings`) are sent to this endpoint on every request; `conductor validate` rejects a plain-`http://` value. |
 | `api_version` | `str` | `"2025-07-01"` | ACA management API version. |
 | `inner_provider` | `"copilot"` | `copilot` | SDK the in-sandbox runner drives. **MVP: `copilot` only** — `claude-agent-sdk` inside is a future extension; the bare `claude` (Anthropic-API) provider has no in-process tool runtime and is not valid here. |
 | `identifier_scope` | `workflow \| agent \| item \| none` | `agent` | Default granularity for *sequential* session reuse (see [Architecture](#architecture)). Concurrent units always diverge regardless. |
@@ -430,7 +437,7 @@ agents:
 | Capability | Value | Notes |
 |---|---|---|
 | `mcp_tools` | ✅ `True` | Full `mcp_servers` forwarded — runner-image contract. |
-| `workflow_tools_passthrough` | ✅ `True` | Per-agent `tools:` allowlist forwarded and enforced by the inner SDK. |
+| `workflow_tools_passthrough` | ❌ **`False`** | The per-agent `tools:` allowlist is forwarded to the runner in the request body, but the in-container `CopilotProvider` it wraps never applies that list to the SDK session — every tool/MCP server available to the session is callable regardless of the declared allowlist. This is a known, allowed experimental carve-out (the same gap `claude_agent_sdk` and `hermes` already declare). |
 | `streaming_events` | ✅ `True` | Single streaming request relays event frames incrementally. |
 | `agent_reasoning_events` | ✅ `True` | Runner forwards reasoning frames from the inner provider. |
 | `reasoning_effort` | ✅ Copilot's full tuple | Inner provider (Copilot) translates reasoning effort natively. |
@@ -440,13 +447,16 @@ agents:
 | `checkpoint_resume` | ❌ **`False`** | Sessions are ephemeral with no volume mount; `conductor resume` re-runs the agent rather than restoring in-sandbox state. |
 | `usage_tracking` | ✅ `True` | The runner returns token counts (and `session_seconds`) on the terminal result frame. |
 | `concurrent_safe` | ✅ `True` | Mandatory concurrency discriminator in identifier derivation. |
-| `working_dir` | ✅ `True` | Interpreted container-relative — see `sandbox.working_dir` above. |
+| `working_dir` | ❌ **`False`** | This capability field means "applies the generic, host-resolved `agent.working_dir` / `runtime.working_dir`". `aca` never reads that field — only the separate, container-relative `sandbox.working_dir` (see above) is honored. Setting the generic field on an `aca`-backed agent fails `conductor validate`. |
 
-The **notable carve-out is `checkpoint_resume=False`**: because the
-session filesystem is ephemeral with no volume mount, there is nothing for
-`conductor resume` to restore in-sandbox — a resumed workflow re-runs the
-`aca`-backed agent from scratch rather than continuing an interrupted
-sandbox session.
+The **notable carve-outs are `workflow_tools_passthrough=False`,
+`working_dir=False`, and `checkpoint_resume=False`**: the first two reflect
+what the wrapped `CopilotProvider` and the sandbox filesystem actually do
+today (not what a naive reading of the runner-image contract might
+suggest), and the third exists because the session filesystem is ephemeral
+with no volume mount, so there is nothing for `conductor resume` to restore
+in-sandbox — a resumed workflow re-runs the `aca`-backed agent from scratch
+rather than continuing an interrupted sandbox session.
 
 There is a **known transport limit**: a single streaming request was
 measured to be cut off at ~30 minutes (~1801s) wall-clock on default,
@@ -536,6 +546,16 @@ Install the extra: `pip install 'conductor-cli[aca]'` (or `uv add
 
 Set `runtime.provider.pool_endpoint` in your workflow YAML — there is no
 default; Conductor does not provision or discover a pool for you.
+
+### `'pool_endpoint' must use https://`
+
+`pool_endpoint` was set to a plain `http://` (or other non-`https`) URL.
+AAD bearer tokens and forwarded provider credentials
+(`inner_provider_settings`) are sent to this endpoint on every request, so
+`conductor validate` rejects anything but `https://`. Use the endpoint
+printed by `scripts/aca/provision-pool.sh` (or `az containerapp
+sessionpool show`) verbatim — ACA dynamic-sessions management endpoints
+are always `https://`.
 
 ### Requests failing with a 401/403
 

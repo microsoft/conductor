@@ -53,6 +53,11 @@ claude-agent-sdk = [
 ]
 aca = [
     "azure-identity>=1.19.0",
+    # azure.identity.aio.DefaultAzureCredential builds an async pipeline
+    # that requires an async HTTP transport; azure-core only vendors one
+    # via its own "aio" extra (aiohttp). Without it, constructing the
+    # async credential raises ImportError at runtime (see aca.py).
+    "azure-core[aio]>=1.29.0",
 ]
 
 [project.urls]

@@ -49,7 +49,7 @@ class TestAcaCapabilities:
         assert caps.tier == "experimental"
         assert caps.is_experimental is True
         assert caps.mcp_tools is True
-        assert caps.workflow_tools_passthrough is True
+        assert caps.workflow_tools_passthrough is False
         assert caps.streaming_events is True
         assert caps.agent_reasoning_events is True
         assert caps.reasoning_effort == ("low", "medium", "high", "xhigh", "max")
@@ -59,16 +59,56 @@ class TestAcaCapabilities:
         assert caps.checkpoint_resume is False
         assert caps.usage_tracking is True
         assert caps.concurrent_safe is True
-        assert caps.working_dir is True
+        assert caps.working_dir is False
 
-    def test_aca_working_dir_capability_true(self) -> None:
-        """`aca` interprets working_dir container-relative but declares it True."""
+    def test_aca_workflow_tools_passthrough_capability_false(self) -> None:
+        """The in-container `CopilotProvider` never applies the `tools:`
+        allowlist to the SDK session (no filtering of which MCP
+        servers/tools the model can call) — `aca` declares this honestly
+        rather than claiming enforcement that doesn't happen."""
         caps = get_capabilities("aca")
-        assert caps.working_dir is True
+        assert caps.workflow_tools_passthrough is False
+        assert "no per-agent tools allowlist" in caps.declared_limitations()
+
+    def test_aca_working_dir_capability_false(self) -> None:
+        """`aca` does not apply the generic, host-resolved `working_dir` —
+        only the separate, container-relative `sandbox.working_dir` field."""
+        caps = get_capabilities("aca")
+        assert caps.working_dir is False
+        assert "working_dir ignored" in caps.declared_limitations()
 
     def test_aca_declared_limitations_lists_no_checkpoint_resume(self) -> None:
         caps = get_capabilities("aca")
         assert "no checkpoint resume" in caps.declared_limitations()
+
+
+class TestAcaExtraCleanInstall:
+    """The `aca` extra must be sufficient on its own — no other test in this
+    file exercises the real, unmocked azure-identity async credential path
+    (they all patch `AZURE_IDENTITY_AVAILABLE` and swap in a fake credential),
+    so a missing transitive dependency could regress silently. `aca.py` uses
+    `azure.identity.aio.DefaultAzureCredential`, which builds an async HTTP
+    pipeline requiring `aiohttp` — `azure-identity` alone does not pull it in
+    (`azure-core`'s own `aio` extra does). See pyproject.toml's `aca` extra."""
+
+    @pytest.mark.asyncio
+    async def test_async_default_azure_credential_constructs_without_import_error(self) -> None:
+        """Skipped when the `aca` extra isn't installed in this environment;
+        when it *is* installed, construction must not raise the `aiohttp
+        package is not installed` ImportError that azure-core's async
+        transport raises when only `azure-identity` (and not `aiohttp` /
+        `azure-core[aio]`) is present."""
+        pytest.importorskip(
+            "azure.identity.aio",
+            reason="aca extra not installed (pip install 'conductor-cli[aca]')",
+        )
+        from azure.identity.aio import DefaultAzureCredential
+
+        credential = DefaultAzureCredential()
+        try:
+            pass  # construction alone is the regression surface; no token fetch needed
+        finally:
+            await credential.close()
 
 
 class TestAcaFactory:
@@ -754,6 +794,56 @@ class TestAcaExecuteStreaming:
             await provider.execute(agent=_agent(), context={}, rendered_prompt="x")
 
         assert captured["body"]["tool_output"] is None
+
+    @pytest.mark.asyncio
+    async def test_execute_forwards_sandbox_working_dir_only(self) -> None:
+        """`_build_request` reads only `agent.sandbox.working_dir` — the
+        generic, host-resolved `agent.working_dir` (a different field, with a
+        different meaning: a host path resolved against the workflow file's
+        directory) must never leak into the request body, since a host path
+        has no meaning inside the sandbox filesystem. Capability declaration:
+        `CAPABILITIES.working_dir=False` (only `sandbox.working_dir` is
+        honored)."""
+        captured: dict[str, object] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(
+                200, content=_ndjson_body([{"type": "result", "data": {"content": {}}}])
+            )
+
+        provider = _make_provider()
+        provider._http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        # The engine only ever resolves generic `working_dir` for providers
+        # that declare `capabilities.working_dir=True`; constructing it here
+        # directly on the AgentDef exercises `_build_request` in isolation
+        # even though `conductor validate` would reject this combination
+        # against the real aca capability descriptor.
+        agent = _agent(
+            working_dir="/host/should/be/ignored",
+            sandbox=SandboxConfig(working_dir="/workspace"),
+        )
+        with patch("conductor.providers.aca._AsyncDefaultAzureCredential", _FakeAsyncCredential):
+            await provider.execute(agent=agent, context={}, rendered_prompt="x")
+
+        assert captured["body"]["agent"]["working_dir"] == "/workspace"
+
+    @pytest.mark.asyncio
+    async def test_execute_omits_working_dir_when_sandbox_unset(self) -> None:
+        captured: dict[str, object] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(
+                200, content=_ndjson_body([{"type": "result", "data": {"content": {}}}])
+            )
+
+        provider = _make_provider()
+        provider._http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        with patch("conductor.providers.aca._AsyncDefaultAzureCredential", _FakeAsyncCredential):
+            await provider.execute(agent=_agent(), context={}, rendered_prompt="x")
+
+        assert captured["body"]["agent"]["working_dir"] is None
 
 
 class _FakeUnreadStreamedResponse:
