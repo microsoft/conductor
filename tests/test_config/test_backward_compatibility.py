@@ -48,6 +48,8 @@ def get_copilot_example_files() -> list[Path]:
             continue
         if "hermes" in example.name.lower():
             continue
+        if "aca" in example.name.lower():
+            continue
 
         copilot_examples.append(example)
 

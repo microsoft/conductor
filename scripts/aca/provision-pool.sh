@@ -16,7 +16,7 @@
 #
 # The resulting pool's management endpoint is printed at the end — copy it
 # into your workflow's `runtime.provider.pool_endpoint` (see
-# docs/projects/aca/aca-provider-example.yaml).
+# examples/aca-coding-agent.yaml).
 #
 # Prerequisites (not created by this script — bring-your-own, per DD6):
 #   - An Azure resource group.

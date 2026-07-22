@@ -256,6 +256,48 @@ Conductor:
 - **Tool execution**: Tools and MCP servers are managed by the `claude` CLI's own configuration. The provider rejects workflow-level `runtime.mcp_servers` at the factory and refuses any non-empty per-agent `tools:` list (workflow tool names do not translate to CLI tool IDs). An agent with `tools: []` runs with no tools; omitting `tools:` grants the full `claude_code` preset.
 - **Runtime config**: `temperature` and `max_tokens` are rejected at the factory — the CLI controls sampling behavior.
 
+#### `aca.py` parity notes
+
+The ACA (Azure Container Apps) provider (`aca.py`) is an **experimental**
+provider (issue #284) — see the "Experimental Providers" section below for
+the carve-out policy. Unlike `claude_agent_sdk.py`, which delegates the
+loop to a local CLI subprocess, `aca.py` delegates the **entire agentic
+loop to a remote sandbox**: `AcaRuntimeProvider` is a thin host-side
+transport shim that derives a session identifier, authenticates via
+`DefaultAzureCredential`, and relays NDJSON event frames from an
+in-container `conductor-agent-runner` (which itself wraps a real
+`CopilotProvider`) verbatim to `event_callback`. Because the runner
+re-emits Conductor's own event vocabulary and forwards a real
+`CopilotProvider`'s output, this achieves **full event and output
+parity** (`mcp_tools`, `workflow_tools_passthrough`, `streaming_events`,
+`agent_reasoning_events`, and `reasoning_effort` are all declared
+`True`) — with two caveats and one deliberate carve-out:
+
+- **`interrupt`/`max_session_seconds` are declared `True` host-side but
+  not fully backed by the shipped runner MVP (epic E4)**: the runner has
+  no `/interrupt` endpoint yet (the host's in-stream interrupt POST has
+  nowhere to land, so the host falls back to a best-effort session-delete
+  call, itself unsupported for custom-container pools, before giving up
+  waiting — not instantaneous; both cleanup calls use an explicit
+  10-second per-call timeout), and `max_session_seconds` enforcement is only a
+  best-effort, Copilot-internal timeout (the wrapped `CopilotProvider`'s
+  own `IdleRecoveryConfig` check) — there is no independent runner-level
+  guard. Stopping an `aca`-backed agent today eventually stops the host
+  from *waiting*, not the sandbox from *computing*. See
+  `docs/providers/aca.md#known-gaps-runner-mvp`.
+- **`checkpoint_resume=False`**: ACA dynamic-sessions sessions are
+  ephemeral with no volume mount, so there is nothing in-sandbox for
+  `conductor resume` to restore. A resumed workflow re-runs the
+  `aca`-backed agent from scratch rather than continuing an interrupted
+  sandbox session — the same posture `claude_agent_sdk.py` and `hermes.py`
+  declare, but for a different underlying reason (remote ephemeral
+  filesystem vs. local CLI process state).
+
+Full architecture, the runner `/execute`/`/health` contract, the NDJSON
+frame schema, and the credential/security model are documented in
+`docs/providers/aca.md` and the source design at
+`docs/projects/aca/aca-provider.design.md`.
+
 ### Experimental Providers
 
 Some providers delegate part of the agentic loop to an upstream SDK or

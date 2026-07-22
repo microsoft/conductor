@@ -1,0 +1,161 @@
+# Coding agent running entirely inside an Azure Container Apps (ACA)
+# dynamic-sessions sandbox instead of on the host (issue #284, epic E7).
+#
+# This is the verified, runnable successor to the design-time preview at
+# docs/projects/aca/aca-provider-example.yaml (removed once this file
+# passed `conductor validate` — see aca-provider.plan.md, epic E7).
+#
+# Prerequisites:
+#   1. An operator-provisioned ACA custom-container session pool running
+#      the `conductor-agent-runner` image (see docker/aca-runner/Dockerfile
+#      and scripts/aca/provision-pool.sh — Conductor does not provision ACA
+#      infrastructure itself; DD6, bring-your-own pool). The pool must allow
+#      egress (see the `egress:` note below — cloning the repo and reaching
+#      the Copilot model backend both require outbound network access from
+#      the sandbox).
+#   2. `pip install 'conductor-cli[aca]'` on the host (pins azure-identity).
+#   3. `az login` (or another `DefaultAzureCredential`-compatible identity)
+#      with the *Session Executor* role on the pool.
+#   4. Inner Copilot authentication: the in-sandbox runner drives a real
+#      CopilotProvider but cannot do interactive OAuth login inside a
+#      headless container, so the HOST must export one of
+#      COPILOT_PROVIDER_BEARER_TOKEN / COPILOT_PROVIDER_API_KEY (with
+#      COPILOT_PROVIDER_BASE_URL) before `conductor run` — these are
+#      forwarded into the sandbox as `inner_provider_settings` (Phase 1
+#      trusted-use credential stopgap, DD4/OQ#6). This MUST be a
+#      short-lived, narrowly-scoped credential — never a long-lived
+#      personal token or a general-purpose API key — and this mechanism
+#      is only acceptable for TRUSTED workloads, not untrusted/
+#      multi-tenant use (see docs/providers/aca.md#security). Without one
+#      of these set, the sandbox's Copilot session has no credential and
+#      every agent turn fails. See docs/providers/aca.md#authentication.
+#   5. Set POOL_ENDPOINT below to your pool's management endpoint.
+#
+# Full architecture, security model, and API contract:
+#   docs/providers/aca.md
+#   docs/projects/aca/aca-provider.design.md
+#
+# Run:
+#   export COPILOT_PROVIDER_BEARER_TOKEN=<your Copilot-compatible token>
+#   conductor run examples/aca-coding-agent.yaml \
+#     --input repo_url="https://github.com/octocat/Hello-World" \
+#     --input task="Add a CONTRIBUTING.md with a one-paragraph guide"
+
+workflow:
+  name: aca-coding-agent
+  description: >
+    Coding agent (clone -> implement -> test -> loop back on failure)
+    running entirely inside an ACA dynamic-session sandbox instead of the
+    host.
+  version: "1.0.0"
+  entry_point: implement
+
+  runtime:
+    provider:
+      name: aca
+      # Operator-provisioned pool (DD6, bring-your-own — Conductor does not
+      # provision ACA infrastructure). See scripts/aca/provision-pool.sh
+      # for a throwaway provisioning example.
+      # ${ACA_POOL_ENDPOINT:-default} interpolation: falls back to a
+      # placeholder so `conductor validate` (and CI's examples-validation
+      # set) never requires a real pool endpoint — override with a real
+      # `az containerapp sessionpool show` endpoint before `conductor run`.
+      pool_endpoint: "${ACA_POOL_ENDPOINT:-https://my-agent-pool.example.westus2.azurecontainerapps.io}"
+      api_version: "2025-07-01"
+      # MVP: the in-container runner drives a real CopilotProvider only.
+      inner_provider: copilot
+      # Default granularity for *sequential* session reuse; concurrent
+      # units (parallel / for_each) always diverge via the mandatory
+      # concurrency discriminator regardless of this setting (DD5).
+      identifier_scope: agent
+      # Advisory mirrors of the pool's own settings (the pool governs).
+      # egress MUST be enabled here: this workflow clones a repo over the
+      # network and its inner_provider (copilot) always needs outbound
+      # access to reach the model backend, regardless of what this
+      # workflow-level field says — the pool's own network configuration is
+      # what actually gates it.
+      egress: enabled
+      lifecycle: timed
+      auth: azure_default
+    default_model: gpt-4.1
+    mcp_servers:
+      # Baked into the conductor-agent-runner image (docker/aca-runner) —
+      # stdio MCP servers cannot be provisioned by Conductor itself once
+      # execution has moved into the sandbox (the "runner-image contract").
+      git:
+        command: git-mcp-server
+        tools: ["*"]
+
+  input:
+    repo_url:
+      type: string
+      required: true
+      description: Repository to clone inside the sandbox
+    task:
+      type: string
+      required: true
+      description: The change to implement
+
+  limits:
+    max_iterations: 5 # caps the implement <-> self loop-back below
+
+agents:
+  - name: implement
+    description: >
+      Clones the repo on first run, implements the task, and runs the test
+      suite — all inside the sandbox. On failure, loops back into itself:
+      identifier_scope: agent means this re-execution reuses the SAME ACA
+      session, so the clone and any partial edits are still there.
+    model: gpt-4.1
+    # Per-agent sandbox override block (SandboxConfig). working_dir is
+    # container-relative — a path inside the remote session filesystem,
+    # never resolved against the host workflow directory. Set to /workspace
+    # (created by docker/aca-runner/Dockerfile at image build time) rather
+    # than /workspace/repo: the latter doesn't exist until the clone below
+    # runs, and a working_dir that's absent when the session starts is a
+    # runtime error (never a silent host fallback) — see
+    # docs/providers/aca.md#workflow-configuration. The agent clones into
+    # the `repo` subdirectory itself on first run.
+    sandbox:
+      working_dir: /workspace
+      identifier_scope: agent # explicit here for clarity; matches the default
+    # Comfortably under the ~30-min measured per-request cap (issue #312) so
+    # one attempt can't outrun the streaming transport (DD3).
+    max_session_seconds: 900
+    prompt: |
+      Working directory: /workspace
+
+      If the `repo` subdirectory does not exist yet, clone
+      {{ workflow.input.repo_url }} into `repo` (e.g. `git clone <url> repo`).
+      Then `cd repo` and implement the following change there:
+
+      {{ workflow.input.task }}
+
+      {% if implement is defined and implement.output and implement.output.tests_passed == false %}
+      Your previous attempt failed:
+      {{ implement.output.failure_notes }}
+
+      Fix the issue (the repo and your prior edits are still present in this
+      same sandbox session, under ./repo) and try again.
+      {% endif %}
+
+      Run the test suite and report the outcome.
+    output:
+      summary:
+        type: string
+        description: What changed in this attempt
+      tests_passed:
+        type: boolean
+        description: Whether the test suite passed
+      failure_notes:
+        type: string
+        description: Populated only when tests_passed is false
+    routes:
+      - to: implement
+        when: "{{ not output.tests_passed }}"
+      - to: $end
+
+output:
+  summary: "{{ implement.output.summary }}"
+  tests_passed: "{{ implement.output.tests_passed }}"
+  attempts: "{{ context.iteration }}"

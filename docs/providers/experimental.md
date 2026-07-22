@@ -100,9 +100,11 @@ adopting one does not inflate the install surface for others.
 |---|---|---|---|
 | `claude-agent-sdk` | `claude-agent-sdk>=0.1.0` | `@lesandiz (best-effort)` | no `mcp_tools`, no `workflow_tools_passthrough`, no `reasoning_effort`, `prompt_injection` structured output, no `checkpoint_resume`, no `working_dir` |
 | `hermes` | `hermes-agent` | `(community contribution)` | no `mcp_tools`, `prompt_injection` structured output, no `working_dir` |
+| `aca` | `azure-identity>=1.19.0` | `(unassigned)` | `prompt_injection` structured output (inherits the inner Copilot provider), no `checkpoint_resume` (ephemeral sandbox sessions, no volume mount). Declares `interrupt`/`max_session_seconds` as `True`, but the shipped runner MVP doesn't fully back either yet — see [Known Gaps](./aca.md#known-gaps-runner-mvp). |
 
 ## See also
 
 - `AGENTS.md` — "Provider Parity" section (the rules experimental providers carve out from) and "Experimental Providers" section (rules they must still uphold)
 - `src/conductor/providers/capabilities.py` — `ProviderCapabilities` schema
 - Issue [#241](https://github.com/microsoft/conductor/issues/241) — design rationale
+- [`docs/providers/aca.md`](./aca.md) — `aca` provider documentation (issue [#284](https://github.com/microsoft/conductor/issues/284))

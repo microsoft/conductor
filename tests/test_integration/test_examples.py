@@ -225,6 +225,7 @@ class TestExampleWorkflowsValidity:
             "parallel-validation.yaml",
             "research-assistant.yaml",
             "design-review.yaml",
+            "aca-coding-agent.yaml",
         ],
     )
     def test_example_workflow_is_valid(self, example_file: str) -> None:
@@ -243,3 +244,52 @@ class TestExampleWorkflowsValidity:
         assert config.workflow.name is not None
         assert config.workflow.entry_point is not None
         assert len(config.agents) > 0
+
+
+class TestAcaCodingAgentExample:
+    """`examples/aca-coding-agent.yaml` (issue #284, epic E7): the verified,
+    runnable successor to the `docs/projects/aca/aca-provider-example.yaml`
+    preview. Exercises full `conductor validate` semantics (not just
+    `load_config`) and confirms the experimental banner metadata the CLI
+    relies on is present for the `aca` provider.
+    """
+
+    @property
+    def _workflow_file(self) -> Path:
+        return Path(__file__).parent.parent.parent / "examples" / "aca-coding-agent.yaml"
+
+    def test_example_file_exists(self) -> None:
+        assert self._workflow_file.exists(), (
+            "examples/aca-coding-agent.yaml must exist as the runnable "
+            "successor to docs/projects/aca/aca-provider-example.yaml"
+        )
+
+    def test_conductor_validate_passes(self) -> None:
+        """Mirrors `conductor validate examples/aca-coding-agent.yaml` (E7-T5)."""
+        from conductor.cli.validate import validate_workflow
+
+        is_valid, config = validate_workflow(self._workflow_file)
+        assert is_valid, "examples/aca-coding-agent.yaml must pass `conductor validate`"
+        assert config is not None
+        assert config.workflow.runtime.provider.name == "aca"
+
+    def test_experimental_banner_metadata_present(self) -> None:
+        """The workflow_started `providers` block must mark `aca` as experimental.
+
+        Mirrors `test_workflow_started_provider_tier.py`'s
+        `test_experimental_provider_surfaces_in_block` for the `claude-agent-sdk`
+        provider, but driven from the real example file rather than a
+        hand-built config.
+        """
+        from conductor.config.loader import load_config as _load_config
+        from conductor.engine.workflow import WorkflowEngine
+
+        config = _load_config(self._workflow_file)
+        engine = WorkflowEngine(config=config, provider=None)
+        data = engine.build_workflow_started_data()
+
+        assert "aca" in data["providers"]
+        aca_meta = data["providers"]["aca"]
+        assert aca_meta["tier"] == "experimental"
+        assert aca_meta["upstream_pin"] is not None
+        assert "azure-identity" in aca_meta["upstream_pin"]

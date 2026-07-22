@@ -58,7 +58,7 @@ FROM python:3.12-slim
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 # git: baked in per the runner-image contract — the coding-agent pattern in
-# docs/projects/aca/aca-provider-example.yaml clones/edits/tests entirely
+# examples/aca-coding-agent.yaml clones/edits/tests entirely
 # in-sandbox. Node.js/npm: the transport the common stdio MCP servers use
 # (`command: npx`, see docs/mcp-tools.md) — a declared-but-absent stdio
 # binary is a *runtime error* under the runner-image contract
@@ -75,7 +75,7 @@ RUN apt-get update \
     && apt-get purge -y --auto-remove gnupg \
     && rm -rf /var/lib/apt/lists/*
 
-# git-mcp-server: the stdio MCP binary docs/projects/aca/aca-provider-example.yaml
+# git-mcp-server: the stdio MCP binary examples/aca-coding-agent.yaml
 # declares (`mcp_servers.git.command: git-mcp-server`) — bake it in so that
 # example (and any workflow relying on the same binary name) works out of the
 # box even with pool egress disabled, per the runner-image contract's "common

@@ -47,7 +47,11 @@ workflow:
   context_mode: accumulate          # accumulate | snapshot | minimal (default: accumulate)
 
   runtime:
-    provider: copilot               # copilot | claude | hermes
+    provider: copilot               # copilot | claude | hermes | claude-agent-sdk
+                                      # Structured object form (e.g. custom routing,
+                                      # or the experimental `aca` sandbox provider)
+                                      # is also accepted — see docs/configuration.md
+                                      # and docs/providers/aca.md.
     default_model: gpt-5.2
     temperature: 0.7
     max_tokens: 4096
@@ -312,6 +316,49 @@ Because paths are normalized lexically instead of resolving to their real paths:
 
 > ⚠️ **Warning: Working directory is NOT a sandbox**
 > Setting `working_dir` doesn't restrict the model's filesystem access. The model can still read and write files outside this directory if it uses absolute paths or parent directory traversals (e.g., `../`). Avoid relying on this configuration to sandbox untrusted model execution.
+
+### Sandbox Configuration (ACA)
+
+The optional per-agent `sandbox:` block overrides settings for the
+experimental `aca` (Azure Container Apps) sandbox provider — the one
+provider that *does* isolate an agent's execution off the host, running it
+inside an Azure Container Apps dynamic-sessions custom-container pool
+instead. See [`docs/providers/aca.md`](./providers/aca.md) for the full
+provider documentation, architecture, and workflow-level
+`runtime.provider: {name: aca, ...}` configuration.
+
+```yaml
+workflow:
+  runtime:
+    provider:
+      name: aca
+      pool_endpoint: "https://my-agent-pool.<region>.azurecontainerapps.io"
+      api_version: "2025-07-01"
+      inner_provider: copilot
+      identifier_scope: agent       # workflow | agent | item | none (default: agent)
+      egress: enabled               # enabled | disabled (advisory; pool governs). The
+                                     # inner Copilot call always needs outbound network
+                                     # access, so this is effectively always `enabled`.
+      lifecycle: timed              # timed | on_container_exit (advisory)
+      auth: azure_default           # only supported strategy
+
+agents:
+  - name: implement
+    sandbox:                        # Optional: aca-only per-agent overrides
+      identifier_scope: item        # overrides runtime.provider.identifier_scope
+      working_dir: /workspace       # container-relative — NOT a host path
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `identifier_scope` | `workflow \| agent \| item \| none` | Overrides the workflow-wide `identifier_scope` for this agent's session identifier. `None` (default) inherits the workflow setting. |
+| `working_dir` | `string` | Working directory **inside the sandbox session filesystem**. Unlike the top-level `agent.working_dir` above (a *host* path resolved against the workflow file's directory), this is interpreted container-relative — a path inside the remote ACA session, never resolved against the host. Defaults to the runner's own working directory when unset. **The directory must already exist when the session starts** (e.g. baked into the runner image, or a parent directory an earlier turn in the same reused session created) — a path that doesn't exist yet is a runtime error, not a silent fallback. See [`examples/aca-coding-agent.yaml`](../examples/aca-coding-agent.yaml) for the pattern of pointing `working_dir` at an image-provisioned parent directory and having the agent itself create a subdirectory (e.g. `git clone` into it) on first run. |
+
+
+`sandbox:` is only meaningful when the agent's effective provider is
+`aca` — the fields validate structurally regardless of provider (so
+`conductor validate` still checks types), but are otherwise ignored by
+every other provider.
 
 ### Human Gates
 
@@ -1734,5 +1781,6 @@ output:
 ## See Also
 
 - [Parallel Execution Guide](./parallel-execution.md) - Detailed parallel execution patterns
+- [ACA Provider](./providers/aca.md) - Experimental Azure Container Apps sandbox provider (`sandbox:` block, `runtime.provider: {name: aca}`)
 - [Examples](../examples/) - Complete workflow examples
 - [README](../README.md) - Getting started and CLI reference
