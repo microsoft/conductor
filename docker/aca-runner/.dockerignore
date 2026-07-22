@@ -1,0 +1,12 @@
+# Build context for docker/aca-runner/Dockerfile is this directory
+# (docker/aca-runner/). Nothing here today needs to be excluded — the image
+# installs a pinned `conductor-cli` release from GitHub (`pip install
+# "conductor-cli @ git+https://github.com/microsoft/conductor.git@<ref>"` —
+# there is no PyPI package) rather than copying repo source — but this file
+# exists as the documented place to exclude local build artifacts if this
+# directory ever gains any (e.g. a scratch wheel used for a pre-release
+# smoke build).
+**/__pycache__
+**/*.pyc
+.git
+.DS_Store

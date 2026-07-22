@@ -456,21 +456,78 @@ Copilot custom routing. Covers Epic **E8**.
     for `_InnerProviderCache` concurrency safety (verified to fail without
     the lock).
 
-### E5 — Runner image + bring-your-own pool
+### E5 — Runner image + bring-your-own pool — **DONE**
 - **Goal:** A buildable official base image and a documented two-step provisioning
   path (DD6; *Open Questions → Image ownership*).
 - **Prerequisites:** E4.
 
 | Task ID | Type | Description | Files | Status |
 |---|---|---|---|---|
-| E5-T1 | IMPL | `Dockerfile` for `conductor-agent-runner`: install a pinned Conductor + the runner + common stdio MCP binaries; expose the runner `TARGET_PORT`; `CMD python -m conductor.aca_runner`. | `docker/aca-runner/Dockerfile`, `docker/aca-runner/.dockerignore` | TO DO |
-| E5-T2 | IMPL | Provisioning example script: push image to ACR, then `az containerapp sessionpool create --container-type CustomContainer …` (advisory `egress`/`lifecycle` mirrors). | `scripts/aca/provision-pool.sh` | TO DO |
-| E5-T3 | TEST | CI lint/build check for the Dockerfile (e.g. `hadolint` if already available, else a build smoke in a marked/optional job) and a shellcheck of the provisioning script. Only add if such tooling already exists in the repo. | `docker/aca-runner/Dockerfile`, `scripts/aca/provision-pool.sh` | TO DO |
+| E5-T1 | IMPL | `Dockerfile` for `conductor-agent-runner`: install a pinned Conductor + the runner + common stdio MCP binaries; expose the runner `TARGET_PORT`; `CMD python -m conductor.aca_runner`. | `docker/aca-runner/Dockerfile`, `docker/aca-runner/.dockerignore` | DONE — review fix: the previous default `CONDUCTOR_VERSION=v0.1.25` predates epic E4, so the committed image's default couldn't start (`ModuleNotFoundError: conductor.aca_runner`); repinning to the immutable commit that introduces the module. |
+| E5-T2 | IMPL | Provisioning example script: push image to ACR, then `az containerapp sessionpool create --container-type CustomContainer …` (advisory `egress`/`lifecycle` mirrors). | `scripts/aca/provision-pool.sh` | DONE — review fixes: forward `--build-arg TARGET_PORT` to `az acr build`; stop passing both `--cooldown-period`/`--max-alive-period` (mutually exclusive per lifecycle type); pre-create a user-assigned identity, grant it `acrpull` before pool creation, and pass its resource ID as `--registry-identity` (the prior `--registry-identity system` + post-hoc grant to the *environment's* identity was the wrong identity and the wrong order); drop the `\|\| true` that hid authorization failures. |
+| E5-T3 | TEST | CI lint/build check for the Dockerfile (e.g. `hadolint` if already available, else a build smoke in a marked/optional job) and a shellcheck of the provisioning script. Only add if such tooling already exists in the repo. | `docker/aca-runner/Dockerfile`, `scripts/aca/provision-pool.sh` | DONE — no wiring added (no hadolint/shellcheck/docker job exists anywhere in `.github/workflows/ci.yml` or the `Makefile` today, so per the task's own "only add if already exists" condition, nothing was wired into CI). Verified manually instead: a throwaway `shellcheck` (v0.10.0) run against `provision-pool.sh` is clean; a throwaway `hadolint` (v2.12.0) run against the `Dockerfile` has one accepted `DL3008` (unpinned apt package versions — acceptable for a documented example base image) and is otherwise clean. Neither tool was added to the repo. |
 
 - **Acceptance Criteria:**
-  - [ ] The image builds and starts the runner; `/health` responds.
-  - [ ] The provisioning example documents the ACR → session-pool two-step and the
-    Session Executor role assignment.
+  - [x] The image builds and starts the runner; `/health` responds. Docker itself
+    isn't available in this environment (no daemon/socket, no passwordless
+    `sudo` to install one), so the *container* build couldn't be exercised
+    directly. Verified the actual defect and fix at the package level instead —
+    the same install line the Dockerfile runs, transport swapped from
+    `git+https` to `git+file` (identical ref, no network required):
+    - Before the fix (`CONDUCTOR_VERSION=v0.1.25`, the previously committed
+      default): `pip install "conductor-cli @ git+file://<repo>@v0.1.25"` then
+      `python -c "import conductor.aca_runner"` fails with `ModuleNotFoundError`
+      — reproducing the reviewer-reported defect (that tag predates epic E4).
+    - After the fix (`CONDUCTOR_VERSION=d6db5c817f5c0ae8146fdb7a1e8d3d48b486ef3d`,
+      the commit that introduces `conductor.aca_runner`, epic E4's "Fix review
+      issues" commit): the same install succeeds, `python -m
+      conductor.aca_runner` (with `ACA_RUNNER_HOST=127.0.0.1
+      ACA_RUNNER_PORT=8099`) starts, and `curl http://127.0.0.1:8099/health`
+      returns `{"ready":true,"conductor_version":"0.1.25","runner_version":"0.1.0"}`.
+    - Caveat: `git+https://github.com/microsoft/conductor.git@<sha>` only
+      resolves once that commit is reachable from a ref pushed to
+      `microsoft/conductor` (e.g. once this branch merges) — true of any
+      commit-SHA pin during in-flight development, and why the Dockerfile
+      comment says to bump to a real release tag once one ships the runner.
+    - The rest of the image (apt/`git`/Node.js install, non-root `runner`
+      user, `/workspace` `WORKDIR`, `EXPOSE`/`HEALTHCHECK` wiring against
+      `TARGET_PORT`) is unchanged from the prior pass, which *did* verify
+      those mechanics with a real `docker build`/`docker run` in a different
+      environment — see the superseded note this replaces, preserved in git
+      history on this file. `hadolint`/`shellcheck` (E5-T3, below) stayed clean
+      through this fix.
+  - [x] The provisioning example documents the ACR → session-pool two-step and the
+    Session Executor role assignment (`scripts/aca/provision-pool.sh`: `az acr
+    build` → create + `acrpull`-grant a user-assigned identity → `az
+    containerapp sessionpool create --container-type CustomContainer
+    --registry-identity <identity-id>` → `az role assignment create --role
+    "Azure ContainerApps Session Executor"`). Review fixes: `TARGET_PORT` is
+    now forwarded to `az acr build` as a `--build-arg` (previously the image
+    always listened on 8080 regardless of the pool's configured port);
+    `--cooldown-period`/`--max-alive-period` are no longer both passed
+    (mutually exclusive per `lifecycle-type` in the `az containerapp
+    sessionpool create` API); `--registry-identity` now references a
+    dedicated user-assigned identity created and granted `acrpull` *before*
+    the pool is created (the identity `az containerapp sessionpool create
+    --registry-identity` authenticates with must already have `acrpull` —
+    the previous script granted it to the wrong identity, the Container
+    Apps *environment's* system identity, and did so after the pool create
+    call that needed it); the silent `\|\| true` around that role assignment
+    is removed so a real authorization failure surfaces instead of being
+    swallowed. Verified with a clean `shellcheck` run (no findings).
+
+  **Notes:**
+  - `conductor-cli` has no PyPI package (the name is squatted by an unrelated
+    project — verified via `pypi.org/pypi/conductor-cli/json`). The Dockerfile's
+    pinned install therefore mirrors `install.sh`'s own mechanism: `pip install
+    "conductor-cli @ git+https://github.com/microsoft/conductor.git@<ref>"`
+    (`install.sh` uses the equivalent `uv tool install
+    git+https://github.com/<repo>.git@<tag>`), not a `pip install
+    conductor-cli==X.Y.Z` PyPI pin.
+  - `docker/aca-runner/.dockerignore` uses the plain root-of-context name (not
+    the `<Dockerfile>.dockerignore` convention) because the build context for
+    this Dockerfile is `docker/aca-runner/` itself (`docker build
+    docker/aca-runner`) — confirmed against Docker's build-context docs.
 
 ### E6 — Session-seconds usage surfacing (FR7)
 - **Goal:** Surface sandbox time as a distinct usage dimension, separate from token
