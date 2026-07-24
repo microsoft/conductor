@@ -7,6 +7,11 @@ Esc vs ANSI escape sequence disambiguation using a 50ms read-ahead timeout.
 Uses a dedicated daemon thread for blocking stdin reads, delivering bytes
 into an ``asyncio.Queue`` via ``loop.call_soon_threadsafe``. This avoids
 thread leaks from abandoned ``run_in_executor`` futures.
+
+Terminal safety (issue #290): the original tty settings are captured once per
+process into the module-level ``_CAPTURED_BASELINE_SETTINGS`` cache so a second
+listener never re-captures cbreak state as "original", and the SIGTERM cleanup
+handler restores the terminal before delegating to the previous disposition.
 """
 
 from __future__ import annotations
@@ -15,6 +20,7 @@ import asyncio
 import atexit
 import contextlib
 import logging
+import os
 import select
 import signal
 import sys
@@ -30,6 +36,15 @@ _CTRL_G_BYTE = 0x07
 
 # Timeout for disambiguating bare Esc from escape sequences (seconds)
 _ESC_DISAMBIGUATE_TIMEOUT = 0.05
+
+_CAPTURED_BASELINE_SETTINGS: Any = None
+"""Process-wide tty baseline captured on the FIRST successful start().
+
+Subsequent KeyboardListener instances reuse this baseline so a second
+listener never re-captures cbreak state as "original". Process-lifetime
+and intentionally never reset by production code: after stop() the tty
+has been restored to exactly this baseline, so reuse is always
+legitimate. Tests reset it via a fixture. See issue #290."""
 
 
 @dataclass
@@ -77,6 +92,9 @@ class KeyboardListener:
     _previous_sigterm: Any = field(default=None, repr=False)
     """Previous SIGTERM handler for restoration."""
 
+    _sigterm_handler: Any = field(default=None, repr=False)
+    """This instance's own installed SIGTERM handler closure (issue #290)."""
+
     _byte_queue: asyncio.Queue[int | None] = field(default_factory=asyncio.Queue, repr=False)
     """Async queue for delivering bytes from the reader thread."""
 
@@ -103,9 +121,27 @@ class KeyboardListener:
         self._loop = asyncio.get_running_loop()
         self._stop_flag = False
 
-        # Save original terminal settings
+        # Save original terminal settings. A second listener must never
+        # re-snapshot an already-cbreak terminal as its "original" state, so
+        # the baseline is captured once per process into a module-level cache
+        # (issue #290).
+        global _CAPTURED_BASELINE_SETTINGS
+
+        # Idempotent guard: a start() on a truly-active listener (baseline
+        # held AND reader thread running) is a no-op so it cannot overwrite
+        # the baseline or spawn duplicate threads. After suspend() the thread
+        # is None, so start-after-suspend correctly falls through below.
+        if self._original_settings is not None and self._reader_thread is not None:
+            logger.debug("Keyboard listener already active, start() is a no-op")
+            return
+
         try:
-            self._original_settings = termios.tcgetattr(sys.stdin.fileno())
+            if _CAPTURED_BASELINE_SETTINGS is not None:
+                # Reuse the process-wide pre-listener baseline.
+                self._original_settings = _CAPTURED_BASELINE_SETTINGS
+            else:
+                self._original_settings = termios.tcgetattr(sys.stdin.fileno())
+                _CAPTURED_BASELINE_SETTINGS = self._original_settings  # pyright: ignore[reportConstantRedefinition]
         except termios.error:
             logger.debug("Failed to get terminal settings, listener not started")
             return
@@ -178,7 +214,7 @@ class KeyboardListener:
             try:
                 import termios
 
-                termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, self._original_settings)
+                termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, self._original_settings)
             except (ImportError, termios.error, ValueError, OSError):
                 pass
 
@@ -226,10 +262,12 @@ class KeyboardListener:
             try:
                 import termios
 
-                termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, self._original_settings)
+                termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, self._original_settings)
+                # Clear the baseline only after a successful restore so a
+                # transient failure keeps it for a later retry (issue #290).
+                self._original_settings = None
             except (ImportError, termios.error, ValueError, OSError):
                 pass
-            self._original_settings = None
 
     def _register_cleanup_handlers(self) -> None:
         """Register atexit and SIGTERM handlers for crash safety."""
@@ -237,17 +275,52 @@ class KeyboardListener:
             atexit.register(self._restore_terminal)
             self._atexit_registered = True
 
-        # Install SIGTERM handler that restores terminal then re-raises
+        # Install a SIGTERM handler that restores the terminal, then delegates
+        # to the previously-installed disposition so the process terminates
+        # with its expected action (issue #290).
         try:
-            self._previous_sigterm = signal.getsignal(signal.SIGTERM)
+            # Guard: if THIS instance's own handler is still installed, skip
+            # re-registration. Re-registering would capture our own closure as
+            # the "previous" disposition, recursing forever on invocation. The
+            # identity check targets this instance's stored handler only — a
+            # stale closure from a stopped listener must not block a new one.
+            if (
+                self._sigterm_handler is not None
+                and signal.getsignal(signal.SIGTERM) is self._sigterm_handler
+            ):
+                return
+
+            # Capture the previous disposition into a LOCAL variable so the
+            # closure is immutable: reading the mutable field at invocation
+            # time would let a later re-registration rewrite what an
+            # already-installed closure delegates to.
+            previous = signal.getsignal(signal.SIGTERM)
+            self._previous_sigterm = previous  # backward-compat introspection
 
             def _sigterm_handler(signum: int, frame: Any) -> None:
-                self._restore_terminal()
-                # Call previous handler if it was callable
-                if callable(self._previous_sigterm):
-                    self._previous_sigterm(signum, frame)
+                # A failed restore must never swallow the signal: swallow any
+                # error here so the handler always reaches the delegation path.
+                # The baseline is dropped unconditionally afterward — the
+                # process is terminating, so a stale value must not be reused.
+                try:
+                    self._restore_terminal()
+                except Exception:
+                    pass
+                finally:
+                    self._original_settings = None
+                if previous is signal.SIG_DFL:
+                    # Reset to default and re-raise so the default action
+                    # (terminate) actually runs.
+                    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+                    os.kill(os.getpid(), signum)
+                elif previous is signal.SIG_IGN:
+                    # Caller asked to ignore SIGTERM: restore and stay alive.
+                    return
+                elif callable(previous):
+                    previous(signum, frame)
 
             signal.signal(signal.SIGTERM, _sigterm_handler)
+            self._sigterm_handler = _sigterm_handler
         except (OSError, ValueError):
             # Can't set signal handler (not main thread, etc.)
             pass
