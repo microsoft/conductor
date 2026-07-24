@@ -839,10 +839,11 @@ class TestHermesReasoningEffort:
 class TestHermesBuildPromptSchema:
     """Tests for the Hermes prompt-schema builder wrapper.
 
-    The wrapper delegates to conductor.providers._schema.build_hermes_legacy_prompt_schema
-    and converts SchemaDepthError into ValidationError with the exact legacy message and
-    suggestion. These tests pin the legacy behavior (description fallback, no required
-    inside array-item objects, collapsed array-of-array items) and the depth boundary.
+    The wrapper delegates to the shared recursive builder in
+    conductor.providers._schema and converts SchemaDepthError into ValidationError
+    with the exact message and suggestion. These tests pin the shared
+    semantics (no description fallback, required inside array-item objects,
+    recursive array-of-array items) and the depth boundary.
     """
 
     def _chain_schema(self, levels: int) -> dict[str, OutputField]:
@@ -852,14 +853,14 @@ class TestHermesBuildPromptSchema:
             schema = {"nested": OutputField(type="object", properties=schema)}
         return schema
 
-    def test_build_prompt_schema_top_level_description_fallback(self) -> None:
-        """Top-level fields without explicit descriptions get the legacy fallback."""
+    def test_build_prompt_schema_omits_missing_description(self) -> None:
+        """Top-level fields without explicit descriptions must not synthesize a description."""
         schema = {"answer": OutputField(type="string")}
         result = _build_prompt_schema(schema)
-        assert result == {"answer": {"type": "string", "description": "The answer field"}}
+        assert result == {"answer": {"type": "string"}}
 
-    def test_build_prompt_schema_array_item_object_has_no_required(self) -> None:
-        """Legacy Hermes: array object items include properties but no required."""
+    def test_build_prompt_schema_array_item_object_has_required(self) -> None:
+        """Array<object> item schemas must include the required property names."""
         schema = {
             "items": OutputField(
                 type="array",
@@ -873,11 +874,11 @@ class TestHermesBuildPromptSchema:
             )
         }
         result = _build_prompt_schema(schema)
-        assert "required" not in result["items"]["items"]
+        assert result["items"]["items"]["required"] == ["key", "value"]
         assert "properties" in result["items"]["items"]
 
-    def test_build_prompt_schema_array_of_arrays_collapsed(self) -> None:
-        """Legacy Hermes behavior: array-of-array items collapse to bare {type: array}."""
+    def test_build_prompt_schema_array_of_arrays_recurses(self) -> None:
+        """Array<array> item schemas must recurse and expose the inner item type."""
         schema = {
             "matrix": OutputField(
                 type="array",
@@ -885,11 +886,12 @@ class TestHermesBuildPromptSchema:
             )
         }
         result = _build_prompt_schema(schema)
-        assert result["matrix"]["items"] == {"type": "array"}
+        assert result["matrix"]["items"]["type"] == "array"
+        assert result["matrix"]["items"]["items"]["type"] == "number"
 
     def test_build_prompt_schema_exceeds_max_depth(self) -> None:
         """Depths above _MAX_SCHEMA_DEPTH raise ValidationError with the exact
-        legacy message and suggestion."""
+        shared message and suggestion."""
         # A 12-level object chain reaches depth 11, which exceeds the default max depth of 10.
         overly_nested = self._chain_schema(_MAX_SCHEMA_DEPTH + 2)
         with pytest.raises(ValidationError) as exc_info:
@@ -900,12 +902,51 @@ class TestHermesBuildPromptSchema:
         assert error.args[0] == expected
         assert error.suggestion == "Simplify your output schema to reduce nesting depth"
 
-    def test_build_prompt_schema_array_item_depth_parity(self) -> None:
-        """Array object items must not consume an extra depth level.
+    def test_nested_array_object_descriptions_preserved(self) -> None:
+        """Explicit descriptions must survive at every level of nested array<object> schemas."""
+        schema = {
+            "outer": OutputField(
+                type="array",
+                description="Outer array",
+                items=OutputField(
+                    type="object",
+                    description="Object item",
+                    properties={
+                        "inner": OutputField(
+                            type="array",
+                            description="Inner array",
+                            items=OutputField(
+                                type="object",
+                                description="Inner object",
+                                properties={
+                                    "name": OutputField(type="string", description="Name field"),
+                                },
+                            ),
+                        ),
+                    },
+                ),
+            )
+        }
+        result = _build_prompt_schema(schema)
+        assert result["outer"]["description"] == "Outer array"
+        assert result["outer"]["items"]["description"] == "Object item"
+        assert result["outer"]["items"]["properties"]["inner"]["description"] == "Inner array"
+        assert (
+            result["outer"]["items"]["properties"]["inner"]["items"]["description"]
+            == "Inner object"
+        )
+        assert (
+            result["outer"]["items"]["properties"]["inner"]["items"]["properties"]["name"][
+                "description"
+            ]
+            == "Name field"
+        )
 
-        Legacy Hermes passed the item's properties recursion the same depth as the
-        array field itself (depth+1 total). This pins that a chain reaching depth 10
-        inside an array item is accepted, while a chain reaching depth 11 raises.
+    def test_build_prompt_schema_array_item_depth_parity(self) -> None:
+        """Shared depth counting: for array<object>, properties inside the item start at depth 2.
+
+        A chain of 8 object levels inside an array<object> item (leaf at depth 10) is
+        accepted; a chain of 9 (leaf at depth 11) raises ValidationError.
         """
 
         def chain_in_array_item(levels: int) -> dict[str, OutputField]:
@@ -919,34 +960,41 @@ class TestHermesBuildPromptSchema:
                 )
             }
 
-        # _chain_schema(9) reaches depth 10 inside the array item: accepted.
-        _build_prompt_schema(chain_in_array_item(9))
+        # _chain_schema(8) reaches depth 10 inside the array item: accepted.
+        _build_prompt_schema(chain_in_array_item(8))
 
-        # _chain_schema(10) reaches depth 11: one level too deep.
+        # _chain_schema(9) reaches depth 11: one level too deep.
         with pytest.raises(ValidationError, match="exceeds maximum"):
-            _build_prompt_schema(chain_in_array_item(10))
+            _build_prompt_schema(chain_in_array_item(9))
 
     def test_build_prompt_schema_non_object_array_item_at_boundary_accepted(self) -> None:
-        """Non-object array items must not consume a depth level.
+        """Shared depth counting: every array item, including scalar items, consumes one level.
 
-        Requirement: legacy Hermes checked depth only when recursing into object
-        properties, so a chain reaching exactly _MAX_SCHEMA_DEPTH whose leaf is an
-        array of scalars (or an array of arrays) was accepted pre-refactor. The
-        shared builder must preserve that boundary: no error at depth 10, while a
-        chain one object level deeper still raises.
+        An object chain of 9 nested objects ending in scalar array fields has array items
+        at depth 10 (accepted); 10 nested objects pushes them to depth 11 (raises). A
+        pure chain of 10 nested arrays has its scalar leaf at depth 10 (accepted); 11
+        nested arrays raises.
         """
-        # 10 nested objects (depths 0..9) ending in non-object array fields at depth 10.
+        # 9 nested objects ending in scalar array fields: array items sit at depth 10.
         inner: dict[str, OutputField] = {
             "tags": OutputField(type="array", items=OutputField(type="string")),
-            "matrix": OutputField(
-                type="array", items=OutputField(type="array", items=OutputField(type="number"))
-            ),
         }
-        for _ in range(_MAX_SCHEMA_DEPTH):
+        for _ in range(_MAX_SCHEMA_DEPTH - 1):
             inner = {"nested": OutputField(type="object", properties=inner)}
         _build_prompt_schema(inner)
 
-        # One more object level pushes the object chain to depth 11: must raise.
+        # 10 nested objects push scalar array items to depth 11: raises.
         too_deep = {"nested": OutputField(type="object", properties=inner)}
         with pytest.raises(ValidationError, match="exceeds maximum"):
             _build_prompt_schema(too_deep)
+
+        # Pure array chain: 10 nested arrays accepted, 11 raises.
+        def nested_array_chain(levels: int) -> OutputField:
+            leaf: OutputField = OutputField(type="string")
+            for _ in range(levels):
+                leaf = OutputField(type="array", items=leaf)
+            return leaf
+
+        _build_prompt_schema({"matrix": nested_array_chain(_MAX_SCHEMA_DEPTH)})
+        with pytest.raises(ValidationError, match="exceeds maximum"):
+            _build_prompt_schema({"matrix": nested_array_chain(_MAX_SCHEMA_DEPTH + 1)})
