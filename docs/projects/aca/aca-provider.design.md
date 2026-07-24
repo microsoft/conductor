@@ -34,15 +34,16 @@ deferred (see Decision Status).
 
 **What reviewers are asked to approve now:** the **architecture direction** (a
 remote `aca` `AgentProvider` that delegates `execute()` to an in-sandbox runner,
-orchestrator on the host); the **credential model** (the provider forwards a
-single narrowly-scoped credential to the sandbox — recommended: a fine-grained
-*Copilot Requests* PAT, so trusted workloads run on your own Copilot capacity —
-with BYOK custom routing as the fallback and no mode switch); and the
-**sequencing** (a blocking Phase 0 transport spike gates the build; Alternative B
-may land first).
+orchestrator on the host); and the **sequencing** (a blocking Phase 0 transport
+spike gates the build; Alternative B may land first).
 The Phase 0 transport spike has **run and resolved** (Branch S; see DD3) — the
 transport branch and its two dependent capability values are no longer open and
-are included below for approval alongside everything else.
+are included below for approval alongside everything else. The **credential
+model** (DD4) is likewise no longer an open ask — it's **Accepted** and shipped
+(E8/E9): the provider forwards either a GitHub token or BYOK routing settings
+to the sandbox, recommended default a fine-grained *Copilot Requests* PAT so
+trusted workloads run on your own Copilot capacity, with BYOK custom routing
+as the fallback (endpoint credentials optional within it) and no mode switch.
 
 | Item | Status | Notes |
 |---|---|---|
@@ -62,13 +63,14 @@ Statuses: **Accepted** (settled), **Proposed** (up for approval now),
 **Resolved** (Phase 0 spike outcome, now settled), **Deferred** (out of scope or
 later).
 
-**What is the credential posture?** The provider forwards one narrowly-scoped
-credential to the sandbox (DD4) — recommended: a fine-grained *Copilot Requests*
-PAT, so trusted workloads run on your own Copilot capacity. Because that
-credential is readable inside the session, `aca` targets **trusted** workloads;
-keeping the credential entirely off the sandbox (a host-side broker) for
-untrusted/multi-tenant use is future work. The full model is stated in DD4 and
-Security Considerations.
+**What is the credential posture?** The provider forwards either a GitHub
+token or BYOK routing settings to the sandbox (DD4) — recommended: a
+fine-grained *Copilot Requests* PAT, so trusted workloads run on your own
+Copilot capacity. Because that token (or an optional BYOK endpoint
+credential) is readable inside the session, `aca` targets **trusted**
+workloads; keeping credentials entirely off the sandbox (a host-side broker)
+for untrusted/multi-tenant use is future work. The full model is stated in
+DD4 and Security Considerations.
 
 ## Background
 

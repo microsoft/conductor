@@ -18,21 +18,27 @@
 #      with the *Session Executor* role on the pool.
 #   4. Inner Copilot authentication: the in-sandbox runner drives a real
 #      CopilotProvider but cannot do interactive OAuth login inside a
-#      headless container, so the HOST must forward a credential (design
-#      DD4). Default (recommended): create a fine-grained GitHub PAT scoped
-#      to only the "Copilot Requests" permission and export it as
+#      headless container, so the HOST must forward either a GitHub
+#      token or BYOK routing settings (design DD4). Default
+#      (recommended): create a fine-grained GitHub PAT scoped to only
+#      the "Copilot Requests" permission and export it as
 #      COPILOT_GITHUB_TOKEN (GH_TOKEN / GITHUB_TOKEN also work) — no
 #      COPILOT_PROVIDER_* configuration required; the sandbox then runs on
-#      your own Copilot capacity. Fallback: BYOK custom routing via
-#      COPILOT_PROVIDER_BEARER_TOKEN or COPILOT_PROVIDER_API_KEY (with
-#      COPILOT_PROVIDER_BASE_URL). Either way the credential is delivered
-#      in-memory per request, never as a persisted sandbox secret — but it
-#      IS readable inside the session, so keep it narrowly scoped with a
-#      short expiry. This mechanism is only acceptable for TRUSTED
-#      workloads, not untrusted/multi-tenant use (see
-#      docs/providers/aca.md#security; off-sandbox isolation is future
-#      work). Without a credential, the sandbox's Copilot session has no
-#      way to authenticate and every agent turn fails. See
+#      your own Copilot capacity (the Copilot capacity of the GitHub
+#      account owning that token, independent of the Azure identity used
+#      to reach the pool). Fallback: BYOK custom routing, activated by
+#      COPILOT_PROVIDER_BASE_URL alone — COPILOT_PROVIDER_BEARER_TOKEN /
+#      COPILOT_PROVIDER_API_KEY are optional, only needed if the endpoint
+#      itself requires a credential. Either way, whatever is resolved
+#      (GitHub token or BYOK settings) is delivered in-memory per
+#      request, never as a persisted sandbox secret — but it IS
+#      readable inside the session, so keep it narrowly scoped with a
+#      short expiry. This mechanism is only
+#      acceptable for TRUSTED workloads, not untrusted/multi-tenant use
+#      (see docs/providers/aca.md#security; off-sandbox isolation is
+#      future work). Failure means neither a GitHub token nor a BYOK base
+#      URL is set — in that case the host fails while building the
+#      request, before the sandbox is ever contacted, not inside it. See
 #      docs/providers/aca.md#authentication.
 #   5. Set POOL_ENDPOINT below to your pool's management endpoint.
 #

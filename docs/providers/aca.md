@@ -72,8 +72,8 @@ Executor* role on the pool works — see
 The pool identity above only gets the host into the sandbox — it says
 nothing about the **in-container Copilot session** the runner drives on
 your behalf. That session cannot perform interactive OAuth login inside a
-headless container, so it needs its own credential, forwarded from the
-**host** on every request (see
+headless container, so the **host** resolves either a GitHub token or
+BYOK routing settings and forwards them on every request (see
 [Inner Copilot Authentication](#inner-copilot-authentication)).
 
 **Default: run on your own Copilot capacity.** Create a fine-grained
@@ -87,24 +87,35 @@ export COPILOT_GITHUB_TOKEN=<your fine-grained PAT>
 No `COPILOT_PROVIDER_*` configuration is required for this default path —
 the provider forwards the token in-memory to the sandbox's inner Copilot
 runtime, which authenticates against GitHub Copilot's own model routing
-(the same capacity your `az login`/CLI identity already has). `GH_TOKEN`
-and `GITHUB_TOKEN` are also recognized (in that priority order) for
-environments that already export one of those, but a dedicated
-`COPILOT_GITHUB_TOKEN` scoped to *Copilot Requests only* is recommended so
-you aren't forwarding a broader-scoped token than necessary into the
-sandbox.
+using **the Copilot capacity of the GitHub account that owns the
+forwarded token** — this is independent of the Azure identity from step 2
+(`az login`/`DefaultAzureCredential`), which only grants access to the
+pool itself. `GH_TOKEN` and `GITHUB_TOKEN` are also recognized (in that
+priority order) for environments that already export one of those, but a
+dedicated `COPILOT_GITHUB_TOKEN` scoped to *Copilot Requests only* is
+recommended so you aren't forwarding a broader-scoped token than
+necessary into the sandbox.
 
 **Fallback: BYOK custom routing.** If you need to route the sandbox at a
-custom OpenAI-compatible / Azure / Anthropic endpoint instead (as with the
-host's own [structured `runtime.provider`](../configuration.md)), export:
+custom OpenAI-compatible endpoint instead (as with the host's own
+[structured `runtime.provider`](../configuration.md)), export a base URL
+— it, not the presence of a credential, is what activates BYOK routing:
 
 ```bash
+export COPILOT_PROVIDER_BASE_URL=<your OpenAI-compatible endpoint>
 export COPILOT_PROVIDER_BEARER_TOKEN=<your Copilot-compatible token>
-# or: COPILOT_PROVIDER_API_KEY (+ COPILOT_PROVIDER_BASE_URL)
+# or: COPILOT_PROVIDER_API_KEY=<key>
 ```
 
-`COPILOT_PROVIDER_BASE_URL` (if set) always wins over a GitHub token, so a
-BYOK endpoint stays authoritative even when both are exported.
+`COPILOT_PROVIDER_BEARER_TOKEN` / `COPILOT_PROVIDER_API_KEY` alone (with
+`COPILOT_PROVIDER_BASE_URL` unset) do **not** activate BYOK routing — the
+provider falls through to the GitHub-token default above. Unlike the
+host's own [structured `runtime.provider`](../configuration.md), `aca`
+does not forward a provider `type` or `wire_api`; the runner's inner
+`CopilotProvider` always treats the forwarded endpoint as
+OpenAI-compatible. `COPILOT_PROVIDER_BASE_URL` (if set) always wins over
+a GitHub token, so a BYOK endpoint stays authoritative even when both are
+exported.
 
 **Trusted-use posture:** whichever credential you export, it *does* enter
 the sandbox and is readable by a model-driven shell there — ACA offers no
@@ -116,9 +127,11 @@ revocable. This mechanism is acceptable only for **trusted** workloads
 multi-tenant use. Keeping the credential entirely off the sandbox (a
 host-side broker) is future work; see [Security](#security).
 
-Skipping this step is not a silent no-op: every agent turn in the sandbox
-fails because the in-container `CopilotProvider` has no credential to
-construct a session with.
+Skipping this step is not a silent no-op, but the failure surfaces
+**host-side, before the sandbox is ever contacted**: the host raises
+`ProviderError` while building the `/execute` request (no credential to
+forward), so the request is never dispatched rather than failing inside
+the sandbox.
 
 ### 4. Provision a pool (bring-your-own — Conductor does not do this for you)
 
@@ -397,21 +410,28 @@ The in-container runner wraps a real `CopilotProvider` that itself needs
 model-backend credentials, and it cannot fall back to the normal
 interactive OAuth device-code flow — there is no terminal/browser to
 complete it from inside a headless sandbox session. Instead, the **host**
-resolves one credential per request and forwards it to the runner, with
-no `credential_mode` switch to configure — precedence mirrors the
-Copilot CLI's own auth resolution (design *DD4*):
+resolves either a GitHub token or BYOK routing settings per request and
+forwards them to the runner, with no `credential_mode` switch to
+configure — precedence mirrors the Copilot CLI's own auth resolution
+(design *DD4*):
 
 1. **BYOK custom routing** — if `COPILOT_PROVIDER_BASE_URL` is set on the
    host, it always wins: the base URL plus optional
    `COPILOT_PROVIDER_API_KEY` / `COPILOT_PROVIDER_BEARER_TOKEN` are
-   forwarded unchanged.
+   forwarded unchanged. `COPILOT_PROVIDER_API_KEY` / `_BEARER_TOKEN` alone,
+   without `COPILOT_PROVIDER_BASE_URL`, do **not** activate this path —
+   the resolver falls through to step 2. Only `base_url` and an optional
+   credential are forwarded — no provider `type` or `wire_api`, so the
+   runner's inner `CopilotProvider` always treats the endpoint as
+   OpenAI-compatible.
 2. **Default: your own Copilot capacity** — otherwise, if a GitHub token
    is present (`COPILOT_GITHUB_TOKEN` → `GH_TOKEN` → `GITHUB_TOKEN`, first
    non-empty wins), it is forwarded as `github_token` and the sandbox's
    inner Copilot runtime authenticates against **GitHub Copilot's own
-   model routing** — the same capacity your host identity already has.
-   **Recommended: a fine-grained PAT scoped to only the *Copilot
-   Requests* permission.**
+   model routing**, using the Copilot capacity of **the GitHub account
+   that owns the forwarded token** (independent of the Azure identity used
+   to reach the pool). **Recommended: a fine-grained PAT scoped to only
+   the *Copilot Requests* permission.**
 3. **Neither is set** → the provider fails loudly with setup guidance
    rather than running the sandbox unauthenticated or silently degraded.
 
@@ -419,19 +439,19 @@ Copilot CLI's own auth resolution (design *DD4*):
 # Default (Copilot capacity) — no COPILOT_PROVIDER_* required:
 export COPILOT_GITHUB_TOKEN=<fine-grained PAT, "Copilot Requests" only>
 
-# Fallback (BYOK custom routing):
+# Fallback (BYOK custom routing) — COPILOT_PROVIDER_BASE_URL is required;
+# credentials alone do not activate this path:
+export COPILOT_PROVIDER_BASE_URL=<url>
 export COPILOT_PROVIDER_BEARER_TOKEN=<token>
-# or
-export COPILOT_PROVIDER_API_KEY=<key>
-export COPILOT_PROVIDER_BASE_URL=<url>   # required alongside API_KEY
+# or: export COPILOT_PROVIDER_API_KEY=<key>
 ```
 
 `AcaRuntimeProvider._resolve_inner_provider_settings()` implements this
 precedence and forwards the result as `inner_provider_settings` on the
-`/execute` request body — the credential is delivered **in-memory**
-(request body → the inner runtime's `create_session`/`resume_session`
-call), never written to a sandbox environment variable or persisted as a
-pool secret. The runner constructs
+`/execute` request body — the resolved GitHub token or BYOK routing
+settings are delivered **in-memory** (request body → the inner runtime's
+`create_session`/`resume_session` call), never written to a sandbox
+environment variable or persisted as a pool secret. The runner constructs
 `ProviderSettings(name="copilot", **inner_provider_settings)` (BYOK case)
 or passes `github_token` straight through to its inner `CopilotProvider`
 (default case) instead of attempting an impossible interactive login.
@@ -447,8 +467,10 @@ long-lived personal token or a broadly-scoped API key. This mechanism is
 not safe for untrusted or multi-tenant use; keeping the credential
 entirely off the sandbox (a host-side broker/relay) is future work — see
 [Security](#security). If neither a GitHub token nor a BYOK endpoint is
-configured, every in-sandbox agent turn fails outright — there is no
-silent degraded mode.
+configured, the failure happens **host-side**: `_resolve_inner_provider_settings()`
+raises `ProviderError` while `_build_request()` constructs the `/execute`
+body, before any request reaches the sandbox — there is no silent
+degraded mode and no in-sandbox failure.
 
 ## Workflow Configuration
 
@@ -578,15 +600,17 @@ lifetime** instead of trying to keep it out entirely:
   and a short expiry plus central revocability bounds a leak — this is
   what makes the default path acceptable for **trusted** workloads
   (workflows and repos you control).
-- **Fallback: BYOK custom routing** (`COPILOT_PROVIDER_BASE_URL` +
-  `COPILOT_PROVIDER_API_KEY` / `COPILOT_PROVIDER_BEARER_TOKEN`) — same
-  posture applies; use a scoped, short-lived credential for the custom
+- **Fallback: BYOK custom routing** (`COPILOT_PROVIDER_BASE_URL`, which
+  alone activates it — `COPILOT_PROVIDER_API_KEY` / `COPILOT_PROVIDER_BEARER_TOKEN`
+  are optional and only needed when the endpoint itself requires
+  credentials, e.g. an unauthenticated local gateway needs neither). When
+  a credential is supplied, use a scoped, short-lived one for the custom
   endpoint, not a long-lived master key.
-- **Never** bake a long-lived `GITHUB_TOKEN` / `ANTHROPIC_API_KEY` as a
-  pool secret or image environment variable — this is the named
-  anti-pattern and exposes the whole pool indefinitely. The credential is
-  always delivered in-memory, per request, never as a persisted sandbox
-  environment variable.
+- **Never** bake a long-lived `COPILOT_GITHUB_TOKEN` / `COPILOT_PROVIDER_API_KEY`
+  / `COPILOT_PROVIDER_BEARER_TOKEN` as a pool secret or image environment
+  variable — this is the named anti-pattern and exposes the whole pool
+  indefinitely. The credential is always delivered in-memory, per
+  request, never as a persisted sandbox environment variable.
 - This posture is **trusted-use only**. ACA offers no per-session secret
   isolation and no per-destination egress allowlist, so it is not safe
   for untrusted or multi-tenant workloads. Keeping the credential
@@ -652,16 +676,19 @@ Stdio MCP binaries must be baked into the runner image (or an image
 remote pool. See
 [Building / Extending the Runner Image](#building--extending-the-runner-image).
 
-### Every agent turn fails inside the sandbox (no pool/auth error)
+### Missing inner Copilot credential
 
 Confirm the **inner** Copilot credential is set — `COPILOT_GITHUB_TOKEN`
 (or `GH_TOKEN`/`GITHUB_TOKEN`), or the BYOK fallback
-(`COPILOT_PROVIDER_BASE_URL` + `COPILOT_PROVIDER_API_KEY`/
-`COPILOT_PROVIDER_BEARER_TOKEN`) — on the host, not just the pool's
-`az login`. These are two separate auth layers; see
-[Inner Copilot Authentication](#inner-copilot-authentication). Without
-one of these, the in-container `CopilotProvider` has no credential and
-cannot construct a session.
+`COPILOT_PROVIDER_BASE_URL` (`COPILOT_PROVIDER_API_KEY`/
+`COPILOT_PROVIDER_BEARER_TOKEN` are optional, only needed when the
+endpoint itself requires a credential) — on the host, not just the
+pool's `az login`. These are two separate auth layers; see
+[Inner Copilot Authentication](#inner-copilot-authentication). Failure
+is having **neither** a GitHub token **nor** a BYOK base URL set — in
+that case the host raises `ProviderError` while building the
+`/execute` request — before the sandbox is ever contacted, not inside
+it.
 
 ### Stopping the workflow doesn't stop the sandbox from running
 

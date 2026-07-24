@@ -903,11 +903,13 @@ forwarding neither) are unaffected by this fix — the runner-side seam
   - [x] aca.md's default path is a *Copilot Requests* PAT (Copilot capacity), no
     `COPILOT_PROVIDER_*` required; BYOK documented as the fallback.
   - [x] DD4 shows **Accepted**; the example validates.
-
-- **Acceptance Criteria:**
-  - [ ] aca.md's default path is a *Copilot Requests* PAT (Copilot capacity), no
-    `COPILOT_PROVIDER_*` required; BYOK documented as the fallback.
-  - [ ] DD4 shows **Accepted**; the example validates.
+- **Completion note:** A follow-up pass softened remaining absolute
+  "a credential is always forwarded" phrasing in `aca.md`, the design doc's
+  Decision Status & Review Ask section, and `examples/aca-coding-agent.yaml`'s
+  prerequisite comment — replacing it with "either a GitHub token or BYOK
+  routing settings" to stay consistent with BYOK's optional endpoint
+  credential. Also removed a duplicated, stale copy of this epic's own
+  Acceptance Criteria block left over from an earlier edit pass.
 
 ---
 
