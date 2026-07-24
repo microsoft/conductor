@@ -1,8 +1,10 @@
 """Unit tests for the CopilotProvider implementation."""
 
 import contextlib
+import logging
+import os
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -2607,3 +2609,186 @@ class TestCopilotProviderResolvedModel:
             full_enabled=False,
         )
         assert result.resolved_model == self._RESOLVED_MODEL_FROM_SDK
+
+
+# ---------------------------------------------------------------------------
+# Epic E9 (#284): forward a ``github_token`` to the Copilot SDK in memory
+# ---------------------------------------------------------------------------
+
+
+class TestGithubTokenSessionAuth:
+    """A forwarded ``github_token`` must be delivered to the SDK via the
+    ``create_session`` / ``resume_session`` ``github_token`` parameter — the
+    in-memory ``gitHubToken`` RPC payload — never via the ``CopilotClient``
+    constructor. The SDK forwards a constructor-level ``github_token`` to the
+    spawned runtime as a ``COPILOT_SDK_AUTH_TOKEN`` environment variable,
+    which does not meet the in-memory delivery requirement (ACA sandbox
+    auth, DD4).
+    """
+
+    @staticmethod
+    def _fake_session(session_id: str = "session-xyz") -> AsyncMock:
+        session = AsyncMock()
+        session.session_id = session_id
+        session.disconnect = AsyncMock()
+
+        def _fake_on(callback: Any) -> None:
+            session._callback = callback
+
+        session.on = _fake_on
+
+        async def _fake_send(msg: Any) -> None:
+            evt = MagicMock()
+            evt.type = MagicMock()
+            evt.type.value = "session.idle"
+            session._callback(evt)
+
+        session.send = _fake_send
+        return session
+
+    @pytest.mark.asyncio
+    async def test_github_token_forwarded_to_create_session(self) -> None:
+        """execute() forwards ``github_token`` to ``create_session`` as an
+        in-memory payload field."""
+        mock_client = AsyncMock()
+        mock_client.create_session = AsyncMock(return_value=self._fake_session())
+
+        provider = CopilotProvider(github_token="gh-token-value")
+        provider._client = mock_client
+        provider._started = True
+
+        agent = AgentDef(name="researcher", model="gpt-4o", prompt="Test prompt")
+
+        with (
+            patch("conductor.cli.app.is_verbose", return_value=False),
+            patch("conductor.cli.app.is_full", return_value=False),
+        ):
+            await provider.execute(agent, {}, "Do research")
+
+        _, kwargs = mock_client.create_session.call_args
+        assert kwargs["github_token"] == "gh-token-value"
+
+    @pytest.mark.asyncio
+    async def test_no_github_token_omits_key_from_create_session(self) -> None:
+        """No ``github_token`` supplied → the key is absent entirely (BYOK /
+        logged-in-CLI paths unchanged)."""
+        mock_client = AsyncMock()
+        mock_client.create_session = AsyncMock(return_value=self._fake_session())
+
+        provider = CopilotProvider()
+        provider._client = mock_client
+        provider._started = True
+
+        agent = AgentDef(name="researcher", model="gpt-4o", prompt="Test prompt")
+
+        with (
+            patch("conductor.cli.app.is_verbose", return_value=False),
+            patch("conductor.cli.app.is_full", return_value=False),
+        ):
+            await provider.execute(agent, {}, "Do research")
+
+        _, kwargs = mock_client.create_session.call_args
+        assert "github_token" not in kwargs
+
+    @pytest.mark.asyncio
+    async def test_github_token_forwarded_to_resume_session(self) -> None:
+        """Resuming a prior session also forwards ``github_token`` in memory."""
+        mock_client = AsyncMock()
+        mock_client.resume_session = AsyncMock(return_value=self._fake_session("resumed"))
+        mock_client.create_session = AsyncMock()  # must not be called
+
+        provider = CopilotProvider(github_token="gh-token-value")
+        provider._client = mock_client
+        provider._started = True
+        provider.set_resume_session_ids({"researcher": "sess-old-123"})
+
+        agent = AgentDef(name="researcher", model="gpt-4o", prompt="Test prompt")
+
+        with (
+            patch("conductor.cli.app.is_verbose", return_value=False),
+            patch("conductor.cli.app.is_full", return_value=False),
+        ):
+            await provider.execute(agent, {}, "Continue research")
+
+        mock_client.resume_session.assert_called_once_with(
+            "sess-old-123",
+            on_permission_request=CopilotProvider._default_permission_handler,
+            working_directory=os.getcwd(),
+            large_output={"enabled": True, "max_size_bytes": 50000},
+            github_token="gh-token-value",
+        )
+        mock_client.create_session.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_github_token_forwarded_to_dialog_create_session(self) -> None:
+        """Dialog turns forward ``github_token`` the same way agent sessions do."""
+        captured: dict[str, Any] = {}
+
+        class _DialogSession:
+            def on(self, callback: Any) -> None:
+                self._callback = callback
+
+            async def send(self, msg: Any) -> None:
+                evt = MagicMock()
+                evt.type = MagicMock()
+                evt.type.value = "session.idle"
+                self._callback(evt)
+
+            async def disconnect(self) -> None:
+                return None
+
+        class _Client:
+            async def create_session(self, **kwargs: Any) -> _DialogSession:
+                captured["kwargs"] = kwargs
+                return _DialogSession()
+
+        provider = CopilotProvider(github_token="gh-token-value")
+        provider._client = _Client()
+        provider._started = True
+
+        await provider.execute_dialog_turn("sys", "hi", [])
+        assert captured["kwargs"]["github_token"] == "gh-token-value"
+
+    @pytest.mark.asyncio
+    async def test_github_token_never_forwarded_to_copilot_client_constructor(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression guard: the token must never reach the ``CopilotClient``
+        constructor, which the SDK exports as the ``COPILOT_SDK_AUTH_TOKEN``
+        environment variable on the spawned runtime rather than delivering it
+        in memory."""
+        import conductor.providers.copilot as copilot_mod
+
+        monkeypatch.delenv("COPILOT_PROVIDER_RUNTIME_URL", raising=False)
+        client = object()
+        client_factory = MagicMock(return_value=client)
+        monkeypatch.setattr(copilot_mod, "CopilotClient", client_factory)
+
+        provider = CopilotProvider(github_token="gh-token-value")
+        assert provider._build_client() is client
+        client_factory.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_github_token_not_leaked_in_log_records(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The raw token value must never appear in a log record emitted
+        while executing a session with a forwarded ``github_token``."""
+        mock_client = AsyncMock()
+        mock_client.create_session = AsyncMock(return_value=self._fake_session())
+
+        provider = CopilotProvider(github_token="super-secret-gh-token")
+        provider._client = mock_client
+        provider._started = True
+
+        agent = AgentDef(name="researcher", model="gpt-4o", prompt="Test prompt")
+
+        with (
+            caplog.at_level(logging.DEBUG),
+            patch("conductor.cli.app.is_verbose", return_value=False),
+            patch("conductor.cli.app.is_full", return_value=False),
+        ):
+            await provider.execute(agent, {}, "Do research")
+
+        for record in caplog.records:
+            assert "super-secret-gh-token" not in record.getMessage()

@@ -263,6 +263,7 @@ class CopilotProvider(AgentProvider):
         default_context_tier: ContextTier | None = None,
         provider_settings: ProviderSettings | None = None,
         tool_output: ToolOutputConfig | None = None,
+        github_token: str | None = None,
     ) -> None:
         """Initialize the Copilot provider.
 
@@ -303,6 +304,23 @@ class CopilotProvider(AgentProvider):
             tool_output: MCP tool result output-size configuration. Defines the
                 per-result character limit and spill-to-file behavior for MCP
                 tool outputs. ``None`` means the default configuration is used.
+            github_token: GitHub token used to authenticate each session with
+                the Copilot SDK in memory, via the ``github_token`` parameter
+                on ``create_session`` / ``resume_session`` (the SDK's
+                ``gitHubToken`` connect payload sent over the RPC channel),
+                so the runtime uses GitHub Copilot's own model routing
+                (Copilot capacity) rather than a custom endpoint. This is
+                deliberately *not* passed to the ``CopilotClient`` constructor:
+                the SDK forwards a constructor-level ``github_token`` to the
+                spawned runtime as a ``COPILOT_SDK_AUTH_TOKEN`` environment
+                variable, which is not the in-memory delivery this provider
+                requires. Applied to every session-creation call site (main
+                agent execution, resume, and dialog turns) except when
+                connecting to an existing runtime via ``runtime_url`` — that
+                path authenticates via the external runtime's own connection
+                instead. ``None`` preserves the existing default behavior
+                (the SDK's own credential resolution, e.g. a logged-in
+                ``copilot`` CLI session).
         """
         self._client: Any = None  # Will hold Copilot SDK client
         self._mock_handler = mock_handler
@@ -331,6 +349,7 @@ class CopilotProvider(AgentProvider):
         self._abort_supported: bool | None = None
         self._provider_settings = provider_settings
         self._tool_output_config = tool_output or ToolOutputConfig()
+        self._github_token = github_token
         self._warn_custom_routing_default_model()
 
     @staticmethod
@@ -530,6 +549,28 @@ class CopilotProvider(AgentProvider):
         provider_cfg = self._resolve_sdk_provider_config()
         if provider_cfg is not None:
             session_kwargs["provider"] = provider_cfg
+
+    def _apply_github_token(self, session_kwargs: dict[str, Any]) -> None:
+        """Attach the forwarded GitHub token to a session-creation call.
+
+        Sets ``session_kwargs["github_token"]`` so the SDK includes it in the
+        ``gitHubToken`` field of the in-memory ``create_session`` /
+        ``resume_session`` RPC payload — per-session authentication that
+        never touches the spawned runtime's environment. Called from every
+        session-creation site (main agent execution, resume, and dialog
+        turns) so all sessions for this provider instance authenticate the
+        same way.
+
+        No-op when no token was supplied, or when connecting to an existing
+        runtime via ``runtime_url``: that runtime is already authenticated by
+        its own out-of-band connection and this provider does not own its
+        credentials.
+        """
+        if not self._github_token:
+            return
+        if self._resolve_runtime_connection() is not None:
+            return
+        session_kwargs["github_token"] = self._github_token
 
     def _resolve_runtime_connection(self) -> tuple[str, str | None] | None:
         """Resolve whether to connect to an already-running Copilot runtime.
@@ -967,6 +1008,11 @@ class CopilotProvider(AgentProvider):
             # when runtime.provider opted into it.
             self._apply_provider_config(session_kwargs)
 
+            # Forward a GitHub token in memory (create_session's github_token
+            # param) so the session authenticates against Copilot's own
+            # model routing when one was supplied (ACA sandbox auth, E9).
+            self._apply_github_token(session_kwargs)
+
             # Forward large-output handling configuration to the SDK.
             session_kwargs["large_output"] = self._large_output_config()
 
@@ -1041,6 +1087,7 @@ class CopilotProvider(AgentProvider):
                         if self._mcp_servers:
                             resume_kwargs["mcp_servers"] = self._mcp_servers_for_cwd(resolved_cwd)
                         resume_kwargs["large_output"] = self._large_output_config()
+                        self._apply_github_token(resume_kwargs)
                         session = await self._client.resume_session(resume_sid, **resume_kwargs)
                         logger.info(
                             f"Resumed Copilot session {resume_sid} for agent '{agent.name}'"
@@ -2181,6 +2228,18 @@ class CopilotProvider(AgentProvider):
         ``stop()`` leaves the externally-owned server running, so Conductor
         reuses the authenticated runtime process while creating a separate SDK
         session for each agent.
+
+        Otherwise a nested runtime is spawned via a plain, argument-free
+        ``CopilotClient()``. A ``github_token`` supplied at construction is
+        deliberately *not* passed here: the SDK's constructor-level
+        ``github_token`` is exported to the spawned runtime as a
+        ``COPILOT_SDK_AUTH_TOKEN`` environment variable, not delivered
+        in-memory. Instead, the token is forwarded per-session via
+        ``_apply_github_token`` on each ``create_session`` / ``resume_session``
+        call, which sends it as the in-memory ``gitHubToken`` RPC payload so
+        the runtime authenticates with it and, with no ``base_url``
+        configured, uses Copilot's own model routing (Copilot capacity)
+        rather than a BYOK endpoint.
         """
         connection = self._resolve_runtime_connection()
         if connection is None:
@@ -2421,6 +2480,9 @@ class CopilotProvider(AgentProvider):
             # Honor the same custom provider routing as agent sessions so
             # dialog turns hit the same endpoint as agent execution.
             self._apply_provider_config(dialog_kwargs)
+
+            # Forward a GitHub token in memory, same as agent sessions (E9).
+            self._apply_github_token(dialog_kwargs)
 
             # Forward large-output handling configuration to the SDK.
             dialog_kwargs["large_output"] = self._large_output_config()

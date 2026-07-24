@@ -240,7 +240,7 @@ Covers Epics **E1–E10**.
 | `src/conductor/providers/factory.py` | Add `"aca"` to `ProviderType` (`:27`); add an `aca` arm to `create_provider()` (`:86`) that checks `azure-identity` availability and wires `pool_endpoint`/`api_version`/`inner_provider`/`identifier_scope` from `provider_settings`. *(Key Components §4)* |
 | `src/conductor/providers/capabilities.py` | Add `"aca": "conductor.providers.aca:AcaRuntimeProvider"` to `_PROVIDER_CLASS_PATHS` (`:222`) so `get_capabilities("aca")` resolves under `validate` without instantiation. *(FR5)* |
 | `src/conductor/providers/base.py` | Add optional `session_seconds: float | None = None` to `AgentOutput` (`:66`) for FR7 (E6; contingent on OQ#2). |
-| `src/conductor/providers/copilot.py` | Plumb a `github_token` through `CopilotProvider` to `CopilotClient(github_token=…)` (in-memory `gitHubToken` connect payload) so the sandbox's inner runtime authenticates against Copilot's own model routing (E9; DD4). |
+| `src/conductor/providers/copilot.py` | Plumb a `github_token` through `CopilotProvider` to `create_session`/`resume_session`'s `github_token` parameter (in-memory `gitHubToken` RPC payload) so the sandbox's inner runtime authenticates against Copilot's own model routing (E9; DD4). |
 | `src/conductor/engine/workflow.py` | Record a distinct `"<agent> (sandbox)"` usage row when `output.session_seconds` is set, at the main-loop, parallel-group, and for-each `record()` sites (`:3851`, `:4927`, `:5424`). *(FR7; OQ#2)* |
 | `src/conductor/engine/usage.py` | If needed by OQ#2, a helper to record a session-seconds row (cost `None`); otherwise reuse `record()` with a synthetic `AgentOutput`. |
 | `pyproject.toml` | Add `[project.optional-dependencies] aca = ["azure-identity>=…"]` (`httpx`/`fastapi`/`uvicorn` are already base deps, `:43–46`). Optionally exclude the runner from the wheel (OQ#4). |
@@ -813,17 +813,77 @@ introduced here.
   runtime **in memory** so it authenticates against Copilot's own model routing
   (Copilot capacity), not a BYOK endpoint (*DD4*; *Key Components §2*).
 - **Prerequisites:** E8 (host forwards `github_token`), E4 (runner).
+- **Status:** DONE
 
 | Task ID | Type | Description | Files | Status |
 |---|---|---|---|---|
-| E9-T1 | IMPL | Plumb a `github_token` through `CopilotProvider` to `CopilotClient(github_token=…)` (the SDK's in-memory `gitHubToken` connect payload) so the runtime authenticates with it and — with no `base_url` set — uses Copilot's own model routing. | `src/conductor/providers/copilot.py` | TO DO |
-| E9-T2 | IMPL | In the runner's `_InnerProviderCache`, consume `inner_provider_settings["github_token"]` and construct the inner `CopilotProvider` so the token reaches `CopilotClient` in memory (request body → runtime, not written to a sandbox env var by default). | `src/conductor/aca_runner/server.py` | TO DO |
-| E9-T3 | TEST | Runner + provider: a forwarded `github_token` reaches `CopilotClient(github_token=…)` with no `base_url` (Copilot routing); a BYOK settings dict still routes via `base_url`; the token is redacted in logs/events. | `tests/test_providers/test_copilot.py`, `tests/test_aca_runner/test_server.py` | TO DO |
+| E9-T1 | IMPL | Plumb a `github_token` through `CopilotProvider` to `create_session`/`resume_session`'s `github_token` parameter (the SDK's in-memory `gitHubToken` RPC payload) so the runtime authenticates with it and — with no `base_url` set — uses Copilot's own model routing. | `src/conductor/providers/copilot.py` | DONE |
+| E9-T2 | IMPL | In the runner's `_InnerProviderCache`, consume `inner_provider_settings["github_token"]` and construct the inner `CopilotProvider` so the token reaches the SDK in memory (request body → runtime, not written to a sandbox env var by default). | `src/conductor/aca_runner/server.py` | DONE |
+| E9-T3 | TEST | Runner + provider: a forwarded `github_token` reaches `create_session`/`resume_session` with `github_token=…` and no `base_url` (Copilot routing); the token is never passed to the `CopilotClient` constructor (which would leak into a `COPILOT_SDK_AUTH_TOKEN` env var instead of staying in memory); a BYOK settings dict still routes via `base_url`; the token is redacted in logs/events. | `tests/test_providers/test_copilot.py`, `tests/test_providers/test_copilot_provider_routing.py`, `tests/test_aca_runner/test_server.py` | DONE |
 
 - **Acceptance Criteria:**
-  - [ ] A forwarded GitHub token drives the inner runtime on Copilot capacity,
+  - [x] A forwarded GitHub token drives the inner runtime on Copilot capacity,
     delivered in memory (not an env var).
-  - [ ] BYOK path unchanged; event/output parity preserved (DD2).
+  - [x] BYOK path unchanged; event/output parity preserved (DD2).
+
+`CopilotProvider.__init__` gained a new `github_token: str | None = None`
+parameter (stored as `self._github_token`), documented alongside
+`provider_settings` in the constructor docstring. A prior version of this
+epic forwarded the token to `CopilotClient(github_token=self._github_token)`
+on the nested-spawn path — but the installed SDK treats a
+*constructor-level* `github_token` as a process-spawn option: it is exported
+to the spawned runtime's environment as `COPILOT_SDK_AUTH_TOKEN`
+(`copilot/client.py` `_build_spawn_env`), which is not in-memory delivery and
+does not satisfy DD4. This has been corrected: `_build_client()` now always
+calls the plain, argument-free `CopilotClient()` on the nested-spawn path
+(`_resolve_runtime_connection()` returns `None`), and a new
+`_apply_github_token(session_kwargs)` helper — mirroring the existing
+`_apply_provider_config` pattern — sets `session_kwargs["github_token"]` on
+every session-creation call site (main agent execution's `create_session`,
+resume's `resume_session`, and dialog turns' `create_session`) whenever a
+token was supplied. The SDK forwards a `create_session`/`resume_session`-level
+`github_token` as the `gitHubToken` field of the in-memory RPC payload sent
+over the existing stdio/socket channel to the runtime — never touching the
+process environment. `_apply_github_token` is a no-op when no token was
+supplied, and also a no-op when connecting to an *existing* runtime via
+`runtime_url`: that path authenticates through the external runtime's own
+out-of-band connection, so the token has nothing to attach to there.
+
+In the runner, `_InnerProviderCache.get()` now pops `"github_token"` out of
+`inner_provider_settings` (unwrapping it from `SecretStr` if the request's
+`_redact_inner_provider_secrets` validator already wrapped it, per E8) before
+building the BYOK `ProviderSettings` from whatever remains, then forwards
+the popped value to the new `CopilotProvider(..., github_token=...)` kwarg.
+A `github_token`-only credential therefore builds `provider_settings=None`
+(no `base_url` routing) with the token flowing straight to the inner SDK
+session payload in memory; a BYOK-only dict (`base_url`/`api_key`/`bearer_token`)
+still builds `ProviderSettings` exactly as before with `github_token=None`.
+No sandbox environment variable is written in either case — the credential
+travels only in the request body → the in-process `CopilotProvider` /
+`create_session` RPC payload. The existing `_key_for` cache-key
+hashing (E8 review fix) already treated `github_token` as an opaque dict
+value indistinguishable from any other credential key, so no change was
+needed there for the field to stay out of the long-lived `self._key`
+cache attribute in plaintext.
+
+Tests: `tests/test_providers/test_copilot_provider_routing.py`'s
+`TestGithubTokenAuth` class now asserts against the `_build_client()` /
+`_apply_github_token()` seams directly — including a regression guard that
+`CopilotClient` is always constructed with no arguments regardless of
+`github_token`, and a combined BYOK-plus-token case showing `base_url`
+routing and the in-memory token coexist independently.
+`tests/test_providers/test_copilot.py` gained a new
+`TestGithubTokenSessionAuth` class that drives `execute()` /
+`execute_dialog_turn()` / resume end-to-end against fake SDK clients and
+asserts the literal `create_session`/`resume_session` call kwargs include
+`github_token=...`, that it's absent when unset, and that no log record
+emitted during execution contains the raw token value.
+`tests/test_aca_runner/test_server.py`'s `_FakeCopilotProvider` and
+`TestExecuteInnerProviderCredentials` tests (a `github_token`-only credential
+forwarded with `provider_settings is None`; a BYOK dict still building
+`provider_settings` with `github_token is None`; no `inner_provider_settings`
+forwarding neither) are unaffected by this fix — the runner-side seam
+(`CopilotProvider(..., github_token=...)`) was already correct.
 
 ### E10 — Docs: default the Quick Start to Copilot capacity
 - **Goal:** Rewrite `docs/providers/aca.md` so the recommended, default path is a

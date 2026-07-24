@@ -35,11 +35,13 @@ class _FakeCopilotProvider:
         mcp_servers: dict[str, Any] | None = None,
         provider_settings: Any | None = None,
         tool_output: Any | None = None,
+        github_token: str | None = None,
         **kwargs: Any,
     ) -> None:
         self.mcp_servers = mcp_servers
         self.provider_settings = provider_settings
         self.tool_output = tool_output
+        self.github_token = github_token
         self.close = AsyncMock(return_value=None)
         self.execute_calls: list[dict[str, Any]] = []
         self.execute_error: Exception | None = None
@@ -252,6 +254,55 @@ class TestExecuteInnerProviderCredentials:
         response = client.post("/execute", json=_execute_body(inner_provider="claude-agent-sdk"))
         assert response.status_code >= 400
         assert _FakeCopilotProvider.instances == []
+
+    def test_github_token_forwarded_to_copilot_provider_with_no_provider_settings(
+        self, client: TestClient
+    ) -> None:
+        """Epic E9: a `github_token`-only credential (Copilot-capacity auth,
+        DD4) is forwarded to `CopilotProvider(github_token=...)` and does NOT
+        build a BYOK `ProviderSettings` (no `base_url` routing)."""
+        response = client.post(
+            "/execute",
+            json=_execute_body(inner_provider_settings={"github_token": "gh-forwarded-token"}),
+        )
+        assert response.status_code == 200
+        _parse_ndjson(response.text)
+
+        instance = _FakeCopilotProvider.instances[0]
+        assert instance.github_token == "gh-forwarded-token"
+        assert instance.provider_settings is None
+
+    def test_byok_settings_still_route_via_provider_settings_with_no_github_token(
+        self, client: TestClient
+    ) -> None:
+        """BYOK path unchanged (E9 acceptance criteria): `base_url`/`bearer_token`
+        still build `ProviderSettings` and `github_token` stays unset."""
+        response = client.post(
+            "/execute",
+            json=_execute_body(
+                inner_provider_settings={
+                    "base_url": "http://localhost:11434/v1",
+                    "bearer_token": "byok-token-value",
+                }
+            ),
+        )
+        assert response.status_code == 200
+        _parse_ndjson(response.text)
+
+        instance = _FakeCopilotProvider.instances[0]
+        assert instance.github_token is None
+        assert instance.provider_settings is not None
+        assert instance.provider_settings.base_url == "http://localhost:11434/v1"
+        assert instance.provider_settings.bearer_token.get_secret_value() == "byok-token-value"
+
+    def test_no_inner_provider_settings_forwards_no_github_token(self, client: TestClient) -> None:
+        response = client.post("/execute", json=_execute_body(inner_provider_settings=None))
+        assert response.status_code == 200
+        _parse_ndjson(response.text)
+
+        instance = _FakeCopilotProvider.instances[0]
+        assert instance.github_token is None
+        assert instance.provider_settings is None
 
 
 class TestExecuteValidatesBeforeStreaming:

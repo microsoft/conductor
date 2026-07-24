@@ -280,12 +280,24 @@ class _InnerProviderCache:
             # host's `AcaRuntimeProvider._resolve_inner_provider_settings`
             # (epic E8, DD4): either BYOK `base_url`/`api_key`/`bearer_token`
             # (the existing Copilot custom-routing fields, unchanged), or a
-            # `github_token` for Copilot-capacity auth. Wiring `github_token`
-            # into the inner `CopilotProvider`'s actual authentication is E9 —
-            # this is the seam that change would touch.
+            # `github_token` for Copilot-capacity auth. `github_token` isn't a
+            # `ProviderSettings` field (it authenticates the SDK client itself,
+            # not per-session model routing), so it's popped out here and
+            # forwarded to `CopilotProvider`'s own `github_token` param (E9),
+            # which in turn passes it in memory on each `create_session` /
+            # `resume_session` call (see `CopilotProvider._apply_github_token`)
+            # rather than at `CopilotClient` construction. The remaining dict
+            # (if any) still builds the BYOK `ProviderSettings`, unchanged.
+            remaining_settings = dict(inner_provider_settings) if inner_provider_settings else {}
+            github_token_value = remaining_settings.pop("github_token", None)
+            github_token = (
+                github_token_value.get_secret_value()
+                if isinstance(github_token_value, SecretStr)
+                else github_token_value
+            )
             provider_settings = (
-                ProviderSettings(name="copilot", **inner_provider_settings)
-                if inner_provider_settings
+                ProviderSettings(name="copilot", **remaining_settings)
+                if remaining_settings
                 else None
             )
             tool_output_config = ToolOutputConfig(**tool_output) if tool_output else None
@@ -293,6 +305,7 @@ class _InnerProviderCache:
                 mcp_servers=mcp_servers,
                 provider_settings=provider_settings,
                 tool_output=tool_output_config,
+                github_token=github_token,
             )
             self._key = key
             return self._provider

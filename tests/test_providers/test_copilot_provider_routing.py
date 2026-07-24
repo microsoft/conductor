@@ -713,3 +713,164 @@ class TestResolveRuntimeConnection:
         provider = _make_provider(provider_settings=s)
         with pytest.raises(ProviderError, match="requires a .*RuntimeConnection"):
             provider._build_client()
+
+
+class TestGithubTokenAuth:
+    """Unit-tests for epic E9 (#284): forwarding a ``github_token`` to the
+    Copilot SDK in memory, via ``create_session`` / ``resume_session``'s
+    ``github_token`` parameter (the SDK's ``gitHubToken`` RPC payload), so
+    the (nested, spawned) runtime authenticates against Copilot's own model
+    routing (Copilot capacity) rather than a BYOK endpoint.
+
+    Session-level plumbing (``execute`` / ``execute_dialog_turn`` /
+    resume) is covered end-to-end in ``test_copilot.py::TestGithubTokenSessionAuth``;
+    this class covers the ``_build_client`` / ``_apply_github_token`` seams
+    directly.
+    """
+
+    def test_build_client_never_forwards_github_token_to_constructor(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A ``github_token`` must NOT be passed to the ``CopilotClient``
+        constructor even when spawning a nested runtime: the SDK exports a
+        constructor-level ``github_token`` as the ``COPILOT_SDK_AUTH_TOKEN``
+        environment variable on the spawned process, which is not the
+        in-memory delivery this provider requires. The plain, argument-free
+        ``CopilotClient()`` call must be preserved regardless."""
+        import conductor.providers.copilot as copilot_mod
+
+        monkeypatch.delenv("COPILOT_PROVIDER_RUNTIME_URL", raising=False)
+        client = object()
+        client_factory = MagicMock(return_value=client)
+        monkeypatch.setattr(copilot_mod, "CopilotClient", client_factory)
+        provider = _make_provider(github_token="gh-token-value")
+        assert provider._build_client() is client
+        client_factory.assert_called_once_with()
+
+    def test_apply_github_token_adds_to_session_kwargs_when_spawning(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No runtime connection (nested spawn) + a ``github_token`` → the
+        token is added to the session kwargs dict passed to
+        ``create_session`` / ``resume_session``."""
+        monkeypatch.delenv("COPILOT_PROVIDER_RUNTIME_URL", raising=False)
+        provider = _make_provider(github_token="gh-token-value")
+        session_kwargs: dict[str, Any] = {}
+        provider._apply_github_token(session_kwargs)
+        assert session_kwargs == {"github_token": "gh-token-value"}
+
+    def test_apply_github_token_noop_when_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """No ``github_token`` supplied → the key is never added (BYOK /
+        logged-in-CLI paths unchanged)."""
+        monkeypatch.delenv("COPILOT_PROVIDER_RUNTIME_URL", raising=False)
+        provider = _make_provider()
+        session_kwargs: dict[str, Any] = {}
+        provider._apply_github_token(session_kwargs)
+        assert session_kwargs == {}
+
+    def test_byok_custom_routing_still_uses_base_url_regardless_of_github_token(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """BYOK path unchanged (E9 acceptance criteria): a ``base_url``
+        ``ProviderSettings`` still routes ``create_session`` via
+        ``provider={"base_url": ...}`` even when no ``github_token`` is set."""
+        import conductor.providers.copilot as copilot_mod
+
+        monkeypatch.delenv("COPILOT_PROVIDER_RUNTIME_URL", raising=False)
+        client = object()
+        client_factory = MagicMock(return_value=client)
+        monkeypatch.setattr(copilot_mod, "CopilotClient", client_factory)
+        s = ProviderSettings.model_validate(
+            {
+                "name": "copilot",
+                "base_url": "http://localhost:11434/v1",
+                "api_key": "sk-yaml",
+            }
+        )
+        provider = _make_provider(provider_settings=s, model="ollama/llama3")
+        assert provider._build_client() is client
+        client_factory.assert_called_once_with()
+
+        session_kwargs: dict[str, Any] = {}
+        provider._apply_provider_config(session_kwargs)
+        assert session_kwargs["provider"] == {
+            "type": "openai",
+            "base_url": "http://localhost:11434/v1",
+            "api_key": "sk-yaml",
+        }
+        assert "github_token" not in session_kwargs
+
+    def test_byok_and_github_token_together_use_both_channels(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A workflow may combine BYOK custom routing with a forwarded
+        ``github_token`` (e.g. an ACA sandbox that also opts into custom
+        model routing): ``base_url`` routing keeps flowing through
+        ``provider=`` while ``github_token`` is delivered separately through
+        the session payload. Neither channel suppresses the other."""
+        monkeypatch.delenv("COPILOT_PROVIDER_RUNTIME_URL", raising=False)
+        s = ProviderSettings.model_validate(
+            {
+                "name": "copilot",
+                "base_url": "http://localhost:11434/v1",
+                "api_key": "sk-yaml",
+            }
+        )
+        provider = _make_provider(
+            provider_settings=s, model="ollama/llama3", github_token="gh-token-value"
+        )
+
+        session_kwargs: dict[str, Any] = {}
+        provider._apply_provider_config(session_kwargs)
+        provider._apply_github_token(session_kwargs)
+
+        assert session_kwargs["provider"] == {
+            "type": "openai",
+            "base_url": "http://localhost:11434/v1",
+            "api_key": "sk-yaml",
+        }
+        assert session_kwargs["github_token"] == "gh-token-value"
+
+    def test_apply_github_token_noop_on_external_runtime_connection(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Connecting to an existing runtime (``runtime_url``) authenticates
+        via that runtime's own out-of-band connection; a ``github_token`` is
+        not added to the session kwargs in that case."""
+        monkeypatch.setenv("COPILOT_PROVIDER_RUNTIME_URL", "host:9000")
+        monkeypatch.delenv("COPILOT_PROVIDER_RUNTIME_TOKEN", raising=False)
+        provider = _make_provider(github_token="gh-token-value")
+        session_kwargs: dict[str, Any] = {}
+        provider._apply_github_token(session_kwargs)
+        assert session_kwargs == {}
+
+    def test_github_token_has_no_effect_on_external_runtime_client(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Connecting to an existing runtime (``runtime_url``) authenticates
+        via that runtime's own connection; a ``github_token`` is not forwarded
+        to ``RuntimeConnection.for_uri`` or the resulting ``CopilotClient``."""
+        import conductor.providers.copilot as copilot_mod
+
+        monkeypatch.setenv("COPILOT_PROVIDER_RUNTIME_URL", "host:9000")
+        monkeypatch.delenv("COPILOT_PROVIDER_RUNTIME_TOKEN", raising=False)
+        connection = object()
+        runtime_connection = MagicMock()
+        runtime_connection.for_uri.return_value = connection
+        client = object()
+        client_factory = MagicMock(return_value=client)
+        monkeypatch.setattr(copilot_mod, "RuntimeConnection", runtime_connection)
+        monkeypatch.setattr(copilot_mod, "CopilotClient", client_factory)
+        provider = _make_provider(github_token="gh-token-value")
+        assert provider._build_client() is client
+        runtime_connection.for_uri.assert_called_once_with("host:9000", connection_token=None)
+        client_factory.assert_called_once_with(connection=connection)
+
+    def test_github_token_stored_without_additional_side_channel(self) -> None:
+        """The token is stored on a private attribute only — the provider
+        does not thread it through any logging/event/describe path. (Runner
+        + host-side redaction of the raw value in transit and in the cache
+        key is covered by ``test_aca_runner/test_server.py`` and
+        ``aca_protocol.py``'s ``SecretStr`` wrapping, epic E8.)"""
+        provider = _make_provider(github_token="super-secret-gh-token")
+        assert provider._github_token == "super-secret-gh-token"
