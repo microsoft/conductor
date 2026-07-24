@@ -15,9 +15,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+from pydantic import SecretStr
 
 from conductor.config.schema import AgentDef, ProviderSettings, SandboxConfig, ToolOutputConfig
 from conductor.exceptions import ProviderError
+from conductor.providers.aca_protocol import AcaExecuteRequest
 from conductor.providers.capabilities import ProviderCapabilities, get_capabilities
 from conductor.providers.factory import create_provider
 
@@ -289,6 +291,19 @@ class _FakeInterruptResponse:
         for line in self._lines:
             await asyncio.sleep(0.02)
             yield line
+
+
+@pytest.fixture(autouse=True)
+def _default_aca_credential_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Most tests in this file exercise transport/streaming/interrupt
+    behavior, not credential resolution — supply a default
+    ``COPILOT_GITHUB_TOKEN`` so `_resolve_inner_provider_settings` doesn't
+    fail loudly (DD4, epic E8) for those unrelated tests. Tests in
+    `TestAcaCredentialPrecedence` explicitly clear/override the credential
+    env vars (via the same per-test `monkeypatch` fixture) to exercise the
+    real precedence logic.
+    """
+    monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "test-default-github-token")
 
 
 def _make_provider(**settings_kwargs: object):
@@ -894,52 +909,398 @@ class TestAcaStreamingErrorDiagnostics:
         assert "t-1" in str(exc_info.value)
 
 
-class TestAcaCredentialStopgap:
-    """OQ#6 Phase 1 credential stopgap forwarding."""
+class TestAcaCredentialPrecedence:
+    """DD4 / E8: `base_url` → BYOK; else GitHub token → Copilot capacity; else
+    fail loudly. Supersedes the OQ#6 Phase 1 stopgap (which silently returned
+    ``None`` when nothing was configured)."""
+
+    _CREDENTIAL_ENV_VARS = (
+        "COPILOT_PROVIDER_BASE_URL",
+        "COPILOT_PROVIDER_API_KEY",
+        "COPILOT_PROVIDER_BEARER_TOKEN",
+        "COPILOT_GITHUB_TOKEN",
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+    )
+
+    @classmethod
+    def _clear_credential_env(cls, monkeypatch: pytest.MonkeyPatch) -> None:
+        for var in cls._CREDENTIAL_ENV_VARS:
+            monkeypatch.delenv(var, raising=False)
+
+    @staticmethod
+    def _make_streaming_provider(monkeypatch: pytest.MonkeyPatch, captured: dict[str, object]):
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(
+                200, content=_ndjson_body([{"type": "result", "data": {"content": {}}}])
+            )
+
+        provider = _make_provider()
+        provider._http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        return provider
 
     @pytest.mark.asyncio
-    async def test_execute_forwards_env_credential_stopgap(
+    async def test_execute_forwards_byok_settings_when_base_url_set(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        self._clear_credential_env(monkeypatch)
+        monkeypatch.setenv("COPILOT_PROVIDER_BASE_URL", "https://byok.example.com")
         monkeypatch.setenv("COPILOT_PROVIDER_BEARER_TOKEN", "secret-token")
-        monkeypatch.delenv("COPILOT_PROVIDER_API_KEY", raising=False)
-        monkeypatch.delenv("COPILOT_PROVIDER_BASE_URL", raising=False)
         captured: dict[str, object] = {}
+        provider = self._make_streaming_provider(monkeypatch, captured)
 
-        def handler(request: httpx.Request) -> httpx.Response:
-            captured["body"] = json.loads(request.content)
-            return httpx.Response(
-                200, content=_ndjson_body([{"type": "result", "data": {"content": {}}}])
-            )
-
-        provider = _make_provider()
-        provider._http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
         with patch("conductor.providers.aca._AsyncDefaultAzureCredential", _FakeAsyncCredential):
             await provider.execute(agent=_agent(), context={}, rendered_prompt="x")
 
-        assert captured["body"]["inner_provider_settings"] == {"bearer_token": "secret-token"}
+        assert captured["body"]["inner_provider_settings"] == {
+            "base_url": "https://byok.example.com",
+            "bearer_token": "secret-token",
+        }
 
     @pytest.mark.asyncio
-    async def test_execute_omits_credential_when_no_env_set(
+    async def test_execute_base_url_wins_over_github_token(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.delenv("COPILOT_PROVIDER_BEARER_TOKEN", raising=False)
-        monkeypatch.delenv("COPILOT_PROVIDER_API_KEY", raising=False)
-        monkeypatch.delenv("COPILOT_PROVIDER_BASE_URL", raising=False)
+        """A GitHub token present alongside `base_url` is ignored — `base_url`
+        wins, mirroring the Copilot CLI's own precedence (DD4)."""
+        self._clear_credential_env(monkeypatch)
+        monkeypatch.setenv("COPILOT_PROVIDER_BASE_URL", "https://byok.example.com")
+        monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "gh-token-should-be-ignored")
         captured: dict[str, object] = {}
+        provider = self._make_streaming_provider(monkeypatch, captured)
 
-        def handler(request: httpx.Request) -> httpx.Response:
-            captured["body"] = json.loads(request.content)
-            return httpx.Response(
-                200, content=_ndjson_body([{"type": "result", "data": {"content": {}}}])
-            )
-
-        provider = _make_provider()
-        provider._http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
         with patch("conductor.providers.aca._AsyncDefaultAzureCredential", _FakeAsyncCredential):
             await provider.execute(agent=_agent(), context={}, rendered_prompt="x")
 
-        assert captured["body"]["inner_provider_settings"] is None
+        assert captured["body"]["inner_provider_settings"] == {
+            "base_url": "https://byok.example.com"
+        }
+
+    @pytest.mark.asyncio
+    async def test_execute_forwards_github_token_when_no_base_url(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._clear_credential_env(monkeypatch)
+        monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "gh-secret-token")
+        captured: dict[str, object] = {}
+        provider = self._make_streaming_provider(monkeypatch, captured)
+
+        with patch("conductor.providers.aca._AsyncDefaultAzureCredential", _FakeAsyncCredential):
+            await provider.execute(agent=_agent(), context={}, rendered_prompt="x")
+
+        assert captured["body"]["inner_provider_settings"] == {"github_token": "gh-secret-token"}
+
+    @pytest.mark.parametrize("priority_var", ["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"])
+    def test_github_token_env_var_precedence_order(
+        self, monkeypatch: pytest.MonkeyPatch, priority_var: str
+    ) -> None:
+        """``COPILOT_GITHUB_TOKEN`` → ``GH_TOKEN`` → ``GITHUB_TOKEN``: the
+        highest-priority var set always wins, even with lower-priority vars
+        also present."""
+        self._clear_credential_env(monkeypatch)
+        order = ["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"]
+        for var in order[order.index(priority_var) :]:
+            monkeypatch.setenv(var, f"token-from-{var}")
+
+        provider = _make_provider()
+        settings = provider._resolve_inner_provider_settings()
+
+        assert set(settings) == {"github_token"}
+        assert settings["github_token"].get_secret_value() == f"token-from-{priority_var}"
+
+    def test_raises_provider_error_when_neither_credential_configured(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._clear_credential_env(monkeypatch)
+        provider = _make_provider()
+
+        with pytest.raises(ProviderError) as exc_info:
+            provider._resolve_inner_provider_settings()
+
+        message = str(exc_info.value)
+        assert "COPILOT_GITHUB_TOKEN" in message
+        assert "COPILOT_PROVIDER_BASE_URL" in message
+        assert "secret-token" not in message
+        assert "gh-secret-token" not in message
+
+    @pytest.mark.asyncio
+    async def test_execute_raises_provider_error_when_neither_credential_configured(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._clear_credential_env(monkeypatch)
+        provider = _make_provider()
+
+        with (
+            patch("conductor.providers.aca._AsyncDefaultAzureCredential", _FakeAsyncCredential),
+            pytest.raises(ProviderError),
+        ):
+            await provider.execute(agent=_agent(), context={}, rendered_prompt="x")
+
+    # ------------------------------------------------------------------
+    # Review fix: whitespace-only env vars must not be treated as "configured"
+    # ------------------------------------------------------------------
+
+    def test_whitespace_only_base_url_falls_back_to_github_token(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A blank/whitespace-only `COPILOT_PROVIDER_BASE_URL` (e.g. an unset
+        CI secret expanding to an empty string) must not "win" the BYOK
+        branch and suppress a perfectly valid GitHub token — it should be
+        treated as unset."""
+        self._clear_credential_env(monkeypatch)
+        monkeypatch.setenv("COPILOT_PROVIDER_BASE_URL", "   ")
+        monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "gh-secret-token")
+
+        provider = _make_provider()
+        settings = provider._resolve_inner_provider_settings()
+
+        assert set(settings) == {"github_token"}
+        assert settings["github_token"].get_secret_value() == "gh-secret-token"
+
+    def test_whitespace_only_github_token_vars_treated_as_unset(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """All three GitHub-token env vars set to whitespace-only values, with
+        no BYOK `base_url`, must raise — not silently resolve to a blank
+        credential."""
+        self._clear_credential_env(monkeypatch)
+        monkeypatch.setenv("COPILOT_GITHUB_TOKEN", " ")
+        monkeypatch.setenv("GH_TOKEN", "\t")
+        monkeypatch.setenv("GITHUB_TOKEN", "")
+
+        provider = _make_provider()
+
+        with pytest.raises(ProviderError):
+            provider._resolve_inner_provider_settings()
+
+    def test_whitespace_only_github_token_falls_through_to_next_priority_var(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A whitespace-only `COPILOT_GITHUB_TOKEN` must not suppress a valid
+        lower-priority `GH_TOKEN`."""
+        self._clear_credential_env(monkeypatch)
+        monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "   ")
+        monkeypatch.setenv("GH_TOKEN", "real-token-from-gh-token")
+
+        provider = _make_provider()
+        settings = provider._resolve_inner_provider_settings()
+
+        assert settings["github_token"].get_secret_value() == "real-token-from-gh-token"
+
+    def test_whitespace_only_api_key_and_bearer_token_excluded_from_byok_settings(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`base_url` set to a real value with whitespace-only
+        `COPILOT_PROVIDER_API_KEY`/`COPILOT_PROVIDER_BEARER_TOKEN` should
+        forward only `base_url` — not an empty-looking credential."""
+        self._clear_credential_env(monkeypatch)
+        monkeypatch.setenv("COPILOT_PROVIDER_BASE_URL", "https://byok.example.com")
+        monkeypatch.setenv("COPILOT_PROVIDER_API_KEY", "   ")
+        monkeypatch.setenv("COPILOT_PROVIDER_BEARER_TOKEN", "\t\n")
+
+        provider = _make_provider()
+        settings = provider._resolve_inner_provider_settings()
+
+        assert settings == {"base_url": "https://byok.example.com"}
+
+    def test_whitespace_only_base_url_with_no_other_credentials_raises(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._clear_credential_env(monkeypatch)
+        monkeypatch.setenv("COPILOT_PROVIDER_BASE_URL", "   ")
+
+        provider = _make_provider()
+
+        with pytest.raises(ProviderError):
+            provider._resolve_inner_provider_settings()
+
+    def test_base_url_value_is_stripped_of_surrounding_whitespace(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A real `base_url` with incidental leading/trailing whitespace
+        (e.g. a trailing newline from ``$(cat file)``) is forwarded trimmed,
+        not verbatim."""
+        self._clear_credential_env(monkeypatch)
+        monkeypatch.setenv("COPILOT_PROVIDER_BASE_URL", "  https://byok.example.com  \n")
+
+        provider = _make_provider()
+        settings = provider._resolve_inner_provider_settings()
+
+        assert settings == {"base_url": "https://byok.example.com"}
+
+    def test_github_token_is_redacted_as_secretstr(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The resolved token is held as a `SecretStr` until the instant it is
+        placed in the outgoing settings dict, so any incidental repr/str of
+        the intermediate value never leaks the plaintext — the same
+        redaction discipline as every other secret in the codebase (e.g.
+        `ProviderSettings.api_key`)."""
+        self._clear_credential_env(monkeypatch)
+        monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "super-secret-value")
+
+        provider = _make_provider()
+        secret = provider._resolve_github_token()
+
+        assert secret is not None
+        assert "super-secret-value" not in repr(secret)
+        assert "super-secret-value" not in str(secret)
+        assert secret.get_secret_value() == "super-secret-value"
+
+    def test_github_token_redacted_in_request_dump_and_repr(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Review fix: `_resolve_inner_provider_settings` keeps the token as a
+        `SecretStr` all the way into `AcaExecuteRequest`, so `model_dump()` /
+        `model_dump_json()` / `repr()` on the *request object itself* never
+        expose the plaintext — only the dedicated wire-serialization step
+        (`_wire_body`, exercised by `test_execute_forwards_github_token_when_no_base_url`
+        via `MockTransport`) unwraps it."""
+        self._clear_credential_env(monkeypatch)
+        monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "super-secret-value")
+
+        provider = _make_provider()
+        request = provider._build_request(_agent(), {}, "x", None)
+
+        assert "super-secret-value" not in repr(request)
+        dumped = request.model_dump(mode="json")
+        assert dumped["inner_provider_settings"] == {"github_token": "**********"}
+        assert "super-secret-value" not in json.dumps(dumped)
+        assert "super-secret-value" not in request.model_dump_json()
+
+    def test_byok_bearer_token_redacted_in_request_dump_and_repr(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Same redaction guarantee for the BYOK branch's `bearer_token` /
+        `api_key`, not just the GitHub-token branch."""
+        self._clear_credential_env(monkeypatch)
+        monkeypatch.setenv("COPILOT_PROVIDER_BASE_URL", "https://byok.example.com")
+        monkeypatch.setenv("COPILOT_PROVIDER_BEARER_TOKEN", "byok-secret-token")
+
+        provider = _make_provider()
+        request = provider._build_request(_agent(), {}, "x", None)
+
+        assert "byok-secret-token" not in repr(request)
+        dumped = request.model_dump(mode="json")
+        assert dumped["inner_provider_settings"] == {
+            "base_url": "https://byok.example.com",
+            "bearer_token": "**********",
+        }
+        assert "byok-secret-token" not in json.dumps(dumped)
+
+    @pytest.mark.asyncio
+    async def test_wire_body_unwraps_secret_for_mock_transport_but_dump_stays_redacted(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """End-to-end proof: the object `execute()` builds stays redacted under
+        `model_dump`/`repr`, while the actual bytes received by the runner
+        (`MockTransport`) carry the real plaintext token — i.e. the unwrap
+        happens exactly once, at the wire boundary, and nowhere else."""
+        self._clear_credential_env(monkeypatch)
+        monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "super-secret-value")
+        captured: dict[str, object] = {}
+        provider = self._make_streaming_provider(monkeypatch, captured)
+
+        request = provider._build_request(_agent(), {}, "x", None)
+        assert "super-secret-value" not in repr(request)
+        assert request.model_dump(mode="json")["inner_provider_settings"] == {
+            "github_token": "**********"
+        }
+
+        with patch("conductor.providers.aca._AsyncDefaultAzureCredential", _FakeAsyncCredential):
+            await provider.execute(agent=_agent(), context={}, rendered_prompt="x")
+
+        assert captured["body"]["inner_provider_settings"] == {"github_token": "super-secret-value"}
+
+
+class TestAcaExecuteRequestSecretRedactionOnValidate:
+    """Review fix: `AcaExecuteRequest.inner_provider_settings` is a loosely
+    typed ``dict[str, Any]`` — plain construction via
+    `AcaRuntimeProvider._resolve_inner_provider_settings` already wraps
+    known credential keys in `SecretStr`, but that coercion previously did
+    *not* happen for the model's other construction paths
+    (`model_validate` / `model_validate_json` on a raw dict/JSON payload,
+    e.g. the runner's own FastAPI request parsing), so a plaintext
+    credential string surviving through one of those paths would leak via
+    `repr()`/`model_dump()`. `AcaExecuteRequest._redact_inner_provider_secrets`
+    (a `field_validator`) closes that gap."""
+
+    @staticmethod
+    def _minimal_request_dict(**inner_provider_settings: object) -> dict[str, object]:
+        return {
+            "agent": {"name": "implement"},
+            "rendered_prompt": "hi",
+            "inner_provider_settings": inner_provider_settings,
+        }
+
+    def test_model_validate_dict_coerces_plain_github_token_to_secretstr(self) -> None:
+        request = AcaExecuteRequest.model_validate(
+            self._minimal_request_dict(github_token="plaintext-value")
+        )
+
+        token = request.inner_provider_settings["github_token"]
+        assert isinstance(token, SecretStr)
+        assert token.get_secret_value() == "plaintext-value"
+        assert "plaintext-value" not in repr(request)
+        assert request.model_dump(mode="json")["inner_provider_settings"] == {
+            "github_token": "**********"
+        }
+
+    def test_model_validate_dict_coerces_all_three_credential_keys(self) -> None:
+        request = AcaExecuteRequest.model_validate(
+            self._minimal_request_dict(
+                base_url="https://byok.example.com",
+                api_key="plain-api-key",
+                bearer_token="plain-bearer-token",
+            )
+        )
+
+        settings = request.inner_provider_settings
+        assert isinstance(settings["api_key"], SecretStr)
+        assert isinstance(settings["bearer_token"], SecretStr)
+        assert settings["api_key"].get_secret_value() == "plain-api-key"
+        assert settings["bearer_token"].get_secret_value() == "plain-bearer-token"
+        # `base_url` is not a credential — stays a plain string, unwrapped.
+        assert settings["base_url"] == "https://byok.example.com"
+
+        dumped = request.model_dump(mode="json")["inner_provider_settings"]
+        assert dumped == {
+            "base_url": "https://byok.example.com",
+            "api_key": "**********",
+            "bearer_token": "**********",
+        }
+        assert "plain-api-key" not in json.dumps(dumped)
+        assert "plain-bearer-token" not in repr(request)
+
+    def test_model_validate_json_coerces_plain_secret_to_secretstr(self) -> None:
+        """Same guarantee for `model_validate_json` (raw wire bytes), not
+        just a Python dict passed to `model_validate`."""
+        body = json.dumps(self._minimal_request_dict(github_token="from-the-wire"))
+
+        request = AcaExecuteRequest.model_validate_json(body)
+
+        assert isinstance(request.inner_provider_settings["github_token"], SecretStr)
+        assert request.inner_provider_settings["github_token"].get_secret_value() == "from-the-wire"
+        assert "from-the-wire" not in repr(request)
+        assert "from-the-wire" not in request.model_dump_json()
+
+    def test_model_validate_is_idempotent_when_value_already_secretstr(self) -> None:
+        """Constructing directly with an already-`SecretStr` value (the
+        `AcaRuntimeProvider._resolve_inner_provider_settings` call site)
+        must not be double-wrapped or otherwise mangled by the validator."""
+        request = AcaExecuteRequest.model_validate(
+            self._minimal_request_dict(github_token=SecretStr("already-wrapped"))
+        )
+
+        token = request.inner_provider_settings["github_token"]
+        assert isinstance(token, SecretStr)
+        assert token.get_secret_value() == "already-wrapped"
+
+    def test_model_validate_none_inner_provider_settings_stays_none(self) -> None:
+        request = AcaExecuteRequest.model_validate(
+            {"agent": {"name": "implement"}, "rendered_prompt": "hi"}
+        )
+
+        assert request.inner_provider_settings is None
 
 
 class TestAcaInterrupt:

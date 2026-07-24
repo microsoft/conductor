@@ -14,6 +14,7 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from pydantic import SecretStr
 from starlette.testclient import TestClient
 
 from conductor.providers.base import AgentOutput
@@ -402,3 +403,81 @@ class TestInnerProviderCacheConcurrency:
         )
         assert len(_FakeCopilotProvider.instances) == 1
         assert all(r is results[0] for r in results)
+
+
+class TestInnerProviderCacheKeyHashing:
+    """Review fix: `_key_for` hashes the cache key rather than retaining the
+    canonical JSON (which would otherwise hold plaintext credentials in a
+    long-lived instance attribute for the cache's whole lifetime).
+    """
+
+    def test_distinct_secretstr_credentials_yield_distinct_keys(self) -> None:
+        from conductor.aca_runner.server import _InnerProviderCache
+
+        key_a = _InnerProviderCache._key_for(
+            mcp_servers=None,
+            inner_provider_settings={"bearer_token": SecretStr("token-a-value")},
+            tool_output=None,
+        )
+        key_b = _InnerProviderCache._key_for(
+            mcp_servers=None,
+            inner_provider_settings={"bearer_token": SecretStr("token-b-value")},
+            tool_output=None,
+        )
+        assert key_a != key_b
+
+    def test_same_secretstr_credential_yields_the_same_key(self) -> None:
+        from conductor.aca_runner.server import _InnerProviderCache
+
+        settings = {"bearer_token": SecretStr("token-value")}
+        key_1 = _InnerProviderCache._key_for(
+            mcp_servers=None, inner_provider_settings=settings, tool_output=None
+        )
+        key_2 = _InnerProviderCache._key_for(
+            mcp_servers=None, inner_provider_settings=dict(settings), tool_output=None
+        )
+        assert key_1 == key_2
+
+    def test_key_never_discloses_the_plaintext_credential(self) -> None:
+        import hashlib
+
+        from conductor.aca_runner.server import _InnerProviderCache
+
+        secret_value = "super-secret-token-value"
+        key = _InnerProviderCache._key_for(
+            mcp_servers=None,
+            inner_provider_settings={"github_token": SecretStr(secret_value)},
+            tool_output=None,
+        )
+        assert secret_value not in key
+        # The key is a one-way sha256 hexdigest, not the masked `SecretStr`
+        # repr — guards against a regression back to
+        # `json.dumps(..., default=str)`, whose masked "**********" output
+        # would collapse every distinct credential onto the same key.
+        assert "*" not in key
+        assert len(key) == len(hashlib.sha256(b"").hexdigest())
+        assert all(c in "0123456789abcdef" for c in key)
+
+    async def test_cache_rebuilds_when_only_the_credential_value_changes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """End-to-end: `get()` must still tell two distinct credentials
+        apart post-hashing, even though they otherwise share the same
+        `mcp_servers`/`tool_output` and the same `inner_provider_settings`
+        *key* (`bearer_token`)."""
+        monkeypatch.setattr("conductor.aca_runner.server.CopilotProvider", _FakeCopilotProvider)
+        from conductor.aca_runner.server import _InnerProviderCache
+
+        cache = _InnerProviderCache()
+        await cache.get(
+            mcp_servers=None,
+            inner_provider_settings={"bearer_token": SecretStr("token-one")},
+            tool_output=None,
+        )
+        await cache.get(
+            mcp_servers=None,
+            inner_provider_settings={"bearer_token": SecretStr("token-two")},
+            tool_output=None,
+        )
+        assert len(_FakeCopilotProvider.instances) == 2
+        assert _FakeCopilotProvider.instances[0].close.await_count == 1

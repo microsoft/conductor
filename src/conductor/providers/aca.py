@@ -35,6 +35,7 @@ import time
 from typing import TYPE_CHECKING, Any
 
 import httpx
+from pydantic import SecretStr
 
 from conductor.exceptions import ProviderError
 from conductor.providers.aca_protocol import (
@@ -92,6 +93,25 @@ _IDENTIFIER_INVALID_RE = re.compile(r"[^a-z0-9-]+")
 # Refresh the cached AAD token this many seconds before its reported expiry,
 # so a request never starts with a token that expires mid-flight.
 _TOKEN_REFRESH_MARGIN_SECONDS = 60.0
+
+
+def _clean_env(name: str) -> str | None:
+    """Read an environment variable, normalizing unset/whitespace-only
+    values to ``None`` (review fix, DD4 precedence).
+
+    Without this, a stray blank export (e.g. ``COPILOT_PROVIDER_BASE_URL=""``
+    or ``"  "`` left over from an unset CI secret) would be treated as
+    "configured" — either selecting the BYOK branch with a garbage
+    ``base_url`` or, for a stripped-empty *token*, suppressing a valid
+    lower-priority credential that should have been tried instead. Mirrors
+    the same normalize-then-validate discipline used for
+    ``COPILOT_PROVIDER_RUNTIME_URL``/``_TOKEN`` in ``copilot.py``.
+    """
+    value = os.environ.get(name)
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
 
 
 class AcaRuntimeProvider(AgentProvider):
@@ -458,40 +478,107 @@ class AcaRuntimeProvider(AgentProvider):
         return self._provider_settings.api_version or _DEFAULT_API_VERSION
 
     # ------------------------------------------------------------------
-    # Request construction (OQ#6 credential stopgap)
+    # Request construction (DD4 credential precedence, epic E8)
     # ------------------------------------------------------------------
 
-    def _resolve_inner_provider_settings(self) -> dict[str, Any] | None:
-        """Phase 1 credential stopgap (OQ#6, DD4).
+    def _resolve_github_token(self) -> SecretStr | None:
+        """Source a GitHub token for Copilot capacity, wrapped in ``SecretStr``.
+
+        Precedence (DD4): ``COPILOT_GITHUB_TOKEN`` → ``GH_TOKEN`` →
+        ``GITHUB_TOKEN`` — first non-empty (post-``strip()``) wins, via
+        ``_clean_env`` (review fix: a whitespace-only value no longer counts
+        as "set", which would otherwise suppress a valid lower-priority
+        var). Wrapping in ``SecretStr`` immediately on read keeps the value
+        redacted in any incidental repr/str of the resolved credential;
+        callers must explicitly call ``get_secret_value()`` to obtain the
+        plaintext, mirroring the ``ProviderSettings.api_key`` /
+        ``bearer_token`` pattern in ``copilot.py``. Returns ``None`` when
+        none of the three vars are set.
+        """
+        for var in ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
+            value = _clean_env(var)
+            if value is not None:
+                return SecretStr(value)
+        return None
+
+    def _resolve_inner_provider_settings(self) -> dict[str, Any]:
+        """Resolve the credential to forward to the runner's inner Copilot
+        provider (DD4, epic E8 — supersedes the OQ#6 Phase 1 stopgap).
 
         The ``aca``-scoped ``ProviderSettings`` fields intentionally exclude
         ``bearer_token``/``api_key``/``base_url`` (those stay copilot-only,
-        `_check_field_compatibility`), so this resolves the *same*
-        environment variables the Copilot custom-routing resolver already
-        reads (``copilot.py:_resolve_sdk_provider_config``) and forwards
-        them verbatim so the runner can construct
+        ``_check_field_compatibility``), so this reads environment variables
+        directly and forwards them so the runner can construct
         ``ProviderSettings(name=inner_provider, **inner_provider_settings)``
         for its inner ``CopilotProvider`` instead of attempting an
         impossible interactive OAuth flow inside a headless sandbox.
 
-        Acceptable only for **trusted Phase 1 use** (DD4) — the plaintext
-        credential travels in the request body to the runner. Returns
-        ``None`` when nothing is configured, which is itself an accepted gap
-        until the Phase 2 gateway (E8) removes the need for this mechanism.
+        Precedence mirrors the Copilot CLI's own auth resolution — no
+        ``credential_mode`` switch:
+
+        1. ``COPILOT_PROVIDER_BASE_URL`` set (non-whitespace, via
+           ``_clean_env``) → forward BYOK custom-routing settings unchanged
+           (``base_url`` + optional ``COPILOT_PROVIDER_API_KEY`` /
+           ``COPILOT_PROVIDER_BEARER_TOKEN``) — the same env vars the
+           Copilot custom-routing resolver reads
+           (``copilot.py:_resolve_sdk_provider_config``). ``base_url`` wins
+           even when a GitHub token is also present.
+        2. Otherwise, source a GitHub token (`_resolve_github_token`) and
+           forward it as ``github_token`` so the runner's inner
+           ``CopilotProvider`` authenticates against GitHub Copilot's own
+           model routing — the operator's Copilot capacity.
+        3. Neither resolves → fail loudly rather than run the sandbox
+           unauthenticated or silently degraded.
+
+        Acceptable only for **trusted use** (DD4) — the plaintext credential
+        travels in the request body to the runner.
+
+        Review fix: every secret value (``api_key``/``bearer_token``/
+        ``github_token``) is stored as a ``SecretStr`` instance in the
+        returned dict, not the plaintext ``str``. ``AcaExecuteRequest``'s
+        ``inner_provider_settings`` field is ``dict[str, Any]``, so pydantic
+        still recognizes and redacts these values (``"**********"``) in
+        ``model_dump``/``repr``/logging — only the dedicated wire-serialization
+        step in :meth:`execute` (``_wire_body``) unwraps them to plaintext,
+        right before the request bytes leave the process. A second
+        review fix — ``AcaExecuteRequest._redact_inner_provider_secrets`` —
+        additionally enforces this ``SecretStr`` wrapping for any
+        construction path that does *not* go through this method (e.g. a
+        raw dict/JSON payload passed to ``model_validate``), so redaction
+        does not depend solely on every caller using this helper.
+
+        Raises:
+            ProviderError: when no credential of either kind is configured.
         """
-        base_url = os.environ.get("COPILOT_PROVIDER_BASE_URL")
-        api_key = os.environ.get("COPILOT_PROVIDER_API_KEY")
-        bearer_token = os.environ.get("COPILOT_PROVIDER_BEARER_TOKEN")
-        if not (base_url or api_key or bearer_token):
-            return None
-        settings: dict[str, Any] = {}
-        if base_url:
-            settings["base_url"] = base_url
-        if api_key:
-            settings["api_key"] = api_key
-        if bearer_token:
-            settings["bearer_token"] = bearer_token
-        return settings
+        base_url = _clean_env("COPILOT_PROVIDER_BASE_URL")
+        if base_url is not None:
+            settings: dict[str, Any] = {"base_url": base_url}
+            api_key = _clean_env("COPILOT_PROVIDER_API_KEY")
+            bearer_token = _clean_env("COPILOT_PROVIDER_BEARER_TOKEN")
+            if api_key is not None:
+                settings["api_key"] = SecretStr(api_key)
+            if bearer_token is not None:
+                settings["bearer_token"] = SecretStr(bearer_token)
+            return settings
+
+        github_token = self._resolve_github_token()
+        if github_token is not None:
+            return {"github_token": github_token}
+
+        raise ProviderError(
+            "aca: no credential available for the sandbox's inner Copilot "
+            "provider. Either export a GitHub token to run on your own "
+            "Copilot capacity, or configure a BYOK custom-routing endpoint.",
+            suggestion=(
+                "Create a fine-grained 'Copilot Requests' PAT and export it as "
+                "COPILOT_GITHUB_TOKEN (GH_TOKEN / GITHUB_TOKEN also work), or "
+                "set COPILOT_PROVIDER_BASE_URL (plus COPILOT_PROVIDER_API_KEY / "
+                "COPILOT_PROVIDER_BEARER_TOKEN) to route the sandbox at a BYOK "
+                "endpoint."
+            ),
+            provider_name="aca",
+            is_retryable=False,
+        )
 
     def _serialize_mcp_servers(self) -> dict[str, Any] | None:
         if not self._mcp_servers:
@@ -541,6 +628,27 @@ class AcaRuntimeProvider(AgentProvider):
                 else None
             ),
         )
+
+    def _wire_body(self, request: AcaExecuteRequest) -> dict[str, Any]:
+        """Serialize `request` into the JSON body actually sent to the runner.
+
+        Review fix: `request.model_dump(mode="json")` alone keeps any
+        `SecretStr` values held in `inner_provider_settings` redacted
+        (`"**********"`) — the correct behavior for anything that logs,
+        reprs, or otherwise dumps the request object itself (including the
+        request's own `__repr__`). This method is the one dedicated
+        wire-serialization step that unwraps those secrets back to
+        plaintext, reading them directly off `request.inner_provider_settings`
+        (not off the already-redacted dump) immediately before the bytes are
+        handed to httpx — nowhere else in the codebase sees the plaintext.
+        """
+        body = request.model_dump(mode="json")
+        if request.inner_provider_settings is not None:
+            body["inner_provider_settings"] = {
+                key: value.get_secret_value() if isinstance(value, SecretStr) else value
+                for key, value in request.inner_provider_settings.items()
+            }
+        return body
 
     # ------------------------------------------------------------------
     # Error classification (E3-T5)
@@ -801,7 +909,7 @@ class AcaRuntimeProvider(AgentProvider):
             url = self._build_url("execute")
             params = {"identifier": identifier, "api-version": self._api_version}
             headers = {"Authorization": f"Bearer {token}"}
-            body = request.model_dump(mode="json")
+            body = self._wire_body(request)
 
             try:
                 async with self._stream_execute(url, params, headers, body) as response:

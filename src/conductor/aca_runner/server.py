@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import shutil
@@ -34,6 +35,7 @@ from typing import TYPE_CHECKING, Any
 
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from pydantic import SecretStr
 from pydantic import ValidationError as PydanticValidationError
 
 from conductor import __version__ as _conductor_version
@@ -222,15 +224,43 @@ class _InnerProviderCache:
         inner_provider_settings: dict[str, Any] | None,
         tool_output: dict[str, Any] | None,
     ) -> str:
-        return json.dumps(
+        # Epic E8 (aca_protocol.py's `_redact_inner_provider_secrets`) wraps
+        # known credential keys in `SecretStr` on every `AcaExecuteRequest`
+        # construction path, including this model's own FastAPI request
+        # parsing — so `inner_provider_settings` may now hold `SecretStr`
+        # values here. `json.dumps(..., default=str)` would otherwise call
+        # `str()` on them, which is the same masked "**********" for every
+        # distinct credential — collapsing different requests' distinct
+        # credentials onto the same cache key and wrongly reusing a stale
+        # provider built with a *different* credential. Unwrap to the real
+        # secret value first so the key still reflects the actual credential.
+        unwrapped_settings = (
+            {
+                key: value.get_secret_value() if isinstance(value, SecretStr) else value
+                for key, value in inner_provider_settings.items()
+            }
+            if inner_provider_settings is not None
+            else None
+        )
+        canonical = json.dumps(
             {
                 "mcp_servers": mcp_servers,
-                "inner_provider_settings": inner_provider_settings,
+                "inner_provider_settings": unwrapped_settings,
                 "tool_output": tool_output,
             },
             sort_keys=True,
             default=str,
         )
+        # Review fix: `self._key` (below) is a long-lived instance attribute,
+        # not a local that goes out of scope after this call — retaining the
+        # canonical JSON verbatim would keep the plaintext credential resident
+        # in process memory for the cache's whole lifetime (readable by
+        # anything with introspection access to this object, e.g. a debugger
+        # or a future logging call that reprs the cache). Hash it instead so
+        # only a one-way digest is ever stored; distinct credentials still
+        # produce distinct keys (cache correctness is preserved) but neither
+        # plaintext value is recoverable from `self._key`.
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
     async def get(
         self,
@@ -246,11 +276,12 @@ class _InnerProviderCache:
             if self._provider is not None:
                 await self._provider.close()
 
-            # OQ#6 Phase 1 credential stopgap: `inner_provider_settings` carries
-            # the plaintext bearer_token/api_key/base_url forwarded by the host's
-            # `AcaRuntimeProvider._resolve_inner_provider_settings` (reusing the
-            # existing Copilot custom-routing `bearer_token` path). Phase 2 (E8)
-            # replaces this whole branch with a call to the credential gateway —
+            # `inner_provider_settings` carries the credential forwarded by the
+            # host's `AcaRuntimeProvider._resolve_inner_provider_settings`
+            # (epic E8, DD4): either BYOK `base_url`/`api_key`/`bearer_token`
+            # (the existing Copilot custom-routing fields, unchanged), or a
+            # `github_token` for Copilot-capacity auth. Wiring `github_token`
+            # into the inner `CopilotProvider`'s actual authentication is E9 —
             # this is the seam that change would touch.
             provider_settings = (
                 ProviderSettings(name="copilot", **inner_provider_settings)

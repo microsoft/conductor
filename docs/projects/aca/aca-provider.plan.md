@@ -123,8 +123,8 @@ before the epic they tag reaches "done".
    tradeoff turns out to matter in practice.
 
 5. **Dialog-turn scope for v1 (blocks E4).** *Open Questions → Dialog turns*
-   says `execute_dialog_turn()` should route through the same in-sandbox runner +
-   gateway, **with a fallback** to disable dialog turns under `aca` with a clear
+   says `execute_dialog_turn()` should route through the same in-sandbox runner,
+   **with a fallback** to disable dialog turns under `aca` with a clear
    error if the runner exposes no dialog endpoint. **Decision needed:** does v1
    build a runner dialog endpoint (extra `/execute_dialog_turn` surface + host
    plumbing), or ship the disable-with-clear-error fallback? This sets E4's scope
@@ -143,24 +143,23 @@ before the epic they tag reaches "done".
    no `agent`/`identifier` parameter to key a session lookup on) is a bigger
    seam than this epic's scope.
 
-6. **MVP credential stopgap shape (affects E3/E4 request contract & Security).**
-   *DD4* permits a "short-lived scoped token in the request body" for the
-   *trusted* Phase 1 MVP, deferring the host-side gateway to Phase 2. The design
-   does not specify how that token is acquired, scoped, or consumed by the inner
-   `CopilotProvider` (which normally authenticates via the GitHub Copilot SDK).
-   **Decision needed:** the concrete stopgap for E3/E4 — e.g. host forwards a
-   short-lived Copilot bearer token in the `/execute` body and the runner
-   constructs `CopilotProvider(provider_settings=…)` with it (reusing the custom-
-   routing `bearer_token` path, `copilot.py:360`) — so the request contract and
-   `SecretStr` redaction are settled before the runner is built.
+6. **Credential forwarding contract (affects E3/E4/E8–E10 & Security).**
+   *DD4* specifies the credential model: the host forwards one narrowly-scoped
+   credential to the sandbox per `execute()` — BYOK custom-routing settings
+   (`base_url` + `api_key`/`bearer_token`) when `COPILOT_PROVIDER_BASE_URL` is set,
+   else a GitHub token (`COPILOT_GITHUB_TOKEN`→`GH_TOKEN`→`GITHUB_TOKEN`) the
+   sandbox's inner Copilot runtime uses against Copilot's own model routing
+   (Copilot capacity), else a loud failure. The concrete wire field is
+   `AcaExecuteRequest.inner_provider_settings`, consumed by the runner's
+   `_InnerProviderCache`.
 
-   **Answer (E4) — runner side confirms the E3 shape.** The runner's
-   `_InnerProviderCache` builds `ProviderSettings(name="copilot",
-   **inner_provider_settings)` from the plaintext dict the host forwards in
-   `AcaExecuteRequest.inner_provider_settings` (`bearer_token`/`api_key`/
-   `base_url`), exactly the shape E3 assumed. The Phase 2 gateway seam is a
-   single call site (`_InnerProviderCache.get`, inline comment) — replacing it
-   with a gateway lookup does not touch the wire contract.
+   **Answer.** The runner builds `ProviderSettings(name="copilot",
+   **inner_provider_settings)` from the dict the host forwards. E3/E4 deliver the
+   BYOK half (`bearer_token`/`api_key`/`base_url`); the GitHub-token /
+   Copilot-capacity half — sourcing the token, the `base_url`-wins precedence,
+   in-memory delivery to `CopilotClient(github_token=…)`, and the fail-loudly path
+   — is E8–E10. The wire contract and `SecretStr` redaction are unchanged by the
+   GitHub-token addition.
 
 7. **Per-agent `provider: aca` override (scope confirmation, affects E1).** The
    preview drives `aca` at `runtime.provider` (workflow-wide); every agent
@@ -183,10 +182,12 @@ Branch S (single streaming request) chosen, `streaming_events=True` /
 build work remains here.
 
 ### Phase 1 — Experimental MVP (trusted use)
-Ship the opt-in `aca` provider end-to-end for *trusted* workloads using the
-short-lived-token stopgap (OQ#6); the credential gateway is deferred to Phase 2
-(*DD4* — the gateway is **not** a Phase 1 release requirement, only a requirement
-before untrusted/multi-tenant use). Covers Epics **E1–E7**.
+Ship the opt-in `aca` provider end-to-end for *trusted* workloads with the DD4
+credential model — the host forwards one narrowly-scoped credential to the sandbox
+(recommended: a fine-grained *Copilot Requests* PAT → your Copilot capacity; BYOK
+custom routing as the fallback; no mode switch). Keeping the credential entirely
+off the sandbox for untrusted/multi-tenant use is out of scope (design *Future*).
+Covers Epics **E1–E10**.
 
 **Exit criteria:**
 - [ ] `conductor validate examples/aca-coding-agent.yaml` passes and the
@@ -206,17 +207,9 @@ before untrusted/multi-tenant use). Covers Epics **E1–E7**.
   `aca`.
 - [ ] A buildable `docker/aca-runner` image and a bring-your-own-pool provisioning
   example exist (DD6).
-
-### Phase 2 — Credential gateway (required before untrusted/multi-tenant)
-Add the host-side gateway (*DD4* / *Security Considerations*) so the real upstream
-key never enters the sandbox; point the runner's inner `CopilotProvider` at it via
-Copilot custom routing. Covers Epic **E8**.
-
-**Exit criteria:**
-- [ ] The upstream model key resides only on the host; the sandbox holds at most a
-  short-lived, scoped token, `SecretStr`-redacted in events/checkpoints (NFR2).
-- [ ] Gateway path has a mocked smoke test; docs state the trusted-vs-untrusted
-  boundary and that Phase 2 is required before untrusted/multi-tenant workloads.
+- [ ] The DD4 credential model works: a forwarded GitHub token (`COPILOT_GITHUB_TOKEN`)
+  drives the sandbox on Copilot capacity; BYOK (`COPILOT_PROVIDER_*`) is the fallback;
+  neither present fails loudly. The forwarded credential is `SecretStr`-redacted (NFR2).
 
 ---
 
@@ -247,6 +240,7 @@ Copilot custom routing. Covers Epic **E8**.
 | `src/conductor/providers/factory.py` | Add `"aca"` to `ProviderType` (`:27`); add an `aca` arm to `create_provider()` (`:86`) that checks `azure-identity` availability and wires `pool_endpoint`/`api_version`/`inner_provider`/`identifier_scope` from `provider_settings`. *(Key Components §4)* |
 | `src/conductor/providers/capabilities.py` | Add `"aca": "conductor.providers.aca:AcaRuntimeProvider"` to `_PROVIDER_CLASS_PATHS` (`:222`) so `get_capabilities("aca")` resolves under `validate` without instantiation. *(FR5)* |
 | `src/conductor/providers/base.py` | Add optional `session_seconds: float | None = None` to `AgentOutput` (`:66`) for FR7 (E6; contingent on OQ#2). |
+| `src/conductor/providers/copilot.py` | Plumb a `github_token` through `CopilotProvider` to `CopilotClient(github_token=…)` (in-memory `gitHubToken` connect payload) so the sandbox's inner runtime authenticates against Copilot's own model routing (E9; DD4). |
 | `src/conductor/engine/workflow.py` | Record a distinct `"<agent> (sandbox)"` usage row when `output.session_seconds` is set, at the main-loop, parallel-group, and for-each `record()` sites (`:3851`, `:4927`, `:5424`). *(FR7; OQ#2)* |
 | `src/conductor/engine/usage.py` | If needed by OQ#2, a helper to record a session-seconds row (cost `None`); otherwise reuse `record()` with a synthetic `AgentOutput`. |
 | `pyproject.toml` | Add `[project.optional-dependencies] aca = ["azure-identity>=…"]` (`httpx`/`fastapi`/`uvicorn` are already base deps, `:43–46`). Optionally exclude the runner from the wheel (OQ#4). |
@@ -315,7 +309,7 @@ Copilot custom routing. Covers Epic **E8**.
   runner over a single streaming request, relays events verbatim, and returns
   `AgentOutput` (FR2–FR4, FR6; NFR3; *Key Components §1*, *Data Flow*, *DD1/DD3/DD5*).
 - **Prerequisites:** E1 (schema fields). Resolve OQ#1 (concurrency seam) and OQ#6
-  (stopgap token) before "done".
+  (credential forwarding) before "done".
 
   **Review fixes (this pass).** A prior implementation pass of this epic failed
   review on two points: (1) the in-flight identifier registry tracked only a
@@ -381,15 +375,15 @@ Copilot custom routing. Covers Epic **E8**.
 
   **OQ#6 resolution (taken by this epic).** The `aca`-scoped `ProviderSettings`
   fields intentionally exclude `bearer_token`/`api_key`/`base_url` (those remain
-  copilot-only per `_check_field_compatibility`), so the stopgap credential is
+  copilot-only per `_check_field_compatibility`), so the BYOK credential is
   sourced from the same environment variables the Copilot custom-routing resolver
   already reads (`COPILOT_PROVIDER_BEARER_TOKEN`, `COPILOT_PROVIDER_API_KEY`,
   `COPILOT_PROVIDER_BASE_URL` — `copilot.py:_resolve_sdk_provider_config`) and
   forwarded verbatim as the request's `inner_provider_settings` field so the
   runner can construct `ProviderSettings(name=inner_provider,
   **inner_provider_settings)` for its inner `CopilotProvider`. `None` when no env
-  var is set — an accepted Phase 1 gap (DD4); the Phase 2 gateway (E8) removes the
-  need for this field.
+  var is set. This delivers the BYOK half of the DD4 credential model; the
+  GitHub-token / Copilot-capacity half (the recommended default) is E8–E10.
 
   Note (from E2): a **minimal skeleton** of `AcaRuntimeProvider` already exists in
   `src/conductor/providers/aca.py` — the class, the `CAPABILITIES` descriptor (matches
@@ -415,8 +409,8 @@ Copilot custom routing. Covers Epic **E8**.
     change to the `provider.execute()` call site (`executor/agent.py:288`).
   - [x] Event types/emit points and `AgentOutput` shape match on-host providers
     (NFR3); secrets are `SecretStr`-redacted (NFR2) — the only plaintext secret on
-    the wire is the OQ#6 stopgap credential, which is a deliberate, documented
-    Phase 1 trusted-use exception (DD4) and is never logged or included in
+    the wire is the forwarded credential (the DD4 credential model), a deliberate,
+    documented trusted-use choice, never logged or included in
     exception messages.
   - [x] Concurrency discriminator yields distinct identifiers for concurrent
     siblings and reuse for sequential re-executions (per the OQ#1 decision;
@@ -429,14 +423,14 @@ Copilot custom routing. Covers Epic **E8**.
   streams event frames back, honoring the tools/MCP runner-image contract (*Key
   Components §2*, *API Contracts*, *DD2*).
 - **Prerequisites:** E3-T2 (shared protocol). Resolve OQ#4 (location), OQ#5
-  (dialog), OQ#6 (stopgap token) before "done".
+  (dialog), OQ#6 (credential forwarding) before "done".
 
 | Task ID | Type | Description | Files | Status |
 |---|---|---|---|---|
 | E4-T1 | IMPL | FastAPI app + `python -m conductor.aca_runner` entrypoint; `GET /health` returns readiness + Conductor/runner version for `validate_connection` skew checks. | `src/conductor/aca_runner/__init__.py`, `server.py`, `__main__.py` | DONE |
 | E4-T2 | IMPL | `POST /execute`: deserialize the request, construct/reuse a `CopilotProvider` (inner provider = `copilot` for the MVP), run `execute()` with an `event_callback` that streams NDJSON frames, terminating with the `AgentOutput` `result` frame (incl. `session_seconds`). | `src/conductor/aca_runner/server.py` | DONE |
 | E4-T3 | IMPL | Tools/MCP: reconstruct the inner provider with the full `mcp_servers` definitions + per-agent `tools:` allowlist; a declared-but-absent stdio binary fails loudly at execute time (runner-image contract; *Open Questions → MCP*). | `src/conductor/aca_runner/server.py` | DONE |
-| E4-T4 | IMPL | Auth: point the inner `CopilotProvider` at the credential source per OQ#6 (Phase 1 stopgap token from the request body via the custom-routing `bearer_token` path); leave a seam for the Phase 2 gateway. | `src/conductor/aca_runner/server.py` | DONE |
+| E4-T4 | IMPL | Auth: point the inner `CopilotProvider` at the credential the host forwards in `inner_provider_settings` (BYOK custom-routing `bearer_token`/`api_key`/`base_url` path). The GitHub-token / Copilot-capacity path is added in E8–E10. | `src/conductor/aca_runner/server.py` | DONE |
 | E4-T5 | IMPL | Dialog turns per OQ#5: either a runner dialog endpoint or a documented disable-with-clear-error under `aca`. | `src/conductor/aca_runner/server.py`, `src/conductor/providers/aca.py` | DONE — chose the disable-with-clear-error fallback (`AcaRuntimeProvider.execute_dialog_turn` raises `ProviderError`); no runner dialog endpoint was built |
 | E4-T6 | TEST | Mocked-`CopilotProvider` server tests: `/execute` streams the expected frame sequence and terminal `result`; `/health` reports version; a missing stdio MCP binary surfaces as a runner error; tools/MCP passthrough is forwarded. | `tests/test_aca_runner/test_server.py` | DONE |
 
@@ -689,23 +683,165 @@ Verified after this round: `conductor validate examples/aca-coding-agent.yaml` a
   - [x] The preview is removed only after the `examples/` version validates.
 
 
-### E8 — Credential gateway *(Phase 2)*
-- **Goal:** Route the in-sandbox SDK's inference through a host-side gateway so the
-  real upstream key never enters the sandbox (*DD4*, *Security Considerations*);
-  required before untrusted/multi-tenant workloads.
-- **Prerequisites:** Phase 1 (E1–E7) complete. Depends on the design *Future* open
-  questions on egress posture / minimum viable gateway.
+### E8 — Host: forward a GitHub token for Copilot capacity — **DONE**
+- **Goal:** Extend the host provider to source and forward a GitHub token so a
+  sandbox agent runs on the operator's **Copilot capacity**; define precedence with
+  BYOK and fail loudly when neither credential is available (*DD4*).
+- **Prerequisites:** E3 (transport shim + `inner_provider_settings` forwarding).
+
+  **Review fixes (this pass).** A prior implementation pass of this epic failed
+  review on two points: (1) `AcaExecuteRequest.inner_provider_settings` stayed a
+  loosely typed `dict[str, Any]`, so constructing the model via
+  `model_validate`/`model_validate_json` on a raw dict/JSON payload (e.g. the
+  runner's own FastAPI request parsing) retained plaintext credential strings —
+  `SecretStr` redaction only held for the host's own direct-construction call
+  site; and (2) whitespace-only env var values (e.g. an unset CI secret
+  expanding to `""`/`"  "`) were treated as "configured", either selecting the
+  BYOK branch with a garbage `base_url` or suppressing a valid lower-priority
+  credential. Both are fixed here: `AcaExecuteRequest` gained a
+  `_redact_inner_provider_secrets` `field_validator` (`mode="after"`) that
+  wraps any plain-`str` value under a known credential key (`api_key` /
+  `bearer_token` / `github_token`) in `SecretStr` on every *validated*
+  construction path — `__init__`, `model_validate`, and `model_validate_json`,
+  not just `_resolve_inner_provider_settings`'s own direct-construction call
+  site. (This does not cover `model_construct()`/`model_copy(update=...)`,
+  which bypass field validators entirely; neither is used to build this model
+  anywhere in this codebase.) `aca.py` also gained a `_clean_env` helper
+  (normalizing unset/whitespace-only env values to `None`, mirroring
+  `copilot.py`'s `runtime_url`/`runtime_token` handling) used by both
+  `_resolve_github_token` and `_resolve_inner_provider_settings`. A tightly
+  coupled fix also landed in `aca_runner/server.py`: because
+  `inner_provider_settings` can now hold `SecretStr` values when the runner
+  parses an incoming request, `_InnerProviderCache._key_for`'s cache-key
+  computation (`json.dumps(..., default=str)`) would otherwise mask every
+  distinct credential to the same `"**********"` string, colliding two
+  requests with different credentials onto the same provider-cache key; it now
+  unwraps `SecretStr` values to their real secret, then hashes the canonical
+  JSON (`hashlib.sha256(...).hexdigest()`) rather than storing it verbatim —
+  distinct credentials still produce distinct cache keys, but the plaintext
+  credential is never retained in the cache's long-lived `_key` attribute.
+  Also fixed: `docs/projects/aca/aca-provider.design.md`'s DD4 narrative (the
+  Executive Summary, Decision Status table, Data Flow diagram, Security
+  Boundary, DD4 itself, Security Considerations, and Open Questions) is
+  updated in this same pass to describe the credential precedence this epic
+  actually implements (forward one narrowly-scoped credential — GitHub token
+  or BYOK, no modes) instead of the earlier "host-side gateway" framing that
+  Phase 1/Phase 2 language implied but this codebase never built; DD4's
+  Decision Status stays **Proposed** (flipping it to Accepted is E10-T2).
 
 | Task ID | Type | Description | Files | Status |
 |---|---|---|---|---|
-| E8-T1 | IMPL | Minimal host-side gateway that injects the real upstream key and forwards inference; point the runner's inner `CopilotProvider` at it via `COPILOT_PROVIDER_BASE_URL` / `COPILOT_PROVIDER_BEARER_TOKEN` custom routing (`copilot.py:360`). | `src/conductor/providers/aca_gateway.py` (or equivalent), `src/conductor/aca_runner/server.py` | TO DO |
-| E8-T2 | IMPL | Replace the Phase 1 stopgap for untrusted use: sandbox holds only a short-lived scoped token; `SecretStr` redaction throughout. | `src/conductor/providers/aca.py`, `src/conductor/aca_runner/server.py` | TO DO |
-| E8-T3 | TEST | Mocked gateway smoke test: the real key never appears in the request forwarded into the sandbox; redaction holds in emitted events. | `tests/test_providers/test_aca_gateway.py` | TO DO |
+| E8-T1 | IMPL | In `_resolve_inner_provider_settings`, when no `COPILOT_PROVIDER_BASE_URL` is set, source a GitHub token from `COPILOT_GITHUB_TOKEN`→`GH_TOKEN`→`GITHUB_TOKEN` and forward it as a new `SecretStr`-redacted `github_token` field on `AcaExecuteRequest.inner_provider_settings`. When `base_url` **is** set, forward BYOK settings unchanged — `base_url` wins, mirroring the Copilot CLI's own precedence. | `src/conductor/providers/aca.py`, `src/conductor/providers/aca_protocol.py` | DONE — env reads normalize whitespace-only values to unset via `_clean_env` (review fix); tightly coupled review fixes also touched `src/conductor/aca_runner/server.py` (cache-key hashing, so the runner-side provider cache never retains a plaintext credential — see "Review fixes" above) and `docs/projects/aca/aca-provider.design.md` (DD4 narrative kept in sync with the implemented precedence) |
+| E8-T2 | IMPL | Fail loudly when neither a GitHub token nor BYOK settings resolve: raise a `ProviderError` at execute time naming both remedies (create a fine-grained *Copilot Requests* PAT and export `COPILOT_GITHUB_TOKEN`, or set `COPILOT_PROVIDER_*`). No silent `None` / degraded run. | `src/conductor/providers/aca.py` | DONE |
+| E8-T3 | TEST | GitHub token forwarded when only a token env var is set; BYOK forwarded (token ignored) when `base_url` is also set; neither present raises a clear `ProviderError`; the token is `SecretStr`-redacted in `model_dump`/events and never in exception text. | `tests/test_providers/test_aca.py` | DONE — plus whitespace-only-credential precedence tests, `AcaExecuteRequest.model_validate`/`model_validate_json` secret-redaction tests (review fix), and (in `tests/test_aca_runner/test_server.py`) cache-key uniqueness/non-disclosure tests for `_InnerProviderCache._key_for`'s hashing (review fix) |
 
 - **Acceptance Criteria:**
-  - [ ] Real key resides only on the host (NFR2); docs state the trusted-vs-
-    untrusted boundary and that the gateway is required before untrusted/multi-
-    tenant workloads.
+  - [x] Precedence matches *DD4* (`base_url` → BYOK; else GitHub token → Copilot
+    capacity; else fail loudly).
+  - [x] The forwarded GitHub token is `SecretStr`-redacted wherever a secret is.
+
+`_resolve_inner_provider_settings` now branches strictly on
+`COPILOT_PROVIDER_BASE_URL`: when set, it forwards the existing BYOK dict
+unchanged (`base_url` + optional `api_key`/`bearer_token`) and a GitHub token
+present at the same time is ignored (`base_url` wins, matching the Copilot
+CLI's own precedence — DD4). When unset, a new `_resolve_github_token()`
+helper sources `COPILOT_GITHUB_TOKEN` → `GH_TOKEN` → `GITHUB_TOKEN` (first
+non-empty wins), wrapping the value in `SecretStr` immediately on read so any
+incidental repr/str of the intermediate value stays redacted; only
+`get_secret_value()` (called once, right at the point the plaintext must
+enter the outgoing `{"github_token": ...}` dict destined for the wire) ever
+exposes it — mirroring the `ProviderSettings.api_key`/`bearer_token` →
+`copilot.py:_resolve_sdk_provider_config` pattern already used for BYOK.
+When neither `base_url` nor a GitHub token resolves, the method now raises
+`ProviderError` (previously returned `None` silently, per the superseded
+OQ#6 Phase 1 stopgap) naming both remedies in `message`/`suggestion`: create
+a fine-grained *Copilot Requests* PAT and export `COPILOT_GITHUB_TOKEN`, or
+configure `COPILOT_PROVIDER_BASE_URL` (+ `COPILOT_PROVIDER_API_KEY` /
+`COPILOT_PROVIDER_BEARER_TOKEN`) for BYOK. `aca_protocol.py`'s module and
+field docstrings for `inner_provider_settings` were updated to describe the
+new precedence in place of the old OQ#6-only framing (no schema/type change
+— it stays `dict[str, Any] | None`, since a typed `SecretStr` field on the
+Pydantic model would mask the value in the very `model_dump(mode="json")`
+call that builds the real outgoing wire body).
+
+Replaced the old `TestAcaCredentialStopgap` class in `tests/test_providers/test_aca.py`
+with `TestAcaCredentialPrecedence` (its `test_execute_omits_credential_when_no_env_set`
+case is superseded — that scenario now fails loudly instead of returning `None`).
+New coverage: BYOK forwarded verbatim when `base_url` is set; `base_url` wins
+over a simultaneously-present GitHub token; GitHub token forwarded when
+`base_url` is unset; the `COPILOT_GITHUB_TOKEN`→`GH_TOKEN`→`GITHUB_TOKEN`
+precedence order (parametrized); `ProviderError` raised (both from
+`_resolve_inner_provider_settings()` directly and via `execute()`) when no
+credential resolves, with the exception text checked for the expected
+env-var names and confirmed to never contain example secret values; and a
+dedicated test that `_resolve_github_token()` returns a `SecretStr` whose
+`repr()`/`str()` never leak the plaintext while `get_secret_value()` does.
+Added an autouse `_default_aca_credential_env` fixture (module-level) that
+sets a default `COPILOT_GITHUB_TOKEN` for every other test in the file —
+none of the pre-existing transport/streaming/concurrency/interrupt tests
+exercise credential resolution, so without a default they would now fail
+loudly in any environment lacking `COPILOT_GITHUB_TOKEN`/`GH_TOKEN`/
+`GITHUB_TOKEN`/`COPILOT_PROVIDER_BASE_URL`; `TestAcaCredentialPrecedence`
+tests explicitly clear/override the six credential env vars via the same
+per-test `monkeypatch` fixture to exercise the real precedence logic.
+
+Verified: `tests/test_providers/test_aca.py` — 66 passed. Full suite
+(`pytest -m "not performance and not real_api and not install_scripts"`) —
+4467 passed, 5 skipped, 1 pre-existing known-flaky failure in
+`test_event_log.py::test_filenames_unique_for_simultaneous_starts`
+(unrelated to this change, same failure mode documented in prior epics'
+review rounds). `ruff check`/`ruff format --check` clean on all three
+changed files; `ty check` on `aca.py`/`aca_protocol.py` shows only two
+pre-existing, unrelated `unused-ignore-comment` warnings on the
+`azure-identity` import guard (confirmed present before this change via
+`git stash`).
+
+Left for E9/E10 (explicitly out of this epic's scope): the in-container
+runner (`src/conductor/aca_runner/server.py`) still only consumes
+`inner_provider_settings` as BYOK `ProviderSettings(name="copilot",
+**inner_provider_settings)` — it does not yet understand a `github_token`
+key (E9-T2), and `CopilotProvider`/`CopilotClient` do not yet accept a
+`github_token` in-memory credential (E9-T1). A workflow whose host now
+resolves and forwards `{"github_token": ...}` (no `COPILOT_PROVIDER_*` env
+vars set) will therefore reach the runner but fail there until E9 ships —
+an expected, sequenced gap per the epic dependency chain, not a regression
+introduced here.
+
+
+### E9 — Inner auth: authenticate the sandbox runtime with the forwarded token (in-memory)
+- **Goal:** Deliver the forwarded GitHub token to the sandbox's inner Copilot
+  runtime **in memory** so it authenticates against Copilot's own model routing
+  (Copilot capacity), not a BYOK endpoint (*DD4*; *Key Components §2*).
+- **Prerequisites:** E8 (host forwards `github_token`), E4 (runner).
+
+| Task ID | Type | Description | Files | Status |
+|---|---|---|---|---|
+| E9-T1 | IMPL | Plumb a `github_token` through `CopilotProvider` to `CopilotClient(github_token=…)` (the SDK's in-memory `gitHubToken` connect payload) so the runtime authenticates with it and — with no `base_url` set — uses Copilot's own model routing. | `src/conductor/providers/copilot.py` | TO DO |
+| E9-T2 | IMPL | In the runner's `_InnerProviderCache`, consume `inner_provider_settings["github_token"]` and construct the inner `CopilotProvider` so the token reaches `CopilotClient` in memory (request body → runtime, not written to a sandbox env var by default). | `src/conductor/aca_runner/server.py` | TO DO |
+| E9-T3 | TEST | Runner + provider: a forwarded `github_token` reaches `CopilotClient(github_token=…)` with no `base_url` (Copilot routing); a BYOK settings dict still routes via `base_url`; the token is redacted in logs/events. | `tests/test_providers/test_copilot.py`, `tests/test_aca_runner/test_server.py` | TO DO |
+
+- **Acceptance Criteria:**
+  - [ ] A forwarded GitHub token drives the inner runtime on Copilot capacity,
+    delivered in memory (not an env var).
+  - [ ] BYOK path unchanged; event/output parity preserved (DD2).
+
+### E10 — Docs: default the Quick Start to Copilot capacity
+- **Goal:** Rewrite `docs/providers/aca.md` so the recommended, default path is a
+  fine-grained *Copilot Requests* PAT forwarded automatically (no
+  `COPILOT_PROVIDER_*` required), with BYOK as the documented fallback; align the
+  design decision status (Goals #6; *DD4*).
+- **Prerequisites:** E8, E9.
+
+| Task ID | Type | Description | Files | Status |
+|---|---|---|---|---|
+| E10-T1 | IMPL | Rewrite the aca.md Quick Start / Authentication / Security sections: create a fine-grained *Copilot Requests* PAT, export `COPILOT_GITHUB_TOKEN` (Copilot capacity) as the default; BYOK (`COPILOT_PROVIDER_*`) as the fallback; state the trusted-use posture (the credential enters the sandbox — keep it narrowly scoped with a short expiry) and that off-sandbox isolation is future work. | `docs/providers/aca.md` | TO DO |
+| E10-T2 | IMPL | Flip DD4's status to **Accepted** in the design's Decision Status table once E8/E9 ship. | `docs/projects/aca/aca-provider.design.md` | TO DO |
+| E10-T3 | TEST | `conductor validate examples/aca-coding-agent.yaml` still passes; the example header/prereqs reflect the Copilot-token default. | `examples/aca-coding-agent.yaml` | TO DO |
+
+- **Acceptance Criteria:**
+  - [ ] aca.md's default path is a *Copilot Requests* PAT (Copilot capacity), no
+    `COPILOT_PROVIDER_*` required; BYOK documented as the fallback.
+  - [ ] DD4 shows **Accepted**; the example validates.
 
 ---
 

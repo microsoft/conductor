@@ -34,9 +34,12 @@ deferred (see Decision Status).
 
 **What reviewers are asked to approve now:** the **architecture direction** (a
 remote `aca` `AgentProvider` that delegates `execute()` to an in-sandbox runner,
-orchestrator on the host); the **credential-boundary approach** (a host-side
-gateway so the model key never enters the sandbox); and the **sequencing** (a
-blocking Phase 0 transport spike gates the build; Alternative B may land first).
+orchestrator on the host); the **credential model** (the provider forwards a
+single narrowly-scoped credential to the sandbox — recommended: a fine-grained
+*Copilot Requests* PAT, so trusted workloads run on your own Copilot capacity —
+with BYOK custom routing as the fallback and no mode switch); and the
+**sequencing** (a blocking Phase 0 transport spike gates the build; Alternative B
+may land first).
 The Phase 0 transport spike has **run and resolved** (Branch S; see DD3) — the
 transport branch and its two dependent capability values are no longer open and
 are included below for approval alongside everything else.
@@ -45,7 +48,7 @@ are included below for approval alongside everything else.
 |---|---|---|
 | `AgentProvider` at `execute()` granularity (DD1) | Proposed | Engine, routing, context, checkpoints stay on host |
 | Runner wraps the real `CopilotProvider` (DD2) | Proposed | Event/output parity comes "for free" |
-| Credential boundary = host-side gateway (DD4) | Proposed | Recommended; timing below |
+| Credential model = forward a narrowly-scoped credential (DD4) | Proposed | No modes; Copilot-Requests PAT recommended, BYOK fallback |
 | Transport: streaming vs submit+poll (DD3) | **Resolved — Branch S** | Phase 0 spike (#312) measured a ~30-min per-request cap; streaming chosen |
 | `streaming_events` / `interrupt` capability values | **Resolved — both `True`** | Follow directly from the DD3 outcome |
 | `concurrent_safe = True` via concurrency discriminator (DD5) | Proposed | Mechanism in Data Flow |
@@ -59,11 +62,13 @@ Statuses: **Accepted** (settled), **Proposed** (up for approval now),
 **Resolved** (Phase 0 spike outcome, now settled), **Deferred** (out of scope or
 later).
 
-**Is the credential gateway a release requirement?** No — not for the Phase 1
-MVP, which may run with a short-lived-token stopgap for *trusted* use. The
-gateway (DD4, Phase 2) **is required before the provider is recommended for
-untrusted or multi-tenant workloads**. Both facts are stated once more where they
-apply (DD4, Security Considerations) and nowhere else.
+**What is the credential posture?** The provider forwards one narrowly-scoped
+credential to the sandbox (DD4) — recommended: a fine-grained *Copilot Requests*
+PAT, so trusted workloads run on your own Copilot capacity. Because that
+credential is readable inside the session, `aca` targets **trusted** workloads;
+keeping the credential entirely off the sandbox (a host-side broker) for
+untrusted/multi-tenant use is future work. The full model is stated in DD4 and
+Security Considerations.
 
 ## Background
 
@@ -109,7 +114,7 @@ Two facts about *where side effects land* motivate this work:
   `_check_field_compatibility` validator, and `has_custom_routing()`. It backs
   Copilot **custom routing** (`_resolve_sdk_provider_config`, `copilot.py:360`),
   which points the SDK at an arbitrary endpoint via `COPILOT_PROVIDER_BASE_URL` /
-  `COPILOT_PROVIDER_BEARER_TOKEN` — the reuse hook for the credential gateway.
+  `COPILOT_PROVIDER_BEARER_TOKEN` — the reuse hook for BYOK credential forwarding.
 - **Experimental provider tier.** `ProviderCapabilities`
   (`capabilities.py`) is a declarative contract that `conductor validate`
   cross-checks (`config/validator.py`); carve-outs live in
@@ -165,8 +170,9 @@ the **whole SDK** off-host — which no current provider type does.
 3. Slot into existing seams (`create_provider()`, structured `runtime.provider`, a
    declared `ProviderCapabilities`, unchanged event/`AgentOutput` contracts) so
    dashboard/JSONL/console render identically.
-4. Establish a **credential boundary** so the model key need not persist inside the
-   sandbox (recommended: host-side gateway).
+4. Forward only a **narrowly-scoped credential** to the sandbox (recommended: a
+   fine-grained *Copilot Requests* PAT — your Copilot capacity), never a broad or
+   long-lived key baked as a pool secret.
 5. Preserve isolation under concurrency: distinct ACA sessions per concurrency
    unit (`concurrent_safe=True`).
 6. Ship behind an optional extra with an experimental banner, a docs page, one
@@ -211,8 +217,9 @@ the **whole SDK** off-host — which no current provider type does.
 
 - **NFR1 — Isolation.** Tool side effects execute in the session filesystem, never
   the host's; distinct concurrency units get distinct sessions.
-- **NFR2 — Credential safety.** In the recommended design the upstream key never
-  resides in the sandbox; secrets are `SecretStr`-redacted in events/checkpoints.
+- **NFR2 — Credential safety.** The credential forwarded to the sandbox is narrowly
+  scoped (recommended: a *Copilot Requests* PAT); a broad or long-lived key is never
+  baked as a pool secret; secrets are `SecretStr`-redacted in events/checkpoints.
 - **NFR3 — Parity.** Event types, emit points, and `AgentOutput` shape match the
   on-host providers.
 - **NFR4 — Long-running tolerance.** A single step runs for minutes; the transport
@@ -238,8 +245,8 @@ the **whole SDK** off-host — which no current provider type does.
 │     for line in ndjson(resp): event_callback(line.type, line.data)     │
 │     return AgentOutput(**final_result)                                 │
 │                                                                        │
-│ (optional) Credential gateway: holds the real upstream key on the host │
-│   and injects it into inference; sandbox holds only a short-lived token.│
+│ Per execute(): forward one narrowly-scoped credential to the runner    │
+│   (Copilot-Requests PAT → Copilot capacity, or BYOK settings).         │
 └──────────────────────────────┬─────────────────────────────────────────┘
                                │ HTTPS · aud dynamicsessions.io
                                │ POST /<path>?identifier=<id> → <TARGET_PORT>/<path>
@@ -251,7 +258,7 @@ the **whole SDK** off-host — which no current provider type does.
                  │  │  FastAPI /execute      │  │
                  │  │  wraps CopilotProvider │  │
                  │  │  SDK loop + CLI tools  │──┼─▶ edits/exec on CONTAINER fs (ephemeral)
-                 │  │  inner SDK → gateway ──┼──┼─▶ model inference (Copilot / Anthropic)
+                 │  │  inner SDK ────────────┼──┼─▶ model inference (Copilot capacity/BYOK)
                  │  └────────────────────────┘  │
                  └──────────────────────────────┘
 ```
@@ -264,14 +271,18 @@ retreated *to*.
 
 ### Security Boundary (at a glance)
 
-Because a model-driven shell inside the session can read any env var or file
-there, the design's one hard security rule is: **the real model key must never
-enter the sandbox.** The recommended mechanism routes the in-sandbox SDK's
-inference through a **host-side gateway** that injects the real key; the sandbox
-holds at most a short-lived, narrowly-scoped token. ACA offers no per-session
-secret and no per-destination egress allowlist, so the boundary must live on the
-host, not in the image. Full model, threat analysis, and the managed-identity
-trade-off are in **Security Considerations**; the decision rationale is **DD4**.
+A model-driven shell inside the session can read any env var or file there, so the
+design's rule is: **only a narrowly-scoped credential is ever forwarded to the
+sandbox.** The provider forwards one credential per `execute()` — recommended: a
+fine-grained *Copilot Requests* PAT, which can do nothing on your account but make
+Copilot inference calls (your Copilot capacity), with a bounded expiry — or BYOK
+custom-routing settings as the fallback. Because that credential does enter the
+session, `aca` targets **trusted** workloads; a broad or long-lived key is never
+baked as a pool secret. ACA offers no per-session secret and no per-destination
+egress allowlist, so keeping the credential entirely off the sandbox (a host-side
+broker) is future work for untrusted/multi-tenant use. Full model, threat analysis,
+and the managed-identity trade-off are in **Security Considerations**; the decision
+rationale is **DD4**.
 
 ### Design Decisions
 
@@ -333,14 +344,24 @@ premises the rest of the design builds on.
   default. Whether to build that resume path for v1 or defer it is now a Pre-MVP
   open question (see Open Questions).
 
-- **DD4 — Credential gateway is the recommended boundary.** Route the in-sandbox
-  SDK's inference through a host-side gateway that injects the real upstream key,
-  reusing Copilot custom routing (`COPILOT_PROVIDER_BASE_URL` /
-  `COPILOT_PROVIDER_BEARER_TOKEN`). **Timing:** the Phase 1 MVP may use a
-  short-lived scoped token in the request body (acceptable only for *trusted*
-  use); the gateway is a **release requirement before untrusted / multi-tenant
-  workloads** (Phase 2). Baking a long-lived token as a pool secret is the named
-  anti-pattern and is rejected. Full model in **Security Considerations**.
+- **DD4 — Forward one narrowly-scoped credential; no modes.** Per `execute()` the
+  provider forwards a single credential to the sandbox runner, mirroring the Copilot
+  CLI's own auth precedence (no `credential_mode` switch): if
+  `COPILOT_PROVIDER_BASE_URL` is set on the host → forward the BYOK custom-routing
+  settings (`base_url` + `api_key`/`bearer_token`); otherwise, if a GitHub token is
+  present (`COPILOT_GITHUB_TOKEN` → `GH_TOKEN` → `GITHUB_TOKEN`) → forward it and the
+  sandbox's inner Copilot runtime authenticates to **GitHub Copilot's own model
+  routing** (your Copilot capacity) — **recommended: a fine-grained PAT with only the
+  *Copilot Requests* permission**; otherwise → fail loudly with setup guidance. The
+  credential is delivered in-memory per call (request body → the inner runtime's
+  `github_token`), never a persisted pool secret. **Posture:** the credential *does*
+  enter the sandbox and is readable by a shell there, so the defense is *scope and
+  lifetime* — a leaked *Copilot Requests* PAT can only spend your Copilot quota until
+  it expires and is centrally revocable — which makes `aca` suitable for *trusted*
+  workloads. Baking a long-lived, broadly-scoped token as a pool secret is the named
+  anti-pattern and is rejected. Keeping the credential entirely off the sandbox (a
+  host-side broker/relay) for untrusted/multi-tenant use is future work. Full model in
+  **Security Considerations**.
 
 - **DD5 — `identifier` is the isolation/persistence knob.** ACA keys sessions by a
   free-form `identifier` (existing → routed; new → auto-allocated), with state
@@ -416,8 +437,10 @@ and wraps the real provider:
   contract** (stdio binaries baked in; remote MCP needs egress) detailed in API
   Contracts.
 - `GET /health` — readiness/liveness for probes and `validate_connection`.
-- **Auth** — inner `CopilotProvider` pointed at the host gateway via custom
-  routing (DD4); the real key is never in the container.
+- **Auth** — the runner authenticates the inner `CopilotProvider` with the
+  credential the host forwards per call (DD4): a GitHub token → Copilot's own model
+  routing (Copilot capacity), or BYOK custom-routing settings. Only a
+  narrowly-scoped credential is forwarded; no broad key is baked into the image.
 
 The runner is deliberately minimal: loop, tools, structured output, and retries
 are the *existing, tested* `CopilotProvider` running in a new location. The
@@ -635,8 +658,10 @@ exclusive — B and A are the lighter, more defensive plays and can land first.
   per-request cap was measured and confirmed reproducible; **Branch S** is
   chosen. Everything else is buildable; this was the true unknown and no longer
   blocks the build.
-- **Credential gateway** (DD4) is required before untrusted workloads (Phase 2);
-  the MVP may start with the short-lived-token stopgap for trusted use.
+- **Credential model** (DD4): forward one narrowly-scoped credential (recommended a
+  *Copilot Requests* PAT — your Copilot capacity); trusted-use posture. Keeping the
+  credential off the sandbox for untrusted/multi-tenant use is future work — not a
+  build blocker.
 - **Alternative B** is recommended to precede this work if the immediate goal is
   safe containment.
 
@@ -688,16 +713,19 @@ the architecture; it follows directly from ACA's documented model.
   identical for every session, and egress is a single on/off
   (`sessionNetworkConfiguration.status`) with no per-destination filtering. The
   platform cannot keep a key from a compromised session or constrain exfiltration.
-- **Recommended boundary (DD4).** A host-side gateway holds the real upstream key
-  and injects it; the sandbox receives only a short-lived, scoped token. **The
-  primary defense is that the real key never enters the sandbox** — a shell
-  (possibly root; the Cowork root-escape shows root is reachable) can read any env
-  var, file, or in-container egress rule. Enforcing "the gateway is the only
-  egress" *inside the image* is therefore **defense-in-depth, not a robust
-  boundary** on its own. Keep the gateway minimal (*"the weakest layer is the one
-  you built yourself"*; exfiltration through an allow-listed domain is a documented
-  real-world event). **Release timing:** stopgap token acceptable for trusted MVP
-  use; gateway required before untrusted/multi-tenant workloads.
+- **Credential model (DD4).** The provider forwards one narrowly-scoped credential
+  to the sandbox per `execute()` — recommended: a fine-grained *Copilot Requests*
+  PAT (authorizes only Copilot inference on your capacity, nothing else on the
+  account) with a bounded expiry; BYOK custom-routing settings are the fallback.
+  **The credential does enter the session** — a shell (possibly root; the Cowork
+  root-escape shows root is reachable) can read any env var or file — so the
+  defense is *scope and lifetime*, not concealment: a leaked *Copilot Requests* PAT
+  can only spend your Copilot quota until it expires, and is centrally revocable.
+  This makes `aca` suitable for **trusted** workloads (repos/workflows you control).
+  Keeping the credential entirely off the sandbox (a host-side broker/relay that
+  makes the model call on the sandbox's behalf) is the stronger boundary for
+  untrusted/multi-tenant use and is **future work** — noted because ACA offers no
+  per-session secret and no per-destination egress allowlist to lean on instead.
 - **Anti-pattern (rejected).** Baking a long-lived `GITHUB_TOKEN`/
   `ANTHROPIC_API_KEY` as a pool secret or image env exposes the whole pool
   indefinitely.
@@ -709,12 +737,12 @@ the architecture; it follows directly from ACA's documented model.
   IMDS — the same exposure class as a short-lived token — so it does not substitute
   for the boundary. If used (e.g. blob artifact staging), scope its RBAC to the
   minimum and never grant it the upstream model credential.
-- **Secret hygiene.** Pool and gateway tokens are `SecretStr`, redacted in events,
+- **Secret hygiene.** Forwarded credentials are `SecretStr`, redacted in events,
   checkpoints, and the dashboard via existing `ProviderSettings` redaction.
 - **Identifier as a capability.** The `identifier` is the routing/isolation key:
   cryptographically salted, never guessable, always over HTTPS.
-- **Attack-surface delta.** New: a host→ACA management call, an in-container HTTP
-  server, and (recommended) a host gateway. The *agent's* attack surface moves
+- **Attack-surface delta.** New: a host→ACA management call and an in-container HTTP
+  server. The *agent's* attack surface moves
   off-host into an ephemeral isolated VM (the point); the new host-side surface
   must stay minimal and credential-light.
 
@@ -723,7 +751,7 @@ the architecture; it follows directly from ACA's documented model.
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
 | Sessions endpoint drops long/streamed requests (the #1 unknown) | ~~High~~ Resolved | ~~High~~ Low | Phase 0 spike (#312, closed) measured a reproducible ~30-min per-request cap on default ingress; Branch S chosen (DD3); `streaming_events=True`/`interrupt=True` set honestly. Residual risk: a turn exceeding ~30 min still hits the cap (see DD3 caveat / Open Questions). |
-| Credential leak from a compromised session | Medium | High | Real key never enters the sandbox (DD4 gateway); short-lived scoped tokens; never bake pool secrets. |
+| Credential leak from a compromised session | Medium | Medium | Forward only a narrowly-scoped credential — recommended a *Copilot Requests* PAT (Copilot-quota-only, bounded expiry, revocable); never bake a broad/long-lived pool secret. Trusted-use posture; off-sandbox isolation is future work (DD4). |
 | Cost surprise (E16 nodes; idle warm pool) | Medium | Medium | Distinct session-seconds row; right-size `readySessionInstances`; modest per-session `--cpu/--memory`. |
 | Required MCP stdio binary / egress absent (runner-image contract) | Medium | Medium | Bake stdio binaries into the image; enable egress for remote MCP; fail loudly at execute time. |
 | Ephemeral FS loses artifacts (no volume mount) | High | Medium | Seed inputs at start; push artifacts out before cooldown; `checkpoint_resume=False`. |
@@ -809,7 +837,7 @@ Phase 1), **Future** (post-MVP / v2).
   (the runner + a pinned Conductor + the common stdio MCP binaries) that works
   out-of-the-box for the Copilot MVP, **and** document the runner *contract* — the
   `/execute` + `/health` HTTP surface, the NDJSON event-frame schema, and the
-  gateway auth expectation — so users can `FROM conductor-agent-runner:<tag>` to
+  credential-forwarding contract — so users can `FROM conductor-agent-runner:<tag>` to
   extend it (extra MCP servers, system deps, language toolchains) or build a fully
   custom conformant image. Base image = zero-config fast path; contract = escape
   hatch. `validate_connection()` checks the runner/Conductor version to catch skew.
@@ -838,24 +866,26 @@ Phase 1), **Future** (post-MVP / v2).
   ones are added by extending the image; remote MCP requires pool egress. A
   non-blocking `validate` *warning* (stdio MCP under `aca` depends on image
   contents) is acceptable, but not a hard error.
-- **Dialog turns.** Must `execute_dialog_turn()` route through the sandbox/gateway
+- **Dialog turns.** Must `execute_dialog_turn()` route through the sandbox
   for consistency in v1, or is it deferred?
 
-  **Answer — route through the sandbox/gateway for consistency.** A "dialog turn"
+  **Answer — route through the sandbox for consistency.** A "dialog turn"
   is the follow-up interactive turn some flows issue on an existing session (e.g.
   the dialog evaluator behind human-gate refinement). For v1, `execute_dialog_turn()`
-  should hit the **same** in-sandbox runner + host gateway as `execute()`, reusing
+  should hit the **same** in-sandbox runner as `execute()`, reusing
   the agent's `identifier` (DD5) so every turn for that agent shares one isolation
   and credential boundary; running dialog turns on the host would leak to the host
-  filesystem and bypass the gateway — exactly the inconsistency to avoid. If the
+  filesystem and bypass the sandbox boundary — exactly the inconsistency to avoid. If the
   runner does not expose a dialog endpoint in the MVP, the fallback is to disable
   dialog turns under `aca` with a clear error rather than silently run them
   on-host.
 
 **Future (post-MVP):**
 
-- **Egress posture.** Open egress + self-hosted gateway, or VNet + NSG
-  allowlisting? What is the minimum viable gateway?
+- **Stronger credential isolation (untrusted/multi-tenant).** Keep the forwarded
+  credential entirely off the sandbox via a host-side broker/relay that makes the
+  model call on the sandbox's behalf; pair with egress allowlisting (VNet + NSG).
+  Out of scope for the trusted-use MVP.
 - **Resume meaningfulness.** Persist the workspace to blob so `conductor resume`
   becomes meaningful despite `checkpoint_resume=False`?
 - **Inner provider coverage.** Add `claude-agent-sdk` (the containerizable `claude`

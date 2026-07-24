@@ -11,16 +11,37 @@ the way in; one NDJSON event frame per line on the way out, terminated by a
 Two fields are additive beyond the literal API Contracts example, resolving
 open questions the design left for this epic:
 
-- ``AcaExecuteRequest.inner_provider`` / ``inner_provider_settings`` — OQ#6
-  (MVP credential stopgap). The runner has no interactive OAuth flow, so for
-  Phase 1 trusted use the host may forward a short-lived, narrowly-scoped
-  credential (bearer token / API key / base URL) that the runner uses to
-  construct ``ProviderSettings(name=inner_provider, **inner_provider_settings)``
-  for its inner ``CopilotProvider`` — reusing the existing custom-routing
+- ``AcaExecuteRequest.inner_provider`` / ``inner_provider_settings`` — DD4
+  credential precedence (epic E8; originally OQ#6's MVP stopgap). The runner
+  has no interactive OAuth flow, so the host forwards one narrowly-scoped
+  credential per call that the runner uses to construct
+  ``ProviderSettings(name=inner_provider, **inner_provider_settings)`` for its
+  inner ``CopilotProvider`` — reusing the existing custom-routing
   ``bearer_token`` path (``copilot.py:_resolve_sdk_provider_config``) instead
-  of inventing a new auth mechanism. ``None`` when no stopgap credential is
-  configured on the host (DD4: the Phase 2 gateway removes the need for this
-  field entirely).
+  of inventing a new auth mechanism. Precedence mirrors the Copilot CLI's own
+  auth resolution: when ``COPILOT_PROVIDER_BASE_URL`` is set on the host, this
+  is ``{"base_url": ..., "api_key": ..., "bearer_token": ...}`` (BYOK,
+  unchanged from the stopgap); otherwise it is ``{"github_token": ...}``, a
+  GitHub token sourced from ``COPILOT_GITHUB_TOKEN`` → ``GH_TOKEN`` →
+  ``GITHUB_TOKEN`` so the sandbox's inner runtime authenticates against
+  GitHub Copilot's own model routing (the operator's Copilot capacity). The
+  host (``AcaRuntimeProvider._resolve_inner_provider_settings``) raises
+  ``ProviderError`` rather than sending a request when neither resolves — no
+  silently unauthenticated sandbox run. Every secret value in this dict
+  (``api_key`` / ``bearer_token`` / ``github_token``) is a ``SecretStr``
+  instance, not a plain ``str`` — pydantic still recognizes and redacts it in
+  ``AcaExecuteRequest.model_dump()`` / ``repr()``; only
+  ``AcaRuntimeProvider._wire_body`` unwraps it to plaintext, immediately
+  before the request bytes leave the process. Review fix:
+  ``AcaExecuteRequest._redact_inner_provider_secrets`` (a ``field_validator``)
+  enforces this ``SecretStr`` wrapping on every *validated* construction path
+  — not just ``AcaRuntimeProvider``'s own direct-construction call site, but
+  also a plain dict/JSON payload validated via ``model_validate``/
+  ``model_validate_json`` (e.g. the runner's own FastAPI request parsing),
+  which would otherwise retain a plaintext credential string. This does not
+  cover ``model_construct()`` or ``model_copy(update=...)``, both of which
+  bypass validators by design; neither is used to build this model anywhere
+  in this codebase.
 - ``AcaExecuteRequest.tool_output`` / ``AcaResultData.cache_read_tokens`` /
   ``AcaResultData.cache_write_tokens`` — review fix: these were captured
   host-side (``ToolOutputConfig`` on the provider; Claude-style prompt-cache
@@ -45,7 +66,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
+
+# `inner_provider_settings` keys that carry a credential (as opposed to
+# `base_url`, which is not secret). Kept in one place so the redaction
+# validator below and any future field additions stay in sync.
+_INNER_PROVIDER_SECRET_KEYS = ("api_key", "bearer_token", "github_token")
 
 
 class AcaAgentPayload(BaseModel):
@@ -124,8 +150,60 @@ class AcaExecuteRequest(BaseModel):
     """SDK the runner should drive. MVP: ``"copilot"`` only."""
 
     inner_provider_settings: dict[str, Any] | None = None
-    """OQ#6 Phase 1 credential stopgap — see module docstring. ``None`` when
-    unset on the host."""
+    """DD4 credential precedence (epic E8) — see module docstring. Either
+    BYOK settings (``base_url`` + optional ``api_key``/``bearer_token``) or a
+    single ``github_token`` field for Copilot-capacity auth. The host raises
+    ``ProviderError`` rather than sending a request with this unset, so in
+    practice this field is never ``None`` on the wire. Secret values are
+    ``SecretStr`` instances (redacted in ``model_dump``/``repr``); the host
+    unwraps them to plaintext only in its dedicated wire-serialization step
+    (``AcaRuntimeProvider._wire_body``).
+
+    The type is a loosely-typed ``dict[str, Any]`` (not a dedicated
+    sub-model) because the runner side (epic E4) treats it as opaque
+    ``ProviderSettings`` constructor kwargs. ``_redact_inner_provider_secrets``
+    below still guarantees redaction on every *validated* construction path
+    — not just ``AcaRuntimeProvider``'s own direct-construction call site —
+    by wrapping any plain-``str`` value under a known credential key in
+    ``SecretStr`` immediately after validation. (Field validators only run
+    on validated construction; ``model_construct()``/``model_copy(update=...)``
+    bypass them and are not used to build this model anywhere in this
+    codebase.)"""
+
+    @field_validator("inner_provider_settings", mode="after")
+    @classmethod
+    def _redact_inner_provider_secrets(cls, value: dict[str, Any] | None) -> dict[str, Any] | None:
+        """Coerce known credential keys to ``SecretStr`` regardless of how
+        this model was validated (review fix).
+
+        ``AcaRuntimeProvider._resolve_inner_provider_settings`` already
+        returns these fields pre-wrapped in ``SecretStr`` for the host's own
+        direct-construction call site, so `model_dump`/`repr` already
+        redact them there. But `dict[str, Any]` performs no coercion of its
+        own — constructing this model via `model_validate`/
+        `model_validate_json` on a plain dict/JSON payload (e.g. the
+        runner's own FastAPI request parsing) would otherwise retain
+        plaintext credential strings, silently defeating that redaction.
+        Values that are already ``SecretStr`` (not a ``str`` subclass) pass
+        through unchanged, so this is idempotent across repeated
+        validation.
+
+        Like all field validators, this only runs on *validated*
+        construction (``__init__``/``model_validate``/``model_validate_json``).
+        ``model_construct()`` (skips validation entirely) and
+        ``model_copy(update=...)`` (assigns the update dict directly, no
+        validator re-run) both bypass it — neither is used to build this
+        model anywhere in this codebase, so this is a documented scope
+        limit, not a gap in current call sites.
+        """
+        if value is None:
+            return value
+        return {
+            key: SecretStr(raw)
+            if key in _INNER_PROVIDER_SECRET_KEYS and isinstance(raw, str)
+            else raw
+            for key, raw in value.items()
+        }
 
     tool_output: dict[str, Any] | None = None
     """``runtime.tool_output`` (``ToolOutputConfig``), dumped to a plain dict.
