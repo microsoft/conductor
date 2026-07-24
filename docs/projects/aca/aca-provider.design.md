@@ -48,7 +48,7 @@ are included below for approval alongside everything else.
 |---|---|---|
 | `AgentProvider` at `execute()` granularity (DD1) | Proposed | Engine, routing, context, checkpoints stay on host |
 | Runner wraps the real `CopilotProvider` (DD2) | Proposed | Event/output parity comes "for free" |
-| Credential model = forward a narrowly-scoped credential (DD4) | Proposed | No modes; Copilot-Requests PAT recommended, BYOK fallback |
+| Credential model = forward a narrowly-scoped credential (DD4) | **Accepted** | No modes; Copilot-Requests PAT recommended (default), BYOK fallback — shipped in E8/E9 |
 | Transport: streaming vs submit+poll (DD3) | **Resolved — Branch S** | Phase 0 spike (#312) measured a ~30-min per-request cap; streaming chosen |
 | `streaming_events` / `interrupt` capability values | **Resolved — both `True`** | Follow directly from the DD3 outcome |
 | `concurrent_safe = True` via concurrency discriminator (DD5) | Proposed | Mechanism in Data Flow |

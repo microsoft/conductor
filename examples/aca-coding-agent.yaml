@@ -18,17 +18,22 @@
 #      with the *Session Executor* role on the pool.
 #   4. Inner Copilot authentication: the in-sandbox runner drives a real
 #      CopilotProvider but cannot do interactive OAuth login inside a
-#      headless container, so the HOST must export one of
-#      COPILOT_PROVIDER_BEARER_TOKEN / COPILOT_PROVIDER_API_KEY (with
-#      COPILOT_PROVIDER_BASE_URL) before `conductor run` — these are
-#      forwarded into the sandbox as `inner_provider_settings` (Phase 1
-#      trusted-use credential stopgap, DD4/OQ#6). This MUST be a
-#      short-lived, narrowly-scoped credential — never a long-lived
-#      personal token or a general-purpose API key — and this mechanism
-#      is only acceptable for TRUSTED workloads, not untrusted/
-#      multi-tenant use (see docs/providers/aca.md#security). Without one
-#      of these set, the sandbox's Copilot session has no credential and
-#      every agent turn fails. See docs/providers/aca.md#authentication.
+#      headless container, so the HOST must forward a credential (design
+#      DD4). Default (recommended): create a fine-grained GitHub PAT scoped
+#      to only the "Copilot Requests" permission and export it as
+#      COPILOT_GITHUB_TOKEN (GH_TOKEN / GITHUB_TOKEN also work) — no
+#      COPILOT_PROVIDER_* configuration required; the sandbox then runs on
+#      your own Copilot capacity. Fallback: BYOK custom routing via
+#      COPILOT_PROVIDER_BEARER_TOKEN or COPILOT_PROVIDER_API_KEY (with
+#      COPILOT_PROVIDER_BASE_URL). Either way the credential is delivered
+#      in-memory per request, never as a persisted sandbox secret — but it
+#      IS readable inside the session, so keep it narrowly scoped with a
+#      short expiry. This mechanism is only acceptable for TRUSTED
+#      workloads, not untrusted/multi-tenant use (see
+#      docs/providers/aca.md#security; off-sandbox isolation is future
+#      work). Without a credential, the sandbox's Copilot session has no
+#      way to authenticate and every agent turn fails. See
+#      docs/providers/aca.md#authentication.
 #   5. Set POOL_ENDPOINT below to your pool's management endpoint.
 #
 # Full architecture, security model, and API contract:
@@ -36,7 +41,7 @@
 #   docs/projects/aca/aca-provider.design.md
 #
 # Run:
-#   export COPILOT_PROVIDER_BEARER_TOKEN=<your Copilot-compatible token>
+#   export COPILOT_GITHUB_TOKEN=<fine-grained PAT, "Copilot Requests" only>
 #   conductor run examples/aca-coding-agent.yaml \
 #     --input repo_url="https://github.com/octocat/Hello-World" \
 #     --input task="Add a CONTRIBUTING.md with a one-paragraph guide"

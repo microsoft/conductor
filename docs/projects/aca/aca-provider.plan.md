@@ -891,12 +891,18 @@ forwarding neither) are unaffected by this fix — the runner-side seam
   `COPILOT_PROVIDER_*` required), with BYOK as the documented fallback; align the
   design decision status (Goals #6; *DD4*).
 - **Prerequisites:** E8, E9.
+- **Status:** DONE
 
 | Task ID | Type | Description | Files | Status |
 |---|---|---|---|---|
-| E10-T1 | IMPL | Rewrite the aca.md Quick Start / Authentication / Security sections: create a fine-grained *Copilot Requests* PAT, export `COPILOT_GITHUB_TOKEN` (Copilot capacity) as the default; BYOK (`COPILOT_PROVIDER_*`) as the fallback; state the trusted-use posture (the credential enters the sandbox — keep it narrowly scoped with a short expiry) and that off-sandbox isolation is future work. | `docs/providers/aca.md` | TO DO |
-| E10-T2 | IMPL | Flip DD4's status to **Accepted** in the design's Decision Status table once E8/E9 ship. | `docs/projects/aca/aca-provider.design.md` | TO DO |
-| E10-T3 | TEST | `conductor validate examples/aca-coding-agent.yaml` still passes; the example header/prereqs reflect the Copilot-token default. | `examples/aca-coding-agent.yaml` | TO DO |
+| E10-T1 | IMPL | Rewrite the aca.md Quick Start / Authentication / Security sections: create a fine-grained *Copilot Requests* PAT, export `COPILOT_GITHUB_TOKEN` (Copilot capacity) as the default; BYOK (`COPILOT_PROVIDER_*`) as the fallback; state the trusted-use posture (the credential enters the sandbox — keep it narrowly scoped with a short expiry) and that off-sandbox isolation is future work. | `docs/providers/aca.md` | DONE |
+| E10-T2 | IMPL | Flip DD4's status to **Accepted** in the design's Decision Status table once E8/E9 ship. | `docs/projects/aca/aca-provider.design.md` | DONE |
+| E10-T3 | TEST | `conductor validate examples/aca-coding-agent.yaml` still passes; the example header/prereqs reflect the Copilot-token default. | `examples/aca-coding-agent.yaml` | DONE |
+
+- **Acceptance Criteria:**
+  - [x] aca.md's default path is a *Copilot Requests* PAT (Copilot capacity), no
+    `COPILOT_PROVIDER_*` required; BYOK documented as the fallback.
+  - [x] DD4 shows **Accepted**; the example validates.
 
 - **Acceptance Criteria:**
   - [ ] aca.md's default path is a *Copilot Requests* PAT (Copilot capacity), no
