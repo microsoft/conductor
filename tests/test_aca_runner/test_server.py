@@ -305,6 +305,64 @@ class TestExecuteInnerProviderCredentials:
         assert instance.provider_settings is None
 
 
+class TestHostRunnerCredentialContract:
+    """Cross-component contract test (review follow-up, issue #284): pins the
+    host's default credential body to the runner's actual acceptance of it.
+
+    Prior tests confirmed each side of the seam in isolation — host tests
+    assert `AcaRuntimeProvider._resolve_inner_provider_settings()` returns
+    `{"github_token": ...}` by default (`COPILOT_GITHUB_TOKEN` set, no
+    `COPILOT_PROVIDER_BASE_URL`); runner tests assert `_InnerProviderCache`
+    pops a `github_token` key correctly. Neither test constructs the host's
+    *actual* output and feeds it into the runner's *actual* cache, so a
+    version skew between the two sides (e.g. a runner image pinned to a
+    commit predating the `github_token` pop, epic E9) would build and pass
+    every existing test while failing at runtime with a Pydantic
+    `extra="forbid"` `ValidationError` on `ProviderSettings`. This test
+    would have caught that: it builds the exact dict the host produces by
+    default and asserts the runner's cache accepts it without raising.
+    """
+
+    async def test_runner_cache_accepts_hosts_default_github_token_body(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from unittest.mock import patch
+
+        from conductor.aca_runner.server import _InnerProviderCache
+        from conductor.config.schema import ProviderSettings
+        from conductor.providers.aca import AcaRuntimeProvider
+
+        monkeypatch.setattr("conductor.aca_runner.server.CopilotProvider", _FakeCopilotProvider)
+        # Default credential path (DD4/E8/E10): no COPILOT_PROVIDER_BASE_URL,
+        # a GitHub token available via the top env-var precedence.
+        monkeypatch.delenv("COPILOT_PROVIDER_BASE_URL", raising=False)
+        monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "hosts-default-github-token")
+
+        settings = ProviderSettings(
+            name="aca",
+            pool_endpoint="https://pool.example.com",
+            api_version="2025-07-01",
+        )
+        with patch("conductor.providers.aca.AZURE_IDENTITY_AVAILABLE", True):
+            host_provider = AcaRuntimeProvider(provider_settings=settings)
+
+        # The exact dict the host forwards in the `/execute` request body.
+        inner_provider_settings = host_provider._resolve_inner_provider_settings()
+        assert inner_provider_settings.keys() == {"github_token"}
+
+        cache = _InnerProviderCache()
+        # Must not raise (e.g. Pydantic `extra="forbid"` on `ProviderSettings`
+        # from a stale runner that hasn't popped `github_token` yet).
+        provider = await cache.get(
+            mcp_servers=None,
+            inner_provider_settings=inner_provider_settings,
+            tool_output=None,
+        )
+
+        assert provider.github_token == "hosts-default-github-token"
+        assert provider.provider_settings is None
+
+
 class TestExecuteValidatesBeforeStreaming:
     """Review fix: agent reconstruction runs before `StreamingResponse` opens.
 

@@ -625,7 +625,7 @@ class SandboxConfig(BaseModel):
 
         sandbox:
           identifier_scope: item
-          working_dir: /workspace/repo
+          working_dir: /workspace
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -639,10 +639,14 @@ class SandboxConfig(BaseModel):
 
     Unlike :attr:`AgentDef.working_dir` (a *host* path resolved against the
     workflow file's directory), this is interpreted **container-relative** —
-    a path inside the remote session filesystem (e.g. ``/workspace/repo``) —
-    because a host path is meaningless in a remote container. Defaults to the
-    runner's working directory when unset. A path that does not exist in the
-    container is a runtime error, never a silent host fallback.
+    a path inside the remote session filesystem (e.g. ``/workspace``, the
+    runner image's default home directory) — because a host path is
+    meaningless in a remote container. A subdirectory such as
+    ``/workspace/repo`` only exists once something (e.g. a ``git clone``
+    step earlier in the workflow) has created it — it does not exist at
+    session start, so using it as the *initial* ``working_dir`` is a
+    runtime error, never a silent host fallback. Defaults to the runner's
+    working directory when unset.
     """
 
 
@@ -1075,7 +1079,7 @@ class AgentDef(BaseModel):
 
         sandbox:
           identifier_scope: item
-          working_dir: /workspace/repo
+          working_dir: /workspace
     """
 
     status: Literal["success", "failed"] | None = None

@@ -913,7 +913,53 @@ forwarding neither) are unaffected by this fix — the runner-side seam
 
 ---
 
-## References
+### E11 — Fix reviewer-blocking runner/pin skew — **DONE**
+- **Goal:** Close the gap flagged by holistic review: the reference runner
+  image (`docker/aca-runner/Dockerfile`) was still pinned to the E4 runner
+  commit, which predates E9's `_InnerProviderCache` fix (popping
+  `github_token` before constructing `ProviderSettings`). Since E8/E10 made
+  the host's *default* credential path forward `{"github_token": ...}`
+  (export `COPILOT_GITHUB_TOKEN`, no `COPILOT_PROVIDER_BASE_URL`), and
+  `ProviderSettings` uses `extra="forbid"`, an image built from the
+  documented Quick Start rejected the default credential at `/execute`
+  (400) — the "run on your own Copilot capacity" happy path failed
+  end-to-end despite E9 shipping in source.
+- **Prerequisites:** E9, E10.
+- **Status:** DONE (pin + regression test; remote-branch reconciliation and a
+  real container build/run are maintainer follow-ups — see below).
+
+| Task ID | Type | Description | Files | Status |
+|---|---|---|---|---|
+| E11-T1 | IMPL | Bump `docker/aca-runner/Dockerfile`'s `CONDUCTOR_VERSION` default to the current branch tip (which includes E9's runner fix); rewrite the pin comment to spell out the `github_token`-pop requirement and point at the new regression test instead of a stale "verified against d6db5c8" claim. | `docker/aca-runner/Dockerfile` | DONE |
+| E11-T2 | TEST | Add a cross-component contract test that builds `AcaRuntimeProvider._resolve_inner_provider_settings()`'s actual default output (no `COPILOT_PROVIDER_BASE_URL`, `COPILOT_GITHUB_TOKEN` set) and feeds it directly into the runner's `_InnerProviderCache.get()`, asserting it's accepted. Verified this test fails against the E4-era cache logic (`ProviderSettings(name="copilot", **inner_provider_settings)` with no pop) and passes against the current E9 logic. | `tests/test_aca_runner/test_server.py::TestHostRunnerCredentialContract` | DONE |
+| E11-T3 | DOCS | Align the `SandboxConfig.working_dir` / `AgentDef.sandbox` docstring examples in `schema.py` and the `/execute` wire-contract JSON sample in `aca.md` to `/workspace` (matching the E7-round fix to the runnable example and `workflow-syntax.md`), since `/workspace/repo` doesn't exist at session start. | `src/conductor/config/schema.py`, `docs/providers/aca.md` | DONE |
+
+- **Acceptance Criteria:**
+  - [x] The Dockerfile pin's comment no longer overclaims a specific
+    "verified" SHA that predates E9; it states the actual requirement
+    (must include E9's `github_token` pop) and points at the regression
+    test that enforces it going forward.
+  - [x] `TestHostRunnerCredentialContract` exists, passes against current
+    `src/conductor/aca_runner/server.py`, and was confirmed (by checking out
+    the E4 runner's cache logic) to fail against the pre-E9 contract.
+  - [x] Stale `/workspace/repo` example paths are corrected to `/workspace`.
+  - [ ] **Not done in this pass, left for the maintainer:** (a) reconciling
+    this local branch with `origin/docs/284-aca-provider-design` — the two
+    have diverged (origin carries a different E8 "credential gateway"
+    design plus E9–E11 planning docs not present locally) and force-pushing
+    over that without maintainer input would destroy work; until
+    reconciled, the pinned `CONDUCTOR_VERSION` commit is not resolvable via
+    `pip install ... @git+https://github.com/microsoft/conductor.git@<ref>`
+    for anyone outside this sandbox — the same "not reachable" failure mode
+    E5's second review pass already fixed once for the E4 pin. (b) an actual
+    `docker build` → provision → run-with-`COPILOT_GITHUB_TOKEN`
+    end-to-end verification (still blocked in this sandbox: no Docker
+    daemon, no passwordless `sudo` to install one — the same limitation
+    E5's acceptance criteria hit).
+
+---
+
+
 
 - **Source design (authoritative):**
   [`docs/projects/aca/aca-provider.design.md`](./aca-provider.design.md) — all

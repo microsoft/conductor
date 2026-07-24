@@ -292,7 +292,7 @@ Runs one agent turn and streams the result back as
   "agent": {
     "name": "...", "model": "...", "system_prompt": "...", "output": {...},
     "max_agent_iterations": 10, "max_session_seconds": 900,
-    "reasoning_effort": "medium", "working_dir": "/workspace/repo",
+    "reasoning_effort": "medium", "working_dir": "/workspace",
     "retry": {...}, "context_tier": "default"
   },
   "rendered_prompt": "...",

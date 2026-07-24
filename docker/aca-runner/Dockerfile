@@ -31,20 +31,38 @@
 #
 # No released tag contains `conductor.aca_runner` yet (epic E4 hasn't shipped
 # in a `microsoft/conductor` release as of this writing), so the default
-# below is pinned to the immutable commit SHA that introduced it rather than
-# a floating tag — a floating default here would silently produce a
-# `ModuleNotFoundError: No module named 'conductor.aca_runner'` container that
-# builds cleanly but crashes on `CMD`. This SHA is pushed to the
-# `docs/284-aca-provider-design` branch on `microsoft/conductor` (reachable
-# by `pip install`'s `git+https` fetch — a commit that only exists on a local
-# clone is NOT a usable pin, since the default GitHub install has nothing to
-# resolve). Verified: `pip install "conductor-cli @
-# git+https://github.com/microsoft/conductor.git@d6db5c817f5c0ae8146fdb7a1e8d3d48b486ef3d"`
-# installs a package exposing `python -m conductor.aca_runner`, and running it
-# answers `GET /health`. Once a real release tag ships with the runner,
-# update this default to that tag (`vX.Y.Z`) — see
-# docs/projects/aca/aca-provider.plan.md (epic E5).
-ARG CONDUCTOR_VERSION=d6db5c817f5c0ae8146fdb7a1e8d3d48b486ef3d
+# below is pinned to an immutable commit SHA rather than a floating tag — a
+# floating default here would silently produce a `ModuleNotFoundError: No
+# module named 'conductor.aca_runner'` container that builds cleanly but
+# crashes on `CMD`.
+#
+# IMPORTANT (review fix, issue #284): the pin MUST be a commit that includes
+# epic E9's runner fix (`_InnerProviderCache.get()` popping `github_token`
+# before constructing `ProviderSettings`), not just E4's original
+# `conductor.aca_runner` module. The host's *default* credential path
+# (epic E8/E10 — export `COPILOT_GITHUB_TOKEN`, set no
+# `COPILOT_PROVIDER_BASE_URL`) forwards `{"github_token": <secret>}` in the
+# `/execute` request body; a pre-E9 runner instead does
+# `ProviderSettings(name="copilot", **inner_provider_settings)` directly,
+# which raises a Pydantic `extra="forbid"` `ValidationError` on that exact
+# body — the documented Quick Start's happy path fails end-to-end against
+# an E4-only image. `tests/test_aca_runner/test_server.py::
+# TestHostRunnerCredentialContract` pins this contract in-repo so a future
+# regression fails CI instead of only failing at image build/run time.
+#
+# The pinned ref MUST also actually exist on the `microsoft/conductor`
+# remote (reachable by `pip install`'s `git+https` fetch — a commit that
+# only exists on a local clone is NOT a usable pin, since the default
+# GitHub install has nothing to resolve). Once a real release tag ships
+# with the runner, update this default to that tag (`vX.Y.Z`) — see
+# docs/projects/aca/aca-provider.plan.md (epic E5). Until then, whoever
+# bumps this pin is responsible for pushing the referenced commit to
+# `microsoft/conductor` first and re-verifying:
+#   pip install "conductor-cli @ git+https://github.com/microsoft/conductor.git@<ref>"
+# installs a package exposing `python -m conductor.aca_runner`, answering
+# `GET /health`, and accepting a `github_token`-only `inner_provider_settings`
+# body at `/execute`.
+ARG CONDUCTOR_VERSION=e0a4214e30327c7c0fee2852ae0feb81e2051b00
 
 # Session port used for ingress traffic — must match the pool's
 # `--target-port` (see scripts/aca/provision-pool.sh). Overridable at build
