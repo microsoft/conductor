@@ -305,6 +305,60 @@ def test_end_to_end_with_real_manager_truncate(
     assert stat.S_IMODE(spill_file.stat().st_mode) == 0o600
 
 
+def test_end_to_end_with_real_manager_explicit_spill_dir(tmp_path: Any) -> None:
+    """Requirement: explicit ``spill_dir`` in ``ToolOutputConfig`` is honored through the adapter.
+
+    This covers the user-requested branch where a custom spill directory is
+    configured; the adapter must still delegate truncation to ``MCPManager`` and
+    the resulting spill file must land under the requested directory.
+    """
+    import stat
+    from types import SimpleNamespace
+
+    custom_dir = tmp_path / "custom-spill"
+
+    manager = MCPManager(
+        tool_output=ToolOutputConfig(max_chars=1000, spill_to_file=True, spill_dir=str(custom_dir))
+    )
+    manager.tool_to_server["big__data"] = "big"
+    manager.tools["big"] = [
+        {
+            "name": "big__data",
+            "description": "return big data",
+            "input_schema": {"type": "object"},
+            "server": "big",
+            "original_name": "data",
+        }
+    ]
+
+    class _FakeSession:
+        async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+            return SimpleNamespace(
+                content=[SimpleNamespace(text="x" * 5000)], structuredContent=None
+            )
+
+    manager.sessions["big"] = _FakeSession()
+    toolset = MCPManagerToolset(manager, None, ToolOutputConfig())
+    agent = build_agent(
+        AgentDef(name="agent"),
+        system_prompt="sys",
+        rendered_prompt="",
+        api_key="dummy",
+        toolsets=[toolset],
+    )
+
+    result = agent.run_sync("fetch big data", model=TestModel())
+
+    assert "[output truncated: 5000 chars -> 1000 kept" in result.output
+    assert "full output saved to:" in result.output
+    assert str(custom_dir) in result.output
+
+    spill_file = next(custom_dir.glob("*.txt"))
+    assert spill_file.exists()
+    assert spill_file.read_text() == "x" * 5000
+    assert stat.S_IMODE(spill_file.stat().st_mode) == 0o600
+
+
 def test_attach_mcp_toolset_with_none_manager() -> None:
     """Requirement: attaching a toolset with no manager is a no-op."""
     from conductor.providers._pydantic_ai.mcp_toolset import attach_mcp_toolset
