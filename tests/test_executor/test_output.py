@@ -8,6 +8,8 @@ Tests cover:
 - JSON parsing from raw responses
 """
 
+from typing import Any
+
 import pytest
 
 from conductor.config.schema import OutputField
@@ -200,6 +202,148 @@ class TestValidateOutputNested:
 
         with pytest.raises(ValidationError, match="Array item 2.*wrong type"):
             validate_output(content, schema)
+
+
+class TestValidateOutputArrayRecursion:
+    """Tests for recursive validation of array item schemas (issue regression)."""
+
+    def test_array_of_objects_valid_passes(self) -> None:
+        """Valid array<object> content must pass unchanged (no false positives)."""
+        schema = {
+            "findings": OutputField(
+                type="array",
+                items=OutputField(
+                    type="object",
+                    properties={
+                        "title": OutputField(type="string"),
+                        "score": OutputField(type="number"),
+                    },
+                ),
+            )
+        }
+        content = {
+            "findings": [
+                {"title": "first", "score": 1.0},
+                {"title": "second", "score": 2.0},
+            ]
+        }
+
+        validate_output(content, schema)
+
+    def test_array_of_objects_missing_nested_field_raises(self) -> None:
+        """Missing required field inside an array item must raise (previously silently accepted)."""
+        schema = {
+            "findings": OutputField(
+                type="array",
+                items=OutputField(
+                    type="object",
+                    properties={
+                        "title": OutputField(type="string"),
+                        "score": OutputField(type="number"),
+                    },
+                ),
+            )
+        }
+        content = {
+            "findings": [
+                {"title": "first", "score": 1.0},
+                {"title": "second"},
+            ]
+        }
+
+        with pytest.raises(ValidationError, match="Missing required output field: score"):
+            validate_output(content, schema)
+
+    def test_array_of_objects_wrong_nested_type_raises(self) -> None:
+        """Wrong-typed nested field inside an array item must raise."""
+        schema = {
+            "findings": OutputField(
+                type="array",
+                items=OutputField(
+                    type="object",
+                    properties={
+                        "title": OutputField(type="string"),
+                        "score": OutputField(type="number"),
+                    },
+                ),
+            )
+        }
+        content = {
+            "findings": [
+                {"title": 42, "score": 1.0},
+            ]
+        }
+
+        with pytest.raises(ValidationError, match="wrong type"):
+            validate_output(content, schema)
+
+    def test_nested_array_of_objects_deep_error_raises(self) -> None:
+        """array<array<object>> must validate the object level, pinning general recursion."""
+        schema = {
+            "matrix": OutputField(
+                type="array",
+                items=OutputField(
+                    type="array",
+                    items=OutputField(
+                        type="object",
+                        properties={"v": OutputField(type="number")},
+                    ),
+                ),
+            )
+        }
+        content = {
+            "matrix": [
+                [{"v": 1.0}, {"v": "x"}],
+            ]
+        }
+
+        with pytest.raises(ValidationError, match="wrong type"):
+            validate_output(content, schema)
+
+    def test_array_without_items_unchanged(self) -> None:
+        """Arrays declared without items keep historical passthrough behavior."""
+        schema = {"tags": OutputField(type="array")}
+        content = {"tags": [1, "two", {"three": 3}]}
+
+        validate_output(content, schema)
+
+    def test_builder_shaped_deep_schema_invalid_content_raises(self) -> None:
+        """A schema at the builder boundary (max_depth=10) must be
+        enforceable without RecursionError."""
+        from conductor.providers._schema import build_json_schema_field
+
+        # Build 5 array/object pairs: depth 10 leaf string at the innermost level.
+        inner: OutputField = OutputField(type="string")
+        for _ in range(5):
+            inner = OutputField(
+                type="array",
+                items=OutputField(
+                    type="object",
+                    properties={"x": inner},
+                ),
+            )
+        schema_root = {"data": inner}
+
+        built = build_json_schema_field(inner)
+        assert isinstance(built, dict)
+
+        # Content mirrors the nested structure with a wrong-typed leaf.
+        content: dict[str, Any] = {"data": [{"x": [{"x": [{"x": [{"x": [{"x": 123}]}]}]}]}]}
+
+        with pytest.raises(ValidationError, match="wrong type"):
+            validate_output(content, schema_root)
+
+    def test_validate_output_does_not_call_check_type_directly(self) -> None:
+        """After refactor all value checks must flow through _validate_field."""
+        import inspect
+
+        from conductor.executor.output import _validate_field, validate_output
+
+        validate_source = inspect.getsource(validate_output)
+        validate_field_source = inspect.getsource(_validate_field)
+
+        assert "_check_type(" not in validate_source
+        assert "_check_type(" in validate_field_source
 
 
 class TestParseJsonOutput:

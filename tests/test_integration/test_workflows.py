@@ -744,7 +744,7 @@ class TestBackwardCompatibility:
             agent_calls.append(agent.name)
 
             if agent.name == "planner":
-                return {"plan": [{"step": "1"}], "confidence": 0.9}
+                return {"plan": [{"step": "1", "action": "Research"}], "confidence": 0.9}
             elif agent.name == "executor":
                 return {"result": {"success": True, "output": "Done"}}
             return {}

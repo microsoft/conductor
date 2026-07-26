@@ -19,6 +19,7 @@ def validate_output(
     """Validate agent output against declared schema.
 
     Checks that all required fields are present and have the correct types.
+    Nested object properties and array items are validated recursively.
 
     Args:
         content: Agent's output content as a dictionary.
@@ -40,29 +41,44 @@ def validate_output(
                 suggestion=f"Ensure agent returns '{field_name}' in output",
             )
 
-        value = content[field_name]
-        expected_type = field_def.type
+        _validate_field(field_name, content[field_name], field_def)
 
-        # Type checking
-        if not _check_type(value, expected_type):
-            raise ValidationError(
-                f"Output field '{field_name}' has wrong type: "
-                f"expected {expected_type}, got {type(value).__name__}",
-                suggestion=f"Ensure agent returns correct type for '{field_name}'",
-            )
 
-        # Recursively validate nested structures
-        if expected_type == "object" and field_def.properties and isinstance(value, dict):
-            validate_output(value, field_def.properties)
+def _validate_field(field_name: str, value: Any, field_def: OutputField) -> None:
+    """Validate a single value against its output field definition.
 
-        if expected_type == "array" and field_def.items and isinstance(value, list):
-            for i, item in enumerate(value):
-                if not _check_type(item, field_def.items.type):
-                    raise ValidationError(
-                        f"Array item {i} in '{field_name}' has wrong type: "
-                        f"expected {field_def.items.type}, got {type(item).__name__}",
-                        suggestion=f"Ensure all items in '{field_name}' have correct type",
-                    )
+    Recursively validates nested object properties and array items so
+    ``array<object>`` and deeper combinations are checked at every depth,
+    matching the recursion the object branch has always had.
+
+    Args:
+        field_name: Field name used in error messages (array items keep the
+            parent array's name, matching the existing message style).
+        value: The value to validate.
+        field_def: The field definition to validate against.
+
+    Raises:
+        ValidationError: If the value or any nested value doesn't match.
+    """
+    if not _check_type(value, field_def.type):
+        raise ValidationError(
+            f"Output field '{field_name}' has wrong type: "
+            f"expected {field_def.type}, got {type(value).__name__}",
+            suggestion=f"Ensure agent returns correct type for '{field_name}'",
+        )
+
+    if field_def.type == "object" and field_def.properties and isinstance(value, dict):
+        validate_output(value, field_def.properties)
+
+    if field_def.type == "array" and field_def.items and isinstance(value, list):
+        for i, item in enumerate(value):
+            if not _check_type(item, field_def.items.type):
+                raise ValidationError(
+                    f"Array item {i} in '{field_name}' has wrong type: "
+                    f"expected {field_def.items.type}, got {type(item).__name__}",
+                    suggestion=f"Ensure all items in '{field_name}' have correct type",
+                )
+            _validate_field(field_name, item, field_def.items)
 
 
 def _check_type(value: Any, expected: str) -> bool:
