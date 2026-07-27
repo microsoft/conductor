@@ -789,10 +789,7 @@ class ClaudeProvider(AgentProvider):
         history: list[dict[str, str]] | None = None,
         model: str | None = None,
     ) -> str:
-        """Execute a single dialog turn using the Claude messages API.
-
-        Creates a lightweight message call with the conversation context
-        and returns the agent's response text.
+        """Execute a single dialog turn using a Pydantic AI agent.
 
         Args:
             system_prompt: System prompt providing dialog context.
@@ -806,78 +803,87 @@ class ClaudeProvider(AgentProvider):
         Raises:
             ProviderError: If the dialog turn fails.
         """
-        if self._client is None:
-            raise ProviderError(
-                "Claude client not initialized",
-                suggestion="Call validate_connection() first",
-            )
+        from anthropic.types.beta.beta_thinking_config_enabled_param import (
+            BetaThinkingConfigEnabledParam,
+        )
+        from pydantic_ai import Agent
+        from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
+        from pydantic_ai.models.anthropic import AnthropicModelSettings
 
-        # Build messages list from history + current message
-        messages: list[dict[str, str]] = []
+        from conductor.config.schema import AgentDef
+        from conductor.providers._pydantic_ai.agent_builder import (
+            _coerce_for_thinking,
+            _resolve_anthropic_model,
+        )
+
+        resolved_model = model or self._default_model
+
+        pydantic_history: list[ModelRequest | ModelResponse] = []
         for msg in history or []:
-            messages.append(
-                {
-                    "role": msg["role"],
-                    "content": msg["content"],
-                }
-            )
-        messages.append({"role": "user", "content": user_message})
-
-        try:
-            kwargs: dict[str, Any] = {
-                "model": model or self._default_model,
-                "max_tokens": 4096,
-                "system": system_prompt,
-                "messages": messages,
-            }
-
-            # Apply workflow-wide default reasoning effort if configured.
-            # Per-agent reasoning is not available here (no AgentDef in scope).
-            # Mirrors _resolve_thinking_for_agent: raise ValidationError when
-            # the resolved model does not support extended thinking, rather
-            # than silently dropping the reasoning request.
-            if self._default_reasoning_effort is not None:
-                resolved_model = kwargs["model"]
-                if not is_claude_thinking_model(resolved_model):
-                    raise ValidationError(
-                        f"Model {resolved_model!r} does not support extended thinking, "
-                        f"but default_reasoning_effort={self._default_reasoning_effort!r} "
-                        "was configured.",
-                        suggestion=(
-                            "Use a Claude 3.7+ or 4.x model (e.g. claude-opus-4-20250514, "
-                            "claude-sonnet-4-20250514) or remove the reasoning config."
-                        ),
-                    )
-                budget = effort_to_budget_tokens(self._default_reasoning_effort)
-                thinking = {"type": "enabled", "budget_tokens": budget}
-                kwargs["thinking"] = thinking
-                # Reuse the same clamp/validate logic as the main agentic-loop
-                # path (_coerce_for_thinking) instead of duplicating the
-                # budget + headroom arithmetic here — this keeps dialog turns
-                # subject to the same 64000-token per-model cap and the same
-                # defensive raise if a future budget ever collapses below it.
-                # No temperature kwarg is sent for dialog turns (omitting it
-                # satisfies the Anthropic "1.0 or omitted" requirement), so
-                # only the max_tokens half of the returned tuple is used.
-                _, kwargs["max_tokens"] = self._coerce_for_thinking(
-                    temperature=None,
-                    max_tokens=kwargs["max_tokens"],
-                    model=resolved_model,
-                    thinking=thinking,
+            if msg["role"] == "user":
+                pydantic_history.append(
+                    ModelRequest(parts=[UserPromptPart(content=msg["content"])])
+                )
+            elif msg["role"] == "assistant":
+                pydantic_history.append(
+                    ModelResponse(parts=[TextPart(content=msg["content"])])
                 )
 
-            response = await self._client.messages.create(**kwargs)
+        model_settings = AnthropicModelSettings()
+        max_tokens = 4096
 
-            # Extract text from response (skip thinking blocks)
-            text_parts = []
-            for block in response.content:
-                if hasattr(block, "type") and block.type == "thinking":
-                    continue
-                if hasattr(block, "text"):
-                    text_parts.append(block.text)
+        if self._default_reasoning_effort is not None:
+            if not is_claude_thinking_model(resolved_model):
+                raise ValidationError(
+                    f"Model {resolved_model!r} does not support extended thinking, "
+                    f"but default_reasoning_effort={self._default_reasoning_effort!r} "
+                    "was configured.",
+                    suggestion=(
+                        "Use a Claude 3.7+ or 4.x model (e.g. claude-opus-4-20250514, "
+                        "claude-sonnet-4-20250514) or remove the reasoning config."
+                    ),
+                )
+            budget = effort_to_budget_tokens(self._default_reasoning_effort)
+            thinking = BetaThinkingConfigEnabledParam(
+                type="enabled", budget_tokens=budget
+            )
+            _, coerced_max = _coerce_for_thinking(
+                temperature=None,
+                max_tokens=max_tokens,
+                thinking={"type": "enabled", "budget_tokens": budget},
+                model=resolved_model,
+            )
+            coerced_max = coerced_max or max_tokens
+            model_settings["max_tokens"] = coerced_max
+            model_settings["anthropic_thinking"] = thinking
+        else:
+            model_settings["max_tokens"] = max_tokens
 
-            return "\n".join(text_parts) if text_parts else ""
+        try:
+            dummy_agent = AgentDef(
+                name="dialog_agent",
+                model=resolved_model,
+                prompt="",
+            )
+            pydantic_model = _resolve_anthropic_model(
+                agent=dummy_agent,
+                default_model=self._default_model,
+                api_key=self._api_key,
+                base_url=self._base_url,
+            )
 
+            pydantic_agent = Agent(
+                model=pydantic_model,
+                output_type=str,
+                system_prompt=system_prompt,
+                model_settings=model_settings,
+                retries=0,
+            )
+            result = await pydantic_agent.run(
+                user_prompt=user_message,
+                message_history=pydantic_history,
+            )
+            return str(result.output)
         except ValidationError:
             raise
         except Exception as exc:
@@ -896,17 +902,18 @@ class ClaudeProvider(AgentProvider):
         event_callback: EventCallback | None = None,
         skill_directories: list[str] | None = None,
     ) -> AgentOutput:
-        """Execute an agent using the Claude SDK.
+        """Execute an agent using the Pydantic AI pipeline.
 
         Args:
             agent: Agent definition from workflow config.
             context: Accumulated workflow context.
             rendered_prompt: Jinja2-rendered user prompt.
-            tools: List of tool names available to this agent (currently unused).
+            tools: List of tool names available to this agent. ``None`` grants
+                all MCP tools, ``[]`` grants none, and a list filters to the
+                named tools.
             interrupt_signal: Optional event for mid-agent interrupt signaling.
-                When set during the agentic loop, Claude is asked to emit
-                partial output via the ``emit_output`` tool, and the result
-                is returned with ``partial=True``.
+                When set during the agentic loop, the agent is asked for a
+                partial result and the output is returned with ``partial=True``.
             skill_directories: Ignored. Claude has no server-side skill
                 surface without adopting the container/code-execution
                 beta, so :class:`AgentExecutor` has already eager-injected
@@ -921,15 +928,167 @@ class ClaudeProvider(AgentProvider):
             ValidationError: If output doesn't match schema.
         """
         del skill_directories  # Claude relies on eager preamble injection (see docstring).
-        # Use retry logic wrapper for execution
-        return await self._execute_with_retry(
-            agent,
-            context,
-            rendered_prompt,
-            tools,
-            interrupt_signal=interrupt_signal,
-            event_callback=event_callback,
+        from pydantic_ai import UsageLimits
+
+        from conductor.providers._pydantic_ai.agent_builder import build_agent
+        from conductor.providers._pydantic_ai.interrupt import run_with_interrupt
+        from conductor.providers._pydantic_ai.mcp_toolset import MCPManagerToolset
+        from conductor.providers._pydantic_ai.retry import (
+            RetryConfig as PydanticRetryConfig,
         )
+        from conductor.providers._pydantic_ai.retry import (
+            _resolve_retry_config,
+            execute_with_retry,
+        )
+        from conductor.providers._pydantic_ai.structured_output import extract_content
+        from conductor.providers._pydantic_ai.usage import build_agent_output
+
+        resolved_cwd = agent.working_dir or os.getcwd()
+        manager = await self._get_mcp_manager_for_cwd(resolved_cwd)
+
+        toolsets: list[Any] = []
+        if manager is not None:
+            toolsets.append(
+                MCPManagerToolset(
+                    manager,
+                    tools,
+                    self._tool_output_config,
+                )
+            )
+
+        pydantic_agent = build_agent(
+            agent=agent,
+            system_prompt=agent.system_prompt or "",
+            rendered_prompt=rendered_prompt,
+            default_model=self._default_model,
+            default_temperature=self._default_temperature,
+            default_max_tokens=self._default_max_tokens,
+            default_reasoning_effort=self._default_reasoning_effort,
+            api_key=self._api_key,
+            base_url=self._base_url,
+            toolsets=toolsets,
+        )
+
+        max_iterations = (
+            agent.max_agent_iterations
+            if agent.max_agent_iterations is not None
+            else self._default_max_agent_iterations
+        )
+        max_session = (
+            agent.max_session_seconds
+            if agent.max_session_seconds is not None
+            else self._default_max_session_seconds
+        )
+        retry_cfg = _resolve_retry_config(
+            agent,
+            PydanticRetryConfig(
+                max_attempts=self._retry_config.max_attempts,
+                base_delay=self._retry_config.base_delay,
+                max_delay=self._retry_config.max_delay,
+                jitter=self._retry_config.jitter,
+                backoff=self._retry_config.backoff,
+                retry_on=(
+                    list(self._retry_config.retry_on)
+                    if self._retry_config.retry_on is not None
+                    else None
+                ),
+                max_parse_recovery_attempts=self._retry_config.max_parse_recovery_attempts,
+            ),
+        )
+
+        self._retry_history.clear()
+
+        def intercepting_callback(event_type: str, data: dict[str, Any]) -> None:
+            if event_type == "agent_retry":
+                self._retry_history.append(data)
+            if event_callback is not None:
+                event_callback(event_type, data)
+
+        try:
+            outcome = await execute_with_retry(
+                coro_factory=lambda: run_with_interrupt(
+                    agent=pydantic_agent,
+                    user_prompt=rendered_prompt,
+                    interrupt_signal=interrupt_signal,
+                    event_callback=intercepting_callback,
+                    has_output_schema=bool(agent.output),
+                    usage_limits=UsageLimits(request_limit=max_iterations),
+                    max_session_seconds=max_session,
+                ),
+                retry_config=retry_cfg,
+                event_callback=intercepting_callback,
+                agent_name=agent.name,
+            )
+        finally:
+            pass
+
+        if outcome.is_cancelled:
+            raise asyncio.CancelledError()
+
+        model_name = self._model_name_from_pydantic_agent(pydantic_agent)
+
+        if outcome.is_partial:
+            content = self._build_partial_content(
+                outcome.partial_output, agent.output, agent.name
+            )
+            total_usage = outcome.total_usage or {}
+            return AgentOutput(
+                content=content,
+                raw_response=outcome.partial_output,
+                tokens_used=total_usage.get("total_tokens"),
+                input_tokens=total_usage.get("request_tokens"),
+                output_tokens=total_usage.get("response_tokens"),
+                partial=True,
+                model=model_name,
+            )
+
+        if outcome.result is None:
+            raise ProviderError(
+                f"Agent '{agent.name}' produced no result",
+                suggestion="Check the model and prompt configuration.",
+                is_retryable=False,
+            )
+
+        content = extract_content(outcome.result.output, agent.output, agent.name)
+        return build_agent_output(
+            content=content,
+            raw_response=outcome.result,
+            usage=outcome.result.usage,
+            model=model_name,
+        )
+
+    def _model_name_from_pydantic_agent(self, pydantic_agent: Any) -> str:
+        """Return a resolved model name from a Pydantic AI agent instance."""
+        model = pydantic_agent.model
+        if model is None:
+            return self._default_model
+        if hasattr(model, "model_name"):
+            return model.model_name
+        if hasattr(model, "name"):
+            return model.name
+        return str(model)
+
+    def _build_partial_content(
+        self,
+        partial_output: Any,
+        output_schema: dict[str, OutputField] | None,
+        agent_name: str,
+    ) -> dict[str, Any]:
+        """Build a content dict from a partial/interrupted output."""
+        from conductor.executor.output import parse_json_output
+
+        if isinstance(partial_output, BaseModel):
+            return partial_output.model_dump()
+
+        if isinstance(partial_output, str):
+            if output_schema is not None:
+                try:
+                    return parse_json_output(partial_output)
+                except ValidationError:
+                    pass
+            return {"result": partial_output}
+
+        return {"result": partial_output}
 
     def _resolve_retry_config(self, agent: AgentDef) -> RetryConfig:
         """Resolve the retry config for an agent.
@@ -1076,16 +1235,18 @@ class ClaudeProvider(AgentProvider):
             # Handle mocked exceptions
             is_rate_limit = type(exception).__name__ in ("RateLimitError", "MockRateLimitError")
 
-        if is_rate_limit and hasattr(exception, "response") and exception.response:
-            # Check response headers for retry-after
-            # Anthropic SDK APIStatusError provides .response attribute with headers dict
-            headers = getattr(exception.response, "headers", {})
-            retry_after = headers.get("retry-after") or headers.get("Retry-After")
-            if retry_after:
-                try:
-                    return float(retry_after)
-                except ValueError:
-                    pass
+        if is_rate_limit:
+            response_obj = getattr(exception, "response", None)
+            if response_obj:
+                # Check response headers for retry-after
+                # Anthropic SDK APIStatusError provides .response attribute with headers dict
+                headers = getattr(response_obj, "headers", {})
+                retry_after = headers.get("retry-after") or headers.get("Retry-After")
+                if retry_after:
+                    try:
+                        return float(retry_after)
+                    except ValueError:
+                        pass
         return None
 
     def _calculate_delay(self, attempt: int, config: RetryConfig) -> float:
