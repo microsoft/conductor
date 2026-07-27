@@ -6,19 +6,22 @@ When a Claude workflow has mcp_servers configured but no workflow-level
 
 This test exercises the full path:
   YAML workflow (mcp_servers, no tools:) → WorkflowEngine → AgentExecutor
-  → ClaudeProvider._execute_with_retry → _convert_mcp_tools_to_claude(tools=[])
+  → ClaudeProvider.execute → build_agent(toolsets=[MCPManagerToolset])
 
-The bug causes ``tool_filter=[]`` to be treated as "include nothing" instead
-of "no filter — include all MCP tools".
+The bug caused ``tools=[]`` to be treated as "include nothing" instead of
+"no filter — include all MCP tools". The provider now normalizes an empty
+filter to ``None`` so ``MCPManagerToolset`` exposes every manager tool.
 """
 
 from __future__ import annotations
 
-import os
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
+from pydantic import BaseModel
+from pydantic_ai import Agent
+from pydantic_ai.models.test import TestModel
 
 from conductor.config.loader import load_workflow
 from conductor.config.schema import (
@@ -31,6 +34,7 @@ from conductor.config.schema import (
     WorkflowDef,
 )
 from conductor.engine.workflow import WorkflowEngine
+from conductor.providers._pydantic_ai.mcp_toolset import MCPManagerToolset
 from conductor.providers.claude import ClaudeProvider
 
 # ---------------------------------------------------------------------------
@@ -67,10 +71,11 @@ def _make_provider_with_mcp() -> ClaudeProvider:
 
     The provider is constructed via ``__new__`` to bypass real SDK
     initialisation, then populated with the minimum attributes needed
-    for ``execute()`` → ``_execute_with_retry()`` to reach the MCP
-    tool-building code path.
+    for ``execute()`` to reach the MCP tool-building code path.
     """
     provider = ClaudeProvider.__new__(ClaudeProvider)
+    provider._api_key = None
+    provider._base_url = None
     provider._client = MagicMock()
     provider._default_model = "claude-3-5-sonnet-latest"
     provider._default_temperature = None
@@ -82,40 +87,57 @@ def _make_provider_with_mcp() -> ClaudeProvider:
     provider._retry_config.jitter = 0.0
     provider._retry_config.max_parse_recovery_attempts = 2
     provider._retry_history = []
-    provider._max_schema_depth = 10
     provider._default_max_agent_iterations = 50
     provider._default_max_session_seconds = None
     provider._default_reasoning_effort = None
+    provider._tool_output_config = MagicMock()
 
+    # Pre-wire a mock MCP manager so _get_mcp_manager_for_cwd returns it.
     mock_mcp = MagicMock()
     mock_mcp.get_all_tools.return_value = FAKE_MCP_TOOLS
     mock_mcp.has_servers.return_value = True
     provider._mcp_servers_config = {
         "filesystem": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem"]},
     }
+    import os
+
     provider._mcp_managers = {os.getcwd(): mock_mcp}
     provider._mcp_manager_locks = {}
 
     return provider
 
 
-def _make_emit_output_response(output: dict[str, Any]) -> MagicMock:
-    """Create a mock Claude API response that calls emit_output."""
-    tool_block = MagicMock()
-    tool_block.type = "tool_use"
-    tool_block.name = "emit_output"
-    tool_block.id = "tool_call_1"
-    tool_block.input = output
+def _build_structured_agent(data: dict[str, Any]) -> Agent[Any, Any]:
+    """Build a Pydantic AI structured-output agent backed by TestModel."""
 
-    response = MagicMock()
-    response.content = [tool_block]
-    response.usage = MagicMock()
-    response.usage.input_tokens = 100
-    response.usage.output_tokens = 50
-    response.usage.cache_read_input_tokens = None
-    response.usage.cache_creation_input_tokens = None
-    response.stop_reason = "end_turn"
-    return response
+    class DynamicModel(BaseModel):
+        model_config = {"extra": "allow"}
+
+    return Agent(
+        model=TestModel(custom_output_args=data),
+        output_type=DynamicModel,
+    )
+
+
+def _patch_build_agent(
+    captured: dict[str, Any],
+    output_data: dict[str, Any],
+    target: str = "conductor.providers._pydantic_ai.agent_builder.build_agent",
+) -> Any:
+    """Return a patch that captures the toolsets kwarg and returns a canned agent.
+
+    The canned agent completes immediately with ``output_data`` as its structured
+    output, so the workflow engine can finish without touching the network.
+    """
+
+    class DynamicModel(BaseModel):
+        model_config = {"extra": "allow"}
+
+    def make_agent(**kwargs: Any) -> Agent[Any, Any]:
+        captured["toolsets"] = kwargs.get("toolsets")
+        return _build_structured_agent(output_data)
+
+    return patch(target, side_effect=make_agent)
 
 
 # ---------------------------------------------------------------------------
@@ -124,83 +146,56 @@ def _make_emit_output_response(output: dict[str, Any]) -> MagicMock:
 
 
 class TestMcpToolsReachApiInWorkflow:
-    """Verify MCP tools survive the full workflow → provider pipeline.
-
-    The common scenario: a workflow declares ``mcp_servers`` but has no
-    ``tools:`` key.  WorkflowConfig.tools defaults to ``[]``, which flows
-    through AgentExecutor → resolve_agent_tools → ClaudeProvider.execute
-    as ``tools=[]``.
-
-    The bug: ``_convert_mcp_tools_to_claude(tool_filter=[])`` treated
-    ``[]`` as "include nothing", silently dropping every MCP tool.
-    """
+    """Verify MCP tools survive the full workflow → provider pipeline."""
 
     @pytest.mark.asyncio
     async def test_mcp_tools_included_when_workflow_has_no_tools_section(self) -> None:
-        """MCP tools must appear in the API request even without a tools: section."""
+        """MCP tools must appear in the Pydantic AI agent even without a tools: section."""
         provider = _make_provider_with_mcp()
-
-        # Capture the tools kwarg passed to _execute_agentic_loop
         captured: dict[str, Any] = {}
 
-        async def spy_agentic_loop(**kwargs: Any) -> Any:
-            captured["tools"] = kwargs.get("tools")
-            # Return a canned emit_output response so execute completes
-            response = _make_emit_output_response({"content": "file contents here"})
-            return (response, 150, False)
+        with _patch_build_agent(captured, {"content": "file contents here"}) as mock_build_agent:
+            agent = AgentDef(
+                name="reader",
+                model="claude-3-5-sonnet-latest",
+                prompt="Read the file at /tmp/test.txt",
+                output={"content": OutputField(type="string", description="File contents")},
+                routes=[RouteDef(to="$end")],
+            )
 
-        provider._execute_agentic_loop = AsyncMock(side_effect=spy_agentic_loop)
+            # Simulate what the engine does: tools=[] (no workflow tools defined)
+            result = await provider.execute(
+                agent=agent,
+                context={},
+                rendered_prompt="Read the file at /tmp/test.txt",
+                tools=[],
+            )
 
-        agent = AgentDef(
-            name="reader",
-            model="claude-3-5-sonnet-latest",
-            prompt="Read the file at /tmp/test.txt",
-            output={"content": OutputField(type="string", description="File contents")},
-            routes=[RouteDef(to="$end")],
-        )
+        # The provider should have constructed a Pydantic AI agent.
+        assert mock_build_agent.called
 
-        # Simulate what the engine does: tools=[] (no workflow tools defined)
-        await provider.execute(
-            agent=agent,
-            context={},
-            rendered_prompt="Read the file at /tmp/test.txt",
-            tools=[],
-        )
+        toolsets = captured.get("toolsets")
+        assert toolsets, "Expected at least one toolset to be passed to build_agent"
+        assert isinstance(toolsets[0], MCPManagerToolset)
 
-        # The tools list sent to the agentic loop must contain the MCP tools
-        # plus emit_output.  Before the fix, only emit_output would appear.
-        api_tools = captured["tools"]
-        assert api_tools is not None, "tools should not be None"
-
-        tool_names = {t["name"] for t in api_tools}
-        assert "emit_output" in tool_names, "emit_output should always be present"
-
-        # THE KEY ASSERTION: MCP tools must be included
+        # Issue #37: an empty tools filter must expose every MCP tool.
+        tools = await toolsets[0].get_tools(None)
+        tool_names = set(tools)
         assert "filesystem__read_file" in tool_names, (
             "MCP tool 'filesystem__read_file' was filtered out — this is the bug from issue #37"
         )
         assert "filesystem__write_file" in tool_names
         assert "web_search__search" in tool_names
-        assert len(tool_names) == 4  # 3 MCP + 1 emit_output
+        assert len(tool_names) == 3
+
+        # The workflow should also have produced the canned output.
+        assert result.content == {"content": "file contents here"}
 
     @pytest.mark.asyncio
     async def test_mcp_tools_included_in_full_workflow_engine_run(self, tmp_path) -> None:
-        """End-to-end: WorkflowEngine → AgentExecutor → ClaudeProvider with MCP.
-
-        Wires up a real WorkflowConfig (no ``tools:`` section) and verifies
-        MCP tools reach the agentic loop through the full call chain.
-        """
+        """End-to-end: WorkflowEngine → AgentExecutor → ClaudeProvider with MCP."""
         provider = _make_provider_with_mcp()
-
-        # Spy on _execute_agentic_loop to capture the tools list
         captured: dict[str, Any] = {}
-
-        async def spy_agentic_loop(**kwargs: Any) -> Any:
-            captured["tools"] = kwargs.get("tools")
-            response = _make_emit_output_response({"content": "hello world"})
-            return (response, 150, False)
-
-        provider._execute_agentic_loop = AsyncMock(side_effect=spy_agentic_loop)
 
         # Build a workflow config — note: no `tools` key, so defaults to []
         config = WorkflowConfig(
@@ -213,7 +208,11 @@ class TestMcpToolsReachApiInWorkflow:
                     mcp_servers={
                         "filesystem": {
                             "command": "npx",
-                            "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+                            "args": [
+                                "-y",
+                                "@modelcontextprotocol/server-filesystem",
+                                str(tmp_path),
+                            ],
                             "tools": ["*"],
                         },
                     },
@@ -237,19 +236,22 @@ class TestMcpToolsReachApiInWorkflow:
         # Sanity: the workflow has no explicit tools
         assert config.tools == []
 
-        engine = WorkflowEngine(config, provider)
-        result = await engine.run({"path": "/tmp/test.txt"})
+        with _patch_build_agent(captured, {"content": "hello world"}):
+            engine = WorkflowEngine(config, provider)
+            result = await engine.run({"path": str(tmp_path / "test.txt")})
 
         # Verify the workflow completed
         assert result["content"] == "hello world"
 
-        # Verify MCP tools were included in the API call
-        api_tools = captured["tools"]
-        assert api_tools is not None
+        # Verify MCP tools were included in the Pydantic AI agent
+        toolsets = captured.get("toolsets")
+        assert toolsets
+        assert isinstance(toolsets[0], MCPManagerToolset)
 
-        tool_names = {t["name"] for t in api_tools}
+        tools = await toolsets[0].get_tools(None)
+        tool_names = set(tools)
         assert "filesystem__read_file" in tool_names, (
-            "MCP tool missing from API request — issue #37 regression"
+            "MCP tool missing from Pydantic AI agent — issue #37 regression"
         )
         assert "filesystem__write_file" in tool_names
         assert "web_search__search" in tool_names
@@ -258,40 +260,37 @@ class TestMcpToolsReachApiInWorkflow:
     async def test_explicit_tool_filter_still_works(self) -> None:
         """When workflow defines specific tools, only those MCP tools are included."""
         provider = _make_provider_with_mcp()
-
         captured: dict[str, Any] = {}
 
-        async def spy_agentic_loop(**kwargs: Any) -> Any:
-            captured["tools"] = kwargs.get("tools")
-            response = _make_emit_output_response({"content": "filtered"})
-            return (response, 150, False)
+        with _patch_build_agent(captured, {"content": "filtered"}):
+            agent = AgentDef(
+                name="reader",
+                model="claude-3-5-sonnet-latest",
+                prompt="Read the file",
+                output={"content": OutputField(type="string")},
+                routes=[RouteDef(to="$end")],
+            )
 
-        provider._execute_agentic_loop = AsyncMock(side_effect=spy_agentic_loop)
+            # Pass a specific tool filter — only filesystem__read_file
+            await provider.execute(
+                agent=agent,
+                context={},
+                rendered_prompt="Read the file",
+                tools=["filesystem__read_file"],
+            )
 
-        agent = AgentDef(
-            name="reader",
-            model="claude-3-5-sonnet-latest",
-            prompt="Read the file",
-            output={"content": OutputField(type="string")},
-            routes=[RouteDef(to="$end")],
-        )
+        toolsets = captured.get("toolsets")
+        assert toolsets
+        assert isinstance(toolsets[0], MCPManagerToolset)
 
-        # Pass a specific tool filter — only filesystem__read_file
-        await provider.execute(
-            agent=agent,
-            context={},
-            rendered_prompt="Read the file",
-            tools=["filesystem__read_file"],
-        )
+        tools = await toolsets[0].get_tools(None)
+        tool_names = set(tools)
 
-        api_tools = captured["tools"]
-        tool_names = {t["name"] for t in api_tools}
-
-        # Only the explicitly listed MCP tool + emit_output
+        # Only the explicitly listed MCP tool
         assert "filesystem__read_file" in tool_names
         assert "filesystem__write_file" not in tool_names
         assert "web_search__search" not in tool_names
-        assert "emit_output" in tool_names
+        assert len(tool_names) == 1
 
 
 class TestWorkflowYamlWithMcpServers:

@@ -1,28 +1,79 @@
 """Parameter flow verification tests.
 
-These tests verify that parameters ACTUALLY reach the Anthropic SDK API calls,
-addressing the reviewer concern: 'No verification that temperature, max_tokens
-actually reach the Anthropic SDK API calls'.
+These tests verify that parameters ACTUALLY reach the Pydantic AI model
+boundary, addressing the reviewer concern: 'No verification that temperature,
+max_tokens actually reach the Anthropic SDK API calls'.
 
-This test file inspects the actual kwargs passed to the Anthropic SDK's
-messages.create() method to ensure all parameters flow correctly.
+With the Pydantic AI refactor, the SDK call is made by the pydantic-ai
+AnthropicModel. The canonical seam to assert on is ``build_agent``: it
+receives the resolved temperature/max_tokens and stores them in the agent's
+``model_settings`` (an ``AnthropicModelSettings`` TypedDict). The tests run the
+full WorkflowEngine path and inspect the constructed Pydantic AI agent.
 """
 
-from unittest.mock import AsyncMock, MagicMock, Mock, patch
+from __future__ import annotations
+
+from typing import Any
+from unittest.mock import MagicMock, patch
 
 import pytest
+from pydantic import BaseModel
+from pydantic_ai import Agent
 
 from conductor.config.loader import load_workflow
 from conductor.engine.workflow import WorkflowEngine
+from conductor.providers._pydantic_ai import agent_builder as _ab
 from conductor.providers.factory import create_provider
 
 
-class TestParameterFlowToAnthropicSDK:
-    """Verify ALL parameters reach Anthropic SDK API calls."""
+def _build_stub_agent(data: dict[str, Any]) -> Agent[Any, Any]:
+    """Build a Pydantic AI structured-output agent whose run() returns canned data."""
+
+    class DynamicModel(BaseModel):
+        model_config = {"extra": "allow"}
+
+    async def _stub_run(*args: Any, **kwargs: Any) -> Any:
+        class _Result:
+            output = DynamicModel(**data)
+            usage = MagicMock(request_tokens=10, response_tokens=20, total_tokens=30)
+
+        return _Result()
+
+    agent = Agent(model=None, output_type=DynamicModel)
+    agent.run = _stub_run  # type: ignore[method-assign]
+    return agent
+
+
+def _capture_build_agent(
+    captured: dict[str, Any],
+    output_data: dict[str, Any],
+) -> Any:
+    """Return a patch that captures the real Agent's model_settings.
+
+    The returned Agent is built by the real ``build_agent`` so its
+    ``model_settings`` reflect the actual temperature/max_tokens flow, but its
+    ``run`` method is stubbed to avoid network calls.
+    """
+    target = "conductor.providers._pydantic_ai.agent_builder.build_agent"
+    real_build_agent = _ab.build_agent
+
+    def make_agent(**kwargs: Any) -> Agent[Any, Any]:
+        agent = real_build_agent(**kwargs)
+        captured["model_settings"] = agent.model_settings
+        captured["agent"] = kwargs.get("agent")
+
+        return _build_stub_agent(output_data)
+
+    return patch(target, side_effect=make_agent)
+
+
+class TestParameterFlowToPydanticAiAgent:
+    """Verify temperature and max_tokens reach the Pydantic AI Agent model_settings."""
 
     @pytest.mark.asyncio
-    async def test_temperature_reaches_api_call(self, tmp_path):
-        """Verify temperature parameter reaches Anthropic SDK API call."""
+    async def test_temperature_reaches_model_settings(self, tmp_path, monkeypatch) -> None:
+        """Workflow runtime temperature is forwarded to Agent.model_settings."""
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         workflow_yaml = tmp_path / "test_temp.yaml"
         workflow_yaml.write_text("""
 workflow:
@@ -43,50 +94,28 @@ agents:
       - to: $end
 """)
 
-        with (
-            patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True),
-            patch("conductor.providers.claude.AsyncAnthropic") as mock_anthropic,
-            patch("conductor.providers.claude.anthropic") as mock_module,
-        ):
-            mock_module.__version__ = "0.77.0"
-            mock_client = MagicMock()
-            mock_anthropic.return_value = mock_client
+        config = load_workflow(str(workflow_yaml))
+        provider = await create_provider(
+            "claude",
+            validate=False,
+            temperature=config.workflow.runtime.temperature,
+        )
+        engine = WorkflowEngine(config, provider)
+        captured: dict[str, Any] = {}
 
-            # Mock successful response with valid JSON
-            mock_response = Mock()
-            mock_response.content = [Mock(text='{"result": "Test response"}', type="text")]
-            mock_response.model = "claude-3-5-sonnet-20241022"
-            mock_response.usage = Mock(
-                input_tokens=10, output_tokens=20, cache_creation_input_tokens=0
-            )
-            mock_response.stop_reason = "end_turn"
-            mock_response.id = "msg_123"
-            mock_response.type = "message"
-            mock_response.role = "assistant"
-
-            mock_client.messages.create = AsyncMock(return_value=mock_response)
-            mock_client.close = AsyncMock()
-
-            config = load_workflow(str(workflow_yaml))
-            provider = await create_provider(
-                provider_type="claude",
-                validate=False,
-                temperature=config.workflow.runtime.temperature,
-            )
-            engine = WorkflowEngine(config, provider)
+        with _capture_build_agent(captured, {"result": "Test response"}):
             await engine.run({})
 
-            # Verify temperature=0.42 was passed to SDK
-            call_kwargs = mock_client.messages.create.call_args.kwargs
-            assert call_kwargs["temperature"] == 0.42, (
-                f"Expected temperature=0.42, got {call_kwargs.get('temperature')}"
-            )
+        assert captured["model_settings"]["temperature"] == 0.42, (
+            f"Expected temperature=0.42 in model_settings, got {captured['model_settings']}"
+        )
 
-            await provider.close()
+        await provider.close()
 
     @pytest.mark.asyncio
-    async def test_max_tokens_reaches_api_call(self, tmp_path):
-        """Verify max_tokens parameter reaches Anthropic SDK API call."""
+    async def test_max_tokens_reaches_model_settings(self, tmp_path, monkeypatch) -> None:
+        """Workflow runtime max_tokens is forwarded to Agent.model_settings."""
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         workflow_yaml = tmp_path / "test_max_tokens.yaml"
         workflow_yaml.write_text("""
 workflow:
@@ -107,49 +136,30 @@ agents:
       - to: $end
 """)
 
-        with (
-            patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True),
-            patch("conductor.providers.claude.AsyncAnthropic") as mock_anthropic,
-            patch("conductor.providers.claude.anthropic") as mock_module,
-        ):
-            mock_module.__version__ = "0.77.0"
-            mock_client = MagicMock()
-            mock_anthropic.return_value = mock_client
+        config = load_workflow(str(workflow_yaml))
+        provider = await create_provider(
+            "claude",
+            validate=False,
+            max_tokens=config.workflow.runtime.max_tokens,
+        )
+        engine = WorkflowEngine(config, provider)
+        captured: dict[str, Any] = {}
 
-            mock_response = Mock()
-            mock_response.content = [Mock(text='{"result": "Test response"}', type="text")]
-            mock_response.model = "claude-3-5-sonnet-20241022"
-            mock_response.usage = Mock(
-                input_tokens=10, output_tokens=20, cache_creation_input_tokens=0
-            )
-            mock_response.stop_reason = "end_turn"
-            mock_response.id = "msg_123"
-            mock_response.type = "message"
-            mock_response.role = "assistant"
-
-            mock_client.messages.create = AsyncMock(return_value=mock_response)
-            mock_client.close = AsyncMock()
-
-            config = load_workflow(str(workflow_yaml))
-            provider = await create_provider(
-                provider_type="claude",
-                validate=False,
-                max_tokens=config.workflow.runtime.max_tokens,
-            )
-            engine = WorkflowEngine(config, provider)
+        with _capture_build_agent(captured, {"result": "Test response"}):
             await engine.run({})
 
-            # Verify max_tokens=2048 was passed to SDK
-            call_kwargs = mock_client.messages.create.call_args.kwargs
-            assert call_kwargs["max_tokens"] == 2048, (
-                f"Expected max_tokens=2048, got {call_kwargs.get('max_tokens')}"
-            )
+        assert captured["model_settings"]["max_tokens"] == 2048, (
+            f"Expected max_tokens=2048 in model_settings, got {captured['model_settings']}"
+        )
 
-            await provider.close()
+        await provider.close()
 
     @pytest.mark.asyncio
-    async def test_all_parameters_together_reach_api_call(self, tmp_path):
-        """Verify ALL Claude parameters reach Anthropic SDK API call simultaneously."""
+    async def test_all_parameters_together_reach_model_settings(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """Temperature and max_tokens both flow to Agent.model_settings simultaneously."""
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         workflow_yaml = tmp_path / "test_all_params.yaml"
         workflow_yaml.write_text("""
 workflow:
@@ -171,49 +181,28 @@ agents:
       - to: $end
 """)
 
-        with (
-            patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True),
-            patch("conductor.providers.claude.AsyncAnthropic") as mock_anthropic,
-            patch("conductor.providers.claude.anthropic") as mock_module,
-        ):
-            mock_module.__version__ = "0.77.0"
-            mock_client = MagicMock()
-            mock_anthropic.return_value = mock_client
+        config = load_workflow(str(workflow_yaml))
+        provider = await create_provider(
+            "claude",
+            validate=False,
+            temperature=config.workflow.runtime.temperature,
+            max_tokens=config.workflow.runtime.max_tokens,
+        )
+        engine = WorkflowEngine(config, provider)
+        captured: dict[str, Any] = {}
 
-            mock_response = Mock()
-            mock_response.content = [Mock(text='{"result": "Test response"}', type="text")]
-            mock_response.model = "claude-3-5-sonnet-20241022"
-            mock_response.usage = Mock(
-                input_tokens=10, output_tokens=20, cache_creation_input_tokens=0
-            )
-            mock_response.stop_reason = "end_turn"
-            mock_response.id = "msg_123"
-            mock_response.type = "message"
-            mock_response.role = "assistant"
-
-            mock_client.messages.create = AsyncMock(return_value=mock_response)
-            mock_client.close = AsyncMock()
-
-            config = load_workflow(str(workflow_yaml))
-            provider = await create_provider(
-                provider_type="claude",
-                validate=False,
-                temperature=config.workflow.runtime.temperature,
-                max_tokens=config.workflow.runtime.max_tokens,
-            )
-            engine = WorkflowEngine(config, provider)
+        with _capture_build_agent(captured, {"result": "Test response"}):
             await engine.run({})
 
-            # Verify ALL parameters were passed to SDK in the same call
-            call_kwargs = mock_client.messages.create.call_args.kwargs
-            assert call_kwargs["temperature"] == 0.75
-            assert call_kwargs["max_tokens"] == 4096
+        assert captured["model_settings"]["temperature"] == 0.75
+        assert captured["model_settings"]["max_tokens"] == 4096
 
-            await provider.close()
+        await provider.close()
 
     @pytest.mark.asyncio
-    async def test_none_parameters_use_defaults(self, tmp_path):
-        """Verify parameters with None values use provider defaults."""
+    async def test_none_parameters_use_defaults(self, tmp_path, monkeypatch) -> None:
+        """When parameters are omitted, provider defaults are used."""
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         workflow_yaml = tmp_path / "test_none_params.yaml"
         workflow_yaml.write_text("""
 workflow:
@@ -233,52 +222,27 @@ agents:
       - to: $end
 """)
 
-        with (
-            patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True),
-            patch("conductor.providers.claude.AsyncAnthropic") as mock_anthropic,
-            patch("conductor.providers.claude.anthropic") as mock_module,
-        ):
-            mock_module.__version__ = "0.77.0"
-            mock_client = MagicMock()
-            mock_anthropic.return_value = mock_client
+        config = load_workflow(str(workflow_yaml))
+        provider = await create_provider("claude", validate=False)
+        engine = WorkflowEngine(config, provider)
+        captured: dict[str, Any] = {}
 
-            mock_response = Mock()
-            mock_response.content = [Mock(text='{"result": "Test response"}', type="text")]
-            mock_response.model = "claude-3-5-sonnet-20241022"
-            mock_response.usage = Mock(
-                input_tokens=10, output_tokens=20, cache_creation_input_tokens=0
-            )
-            mock_response.stop_reason = "end_turn"
-            mock_response.id = "msg_123"
-            mock_response.type = "message"
-            mock_response.role = "assistant"
-
-            mock_client.messages.create = AsyncMock(return_value=mock_response)
-            mock_client.close = AsyncMock()
-
-            config = load_workflow(str(workflow_yaml))
-            provider = await create_provider(
-                provider_type="claude",
-                validate=False,
-            )
-            engine = WorkflowEngine(config, provider)
+        with _capture_build_agent(captured, {"result": "Test response"}):
             await engine.run({})
 
-            # When temperature is None, Claude provider uses default (1.0)
-            call_kwargs = mock_client.messages.create.call_args.kwargs
-            # Required parameters should still be present
-            assert "model" in call_kwargs
-            assert "max_tokens" in call_kwargs
-            assert "messages" in call_kwargs
+        # ClaudeProvider defaults: temperature=None, max_tokens=8192.
+        # _build_model_settings only includes temperature when it is not None.
+        assert captured["model_settings"].get("temperature") is None
+        assert captured["model_settings"]["max_tokens"] == 8192
 
-            await provider.close()
+        await provider.close()
 
 
 class TestExcludeNoneInSerialization:
     """Verify exclude_none=True prevents Claude fields in serialized Copilot configs."""
 
     @pytest.mark.asyncio
-    async def test_exclude_none_during_workflow_execution(self, tmp_path):
+    async def test_exclude_none_during_workflow_execution(self, tmp_path) -> None:
         """Test that exclude_none=True works during actual workflow execution."""
         workflow_yaml = tmp_path / "copilot_workflow.yaml"
         workflow_yaml.write_text("""
@@ -317,7 +281,7 @@ agents:
         assert runtime["provider"] == "copilot"
 
     @pytest.mark.asyncio
-    async def test_exclude_none_with_partial_claude_params(self, tmp_path):
+    async def test_exclude_none_with_partial_claude_params(self, tmp_path) -> None:
         """Test exclude_none with some Claude params set, others None."""
         workflow_yaml = tmp_path / "partial_claude.yaml"
         workflow_yaml.write_text("""
