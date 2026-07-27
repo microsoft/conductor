@@ -8,8 +8,9 @@ Pydantic AI model and the MCP manager resolution.
 from __future__ import annotations
 
 import asyncio
+import os
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from pydantic import BaseModel
@@ -193,3 +194,49 @@ class TestExecuteDialogTurnReasoning:
                 "user",
                 model="claude-3-5-sonnet-latest",
             )
+
+
+class TestMCPToolFilter:
+    """Tests for MCP tool filtering semantics."""
+
+    async def test_empty_tool_filter_does_not_exclude_mcp_tools(
+        self, provider: ClaudeProvider
+    ) -> None:
+        # Requirement: issue #37 — empty resolved tool filter must not exclude MCP tools.
+        mock_mcp = MagicMock()
+        mock_mcp.get_all_tools.return_value = [
+            {
+                "name": "filesystem__read_file",
+                "description": "Read a file from the filesystem",
+                "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}},
+                "server": "filesystem",
+                "original_name": "read_file",
+            }
+        ]
+
+        provider._mcp_managers = {os.getcwd(): mock_mcp}
+
+        captured_toolsets: list[Any] = []
+
+        def spy_build_agent(*args: Any, **kwargs: Any) -> Any:
+            captured_toolsets.extend(kwargs.get("toolsets", []))
+            return _build_text_agent("hello")
+
+        agent = AgentDef(name="reader", model="test", prompt="Read the file")
+
+        with patch(
+            "conductor.providers._pydantic_ai.agent_builder.build_agent",
+            side_effect=spy_build_agent,
+        ):
+            await provider.execute(
+                agent=agent,
+                context={},
+                rendered_prompt="Read the file",
+                tools=[],
+            )
+
+        assert len(captured_toolsets) == 1
+        mcp_toolset = captured_toolsets[0]
+
+        tools = await mcp_toolset.get_tools(None)
+        assert "filesystem__read_file" in tools

@@ -799,10 +799,12 @@ class ClaudeProvider(AgentProvider):
 
         toolsets: list[Any] = []
         if manager is not None:
+            # Issue #37: an empty resolved filter means "no filter" — pass None
+            # so MCPManagerToolset exposes every manager tool instead of none.
             toolsets.append(
                 MCPManagerToolset(
                     manager,
-                    tools,
+                    tools or None,
                     self._tool_output_config,
                 )
             )
