@@ -4,12 +4,20 @@ This module tests that all Claude-specific schema fields (temperature, max_token
 are correctly passed from the schema to the ClaudeProvider constructor and used
 during execution.
 
-These tests use real provider classes (not mocks) to verify actual integration.
+These tests use real provider classes (not mocks) and patch the Pydantic AI
+``build_agent`` seam to verify that runtime parameters reach the constructed
+Agent's ``model_settings`` without making real network calls.
 """
 
-from unittest.mock import AsyncMock, Mock, patch
+from __future__ import annotations
+
+from typing import Any
+from unittest.mock import patch
 
 import pytest
+from pydantic import BaseModel
+from pydantic_ai import Agent
+from pydantic_ai.models.test import TestModel
 
 from conductor.config.schema import (
     AgentDef,
@@ -24,38 +32,33 @@ from conductor.providers.claude import ClaudeProvider
 from conductor.providers.factory import create_provider
 
 
+class _ResultModel(BaseModel):
+    """Structured output shape used to short-circuit the Pydantic AI run."""
+
+    result: str
+
+
+def _build_structured_agent(data: dict[str, Any]) -> Agent[Any, Any]:
+    """Build a Pydantic AI structured-output agent backed by TestModel."""
+
+    class DynamicModel(BaseModel):
+        model_config = {"extra": "allow"}
+
+    return Agent(
+        model=TestModel(custom_output_args=data),
+        output_type=DynamicModel,
+    )
+
+
 class TestSchemaToProviderIntegration:
     """Test that schema fields correctly integrate with provider implementations."""
 
     @pytest.mark.asyncio
-    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
-    @patch("conductor.providers.claude.AsyncAnthropic")
-    @patch("conductor.providers.claude.anthropic")
-    async def test_claude_runtime_config_fields_passed_to_provider(
-        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
-    ):
+    async def test_claude_runtime_config_fields_passed_to_provider(self) -> None:
         """Test that all Claude runtime config fields are passed to ClaudeProvider.
 
         Verifies: temperature, max_tokens
         """
-        mock_anthropic_module.__version__ = "0.77.0"
-        mock_client = Mock()
-        mock_client.models.list = AsyncMock(return_value=Mock(data=[]))
-
-        # Mock the messages.create method
-        mock_message = Mock()
-        mock_message.id = "msg_123"
-        mock_message.type = "message"
-        mock_message.role = "assistant"
-        mock_message.model = "claude-3-5-sonnet-latest"
-        mock_message.stop_reason = "end_turn"
-        mock_message.usage = Mock(input_tokens=10, output_tokens=20, cache_creation_input_tokens=0)
-        mock_message.content = [Mock(type="text", text='{"answer": "test"}')]
-
-        mock_client.messages.create = AsyncMock(return_value=mock_message)
-        mock_client.close = AsyncMock()
-        mock_anthropic_class.return_value = mock_client
-
         # Create workflow config with all Claude fields
         config = WorkflowConfig(
             workflow=WorkflowDef(
@@ -93,43 +96,23 @@ class TestSchemaToProviderIntegration:
         # Verify provider is ClaudeProvider
         assert isinstance(provider, ClaudeProvider)
 
-        # Execute through engine to verify fields are used
+        # Execute through engine and inspect the constructed Pydantic AI agent
         engine = WorkflowEngine(config, provider)
-        await engine.run({})
+        with patch(
+            "conductor.providers._pydantic_ai.agent_builder.build_agent",
+            return_value=_build_structured_agent({"answer": "test"}),
+        ) as mock_build_agent:
+            await engine.run({})
 
-        # Verify messages.create was called with correct parameters
-        call_kwargs = mock_client.messages.create.call_args.kwargs
-        assert call_kwargs["temperature"] == 0.8
-        assert call_kwargs["max_tokens"] == 2048
+        # Verify build_agent received the runtime sampling settings
+        assert mock_build_agent.call_args.kwargs["default_temperature"] == 0.8
+        assert mock_build_agent.call_args.kwargs["default_max_tokens"] == 2048
 
         await provider.close()
 
     @pytest.mark.asyncio
-    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
-    @patch("conductor.providers.claude.AsyncAnthropic")
-    @patch("conductor.providers.claude.anthropic")
-    async def test_claude_provider_with_none_fields(
-        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
-    ):
+    async def test_claude_provider_with_none_fields(self) -> None:
         """Test that ClaudeProvider handles None values for optional fields correctly."""
-        mock_anthropic_module.__version__ = "0.77.0"
-        mock_client = Mock()
-        mock_client.models.list = AsyncMock(return_value=Mock(data=[]))
-
-        # Mock the messages.create method
-        mock_message = Mock()
-        mock_message.id = "msg_123"
-        mock_message.type = "message"
-        mock_message.role = "assistant"
-        mock_message.model = "claude-3-5-sonnet-latest"
-        mock_message.stop_reason = "end_turn"
-        mock_message.usage = Mock(input_tokens=10, output_tokens=20, cache_creation_input_tokens=0)
-        mock_message.content = [Mock(type="text", text='{"result": "ok"}')]
-
-        mock_client.messages.create = AsyncMock(return_value=mock_message)
-        mock_client.close = AsyncMock()
-        mock_anthropic_class.return_value = mock_client
-
         # Create workflow config with all Claude fields set to None
         config = WorkflowConfig(
             workflow=WorkflowDef(
@@ -165,46 +148,24 @@ class TestSchemaToProviderIntegration:
         # Verify provider is ClaudeProvider
         assert isinstance(provider, ClaudeProvider)
 
-        # Execute workflow
+        # Execute workflow and inspect the constructed Pydantic AI agent
         engine = WorkflowEngine(config, provider)
-        await engine.run({})
+        with patch(
+            "conductor.providers._pydantic_ai.agent_builder.build_agent",
+            return_value=_build_structured_agent({"result": "ok"}),
+        ) as mock_build_agent:
+            await engine.run({})
 
-        # Verify messages.create was called with defaults
-        call_kwargs = mock_client.messages.create.call_args.kwargs
-        # When temperature is None, it should NOT be in call_kwargs
-        # (provider correctly omits None values from API calls)
-        assert "temperature" not in call_kwargs
-        # max_tokens uses a default of 8192 when not specified
-        assert "max_tokens" in call_kwargs
+        # When temperature is None, it should NOT be passed as a default
+        assert mock_build_agent.call_args.kwargs["default_temperature"] is None
+        # max_tokens uses the provider default of 8192 when not specified
+        assert mock_build_agent.call_args.kwargs["default_max_tokens"] == 8192
 
         await provider.close()
 
     @pytest.mark.asyncio
-    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
-    @patch("conductor.providers.claude.AsyncAnthropic")
-    @patch("conductor.providers.claude.anthropic")
-    async def test_agent_level_overrides_runtime_defaults(
-        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
-    ):
+    async def test_agent_level_overrides_runtime_defaults(self) -> None:
         """Test that agent-level config overrides runtime defaults."""
-        mock_anthropic_module.__version__ = "0.77.0"
-        mock_client = Mock()
-        mock_client.models.list = AsyncMock(return_value=Mock(data=[]))
-
-        # Mock the messages.create method
-        mock_message = Mock()
-        mock_message.id = "msg_123"
-        mock_message.type = "message"
-        mock_message.role = "assistant"
-        mock_message.model = "claude-3-5-sonnet-latest"
-        mock_message.stop_reason = "end_turn"
-        mock_message.usage = Mock(input_tokens=10, output_tokens=20, cache_creation_input_tokens=0)
-        mock_message.content = [Mock(type="text", text='{"result": "ok"}')]
-
-        mock_client.messages.create = AsyncMock(return_value=mock_message)
-        mock_client.close = AsyncMock()
-        mock_anthropic_class.return_value = mock_client
-
         # Create workflow with runtime defaults
         config = WorkflowConfig(
             workflow=WorkflowDef(
@@ -235,13 +196,16 @@ class TestSchemaToProviderIntegration:
             max_tokens=config.workflow.runtime.max_tokens,
         )
 
-        # Execute workflow
+        # Execute workflow and inspect the constructed Pydantic AI agent
         engine = WorkflowEngine(config, provider)
-        await engine.run({})
+        with patch(
+            "conductor.providers._pydantic_ai.agent_builder.build_agent",
+            return_value=_build_structured_agent({"result": "ok"}),
+        ) as mock_build_agent:
+            await engine.run({})
 
-        # Verify API was called
-        call_kwargs = mock_client.messages.create.call_args.kwargs
-        assert call_kwargs["temperature"] == 0.5
-        assert call_kwargs["max_tokens"] == 1024
+        # Verify API was called with runtime defaults (no agent-level overrides set)
+        assert mock_build_agent.call_args.kwargs["default_temperature"] == 0.5
+        assert mock_build_agent.call_args.kwargs["default_max_tokens"] == 1024
 
         await provider.close()
