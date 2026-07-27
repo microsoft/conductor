@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.25...HEAD)
 
+### Added
+
+- **ACA provider resolves a Copilot credential automatically** — the `aca`
+  provider now falls back to `gh auth token` when no credential env var is
+  set, so an operator already signed in with the GitHub CLI needs no
+  ACA-specific credential setup at all. The full precedence is
+  `COPILOT_PROVIDER_BASE_URL` (BYOK) →
+  `COPILOT_GITHUB_TOKEN`/`GH_TOKEN`/`GITHUB_TOKEN` → `gh auth token`,
+  mirroring the Copilot CLI's own documented chain, so an explicit token
+  still overrides the ambient `gh` identity. A fine-grained *Copilot
+  Requests* PAT remains the recommended, narrowest credential for CI and
+  service accounts. Every `gh` failure mode (not installed, not signed in,
+  wedged keyring, empty output) is treated as "no token" and falls through
+  to the existing actionable error rather than raising.
+
+### Fixed
+
+- **ACA pool provisioning no longer fails with `ImageManifestNotFound`** —
+  `scripts/aca/provision-pool.sh` generated a default `IMAGE_TAG` from
+  `date -u +%Y%m%dT%H%M%SZ`, but the ACA session-pool API lowercases image
+  references while OCI tags are case-sensitive, so *every* run with default
+  settings pushed `...T1816Z-...` and then failed to find `...t1816z-...`
+  minutes later during pool creation. The default tag is now all-lowercase,
+  and an uppercase `IMAGE_TAG` override is rejected up front instead of
+  failing after the image build.
+- **ACA errors no longer hide the response body** — a non-2xx response whose
+  body carries no recognizable ACA `message` (e.g. a 429 from the pool's
+  front end) collapsed to the bare placeholder "aca runner reported an
+  error", discarding the actual body and implying the runner had been
+  reached when it may not have been. The raw body is now included
+  (truncated) whenever parsing yields nothing better.
+- **`examples/aca-coding-agent.yaml` no longer pins an unavailable model** —
+  the `implement` agent hard-coded `model: gpt-4.1`, which is not available
+  on all Copilot accounts and failed inside the sandbox with
+  `Model "gpt-4.1" is not available.`. It now inherits the workflow's
+  `default_model` (`gpt-5-mini`), verified working end-to-end.
+
 ## [0.1.25](https://github.com/microsoft/conductor/compare/v0.1.24...v0.1.25) - 2026-07-21
 
 ### Fixed

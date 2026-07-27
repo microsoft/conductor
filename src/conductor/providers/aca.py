@@ -31,6 +31,7 @@ import logging
 import os
 import re
 import secrets
+import subprocess
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -94,6 +95,23 @@ _IDENTIFIER_INVALID_RE = re.compile(r"[^a-z0-9-]+")
 # so a request never starts with a token that expires mid-flight.
 _TOKEN_REFRESH_MARGIN_SECONDS = 60.0
 
+# Upper bound on the `gh auth token` subprocess (DD4 step 3). `gh` reads a
+# local config/keyring and normally returns in well under a second; the
+# timeout only exists so a wedged keyring prompt (e.g. a locked libsecret
+# store on a headless host) degrades to "no token" instead of hanging the
+# workflow before its first agent turn.
+_GH_TOKEN_TIMEOUT_SECONDS = 10.0
+
+# `AcaErrorData.message`'s placeholder, read off the model so the two can't
+# drift. Used to detect "the body told us nothing" and fall back to echoing
+# the raw response body instead.
+_DEFAULT_ACA_ERROR_MESSAGE = AcaErrorData.model_fields["message"].default
+
+# How much of an unrecognized error body to echo into the ProviderError
+# message — enough to identify an ACA front-end error page or JSON payload
+# without dumping a full HTML document into the terminal.
+_MAX_ERROR_BODY_CHARS = 500
+
 
 def _clean_env(name: str) -> str | None:
     """Read an environment variable, normalizing unset/whitespace-only
@@ -112,6 +130,58 @@ def _clean_env(name: str) -> str | None:
         return None
     value = value.strip()
     return value or None
+
+
+def _resolve_gh_cli_token() -> SecretStr | None:
+    """Best-effort ``gh auth token`` lookup for the inner Copilot credential.
+
+    Last step of the DD4 precedence chain, and the reason a workflow can run
+    with **zero** ACA-specific credential setup: GitHub documents ``gh``'s
+    OAuth token as a supported Copilot credential source (``copilot login
+    --help`` lists "OAuth tokens from the GitHub CLI (gh) app"), and most
+    operators are already signed in.
+
+    Every failure mode means the same thing — "no token from this source" —
+    and is swallowed so the caller falls through to a single, actionable
+    "no credential configured" error instead of leaking a subprocess
+    exception from inside credential resolution:
+
+    - ``FileNotFoundError``: ``gh`` isn't installed.
+    - non-zero exit: installed but not logged in (or the host is unknown).
+    - ``TimeoutExpired``: a wedged keyring/credential-helper prompt.
+    - empty stdout: logged in but no token available for the active account.
+
+    ``OSError`` covers the residual exec failures (e.g. ``PermissionError``
+    on a non-executable ``gh`` on ``PATH``). The token is returned as a
+    ``SecretStr`` and is never logged — only *which source won* is logged.
+
+    Caveats worth knowing (documented, not enforced here): ``gh`` tokens are
+    user OAuth tokens subject to SAML SSO authorization and org OAuth-app
+    restrictions, and a GHEC-with-data-residency host needs an explicit
+    ``gh auth token --hostname``.
+    """
+    try:
+        completed = subprocess.run(
+            ["gh", "auth", "token"],
+            capture_output=True,
+            text=True,
+            timeout=_GH_TOKEN_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        # OSError covers `gh` being absent (FileNotFoundError) or not
+        # executable (PermissionError); SubprocessError covers TimeoutExpired.
+        logger.debug("aca: `gh auth token` unavailable (%s)", type(exc).__name__)
+        return None
+    if completed.returncode != 0:
+        logger.debug("aca: `gh auth token` exited %d (not signed in?)", completed.returncode)
+        return None
+    token = (completed.stdout or "").strip()
+    if not token:
+        logger.debug("aca: `gh auth token` returned no token")
+        return None
+    logger.debug("aca: resolved inner Copilot credential from `gh auth token`")
+    return SecretStr(token)
 
 
 class AcaRuntimeProvider(AgentProvider):
@@ -485,21 +555,38 @@ class AcaRuntimeProvider(AgentProvider):
         """Source a GitHub token for Copilot capacity, wrapped in ``SecretStr``.
 
         Precedence (DD4): ``COPILOT_GITHUB_TOKEN`` → ``GH_TOKEN`` →
-        ``GITHUB_TOKEN`` — first non-empty (post-``strip()``) wins, via
-        ``_clean_env`` (review fix: a whitespace-only value no longer counts
-        as "set", which would otherwise suppress a valid lower-priority
-        var). Wrapping in ``SecretStr`` immediately on read keeps the value
+        ``GITHUB_TOKEN`` → ``gh auth token`` — first non-empty
+        (post-``strip()``) wins, via ``_clean_env`` (review fix: a
+        whitespace-only value no longer counts as "set", which would
+        otherwise suppress a valid lower-priority var). This mirrors the
+        Copilot CLI's *own* documented credential chain (env vars, then its
+        stored OAuth token, then a ``gh`` CLI fallback), so an operator
+        already signed in with ``gh`` needs no ACA-specific setup at all.
+
+        The ``gh`` fallback exists because the sandbox's inner Copilot
+        session cannot perform interactive OAuth inside a headless
+        container, so *something* host-side has to produce a token; reusing
+        the one the operator already has beats requiring a hand-created PAT
+        for every run. Deliberately **not** implemented: reading the Copilot
+        editor plugins' credential store (``~/.config/github-copilot/auth.db``).
+        That store belongs to the Copilot Language Server rather than the
+        CLI/SDK this provider drives, has changed format twice, and is
+        slated to be encrypted at rest — see
+        ``docs/projects/aca/aca-provider.design.md`` (DD4).
+
+        Wrapping in ``SecretStr`` immediately on read keeps the value
         redacted in any incidental repr/str of the resolved credential;
         callers must explicitly call ``get_secret_value()`` to obtain the
         plaintext, mirroring the ``ProviderSettings.api_key`` /
         ``bearer_token`` pattern in ``copilot.py``. Returns ``None`` when
-        none of the three vars are set.
+        no source yields a token.
         """
         for var in ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
             value = _clean_env(var)
             if value is not None:
+                logger.debug("aca: resolved inner Copilot credential from %s", var)
                 return SecretStr(value)
-        return None
+        return _resolve_gh_cli_token()
 
     def _resolve_inner_provider_settings(self) -> dict[str, Any]:
         """Resolve the credential to forward to the runner's inner Copilot
@@ -523,10 +610,11 @@ class AcaRuntimeProvider(AgentProvider):
            Copilot custom-routing resolver reads
            (``copilot.py:_resolve_sdk_provider_config``). ``base_url`` wins
            even when a GitHub token is also present.
-        2. Otherwise, source a GitHub token (`_resolve_github_token`) and
-           forward it as ``github_token`` so the runner's inner
-           ``CopilotProvider`` authenticates against GitHub Copilot's own
-           model routing — the operator's Copilot capacity.
+        2. Otherwise, source a GitHub token (`_resolve_github_token`) — env
+           vars first, then a best-effort ``gh auth token`` — and forward it
+           as ``github_token`` so the runner's inner ``CopilotProvider``
+           authenticates against GitHub Copilot's own model routing — the
+           operator's Copilot capacity.
         3. Neither resolves → fail loudly rather than run the sandbox
            unauthenticated or silently degraded.
 
@@ -567,10 +655,11 @@ class AcaRuntimeProvider(AgentProvider):
 
         raise ProviderError(
             "aca: no credential available for the sandbox's inner Copilot "
-            "provider. Either export a GitHub token to run on your own "
-            "Copilot capacity, or configure a BYOK custom-routing endpoint.",
+            "provider. Either sign in to GitHub on this host to run on your "
+            "own Copilot capacity, or configure a BYOK custom-routing endpoint.",
             suggestion=(
-                "Create a fine-grained 'Copilot Requests' PAT and export it as "
+                "Run `gh auth login` (the token is picked up automatically), or "
+                "create a fine-grained 'Copilot Requests' PAT and export it as "
                 "COPILOT_GITHUB_TOKEN (GH_TOKEN / GITHUB_TOKEN also work), or "
                 "set COPILOT_PROVIDER_BASE_URL (plus COPILOT_PROVIDER_API_KEY / "
                 "COPILOT_PROVIDER_BEARER_TOKEN) to route the sandbox at a BYOK "
@@ -670,8 +759,22 @@ class AcaRuntimeProvider(AgentProvider):
         a no-op on a response that was already fully read (e.g. the
         non-streaming `client.get()`/`client.post()` callers), so this is
         safe for every call site.
+
+        Second fix (functional test, issue #284): an ACA data-plane error
+        whose body carries *no* recognizable ``message`` (e.g. an HTTP 429
+        emitted by the pool's own front end rather than the runner) fell
+        back to ``AcaErrorData``'s placeholder default, so the operator saw
+        only "aca runner reported an error" with the real body discarded —
+        actively misleading, since the runner may never have been reached.
+        The raw body is now preserved (truncated) whenever the parsed
+        message is just that default, so there is always *something*
+        diagnosable.
         """
         await response.aread()
+        # Defensive: this method runs while constructing an error, so it must
+        # never raise on its own — an exception here would mask the failure
+        # the caller is actually trying to report.
+        raw_body = (getattr(response, "text", "") or "").strip()
         try:
             body = response.json()
         except (json.JSONDecodeError, ValueError):
@@ -682,16 +785,30 @@ class AcaRuntimeProvider(AgentProvider):
             if isinstance(error_obj, dict)
             else AcaErrorData()
         )
-        return self._provider_error_from_parts(parsed, status_code=response.status_code)
+        return self._provider_error_from_parts(
+            parsed, status_code=response.status_code, raw_body=raw_body
+        )
 
     def _provider_error_from_parts(
-        self, error: AcaErrorData, status_code: int | None = None
+        self,
+        error: AcaErrorData,
+        status_code: int | None = None,
+        raw_body: str | None = None,
     ) -> ProviderError:
+        message = error.message
+        # Only append the raw body when parsing produced nothing better than
+        # the placeholder default — otherwise the ACA-shaped `message` is
+        # already the best description and duplicating the body just adds noise.
+        if raw_body and message == _DEFAULT_ACA_ERROR_MESSAGE:
+            snippet = raw_body[:_MAX_ERROR_BODY_CHARS]
+            if len(raw_body) > _MAX_ERROR_BODY_CHARS:
+                snippet += "… (truncated)"
+            message = f"{message}: {snippet}"
         suggestion = None
         if error.code or error.trace_id:
             suggestion = f"ACA error code={error.code} traceId={error.trace_id}"
         return ProviderError(
-            f"aca: {error.message}",
+            f"aca: {message}",
             suggestion=suggestion,
             status_code=status_code,
             provider_name="aca",

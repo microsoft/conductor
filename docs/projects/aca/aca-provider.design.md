@@ -49,7 +49,7 @@ as the fallback (endpoint credentials optional within it) and no mode switch.
 |---|---|---|
 | `AgentProvider` at `execute()` granularity (DD1) | Proposed | Engine, routing, context, checkpoints stay on host |
 | Runner wraps the real `CopilotProvider` (DD2) | Proposed | Event/output parity comes "for free" |
-| Credential model = forward a narrowly-scoped credential (DD4) | **Accepted** | No modes; Copilot-Requests PAT recommended (default), BYOK fallback — shipped in E8/E9 |
+| Credential model = forward a narrowly-scoped credential (DD4) | **Accepted** | No modes; `gh auth token` zero-setup default, Copilot-Requests PAT recommended for CI, BYOK fallback — shipped in E8/E9 |
 | Transport: streaming vs submit+poll (DD3) | **Resolved — Branch S** | Phase 0 spike (#312) measured a ~30-min per-request cap; streaming chosen |
 | `streaming_events` / `interrupt` capability values | **Resolved — both `True`** | Follow directly from the DD3 outcome |
 | `concurrent_safe = True` via concurrency discriminator (DD5) | Proposed | Mechanism in Data Flow |
@@ -353,15 +353,28 @@ premises the rest of the design builds on.
   settings (`base_url` + `api_key`/`bearer_token`); otherwise, if a GitHub token is
   present (`COPILOT_GITHUB_TOKEN` → `GH_TOKEN` → `GITHUB_TOKEN`) → forward it and the
   sandbox's inner Copilot runtime authenticates to **GitHub Copilot's own model
-  routing** (your Copilot capacity) — **recommended: a fine-grained PAT with only the
-  *Copilot Requests* permission**; otherwise → fail loudly with setup guidance. The
+  routing** (your Copilot capacity); otherwise → **`gh auth token`**, the zero-setup
+  default that reuses the operator's existing GitHub CLI sign-in (a documented
+  Copilot credential source; every failure mode means "no token" and falls
+  through); otherwise → fail loudly with setup guidance. **Recommended where blast
+  radius matters (CI, service accounts): a fine-grained PAT with only the
+  *Copilot Requests* permission**, which overrides the `gh` default. The
   credential is delivered in-memory per call (request body → the inner runtime's
   `github_token`), never a persisted pool secret. **Posture:** the credential *does*
   enter the sandbox and is readable by a shell there, so the defense is *scope and
   lifetime* — a leaked *Copilot Requests* PAT can only spend your Copilot quota until
   it expires and is centrally revocable — which makes `aca` suitable for *trusted*
-  workloads. Baking a long-lived, broadly-scoped token as a pool secret is the named
-  anti-pattern and is rejected. Keeping the credential entirely off the sandbox (a
+  workloads; the `gh` default forwards the operator's broader OAuth identity and is
+  the convenience end of that trade. Baking a long-lived, broadly-scoped token as a
+  pool secret is the named
+  anti-pattern and is rejected. **Rejected alternative:** harvesting the Copilot
+  editor plugins' credential store (`~/.config/github-copilot/auth.db`). It is owned
+  by the Copilot *Language Server* rather than the CLI/SDK the runner drives, has
+  changed format twice (`hosts.json` → `apps.json` → `auth.db`), and has already
+  shipped encryption-at-rest once before an incident-driven rollback — so a plaintext
+  read is a temporary accident, not a contract; reading another product's secret
+  database is also a credential-harvesting pattern this design avoids. Keeping the
+  credential entirely off the sandbox (a
   host-side broker/relay) for untrusted/multi-tenant use is future work. Full model in
   **Security Considerations**.
 

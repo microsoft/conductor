@@ -346,7 +346,12 @@ class TestImageTag:
         # working. Freeze `date` so both runs get the identical timestamp
         # component deterministically, isolating the nonce as the only
         # possible source of uniqueness.
-        fixed_timestamp = "20990101T000000Z"
+        #
+        # The frozen value is all-lowercase/digits to match the real format
+        # string the script now uses (`%Y%m%d%H%M%S`, no literal `T`/`Z`) —
+        # the tag must be lowercase or ACA can't resolve the pushed manifest,
+        # and the script rejects an uppercase tag outright.
+        fixed_timestamp = "20990101000000"
         proc_a, calls_a = run_provision_script_raw(tmp_path / "a", freeze_date=fixed_timestamp)
         proc_b, calls_b = run_provision_script_raw(tmp_path / "b", freeze_date=fixed_timestamp)
         assert proc_a.returncode == 0, proc_a.stderr
@@ -356,7 +361,7 @@ class TestImageTag:
         image_b = _flag_value(_find_calls(calls_b, "acr", "build")[0], "--image")
         assert image_a is not None and image_b is not None
 
-        prefix = f"conductor-agent-runner:{fixed_timestamp}-"
+        prefix = f"conductor-agent-runner:build-{fixed_timestamp}-"
         assert image_a.startswith(prefix)
         assert image_b.startswith(prefix)
 
@@ -375,6 +380,30 @@ class TestImageTag:
         calls = run_provision_script(tmp_path, {"IMAGE_TAG": "v1.2.3"})
         build_call = _find_calls(calls, "acr", "build")[0]
         assert _flag_value(build_call, "--image") == "conductor-agent-runner:v1.2.3"
+
+    def test_default_tag_is_all_lowercase(self, tmp_path: Path) -> None:
+        """Regression: the ACA session-pool API lowercases the image reference
+        it is handed, while OCI/Docker tags are case-SENSITIVE. The previous
+        default (`date -u +%Y%m%dT%H%M%SZ`) therefore pushed `...T0000Z-...`
+        and had pool creation fail minutes later looking for `...t0000z-...`
+        (`ImageManifestNotFound`/`MANIFEST_UNKNOWN`) — on *every* run with
+        default settings."""
+        calls = run_provision_script(tmp_path)
+        image = _flag_value(_find_calls(calls, "acr", "build")[0], "--image")
+        assert image is not None
+        tag = image.split(":", 1)[1]
+        assert tag == tag.lower(), f"default IMAGE_TAG must be lowercase, got: {tag!r}"
+
+    def test_uppercase_image_tag_override_is_rejected_before_any_az_call(
+        self, tmp_path: Path
+    ) -> None:
+        """An uppercase override must fail fast, not after `az acr build` has
+        already spent minutes pushing an image the pool can never resolve."""
+        proc, calls = run_provision_script_raw(tmp_path, {"IMAGE_TAG": "Build-2099T01Z"})
+
+        assert proc.returncode != 0
+        assert "lowercase" in proc.stderr
+        assert calls == [], f"no az call should have run, got: {calls}"
 
 
 class TestPreflight:

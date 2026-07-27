@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -927,6 +928,35 @@ class TestAcaCredentialPrecedence:
     def _clear_credential_env(cls, monkeypatch: pytest.MonkeyPatch) -> None:
         for var in cls._CREDENTIAL_ENV_VARS:
             monkeypatch.delenv(var, raising=False)
+        # The DD4 chain now ends in a `gh auth token` subprocess. Without
+        # stubbing it, every "nothing configured" assertion below would shell
+        # out to the *developer's own* signed-in `gh` and resolve a real
+        # token — passing on a machine with no `gh`, failing on one with it
+        # (and silently exfiltrating a live credential into test state).
+        # Default every credential-precedence test to "gh not installed";
+        # tests that want the fallback opt in via `_stub_gh_token`.
+        cls._stub_gh_token(monkeypatch, absent=True)
+
+    @staticmethod
+    def _stub_gh_token(
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        stdout: str = "",
+        returncode: int = 0,
+        absent: bool = False,
+        timeout: bool = False,
+    ) -> None:
+        """Stub the `gh auth token` subprocess used by `_resolve_gh_cli_token`."""
+
+        def fake_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            assert cmd == ["gh", "auth", "token"], f"unexpected subprocess: {cmd}"
+            if absent:
+                raise FileNotFoundError(2, "No such file or directory: 'gh'")
+            if timeout:
+                raise subprocess.TimeoutExpired(cmd, 10.0)
+            return subprocess.CompletedProcess(cmd, returncode, stdout=stdout, stderr="")
+
+        monkeypatch.setattr("conductor.providers.aca.subprocess.run", fake_run)
 
     @staticmethod
     def _make_streaming_provider(monkeypatch: pytest.MonkeyPatch, captured: dict[str, object]):
@@ -1210,6 +1240,168 @@ class TestAcaCredentialPrecedence:
             await provider.execute(agent=_agent(), context={}, rendered_prompt="x")
 
         assert captured["body"]["inner_provider_settings"] == {"github_token": "super-secret-value"}
+
+
+class TestAcaGhCliTokenFallback:
+    """DD4 step 3: `gh auth token` as the zero-setup default credential.
+
+    GitHub documents the `gh` CLI's OAuth token as a supported Copilot
+    credential source, so an operator already signed in with `gh` needs no
+    ACA-specific credential setup at all. Verified end-to-end against a real
+    ACA pool during the epic's functional test.
+    """
+
+    # Wrapped in `staticmethod` so they stay plain callables here: a bare
+    # class-body assignment would re-bind them as instance methods and pass
+    # `self` through as the first positional argument.
+    _clear_credential_env = staticmethod(TestAcaCredentialPrecedence._clear_credential_env)
+    _stub_gh_token = staticmethod(TestAcaCredentialPrecedence._stub_gh_token)
+
+    def test_gh_token_used_when_no_env_vars_set(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._clear_credential_env(monkeypatch)
+        self._stub_gh_token(monkeypatch, stdout="gho_from_gh_cli\n")
+
+        provider = _make_provider()
+        settings = provider._resolve_inner_provider_settings()
+
+        assert set(settings) == {"github_token"}
+        # Trailing newline from the subprocess must be stripped, or the token
+        # would be forwarded with a newline embedded in it.
+        assert settings["github_token"].get_secret_value() == "gho_from_gh_cli"
+
+    def test_env_var_takes_precedence_over_gh_cli(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An explicit env var must win, so a user can override the ambient
+        `gh` identity (e.g. a narrower 'Copilot Requests' PAT) without
+        logging out of `gh`."""
+        self._clear_credential_env(monkeypatch)
+        self._stub_gh_token(monkeypatch, stdout="gho_from_gh_cli")
+        monkeypatch.setenv("GITHUB_TOKEN", "token-from-env")
+
+        provider = _make_provider()
+        settings = provider._resolve_inner_provider_settings()
+
+        assert settings["github_token"].get_secret_value() == "token-from-env"
+
+    def test_byok_base_url_takes_precedence_over_gh_cli(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._clear_credential_env(monkeypatch)
+        self._stub_gh_token(monkeypatch, stdout="gho_from_gh_cli")
+        monkeypatch.setenv("COPILOT_PROVIDER_BASE_URL", "https://byok.example.com")
+
+        provider = _make_provider()
+        settings = provider._resolve_inner_provider_settings()
+
+        assert settings == {"base_url": "https://byok.example.com"}
+
+    @pytest.mark.parametrize(
+        ("kwargs", "label"),
+        [
+            ({"absent": True}, "gh not installed"),
+            ({"returncode": 1}, "gh installed but not signed in"),
+            ({"timeout": True}, "gh wedged on a locked keyring"),
+            ({"stdout": "   \n"}, "gh returned only whitespace"),
+            ({"stdout": ""}, "gh returned nothing"),
+        ],
+    )
+    def test_unusable_gh_result_falls_through_to_clean_error(
+        self, monkeypatch: pytest.MonkeyPatch, kwargs: dict[str, object], label: str
+    ) -> None:
+        """Every `gh` failure mode means the same thing — "no token from this
+        source" — and must surface as the actionable "no credential
+        configured" ProviderError, never as a raw subprocess exception
+        escaping credential resolution."""
+        self._clear_credential_env(monkeypatch)
+        self._stub_gh_token(monkeypatch, **kwargs)  # ty: ignore[invalid-argument-type]
+
+        provider = _make_provider()
+
+        with pytest.raises(ProviderError) as exc_info:
+            provider._resolve_inner_provider_settings()
+
+        assert "gh auth login" in str(exc_info.value), label
+
+    def test_gh_token_is_redacted_as_secretstr(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A `gh`-sourced token gets the same redaction discipline as an
+        env-var one — it must not leak via an incidental repr/str."""
+        self._clear_credential_env(monkeypatch)
+        self._stub_gh_token(monkeypatch, stdout="gho_super_secret")
+
+        provider = _make_provider()
+        secret = provider._resolve_github_token()
+
+        assert secret is not None
+        assert "gho_super_secret" not in repr(secret)
+        assert "gho_super_secret" not in str(secret)
+        assert secret.get_secret_value() == "gho_super_secret"
+
+    def test_gh_subprocess_is_not_shell_invoked(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The token lookup must pass an argv list (never `shell=True`), so a
+        hostile PATH entry or shell metacharacter can't turn credential
+        resolution into arbitrary command execution."""
+        self._clear_credential_env(monkeypatch)
+        captured: dict[str, object] = {}
+
+        def fake_run(cmd: list[str], **kwargs: object):
+            captured["cmd"] = cmd
+            captured["kwargs"] = kwargs
+            return subprocess.CompletedProcess(cmd, 0, stdout="gho_x", stderr="")
+
+        monkeypatch.setattr("conductor.providers.aca.subprocess.run", fake_run)
+
+        _make_provider()._resolve_github_token()
+
+        assert captured["cmd"] == ["gh", "auth", "token"]
+        assert captured["kwargs"].get("shell") is not True  # ty: ignore[possibly-unbound-attribute]
+        # A hung `gh` must not stall the workflow before its first agent turn.
+        assert captured["kwargs"].get("timeout") is not None  # ty: ignore[possibly-unbound-attribute]
+
+
+class TestAcaErrorBodyDiagnostics:
+    """Functional-test fix: a non-2xx whose body carries no recognizable
+    ACA `message` used to collapse to the bare placeholder "aca runner
+    reported an error", discarding the body — actively misleading, since
+    such a response (e.g. a 429 from the pool front end) may mean the runner
+    was never reached at all."""
+
+    @pytest.mark.asyncio
+    async def test_unrecognized_error_body_is_echoed(self) -> None:
+        provider = _make_provider()
+        response = httpx.Response(429, text="Too many requests for session pool 'x'")
+
+        error = await provider._error_from_response(response)
+
+        assert "Too many requests for session pool 'x'" in str(error)
+        assert error.status_code == 429
+
+    @pytest.mark.asyncio
+    async def test_aca_shaped_message_is_not_polluted_with_raw_body(self) -> None:
+        """When the body *does* parse into an ACA-shaped error, that message
+        is already the best description — appending the raw JSON on top
+        would just add noise."""
+        provider = _make_provider()
+        response = httpx.Response(
+            400,
+            json={"error": {"message": "Pool is not ready", "code": "PoolNotReady"}},
+        )
+
+        error = await provider._error_from_response(response)
+
+        assert "Pool is not ready" in str(error)
+        assert "aca runner reported an error" not in str(error)
+        assert '{"error"' not in str(error)
+
+    @pytest.mark.asyncio
+    async def test_long_error_body_is_truncated(self) -> None:
+        """An ACA front end can return a full HTML error page; echo enough to
+        identify it without flooding the terminal."""
+        provider = _make_provider()
+        response = httpx.Response(502, text="<html>" + ("x" * 5000) + "</html>")
+
+        error = await provider._error_from_response(response)
+
+        assert "truncated" in str(error)
+        assert len(str(error)) < 1000
 
 
 class TestAcaExecuteRequestSecretRedactionOnValidate:

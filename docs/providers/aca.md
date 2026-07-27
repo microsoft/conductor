@@ -63,9 +63,22 @@ az login
 ```
 
 Any `DefaultAzureCredential`-compatible identity (Azure CLI login,
-managed identity, service principal env vars, …) with the *Session
+managed identity, service principal, …) with the *Session
 Executor* role on the pool works — see
 [Authentication](#authentication).
+
+> **Multi-tenant / guest accounts:** plain `az login` targets the
+> `organizations` endpoint and may land on a tenant where your account is
+> a disabled guest, failing with `AADSTS500571`. Pass the tenant holding
+> your subscription explicitly: `az login --tenant <tenant-id>`. Some
+> corporate tenants additionally block the device-code flow via
+> Conditional Access (`AADSTS53003`), so `--use-device-code` is not a
+> workaround there — use the default interactive browser flow.
+
+> **WSL:** the interactive flow works from WSL2 (the loopback redirect is
+> forwarded from Windows), but if no browser opens, copy the printed URL
+> into a Windows browser manually. Note that credentials are per-Linux-user
+> — being signed in to `az` on Windows does **not** authenticate WSL.
 
 ### 3. Authenticate the inner Copilot session
 
@@ -76,25 +89,37 @@ headless container, so the **host** resolves either a GitHub token or
 BYOK routing settings and forwards them on every request (see
 [Inner Copilot Authentication](#inner-copilot-authentication)).
 
-**Default: run on your own Copilot capacity.** Create a fine-grained
-GitHub personal access token with only the ***Copilot Requests*
-permission**, then export it before `conductor run`:
+**Default: nothing to do.** If you are signed in with the GitHub CLI,
+Conductor picks that token up automatically via `gh auth token` — no
+ACA-specific credential setup at all. GitHub documents the `gh` CLI's
+OAuth token as a supported Copilot credential source, and no special
+Copilot scope is required (entitlement is evaluated per-user seat, not via
+OAuth scopes):
 
 ```bash
-export COPILOT_GITHUB_TOKEN=<your fine-grained PAT>
+gh auth login   # only if you aren't already signed in
 ```
 
-No `COPILOT_PROVIDER_*` configuration is required for this default path —
-the provider forwards the token in-memory to the sandbox's inner Copilot
-runtime, which authenticates against GitHub Copilot's own model routing
-using **the Copilot capacity of the GitHub account that owns the
-forwarded token** — this is independent of the Azure identity from step 2
-(`az login`/`DefaultAzureCredential`), which only grants access to the
-pool itself. `GH_TOKEN` and `GITHUB_TOKEN` are also recognized (in that
-priority order) for environments that already export one of those, but a
-dedicated `COPILOT_GITHUB_TOKEN` scoped to *Copilot Requests only* is
-recommended so you aren't forwarding a broader-scoped token than
-necessary into the sandbox.
+**To use a different credential**, export it — an explicit environment
+variable always beats the ambient `gh` identity, so you can point a single
+workflow at a narrower token without logging out of `gh`:
+
+```bash
+export COPILOT_GITHUB_TOKEN=<token>
+```
+
+The narrowest option, and the recommended one for CI, service accounts, or
+any host where you'd rather not forward your full `gh` identity into a
+sandbox, is a fine-grained GitHub personal access token with only the
+***Copilot Requests* permission** (see
+[Inner Copilot Authentication](#inner-copilot-authentication) for how to
+create one). `GH_TOKEN` and `GITHUB_TOKEN` are also recognized, in that
+priority order.
+
+Either way the sandbox runs on **the Copilot capacity of the GitHub
+account owning the resolved token** — independent of the Azure identity
+from step 2 (`az login`/`DefaultAzureCredential`), which only grants
+access to the pool itself.
 
 **Fallback: BYOK custom routing.** If you need to route the sandbox at a
 custom OpenAI-compatible endpoint instead (as with the host's own
@@ -117,21 +142,25 @@ OpenAI-compatible. `COPILOT_PROVIDER_BASE_URL` (if set) always wins over
 a GitHub token, so a BYOK endpoint stays authoritative even when both are
 exported.
 
-**Trusted-use posture:** whichever credential you export, it *does* enter
+**Trusted-use posture:** whichever credential is resolved, it *does* enter
 the sandbox and is readable by a model-driven shell there — ACA offers no
-per-session secret isolation or per-destination egress allowlist. Keep it
-narrowly scoped (a *Copilot Requests*-only PAT can spend nothing but your
-Copilot quota) and give it a short expiry so a leak is bounded and
-revocable. This mechanism is acceptable only for **trusted** workloads
-(workflows and repos you control) — it is not safe for untrusted or
-multi-tenant use. Keeping the credential entirely off the sandbox (a
-host-side broker) is future work; see [Security](#security).
+per-session secret isolation or per-destination egress allowlist. The
+`gh auth token` default trades a little scope for a lot of convenience: a
+`gh` OAuth token is broader than a *Copilot Requests*-only PAT, so when
+blast radius matters more than setup cost (CI, shared hosts, anything
+running untrusted-ish code), export a narrowly scoped PAT with a short
+expiry instead — it can spend nothing but your Copilot quota, and a leak
+stays bounded and centrally revocable. This mechanism is acceptable only
+for **trusted** workloads (workflows and repos you control) — it is not
+safe for untrusted or multi-tenant use. Keeping the credential entirely
+off the sandbox (a host-side broker) is future work; see
+[Security](#security).
 
-Skipping this step is not a silent no-op, but the failure surfaces
-**host-side, before the sandbox is ever contacted**: the host raises
-`ProviderError` while building the `/execute` request (no credential to
-forward), so the request is never dispatched rather than failing inside
-the sandbox.
+If no credential can be resolved from *any* source, the failure is not a
+silent no-op and surfaces **host-side, before the sandbox is ever
+contacted**: the host raises `ProviderError` while building the `/execute`
+request (no credential to forward), so the request is never dispatched
+rather than failing inside the sandbox.
 
 ### 4. Provision a pool (bring-your-own — Conductor does not do this for you)
 
@@ -148,6 +177,13 @@ environment, ACR). `EGRESS=enabled` is required (the script defaults to
 `disabled`, the safer choice for pools that don't need it) — both cloning a
 repo and reaching the Copilot model backend from inside the sandbox require
 outbound network access.
+
+The script needs the `containerapp` Azure CLI extension, which it installs
+for you. That install shells out to `pip`, so if you installed the Azure
+CLI into an isolated environment that omits `pip` (e.g. `uv tool install
+azure-cli`), it fails with `No module named pip` — reinstall including
+pip (`uv tool install azure-cli --with pip`) or use a distro/installer
+package.
 
 ### 5. Update your workflow
 
@@ -424,19 +460,48 @@ configure — precedence mirrors the Copilot CLI's own auth resolution
    credential are forwarded — no provider `type` or `wire_api`, so the
    runner's inner `CopilotProvider` always treats the endpoint as
    OpenAI-compatible.
-2. **Default: your own Copilot capacity** — otherwise, if a GitHub token
-   is present (`COPILOT_GITHUB_TOKEN` → `GH_TOKEN` → `GITHUB_TOKEN`, first
-   non-empty wins), it is forwarded as `github_token` and the sandbox's
-   inner Copilot runtime authenticates against **GitHub Copilot's own
-   model routing**, using the Copilot capacity of **the GitHub account
-   that owns the forwarded token** (independent of the Azure identity used
-   to reach the pool). **Recommended: a fine-grained PAT scoped to only
-   the *Copilot Requests* permission.**
-3. **Neither is set** → the provider fails loudly with setup guidance
+2. **Explicit GitHub token** — otherwise, if a GitHub token is present in
+   the environment (`COPILOT_GITHUB_TOKEN` → `GH_TOKEN` → `GITHUB_TOKEN`,
+   first non-empty wins), it is forwarded as `github_token`.
+   **Recommended for CI/service accounts: a fine-grained PAT scoped to
+   only the *Copilot Requests* permission**, which is the narrowest
+   credential that works.
+3. **Default: `gh auth token`** — otherwise the host shells out to the
+   GitHub CLI. This is what makes the zero-setup path work: if you are
+   signed in with `gh`, nothing else is required. GitHub documents `gh`'s
+   OAuth token as a supported Copilot credential source, and no special
+   OAuth scope is needed — Copilot entitlement is evaluated per-user
+   (seat), not via scopes. Every failure mode (`gh` not installed, not
+   signed in, wedged keyring, empty output) is treated as "no token" and
+   falls through to step 4 rather than raising.
+4. **Nothing resolves** → the provider fails loudly with setup guidance
    rather than running the sandbox unauthenticated or silently degraded.
 
+In cases 2 and 3 the sandbox's inner Copilot runtime authenticates against
+**GitHub Copilot's own model routing**, using the Copilot capacity of
+**the GitHub account that owns the forwarded token** (independent of the
+Azure identity used to reach the pool).
+
+> **Not implemented on purpose:** reading the Copilot editor plugins'
+> credential store (`~/.config/github-copilot/auth.db`). That store belongs
+> to the Copilot *Language Server*, not the CLI/SDK this provider drives;
+> its format has already changed twice (`hosts.json` → `apps.json` →
+> `auth.db`), and encryption-at-rest has shipped once before being rolled
+> back — so any plaintext read is a temporary accident, not a contract.
+> `gh auth token` is the supported equivalent.
+
+**Caveats for the `gh` path.** `gh` tokens are *user* OAuth tokens, so they
+are subject to SAML SSO authorization and org OAuth-app restrictions; if an
+org enforces either, authorize the GitHub CLI app for it (or export an
+explicit token instead). For GHEC-with-data-residency you must also
+propagate `GH_HOST`/`COPILOT_GH_HOST` and select the matching host with
+`gh auth token --hostname`.
+
 ```bash
-# Default (Copilot capacity) — no COPILOT_PROVIDER_* required:
+# Default (Copilot capacity) — nothing to export if `gh` is signed in:
+gh auth login
+
+# Explicit override — beats the ambient `gh` identity:
 export COPILOT_GITHUB_TOKEN=<fine-grained PAT, "Copilot Requests" only>
 
 # Fallback (BYOK custom routing) — COPILOT_PROVIDER_BASE_URL is required;
@@ -461,12 +526,17 @@ and is readable by a model-driven shell there — ACA offers no
 per-session secret isolation or per-destination egress allowlist. The
 defense is *scope and lifetime*, not concealment: a leaked *Copilot
 Requests* PAT can only spend your Copilot quota until it expires and is
-centrally revocable, which is what makes the default path safe for
+centrally revocable, which is what makes that path safe for
 **trusted** workloads (workflows and repos you control) — never a
-long-lived personal token or a broadly-scoped API key. This mechanism is
+long-lived personal token or a broadly-scoped API key. The zero-setup
+`gh auth token` default is the convenience end of that trade: it forwards
+your full `gh` OAuth identity, which is broader than a *Copilot
+Requests*-only PAT, so prefer an explicit scoped token wherever blast
+radius matters. This mechanism is
 not safe for untrusted or multi-tenant use; keeping the credential
 entirely off the sandbox (a host-side broker/relay) is future work — see
-[Security](#security). If neither a GitHub token nor a BYOK endpoint is
+[Security](#security). If no GitHub token can be resolved and no BYOK
+endpoint is
 configured, the failure happens **host-side**: `_resolve_inner_provider_settings()`
 raises `ProviderError` while `_build_request()` constructs the `/execute`
 body, before any request reaches the sandbox — there is no silent
@@ -595,11 +665,18 @@ variable or file there, `aca`'s credential model (DD4) accepts that the
 forwarded credential *does* enter the sandbox and defends via **scope and
 lifetime** instead of trying to keep it out entirely:
 
-- **Default (recommended): a fine-grained *Copilot Requests* PAT**
-  (`COPILOT_GITHUB_TOKEN`). It can spend nothing but your Copilot quota,
+- **Default (zero-setup): `gh auth token`.** If the operator is signed in
+  with the GitHub CLI, that OAuth token is used automatically. It is a
+  documented Copilot credential source, but it is the operator's *full*
+  `gh` identity — broader than the PAT below. Fine for **trusted**
+  workloads on a machine you control; prefer an explicit scoped token
+  anywhere else.
+- **Recommended when blast radius matters: a fine-grained *Copilot
+  Requests* PAT** (`COPILOT_GITHUB_TOKEN`, which overrides the `gh`
+  default). It can spend nothing but your Copilot quota,
   and a short expiry plus central revocability bounds a leak — this is
-  what makes the default path acceptable for **trusted** workloads
-  (workflows and repos you control).
+  what makes the path acceptable for CI, service accounts, and shared
+  hosts.
 - **Fallback: BYOK custom routing** (`COPILOT_PROVIDER_BASE_URL`, which
   alone activates it — `COPILOT_PROVIDER_API_KEY` / `COPILOT_PROVIDER_BEARER_TOKEN`
   are optional and only needed when the endpoint itself requires
@@ -611,6 +688,13 @@ lifetime** instead of trying to keep it out entirely:
   variable — this is the named anti-pattern and exposes the whole pool
   indefinitely. The credential is always delivered in-memory, per
   request, never as a persisted sandbox environment variable.
+- **Not implemented on purpose:** harvesting the Copilot editor plugins'
+  credential store (`~/.config/github-copilot/auth.db`). Besides being an
+  undocumented store owned by a different product (the Copilot Language
+  Server) that has already changed format twice and is slated for
+  encryption at rest, reading another tool's secret database is a
+  credential-harvesting pattern Conductor deliberately avoids.
+  `gh auth token` is the supported equivalent.
 - This posture is **trusted-use only**. ACA offers no per-session secret
   isolation and no per-destination egress allowlist, so it is not safe
   for untrusted or multi-tenant workloads. Keeping the credential
@@ -678,17 +762,63 @@ remote pool. See
 
 ### Missing inner Copilot credential
 
-Confirm the **inner** Copilot credential is set — `COPILOT_GITHUB_TOKEN`
-(or `GH_TOKEN`/`GITHUB_TOKEN`), or the BYOK fallback
+Confirm the **inner** Copilot credential is available on the host — the
+easiest fix is `gh auth login` (the CLI's token is picked up
+automatically). Otherwise export `COPILOT_GITHUB_TOKEN` (or
+`GH_TOKEN`/`GITHUB_TOKEN`), or the BYOK fallback
 `COPILOT_PROVIDER_BASE_URL` (`COPILOT_PROVIDER_API_KEY`/
 `COPILOT_PROVIDER_BEARER_TOKEN` are optional, only needed when the
-endpoint itself requires a credential) — on the host, not just the
-pool's `az login`. These are two separate auth layers; see
+endpoint itself requires a credential). Note this is separate from the
+pool's `az login` — they are two independent auth layers; see
 [Inner Copilot Authentication](#inner-copilot-authentication). Failure
-is having **neither** a GitHub token **nor** a BYOK base URL set — in
+means **no** GitHub token could be resolved from any source **and** no
+BYOK base URL is set — in
 that case the host raises `ProviderError` while building the
 `/execute` request — before the sandbox is ever contacted, not inside
 it.
+
+If `gh` is installed and signed in but still isn't being used, check that
+`gh auth token` prints a token in the same shell that runs `conductor`
+(SAML SSO authorization or an org OAuth-app restriction can suppress it),
+or export the token explicitly.
+
+### `Model "<name>" is not available.`
+
+The model named in `runtime.default_model` (or an agent's `model:`) is not
+available to the Copilot account owning the forwarded credential — model
+availability varies by account, plan, and enterprise policy. The failure
+happens *inside* the sandbox at `session.create` time and is surfaced
+host-side as a `ProviderError`.
+
+Pick a model your account actually has. `gpt-5-mini` and
+`claude-sonnet-4.5` are verified working with
+[`examples/aca-coding-agent.yaml`](../../examples/aca-coding-agent.yaml);
+`gpt-4.1` and `gpt-4o` are **not** available on all accounts. Prefer
+setting `runtime.default_model` once rather than pinning a per-agent
+`model:` you may not be able to use.
+
+### Pool creation fails with `ImageManifestNotFound` / `MANIFEST_UNKNOWN`
+
+The image tag contains uppercase characters. The ACA session-pool API
+lowercases the image reference it is given, but OCI/Docker tags are
+case-**sensitive**, so a tag pushed as `...T1816Z-...` is looked up as
+`...t1816z-...` and never found — the image builds and pushes fine, then
+pool creation fails minutes later.
+
+Use an all-lowercase `IMAGE_TAG`.
+[`scripts/aca/provision-pool.sh`](../../scripts/aca/provision-pool.sh)
+generates a lowercase tag by default and rejects an uppercase override up
+front.
+
+### Requests failing with a 429
+
+The pool is at its session ceiling. `provision-pool.sh` defaults to
+`--max-sessions 20`; a lower value (or many concurrent
+parallel/for-each units, which each get their own session) exhausts it
+quickly. Raise `MAX_SESSIONS`, lower workflow concurrency, or wait for
+sessions to hit their cooldown. Note a 429 comes from the pool's front
+end, so the runner may never have been reached — the error message
+includes the raw response body to make that distinguishable.
 
 ### Stopping the workflow doesn't stop the sandbox from running
 

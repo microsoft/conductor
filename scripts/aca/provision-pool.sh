@@ -77,6 +77,15 @@ IMAGE_NAME="${IMAGE_NAME:-conductor-agent-runner}"
 # happen to share both a timestamp and a PID) so concurrent runs get
 # distinct tags even when the timestamp matches. Set IMAGE_TAG explicitly to
 # pin/reuse a specific build.
+#
+# The tag MUST be all-lowercase. The ACA session-pool API lowercases the
+# image reference it is given, while Docker/OCI tags are case-SENSITIVE, so
+# an uppercase-bearing tag is pushed as `...T181646Z-...` but looked up as
+# `...t181646z-...` and pool creation fails with:
+#   ImageManifestNotFound ... MANIFEST_UNKNOWN ... manifest tagged by "..." is not found
+# That ruled out the obvious `date -u +%Y%m%dT%H%M%SZ` (note the literal
+# `T`/`Z`), so the timestamp below is deliberately separator-free and
+# lowercase.
 _random_nonce() {
     # Prefer the kernel's UUID generator (no extra binary required on most
     # Linux hosts/containers), then `uuidgen`, then `openssl rand`, falling
@@ -92,7 +101,7 @@ _random_nonce() {
         od -An -tx1 -N16 /dev/urandom | tr -d ' \n'
     fi
 }
-IMAGE_TAG="${IMAGE_TAG:-$(date -u +%Y%m%dT%H%M%SZ)-$(_random_nonce)}"
+IMAGE_TAG="${IMAGE_TAG:-build-$(date -u +%Y%m%d%H%M%S)-$(_random_nonce)}"
 DOCKERFILE_DIR="${DOCKERFILE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../docker/aca-runner" && pwd)}"
 # Conductor release tag baked into the image (docker/aca-runner/Dockerfile's
 # CONDUCTOR_VERSION build arg). Empty = use the Dockerfile's own default.
@@ -160,6 +169,17 @@ case "$LIFECYCLE" in
         exit 1
         ;;
 esac
+
+# Reject an uppercase IMAGE_TAG override up front. The ACA session-pool API
+# lowercases the image reference while OCI tags are case-sensitive, so an
+# uppercase tag builds and pushes fine and only fails minutes later, during
+# pool creation, as an opaque ImageManifestNotFound/MANIFEST_UNKNOWN error.
+if [ "$IMAGE_TAG" != "$(printf '%s' "$IMAGE_TAG" | tr '[:upper:]' '[:lower:]')" ]; then
+    echo "IMAGE_TAG must be all-lowercase (ACA lowercases image tags, but OCI tags" >&2
+    echo "are case-sensitive, so an uppercase tag fails pool creation with" >&2
+    echo "ImageManifestNotFound). Got: $IMAGE_TAG" >&2
+    exit 1
+fi
 
 # `--cooldown-period` and `--max-alive-period` are mutually exclusive in the
 # `az containerapp sessionpool create` API — each only applies to one

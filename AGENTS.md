@@ -272,6 +272,22 @@ re-emits Conductor's own event vocabulary and forwards a real
 parity** (`mcp_tools`, `streaming_events`, `agent_reasoning_events`, and
 `reasoning_effort` are all declared `True`) — with the following carve-outs:
 
+**Inner Copilot credential (DD4).** The sandbox's Copilot session can't do
+interactive OAuth, so the host resolves a credential per request and
+forwards it in-memory: `COPILOT_PROVIDER_BASE_URL` (BYOK) →
+`COPILOT_GITHUB_TOKEN`/`GH_TOKEN`/`GITHUB_TOKEN` → **`gh auth token`** →
+`ProviderError`. The `gh` step (`_resolve_gh_cli_token`) is what makes the
+zero-setup path work and mirrors the Copilot CLI's own documented chain;
+every failure mode (not installed, not signed in, timeout, empty output)
+means "no token" and falls through rather than raising. Reading the
+Copilot editor plugins' `~/.config/github-copilot/auth.db` is
+**deliberately not implemented** — that store belongs to the Copilot
+Language Server (not the CLI/SDK the runner drives), has changed format
+twice, and is slated for encryption at rest. Note for tests: any test
+asserting the "no credential" error **must** stub the `gh` subprocess, or
+it will pick up the developer's real token (see
+`TestAcaCredentialPrecedence._clear_credential_env`).
+
 - **`workflow_tools_passthrough=False`**: the per-agent `tools:` allowlist
   is forwarded to the runner in the request body, but the in-container
   `CopilotProvider` it wraps never applies that list to the SDK session —
