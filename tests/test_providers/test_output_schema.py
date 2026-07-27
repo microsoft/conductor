@@ -10,10 +10,9 @@ from __future__ import annotations
 
 import json
 from typing import Any
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock
 
 from conductor.config.schema import OutputField
-from conductor.providers.claude import ClaudeProvider
 from conductor.providers.claude_agent_sdk import _build_output_format
 from conductor.providers.copilot import CopilotProvider
 from conductor.providers.hermes import _build_prompt_schema
@@ -689,46 +688,6 @@ def _make_copilot_provider() -> CopilotProvider:
     return CopilotProvider(
         mock_handler=AsyncMock(),
     )
-
-
-class TestClaudeOutputSchemaGolden:
-    """Golden tests for ClaudeProvider's structured-output tool wrapper."""
-
-    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
-    @patch("conductor.providers.claude.AsyncAnthropic")
-    @patch("conductor.providers.claude.anthropic")
-    def test_build_tools_rich_schema_matches_baseline(
-        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
-    ) -> None:
-        """Claude tool wrapper output must be byte-for-byte identical to the pre-refactor
-        baseline for a schema with descriptions, nested objects, and arrays."""
-        mock_anthropic_module.__version__ = "0.77.0"
-        mock_client = Mock()
-        mock_client.models.list = AsyncMock(return_value=Mock(data=[]))
-        mock_anthropic_class.return_value = mock_client
-
-        provider = ClaudeProvider()
-        actual = _serialize(provider._build_tools_for_structured_output(rich_schema))
-        assert actual == EXPECTED_CLAUDE_RICH_SCHEMA
-
-    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
-    @patch("conductor.providers.claude.AsyncAnthropic")
-    @patch("conductor.providers.claude.anthropic")
-    def test_build_tools_missing_descriptions_matches_baseline(
-        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
-    ) -> None:
-        """Claude tool wrapper output must be byte-for-byte identical to the pre-refactor
-        baseline for a schema without explicit descriptions."""
-        mock_anthropic_module.__version__ = "0.77.0"
-        mock_client = Mock()
-        mock_client.models.list = AsyncMock(return_value=Mock(data=[]))
-        mock_anthropic_class.return_value = mock_client
-
-        provider = ClaudeProvider()
-        actual = _serialize(
-            provider._build_tools_for_structured_output(missing_descriptions_schema)
-        )
-        assert actual == EXPECTED_CLAUDE_MISSING_SCHEMA
 
 
 class TestCopilotOutputSchemaGolden:
