@@ -1,0 +1,199 @@
+"""Unit tests for interrupt-aware Pydantic AI agent execution.
+
+These tests verify that ``run_with_interrupt`` mirrors the interrupt semantics
+of ``ClaudeProvider``:
+
+- An interrupt set before the run starts takes the partial path immediately.
+- An interrupt set between tool/model iterations stops the loop and returns a
+  partial result without schema validation.
+- A run without interrupts completes normally.
+- A hard abort (cancellation of the in-flight API call) returns a cancelled
+  outcome.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+from typing import Any
+
+import pytest
+from pydantic_ai import Agent
+from pydantic_ai.models.test import TestModel
+from pydantic_ai.output import ToolOutput
+from pydantic_ai.tools import Tool
+
+from conductor.config.schema import OutputField
+from conductor.providers._pydantic_ai.converters import output_schema_to_pydantic_model
+from conductor.providers._pydantic_ai.interrupt import run_with_interrupt
+
+
+@pytest.fixture(autouse=True)
+def _ensure_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Provide a dummy API key so AnthropicModel construction succeeds."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+
+
+def _make_text_agent() -> Agent[Any, Any]:
+    """Build a text-output Pydantic AI agent using the scripted TestModel."""
+    return Agent(TestModel(), output_type=str, retries=0)
+
+
+def _make_structured_agent() -> Agent[Any, Any]:
+    """Build a structured-output Pydantic AI agent using the scripted TestModel."""
+    output_schema = {"answer": OutputField(type="string")}
+    dynamic_model = output_schema_to_pydantic_model("FormatterOutput", output_schema)
+    assert dynamic_model is not None
+    return Agent(
+        TestModel(custom_output_args={"answer": "partial"}),
+        output_type=ToolOutput(dynamic_model),
+        retries=0,
+    )
+
+
+class TestInterruptBeforeRun:
+    """Requirement: an already-set interrupt takes the partial path immediately."""
+
+    @pytest.mark.asyncio
+    async def test_interrupt_set_before_run_returns_partial_text(self) -> None:
+        """When the interrupt signal is set before ``run_with_interrupt`` starts,
+        the helper must not run the original task and instead perform a single
+        partial request, returning ``is_partial=True`` with best-effort text."""
+        signal = asyncio.Event()
+        signal.set()
+
+        outcome = await run_with_interrupt(
+            _make_text_agent(),
+            "say hello",
+            interrupt_signal=signal,
+            event_callback=None,
+            has_output_schema=False,
+        )
+
+        assert outcome.is_partial is True
+        assert outcome.partial_output is not None
+        assert outcome.result is None
+        assert outcome.is_cancelled is False
+
+    @pytest.mark.asyncio
+    async def test_interrupt_before_run_skips_structured_validation(self) -> None:
+        """A pre-run interrupt on a structured-output agent must return
+        ``is_partial=True`` without enforcing the output schema, so a plain text
+        partial result does not raise validation errors."""
+        signal = asyncio.Event()
+        signal.set()
+
+        outcome = await run_with_interrupt(
+            _make_structured_agent(),
+            "format this",
+            interrupt_signal=signal,
+            event_callback=None,
+            has_output_schema=True,
+        )
+
+        assert outcome.is_partial is True
+        assert outcome.result is None
+
+
+class TestInterruptMidRun:
+    """Requirement: an interrupt between tool/model iterations returns partial output."""
+
+    @pytest.mark.asyncio
+    async def test_interrupt_between_iterations_returns_partial(self) -> None:
+        """When the interrupt signal is set after a tool call but before the next
+        model request, the helper must stop the loop and ask the model for a
+        partial result.  The returned outcome must be marked partial and must not
+        validate the output against a schema."""
+        signal = asyncio.Event()
+
+        def set_interrupt_signal() -> str:
+            signal.set()
+            return "interrupted"
+
+        output_schema = {"answer": OutputField(type="string")}
+        dynamic_model = output_schema_to_pydantic_model("MultiTurnOutput", output_schema)
+        assert dynamic_model is not None
+        agent = Agent(
+            TestModel(custom_output_args={"answer": "partial"}),
+            tools=[Tool(set_interrupt_signal)],
+            output_type=ToolOutput(dynamic_model),
+            retries=0,
+        )
+
+        outcome = await run_with_interrupt(
+            agent,
+            "format this",
+            interrupt_signal=signal,
+            event_callback=None,
+            has_output_schema=True,
+        )
+
+        assert outcome.is_partial is True
+        assert outcome.result is None
+        assert outcome.is_cancelled is False
+
+
+class TestNormalCompletion:
+    """Requirement: absence of an interrupt yields a normal completed run."""
+
+    @pytest.mark.asyncio
+    async def test_no_interrupt_returns_full_result(self) -> None:
+        """Without an interrupt signal, ``run_with_interrupt`` must return a
+        normal ``RunOutcome`` with ``result`` populated and ``is_partial=False``."""
+        signal = asyncio.Event()
+
+        outcome = await run_with_interrupt(
+            _make_text_agent(),
+            "say hello",
+            interrupt_signal=signal,
+            event_callback=None,
+            has_output_schema=False,
+        )
+
+        assert outcome.is_partial is False
+        assert outcome.is_cancelled is False
+        assert outcome.result is not None
+        assert outcome.partial_output is None
+
+
+class TestHardAbort:
+    """Requirement: a signal during an in-flight model call cancels the run."""
+
+    @pytest.mark.asyncio
+    async def test_interrupt_during_api_call_is_cancelled(self) -> None:
+        """When the interrupt signal fires while a model request is in progress,
+        the helper must cancel the in-flight model request task and return
+        ``is_cancelled=True``.  This matches ``ClaudeProvider``'s hard-abort
+        semantics for mid-API-call interrupts."""
+        signal = asyncio.Event()
+        started_event = asyncio.Event()
+
+        class _SlowTestModel(TestModel):
+            async def request(self, messages, *args, **kwargs):
+                started_event.set()
+                await asyncio.sleep(1)
+                return await super().request(messages, *args, **kwargs)
+
+        async def set_signal_after_model_start() -> None:
+            await started_event.wait()
+            signal.set()
+
+        agent = Agent(_SlowTestModel(), output_type=str, retries=0)
+        signal_task = asyncio.create_task(set_signal_after_model_start())
+        try:
+            outcome = await run_with_interrupt(
+                agent,
+                "say hello",
+                interrupt_signal=signal,
+                event_callback=None,
+                has_output_schema=False,
+            )
+        finally:
+            signal_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await signal_task
+
+        assert outcome.is_cancelled is True
+        assert outcome.is_partial is False
+        assert outcome.result is None
+        assert outcome.partial_output is None
