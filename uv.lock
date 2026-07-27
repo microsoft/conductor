@@ -391,7 +391,7 @@ wheels = [
 
 [[package]]
 name = "conductor-cli"
-version = "0.1.25"
+version = "0.1.26"
 source = { editable = "." }
 dependencies = [
     { name = "anthropic" },

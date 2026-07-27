@@ -5,44 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.25...HEAD)
+## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.26...HEAD)
+
+## [0.1.26](https://github.com/microsoft/conductor/compare/v0.1.25...v0.1.26) - 2026-07-27
 
 ### Added
 
-- **ACA provider resolves a Copilot credential automatically** — the `aca`
-  provider now falls back to `gh auth token` when no credential env var is
-  set, so an operator already signed in with the GitHub CLI needs no
-  ACA-specific credential setup at all. The full precedence is
+- **New experimental `aca` provider (Azure Container Apps)** — delegates an
+  agent's entire agentic loop, tools, and MCP calls to a remote ACA
+  dynamic-sessions sandbox instead of running it on the host, so untrusted or
+  isolation-sensitive agents execute in a disposable container. Includes
+  provisioning tooling (`scripts/aca/provision-pool.sh`), an in-package
+  runner image, an end-to-end example (`examples/aca-coding-agent.yaml`), and
+  automatic inner-Copilot credential resolution — falling back through
   `COPILOT_PROVIDER_BASE_URL` (BYOK) →
-  `COPILOT_GITHUB_TOKEN`/`GH_TOKEN`/`GITHUB_TOKEN` → `gh auth token`,
-  mirroring the Copilot CLI's own documented chain, so an explicit token
-  still overrides the ambient `gh` identity. A fine-grained *Copilot
-  Requests* PAT remains the recommended, narrowest credential for CI and
-  service accounts. Every `gh` failure mode (not installed, not signed in,
-  wedged keyring, empty output) is treated as "no token" and falls through
-  to the existing actionable error rather than raising.
+  `COPILOT_GITHUB_TOKEN`/`GH_TOKEN`/`GITHUB_TOKEN` → `gh auth token` — so an
+  operator already signed in with the GitHub CLI needs no ACA-specific
+  credential setup. See [`docs/providers/aca.md`](docs/providers/aca.md) for
+  architecture, setup, and the declared experimental-tier capability
+  carve-outs. ([#284](https://github.com/microsoft/conductor/issues/284))
 
 ### Fixed
 
-- **ACA pool provisioning no longer fails with `ImageManifestNotFound`** —
-  `scripts/aca/provision-pool.sh` generated a default `IMAGE_TAG` from
-  `date -u +%Y%m%dT%H%M%SZ`, but the ACA session-pool API lowercases image
-  references while OCI tags are case-sensitive, so *every* run with default
-  settings pushed `...T1816Z-...` and then failed to find `...t1816z-...`
-  minutes later during pool creation. The default tag is now all-lowercase,
-  and an uppercase `IMAGE_TAG` override is rejected up front instead of
-  failing after the image build.
-- **ACA errors no longer hide the response body** — a non-2xx response whose
-  body carries no recognizable ACA `message` (e.g. a 429 from the pool's
-  front end) collapsed to the bare placeholder "aca runner reported an
-  error", discarding the actual body and implying the runner had been
-  reached when it may not have been. The raw body is now included
-  (truncated) whenever parsing yields nothing better.
-- **`examples/aca-coding-agent.yaml` no longer pins an unavailable model** —
-  the `implement` agent hard-coded `model: gpt-4.1`, which is not available
-  on all Copilot accounts and failed inside the sandbox with
-  `Model "gpt-4.1" is not available.`. It now inherits the workflow's
-  `default_model` (`gpt-5-mini`), verified working end-to-end.
+- **Copilot and Hermes prompt schemas no longer fall back to a synthetic
+  `"The {field} field"` description**, matching Claude's existing behavior —
+  fields without an explicit `description` now produce a shorter JSON Schema
+  object instead of a made-up one. Hermes also now shares the same recursive
+  prompt-schema builder as Copilot, fixing cases its old hand-rolled builder
+  got wrong: `array<object>` items now include `required` alongside
+  `properties`, and `array<array>` nesting recurses correctly instead of
+  collapsing. ([#317](https://github.com/microsoft/conductor/pull/317))
 
 ## [0.1.25](https://github.com/microsoft/conductor/compare/v0.1.24...v0.1.25) - 2026-07-21
 
