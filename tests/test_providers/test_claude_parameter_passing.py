@@ -1,25 +1,48 @@
 """End-to-end parameter passing tests for Claude provider.
 
-Verifies that common parameters are properly passed through:
-- temperature
-- max_tokens
-
-Note: top_p, top_k, stop_sequences, and metadata have been removed as they
-were Claude-specific parameters not supported by both providers.
-
-Tests the full chain: factory -> provider -> SDK
+Verifies that common parameters are forwarded from the factory to the
+provider and from the provider into the constructed Pydantic AI Agent. The
+deleted legacy tests inspected raw SDK keyword arguments; the Pydantic AI
+rewrite maps those parameters to ``Agent.model_settings`` via
+``build_agent``, so these tests assert the new seam.
 """
 
+from __future__ import annotations
+
+from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
+from pydantic import BaseModel
+from pydantic_ai import Agent
+from pydantic_ai.models.test import TestModel
 
 from conductor.config.schema import AgentDef
+from conductor.providers.claude import ClaudeProvider
 from conductor.providers.factory import create_provider
 
 
+class SimpleModel(BaseModel):
+    """Structured output shape used to short-circuit the Pydantic AI run."""
+
+    result: str
+
+
+def _build_text_agent(text: str) -> Agent[Any, str]:
+    """Build a Pydantic AI text agent backed by TestModel."""
+    return Agent(model=TestModel(custom_output_text=text), output_type=str)
+
+
+def _build_structured_agent(data: dict[str, Any]) -> Agent[Any, Any]:
+    """Build a Pydantic AI structured-output agent backed by TestModel."""
+    return Agent(
+        model=TestModel(custom_output_args=data),
+        output_type=SimpleModel,
+    )
+
+
 class TestClaudeParameterPassing:
-    """Tests for end-to-end parameter passing through factory."""
+    """Tests for end-to-end parameter passing through factory and provider."""
 
     @pytest.mark.asyncio
     @patch("conductor.providers.factory.ClaudeProvider")
@@ -29,7 +52,6 @@ class TestClaudeParameterPassing:
         mock_instance.validate_connection = AsyncMock(return_value=True)
         mock_claude_class.return_value = mock_instance
 
-        # Create provider with common parameters
         await create_provider(
             provider_type="claude",
             default_model="claude-3-opus-20240229",
@@ -38,7 +60,6 @@ class TestClaudeParameterPassing:
             timeout=120.0,
         )
 
-        # Verify parameters were passed to ClaudeProvider constructor
         mock_claude_class.assert_called_once_with(
             model="claude-3-opus-20240229",
             temperature=0.7,
@@ -53,29 +74,9 @@ class TestClaudeParameterPassing:
             tool_output=None,
         )
 
-    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
-    @patch("conductor.providers.claude.AsyncAnthropic")
-    @patch("conductor.providers.claude.anthropic")
     @pytest.mark.asyncio
-    async def test_common_parameters_passed_to_sdk(
-        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
-    ) -> None:
-        """Test that provider passes common parameters to Claude SDK."""
-        mock_anthropic_module.__version__ = "0.77.0"
-        mock_client = Mock()
-        mock_client.models.list = AsyncMock(return_value=Mock(data=[]))
-
-        # Mock successful response
-        mock_response = Mock()
-        mock_response.content = [Mock(type="text", text="Test response")]
-        mock_response.usage = Mock(input_tokens=10, output_tokens=20)
-        mock_client.messages.create = AsyncMock(return_value=mock_response)
-        mock_anthropic_class.return_value = mock_client
-
-        # Import after patching
-        from conductor.providers.claude import ClaudeProvider
-
-        # Create provider with common parameters
+    async def test_common_parameters_passed_to_pydantic_agent(self) -> None:
+        """Provider passes common parameters into build_agent defaults."""
         provider = ClaudeProvider(
             api_key="test-key",
             model="claude-3-opus-20240229",
@@ -83,92 +84,55 @@ class TestClaudeParameterPassing:
             max_tokens=4096,
         )
 
-        # Execute agent
-        agent = AgentDef(name="test_agent", prompt="Test prompt", model="claude-3-sonnet-20240229")
-        context = {}
-        rendered_prompt = "Test prompt"
+        with patch.object(provider, "_get_mcp_manager_for_cwd", return_value=None), patch(
+            "conductor.providers._pydantic_ai.agent_builder.build_agent",
+            return_value=_build_text_agent("Test response"),
+        ) as mock_build_agent:
+            agent = AgentDef(
+                name="test_agent",
+                prompt="Test prompt",
+                model="claude-3-sonnet-20240229",
+            )
+            await provider.execute(agent, {}, "Test prompt")
 
-        await provider.execute(agent, context, rendered_prompt)
+        kwargs = mock_build_agent.call_args.kwargs
+        assert kwargs["agent"].model == "claude-3-sonnet-20240229"
+        assert kwargs["default_temperature"] == 0.7
+        assert kwargs["default_max_tokens"] == 4096
 
-        # Verify SDK was called with parameters
-        call_kwargs = mock_client.messages.create.call_args.kwargs
-        assert call_kwargs["model"] == "claude-3-sonnet-20240229"  # Agent model overrides
-        assert call_kwargs["max_tokens"] == 4096
-        assert call_kwargs["temperature"] == 0.7
-        assert call_kwargs["messages"] == [{"role": "user", "content": "Test prompt"}]
-
-    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
-    @patch("conductor.providers.claude.AsyncAnthropic")
-    @patch("conductor.providers.claude.anthropic")
     @pytest.mark.asyncio
-    async def test_optional_parameters_not_passed_when_none(
-        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
-    ) -> None:
-        """Test that optional parameters are not passed to SDK when None."""
-        mock_anthropic_module.__version__ = "0.77.0"
-        mock_client = Mock()
-        mock_client.models.list = AsyncMock(return_value=Mock(data=[]))
+    async def test_optional_parameters_not_passed_when_none(self) -> None:
+        """When temperature is None, build_agent defaults to None."""
+        provider = ClaudeProvider(api_key="test-key")
 
-        # Mock successful response
-        mock_response = Mock()
-        mock_response.content = [Mock(type="text", text="Test response")]
-        mock_response.usage = Mock(input_tokens=10, output_tokens=20)
-        mock_client.messages.create = AsyncMock(return_value=mock_response)
-        mock_anthropic_class.return_value = mock_client
+        with patch.object(provider, "_get_mcp_manager_for_cwd", return_value=None), patch(
+            "conductor.providers._pydantic_ai.agent_builder.build_agent",
+            return_value=_build_text_agent("Test response"),
+        ) as mock_build_agent:
+            agent = AgentDef(name="test_agent", prompt="Test prompt")
+            await provider.execute(agent, {}, "Test prompt")
 
-        # Import after patching
-        from conductor.providers.claude import ClaudeProvider
+        kwargs = mock_build_agent.call_args.kwargs
+        assert kwargs["default_temperature"] is None
+        assert kwargs["default_max_tokens"] == 8192
 
-        # Create provider with minimal parameters (all optional params are None)
-        provider = ClaudeProvider()
-
-        # Execute agent
-        agent = AgentDef(name="test_agent", prompt="Test prompt")
-        context = {}
-        rendered_prompt = "Test prompt"
-
-        await provider.execute(agent, context, rendered_prompt)
-
-        # Verify SDK was called without optional parameters
-        call_kwargs = mock_client.messages.create.call_args.kwargs
-        assert "temperature" not in call_kwargs  # None, so not passed
-        # Required parameters should still be present
-        assert "model" in call_kwargs
-        assert "max_tokens" in call_kwargs
-        assert "messages" in call_kwargs
-
-    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
-    @patch("conductor.providers.claude.AsyncAnthropic")
-    @patch("conductor.providers.claude.anthropic")
     @pytest.mark.asyncio
-    async def test_agent_model_overrides_provider_model(
-        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
-    ) -> None:
-        """Test that agent-level model overrides provider default."""
-        mock_anthropic_module.__version__ = "0.77.0"
-        mock_client = Mock()
-        mock_client.models.list = AsyncMock(return_value=Mock(data=[]))
+    async def test_agent_model_overrides_provider_model(self) -> None:
+        """Agent-level model overrides the provider default in build_agent."""
+        provider = ClaudeProvider(
+            api_key="test-key",
+            model="claude-3-5-sonnet-latest",
+        )
 
-        # Mock successful response
-        mock_response = Mock()
-        mock_response.content = [Mock(type="text", text="Test response")]
-        mock_response.usage = Mock(input_tokens=10, output_tokens=20)
-        mock_client.messages.create = AsyncMock(return_value=mock_response)
-        mock_anthropic_class.return_value = mock_client
+        with patch.object(provider, "_get_mcp_manager_for_cwd", return_value=None), patch(
+            "conductor.providers._pydantic_ai.agent_builder.build_agent",
+            return_value=_build_text_agent("Test response"),
+        ) as mock_build_agent:
+            agent = AgentDef(
+                name="test_agent",
+                prompt="Test prompt",
+                model="claude-3-opus-20240229",
+            )
+            await provider.execute(agent, {}, "Test prompt")
 
-        # Import after patching
-        from conductor.providers.claude import ClaudeProvider
-
-        # Create provider with default model
-        provider = ClaudeProvider(model="claude-3-5-sonnet-latest")
-
-        # Execute agent with different model
-        agent = AgentDef(name="test_agent", prompt="Test prompt", model="claude-3-opus-20240229")
-        context = {}
-        rendered_prompt = "Test prompt"
-
-        await provider.execute(agent, context, rendered_prompt)
-
-        # Verify agent model was used
-        call_kwargs = mock_client.messages.create.call_args.kwargs
-        assert call_kwargs["model"] == "claude-3-opus-20240229"
+        assert mock_build_agent.call_args.kwargs["agent"].model == "claude-3-opus-20240229"
