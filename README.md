@@ -16,7 +16,7 @@ Conductor makes multi-agent workflows — code review pipelines, research-then-s
 ## Features
 
 - **YAML-based workflows** - Define multi-agent workflows in readable YAML
-- **Multiple providers** - GitHub Copilot, Anthropic Claude, Claude Agent SDK (experimental), or NousResearch Hermes (experimental) with seamless switching
+- **Multiple providers** - GitHub Copilot, Anthropic Claude, Claude Agent SDK (experimental), NousResearch Hermes (experimental), or Azure Container Apps sandboxed execution (experimental) with seamless switching
 - **Parallel execution** - Run agents concurrently (static groups or dynamic for-each)
 - **Sub-workflow composition** - Reusable sub-workflows with templated `input_mapping`, usable inside `for_each` groups for dynamic fan-out
 - **Script steps** - Run shell commands and route on exit code or parsed JSON stdout
@@ -211,14 +211,14 @@ conductor stop
 
 Conductor supports multiple AI providers. Choose based on your needs:
 
-| Feature | Copilot | Claude | Claude Agent SDK | Hermes |
-|---------|---------|--------|------------------|--------|
-| **Tier** | Stable | Stable | Experimental | Experimental |
-| **Pricing** | Subscription | Pay-per-token | Subscription | Pay-per-token (via hermes) |
-| **Context Window** | Per-model | Per-model | Per-model | Per-model |
-| **Tool Support (MCP)** | Yes | Planned | Yes (built-in) | No (hermes internal tools) |
-| **Streaming** | Yes | Planned | Yes | No |
-| **Best For** | Heavy usage, tools | Large context, pay-per-use | Full Claude Code toolset | Multi-provider model access |
+| Feature | Copilot | Claude | Claude Agent SDK | Hermes | ACA |
+|---------|---------|--------|------------------|--------|-----|
+| **Tier** | Stable | Stable | Experimental | Experimental | Experimental |
+| **Pricing** | Subscription | Pay-per-token | Subscription | Pay-per-token (via hermes) | Subscription + ACA compute |
+| **Context Window** | Per-model | Per-model | Per-model | Per-model | Per-model (inner Copilot) |
+| **Tool Support (MCP)** | Yes | Planned | Yes (built-in) | No (hermes internal tools) | Yes (always forwarded, not allowlisted) |
+| **Streaming** | Yes | Planned | Yes | No | Yes |
+| **Best For** | Heavy usage, tools | Large context, pay-per-use | Full Claude Code toolset | Multi-provider model access | Untrusted/isolation-sensitive agents |
 
 ### Using Copilot
 
@@ -266,7 +266,21 @@ workflow:
 
 Install the library: `pip install hermes-agent`
 
-**See also:** [Claude Documentation](docs/providers/claude.md) | [Hermes Documentation](docs/providers/hermes.md) | [Provider Comparison](docs/providers/comparison.md) | [Migration Guide](docs/providers/migration.md)
+### Using ACA (Experimental)
+
+```yaml
+workflow:
+  runtime:
+    provider:
+      name: aca
+      pool_endpoint: "https://my-agent-pool.example.westus2.azurecontainerapps.io"
+      inner_provider: copilot
+    default_model: gpt-5-mini
+```
+
+The `aca` provider delegates an agent's entire agentic loop, tools, and MCP calls to a remote **Azure Container Apps dynamic-sessions sandbox** instead of running it on the host — useful for untrusted or isolation-sensitive agents (e.g. running arbitrary generated code). Unlike the other providers, `aca` requires the structured `provider:` form with a `pool_endpoint` pointing at an operator-provisioned ACA session pool (`scripts/aca/provision-pool.sh`) and `azure-identity` for authentication. Resolves its inner Copilot credential automatically via `COPILOT_PROVIDER_BASE_URL` → `COPILOT_GITHUB_TOKEN`/`GH_TOKEN`/`GITHUB_TOKEN` → `gh auth token`, so a `gh`-authenticated operator needs no ACA-specific setup. See [`examples/aca-coding-agent.yaml`](examples/aca-coding-agent.yaml) for a full end-to-end example.
+
+**See also:** [Claude Documentation](docs/providers/claude.md) | [Hermes Documentation](docs/providers/hermes.md) | [ACA Documentation](docs/providers/aca.md) | [Provider Comparison](docs/providers/comparison.md) | [Migration Guide](docs/providers/migration.md)
 
 ### Using a Local / Custom LLM Endpoint (Ollama, vLLM, Azure OpenAI, ...)
 
@@ -387,6 +401,7 @@ See the [`examples/`](./examples/) directory for complete workflows:
 | [Dynamic Parallel](./docs/dynamic-parallel.md) | For-each groups and array processing |
 | [Claude Provider](./docs/providers/claude.md) | Claude setup and configuration |
 | [Hermes Provider](./docs/providers/hermes.md) | Hermes setup and configuration |
+| [ACA Provider](./docs/providers/aca.md) | Azure Container Apps sandboxed execution setup and configuration |
 | [Provider Comparison](./docs/providers/comparison.md) | Copilot vs Claude vs Hermes decision guide |
 
 ## Development
