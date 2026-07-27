@@ -65,13 +65,16 @@ class TestClaudeEdgeCases:
         context: dict[str, Any] = {}
         rendered_prompt = "Test prompt"
 
-        with patch(
-            "conductor.providers._pydantic_ai.agent_builder.build_agent",
-            return_value=_build_text_agent(""),
-        ), patch(
-            "conductor.providers._pydantic_ai.interrupt._run_to_completion",
-            new_callable=AsyncMock,
-            return_value=RunOutcome(result=AgentRunResult(output="")),
+        with (
+            patch(
+                "conductor.providers._pydantic_ai.agent_builder.build_agent",
+                return_value=_build_text_agent(""),
+            ),
+            patch(
+                "conductor.providers._pydantic_ai.interrupt._run_to_completion",
+                new_callable=AsyncMock,
+                return_value=RunOutcome(result=AgentRunResult(output="")),
+            ),
         ):
             result = await provider.execute(agent, context, rendered_prompt)
 

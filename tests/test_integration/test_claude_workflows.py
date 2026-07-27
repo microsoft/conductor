@@ -447,8 +447,10 @@ class TestErrorHandlingClaudeWorkflow:
                     error_responses["rate_limit"]["error"]["message"],
                     retry_after=0.01,
                 )
+
             class _SuccessModel(BaseModel):
                 result: str
+
             return Mock(output=_SuccessModel(result="Success after retry"))
 
         def make_agent(**kwargs: Any) -> Agent[Any, Any]:
@@ -479,10 +481,13 @@ class TestErrorHandlingClaudeWorkflow:
         provider = ClaudeProvider(api_key="test-key")
         engine = WorkflowEngine(workflow, provider)
 
-        with patch(
-            "conductor.providers._pydantic_ai.agent_builder.build_agent",
-            side_effect=make_agent,
-        ), patch("conductor.providers._pydantic_ai.retry.asyncio.sleep") as mock_sleep:
+        with (
+            patch(
+                "conductor.providers._pydantic_ai.agent_builder.build_agent",
+                side_effect=make_agent,
+            ),
+            patch("conductor.providers._pydantic_ai.retry.asyncio.sleep") as mock_sleep,
+        ):
             result = await engine.run({})
 
         # Should succeed after retries

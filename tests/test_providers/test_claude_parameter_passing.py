@@ -84,10 +84,13 @@ class TestClaudeParameterPassing:
             max_tokens=4096,
         )
 
-        with patch.object(provider, "_get_mcp_manager_for_cwd", return_value=None), patch(
-            "conductor.providers._pydantic_ai.agent_builder.build_agent",
-            return_value=_build_text_agent("Test response"),
-        ) as mock_build_agent:
+        with (
+            patch.object(provider, "_get_mcp_manager_for_cwd", return_value=None),
+            patch(
+                "conductor.providers._pydantic_ai.agent_builder.build_agent",
+                return_value=_build_text_agent("Test response"),
+            ) as mock_build_agent,
+        ):
             agent = AgentDef(
                 name="test_agent",
                 prompt="Test prompt",
@@ -105,10 +108,13 @@ class TestClaudeParameterPassing:
         """When temperature is None, build_agent defaults to None."""
         provider = ClaudeProvider(api_key="test-key")
 
-        with patch.object(provider, "_get_mcp_manager_for_cwd", return_value=None), patch(
-            "conductor.providers._pydantic_ai.agent_builder.build_agent",
-            return_value=_build_text_agent("Test response"),
-        ) as mock_build_agent:
+        with (
+            patch.object(provider, "_get_mcp_manager_for_cwd", return_value=None),
+            patch(
+                "conductor.providers._pydantic_ai.agent_builder.build_agent",
+                return_value=_build_text_agent("Test response"),
+            ) as mock_build_agent,
+        ):
             agent = AgentDef(name="test_agent", prompt="Test prompt")
             await provider.execute(agent, {}, "Test prompt")
 
@@ -124,10 +130,13 @@ class TestClaudeParameterPassing:
             model="claude-3-5-sonnet-latest",
         )
 
-        with patch.object(provider, "_get_mcp_manager_for_cwd", return_value=None), patch(
-            "conductor.providers._pydantic_ai.agent_builder.build_agent",
-            return_value=_build_text_agent("Test response"),
-        ) as mock_build_agent:
+        with (
+            patch.object(provider, "_get_mcp_manager_for_cwd", return_value=None),
+            patch(
+                "conductor.providers._pydantic_ai.agent_builder.build_agent",
+                return_value=_build_text_agent("Test response"),
+            ) as mock_build_agent,
+        ):
             agent = AgentDef(
                 name="test_agent",
                 prompt="Test prompt",

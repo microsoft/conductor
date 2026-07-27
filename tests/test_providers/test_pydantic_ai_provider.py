@@ -164,9 +164,10 @@ class TestExecuteDialogTurn:
 
             return FakeResult()
 
-        with patch(
-            "conductor.providers._pydantic_ai.agent_builder._resolve_anthropic_model"
-        ), patch("pydantic_ai.Agent") as mock_agent_cls:
+        with (
+            patch("conductor.providers._pydantic_ai.agent_builder._resolve_anthropic_model"),
+            patch("pydantic_ai.Agent") as mock_agent_cls,
+        ):
             mock_agent = mock_agent_cls.return_value
             mock_agent.run = fake_run
             result = await provider.execute_dialog_turn(

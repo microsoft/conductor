@@ -153,9 +153,7 @@ class TestReasoningMapping:
             ("max", 59904),
         ],
     )
-    def test_reasoning_effort_maps_to_budget(
-        self, effort: str, expected_budget: int
-    ) -> None:
+    def test_reasoning_effort_maps_to_budget(self, effort: str, expected_budget: int) -> None:
         """Each reasoning effort level must map to the correct Anthropic
         budget_tokens value in anthropic_thinking."""
         agent_def = AgentDef(

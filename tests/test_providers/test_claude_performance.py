@@ -21,9 +21,7 @@ from conductor.config.schema import AgentDef, OutputField
 from conductor.providers.claude import ClaudeProvider
 
 
-def _build_structured_agent(
-    model_cls: type[BaseModel], data: dict[str, Any]
-) -> Agent[Any, Any]:
+def _build_structured_agent(model_cls: type[BaseModel], data: dict[str, Any]) -> Agent[Any, Any]:
     """Build a Pydantic AI structured-output agent backed by TestModel."""
     return Agent(
         model=TestModel(custom_output_args=data),

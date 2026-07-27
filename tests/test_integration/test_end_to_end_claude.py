@@ -98,9 +98,7 @@ output:
 
             # Verify the provider built a Pydantic AI agent with the right settings
             assert mock_build_agent.called
-            assert (
-                mock_build_agent.call_args.kwargs["default_temperature"] == 0.7
-            )
+            assert mock_build_agent.call_args.kwargs["default_temperature"] == 0.7
             assert mock_build_agent.call_args.kwargs["default_max_tokens"] == 1000
 
         await provider.close()

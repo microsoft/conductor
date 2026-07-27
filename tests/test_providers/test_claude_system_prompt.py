@@ -20,9 +20,7 @@ def _build_text_agent(text: str = "Done") -> Agent[Any, str]:
     return Agent(model=TestModel(custom_output_text=text), output_type=str)
 
 
-def _build_structured_agent(
-    model_cls: type[BaseModel], data: dict[str, Any]
-) -> Agent[Any, Any]:
+def _build_structured_agent(model_cls: type[BaseModel], data: dict[str, Any]) -> Agent[Any, Any]:
     """Build a Pydantic AI structured-output agent backed by TestModel."""
     return Agent(
         model=TestModel(custom_output_args=data),
@@ -63,10 +61,7 @@ class TestClaudeSystemPromptForwarding:
             )
             await provider.execute(agent=agent, context={}, rendered_prompt="Test prompt")
 
-        assert (
-            mock_build_agent.call_args.kwargs["system_prompt"]
-            == "Rendered system instructions"
-        )
+        assert mock_build_agent.call_args.kwargs["system_prompt"] == "Rendered system instructions"
 
     @pytest.mark.asyncio
     async def test_tool_use_loop_passes_system_prompt_to_agent(
@@ -89,8 +84,7 @@ class TestClaudeSystemPromptForwarding:
             await provider.execute(agent=agent, context={}, rendered_prompt="Test prompt")
 
         assert (
-            mock_build_agent.call_args.kwargs["system_prompt"]
-            == "Rendered tool-loop instructions"
+            mock_build_agent.call_args.kwargs["system_prompt"] == "Rendered tool-loop instructions"
         )
 
     @pytest.mark.asyncio
@@ -117,14 +111,11 @@ class TestClaudeSystemPromptForwarding:
             await provider.execute(agent=agent, context={}, rendered_prompt="Test prompt")
 
         assert (
-            mock_build_agent.call_args.kwargs["system_prompt"]
-            == "Rendered recovery instructions"
+            mock_build_agent.call_args.kwargs["system_prompt"] == "Rendered recovery instructions"
         )
 
     @pytest.mark.asyncio
-    async def test_retry_loop_passes_system_prompt_to_agent(
-        self, provider: ClaudeProvider
-    ) -> None:
+    async def test_retry_loop_passes_system_prompt_to_agent(self, provider: ClaudeProvider) -> None:
         """Requirement AC-A(e): outer retry loop rebuilds the same Agent with the system_prompt."""
         with patch(
             "conductor.providers._pydantic_ai.agent_builder.build_agent",
@@ -172,8 +163,7 @@ class TestClaudeSystemPromptForwarding:
             )
 
         assert (
-            mock_build_agent.call_args.kwargs["system_prompt"]
-            == "Rendered interrupt instructions"
+            mock_build_agent.call_args.kwargs["system_prompt"] == "Rendered interrupt instructions"
         )
 
     # Removed: test_in_flight_interrupt_partial_output_passes_system_prompt.
@@ -225,9 +215,7 @@ class TestValidatorSystemPromptForwarding:
         criteria = "Answer must mention the verified source."
         with patch(
             "conductor.providers._pydantic_ai.agent_builder.build_agent",
-            return_value=_build_structured_agent(
-                ValidationResult, {"passed": True, "issues": []}
-            ),
+            return_value=_build_structured_agent(ValidationResult, {"passed": True, "issues": []}),
         ) as mock_build_agent:
             agent = AgentDef.model_validate(
                 {
@@ -247,7 +235,5 @@ class TestValidatorSystemPromptForwarding:
 
         assert outcome.passed is True
         expected_system_prompt = VALIDATOR_SYSTEM_PROMPT.format(criteria=criteria)
-        assert (
-            mock_build_agent.call_args.kwargs["system_prompt"] == expected_system_prompt
-        )
+        assert mock_build_agent.call_args.kwargs["system_prompt"] == expected_system_prompt
         assert "{{" not in mock_build_agent.call_args.kwargs["system_prompt"]

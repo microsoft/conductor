@@ -35,8 +35,8 @@ def _build_structured_agent(data: dict[str, Any]) -> Agent[Any, Any]:
         output_type=AnswerModel,
     )
 
-@pytest.fixture
 
+@pytest.fixture
 def provider(monkeypatch: pytest.MonkeyPatch) -> ClaudeProvider:
     """Return a fresh ClaudeProvider instance using a dummy API key."""
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")

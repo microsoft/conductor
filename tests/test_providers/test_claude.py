@@ -48,9 +48,7 @@ def _build_text_agent(text: str) -> Agent[Any, str]:
     return Agent(model=TestModel(custom_output_text=text), output_type=str)
 
 
-def _build_structured_agent(
-    model_cls: type[BaseModel], data: dict[str, Any]
-) -> Agent[Any, Any]:
+def _build_structured_agent(model_cls: type[BaseModel], data: dict[str, Any]) -> Agent[Any, Any]:
     """Build a Pydantic AI structured-output agent backed by TestModel."""
     return Agent(
         model=TestModel(custom_output_args=data),
@@ -291,10 +289,13 @@ class TestBasicExecution:
         """execute() returns text output from a TestModel-backed agent."""
         provider = ClaudeProvider(api_key="test-key")
 
-        with patch.object(provider, "_get_mcp_manager_for_cwd", return_value=None), patch(
-            "conductor.providers._pydantic_ai.agent_builder.build_agent",
-            return_value=_build_text_agent("Hello, world!"),
-        ) as mock_build_agent:
+        with (
+            patch.object(provider, "_get_mcp_manager_for_cwd", return_value=None),
+            patch(
+                "conductor.providers._pydantic_ai.agent_builder.build_agent",
+                return_value=_build_text_agent("Hello, world!"),
+            ) as mock_build_agent,
+        ):
             agent = AgentDef(name="test", prompt="Say hello")
             result = await provider.execute(
                 agent=agent,
@@ -316,10 +317,13 @@ class TestBasicExecution:
         """Agent-level model overrides the provider default in build_agent."""
         provider = ClaudeProvider(api_key="test-key")
 
-        with patch.object(provider, "_get_mcp_manager_for_cwd", return_value=None), patch(
-            "conductor.providers._pydantic_ai.agent_builder.build_agent",
-            return_value=_build_text_agent("Response"),
-        ) as mock_build_agent:
+        with (
+            patch.object(provider, "_get_mcp_manager_for_cwd", return_value=None),
+            patch(
+                "conductor.providers._pydantic_ai.agent_builder.build_agent",
+                return_value=_build_text_agent("Response"),
+            ) as mock_build_agent,
+        ):
             agent = AgentDef(
                 name="test",
                 prompt="Test",
@@ -339,10 +343,13 @@ class TestBasicExecution:
         """Provider temperature is forwarded to build_agent defaults."""
         provider = ClaudeProvider(api_key="test-key", temperature=0.7)
 
-        with patch.object(provider, "_get_mcp_manager_for_cwd", return_value=None), patch(
-            "conductor.providers._pydantic_ai.agent_builder.build_agent",
-            return_value=_build_text_agent("Response"),
-        ) as mock_build_agent:
+        with (
+            patch.object(provider, "_get_mcp_manager_for_cwd", return_value=None),
+            patch(
+                "conductor.providers._pydantic_ai.agent_builder.build_agent",
+                return_value=_build_text_agent("Response"),
+            ) as mock_build_agent,
+        ):
             agent = AgentDef(name="test", prompt="Test")
             await provider.execute(
                 agent=agent,
@@ -365,10 +372,13 @@ class TestStructuredOutput:
             answer: str
             confidence: float
 
-        with patch.object(provider, "_get_mcp_manager_for_cwd", return_value=None), patch(
-            "conductor.providers._pydantic_ai.agent_builder.build_agent",
-            return_value=_build_structured_agent(
-                AnswerModel, {"answer": "42", "confidence": 0.95}
+        with (
+            patch.object(provider, "_get_mcp_manager_for_cwd", return_value=None),
+            patch(
+                "conductor.providers._pydantic_ai.agent_builder.build_agent",
+                return_value=_build_structured_agent(
+                    AnswerModel, {"answer": "42", "confidence": 0.95}
+                ),
             ),
         ):
             agent = AgentDef(
@@ -395,9 +405,12 @@ class TestStructuredOutput:
 
         text_response = '```json\n{"answer": "Paris", "country": "France"}\n```'
 
-        with patch.object(provider, "_get_mcp_manager_for_cwd", return_value=None), patch(
-            "conductor.providers._pydantic_ai.agent_builder.build_agent",
-            return_value=_build_text_agent(text_response),
+        with (
+            patch.object(provider, "_get_mcp_manager_for_cwd", return_value=None),
+            patch(
+                "conductor.providers._pydantic_ai.agent_builder.build_agent",
+                return_value=_build_text_agent(text_response),
+            ),
         ):
             agent = AgentDef(
                 name="test",
@@ -453,9 +466,12 @@ class TestErrorHandling:
 
         failing_agent.run = failing_run
 
-        with patch.object(provider, "_get_mcp_manager_for_cwd", return_value=None), patch(
-            "conductor.providers._pydantic_ai.agent_builder.build_agent",
-            return_value=failing_agent,
+        with (
+            patch.object(provider, "_get_mcp_manager_for_cwd", return_value=None),
+            patch(
+                "conductor.providers._pydantic_ai.agent_builder.build_agent",
+                return_value=failing_agent,
+            ),
         ):
             agent = AgentDef(name="test", prompt="Test")
             with pytest.raises(ProviderError) as exc_info:
@@ -476,9 +492,12 @@ class TestErrorHandling:
         class AnswerModel(BaseModel):
             answer: str
 
-        with patch.object(provider, "_get_mcp_manager_for_cwd", return_value=None), patch(
-            "conductor.providers._pydantic_ai.agent_builder.build_agent",
-            return_value=_build_structured_agent(AnswerModel, {"answer": "42"}),
+        with (
+            patch.object(provider, "_get_mcp_manager_for_cwd", return_value=None),
+            patch(
+                "conductor.providers._pydantic_ai.agent_builder.build_agent",
+                return_value=_build_structured_agent(AnswerModel, {"answer": "42"}),
+            ),
         ):
             agent = AgentDef(
                 name="test",
@@ -549,9 +568,12 @@ class TestClaudeExecuteDialogTurn:
 
             return FakeResult()
 
-        with patch(
-            "conductor.providers._pydantic_ai.agent_builder._resolve_anthropic_model"
-        ) as mock_resolve_model, patch("pydantic_ai.Agent") as mock_agent_cls:
+        with (
+            patch(
+                "conductor.providers._pydantic_ai.agent_builder._resolve_anthropic_model"
+            ) as mock_resolve_model,
+            patch("pydantic_ai.Agent") as mock_agent_cls,
+        ):
             mock_agent = mock_agent_cls.return_value
             mock_agent.run = AsyncMock(side_effect=fake_run)
             result = await provider.execute_dialog_turn(
@@ -578,9 +600,12 @@ class TestClaudeExecuteDialogTurn:
 
             return FakeResult()
 
-        with patch(
-            "conductor.providers._pydantic_ai.agent_builder._resolve_anthropic_model"
-        ) as mock_resolve_model, patch("pydantic_ai.Agent") as mock_agent_cls:
+        with (
+            patch(
+                "conductor.providers._pydantic_ai.agent_builder._resolve_anthropic_model"
+            ) as mock_resolve_model,
+            patch("pydantic_ai.Agent") as mock_agent_cls,
+        ):
             mock_agent = mock_agent_cls.return_value
             mock_agent.run = AsyncMock(side_effect=fake_run)
             await provider.execute_dialog_turn(
@@ -619,10 +644,13 @@ class TestClaudeExecuteDialogTurn:
             captured_model = args[0] if args else kwargs.get("agent")
             return Mock()
 
-        with patch(
-            "conductor.providers._pydantic_ai.agent_builder._resolve_anthropic_model",
-            side_effect=capture_model,
-        ), patch("pydantic_ai.Agent") as mock_agent_cls:
+        with (
+            patch(
+                "conductor.providers._pydantic_ai.agent_builder._resolve_anthropic_model",
+                side_effect=capture_model,
+            ),
+            patch("pydantic_ai.Agent") as mock_agent_cls,
+        ):
             mock_agent = mock_agent_cls.return_value
             mock_agent.run = fake_run
             await provider.execute_dialog_turn(
@@ -639,9 +667,10 @@ class TestClaudeExecuteDialogTurn:
         """SDK errors propagate as ProviderError, not bare exceptions."""
         provider = ClaudeProvider(api_key="test-key")
 
-        with patch(
-            "conductor.providers._pydantic_ai.agent_builder._resolve_anthropic_model"
-        ), patch("pydantic_ai.Agent") as mock_agent_cls:
+        with (
+            patch("conductor.providers._pydantic_ai.agent_builder._resolve_anthropic_model"),
+            patch("pydantic_ai.Agent") as mock_agent_cls,
+        ):
             mock_agent = mock_agent_cls.return_value
             mock_agent.run = AsyncMock(side_effect=RuntimeError("api down"))
             with pytest.raises(ProviderError, match="api down"):
@@ -654,13 +683,12 @@ class TestClaudeExecuteDialogTurn:
     @pytest.mark.asyncio
     async def test_dialog_turn_rejects_non_thinking_model_with_reasoning(self) -> None:
         """execute_dialog_turn() raises ValidationError for reasoning on non-thinking models."""
-        provider = ClaudeProvider(
-            api_key="test-key", default_reasoning_effort="medium"
-        )
+        provider = ClaudeProvider(api_key="test-key", default_reasoning_effort="medium")
 
-        with patch(
-            "conductor.providers._pydantic_ai.agent_builder._resolve_anthropic_model"
-        ), patch("pydantic_ai.Agent") as mock_agent_cls:
+        with (
+            patch("conductor.providers._pydantic_ai.agent_builder._resolve_anthropic_model"),
+            patch("pydantic_ai.Agent") as mock_agent_cls,
+        ):
             mock_agent = mock_agent_cls.return_value
             mock_agent.run = AsyncMock(return_value=Mock(output="x"))
             with pytest.raises(ValidationError, match="extended thinking"):

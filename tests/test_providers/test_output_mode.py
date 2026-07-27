@@ -277,12 +277,11 @@ class TestClaudeOutputModeRaw:
             "conductor.providers._pydantic_ai.agent_builder.build_agent",
             return_value=_build_text_agent("raw output"),
         ):
-            result = await claude_provider.execute(
-                agent=agent, context={}, rendered_prompt="p"
-            )
+            result = await claude_provider.execute(agent=agent, context={}, rendered_prompt="p")
 
         # Raw mode wraps text response as {"result": "..."} — matches Copilot parity
         assert result.content == {"result": "raw output"}
+
 
 def test_no_emit_output_tool_in_raw_agent() -> None:
     """output_mode=raw must not register the structured-output 'final_result' tool."""
