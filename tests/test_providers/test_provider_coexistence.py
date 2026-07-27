@@ -5,42 +5,98 @@ installation without conflicts. Includes both unit tests with mocks
 and integration tests for real provider instances.
 """
 
+from __future__ import annotations
+
+from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
+from pydantic import BaseModel
+from pydantic_ai import Agent
+from pydantic_ai.models.test import TestModel
 
-from conductor.providers.claude import ANTHROPIC_SDK_AVAILABLE
+from conductor.config.schema import AgentDef, OutputField
+from conductor.providers.claude import ClaudeProvider
+from conductor.providers.copilot import CopilotProvider
+
+
+class _ClaudeResultModel(BaseModel):
+    result: str
+
+
+def _build_claude_result_agent() -> Agent[Any, Any]:
+    """Build a Pydantic AI structured-output agent returning a fixed result."""
+    return Agent(
+        model=TestModel(custom_output_args={"result": "Claude response"}),
+        output_type=_ClaudeResultModel,
+    )
 
 
 class TestProviderCoexistence:
     """Tests for Claude and Copilot provider coexistence."""
 
-    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
-    @patch("conductor.providers.claude.AsyncAnthropic")
-    @patch("conductor.providers.claude.anthropic")
-    def test_both_providers_can_be_imported(
-        self,
-        mock_anthropic_module: Mock,
-        mock_anthropic_class: Mock,
-    ) -> None:
-        """Test that both providers can be imported without conflicts."""
-        mock_anthropic_module.__version__ = "0.77.0"
-        mock_claude_client = Mock()
-        mock_claude_client.models.list = AsyncMock(return_value=Mock(data=[]))
-        mock_anthropic_class.return_value = mock_claude_client
+    @pytest.mark.asyncio
+    async def test_both_providers_can_execute_concurrently(self) -> None:
+        """Test that both providers can execute concurrently without interference."""
+        import asyncio
 
-        # Import both providers
-        from conductor.providers.claude import ClaudeProvider
-        from conductor.providers.copilot import CopilotProvider
+        # Setup Copilot mock handler
+        def copilot_mock_handler(
+            agent: AgentDef, prompt: str, context: dict[str, Any]
+        ) -> dict[str, Any]:
+            return {"result": "Copilot response"}
 
-        # Verify both can be instantiated
-        claude = ClaudeProvider()
-        copilot = CopilotProvider()
+        claude_provider = ClaudeProvider(api_key="test-key")
+        copilot_provider = CopilotProvider(mock_handler=copilot_mock_handler)
 
-        assert claude is not None
-        assert copilot is not None
-        assert type(claude).__name__ == "ClaudeProvider"
-        assert type(copilot).__name__ == "CopilotProvider"
+        # Create agent with output schema
+        agent = AgentDef(
+            name="test",
+            prompt="Test",
+            output={"result": OutputField(type="string")},
+        )
+
+        async def run_claude() -> Any:
+            with patch(
+                "conductor.providers._pydantic_ai.agent_builder.build_agent",
+                return_value=_build_claude_result_agent(),
+            ):
+                return await claude_provider.execute(agent, {}, "Claude test")
+
+        async def run_copilot() -> Any:
+            return await copilot_provider.execute(agent, {}, "Copilot test")
+
+        # Run concurrently
+        claude_result, copilot_result = await asyncio.gather(run_claude(), run_copilot())
+
+        # Verify both executed successfully
+        assert "result" in claude_result.content
+        assert "result" in copilot_result.content
+
+        await claude_provider.close()
+        await copilot_provider.close()
+
+    def test_claude_exceptions_dont_conflict_with_copilot(self) -> None:
+        """Test that Claude-specific exception handling doesn't affect Copilot."""
+        # This test verifies that both providers can handle their own exceptions
+        # without namespace collisions
+        from conductor.exceptions import ProviderError, ValidationError
+
+        # Both providers should use the same base exceptions
+        # This ensures consistent error handling across providers
+
+        error1 = ProviderError("Claude error", status_code=400)
+        error2 = ValidationError("Copilot validation error")
+
+        assert isinstance(error1, ProviderError)
+        assert isinstance(error2, ValidationError)
+        assert error1.status_code == 400
+        assert "Claude error" in str(error1)
+        assert "Copilot validation error" in str(error2)
+
+
+class TestProviderFactory:
+    """Factory-level coexistence tests using mocked SDK construction."""
 
     @pytest.mark.asyncio
     async def test_factory_can_create_both_providers(self) -> None:
@@ -70,83 +126,26 @@ class TestProviderCoexistence:
             await claude.close()
             await copilot.close()
 
-    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
-    @patch("conductor.providers.claude.AsyncAnthropic")
-    @patch("conductor.providers.claude.anthropic")
-    @pytest.mark.asyncio
-    async def test_both_providers_can_execute_concurrently(
-        self,
-        mock_anthropic_module: Mock,
-        mock_anthropic_class: Mock,
-    ) -> None:
-        """Test that both providers can execute concurrently without interference."""
-        import asyncio
 
-        # Setup Claude mock
-        mock_anthropic_module.__version__ = "0.77.0"
-        mock_claude_client = Mock()
-        mock_claude_client.models.list = AsyncMock(return_value=Mock(data=[]))
-        mock_claude_response = Mock()
-        mock_claude_response.content = [Mock(type="text", text='{"result": "Claude response"}')]
-        mock_claude_response.model = "claude-3-5-sonnet-latest"
-        mock_claude_response.usage = Mock(
-            input_tokens=10, output_tokens=20, cache_creation_input_tokens=0
-        )
-        mock_claude_response.stop_reason = "end_turn"
-        mock_claude_response.id = "msg_123"
-        mock_claude_response.type = "message"
-        mock_claude_response.role = "assistant"
-        mock_claude_client.messages.create = AsyncMock(return_value=mock_claude_response)
-        mock_claude_client.close = AsyncMock()
-        mock_anthropic_class.return_value = mock_claude_client
+class TestProviderInstantiation:
+    """Tests that both providers can be imported and instantiated."""
 
-        # Import providers
-        from conductor.config.schema import AgentDef, OutputField
-        from conductor.providers.claude import ClaudeProvider
+    def test_both_providers_can_be_imported(self) -> None:
+        """Test that both providers can be imported without conflicts."""
+        # Import both providers
         from conductor.providers.copilot import CopilotProvider
 
-        # Setup Copilot mock handler
-        def copilot_mock_handler(agent, prompt, context):
-            return {"result": "Copilot response"}
+        # Verify both can be instantiated
+        claude = ClaudeProvider(api_key="test-key")
+        copilot = CopilotProvider()
 
-        claude_provider = ClaudeProvider()
-        copilot_provider = CopilotProvider(mock_handler=copilot_mock_handler)
+        assert claude is not None
+        assert copilot is not None
+        assert type(claude).__name__ == "ClaudeProvider"
+        assert type(copilot).__name__ == "CopilotProvider"
 
-        # Create agent with output schema
-        agent = AgentDef(
-            name="test",
-            prompt="Test",
-            output={"result": OutputField(type="string")},
-        )
-
-        async def run_claude():
-            return await claude_provider.execute(agent, {}, "Claude test")
-
-        async def run_copilot():
-            return await copilot_provider.execute(agent, {}, "Copilot test")
-
-        # Run concurrently
-        claude_result, copilot_result = await asyncio.gather(run_claude(), run_copilot())
-
-        # Verify both executed successfully
-        assert "result" in claude_result.content
-        assert "result" in copilot_result.content
-
-        await claude_provider.close()
-        await copilot_provider.close()
-
-    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
-    @patch("conductor.providers.claude.AsyncAnthropic")
-    @patch("conductor.providers.claude.anthropic")
-    def test_claude_retry_config_independent_from_copilot(
-        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
-    ) -> None:
+    def test_claude_retry_config_independent_from_copilot(self) -> None:
         """Test that Claude RetryConfig doesn't conflict with Copilot's."""
-        mock_anthropic_module.__version__ = "0.77.0"
-        mock_claude_client = Mock()
-        mock_claude_client.models.list = AsyncMock(return_value=Mock(data=[]))
-        mock_anthropic_class.return_value = mock_claude_client
-
         # Import both RetryConfigs
         from conductor.providers.claude import (
             RetryConfig as ClaudeRetryConfig,
@@ -169,33 +168,18 @@ class TestProviderCoexistence:
         assert claude_config.max_parse_recovery_attempts == 2  # Claude: conservative
         assert copilot_config.max_parse_recovery_attempts == 5  # Copilot: more retries
 
-    def test_claude_exceptions_dont_conflict_with_copilot(self) -> None:
-        """Test that Claude-specific exception handling doesn't affect Copilot."""
-        # This test verifies that both providers can handle their own exceptions
-        # without namespace collisions
-        from conductor.exceptions import ProviderError, ValidationError
-
-        # Both providers should use the same base exceptions
-        # This ensures consistent error handling across providers
-
-        error1 = ProviderError("Claude error", status_code=400)
-        error2 = ValidationError("Copilot validation error")
-
-        assert isinstance(error1, ProviderError)
-        assert isinstance(error2, ValidationError)
-        assert error1.status_code == 400
-        assert "Claude error" in str(error1)
-        assert "Copilot validation error" in str(error2)
-
 
 class TestProviderCoexistenceIntegration:
     """Integration tests for real provider coexistence (no mocks)."""
 
-    @pytest.mark.skipif(not ANTHROPIC_SDK_AVAILABLE, reason="Anthropic SDK not installed")
     @pytest.mark.asyncio
     async def test_both_providers_can_be_created_and_closed(self) -> None:
         """Test creating and closing both provider types without validation."""
+        from conductor.providers.claude import ANTHROPIC_SDK_AVAILABLE
         from conductor.providers.factory import create_provider
+
+        if not ANTHROPIC_SDK_AVAILABLE:
+            pytest.skip("Anthropic SDK not installed")
 
         # Create both providers (without API validation)
         copilot = await create_provider("copilot", validate=False)
@@ -210,11 +194,13 @@ class TestProviderCoexistenceIntegration:
         await copilot.close()
         await claude.close()
 
-    @pytest.mark.skipif(not ANTHROPIC_SDK_AVAILABLE, reason="Anthropic SDK not installed")
     @pytest.mark.asyncio
     async def test_multiple_claude_instances_with_different_configs(self) -> None:
         """Test multiple Claude instances with different configurations."""
-        from conductor.providers.claude import ClaudeProvider
+        from conductor.providers.claude import ANTHROPIC_SDK_AVAILABLE
+
+        if not ANTHROPIC_SDK_AVAILABLE:
+            pytest.skip("Anthropic SDK not installed")
 
         claude1 = ClaudeProvider(
             model="claude-3-5-sonnet-latest",
@@ -243,11 +229,13 @@ class TestProviderCoexistenceIntegration:
         await claude1.close()
         await claude2.close()
 
-    @pytest.mark.skipif(not ANTHROPIC_SDK_AVAILABLE, reason="Anthropic SDK not installed")
     @pytest.mark.asyncio
     async def test_provider_state_isolation(self) -> None:
         """Test that provider state is isolated between instances."""
-        from conductor.providers.claude import ClaudeProvider
+        from conductor.providers.claude import ANTHROPIC_SDK_AVAILABLE
+
+        if not ANTHROPIC_SDK_AVAILABLE:
+            pytest.skip("Anthropic SDK not installed")
 
         claude1 = ClaudeProvider()
         claude2 = ClaudeProvider()
