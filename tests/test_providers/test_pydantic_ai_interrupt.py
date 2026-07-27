@@ -18,12 +18,13 @@ import contextlib
 from typing import Any
 
 import pytest
-from pydantic_ai import Agent
+from pydantic_ai import Agent, UsageLimits
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.output import ToolOutput
 from pydantic_ai.tools import Tool
 
 from conductor.config.schema import OutputField
+from conductor.exceptions import ProviderError
 from conductor.providers._pydantic_ai.converters import output_schema_to_pydantic_model
 from conductor.providers._pydantic_ai.interrupt import run_with_interrupt
 
@@ -196,4 +197,95 @@ class TestHardAbort:
         assert outcome.is_cancelled is True
         assert outcome.is_partial is False
         assert outcome.result is None
+        assert outcome.partial_output is None
+
+
+class TestUsageLimits:
+    """Requirement: usage_limits are forwarded and UsageLimitExceeded maps to a
+    non-retryable ProviderError."""
+
+    @pytest.mark.asyncio
+    async def test_usage_limit_request_limit_maps_to_provider_error(self) -> None:
+        """When pydantic-ai raises UsageLimitExceeded because request_limit=1 is
+        exceeded by a two-request tool loop, the helper must raise a non-retryable
+        ProviderError matching the legacy ClaudeProvider max-iterations message."""
+
+        async def loop_tool() -> str:
+            return "again"
+
+        agent = Agent(
+            TestModel(),
+            tools=[Tool(loop_tool)],
+            output_type=str,
+            retries=0,
+        )
+
+        with pytest.raises(ProviderError) as exc_info:
+            await run_with_interrupt(
+                agent,
+                "call loop",
+                interrupt_signal=asyncio.Event(),
+                event_callback=None,
+                has_output_schema=False,
+                usage_limits=UsageLimits(request_limit=1),
+            )
+
+        assert "exceeded maximum iterations (1)" in str(exc_info.value)
+        assert exc_info.value.is_retryable is False
+
+
+class TestMaxSessionSeconds:
+    """Requirement: max_session_seconds is enforced at iteration boundaries and
+    raises a non-retryable ProviderError."""
+
+    @pytest.mark.asyncio
+    async def test_max_session_seconds_expired_raises_provider_error(self) -> None:
+        """When a model call takes longer than max_session_seconds, the helper must
+        raise a non-retryable ProviderError at the next iteration boundary, matching
+        the legacy ClaudeProvider session-timeout behavior."""
+
+        class _SlowTestModel(TestModel):
+            async def request(self, messages, *args, **kwargs):
+                await asyncio.sleep(0.2)
+                return await super().request(messages, *args, **kwargs)
+
+        agent = Agent(_SlowTestModel(), output_type=str, retries=0)
+
+        with pytest.raises(ProviderError) as exc_info:
+            await run_with_interrupt(
+                agent,
+                "say hello",
+                interrupt_signal=asyncio.Event(),
+                event_callback=None,
+                has_output_schema=False,
+                max_session_seconds=0.05,
+            )
+
+        assert "exceeded maximum session duration" in str(exc_info.value).lower()
+        assert exc_info.value.is_retryable is False
+
+
+class TestLimitsDisabled:
+    """Requirement: None limits preserve the existing no-limit interrupt behavior."""
+
+    @pytest.mark.asyncio
+    async def test_none_limits_completes_normally(self) -> None:
+        """When usage_limits=None and max_session_seconds=None, the helper must
+        complete normally without raising limit errors, matching the original
+        default behavior."""
+        signal = asyncio.Event()
+
+        outcome = await run_with_interrupt(
+            _make_text_agent(),
+            "say hello",
+            interrupt_signal=signal,
+            event_callback=None,
+            has_output_schema=False,
+            usage_limits=None,
+            max_session_seconds=None,
+        )
+
+        assert outcome.is_partial is False
+        assert outcome.is_cancelled is False
+        assert outcome.result is not None
         assert outcome.partial_output is None
