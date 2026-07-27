@@ -1,10 +1,12 @@
 # Claude Provider Documentation
 
-The Claude provider enables Conductor workflows to use Anthropic's Claude models via the official Anthropic Python SDK.
+The Claude provider enables Conductor workflows to use Anthropic's Claude models via Pydantic AI (`pydantic-ai` package, `AnthropicModel`).
 
 ## Table of Contents
 
 - [Quick Start](#quick-start)
+- [Architecture & Internal Design](#architecture--internal-design)
+- [Behavioral & Migration Notes](#behavioral--migration-notes)
 - [API Key Setup](#api-key-setup)
 - [Model Selection](#model-selection)
 - [Runtime Configuration](#runtime-configuration)
@@ -58,6 +60,31 @@ agents:
 ```bash
 conductor run my-workflow.yaml --input question="What is Python?"
 ```
+
+## Architecture & Internal Design
+
+The Claude provider delegates its agentic loop, tool execution, and structured output processing to Pydantic AI (`pydantic-ai` package, `AnthropicModel`). `ClaudeProvider` in `src/conductor/providers/claude.py` implements the `AgentProvider` interface while delegating execution details to internal helpers in `src/conductor/providers/_pydantic_ai/`.
+
+### Package Structure (`src/conductor/providers/_pydantic_ai/`)
+
+- **`agent_builder.py`**: Factory (`build_agent`) mapping Conductor `AgentDef` configurations, system prompts, reasoning effort settings, temperature/max_tokens coercion, and output schemas to a Pydantic AI `Agent`.
+- **`converters.py`**: Recursively converts workflow `output` schemas into dynamic Pydantic models for Pydantic AI `ToolOutput`, enforcing scalar type checks and boolean rejection.
+- **`events.py`**: Bridges streaming Pydantic AI events (`PartStartEvent`, `PartDeltaEvent`, `FunctionToolCallEvent`, `FunctionToolResultEvent`) to Conductor `EventCallback` payloads (`agent_message`, `agent_reasoning`, `agent_tool_start`, `agent_tool_complete`, `agent_tool_output_truncated`), and emits turn boundary events.
+- **`interrupt.py`**: Drives agent execution via `Agent.iter()` while honoring Conductor's `interrupt_signal`, wall-clock `max_session_seconds`, and `UsageLimits`.
+- **`mcp_toolset.py`**: Wraps Conductor's `MCPManager` as a Pydantic AI `AbstractToolset`, managing tool naming, truncation, spill-to-file, and error signaling (`ToolFailed`).
+- **`retry.py`**: Provides Conductor-level retries (`execute_with_retry`) with exponential backoff, jitter, and Anthropic error classification (with internal Pydantic AI retries disabled via `retries=0`).
+- **`structured_output.py`**: Handles post-processing (`extract_content`, `parse_text_fallback`), converting `ToolOutput` model dumps or fenced JSON text fallbacks into validated dicts via Conductor's `validate_output()`.
+- **`usage.py`**: Maps Pydantic AI `RunUsage` (token counts, cache reads and writes) to `AgentOutput` fields for tracking and pricing calculation by `UsageTracker`.
+
+## Behavioral & Migration Notes
+
+There are no user-facing breaking changes. Workflow YAML syntax, `runtime.provider: claude` configuration, provider contracts, and CLI commands remain completely unchanged.
+
+The transition to Pydantic AI includes the following internal behavioral changes:
+
+- **Multi-turn parse recovery loop removed**: The legacy `max_parse_recovery_attempts` multi-turn loop was removed by design. Pydantic AI `ToolOutput` natively steers model responses via tool schemas, eliminating malformed structured outputs. In-prose JSON text fallback is preserved for models returning raw text.
+- **Truncation-hint path rewriting removed**: Legacy conductor-side path replacement in tool result text was removed. Tool output truncation and spill-to-file behavior are managed directly by `MCPManagerToolset`, and `agent_tool_output_truncated` events are emitted natively with original character length, truncated length, and spill path.
+- **Thinking signature preservation**: Thinking/reasoning block handling and signature preservation are delegated to Pydantic AI's native Anthropic model adapter.
 
 ## API Key Setup
 
