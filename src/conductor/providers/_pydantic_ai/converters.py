@@ -155,7 +155,7 @@ def _build_pydantic_model(
         field_info = (
             Field(description=field.description) if field.description else Field(default=...)
         )
-        model_fields[field_name] = (field_type, field_info)  # type: ignore[assignment]
+        model_fields[field_name] = (field_type, field_info)
 
     return create_model(
         name,
