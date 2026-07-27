@@ -29,10 +29,10 @@ from unittest.mock import AsyncMock, Mock, patch
 import pytest
 from pydantic import BaseModel
 from pydantic_ai import Agent
-from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
+from pydantic_ai.messages import ModelRequest, ModelResponse
 from pydantic_ai.models.test import TestModel
 
-from conductor.config.schema import AgentDef, OutputField, ReasoningConfig
+from conductor.config.schema import AgentDef, OutputField
 from conductor.exceptions import ProviderError, ValidationError
 from conductor.providers.claude import ClaudeProvider
 
@@ -679,7 +679,9 @@ class TestClaudeGetMaxPromptTokens:
     """Tests for ClaudeProvider.get_max_prompt_tokens."""
 
     @pytest.mark.asyncio
-    async def test_returns_max_input_tokens_for_known_model(self, mock_anthropic_class: Mock) -> None:
+    async def test_returns_max_input_tokens_for_known_model(
+        self, mock_anthropic_class: Mock
+    ) -> None:
         mock_client = Mock()
         mock_client.models.list = AsyncMock(
             return_value=Mock(
@@ -704,7 +706,9 @@ class TestClaudeGetMaxPromptTokens:
         assert await provider.get_max_prompt_tokens("unknown-x") is None
 
     @pytest.mark.asyncio
-    async def test_sdk_failure_returns_none_and_does_not_cache(self, mock_anthropic_class: Mock) -> None:
+    async def test_sdk_failure_returns_none_and_does_not_cache(
+        self, mock_anthropic_class: Mock
+    ) -> None:
         from anthropic import APIConnectionError
 
         err = APIConnectionError(request=Mock())
@@ -841,7 +845,9 @@ class TestClaudeGetModelCapabilities:
         assert caps.max_prompt_tokens is None
 
     @pytest.mark.asyncio
-    async def test_reasoning_fields_populated_when_sdk_call_fails(self, mock_anthropic_class: Mock) -> None:
+    async def test_reasoning_fields_populated_when_sdk_call_fails(
+        self, mock_anthropic_class: Mock
+    ) -> None:
         mock_client = Mock()
         mock_client.models.list = AsyncMock(side_effect=RuntimeError("boom"))
         mock_anthropic_class.return_value = mock_client
@@ -853,7 +859,9 @@ class TestClaudeGetModelCapabilities:
         assert caps.max_prompt_tokens is None
 
     @pytest.mark.asyncio
-    async def test_reasoning_fields_populated_when_sdk_unavailable(self, mock_anthropic_class: Mock) -> None:
+    async def test_reasoning_fields_populated_when_sdk_unavailable(
+        self, mock_anthropic_class: Mock
+    ) -> None:
         mock_client = Mock()
         mock_client.models.list = AsyncMock(return_value=Mock(data=[]))
         mock_anthropic_class.return_value = mock_client
