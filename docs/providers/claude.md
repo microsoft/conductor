@@ -82,7 +82,7 @@ There are no user-facing breaking changes. Workflow YAML syntax, `runtime.provid
 
 The transition to Pydantic AI includes the following internal behavioral changes:
 
-- **Multi-turn parse recovery loop removed**: The legacy `max_parse_recovery_attempts` multi-turn loop was removed by design. Pydantic AI `ToolOutput` natively steers model responses via tool schemas, eliminating malformed structured outputs. In-prose JSON text fallback is preserved for models returning raw text.
+- **`max_parse_recovery_attempts` accepted but has no effect**: The `retry.max_parse_recovery_attempts` YAML field (and the older provider-level default) is still accepted for configuration compatibility, but the Claude provider no longer runs a multi-turn parse-recovery loop. Pydantic AI's `ToolOutput` steers structured responses via the native tool schema, and the in-prose JSON fallback is single-shot — no correction loop is sent. The Copilot provider still honors the field.
 - **Truncation-hint path rewriting removed**: Legacy conductor-side path replacement in tool result text was removed. Tool output truncation and spill-to-file behavior are managed directly by `MCPManagerToolset`, and `agent_tool_output_truncated` events are emitted natively with original character length, truncated length, and spill path.
 - **Thinking signature preservation**: Thinking/reasoning block handling and signature preservation are delegated to Pydantic AI's native Anthropic model adapter.
 
@@ -271,9 +271,9 @@ agents:
 ## System Prompt
 
 When an agent defines a `system_prompt`, the Claude provider forwards this value as the native top-level `system` parameter in the Anthropic Messages API. 
-
 Key details of this integration:
-- **Consistent Application**: The `system_prompt` is sent on every API call in the agent's execution path, including the main loop, tool-use iterations, parse recovery, interrupt partial output requests, and retries.
+
+- **Consistent Application**: The `system_prompt` is sent on every API call in the agent's execution path, including the main loop, tool-use iterations, interrupt partial output requests, and retries.
 - **Empty Prompts**: Any empty or whitespace-only `system_prompt` is normalized to `None` and is not sent to the API.
 - **Caching**: Anthropic `cache_control` support for the `system` parameter is not implemented yet and is planned as a follow-up.
 
