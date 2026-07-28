@@ -5,7 +5,8 @@ Pydantic AI's tool retry budget is disabled (``retries={"tools": 0}`` in
 ``build_agent``) and all transient API/tool retries are handled by Conductor.
 Structured-output recovery retries are left enabled in ``build_agent`` because
 plain-text answers to a tool-output schema must be recovered in-session before
-``execute_with_retry`` can see a result.
+``execute_with_retry`` can see a result. If that internal budget is exhausted,
+Conductor retries the whole call.
 """
 
 from __future__ import annotations
@@ -128,6 +129,7 @@ def _is_retryable_error(exception: Exception) -> bool:
         "MockAPIConnectionError",
         "MockRateLimitError",
         "MockAPITimeoutError",
+        "UnexpectedModelBehavior",
     }
     if error_type_name in retryable_names:
         return True
@@ -336,8 +338,16 @@ async def execute_with_retry[T](
 
             await asyncio.sleep(delay)
 
+    if last_error is not None and type(last_error).__name__ == "UnexpectedModelBehavior":
+        suggestion = (
+            "Model repeatedly failed to produce valid structured output (output tool not called); "
+            "retry later or simplify the output schema"
+        )
+    else:
+        suggestion = f"Check API connectivity and rate limits. Last error: {last_error}"
+
     raise ProviderError(
         f"Pydantic AI call failed after {retry_config.max_attempts} attempts: {last_error}",
-        suggestion=f"Check API connectivity and rate limits. Last error: {last_error}",
+        suggestion=suggestion,
         is_retryable=False,
     )

@@ -12,6 +12,7 @@ from typing import Any
 from unittest.mock import Mock, patch
 
 import pytest
+from pydantic_ai.exceptions import UnexpectedModelBehavior
 
 from conductor.config.schema import AgentDef, RetryPolicy
 from conductor.exceptions import ProviderError, ValidationError
@@ -121,6 +122,11 @@ class TestRetryClassification:
         assert _classify_error(TimeoutError()) == "timeout"
         assert _classify_error(ProviderError("timeout", status_code=408)) == "timeout"
         assert _classify_error(ValueError("fail")) == "provider_error"
+
+    def test_unexpected_model_behavior_is_retryable(self) -> None:
+        """UnexpectedModelBehavior must be retryable."""
+        err = UnexpectedModelBehavior("Exceeded maximum output retries (2)")
+        assert _is_retryable_error(err) is True
 
 
 class TestRetryConfig:
@@ -430,6 +436,65 @@ class TestExecuteWithRetry:
             "error_type",
             "delay",
         }
+
+    @pytest.mark.asyncio
+    async def test_unexpected_model_behavior_retries_and_succeeds(self) -> None:
+        """execute_with_retry must retry on UnexpectedModelBehavior and succeed later."""
+        events: list[tuple[str, dict[str, Any]]] = []
+
+        def callback(event_type: str, payload: dict[str, Any]) -> None:
+            events.append((event_type, payload))
+
+        config = RetryConfig(max_attempts=3, base_delay=0.0, jitter=0.0)
+        factory = _make_factory(
+            [
+                UnexpectedModelBehavior("Exceeded maximum output retries (2)"),
+                "success",
+            ]
+        )
+
+        with patch("conductor.providers._pydantic_ai.retry.asyncio.sleep") as mock_sleep:
+            result = await execute_with_retry(
+                factory,
+                retry_config=config,
+                event_callback=callback,
+                agent_name="retryer",
+            )
+
+        assert result == "success"
+        assert len(events) == 1
+        assert events[0][0] == "agent_retry"
+        assert events[0][1]["error_type"] == "UnexpectedModelBehavior"
+        mock_sleep.assert_called_once_with(0.0)
+
+    @pytest.mark.asyncio
+    async def test_unexpected_model_behavior_exhausted_raises_honest_error(self) -> None:
+        """After exhausting attempts, ProviderError must mention structured output."""
+        config = RetryConfig(max_attempts=2, base_delay=0.0, jitter=0.0)
+        factory = _make_factory(
+            [
+                UnexpectedModelBehavior("Exceeded maximum output retries (2)"),
+                UnexpectedModelBehavior("Exceeded maximum output retries (2)"),
+            ]
+        )
+
+        with (
+            patch("conductor.providers._pydantic_ai.retry.asyncio.sleep"),
+            pytest.raises(ProviderError) as exc_info,
+        ):
+            await execute_with_retry(
+                factory,
+                retry_config=config,
+                event_callback=None,
+                agent_name="retryer",
+            )
+
+        assert exc_info.value.is_retryable is False
+        suggestion = exc_info.value.suggestion
+        assert suggestion is not None
+        assert "structured output" in suggestion
+        assert "output tool" in suggestion
+        assert "Check API key" not in suggestion
 
 
 class TestPydanticAIRetriesSplit:
