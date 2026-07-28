@@ -311,6 +311,7 @@ def build_agent(
     default_temperature: float | None = None,
     default_max_tokens: int | None = None,
     default_reasoning_effort: ReasoningEffort | None = None,
+    max_parse_recovery_attempts: int = _OUTPUT_RECOVERY_RETRIES,
     api_key: str | None = None,
     auth_token: str | None = None,
     base_url: str | None = None,
@@ -328,6 +329,8 @@ def build_agent(
         default_temperature: Workflow-level default temperature.
         default_max_tokens: Workflow-level default ``max_tokens``.
         default_reasoning_effort: Workflow-level default reasoning effort.
+        max_parse_recovery_attempts: Output correction retries handled inside
+            the Pydantic AI agent.
         api_key: Anthropic API key. Falls back to ``ANTHROPIC_API_KEY`` env var.
         auth_token: Optional bearer-auth token for gateway / LiteLLM endpoints.
         base_url: Optional custom API endpoint.
@@ -364,7 +367,7 @@ def build_agent(
         name=agent.name,
         description=agent.description,
         model_settings=model_settings,
-        retries=AgentRetries(tools=0, output=_OUTPUT_RECOVERY_RETRIES),
+        retries=AgentRetries(tools=0, output=max_parse_recovery_attempts),
         toolsets=toolsets or [],
         tools=tools or [],
     )

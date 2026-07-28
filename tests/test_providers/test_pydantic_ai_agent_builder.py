@@ -220,6 +220,20 @@ class TestRetries:
         assert pydantic_agent._max_tool_retries == 0
         assert pydantic_agent._max_output_retries == 2
 
+    def test_custom_output_retries_preserve_zero_tool_retries(self) -> None:
+        """A custom recovery budget must not enable Pydantic AI tool retries."""
+        agent_def = AgentDef(name="custom-recovery")
+
+        pydantic_agent = build_agent(
+            agent_def,
+            system_prompt="",
+            rendered_prompt="",
+            max_parse_recovery_attempts=4,
+        )
+
+        assert pydantic_agent._max_tool_retries == 0
+        assert pydantic_agent._max_output_retries == 4
+
 
 class TestOutputRecovery:
     """Regression tests for structured-output recovery from plain-text responses."""
