@@ -432,14 +432,15 @@ class TestExecuteWithRetry:
         }
 
 
-class TestPydanticAIRetriesDisabled:
-    """Tests that Pydantic AI's own retry mechanism is disabled."""
+class TestPydanticAIRetriesSplit:
+    """Tests that Pydantic AI's retry budgets are split correctly."""
 
-    def test_pydantic_ai_internal_retries_are_zero(self) -> None:
-        """Pydantic AI internal retries must be disabled so Conductor controls retries."""
+    def test_pydantic_ai_tool_retries_zero_output_retries_enabled(self) -> None:
+        """Pydantic AI tool retries must be disabled so Conductor controls retries,
+        but output retries must be enabled for structured-output recovery."""
         agent_def = AgentDef(name="single-shot")
 
         pydantic_agent = build_agent(agent_def, system_prompt="", rendered_prompt="")
 
-        assert pydantic_agent._max_output_retries == 0
         assert pydantic_agent._max_tool_retries == 0
+        assert pydantic_agent._max_output_retries == 2

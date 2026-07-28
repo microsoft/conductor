@@ -13,7 +13,10 @@ from typing import Any
 import pytest
 from pydantic import BaseModel
 from pydantic_ai import Agent
+from pydantic_ai.exceptions import UnexpectedModelBehavior
+from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart
 from pydantic_ai.models.anthropic import AnthropicModel
+from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.output import ToolOutput
 
 from conductor.config.schema import AgentDef, OutputField, ReasoningConfig
@@ -203,18 +206,99 @@ class TestReasoningMapping:
 
 
 class TestRetries:
-    """Tests for Pydantic AI retry disabling."""
+    """Tests for Pydantic AI retry budget configuration."""
 
-    def test_retries_are_zero(self) -> None:
-        """Pydantic AI own retries must be disabled so Conductor-level retry is
-        the only retry mechanism."""
+    def test_tool_retries_zero_output_retries_enabled(self) -> None:
+        """Pydantic AI tool retries must be disabled so Conductor-level retry is
+        the only retry mechanism, but output retries must be enabled so
+        structured-output agents can recover from plain-text responses."""
         agent_def = AgentDef(name="single-shot")
 
         pydantic_agent = build_agent(agent_def, system_prompt="", rendered_prompt="")
 
         # pydantic-ai exposes retries via _max_output_retries / _max_tool_retries
-        assert pydantic_agent._max_output_retries == 0
         assert pydantic_agent._max_tool_retries == 0
+        assert pydantic_agent._max_output_retries == 2
+
+
+class TestOutputRecovery:
+    """Regression tests for structured-output recovery from plain-text responses."""
+
+    @pytest.mark.asyncio
+    async def test_plain_text_response_recovered_via_output_retry(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """When the model first answers with plain text instead of calling the
+        structured-output tool, pydantic-ai's output retry must recover and
+        return parsed structured output."""
+        calls: list[int] = []
+
+        async def _fake_model(
+            messages: list[Any],
+            info: Any,
+        ) -> ModelResponse:
+            calls.append(len(calls))
+            output_tool_name = info.output_tools[0].name
+            if len(calls) == 1:
+                return ModelResponse(parts=[TextPart(content='{"passed": true}')])
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name=output_tool_name,
+                        args={"passed": True, "issues": "no issues"},
+                    )
+                ]
+            )
+
+        monkeypatch.setattr(
+            "conductor.providers._pydantic_ai.agent_builder._resolve_anthropic_model",
+            lambda *_args, **_kwargs: FunctionModel(_fake_model),
+        )
+
+        agent_def = AgentDef(
+            name="validator",
+            output={
+                "passed": OutputField(type="boolean"),
+                "issues": OutputField(type="string"),
+            },
+        )
+        pydantic_agent = build_agent(agent_def, system_prompt="sys", rendered_prompt="go")
+
+        result = await pydantic_agent.run("go")
+
+        assert len(calls) == 2
+        assert result.output.passed is True
+        assert result.output.issues == "no issues"
+
+    @pytest.mark.asyncio
+    async def test_zero_output_retries_raises_on_plain_text(self) -> None:
+        """With output retries disabled, a plain-text answer to a tool-output
+        schema must raise ``UnexpectedModelBehavior`` immediately."""
+
+        async def _fake_model(
+            messages: list[Any],
+            info: Any,
+        ) -> ModelResponse:
+            return ModelResponse(parts=[TextPart(content='{"passed": true}')])
+
+        agent_def = AgentDef(
+            name="validator",
+            output={
+                "passed": OutputField(type="boolean"),
+                "issues": OutputField(type="string"),
+            },
+        )
+        output_type = build_agent(agent_def, system_prompt="", rendered_prompt="").output_type
+
+        agent = Agent(
+            model=FunctionModel(_fake_model),
+            output_type=output_type,
+            retries={"tools": 0, "output": 0},
+        )
+
+        with pytest.raises(UnexpectedModelBehavior):
+            await agent.run("go")
 
 
 class TestApiKey:

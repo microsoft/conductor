@@ -16,7 +16,7 @@ from anthropic import AsyncAnthropic
 from anthropic.types.beta.beta_thinking_config_enabled_param import (
     BetaThinkingConfigEnabledParam,
 )
-from pydantic_ai import Agent
+from pydantic_ai import Agent, AgentRetries
 from pydantic_ai.models.anthropic import AnthropicModel, AnthropicModelSettings
 from pydantic_ai.output import ToolOutput
 from pydantic_ai.providers.anthropic import AnthropicProvider
@@ -51,6 +51,15 @@ _ANTHROPIC_THINKING_OUTPUT_CAP: int = 64_000
 # Headroom above the thinking budget required by the Anthropic API:
 # ``max_tokens > budget_tokens``. Matches CLAUDE_ANSWER_HEADROOM_TOKENS.
 _ANTHROPIC_THINKING_HEADROOM: int = 4_096
+
+# Pydantic AI v2 splits the ``Agent(retries=...)`` budget into tool retries and
+# output retries. Tool retries must stay at 0 because Conductor's
+# ``execute_with_retry`` is the sole retry layer for API and tool failures.
+# Output retries, however, must be > 0 so that structured-output agents recover
+# when the model answers with plain text instead of calling the output tool.
+# This value matches the legacy ``RetryConfig.max_parse_recovery_attempts=2``
+# default used by ClaudeProvider.
+_OUTPUT_RECOVERY_RETRIES: int = 2
 
 
 def _resolve_anthropic_model(
@@ -355,7 +364,7 @@ def build_agent(
         name=agent.name,
         description=agent.description,
         model_settings=model_settings,
-        retries=0,
+        retries=AgentRetries(tools=0, output=_OUTPUT_RECOVERY_RETRIES),
         toolsets=toolsets or [],
         tools=tools or [],
     )

@@ -1,8 +1,11 @@
 """Conductor-level retry wrapper for the Pydantic AI provider.
 
 Mirrors the retry semantics of ``ClaudeProvider._execute_with_retry`` so that
-Pydantic AI's own retry budget is disabled (``retries=0`` in ``build_agent``)
-and all transient retries are handled by Conductor.
+Pydantic AI's tool retry budget is disabled (``retries={"tools": 0}`` in
+``build_agent``) and all transient API/tool retries are handled by Conductor.
+Structured-output recovery retries are left enabled in ``build_agent`` because
+plain-text answers to a tool-output schema must be recovered in-session before
+``execute_with_retry`` can see a result.
 """
 
 from __future__ import annotations
