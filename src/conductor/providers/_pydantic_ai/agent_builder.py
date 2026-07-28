@@ -242,6 +242,7 @@ def _build_model_settings(
     default_temperature: float | None,
     default_max_tokens: int | None,
     default_reasoning_effort: ReasoningEffort | None,
+    timeout: float | None = None,
 ) -> AnthropicModelSettings:
     """Build ``AnthropicModelSettings`` from the agent and runtime defaults.
 
@@ -249,7 +250,11 @@ def _build_model_settings(
         agent: The Conductor agent definition.
         default_temperature: Workflow-level default temperature.
         default_max_tokens: Workflow-level default ``max_tokens``.
-        default_reasoning_effort: Workflow-level default reasoning effort.
+        default_reasoning_effort: Workflow-wide default reasoning effort.
+        timeout: Optional per-request timeout in seconds. When set, it is
+            forwarded to the model settings so individual model calls are
+            bounded even when the caller does not wrap the run in its own
+            timeout.
 
     Returns:
         A TypedDict of Anthropic-specific settings ready for ``Agent``.
@@ -279,6 +284,8 @@ def _build_model_settings(
         settings["temperature"] = effective_temperature
     if effective_max_tokens is not None:
         settings["max_tokens"] = effective_max_tokens
+    if timeout is not None:
+        settings["timeout"] = timeout
     if thinking is not None:
         settings["anthropic_thinking"] = BetaThinkingConfigEnabledParam(
             type="enabled",
@@ -338,6 +345,7 @@ def build_agent(
         default_temperature,
         default_max_tokens,
         default_reasoning_effort,
+        timeout=timeout,
     )
 
     pydantic_agent: Agent[Any, Any] = Agent(
