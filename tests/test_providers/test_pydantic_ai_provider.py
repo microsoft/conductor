@@ -280,10 +280,10 @@ class TestExecuteDialogTurnReasoning:
 class TestMCPToolFilter:
     """Tests for MCP tool filtering semantics."""
 
-    async def test_empty_tool_filter_does_not_exclude_mcp_tools(
+    async def test_empty_resolved_filter_does_not_exclude_mcp_tools(
         self, provider: ClaudeProvider
     ) -> None:
-        # Requirement: issue #37 — empty resolved tool filter must not exclude MCP tools.
+        # Requirement: issue #37 — an empty resolved filter grants all tools when unspecified.
         mock_mcp = MagicMock()
         mock_mcp.get_all_tools.return_value = [
             {
@@ -296,7 +296,6 @@ class TestMCPToolFilter:
         ]
 
         provider._mcp_managers = {os.getcwd(): mock_mcp}
-
         captured_toolsets: list[Any] = []
 
         def spy_build_agent(*args: Any, **kwargs: Any) -> Any:
@@ -317,7 +316,47 @@ class TestMCPToolFilter:
             )
 
         assert len(captured_toolsets) == 1
+        tools = await captured_toolsets[0].get_tools(None)
+        assert "filesystem__read_file" in tools
+
+    async def test_explicit_empty_agent_tools_exclude_mcp_tools(
+        self, provider: ClaudeProvider
+    ) -> None:
+        # Requirement: a synthetic validator's explicit tools=[] disables workflow MCP tools.
+        mock_mcp = MagicMock()
+        mock_mcp.get_all_tools.return_value = [
+            {
+                "name": "filesystem__read_file",
+                "description": "Read a file from the filesystem",
+                "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}},
+                "server": "filesystem",
+                "original_name": "read_file",
+            }
+        ]
+
+        provider._mcp_managers = {os.getcwd(): mock_mcp}
+
+        captured_toolsets: list[Any] = []
+
+        def spy_build_agent(*args: Any, **kwargs: Any) -> Any:
+            captured_toolsets.extend(kwargs.get("toolsets", []))
+            return _build_text_agent("hello")
+
+        agent = AgentDef(name="validator", model="test", prompt="Validate", tools=[])
+
+        with patch(
+            "conductor.providers._pydantic_ai.agent_builder.build_agent",
+            side_effect=spy_build_agent,
+        ):
+            await provider.execute(
+                agent=agent,
+                context={},
+                rendered_prompt="Validate",
+                tools=[],
+            )
+
+        assert len(captured_toolsets) == 1
         mcp_toolset = captured_toolsets[0]
 
         tools = await mcp_toolset.get_tools(None)
-        assert "filesystem__read_file" in tools
+        assert tools == {}
