@@ -26,7 +26,7 @@ from pydantic_ai.tools import Tool
 from conductor.config.schema import OutputField
 from conductor.exceptions import ProviderError
 from conductor.providers._pydantic_ai.converters import output_schema_to_pydantic_model
-from conductor.providers._pydantic_ai.interrupt import run_with_interrupt
+from conductor.providers._pydantic_ai.interrupt import _make_interrupt_message, run_with_interrupt
 
 
 @pytest.fixture(autouse=True)
@@ -50,6 +50,14 @@ def _make_structured_agent() -> Agent[Any, Any]:
         output_type=ToolOutput(dynamic_model),
         retries=0,
     )
+
+
+def test_structured_interrupt_requests_registered_output_tool() -> None:
+    # Requirement: structured interrupt recovery names Pydantic AI's registered output tool.
+    message = _make_interrupt_message(has_output_schema=True)
+
+    assert "final_result" in message.content
+    assert "emit_output" not in message.content
 
 
 class TestInterruptBeforeRun:

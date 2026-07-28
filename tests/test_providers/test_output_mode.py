@@ -283,7 +283,7 @@ class TestClaudeOutputModeRaw:
         assert result.content == {"result": "raw output"}
 
 
-def test_no_emit_output_tool_in_raw_agent() -> None:
+def test_no_final_result_tool_in_raw_agent() -> None:
     """output_mode=raw must not register the structured-output 'final_result' tool."""
     agent = AgentDef(
         name="a",

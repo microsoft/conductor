@@ -48,7 +48,7 @@ _INTERRUPTION_USER_PROMPT = (
 
 _INTERRUPTION_TOOL_PROMPT = (
     "The user has interrupted execution. Please immediately call the "
-    "'emit_output' tool with your best partial result based on the work "
+    "'final_result' tool with your best partial result based on the work "
     "completed so far. Return whatever you have, even if incomplete."
 )
 
