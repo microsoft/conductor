@@ -69,28 +69,13 @@ FAKE_MCP_TOOLS: list[dict[str, Any]] = [
 def _make_provider_with_mcp() -> ClaudeProvider:
     """Create a ClaudeProvider pre-wired with a mock MCP manager.
 
-    The provider is constructed via ``__new__`` to bypass real SDK
-    initialisation, then populated with the minimum attributes needed
-    for ``execute()`` to reach the MCP tool-building code path.
+    The provider is constructed through its real ``__init__`` so it has
+    every attribute ``execute()`` expects, then the network client and MCP
+    pool are replaced with test doubles. This keeps the fixture aligned
+    with the provider's attribute contract when the implementation changes.
     """
-    provider = ClaudeProvider.__new__(ClaudeProvider)
-    provider._api_key = None
-    provider._base_url = None
+    provider = ClaudeProvider(api_key="test-key")
     provider._client = MagicMock()
-    provider._default_model = "claude-3-5-sonnet-latest"
-    provider._default_temperature = None
-    provider._default_max_tokens = 8192
-    provider._retry_config = MagicMock()
-    provider._retry_config.max_attempts = 1
-    provider._retry_config.base_delay = 1.0
-    provider._retry_config.max_delay = 30.0
-    provider._retry_config.jitter = 0.0
-    provider._retry_config.max_parse_recovery_attempts = 2
-    provider._retry_history = []
-    provider._default_max_agent_iterations = 50
-    provider._default_max_session_seconds = None
-    provider._default_reasoning_effort = None
-    provider._tool_output_config = MagicMock()
 
     # Pre-wire a mock MCP manager so _get_mcp_manager_for_cwd returns it.
     mock_mcp = MagicMock()
@@ -103,6 +88,7 @@ def _make_provider_with_mcp() -> ClaudeProvider:
 
     provider._mcp_managers = {os.getcwd(): mock_mcp}
     provider._mcp_manager_locks = {}
+    provider._tool_output_config = MagicMock()
 
     return provider
 
