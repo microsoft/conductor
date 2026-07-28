@@ -721,6 +721,8 @@ class ClaudeProvider(AgentProvider):
                 default_model=self._default_model,
                 api_key=self._api_key,
                 base_url=self._base_url,
+                auth_token=self._auth_token,
+                timeout=self._timeout,
             )
 
             pydantic_agent = Agent(
@@ -818,7 +820,9 @@ class ClaudeProvider(AgentProvider):
             default_max_tokens=self._default_max_tokens,
             default_reasoning_effort=self._default_reasoning_effort,
             api_key=self._api_key,
+            auth_token=self._auth_token,
             base_url=self._base_url,
+            timeout=self._timeout,
             toolsets=toolsets,
         )
 

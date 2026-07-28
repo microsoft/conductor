@@ -11,6 +11,8 @@ import logging
 import os
 from typing import TYPE_CHECKING, Any
 
+from anthropic import NOT_GIVEN as ANTHROPIC_NOT_GIVEN
+from anthropic import AsyncAnthropic
 from anthropic.types.beta.beta_thinking_config_enabled_param import (
     BetaThinkingConfigEnabledParam,
 )
@@ -56,34 +58,56 @@ def _resolve_anthropic_model(
     default_model: str | None = None,
     api_key: str | None = None,
     base_url: str | None = None,
+    auth_token: str | None = None,
+    timeout: float | None = None,
 ) -> AnthropicModel:
     """Build a Pydantic AI ``AnthropicModel`` from the agent definition.
 
-    Resolves the model identifier, API key, and optional base URL, mirroring
-    the minimal client construction semantics of ``ClaudeProvider``.
+    Resolves the model identifier, API key, optional base URL, auth token, and
+    timeout, mirroring the client construction semantics of ``ClaudeProvider``.
+    Transport-level retries are explicitly disabled because Conductor's own
+    retry layer is the sole retry mechanism.
 
     Args:
         agent: The Conductor agent definition.
         default_model: Fallback model identifier when ``agent.model`` is unset.
         api_key: Anthropic API key. Falls back to ``ANTHROPIC_API_KEY`` env var.
         base_url: Optional custom API endpoint.
+        auth_token: Optional bearer-auth token for gateway / LiteLLM
+            endpoints. Falls back to ``ANTHROPIC_AUTH_TOKEN`` env var handled by
+            the SDK when omitted here.
+        timeout: Request timeout in seconds. ``None`` lets the Anthropic SDK
+            apply its own default.
 
     Returns:
         A configured Pydantic AI ``AnthropicModel`` instance.
 
     Raises:
-        ValidationError: If no API key is available.
+        ValidationError: If no API key or auth token is available.
     """
     effective_api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
-    if not effective_api_key:
+    effective_auth_token = auth_token or os.environ.get("ANTHROPIC_AUTH_TOKEN")
+
+    if not effective_api_key and not effective_auth_token:
         raise ValidationError(
-            "ANTHROPIC_API_KEY environment variable is not set and no api_key was provided",
-            suggestion="Set ANTHROPIC_API_KEY or pass api_key to the provider.",
+            "ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN environment variables are not set "
+            "and no api_key or auth_token was provided",
+            suggestion="Set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN, "
+            "or pass api_key/auth_token to the provider.",
         )
 
     model_name = (agent.model or default_model) or DEFAULT_ANTHROPIC_MODEL
 
-    provider = AnthropicProvider(api_key=effective_api_key, base_url=base_url)
+    # Disable transport-level retries; Conductor's execute_with_retry is the
+    # only retry layer allowed by the provider plan (Must-NOT-Have double retry).
+    anthropic_client = AsyncAnthropic(
+        api_key=effective_api_key,
+        auth_token=effective_auth_token,
+        base_url=base_url,
+        timeout=timeout if timeout is not None else ANTHROPIC_NOT_GIVEN,
+        max_retries=0,
+    )
+    provider = AnthropicProvider(anthropic_client=anthropic_client)
     return AnthropicModel(model_name=model_name, provider=provider)
 
 
@@ -272,7 +296,9 @@ def build_agent(
     default_max_tokens: int | None = None,
     default_reasoning_effort: ReasoningEffort | None = None,
     api_key: str | None = None,
+    auth_token: str | None = None,
     base_url: str | None = None,
+    timeout: float | None = None,
     toolsets: list[AgentToolset[Any]] | None = None,
     tools: list[Any] | None = None,
 ) -> Agent[Any, Any]:
@@ -287,7 +313,10 @@ def build_agent(
         default_max_tokens: Workflow-level default ``max_tokens``.
         default_reasoning_effort: Workflow-level default reasoning effort.
         api_key: Anthropic API key. Falls back to ``ANTHROPIC_API_KEY`` env var.
+        auth_token: Optional bearer-auth token for gateway / LiteLLM endpoints.
         base_url: Optional custom API endpoint.
+        timeout: Request timeout in seconds. ``None`` lets the Anthropic SDK use
+            its own default.
         toolsets: Optional Pydantic AI toolsets to register. Used by Phase 4 to
             inject MCP toolsets without changing this signature.
         tools: Optional plain Pydantic AI tools to register. Also reserved for
@@ -296,7 +325,9 @@ def build_agent(
     Returns:
         A configured Pydantic AI ``Agent`` ready to run.
     """
-    model = _resolve_anthropic_model(agent, default_model, api_key, base_url)
+    model = _resolve_anthropic_model(
+        agent, default_model, api_key, base_url, auth_token=auth_token, timeout=timeout
+    )
 
     output_type = _build_output_type(agent)
     if output_type is None:

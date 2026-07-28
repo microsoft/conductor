@@ -218,11 +218,12 @@ class TestRetries:
 
 
 class TestApiKey:
-    """Tests for API key resolution."""
+    """Tests for API key and auth token resolution."""
 
-    def test_missing_api_key_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Building an agent without an API key must raise ValidationError."""
+    def test_missing_api_key_and_auth_token_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Building an agent without an API key or auth token must raise ValidationError."""
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
         agent_def = AgentDef(name="unauthenticated")
 
         with pytest.raises(ValidationError):
@@ -231,6 +232,7 @@ class TestApiKey:
     def test_explicit_api_key_used(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """An explicit api_key argument must be used even when the env var is absent."""
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
         agent_def = AgentDef(name="authenticated")
 
         pydantic_agent = build_agent(
@@ -241,3 +243,68 @@ class TestApiKey:
         )
 
         assert isinstance(pydantic_agent.model, AnthropicModel)
+
+    def test_auth_token_only_no_api_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An auth_token alone must satisfy authentication with no API key set."""
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+        agent_def = AgentDef(name="bearer_authenticated")
+
+        pydantic_agent = build_agent(
+            agent_def,
+            system_prompt="",
+            rendered_prompt="",
+            auth_token="bearer-token",
+        )
+
+        assert isinstance(pydantic_agent.model, AnthropicModel)
+
+
+class TestClientConstruction:
+    """Tests that Anthropic SDK client construction matches Conductor semantics."""
+
+    def test_transport_retries_are_disabled(self) -> None:
+        """The Anthropic client is built with max_retries=0; only Conductor's
+        retry layer must retry."""
+        agent_def = AgentDef(name="no_double_retry")
+
+        pydantic_agent = build_agent(
+            agent_def,
+            system_prompt="",
+            rendered_prompt="",
+            api_key="explicit-key",
+        )
+
+        assert isinstance(pydantic_agent.model, AnthropicModel)
+        # The AnthropicProvider was created from an explicit AsyncAnthropic client
+        # built with max_retries=0.
+        assert pydantic_agent.model.client.max_retries == 0
+
+    def test_timeout_is_forwarded(self) -> None:
+        """The provided timeout must reach the Anthropic SDK client."""
+        agent_def = AgentDef(name="timeout_agent")
+
+        pydantic_agent = build_agent(
+            agent_def,
+            system_prompt="",
+            rendered_prompt="",
+            api_key="explicit-key",
+            timeout=120.0,
+        )
+
+        assert isinstance(pydantic_agent.model, AnthropicModel)
+        assert pydantic_agent.model.client.timeout == 120.0
+
+    def test_auth_token_reaches_client(self) -> None:
+        """The provided auth_token must reach the Anthropic SDK client."""
+        agent_def = AgentDef(name="token_agent")
+
+        pydantic_agent = build_agent(
+            agent_def,
+            system_prompt="",
+            rendered_prompt="",
+            auth_token="bearer-token",
+        )
+
+        assert isinstance(pydantic_agent.model, AnthropicModel)
+        assert pydantic_agent.model.client.auth_token == "bearer-token"

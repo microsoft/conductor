@@ -152,6 +152,60 @@ class TestRetryHistory:
         assert provider.get_retry_history() == []
 
 
+class TestProviderConstructionForwarding:
+    """Tests that ClaudeProvider forwards construction settings to build_agent."""
+
+    async def test_execute_forwards_auth_token_and_timeout(self) -> None:
+        """execute() passes auth_token and timeout to build_agent."""
+        provider = ClaudeProvider(auth_token="bearer-token", timeout=120.0)
+        agent = AgentDef(name="forwarded", model="test", prompt="work")
+        captured_kwargs: dict[str, Any] = {}
+
+        def spy_build_agent(*args: Any, **kwargs: Any) -> Agent[Any, Any]:
+            captured_kwargs.update(kwargs)
+            return _build_text_agent("hello")
+
+        with (
+            patch(
+                "conductor.providers._pydantic_ai.agent_builder.build_agent",
+                side_effect=spy_build_agent,
+            ),
+            patch.object(provider, "_get_mcp_manager_for_cwd", return_value=None),
+        ):
+            await provider.execute(agent, {}, "work")
+
+        assert captured_kwargs.get("auth_token") == "bearer-token"
+        assert captured_kwargs.get("timeout") == 120.0
+
+    async def test_dialog_turn_forwards_auth_token_and_timeout(self) -> None:
+        """execute_dialog_turn() passes auth_token and timeout to _resolve_anthropic_model."""
+        provider = ClaudeProvider(auth_token="bearer-token", timeout=120.0)
+
+        async def fake_run(*args: Any, **kwargs: Any) -> Any:
+            class FakeResult:
+                output = "dialog reply"
+
+            return FakeResult()
+
+        with (
+            patch(
+                "conductor.providers._pydantic_ai.agent_builder._resolve_anthropic_model"
+            ) as mock_resolve_model,
+            patch("pydantic_ai.Agent") as mock_agent_cls,
+        ):
+            mock_agent = mock_agent_cls.return_value
+            mock_agent.run = fake_run
+            await provider.execute_dialog_turn(
+                "system prompt",
+                "user message",
+                history=[],
+            )
+
+        kwargs = mock_resolve_model.call_args.kwargs
+        assert kwargs.get("auth_token") == "bearer-token"
+        assert kwargs.get("timeout") == 120.0
+
+
 class TestExecuteDialogTurn:
     """Tests for the dialog-turn path."""
 
