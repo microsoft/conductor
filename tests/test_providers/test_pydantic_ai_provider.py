@@ -17,7 +17,7 @@ from pydantic import BaseModel
 from pydantic_ai import Agent
 from pydantic_ai.models.test import TestModel
 
-from conductor.config.schema import AgentDef, OutputField
+from conductor.config.schema import AgentDef, OutputField, RetryPolicy
 from conductor.exceptions import ValidationError
 from conductor.providers.claude import ClaudeProvider
 
@@ -176,6 +176,32 @@ class TestProviderConstructionForwarding:
 
         assert captured_kwargs.get("auth_token") == "bearer-token"
         assert captured_kwargs.get("timeout") == 120.0
+
+    async def test_execute_forwards_parse_recovery_attempts(self) -> None:
+        # Requirement: per-agent parse recovery config controls Pydantic AI output retries.
+        provider = ClaudeProvider(api_key="test-key")
+        agent = AgentDef(
+            name="custom-recovery",
+            model="test",
+            prompt="work",
+            retry=RetryPolicy(max_parse_recovery_attempts=4),
+        )
+        captured_kwargs: dict[str, Any] = {}
+
+        def spy_build_agent(*args: Any, **kwargs: Any) -> Agent[Any, Any]:
+            captured_kwargs.update(kwargs)
+            return _build_text_agent("hello")
+
+        with (
+            patch(
+                "conductor.providers._pydantic_ai.agent_builder.build_agent",
+                side_effect=spy_build_agent,
+            ),
+            patch.object(provider, "_get_mcp_manager_for_cwd", return_value=None),
+        ):
+            await provider.execute(agent, {}, "work")
+
+        assert captured_kwargs.get("max_parse_recovery_attempts") == 4
 
     async def test_dialog_turn_forwards_auth_token_and_timeout(self) -> None:
         """execute_dialog_turn() passes auth_token and timeout to _resolve_anthropic_model."""

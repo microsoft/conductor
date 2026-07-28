@@ -811,6 +811,23 @@ class ClaudeProvider(AgentProvider):
                 )
             )
 
+        retry_cfg = _resolve_retry_config(
+            agent,
+            PydanticRetryConfig(
+                max_attempts=self._retry_config.max_attempts,
+                base_delay=self._retry_config.base_delay,
+                max_delay=self._retry_config.max_delay,
+                jitter=self._retry_config.jitter,
+                backoff=self._retry_config.backoff,
+                retry_on=(
+                    list(self._retry_config.retry_on)
+                    if self._retry_config.retry_on is not None
+                    else None
+                ),
+                max_parse_recovery_attempts=self._retry_config.max_parse_recovery_attempts,
+            ),
+        )
+
         pydantic_agent = build_agent(
             agent=agent,
             system_prompt=agent.system_prompt or "",
@@ -819,6 +836,7 @@ class ClaudeProvider(AgentProvider):
             default_temperature=self._default_temperature,
             default_max_tokens=self._default_max_tokens,
             default_reasoning_effort=self._default_reasoning_effort,
+            max_parse_recovery_attempts=retry_cfg.max_parse_recovery_attempts,
             api_key=self._api_key,
             auth_token=self._auth_token,
             base_url=self._base_url,
@@ -835,22 +853,6 @@ class ClaudeProvider(AgentProvider):
             agent.max_session_seconds
             if agent.max_session_seconds is not None
             else self._default_max_session_seconds
-        )
-        retry_cfg = _resolve_retry_config(
-            agent,
-            PydanticRetryConfig(
-                max_attempts=self._retry_config.max_attempts,
-                base_delay=self._retry_config.base_delay,
-                max_delay=self._retry_config.max_delay,
-                jitter=self._retry_config.jitter,
-                backoff=self._retry_config.backoff,
-                retry_on=(
-                    list(self._retry_config.retry_on)
-                    if self._retry_config.retry_on is not None
-                    else None
-                ),
-                max_parse_recovery_attempts=self._retry_config.max_parse_recovery_attempts,
-            ),
         )
 
         self._retry_history.clear()
