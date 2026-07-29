@@ -176,9 +176,22 @@ class TestToolsAllowlistCrossCheck:
         patch_caps({"copilot": _caps(workflow_tools_passthrough=False, mcp_tools=True)})
         config = _build_workflow(
             agents=[AgentDef(name="a", prompt="hi", tools=[])],
+            mcp_servers={"docs": MCPServerDef(command="docs-server")},
         )
         with pytest.raises(ConfigurationError, match="there is no way to disable tools"):
             validate_workflow_config(config)
+
+    def test_empty_tools_list_with_mcp_tools_but_no_servers_is_allowed(
+        self, patch_caps: Any
+    ) -> None:
+        """With no ``mcp_servers`` declared there is nothing to forward, so
+        ``tools: []`` genuinely disables every tool and must stay valid even
+        against an ``mcp_tools=True`` provider."""
+        patch_caps({"copilot": _caps(workflow_tools_passthrough=False, mcp_tools=True)})
+        config = _build_workflow(
+            agents=[AgentDef(name="a", prompt="hi", tools=[])],
+        )
+        validate_workflow_config(config)  # no raise
 
     def test_non_empty_tools_list_against_no_passthrough_errors(self, patch_caps: Any) -> None:
         patch_caps({"copilot": _caps(workflow_tools_passthrough=False)})
@@ -1332,7 +1345,12 @@ class TestAcaRealCapabilitiesCrossCheck:
     it as the workflow default.
     """
 
-    def _aca_workflow(self, *, agents: list[AgentDef]) -> WorkflowConfig:
+    def _aca_workflow(
+        self,
+        *,
+        agents: list[AgentDef],
+        mcp_servers: dict[str, MCPServerDef] | None = None,
+    ) -> WorkflowConfig:
         from conductor.config.schema import ProviderSettings
 
         return WorkflowConfig(
@@ -1340,7 +1358,8 @@ class TestAcaRealCapabilitiesCrossCheck:
                 name="test",
                 entry_point=agents[0].name,
                 runtime=RuntimeConfig(
-                    provider=ProviderSettings(name="aca", pool_endpoint="https://pool.example.com")
+                    provider=ProviderSettings(name="aca", pool_endpoint="https://pool.example.com"),
+                    mcp_servers=mcp_servers or {},
                 ),
             ),
             agents=agents,
@@ -1375,9 +1394,19 @@ class TestAcaRealCapabilitiesCrossCheck:
         patch_caps({"aca": AcaRuntimeProvider.CAPABILITIES})
         config = self._aca_workflow(
             agents=[AgentDef(name="a", prompt="hi", tools=[])],
+            mcp_servers={"docs": MCPServerDef(command="docs-server")},
         )
         with pytest.raises(ConfigurationError, match="there is no way to disable tools"):
             validate_workflow_config(config)
+
+    def test_empty_tools_without_mcp_servers_passes_against_aca(self, patch_caps: Any) -> None:
+        """With no ``mcp_servers`` declared the runner has nothing to attach,
+        so ``tools: []`` genuinely disables every tool and must validate."""
+        from conductor.providers.aca import AcaRuntimeProvider
+
+        patch_caps({"aca": AcaRuntimeProvider.CAPABILITIES})
+        config = self._aca_workflow(agents=[AgentDef(name="a", prompt="hi", tools=[])])
+        validate_workflow_config(config)  # no raise
 
     def test_no_tools_against_real_aca_capabilities_passes(self, patch_caps: Any) -> None:
         """Positive control: omitting ``tools:`` (agent gets the provider's

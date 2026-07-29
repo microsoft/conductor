@@ -1617,9 +1617,9 @@ def _validate_provider_capabilities(
           runner attaches every configured MCP server unconditionally). There
           is no allowlist value, empty or not, that provider can honor, so
           ``tools: []`` would misleadingly pass validation while every tool
-          stays attached. When ``mcp_tools=False`` there is nothing to
-          forward regardless of the list, so ``tools: []`` genuinely disables
-          all tools and stays valid.
+          stays attached. This only applies when the workflow actually declares
+          ``mcp_servers``: with nothing to forward, ``tools: []`` genuinely
+          disables all tools and stays valid regardless of ``mcp_tools``.
         * Omitted ``tools:`` + non-empty workflow-level ``tools:`` — the agent
           inherits that list at runtime (``resolve_agent_tools`` returns a copy)
           and hits the same refusal mid-run (now a ``resolves to tools=[...]``
@@ -1633,7 +1633,7 @@ def _validate_provider_capabilities(
                     f"(capabilities.workflow_tools_passthrough=False). Silently "
                     f"granting different tools than declared is a security regression."
                 )
-            elif caps.mcp_tools:
+            elif caps.mcp_tools and workflow_mcp_servers:
                 errors.append(
                     f"Agent '{agent.name}' declares 'tools: []' to disable all tools, but "
                     f"provider '{provider_name}' forwards the full configured MCP server "

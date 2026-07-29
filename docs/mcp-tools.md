@@ -89,7 +89,7 @@ mcp_servers:
 
 The configuration fields are the same as `http`.
 
-> **Provider note:** The Claude provider only supports `stdio` servers. The `http` and `sse` types are supported by the Copilot provider only.
+> **Provider note:** The Claude provider only supports `stdio` servers. The `http` and `sse` types are supported by the Copilot and Claude Agent SDK providers.
 
 ## Configuration Reference
 
@@ -326,12 +326,12 @@ workflow:
 
 | Feature | Copilot | Claude | Claude Agent SDK | Hermes |
 |---|---|---|---|---|
-| stdio servers | ✅ | ✅ | ❌ | ❌ |
-| http servers | ✅ | ❌ | ❌ | ❌ |
-| sse servers | ✅ | ❌ | ❌ | ❌ |
-| Tool filtering | ✅ | ✅ | ❌ | ❌ |
+| stdio servers | ✅ | ✅ | ✅ | ❌ |
+| http servers | ✅ | ❌ | ✅ | ❌ |
+| sse servers | ✅ | ❌ | ✅ | ❌ |
+| Tool filtering | ✅ | ✅ | ❌ (refused) | ❌ |
 | OAuth auto-auth | ✅ | N/A | ❌ | ❌ |
-| env var passing | ⚠️ Bug ([#163](https://github.com/github/copilot-sdk/issues/163)) | ✅ | ❌ | ❌ |
+| env var passing | ⚠️ Bug ([#163](https://github.com/github/copilot-sdk/issues/163)) | ✅ | ✅ | ❌ |
 | Tool output limits | ✅ (native SDK) | ✅ (conductor-side) | ✅ (native CLI env var) | N/A |
 
 ### Copilot Provider
@@ -348,6 +348,19 @@ The Claude provider uses Conductor's built-in `MCPManager` to spawn and manage M
 - Runs an agentic loop: Claude decides when to call tools, Conductor executes them and returns results
 
 HTTP and SSE servers are not supported with the Claude provider. If configured, a warning is logged and the server is skipped.
+
+### Claude Agent SDK Provider
+
+The Claude Agent SDK provider translates each server into the SDK's own MCP config shape and passes it to the `claude` CLI, which owns server lifecycle and tool execution. All three transport types are supported, and MCP tools attach *alongside* the built-in `claude_code` tool preset — see [`examples/claude-agent-sdk-mcp.yaml`](../examples/claude-agent-sdk-mcp.yaml).
+
+Two behaviors are specific to this provider:
+
+- **Per-server `tools:` filters are refused.** The SDK's MCP config has no equivalent field, so a narrowing filter cannot be enforced. Rather than forward the server unfiltered — granting more tools than the workflow declared — Conductor fails at startup. Keep the default `tools: ["*"]`.
+- **Only declared servers are reachable.** Conductor sets `strict_mcp_config`, so a project `.mcp.json` or user-global MCP setting cannot add servers the workflow never declared.
+
+The generated config is written to a `0600` temp file and passed to the CLI by path, so resolved `env` values and `Authorization` headers stay out of the process command line. The file is deleted when the agent finishes.
+
+A per-server `timeout` has no SDK equivalent and is dropped with a warning.
 
 ## Examples
 

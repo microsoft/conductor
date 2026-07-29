@@ -5,7 +5,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import tempfile
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Final, cast
 
 from conductor.exceptions import ProviderError
@@ -101,6 +105,158 @@ _TOOL_RESULT_PREVIEW_LEN: Final[int] = 500
 # in pyproject.toml.
 _DEFAULT_MODEL: Final[str] = "claude-sonnet-4-5"
 
+# Sentinel meaning "expose every tool this server offers" in
+# ``MCPServerDef.tools``. Any other value is a narrowing filter the SDK has no
+# way to express — see :func:`_translate_mcp_servers`.
+_ALL_TOOLS: Final[str] = "*"
+
+
+def _translate_mcp_servers(mcp_servers: dict[str, Any]) -> dict[str, Any]:
+    """Translate Conductor MCP server configs into the SDK's config shapes.
+
+    The input is the already-resolved mapping built by
+    :func:`conductor.cli.run._build_mcp_servers` — environment variables and
+    auth headers have been expanded from the process environment by the time
+    it reaches us. Output matches the SDK's ``McpStdioServerConfig`` /
+    ``McpHttpServerConfig`` / ``McpSSEServerConfig`` TypedDicts.
+
+    Two Conductor fields have no SDK counterpart and are handled differently
+    on purpose:
+
+    * ``tools`` — a per-server allowlist. ``["*"]`` (the default) means "no
+      filter" and is simply dropped. Any narrowing value is **refused**:
+      ignoring it would hand the model more tools than the workflow declared,
+      the same security regression that justifies refusing the per-agent
+      ``tools:`` allowlist elsewhere in this provider.
+    * ``timeout`` — dropped with a warning. Unlike a tool filter, losing a
+      timeout cannot widen tool access, so it does not warrant a hard failure.
+
+    Args:
+        mcp_servers: Mapping of server name to resolved Conductor config.
+
+    Returns:
+        Mapping of server name to SDK-shaped config dict.
+
+    Raises:
+        ProviderError: If a server declares a narrowing ``tools`` filter, or
+            carries a type this provider cannot translate.
+    """
+    translated: dict[str, Any] = {}
+
+    for name, config in mcp_servers.items():
+        server_type = config.get("type") or "stdio"
+
+        tools = config.get("tools")
+        if tools is not None and list(tools) != [_ALL_TOOLS]:
+            raise ProviderError(
+                f"MCP server '{name}' declares a tool filter tools={list(tools)!r}, "
+                "but claude-agent-sdk cannot enforce per-server tool filters "
+                "(the SDK's MCP config has no equivalent field). Forwarding the "
+                "server unfiltered would grant more tools than declared.",
+                suggestion=(
+                    f"Set 'tools: [\"*\"]' on MCP server '{name}' to accept every "
+                    "tool it offers, or use the 'copilot' provider for agents that "
+                    "need per-server tool filtering."
+                ),
+            )
+
+        if config.get("timeout") is not None:
+            logger.warning(
+                "MCP server '%s' sets timeout=%s, which claude-agent-sdk does not "
+                "support; the CLI's own default will apply instead.",
+                name,
+                config["timeout"],
+            )
+
+        if server_type == "stdio":
+            entry: dict[str, Any] = {"type": "stdio", "command": config["command"]}
+            if config.get("args"):
+                entry["args"] = list(config["args"])
+            if config.get("env"):
+                entry["env"] = dict(config["env"])
+        elif server_type in ("http", "sse"):
+            entry = {"type": server_type, "url": config["url"]}
+            if config.get("headers"):
+                entry["headers"] = dict(config["headers"])
+        else:
+            raise ProviderError(
+                f"MCP server '{name}' has unsupported type '{server_type}' for "
+                "claude-agent-sdk (expected 'stdio', 'http', or 'sse').",
+            )
+
+        translated[name] = entry
+
+    return translated
+
+
+@contextmanager
+def _mcp_config_file(servers: dict[str, Any]) -> Iterator[str]:
+    """Write ``servers`` to a private temp file and yield its path.
+
+    Convenience wrapper around :func:`_write_mcp_config` /
+    :func:`_remove_mcp_config` for callers (and tests) that can use a
+    ``with`` block. ``execute`` uses the two functions directly because its
+    cleanup has to hang off an existing ``try``/``except`` chain.
+
+    Args:
+        servers: Already-translated, SDK-shaped server configs.
+
+    Yields:
+        Absolute path to the config file, valid for the duration of the block.
+    """
+    path = _write_mcp_config(servers)
+    try:
+        yield path
+    finally:
+        _remove_mcp_config(path)
+
+
+def _write_mcp_config(servers: dict[str, Any]) -> str:
+    """Write ``servers`` to a private temp file and return its path.
+
+    The SDK serializes a ``mcp_servers`` *dict* straight into a
+    ``--mcp-config <json>`` command-line argument, which would publish resolved
+    stdio ``env`` values and http/sse ``Authorization`` headers to anyone who
+    can read ``/proc/<pid>/cmdline``. Passing a path instead keeps those
+    secrets in a file only the current user can read.
+
+    ``tempfile.mkstemp`` creates the file with mode ``0600`` and ``O_EXCL``, so
+    the secrets are never briefly world-readable.
+
+    The payload uses the CLI's ``{"mcpServers": {...}}`` envelope — a bare
+    mapping is rejected with "mcpServers: Invalid input: expected record,
+    received undefined".
+
+    Args:
+        servers: Already-translated, SDK-shaped server configs.
+
+    Returns:
+        Absolute path to the config file. The caller owns its removal.
+    """
+    fd, path = tempfile.mkstemp(prefix="conductor-mcp-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump({"mcpServers": servers}, handle)
+    except BaseException:
+        _remove_mcp_config(path)
+        raise
+    return path
+
+
+def _remove_mcp_config(path: str) -> None:
+    """Delete an MCP config file written by :func:`_write_mcp_config`.
+
+    Best-effort: a cleanup failure must never mask the error that is already
+    propagating, so removal problems are logged and swallowed.
+
+    Args:
+        path: Path returned by :func:`_write_mcp_config`.
+    """
+    try:
+        os.unlink(path)
+    except OSError:
+        logger.debug("Failed to remove MCP config file %s", path, exc_info=True)
+
 
 class ClaudeAgentSdkProvider(AgentProvider):
     """Claude Agent SDK provider.
@@ -112,9 +268,12 @@ class ClaudeAgentSdkProvider(AgentProvider):
 
     CAPABILITIES = ProviderCapabilities(
         tier="experimental",
-        # MCP servers are rejected at the factory (no translation from
-        # Conductor's MCP config to the SDK's MCP dict is implemented).
-        mcp_tools=False,
+        # Workflow-level ``runtime.mcp_servers`` are translated to the SDK's
+        # own MCP config shapes and passed via ``ClaudeAgentOptions``
+        # (``strict_mcp_config=True``, so ambient project/user MCP config
+        # cannot add undeclared servers). A narrowing per-server ``tools:``
+        # filter has no SDK equivalent and is refused at construction.
+        mcp_tools=True,
         # Per-agent ``tools: []`` is honored (disables all tools). Per-agent
         # ``tools: [<names>]`` is refused loudly at execute time because
         # workflow tool names do not translate to Claude CLI tool IDs.
@@ -151,12 +310,13 @@ class ClaudeAgentSdkProvider(AgentProvider):
         # No global mutable state shared across calls — the SDK spawns
         # an independent subprocess per query() invocation.
         concurrent_safe=True,
-        # MCP servers are rejected at the factory (mcp_tools=False), so
-        # there is nothing to scope by directory — the SDK CLI manages its
-        # own cwd. Declared False so ``conductor validate`` errors when a
-        # workflow sets ``working_dir`` against this provider.
+        # The provider never forwards the engine-resolved working directory
+        # to ``ClaudeAgentOptions.cwd``, so an agent's ``working_dir`` would
+        # be silently ignored (both for the CLI itself and for any stdio MCP
+        # servers it spawns). Declared False so ``conductor validate`` errors
+        # instead of lying about where the agent runs.
         working_dir=False,
-        upstream_pin="claude-agent-sdk>=0.1.0",
+        upstream_pin="claude-agent-sdk>=0.2.82",
         maintainer="@lesandiz (best-effort)",
     )
 
@@ -165,16 +325,21 @@ class ClaudeAgentSdkProvider(AgentProvider):
         model: str | None = None,
         max_turns: int | None = None,
         max_session_seconds: float | None = None,
+        mcp_servers: dict[str, Any] | None = None,
     ) -> None:
         if not CLAUDE_AGENT_SDK_AVAILABLE:
             raise ProviderError(
                 "Claude Agent SDK not installed",
-                suggestion="Install with: uv add 'claude-agent-sdk>=0.1.0'",
+                suggestion="Install with: uv add 'claude-agent-sdk>=0.2.82'",
             )
 
         self._default_model = model or _DEFAULT_MODEL
         self._default_max_turns = max_turns if max_turns is not None else 50
         self._max_session_seconds = max_session_seconds
+        # Translate eagerly so an untranslatable server config fails during
+        # provider construction (i.e. at the factory boundary, before the
+        # workflow starts) rather than mid-run on the first agent.
+        self._mcp_servers = _translate_mcp_servers(mcp_servers) if mcp_servers else {}
 
     async def execute(
         self,
@@ -218,6 +383,15 @@ class ClaudeAgentSdkProvider(AgentProvider):
 
         sdk_tools, permission_mode = self._resolve_tool_config(tools, agent)
 
+        # Secrets inside the MCP config must not reach the CLI's argv, so the
+        # config goes to a private file and the SDK receives only its path.
+        mcp_config_path = _write_mcp_config(self._mcp_servers) if self._mcp_servers else None
+        mcp_options: dict[str, Any] = {}
+        if mcp_config_path is not None:
+            # strict_mcp_config: ignore project .mcp.json and user-global MCP
+            # settings so only the servers this workflow declared are reachable.
+            mcp_options = {"mcp_servers": mcp_config_path, "strict_mcp_config": True}
+
         options = ClaudeAgentOptions(
             model=model,
             system_prompt=agent.system_prompt,
@@ -225,6 +399,7 @@ class ClaudeAgentSdkProvider(AgentProvider):
             max_turns=max_turns,
             permission_mode=permission_mode,
             tools=sdk_tools,
+            **mcp_options,
         )
 
         content_parts: list[str] = []
@@ -367,6 +542,11 @@ class ClaudeAgentSdkProvider(AgentProvider):
                 suggestion=_classify_error_suggestion(e),
                 is_retryable=_is_retryable_exception(e),
             ) from e
+        finally:
+            # Covers the normal exit, both raising paths, and the early
+            # partial-output returns inside the loop.
+            if mcp_config_path is not None:
+                _remove_mcp_config(mcp_config_path)
 
         return self._build_output(
             content_parts,

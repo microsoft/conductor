@@ -49,7 +49,10 @@ dependencies = [
 
 [project.optional-dependencies]
 claude-agent-sdk = [
-    "claude-agent-sdk>=0.1.64",
+    # >=0.2.82 is the earliest release exposing `strict_mcp_config`, which the
+    # provider sets so ambient MCP config (project .mcp.json, user settings)
+    # cannot inject servers the workflow never declared.
+    "claude-agent-sdk>=0.2.82",
 ]
 aca = [
     "azure-identity>=1.19.0",

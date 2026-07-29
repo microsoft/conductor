@@ -177,22 +177,11 @@ async def create_provider(
                     suggestion="Install with: uv add 'claude-agent-sdk>=0.1.0'",
                 )
             # claude-agent-sdk delegates the agentic loop to the underlying
-            # `claude` CLI, which currently does not expose hooks for
-            # workflow-level MCP servers, sampling temperature, or token
-            # caps. Silently dropping any of these would either change
-            # behavior (mcp tools the workflow expects suddenly missing)
-            # or quietly violate user intent (temperature/max_tokens).
-            # Refuse loudly until proper plumbing exists.
-            if mcp_servers:
-                raise ProviderError(
-                    "claude-agent-sdk does not support workflow MCP servers "
-                    f"(received {sorted(mcp_servers)!r}).",
-                    suggestion=(
-                        "Remove `runtime.mcp_servers` for this workflow, or "
-                        "use the `copilot` or `claude` provider for agents "
-                        "that need MCP tools."
-                    ),
-                )
+            # `claude` CLI, which exposes no hooks for sampling temperature or
+            # token caps. Silently dropping either would quietly violate user
+            # intent, so refuse loudly until proper plumbing exists.
+            # (`mcp_servers` IS supported — translated in the provider and
+            # passed via ClaudeAgentOptions; see issue #335.)
             if temperature is not None:
                 raise ProviderError(
                     f"claude-agent-sdk does not support `temperature` (received {temperature!r}).",
@@ -211,6 +200,7 @@ async def create_provider(
                 model=default_model,
                 max_turns=max_agent_iterations,
                 max_session_seconds=max_session_seconds,
+                mcp_servers=mcp_servers,
             )
         case "aca":
             if not AZURE_IDENTITY_AVAILABLE:

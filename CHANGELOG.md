@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.26...HEAD)
 
+### Added
+
+- **`claude-agent-sdk` provider now supports MCP servers** — workflow-level
+  `runtime.mcp_servers` are translated to the SDK's own `stdio` / `http` /
+  `sse` config shapes and passed through `ClaudeAgentOptions`, so an agent can
+  use custom MCP tool servers *and* the built-in `claude_code` tool preset at
+  the same time. Previously the two were mutually exclusive: the provider
+  declared `mcp_tools=False` and the factory rejected any workflow declaring
+  MCP servers. The generated config is written to a `0600` temp file and
+  passed by path so resolved `env` values and `Authorization` headers never
+  reach the `claude` CLI's command line, and `strict_mcp_config` is enabled so
+  ambient project/user MCP config cannot inject undeclared servers. A
+  narrowing per-server `tools:` filter has no SDK equivalent and is refused at
+  startup rather than silently ignored. See
+  [`examples/claude-agent-sdk-mcp.yaml`](examples/claude-agent-sdk-mcp.yaml)
+  and [`docs/mcp-tools.md`](docs/mcp-tools.md).
+  ([#335](https://github.com/microsoft/conductor/issues/335))
+
+### Fixed
+
+- **`tools: []` no longer fails validation when no MCP servers are declared** —
+  the capability cross-check rejected an explicit empty allowlist against any
+  provider with `mcp_tools=True` and `workflow_tools_passthrough=False` (such
+  as `aca`), even when the workflow declared no `mcp_servers` and therefore had
+  nothing to forward. The check is now gated on MCP servers actually being
+  configured.
+  ([#335](https://github.com/microsoft/conductor/issues/335))
+
+### Changed
+
+- The `claude-agent-sdk` optional dependency floor is now
+  `claude-agent-sdk>=0.2.82`, the earliest release exposing
+  `strict_mcp_config`.
+  ([#335](https://github.com/microsoft/conductor/issues/335))
+
 ## [0.1.26](https://github.com/microsoft/conductor/compare/v0.1.25...v0.1.26) - 2026-07-27
 
 ### Added

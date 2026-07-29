@@ -3,7 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import json
+import logging
+import os
+import stat
 from dataclasses import dataclass, field
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 import pytest
@@ -25,7 +31,12 @@ from claude_agent_sdk import (  # noqa: E402
 
 from conductor.config.schema import AgentDef, OutputField  # noqa: E402
 from conductor.exceptions import ProviderError  # noqa: E402
-from conductor.providers.claude_agent_sdk import ClaudeAgentSdkProvider  # noqa: E402
+from conductor.providers.claude_agent_sdk import (  # noqa: E402
+    ClaudeAgentSdkProvider,
+    _mcp_config_file,
+    _remove_mcp_config,
+    _translate_mcp_servers,
+)
 
 
 def _assistant(
@@ -1683,3 +1694,227 @@ class TestSafeCallbackSwallowing:
                 event_callback=boom,
             )
         assert output.content == {"response": "hi"}
+
+
+class TestMcpServerTranslation:
+    """Conductor MCP configs must map onto the SDK's own config shapes (#335)."""
+
+    def test_stdio_server_translates(self) -> None:
+        translated = _translate_mcp_servers(
+            {
+                "docs": {
+                    "type": "stdio",
+                    "command": "docs-server",
+                    "args": ["--port", "1234"],
+                    "env": {"API_KEY": "secret"},
+                    "tools": ["*"],
+                }
+            }
+        )
+        assert translated == {
+            "docs": {
+                "type": "stdio",
+                "command": "docs-server",
+                "args": ["--port", "1234"],
+                "env": {"API_KEY": "secret"},
+            }
+        }
+
+    def test_stdio_omits_empty_args_and_env(self) -> None:
+        """Empty collections are dropped rather than sent as empty lists/dicts."""
+        translated = _translate_mcp_servers(
+            {"docs": {"type": "stdio", "command": "docs-server", "args": [], "tools": ["*"]}}
+        )
+        assert translated == {"docs": {"type": "stdio", "command": "docs-server"}}
+
+    def test_missing_type_defaults_to_stdio(self) -> None:
+        translated = _translate_mcp_servers({"docs": {"command": "docs-server"}})
+        assert translated["docs"]["type"] == "stdio"
+
+    @pytest.mark.parametrize("server_type", ["http", "sse"])
+    def test_remote_server_translates(self, server_type: str) -> None:
+        translated = _translate_mcp_servers(
+            {
+                "remote": {
+                    "type": server_type,
+                    "url": "https://mcp.example.com/tools",
+                    "headers": {"Authorization": "Bearer tok"},
+                    "tools": ["*"],
+                }
+            }
+        )
+        assert translated == {
+            "remote": {
+                "type": server_type,
+                "url": "https://mcp.example.com/tools",
+                "headers": {"Authorization": "Bearer tok"},
+            }
+        }
+
+    def test_remote_omits_empty_headers(self) -> None:
+        translated = _translate_mcp_servers(
+            {"remote": {"type": "http", "url": "https://x.test", "headers": {}}}
+        )
+        assert translated == {"remote": {"type": "http", "url": "https://x.test"}}
+
+    def test_narrowing_tool_filter_is_refused(self) -> None:
+        """Ignoring a per-server allowlist would grant more tools than declared."""
+        with pytest.raises(ProviderError, match="cannot enforce per-server tool filters"):
+            _translate_mcp_servers(
+                {"docs": {"type": "stdio", "command": "docs-server", "tools": ["search"]}}
+            )
+
+    def test_empty_tool_filter_is_refused(self) -> None:
+        """``tools: []`` is still a narrowing filter the SDK cannot express."""
+        with pytest.raises(ProviderError, match="cannot enforce per-server tool filters"):
+            _translate_mcp_servers(
+                {"docs": {"type": "stdio", "command": "docs-server", "tools": []}}
+            )
+
+    def test_unsupported_type_is_refused(self) -> None:
+        with pytest.raises(ProviderError, match="unsupported type 'grpc'"):
+            _translate_mcp_servers({"docs": {"type": "grpc", "url": "https://x.test"}})
+
+    def test_timeout_is_dropped_with_a_warning(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A dropped timeout cannot widen tool access, so it warns instead of raising."""
+        with caplog.at_level(logging.WARNING, logger="conductor.providers.claude_agent_sdk"):
+            translated = _translate_mcp_servers(
+                {"docs": {"type": "stdio", "command": "docs-server", "timeout": 5000}}
+            )
+        assert "timeout" not in translated["docs"]
+        assert "does not support" in caplog.text
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    def test_provider_translates_eagerly_at_construction(self) -> None:
+        """Bad MCP config must fail at the factory boundary, not mid-workflow."""
+        with pytest.raises(ProviderError, match="cannot enforce per-server tool filters"):
+            ClaudeAgentSdkProvider(
+                mcp_servers={"docs": {"type": "stdio", "command": "d", "tools": ["search"]}}
+            )
+
+
+class TestMcpConfigFile:
+    """MCP secrets must reach the CLI via a private file, never via argv (#335)."""
+
+    def test_config_file_is_owner_only_and_wrapped(self) -> None:
+        servers = {"docs": {"type": "stdio", "command": "docs-server"}}
+        with _mcp_config_file(servers) as path:
+            mode = stat.S_IMODE(os.stat(path).st_mode)
+            payload = json.loads(Path(path).read_text(encoding="utf-8"))
+
+        # 0600: resolved env values and Authorization headers live in here.
+        assert mode == 0o600
+        # The CLI rejects a bare mapping: "mcpServers: Invalid input:
+        # expected record, received undefined".
+        assert payload == {"mcpServers": servers}
+
+    def test_config_file_is_removed_on_exit(self) -> None:
+        with _mcp_config_file({"docs": {"type": "stdio", "command": "d"}}) as path:
+            assert Path(path).exists()
+        assert not Path(path).exists()
+
+    def test_config_file_is_removed_on_exception(self) -> None:
+        with (
+            contextlib.suppress(RuntimeError),
+            _mcp_config_file({"docs": {"type": "stdio", "command": "d"}}) as path,
+        ):
+            raise RuntimeError("boom")
+        assert not Path(path).exists()
+
+    def test_remove_is_best_effort(self) -> None:
+        """Cleanup failure must never mask the error already propagating."""
+        _remove_mcp_config("/nonexistent/conductor-mcp-does-not-exist.json")
+
+
+class TestMcpOptionsWiring:
+    """``execute`` must hand the SDK a config path and isolate ambient config."""
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_execute_passes_config_path_and_strict_flag(self) -> None:
+        captured: dict = {}
+        seen_payload: dict = {}
+
+        async def fake_query(**kwargs):
+            options = kwargs["options"]
+            captured["mcp_servers"] = options.mcp_servers
+            captured["strict"] = options.strict_mcp_config
+            # The file must still exist while the SDK is consuming it.
+            seen_payload.update(json.loads(Path(options.mcp_servers).read_text()))
+            yield _result(result="ok")
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider(
+                mcp_servers={"docs": {"type": "stdio", "command": "docs-server"}}
+            )
+            await provider.execute(
+                agent=AgentDef(name="t", prompt="hi"), context={}, rendered_prompt="hi"
+            )
+
+        # A path, not a dict — a dict would be serialized into the CLI's argv.
+        assert isinstance(captured["mcp_servers"], str)
+        assert captured["strict"] is True
+        assert seen_payload == {"mcpServers": {"docs": {"type": "stdio", "command": "docs-server"}}}
+        assert not Path(captured["mcp_servers"]).exists()
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_no_mcp_servers_leaves_sdk_defaults(self) -> None:
+        captured: dict = {}
+
+        async def fake_query(**kwargs):
+            captured["mcp_servers"] = kwargs["options"].mcp_servers
+            captured["strict"] = kwargs["options"].strict_mcp_config
+            yield _result(result="ok")
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider()
+            await provider.execute(
+                agent=AgentDef(name="t", prompt="hi"), context={}, rendered_prompt="hi"
+            )
+
+        assert captured["mcp_servers"] == {}
+        assert captured["strict"] is False
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_config_file_removed_when_query_raises(self) -> None:
+        captured: dict = {}
+
+        async def fake_query(**kwargs):
+            captured["path"] = kwargs["options"].mcp_servers
+            raise RuntimeError("sdk exploded")
+            yield  # pragma: no cover - unreachable, keeps this an async generator
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider(
+                mcp_servers={"docs": {"type": "stdio", "command": "docs-server"}}
+            )
+            with pytest.raises(ProviderError):
+                await provider.execute(
+                    agent=AgentDef(name="t", prompt="hi"), context={}, rendered_prompt="hi"
+                )
+
+        assert not Path(captured["path"]).exists()
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_config_file_removed_on_interrupt_return(self) -> None:
+        """The interrupt path returns early from inside the loop — still cleans up."""
+        captured: dict = {}
+        interrupt = asyncio.Event()
+        interrupt.set()
+
+        async def fake_query(**kwargs):
+            captured["path"] = kwargs["options"].mcp_servers
+            yield _assistant(content=[TextBlock(text="partial")])
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider(
+                mcp_servers={"docs": {"type": "stdio", "command": "docs-server"}}
+            )
+            output = await provider.execute(
+                agent=AgentDef(name="t", prompt="hi"),
+                context={},
+                rendered_prompt="hi",
+                interrupt_signal=interrupt,
+            )
+
+        assert output.partial is True
+        assert not Path(captured["path"]).exists()

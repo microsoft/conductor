@@ -253,20 +253,38 @@ class TestMaxSessionSeconds:
 class TestClaudeAgentSdkFactoryRejections:
     """Factory rejects workflow features claude-agent-sdk does not honor (#241 / A2).
 
-    Silently dropping mcp_servers, temperature, or max_tokens at the factory
-    boundary is a parity violation: agents that expect those features end up
-    running with different behavior than declared. Refuse loudly until proper
-    plumbing exists.
+    Silently dropping temperature or max_tokens at the factory boundary is a
+    parity violation: agents that expect those features end up running with
+    different behavior than declared. Refuse loudly until proper plumbing
+    exists. ``mcp_servers`` IS supported as of #335 — it is translated to the
+    SDK's own MCP config shapes and forwarded.
     """
 
     @pytest.mark.asyncio
-    async def test_factory_rejects_mcp_servers(self) -> None:
+    async def test_factory_forwards_mcp_servers(self) -> None:
         pytest.importorskip("claude_agent_sdk")
-        with pytest.raises(ProviderError, match="does not support workflow MCP servers"):
+        from conductor.providers.claude_agent_sdk import ClaudeAgentSdkProvider
+
+        provider = await create_provider(
+            "claude-agent-sdk",
+            validate=False,
+            mcp_servers={"docs": {"type": "stdio", "command": "docs-server"}},
+        )
+        assert isinstance(provider, ClaudeAgentSdkProvider)
+        assert provider._mcp_servers == {"docs": {"type": "stdio", "command": "docs-server"}}
+        await provider.close()
+
+    @pytest.mark.asyncio
+    async def test_factory_rejects_per_server_tool_filter(self) -> None:
+        """A narrowing per-server allowlist has no SDK equivalent — fail fast."""
+        pytest.importorskip("claude_agent_sdk")
+        with pytest.raises(ProviderError, match="cannot enforce per-server tool filters"):
             await create_provider(
                 "claude-agent-sdk",
                 validate=False,
-                mcp_servers={"docs": {"command": "docs-server"}},
+                mcp_servers={
+                    "docs": {"type": "stdio", "command": "docs-server", "tools": ["search"]}
+                },
             )
 
     @pytest.mark.asyncio

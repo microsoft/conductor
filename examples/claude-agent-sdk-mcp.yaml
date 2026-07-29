@@ -1,0 +1,97 @@
+# claude-agent-sdk + MCP servers
+#
+# Demonstrates the combination that was impossible before issue #335: the full
+# `claude_code` CLI tool preset AND custom MCP tool servers in the same agent.
+# Previously the provider declared `mcp_tools=False` and the factory refused
+# any workflow that declared `runtime.mcp_servers`, so authors had to choose
+# one or the other.
+#
+# How it works:
+#   - Conductor translates each `mcp_servers:` entry into the SDK's own
+#     `McpStdioServerConfig` / `McpHttpServerConfig` / `McpSSEServerConfig`
+#     shape and hands it to `ClaudeAgentOptions`.
+#   - The config is written to a private (0600) temp file and passed by path,
+#     so resolved `env` values and `Authorization` headers never appear in the
+#     `claude` CLI's command line (visible via /proc/<pid>/cmdline otherwise).
+#   - `strict_mcp_config` is enabled, so an ambient project `.mcp.json` or a
+#     user-global MCP setting cannot inject servers this workflow never
+#     declared.
+#
+# Two carve-outs still apply to this provider:
+#   - Per-server `tools:` filters are refused (the SDK's MCP config has no
+#     equivalent field, and ignoring a filter would grant MORE tools than
+#     declared). Use `tools: ["*"]`, which is the default.
+#   - Per-agent `tools:` allowlists are still refused
+#     (`workflow_tools_passthrough=False`). Omit `tools:` to get the
+#     `claude_code` preset plus every declared MCP server.
+#
+# Pre-requisites:
+#   pip install conductor[claude-agent-sdk]
+#   # Plus the `claude` CLI:
+#   npm install -g @anthropic-ai/claude-code
+#   claude login
+#   # The MCP server below is fetched on demand by npx (Node.js required).
+#
+# Usage:
+#   conductor run examples/claude-agent-sdk-mcp.yaml \
+#     --input question="What changed in the Python 3.13 release?"
+#
+# Validation only (no execution / no API calls):
+#   conductor validate examples/claude-agent-sdk-mcp.yaml
+
+workflow:
+  name: claude-agent-sdk-mcp
+  description: >
+    Research agent running on the experimental claude-agent-sdk provider with
+    a custom MCP search server attached alongside the built-in claude_code
+    tool preset.
+  entry_point: researcher
+
+  runtime:
+    provider: claude-agent-sdk
+    default_model: claude-sonnet-4-5
+    max_agent_iterations: 20
+
+    mcp_servers:
+      web-search:
+        type: stdio
+        command: npx
+        args: ["-y", "open-websearch@latest"]
+        env:
+          MODE: stdio
+        # Must stay ["*"] for this provider: a narrowing filter has no SDK
+        # equivalent and is refused at provider construction.
+        tools: ["*"]
+
+  limits:
+    max_iterations: 5
+    timeout_seconds: 600
+
+agents:
+  - name: researcher
+    description: Researches a question using MCP search plus the built-in tools
+    # NOTE: no `tools:` here on purpose. Omitting it grants the claude_code
+    # preset; the MCP servers above are attached on top of it. Declaring an
+    # explicit allowlist would fail validation for this provider.
+    prompt: |
+      Research the following question and report what you find.
+
+      Question: {{ workflow.input.question }}
+
+      Use the web-search MCP tools for current information, and the built-in
+      file and shell tools if local context helps.
+    output:
+      answer:
+        type: string
+        description: A concise answer to the question
+      sources:
+        type: array
+        description: URLs or references supporting the answer
+        items:
+          type: string
+    routes:
+      - to: $end
+
+output:
+  answer: "{{ researcher.output.answer }}"
+  sources: "{{ researcher.output.sources }}"
