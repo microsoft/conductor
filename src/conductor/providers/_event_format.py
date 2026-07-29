@@ -1,9 +1,12 @@
-"""Helpers for formatting tool-call event payloads emitted to subscribers.
+"""Helpers for formatting event payloads emitted to subscribers.
 
 The console renderer, JSONL event logger, and web dashboard all consume
 ``agent_tool_start`` / ``agent_tool_complete`` events from both providers.
 These helpers ensure the payloads are human-readable strings rather than
 Python ``repr()`` output of structured SDK objects.
+
+Parse-recovery events share this module so every provider emits an
+identically-shaped payload.
 
 See https://github.com/microsoft/conductor/issues/93.
 """
@@ -11,7 +14,56 @@ See https://github.com/microsoft/conductor/issues/93.
 from __future__ import annotations
 
 import json
+import logging
+from collections.abc import Callable
 from typing import Any
+
+logger = logging.getLogger(__name__)
+
+
+def emit_parse_recovery_event(
+    event_callback: Callable[[str, dict[str, Any]], None] | None,
+    *,
+    attempt: int,
+    max_attempts: int,
+    is_schema_failure: bool,
+    error: str,
+    max_error_chars: int = 500,
+) -> None:
+    """Emit an ``agent_parse_recovery`` event, swallowing subscriber errors.
+
+    Recovery attempts were previously visible only under verbose console
+    logging, so a run that silently burned its recovery budget left no trace
+    in the dashboard or the structured event log.
+
+    Args:
+        event_callback: Subscriber callback, or ``None`` to skip emission.
+        attempt: 1-based recovery attempt about to be made.
+        max_attempts: Configured recovery budget.
+        is_schema_failure: True when the response parsed but failed schema
+            validation, False for a JSON syntax failure.
+        error: The error that triggered this recovery attempt.
+        max_error_chars: Truncation limit for ``error``.
+
+    Raises:
+        Nothing. A failing subscriber must not break agent execution.
+    """
+    if event_callback is None:
+        return
+
+    truncated = error if len(error) <= max_error_chars else error[:max_error_chars] + "..."
+    try:
+        event_callback(
+            "agent_parse_recovery",
+            {
+                "attempt": attempt,
+                "max_attempts": max_attempts,
+                "reason": "schema" if is_schema_failure else "syntax",
+                "error": truncated,
+            },
+        )
+    except Exception:
+        logger.debug("Error in event_callback for agent_parse_recovery", exc_info=True)
 
 
 def format_tool_arguments(arguments: Any, max_length: int = 500) -> str | None:

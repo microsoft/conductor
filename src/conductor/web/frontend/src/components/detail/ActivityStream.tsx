@@ -51,6 +51,7 @@ function ActivityEntryRow({ entry }: { entry: ActivityEntry }) {
     'tool-complete': 'text-green-400',
     turn: 'text-amber-400',
     message: 'text-[var(--text)]',
+    'parse-recovery': 'text-yellow-400',
   };
 
   return (

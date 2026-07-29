@@ -16,6 +16,7 @@ export type EventType =
   | 'agent_tool_start'
   | 'agent_tool_complete'
   | 'agent_tool_output_truncated'
+  | 'agent_parse_recovery'
   | 'agent_turn_start'
   | 'agent_message'
   | 'script_started'
@@ -192,6 +193,14 @@ export interface AgentToolOutputTruncatedData {
   original_chars?: number;
   kept_chars?: number;
   spill_path?: string;
+}
+
+export interface AgentParseRecoveryData {
+  agent_name: string;
+  attempt?: number;
+  max_attempts?: number;
+  reason?: 'schema' | 'syntax';
+  error?: string;
 }
 
 export interface AgentTurnStartData {

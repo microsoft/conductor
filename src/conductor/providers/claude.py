@@ -41,9 +41,11 @@ from conductor.mcp.manager import (
     MCPManager,
 )
 from conductor.providers._event_format import (
+    emit_parse_recovery_event,
     extract_tool_result_text,
     format_tool_arguments,
 )
+from conductor.providers._output_shape import unwrap_scalar_wrappers
 from conductor.providers._schema import SchemaDepthError, build_json_schema_properties
 from conductor.providers.base import (
     AgentOutput,
@@ -1677,6 +1679,7 @@ class ClaudeProvider(AgentProvider):
                             thinking=thinking,
                             max_parse_recovery_attempts=max_parse_recovery_attempts,
                             system_prompt=system_prompt,
+                            event_callback=event_callback,
                         )
                     )
                 else:
@@ -1737,6 +1740,7 @@ class ClaudeProvider(AgentProvider):
                     thinking=thinking,
                     max_parse_recovery_attempts=max_parse_recovery_attempts,
                     system_prompt=system_prompt,
+                    event_callback=event_callback,
                 )
             else:
                 response = await self._execute_api_call(
@@ -2043,6 +2047,7 @@ class ClaudeProvider(AgentProvider):
         thinking: dict[str, Any] | None = None,
         max_parse_recovery_attempts: int | None = None,
         system_prompt: str | None = None,
+        event_callback: EventCallback | None = None,
     ) -> ClaudeResponse:
         """Execute API call with parse recovery for malformed JSON responses.
 
@@ -2061,12 +2066,16 @@ class ClaudeProvider(AgentProvider):
             max_parse_recovery_attempts: Resolved per-agent parse recovery limit.
                 None means use the provider-level default.
             system_prompt: Optional rendered system prompt forwarded to every API call.
+            event_callback: Optional callback used to surface recovery attempts.
 
         Returns:
             Claude API response.
 
         Raises:
             ProviderError: If all retry attempts fail with context about attempts.
+            ValidationError: If the final attempt parsed cleanly but failed
+                schema validation. The specific field error is preserved
+                rather than collapsed into a generic parse error.
         """
         effective_max_recovery = (
             max_parse_recovery_attempts
@@ -2075,6 +2084,7 @@ class ClaudeProvider(AgentProvider):
         )
         # Track recovery attempts for error reporting
         recovery_history: list[str] = []
+        last_schema_error: ValidationError | None = None
 
         # Initial attempt using non-streaming API call
         response = await self._execute_api_call(
@@ -2091,36 +2101,36 @@ class ClaudeProvider(AgentProvider):
         if not output_schema:
             return response
 
-        # Check if we got tool_use (success path)
-        if self._extract_structured_output(response) is not None:
-            logger.debug("Successfully extracted structured output from tool_use block")
+        outcome, assistant_text, schema_error = self._evaluate_structured_response(
+            response, output_schema
+        )
+        if outcome in ("success", "mcp_tools"):
             return response
 
-        # Check for MCP tool calls — return to agentic loop for execution
-        if self._has_mcp_tool_use(response):
-            logger.debug("Response contains MCP tool calls, returning to agentic loop")
-            return response
+        last_schema_error = schema_error
+        if outcome == "schema_error":
+            initial_text = assistant_text or ""
+            failure_reason = str(schema_error)
+        else:
+            initial_text = self._extract_text_from_response(response)
+            failure_reason = self._diagnose_json_failure(initial_text)
 
-        # Check if we can extract JSON from text (fallback success path)
-        json_content = self._extract_json_fallback(response)
-        if json_content is not None:
-            logger.warning(
-                "Claude returned text instead of tool_use, but JSON extraction succeeded "
-                "via fallback parsing. Consider reviewing prompt to encourage tool usage."
-            )
-            return response
-
-        # Parse recovery: JSON extraction failed
-        initial_text = self._extract_text_from_response(response)
-        failure_reason = self._diagnose_json_failure(initial_text)
         recovery_history.append(f"Attempt 0 (initial): {failure_reason}")
         logger.warning(
-            f"Initial JSON extraction failed: {failure_reason}. "
+            f"Initial structured output failed ({outcome}): {failure_reason}. "
             f"Starting parse recovery (max {effective_max_recovery} attempts)"
         )
 
         for attempt in range(1, effective_max_recovery + 1):
             logger.info(f"Parse recovery attempt {attempt}/{effective_max_recovery}")
+
+            emit_parse_recovery_event(
+                event_callback,
+                attempt=attempt,
+                max_attempts=effective_max_recovery,
+                is_schema_failure=outcome == "schema_error",
+                error=failure_reason,
+            )
 
             # Append recovery message with specific error context
             recovery_messages = messages.copy()
@@ -2133,11 +2143,8 @@ class ClaudeProvider(AgentProvider):
             recovery_messages.append(
                 {
                     "role": "user",
-                    "content": (
-                        f"Your previous response did not contain valid JSON. {failure_reason} "
-                        "Please provide your response in valid JSON format.\n\n"
-                        "IMPORTANT: Use the 'emit_output' tool to return your response "
-                        "in the required structured format."
+                    "content": self._build_recovery_instruction(
+                        failure_reason, is_schema_failure=outcome == "schema_error"
                     ),
                 }
             )
@@ -2153,27 +2160,26 @@ class ClaudeProvider(AgentProvider):
                 system_prompt=system_prompt,
             )
 
-            # Check if recovery succeeded (tool_use)
-            if self._extract_structured_output(response) is not None:
-                logger.info(f"Parse recovery succeeded on attempt {attempt} (tool_use)")
+            outcome, assistant_text, schema_error = self._evaluate_structured_response(
+                response, output_schema
+            )
+            if outcome == "success":
+                logger.info(f"Parse recovery succeeded on attempt {attempt}")
                 return response
-
-            # Check for MCP tool calls — return to agentic loop for execution
-            if self._has_mcp_tool_use(response):
+            if outcome == "mcp_tools":
                 logger.debug(
                     f"Recovery attempt {attempt} returned MCP tool calls, returning to agentic loop"
                 )
                 return response
 
-            # Check if recovery succeeded (JSON fallback)
-            json_content = self._extract_json_fallback(response)
-            if json_content is not None:
-                logger.info(f"Parse recovery succeeded on attempt {attempt} (JSON)")
-                return response
-
             # Record failure for this attempt
-            attempt_text = self._extract_text_from_response(response)
-            attempt_failure = self._diagnose_json_failure(attempt_text)
+            last_schema_error = schema_error
+            if outcome == "schema_error":
+                attempt_text = assistant_text or ""
+                attempt_failure = str(schema_error)
+            else:
+                attempt_text = self._extract_text_from_response(response)
+                attempt_failure = self._diagnose_json_failure(attempt_text)
             recovery_history.append(f"Attempt {attempt}: {attempt_failure}")
             logger.warning(f"Parse recovery attempt {attempt} failed: {attempt_failure}")
             # Update for next iteration
@@ -2185,6 +2191,10 @@ class ClaudeProvider(AgentProvider):
             f"Parse recovery exhausted after {effective_max_recovery} attempts. "
             f"History: {'; '.join(recovery_history)}"
         )
+        # A schema-shape failure keeps its own error: it names the offending
+        # field and type, which the generic parse error would discard.
+        if outcome == "schema_error" and last_schema_error is not None:
+            raise last_schema_error
         # is_retryable=False marks this as terminal: _is_retryable_error()
         # honors the flag directly for ProviderError, so the outer retry loop
         # will not retry parse exhaustion.
@@ -2198,6 +2208,90 @@ class ClaudeProvider(AgentProvider):
             ),
             is_retryable=False,
         )
+
+    def _build_recovery_instruction(self, failure_reason: str, *, is_schema_failure: bool) -> str:
+        """Build the user-turn instruction sent on a recovery attempt.
+
+        Args:
+            failure_reason: Diagnosis of what went wrong on the last attempt.
+            is_schema_failure: True when the response parsed cleanly but a
+                field had the wrong type, which needs different wording from
+                a syntax error.
+
+        Returns:
+            The instruction text for the recovery user message.
+        """
+        if is_schema_failure:
+            return (
+                f"Your previous response was valid JSON but did not match the required "
+                f"output schema. {failure_reason} Please correct the field types and "
+                "respond again.\n\n"
+                "IMPORTANT: Use the 'emit_output' tool to return your response in the "
+                "required structured format. Return scalar values directly rather than "
+                "wrapping them in an object."
+            )
+        return (
+            f"Your previous response did not contain valid JSON. {failure_reason} "
+            "Please provide your response in valid JSON format.\n\n"
+            "IMPORTANT: Use the 'emit_output' tool to return your response "
+            "in the required structured format."
+        )
+
+    def _evaluate_structured_response(
+        self,
+        response: Any,
+        output_schema: dict[str, OutputField],
+    ) -> tuple[str, str | None, ValidationError | None]:
+        """Classify a response against the declared output schema.
+
+        Schema validation runs here, inside the recovery loop, so a
+        wrong-shaped field is re-prompted like any other contract violation
+        rather than escaping to the caller as a terminal error.
+
+        MCP tool calls are deliberately not validated: that response is not a
+        final answer, and the agentic loop still has tools to execute.
+
+        Args:
+            response: Claude API response.
+            output_schema: Expected output schema.
+
+        Returns:
+            A ``(outcome, assistant_text, error)`` tuple. ``outcome`` is one of
+            ``success``, ``mcp_tools``, ``schema_error``, or ``parse_error``.
+            ``assistant_text`` carries the text to replay as the assistant turn
+            for a schema failure, and ``error`` the validation error.
+        """
+        raw_content = self._extract_structured_output(response)
+        from_tool_use = raw_content is not None
+
+        if raw_content is None:
+            if self._has_mcp_tool_use(response):
+                return ("mcp_tools", None, None)
+            raw_content = self._extract_json_fallback(response)
+            if raw_content is not None:
+                logger.warning(
+                    "Claude returned text instead of tool_use, but JSON extraction "
+                    "succeeded via fallback parsing. Consider reviewing prompt to "
+                    "encourage tool usage."
+                )
+
+        if raw_content is None:
+            return ("parse_error", None, None)
+
+        normalized = unwrap_scalar_wrappers(raw_content, output_schema)
+        try:
+            validate_output(normalized, output_schema)
+        except ValidationError as exc:
+            # Replay the bad answer as plain text. Appending a real tool_use
+            # block without a matching tool_result would violate the Anthropic
+            # message contract.
+            if from_tool_use:
+                assistant_text = json.dumps(raw_content, default=str)
+            else:
+                assistant_text = self._extract_text_from_response(response)
+            return ("schema_error", assistant_text, exc)
+
+        return ("success", None, None)
 
     def _diagnose_json_failure(self, text: str) -> str:
         """Diagnose why JSON extraction failed from text response.
@@ -2372,7 +2466,9 @@ class ClaudeProvider(AgentProvider):
     ) -> dict[str, Any]:
         """Extract structured output from Claude response.
 
-        Tries tool_use blocks first, falls back to text parsing.
+        Tries tool_use blocks first, falls back to text parsing. Wrapper-shaped
+        scalars are normalized here so the content returned to the caller
+        matches what the recovery loop validated.
 
         Args:
             response: Claude API response.
@@ -2391,12 +2487,12 @@ class ClaudeProvider(AgentProvider):
         # Try to extract from tool_use blocks
         content = self._extract_structured_output(response)
         if content is not None:
-            return content
+            return unwrap_scalar_wrappers(content, output_schema)
 
         # Fallback: try to parse JSON from text
         content = self._extract_json_fallback(response)
         if content is not None:
-            return content
+            return unwrap_scalar_wrappers(content, output_schema)
 
         # If both failed, raise error
         raise ProviderError(

@@ -11,6 +11,7 @@ import type {
   AgentToolStartData,
   AgentToolCompleteData,
   AgentToolOutputTruncatedData,
+  AgentParseRecoveryData,
   AgentTurnStartData,
   AgentMessageData,
   ScriptCompletedData,
@@ -261,7 +262,7 @@ export interface HighlightedEdge {
 
 export type LogLevel = 'info' | 'success' | 'error' | 'warning' | 'debug';
 
-export type ActivityLogType = 'reasoning' | 'tool-start' | 'tool-complete' | 'turn' | 'message' | 'prompt';
+export type ActivityLogType = 'reasoning' | 'tool-start' | 'tool-complete' | 'turn' | 'message' | 'prompt' | 'parse-recovery';
 
 export interface LogEntry {
   timestamp: number;
@@ -1469,6 +1470,17 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     replaceNode(t.nodes, data.agent_name);
   },
 
+  agent_parse_recovery: (state, _data) => {
+    const data = _data as unknown as AgentParseRecoveryData;
+    const itemKey = (_data as Record<string, unknown>).item_key as string | undefined;
+    const t = activeTarget(state, _data);
+    const kind = data.reason === 'schema' ? 'output schema mismatch' : 'invalid JSON';
+    const entry: ActivityEntry = { type: 'parse-recovery', icon: '↻', label: 'retry', text: `${kind} (${data.attempt ?? '?'}/${data.max_attempts ?? '?'})`, detail: data.error || null };
+    addActivity(t.nodes, data.agent_name, entry);
+    if (itemKey) addForEachItemActivity(t.nodes, data.agent_name, itemKey, entry);
+    replaceNode(t.nodes, data.agent_name);
+  },
+
   agent_turn_start: (state, _data) => {
     const data = _data as unknown as AgentTurnStartData;
     const itemKey = (_data as Record<string, unknown>).item_key as string | undefined;
@@ -2498,6 +2510,13 @@ function buildActivityLogEntry(event: WorkflowEvent): ActivityLogEntry | null {
         timestamp: ts, source: String(d.agent_name), type: 'tool-complete',
         message: `✂ ${d.tool_name || 'tool'} truncated`,
         detail: `${d.original_chars}→${d.kept_chars} chars${d.spill_path ? ' · full: ' + d.spill_path : ''}`,
+      };
+
+    case 'agent_parse_recovery':
+      return {
+        timestamp: ts, source: String(d.agent_name), type: 'parse-recovery',
+        message: `↻ retrying output — ${d.reason === 'schema' ? 'output schema mismatch' : 'invalid JSON'} (${d.attempt ?? '?'}/${d.max_attempts ?? '?'})`,
+        detail: d.error ? truncate(String(d.error), 300) : null,
       };
 
     case 'agent_turn_start':

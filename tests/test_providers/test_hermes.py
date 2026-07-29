@@ -157,6 +157,23 @@ class TestHermesExecute:
             mock_instance.run_conversation.return_value = result_dict
             mock_cls.return_value = mock_instance
 
+            # Exhausted recovery re-raises the original ValidationError so the
+            # offending field survives instead of being flattened into a
+            # generic parse error.
+            with pytest.raises(ValidationError, match="Missing required output field: answer"):
+                self._run(provider.execute(agent, {}, "answer this"))
+
+    def test_json_syntax_error_still_raises_provider_error(self, provider: HermesProvider) -> None:
+        """A genuine syntax failure keeps the ProviderError contract."""
+        schema = {"answer": OutputField(type="string")}
+        agent = _make_agent(output=schema)
+        result_dict = _make_result(final_response="not json at all {{{")
+
+        with patch("conductor.providers.hermes.AIAgent") as mock_cls:
+            mock_instance = Mock()
+            mock_instance.run_conversation.return_value = result_dict
+            mock_cls.return_value = mock_instance
+
             with pytest.raises(ProviderError, match="Failed to parse structured output"):
                 self._run(provider.execute(agent, {}, "answer this"))
 

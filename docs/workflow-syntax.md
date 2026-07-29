@@ -183,17 +183,26 @@ agents:
 | `backoff` | `exponential \| fixed` | `exponential` | Backoff strategy between retries. |
 | `delay_seconds` | `0.0-300.0` | `2.0` | Base delay in seconds before the first retry. |
 | `retry_on` | list | `[provider_error, timeout]` | Error categories that trigger a retry. |
-| `max_parse_recovery_attempts` | `0-10` | Provider default | In-session parse-recovery attempts before giving up. See below. |
+| `max_parse_recovery_attempts` | `0-10` | Provider default | In-session recovery attempts before giving up. See below. |
 
 #### `max_parse_recovery_attempts`
 
-When an agent declares `output:` (structured JSON), the provider tries to parse JSON from the model's response. If parsing fails, a correction prompt is sent in the same session asking the model to fix its response format. This field controls how many correction prompts to send.
+When an agent declares `output:` (structured JSON), the provider checks the model's response two ways: it parses the JSON, then validates the parsed fields against the declared schema. If either check fails, a correction prompt is sent in the same session asking the model to fix its response. This field controls how many correction prompts to send.
 
-- **Omit** (default): Use the provider default (Copilot=5, Claude=2).
-- **`0`**: Disable parse recovery entirely — fail immediately on bad JSON.
+Both failure kinds are covered:
+
+- **Syntax failures** — the response isn't valid JSON at all.
+- **Schema-shape failures** — the response is valid JSON but a field has the wrong type, such as returning an object where `type: string` was declared.
+
+Before validating, providers apply one conservative normalization: if a scalar field (`string`, `number`, `boolean`) receives an object wrapping a single value of the expected type — under a key matching the field name, a `value`/`result` key, or as the object's only key — the value is unwrapped and a warning is logged. Anything ambiguous is left alone and re-prompted instead.
+
+- **Omit** (default): Use the provider default (Copilot=5, Claude=2, Hermes=3).
+- **`0`**: Disable recovery entirely — fail immediately.
 - **`1-10`**: Custom limit.
 
 This is useful when you know an agent's output is simple and a single attempt should suffice, or when you want to fail fast instead of burning tokens on recovery loops.
+
+When the budget runs out, a schema-shape failure raises the specific validation error naming the offending field and its expected type, while a syntax failure raises a provider error. Each recovery attempt emits an `agent_parse_recovery` event, visible in the dashboard activity stream and the structured event log.
 
 ### Choosing whether to declare `output:`
 

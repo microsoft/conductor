@@ -23,6 +23,8 @@ from typing import TYPE_CHECKING, Any
 
 from conductor.exceptions import ProviderError, ValidationError
 from conductor.executor.output import parse_json_output, validate_output
+from conductor.providers._event_format import emit_parse_recovery_event
+from conductor.providers._output_shape import unwrap_scalar_wrappers
 from conductor.providers._schema import (
     SchemaDepthError,
     build_prompt_schema_properties,
@@ -447,6 +449,7 @@ class HermesProvider(AgentProvider):
                 agent,
                 conversation_history,
                 loop,
+                event_callback,
             )
 
         # Populate token counts from the result dict when available.
@@ -514,85 +517,157 @@ class HermesProvider(AgentProvider):
         agent: AgentDef,
         conversation_history: list[dict[str, Any]] | None,
         loop: asyncio.AbstractEventLoop,
+        event_callback: EventCallback | None = None,
     ) -> dict[str, Any]:
         """Parse response as JSON, retrying via conversation if parsing fails."""
         last_error: str | None = None
+        last_schema_failure: ValidationError | None = None
+        max_recovery = self._resolve_parse_recovery_attempts(agent)
 
-        for attempt in range(_MAX_PARSE_RECOVERY_ATTEMPTS + 1):
-            try:
-                content = parse_json_output(response)
-                validate_output(content, agent.output)  # type: ignore[arg-type]
+        for attempt in range(max_recovery + 1):
+            content, failure, is_schema_failure = self._parse_and_validate(response, agent)
+            if failure is None:
+                assert content is not None  # guaranteed when no failure
                 return content
-            except (json.JSONDecodeError, ValueError, ValidationError) as e:
-                last_error = str(e)
-                if attempt >= _MAX_PARSE_RECOVERY_ATTEMPTS:
-                    break
 
-                logger.info(
-                    "Agent '%s' parse recovery attempt %d/%d: %s",
-                    agent.name,
-                    attempt + 1,
-                    _MAX_PARSE_RECOVERY_ATTEMPTS,
-                    last_error,
-                )
+            last_error = str(failure)
+            # ``is_schema_failure`` is what distinguishes the two: a syntax
+            # error from ``parse_json_output`` is also a ``ValidationError``.
+            last_schema_failure = (
+                failure if is_schema_failure and isinstance(failure, ValidationError) else None
+            )
+            if attempt >= max_recovery:
+                break
 
-                # Build recovery prompt and re-run with conversation history
-                recovery_prompt = _build_recovery_prompt(last_error, response, schema)
-                # Use the messages from the failed run as history
-                history = messages if messages else conversation_history
+            logger.info(
+                "Agent '%s' parse recovery attempt %d/%d: %s",
+                agent.name,
+                attempt + 1,
+                max_recovery,
+                last_error,
+            )
 
-                recovery_kwargs = {
-                    k: v
-                    for k, v in agent_kwargs.items()
-                    if k not in ("stream_delta_callback", "reasoning_callback")
-                }
+            emit_parse_recovery_event(
+                event_callback,
+                attempt=attempt + 1,
+                max_attempts=max_recovery,
+                is_schema_failure=is_schema_failure,
+                error=last_error,
+            )
 
-                def _run_recovery(
-                    prompt: str = recovery_prompt,
-                    sys_msg: str | None = agent.system_prompt or None,
-                    hist: list[dict[str, Any]] | None = history,
-                    kwargs: dict[str, Any] = recovery_kwargs,
-                ) -> dict[str, Any]:
-                    _home_token = None
-                    if self._hermes_home:
-                        import hermes_constants  # ty: ignore[unresolved-import]
+            # Build recovery prompt and re-run with conversation history
+            recovery_prompt = _build_recovery_prompt(last_error, response, schema)
+            # Use the messages from the failed run as history
+            history = messages if messages else conversation_history
 
-                        expanded_home = str(Path(self._hermes_home).expanduser())
-                        _home_token = hermes_constants.set_hermes_home_override(expanded_home)
-                    try:
-                        hermes_agent = AIAgent(**kwargs)  # ty: ignore[call-non-callable]
-                        return hermes_agent.run_conversation(
-                            prompt,
-                            system_message=sys_msg,
-                            conversation_history=hist,
-                        )
-                    finally:
-                        if _home_token is not None:
-                            import hermes_constants
+            recovery_kwargs = {
+                k: v
+                for k, v in agent_kwargs.items()
+                if k not in ("stream_delta_callback", "reasoning_callback")
+            }
 
-                            hermes_constants.reset_hermes_home_override(_home_token)
+            def _run_recovery(
+                prompt: str = recovery_prompt,
+                sys_msg: str | None = agent.system_prompt or None,
+                hist: list[dict[str, Any]] | None = history,
+                kwargs: dict[str, Any] = recovery_kwargs,
+            ) -> dict[str, Any]:
+                _home_token = None
+                if self._hermes_home:
+                    import hermes_constants  # ty: ignore[unresolved-import]
 
+                    expanded_home = str(Path(self._hermes_home).expanduser())
+                    _home_token = hermes_constants.set_hermes_home_override(expanded_home)
                 try:
-                    recovery_result = await loop.run_in_executor(None, _run_recovery)
-                    response = recovery_result.get("final_response") or ""
-                    messages = recovery_result.get("messages", [])
-                except (json.JSONDecodeError, ValueError, ValidationError):
-                    raise
-                except Exception as e:
-                    raise ProviderError(
-                        f"Hermes recovery call failed for agent '{agent.name}': {e}",
-                        suggestion="Check hermes-agent logs and verify base_url/api_key.",
-                    ) from e
+                    hermes_agent = AIAgent(**kwargs)  # ty: ignore[call-non-callable]
+                    return hermes_agent.run_conversation(
+                        prompt,
+                        system_message=sys_msg,
+                        conversation_history=hist,
+                    )
+                finally:
+                    if _home_token is not None:
+                        import hermes_constants
+
+                        hermes_constants.reset_hermes_home_override(_home_token)
+
+            try:
+                recovery_result = await loop.run_in_executor(None, _run_recovery)
+                response = recovery_result.get("final_response") or ""
+                messages = recovery_result.get("messages", [])
+            except (json.JSONDecodeError, ValueError, ValidationError):
+                raise
+            except Exception as e:
+                raise ProviderError(
+                    f"Hermes recovery call failed for agent '{agent.name}': {e}",
+                    suggestion="Check hermes-agent logs and verify base_url/api_key.",
+                ) from e
+
+        # A schema-shape failure keeps its own error: it names the offending
+        # field and type, which the generic parse error would discard.
+        if last_schema_failure is not None:
+            raise last_schema_failure
 
         expected_fields = list(agent.output.keys()) if agent.output else []
         raise ProviderError(
-            f"Failed to parse structured output after {_MAX_PARSE_RECOVERY_ATTEMPTS} "
+            f"Failed to parse structured output after {max_recovery} "
             f"recovery attempts: {last_error}",
             suggestion=(
                 f"Agent was expected to return JSON with fields: {expected_fields}. "
                 "Consider simplifying the output schema or making the prompt more explicit."
             ),
         )
+
+    def _parse_and_validate(
+        self,
+        response: str,
+        agent: AgentDef,
+    ) -> tuple[dict[str, Any] | None, Exception | None, bool]:
+        """Parse a response and validate it against the agent's output schema.
+
+        ``parse_json_output`` wraps syntax errors in ``ValidationError`` too,
+        so the two failure kinds cannot be told apart by exception type. This
+        splits them by which call failed, letting a schema failure keep its
+        specific error while a syntax failure stays a ``ProviderError``.
+
+        Args:
+            response: Raw model response text.
+            agent: Agent definition supplying the output schema.
+
+        Returns:
+            A ``(content, failure, is_schema_failure)`` tuple. ``content`` is
+            set only when both parsing and validation succeeded.
+        """
+        try:
+            parsed = parse_json_output(response)
+        except (json.JSONDecodeError, ValueError, ValidationError) as exc:
+            return (None, exc, False)
+
+        parsed = unwrap_scalar_wrappers(parsed, agent.output)  # type: ignore[arg-type]
+        try:
+            validate_output(parsed, agent.output)  # type: ignore[arg-type]
+        except ValidationError as exc:
+            return (None, exc, True)
+
+        return (parsed, None, False)
+
+    def _resolve_parse_recovery_attempts(self, agent: AgentDef) -> int:
+        """Resolve the parse recovery budget for an agent.
+
+        Honors the YAML ``retry.max_parse_recovery_attempts`` the other
+        providers already respect, falling back to the hermes default.
+
+        Args:
+            agent: Agent definition that may carry a retry policy.
+
+        Returns:
+            Number of recovery attempts to allow.
+        """
+        retry = getattr(agent, "retry", None)
+        configured = getattr(retry, "max_parse_recovery_attempts", None) if retry else None
+        if configured is not None:
+            return configured
+        return _MAX_PARSE_RECOVERY_ATTEMPTS
 
     # ------------------------------------------------------------------
     # Session state for checkpoint resume

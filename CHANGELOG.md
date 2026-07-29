@@ -26,6 +26,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and [`docs/mcp-tools.md`](docs/mcp-tools.md).
   ([#335](https://github.com/microsoft/conductor/issues/335))
 
+- **Conservative unwrapping of wrapper-shaped scalars.** When a scalar output
+  field receives an object wrapping a single value of the expected type —
+  under a key matching the field name, a `value`/`result` key, or as the
+  object's only key — providers unwrap it and log a warning instead of
+  spending a recovery round-trip. Ambiguous shapes are left alone and
+  re-prompted. Validation itself stays strict, so `set` and `script` step
+  output is unaffected. ([#343](https://github.com/microsoft/conductor/issues/343))
+
+- **`agent_parse_recovery` event.** Recovery attempts were previously visible
+  only under verbose console logging, so a run could burn its entire recovery
+  budget without leaving a trace. All three providers now emit an event
+  carrying the attempt number, the budget, whether the cause was `schema` or
+  `syntax`, and the error. Rendered in the dashboard activity stream, the
+  console, and the structured event log.
+  ([#343](https://github.com/microsoft/conductor/issues/343))
+
+- **Output validation errors include the offending value**, truncated, so a
+  type mismatch can be diagnosed from logs without re-running with verbose
+  output. ([#343](https://github.com/microsoft/conductor/issues/343))
+
 ### Fixed
 
 - **`tools: []` no longer fails validation when no MCP servers are declared** —
@@ -35,6 +55,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   nothing to forward. The check is now gated on MCP servers actually being
   configured.
   ([#335](https://github.com/microsoft/conductor/issues/335))
+
+- **Schema-shape failures now go through the parse-recovery loop instead of
+  killing the workflow.** When an agent returned syntactically valid JSON whose
+  fields had the wrong shape (for example an object where `type: string` was
+  declared), the Copilot and Claude providers failed the run immediately with
+  zero recovery attempts, even though `max_parse_recovery_attempts` exists for
+  exactly this class of contract violation. Schema validation ran one layer up
+  in `executor/agent.py`, after the provider had already returned and — for
+  Copilot — after its SDK session had been disconnected, so the loop that could
+  have re-prompted never saw the error. Both providers now validate inside the
+  recovery loop, matching Hermes. ([#343](https://github.com/microsoft/conductor/issues/343))
+
+- **Exhausted recovery keeps the specific validation error.** A schema-shape
+  failure that survives every recovery attempt now re-raises the original
+  `ValidationError` naming the offending field and its expected type, rather
+  than collapsing into a generic "failed to parse structured output" provider
+  error. Syntax failures keep raising `ProviderError` as before. This also
+  fixes Hermes, which previously discarded the field detail.
+  ([#343](https://github.com/microsoft/conductor/issues/343))
+
+- **Hermes now honors `retry.max_parse_recovery_attempts`.** It used a
+  hardcoded module constant of 3 and silently ignored the YAML value that
+  Copilot and Claude both respect. ([#343](https://github.com/microsoft/conductor/issues/343))
 
 ### Changed
 
@@ -47,6 +90,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   servers declared in `runtime.mcp_servers` attach. Workflows that relied on
   Claude Code's own MCP settings must declare those servers in the workflow.
   ([#335](https://github.com/microsoft/conductor/issues/335))
+
+
 
 ## [0.1.26](https://github.com/microsoft/conductor/compare/v0.1.25...v0.1.26) - 2026-07-27
 

@@ -63,7 +63,8 @@ def _validate_field(field_name: str, value: Any, field_def: OutputField) -> None
     if not _check_type(value, field_def.type):
         raise ValidationError(
             f"Output field '{field_name}' has wrong type: "
-            f"expected {field_def.type}, got {type(value).__name__}",
+            f"expected {field_def.type}, got {type(value).__name__} "
+            f"(received: {_describe_value(value)})",
             suggestion=f"Ensure agent returns correct type for '{field_name}'",
         )
 
@@ -75,10 +76,30 @@ def _validate_field(field_name: str, value: Any, field_def: OutputField) -> None
             if not _check_type(item, field_def.items.type):
                 raise ValidationError(
                     f"Array item {i} in '{field_name}' has wrong type: "
-                    f"expected {field_def.items.type}, got {type(item).__name__}",
+                    f"expected {field_def.items.type}, got {type(item).__name__} "
+                    f"(received: {_describe_value(item)})",
                     suggestion=f"Ensure all items in '{field_name}' have correct type",
                 )
             _validate_field(field_name, item, field_def.items)
+
+
+def _describe_value(value: Any, max_chars: int = 200) -> str:
+    """Render a value for an error message, truncated to stay log-friendly.
+
+    Diagnosing a shape mismatch from logs alone is impractical when the
+    message names only the two types, so the offending value is included.
+
+    Args:
+        value: The value that failed validation.
+        max_chars: Maximum length of the rendered value before truncation.
+
+    Returns:
+        A ``repr``-style rendering, truncated with an ellipsis when long.
+    """
+    rendered = repr(value)
+    if len(rendered) > max_chars:
+        return rendered[:max_chars] + "..."
+    return rendered
 
 
 def _check_type(value: Any, expected: str) -> bool:

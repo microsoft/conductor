@@ -186,6 +186,7 @@ const ACTIVITY_TYPE_STYLES: Record<string, { color: string; label: string; label
   turn:           { color: 'text-amber-400',      label: 'STEP',   labelColor: 'text-amber-500' },
   message:        { color: 'text-[var(--text)]',  label: 'MSG',    labelColor: 'text-[var(--text-muted)]' },
   prompt:         { color: 'text-cyan-400/70',    label: 'PROMPT', labelColor: 'text-cyan-600' },
+  'parse-recovery': { color: 'text-yellow-400',   label: 'RETRY',  labelColor: 'text-yellow-600' },
 };
 
 function ActivityView({ entries }: { entries: ActivityLogEntry[] }) {
