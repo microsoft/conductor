@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, Any
 from conductor.exceptions import ProviderError, ValidationError
 from conductor.executor.output import parse_json_output, validate_output
 from conductor.providers._event_format import emit_parse_recovery_event
-from conductor.providers._output_shape import unwrap_scalar_wrappers
+from conductor.providers._output_shape import normalize_agent_output
 from conductor.providers._schema import (
     SchemaDepthError,
     build_prompt_schema_properties,
@@ -556,7 +556,9 @@ class HermesProvider(AgentProvider):
             )
 
             # Build recovery prompt and re-run with conversation history
-            recovery_prompt = _build_recovery_prompt(last_error, response, schema)
+            recovery_prompt = _build_recovery_prompt(
+                last_error, response, schema, is_schema_failure=is_schema_failure
+            )
             # Use the messages from the failed run as history
             history = messages if messages else conversation_history
 
@@ -605,10 +607,18 @@ class HermesProvider(AgentProvider):
 
         # A schema-shape failure keeps its own error: it names the offending
         # field and type, which the generic parse error would discard.
+        expected_fields = list(agent.output.keys()) if agent.output else []
         if last_schema_failure is not None:
+            logger.error(
+                "Agent '%s': parse recovery exhausted after %d attempts "
+                "(schema failure). Expected fields: %s. Response started with: %s",
+                agent.name,
+                max_recovery,
+                expected_fields,
+                response[:500],
+            )
             raise last_schema_failure
 
-        expected_fields = list(agent.output.keys()) if agent.output else []
         raise ProviderError(
             f"Failed to parse structured output after {max_recovery} "
             f"recovery attempts: {last_error}",
@@ -643,13 +653,13 @@ class HermesProvider(AgentProvider):
         except (json.JSONDecodeError, ValueError, ValidationError) as exc:
             return (None, exc, False)
 
-        parsed = unwrap_scalar_wrappers(parsed, agent.output)  # type: ignore[arg-type]
         try:
-            validate_output(parsed, agent.output)  # type: ignore[arg-type]
+            normalized = normalize_agent_output(parsed, agent.output)  # type: ignore[arg-type]
+            validate_output(normalized, agent.output)  # type: ignore[arg-type]
         except ValidationError as exc:
             return (None, exc, True)
 
-        return (parsed, None, False)
+        return (normalized, None, False)
 
     def _resolve_parse_recovery_attempts(self, agent: AgentDef) -> int:
         """Resolve the parse recovery budget for an agent.
@@ -663,10 +673,9 @@ class HermesProvider(AgentProvider):
         Returns:
             Number of recovery attempts to allow.
         """
-        retry = getattr(agent, "retry", None)
-        configured = getattr(retry, "max_parse_recovery_attempts", None) if retry else None
-        if configured is not None:
-            return configured
+        retry = agent.retry
+        if retry is not None and retry.max_parse_recovery_attempts is not None:
+            return retry.max_parse_recovery_attempts
         return _MAX_PARSE_RECOVERY_ATTEMPTS
 
     # ------------------------------------------------------------------
@@ -732,18 +741,56 @@ def _build_prompt_schema(schema: dict[str, OutputField], depth: int = 0) -> dict
         ) from exc
 
 
-def _build_recovery_prompt(parse_error: str, original_response: str, schema: dict[str, Any]) -> str:
-    """Build a prompt to recover from JSON parse failures."""
+def _build_recovery_prompt(
+    parse_error: str,
+    original_response: str,
+    schema: dict[str, Any],
+    is_schema_failure: bool = False,
+) -> str:
+    """Build a prompt to recover from JSON parse or schema-shape failures.
+
+    Args:
+        parse_error: The error from the parse or validation attempt.
+        original_response: The model's rejected response.
+        schema: Expected output schema, rendered into the prompt.
+        is_schema_failure: True when the response parsed cleanly but a field
+            had the wrong type. Telling a model its valid JSON "could not be
+            parsed" invites it to re-send the same payload.
+
+    Returns:
+        A prompt asking the model to correct its response.
+    """
     truncated = original_response[:500]
     if len(original_response) > 500:
         truncated += "..."
     schema_desc = json.dumps(schema, indent=2)
+
+    if is_schema_failure:
+        opening = (
+            "Your previous response was valid JSON but did not match the "
+            "required output schema.\n\n"
+            f"**Schema Error:** {parse_error}\n\n"
+        )
+        closing = (
+            "Please respond with ONLY a valid JSON object matching the schema above, "
+            "paying close attention to the type of each field. Return scalar values "
+            "directly rather than wrapping them in an object. Do NOT include markdown "
+            "code blocks, explanatory text, or anything other than the raw JSON object."
+        )
+    else:
+        opening = (
+            "Your previous response could not be parsed as valid JSON.\n\n"
+            f"**Parse Error:** {parse_error}\n\n"
+        )
+        closing = (
+            "Please respond with ONLY a valid JSON object matching the schema above. "
+            "Do NOT include markdown code blocks, explanatory text, or anything other "
+            "than the raw JSON object."
+        )
+
     return (
-        f"Your previous response could not be parsed as valid JSON.\n\n"
-        f"**Parse Error:** {parse_error}\n\n"
+        f"{opening}"
         f"**Your response started with:**\n```\n{truncated}\n```\n\n"
         f"**Expected JSON schema:**\n```json\n{schema_desc}\n```\n\n"
-        f"Please respond with ONLY a valid JSON object matching the schema above. "
-        f"Do NOT include markdown code blocks, explanatory text, or anything other "
-        f"than the raw JSON object."
+        f"{closing}"
     )

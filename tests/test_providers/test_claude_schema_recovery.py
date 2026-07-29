@@ -12,8 +12,8 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
-from conductor.config.schema import AgentDef, OutputField
-from conductor.exceptions import ValidationError
+from conductor.config.schema import AgentDef, OutputField, RetryPolicy
+from conductor.exceptions import ProviderError, ValidationError
 from conductor.providers.claude import ClaudeProvider
 
 
@@ -296,6 +296,31 @@ class TestClaudeSchemaShapeRecovery:
     @patch("conductor.providers.claude.AsyncAnthropic")
     @patch("conductor.providers.claude.anthropic")
     @pytest.mark.asyncio
+    async def test_bare_scalar_json_fallback_is_recovered(
+        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
+    ) -> None:
+        """A bare JSON scalar used to raise TypeError out of the provider,
+        surfacing as 'check API key' with zero recovery attempts."""
+        mock_anthropic_module.__version__ = "0.77.0"
+        mock_anthropic_module.APIStatusError = None
+
+        bad = create_response([create_text_block("42")], "msg_bad")
+        good = create_response([create_tool_use_block({"decision": "APPROVE"})], "msg_good")
+
+        client = _mock_client([bad, good])
+        mock_anthropic_class.return_value = client
+        provider = ClaudeProvider()
+
+        result = await provider.execute(_agent(), {"workflow": {"input": {}}}, "review it")
+
+        assert result.content["decision"] == "APPROVE"
+        assert client.messages.create.call_count == 2
+        await provider.close()
+
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    @pytest.mark.asyncio
     async def test_emits_parse_recovery_event(
         self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
     ) -> None:
@@ -320,4 +345,90 @@ class TestClaudeSchemaShapeRecovery:
         recovery = [d for name, d in events if name == "agent_parse_recovery"]
         assert len(recovery) == 1
         assert recovery[0]["reason"] == "schema"
+        await provider.close()
+
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    @pytest.mark.asyncio
+    async def test_syntax_failure_event_is_labelled_syntax(
+        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
+    ) -> None:
+        mock_anthropic_module.__version__ = "0.77.0"
+        mock_anthropic_module.APIStatusError = None
+
+        bad = create_response([create_text_block("not json at all {{{")], "msg_bad")
+        good = create_response([create_tool_use_block({"decision": "APPROVE"})], "msg_good")
+
+        client = _mock_client([bad, good])
+        mock_anthropic_class.return_value = client
+        provider = ClaudeProvider()
+
+        events: list[tuple[str, dict[str, Any]]] = []
+        await provider.execute(
+            _agent(),
+            {"workflow": {"input": {}}},
+            "review it",
+            event_callback=lambda name, data: events.append((name, data)),
+        )
+
+        recovery = [d for name, d in events if name == "agent_parse_recovery"]
+        assert len(recovery) == 1
+        assert recovery[0]["reason"] == "syntax"
+        await provider.close()
+
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    @pytest.mark.asyncio
+    async def test_syntax_exhaustion_raises_provider_error(
+        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
+    ) -> None:
+        """Syntax failures keep the ProviderError contract."""
+        mock_anthropic_module.__version__ = "0.77.0"
+        mock_anthropic_module.APIStatusError = None
+
+        bad = [create_response([create_text_block("not json {{{")], f"m{i}") for i in range(6)]
+
+        client = _mock_client(bad)
+        mock_anthropic_class.return_value = client
+        provider = ClaudeProvider()
+
+        with pytest.raises(ProviderError, match="Failed to extract valid JSON"):
+            await provider.execute(_agent(), {"workflow": {"input": {}}}, "review it")
+
+        await provider.close()
+
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    @pytest.mark.asyncio
+    async def test_zero_budget_makes_exactly_one_attempt(
+        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
+    ) -> None:
+        """0 is a legal configured value meaning "fail fast", not "unset"."""
+        mock_anthropic_module.__version__ = "0.77.0"
+        mock_anthropic_module.APIStatusError = None
+
+        bad = [
+            create_response([create_tool_use_block({"decision": {"a": 1, "b": 2}})], f"m{i}")
+            for i in range(4)
+        ]
+
+        client = _mock_client(bad)
+        mock_anthropic_class.return_value = client
+        provider = ClaudeProvider()
+
+        agent = AgentDef(
+            name="reviewer",
+            model="claude-3-5-sonnet-latest",
+            prompt="review it",
+            output={"decision": OutputField(type="string")},
+            retry=RetryPolicy(max_parse_recovery_attempts=0),
+        )
+
+        with pytest.raises(ValidationError):
+            await provider.execute(agent, {"workflow": {"input": {}}}, "review it")
+
+        assert client.messages.create.call_count == 1
         await provider.close()

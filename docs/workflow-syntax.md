@@ -194,7 +194,9 @@ Both failure kinds are covered:
 - **Syntax failures** — the response isn't valid JSON at all.
 - **Schema-shape failures** — the response is valid JSON but a field has the wrong type, such as returning an object where `type: string` was declared.
 
-Before validating, providers apply one conservative normalization: if a scalar field (`string`, `number`, `boolean`) receives an object wrapping a single value of the expected type — under a key matching the field name, a `value`/`result` key, or as the object's only key — the value is unwrapped and a warning is logged. Anything ambiguous is left alone and re-prompted instead.
+Before validating, providers apply one conservative normalization: if a scalar field (`string`, `number`, `boolean`) receives an object holding exactly one value of the expected type under either the field's own name or a generic `value`/`result` key, that value is unwrapped and a warning is logged. Two or more matching candidates count as ambiguous, and a wrapper with any other key shape is left alone — both are re-prompted rather than guessed at, so an object like `{"error": "I could not complete the task"}` never becomes the answer.
+
+A response that parses as JSON but isn't an object at all (a bare `42`, `null`, or an array) is treated as a shape failure and re-prompted the same way.
 
 - **Omit** (default): Use the provider default (Copilot=5, Claude=2, Hermes=3).
 - **`0`**: Disable recovery entirely — fail immediately.

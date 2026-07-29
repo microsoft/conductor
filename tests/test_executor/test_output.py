@@ -439,3 +439,49 @@ class TestParseJsonOutput:
         result = parse_json_output(raw)
 
         assert result == {"a": 1}
+
+
+class TestValidationErrorValueDescription:
+    """The error names the offending value, without echoing secrets.
+
+    `validate_output` also validates `set` and `script` step output, which may
+    carry credentials, so containers are described by shape rather than dumped.
+    """
+
+    def test_scalar_mismatch_shows_the_value(self) -> None:
+        schema = {"count": OutputField(type="number")}
+
+        with pytest.raises(ValidationError, match="received: 'many'"):
+            validate_output({"count": "many"}, schema)
+
+    def test_object_is_described_by_keys_not_contents(self) -> None:
+        schema = {"decision": OutputField(type="string")}
+        secret = {"decision": {"decision": "APPROVE", "api_key": "sk-live-SECRET"}}
+
+        with pytest.raises(ValidationError) as exc_info:
+            validate_output(secret, schema)
+
+        message = str(exc_info.value)
+        assert "object with keys" in message
+        assert "api_key" in message
+        assert "sk-live-SECRET" not in message
+
+    def test_array_is_described_by_length(self) -> None:
+        schema = {"decision": OutputField(type="string")}
+
+        with pytest.raises(ValidationError, match=r"array of 3 item\(s\)"):
+            validate_output({"decision": ["a", "b", "c"]}, schema)
+
+    def test_long_scalar_is_truncated(self) -> None:
+        schema = {"count": OutputField(type="number")}
+
+        with pytest.raises(ValidationError) as exc_info:
+            validate_output({"count": "x" * 500}, schema)
+
+        assert "..." in str(exc_info.value)
+
+    def test_array_item_mismatch_also_describes_the_value(self) -> None:
+        schema = {"tags": OutputField(type="array", items=OutputField(type="string"))}
+
+        with pytest.raises(ValidationError, match="received: 42"):
+            validate_output({"tags": ["ok", 42]}, schema)

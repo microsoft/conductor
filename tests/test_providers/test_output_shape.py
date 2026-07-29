@@ -2,9 +2,53 @@
 
 from __future__ import annotations
 
+import pytest
+
 from conductor.config.schema import OutputField
+from conductor.exceptions import ValidationError
 from conductor.executor.output import validate_output
-from conductor.providers._output_shape import unwrap_scalar_wrappers
+from conductor.providers._output_shape import normalize_agent_output, unwrap_scalar_wrappers
+
+
+class TestNormalizeAgentOutput:
+    """Non-object responses must become a recoverable ValidationError.
+
+    Without this guard `validate_output` does `field_name not in content` on a
+    scalar and raises TypeError, which no provider recovery loop catches.
+    """
+
+    def test_bare_scalar_raises_validation_error(self) -> None:
+        schema = {"decision": OutputField(type="string")}
+
+        with pytest.raises(ValidationError, match="not an object"):
+            normalize_agent_output(42, schema)
+
+    def test_list_raises_validation_error(self) -> None:
+        schema = {"decision": OutputField(type="string")}
+
+        with pytest.raises(ValidationError, match="not an object"):
+            normalize_agent_output(["decision", 1], schema)
+
+    def test_none_raises_validation_error(self) -> None:
+        schema = {"decision": OutputField(type="string")}
+
+        with pytest.raises(ValidationError, match="not an object"):
+            normalize_agent_output(None, schema)
+
+    def test_error_names_the_expected_fields(self) -> None:
+        schema = {"decision": OutputField(type="string")}
+
+        with pytest.raises(ValidationError) as exc_info:
+            normalize_agent_output(42, schema)
+
+        assert "decision" in (exc_info.value.suggestion or "")
+
+    def test_object_passes_through_with_unwrap_applied(self) -> None:
+        schema = {"decision": OutputField(type="string")}
+
+        result = normalize_agent_output({"decision": {"decision": "APPROVE"}}, schema)
+
+        assert result == {"decision": "APPROVE"}
 
 
 class TestUnwrapMatches:
@@ -29,12 +73,6 @@ class TestUnwrapMatches:
 
         assert unwrap_scalar_wrappers(content, schema) == {"answer": "42"}
 
-    def test_sole_key_with_unrelated_name(self) -> None:
-        schema = {"answer": OutputField(type="string")}
-        content = {"answer": {"text": "hello"}}
-
-        assert unwrap_scalar_wrappers(content, schema) == {"answer": "hello"}
-
     def test_number_field(self) -> None:
         schema = {"score": OutputField(type="number")}
         content = {"score": {"score": 0.87}}
@@ -52,7 +90,8 @@ class TestUnwrapMatches:
         schema = {"decision": OutputField(type="string")}
         content = {"decision": {"decision": "APPROVE", "value": "REJECT"}}
 
-        assert unwrap_scalar_wrappers(content, schema) == {"decision": "APPROVE"}
+        # Two candidates of the expected type is ambiguous — leave it alone.
+        assert unwrap_scalar_wrappers(content, schema) is content
 
     def test_only_the_wrapped_field_is_touched(self) -> None:
         schema = {
@@ -120,6 +159,33 @@ class TestUnwrapDeclines:
     def test_empty_wrapper(self) -> None:
         schema = {"decision": OutputField(type="string")}
         content: dict[str, object] = {"decision": {}}
+
+        assert unwrap_scalar_wrappers(content, schema) is content
+
+    def test_error_signal_is_not_laundered_into_an_answer(self) -> None:
+        """An agent's failure signal must not become the workflow's answer."""
+        schema = {"answer": OutputField(type="string")}
+        content = {"answer": {"error": "I could not complete the task"}}
+
+        assert unwrap_scalar_wrappers(content, schema) is content
+
+    def test_sole_key_with_unrelated_name_is_not_unwrapped(self) -> None:
+        """A lone key of any name is too weak a signal to act on."""
+        schema = {"answer": OutputField(type="string")}
+        content = {"answer": {"text": "hello"}}
+
+        assert unwrap_scalar_wrappers(content, schema) is content
+
+    def test_negated_key_name_does_not_flip_meaning(self) -> None:
+        """`{"approved": {"not_approved": false}}` must not become approved=False."""
+        schema = {"approved": OutputField(type="boolean")}
+        content = {"approved": {"not_approved": False}}
+
+        assert unwrap_scalar_wrappers(content, schema) is content
+
+    def test_two_generic_keys_are_ambiguous(self) -> None:
+        schema = {"summary": OutputField(type="string")}
+        content = {"summary": {"value": "N/A", "result": "the real summary"}}
 
         assert unwrap_scalar_wrappers(content, schema) is content
 

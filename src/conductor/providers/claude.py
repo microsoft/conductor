@@ -45,7 +45,7 @@ from conductor.providers._event_format import (
     extract_tool_result_text,
     format_tool_arguments,
 )
-from conductor.providers._output_shape import unwrap_scalar_wrappers
+from conductor.providers._output_shape import normalize_agent_output
 from conductor.providers._schema import SchemaDepthError, build_json_schema_properties
 from conductor.providers.base import (
     AgentOutput,
@@ -2278,8 +2278,8 @@ class ClaudeProvider(AgentProvider):
         if raw_content is None:
             return ("parse_error", None, None)
 
-        normalized = unwrap_scalar_wrappers(raw_content, output_schema)
         try:
+            normalized = normalize_agent_output(raw_content, output_schema)
             validate_output(normalized, output_schema)
         except ValidationError as exc:
             # Replay the bad answer as plain text. Appending a real tool_use
@@ -2479,6 +2479,7 @@ class ClaudeProvider(AgentProvider):
 
         Raises:
             ProviderError: If extraction fails.
+            ValidationError: If the response is JSON but not an object.
         """
         # If no schema, extract text content
         if not output_schema:
@@ -2487,12 +2488,12 @@ class ClaudeProvider(AgentProvider):
         # Try to extract from tool_use blocks
         content = self._extract_structured_output(response)
         if content is not None:
-            return unwrap_scalar_wrappers(content, output_schema)
+            return normalize_agent_output(content, output_schema)
 
         # Fallback: try to parse JSON from text
         content = self._extract_json_fallback(response)
         if content is not None:
-            return unwrap_scalar_wrappers(content, output_schema)
+            return normalize_agent_output(content, output_schema)
 
         # If both failed, raise error
         raise ProviderError(

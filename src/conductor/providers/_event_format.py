@@ -46,13 +46,17 @@ def emit_parse_recovery_event(
         max_error_chars: Truncation limit for ``error``.
 
     Raises:
-        Nothing. A failing subscriber must not break agent execution.
+        Nothing. A failing subscriber must not break agent execution, so both
+        payload rendering and the callback itself are guarded.
     """
     if event_callback is None:
         return
 
-    truncated = error if len(error) <= max_error_chars else error[:max_error_chars] + "..."
     try:
+        rendered = str(error)
+        truncated = (
+            rendered if len(rendered) <= max_error_chars else rendered[:max_error_chars] + "..."
+        )
         event_callback(
             "agent_parse_recovery",
             {
@@ -63,7 +67,7 @@ def emit_parse_recovery_event(
             },
         )
     except Exception:
-        logger.debug("Error in event_callback for agent_parse_recovery", exc_info=True)
+        logger.warning("Error in event_callback for agent_parse_recovery", exc_info=True)
 
 
 def format_tool_arguments(arguments: Any, max_length: int = 500) -> str | None:

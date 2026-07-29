@@ -182,3 +182,93 @@ class TestCopilotSchemaShapeRecovery:
         recovery = [d for name, d in events if name == "agent_parse_recovery"]
         assert len(recovery) == 1
         assert recovery[0]["reason"] == "syntax"
+
+    def test_bare_scalar_response_is_recovered_not_misreported(self) -> None:
+        """A bare JSON scalar used to raise TypeError, misclassified as a
+        retryable SDK/auth failure with zero recovery attempts."""
+        provider, prompts = _make_provider(["42", '{"decision": "APPROVE"}'])
+
+        output = asyncio.run(provider.execute(_agent(), {}, "review it"))
+
+        assert output.content == {"decision": "APPROVE"}
+        assert len(prompts) == 2
+
+    def test_bare_scalar_exhaustion_reports_the_real_cause(self) -> None:
+        """The error must name the shape problem, not the Copilot CLI."""
+        provider, _ = _make_provider(["42"])
+
+        with pytest.raises(ValidationError) as exc_info:
+            asyncio.run(provider.execute(_agent(max_parse_recovery_attempts=1), {}, "review it"))
+
+        message = str(exc_info.value)
+        assert "not an object" in message
+        assert "installed and authenticated" not in message
+
+    def test_json_array_response_is_recovered(self) -> None:
+        provider, prompts = _make_provider(['["decision", 1]', '{"decision": "APPROVE"}'])
+
+        output = asyncio.run(provider.execute(_agent(), {}, "review it"))
+
+        assert output.content == {"decision": "APPROVE"}
+        assert len(prompts) == 2
+
+    def test_zero_budget_makes_exactly_one_attempt(self) -> None:
+        """0 is a legal configured value meaning "fail fast", not "unset"."""
+        provider, prompts = _make_provider(['{"decision": {"a": 1, "b": 2}}'])
+
+        with pytest.raises(ValidationError):
+            asyncio.run(provider.execute(_agent(max_parse_recovery_attempts=0), {}, "review it"))
+
+        assert len(prompts) == 1
+
+    def test_syntax_recovery_prompt_keeps_parse_wording(self) -> None:
+        provider, prompts = _make_provider(["not json", '{"decision": "APPROVE"}'])
+
+        asyncio.run(provider.execute(_agent(), {}, "review it"))
+
+        assert "could not be parsed as valid JSON" in prompts[1]
+        assert "did not match the required output schema" not in prompts[1]
+
+    def test_schema_then_syntax_exhaustion_raises_provider_error(self) -> None:
+        """The error kind must follow the LAST failure, not the first."""
+        provider, _ = _make_provider(['{"decision": {"a": 1, "b": 2}}', "not json at all"])
+
+        with pytest.raises(ProviderError, match="Failed to parse structured output"):
+            asyncio.run(provider.execute(_agent(max_parse_recovery_attempts=1), {}, "review it"))
+
+    def test_syntax_then_schema_exhaustion_raises_validation_error(self) -> None:
+        provider, _ = _make_provider(["not json at all", '{"decision": {"a": 1, "b": 2}}'])
+
+        with pytest.raises(ValidationError, match="expected string, got dict"):
+            asyncio.run(provider.execute(_agent(max_parse_recovery_attempts=1), {}, "review it"))
+
+    def test_interrupted_partial_scalar_is_still_a_dict(self) -> None:
+        """The partial path has no recovery loop, so a non-object there would
+        reach the engine as a scalar `AgentOutput.content`."""
+        provider = CopilotProvider()
+        provider._client = _FakeClient()
+        provider._mock_handler = None
+        provider._started = True
+
+        async def _noop() -> None:
+            return None
+
+        async def _fake_send_and_wait(*args: Any, **kwargs: Any) -> SDKResponse:
+            return SDKResponse(content="42", partial=True, input_tokens=1, output_tokens=1)
+
+        provider._ensure_client_started = _noop  # type: ignore[method-assign]
+        provider._send_and_wait = _fake_send_and_wait  # type: ignore[method-assign]
+
+        output = asyncio.run(provider.execute(_agent(), {}, "review it"))
+
+        assert isinstance(output.content, dict)
+
+    def test_raising_event_subscriber_does_not_break_execution(self) -> None:
+        provider, _ = _make_provider(['{"decision": {"a": 1, "b": 2}}', '{"decision": "APPROVE"}'])
+
+        def _boom(name: str, data: dict[str, Any]) -> None:
+            raise RuntimeError("subscriber exploded")
+
+        output = asyncio.run(provider.execute(_agent(), {}, "review it", event_callback=_boom))
+
+        assert output.content == {"decision": "APPROVE"}

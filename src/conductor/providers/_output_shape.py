@@ -1,4 +1,4 @@
-"""Shared, provider-neutral normalization of wrapper-shaped agent output.
+"""Shared, provider-neutral normalization of agent output before validation.
 
 Models sometimes satisfy a scalar output field by returning a small object
 around the value (``{"decision": {"decision": "APPROVE"}}``) instead of the
@@ -19,6 +19,7 @@ import logging
 from typing import Any
 
 from conductor.config.schema import OutputField
+from conductor.exceptions import ValidationError
 
 logger = logging.getLogger(__name__)
 
@@ -30,22 +31,54 @@ _UNWRAPPABLE_TYPES = ("string", "number", "boolean")
 _GENERIC_VALUE_KEYS = ("value", "result")
 
 
+def normalize_agent_output(
+    content: Any,
+    schema: dict[str, OutputField],
+) -> dict[str, Any]:
+    """Prepare a parsed agent response for schema validation.
+
+    Guarantees the caller a ``dict``, so ``validate_output`` cannot be handed
+    a bare scalar or list and raise ``TypeError`` from a membership test. A
+    non-object response is a contract violation like any other wrong shape and
+    is raised as :class:`ValidationError` so the provider's recovery loop
+    re-prompts it instead of surfacing an opaque error.
+
+    Args:
+        content: Parsed JSON from the model. Any type.
+        schema: Declared output schema for the agent.
+
+    Returns:
+        The content as a dict, with wrapper-shaped scalars unwrapped.
+
+    Raises:
+        ValidationError: If ``content`` is not a JSON object.
+    """
+    if not isinstance(content, dict):
+        raise ValidationError(
+            f"Agent returned a JSON {type(content).__name__}, not an object",
+            suggestion=(
+                f"Return a JSON object with the declared fields: {list(schema)}. "
+                "Arrays and bare scalars are not accepted."
+            ),
+        )
+    return unwrap_scalar_wrappers(content, schema)
+
+
 def unwrap_scalar_wrappers(
     content: dict[str, Any],
     schema: dict[str, OutputField],
 ) -> dict[str, Any]:
     """Unwrap single-value objects returned where a scalar was declared.
 
-    Conservative by design: a field is only rewritten when the schema expects
-    a scalar, a ``dict`` arrived, and exactly one unambiguous candidate inside
-    it already has the expected type. Anything else is left untouched so the
-    caller's recovery loop re-prompts rather than guessing.
+    Conservative by design. A field is only rewritten when the schema expects
+    a scalar, a ``dict`` arrived, and **exactly one** candidate key inside it
+    holds a value of the expected type. Candidate keys are the field's own
+    name and the generic ``value`` / ``result`` keys — nothing else, so an
+    object like ``{"error": "I could not complete the task"}`` is left alone
+    and re-prompted rather than laundered into a plausible-looking answer.
 
-    Candidates are tried in order:
-
-    1. a key matching the field name (``{"decision": {"decision": "APPROVE"}}``)
-    2. a generic ``value`` or ``result`` key
-    3. a sole key, whatever it is named
+    Two or more matching candidates count as ambiguous and are also left
+    alone: guessing between them is how a wrong answer becomes a silent one.
 
     Args:
         content: Parsed agent output. Not mutated.
@@ -75,12 +108,14 @@ def unwrap_scalar_wrappers(
         if unwrapped is None:
             unwrapped = dict(content)
         unwrapped[field_name] = candidate
+        discarded = sorted(k for k in value if value[k] is not candidate)
         logger.warning(
             "Unwrapped object returned for scalar output field '%s' "
-            "(expected %s); using inner value %r",
+            "(expected %s); using inner value %r%s",
             field_name,
             field_def.type,
             candidate,
+            f", discarding keys {discarded}" if discarded else "",
         )
 
     return unwrapped if unwrapped is not None else content
@@ -107,20 +142,16 @@ def _find_scalar_candidate(
 
     Returns:
         The unwrapped value, or the ``_NO_CANDIDATE`` sentinel when no
-        candidate is unambiguous.
+        candidate matches or more than one does.
     """
-    keys_to_try = [field_name, *_GENERIC_VALUE_KEYS]
-    if len(wrapper) == 1:
-        keys_to_try.append(next(iter(wrapper)))
-
-    for key in keys_to_try:
-        if key not in wrapper:
-            continue
-        value = wrapper[key]
-        if _matches_scalar_type(value, expected_type):
-            return value
-
-    return _NO_CANDIDATE
+    matches = [
+        wrapper[key]
+        for key in (field_name, *_GENERIC_VALUE_KEYS)
+        if key in wrapper and _matches_scalar_type(wrapper[key], expected_type)
+    ]
+    if len(matches) != 1:
+        return _NO_CANDIDATE
+    return matches[0]
 
 
 def _matches_scalar_type(value: Any, expected: str) -> bool:

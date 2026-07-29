@@ -26,7 +26,7 @@ from conductor.providers._event_format import (
     extract_tool_result_text,
     format_tool_arguments,
 )
-from conductor.providers._output_shape import unwrap_scalar_wrappers
+from conductor.providers._output_shape import normalize_agent_output
 from conductor.providers._schema import SchemaDepthError, build_prompt_schema_properties
 from conductor.providers.base import (
     AgentOutput,
@@ -1153,8 +1153,15 @@ class CopilotProvider(AgentProvider):
                     session_destroyed = True  # Prevent finally from destroying it
                     partial_content: dict[str, Any]
                     try:
-                        partial_content = self._extract_json(response_content)
+                        extracted = self._extract_json(response_content)
                     except (json.JSONDecodeError, ValueError):
+                        extracted = None
+                    # Partial output skips validation and has no recovery loop,
+                    # so a non-object here would reach the engine as a scalar
+                    # ``AgentOutput.content`` and fail downstream.
+                    if isinstance(extracted, dict):
+                        partial_content = extracted
+                    else:
                         partial_content = {"result": response_content}
                     partial_usage = SDKResponse(
                         content=response_content,
@@ -1194,7 +1201,7 @@ class CopilotProvider(AgentProvider):
                 for recovery_attempt in range(max_recovery + 1):  # +1 for initial attempt
                     try:
                         parsed_content = self._extract_json(response_content)
-                        parsed_content = unwrap_scalar_wrappers(parsed_content, output_schema)
+                        parsed_content = normalize_agent_output(parsed_content, output_schema)
                         validate_output(parsed_content, output_schema)
                         final_usage = SDKResponse(
                             content=response_content,
@@ -1266,10 +1273,18 @@ class CopilotProvider(AgentProvider):
                 # All recovery attempts exhausted. A schema-shape failure keeps
                 # its own error: it names the offending field and type, which a
                 # generic parse error would discard.
+                expected_fields = list(output_schema.keys())
                 if isinstance(last_failure, ValidationError):
+                    logger.error(
+                        "Agent '%s': parse recovery exhausted after %d attempts "
+                        "(schema failure). Expected fields: %s. Response started with: %s",
+                        agent.name,
+                        max_recovery,
+                        expected_fields,
+                        response_content[:500],
+                    )
                     raise last_failure
 
-                expected_fields = list(output_schema.keys())
                 raise ProviderError(
                     f"Failed to parse structured output from agent response: {last_parse_error}",
                     suggestion=(
@@ -1289,8 +1304,11 @@ class CopilotProvider(AgentProvider):
         except ProviderError:
             raise
         except ValidationError:
-            # Configuration errors (e.g. unsupported reasoning_effort) are
-            # deterministic; surface unwrapped so retries don't mask them.
+            # Deterministic failures: a configuration error (e.g. unsupported
+            # reasoning_effort) or a schema-shape failure that already
+            # exhausted its recovery budget. Neither is fixed by re-running
+            # the agent, so surface unwrapped rather than letting the retry
+            # loop mask it.
             raise
         except Exception as e:
             raise ProviderError(
