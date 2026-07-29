@@ -27,12 +27,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ([#335](https://github.com/microsoft/conductor/issues/335))
 
 - **Conservative unwrapping of wrapper-shaped scalars.** When a scalar output
-  field receives an object wrapping a single value of the expected type —
-  under a key matching the field name, a `value`/`result` key, or as the
-  object's only key — providers unwrap it and log a warning instead of
-  spending a recovery round-trip. Ambiguous shapes are left alone and
-  re-prompted. Validation itself stays strict, so `set` and `script` step
-  output is unaffected. ([#343](https://github.com/microsoft/conductor/issues/343))
+  field receives an object holding exactly one value of the expected type
+  under either the field's own name or a generic `value`/`result` key,
+  providers unwrap it and log a warning instead of spending a recovery
+  round-trip. Ambiguous shapes (two matching candidates) and any other key
+  shape are left alone and re-prompted, so an object like
+  `{"error": "I could not complete the task"}` is never laundered into an
+  answer. Validation itself stays strict, so `set` and `script` step output is
+  unaffected. ([#343](https://github.com/microsoft/conductor/issues/343))
+
+- **Non-object JSON responses are recoverable.** A response parsing to a bare
+  scalar, `null`, or an array is now re-prompted as a shape failure rather
+  than producing an unhelpful terminal error. On Claude this previously
+  reached `validate_output` inside the API error handler and surfaced as
+  "check API key, model name, and request parameters"; on Copilot it reached
+  the executor backstop and was reported as a missing required field.
+  ([#343](https://github.com/microsoft/conductor/issues/343))
 
 - **`agent_parse_recovery` event.** Recovery attempts were previously visible
   only under verbose console logging, so a run could burn its entire recovery
@@ -42,9 +52,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   console, and the structured event log.
   ([#343](https://github.com/microsoft/conductor/issues/343))
 
-- **Output validation errors include the offending value**, truncated, so a
-  type mismatch can be diagnosed from logs without re-running with verbose
-  output. ([#343](https://github.com/microsoft/conductor/issues/343))
+- **Output validation errors describe the offending value.** Container values
+  are rendered by shape (`object with keys ['a', 'b']`) rather than dumped,
+  since `validate_output` also runs on `set` and `script` step output that may
+  carry secrets. ([#343](https://github.com/microsoft/conductor/issues/343))
 
 ### Fixed
 
