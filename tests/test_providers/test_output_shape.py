@@ -105,6 +105,25 @@ class TestUnwrapMatches:
             "summary": "all good",
         }
 
+    def test_field_literally_named_value(self) -> None:
+        """The field name and a generic key can collide.
+
+        `value` and `result` are idiomatic field names here — `parse_json_output`
+        wraps every non-object response as `{"result": ...}` — so the candidate
+        slots must be deduped or such a field is rejected as ambiguous against
+        itself and never unwrapped.
+        """
+        schema = {"value": OutputField(type="string")}
+        content = {"value": {"value": "APPROVE"}}
+
+        assert unwrap_scalar_wrappers(content, schema) == {"value": "APPROVE"}
+
+    def test_field_literally_named_result(self) -> None:
+        schema = {"result": OutputField(type="string")}
+        content = {"result": {"result": "APPROVE"}}
+
+        assert unwrap_scalar_wrappers(content, schema) == {"result": "APPROVE"}
+
     def test_unwrapped_result_passes_validation(self) -> None:
         """The unwrap must never produce a value validation would then reject."""
         schema = {"decision": OutputField(type="string")}

@@ -1,7 +1,7 @@
 """Helpers for formatting event payloads emitted to subscribers.
 
 The console renderer, JSONL event logger, and web dashboard all consume
-``agent_tool_start`` / ``agent_tool_complete`` events from both providers.
+``agent_tool_start`` / ``agent_tool_complete`` events from the providers.
 These helpers ensure the payloads are human-readable strings rather than
 Python ``repr()`` output of structured SDK objects.
 

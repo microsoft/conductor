@@ -1221,23 +1221,15 @@ class CopilotProvider(AgentProvider):
                         if recovery_attempt >= max_recovery:
                             break
 
-                        # Log recovery attempt in verbose mode
-                        if verbose_enabled:
-                            self._log_parse_recovery(
-                                recovery_attempt + 1,
-                                max_recovery,
-                                last_parse_error,
-                                agent_name=agent.name,
-                            )
-
-                        if event_callback is not None:
-                            emit_parse_recovery_event(
-                                event_callback,
-                                attempt=recovery_attempt + 1,
-                                max_attempts=max_recovery,
-                                is_schema_failure=is_schema_failure,
-                                error=last_parse_error,
-                            )
+                        # Rendered by ConsoleEventSubscriber under --verbose,
+                        # so no separate console write here.
+                        emit_parse_recovery_event(
+                            event_callback,
+                            attempt=recovery_attempt + 1,
+                            max_attempts=max_recovery,
+                            is_schema_failure=is_schema_failure,
+                            error=last_parse_error,
+                        )
 
                         # Build recovery prompt and send to same session
                         recovery_prompt = self._build_parse_recovery_prompt(
@@ -1609,39 +1601,6 @@ class CopilotProvider(AgentProvider):
             )
         finally:
             await session.disconnect()
-
-    def _log_parse_recovery(
-        self,
-        attempt: int,
-        max_attempts: int,
-        error: str,
-        agent_name: str | None = None,
-    ) -> None:
-        """Log a parse recovery attempt in verbose mode.
-
-        Args:
-            attempt: Current recovery attempt number (1-based).
-            max_attempts: Maximum number of recovery attempts.
-            error: The parse error message.
-            agent_name: Optional agent identifier used to attribute the
-                recovery message to a specific concurrent agent.
-        """
-        from rich.console import Console
-        from rich.text import Text
-
-        console = Console(stderr=True, highlight=False)
-
-        text = Text()
-        text.append("    ├─ ", style="dim")
-        if agent_name:
-            text.append(f"[{agent_name}] ", style="magenta")
-        text.append("🔄 ", style="")
-        text.append(f"Parse Recovery {attempt}/{max_attempts}", style="yellow bold")
-        text.append(" - ", style="dim")
-        # Truncate error message for display
-        error_preview = error[:100] + "..." if len(error) > 100 else error
-        text.append(error_preview, style="dim italic")
-        console.print(text)
 
     def _extract_json(self, content: str) -> dict[str, Any]:
         """Extract JSON from response content.

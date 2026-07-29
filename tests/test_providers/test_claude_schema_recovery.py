@@ -299,8 +299,9 @@ class TestClaudeSchemaShapeRecovery:
     async def test_bare_scalar_json_fallback_is_recovered(
         self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
     ) -> None:
-        """A bare JSON scalar used to raise TypeError out of the provider,
-        surfacing as 'check API key' with zero recovery attempts."""
+        """A bare JSON scalar raises TypeError out of `validate_output`, which
+        the loop's except clause does not catch, so it must be normalized
+        into a ValidationError first."""
         mock_anthropic_module.__version__ = "0.77.0"
         mock_anthropic_module.APIStatusError = None
 

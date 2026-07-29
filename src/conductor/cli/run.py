@@ -1090,6 +1090,7 @@ class ConsoleEventSubscriber:
             )
 
         elif t == "agent_parse_recovery":
+            agent_name = d.get("agent_name", "?")
             attempt = d.get("attempt", "?")
             max_attempts = d.get("max_attempts", "?")
             reason = d.get("reason", "?")
@@ -1097,7 +1098,7 @@ class ConsoleEventSubscriber:
             kind = "output schema mismatch" if reason == "schema" else "invalid JSON"
             detail = f": {error}" if error else ""
             verbose_log(
-                f"  WARNING: retrying agent output ({kind}) "
+                f"  WARNING: retrying '{agent_name}' output ({kind}) "
                 f"— attempt {attempt}/{max_attempts}{detail}",
                 style="yellow",
             )

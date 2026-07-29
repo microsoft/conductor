@@ -84,20 +84,20 @@ def _validate_field(field_name: str, value: Any, field_def: OutputField) -> None
 
 
 def _describe_value(value: Any, max_chars: int = 200) -> str:
-    """Render a value for an error message without echoing its contents.
+    """Render a value for an error message, describing containers by shape.
 
     Diagnosing a shape mismatch from logs alone is impractical when the
-    message names only the two types. But ``validate_output`` also runs on
-    ``set`` and ``script`` step output, which may carry secrets, so container
-    values are described by shape rather than dumped: the keys of a wrapper
-    object identify the mismatch just as well as its contents.
+    message names only the two types. ``validate_output`` also runs on ``set``
+    and ``script`` step output, so dict and list values are reduced to their
+    keys or length rather than dumped. Scalars are still rendered via ``repr``
+    and truncated, since a mismatched scalar is usually the whole diagnosis.
 
     Args:
         value: The value that failed validation.
         max_chars: Maximum length of the rendered value before truncation.
 
     Returns:
-        A short description safe to place in an error message.
+        A short description suitable for an error message.
     """
     if isinstance(value, dict):
         keys = sorted(str(k) for k in value)

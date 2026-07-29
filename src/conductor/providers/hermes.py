@@ -597,7 +597,10 @@ class HermesProvider(AgentProvider):
                 recovery_result = await loop.run_in_executor(None, _run_recovery)
                 response = recovery_result.get("final_response") or ""
                 messages = recovery_result.get("messages", [])
-            except (json.JSONDecodeError, ValueError, ValidationError):
+            except ValueError:
+                # A bad model name or kwargs surfaces as ValueError from the
+                # SDK. Left unwrapped: it is a caller error, not a transport
+                # failure, so the ProviderError suggestion below would mislead.
                 raise
             except Exception as e:
                 raise ProviderError(

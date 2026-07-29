@@ -2049,11 +2049,12 @@ class ClaudeProvider(AgentProvider):
         system_prompt: str | None = None,
         event_callback: EventCallback | None = None,
     ) -> ClaudeResponse:
-        """Execute API call with parse recovery for malformed JSON responses.
+        """Execute API call with recovery for unusable structured output.
 
-        This method handles the fallback case where Claude returns text instead
-        of using the tool, and the text contains malformed JSON. It will retry
-        up to max_parse_recovery_attempts times with clarifying prompts.
+        Covers two failure kinds under the same budget: a response with no
+        parseable JSON, and a response that parses cleanly — including a valid
+        ``emit_output`` tool_use — but violates the declared schema. Each
+        attempt re-prompts with wording specific to the failure kind.
 
         Args:
             messages: Message history to send.

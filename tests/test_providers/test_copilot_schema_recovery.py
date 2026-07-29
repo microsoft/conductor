@@ -184,8 +184,12 @@ class TestCopilotSchemaShapeRecovery:
         assert recovery[0]["reason"] == "syntax"
 
     def test_bare_scalar_response_is_recovered_not_misreported(self) -> None:
-        """A bare JSON scalar used to raise TypeError, misclassified as a
-        retryable SDK/auth failure with zero recovery attempts."""
+        """A bare JSON scalar must re-enter the recovery loop.
+
+        `validate_output` raises TypeError on a scalar rather than
+        ValidationError, so without the normalize guard it escapes the loop's
+        except clause entirely and gets zero recovery attempts.
+        """
         provider, prompts = _make_provider(["42", '{"decision": "APPROVE"}'])
 
         output = asyncio.run(provider.execute(_agent(), {}, "review it"))

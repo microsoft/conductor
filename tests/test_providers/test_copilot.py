@@ -757,69 +757,6 @@ class TestExtractJson:
         assert result == {"a": 1}
 
 
-class TestLogParseRecovery:
-    """Tests for parse recovery logging."""
-
-    def test_log_parse_recovery_does_not_raise(self, capsys: pytest.CaptureFixture[str]) -> None:
-        """Test that logging parse recovery doesn't raise exceptions."""
-        provider = CopilotProvider(mock_handler=stub_handler)
-
-        # This should not raise even if Rich isn't available
-        # (it uses stderr, so we just verify it doesn't crash)
-        provider._log_parse_recovery(
-            attempt=1,
-            max_attempts=5,
-            error="Some parse error message",
-        )
-        # If we get here without exception, the test passes
-
-    def test_log_parse_recovery_truncates_long_error(
-        self, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        """Test that long error messages are truncated in logs."""
-        provider = CopilotProvider(mock_handler=stub_handler)
-
-        long_error = "x" * 200
-
-        # Should not raise
-        provider._log_parse_recovery(
-            attempt=2,
-            max_attempts=5,
-            error=long_error,
-        )
-
-    def test_log_parse_recovery_emits_agent_tag_when_named(
-        self, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        """When ``agent_name`` is provided, the rendered line includes it."""
-        provider = CopilotProvider(mock_handler=stub_handler)
-
-        provider._log_parse_recovery(
-            attempt=1,
-            max_attempts=5,
-            error="boom",
-            agent_name="analyzer[item_a]",
-        )
-
-        captured = capsys.readouterr().err
-        assert "[analyzer[item_a]]" in captured
-        assert "Parse Recovery 1/5" in captured
-        # The tag must precede the recovery icon
-        assert captured.index("[analyzer[item_a]]") < captured.index("🔄")
-
-    def test_log_parse_recovery_omits_tag_when_unnamed(
-        self, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        """When ``agent_name`` is omitted, no attribution tag is emitted."""
-        provider = CopilotProvider(mock_handler=stub_handler)
-
-        provider._log_parse_recovery(attempt=1, max_attempts=5, error="boom")
-
-        captured = capsys.readouterr().err
-        # No bracketed tag preceding the recovery icon
-        assert "[" not in captured.split("Parse Recovery")[0]
-
-
 class TestLogRecoveryAttempt:
     """Tests for idle recovery attempt logging."""
 

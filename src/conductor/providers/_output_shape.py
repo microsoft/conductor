@@ -37,11 +37,12 @@ def normalize_agent_output(
 ) -> dict[str, Any]:
     """Prepare a parsed agent response for schema validation.
 
-    Guarantees the caller a ``dict``, so ``validate_output`` cannot be handed
-    a bare scalar or list and raise ``TypeError`` from a membership test. A
-    non-object response is a contract violation like any other wrong shape and
-    is raised as :class:`ValidationError` so the provider's recovery loop
-    re-prompts it instead of surfacing an opaque error.
+    Guarantees the caller a ``dict``. Handed a bare scalar, ``validate_output``
+    either raises ``TypeError`` from a membership test (numbers, booleans,
+    ``null``) or reports a misleading "missing required field" (strings and
+    arrays, where ``in`` is a valid substring or element test). Neither is
+    actionable, so a non-object response is raised as :class:`ValidationError`
+    and re-prompted like any other wrong shape.
 
     Args:
         content: Parsed JSON from the model. Any type.
@@ -92,7 +93,6 @@ def unwrap_scalar_wrappers(
         return content
 
     unwrapped: dict[str, Any] | None = None
-
     for field_name, field_def in schema.items():
         if field_def.type not in _UNWRAPPABLE_TYPES:
             continue
@@ -144,9 +144,13 @@ def _find_scalar_candidate(
         The unwrapped value, or the ``_NO_CANDIDATE`` sentinel when no
         candidate matches or more than one does.
     """
+    # dict.fromkeys dedupes while preserving order: a field literally named
+    # "value" or "result" would otherwise occupy two slots and be rejected as
+    # ambiguous against itself.
+    candidate_keys = dict.fromkeys((field_name, *_GENERIC_VALUE_KEYS))
     matches = [
         wrapper[key]
-        for key in (field_name, *_GENERIC_VALUE_KEYS)
+        for key in candidate_keys
         if key in wrapper and _matches_scalar_type(wrapper[key], expected_type)
     ]
     if len(matches) != 1:
