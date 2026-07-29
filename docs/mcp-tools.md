@@ -330,7 +330,7 @@ workflow:
 | http servers | ✅ | ❌ | ✅ | ❌ |
 | sse servers | ✅ | ❌ | ✅ | ❌ |
 | Tool filtering | ✅ | ✅ | ❌ (refused) | ❌ |
-| OAuth auto-auth | ✅ | N/A | ❌ | ❌ |
+| OAuth auto-auth | ✅ | N/A | ✅ | ❌ |
 | env var passing | ⚠️ Bug ([#163](https://github.com/github/copilot-sdk/issues/163)) | ✅ | ✅ | ❌ |
 | Tool output limits | ✅ (native SDK) | ✅ (conductor-side) | ✅ (native CLI env var) | N/A |
 
@@ -355,10 +355,10 @@ The Claude Agent SDK provider translates each server into the SDK's own MCP conf
 
 Two behaviors are specific to this provider:
 
-- **Per-server `tools:` filters are refused.** The SDK's MCP config has no equivalent field, so a narrowing filter cannot be enforced. Rather than forward the server unfiltered — granting more tools than the workflow declared — Conductor fails at startup. Keep the default `tools: ["*"]`.
+- **Per-server `tools:` filters are refused.** The SDK's MCP config has no equivalent field, so a narrowing filter cannot be enforced. Rather than forward the server unfiltered — granting more tools than the workflow declared — Conductor raises a `ProviderError` the first time an agent on this provider runs. Note `conductor validate` does not catch this today. Keep the default `tools: ["*"]`.
 - **Only declared servers are reachable.** Conductor sets `strict_mcp_config`, so a project `.mcp.json` or user-global MCP setting cannot add servers the workflow never declared.
 
-The generated config is written to a `0600` temp file and passed to the CLI by path, so resolved `env` values and `Authorization` headers stay out of the process command line. The file is deleted when the agent finishes.
+The generated config is written to a `0600` temp file and passed to the CLI by path, so resolved `env` values and `Authorization` headers stay out of the process command line. A fresh file is written and deleted per agent execution.
 
 A per-server `timeout` has no SDK equivalent and is dropped with a warning.
 

@@ -174,14 +174,12 @@ async def create_provider(
             if not CLAUDE_AGENT_SDK_AVAILABLE:
                 raise ProviderError(
                     "Claude Agent SDK provider requires claude-agent-sdk package",
-                    suggestion="Install with: uv add 'claude-agent-sdk>=0.1.0'",
+                    suggestion="Install with: uv add 'claude-agent-sdk>=0.2.82'",
                 )
             # claude-agent-sdk delegates the agentic loop to the underlying
             # `claude` CLI, which exposes no hooks for sampling temperature or
             # token caps. Silently dropping either would quietly violate user
             # intent, so refuse loudly until proper plumbing exists.
-            # (`mcp_servers` IS supported — translated in the provider and
-            # passed via ClaudeAgentOptions; see issue #335.)
             if temperature is not None:
                 raise ProviderError(
                     f"claude-agent-sdk does not support `temperature` (received {temperature!r}).",

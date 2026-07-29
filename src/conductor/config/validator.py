@@ -1613,13 +1613,15 @@ def _validate_provider_capabilities(
         * Explicit ``tools: []`` against a provider that still forwards the
           full workflow-level MCP server set regardless of the per-agent list
           (``capabilities.mcp_tools=True`` alongside
-          ``workflow_tools_passthrough=False``, e.g. ``aca`` — the in-container
-          runner attaches every configured MCP server unconditionally). There
-          is no allowlist value, empty or not, that provider can honor, so
-          ``tools: []`` would misleadingly pass validation while every tool
-          stays attached. This only applies when the workflow actually declares
-          ``mcp_servers``: with nothing to forward, ``tools: []`` genuinely
-          disables all tools and stays valid regardless of ``mcp_tools``.
+          ``workflow_tools_passthrough=False`` — ``aca``, whose in-container
+          runner attaches every configured MCP server unconditionally, and
+          ``claude-agent-sdk``, where ``tools: []`` disables only the built-in
+          CLI tools). There is no allowlist value, empty or not, those
+          providers can honor, so ``tools: []`` would misleadingly pass
+          validation while every MCP tool stays attached. This only applies
+          when the workflow actually declares ``mcp_servers``: with nothing to
+          forward, ``tools: []`` genuinely disables all tools and stays valid
+          regardless of ``mcp_tools``.
         * Omitted ``tools:`` + non-empty workflow-level ``tools:`` — the agent
           inherits that list at runtime (``resolve_agent_tools`` returns a copy)
           and hits the same refusal mid-run (now a ``resolves to tools=[...]``

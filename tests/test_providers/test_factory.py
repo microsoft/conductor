@@ -268,10 +268,22 @@ class TestClaudeAgentSdkFactoryRejections:
         provider = await create_provider(
             "claude-agent-sdk",
             validate=False,
-            mcp_servers={"docs": {"type": "stdio", "command": "docs-server"}},
+            mcp_servers={
+                "docs": {
+                    "type": "stdio",
+                    "command": "docs-server",
+                    "args": ["--port", "1234"],
+                    # Dropped by the translation: no SDK equivalent.
+                    "tools": ["*"],
+                    "timeout": 5000,
+                }
+            },
         )
         assert isinstance(provider, ClaudeAgentSdkProvider)
-        assert provider._mcp_servers == {"docs": {"type": "stdio", "command": "docs-server"}}
+        # Translated to the SDK shape, not stored verbatim.
+        assert provider._mcp_servers == {
+            "docs": {"type": "stdio", "command": "docs-server", "args": ["--port", "1234"]}
+        }
         await provider.close()
 
     @pytest.mark.asyncio

@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
+import glob
 import json
 import logging
 import os
 import stat
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -33,9 +34,9 @@ from conductor.config.schema import AgentDef, OutputField  # noqa: E402
 from conductor.exceptions import ProviderError  # noqa: E402
 from conductor.providers.claude_agent_sdk import (  # noqa: E402
     ClaudeAgentSdkProvider,
-    _mcp_config_file,
     _remove_mcp_config,
     _translate_mcp_servers,
+    _write_mcp_config,
 )
 
 
@@ -1696,6 +1697,11 @@ class TestSafeCallbackSwallowing:
         assert output.content == {"response": "hi"}
 
 
+def _mcp_temp_files() -> set[str]:
+    """Snapshot the MCP config files currently on disk in the temp dir."""
+    return set(glob.glob(os.path.join(tempfile.gettempdir(), "conductor-mcp-*.json")))
+
+
 class TestMcpServerTranslation:
     """Conductor MCP configs must map onto the SDK's own config shapes (#335)."""
 
@@ -1728,8 +1734,10 @@ class TestMcpServerTranslation:
         assert translated == {"docs": {"type": "stdio", "command": "docs-server"}}
 
     def test_missing_type_defaults_to_stdio(self) -> None:
+        """Matches MCPServerDef.type's default, so a config that omits it is
+        not silently reshaped."""
         translated = _translate_mcp_servers({"docs": {"command": "docs-server"}})
-        assert translated["docs"]["type"] == "stdio"
+        assert translated == {"docs": {"type": "stdio", "command": "docs-server"}}
 
     @pytest.mark.parametrize("server_type", ["http", "sse"])
     def test_remote_server_translates(self, server_type: str) -> None:
@@ -1781,12 +1789,16 @@ class TestMcpServerTranslation:
             translated = _translate_mcp_servers(
                 {"docs": {"type": "stdio", "command": "docs-server", "timeout": 5000}}
             )
-        assert "timeout" not in translated["docs"]
-        assert "does not support" in caplog.text
+        assert translated == {"docs": {"type": "stdio", "command": "docs-server"}}
+        # Name the server and the dropped value, so the warning is actionable.
+        assert "docs" in caplog.text
+        assert "5000" in caplog.text
 
     @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
-    def test_provider_translates_eagerly_at_construction(self) -> None:
-        """Bad MCP config must fail at the factory boundary, not mid-workflow."""
+    def test_provider_translates_at_construction(self) -> None:
+        """Translation happens once, when the provider is built -- not per
+        execute() call. Providers are constructed lazily, so this surfaces on
+        the first agent that uses the provider, not at validate time."""
         with pytest.raises(ProviderError, match="cannot enforce per-server tool filters"):
             ClaudeAgentSdkProvider(
                 mcp_servers={"docs": {"type": "stdio", "command": "d", "tools": ["search"]}}
@@ -1798,9 +1810,12 @@ class TestMcpConfigFile:
 
     def test_config_file_is_owner_only_and_wrapped(self) -> None:
         servers = {"docs": {"type": "stdio", "command": "docs-server"}}
-        with _mcp_config_file(servers) as path:
+        path = _write_mcp_config(servers)
+        try:
             mode = stat.S_IMODE(os.stat(path).st_mode)
             payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        finally:
+            _remove_mcp_config(path)
 
         # 0600: resolved env values and Authorization headers live in here.
         assert mode == 0o600
@@ -1808,22 +1823,35 @@ class TestMcpConfigFile:
         # expected record, received undefined".
         assert payload == {"mcpServers": servers}
 
-    def test_config_file_is_removed_on_exit(self) -> None:
-        with _mcp_config_file({"docs": {"type": "stdio", "command": "d"}}) as path:
-            assert Path(path).exists()
+    def test_remove_deletes_the_file(self) -> None:
+        path = _write_mcp_config({"docs": {"type": "stdio", "command": "d"}})
+        assert Path(path).exists()
+        _remove_mcp_config(path)
         assert not Path(path).exists()
 
-    def test_config_file_is_removed_on_exception(self) -> None:
-        with (
-            contextlib.suppress(RuntimeError),
-            _mcp_config_file({"docs": {"type": "stdio", "command": "d"}}) as path,
-        ):
-            raise RuntimeError("boom")
-        assert not Path(path).exists()
+    def test_write_cleans_up_when_serialization_fails(self) -> None:
+        """A partial secrets file is worse than none, so the write guard must
+        remove it before re-raising."""
+        created: list[str] = []
+        real_mkstemp = tempfile.mkstemp
 
-    def test_remove_is_best_effort(self) -> None:
-        """Cleanup failure must never mask the error already propagating."""
-        _remove_mcp_config("/nonexistent/conductor-mcp-does-not-exist.json")
+        def spy(*args, **kwargs):
+            fd, path = real_mkstemp(*args, **kwargs)
+            created.append(path)
+            return fd, path
+
+        # A set is not JSON-serializable -> json.dump raises mid-write.
+        with patch.object(tempfile, "mkstemp", spy), pytest.raises(TypeError):
+            _write_mcp_config({"docs": {"type": "stdio", "command": {"unserializable"}}})
+
+        assert created and not Path(created[0]).exists()
+
+    def test_remove_is_best_effort(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Cleanup failure must never mask the error already propagating -- but
+        it must still be visible, because the file holds credentials."""
+        with caplog.at_level(logging.WARNING, logger="conductor.providers.claude_agent_sdk"):
+            _remove_mcp_config("/nonexistent/conductor-mcp-does-not-exist.json")
+        assert "should be deleted manually" in caplog.text
 
 
 class TestMcpOptionsWiring:
@@ -1872,7 +1900,9 @@ class TestMcpOptionsWiring:
             )
 
         assert captured["mcp_servers"] == {}
-        assert captured["strict"] is False
+        # Unconditional: without it the CLI would still load project
+        # .mcp.json / user-global / plugin servers.
+        assert captured["strict"] is True
 
     @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
     async def test_config_file_removed_when_query_raises(self) -> None:
@@ -1918,3 +1948,142 @@ class TestMcpOptionsWiring:
 
         assert output.partial is True
         assert not Path(captured["path"]).exists()
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_no_config_file_leaks_when_options_construction_fails(self) -> None:
+        """Regression: the config was once written BEFORE the try, so anything
+        raising in between left a file full of resolved credentials on disk --
+        once per retry attempt."""
+        before = _mcp_temp_files()
+
+        deep = OutputField(type="string")
+        for _ in range(12):
+            deep = OutputField(type="object", properties={"x": deep})
+
+        provider = ClaudeAgentSdkProvider(
+            mcp_servers={"docs": {"type": "stdio", "command": "d", "env": {"K": "secret"}}}
+        )
+        with pytest.raises(ProviderError, match="nesting exceeds 10 levels"):
+            await provider.execute(
+                agent=AgentDef(name="t", prompt="hi", output={"deep": deep}),
+                context={},
+                rendered_prompt="hi",
+            )
+
+        assert _mcp_temp_files() == before
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_secrets_reach_the_file_but_not_the_options(self) -> None:
+        """The whole point of the path indirection: credentials live in the
+        file, never in an object the SDK serializes into argv."""
+        captured: dict = {}
+
+        async def fake_query(**kwargs):
+            options = kwargs["options"]
+            captured["mcp"] = options.mcp_servers
+            captured["payload"] = Path(options.mcp_servers).read_text(encoding="utf-8")
+            yield _result(result="ok")
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider(
+                mcp_servers={
+                    "remote": {
+                        "type": "http",
+                        "url": "https://mcp.example.com",
+                        "headers": {"Authorization": "Bearer s3cret"},
+                    }
+                }
+            )
+            await provider.execute(
+                agent=AgentDef(name="t", prompt="hi"), context={}, rendered_prompt="hi"
+            )
+
+        assert "s3cret" in captured["payload"]
+        # The options field is a path string, so nothing the SDK turns into a
+        # command-line argument carries the secret.
+        assert "s3cret" not in captured["mcp"]
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_concurrent_executions_get_independent_config_files(self) -> None:
+        """concurrent_safe=True now covers a filesystem resource: one agent's
+        cleanup must not delete a sibling's live config."""
+        paths: list[str] = []
+
+        async def fake_query(**kwargs):
+            path = kwargs["options"].mcp_servers
+            paths.append(path)
+            await asyncio.sleep(0.05)  # overlap with the other executions
+            assert Path(path).exists(), f"{path} deleted while still in use"
+            yield _result(result="ok")
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider(
+                mcp_servers={"docs": {"type": "stdio", "command": "docs-server"}}
+            )
+            await asyncio.gather(
+                *(
+                    provider.execute(
+                        agent=AgentDef(name=f"a{i}", prompt="hi"),
+                        context={},
+                        rendered_prompt="hi",
+                    )
+                    for i in range(5)
+                )
+            )
+
+        assert len(set(paths)) == 5
+        assert not any(Path(p).exists() for p in paths)
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_empty_tools_still_attaches_mcp_servers(self) -> None:
+        """``tools: []`` disables the CLI preset but does NOT detach MCP
+        servers -- the SDK has no per-request MCP toggle. ``conductor validate``
+        is the only guard and ``conductor run`` never calls it, so pin the
+        runtime behavior. If this ever becomes "detach the servers too", change
+        this test deliberately rather than by accident."""
+        captured: dict = {}
+
+        async def fake_query(**kwargs):
+            captured["tools"] = kwargs["options"].tools
+            captured["mcp"] = kwargs["options"].mcp_servers
+            yield _result(result="ok")
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider(
+                mcp_servers={"docs": {"type": "stdio", "command": "docs-server"}}
+            )
+            await provider.execute(
+                agent=AgentDef(name="t", prompt="hi", tools=[]),
+                context={},
+                rendered_prompt="hi",
+                tools=[],
+            )
+
+        assert captured["tools"] == []
+        assert isinstance(captured["mcp"], str)
+
+
+class TestMcpRequiredFields:
+    """Malformed configs must produce actionable errors, not bare KeyErrors.
+
+    ``MCPServerDef`` guards the YAML path, but ``create_provider`` is public
+    API -- a library caller can pass these dicts directly.
+    """
+
+    def test_stdio_without_command_is_refused(self) -> None:
+        with pytest.raises(ProviderError, match="declares no 'command'"):
+            _translate_mcp_servers({"docs": {"type": "stdio"}})
+
+    @pytest.mark.parametrize("server_type", ["http", "sse"])
+    def test_remote_without_url_is_refused(self, server_type: str) -> None:
+        with pytest.raises(ProviderError, match="declares no 'url'"):
+            _translate_mcp_servers({"docs": {"type": server_type}})
+
+    def test_config_errors_are_not_retryable(self) -> None:
+        """A server named e.g. 'timeout-probe' must not flip the retryability
+        heuristic, which sniffs the message for 'timeout'/'connection'."""
+        with pytest.raises(ProviderError) as exc:
+            _translate_mcp_servers(
+                {"timeout-probe": {"type": "stdio", "command": "d", "tools": ["connection"]}}
+            )
+        assert exc.value.is_retryable is False

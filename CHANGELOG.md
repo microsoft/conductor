@@ -17,10 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   declared `mcp_tools=False` and the factory rejected any workflow declaring
   MCP servers. The generated config is written to a `0600` temp file and
   passed by path so resolved `env` values and `Authorization` headers never
-  reach the `claude` CLI's command line, and `strict_mcp_config` is enabled so
-  ambient project/user MCP config cannot inject undeclared servers. A
-  narrowing per-server `tools:` filter has no SDK equivalent and is refused at
-  startup rather than silently ignored. See
+  reach the `claude` CLI's command line, and `strict_mcp_config` is always
+  enabled so ambient project/user MCP config cannot inject undeclared servers.
+  A narrowing per-server `tools:` filter has no SDK equivalent and is refused
+  (when the first agent on this provider runs) rather than silently ignored.
+  See
   [`examples/claude-agent-sdk-mcp.yaml`](examples/claude-agent-sdk-mcp.yaml)
   and [`docs/mcp-tools.md`](docs/mcp-tools.md).
   ([#335](https://github.com/microsoft/conductor/issues/335))
@@ -38,8 +39,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - The `claude-agent-sdk` optional dependency floor is now
-  `claude-agent-sdk>=0.2.82`, the earliest release exposing
-  `strict_mcp_config`.
+  `claude-agent-sdk>=0.2.82` — the 0.2.x line is what Conductor tests against.
+  ([#335](https://github.com/microsoft/conductor/issues/335))
+- `claude-agent-sdk` agents no longer inherit ambient MCP configuration.
+  Conductor now always sets `strict_mcp_config`, so a project `.mcp.json`,
+  user-global settings, or plugin-provided servers are ignored and only
+  servers declared in `runtime.mcp_servers` attach. Workflows that relied on
+  Claude Code's own MCP settings must declare those servers in the workflow.
   ([#335](https://github.com/microsoft/conductor/issues/335))
 
 ## [0.1.26](https://github.com/microsoft/conductor/compare/v0.1.25...v0.1.26) - 2026-07-27

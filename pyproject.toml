@@ -49,9 +49,9 @@ dependencies = [
 
 [project.optional-dependencies]
 claude-agent-sdk = [
-    # >=0.2.82 is the earliest release exposing `strict_mcp_config`, which the
-    # provider sets so ambient MCP config (project .mcp.json, user settings)
-    # cannot inject servers the workflow never declared.
+    # `strict_mcp_config` (which the provider always sets, so ambient MCP
+    # config cannot attach undeclared servers) has existed since 0.1.74, but
+    # the 0.2.x line is what Conductor tests against.
     "claude-agent-sdk>=0.2.82",
 ]
 aca = [

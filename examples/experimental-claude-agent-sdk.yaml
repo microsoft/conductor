@@ -20,7 +20,7 @@
 # Pre-requisites:
 #   pip install conductor[claude-agent-sdk]
 #   # Or with uv:
-#   uv add 'claude-agent-sdk>=0.1.0'
+#   uv add 'claude-agent-sdk>=0.2.82'
 #   # Plus the `claude` CLI:
 #   npm install -g @anthropic-ai/claude-code
 #   claude login

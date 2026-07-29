@@ -12,8 +12,8 @@ This guide helps you choose between GitHub Copilot, Anthropic Claude, Claude Age
 | **Setup** | GitHub auth | API key | `claude` CLI auth | API key (model-provider's key) |
 | **Model Selection** | GPT-5.2, o1 | Haiku, Sonnet, Opus | Haiku, Sonnet, Opus | Any OpenRouter-style model |
 | **Streaming** | Yes | No (Phase 1) | Yes | Yes |
-| **Tool Support** | Yes (MCP, all types) | Yes (MCP, stdio only) | Yes (built-in, CLI-managed) | Yes (hermes toolsets) |
-| **MCP Servers** | Yes | Yes (stdio) | No | No |
+| **Tool Support** | Yes (MCP, all types) | Yes (MCP, stdio only) | Yes (MCP + built-in preset) | Yes (hermes toolsets) |
+| **MCP Servers** | Yes | Yes (stdio) | Yes (all types) | No |
 | **Reasoning / Extended Thinking** | Yes (`reasoning_effort` on session) | Yes (extended `thinking` budget) | Inherits from CLI config | Yes (`reasoning_config`) |
 | **Speed** | Fast | Fast | Fast | Depends on model |
 | **Output Quality** | Excellent | Excellent | Excellent | Depends on model |
@@ -25,7 +25,7 @@ This guide helps you choose between GitHub Copilot, Anthropic Claude, Claude Age
 | **Tool Output Limits** | native SDK spill (large_output) | conductor-side truncation+spill | native CLI env var | N/A |
 
 > **About the experimental tier.** `claude-agent-sdk` and `hermes` declare
-> specific capability carve-outs (e.g. no MCP servers). `conductor validate`
+> specific capability carve-outs (e.g. no per-agent tools allowlist). `conductor validate`
 > catches workflows that depend on those features against these providers,
 > and the CLI prints a one-time banner when the workflow runs. See
 > [docs/providers/experimental.md](./experimental.md) for the stability
@@ -123,10 +123,10 @@ agents:
 
 ### Important: Tools and MCP Servers
 
-The `claude-agent-sdk` provider does not bridge workflow-level tools/MCP into the CLI. Concretely:
+The `claude-agent-sdk` provider bridges MCP servers into the CLI, but not per-agent tool allowlists. Concretely:
 
-- `runtime.mcp_servers` — **rejected at the factory** with a clear error. Translation to the CLI's MCP configuration is not implemented. Configure MCP servers through your Claude Code settings instead.
-- Per-agent `tools: []` — disables all tools for that agent.
+- `runtime.mcp_servers` — **supported**. Servers are translated into the SDK's MCP config and attach alongside the built-in preset. Only declared servers attach: Conductor sets `strict_mcp_config`, so ambient Claude Code MCP settings are ignored. A narrowing per-server `tools:` filter is refused, since the SDK has no equivalent field.
+- Per-agent `tools: []` — disables the built-in tools for that agent. Declared MCP servers still attach, so this combination is rejected at `conductor validate` when the workflow declares `mcp_servers`.
 - Per-agent `tools: [list]` — **refused loudly**. Workflow tool names do not translate to Claude CLI tool IDs; silently passing them through would risk granting the wrong native tool.
 - Workflow-level `tools:` combined with an agent that omits `tools:` — **rejected at `conductor validate`**. The agent would otherwise inherit that non-empty list at runtime and hit the same refusal with a confusing message. Remove the workflow-level `tools:` (so omitting `tools:` grants the preset) or set the agent's `tools: []`.
 - Omitting `tools:` entirely (with no workflow-level `tools:`) — grants the full `claude_code` preset (filesystem, bash, web), matching the bare `claude` CLI experience.

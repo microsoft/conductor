@@ -251,9 +251,9 @@ workflow:
     default_model: claude-sonnet-5
 ```
 
-Requires the `claude` CLI to be installed and authenticated. Install the SDK: `uv add 'claude-agent-sdk>=0.1.0'`
+Requires the `claude` CLI to be installed and authenticated. Install the SDK: `uv add 'claude-agent-sdk>=0.2.82'`
 
-> **Note:** The `claude-agent-sdk` provider delegates tool and MCP management to the `claude` CLI; workflow-level tool/MCP config is **not** bridged into it. `runtime.mcp_servers` is rejected at the factory, and a workflow-level `tools:` block is rejected at `conductor validate` for any agent that omits `tools:` (it would otherwise inherit a list the CLI can't map). Omit `tools:` to grant the full `claude_code` preset, set an agent's `tools: []` to disable all tools, and configure MCP servers through your Claude Code settings instead.
+> **Note:** `runtime.mcp_servers` is supported — servers are translated into the SDK's own MCP config and attach alongside the built-in `claude_code` preset (a narrowing per-server `tools:` filter is refused, since the SDK cannot enforce one). Per-agent tool allowlists are not bridged: a workflow-level `tools:` block is rejected at `conductor validate` for any agent that omits `tools:` (it would otherwise inherit a list the CLI can't map). Omit `tools:` to grant the full `claude_code` preset; an agent's `tools: []` disables the built-in tools, though declared MCP servers still attach.
 
 ### Using Hermes (Experimental)
 

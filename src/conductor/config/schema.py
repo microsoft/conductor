@@ -1686,8 +1686,8 @@ class MCPServerDef(BaseModel):
     Supports ${VAR} and ${VAR:-default} syntax for environment variable
     interpolation at runtime.
 
-    Note: With the Claude provider, env vars are passed correctly to MCP
-    server subprocesses via the MCP SDK. However, the Copilot provider
+    Note: With the Claude and Claude Agent SDK providers, env vars are passed
+    correctly to MCP server subprocesses. However, the Copilot provider
     has a known bug where env vars are not passed to MCP servers.
     See: https://github.com/github/copilot-sdk/issues/163
     """
