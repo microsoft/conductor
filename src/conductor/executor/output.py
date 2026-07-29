@@ -60,7 +60,7 @@ def _validate_field(field_name: str, value: Any, field_def: OutputField) -> None
     Raises:
         ValidationError: If the value or any nested value doesn't match.
     """
-    if not _check_type(value, field_def.type):
+    if not check_type(value, field_def.type):
         raise ValidationError(
             f"Output field '{field_name}' has wrong type: "
             f"expected {field_def.type}, got {type(value).__name__} "
@@ -73,7 +73,7 @@ def _validate_field(field_name: str, value: Any, field_def: OutputField) -> None
 
     if field_def.type == "array" and field_def.items and isinstance(value, list):
         for i, item in enumerate(value):
-            if not _check_type(item, field_def.items.type):
+            if not check_type(item, field_def.items.type):
                 raise ValidationError(
                     f"Array item {i} in '{field_name}' has wrong type: "
                     f"expected {field_def.items.type}, got {type(item).__name__} "
@@ -112,7 +112,7 @@ def _describe_value(value: Any, max_chars: int = 200) -> str:
     return rendered
 
 
-def _check_type(value: Any, expected: str) -> bool:
+def check_type(value: Any, expected: str) -> bool:
     """Check if value matches expected type.
 
     Args:

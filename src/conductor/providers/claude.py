@@ -26,7 +26,7 @@ import os
 import random
 import re
 import time
-from typing import Any, Protocol, get_args
+from typing import Any, Literal, NamedTuple, Protocol, get_args
 
 from pydantic import BaseModel
 
@@ -77,6 +77,40 @@ except ImportError:
     AnthropicError = Exception  # type: ignore[misc, assignment]
 
 logger = logging.getLogger(__name__)
+
+StructuredOutcome = Literal["success", "mcp_tools", "schema_error", "parse_error"]
+"""How a response scored against the declared output schema.
+
+``mcp_tools`` is not a final answer: the agentic loop still has tools to run,
+so that response is deliberately not validated.
+"""
+
+
+class _StructuredEvaluation(NamedTuple):
+    """Verdict on one structured-output attempt, plus what recovery needs next.
+
+    The failure fields are populated together with the outcome so the recovery
+    loop never has to re-derive them, and are left at their defaults for the
+    two success outcomes, which end the loop.
+
+    Attributes:
+        outcome: How the response scored.
+        replay_text: Text to replay as the assistant turn on the next attempt.
+        failure_reason: Human-readable diagnosis, logged and sent to the model.
+        schema_error: The validation error, set only for ``schema_error``. It
+            names the offending field and type, so it is re-raised verbatim
+            once the recovery budget runs out.
+    """
+
+    outcome: StructuredOutcome
+    replay_text: str = ""
+    failure_reason: str = ""
+    schema_error: ValidationError | None = None
+
+    @property
+    def is_schema_failure(self) -> bool:
+        """True when the response parsed cleanly but violated the schema."""
+        return self.outcome == "schema_error"
 
 
 # Protocol for Claude API response structure (improves type safety)
@@ -2085,7 +2119,6 @@ class ClaudeProvider(AgentProvider):
         )
         # Track recovery attempts for error reporting
         recovery_history: list[str] = []
-        last_schema_error: ValidationError | None = None
 
         # Initial attempt using non-streaming API call
         response = await self._execute_api_call(
@@ -2102,23 +2135,14 @@ class ClaudeProvider(AgentProvider):
         if not output_schema:
             return response
 
-        outcome, assistant_text, schema_error = self._evaluate_structured_response(
-            response, output_schema
-        )
-        if outcome in ("success", "mcp_tools"):
+        evaluation = self._evaluate_structured_response(response, output_schema)
+        if evaluation.outcome in ("success", "mcp_tools"):
             return response
 
-        last_schema_error = schema_error
-        if outcome == "schema_error":
-            initial_text = assistant_text or ""
-            failure_reason = str(schema_error)
-        else:
-            initial_text = self._extract_text_from_response(response)
-            failure_reason = self._diagnose_json_failure(initial_text)
-
-        recovery_history.append(f"Attempt 0 (initial): {failure_reason}")
+        recovery_history.append(f"Attempt 0 (initial): {evaluation.failure_reason}")
         logger.warning(
-            f"Initial structured output failed ({outcome}): {failure_reason}. "
+            f"Initial structured output failed ({evaluation.outcome}): "
+            f"{evaluation.failure_reason}. "
             f"Starting parse recovery (max {effective_max_recovery} attempts)"
         )
 
@@ -2129,8 +2153,8 @@ class ClaudeProvider(AgentProvider):
                 event_callback,
                 attempt=attempt,
                 max_attempts=effective_max_recovery,
-                is_schema_failure=outcome == "schema_error",
-                error=failure_reason,
+                is_schema_failure=evaluation.is_schema_failure,
+                error=evaluation.failure_reason,
             )
 
             # Append recovery message with specific error context
@@ -2138,14 +2162,15 @@ class ClaudeProvider(AgentProvider):
             recovery_messages.append(
                 {
                     "role": "assistant",
-                    "content": initial_text,
+                    "content": evaluation.replay_text,
                 }
             )
             recovery_messages.append(
                 {
                     "role": "user",
                     "content": self._build_recovery_instruction(
-                        failure_reason, is_schema_failure=outcome == "schema_error"
+                        evaluation.failure_reason,
+                        is_schema_failure=evaluation.is_schema_failure,
                     ),
                 }
             )
@@ -2161,31 +2186,18 @@ class ClaudeProvider(AgentProvider):
                 system_prompt=system_prompt,
             )
 
-            outcome, assistant_text, schema_error = self._evaluate_structured_response(
-                response, output_schema
-            )
-            if outcome == "success":
+            evaluation = self._evaluate_structured_response(response, output_schema)
+            if evaluation.outcome == "success":
                 logger.info(f"Parse recovery succeeded on attempt {attempt}")
                 return response
-            if outcome == "mcp_tools":
+            if evaluation.outcome == "mcp_tools":
                 logger.debug(
                     f"Recovery attempt {attempt} returned MCP tool calls, returning to agentic loop"
                 )
                 return response
 
-            # Record failure for this attempt
-            last_schema_error = schema_error
-            if outcome == "schema_error":
-                attempt_text = assistant_text or ""
-                attempt_failure = str(schema_error)
-            else:
-                attempt_text = self._extract_text_from_response(response)
-                attempt_failure = self._diagnose_json_failure(attempt_text)
-            recovery_history.append(f"Attempt {attempt}: {attempt_failure}")
-            logger.warning(f"Parse recovery attempt {attempt} failed: {attempt_failure}")
-            # Update for next iteration
-            initial_text = attempt_text
-            failure_reason = attempt_failure
+            recovery_history.append(f"Attempt {attempt}: {evaluation.failure_reason}")
+            logger.warning(f"Parse recovery attempt {attempt} failed: {evaluation.failure_reason}")
 
         # All recovery attempts exhausted - raise detailed error
         logger.error(
@@ -2194,8 +2206,8 @@ class ClaudeProvider(AgentProvider):
         )
         # A schema-shape failure keeps its own error: it names the offending
         # field and type, which the generic parse error would discard.
-        if outcome == "schema_error" and last_schema_error is not None:
-            raise last_schema_error
+        if evaluation.schema_error is not None:
+            raise evaluation.schema_error
         # is_retryable=False marks this as terminal: _is_retryable_error()
         # honors the flag directly for ProviderError, so the outer retry loop
         # will not retry parse exhaustion.
@@ -2242,7 +2254,7 @@ class ClaudeProvider(AgentProvider):
         self,
         response: Any,
         output_schema: dict[str, OutputField],
-    ) -> tuple[str, str | None, ValidationError | None]:
+    ) -> _StructuredEvaluation:
         """Classify a response against the declared output schema.
 
         Schema validation runs here, inside the recovery loop, so a
@@ -2257,17 +2269,17 @@ class ClaudeProvider(AgentProvider):
             output_schema: Expected output schema.
 
         Returns:
-            A ``(outcome, assistant_text, error)`` tuple. ``outcome`` is one of
-            ``success``, ``mcp_tools``, ``schema_error``, or ``parse_error``.
-            ``assistant_text`` carries the text to replay as the assistant turn
-            for a schema failure, and ``error`` the validation error.
+            An evaluation carrying everything the recovery loop needs: the
+            outcome, the text to replay as the assistant turn, the failure
+            description to log and re-prompt with, and the validation error to
+            re-raise once the budget runs out.
         """
         raw_content = self._extract_structured_output(response)
         from_tool_use = raw_content is not None
 
         if raw_content is None:
             if self._has_mcp_tool_use(response):
-                return ("mcp_tools", None, None)
+                return _StructuredEvaluation("mcp_tools")
             raw_content = self._extract_json_fallback(response)
             if raw_content is not None:
                 logger.warning(
@@ -2277,7 +2289,12 @@ class ClaudeProvider(AgentProvider):
                 )
 
         if raw_content is None:
-            return ("parse_error", None, None)
+            text = self._extract_text_from_response(response)
+            return _StructuredEvaluation(
+                "parse_error",
+                replay_text=text,
+                failure_reason=self._diagnose_json_failure(text),
+            )
 
         try:
             normalized = normalize_agent_output(raw_content, output_schema)
@@ -2287,12 +2304,17 @@ class ClaudeProvider(AgentProvider):
             # block without a matching tool_result would violate the Anthropic
             # message contract.
             if from_tool_use:
-                assistant_text = json.dumps(raw_content, default=str)
+                replay_text = json.dumps(raw_content, default=str)
             else:
-                assistant_text = self._extract_text_from_response(response)
-            return ("schema_error", assistant_text, exc)
+                replay_text = self._extract_text_from_response(response)
+            return _StructuredEvaluation(
+                "schema_error",
+                replay_text=replay_text,
+                failure_reason=str(exc),
+                schema_error=exc,
+            )
 
-        return ("success", None, None)
+        return _StructuredEvaluation("success")
 
     def _diagnose_json_failure(self, text: str) -> str:
         """Diagnose why JSON extraction failed from text response.

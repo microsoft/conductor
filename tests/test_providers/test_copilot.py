@@ -10,6 +10,7 @@ import pytest
 
 from conductor.config.schema import AgentDef, ProviderSettings, ToolOutputConfig
 from conductor.exceptions import ProviderError
+from conductor.providers._recovery_prompt import build_parse_recovery_prompt
 from conductor.providers.copilot import CopilotProvider, RetryConfig, SDKResponse
 
 
@@ -596,18 +597,16 @@ class TestRetryConfig:
 
 
 class TestParseRecoveryPrompt:
-    """Tests for the parse recovery prompt builder."""
+    """Tests for the parse recovery prompt builder, as Copilot uses it."""
 
     def test_build_parse_recovery_prompt_basic(self) -> None:
         """Test basic parse recovery prompt generation."""
-        provider = CopilotProvider(mock_handler=stub_handler)
-
         schema = {
             "name": {"type": "string", "description": "The name field"},
             "value": {"type": "number", "description": "The value field"},
         }
 
-        prompt = provider._build_parse_recovery_prompt(
+        prompt = build_parse_recovery_prompt(
             parse_error="Could not extract JSON from response",
             original_response="```json\n{invalid json",
             schema=schema,
@@ -635,7 +634,7 @@ class TestParseRecoveryPrompt:
         )
 
         schema = provider._build_prompt_schema(agent.output or {})
-        prompt = provider._build_parse_recovery_prompt(
+        prompt = build_parse_recovery_prompt(
             parse_error="missing quotes",
             original_response='{"name": "x}',
             schema=schema,
@@ -649,12 +648,10 @@ class TestParseRecoveryPrompt:
 
     def test_build_parse_recovery_prompt_truncates_long_response(self) -> None:
         """Test that long responses are truncated in recovery prompt."""
-        provider = CopilotProvider(mock_handler=stub_handler)
-
         # Create a response longer than 500 characters
         long_response = "x" * 600
 
-        prompt = provider._build_parse_recovery_prompt(
+        prompt = build_parse_recovery_prompt(
             parse_error="Parse error",
             original_response=long_response,
             schema={"field": {"type": "string", "description": "A field"}},
@@ -667,11 +664,9 @@ class TestParseRecoveryPrompt:
 
     def test_build_parse_recovery_prompt_preserves_short_response(self) -> None:
         """Test that short responses are not truncated."""
-        provider = CopilotProvider(mock_handler=stub_handler)
-
         short_response = "short response"
 
-        prompt = provider._build_parse_recovery_prompt(
+        prompt = build_parse_recovery_prompt(
             parse_error="Parse error",
             original_response=short_response,
             schema={"field": {"type": "string", "description": "A field"}},

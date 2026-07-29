@@ -27,6 +27,7 @@ from conductor.providers._event_format import (
     format_tool_arguments,
 )
 from conductor.providers._output_shape import normalize_agent_output
+from conductor.providers._recovery_prompt import build_parse_recovery_prompt
 from conductor.providers._schema import SchemaDepthError, build_prompt_schema_properties
 from conductor.providers.base import (
     AgentOutput,
@@ -1195,7 +1196,6 @@ class CopilotProvider(AgentProvider):
 
                 # Try to parse the response as JSON with recovery loop
                 max_recovery = (retry_config or self._retry_config).max_parse_recovery_attempts
-                last_parse_error: str | None = None
                 last_failure: Exception | None = None
 
                 for recovery_attempt in range(max_recovery + 1):  # +1 for initial attempt
@@ -1213,7 +1213,6 @@ class CopilotProvider(AgentProvider):
                         )
                         return parsed_content, final_usage
                     except (json.JSONDecodeError, ValueError, ValidationError) as e:
-                        last_parse_error = str(e)
                         last_failure = e
                         is_schema_failure = isinstance(e, ValidationError)
 
@@ -1228,12 +1227,12 @@ class CopilotProvider(AgentProvider):
                             attempt=recovery_attempt + 1,
                             max_attempts=max_recovery,
                             is_schema_failure=is_schema_failure,
-                            error=last_parse_error,
+                            error=str(e),
                         )
 
                         # Build recovery prompt and send to same session
-                        recovery_prompt = self._build_parse_recovery_prompt(
-                            parse_error=last_parse_error,
+                        recovery_prompt = build_parse_recovery_prompt(
+                            parse_error=str(e),
                             original_response=response_content,
                             schema=schema_for_prompt,  # type: ignore[arg-type]
                             is_schema_failure=is_schema_failure,
@@ -1278,7 +1277,7 @@ class CopilotProvider(AgentProvider):
                     raise last_failure
 
                 raise ProviderError(
-                    f"Failed to parse structured output from agent response: {last_parse_error}",
+                    f"Failed to parse structured output from agent response: {last_failure}",
                     suggestion=(
                         f"Agent was expected to return JSON with fields: {expected_fields}. "
                         f"Response started with: {response_content[:500]}... "
@@ -1654,72 +1653,6 @@ class CopilotProvider(AgentProvider):
                 pass
 
         raise ValueError(f"Could not extract JSON from response: {content[:500]}...")
-
-    def _build_parse_recovery_prompt(
-        self,
-        parse_error: str,
-        original_response: str,
-        schema: dict[str, Any],
-        is_schema_failure: bool = False,
-    ) -> str:
-        """Build a prompt to recover from JSON parse or schema-shape failures.
-
-        When an agent's response cannot be used, this method creates a
-        follow-up prompt that provides the model with:
-        - The specific error encountered
-        - A truncated view of its original response
-        - The expected JSON schema
-
-        This allows the model to understand what went wrong and correct its
-        response without starting a new conversation.
-
-        Args:
-            parse_error: The error message from the parse or validation attempt.
-            original_response: The agent's malformed response.
-            schema: The expected output schema as a dict.
-            is_schema_failure: True when the response parsed cleanly but a
-                field had the wrong type, which needs different wording from
-                a syntax error.
-
-        Returns:
-            A prompt asking the agent to correct its response.
-        """
-        # Truncate the original response to avoid overwhelming the context
-        truncated_response = original_response[:500]
-        if len(original_response) > 500:
-            truncated_response += "..."
-
-        schema_desc = json.dumps(schema, indent=2)
-
-        if is_schema_failure:
-            opening = (
-                "Your previous response was valid JSON but did not match the "
-                "required output schema.\n\n"
-                f"**Schema Error:** {parse_error}\n\n"
-            )
-            closing = (
-                "Please respond with ONLY a valid JSON object matching the schema above, "
-                "paying close attention to the type of each field. Return scalar values "
-                "directly rather than wrapping them in an object. Do NOT include markdown "
-                "code blocks, explanatory text, or anything other than the raw JSON object."
-            )
-        else:
-            opening = (
-                "Your previous response could not be parsed as valid JSON.\n\n"
-                f"**Parse Error:** {parse_error}\n\n"
-            )
-            closing = (
-                "Please respond with ONLY a valid JSON object matching the schema above. "
-                "Do NOT include markdown code blocks, explanatory text, or anything other "
-                "than the raw JSON object."
-            )
-
-        return (
-            f"{opening}"
-            f"**Your response started with:**\n```\n{truncated_response}\n```\n\n"
-            f"**Expected JSON schema:**\n```json\n{schema_desc}\n```\n\n"
-            f"{closing}"
-        )
 
     def _build_prompt_schema(
         self, schema: dict[str, OutputField], depth: int = 0

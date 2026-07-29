@@ -53,10 +53,7 @@ def emit_parse_recovery_event(
         return
 
     try:
-        rendered = str(error)
-        truncated = (
-            rendered if len(rendered) <= max_error_chars else rendered[:max_error_chars] + "..."
-        )
+        truncated = error if len(error) <= max_error_chars else error[:max_error_chars] + "..."
         event_callback(
             "agent_parse_recovery",
             {

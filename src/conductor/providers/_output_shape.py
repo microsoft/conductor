@@ -16,16 +16,20 @@ narrow cases below.
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Literal
 
 from conductor.config.schema import OutputField
 from conductor.exceptions import ValidationError
+from conductor.executor.output import check_type
 
 logger = logging.getLogger(__name__)
 
+ScalarOutputType = Literal["string", "number", "boolean"]
+"""The ``OutputField.type`` values a wrapper object can be unwrapped into."""
+
 # Only scalar targets are unwrapped. A dict arriving for an ``object`` field is
 # plausibly correct, and for ``array`` there is no unambiguous single value.
-_UNWRAPPABLE_TYPES = ("string", "number", "boolean")
+_UNWRAPPABLE_TYPES: tuple[ScalarOutputType, ...] = ("string", "number", "boolean")
 
 # Generic keys models use when they wrap a value without echoing the field name.
 _GENERIC_VALUE_KEYS = ("value", "result")
@@ -89,9 +93,6 @@ def unwrap_scalar_wrappers(
         A new dict when any field was unwrapped, otherwise ``content``
         unchanged (the same object, not a copy).
     """
-    if not isinstance(content, dict):
-        return content
-
     unwrapped: dict[str, Any] | None = None
     for field_name, field_def in schema.items():
         if field_def.type not in _UNWRAPPABLE_TYPES:
@@ -101,9 +102,11 @@ def unwrap_scalar_wrappers(
         if not isinstance(value, dict) or not value:
             continue
 
-        candidate = _find_scalar_candidate(value, field_name, field_def.type)
-        if candidate is _NO_CANDIDATE:
+        # Two or more matches are ambiguous — see the docstring.
+        candidates = _find_scalar_candidates(value, field_name, field_def.type)
+        if len(candidates) != 1:
             continue
+        candidate = candidates[0]
 
         if unwrapped is None:
             unwrapped = dict(content)
@@ -121,61 +124,28 @@ def unwrap_scalar_wrappers(
     return unwrapped if unwrapped is not None else content
 
 
-class _NoCandidate:
-    """Sentinel type distinguishing "no match" from a legitimate ``None``."""
-
-
-_NO_CANDIDATE = _NoCandidate()
-
-
-def _find_scalar_candidate(
+def _find_scalar_candidates(
     wrapper: dict[str, Any],
     field_name: str,
     expected_type: str,
-) -> Any:
-    """Find the single unambiguous scalar inside ``wrapper``.
+) -> list[Any]:
+    """Collect the values in ``wrapper`` that could be the declared scalar.
 
     Args:
         wrapper: The object that arrived where a scalar was expected.
         field_name: Name of the declared field, used for the echo match.
-        expected_type: Declared scalar type the candidate must already satisfy.
+        expected_type: Declared scalar type a candidate must already satisfy.
 
     Returns:
-        The unwrapped value, or the ``_NO_CANDIDATE`` sentinel when no
-        candidate matches or more than one does.
+        Every matching value. Exactly one means the wrapper is unambiguous;
+        anything else means the caller must leave the field alone.
     """
     # dict.fromkeys dedupes while preserving order: a field literally named
     # "value" or "result" would otherwise occupy two slots and be rejected as
     # ambiguous against itself.
     candidate_keys = dict.fromkeys((field_name, *_GENERIC_VALUE_KEYS))
-    matches = [
+    return [
         wrapper[key]
         for key in candidate_keys
-        if key in wrapper and _matches_scalar_type(wrapper[key], expected_type)
+        if key in wrapper and check_type(wrapper[key], expected_type)
     ]
-    if len(matches) != 1:
-        return _NO_CANDIDATE
-    return matches[0]
-
-
-def _matches_scalar_type(value: Any, expected: str) -> bool:
-    """Check a candidate against the declared scalar type.
-
-    Mirrors :func:`~conductor.executor.output._check_type` for the scalar
-    cases so an unwrap never produces a value validation would then reject.
-
-    Args:
-        value: Candidate value pulled out of the wrapper object.
-        expected: Declared scalar type name.
-
-    Returns:
-        True when ``value`` already satisfies ``expected``.
-    """
-    if expected == "string":
-        return isinstance(value, str)
-    if expected == "boolean":
-        return isinstance(value, bool)
-    # bool is a subclass of int in Python; exclude it from the numeric type.
-    if expected == "number":
-        return isinstance(value, int | float) and not isinstance(value, bool)
-    return False

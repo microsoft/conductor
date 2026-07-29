@@ -207,13 +207,11 @@ class TestClaudeSchemaShapeRecovery:
         mcp_response = create_response([create_mcp_tool_use_block()], "msg_mcp")
         schema = {"decision": OutputField(type="string")}
 
-        outcome, assistant_text, error = provider._evaluate_structured_response(
-            mcp_response, schema
-        )
+        evaluation = provider._evaluate_structured_response(mcp_response, schema)
 
-        assert outcome == "mcp_tools"
-        assert error is None
-        assert assistant_text is None
+        assert evaluation.outcome == "mcp_tools"
+        assert evaluation.schema_error is None
+        assert evaluation.replay_text == ""
         await provider.close()
 
     @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
@@ -234,10 +232,10 @@ class TestClaudeSchemaShapeRecovery:
         )
         schema = {"decision": OutputField(type="string")}
 
-        outcome, _, error = provider._evaluate_structured_response(both, schema)
+        evaluation = provider._evaluate_structured_response(both, schema)
 
-        assert outcome == "success"
-        assert error is None
+        assert evaluation.outcome == "success"
+        assert evaluation.schema_error is None
         await provider.close()
 
     @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)

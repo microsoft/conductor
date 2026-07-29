@@ -15,59 +15,59 @@ import pytest
 from conductor.config.schema import OutputField
 from conductor.exceptions import ValidationError
 from conductor.executor.output import (
-    _check_type,
+    check_type,
     parse_json_output,
     validate_output,
 )
 
 
 class TestCheckType:
-    """Tests for _check_type helper function."""
+    """Tests for check_type helper function."""
 
     def test_string_type(self) -> None:
         """Test string type checking."""
-        assert _check_type("hello", "string") is True
-        assert _check_type("", "string") is True
-        assert _check_type(123, "string") is False
-        assert _check_type(None, "string") is False
+        assert check_type("hello", "string") is True
+        assert check_type("", "string") is True
+        assert check_type(123, "string") is False
+        assert check_type(None, "string") is False
 
     def test_number_type(self) -> None:
         """Test number type checking."""
-        assert _check_type(42, "number") is True
-        assert _check_type(3.14, "number") is True
-        assert _check_type(0, "number") is True
-        assert _check_type(-1, "number") is True
-        assert _check_type("42", "number") is False
+        assert check_type(42, "number") is True
+        assert check_type(3.14, "number") is True
+        assert check_type(0, "number") is True
+        assert check_type(-1, "number") is True
+        assert check_type("42", "number") is False
         # Booleans should not count as numbers
-        assert _check_type(True, "number") is False
-        assert _check_type(False, "number") is False
+        assert check_type(True, "number") is False
+        assert check_type(False, "number") is False
 
     def test_boolean_type(self) -> None:
         """Test boolean type checking."""
-        assert _check_type(True, "boolean") is True
-        assert _check_type(False, "boolean") is True
-        assert _check_type(1, "boolean") is False
-        assert _check_type("true", "boolean") is False
+        assert check_type(True, "boolean") is True
+        assert check_type(False, "boolean") is True
+        assert check_type(1, "boolean") is False
+        assert check_type("true", "boolean") is False
 
     def test_array_type(self) -> None:
         """Test array type checking."""
-        assert _check_type([], "array") is True
-        assert _check_type([1, 2, 3], "array") is True
-        assert _check_type(["a", "b"], "array") is True
-        assert _check_type({}, "array") is False
-        assert _check_type("[]", "array") is False
+        assert check_type([], "array") is True
+        assert check_type([1, 2, 3], "array") is True
+        assert check_type(["a", "b"], "array") is True
+        assert check_type({}, "array") is False
+        assert check_type("[]", "array") is False
 
     def test_object_type(self) -> None:
         """Test object type checking."""
-        assert _check_type({}, "object") is True
-        assert _check_type({"key": "value"}, "object") is True
-        assert _check_type([], "object") is False
-        assert _check_type("{}", "object") is False
+        assert check_type({}, "object") is True
+        assert check_type({"key": "value"}, "object") is True
+        assert check_type([], "object") is False
+        assert check_type("{}", "object") is False
 
     def test_unknown_type(self) -> None:
         """Test unknown type accepts anything."""
-        assert _check_type("anything", "unknown_type") is True
-        assert _check_type(123, "unknown_type") is True
+        assert check_type("anything", "unknown_type") is True
+        assert check_type(123, "unknown_type") is True
 
 
 class TestValidateOutput:
@@ -342,8 +342,8 @@ class TestValidateOutputArrayRecursion:
         validate_source = inspect.getsource(validate_output)
         validate_field_source = inspect.getsource(_validate_field)
 
-        assert "_check_type(" not in validate_source
-        assert "_check_type(" in validate_field_source
+        assert "check_type(" not in validate_source
+        assert "check_type(" in validate_field_source
 
 
 class TestParseJsonOutput:

@@ -124,10 +124,25 @@ class TestUnwrapMatches:
 
         assert unwrap_scalar_wrappers(content, schema) == {"result": "APPROVE"}
 
-    def test_unwrapped_result_passes_validation(self) -> None:
-        """The unwrap must never produce a value validation would then reject."""
-        schema = {"decision": OutputField(type="string")}
-        content = {"decision": {"decision": "APPROVE", "reasoning": "fine"}}
+    @pytest.mark.parametrize(
+        ("field_type", "inner"),
+        [
+            ("string", "APPROVE"),
+            ("number", 0),
+            ("number", 0.0),
+            ("number", 42),
+            ("boolean", False),
+            ("boolean", True),
+        ],
+    )
+    def test_unwrapped_result_passes_validation(self, field_type: str, inner: object) -> None:
+        """The unwrap must never produce a value validation would then reject.
+
+        Covers every unwrappable type, including the falsy values the sentinel
+        exists for and the bool-is-not-a-number rule.
+        """
+        schema = {"f": OutputField(type=field_type)}  # type: ignore[arg-type]
+        content = {"f": {"f": inner, "note": "sibling"}}
 
         validate_output(unwrap_scalar_wrappers(content, schema), schema)
 

@@ -25,6 +25,7 @@ from conductor.exceptions import ProviderError, ValidationError
 from conductor.executor.output import parse_json_output, validate_output
 from conductor.providers._event_format import emit_parse_recovery_event
 from conductor.providers._output_shape import normalize_agent_output
+from conductor.providers._recovery_prompt import build_parse_recovery_prompt
 from conductor.providers._schema import (
     SchemaDepthError,
     build_prompt_schema_properties,
@@ -525,17 +526,12 @@ class HermesProvider(AgentProvider):
         max_recovery = self._resolve_parse_recovery_attempts(agent)
 
         for attempt in range(max_recovery + 1):
-            content, failure, is_schema_failure = self._parse_and_validate(response, agent)
-            if failure is None:
-                assert content is not None  # guaranteed when no failure
+            content, failure, schema_failure = self._parse_and_validate(response, agent)
+            if content is not None:
                 return content
 
             last_error = str(failure)
-            # ``is_schema_failure`` is what distinguishes the two: a syntax
-            # error from ``parse_json_output`` is also a ``ValidationError``.
-            last_schema_failure = (
-                failure if is_schema_failure and isinstance(failure, ValidationError) else None
-            )
+            last_schema_failure = schema_failure
             if attempt >= max_recovery:
                 break
 
@@ -551,13 +547,13 @@ class HermesProvider(AgentProvider):
                 event_callback,
                 attempt=attempt + 1,
                 max_attempts=max_recovery,
-                is_schema_failure=is_schema_failure,
+                is_schema_failure=schema_failure is not None,
                 error=last_error,
             )
 
             # Build recovery prompt and re-run with conversation history
-            recovery_prompt = _build_recovery_prompt(
-                last_error, response, schema, is_schema_failure=is_schema_failure
+            recovery_prompt = build_parse_recovery_prompt(
+                last_error, response, schema, is_schema_failure=schema_failure is not None
             )
             # Use the messages from the failed run as history
             history = messages if messages else conversation_history
@@ -635,7 +631,7 @@ class HermesProvider(AgentProvider):
         self,
         response: str,
         agent: AgentDef,
-    ) -> tuple[dict[str, Any] | None, Exception | None, bool]:
+    ) -> tuple[dict[str, Any] | None, Exception | None, ValidationError | None]:
         """Parse a response and validate it against the agent's output schema.
 
         ``parse_json_output`` wraps syntax errors in ``ValidationError`` too,
@@ -648,21 +644,22 @@ class HermesProvider(AgentProvider):
             agent: Agent definition supplying the output schema.
 
         Returns:
-            A ``(content, failure, is_schema_failure)`` tuple. ``content`` is
-            set only when both parsing and validation succeeded.
+            A ``(content, failure, schema_failure)`` tuple. ``content`` is set
+            only when both parsing and validation succeeded; ``schema_failure``
+            repeats ``failure`` only when it came from schema validation.
         """
         try:
             parsed = parse_json_output(response)
         except (json.JSONDecodeError, ValueError, ValidationError) as exc:
-            return (None, exc, False)
+            return (None, exc, None)
 
         try:
             normalized = normalize_agent_output(parsed, agent.output)  # type: ignore[arg-type]
             validate_output(normalized, agent.output)  # type: ignore[arg-type]
         except ValidationError as exc:
-            return (None, exc, True)
+            return (None, exc, exc)
 
-        return (normalized, None, False)
+        return (normalized, None, None)
 
     def _resolve_parse_recovery_attempts(self, agent: AgentDef) -> int:
         """Resolve the parse recovery budget for an agent.
@@ -742,58 +739,3 @@ def _build_prompt_schema(schema: dict[str, OutputField], depth: int = 0) -> dict
             f"Schema nesting depth exceeds maximum of {_MAX_SCHEMA_DEPTH} levels",
             suggestion="Simplify your output schema to reduce nesting depth",
         ) from exc
-
-
-def _build_recovery_prompt(
-    parse_error: str,
-    original_response: str,
-    schema: dict[str, Any],
-    is_schema_failure: bool = False,
-) -> str:
-    """Build a prompt to recover from JSON parse or schema-shape failures.
-
-    Args:
-        parse_error: The error from the parse or validation attempt.
-        original_response: The model's rejected response.
-        schema: Expected output schema, rendered into the prompt.
-        is_schema_failure: True when the response parsed cleanly but a field
-            had the wrong type. Telling a model its valid JSON "could not be
-            parsed" invites it to re-send the same payload.
-
-    Returns:
-        A prompt asking the model to correct its response.
-    """
-    truncated = original_response[:500]
-    if len(original_response) > 500:
-        truncated += "..."
-    schema_desc = json.dumps(schema, indent=2)
-
-    if is_schema_failure:
-        opening = (
-            "Your previous response was valid JSON but did not match the "
-            "required output schema.\n\n"
-            f"**Schema Error:** {parse_error}\n\n"
-        )
-        closing = (
-            "Please respond with ONLY a valid JSON object matching the schema above, "
-            "paying close attention to the type of each field. Return scalar values "
-            "directly rather than wrapping them in an object. Do NOT include markdown "
-            "code blocks, explanatory text, or anything other than the raw JSON object."
-        )
-    else:
-        opening = (
-            "Your previous response could not be parsed as valid JSON.\n\n"
-            f"**Parse Error:** {parse_error}\n\n"
-        )
-        closing = (
-            "Please respond with ONLY a valid JSON object matching the schema above. "
-            "Do NOT include markdown code blocks, explanatory text, or anything other "
-            "than the raw JSON object."
-        )
-
-    return (
-        f"{opening}"
-        f"**Your response started with:**\n```\n{truncated}\n```\n\n"
-        f"**Expected JSON schema:**\n```json\n{schema_desc}\n```\n\n"
-        f"{closing}"
-    )
