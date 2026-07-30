@@ -25,7 +25,7 @@ prints a one-time banner per provider:
 │   (claude-agent-sdk>=0.2.82) maintained by @lesandiz (best-effort)  │
 │ Limitations: no per-agent tools allowlist, reasoning_effort         │
 │   ignored, structured output via prompt injection, no checkpoint    │
-│   resume, working_dir ignored.                                      │
+│   resume.                                                           │
 │ See docs/providers/experimental.md for stability policy.            │
 └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -99,7 +99,7 @@ adopting one does not inflate the install surface for others.
 
 | Provider | Upstream pin | Maintainer | Capability carve-outs |
 |---|---|---|---|
-| `claude-agent-sdk` | `claude-agent-sdk>=0.2.82` | `@lesandiz (best-effort)` | no `workflow_tools_passthrough`, no `reasoning_effort`, `prompt_injection` structured output, no `checkpoint_resume`, no `working_dir`. Supports `mcp_tools` as of [#335](https://github.com/microsoft/conductor/issues/335), except that a narrowing per-server `tools:` filter is refused (no SDK equivalent). |
+| `claude-agent-sdk` | `claude-agent-sdk>=0.2.82` | `@lesandiz (best-effort)` | no `workflow_tools_passthrough`, no `reasoning_effort`, `prompt_injection` structured output, no `checkpoint_resume`. Supports `mcp_tools` as of [#335](https://github.com/microsoft/conductor/issues/335), except that a narrowing per-server `tools:` filter is refused (no SDK equivalent). Supports `working_dir` as of [#348](https://github.com/microsoft/conductor/issues/348). |
 | `hermes` | `hermes-agent` | `(community contribution)` | no `mcp_tools`, `prompt_injection` structured output, no `working_dir` |
 | `aca` | `azure-identity>=1.19.0` | `(unassigned)` | no `workflow_tools_passthrough` (the wrapped in-container `CopilotProvider` never applies the `tools:` allowlist to the SDK session), no `working_dir` (only the separate, container-relative `sandbox.working_dir` is honored — not the generic host-resolved field), `prompt_injection` structured output (inherits the inner Copilot provider), no `checkpoint_resume` (ephemeral sandbox sessions, no volume mount). Declares `interrupt`/`max_session_seconds` as `True`, but the shipped runner MVP doesn't fully back either yet — see [Known Gaps](./aca.md#known-gaps-runner-mvp). |
 

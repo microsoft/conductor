@@ -329,12 +329,12 @@ class ClaudeAgentSdkProvider(AgentProvider):
         # No global mutable state shared across calls — the SDK spawns
         # an independent subprocess per query() invocation.
         concurrent_safe=True,
-        # The provider never forwards the engine-resolved working directory
-        # to ``ClaudeAgentOptions.cwd``, so an agent's ``working_dir`` would
-        # be silently ignored (both for the CLI itself and for any stdio MCP
-        # servers it spawns). Declared False so ``conductor validate`` errors
-        # instead of lying about where the agent runs.
-        working_dir=False,
+        # The engine-resolved working directory is forwarded to
+        # ``ClaudeAgentOptions.cwd``, which the SDK applies as the ``claude``
+        # subprocess's cwd. Stdio MCP servers inherit it from that subprocess
+        # rather than being stamped individually as they are for Copilot:
+        # the SDK's ``McpStdioServerConfig`` has no cwd field.
+        working_dir=True,
         # Skill content is eagerly injected into the rendered prompt by
         # AgentExecutor (the claude-agent-sdk surfaces no
         # ``skill_directories`` kwarg today; once it does we can flip
@@ -417,6 +417,12 @@ class ClaudeAgentSdkProvider(AgentProvider):
         options = ClaudeAgentOptions(
             model=model,
             system_prompt=agent.system_prompt,
+            # The engine resolves ``agent.working_dir`` (Jinja render,
+            # absolutize, is_dir check) before dispatching here, so pass it
+            # through verbatim; ``None`` keeps the process-cwd behavior. The
+            # CLI subprocess starts in this directory and every stdio MCP
+            # server it spawns inherits it.
+            cwd=agent.working_dir or os.getcwd(),
             output_format=_build_output_format(agent.output) if agent.output else None,
             max_turns=max_turns,
             permission_mode=permission_mode,

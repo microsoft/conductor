@@ -206,13 +206,13 @@ class TestResolver:
     @pytest.mark.parametrize(
         ("provider_name", "expected"),
         [
-            # Requirement: copilot and claude honor agent/runtime ``working_dir``
-            # for the SDK session and its MCP servers; hermes and
-            # claude-agent-sdk do not (declared False so validate errors out).
+            # Requirement: copilot, claude, and claude-agent-sdk honor
+            # agent/runtime ``working_dir`` for the SDK session and its MCP
+            # servers; hermes does not (declared False so validate errors out).
             ("copilot", True),
             ("claude", True),
             ("hermes", False),
-            ("claude-agent-sdk", False),
+            ("claude-agent-sdk", True),
         ],
     )
     def test_working_dir_capability_matrix(self, provider_name: str, expected: bool) -> None:

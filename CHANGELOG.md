@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`claude-agent-sdk` provider now honors `working_dir`** — the directory
+  resolved from `agent.working_dir` / `runtime.working_dir` is forwarded to
+  `ClaudeAgentOptions.cwd`, so the `claude` CLI runs there and every stdio MCP
+  server it spawns inherits the same directory. Previously the provider
+  declared `working_dir=False` and `conductor validate` rejected any workflow
+  that set it, which was accurate but left the provider out of step with
+  `copilot` and `claude`. There is no per-server stamping as there is for
+  Copilot, because the SDK's stdio server config has no working-directory
+  field — inheritance from the CLI subprocess covers it. A missing directory
+  still fails before the provider is reached, and `strict_mcp_config` remains
+  enabled so a `.mcp.json` sitting in the new directory cannot inject
+  undeclared servers. See
+  [`docs/mcp-tools.md`](docs/mcp-tools.md).
+  ([#348](https://github.com/microsoft/conductor/issues/348))
+
 - **`claude-agent-sdk` provider now supports MCP servers** — workflow-level
   `runtime.mcp_servers` are translated to the SDK's own `stdio` / `http` /
   `sse` config shapes and passed through `ClaudeAgentOptions`, so an agent can

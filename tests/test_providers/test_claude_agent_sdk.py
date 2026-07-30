@@ -2087,3 +2087,111 @@ class TestMcpRequiredFields:
                 {"timeout-probe": {"type": "stdio", "command": "d", "tools": ["connection"]}}
             )
         assert exc.value.is_retryable is False
+
+
+class TestWorkingDirectory:
+    """The engine-resolved ``working_dir`` must reach ``ClaudeAgentOptions.cwd``.
+
+    The SDK applies ``cwd`` to the ``claude`` subprocess it spawns
+    (``_internal/transport/subprocess_cli.py``), so it governs both where the
+    CLI runs and where the stdio MCP servers it spawns inherit their cwd from.
+    These tests use the real ``ClaudeAgentOptions`` rather than a Mock so a
+    renamed or removed SDK field fails here instead of silently passing.
+    """
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_resolved_working_dir_becomes_cwd(self, tmp_path: Path) -> None:
+        captured: dict = {}
+
+        async def fake_query(**kwargs):
+            captured["cwd"] = kwargs["options"].cwd
+            yield _result(result="ok")
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider()
+            await provider.execute(
+                agent=AgentDef(name="t", prompt="hi", working_dir=str(tmp_path)),
+                context={},
+                rendered_prompt="hi",
+            )
+
+        assert captured["cwd"] == str(tmp_path)
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_unset_working_dir_falls_back_to_process_cwd(self) -> None:
+        """No ``working_dir`` keeps the legacy process-cwd behavior."""
+        captured: dict = {}
+
+        async def fake_query(**kwargs):
+            captured["cwd"] = kwargs["options"].cwd
+            yield _result(result="ok")
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider()
+            await provider.execute(
+                agent=AgentDef(name="t", prompt="hi"), context={}, rendered_prompt="hi"
+            )
+
+        assert captured["cwd"] == os.getcwd()
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_working_dir_passed_verbatim(self, tmp_path: Path) -> None:
+        """The engine already renders, absolutizes, and existence-checks the
+        path (``WorkflowEngine._resolve_agent_working_dir``). The provider must
+        not re-resolve it -- ``resolve()`` here would collapse symlink aliases
+        the engine deliberately preserves."""
+        real = tmp_path / "real"
+        real.mkdir()
+        link = tmp_path / "link"
+        link.symlink_to(real, target_is_directory=True)
+        captured: dict = {}
+
+        async def fake_query(**kwargs):
+            captured["cwd"] = kwargs["options"].cwd
+            yield _result(result="ok")
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider()
+            await provider.execute(
+                agent=AgentDef(name="t", prompt="hi", working_dir=str(link)),
+                context={},
+                rendered_prompt="hi",
+            )
+
+        assert captured["cwd"] == str(link)
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_working_dir_composes_with_mcp_servers(self, tmp_path: Path) -> None:
+        """``cwd`` and the MCP config path are independent: stdio servers pick
+        the directory up by inheriting it from the CLI subprocess, so nothing
+        is stamped onto the per-server config (``McpStdioServerConfig`` has no
+        cwd field)."""
+        captured: dict = {}
+
+        async def fake_query(**kwargs):
+            options = kwargs["options"]
+            captured["cwd"] = options.cwd
+            captured["payload"] = json.loads(Path(options.mcp_servers).read_text())
+            yield _result(result="ok")
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider(
+                mcp_servers={"docs": {"type": "stdio", "command": "docs-server"}}
+            )
+            await provider.execute(
+                agent=AgentDef(name="t", prompt="hi", working_dir=str(tmp_path)),
+                context={},
+                rendered_prompt="hi",
+            )
+
+        assert captured["cwd"] == str(tmp_path)
+        assert captured["payload"] == {
+            "mcpServers": {"docs": {"type": "stdio", "command": "docs-server"}}
+        }
+
+    def test_capability_declares_working_dir_support(self) -> None:
+        """The descriptor is a contract -- it must match the wiring above."""
+        assert ClaudeAgentSdkProvider.CAPABILITIES.working_dir is True
+        assert (
+            "working_dir ignored" not in ClaudeAgentSdkProvider.CAPABILITIES.declared_limitations()
+        )
