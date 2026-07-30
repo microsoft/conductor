@@ -248,6 +248,13 @@ class AcaRuntimeProvider(AgentProvider):
         # a host path has no meaning inside the sandbox filesystem — so
         # this is declared `False` rather than pretending to honor it.
         working_dir=False,
+        # Skill directories resolve to *host* filesystem paths, which have
+        # no meaning inside the sandbox — the same reason `working_dir` is
+        # declared `False` above. `_build_request` never forwards them, and
+        # the in-container runner has no way to read them, so declare
+        # `False` and let `conductor validate` reject `skills:` on an
+        # `aca`-backed agent rather than silently dropping it.
+        skills=False,
         upstream_pin="azure-identity>=1.19.0",
         maintainer=None,
     )
@@ -1000,6 +1007,7 @@ class AcaRuntimeProvider(AgentProvider):
         tools: list[str] | None = None,
         interrupt_signal: asyncio.Event | None = None,
         event_callback: EventCallback | None = None,
+        skill_directories: list[str] | None = None,
     ) -> AgentOutput:
         """Delegate execution to the in-sandbox runner over Branch S streaming.
 
@@ -1008,7 +1016,13 @@ class AcaRuntimeProvider(AgentProvider):
         frame; returns a partial `AgentOutput` when `interrupt_signal` fires
         and the runner's resulting `result` frame (if any) arrives before
         the stream otherwise ends.
+
+        `skill_directories` is accepted for signature compatibility with
+        `AgentProvider.execute` and ignored — the paths are host-side and
+        unreadable from the sandbox, so `CAPABILITIES.skills` is `False`
+        and `conductor validate` rejects `skills:` before this point.
         """
+        del skill_directories  # Host paths are meaningless in-sandbox (see docstring).
         logical_id = self.identifier_for(agent, context)
         # Reserve the wire identifier for the full lifetime of this request
         # (acquired before the request starts, released once it finishes —

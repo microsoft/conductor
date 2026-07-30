@@ -3825,6 +3825,7 @@ class _RecordingWorkingDirProvider:
         tools=None,
         interrupt_signal=None,
         event_callback=None,
+        skill_directories=None,
     ):
         self.calls += 1
         self.seen.append((agent.name, agent.working_dir))
