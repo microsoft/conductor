@@ -1583,6 +1583,7 @@ def _validate_provider_capabilities(
     runtime_default_effort = config.workflow.runtime.default_reasoning_effort
     runtime_max_session_seconds = config.workflow.runtime.max_session_seconds
     runtime_working_dir = config.workflow.runtime.working_dir
+    runtime_skills = config.workflow.runtime.skills
 
     # Cache per provider name so we don't re-resolve for every agent.
     cache: dict[str, ProviderCapabilities] = {}
@@ -1763,6 +1764,18 @@ def _validate_provider_capabilities(
                 f"directories (capabilities.working_dir=False)."
             )
 
+        # skills: a provider that cannot surface skill content would drop it
+        # silently — the agent still runs, just without the knowledge the
+        # author asked for. An empty list is an explicit opt-out, so only a
+        # non-empty list is an error.
+        if agent.skills and not caps.skills:
+            errors.append(
+                f"Agent '{agent.name}' declares skills={agent.skills!r} but provider "
+                f"'{provider_name}' does not support skills "
+                f"(capabilities.skills=False). Remove the skills, opt out with "
+                f"'skills: []', or override the agent to a skill-aware provider."
+            )
+
     # All provider-backed agents that run at workflow scope: top-level agents
     # PLUS for_each inline agents (``ForEachDef.agent``), which inherit the
     # workflow-level ``mcp_servers`` / ``max_session_seconds`` and run with
@@ -1852,6 +1865,34 @@ def _validate_provider_capabilities(
                     f"{sorted(agent_names)!r}. Override these agents to a provider "
                     f"with working-directory support, or remove the workflow-level "
                     f"working_dir."
+                )
+
+    # ----- Workflow-level: skills -----
+    # A runtime-wide skills list is inherited by every LLM agent that does not
+    # declare its own (``skills: []`` is an explicit opt-out and counts as an
+    # override). A provider that cannot surface skill content would drop it
+    # silently, so error against every resolved provider that actually
+    # receives the setting.
+    if runtime_skills:
+        providers_inheriting_skills: dict[str, list[str]] = {}
+        for agent in all_llm_agents:
+            # Any per-agent ``skills:`` — including the empty-list opt-out —
+            # replaces the runtime default; that case is checked in
+            # ``_check_agent_capabilities`` instead.
+            if agent.skills is not None:
+                continue
+            pname = _resolved_provider_name(agent, default_provider)
+            providers_inheriting_skills.setdefault(pname, []).append(agent.name)
+        for pname, agent_names in providers_inheriting_skills.items():
+            pcaps = _caps_for(pname)
+            if pcaps is not None and not pcaps.skills:
+                errors.append(
+                    f"Workflow declares 'runtime.skills'={sorted(runtime_skills)!r} "
+                    f"but provider '{pname}' does not support skills "
+                    f"(capabilities.skills=False) and is used by agent(s): "
+                    f"{sorted(agent_names)!r}. Override these agents to a "
+                    f"skill-aware provider, opt out per-agent with 'skills: []', "
+                    f"or remove the workflow-level skills."
                 )
 
     # ----- Per-agent checks -----

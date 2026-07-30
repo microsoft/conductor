@@ -37,6 +37,7 @@ def _caps(**overrides: object) -> ProviderCapabilities:
         "checkpoint_resume": True,
         "usage_tracking": True,
         "concurrent_safe": True,
+        "skills": True,
     }
     base.update(overrides)
     return ProviderCapabilities(**base)  # type: ignore[arg-type]
@@ -49,10 +50,13 @@ def _build_workflow(
     for_each: list[ForEachDef] | None = None,
     mcp_servers: dict[str, MCPServerDef] | None = None,
     tools: list[str] | None = None,
+    skills: list[str] | None = None,
 ) -> WorkflowConfig:
     runtime_kwargs: dict[str, Any] = {"provider": "copilot"}
     if mcp_servers is not None:
         runtime_kwargs["mcp_servers"] = mcp_servers
+    if skills is not None:
+        runtime_kwargs["skills"] = skills
     workflow_kwargs: dict[str, Any] = {}
     if tools is not None:
         workflow_kwargs["tools"] = tools
@@ -74,6 +78,7 @@ def _for_each_workflow(
     inline: AgentDef,
     tools: list[str] | None = None,
     mcp_servers: dict[str, MCPServerDef] | None = None,
+    skills: list[str] | None = None,
 ) -> WorkflowConfig:
     """Build a workflow whose only for_each group carries ``inline``.
 
@@ -86,6 +91,7 @@ def _for_each_workflow(
         agents=[AgentDef(name="entry", prompt="hi", tools=[])],
         tools=tools,
         mcp_servers=mcp_servers,
+        skills=skills,
         for_each=[
             ForEachDef(
                 name="loop",
@@ -1558,4 +1564,147 @@ class TestClaudeAgentSdkRealCapabilitiesCrossCheck:
         self._patch(patch_caps)
         config = self._sdk_workflow(agents=[AgentDef(name="a", prompt="hi", tools=["search"])])
         with pytest.raises(ConfigurationError, match="does not honor per-agent tool allowlists"):
+            validate_workflow_config(config)
+
+
+class TestSkillsCrossCheck:
+    """Requirement: ``skills`` (per-agent or runtime-wide) against a provider
+    declaring ``skills=False`` is a hard validate error.
+
+    ``capabilities.skills`` promises this cross-check in its docstring, but the
+    check was missing — a workflow on a skill-blind provider validated cleanly
+    and then silently dropped the skill content at run time (follow-up to #180).
+    """
+
+    def test_agent_skills_against_unsupported_provider_errors(self, patch_caps: Any) -> None:
+        patch_caps({"copilot": _caps(skills=False)})
+        config = _build_workflow(
+            agents=[AgentDef(name="a", prompt="hi", skills=["conductor"])],
+        )
+        with pytest.raises(ConfigurationError, match="does not support skills"):
+            validate_workflow_config(config)
+
+    def test_agent_skills_against_supported_provider_passes(self, patch_caps: Any) -> None:
+        patch_caps({"copilot": _caps(skills=True)})
+        config = _build_workflow(
+            agents=[AgentDef(name="a", prompt="hi", skills=["conductor"])],
+        )
+        validate_workflow_config(config)  # no raise
+
+    def test_empty_skills_list_is_opt_out_not_an_error(self, patch_caps: Any) -> None:
+        """``skills: []`` asks for nothing, so a skill-blind provider is fine."""
+        patch_caps({"copilot": _caps(skills=False)})
+        config = _build_workflow(
+            agents=[AgentDef(name="a", prompt="hi", skills=[])],
+        )
+        validate_workflow_config(config)  # no raise
+
+    def test_runtime_skills_against_unsupported_provider_errors(self, patch_caps: Any) -> None:
+        """runtime.skills is inherited by every LLM agent that does not override."""
+        patch_caps({"copilot": _caps(skills=False)})
+        config = _build_workflow(
+            agents=[AgentDef(name="a", prompt="hi")],
+            skills=["conductor"],
+        )
+        with pytest.raises(ConfigurationError, match="runtime.skills"):
+            validate_workflow_config(config)
+
+    def test_runtime_skills_per_agent_opt_out_passes(self, patch_caps: Any) -> None:
+        """A per-agent ``skills: []`` overrides the runtime default, so the
+        skill-blind provider never receives it."""
+        patch_caps({"copilot": _caps(skills=False)})
+        config = _build_workflow(
+            agents=[AgentDef(name="a", prompt="hi", skills=[])],
+            skills=["conductor"],
+        )
+        validate_workflow_config(config)  # no raise
+
+    def test_runtime_skills_all_agents_override_to_capable_provider_passes(
+        self, patch_caps: Any
+    ) -> None:
+        patch_caps(
+            {
+                "copilot": _caps(skills=False),
+                "claude": _caps(skills=True),
+            }
+        )
+        config = _build_workflow(
+            agents=[AgentDef(name="a", prompt="hi", provider="claude")],
+            skills=["conductor"],
+        )
+        validate_workflow_config(config)  # no raise
+
+    def test_per_agent_provider_override_to_skill_blind_provider_errors(
+        self, patch_caps: Any
+    ) -> None:
+        patch_caps(
+            {
+                "copilot": _caps(skills=True),
+                "claude": _caps(skills=False),
+            }
+        )
+        config = _build_workflow(
+            agents=[AgentDef(name="a", prompt="hi", provider="claude", skills=["conductor"])],
+        )
+        with pytest.raises(ConfigurationError, match="does not support skills"):
+            validate_workflow_config(config)
+
+    def test_for_each_inline_agent_skills_errors(self, patch_caps: Any) -> None:
+        """A for_each inline agent is not in ``config.agents``; it must still be
+        cross-checked (#270 pattern)."""
+        patch_caps({"copilot": _caps(skills=False)})
+        config = _for_each_workflow(
+            inline=AgentDef(name="inline", prompt="hi", tools=[], skills=["conductor"]),
+        )
+        with pytest.raises(ConfigurationError, match="does not support skills"):
+            validate_workflow_config(config)
+
+    def test_for_each_inline_agent_inherits_runtime_skills_errors(self, patch_caps: Any) -> None:
+        """The inline agent inherits runtime.skills just like a top-level agent."""
+        patch_caps({"copilot": _caps(skills=False)})
+        config = _for_each_workflow(
+            inline=AgentDef(name="inline", prompt="hi", tools=[]),
+            skills=["conductor"],
+        )
+        with pytest.raises(ConfigurationError, match="runtime.skills"):
+            validate_workflow_config(config)
+
+
+class TestAcaSkillsRealCapabilities:
+    """Cross-check against the REAL ``AcaRuntimeProvider`` descriptor, which
+    declares ``skills=False`` — skill directories are host paths the in-sandbox
+    runner cannot read. ``aca`` is workflow-level only (no ``AgentDef.provider``
+    literal), so it is set via ``runtime.provider``.
+    """
+
+    def _aca_workflow(self, *, agents: list[AgentDef], skills: list[str] | None = None):
+        from conductor.config.schema import ProviderSettings
+
+        runtime_kwargs: dict[str, Any] = {
+            "provider": ProviderSettings(name="aca", pool_endpoint="https://pool.example.com"),
+        }
+        if skills is not None:
+            runtime_kwargs["skills"] = skills
+        return WorkflowConfig(
+            workflow=WorkflowDef(
+                name="test",
+                entry_point=agents[0].name,
+                runtime=RuntimeConfig(**runtime_kwargs),
+            ),
+            agents=agents,
+        )
+
+    def test_real_aca_rejects_agent_skills(self) -> None:
+        config = self._aca_workflow(
+            agents=[AgentDef(name="a", prompt="hi", skills=["conductor"])],
+        )
+        with pytest.raises(ConfigurationError, match="does not support skills"):
+            validate_workflow_config(config)
+
+    def test_real_aca_rejects_runtime_skills(self) -> None:
+        config = self._aca_workflow(
+            agents=[AgentDef(name="a", prompt="hi")],
+            skills=["conductor"],
+        )
+        with pytest.raises(ConfigurationError, match="runtime.skills"):
             validate_workflow_config(config)

@@ -385,6 +385,15 @@ descriptor undermines the framework.
 - `AgentOutput` shape on every successful execution (fields may be `None`).
 - Raise real exceptions on real errors — no silent failure swallowing.
 - Declare accurate `ProviderCapabilities` matching observed behavior.
+- Declare `skills` accurately. Skills are **not** an allowed carve-out — a
+  provider reaches `skills=True` either natively (`supports_native_skills=True`,
+  forwarding `skill_directories` to its SDK) or via `AgentExecutor`'s eager
+  preamble injection, which is provider-agnostic. Declare `False` only when
+  neither path can work (e.g. `aca`, where skill directories are host paths the
+  in-sandbox runner cannot read). `config/validator.py` cross-checks per-agent
+  `skills:` and inherited `runtime.skills` against this flag, so an inaccurate
+  `False` turns into a spurious validate error and an inaccurate `True` silently
+  drops the skill content at run time.
 - Provide a smoke test that exercises construct + execute paths against
   a mocked SDK.
 - Maintain `concurrent_safe: true`, or fail validation when used in
