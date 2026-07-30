@@ -207,7 +207,8 @@ class TestResolver:
         ("provider_name", "expected"),
         [
             # Requirement: copilot, claude, and claude-agent-sdk honor
-            # agent/runtime ``working_dir`` for the SDK session and its MCP
+            # agent/runtime ``working_dir`` for the SDK session and (by
+            # per-server stamping or by subprocess inheritance) its MCP
             # servers; hermes does not (declared False so validate errors out).
             ("copilot", True),
             ("claude", True),

@@ -2093,14 +2093,18 @@ class TestWorkingDirectory:
     """The engine-resolved ``working_dir`` must reach ``ClaudeAgentOptions.cwd``.
 
     The SDK applies ``cwd`` to the ``claude`` subprocess it spawns
-    (``_internal/transport/subprocess_cli.py``), so it governs both where the
-    CLI runs and where the stdio MCP servers it spawns inherit their cwd from.
-    These tests use the real ``ClaudeAgentOptions`` rather than a Mock so a
-    renamed or removed SDK field fails here instead of silently passing.
+    (``_internal/transport/subprocess_cli.py``, as of 0.2.87), so it governs
+    where the CLI runs. Stdio MCP servers are expected to inherit it as
+    children of that subprocess — not asserted here, since the CLI binary owns
+    server spawning. These tests use the real ``ClaudeAgentOptions`` rather
+    than a Mock so a renamed or removed SDK field fails here instead of
+    silently passing.
     """
 
     @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
     async def test_resolved_working_dir_becomes_cwd(self, tmp_path: Path) -> None:
+        """Requirement: the directory the engine resolved is the one the CLI
+        subprocess starts in."""
         captured: dict = {}
 
         async def fake_query(**kwargs):
@@ -2119,7 +2123,12 @@ class TestWorkingDirectory:
 
     @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
     async def test_unset_working_dir_falls_back_to_process_cwd(self) -> None:
-        """No ``working_dir`` keeps the legacy process-cwd behavior."""
+        """No ``working_dir`` keeps the process-cwd fallback.
+
+        Passing the explicit string rather than ``None`` is what makes the SDK
+        stamp ``PWD`` on the child and disambiguate a missing directory from a
+        generic launch failure, so this is not merely cosmetic.
+        """
         captured: dict = {}
 
         async def fake_query(**kwargs):
@@ -2192,6 +2201,103 @@ class TestWorkingDirectory:
     def test_capability_declares_working_dir_support(self) -> None:
         """The descriptor is a contract -- it must match the wiring above."""
         assert ClaudeAgentSdkProvider.CAPABILITIES.working_dir is True
-        assert (
-            "working_dir ignored" not in ClaudeAgentSdkProvider.CAPABILITIES.declared_limitations()
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_concurrent_agents_get_their_own_cwd(self, tmp_path: Path) -> None:
+        """``concurrent_safe=True`` has to hold for cwd too: no instance-level
+        caching may let one agent's directory leak into an overlapping
+        sibling's options."""
+        dirs = []
+        for i in range(4):
+            d = tmp_path / f"d{i}"
+            d.mkdir()
+            dirs.append(str(d))
+        seen: dict[str, str] = {}
+
+        async def fake_query(**kwargs):
+            await asyncio.sleep(0.05)  # force the executions to overlap
+            seen[kwargs["prompt"]] = kwargs["options"].cwd
+            yield _result(result="ok")
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider()
+            await asyncio.gather(
+                *(
+                    provider.execute(
+                        agent=AgentDef(name=f"a{i}", prompt="hi", working_dir=d),
+                        context={},
+                        rendered_prompt=f"p{i}",
+                    )
+                    for i, d in enumerate(dirs)
+                )
+            )
+
+        assert seen == {f"p{i}": d for i, d in enumerate(dirs)}
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_unresolvable_process_cwd_raises_provider_error(self) -> None:
+        """``os.getcwd()`` raises when the process cwd has been deleted. It must
+        surface as ``ProviderError`` naming the real subsystem -- the generic
+        handler would call it a CLI installation problem and hand back a bare
+        pathless errno, which is close to useless."""
+
+        async def fake_query(**kwargs):
+            raise AssertionError("query should never be reached")
+            yield  # pragma: no cover - keeps this an async generator
+
+        with (
+            patch("conductor.providers.claude_agent_sdk.query", fake_query),
+            patch(
+                "conductor.providers.claude_agent_sdk.os.getcwd",
+                side_effect=FileNotFoundError(2, "No such file or directory"),
+            ),
+            pytest.raises(
+                ProviderError, match="working directory could not be resolved"
+            ) as exc_info,
+        ):
+            await ClaudeAgentSdkProvider().execute(
+                agent=AgentDef(name="t", prompt="hi"), context={}, rendered_prompt="hi"
+            )
+
+        assert "working_dir" in (exc_info.value.suggestion or "")
+        assert "installed" not in (exc_info.value.suggestion or "")
+        assert exc_info.value.is_retryable is False
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "Working directory does not exist: /gone",
+            "Failed to start Claude Code: [Errno 20] Not a directory: '/x/afile'",
+            "Failed to start Claude Code: [Errno 13] Permission denied: '/x/noexec'",
+        ],
+    )
+    def test_launch_failures_are_not_misdiagnosed(self, message: str) -> None:
+        """Skipping the provider-side ``is_dir()`` guard is only defensible if
+        the wrapped SDK error is actionable. These three all arrive as
+        ``CLIConnectionError``, whose generic advice is about firewalls, and
+        none of them can succeed on a retry."""
+        from claude_agent_sdk import CLIConnectionError
+
+        from conductor.providers.claude_agent_sdk import (
+            _classify_error_suggestion,
+            _is_retryable_exception,
         )
+
+        exc = CLIConnectionError(message)
+        suggestion = _classify_error_suggestion(exc)
+        assert "firewall" not in suggestion
+        assert "working_dir" in suggestion
+        assert _is_retryable_exception(exc) is False
+
+    def test_genuine_connection_drop_stays_retryable(self) -> None:
+        """The launch-failure carve-out must not swallow the transient case."""
+        from claude_agent_sdk import CLIConnectionError
+
+        from conductor.providers.claude_agent_sdk import (
+            _classify_error_suggestion,
+            _is_retryable_exception,
+        )
+
+        exc = CLIConnectionError("subprocess died unexpectedly")
+        assert "firewall" in _classify_error_suggestion(exc)
+        assert _is_retryable_exception(exc) is True

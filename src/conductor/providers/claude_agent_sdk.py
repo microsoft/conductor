@@ -414,15 +414,33 @@ class ClaudeAgentSdkProvider(AgentProvider):
 
         sdk_tools, permission_mode = self._resolve_tool_config(tools, agent)
 
+        # ``os.getcwd()`` raises ``OSError`` when the process cwd has been
+        # deleted or an ancestor lost traversal permission. Resolve it here
+        # with a dedicated handler rather than leaning on the generic arm
+        # below, which would report a vanished cwd as a CLI installation
+        # problem and hand back a bare pathless errno.
+        try:
+            resolved_cwd = agent.working_dir or os.getcwd()
+        except OSError as exc:
+            raise ProviderError(
+                f"Agent '{agent.name}' declares no working_dir and the process working "
+                f"directory could not be resolved: {exc}",
+                suggestion=(
+                    "The directory conductor was launched from has been deleted or is "
+                    "no longer readable. Re-run from an existing directory, or set an "
+                    "explicit working_dir on the agent or runtime."
+                ),
+                is_retryable=False,
+            ) from exc
+
         options = ClaudeAgentOptions(
             model=model,
             system_prompt=agent.system_prompt,
-            # The engine resolves ``agent.working_dir`` (Jinja render,
-            # absolutize, is_dir check) before dispatching here, so pass it
-            # through verbatim; ``None`` keeps the process-cwd behavior. The
-            # CLI subprocess starts in this directory and every stdio MCP
-            # server it spawns inherits it.
-            cwd=agent.working_dir or os.getcwd(),
+            # Already resolved by ``WorkflowEngine._resolve_agent_working_dir``
+            # (agent over runtime, rendered, absolutized, existence-checked),
+            # so pass it through verbatim rather than re-resolving — that would
+            # collapse the symlink aliases the engine preserves.
+            cwd=resolved_cwd,
             output_format=_build_output_format(agent.output) if agent.output else None,
             max_turns=max_turns,
             permission_mode=permission_mode,
@@ -1069,6 +1087,45 @@ def _safe_callback(callback: EventCallback, event_type: str, data: dict[str, Any
         logger.debug("Error in event_callback for %s", event_type, exc_info=True)
 
 
+def _classify_startup_failure(msg: str) -> str | None:
+    """Return a launch-failure hint for a ``CLIConnectionError`` message.
+
+    The SDK reuses ``CLIConnectionError`` for failures to *spawn* the CLI, not
+    just to talk to a running one. A missing working directory gets a dedicated
+    message; ``ENOTDIR`` (the path is a file) and ``EACCES`` arrive through the
+    generic "Failed to start Claude Code: <errno>" arm instead. The generic
+    connection advice sends users to check firewalls for what is a bad path.
+
+    Matching on upstream free text was audited against ``claude-agent-sdk``
+    0.2.87: CLI stderr never reaches a ``CLIConnectionError`` message (a
+    non-zero exit becomes ``ProcessError``, which this function never sees), so
+    a tool emitting "permission denied" cannot be misfiled as a launch failure.
+
+    Args:
+        msg: Lower-cased exception message.
+
+    Returns:
+        A tailored hint, or ``None`` when the message is not a launch failure
+        and the generic connection advice applies.
+    """
+    if "working directory does not exist" in msg:
+        return (
+            "The working directory disappeared between the engine's existence "
+            "check and the CLI launch — the agent's working_dir, or the process "
+            "cwd when none is set. Check whether an earlier step (e.g. a script "
+            "agent) deletes or moves it mid-run."
+        )
+    if "not a directory" in msg or "permission denied" in msg:
+        # The offending path may be the working directory or the CLI binary --
+        # the errno text does not say which -- so name both.
+        return (
+            "The `claude` CLI could not be started. Check that the agent's "
+            "working_dir points at an existing, readable directory and that "
+            "the `claude` binary is executable."
+        )
+    return None
+
+
 def _classify_error_suggestion(exc: BaseException) -> str:
     """Build a remediation hint tailored to the kind of failure observed.
 
@@ -1086,6 +1143,9 @@ def _classify_error_suggestion(exc: BaseException) -> str:
             "https://docs.anthropic.com/claude/docs/claude-code and verify with `claude --version`."
         )
     if cls == "CLIConnectionError":
+        startup_hint = _classify_startup_failure(msg)
+        if startup_hint is not None:
+            return startup_hint
         return (
             "Could not connect to the `claude` CLI. Check that the binary is "
             "executable and that no firewall is blocking its spawned subprocess."
@@ -1140,8 +1200,10 @@ def _is_retryable_exception(exc: BaseException) -> bool:
         return False
 
     if cls == "CLIConnectionError":
-        # Connection drops to a local subprocess — often transient.
-        return True
+        # A failure to *launch* the CLI (bad working_dir, non-executable
+        # binary) is deterministic — a retry lands on the same path. Only
+        # genuine connection drops to a running subprocess are transient.
+        return _classify_startup_failure(msg) is None
 
     if cls == "ProcessError":
         if "auth" in msg or "401" in msg or "403" in msg or "unauthorized" in msg:

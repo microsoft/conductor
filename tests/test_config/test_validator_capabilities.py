@@ -1502,9 +1502,10 @@ class TestAcaRealCapabilitiesCrossCheck:
 
 
 class TestClaudeAgentSdkRealCapabilitiesCrossCheck:
-    """#335 flipped ``mcp_tools`` to True for ``claude-agent-sdk``. Pin what
-    that means for the validator against the REAL descriptor, not a synthetic
-    one — mirrors ``TestAcaRealCapabilitiesCrossCheck``.
+    """#335 flipped ``mcp_tools`` and #348 flipped ``working_dir`` to True for
+    ``claude-agent-sdk``. Pin what those mean for the validator against the
+    REAL descriptor, not a synthetic one — mirrors
+    ``TestAcaRealCapabilitiesCrossCheck``.
     """
 
     def _sdk_workflow(
@@ -1512,6 +1513,7 @@ class TestClaudeAgentSdkRealCapabilitiesCrossCheck:
         *,
         agents: list[AgentDef],
         mcp_servers: dict[str, MCPServerDef] | None = None,
+        working_dir: str | None = None,
     ) -> WorkflowConfig:
         from conductor.config.schema import ProviderSettings
 
@@ -1522,6 +1524,7 @@ class TestClaudeAgentSdkRealCapabilitiesCrossCheck:
                 runtime=RuntimeConfig(
                     provider=ProviderSettings(name="claude-agent-sdk"),
                     mcp_servers=mcp_servers or {},
+                    working_dir=working_dir,
                 ),
             ),
             agents=agents,
@@ -1565,6 +1568,20 @@ class TestClaudeAgentSdkRealCapabilitiesCrossCheck:
         config = self._sdk_workflow(agents=[AgentDef(name="a", prompt="hi", tools=["search"])])
         with pytest.raises(ConfigurationError, match="does not honor per-agent tool allowlists"):
             validate_workflow_config(config)
+
+    def test_agent_working_dir_is_accepted(self, patch_caps: Any) -> None:
+        """The whole point of #348: an agent-level working_dir no longer fails
+        validate (it raised ConfigurationError before the capability flip)."""
+        self._patch(patch_caps)
+        config = self._sdk_workflow(agents=[AgentDef(name="a", prompt="hi", working_dir="/repo")])
+        validate_workflow_config(config)  # no raise
+
+    def test_runtime_working_dir_is_accepted(self, patch_caps: Any) -> None:
+        """The workflow-level branch is separate code from the per-agent one,
+        so the flip has to be pinned on both paths."""
+        self._patch(patch_caps)
+        config = self._sdk_workflow(agents=[AgentDef(name="a", prompt="hi")], working_dir="/repo")
+        validate_workflow_config(config)  # no raise
 
 
 class TestSkillsCrossCheck:

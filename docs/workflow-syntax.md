@@ -326,6 +326,7 @@ Because paths are normalized lexically instead of resolving to their real paths:
 
 > ⚠️ **Warning: Working directory is NOT a sandbox**
 > Setting `working_dir` doesn't restrict the model's filesystem access. The model can still read and write files outside this directory if it uses absolute paths or parent directory traversals (e.g., `../`). Avoid relying on this configuration to sandbox untrusted model execution.
+> On the `claude-agent-sdk` provider the directory is also a trust boundary in the other direction: the `claude` CLI loads `CLAUDE.md` and `.claude/settings*.json` (including hooks) from wherever it runs, so pointing `working_dir` at an untrusted checkout means running that checkout's instructions.
 
 ### Sandbox Configuration (ACA)
 

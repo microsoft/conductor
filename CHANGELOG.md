@@ -20,8 +20,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   field — inheritance from the CLI subprocess covers it. A missing directory
   still fails before the provider is reached, and `strict_mcp_config` remains
   enabled so a `.mcp.json` sitting in the new directory cannot inject
-  undeclared servers. See
-  [`docs/mcp-tools.md`](docs/mcp-tools.md).
+  undeclared servers. Note that the `claude` CLI also reads `CLAUDE.md` and
+  `.claude/settings*.json` from its working directory, so pointing an agent at
+  an untrusted checkout means running that checkout's instructions and hooks.
+  Launch failures caused by a bad working directory are now reported as such
+  rather than as connection problems, and are no longer treated as retryable.
+  See
+  [`docs/workflow-syntax.md`](docs/workflow-syntax.md#working-directory) and
+  [`docs/providers/experimental.md`](docs/providers/experimental.md).
   ([#348](https://github.com/microsoft/conductor/issues/348))
 
 - **`claude-agent-sdk` provider now supports MCP servers** — workflow-level
