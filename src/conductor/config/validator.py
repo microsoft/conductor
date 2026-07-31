@@ -1617,7 +1617,8 @@ def _validate_provider_capabilities(
           ``workflow_tools_passthrough=False`` — ``aca``, whose in-container
           runner attaches every configured MCP server unconditionally, and
           ``claude-agent-sdk``, where ``tools: []`` disables only the built-in
-          CLI tools). There is no allowlist value, empty or not, those
+          CLI tools — bar the ``Skill`` loader when the agent declares
+          skills). There is no allowlist value, empty or not, those
           providers can honor, so ``tools: []`` would misleadingly pass
           validation while every MCP tool stays attached. This only applies
           when the workflow actually declares ``mcp_servers``: with nothing to
@@ -1653,7 +1654,7 @@ def _validate_provider_capabilities(
                 f"(capabilities.workflow_tools_passthrough=False). Remove the "
                 f"workflow-level 'tools:' so omitting 'tools:' grants the "
                 f"provider's default tool preset, or set this agent's "
-                f"'tools: []' to disable all tools."
+                f"'tools: []' to disable the built-in tools."
             )
 
     def _check_agent_capabilities(

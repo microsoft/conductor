@@ -1095,8 +1095,9 @@ class AgentDef(BaseModel):
     * **Claude Agent SDK** — the Claude Code plugin that owns the skill is
       registered on the session and the skill is enabled by its
       ``<plugin>:<skill>`` name, so the CLI loads only the ``SKILL.md``
-      frontmatter up front. Ambient skills from the machine are not
-      loaded — only what the workflow declares.
+      frontmatter up front. Skills the workflow did not declare are
+      filtered out of the model's listing instead of being inherited
+      from the machine.
     * **Claude** — ``SKILL.md`` plus ``references/*.md`` is eagerly
       injected into the agent's rendered prompt, wrapped in
       ``<skill name="...">`` tags. There is no native skill surface on

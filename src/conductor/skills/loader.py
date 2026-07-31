@@ -1,12 +1,13 @@
 """Load skill content for eager preamble injection (Claude-path mechanism).
 
-On providers that lack a native skill surface (Claude, today), Conductor
-loads the full ``SKILL.md`` plus every ``references/*.md`` file from
-each enabled skill's directory and prepends them to the agent's rendered
-prompt, wrapped in ``<skill name="...">`` tags. On providers with native
-support (Copilot's ``skill_directories``), eager injection is skipped
-and the SDK handles discovery natively — the model loads skill content
-only when relevant, which is more token-efficient.
+On providers that lack a native skill surface, Conductor loads the full
+``SKILL.md`` plus every ``references/*.md`` file from each enabled
+skill's directory and prepends them to the agent's rendered prompt,
+wrapped in ``<skill name="...">`` tags. On providers with native support
+(Copilot's ``skill_directories``, claude-agent-sdk's plugin-scoped
+``skills`` option), eager injection is skipped and the SDK handles
+discovery natively — the model loads skill content only when relevant,
+which is more token-efficient.
 
 The loader is the *content* side of the skill abstraction. The
 :mod:`conductor.skills.registry` module is the *resolution* side.

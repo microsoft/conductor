@@ -22,7 +22,10 @@ from conductor.providers.base import AgentOutput, AgentProvider, EventCallback
 from conductor.providers.capabilities import ProviderCapabilities
 
 if TYPE_CHECKING:
+    from claude_agent_sdk import SdkPluginConfig  # ty: ignore[unresolved-import]
+
     from conductor.config.schema import AgentDef, OutputField
+    from conductor.skills import SkillPlugin
 
 try:
     from claude_agent_sdk import ClaudeAgentOptions, query  # ty: ignore[unresolved-import]
@@ -283,7 +286,7 @@ def _remove_mcp_config(path: str) -> None:
 
 def _resolve_skill_plugins(
     skill_directories: list[str] | None,
-) -> tuple[list[str], list[dict[str, str]]]:
+) -> tuple[list[str], list[SdkPluginConfig]]:
     """Map resolved skill directories to SDK ``skills`` / ``plugins`` options.
 
     The SDK has no "skill directory" surface: a skill is enabled by name and
@@ -298,42 +301,77 @@ def _resolve_skill_plugins(
             when no skills are enabled.
 
     Returns:
-        A ``(skill_names, plugin_configs)`` tuple. Both are empty when no
-        skills are enabled — and an empty ``skills`` list is meaningful to
-        the SDK: it suppresses every skill rather than falling back to CLI
-        discovery defaults.
+        A ``(skill_names, plugin_configs)`` tuple. The lists are not
+        index-parallel: two skills shipped by one plugin produce two names
+        and a single plugin registration. Both are empty when no skills are
+        enabled — and an empty ``skills`` list is meaningful to the SDK: it
+        suppresses every skill rather than falling back to CLI discovery
+        defaults.
 
     Raises:
-        ProviderError: If a skill directory does not live under a plugin
-            root. Loading it would require a surface the SDK does not have,
-            and dropping it silently would hand the agent less than the
-            workflow declared.
+        ProviderError: If a skill cannot be turned into a name the CLI will
+            resolve — it lives under no plugin root, its plugin manifest is
+            unusable, or two plugins claim the same qualified name. Each of
+            those would otherwise hand the agent less than the workflow
+            declared, silently.
     """
     if not skill_directories:
         return [], []
 
-    from conductor.skills import resolve_skill_plugin
+    from conductor.skills import SkillPluginError, resolve_skill_plugin
 
-    skill_names: list[str] = []
-    plugin_paths: list[str] = []
+    plugins: list[SkillPlugin] = []
     for directory in skill_directories:
-        plugin = resolve_skill_plugin(Path(directory))
+        try:
+            plugin = resolve_skill_plugin(Path(directory))
+        except SkillPluginError as exc:
+            raise ProviderError(
+                f"Skill directory {directory!r} belongs to a Claude Code plugin that "
+                f"cannot be loaded: {exc}",
+                suggestion=(
+                    "Repair the plugin, or run this agent on a provider that loads "
+                    "skill directories directly (copilot). A reinstall usually fixes "
+                    "this for a built-in skill."
+                ),
+                is_retryable=False,
+            ) from exc
         if plugin is None:
             raise ProviderError(
-                f"Skill directory {directory!r} is not part of a Claude Code "
-                "plugin (no .claude-plugin/plugin.json in any parent), and "
-                "claude-agent-sdk can only load skills that a plugin provides.",
+                f"Skill directory {directory!r} is not part of a Claude Code plugin "
+                "(no .claude-plugin/plugin.json shipping it in the nearest parent "
+                "directories), and claude-agent-sdk can only load skills that a "
+                "plugin provides.",
                 suggestion=(
                     "Package the skill as a plugin, or run this agent on a "
                     "provider that loads skill directories directly (copilot)."
                 ),
+                is_retryable=False,
             )
-        if plugin.qualified_name not in skill_names:
-            skill_names.append(plugin.qualified_name)
-        root = str(plugin.plugin_root)
-        if root not in plugin_paths:
-            plugin_paths.append(root)
+        plugins.append(plugin)
 
+    # Two skills can ship from one plugin: register the root once but keep every
+    # name. Dropping a name would under-serve the workflow, so a genuine clash --
+    # two different roots claiming one qualified name -- is refused rather than
+    # deduped away.
+    claimed: dict[str, Path] = {}
+    for plugin in plugins:
+        prior = claimed.setdefault(plugin.qualified_name, plugin.plugin_root)
+        if prior != plugin.plugin_root:
+            raise ProviderError(
+                f"Two different plugins both provide the skill "
+                f"{plugin.qualified_name!r}: {prior} and {plugin.plugin_root}. The CLI "
+                "cannot tell them apart, so one of the skills this workflow declared "
+                "would be dropped.",
+                suggestion=(
+                    "Rename one of them in its .claude-plugin/plugin.json, or enable "
+                    "only one of the two."
+                ),
+                is_retryable=False,
+            )
+
+    skill_names = list(claimed)
+    plugin_paths = list(dict.fromkeys(str(p.plugin_root) for p in plugins))
+    logger.debug("Enabling skills %s from plugin roots %s", skill_names, plugin_paths)
     return skill_names, [{"type": "local", "path": path} for path in plugin_paths]
 
 
@@ -353,8 +391,9 @@ class ClaudeAgentSdkProvider(AgentProvider):
         # ambient project/user MCP config is ignored. A narrowing per-server
         # ``tools:`` filter has no SDK equivalent and is refused.
         mcp_tools=True,
-        # Per-agent ``tools: []`` disables all *built-in* tools; declared MCP
-        # servers still attach (the SDK has no per-request MCP toggle), which
+        # Per-agent ``tools: []`` disables all *built-in* tools except the
+        # ``Skill`` loader when skills are enabled; declared MCP servers
+        # still attach (the SDK has no per-request MCP toggle), which
         # is why the validator rejects ``tools: []`` alongside ``mcp_servers:``
         # for this provider. Per-agent ``tools: [<names>]`` is refused loudly
         # at execute time because workflow tool names do not translate to
@@ -400,10 +439,10 @@ class ClaudeAgentSdkProvider(AgentProvider):
         working_dir=True,
         # Skills are loaded natively: the owning plugin is registered via
         # ``ClaudeAgentOptions.plugins`` and enabled by its qualified name
-        # through ``skills``, so the model gets progressive disclosure
-        # instead of the whole SKILL.md tree in its prompt. ``skills`` is
-        # also set (to ``[]``) when the workflow declares none, which is
-        # what makes the ``skills: []`` opt-out real on this provider.
+        # through ``skills``, so the model reads the frontmatter up front
+        # and the body on demand. ``skills`` is also set (to ``[]``) when
+        # the workflow declares none — see the option block in ``execute``
+        # for why that empty list is what makes ``skills: []`` an opt-out.
         skills=True,
         upstream_pin="claude-agent-sdk>=0.2.82",
         maintainer="@lesandiz (best-effort)",
@@ -437,9 +476,10 @@ class ClaudeAgentSdkProvider(AgentProvider):
         :class:`~conductor.executor.agent.AgentExecutor` forwards the
         resolved skill directories on the :meth:`execute`
         ``skill_directories`` kwarg and skips eager preamble injection.
-        Each directory is registered as its owning Claude Code plugin and
-        enabled by name, so the CLI loads only the ``SKILL.md`` frontmatter
-        up front and reads the body on demand.
+        Each directory is resolved to its owning Claude Code plugin, which
+        is registered once and whose skills are enabled by name, so the CLI
+        loads only the ``SKILL.md`` frontmatter up front and reads the body
+        on demand.
         """
         return True
 
@@ -456,8 +496,10 @@ class ClaudeAgentSdkProvider(AgentProvider):
         if query is None or ClaudeAgentOptions is None:
             raise ProviderError("Claude Agent SDK not available")
 
-        # Resolved before anything else so an unloadable skill fails the run
-        # rather than quietly handing the agent less than the workflow declared.
+        # Resolved up front so an unloadable skill fails the run rather than
+        # quietly handing the agent less than the workflow declared. Providers
+        # are constructed lazily, so this surfaces when the first agent on this
+        # provider runs, not at `conductor validate`.
         skill_names, skill_plugins = _resolve_skill_plugins(skill_directories)
 
         # Verbose / full-mode flags drive optional diagnostic output. They
@@ -529,16 +571,25 @@ class ClaudeAgentSdkProvider(AgentProvider):
             # for whatever they expose. Only declared servers may attach.
             strict_mcp_config=True,
             # The skills counterpart of strict_mcp_config, and unconditional
-            # for the same reason: left unset, the CLI loads ~/.claude/skills,
-            # every .claude/skills up the directory tree, CLAUDE.md, project
-            # settings.json, and hooks — none of which the workflow declared.
-            # Conductor surfaces workspace instructions through its own opt-in
-            # `--workspace-instructions` instead.
+            # for the same reason: left unset, the CLI loads user settings
+            # (~/.claude/settings.json), project settings (.claude/settings.json)
+            # and local settings — which between them bring in ambient skills,
+            # CLAUDE.md, and hooks the workflow never declared. Setting `skills`
+            # makes this doubly load-bearing: the SDK re-defaults setting_sources
+            # to ["user", "project"] whenever `skills` is set and this is None.
+            # Conductor surfaces instruction files through its own opt-in
+            # `--workspace-instructions`; settings and hooks have no equivalent.
             setting_sources=[],
-            # An empty list is not the same as None here: None means "CLI
-            # defaults apply", [] means "no skills at all", which is what
-            # makes `skills: []` an honest opt-out.
+            # Load-bearing but invisible in argv: the SDK forwards an explicit
+            # list in the `initialize` control request (_internal/query.py), and
+            # only there does [] differ from None. None means "CLI defaults
+            # apply", [] means "enable no skills" — which is what makes
+            # `skills: []` an honest opt-out. Note this is a context filter, not
+            # a sandbox: unlisted skills are hidden from the model's listing and
+            # rejected by the Skill tool, but their files stay readable on disk.
             skills=skill_names,
+            # Unlike `skills`, [] is already this field's default and means
+            # nothing special.
             plugins=skill_plugins,
         )
 
@@ -775,7 +826,8 @@ class ClaudeAgentSdkProvider(AgentProvider):
     def _resolve_tool_config(
         tools: list[str] | None,
         agent: AgentDef,
-        skills_enabled: bool = False,
+        *,
+        skills_enabled: bool,
     ) -> tuple[Any, str | None]:
         """Resolve the SDK ``tools`` and ``permission_mode`` for an agent.
 
@@ -849,7 +901,8 @@ class ClaudeAgentSdkProvider(AgentProvider):
             suggestion=(
                 "Omit both the per-agent and workflow-level 'tools:' to grant "
                 "the full claude_code preset, or set 'tools: []' to disable "
-                "all tools."
+                "every built-in tool (bar the Skill loader when the agent "
+                "declares skills)."
             ),
         )
 

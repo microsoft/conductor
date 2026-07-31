@@ -87,12 +87,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   enabled plugins — none of which the workflow declared, and all of which
   varied by developer machine and launch directory. Conductor documents
   `skills: []` as an explicit opt-out; on this provider it silently opted out
-  of nothing. `setting_sources` is now always `[]`, the same unconditional
-  isolation `strict_mcp_config` already applies to MCP servers.
+  of nothing. Two options now carry that fix together and neither is redundant:
+  `setting_sources` is always `[]` (the same unconditional isolation
+  `strict_mcp_config` already applies to MCP servers), and `skills` is always
+  passed explicitly, because the SDK treats an omitted list as "CLI defaults
+  apply" and re-defaults `setting_sources` to `["user", "project"]` whenever
+  `skills` is set without it.
   **Behavior change:** agents on this provider also stop picking up ambient
-  `CLAUDE.md`, `.claude/rules/*.md`, project `settings.json`, and hooks — use
-  `--workspace-instructions` (or `--instructions`) to supply that content
-  explicitly. ([#352](https://github.com/microsoft/conductor/issues/352))
+  `CLAUDE.md`, `.claude/rules/*.md`, user/project/local `settings.json`
+  (including `env` and `apiKeyHelper`), and hooks. Instruction files can be
+  supplied explicitly with `--workspace-instructions` (or `--instructions`);
+  settings and hooks have no equivalent, so move anything load-bearing there
+  into the environment. Note the SDK's skill list is a context filter, not a
+  sandbox — undeclared skills are hidden from the model's listing, but their
+  files stay readable on disk.
+  ([#352](https://github.com/microsoft/conductor/issues/352))
 
 - **`tools: []` no longer fails validation when no MCP servers are declared** —
   the capability cross-check rejected an explicit empty allowlist against any
@@ -138,8 +147,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   explicit `tools: []` is granted back the single `Skill` tool when it has
   skills enabled, since an empty base tool set would otherwise leave the
   declared skill unreachable. Wheels now also ship
-  `plugins/conductor/.claude-plugin/`, without which an installed (non-editable)
-  Conductor resolved a plugin root the CLI could not load.
+  `plugins/conductor/.claude-plugin/`; without the manifest no plugin root
+  resolves at all, so a non-editable install would fail every skills-enabled
+  agent on this provider.
   ([#352](https://github.com/microsoft/conductor/issues/352))
 
 - The `claude-agent-sdk` optional dependency floor is now

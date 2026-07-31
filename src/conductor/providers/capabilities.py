@@ -146,9 +146,12 @@ class ProviderCapabilities(BaseModel):
     :attr:`AgentProvider.supports_native_skills`:
 
     * ``supports_native_skills=True`` — resolved skill directories are
-      passed to the SDK on the ``skill_directories`` kwarg of
-      :meth:`AgentProvider.execute` and the SDK loads skill content
-      itself (progressive disclosure via ``SKILL.md`` frontmatter).
+      passed on the ``skill_directories`` kwarg of
+      :meth:`AgentProvider.execute` and the provider forwards them to
+      its SDK in whatever shape that SDK accepts (Copilot registers the
+      directories as-is; claude-agent-sdk maps them to plugin roots and
+      qualified skill names). The SDK then loads skill content itself
+      (progressive disclosure via ``SKILL.md`` frontmatter).
     * ``supports_native_skills=False`` — :class:`AgentExecutor` reads
       every enabled skill's ``SKILL.md`` plus ``references/*.md`` and
       eagerly prepends them to ``rendered_prompt`` inside

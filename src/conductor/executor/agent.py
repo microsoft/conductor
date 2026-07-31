@@ -303,6 +303,7 @@ class AgentExecutor:
                 from conductor.skills import resolve_skill_directories
 
                 skill_dirs = [str(p) for p in resolve_skill_directories(skill_names)]
+                _verbose_log(f"  Skills: {skill_names}")
 
         # Execute via provider
         output = await self.provider.execute(

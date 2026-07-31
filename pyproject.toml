@@ -88,8 +88,8 @@ exclude = [
 # The plugin manifest, not just the skill body: the claude-agent-sdk provider
 # loads skills by registering `plugins/conductor` as a Claude Code plugin
 # (`--plugin-dir`), which requires `.claude-plugin/plugin.json` to be present.
-# Without this the skill loads from a source checkout but silently resolves to
-# nothing from an installed wheel.
+# Without it no plugin root resolves, so the skill works from a source checkout
+# and every skills-enabled agent fails with a ProviderError on a wheel install.
 "plugins/conductor/.claude-plugin" = "plugins/conductor/.claude-plugin"
 
 [dependency-groups]

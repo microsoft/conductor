@@ -11,6 +11,9 @@
 #   * Copilot: the skill directory is registered on the SDK session via
 #     `skill_directories`. The agent discovers and loads SKILL.md and
 #     references on demand (progressive disclosure).
+#   * Claude Agent SDK: also native, via the Claude Code plugin surface —
+#     the plugin shipping the skill is registered and the skill enabled
+#     by its `<plugin>:<skill>` name.
 #   * Claude: SKILL.md + references/*.md are eagerly prepended to the
 #     agent's rendered prompt inside <skills><skill name="conductor">
 #     ... </skill></skills> tags.

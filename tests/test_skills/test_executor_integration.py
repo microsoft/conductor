@@ -19,6 +19,7 @@ from conductor.config.schema import AgentDef
 from conductor.executor.agent import AgentExecutor
 from conductor.providers.base import AgentOutput, AgentProvider, EventCallback
 from conductor.providers.copilot import CopilotProvider
+from conductor.skills import get_skill_directory
 from conductor.skills.loader import _cached_skill_payload
 
 
@@ -30,6 +31,8 @@ class _StubNonNativeProvider(AgentProvider, abstract=True):
     :class:`ProviderCapabilities` declaration enforced on production
     providers — this is a test fake, not a real provider.
     """
+
+    captured: list[str] | None = None
 
     @property
     def supports_native_skills(self) -> bool:
@@ -45,7 +48,8 @@ class _StubNonNativeProvider(AgentProvider, abstract=True):
         event_callback: EventCallback | None = None,
         skill_directories: list[str] | None = None,
     ) -> AgentOutput:
-        return AgentOutput(content={"echo": rendered_prompt})
+        self.captured = skill_directories
+        return AgentOutput(content={"echo": rendered_prompt}, raw_response=rendered_prompt)
 
     async def validate_connection(self) -> bool:
         return True
@@ -73,14 +77,90 @@ class TestCopilotProviderNativeSkills:
         assert CopilotProvider().supports_native_skills is True
 
 
-class TestClaudeAgentSdkNativeSkills:
-    """claude-agent-sdk loads skills through the SDK, not the prompt."""
+class _CapturingNativeProvider(AgentProvider, abstract=True):
+    """Native-skill provider stub that records what the executor forwards.
+
+    The negative "no <skills> in the prompt" assertions cannot tell a
+    working native path from one that dropped the skills entirely, so this
+    captures the positive side.
+    """
+
+    @property
+    def supports_native_skills(self) -> bool:
+        return True
+
+    def __init__(self) -> None:
+        self.captured: list[str] | None = None
+
+    async def execute(
+        self,
+        agent: AgentDef,
+        context: dict[str, Any],
+        rendered_prompt: str,
+        tools: list[str] | None = None,
+        interrupt_signal: asyncio.Event | None = None,
+        event_callback: EventCallback | None = None,
+        skill_directories: list[str] | None = None,
+    ) -> AgentOutput:
+        self.captured = skill_directories
+        return AgentOutput(content={"ok": True}, raw_response="ok")
+
+    async def validate_connection(self) -> bool:
+        return True
+
+    async def close(self) -> None:
+        return None
+
+
+class TestSkillDirectoriesReachTheProvider:
+    """The executor -> provider seam that native skill loading rides on.
+
+    Without these, `skill_directories=None` (or a dropped
+    `supports_native_skills` check) suppresses every skill while the whole
+    suite stays green -- the exact silent-drop failure #352 was about.
+    """
 
     def setup_method(self) -> None:
         _cached_skill_payload.cache_clear()
 
-    def test_no_skill_content_in_rendered_prompt(self) -> None:
+    @staticmethod
+    def _run(provider: _CapturingNativeProvider, agent: AgentDef) -> None:
+        executor = AgentExecutor(provider, workflow_skills=["conductor"])
+        asyncio.run(executor.execute(agent, {}))
+
+    def test_workflow_default_reaches_provider(self) -> None:
+        provider = _CapturingNativeProvider()
+        self._run(provider, AgentDef(name="a", model="m", prompt="p"))
+        assert provider.captured == [str(get_skill_directory("conductor"))]
+
+    def test_agent_list_reaches_provider(self) -> None:
+        provider = _CapturingNativeProvider()
+        executor = AgentExecutor(provider, workflow_skills=[])
+        agent = AgentDef(name="a", model="m", prompt="p", skills=["conductor"])
+        asyncio.run(executor.execute(agent, {}))
+        assert provider.captured == [str(get_skill_directory("conductor"))]
+
+    def test_agent_opt_out_reaches_provider_as_no_dirs(self) -> None:
+        provider = _CapturingNativeProvider()
+        self._run(provider, AgentDef(name="a", model="m", prompt="p", skills=[]))
+        assert not provider.captured
+
+    def test_non_native_provider_gets_no_directories(self) -> None:
+        """Forwarding to a non-native provider would double-load the skill on
+        top of the eager injection it already received."""
+        provider = _StubNonNativeProvider()
+        executor = AgentExecutor(provider, workflow_skills=["conductor"])
+        asyncio.run(executor.execute(AgentDef(name="a", model="m", prompt="p"), {}))
+        assert provider.captured is None
+
+
+class TestClaudeAgentSdkNativeSkills:
+    """claude-agent-sdk loads skills through the SDK, not the prompt."""
+
+    def setup_method(self) -> None:
         pytest.importorskip("claude_agent_sdk", reason="claude-agent-sdk extra not installed")
+
+    def test_no_skill_content_in_rendered_prompt(self) -> None:
         from conductor.providers.claude_agent_sdk import ClaudeAgentSdkProvider
 
         executor = AgentExecutor(ClaudeAgentSdkProvider(), workflow_skills=["conductor"])
@@ -91,7 +171,6 @@ class TestClaudeAgentSdkNativeSkills:
         assert "Hello world" in rendered
 
     def test_provider_advertises_native_support(self) -> None:
-        pytest.importorskip("claude_agent_sdk", reason="claude-agent-sdk extra not installed")
         from conductor.providers.claude_agent_sdk import ClaudeAgentSdkProvider
 
         assert ClaudeAgentSdkProvider().supports_native_skills is True

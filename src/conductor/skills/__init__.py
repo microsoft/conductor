@@ -21,8 +21,8 @@ Provider-parity contract:
     * **Claude Agent SDK** — the Claude Code plugin owning the skill is
       registered on the session (``--plugin-dir``) and the skill enabled
       by its ``<plugin>:<skill>`` name, also progressive. Skills the
-      workflow did not declare are suppressed rather than inherited from
-      the machine.
+      workflow did not declare are filtered out of the model's listing
+      rather than inherited from the machine.
     * **Claude** — eager preamble injection of ``SKILL.md`` plus
       ``references/*.md`` into the agent's rendered prompt. The
       Anthropic API has no server-side skill surface without adopting
@@ -38,6 +38,7 @@ from conductor.skills.loader import load_skill_content
 from conductor.skills.registry import (
     SkillNotFoundError,
     SkillPlugin,
+    SkillPluginError,
     get_skill_directory,
     list_builtin_skills,
     resolve_skill_directories,
@@ -47,6 +48,7 @@ from conductor.skills.registry import (
 __all__ = [
     "SkillNotFoundError",
     "SkillPlugin",
+    "SkillPluginError",
     "get_skill_directory",
     "list_builtin_skills",
     "load_skill_content",

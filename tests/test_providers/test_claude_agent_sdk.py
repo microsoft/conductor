@@ -2352,23 +2352,19 @@ class TestSkillsWiring:
 
         return [str(p) for p in resolve_skill_directories(["conductor"])]
 
-    def test_provider_advertises_native_skills(self) -> None:
-        assert ClaudeAgentSdkProvider().supports_native_skills is True
-
     @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
     async def test_declared_skill_is_enabled_via_plugin(self) -> None:
+        skill_dir = Path(self._skill_dirs()[0])
         options = await self._capture_options(
-            AgentDef(name="t", prompt="hi"), skill_directories=self._skill_dirs()
+            AgentDef(name="t", prompt="hi"), skill_directories=[str(skill_dir)]
         )
 
         assert options.skills == ["conductor:conductor"]
-        assert options.plugins == [
-            {"type": "local", "path": str(Path(self._skill_dirs()[0]).parents[1])}
-        ]
+        assert options.plugins == [{"type": "local", "path": str(skill_dir.parents[1])}]
 
         argv = self._argv(options)
         assert "--plugin-dir" in argv
-        assert argv[argv.index("--plugin-dir") + 1] == options.plugins[0]["path"]
+        assert argv[argv.index("--plugin-dir") + 1] == str(skill_dir.parents[1])
         assert argv[argv.index("--allowedTools") + 1] == "Skill(conductor:conductor)"
 
     @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
@@ -2409,7 +2405,10 @@ class TestSkillsWiring:
         assert options.tools == ["Skill"]
         argv = self._argv(options)
         assert argv[argv.index("--tools") + 1] == "Skill"
-        # Granted by the SDK's allowed_tools injection, so no bypass needed.
+        # With no permission bypass, the SDK's allowed_tools injection is the
+        # only thing permitting the tool -- assert it here, not just on the
+        # preset path where bypassPermissions would mask its absence.
+        assert argv[argv.index("--allowedTools") + 1] == "Skill(conductor:conductor)"
         assert options.permission_mode is None
 
     @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
@@ -2430,6 +2429,15 @@ class TestSkillsWiring:
         argv = self._argv(options)
         assert argv[argv.index("--tools") + 1] == "default"
 
+    @staticmethod
+    def _make_plugin(root: Path, plugin_name: str, *skills: str) -> Path:
+        (root / ".claude-plugin").mkdir(parents=True)
+        (root / ".claude-plugin" / "plugin.json").write_text(f'{{"name": "{plugin_name}"}}')
+        for skill in skills:
+            (root / "skills" / skill).mkdir(parents=True)
+            (root / "skills" / skill / "SKILL.md").write_text(f"---\nname: {skill}\n---\n")
+        return root
+
     @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
     async def test_skill_outside_a_plugin_is_refused(self, tmp_path: Path) -> None:
         orphan = tmp_path / "skills" / "lonely"
@@ -2441,9 +2449,60 @@ class TestSkillsWiring:
                 AgentDef(name="t", prompt="hi"), skill_directories=[str(orphan)]
             )
 
-    def test_two_skills_from_one_plugin_register_it_once(self) -> None:
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_broken_plugin_manifest_is_refused_with_its_reason(self, tmp_path: Path) -> None:
+        """A present-but-broken manifest must not be reported as an absent one."""
+        root = tmp_path / "plug"
+        (root / ".claude-plugin").mkdir(parents=True)
+        (root / ".claude-plugin" / "plugin.json").write_text("{not json")
+        skill = root / "skills" / "s"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text("---\nname: s\n---\n")
+
+        with pytest.raises(ProviderError, match="cannot be loaded") as exc:
+            await self._capture_options(
+                AgentDef(name="t", prompt="hi"), skill_directories=[str(skill)]
+            )
+        assert "could not be read" in str(exc.value)
+        assert exc.value.is_retryable is False
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_missing_plugin_error_is_not_retryable(self, tmp_path: Path) -> None:
+        """A path containing 'connection' must not trip the retryability
+        heuristic, which sniffs the message text."""
+        orphan = tmp_path / "connection-hub" / "skills" / "lonely"
+        orphan.mkdir(parents=True)
+        (orphan / "SKILL.md").write_text("---\nname: lonely\n---\n")
+
+        with pytest.raises(ProviderError) as exc:
+            await self._capture_options(
+                AgentDef(name="t", prompt="hi"), skill_directories=[str(orphan)]
+            )
+        assert exc.value.is_retryable is False
+
+    def test_two_skills_from_one_plugin_register_it_once(self, tmp_path: Path) -> None:
+        """Roots dedupe, names do not -- dropping a name would under-serve the
+        workflow."""
+        root = self._make_plugin(tmp_path / "plug", "p", "alpha", "beta")
+        names, plugins = _resolve_skill_plugins(
+            [str(root / "skills" / "alpha"), str(root / "skills" / "beta")]
+        )
+
+        assert names == ["p:alpha", "p:beta"]
+        assert plugins == [{"type": "local", "path": str(root)}]
+
+    def test_duplicate_skill_directory_is_collapsed(self) -> None:
         skill_dir = self._skill_dirs()[0]
         names, plugins = _resolve_skill_plugins([skill_dir, skill_dir])
 
         assert names == ["conductor:conductor"]
         assert len(plugins) == 1
+
+    def test_two_plugins_claiming_one_name_are_refused(self, tmp_path: Path) -> None:
+        """Deduping the clash away would silently drop one declared skill."""
+        a = self._make_plugin(tmp_path / "vendorA", "dup", "s")
+        b = self._make_plugin(tmp_path / "vendorB", "dup", "s")
+
+        with pytest.raises(ProviderError, match="Two different plugins") as exc:
+            _resolve_skill_plugins([str(a / "skills" / "s"), str(b / "skills" / "s")])
+        assert exc.value.is_retryable is False
