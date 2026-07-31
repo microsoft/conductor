@@ -203,6 +203,10 @@ class TestResolver:
         caps = get_capabilities(provider_name)
         assert isinstance(caps, ProviderCapabilities)
 
+    def test_claude_declares_incremental_streaming(self) -> None:
+        # Requirement: Claude's capability matches its Pydantic AI event stream.
+        assert get_capabilities("claude").streaming_events is True
+
     @pytest.mark.parametrize(
         ("provider_name", "expected"),
         [

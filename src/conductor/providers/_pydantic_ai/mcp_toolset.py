@@ -16,6 +16,7 @@ from pydantic_ai.toolsets import ToolsetTool
 from pydantic_core import SchemaValidator, core_schema
 
 from conductor.mcp.manager import MCPManager
+from conductor.providers._pydantic_ai.events import EventCallback, maybe_emit_tool_truncation
 
 if TYPE_CHECKING:
     from pydantic_ai import Agent
@@ -47,6 +48,8 @@ class MCPManagerToolset(AbstractToolset[Any]):
         manager: MCPManager,
         tool_names: list[str] | None,
         output_config: ToolOutputConfig | None,
+        *,
+        event_callback: EventCallback | None = None,
     ) -> None:
         """Create a toolset adapter.
 
@@ -57,10 +60,12 @@ class MCPManagerToolset(AbstractToolset[Any]):
             output_config: Optional tool output truncation configuration. This is
                 kept for API symmetry and potential future use; truncation itself is
                 performed inside ``MCPManager.call_tool``.
+            event_callback: Optional Conductor callback for truncation events.
         """
         self._manager = manager
         self._tool_names = tool_names
         self._output_config = output_config
+        self._event_callback = event_callback
 
     @property
     def id(self) -> str | None:
@@ -114,9 +119,12 @@ class MCPManagerToolset(AbstractToolset[Any]):
                 ``is_error=True``.
         """
         try:
-            return await self._manager.call_tool(name, tool_args)
+            result = await self._manager.call_tool(name, tool_args)
         except Exception as e:
             raise ToolFailed(f"Error executing tool {name!r}: {e}") from e
+        if self._event_callback is not None and ctx.agent is not None:
+            maybe_emit_tool_truncation(ctx.agent, name, result, self._event_callback)
+        return result
 
     def attach_to(self, agent: Agent[Any, Any]) -> None:
         """Register this toolset on an already-built Pydantic AI agent.

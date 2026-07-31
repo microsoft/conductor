@@ -13,7 +13,7 @@ import pytest
 from pydantic_ai.models.test import TestModel
 
 from conductor.config.schema import AgentDef, ToolOutputConfig
-from conductor.mcp.manager import MCPManager
+from conductor.mcp.manager import GENERIC_HINT, MCPManager
 from conductor.providers._pydantic_ai.agent_builder import build_agent
 from conductor.providers._pydantic_ai.mcp_toolset import MCPManagerToolset
 
@@ -126,6 +126,49 @@ async def test_call_tool_delegates_to_manager() -> None:
 
     assert result == "file contents"
     assert manager.calls == [("fs__read", {"path": "/etc/passwd"})]
+
+
+@pytest.mark.asyncio
+async def test_call_tool_emits_truncation_event() -> None:
+    # Requirement: production MCP calls surface truncation metadata to subscribers.
+    marker = (
+        "\n\n[output truncated: 2000 chars -> 1000 kept; "
+        f"full output saved to: /tmp/spill.txt. {GENERIC_HINT}]"
+    )
+    manager = _FakeMCPManager(
+        [{"name": "fs__read", "description": "read", "input_schema": {}}],
+        result="x" * 1000 + marker,
+    )
+    recorded: list[tuple[str, dict[str, Any]]] = []
+    toolset = MCPManagerToolset(
+        manager,
+        None,
+        None,
+        event_callback=lambda event_type, data: recorded.append((event_type, data)),
+    )
+    tools = await toolset.get_tools(None)
+    agent = build_agent(
+        AgentDef(name="truncation-agent"),
+        system_prompt="",
+        rendered_prompt="",
+        api_key="dummy",
+    )
+    ctx = type("ToolContext", (), {"agent": agent})()
+
+    await toolset.call_tool("fs__read", {}, ctx, tools["fs__read"])
+
+    assert recorded == [
+        (
+            "agent_tool_output_truncated",
+            {
+                "agent_name": "truncation-agent",
+                "tool_name": "fs__read",
+                "original_chars": 2000,
+                "kept_chars": 1000,
+                "spill_path": "/tmp/spill.txt",
+            },
+        )
+    ]
 
 
 @pytest.mark.asyncio

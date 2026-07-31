@@ -92,8 +92,8 @@ class ClaudeProvider(AgentProvider):
     normalizes responses into AgentOutput format. Uses tool-based
     structured output extraction for reliable JSON responses.
 
-    Supports non-streaming message execution with error handling,
-    retry logic, and temperature validation.
+    Supports incremental event streaming with error handling, retry logic,
+    and temperature validation.
 
     Example:
         >>> provider = ClaudeProvider(api_key="sk-...")
@@ -109,9 +109,7 @@ class ClaudeProvider(AgentProvider):
         mcp_tools=True,
         # Per-agent ``tools:`` allowlists are forwarded to the SDK.
         workflow_tools_passthrough=True,
-        # The Claude provider buffers the API response before emitting any
-        # events. Flip to True if/when a streaming codepath is wired up.
-        streaming_events=False,
+        streaming_events=True,
         # ``agent_reasoning`` events fire for extended-thinking content
         # when the model returns it.
         agent_reasoning_events=True,
@@ -807,6 +805,7 @@ class ClaudeProvider(AgentProvider):
                     manager,
                     tool_names,
                     self._tool_output_config,
+                    event_callback=event_callback,
                 )
             )
 
@@ -872,6 +871,7 @@ class ClaudeProvider(AgentProvider):
                     has_output_schema=bool(agent.output),
                     usage_limits=UsageLimits(request_limit=max_iterations),
                     max_session_seconds=max_session,
+                    max_parse_recovery_attempts=retry_cfg.max_parse_recovery_attempts,
                 ),
                 retry_config=retry_cfg,
                 event_callback=intercepting_callback,
