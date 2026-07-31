@@ -12,7 +12,7 @@ as these were Claude-specific parameters not supported by both providers.
 from __future__ import annotations
 
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 import pytest
 from pydantic_ai import Agent
@@ -71,8 +71,7 @@ class TestClaudeEdgeCases:
                 return_value=_build_text_agent(""),
             ),
             patch(
-                "conductor.providers._pydantic_ai.interrupt._run_to_completion",
-                new_callable=AsyncMock,
+                "conductor.providers._pydantic_ai.interrupt.run_with_interrupt",
                 return_value=RunOutcome(result=AgentRunResult(output="")),
             ),
         ):

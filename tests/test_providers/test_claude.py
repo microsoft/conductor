@@ -459,18 +459,18 @@ class TestErrorHandling:
         """Test that API errors are wrapped as ProviderError."""
         provider = ClaudeProvider(api_key="test-key")
 
-        failing_agent = _build_text_agent("never")
-
         async def failing_run(*args: Any, **kwargs: Any) -> Any:
             raise RuntimeError("API error")
-
-        failing_agent.run = failing_run
 
         with (
             patch.object(provider, "_get_mcp_manager_for_cwd", return_value=None),
             patch(
                 "conductor.providers._pydantic_ai.agent_builder.build_agent",
-                return_value=failing_agent,
+                return_value=_build_text_agent("never"),
+            ),
+            patch(
+                "conductor.providers._pydantic_ai.interrupt.run_with_interrupt",
+                side_effect=failing_run,
             ),
         ):
             agent = AgentDef(name="test", prompt="Test")
