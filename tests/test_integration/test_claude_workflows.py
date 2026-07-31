@@ -37,6 +37,7 @@ from conductor.config.schema import (
 )
 from conductor.engine.workflow import WorkflowEngine
 from conductor.exceptions import ExecutionError, ProviderError
+from conductor.providers._pydantic_ai.interrupt import RunOutcome
 from conductor.providers.claude import ClaudeProvider
 
 
@@ -440,7 +441,7 @@ class TestErrorHandlingClaudeWorkflow:
 
         call_count = [0]
 
-        async def failing_run(*args: Any, **kwargs: Any) -> Any:
+        async def failing_run(*args: Any, **kwargs: Any) -> RunOutcome:
             call_count[0] += 1
             if call_count[0] < 3:
                 raise MockRateLimitError(
@@ -448,15 +449,12 @@ class TestErrorHandlingClaudeWorkflow:
                     retry_after=0.01,
                 )
 
-            class _SuccessModel(BaseModel):
-                result: str
-
-            return Mock(output=_SuccessModel(result="Success after retry"))
-
-        def make_agent(**kwargs: Any) -> Agent[Any, Any]:
-            agent = _build_structured_agent({"result": "unused"})
-            agent.run = failing_run
-            return agent
+            agent = _build_structured_agent({"result": "Success after retry"})
+            async with agent.iter("test") as run:
+                async for _node in run:
+                    pass
+            assert run.result is not None
+            return RunOutcome(result=run.result)
 
         # Create simple workflow
         workflow = WorkflowConfig(
@@ -484,7 +482,11 @@ class TestErrorHandlingClaudeWorkflow:
         with (
             patch(
                 "conductor.providers._pydantic_ai.agent_builder.build_agent",
-                side_effect=make_agent,
+                return_value=_build_structured_agent({"result": "unused"}),
+            ),
+            patch(
+                "conductor.providers._pydantic_ai.interrupt.run_with_interrupt",
+                side_effect=failing_run,
             ),
             patch("conductor.providers._pydantic_ai.retry.asyncio.sleep") as mock_sleep,
         ):
@@ -507,13 +509,8 @@ class TestErrorHandlingClaudeWorkflow:
         with open(fixture_file) as f:
             error_responses = json.load(f)
 
-        async def failing_run(*args: Any, **kwargs: Any) -> Any:
+        async def failing_run(*args: Any, **kwargs: Any) -> RunOutcome:
             raise MockAuthenticationError(error_responses["auth_failure"]["error"]["message"])
-
-        def make_agent(**kwargs: Any) -> Agent[Any, Any]:
-            agent = _build_structured_agent({"result": "unused"})
-            agent.run = failing_run
-            return agent
 
         workflow = WorkflowConfig(
             workflow=WorkflowDef(
@@ -542,7 +539,11 @@ class TestErrorHandlingClaudeWorkflow:
             pytest.raises((ProviderError, ExecutionError)),
             patch(
                 "conductor.providers._pydantic_ai.agent_builder.build_agent",
-                side_effect=make_agent,
+                return_value=_build_structured_agent({"result": "unused"}),
+            ),
+            patch(
+                "conductor.providers._pydantic_ai.interrupt.run_with_interrupt",
+                side_effect=failing_run,
             ),
             patch("conductor.providers._pydantic_ai.retry.asyncio.sleep") as mock_sleep,
         ):
