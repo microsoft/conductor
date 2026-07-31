@@ -14,8 +14,10 @@ from pydantic_ai import Agent
 from pydantic_ai.messages import (
     FunctionToolCallEvent,
     FunctionToolResultEvent,
+    OutputToolResultEvent,
     PartDeltaEvent,
     PartStartEvent,
+    RetryPromptPart,
     TextPart,
     TextPartDelta,
     ThinkingPart,
@@ -27,6 +29,7 @@ from pydantic_ai.models.test import TestModel
 
 from conductor.providers._pydantic_ai.events import (
     emit_agent_turn_start,
+    emit_output_recovery_event,
     emit_pydantic_event,
     map_pydantic_event,
     maybe_emit_tool_truncation,
@@ -122,19 +125,16 @@ class TestMapPydanticEventToolCalls:
         assert data["agent_name"] == "mapper"
         assert '"path": "/tmp/test.txt"' in data["arguments"]
 
-    def test_part_start_tool_call(self, agent: Agent[Any, Any]) -> None:
-        """A ``PartStartEvent(ToolCallPart)`` also emits ``agent_tool_start``."""
+    def test_part_start_tool_call_is_ignored(self, agent: Agent[Any, Any]) -> None:
+        # Requirement: a generated tool call does not duplicate the execution-start event.
         call = ToolCallPart(
             tool_name="web__search",
             args={"query": "pydantic"},
             tool_call_id="call-2",
         )
         event = PartStartEvent(index=0, part=call)
-        mapped = map_pydantic_event(agent, event)
 
-        assert mapped is not None
-        assert mapped[0] == "agent_tool_start"
-        assert mapped[1]["tool_name"] == "web__search"
+        assert map_pydantic_event(agent, event) is None
 
     def test_function_tool_result_event(self, agent: Agent[Any, Any]) -> None:
         """``FunctionToolResultEvent`` emits ``agent_tool_complete`` with the result preview."""
@@ -225,6 +225,37 @@ class TestEmitAgentTurnStart:
     def test_no_callback_is_noop(self) -> None:
         """``emit_agent_turn_start`` with ``None`` callback should return silently."""
         emit_agent_turn_start(None, 1)
+
+
+class TestEmitOutputRecoveryEvent:
+    def test_json_validation_error_emits_syntax_reason(self) -> None:
+        # Requirement: invalid JSON is distinguished from schema validation failures.
+        recorded: list[tuple[str, dict[str, Any]]] = []
+        event = OutputToolResultEvent(
+            part=RetryPromptPart(
+                content=[
+                    {
+                        "type": "json_invalid",
+                        "loc": (),
+                        "msg": "Invalid JSON",
+                        "input": "{",
+                    }
+                ],
+                tool_name="final_result",
+                tool_call_id="call-1",
+            )
+        )
+
+        emitted = emit_output_recovery_event(
+            event,
+            lambda event_type, data: recorded.append((event_type, data)),
+            attempt=1,
+            max_attempts=2,
+        )
+
+        assert emitted is True
+        assert recorded[0][0] == "agent_parse_recovery"
+        assert recorded[0][1]["reason"] == "syntax"
 
 
 class TestMaybeEmitToolTruncation:

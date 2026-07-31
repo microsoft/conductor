@@ -15,8 +15,10 @@ from pydantic_ai import Agent
 from pydantic_ai.messages import (
     FunctionToolCallEvent,
     FunctionToolResultEvent,
+    OutputToolResultEvent,
     PartDeltaEvent,
     PartStartEvent,
+    RetryPromptPart,
     TextPart,
     TextPartDelta,
     ThinkingPart,
@@ -26,6 +28,7 @@ from pydantic_ai.messages import (
 
 from conductor.mcp.manager import FS_HINT, GENERIC_HINT, TRUNCATION_MARKER_PREFIX
 from conductor.providers._event_format import (
+    emit_parse_recovery_event,
     extract_tool_result_text,
     format_tool_arguments,
 )
@@ -33,6 +36,31 @@ from conductor.providers._event_format import (
 EventCallback = Callable[[str, dict[str, Any]], None]
 
 logger = logging.getLogger(__name__)
+
+
+def emit_output_recovery_event(
+    event: Any,
+    event_callback: EventCallback | None,
+    *,
+    attempt: int,
+    max_attempts: int,
+) -> bool:
+    """Emit parse recovery metadata for an output-tool retry event."""
+    if not isinstance(event, OutputToolResultEvent) or not isinstance(event.part, RetryPromptPart):
+        return False
+
+    content = event.part.content
+    is_schema_failure = not (
+        isinstance(content, list) and any(error.get("type") == "json_invalid" for error in content)
+    )
+    emit_parse_recovery_event(
+        event_callback,
+        attempt=attempt,
+        max_attempts=max_attempts,
+        is_schema_failure=is_schema_failure,
+        error=event.part.model_response(),
+    )
+    return True
 
 
 def _parse_truncation_marker(result: Any) -> dict[str, Any] | None:
@@ -130,15 +158,6 @@ def map_pydantic_event(
             return ("agent_message", {"agent_name": agent_name, "content": part.content})
         if isinstance(part, ThinkingPart) and part.content:
             return ("agent_reasoning", {"agent_name": agent_name, "content": part.content})
-        if isinstance(part, ToolCallPart):
-            return (
-                "agent_tool_start",
-                {
-                    "agent_name": agent_name,
-                    "tool_name": part.tool_name,
-                    "arguments": format_tool_arguments(_extract_tool_call_args(part)),
-                },
-            )
         return None
 
     if isinstance(event, PartDeltaEvent):
