@@ -14,11 +14,12 @@ full WorkflowEngine path and inspect the constructed Pydantic AI agent.
 from __future__ import annotations
 
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 from pydantic import BaseModel
 from pydantic_ai import Agent
+from pydantic_ai.models.test import TestModel
 
 from conductor.config.loader import load_workflow
 from conductor.engine.workflow import WorkflowEngine
@@ -27,21 +28,10 @@ from conductor.providers.factory import create_provider
 
 
 def _build_stub_agent(data: dict[str, Any]) -> Agent[Any, Any]:
-    """Build a Pydantic AI structured-output agent whose run() returns canned data."""
-
     class DynamicModel(BaseModel):
         model_config = {"extra": "allow"}
 
-    async def _stub_run(*args: Any, **kwargs: Any) -> Any:
-        class _Result:
-            output = DynamicModel(**data)
-            usage = MagicMock(request_tokens=10, response_tokens=20, total_tokens=30)
-
-        return _Result()
-
-    agent = Agent(model=None, output_type=DynamicModel)
-    agent.run = _stub_run  # type: ignore[method-assign]
-    return agent
+    return Agent(model=TestModel(custom_output_args=data), output_type=DynamicModel)
 
 
 def _capture_build_agent(
@@ -51,8 +41,8 @@ def _capture_build_agent(
     """Return a patch that captures the real Agent's model_settings.
 
     The returned Agent is built by the real ``build_agent`` so its
-    ``model_settings`` reflect the actual temperature/max_tokens flow, but its
-    ``run`` method is stubbed to avoid network calls.
+    ``model_settings`` reflect the actual temperature/max_tokens flow, while a
+    TestModel-backed replacement avoids network calls.
     """
     target = "conductor.providers._pydantic_ai.agent_builder.build_agent"
     real_build_agent = _ab.build_agent

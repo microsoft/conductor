@@ -18,7 +18,8 @@ import contextlib
 from typing import Any
 
 import pytest
-from pydantic_ai import Agent, UsageLimits
+from pydantic_ai import Agent, AgentRetries, UsageLimits
+from pydantic_ai.exceptions import UnexpectedModelBehavior
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.output import ToolOutput
 from pydantic_ai.tools import Tool
@@ -163,6 +164,158 @@ class TestNormalCompletion:
         assert outcome.is_cancelled is False
         assert outcome.result is not None
         assert outcome.partial_output is None
+
+    @pytest.mark.asyncio
+    async def test_tool_execution_emits_one_start_event(self) -> None:
+        # Requirement: each tool execution emits exactly one lifecycle start event.
+        agent = Agent(
+            TestModel(call_tools=["echo"]),
+            tools=[Tool(lambda value: value, name="echo")],
+            retries=0,
+        )
+        recorded: list[tuple[str, dict[str, Any]]] = []
+
+        await run_with_interrupt(
+            agent,
+            "echo a value",
+            interrupt_signal=None,
+            event_callback=lambda event_type, data: recorded.append((event_type, data)),
+            has_output_schema=False,
+        )
+
+        starts = [data for event_type, data in recorded if event_type == "agent_tool_start"]
+        assert len(starts) == 1
+        assert starts[0]["tool_name"] == "echo"
+
+    @pytest.mark.asyncio
+    async def test_iter_emits_awaiting_model_before_each_request(self) -> None:
+        # Requirement: every iter-path model request exposes the awaiting-model boundary.
+        agent = Agent(
+            TestModel(call_tools=["echo"]),
+            tools=[Tool(lambda value: value, name="echo")],
+            retries=0,
+        )
+        recorded: list[tuple[str, dict[str, Any]]] = []
+
+        outcome = await run_with_interrupt(
+            agent,
+            "echo a value",
+            interrupt_signal=asyncio.Event(),
+            event_callback=lambda event_type, data: recorded.append((event_type, data)),
+            has_output_schema=False,
+        )
+
+        awaiting = [
+            data
+            for event_type, data in recorded
+            if event_type == "agent_turn_start" and data["turn"] == "awaiting_model"
+        ]
+        assert len(awaiting) == 2
+        assert outcome.result is not None
+        usage = outcome.result.usage
+        assert outcome.total_usage == {
+            "requests": usage.requests,
+            "request_tokens": None,
+            "response_tokens": None,
+            "total_tokens": usage.total_tokens,
+        }
+
+    @pytest.mark.asyncio
+    async def test_noninteractive_emits_awaiting_model_before_each_request(self) -> None:
+        # Requirement: every non-interactive model request exposes the awaiting-model boundary.
+        agent = Agent(
+            TestModel(call_tools=["echo"]),
+            tools=[Tool(lambda value: value, name="echo")],
+            retries=0,
+        )
+        recorded: list[tuple[str, dict[str, Any]]] = []
+
+        outcome = await run_with_interrupt(
+            agent,
+            "echo a value",
+            interrupt_signal=None,
+            event_callback=lambda event_type, data: recorded.append((event_type, data)),
+            has_output_schema=False,
+        )
+
+        awaiting = [
+            data
+            for event_type, data in recorded
+            if event_type == "agent_turn_start" and data["turn"] == "awaiting_model"
+        ]
+        assert len(awaiting) == 2
+        assert outcome.result is not None
+        assert outcome.result.usage.requests == 2
+
+    @pytest.mark.asyncio
+    async def test_iter_output_validation_retry_emits_parse_recovery(self) -> None:
+        # Requirement: Agent.iter output correction attempts are visible to subscribers.
+        output_model = output_schema_to_pydantic_model(
+            "RecoveryOutput", {"answer": OutputField(type="string")}
+        )
+        assert output_model is not None
+        agent = Agent(
+            TestModel(custom_output_args={"answer": 42}),
+            output_type=ToolOutput(output_model),
+            retries=AgentRetries(tools=0, output=1),
+        )
+        recorded: list[tuple[str, dict[str, Any]]] = []
+
+        with pytest.raises(UnexpectedModelBehavior):
+            await run_with_interrupt(
+                agent,
+                "format this",
+                interrupt_signal=asyncio.Event(),
+                event_callback=lambda event_type, data: recorded.append((event_type, data)),
+                has_output_schema=True,
+                max_parse_recovery_attempts=1,
+            )
+
+        recovery_events = [
+            data for event_type, data in recorded if event_type == "agent_parse_recovery"
+        ]
+        assert recovery_events == [
+            {
+                "attempt": 1,
+                "max_attempts": 1,
+                "reason": "schema",
+                "error": recovery_events[0]["error"],
+            }
+        ]
+        assert recovery_events[0]["error"]
+
+    @pytest.mark.asyncio
+    async def test_noninteractive_output_validation_retry_emits_parse_recovery(self) -> None:
+        # Requirement: non-interactive output correction attempts are visible to subscribers.
+        output_model = output_schema_to_pydantic_model(
+            "RunRecoveryOutput", {"answer": OutputField(type="string")}
+        )
+        assert output_model is not None
+        agent = Agent(
+            TestModel(custom_output_args={"answer": 42}),
+            output_type=ToolOutput(output_model),
+            retries=AgentRetries(tools=0, output=1),
+        )
+        recorded: list[tuple[str, dict[str, Any]]] = []
+
+        with pytest.raises(UnexpectedModelBehavior):
+            await run_with_interrupt(
+                agent,
+                "format this",
+                interrupt_signal=None,
+                event_callback=lambda event_type, data: recorded.append((event_type, data)),
+                has_output_schema=True,
+                max_parse_recovery_attempts=1,
+            )
+
+        recovery_events = [
+            data for event_type, data in recorded if event_type == "agent_parse_recovery"
+        ]
+        assert len(recovery_events) == 1
+        assert recovery_events[0]["attempt"] == 1
+        assert recovery_events[0]["max_attempts"] == 1
+        assert recovery_events[0]["reason"] == "schema"
+        assert recovery_events[0]["error"]
 
 
 class TestHardAbort:

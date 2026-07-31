@@ -32,6 +32,7 @@ from pydantic_graph.basenode import End
 from conductor.exceptions import ProviderError
 from conductor.providers._pydantic_ai.events import (
     emit_agent_turn_start,
+    emit_output_recovery_event,
     emit_pydantic_event,
 )
 
@@ -106,33 +107,6 @@ def _usage_from_result(result: AgentRunResult[Any] | None) -> dict[str, Any] | N
     }
 
 
-def _aggregate_usage(
-    usages: list[dict[str, Any] | None],
-) -> dict[str, int | None]:
-    """Sum numeric usage fields across calls, preserving None for unknowns."""
-    total: dict[str, int | None] = {
-        "requests": 0,
-        "request_tokens": 0,
-        "response_tokens": 0,
-        "total_tokens": 0,
-    }
-    had_any = False
-    for usage in usages:
-        if usage is None:
-            continue
-        had_any = True
-        for key in total:
-            value = usage.get(key)
-            if value is not None:
-                current = total.get(key) or 0
-                total[key] = current + int(value)
-            else:
-                total[key] = None
-    if not had_any:
-        return {}
-    return total
-
-
 def _has_stream(node: Any) -> bool:
     """Return whether a graph node supports event streaming."""
     return hasattr(node, "stream")
@@ -143,6 +117,8 @@ async def _stream_node_events(
     node: Any,
     run_context: Any,
     event_callback: EventCallback | None,
+    recovery_attempt: list[int],
+    max_parse_recovery_attempts: int,
 ) -> None:
     """Stream a node's events through the Conductor callback."""
     if event_callback is None or not _has_stream(node):
@@ -150,6 +126,14 @@ async def _stream_node_events(
     async with node.stream(run_context) as stream:
         async for event in stream:
             emit_pydantic_event(agent, event, event_callback)
+            next_attempt = recovery_attempt[0] + 1
+            if emit_output_recovery_event(
+                event,
+                event_callback,
+                attempt=next_attempt,
+                max_attempts=max_parse_recovery_attempts,
+            ):
+                recovery_attempt[0] = next_attempt
 
 
 async def _execute_node(
@@ -157,6 +141,8 @@ async def _execute_node(
     run: Any,
     node: Any,
     event_callback: EventCallback | None,
+    recovery_attempt: list[int],
+    max_parse_recovery_attempts: int,
 ) -> Any:
     """Execute a single graph node and emit its streaming events.
 
@@ -165,7 +151,14 @@ async def _execute_node(
     stream to forward Conductor events, then advance the graph with
     ``run.next(node)`` to obtain the following node.
     """
-    await _stream_node_events(agent, node, run.ctx, event_callback)
+    await _stream_node_events(
+        agent,
+        node,
+        run.ctx,
+        event_callback,
+        recovery_attempt,
+        max_parse_recovery_attempts,
+    )
     return await run.next(node)
 
 
@@ -178,6 +171,7 @@ async def run_with_interrupt(
     has_output_schema: bool,
     usage_limits: UsageLimits | None = None,
     max_session_seconds: float | None = None,
+    max_parse_recovery_attempts: int = 0,
 ) -> RunOutcome:
     """Run a Pydantic AI agent with Conductor interrupt support.
 
@@ -199,7 +193,7 @@ async def run_with_interrupt(
         has_output_schema: Whether the agent was built with a structured
             output schema.  Affects the wording of the interrupt prompt.
         usage_limits: Optional pydantic-ai usage limits forwarded to
-            ``agent.iter`` / ``agent.run``.  ``UsageLimits(request_limit=N)``
+            ``agent.iter``.  ``UsageLimits(request_limit=N)``
             caps model requests; when exceeded pydantic-ai raises
             ``UsageLimitExceeded``, which is mapped to a non-retryable
             ``ProviderError`` matching the legacy ``ClaudeProvider``
@@ -208,20 +202,21 @@ async def run_with_interrupt(
             Enforced at the start of each agentic iteration, matching the
             legacy ``ClaudeProvider`` loop semantics.  When exceeded, a
             non-retryable ``ProviderError`` is raised.
+        max_parse_recovery_attempts: Configured output-correction budget used
+            in ``agent_parse_recovery`` event payloads.
 
     Returns:
         A ``RunOutcome`` describing normal completion, partial output, or
         cancellation.
     """
-    if interrupt_signal is None:
-        return await _run_to_completion(agent, user_prompt, event_callback, usage_limits)
+    interrupt_signal = interrupt_signal or asyncio.Event()
 
     if interrupt_signal.is_set():
         logger.info("Pydantic AI agent interrupted before first iteration")
         interrupt_signal.clear()
         return await _request_partial_output(agent, [], event_callback, has_output_schema)
 
-    usages: list[dict[str, Any] | None] = []
+    recovery_attempt = [0]
     iteration = 0
     session_start = time.monotonic()
 
@@ -250,8 +245,16 @@ async def run_with_interrupt(
                 emit_agent_turn_start(event_callback, iteration)
 
                 if type(next_node).__name__ == "ModelRequestNode":
+                    emit_agent_turn_start(event_callback, "awaiting_model")
                     node_task = asyncio.create_task(
-                        _execute_node(agent, run, next_node, event_callback)
+                        _execute_node(
+                            agent,
+                            run,
+                            next_node,
+                            event_callback,
+                            recovery_attempt,
+                            max_parse_recovery_attempts,
+                        )
                     )
                     signal_task = asyncio.create_task(interrupt_signal.wait())
                     finished: set[asyncio.Task[Any]]
@@ -286,9 +289,14 @@ async def run_with_interrupt(
                     except asyncio.CancelledError:
                         raise
                 else:
-                    next_node = await _execute_node(agent, run, next_node, event_callback)
-
-                usages.append(_usage_from_result(run.result))
+                    next_node = await _execute_node(
+                        agent,
+                        run,
+                        next_node,
+                        event_callback,
+                        recovery_attempt,
+                        max_parse_recovery_attempts,
+                    )
 
     except UsageLimitExceeded as exc:
         request_limit = usage_limits.request_limit if usage_limits is not None else None
@@ -303,30 +311,7 @@ async def run_with_interrupt(
     final_result = run.result
     if final_result is None:
         raise RuntimeError("Pydantic AI run ended without a result")
-    usages.append(_usage_from_result(final_result))
-    return RunOutcome(result=final_result, total_usage=_aggregate_usage(usages))
-
-
-async def _run_to_completion(
-    agent: Agent[Any, Any],
-    user_prompt: str,
-    event_callback: EventCallback | None,
-    usage_limits: UsageLimits | None = None,
-) -> RunOutcome:
-    """Run the agent normally without any interrupt handling."""
-    emit_agent_turn_start(event_callback, "awaiting_model")
-    try:
-        result = await agent.run(user_prompt, usage_limits=usage_limits)
-    except UsageLimitExceeded as exc:
-        request_limit = usage_limits.request_limit if usage_limits is not None else None
-        raise ProviderError(
-            _iterations_exceeded_message(request_limit)
-            if request_limit is not None
-            else f"Agent exceeded usage limits: {exc}",
-            suggestion="The agent may be stuck in a tool-use loop. Check your MCP tools.",
-            is_retryable=False,
-        ) from exc
-    return RunOutcome(result=result, total_usage=_usage_from_result(result))
+    return RunOutcome(result=final_result, total_usage=_usage_from_result(final_result))
 
 
 async def _request_partial_output(
