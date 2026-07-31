@@ -85,6 +85,12 @@ exclude = [
 
 [tool.hatch.build.targets.wheel.force-include]
 "plugins/conductor/skills/conductor" = "plugins/conductor/skills/conductor"
+# The plugin manifest, not just the skill body: the claude-agent-sdk provider
+# loads skills by registering `plugins/conductor` as a Claude Code plugin
+# (`--plugin-dir`), which requires `.claude-plugin/plugin.json` to be present.
+# Without this the skill loads from a source checkout but silently resolves to
+# nothing from an installed wheel.
+"plugins/conductor/.claude-plugin" = "plugins/conductor/.claude-plugin"
 
 [dependency-groups]
 dev = [

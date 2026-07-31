@@ -223,7 +223,8 @@ class AgentProvider(ABC):
         passes resolved skill directories to :meth:`execute` via
         ``skill_directories`` and skips eager preamble injection — the
         provider's SDK is expected to discover and load skill content
-        itself (e.g. Copilot's session-level ``skill_directories``).
+        itself (e.g. Copilot's session-level ``skill_directories``, or
+        the claude-agent-sdk's plugin-scoped ``skills`` option).
 
         When ``False`` (default), the executor eagerly injects the full
         ``SKILL.md`` plus ``references/*.md`` content into the agent's

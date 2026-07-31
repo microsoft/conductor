@@ -1092,11 +1092,16 @@ class AgentDef(BaseModel):
     * **Copilot** — skill directories are passed to the SDK session via
       ``skill_directories``; the model discovers and loads skill content
       as relevant (progressive disclosure, token-efficient).
-    * **Claude / Claude Agent SDK** — ``SKILL.md`` plus
-      ``references/*.md`` is eagerly injected into the agent's rendered
-      prompt, wrapped in ``<skill name="...">`` tags. There is no native
-      skill surface on the Anthropic API without adopting the
-      container/code-execution beta.
+    * **Claude Agent SDK** — the Claude Code plugin that owns the skill is
+      registered on the session and the skill is enabled by its
+      ``<plugin>:<skill>`` name, so the CLI loads only the ``SKILL.md``
+      frontmatter up front. Ambient skills from the machine are not
+      loaded — only what the workflow declares.
+    * **Claude** — ``SKILL.md`` plus ``references/*.md`` is eagerly
+      injected into the agent's rendered prompt, wrapped in
+      ``<skill name="...">`` tags. There is no native skill surface on
+      the Anthropic API without adopting the container/code-execution
+      beta.
 
     Tri-state semantics via list presence:
 
@@ -2511,8 +2516,11 @@ class RuntimeConfig(BaseModel):
     Skill content reaches the model differently per provider:
 
     * **Copilot** — registered on the SDK session via ``skill_directories``
-    * **Claude / Claude Agent SDK** — eagerly injected into the rendered
-      prompt inside ``<skills><skill name="...">...</skill></skills>`` tags
+    * **Claude Agent SDK** — the owning plugin is registered via
+      ``--plugin-dir`` and the skill enabled by its ``<plugin>:<skill>``
+      name, so the CLI loads it on demand
+    * **Claude** — eagerly injected into the rendered prompt inside
+      ``<skills><skill name="...">...</skill></skills>`` tags
 
     Defaults to an empty list (no skills). Phase 1 ships one built-in
     skill (``conductor``); user-defined skill directories will be added

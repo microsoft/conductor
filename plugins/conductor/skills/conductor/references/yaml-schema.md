@@ -39,6 +39,7 @@ workflow:
     skills: [string]                # Skills enabled for every provider-backed agent (default: [])
                                     # Currently registered built-ins: "conductor"
                                     # Copilot loads natively via `skill_directories`;
+                                    # claude-agent-sdk loads natively via its plugin surface;
                                     # Claude eagerly injects SKILL.md + references/*.md into the prompt.
     mcp_servers:                    # MCP server configurations (ignored by claude-agent-sdk — uses CLI config)
       <server_name>:

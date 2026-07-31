@@ -18,7 +18,9 @@ allowlist model; for now the registry only accepts built-in skill names.
 
 from __future__ import annotations
 
+import json
 import logging
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
@@ -27,6 +29,17 @@ logger = logging.getLogger(__name__)
 
 class SkillNotFoundError(ValueError):
     """Raised when a skill name is not found in the registry."""
+
+
+# Marker directory / file identifying a Claude Code plugin root. A skill
+# directory that lives under one can be registered natively with the
+# claude-agent-sdk via ``--plugin-dir``.
+_PLUGIN_MANIFEST = Path(".claude-plugin") / "plugin.json"
+
+# How far above a skill directory to look for the plugin manifest. The
+# plugin layout is ``<root>/skills/<skill>/``, so two levels is the exact
+# distance; a third is allowed for nested skill directories.
+_PLUGIN_SEARCH_DEPTH = 3
 
 
 # Built-in skills. Maps the user-facing skill name (the string that
@@ -129,3 +142,69 @@ def resolve_skill_directories(skills: list[str]) -> list[Path]:
         seen.add(path)
         out.append(path)
     return out
+
+
+@dataclass(frozen=True)
+class SkillPlugin:
+    """A skill directory together with the plugin that owns it.
+
+    Providers whose SDK loads skills through the Claude Code *plugin*
+    surface (``claude-agent-sdk``) need the plugin root and the
+    plugin-qualified skill name, not just the skill directory.
+    """
+
+    skill_name: str
+    """Skill directory name, which matches the ``name`` in ``SKILL.md``."""
+
+    plugin_name: str
+    """Plugin name as declared in ``.claude-plugin/plugin.json``."""
+
+    plugin_root: Path
+    """Absolute path to the plugin root (the directory holding
+    ``.claude-plugin/``), suitable for ``--plugin-dir``."""
+
+    @property
+    def qualified_name(self) -> str:
+        """``<plugin>:<skill>`` — how the SDK names a plugin's skill."""
+        return f"{self.plugin_name}:{self.skill_name}"
+
+
+def resolve_skill_plugin(skill_dir: Path) -> SkillPlugin | None:
+    """Find the Claude Code plugin that owns a skill directory.
+
+    Walks up from ``skill_dir`` looking for a ``.claude-plugin/plugin.json``
+    manifest, which marks a plugin root.
+
+    Args:
+        skill_dir: Absolute path to a skill directory (the one holding
+            ``SKILL.md``).
+
+    Returns:
+        The resolved :class:`SkillPlugin`, or ``None`` when the skill does
+        not live under a plugin root or the manifest is unreadable / has no
+        ``name``. Callers decide whether that is fatal — providers that can
+        only load skills via plugins should refuse loudly rather than drop
+        the skill silently.
+    """
+    skill_dir = Path(skill_dir).resolve()
+    for candidate in list(skill_dir.parents)[:_PLUGIN_SEARCH_DEPTH]:
+        manifest = candidate / _PLUGIN_MANIFEST
+        if not manifest.is_file():
+            continue
+        try:
+            parsed = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            logger.warning("Unreadable plugin manifest at %s: %s", manifest, exc)
+            return None
+        # A manifest that parses to anything other than an object (a bare
+        # array, string, or null) is as unusable as one that fails to parse.
+        plugin_name = parsed.get("name") if isinstance(parsed, dict) else None
+        if not isinstance(plugin_name, str) or not plugin_name:
+            logger.warning("Plugin manifest at %s declares no usable 'name'", manifest)
+            return None
+        return SkillPlugin(
+            skill_name=skill_dir.name,
+            plugin_name=plugin_name,
+            plugin_root=candidate,
+        )
+    return None

@@ -80,6 +80,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`skills: []` is now a real opt-out on `claude-agent-sdk`, and agents no
+  longer inherit ambient skills from the machine.** The provider left the SDK's
+  `setting_sources` unset, so the `claude` CLI discovered and enabled skills
+  from `~/.claude/skills/`, every `.claude/skills/` up the directory tree, and
+  enabled plugins — none of which the workflow declared, and all of which
+  varied by developer machine and launch directory. Conductor documents
+  `skills: []` as an explicit opt-out; on this provider it silently opted out
+  of nothing. `setting_sources` is now always `[]`, the same unconditional
+  isolation `strict_mcp_config` already applies to MCP servers.
+  **Behavior change:** agents on this provider also stop picking up ambient
+  `CLAUDE.md`, `.claude/rules/*.md`, project `settings.json`, and hooks — use
+  `--workspace-instructions` (or `--instructions`) to supply that content
+  explicitly. ([#352](https://github.com/microsoft/conductor/issues/352))
+
 - **`tools: []` no longer fails validation when no MCP servers are declared** —
   the capability cross-check rejected an explicit empty allowlist against any
   provider with `mcp_tools=True` and `workflow_tools_passthrough=False` (such
@@ -112,6 +126,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Copilot and Claude both respect. ([#343](https://github.com/microsoft/conductor/issues/343))
 
 ### Changed
+
+- **`claude-agent-sdk` now loads skills natively instead of injecting them into
+  every prompt.** The provider previously took the eager preamble path on the
+  grounds that the SDK had no skill surface — out of date, and expensive: the
+  full `SKILL.md` plus the entire `references/` tree was prepended to every
+  call, every retry, and every validator pass (~27K tokens for the bundled
+  `conductor` skill). The owning Claude Code plugin is now registered on the
+  session and the skill enabled by its `<plugin>:<skill>` name, so the CLI reads
+  only the frontmatter up front and loads the body on demand. An agent with an
+  explicit `tools: []` is granted back the single `Skill` tool when it has
+  skills enabled, since an empty base tool set would otherwise leave the
+  declared skill unreachable. Wheels now also ship
+  `plugins/conductor/.claude-plugin/`, without which an installed (non-editable)
+  Conductor resolved a plugin root the CLI could not load.
+  ([#352](https://github.com/microsoft/conductor/issues/352))
 
 - The `claude-agent-sdk` optional dependency floor is now
   `claude-agent-sdk>=0.2.82` — the 0.2.x line is what Conductor tests against.

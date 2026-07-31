@@ -18,6 +18,11 @@ Provider-parity contract:
     * **Copilot** — native ``skill_directories`` on the SDK session.
       Skill becomes discoverable; the model loads it as relevant
       (progressive disclosure, token-efficient).
+    * **Claude Agent SDK** — the Claude Code plugin owning the skill is
+      registered on the session (``--plugin-dir``) and the skill enabled
+      by its ``<plugin>:<skill>`` name, also progressive. Skills the
+      workflow did not declare are suppressed rather than inherited from
+      the machine.
     * **Claude** — eager preamble injection of ``SKILL.md`` plus
       ``references/*.md`` into the agent's rendered prompt. The
       Anthropic API has no server-side skill surface without adopting
@@ -32,15 +37,19 @@ progressive disclosure via MCP.
 from conductor.skills.loader import load_skill_content
 from conductor.skills.registry import (
     SkillNotFoundError,
+    SkillPlugin,
     get_skill_directory,
     list_builtin_skills,
     resolve_skill_directories,
+    resolve_skill_plugin,
 )
 
 __all__ = [
     "SkillNotFoundError",
+    "SkillPlugin",
     "get_skill_directory",
     "list_builtin_skills",
     "load_skill_content",
     "resolve_skill_directories",
+    "resolve_skill_plugin",
 ]

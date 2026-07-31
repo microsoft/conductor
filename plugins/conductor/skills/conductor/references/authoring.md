@@ -229,6 +229,7 @@ See `examples/validator.yaml` for a complete example.
 
 **Provider mechanism (same observable contract — "the agent has access to the named skill"):**
 - **Copilot** — the resolved skill directory is registered on the SDK session via `skill_directories`, so the agent discovers and loads skill content natively (progressive disclosure via `SKILL.md` frontmatter). This is more token-efficient than eager injection.
+- **Claude Agent SDK** — also native, through the Claude Code plugin surface: the plugin owning the skill is registered on the session and the skill enabled by its `<plugin>:<skill>` name. Skills the workflow did not declare are suppressed, so `skills: []` really is an opt-out and ambient skills from the machine never load.
 - **Claude** — the loader reads `SKILL.md` plus every `references/*.md` file in the skill directory and prepends them to the agent's rendered prompt inside `<skills><skill name="...">...</skill></skills>` tags. Inserted between workspace instructions and the user prompt.
 
 Not allowed on `script`, `human_gate`, `workflow`, `wait`, `set`, or `terminate` agent types. Unknown skill names fail at workflow validation time.

@@ -13,6 +13,8 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+import pytest
+
 from conductor.config.schema import AgentDef
 from conductor.executor.agent import AgentExecutor
 from conductor.providers.base import AgentOutput, AgentProvider, EventCallback
@@ -69,6 +71,30 @@ class TestCopilotProviderNativeSkills:
 
     def test_provider_advertises_native_support(self) -> None:
         assert CopilotProvider().supports_native_skills is True
+
+
+class TestClaudeAgentSdkNativeSkills:
+    """claude-agent-sdk loads skills through the SDK, not the prompt."""
+
+    def setup_method(self) -> None:
+        _cached_skill_payload.cache_clear()
+
+    def test_no_skill_content_in_rendered_prompt(self) -> None:
+        pytest.importorskip("claude_agent_sdk", reason="claude-agent-sdk extra not installed")
+        from conductor.providers.claude_agent_sdk import ClaudeAgentSdkProvider
+
+        executor = AgentExecutor(ClaudeAgentSdkProvider(), workflow_skills=["conductor"])
+        agent = AgentDef(name="a", model="claude-sonnet-4-5", prompt="Hello world")
+        rendered = executor.render_prompt(agent, {})
+        assert "<skills>" not in rendered
+        assert '<skill name="conductor">' not in rendered
+        assert "Hello world" in rendered
+
+    def test_provider_advertises_native_support(self) -> None:
+        pytest.importorskip("claude_agent_sdk", reason="claude-agent-sdk extra not installed")
+        from conductor.providers.claude_agent_sdk import ClaudeAgentSdkProvider
+
+        assert ClaudeAgentSdkProvider().supports_native_skills is True
 
 
 class TestNonNativeProviderEagerInjection:

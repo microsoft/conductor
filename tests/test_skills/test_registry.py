@@ -11,6 +11,7 @@ from conductor.skills import (
     get_skill_directory,
     list_builtin_skills,
     resolve_skill_directories,
+    resolve_skill_plugin,
 )
 
 
@@ -60,3 +61,70 @@ class TestResolveSkillDirectories:
     def test_unknown_raises(self) -> None:
         with pytest.raises(SkillNotFoundError):
             resolve_skill_directories(["conductor", "nope"])
+
+
+class TestResolveSkillPlugin:
+    """Built-in skills ship inside a Claude Code plugin, which is how the
+    claude-agent-sdk provider loads them (``--plugin-dir`` + qualified name)."""
+
+    def test_builtin_skill_resolves_to_its_plugin(self) -> None:
+        plugin = resolve_skill_plugin(get_skill_directory("conductor"))
+        assert plugin is not None
+        assert plugin.skill_name == "conductor"
+        assert plugin.plugin_name == "conductor"
+        assert plugin.qualified_name == "conductor:conductor"
+
+    def test_plugin_root_holds_the_manifest(self) -> None:
+        plugin = resolve_skill_plugin(get_skill_directory("conductor"))
+        assert plugin is not None
+        assert (plugin.plugin_root / ".claude-plugin" / "plugin.json").is_file()
+
+    def test_manifest_is_packaged_for_wheel_installs(self) -> None:
+        """The manifest must ship alongside the skill body, or an installed
+        wheel resolves a plugin root the CLI cannot load."""
+        import tomllib
+
+        repo_root = Path(__file__).resolve().parents[2]
+        with (repo_root / "pyproject.toml").open("rb") as handle:
+            pyproject = tomllib.load(handle)
+        included = pyproject["tool"]["hatch"]["build"]["targets"]["wheel"]["force-include"]
+        assert "plugins/conductor/.claude-plugin" in included
+
+    def test_directory_outside_a_plugin_returns_none(self, tmp_path: Path) -> None:
+        orphan = tmp_path / "skills" / "lonely"
+        orphan.mkdir(parents=True)
+        assert resolve_skill_plugin(orphan) is None
+
+    def test_unreadable_manifest_returns_none(self, tmp_path: Path) -> None:
+        root = tmp_path / "plug"
+        (root / ".claude-plugin").mkdir(parents=True)
+        (root / ".claude-plugin" / "plugin.json").write_text("{not json")
+        skill = root / "skills" / "s"
+        skill.mkdir(parents=True)
+        assert resolve_skill_plugin(skill) is None
+
+    def test_manifest_without_name_returns_none(self, tmp_path: Path) -> None:
+        root = tmp_path / "plug"
+        (root / ".claude-plugin").mkdir(parents=True)
+        (root / ".claude-plugin" / "plugin.json").write_text('{"version": "1.0.0"}')
+        skill = root / "skills" / "s"
+        skill.mkdir(parents=True)
+        assert resolve_skill_plugin(skill) is None
+
+    @pytest.mark.parametrize("manifest", ["[1, 2, 3]", "null", '"a string"', "42"])
+    def test_non_object_manifest_returns_none(self, tmp_path: Path, manifest: str) -> None:
+        """Valid JSON that is not an object is as unusable as invalid JSON."""
+        root = tmp_path / "plug"
+        (root / ".claude-plugin").mkdir(parents=True)
+        (root / ".claude-plugin" / "plugin.json").write_text(manifest)
+        skill = root / "skills" / "s"
+        skill.mkdir(parents=True)
+        assert resolve_skill_plugin(skill) is None
+
+    def test_non_string_name_returns_none(self, tmp_path: Path) -> None:
+        root = tmp_path / "plug"
+        (root / ".claude-plugin").mkdir(parents=True)
+        (root / ".claude-plugin" / "plugin.json").write_text('{"name": 7}')
+        skill = root / "skills" / "s"
+        skill.mkdir(parents=True)
+        assert resolve_skill_plugin(skill) is None
