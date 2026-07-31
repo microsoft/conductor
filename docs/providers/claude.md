@@ -72,7 +72,7 @@ The Claude provider delegates its agentic loop, tool execution, and structured o
 - **`events.py`**: Bridges streaming Pydantic AI events (`PartStartEvent`, `PartDeltaEvent`, `FunctionToolCallEvent`, `FunctionToolResultEvent`) to Conductor `EventCallback` payloads (`agent_message`, `agent_reasoning`, `agent_tool_start`, `agent_tool_complete`, `agent_tool_output_truncated`), and emits turn boundary events.
 - **`interrupt.py`**: Drives agent execution via `Agent.iter()` while honoring Conductor's `interrupt_signal`, wall-clock `max_session_seconds`, and `UsageLimits`.
 - **`mcp_toolset.py`**: Wraps Conductor's `MCPManager` as a Pydantic AI `AbstractToolset`, managing tool naming, truncation, spill-to-file, and error signaling (`ToolFailed`).
-- **`retry.py`**: Provides Conductor-level retries (`execute_with_retry`) with exponential backoff, jitter, and Anthropic error classification (with internal Pydantic AI retries disabled via `retries=0`).
+- **`retry.py`**: Provides Conductor-level retries (`execute_with_retry`) with exponential backoff, jitter, and Anthropic error classification. Pydantic AI tool retries are disabled, while output retries use `max_parse_recovery_attempts` for native structured-output correction.
 - **`structured_output.py`**: Handles post-processing (`extract_content`, `parse_text_fallback`), converting `ToolOutput` model dumps or fenced JSON text fallbacks into validated dicts via Conductor's `validate_output()`.
 - **`usage.py`**: Maps Pydantic AI `RunUsage` (token counts, cache reads and writes) to `AgentOutput` fields for tracking and pricing calculation by `UsageTracker`.
 
@@ -82,7 +82,7 @@ There are no user-facing breaking changes. Workflow YAML syntax, `runtime.provid
 
 The transition to Pydantic AI includes the following internal behavioral changes:
 
-- **`max_parse_recovery_attempts` accepted but has no effect**: The `retry.max_parse_recovery_attempts` YAML field (and the older provider-level default) is still accepted for configuration compatibility, but the Claude provider no longer runs a multi-turn parse-recovery loop. Pydantic AI's `ToolOutput` steers structured responses via the native tool schema, and the in-prose JSON fallback is single-shot — no correction loop is sent. The Copilot provider still honors the field.
+- **Native parse recovery**: The `retry.max_parse_recovery_attempts` YAML field controls Pydantic AI's output-validation retry budget. Each correction attempt emits `agent_parse_recovery`, matching the observable provider contract used by Copilot and Hermes.
 - **Truncation-hint path rewriting removed**: Legacy conductor-side path replacement in tool result text was removed. Tool output truncation and spill-to-file behavior are managed directly by `MCPManagerToolset`, and `agent_tool_output_truncated` events are emitted natively with original character length, truncated length, and spill path.
 - **Thinking signature preservation**: Thinking/reasoning block handling and signature preservation are delegated to Pydantic AI's native Anthropic model adapter.
 
@@ -277,53 +277,9 @@ Key details of this integration:
 - **Empty Prompts**: Any empty or whitespace-only `system_prompt` is normalized to `None` and is not sent to the API.
 - **Caching**: Anthropic `cache_control` support for the `system` parameter is not implemented yet and is planned as a follow-up.
 
-## Streaming Limitations
+## Streaming
 
-**Phase 1 Implementation Status**: The Claude provider currently does NOT support real-time streaming.
-
-### Current Behavior
-
-- All responses are returned after completion (non-streaming)
-- The provider uses `client.messages.create()` instead of `client.messages.stream()`
-- You will not see partial responses during execution
-
-### Why?
-
-Real-time streaming requires:
-1. UI integration for displaying partial responses
-2. Event-driven architecture for handling streaming events
-3. Buffering and state management for partial content
-4. Error recovery during streaming
-
-These features are complex and deferred to Phase 2+ to keep Phase 1 focused on core functionality.
-
-### Workarounds
-
-If you need faster responses:
-
-1. **Reduce `max_tokens`**: Smaller responses complete faster
-   ```yaml
-   runtime:
-     max_tokens: 1024  # Faster than 8192
-   ```
-
-2. **Use Haiku models**: 3-5x faster than Sonnet/Opus
-   ```yaml
-   runtime:
-     default_model: claude-haiku-4.5
-   ```
-
-3. **Break workflows into smaller agents**: Multiple short responses instead of one long response
-
-### Phase 2+ Timeline
-
-Streaming support is planned for Phase 2 (estimated 2-3 weeks):
-- Real-time response streaming
-- Terminal UI for partial content display
-- Progress indicators and status updates
-- Streaming event handling and error recovery
-
-Track progress in the project roadmap or GitHub issues.
+The Claude provider streams model text, reasoning, tool lifecycle, and parse-recovery events incrementally through Pydantic AI. The dashboard, console, and JSONL event log receive updates while the agent is running rather than only after completion.
 
 ## Extended Thinking
 

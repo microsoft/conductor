@@ -11,7 +11,7 @@ This guide helps you choose between GitHub Copilot, Anthropic Claude, Claude Age
 | **Pricing Model** | Subscription ($10-39/mo) | Pay-per-token | Via Claude Code CLI | Pay-per-token (via hermes) |
 | **Setup** | GitHub auth | API key | `claude` CLI auth | API key (model-provider's key) |
 | **Model Selection** | GPT-5.2, o1 | Haiku, Sonnet, Opus | Haiku, Sonnet, Opus | Any OpenRouter-style model |
-| **Streaming** | Yes | No (Phase 1) | Yes | Yes |
+| **Streaming** | Yes | Yes | Yes | Yes |
 | **Tool Support** | Yes (MCP, all types) | Yes (MCP, stdio only) | Yes (MCP + built-in preset) | Yes (hermes toolsets) |
 | **MCP Servers** | Yes | Yes (stdio) | Yes (all types) | No |
 | **Reasoning / Extended Thinking** | Yes (`reasoning_effort` on session) | Yes (extended `thinking` budget) | Inherits from CLI config | Yes (`reasoning_config`) |
@@ -19,7 +19,7 @@ This guide helps you choose between GitHub Copilot, Anthropic Claude, Claude Age
 | **Output Quality** | Excellent | Excellent | Excellent | Depends on model |
 | **Cost Predictability** | High (flat rate) | Variable (usage-based) | Variable | Variable (usage-based) |
 | **Multi-provider** | No | Yes (via Conductor) | No | Yes (native) |
-| **Agentic Loop** | SDK-managed | Manual (provider code) | SDK-managed (delegated to CLI) | SDK-managed (delegated to hermes) |
+| **Agentic Loop** | SDK-managed | SDK-managed (Pydantic AI) | SDK-managed (delegated to CLI) | SDK-managed (delegated to hermes) |
 | **Structured Output** | Prompt injection | Native | Prompt injection | Prompt injection |
 | **Session Resume** | Yes | No | No | Yes |
 | **Tool Output Limits** | native SDK spill (large_output) | conductor-side truncation+spill | native CLI env var | N/A |

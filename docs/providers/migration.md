@@ -310,20 +310,9 @@ agents:
       Do not make investment recommendations.
 ```
 
-### 5. Streaming (Not Available)
+### 5. Streaming
 
-**Copilot**: Real-time streaming supported
-**Claude**: Phase 1 does NOT support streaming
-
-**Impact**:
-- No partial responses during execution
-- Longer wait for first output
-- Cannot cancel mid-generation
-
-**Workarounds**:
-1. Reduce `max_tokens` for faster responses (less to generate)
-2. Use Haiku models (3-5x faster)
-3. Break workflows into smaller agents
+Both Copilot and Claude stream model, reasoning, and tool events during execution. Claude uses Pydantic AI's event stream, so existing dashboard and event-log consumers require no provider-specific changes.
 
 ### 6. Tool Calling
 
