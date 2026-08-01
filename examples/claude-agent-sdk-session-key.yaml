@@ -1,0 +1,131 @@
+# Session continuity with the claude-agent-sdk provider (`session_key`)
+#
+# By default every agent execution spawns a fresh `claude` session, so an
+# agent that loops back re-reads everything it read the first time. A
+# per-agent `session_key` opts into continuity: every execution tagged with
+# the same key resumes ONE underlying Claude session.
+#
+# This workflow demonstrates both halves of that contract:
+#
+#   1. LOOP-BACK — `investigate` proposes a fix, a script step checks it, and
+#      a failing check routes back to `investigate`. On the second pass the
+#      agent resumes its own session, so it still has every file it read and
+#      knows what it already tried, instead of starting cold.
+#
+#   2. CROSS-AGENT — `summarize` declares the SAME key, so it inherits the
+#      whole investigation rather than being handed a summary of it.
+#
+# THE KEY IS A STATIC LABEL, NOT A VALUE FROM A STEP. The provider maps it to
+# the real Claude session id internally; no session id ever passes through the
+# workflow context, so there is nothing to extract from an earlier agent's
+# output.
+#
+# Notes:
+#   * The prompt is still rendered and sent on every execution. The session
+#     means the model ADDITIONALLY has the prior conversation, so it sees
+#     `[earlier turns] + [freshly rendered prompt]`. Omit `session_key` where
+#     an agent is meant to re-evaluate from scratch.
+#   * Continuity survives `conductor resume` — the key -> session-id map is
+#     written to the checkpoint.
+#   * If the session cannot be resumed (first pass, a pruned transcript, or a
+#     changed working_dir — transcripts are stored per directory), the
+#     provider logs a warning and starts a fresh session. It never fails
+#     the run.
+#   * Do NOT share a key across genuinely concurrent executions (parallel
+#     group members, or for-each with max_concurrent > 1) — they would
+#     interleave turns in a single session.
+#
+# Pre-requisites:
+#   pip install conductor[claude-agent-sdk]      # or: uv add 'claude-agent-sdk>=0.2.82'
+#   npm install -g @anthropic-ai/claude-code     # the `claude` CLI
+#   claude login
+#
+# Usage (run from the repo root):
+#   conductor run examples/claude-agent-sdk-session-key.yaml \
+#     --input goal="Find why tests/test_engine/test_workflow.py is slow"
+#
+# Validation only (no execution / no API calls):
+#   conductor validate examples/claude-agent-sdk-session-key.yaml
+
+workflow:
+  name: claude-agent-sdk-session-key
+  description: >
+    Investigate-check-retry loop where the investigating agent continues one
+    Claude session across every pass, and a second agent inherits that same
+    session to write the summary.
+  version: "1.0.0"
+  entry_point: investigate
+
+  runtime:
+    provider: claude-agent-sdk
+    default_model: claude-sonnet-4-5
+
+  limits:
+    # The loop is bounded by max_iterations as well as by the script's verdict,
+    # so a persistently failing check cannot spin forever.
+    max_iterations: 6
+
+  input:
+    goal:
+      type: string
+      required: true
+      description: What to investigate in the working directory.
+
+agents:
+  - name: investigate
+    description: Investigate the goal, keeping context across every pass.
+    # Executions of this agent share one Claude session. On a loop-back the
+    # agent still has the files it read and the hypotheses it already ruled
+    # out, so each pass builds on the last instead of repeating it.
+    session_key: investigation
+    prompt: |
+      Goal: {{ workflow.input.goal }}
+
+      Investigate the repository in your current working directory and write
+      your current best explanation, plus the single most useful next check.
+
+      If you have already investigated this in earlier turns, do NOT start
+      over: build on what you established and rule out one more hypothesis.
+    output:
+      finding:
+        type: string
+        description: Current best explanation.
+      confident:
+        type: boolean
+        description: Whether the explanation is well enough supported to stop.
+    routes:
+      - to: verify
+
+  - name: verify
+    description: Cheap non-LLM gate deciding whether another pass is needed.
+    type: script
+    # Script steps have no provider session, so `session_key` is rejected on
+    # them. Exit 0 = investigation is good enough; exit 1 = go around again.
+    command: sh
+    args:
+      - "-c"
+      - '[ "{{ investigate.output.confident }}" = "True" ] && exit 0 || exit 1'
+    routes:
+      # Loop back — `investigate` resumes its own session.
+      - to: investigate
+        when: "{{ verify.exit_code != 0 }}"
+      - to: summarize
+
+  - name: summarize
+    description: Write the summary from inside the same investigation session.
+    # Same key as `investigate`, so this agent inherits the entire
+    # investigation transcript rather than a lossy hand-off through context.
+    session_key: investigation
+    prompt: |
+      Summarise the investigation you just carried out for a teammate who has
+      not seen it: what the problem is, the evidence, and what to do next.
+    output:
+      summary:
+        type: string
+        description: Teammate-ready write-up of the investigation.
+    routes:
+      - to: $end
+
+output:
+  finding: "{{ investigate.output.finding }}"
+  summary: "{{ summarize.output.summary }}"

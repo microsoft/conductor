@@ -992,6 +992,37 @@ class AgentDef(BaseModel):
     max_agent_iterations: 200 instead of using the default limit.
     """
 
+    session_key: str | None = Field(None, min_length=1)
+    """Continue one provider session across every execution tagged with this key.
+
+    Executions sharing a key resume the same underlying session instead of
+    starting cold, so a loop-back keeps the files the agent already read and
+    a later agent inherits the earlier one's conversation. ``None`` (the
+    default) starts a fresh session per execution — the historical behavior.
+
+    The key is a static label, not a value produced by a workflow step: the
+    provider maps it to the real session id internally, so no session id ever
+    passes through the workflow context.
+
+    Only meaningful when the agent's effective provider is
+    ``claude-agent-sdk``; like :class:`SandboxConfig`, the field validates
+    structurally regardless of provider but is consumed only by that provider
+    at runtime. The session id is persisted in checkpoints, so continuity
+    survives ``conductor resume``. A session whose transcript no longer
+    exists (pruned, or a changed ``working_dir``) falls back to a fresh
+    session with a logged warning rather than failing the run.
+
+    Concurrency: executions that genuinely overlap — parallel-group members,
+    or for-each iterations with ``max_concurrent > 1`` — must not share a
+    key, since they would interleave turns in one session.
+
+    Example YAML::
+
+        - name: analyze
+          session_key: investigation
+          prompt: Investigate the failing build...
+    """
+
     retry: RetryPolicy | None = None
     """Per-agent retry policy for transient failures.
 
@@ -1310,6 +1341,8 @@ class AgentDef(BaseModel):
                 raise ValueError("human_gate agents cannot have 'output_mode'")
             if self.working_dir:
                 raise ValueError("human_gate agents cannot have 'working_dir'")
+            if self.session_key is not None:
+                raise ValueError("human_gate agents cannot have 'session_key'")
         elif self.type == "script":
             if not self.command:
                 raise ValueError("script agents require 'command'")
@@ -1329,6 +1362,8 @@ class AgentDef(BaseModel):
                 raise ValueError("script agents cannot have 'max_session_seconds'")
             if self.max_agent_iterations is not None:
                 raise ValueError("script agents cannot have 'max_agent_iterations'")
+            if self.session_key is not None:
+                raise ValueError("script agents cannot have 'session_key'")
             if self.retry is not None:
                 raise ValueError("script agents cannot have 'retry'")
             if self.input_mapping is not None:
@@ -1381,6 +1416,8 @@ class AgentDef(BaseModel):
                 raise ValueError("workflow agents cannot have 'max_session_seconds'")
             if self.max_agent_iterations is not None:
                 raise ValueError("workflow agents cannot have 'max_agent_iterations'")
+            if self.session_key is not None:
+                raise ValueError("workflow agents cannot have 'session_key'")
             if self.retry is not None:
                 raise ValueError("workflow agents cannot have 'retry'")
             if self.dialog is not None:
@@ -1436,6 +1473,8 @@ class AgentDef(BaseModel):
                 raise ValueError("wait agents cannot have 'max_session_seconds'")
             if self.max_agent_iterations is not None:
                 raise ValueError("wait agents cannot have 'max_agent_iterations'")
+            if self.session_key is not None:
+                raise ValueError("wait agents cannot have 'session_key'")
             if self.retry is not None:
                 raise ValueError("wait agents cannot have 'retry'")
             if self.dialog is not None:
@@ -1505,6 +1544,8 @@ class AgentDef(BaseModel):
                 raise ValueError("set agents cannot have 'max_session_seconds'")
             if self.max_agent_iterations is not None:
                 raise ValueError("set agents cannot have 'max_agent_iterations'")
+            if self.session_key is not None:
+                raise ValueError("set agents cannot have 'session_key'")
             if self.retry is not None:
                 raise ValueError("set agents cannot have 'retry'")
             if self.dialog is not None:
@@ -1571,6 +1612,8 @@ class AgentDef(BaseModel):
                 raise ValueError("terminate agents cannot have 'max_session_seconds'")
             if self.max_agent_iterations is not None:
                 raise ValueError("terminate agents cannot have 'max_agent_iterations'")
+            if self.session_key is not None:
+                raise ValueError("terminate agents cannot have 'session_key'")
             if self.max_depth is not None:
                 raise ValueError("terminate agents cannot have 'max_depth'")
             if self.retry is not None:

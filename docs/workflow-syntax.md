@@ -328,6 +328,60 @@ Because paths are normalized lexically instead of resolving to their real paths:
 > Setting `working_dir` doesn't restrict the model's filesystem access. The model can still read and write files outside this directory if it uses absolute paths or parent directory traversals (e.g., `../`). Avoid relying on this configuration to sandbox untrusted model execution.
 > On the `claude-agent-sdk` provider the directory is also a trust boundary in the other direction: the `claude` CLI loads `CLAUDE.md` and `.claude/settings*.json` (including hooks) from wherever it runs, so pointing `working_dir` at an untrusted checkout means running that checkout's instructions.
 
+### Session Continuity (`session_key`)
+
+By default each agent execution starts a fresh provider session, so an agent
+that runs twice re-reads everything it read the first time. The optional
+per-agent `session_key` opts into continuity: every execution tagged with the
+same key continues **one** underlying session.
+
+```yaml
+agents:
+  - name: investigate
+    session_key: investigation     # loop-backs continue this session
+    prompt: Investigate the failing build...
+    routes:
+      - to: verify
+
+  - name: verify
+    type: script
+    command: ./verify.sh
+    routes:
+      - to: investigate            # second pass keeps the earlier context
+        when: "{{ verify.exit_code != 0 }}"
+      - to: summarize
+
+  - name: summarize
+    session_key: investigation     # different agent, same session
+    prompt: Summarise what you found.
+```
+
+- **The key is a static label, not a value produced by a step.** The provider
+  maps it to the real session id internally, so no session id passes through
+  the workflow context and nothing has to be extracted from an earlier
+  agent's output. Two agents share a session simply by writing the same
+  string.
+- **The prompt is still rendered and sent every time.** The session means the
+  model *additionally* has the prior conversation, so it sees
+  `[earlier turns] + [freshly rendered prompt]`. Omit `session_key` where an
+  agent is meant to re-evaluate from scratch.
+- **Continuity survives `conductor resume`** — the key → session-id map is
+  written to the checkpoint and restored on resume.
+- **A session that cannot be resumed degrades, it never fails the run.** The
+  first execution under a key has nothing to resume; later ones may find the
+  transcript pruned or the `working_dir` changed (transcripts are stored per
+  directory). Either way the provider logs a warning and starts fresh.
+- **Rejected step types:** `script`, `human_gate`, `workflow`, `wait`, `set`,
+  and `terminate` — none of them have a provider session to continue.
+- **Do not share a key across genuinely concurrent executions** — parallel
+  group members, or for-each iterations with `max_concurrent > 1` — because
+  they would interleave turns in a single session.
+
+Currently implemented by the `claude-agent-sdk` provider; the field validates
+under any provider but is ignored by those that do not support it. See
+[`examples/claude-agent-sdk-session-key.yaml`](../examples/claude-agent-sdk-session-key.yaml)
+and [`docs/providers/experimental.md`](providers/experimental.md).
+
 ### Sandbox Configuration (ACA)
 
 The optional per-agent `sandbox:` block overrides settings for the

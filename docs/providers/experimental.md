@@ -99,9 +99,64 @@ adopting one does not inflate the install surface for others.
 
 | Provider | Upstream pin | Maintainer | Capability carve-outs |
 |---|---|---|---|
-| `claude-agent-sdk` | `claude-agent-sdk>=0.2.82` | `@lesandiz (best-effort)` | no `workflow_tools_passthrough`, no `reasoning_effort`, `prompt_injection` structured output, no `checkpoint_resume`. Supports `mcp_tools` as of [#335](https://github.com/microsoft/conductor/issues/335), except that a narrowing per-server `tools:` filter is refused (no SDK equivalent). Supports `working_dir` as of [#348](https://github.com/microsoft/conductor/issues/348) — note the `claude` CLI also loads `CLAUDE.md` and `.claude/settings*.json` from that directory, so point it only at trees you trust. |
+| `claude-agent-sdk` | `claude-agent-sdk>=0.2.82` | `@lesandiz (best-effort)` | no `workflow_tools_passthrough`, no `reasoning_effort`, `prompt_injection` structured output. Supports `mcp_tools` as of [#335](https://github.com/microsoft/conductor/issues/335), except that a narrowing per-server `tools:` filter is refused (no SDK equivalent). Supports `working_dir` as of [#348](https://github.com/microsoft/conductor/issues/348) — note the `claude` CLI also loads `CLAUDE.md` and `.claude/settings*.json` from that directory, so point it only at trees you trust. Supports `checkpoint_resume` for agents that declare a `session_key` (see [Session Continuity](#session-continuity-claude-agent-sdk)); agents without one start a fresh session per execution and so carry no state across a resume. |
 | `hermes` | `hermes-agent` | `(community contribution)` | no `mcp_tools`, `prompt_injection` structured output, no `working_dir` |
 | `aca` | `azure-identity>=1.19.0` | `(unassigned)` | no `workflow_tools_passthrough` (the wrapped in-container `CopilotProvider` never applies the `tools:` allowlist to the SDK session), no `working_dir` (only the separate, container-relative `sandbox.working_dir` is honored — not the generic host-resolved field), `prompt_injection` structured output (inherits the inner Copilot provider), no `checkpoint_resume` (ephemeral sandbox sessions, no volume mount). Declares `interrupt`/`max_session_seconds` as `True`, but the shipped runner MVP doesn't fully back either yet — see [Known Gaps](./aca.md#known-gaps-runner-mvp). |
+
+## Session Continuity (claude-agent-sdk)
+
+By default every agent execution spawns a fresh `claude` session, so a
+loop-back re-reads everything it read the first time. A per-agent
+`session_key` opts into continuity: executions tagged with the same key
+resume one underlying session.
+
+```yaml
+agents:
+  - name: analyze
+    session_key: investigation
+    prompt: Investigate the failing build...
+    routes:
+      - to: check
+
+  - name: check
+    type: script
+    command: ./verify.sh
+    routes:
+      # Loop back — `analyze` resumes its own session and keeps the
+      # files it already read instead of starting cold.
+      - to: analyze
+        when: "{{ check.exit_code != 0 }}"
+      - to: report
+
+  - name: report
+    session_key: investigation   # different agent, same session
+    prompt: Summarise what you found.
+```
+
+Notes:
+
+- **The key is a static label, not a value produced by a step.** The
+  provider maps it to the real session id internally — no session id
+  passes through the workflow context, and nothing has to be extracted
+  from an earlier agent's output.
+- **The prompt is still rendered and sent on every execution.** The
+  session means the model *additionally* has the prior conversation, so
+  it sees `[earlier turns] + [freshly rendered prompt]`. Omit
+  `session_key` where an agent is meant to re-evaluate from scratch.
+- **Continuity survives `conductor resume`.** The key → session-id map is
+  written to the checkpoint and restored on resume.
+- **A missing session degrades, it does not fail.** The first execution
+  under a key has nothing to resume; later ones may find the transcript
+  pruned or the `working_dir` changed (transcripts are stored per
+  directory). Either way the provider logs a warning and starts a fresh
+  session — passing an unresolvable id to the CLI would otherwise abort
+  it before the agent runs.
+- **Do not share a key across genuinely concurrent executions** —
+  parallel-group members, or for-each iterations with `max_concurrent > 1`
+  — since they would interleave turns in a single session.
+- In a workflow that mixes providers, only one provider's session map is
+  persisted per checkpoint (a pre-existing limitation of the checkpoint
+  format). A key-space mismatch simply misses and starts a fresh session.
 
 ## See also
 
