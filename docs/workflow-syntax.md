@@ -348,7 +348,7 @@ agents:
     command: ./verify.sh
     routes:
       - to: investigate            # second pass keeps the earlier context
-        when: "{{ verify.exit_code != 0 }}"
+        when: "{{ verify.output.exit_code != 0 }}"
       - to: summarize
 
   - name: summarize
