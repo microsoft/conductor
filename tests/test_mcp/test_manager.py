@@ -9,10 +9,75 @@ This module tests:
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import anyio
 import pytest
+
+
+class _TaskAffineMCP:
+    def __init__(self) -> None:
+        self.entries: list[asyncio.Task[Any] | None] = []
+        self.exits: list[asyncio.Task[Any] | None] = []
+        self.initialize_started = asyncio.Event()
+        self.initialize_blocker: asyncio.Event | None = None
+        self.initialize_error: RuntimeError | None = None
+        self.exit_started = asyncio.Event()
+        self.exit_blocker: asyncio.Event | None = None
+        self.exit_error: RuntimeError | None = None
+
+    @asynccontextmanager
+    async def stdio(self, _params: Any) -> AsyncIterator[tuple[MagicMock, MagicMock]]:
+        self.entries.append(asyncio.current_task())
+        with anyio.CancelScope():
+            try:
+                yield MagicMock(), MagicMock()
+            finally:
+                self.exit_started.set()
+                if self.exit_blocker is not None:
+                    await self.exit_blocker.wait()
+                self.exits.append(asyncio.current_task())
+                if self.exit_error is not None:
+                    raise self.exit_error
+
+    @asynccontextmanager
+    async def session(self, _read: Any, _write: Any) -> AsyncIterator[AsyncMock]:
+        self.entries.append(asyncio.current_task())
+        with anyio.CancelScope():
+            try:
+                session = AsyncMock()
+                session.initialize = AsyncMock(side_effect=self._initialize)
+                response = MagicMock()
+                response.tools = []
+                session.list_tools = AsyncMock(return_value=response)
+                yield session
+            finally:
+                self.exits.append(asyncio.current_task())
+
+    async def _initialize(self) -> None:
+        self.initialize_started.set()
+        if self.initialize_error is not None:
+            raise self.initialize_error
+        if self.initialize_blocker is not None:
+            await self.initialize_blocker.wait()
+
+
+@asynccontextmanager
+async def _task_affine_manager() -> AsyncIterator[tuple[Any, _TaskAffineMCP]]:
+    environment = _TaskAffineMCP()
+    with (
+        patch("conductor.mcp.manager.MCP_SDK_AVAILABLE", True),
+        patch("conductor.mcp.manager.StdioServerParameters", return_value=MagicMock()),
+        patch("conductor.mcp.manager.stdio_client", side_effect=environment.stdio),
+        patch("conductor.mcp.manager.ClientSession", side_effect=environment.session),
+    ):
+        from conductor.mcp.manager import MCPManager
+
+        yield MCPManager(), environment
 
 
 class TestMCPManagerImport:
@@ -234,6 +299,12 @@ class TestMCPManagerConnectServer:
         mock_server_params = MagicMock()
         mock_stdio_context = MagicMock()
         mock_client_session = MagicMock()
+        mock_stdio_context.__aenter__ = AsyncMock(
+            return_value=(mock_read_stream, mock_write_stream)
+        )
+        mock_stdio_context.__aexit__ = AsyncMock(return_value=False)
+        mock_client_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_client_session.__aexit__ = AsyncMock(return_value=False)
 
         # Patch all MCP SDK components
         with (
@@ -251,14 +322,6 @@ class TestMCPManagerConnectServer:
                 return_value=mock_client_session,
             ),
         ):
-            # Override the exit stack to return our mocked transport and session
-            manager._exit_stack.enter_async_context = AsyncMock(
-                side_effect=[
-                    (mock_read_stream, mock_write_stream),
-                    mock_session,
-                ]
-            )
-
             tools = await manager.connect_server(
                 name="web-search",
                 command="npx",
@@ -266,17 +329,18 @@ class TestMCPManagerConnectServer:
                 env={"MODE": "stdio"},
             )
 
-        # Verify results
-        assert len(tools) == 1
-        assert tools[0]["name"] == "web-search__search"
-        assert tools[0]["original_name"] == "search"
-        assert tools[0]["server"] == "web-search"
-        assert tools[0]["description"] == "Search the web"
+            # Verify results
+            assert len(tools) == 1
+            assert tools[0]["name"] == "web-search__search"
+            assert tools[0]["original_name"] == "search"
+            assert tools[0]["server"] == "web-search"
+            assert tools[0]["description"] == "Search the web"
 
-        # Verify internal state
-        assert "web-search" in manager.sessions
-        assert "web-search" in manager.tools
-        assert manager.tool_to_server["web-search__search"] == "web-search"
+            # Verify internal state
+            assert "web-search" in manager.sessions
+            assert "web-search" in manager.tools
+            assert manager.tool_to_server["web-search__search"] == "web-search"
+            await manager.close()
 
     async def test_connect_server_forwards_cwd(self, manager: Any) -> None:
         """Requirement: agent working_dir must reach the MCP server subprocess.
@@ -297,6 +361,12 @@ class TestMCPManagerConnectServer:
         mock_write_stream = MagicMock()
         mock_stdio_context = MagicMock()
         mock_client_session = MagicMock()
+        mock_stdio_context.__aenter__ = AsyncMock(
+            return_value=(mock_read_stream, mock_write_stream)
+        )
+        mock_stdio_context.__aexit__ = AsyncMock(return_value=False)
+        mock_client_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_client_session.__aexit__ = AsyncMock(return_value=False)
 
         with (
             patch("conductor.mcp.manager.MCP_SDK_AVAILABLE", True),
@@ -310,19 +380,13 @@ class TestMCPManagerConnectServer:
                 return_value=mock_client_session,
             ),
         ):
-            manager._exit_stack.enter_async_context = AsyncMock(
-                side_effect=[
-                    (mock_read_stream, mock_write_stream),
-                    mock_session,
-                ]
-            )
-
             await manager.connect_server(
                 name="fs",
                 command="npx",
                 args=["-y", "@modelcontextprotocol/server-filesystem"],
                 cwd="/repo/worktree-a",
             )
+            await manager.close()
 
         # StdioServerParameters must receive the cwd so the child process
         # starts in that directory.
@@ -347,6 +411,12 @@ class TestMCPManagerConnectServer:
         mock_write_stream = MagicMock()
         mock_stdio_context = MagicMock()
         mock_client_session = MagicMock()
+        mock_stdio_context.__aenter__ = AsyncMock(
+            return_value=(mock_read_stream, mock_write_stream)
+        )
+        mock_stdio_context.__aexit__ = AsyncMock(return_value=False)
+        mock_client_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_client_session.__aexit__ = AsyncMock(return_value=False)
 
         with (
             patch("conductor.mcp.manager.MCP_SDK_AVAILABLE", True),
@@ -360,14 +430,108 @@ class TestMCPManagerConnectServer:
                 return_value=mock_client_session,
             ),
         ):
-            manager._exit_stack.enter_async_context = AsyncMock(
-                side_effect=[
-                    (mock_read_stream, mock_write_stream),
-                    mock_session,
-                ]
-            )
-
             await manager.connect_server(name="fs", command="npx")
+            await manager.close()
 
         mock_params_cls.assert_called_once()
         assert mock_params_cls.call_args.kwargs["cwd"] is None
+
+
+class TestMCPManagerTaskAffinity:
+    async def test_worker_connect_parent_close_uses_lifecycle_owner_task(self) -> None:
+        # Requirement: parent shutdown exits MCP contexts in the task that entered them.
+        async with _task_affine_manager() as (manager, environment):
+            await asyncio.create_task(manager.connect_server(name="fs", command="server"))
+
+            await manager.close()
+
+        assert environment.exits == environment.entries
+
+    async def test_failed_connection_cleans_up_in_lifecycle_owner_task(self) -> None:
+        # Requirement: a failed MCP connection releases every entered context in its owner task.
+        async with _task_affine_manager() as (manager, environment):
+            environment.initialize_error = RuntimeError("initialization failed")
+
+            with pytest.raises(RuntimeError, match="initialization failed"):
+                await manager.connect_server(name="fs", command="server")
+            await manager.close()
+
+        assert environment.exits == environment.entries
+
+    async def test_cancelled_connection_cleans_up_in_lifecycle_owner_task(self) -> None:
+        # Requirement: cancelling a connection cannot orphan its task-affine MCP contexts.
+        async with _task_affine_manager() as (manager, environment):
+            environment.initialize_blocker = asyncio.Event()
+            connection = asyncio.create_task(manager.connect_server(name="fs", command="server"))
+            await environment.initialize_started.wait()
+
+            connection.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await connection
+            await manager.close()
+
+        assert environment.exits == environment.entries
+
+    async def test_parallel_managers_close_from_parent_task(self) -> None:
+        # Requirement: parent shutdown safely closes managers created by parallel workers.
+        async with _task_affine_manager() as (first_manager, environment):
+            with patch("conductor.mcp.manager.MCP_SDK_AVAILABLE", True):
+                from conductor.mcp.manager import MCPManager
+
+                second_manager = MCPManager()
+            await asyncio.gather(
+                asyncio.create_task(first_manager.connect_server(name="one", command="server")),
+                asyncio.create_task(second_manager.connect_server(name="two", command="server")),
+            )
+
+            await asyncio.gather(first_manager.close(), second_manager.close())
+
+        assert environment.exits == environment.entries
+
+    async def test_cancelled_connection_preserves_cancellation_when_cleanup_fails(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # Requirement: cleanup errors must not replace cancellation requested by the caller.
+        async with _task_affine_manager() as (manager, environment):
+            environment.initialize_blocker = asyncio.Event()
+            environment.exit_error = RuntimeError("cleanup failed")
+            connection = asyncio.create_task(manager.connect_server(name="fs", command="server"))
+            await environment.initialize_started.wait()
+
+            connection.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await connection
+
+        assert environment.exits == environment.entries
+        assert "Error cancelling MCP connection 'fs': cleanup failed" in caplog.messages
+
+    async def test_cancelled_close_finishes_owner_task_cleanup(self) -> None:
+        # Requirement: cancelling shutdown cannot interrupt task-affine owner cleanup.
+        async with _task_affine_manager() as (manager, environment):
+            environment.exit_blocker = asyncio.Event()
+            await manager.connect_server(name="fs", command="server")
+
+            closing = asyncio.create_task(manager.close())
+            await environment.exit_started.wait()
+            closing.cancel()
+            await asyncio.sleep(0)
+            assert not closing.done()
+
+            environment.exit_blocker.set()
+            with pytest.raises(asyncio.CancelledError):
+                await closing
+
+        assert environment.exits == environment.entries
+        assert manager.sessions == {}
+        assert manager._connection_tasks == {}
+
+    async def test_duplicate_server_name_is_rejected_without_replacing_owner(self) -> None:
+        # Requirement: a duplicate server name cannot orphan the original lifecycle task.
+        async with _task_affine_manager() as (manager, environment):
+            await manager.connect_server(name="fs", command="server")
+
+            with pytest.raises(RuntimeError, match="already connected or connecting"):
+                await manager.connect_server(name="fs", command="server")
+            await manager.close()
+
+        assert environment.exits == environment.entries
