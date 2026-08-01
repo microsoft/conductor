@@ -11,26 +11,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Session continuity for the `claude-agent-sdk` provider via a per-agent
   `session_key`** — executions tagged with the same key now continue one
-  underlying Claude session instead of each starting cold. This makes a
-  loop-back keep the files the agent already read and the hypotheses it
-  already ruled out, and lets a later agent inherit an earlier one's
-  conversation by declaring the same key. Previously every execution spawned
-  a fresh session, so an investigate → check → retry loop repeated its own
-  groundwork on each pass. The key is a static label rather than a value
-  produced by a workflow step: the provider maps it to the real session id
-  internally, so no session id passes through the workflow context. The map
-  is persisted in checkpoints, so continuity also survives `conductor
-  resume` — `checkpoint_resume` flips to `True` for this provider. A session
-  that cannot be resumed (the first execution under a key, a transcript the
-  CLI has pruned, or a changed `working_dir` — transcripts are stored per
-  directory) logs a warning and starts a fresh session rather than failing;
-  passing an unresolvable id to the CLI would otherwise abort it before the
-  agent ran. `session_key` is rejected on `script`, `human_gate`, `workflow`,
-  `wait`, `set`, and `terminate` steps, and must not be shared across
-  genuinely concurrent executions. See
-  [`examples/claude-agent-sdk-session-key.yaml`](examples/claude-agent-sdk-session-key.yaml),
-  [`docs/workflow-syntax.md`](docs/workflow-syntax.md#session-continuity-session_key),
-  and [`docs/providers/experimental.md`](docs/providers/experimental.md).
+  underlying Claude session instead of each starting cold, so a loop-back
+  keeps the files the agent already read and a later agent can inherit an
+  earlier one's conversation by declaring the same key. Previously every
+  execution spawned a fresh session, so an investigate → check → retry loop
+  repeated its own groundwork on each pass. The key is a static, unrendered
+  label rather than a value produced by a workflow step: the provider maps it
+  to the real session id internally, so no session id passes through the
+  workflow context. Sessions are scoped per working directory, since that is
+  how the `claude` CLI stores transcripts. The session map is persisted in
+  checkpoints, so continuity survives `conductor resume` —
+  `checkpoint_resume` flips to `True` for this provider. A session the
+  provider cannot confirm on disk (first execution under a key, a pruned
+  transcript, a changed `working_dir`) logs a warning and starts fresh rather
+  than failing the run. `session_key` is rejected on `script`, `human_gate`,
+  `workflow`, `wait`, `set`, and `terminate` steps, and `conductor validate`
+  refuses a key shared across genuinely concurrent executions (two members of
+  one parallel group, or a for-each agent with `max_concurrent > 1`). See
+  [`docs/workflow-syntax.md`](docs/workflow-syntax.md#session-continuity-session_key)
+  for the full documentation and
+  [`examples/claude-agent-sdk-session-key.yaml`](examples/claude-agent-sdk-session-key.yaml)
+  for a runnable example.
+- **Checkpoints now persist every active provider's session map**, rather than
+  stopping at the first provider that exposes one. A workflow mixing providers
+  previously kept only one map, silently dropping the others' sessions
+  depending on which agent happened to run first. Providers namespace their
+  own entries in the shared map, so the merged result cannot collide.
 - **`claude-agent-sdk` provider now honors `working_dir`** — the directory
   resolved from `agent.working_dir` / `runtime.working_dir` is forwarded to
   `ClaudeAgentOptions.cwd`, so the `claude` CLI runs there and every stdio MCP

@@ -2249,7 +2249,9 @@ async def resume_workflow_async(
         async with ProviderRegistry(config, mcp_servers=mcp_servers) as registry:
             verbose_log("Starting resumed workflow execution...")
 
-            # Pass stored session IDs to registry for Copilot session resume
+            # Pass the checkpoint's merged provider session map to the
+            # registry so every provider that supports session resume
+            # (Copilot, claude-agent-sdk) can pick out its own entries.
             if cp.copilot_session_ids:
                 registry.set_resume_session_ids(cp.copilot_session_ids)
             # Pass the sessions' original working directories so the provider

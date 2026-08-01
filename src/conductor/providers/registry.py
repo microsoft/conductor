@@ -185,14 +185,19 @@ class ProviderRegistry:
         return provider_type in self._providers
 
     def set_resume_session_ids(self, ids: dict[str, str]) -> None:
-        """Store session IDs for Copilot session resume.
+        """Store restored session IDs for provider session resume.
 
         The IDs are forwarded to providers that support
         ``set_resume_session_ids`` — both already-active providers
-        and providers created lazily in the future.
+        and providers created lazily in the future. The map is shared by
+        every provider, so each one picks out the entries it recognises
+        and ignores the rest.
 
         Args:
-            ids: Mapping of agent names to Copilot session IDs.
+            ids: Merged provider session map from the checkpoint —
+                provider-defined session keys to provider session IDs.
+                Copilot keys are agent names; ``claude-agent-sdk`` keys are
+                namespaced ``session_key`` + working-directory strings.
         """
         self._resume_session_ids = dict(ids)
         for provider in self._providers.values():

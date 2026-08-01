@@ -361,21 +361,44 @@ agents:
   the workflow context and nothing has to be extracted from an earlier
   agent's output. Two agents share a session simply by writing the same
   string.
+- **The key is never rendered.** Unlike `working_dir` or `model`, `session_key`
+  is *not* a Jinja2 template — a `{{ ... }}` value is used verbatim as the
+  literal key rather than being substituted. Surrounding whitespace is
+  stripped and the result must be non-empty.
 - **The prompt is still rendered and sent every time.** The session means the
   model *additionally* has the prior conversation, so it sees
   `[earlier turns] + [freshly rendered prompt]`. Omit `session_key` where an
   agent is meant to re-evaluate from scratch.
-- **Continuity survives `conductor resume`** — the key → session-id map is
-  written to the checkpoint and restored on resume.
-- **A session that cannot be resumed degrades, it never fails the run.** The
-  first execution under a key has nothing to resume; later ones may find the
-  transcript pruned or the `working_dir` changed (transcripts are stored per
-  directory). Either way the provider logs a warning and starts fresh.
+- **A session is scoped to one working directory.** The `claude` CLI stores
+  transcripts per directory, so the provider tracks sessions by
+  `(session_key, working directory)`. Two agents that share a key but run
+  under different `working_dir` values get two independent sessions — they
+  cannot share one. Keep the `working_dir` stable across executions that are
+  meant to continue each other.
+- **Continuity survives `conductor resume`** — the session map is written to
+  the checkpoint and restored on resume. Each provider namespaces its own
+  entries in that shared map (this provider writes
+  `claude-agent-sdk:["<key>", "<cwd>"]`) and the engine merges every active
+  provider's map, so a workflow that mixes providers persists all of them and
+  each provider ignores entries that are not its own.
+- **A session that cannot be resumed degrades, it never fails the run.**
+  Passing `--resume` for a session the CLI cannot find makes it abort *before
+  running the agent*, so the provider only resumes once it has confirmed the
+  transcript is on disk — it checks the exact path the CLI would use,
+  `<CLAUDE_CONFIG_DIR or ~/.claude>/projects/<project key for the working
+  directory>/<session id>.jsonl`, and consults the SDK's own session lookup
+  only as a fallback (and only when that lookup agrees the session belongs to
+  this directory). Anything unresolvable — the first execution under a key, a
+  transcript the CLI has pruned on its own schedule, a changed `working_dir`,
+  or a session recorded elsewhere — logs a warning and starts fresh.
 - **Rejected step types:** `script`, `human_gate`, `workflow`, `wait`, `set`,
   and `terminate` — none of them have a provider session to continue.
-- **Do not share a key across genuinely concurrent executions** — parallel
-  group members, or for-each iterations with `max_concurrent > 1` — because
-  they would interleave turns in a single session.
+- **Concurrent executions cannot share a key.** Two members of the same
+  parallel group declaring one key, or a for-each agent with a `session_key`
+  and `max_concurrent > 1`, are rejected at `conductor validate` time: the
+  second execution would resume a session the first still has open, leaving
+  two `claude` processes appending to one transcript. Give them distinct
+  keys, drop the key, or set `max_concurrent: 1`.
 
 Currently implemented by the `claude-agent-sdk` provider; the field validates
 under any provider but is ignored by those that do not support it. See
@@ -682,7 +705,7 @@ agents:
 
 **Iteration counting** — wait steps count toward `workflow.limits.max_iterations` (each pause is one step). They are not subject to `max_agent_iterations`, which counts per-LLM-agent tool iterations.
 
-**Restrictions** — wait steps cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, `options`, `command`, `args`, `env`, `working_dir`, `timeout`, `workflow`, `input_mapping`, `max_depth`, `max_session_seconds`, `max_agent_iterations`, `retry`, `dialog`, `reasoning`, `validator`, `timeout_seconds`, or `output`. Wait steps also cannot be used inside `parallel` groups or `for_each` groups.
+**Restrictions** — wait steps cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, `options`, `command`, `args`, `env`, `working_dir`, `timeout`, `workflow`, `input_mapping`, `max_depth`, `max_session_seconds`, `max_agent_iterations`, `session_key`, `retry`, `dialog`, `reasoning`, `validator`, `timeout_seconds`, or `output`. Wait steps also cannot be used inside `parallel` groups or `for_each` groups.
 
 See [`examples/wait-step.yaml`](../examples/wait-step.yaml) for a complete polling workflow.
 ### Set Steps
@@ -768,7 +791,7 @@ Per-key typing on multi `values:` is not supported.
 
 **Composition** — set steps are allowed inside `parallel` groups (each member publishes its bound value to context) and as the inline agent of a `for_each` group (one bound value per item). Inside a parallel group, set templates cannot reference sibling group members (the validator catches this at config time, since the engine renders against a pre-group snapshot).
 
-**Restrictions** — set agents cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, `command`, `args`, `env`, `working_dir`, `timeout`, `workflow`, `options`, `input_mapping`, `max_depth`, `retry`, `dialog`, `reasoning`, `validator`, `timeout_seconds`, `max_session_seconds`, or `max_agent_iterations`. They count toward `limits.max_iterations` like any other step.
+**Restrictions** — set agents cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, `command`, `args`, `env`, `working_dir`, `timeout`, `workflow`, `options`, `input_mapping`, `max_depth`, `retry`, `dialog`, `reasoning`, `validator`, `timeout_seconds`, `max_session_seconds`, `max_agent_iterations`, or `session_key`. They count toward `limits.max_iterations` like any other step.
 
 **Events** — set steps emit `set_started` / `set_completed` / `set_failed` (mirroring the script-step lifecycle) in all three positions: linear main loop, parallel group member, and for-each iteration. The `set_completed` payload carries `output_type`, `output_keys` (sorted, empty for scalars), and `value_repr` (a JSON-safe preview, truncated at 512 chars).
 
@@ -908,7 +931,7 @@ agents:
 
 **Final output** — when `output_template:` is set, it *replaces* the workflow-level `output:` mapping for this termination path. Each rendered value is passed through the same JSON-coercion helper used elsewhere in the engine, so `"true"` becomes `True`, `"42"` becomes `42`, and JSON literals are parsed. When `output_template:` is omitted, the workflow-level `output:` is rendered as on any other terminal path.
 
-**Restrictions** — terminate steps cannot have `routes`, `tools`, `output`, `prompt`, `model`, `provider`, `system_prompt`, `command`, `args`, `env`, `working_dir`, `timeout`, `timeout_seconds`, `max_session_seconds`, `max_agent_iterations`, `max_depth`, `retry`, `dialog`, `reasoning`, `validator`, `workflow`, `input_mapping`, or `options`. They cannot appear as members of a parallel group or as a `for_each` inline agent — route to them from those groups' `routes:` instead.
+**Restrictions** — terminate steps cannot have `routes`, `tools`, `output`, `prompt`, `model`, `provider`, `system_prompt`, `command`, `args`, `env`, `working_dir`, `timeout`, `timeout_seconds`, `max_session_seconds`, `max_agent_iterations`, `session_key`, `max_depth`, `retry`, `dialog`, `reasoning`, `validator`, `workflow`, `input_mapping`, or `options`. They cannot appear as members of a parallel group or as a `for_each` inline agent — route to them from those groups' `routes:` instead.
 
 **Sub-workflow boundary** — a `status: failed` terminate inside a sub-workflow is downgraded to a `SubworkflowTerminatedError` (subclass of `ExecutionError`) at the parent boundary so the parent treats it as a normal sub-workflow failure (its own `workflow_failed` does NOT inherit `is_explicit: true`). The child's rendered output, reason, and terminate step name are preserved on the wrapper as `terminated_output`, `terminated_reason`, and `terminated_by` for `on_error` hooks and debugging surfaces. A `status: success` terminate inside a sub-workflow returns its rendered output cleanly and the parent continues with its next routes.
 

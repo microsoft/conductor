@@ -1725,3 +1725,73 @@ class TestAcaSkillsRealCapabilities:
         )
         with pytest.raises(ConfigurationError, match="runtime.skills"):
             validate_workflow_config(config)
+
+
+class TestSharedSessionKeyConcurrency:
+    """Concurrent executions must not resume the same session.
+
+    Two ``claude`` processes resuming one session orphan the first and
+    append to a single transcript concurrently, so this is caught statically
+    rather than left to the author.
+    """
+
+    def test_parallel_members_sharing_a_key_error(self) -> None:
+        config = _build_workflow(
+            agents=[
+                AgentDef(name="a", prompt="hi", session_key="shared"),
+                AgentDef(name="b", prompt="hi", session_key="shared"),
+                AgentDef(name="entry", prompt="hi"),
+            ],
+            parallel=[ParallelGroup(name="entry", agents=["a", "b"])],
+        )
+        config.workflow.entry_point = "entry"
+        with pytest.raises(ConfigurationError, match="Concurrent executions cannot share"):
+            validate_workflow_config(config)
+
+    def test_parallel_members_with_distinct_keys_pass(self) -> None:
+        config = _build_workflow(
+            agents=[
+                AgentDef(name="a", prompt="hi", session_key="alpha"),
+                AgentDef(name="b", prompt="hi", session_key="beta"),
+            ],
+            parallel=[ParallelGroup(name="grp", agents=["a", "b"])],
+        )
+        config.workflow.entry_point = "grp"
+        validate_workflow_config(config)
+
+    def test_concurrent_for_each_with_a_key_errors(self) -> None:
+        inline = AgentDef(name="inner", prompt="{{ item }}", session_key="shared")
+        config = _build_workflow(
+            agents=[AgentDef(name="entry", prompt="hi")],
+            for_each=[
+                ForEachDef(
+                    name="loop",
+                    type="for_each",
+                    source="entry.output.items",
+                    **{"as": "item"},
+                    agent=inline,
+                    max_concurrent=4,
+                )
+            ],
+        )
+        config.workflow.entry_point = "loop"
+        with pytest.raises(ConfigurationError, match="Iterations would run concurrently"):
+            validate_workflow_config(config)
+
+    def test_serial_for_each_with_a_key_passes(self) -> None:
+        inline = AgentDef(name="inner", prompt="{{ item }}", session_key="shared")
+        config = _build_workflow(
+            agents=[AgentDef(name="entry", prompt="hi")],
+            for_each=[
+                ForEachDef(
+                    name="loop",
+                    type="for_each",
+                    source="entry.output.items",
+                    **{"as": "item"},
+                    agent=inline,
+                    max_concurrent=1,
+                )
+            ],
+        )
+        config.workflow.entry_point = "loop"
+        validate_workflow_config(config)

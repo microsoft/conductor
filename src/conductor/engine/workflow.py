@@ -1969,12 +1969,22 @@ class WorkflowEngine:
                 if hasattr(provider, "get_session_cwds"):
                     copilot_session_cwds = provider.get_session_cwds()  # type: ignore[union-attr]
             elif self._registry is not None:
+                # Merge across every active provider rather than stopping at
+                # the first: more than one provider exposes these hooks now,
+                # and taking only the first would silently drop the others'
+                # sessions based on which agent happened to run earliest.
+                # Providers namespace their own keys so the flat map cannot
+                # collide, and each ignores entries it does not recognise.
+                merged_ids: dict[str, str] = {}
+                merged_cwds: dict[str, str] = {}
                 for p in self._registry.get_active_providers().values():
                     if hasattr(p, "get_session_ids"):
-                        copilot_session_ids = p.get_session_ids()  # type: ignore[union-attr]
+                        merged_ids.update(p.get_session_ids())  # type: ignore[union-attr]
                         if hasattr(p, "get_session_cwds"):
-                            copilot_session_cwds = p.get_session_cwds()  # type: ignore[union-attr]
-                        break
+                            merged_cwds.update(p.get_session_cwds())  # type: ignore[union-attr]
+                if merged_ids:
+                    copilot_session_ids = merged_ids
+                    copilot_session_cwds = merged_cwds
         except Exception:
             logger.warning("Failed to collect provider session IDs for checkpoint", exc_info=True)
             copilot_session_ids = None

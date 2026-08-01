@@ -6,7 +6,7 @@ workflow YAML configuration files.
 
 from __future__ import annotations
 
-from typing import Any, Literal, get_args
+from typing import Annotated, Any, Literal, get_args
 from urllib.parse import urlparse
 
 from pydantic import (
@@ -14,6 +14,7 @@ from pydantic import (
     ConfigDict,
     Field,
     SecretStr,
+    StringConstraints,
     ValidatorFunctionWrapHandler,
     field_validator,
     model_serializer,
@@ -992,7 +993,9 @@ class AgentDef(BaseModel):
     max_agent_iterations: 200 instead of using the default limit.
     """
 
-    session_key: str | None = Field(None, min_length=1)
+    session_key: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)] | None = (
+        None
+    )
     """Continue one provider session across every execution tagged with this key.
 
     Executions sharing a key resume the same underlying session instead of
@@ -1014,7 +1017,13 @@ class AgentDef(BaseModel):
 
     Concurrency: executions that genuinely overlap — parallel-group members,
     or for-each iterations with ``max_concurrent > 1`` — must not share a
-    key, since they would interleave turns in one session.
+    key, since they would interleave turns in one session. A for-each agent
+    with a static key shares one session across every item; that is only
+    sensible when the items are meant to build on each other.
+
+    Not a Jinja2 template. Unlike ``working_dir`` or ``model`` this value is
+    never rendered, so ``{{ ... }}`` is rejected rather than silently used as
+    a literal key (see :meth:`_validate_session_key_is_literal`).
 
     Example YAML::
 

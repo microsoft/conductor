@@ -1,39 +1,13 @@
 # Session continuity with the claude-agent-sdk provider (`session_key`)
 #
-# By default every agent execution spawns a fresh `claude` session, so an
-# agent that loops back re-reads everything it read the first time. A
-# per-agent `session_key` opts into continuity: every execution tagged with
-# the same key resumes ONE underlying Claude session.
+# Every execution tagged with the same `session_key` continues ONE underlying
+# Claude session. This workflow shows both halves of that: a LOOP-BACK
+# (`investigate` resumes its own session on each pass) and a CROSS-AGENT
+# hand-off (`summarize` declares the same key and inherits the whole
+# investigation instead of a lossy summary of it).
 #
-# This workflow demonstrates both halves of that contract:
-#
-#   1. LOOP-BACK — `investigate` proposes a fix, a script step checks it, and
-#      a failing check routes back to `investigate`. On the second pass the
-#      agent resumes its own session, so it still has every file it read and
-#      knows what it already tried, instead of starting cold.
-#
-#   2. CROSS-AGENT — `summarize` declares the SAME key, so it inherits the
-#      whole investigation rather than being handed a summary of it.
-#
-# THE KEY IS A STATIC LABEL, NOT A VALUE FROM A STEP. The provider maps it to
-# the real Claude session id internally; no session id ever passes through the
-# workflow context, so there is nothing to extract from an earlier agent's
-# output.
-#
-# Notes:
-#   * The prompt is still rendered and sent on every execution. The session
-#     means the model ADDITIONALLY has the prior conversation, so it sees
-#     `[earlier turns] + [freshly rendered prompt]`. Omit `session_key` where
-#     an agent is meant to re-evaluate from scratch.
-#   * Continuity survives `conductor resume` — the key -> session-id map is
-#     written to the checkpoint.
-#   * If the session cannot be resumed (first pass, a pruned transcript, or a
-#     changed working_dir — transcripts are stored per directory), the
-#     provider logs a warning and starts a fresh session. It never fails
-#     the run.
-#   * Do NOT share a key across genuinely concurrent executions (parallel
-#     group members, or for-each with max_concurrent > 1) — they would
-#     interleave turns in a single session.
+# Full documentation: docs/workflow-syntax.md, "Session Continuity
+# (`session_key`)".
 #
 # Pre-requisites:
 #   pip install conductor[claude-agent-sdk]      # or: uv add 'claude-agent-sdk>=0.2.82'
@@ -101,14 +75,16 @@ agents:
     type: script
     # Script steps have no provider session, so `session_key` is rejected on
     # them. Exit 0 = investigation is good enough; exit 1 = go around again.
+    # The boolean is resolved in Jinja2 rather than compared as a shell string,
+    # so the gate does not depend on how the value renders ("True" vs "true").
     command: sh
     args:
       - "-c"
-      - '[ "{{ investigate.output.confident }}" = "True" ] && exit 0 || exit 1'
+      - "exit {{ 0 if investigate.output.confident else 1 }}"
     routes:
       # Loop back — `investigate` resumes its own session.
       - to: investigate
-        when: "{{ verify.exit_code != 0 }}"
+        when: "{{ verify.output.exit_code != 0 }}"
       - to: summarize
 
   - name: summarize
