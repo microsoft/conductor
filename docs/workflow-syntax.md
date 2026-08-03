@@ -1426,7 +1426,10 @@ A **skill** is a directory of reusable knowledge an agent can opt into: a
 `SKILL.md` describing what the skill covers, plus an optional `references/`
 tree of supporting docs. Conductor consumes the same format the GitHub
 Copilot CLI and Anthropic Claude Code use, so a skill written for either
-works here unchanged.
+generally works here unchanged. Conductor adds two constraints neither CLI
+enforces: the frontmatter must actually parse (that is the point of this —
+see below), and on `claude-agent-sdk` the frontmatter `name` must match the
+directory basename, since the skill is enabled by name.
 
 ### Enabling skills
 
@@ -1438,7 +1441,7 @@ workflow:
     skills:
       - conductor                     # built-in, ships in the wheel
       - ./team-skills/acme-widgets    # versioned alongside the workflow
-      - ~/scratch/skills              # a skills root — loads everything under it
+      - ~/scratch/skills              # a skills root — every skill directly inside
 
 agents:
   - name: reviewer
@@ -1468,8 +1471,8 @@ Skills apply only to provider-backed agents. They are rejected on `script`,
 ### Names and paths
 
 Each entry is either a **registered built-in name** or a **filesystem path**.
-The distinction is syntactic — an entry is a path when it starts with `./`,
-`../`, or `~/`, or contains a path separator. Everything else must be a
+The distinction is syntactic — an entry is a path when it starts with `.` or
+`~`, or contains `/` or `\`. Everything else must be a
 built-in name, so a bare `conductor` can never be shadowed by a directory
 that happens to share its name.
 
@@ -1509,8 +1512,8 @@ description: |
 ```
 
 Use a block scalar (`description: |`) whenever the text contains a colon
-followed by a space. This is invalid YAML and is the single most common
-mistake:
+followed by a space — without one the value is invalid YAML, and this is the
+single most common mistake:
 
 ```yaml
 # Wrong — 'Triggers:' makes this unparseable
@@ -1533,7 +1536,7 @@ skill* — but the mechanism and its cost differ:
 | `claude-agent-sdk` | owning plugin registered, skill enabled by `<plugin>:<skill>` | progressive |
 | `claude` | eager injection into the rendered prompt | **full body on every call** |
 | `hermes` | eager injection into the rendered prompt | **full body on every call** |
-| `aca` | not supported (`skills=False`) — skill paths are host paths the sandbox cannot read | n/a |
+| `aca` | not supported (`skills=False`) — rejected by `conductor validate` and by the executor at run time | n/a |
 
 Two consequences worth knowing:
 
@@ -1543,8 +1546,7 @@ Two consequences worth knowing:
   `conductor validate` reports a path skill that is not, rather than letting
   it fail mid-run. The same skill works on `copilot` untouched.
 * **Eager injection is expensive.** The bundled `conductor` skill alone is
-  ~117KB (~29K tokens), prepended to *every* call, every retry, and every
-  `validator:` call.
+  ~117KB (~29K tokens), prepended to *every* call and every retry.
 
 ### Limiting eager injection
 

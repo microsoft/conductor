@@ -2348,9 +2348,9 @@ class TestSkillsWiring:
 
     @staticmethod
     def _skill_dirs() -> list[str]:
-        from conductor.skills import resolve_skill_directories
+        from conductor.skills import resolve_skills
 
-        return [str(p) for p in resolve_skill_directories(["conductor"])]
+        return [str(item.directory) for item in resolve_skills(["conductor"])]
 
     @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
     async def test_declared_skill_is_enabled_via_plugin(self) -> None:

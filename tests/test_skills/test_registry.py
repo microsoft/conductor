@@ -9,13 +9,16 @@ from pathlib import Path
 import pytest
 
 from conductor.skills import (
+    ResolvedSkill,
+    SkillError,
+    SkillManifestError,
     SkillNotFoundError,
     SkillPlugin,
     SkillPluginError,
     get_skill_directory,
     list_builtin_skills,
-    resolve_skill_directories,
     resolve_skill_plugin,
+    resolve_skills,
 )
 from conductor.skills.registry import _BUILTIN_SKILLS
 
@@ -54,22 +57,22 @@ class TestGetSkillDirectory:
             get_skill_directory("does-not-exist")
 
 
-class TestResolveSkillDirectories:
+class TestResolveSkills:
     def test_empty_input_returns_empty(self) -> None:
-        assert resolve_skill_directories([]) == []
+        assert resolve_skills([]) == []
 
     def test_single_skill(self) -> None:
-        dirs = resolve_skill_directories(["conductor"])
-        assert len(dirs) == 1
-        assert dirs[0].is_dir()
+        resolved = resolve_skills(["conductor"])
+        assert len(resolved) == 1
+        assert resolved[0].name == "conductor"
+        assert resolved[0].directory.is_dir()
 
     def test_deduplicates(self) -> None:
-        dirs = resolve_skill_directories(["conductor", "conductor"])
-        assert len(dirs) == 1
+        assert len(resolve_skills(["conductor", "conductor"])) == 1
 
     def test_unknown_raises(self) -> None:
         with pytest.raises(SkillNotFoundError):
-            resolve_skill_directories(["conductor", "nope"])
+            resolve_skills(["conductor", "nope"])
 
 
 def _make_plugin(
@@ -255,3 +258,33 @@ class TestSkillPluginInvariants:
     def test_valid_instance_builds_qualified_name(self) -> None:
         plugin = SkillPlugin(skill_name="s", plugin_name="p", plugin_root=Path("/plug"))
         assert plugin.qualified_name == "p:s"
+
+
+class TestResolvedSkillInvariants:
+    """Also exported, and ``name`` is interpolated unescaped into the
+    ``<skill name="...">`` tag the loader emits — so it guards itself for the
+    same reason :class:`SkillPlugin` does."""
+
+    def test_name_must_be_the_directory_basename(self) -> None:
+        with pytest.raises(SkillNotFoundError, match="must equal its directory"):
+            ResolvedSkill(name="other", directory=Path("/skills/acme"), source="./acme")
+
+    def test_directory_must_be_absolute(self) -> None:
+        with pytest.raises(SkillNotFoundError, match="must be absolute"):
+            ResolvedSkill(name="acme", directory=Path("skills/acme"), source="./acme")
+
+    def test_valid_construction_is_unaffected(self) -> None:
+        item = ResolvedSkill(name="acme", directory=Path("/skills/acme"), source="./acme")
+        assert item.name == "acme"
+
+
+class TestSkillErrorHierarchy:
+    """Resolution and manifest failures originate in different modules but
+    reach the same handlers, so a call site that can trigger both needs one
+    correct thing to catch."""
+
+    @pytest.mark.parametrize("exc_type", [SkillNotFoundError, SkillPluginError, SkillManifestError])
+    def test_every_skill_failure_shares_a_base(self, exc_type: type[Exception]) -> None:
+        assert issubclass(exc_type, SkillError)
+        # ValueError so these still nest inside Pydantic field validation.
+        assert issubclass(exc_type, ValueError)

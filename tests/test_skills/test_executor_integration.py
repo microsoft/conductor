@@ -21,7 +21,6 @@ from conductor.executor.agent import AgentExecutor
 from conductor.providers.base import AgentOutput, AgentProvider, EventCallback
 from conductor.providers.copilot import CopilotProvider
 from conductor.skills import get_skill_directory
-from conductor.skills.loader import _cached_skill_payload
 
 
 class _StubNonNativeProvider(AgentProvider, abstract=True):
@@ -61,9 +60,6 @@ class _StubNonNativeProvider(AgentProvider, abstract=True):
 
 class TestCopilotProviderNativeSkills:
     """Copilot owns native ``skill_directories``; preamble is NOT injected."""
-
-    def setup_method(self) -> None:
-        _cached_skill_payload.cache_clear()
 
     def test_no_skill_content_in_rendered_prompt(self) -> None:
         provider = CopilotProvider()
@@ -121,9 +117,6 @@ class TestSkillDirectoriesReachTheProvider:
     suite stays green -- the exact silent-drop failure #352 was about.
     """
 
-    def setup_method(self) -> None:
-        _cached_skill_payload.cache_clear()
-
     @staticmethod
     def _run(provider: _CapturingNativeProvider, agent: AgentDef) -> None:
         executor = AgentExecutor(provider, workflow_skills=["conductor"])
@@ -160,9 +153,6 @@ class TestPathSkillsReachTheProvider:
     (issue #350). ``workflow_dir`` is the only thing that makes a relative
     entry resolvable, so a dropped constructor argument would silently turn
     every team-local skill into a resolution error."""
-
-    def setup_method(self) -> None:
-        _cached_skill_payload.cache_clear()
 
     @staticmethod
     def _make_skill(directory: Path) -> Path:
@@ -234,9 +224,6 @@ class TestClaudeAgentSdkNativeSkills:
 
 class TestNonNativeProviderEagerInjection:
     """Non-native providers receive skill content via the rendered prompt."""
-
-    def setup_method(self) -> None:
-        _cached_skill_payload.cache_clear()
 
     def test_not_injected_when_no_skills(self) -> None:
         executor = AgentExecutor(_StubNonNativeProvider())

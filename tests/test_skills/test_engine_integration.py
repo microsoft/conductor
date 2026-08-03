@@ -31,7 +31,6 @@ from conductor.engine.workflow import WorkflowEngine
 from conductor.exceptions import ExecutionError
 from conductor.providers.base import AgentOutput, AgentProvider, EventCallback
 from conductor.skills import SkillNotFoundError
-from conductor.skills.loader import _cached_skill_payload
 
 
 class _CapturingProvider(AgentProvider, abstract=True):
@@ -107,11 +106,6 @@ def _config(
 def _run(config: WorkflowConfig, provider: AgentProvider, workflow_path: Path | None) -> None:
     engine = WorkflowEngine(config, provider, workflow_path=workflow_path)
     asyncio.run(engine.run({}))
-
-
-@pytest.fixture(autouse=True)
-def _clear_skill_cache() -> None:
-    _cached_skill_payload.cache_clear()
 
 
 class TestRelativeSkillPathsThroughTheEngine:

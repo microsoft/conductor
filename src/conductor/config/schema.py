@@ -672,13 +672,12 @@ def _validate_skill_entries(entries: list[str]) -> list[str]:
         ValueError: If an entry is not a non-empty string, or is a bare
             name that no built-in skill matches.
     """
-    from conductor.skills import SkillNotFoundError, get_skill_directory
-    from conductor.skills.registry import _is_path_entry
+    from conductor.skills import SkillNotFoundError, get_skill_directory, is_path_entry
 
     for entry in entries:
         if not isinstance(entry, str) or not entry.strip():
             raise ValueError(f"skills entries must be non-empty strings, got {entry!r}")
-        if _is_path_entry(entry):
+        if is_path_entry(entry):
             continue
         try:
             get_skill_directory(entry)
@@ -1120,13 +1119,13 @@ class AgentDef(BaseModel):
     """
 
     skills: list[str] | None = None
-    """Opt this agent into a list of skills.
+    r"""Opt this agent into a list of skills.
 
     Each entry is either a **registered built-in name** (e.g.
     ``conductor``) or a **filesystem path**. An entry is treated as a
-    path when it starts with ``./``, ``../``, or ``~/``, or contains a
-    path separator; everything else must be a built-in name, so a bare
-    name can never be shadowed by a same-named local directory.
+    path when it starts with ``.`` or ``~``, or contains ``/`` or ``\``;
+    everything else must be a built-in name, so a bare name can never be
+    shadowed by a same-named local directory.
 
     A path may point at either granularity:
 
@@ -2419,22 +2418,16 @@ class ToolOutputConfig(BaseModel):
         return v.strip() or None
 
 
-# Rough bytes-per-token ratio used only to annotate size messages. English
-# prose sits near 4; the exact figure is model- and tokenizer-specific, so
-# every message derived from it says "approximately".
-_BYTES_PER_TOKEN_ESTIMATE = 4
-
-
 class SkillInjectionConfig(BaseModel):
     """Size limits for eagerly injected skill content.
 
     Providers without a native skill surface (``claude``, ``hermes``)
     have no progressive disclosure: :class:`~conductor.executor.agent.AgentExecutor`
     prepends every enabled skill's ``SKILL.md`` **plus its entire
-    ``references/`` tree** to the rendered prompt, on every agent call,
-    every retry, and every ``validator:`` call. The bundled ``conductor``
-    skill alone is ~117KB (~29K tokens), so an unbounded list is easy to
-    turn into most of a context window by accident.
+    ``references/`` tree** to the rendered prompt, on every agent call and
+    every retry. The bundled ``conductor`` skill alone is ~117KB (~29K
+    tokens), so an unbounded list is easy to turn into most of a context
+    window by accident.
 
     Both limits are measured against the exact string that gets
     prepended. Setting either to ``null`` disables that limit.
@@ -2447,7 +2440,11 @@ class SkillInjectionConfig(BaseModel):
                 max_bytes: 131072     # fail above 128KB
     """
 
-    model_config = ConfigDict(extra="forbid")
+    # Frozen for the reason ``ProviderSettings`` documents: this model carries a
+    # cross-field invariant in a ``model_validator(mode="after")``, and that does
+    # not re-fire on per-attribute assignment even under the enclosing
+    # ``RuntimeConfig``'s ``validate_assignment=True``.
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     warn_bytes: int | None = Field(default=64 * 1024, ge=0)
     """Log a warning when injected skill content exceeds this many bytes.
@@ -2659,7 +2656,7 @@ class RuntimeConfig(BaseModel):
               - ./team-skills/acme-widgets
     """
 
-    skill_injection: SkillInjectionConfig = Field(default_factory=lambda: SkillInjectionConfig())
+    skill_injection: SkillInjectionConfig = Field(default_factory=SkillInjectionConfig)
     """Size limits for *eagerly injected* skill content.
 
     Only affects providers without a native skill surface (``claude``,

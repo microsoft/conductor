@@ -21,24 +21,19 @@ from conductor.providers.capabilities import (
     uses_native_skills,
 )
 from conductor.skills import (
-    SkillManifestError,
-    SkillNotFoundError,
+    BYTES_PER_TOKEN_ESTIMATE,
+    SkillError,
     SkillPluginError,
+    is_path_entry,
     load_skill_content,
     resolve_skill_plugin,
     resolve_skills,
 )
-from conductor.skills.registry import _is_path_entry
 from conductor.templating import is_jinja_template
 
 if TYPE_CHECKING:
     from conductor.config.schema import AgentDef, WorkflowConfig
     from conductor.skills import ResolvedSkill
-
-# Rough bytes-per-token ratio used only to annotate skill-size messages;
-# kept in step with ``conductor.executor.agent._BYTES_PER_TOKEN_ESTIMATE``
-# so static and runtime reports quote the same number.
-_BYTES_PER_TOKEN_ESTIMATE = 4
 
 
 # Shared Jinja2 environment used purely for AST parsing of template strings.
@@ -1593,9 +1588,11 @@ def _validate_provider_capabilities(
     Args:
         config: The workflow configuration to check.
         workflow_path: Path of the workflow file, used as the base directory
-            for relative skill paths. When ``None``, relative skill paths
-            cannot be resolved and skill checks that need the filesystem are
-            skipped — matching how ``_validate_subworkflow_refs`` behaves.
+            for relative skill paths. When ``None``, checks needing the
+            filesystem are skipped with a warning rather than falling back to
+            ``Path.cwd()`` as ``_validate_subworkflow_refs`` does — resolving
+            a skill path against an arbitrary working directory would report
+            failures that say nothing about the workflow.
     """
     errors: list[str] = []
     warnings: list[str] = []
@@ -1715,14 +1712,35 @@ def _validate_provider_capabilities(
         # above; re-reporting resolution failures for it would be noise.
         if not entries or not caps.skills:
             return
-        if skill_base_dir is None and any(_is_path_entry(entry) for entry in entries):
+        # Only *relative* entries need a base directory. ``~/skills`` becomes
+        # absolute under expanduser(), so it is checkable too — narrowing here
+        # rather than on is_path_entry() keeps absolute entries validated
+        # instead of silently waved through.
+        unresolvable = [
+            entry
+            for entry in entries
+            if is_path_entry(entry) and not Path(entry).expanduser().is_absolute()
+        ]
+        if skill_base_dir is None and unresolvable:
+            # Every other skip in this function has a second reporting path;
+            # this one has none, so say so rather than returning mute. Same
+            # don't-return-mute pattern as ``_caps_for``, at warning severity
+            # rather than error because the skill is still resolved at run time.
+            warnings.append(
+                f"Agent '{agent.name}': relative skill path(s) {sorted(unresolvable)!r} "
+                "were not checked because no workflow file path was supplied, so there "
+                "is no base directory to resolve them against. They are still resolved "
+                "at run time."
+            )
             return
 
         key = tuple(entries)
         if key not in skill_cache:
             try:
-                skill_cache[key] = resolve_skills(list(entries), base_dir=skill_base_dir)
-            except (SkillNotFoundError, SkillManifestError) as exc:
+                skill_cache[key] = resolve_skills(
+                    list(entries), base_dir=skill_base_dir, on_warning=warnings.append
+                )
+            except SkillError as exc:
                 skill_cache[key] = str(exc)
         resolved = skill_cache[key]
         if isinstance(resolved, str):
@@ -1763,16 +1781,24 @@ def _validate_provider_capabilities(
         Measures the exact string ``AgentExecutor`` would prepend, so the
         numbers reported here match the ones enforced at run time.
         """
-        content = load_skill_content([(item.name, item.directory) for item in resolved])
+        # Reading the content can fail on an unreadable ``references/*.md``,
+        # which ``read_skill_frontmatter`` never opens and so cannot have
+        # caught upstream. Collect it like any other validation failure —
+        # letting it escape prints a traceback out of ``conductor validate``.
+        try:
+            content = load_skill_content([(item.name, item.directory) for item in resolved])
+        except SkillError as exc:
+            errors.append(f"Agent '{agent.name}': {exc}")
+            return
         if not content:
             return
         size = len(content.encode("utf-8"))
-        approx_tokens = size // _BYTES_PER_TOKEN_ESTIMATE
+        approx_tokens = size // BYTES_PER_TOKEN_ESTIMATE
         detail = (
             f"Agent '{agent.name}' eagerly injects {size:,} bytes "
             f"(~{approx_tokens:,} tokens) of skill content on every call: provider "
             f"'{provider_name}' has no progressive disclosure, so this is paid "
-            f"again on every retry and every validator call."
+            f"again on every retry."
         )
         if skill_limits.max_bytes is not None and size > skill_limits.max_bytes:
             errors.append(

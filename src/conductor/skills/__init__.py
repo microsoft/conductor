@@ -23,47 +23,58 @@ Provider-parity contract:
       by its ``<plugin>:<skill>`` name, also progressive. Skills the
       workflow did not declare are filtered out of the model's listing
       rather than inherited from the machine.
-    * **Claude** — eager preamble injection of ``SKILL.md`` plus
-      ``references/*.md`` into the agent's rendered prompt. The
-      Anthropic API has no server-side skill surface without adopting
-      the container/code-execution beta.
+    * **Claude** and **Hermes** — eager preamble injection of
+      ``SKILL.md`` plus ``references/*.md`` into the agent's rendered
+      prompt. Neither has a native skill surface: the Anthropic API
+      offers none without adopting the container/code-execution beta,
+      and hermes runs its own internal toolsets. Injected size is
+      bounded by ``runtime.skill_injection``, since the whole body is
+      re-sent on every call and every retry.
 
-Phase 1 ships one built-in skill: ``conductor``, sourced from
-``plugins/conductor/skills/conductor/``. Future phases will add
-user-defined skill directories, executable skill resources, and
-progressive disclosure via MCP.
+A ``skills:`` entry is either a **built-in name** or a **filesystem
+path** — see :func:`conductor.skills.registry.resolve_skills`. Conductor
+ships one built-in skill, ``conductor``, sourced from
+``plugins/conductor/skills/conductor/``. Discovering skills already
+installed in the user's environment is tracked separately in issue #362;
+discovery locations differ per provider, so a single switch would hand
+different skill sets to different agents inside one run.
 """
 
+from conductor.skills.errors import SkillError
 from conductor.skills.frontmatter import (
     SkillFrontmatter,
     SkillManifestError,
     read_skill_frontmatter,
 )
-from conductor.skills.loader import load_skill_content
+from conductor.skills.loader import BYTES_PER_TOKEN_ESTIMATE, load_skill_content
 from conductor.skills.registry import (
     ResolvedSkill,
     SkillNotFoundError,
     SkillPlugin,
     SkillPluginError,
+    WarningSink,
     get_skill_directory,
+    is_path_entry,
     list_builtin_skills,
-    resolve_skill_directories,
     resolve_skill_plugin,
     resolve_skills,
 )
 
 __all__ = [
+    "BYTES_PER_TOKEN_ESTIMATE",
     "ResolvedSkill",
+    "SkillError",
     "SkillFrontmatter",
     "SkillManifestError",
     "SkillNotFoundError",
     "SkillPlugin",
     "SkillPluginError",
+    "WarningSink",
     "get_skill_directory",
+    "is_path_entry",
     "list_builtin_skills",
     "load_skill_content",
     "read_skill_frontmatter",
-    "resolve_skill_directories",
     "resolve_skill_plugin",
     "resolve_skills",
 ]

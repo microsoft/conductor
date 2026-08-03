@@ -2,11 +2,12 @@
 
 Providers without a native skill surface have no progressive disclosure:
 ``AgentExecutor`` prepends every enabled skill's ``SKILL.md`` *plus its
-whole ``references/`` tree* to the prompt on every call, every retry, and
-every ``validator:`` call. The bundled ``conductor`` skill alone is ~117KB
-(~29K tokens), and before this there was no ceiling of any kind.
+whole ``references/`` tree* to the prompt on every call and every retry. The
+bundled ``conductor`` skill alone is ~117KB (~29K tokens), and before this
+there was no ceiling of any kind. (A ``validator:`` block's
+own grading call bypasses prompt rendering, so it does not re-pay this.)
 
-Defaults are deliberately chosen so that existing ~117KB case *warns*
+Defaults are deliberately chosen so that the existing ~117KB case *warns*
 rather than breaking — ``test_bundled_skill_warns_but_does_not_error``
 pins that, since a stricter default would be a silent breaking change.
 """
@@ -19,12 +20,13 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 
-from conductor.config.schema import AgentDef, SkillInjectionConfig
+from conductor.config.schema import AgentDef, RuntimeConfig, SkillInjectionConfig
 from conductor.exceptions import ExecutionError
 from conductor.executor.agent import AgentExecutor
 from conductor.providers.base import AgentOutput, AgentProvider, EventCallback
-from conductor.skills import get_skill_directory
+from conductor.skills import get_skill_directory, load_skill_content
 
 
 class _EagerProvider(AgentProvider, abstract=True):
@@ -143,11 +145,14 @@ class TestBudgetEnforcement:
 
     def test_bundled_skill_size_sits_between_the_defaults(self) -> None:
         """Pins the assumption the defaults were chosen against, so a skill
-        that grows past 128KB fails here rather than in a user's workflow."""
+        that grows past 128KB fails here rather than in a user's workflow.
+
+        Measures the *rendered* string, which is what both enforcement paths
+        compare against — summing raw file sizes would understate it by the
+        ``<skills>``/``<skill>`` envelope and drift further as references grow.
+        """
         directory = get_skill_directory("conductor")
-        size = (directory / "SKILL.md").stat().st_size + sum(
-            path.stat().st_size for path in (directory / "references").glob("*.md")
-        )
+        size = len(load_skill_content([("conductor", directory)]).encode("utf-8"))
         defaults = SkillInjectionConfig()
         assert defaults.warn_bytes is not None and defaults.max_bytes is not None
         assert defaults.warn_bytes < size < defaults.max_bytes
@@ -192,7 +197,10 @@ class TestBudgetScope:
         second = _make_skill(tmp_path / "two", filler_bytes=3000)
         executor = _executor(_EagerProvider(), warn_bytes=100, max_bytes=5000)
         for skill in (first, second):
-            executor._build_prompt_prefix(AgentDef(name="a", prompt="hi", skills=[str(skill)]))
+            alone = executor._build_prompt_prefix(
+                AgentDef(name="a", prompt="hi", skills=[str(skill)])
+            )
+            assert len(alone.encode("utf-8")) <= 5000, "each skill must fit on its own"
         with pytest.raises(ExecutionError, match="max_bytes"):
             executor._build_prompt_prefix(
                 AgentDef(name="a", prompt="hi", skills=[str(first), str(second)])
@@ -211,7 +219,26 @@ class TestSkillInjectionConfigSchema:
             SkillInjectionConfig(warn_bytes=200_000, max_bytes=1_000)
 
     def test_equal_thresholds_are_allowed(self) -> None:
+        """Equality makes the warning unreachable for the same reason
+        ``warn > max`` does, but it is a coherent "hard limit only" request
+        and ``warn_bytes: null`` is not the only way to spell it. Allowed
+        deliberately rather than by oversight.
+        """
         assert SkillInjectionConfig(warn_bytes=1000, max_bytes=1000).max_bytes == 1000
+
+    def test_frozen_after_construction(self) -> None:
+        """``validate_assignment`` on the enclosing ``RuntimeConfig`` does not
+        re-fire this model's cross-field validator on attribute assignment, so
+        without ``frozen=True`` both invariants are bypassable post-construction.
+
+        Same reasoning ``ProviderSettings`` records for the same Pydantic gotcha.
+        """
+        config = SkillInjectionConfig(warn_bytes=100, max_bytes=1000)
+        with pytest.raises(ValidationError):
+            config.warn_bytes = 999_999
+        assert RuntimeConfig().skill_injection is not None
+        with pytest.raises(ValidationError):
+            RuntimeConfig().skill_injection.max_bytes = -5
 
     def test_negative_values_rejected(self) -> None:
         with pytest.raises(ValueError):
@@ -220,3 +247,86 @@ class TestSkillInjectionConfigSchema:
     def test_unknown_field_rejected(self) -> None:
         with pytest.raises(ValueError):
             SkillInjectionConfig(max_byte=1)  # ty: ignore[unknown-argument]
+
+
+class TestUnsupportedProviderRejection:
+    """``capabilities.skills=False`` must hold at run time, not only at
+    ``conductor validate`` time.
+
+    ``conductor run`` never calls the static validator, so without this the
+    declaration was enforced in one place and quietly contradicted in the
+    other: the eager-injection path keys off ``supports_native_skills``, so a
+    provider declaring ``skills=False`` still had the full skill body
+    prepended to its prompt.
+    """
+
+    def test_provider_declaring_no_skill_support_is_refused(self) -> None:
+        from conductor.providers.aca import AcaRuntimeProvider
+
+        assert AcaRuntimeProvider.CAPABILITIES.skills is False
+
+        class _Unsupported(_EagerProvider, abstract=True):
+            CAPABILITIES = AcaRuntimeProvider.CAPABILITIES
+
+        agent = AgentDef(name="a", prompt="hi", skills=["conductor"])
+        with pytest.raises(ExecutionError) as exc_info:
+            AgentExecutor(_Unsupported())._build_prompt_prefix(agent)
+        assert "does not support skills" in str(exc_info.value)
+        assert exc_info.value.agent_name == "a"
+
+    def test_opting_out_on_such_a_provider_is_fine(self) -> None:
+        from conductor.providers.aca import AcaRuntimeProvider
+
+        class _Unsupported(_EagerProvider, abstract=True):
+            CAPABILITIES = AcaRuntimeProvider.CAPABILITIES
+
+        agent = AgentDef(name="a", prompt="hi", skills=[])
+        assert AgentExecutor(_Unsupported())._build_prompt_prefix(agent) == ""
+
+    def test_provider_without_capabilities_is_left_alone(self) -> None:
+        """Test fakes declare ``abstract=True`` and have no CAPABILITIES;
+        they must not be swept up by the check."""
+        agent = AgentDef(name="a", prompt="hi", skills=["conductor"])
+        assert AgentExecutor(_EagerProvider())._build_prompt_prefix(agent)
+
+
+class TestWarningReachesTheUser:
+    """`logger.warning` alone does not reach a user running `conductor run`:
+    Conductor installs no logging handlers, so it surfaces through
+    `logging.lastResort` as an unattributed stderr line, absent from the JSONL
+    log and the dashboard. Since the defaults trip this for the bundled skill
+    on every eager-provider call, it has to travel the event channel too —
+    the same both-halves pattern as `checkpoint_save_failed`.
+    """
+
+    @staticmethod
+    def _capture(tmp_path: Path, **limits: int | None) -> list[tuple[str, dict[str, object]]]:
+        skill = _make_skill(tmp_path / "mid", filler_bytes=5000)
+        events: list[tuple[str, dict[str, object]]] = []
+        executor = _executor(_EagerProvider(), **limits)
+        executor._build_prompt_prefix(
+            AgentDef(name="a", prompt="hi", skills=[str(skill)]),
+            lambda name, data: events.append((name, data)),
+        )
+        return events
+
+    def test_breach_emits_an_event(self, tmp_path: Path) -> None:
+        events = self._capture(tmp_path, warn_bytes=1000, max_bytes=100_000)
+        assert [name for name, _ in events] == ["skill_injection_warning"]
+        payload = events[0][1]
+        assert payload["agent_name"] == "a"
+        assert isinstance(payload["bytes"], int) and payload["bytes"] > 1000
+        assert payload["warn_bytes"] == 1000
+        assert "mid" in str(payload["breakdown"])
+
+    def test_no_event_below_the_threshold(self, tmp_path: Path) -> None:
+        assert self._capture(tmp_path, warn_bytes=100_000, max_bytes=200_000) == []
+
+    def test_no_event_when_warning_disabled(self, tmp_path: Path) -> None:
+        assert self._capture(tmp_path, warn_bytes=None, max_bytes=200_000) == []
+
+    def test_omitting_the_callback_still_works(self, tmp_path: Path) -> None:
+        """The callback is optional — `render_prompt` is called without one."""
+        skill = _make_skill(tmp_path / "mid", filler_bytes=5000)
+        executor = _executor(_EagerProvider(), warn_bytes=1000, max_bytes=100_000)
+        assert executor._build_prompt_prefix(AgentDef(name="a", prompt="hi", skills=[str(skill)]))

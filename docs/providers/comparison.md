@@ -166,7 +166,9 @@ package it as a plugin (a `.claude-plugin/plugin.json` with the skill under
 `<plugin>/skills/`), or run that agent on `copilot`, which registers skill
 directories directly and accepts the identical skill untouched. See the
 [Skills section of the workflow syntax guide](../workflow-syntax.md#skills).
-- `temperature` and `max_tokens` are **rejected at the factory** — sampling behavior is controlled by the CLI.
+
+Separately, `temperature` and `max_tokens` are **rejected at the factory** —
+sampling behavior is controlled by the CLI.
 
 ### Example Claude Agent SDK Workflow
 

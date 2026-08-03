@@ -39,13 +39,14 @@ workflow:
     skills: [string]                # Skills enabled for every provider-backed agent (default: [])
                                     # Each entry is a built-in NAME or a filesystem PATH.
                                     #   name:  "conductor" (the only registered built-in)
-                                    #   path:  starts with ./ ../ ~/ or contains a separator
+                                    #   path:  starts with . or ~, or contains / or \
                                     #          -> a skill dir (holds SKILL.md), or a root of them
                                     #             which expands to every immediate child holding one
                                     # Relative paths resolve against the workflow FILE's directory.
                                     # Every resolved SKILL.md must declare `name` and `description`
                                     # in valid YAML frontmatter (use `description: |` if it contains
-                                    # a colon) -- both CLIs skip an unparseable skill silently.
+                                    # a colon followed by a space) -- both CLIs skip
+                                    # an unparseable skill silently.
                                     # Copilot loads natively via `skill_directories`;
                                     # claude-agent-sdk loads natively via its plugin surface, so a
                                     #   path skill OUTSIDE a Claude Code plugin is rejected there;

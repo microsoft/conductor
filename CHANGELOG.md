@@ -10,8 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **`skills:` now accepts filesystem paths, not just built-in names**
-  (issue #350) — an entry is treated as a path when it starts with `./`,
-  `../`, or `~/`, or contains a path separator; everything else must still be
+  (issue #350) — an entry is treated as a path when it starts with `.`
+  or `~`, or contains `/` or `\`; everything else must still be
   a registered built-in, so a bare `conductor` can never be shadowed by a
   same-named local directory. A path may point at a single skill directory
   (one holding `SKILL.md`) or at a root of them, which expands to every
@@ -31,7 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   can be set to `null` to disable it. Providers without a native skill
   surface (`claude`, `hermes`) have no progressive disclosure: `AgentExecutor`
   prepends each enabled skill's `SKILL.md` **plus its entire `references/`
-  tree** on every call, every retry, and every `validator:` call, and there
+  tree** on every call and every retry, and there
   was previously no ceiling at all. The bundled `conductor` skill alone is
   ~117KB (~29K tokens), so the defaults deliberately straddle it — enabling
   it on `claude` now warns instead of breaking, while accumulating several
@@ -197,8 +197,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every prompt.** The provider previously took the eager preamble path on the
   grounds that the SDK had no skill surface — out of date, and expensive: the
   full `SKILL.md` plus the entire `references/` tree was prepended to every
-  call, every retry, and every validator pass (~27K tokens for the bundled
-  `conductor` skill). The owning Claude Code plugin is now registered on the
+  call and every retry (~29K tokens for the bundled `conductor` skill). The owning Claude Code plugin is now registered on the
   session and the skill enabled by its `<plugin>:<skill>` name, so the CLI reads
   only the frontmatter up front and loads the body on demand. An agent with an
   explicit `tools: []` is granted back the single `Skill` tool when it has

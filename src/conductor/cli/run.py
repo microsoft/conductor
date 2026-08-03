@@ -1061,6 +1061,21 @@ class ConsoleEventSubscriber:
             for issue in issues:
                 verbose_log(f"    - {issue}", style="dim")
 
+        elif t == "skill_injection_warning":
+            # Only reaches the console through this branch: the executor's
+            # logger.warning has no handler behind it (see the comment at the
+            # emit site in executor/agent.py).
+            verbose_log(
+                f"  WARNING: agent '{d.get('agent_name')}' injects "
+                f"{d.get('bytes', 0):,} bytes (~{d.get('approx_tokens', 0):,} tokens) "
+                f"of skill content on every call — provider "
+                f"'{d.get('provider')}' has no progressive disclosure "
+                f"(runtime.skill_injection.warn_bytes={d.get('warn_bytes', 0):,})",
+                style="yellow",
+            )
+            if breakdown := d.get("breakdown"):
+                verbose_log(f"    {breakdown}", style="dim")
+
         elif t == "checkpoint_save_failed":
             n = d.get("consecutive_failures", 1)
             # Avoid spamming when every boundary fails (e.g. disk full): warn on

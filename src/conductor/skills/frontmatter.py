@@ -37,12 +37,14 @@ from pathlib import Path
 from ruamel.yaml import YAML
 from ruamel.yaml.error import YAMLError
 
+from conductor.skills.errors import SkillError
+
 # The leading ``---`` fenced block. Anchored at the start of the file:
 # a ``---`` further down is a thematic break in the body, not metadata.
 _FRONTMATTER = re.compile(r"\A---[ \t]*\r?\n(.*?)\r?\n---[ \t]*(?:\r?\n|\Z)", re.DOTALL)
 
-# Appended to every parse failure. The block-scalar form is what every
-# skill under ``~/.copilot/installed-plugins/`` uses, for this reason.
+# Appended to every parse failure: the block-scalar form sidesteps the
+# colon-in-a-plain-scalar trap entirely.
 _BLOCK_SCALAR_HINT = (
     "A ':' followed by a space inside an unquoted value (e.g. "
     "'description: Does things. Triggers: a, b') is invalid YAML. Use a "
@@ -52,11 +54,13 @@ _BLOCK_SCALAR_HINT = (
 )
 
 
-class SkillManifestError(ValueError):
+class SkillManifestError(SkillError):
     """Raised when a skill's ``SKILL.md`` is missing, unparseable, or incomplete.
 
-    A ``ValueError`` subclass so it nests cleanly inside Pydantic
-    validation, matching :class:`~conductor.skills.registry.SkillNotFoundError`.
+    A sibling of :class:`~conductor.skills.registry.SkillNotFoundError`
+    rather than a subclass — a broken manifest is not a species of "no
+    such skill". Catch :class:`~conductor.skills.errors.SkillError` to
+    handle both.
     """
 
 

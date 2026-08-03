@@ -11,10 +11,13 @@ budget.
 
 from __future__ import annotations
 
+import os
+import re
 from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic import ValidationError as PydanticValidationError
 
 from conductor.config.schema import (
     AgentDef,
@@ -26,7 +29,10 @@ from conductor.config.schema import (
     WorkflowDef,
 )
 from conductor.config.validator import validate_workflow_config
-from conductor.exceptions import ConfigurationError
+from conductor.exceptions import ConfigurationError, ExecutionError
+from conductor.executor.agent import AgentExecutor
+from conductor.skills import load_skill_content
+from tests.test_skills.test_injection_budget import _EagerProvider
 
 _FRONTMATTER = "---\nname: {name}\ndescription: A test skill.\n---\nBody\n"
 
@@ -127,13 +133,42 @@ class TestPathResolution:
         path.write_text("# placeholder\n")
         _validate(_workflow(agent_skills=["./acme"]), path)
 
-    def test_relative_paths_are_skipped_without_a_workflow_path(self) -> None:
+    def test_relative_paths_are_skipped_without_a_workflow_path(self, tmp_path: Path) -> None:
         """Mirrors ``_validate_subworkflow_refs``: with no base directory a
-        relative path cannot be resolved, so it is not reported as missing."""
-        _validate(_workflow(agent_skills=["./nope"]), None)
+        relative path cannot be resolved, so it is not reported as missing.
+        Absolute entries are unaffected — see the test below.
+
+        Paired with a positive control — the same config *with* a workflow path
+        must raise — so deleting the skill check outright cannot pass this.
+        """
+        config = _workflow(agent_skills=["./nope"])
+        _validate(config, None)
+        with pytest.raises(ConfigurationError, match="does not exist"):
+            _validate(config, _wf_path(tmp_path))
+
+    def test_absolute_paths_still_validate_without_a_workflow_path(self, tmp_path: Path) -> None:
+        """An absolute entry needs no base directory, so the skip must not
+        swallow it either.
+
+        ``~``-prefixed entries take the same branch, since ``expanduser()``
+        makes them absolute.
+        """
+        _make_skill(tmp_path / "acme")
+        _validate(_workflow(agent_skills=[str(tmp_path / "acme")]), None)
+        with pytest.raises(ConfigurationError, match="does not exist"):
+            _validate(_workflow(agent_skills=[str(tmp_path / "nope")]), None)
 
     def test_builtin_names_still_validate_without_a_workflow_path(self) -> None:
+        """Built-in names need no base directory, so the skip must not swallow
+        them.
+
+        The control is that an unknown *name* is caught earlier still — at
+        config construction, by ``AgentDef.validate_skills`` — which is the
+        pre-#350 error timing this change deliberately preserves.
+        """
         _validate(_workflow(agent_skills=["conductor"]), None)
+        with pytest.raises(PydanticValidationError, match="Unknown skill"):
+            _workflow(agent_skills=["not-a-real-skill"])
 
     def test_runtime_skills_are_validated(self, tmp_path: Path) -> None:
         with pytest.raises(ConfigurationError, match="does not exist"):
@@ -269,3 +304,90 @@ class TestInjectionBudget:
                 ),
                 _wf_path(tmp_path),
             )
+
+    def test_unreadable_reference_is_reported_not_raised(self, tmp_path: Path) -> None:
+        """``read_skill_frontmatter`` only opens ``SKILL.md``, so a broken
+        ``references/*.md`` first surfaces here, inside ``load_skill_content``.
+
+        Without a guard it escaped ``validate_workflow_config`` as a bare
+        traceback — the one file class in a skill directory whose failure was
+        reported differently from every other.
+        """
+        skill = _make_skill(tmp_path / "acme", filler=10)
+        unreadable = skill / "references" / "big.md"
+        unreadable.chmod(0o000)
+        try:
+            if os.access(unreadable, os.R_OK):
+                pytest.skip("running as a user that bypasses file permissions")
+            with pytest.raises(ConfigurationError, match="could not be read"):
+                _validate(
+                    _workflow(provider="claude", agent_skills=["./acme"]),
+                    _wf_path(tmp_path),
+                )
+        finally:
+            unreadable.chmod(0o644)
+
+
+class TestStaticAndRuntimeBudgetAgree:
+    """`conductor validate` and `conductor run` compute the injected size
+    independently, in `_check_skill_injection_budget` and
+    `AgentExecutor._enforce_injection_budget`. If they drift, a workflow
+    passes one command and fails the other — which is the exact class of
+    validate/run disagreement `_reject_unsupported_skills` exists to close.
+
+    Both tests deliberately exercise the two paths together so neither can be
+    changed in isolation.
+    """
+
+    @staticmethod
+    def _bytes_reported(message: str) -> str:
+        match = re.search(r"([\d,]+) bytes", message)
+        assert match is not None, f"no byte count in: {message}"
+        return match.group(1)
+
+    @staticmethod
+    def _runtime_executor(tmp_path: Path, limits: SkillInjectionConfig) -> AgentExecutor:
+        return AgentExecutor(_EagerProvider(), workflow_dir=tmp_path, skill_injection=limits)
+
+    def test_both_paths_report_the_same_byte_count(self, tmp_path: Path) -> None:
+        _make_skill(tmp_path / "acme", filler=5000)
+        limits = SkillInjectionConfig(warn_bytes=100, max_bytes=1000)
+
+        with pytest.raises(ConfigurationError) as static_exc:
+            _validate(
+                _workflow(provider="claude", agent_skills=["./acme"], skill_injection=limits),
+                _wf_path(tmp_path),
+            )
+        with pytest.raises(ExecutionError) as runtime_exc:
+            self._runtime_executor(tmp_path, limits)._build_prompt_prefix(
+                AgentDef(name="worker", prompt="p", skills=["./acme"])
+            )
+
+        assert self._bytes_reported(str(static_exc.value)) == self._bytes_reported(
+            str(runtime_exc.value)
+        )
+
+    @pytest.mark.parametrize(
+        ("delta", "should_reject"),
+        [(0, False), (-1, True)],
+        ids=["limit-exactly-at-size", "limit-one-byte-under"],
+    )
+    def test_limit_at_the_exact_rendered_size(
+        self, tmp_path: Path, delta: int, should_reject: bool
+    ) -> None:
+        """Catches both envelope drift (measuring raw file bytes instead of the
+        rendered string) and a `>` / `>=` comparison flip, on both paths."""
+        skill = _make_skill(tmp_path / "acme", filler=5000)
+        exact = len(load_skill_content([("acme", skill)]).encode("utf-8"))
+        limits = SkillInjectionConfig(warn_bytes=None, max_bytes=exact + delta)
+        config = _workflow(provider="claude", agent_skills=["./acme"], skill_injection=limits)
+        agent = AgentDef(name="worker", prompt="p", skills=["./acme"])
+
+        if should_reject:
+            with pytest.raises(ConfigurationError, match="max_bytes"):
+                _validate(config, _wf_path(tmp_path))
+            with pytest.raises(ExecutionError, match="max_bytes"):
+                self._runtime_executor(tmp_path, limits)._build_prompt_prefix(agent)
+        else:
+            _validate(config, _wf_path(tmp_path))
+            assert self._runtime_executor(tmp_path, limits)._build_prompt_prefix(agent)

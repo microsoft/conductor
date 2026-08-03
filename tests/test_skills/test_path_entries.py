@@ -3,7 +3,7 @@
 Before this, ``skills:`` accepted exactly one hardcoded name and
 ``get_skill_directory`` raised for anything else, so a team could not
 version a skill alongside its workflow. These tests cover the two things
-that makes possible — classifying an entry as a name or a path, and
+this made possible — classifying an entry as a name or a path, and
 expanding a path at either granularity.
 """
 
@@ -18,10 +18,9 @@ from conductor.skills import (
     SkillManifestError,
     SkillNotFoundError,
     get_skill_directory,
-    resolve_skill_directories,
+    is_path_entry,
     resolve_skills,
 )
-from conductor.skills.registry import _is_path_entry
 
 _FRONTMATTER = "---\nname: {name}\ndescription: A test skill.\n---\nBody\n"
 
@@ -41,11 +40,11 @@ class TestPathClassification:
         ["./skills/a", "../a", "~/skills", "/abs/a", "team/a", r"team\a", "~"],
     )
     def test_path_shaped_entries(self, entry: str) -> None:
-        assert _is_path_entry(entry) is True
+        assert is_path_entry(entry) is True
 
     @pytest.mark.parametrize("entry", ["conductor", "acme-widgets", "a_b.c"])
     def test_name_shaped_entries(self, entry: str) -> None:
-        assert _is_path_entry(entry) is False
+        assert is_path_entry(entry) is False
 
     def test_bare_name_is_not_shadowed_by_a_local_directory(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -201,16 +200,6 @@ class TestOrderingAndDeduplication:
         assert [item.name for item in resolved] == ["conductor"]
 
 
-class TestResolveSkillDirectoriesWrapper:
-    def test_returns_directories_only(self, tmp_path: Path) -> None:
-        skill = _make_skill(tmp_path / "acme")
-        assert resolve_skill_directories([str(skill)]) == [skill]
-
-    def test_forwards_base_dir(self, tmp_path: Path) -> None:
-        skill = _make_skill(tmp_path / "acme")
-        assert resolve_skill_directories(["./acme"], base_dir=tmp_path) == [skill]
-
-
 class TestUnreadableDirectory:
     @pytest.mark.skipif(
         hasattr(os, "geteuid") and os.geteuid() == 0,
@@ -227,3 +216,123 @@ class TestUnreadableDirectory:
                 resolve_skills([str(blocked)])
         finally:
             blocked.chmod(0o755)
+
+
+class TestNameCollisions:
+    """Every consumer is name-keyed — the eager preamble emits one
+    ``<skill name="...">`` per skill and the native CLIs resolve by name — so
+    two directories claiming one name would leave one silently shadowed. That
+    is the failure mode #350 exists to remove, so it is refused."""
+
+    def test_two_directories_with_the_same_basename_are_refused(self, tmp_path: Path) -> None:
+        _make_skill(tmp_path / "a" / "review")
+        _make_skill(tmp_path / "b" / "review")
+        with pytest.raises(SkillNotFoundError, match="both resolve to a skill named 'review'"):
+            resolve_skills([str(tmp_path / "a" / "review"), str(tmp_path / "b" / "review")])
+
+    def test_error_names_both_sources_as_written(self, tmp_path: Path) -> None:
+        _make_skill(tmp_path / "a" / "review")
+        _make_skill(tmp_path / "b" / "review")
+        with pytest.raises(SkillNotFoundError) as exc_info:
+            resolve_skills(["./a/review", "./b/review"], base_dir=tmp_path)
+        message = str(exc_info.value)
+        assert "'./a/review'" in message and "'./b/review'" in message
+
+    def test_a_root_colliding_with_an_explicit_path_is_refused(self, tmp_path: Path) -> None:
+        """The likely real-world shape: a skills root plus a same-named skill
+        from somewhere else."""
+        _make_skill(tmp_path / "root" / "review")
+        _make_skill(tmp_path / "other" / "review")
+        with pytest.raises(SkillNotFoundError, match="must be unique"):
+            resolve_skills([str(tmp_path / "root"), str(tmp_path / "other" / "review")])
+
+    def test_the_same_directory_twice_is_still_deduplicated(self, tmp_path: Path) -> None:
+        """Collision refusal must not break dedupe — the same directory named
+        twice is one skill, not a clash."""
+        skill = _make_skill(tmp_path / "review")
+        resolved = resolve_skills([str(skill), str(skill)])
+        assert [item.name for item in resolved] == ["review"]
+
+    def test_builtin_and_a_same_named_path_collide(self, tmp_path: Path) -> None:
+        _make_skill(tmp_path / "conductor")
+        with pytest.raises(SkillNotFoundError, match="must be unique"):
+            resolve_skills(["conductor", str(tmp_path / "conductor")])
+
+
+class TestUnreadableParent:
+    @pytest.mark.skipif(
+        hasattr(os, "geteuid") and os.geteuid() == 0,
+        reason="root bypasses directory permissions",
+    )
+    def test_unreadable_parent_is_reported_not_raised_raw(self, tmp_path: Path) -> None:
+        """``exists`` and ``is_dir`` sit inside the OSError guard for this case;
+        without them there it escapes as a bare PermissionError."""
+        parent = tmp_path / "locked"
+        (parent / "acme").mkdir(parents=True)
+        parent.chmod(0o000)
+        try:
+            with pytest.raises(SkillNotFoundError, match="could not be read"):
+                resolve_skills([str(parent / "acme")])
+        finally:
+            parent.chmod(0o755)
+
+
+class TestWindowsSeparatorOnPosix:
+    @pytest.mark.skipif(os.name == "nt", reason="backslash is a real separator on Windows")
+    def test_backslash_relative_path_classifies_but_does_not_resolve(self, tmp_path: Path) -> None:
+        """Pins current behaviour: a workflow authored on Windows with
+        ``skills: ["team\\acme"]`` classifies as a path everywhere, but on POSIX
+        the backslash is an ordinary filename character, so it fails to resolve
+        rather than finding ``team/acme``."""
+        _make_skill(tmp_path / "team" / "acme")
+        assert is_path_entry("team\\acme") is True
+        with pytest.raises(SkillNotFoundError, match="does not exist"):
+            resolve_skills(["team\\acme"], base_dir=tmp_path)
+
+
+class TestSkillsRootDiagnostics:
+    """A skills root that skips a subdirectory reports it.
+
+    Naming a directory with no `SKILL.md` directly raises; naming its *parent*
+    used to turn that same mistake into silence — one fewer skill, no message.
+    """
+
+    def test_subdirectory_without_skill_md_is_reported(self, tmp_path: Path) -> None:
+        root = tmp_path / "skills"
+        _make_skill(root / "alpha")
+        (root / "oops").mkdir()
+        (root / "oops" / "Skill.md").write_text("mis-cased filename")
+
+        warnings: list[str] = []
+        resolved = resolve_skills([str(root)], on_warning=warnings.append)
+
+        assert [item.name for item in resolved] == ["alpha"]
+        assert len(warnings) == 1
+        assert "oops" in warnings[0]
+        assert "SKILL.md" in warnings[0]
+
+    def test_loose_files_are_not_reported(self, tmp_path: Path) -> None:
+        """A README beside skill directories is normal, not a mistake."""
+        root = tmp_path / "skills"
+        _make_skill(root / "alpha")
+        (root / "README.md").write_text("about these skills")
+        (root / "LICENSE").write_text("MIT")
+
+        warnings: list[str] = []
+        resolve_skills([str(root)], on_warning=warnings.append)
+        assert warnings == []
+
+    def test_no_warning_when_every_child_is_a_skill(self, tmp_path: Path) -> None:
+        root = tmp_path / "skills"
+        for name in ("alpha", "beta"):
+            _make_skill(root / name)
+        warnings: list[str] = []
+        resolve_skills([str(root)], on_warning=warnings.append)
+        assert warnings == []
+
+    def test_resolution_works_without_a_sink(self, tmp_path: Path) -> None:
+        """The sink is optional — omitting it must not break resolution."""
+        root = tmp_path / "skills"
+        _make_skill(root / "alpha")
+        (root / "oops").mkdir()
+        assert [item.name for item in resolve_skills([str(root)])] == ["alpha"]
