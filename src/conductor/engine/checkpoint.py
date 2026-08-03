@@ -295,8 +295,9 @@ class CheckpointManager:
 
             return checkpoint_path
 
-        except Exception:
-            logger.warning("Failed to save checkpoint", exc_info=True)
+        except Exception as exc:
+            logger.warning("Failed to save checkpoint (%s: %s)", type(exc).__name__, exc)
+            logger.debug("Checkpoint save traceback", exc_info=True)
             return None
 
     @staticmethod
@@ -510,8 +511,11 @@ class CheckpointManager:
         """
         try:
             candidates = CheckpointManager._periodic_checkpoints_for_run(workflow_path, run_id)
-        except Exception:
-            logger.warning("Failed to list checkpoints for %s", action, exc_info=True)
+        except Exception as exc:
+            logger.warning(
+                "Failed to list checkpoints for %s (%s: %s)", action, type(exc).__name__, exc
+            )
+            logger.debug("Checkpoint listing traceback", exc_info=True)
             return
         # list_checkpoints sorts newest-first, so anything past keep_last is old.
         for cp in candidates[keep_last:]:

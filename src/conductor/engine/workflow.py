@@ -2138,8 +2138,13 @@ class WorkflowEngine:
                         if hasattr(p, "get_session_cwds"):
                             copilot_session_cwds = p.get_session_cwds()  # type: ignore[union-attr]
                         break
-        except Exception:
-            logger.warning("Failed to collect provider session IDs for checkpoint", exc_info=True)
+        except Exception as exc:
+            logger.warning(
+                "Failed to collect provider session IDs for checkpoint (%s: %s)",
+                type(exc).__name__,
+                exc,
+            )
+            logger.debug("Session ID collection traceback", exc_info=True)
             copilot_session_ids = None
             copilot_session_cwds = None
 
@@ -3036,12 +3041,14 @@ class WorkflowEngine:
                 outcome = await validate_coro
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
             logger.warning(
-                "Validator call for '%s' timed out or failed; treating as pass",
+                "Validator call for '%s' timed out or failed; treating as pass (%s: %s)",
                 agent.name,
-                exc_info=True,
+                type(exc).__name__,
+                exc,
             )
+            logger.debug("Validator call traceback for '%s'", agent.name, exc_info=True)
             outcome = ValidationOutcome(passed=True, errored=True)
         _v_elapsed = _time.time() - _v_start
 
@@ -3094,15 +3101,23 @@ class WorkflowEngine:
             )
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
             # The re-run hit a real failure (provider error, agent timeout, or
             # the retried output failed the agent's output schema). Fail open
             # to the original output, but surface it — otherwise enabling the
             # validator would silently downgrade a hard failure into a quiet
             # one. The original is recorded once by the caller under the
             # primary name; it is NOT also attributed to the validator row.
+            # The warning stays concise because the workflow continues; the
+            # full traceback is kept at debug level for diagnosis (issue #357).
             logger.warning(
-                "Validator re-run failed for '%s'; using original output",
+                "Validator re-run failed for '%s'; using original output (%s: %s)",
+                agent.name,
+                type(exc).__name__,
+                exc,
+            )
+            logger.debug(
+                "Validator re-run traceback for '%s'",
                 agent.name,
                 exc_info=True,
             )

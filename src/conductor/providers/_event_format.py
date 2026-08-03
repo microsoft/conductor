@@ -64,7 +64,7 @@ def emit_parse_recovery_event(
             },
         )
     except Exception:
-        logger.warning("Error in event_callback for agent_parse_recovery", exc_info=True)
+        logger.debug("Error in event_callback for agent_parse_recovery", exc_info=True)
 
 
 def format_tool_arguments(arguments: Any, max_length: int = 500) -> str | None:

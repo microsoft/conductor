@@ -192,12 +192,14 @@ class OutputValidator:
         except asyncio.CancelledError:
             # Interrupt / cancellation must propagate — never silently pass.
             raise
-        except Exception:
+        except Exception as exc:
             logger.warning(
-                "Validator call failed for agent '%s'; treating as pass",
+                "Validator call failed for agent '%s'; treating as pass (%s: %s)",
                 agent.name,
-                exc_info=True,
+                type(exc).__name__,
+                exc,
             )
+            logger.debug("Validator call traceback for agent '%s'", agent.name, exc_info=True)
             return ValidationOutcome(passed=True, errored=True)
 
         passed, issues, parse_ok = self._parse(output.content)

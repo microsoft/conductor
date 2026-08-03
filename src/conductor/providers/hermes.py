@@ -724,7 +724,7 @@ def _fire(callback: EventCallback | None, event: str, data: dict[str, Any]) -> N
     try:
         callback(event, data)
     except Exception:
-        logger.warning("Error in event_callback for %s", event, exc_info=True)
+        logger.debug("Error in event_callback for %s", event, exc_info=True)
 
 
 async def _wait_for_event(event: asyncio.Event) -> None:
