@@ -345,12 +345,15 @@ class ClaudeAgentSdkProvider(AgentProvider):
         # ``max_session_seconds`` is enforced between messages via
         # ``time.monotonic()``.
         max_session_seconds=True,
-        # Sessions recorded for agents with a ``session_key`` are persisted
-        # in the checkpoint and re-applied at ``conductor resume`` via
-        # ``set_resume_session_ids``. Agents without a ``session_key`` keep
-        # the default one-session-per-execution behavior, for which there is
-        # no state to carry across a resume.
-        checkpoint_resume=True,
+        # Deliberately False even though a ``session_key`` agent's session
+        # *is* persisted and re-applied on resume (see
+        # ``get_session_ids`` / ``set_resume_session_ids``). The flag is a
+        # blanket promise read by the startup banner, and it would be false
+        # for every agent that does not opt in — which is all of them by
+        # default. ``session_continuity`` below is the honest, granular
+        # claim; under-claiming here keeps the banner truthful for the
+        # majority who declare no key and genuinely get nothing back.
+        checkpoint_resume=False,
         # Token counts come from ``ResultMessage.usage`` (cumulative
         # session total — see A4 fix).
         usage_tracking=True,
@@ -371,6 +374,9 @@ class ClaudeAgentSdkProvider(AgentProvider):
         # ``skill_directories`` kwarg today; once it does we can flip
         # to native via ``supports_native_skills``).
         skills=True,
+        # ``session_key`` is honored: executions sharing a key resume one
+        # Claude session, and the map is persisted across ``conductor resume``.
+        session_continuity=True,
         upstream_pin="claude-agent-sdk>=0.2.82",
         maintainer="@lesandiz (best-effort)",
     )

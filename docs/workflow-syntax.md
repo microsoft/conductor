@@ -362,9 +362,10 @@ agents:
   agent's output. Two agents share a session simply by writing the same
   string.
 - **The key is never rendered.** Unlike `working_dir` or `model`, `session_key`
-  is *not* a Jinja2 template — a `{{ ... }}` value is used verbatim as the
-  literal key rather than being substituted. Surrounding whitespace is
-  stripped and the result must be non-empty.
+  is *not* a Jinja2 template, so a `{{ ... }}` value is **rejected at
+  validation** rather than becoming one literal key shared by every
+  execution. Surrounding whitespace is stripped and the result must be
+  non-empty.
 - **The prompt is still rendered and sent every time.** The session means the
   model *additionally* has the prior conversation, so it sees
   `[earlier turns] + [freshly rendered prompt]`. Omit `session_key` where an
@@ -393,6 +394,11 @@ agents:
   or a session recorded elsewhere — logs a warning and starts fresh.
 - **Rejected step types:** `script`, `human_gate`, `workflow`, `wait`, `set`,
   and `terminate` — none of them have a provider session to continue.
+- **Providers that cannot honor it fail validation.** `session_key` is gated
+  on the `session_continuity` capability, so declaring it against a provider
+  without support is a `conductor validate` error rather than a setting that
+  is quietly dropped at runtime. Currently only `claude-agent-sdk` declares
+  it.
 - **Concurrent executions cannot share a key.** Two members of the same
   parallel group declaring one key, or a for-each agent with a `session_key`
   and `max_concurrent > 1`, are rejected at `conductor validate` time: the
@@ -400,8 +406,7 @@ agents:
   two `claude` processes appending to one transcript. Give them distinct
   keys, drop the key, or set `max_concurrent: 1`.
 
-Currently implemented by the `claude-agent-sdk` provider; the field validates
-under any provider but is ignored by those that do not support it. See
+See
 [`examples/claude-agent-sdk-session-key.yaml`](../examples/claude-agent-sdk-session-key.yaml)
 and [`docs/providers/experimental.md`](providers/experimental.md).
 

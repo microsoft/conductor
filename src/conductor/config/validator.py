@@ -1764,6 +1764,17 @@ def _validate_provider_capabilities(
                 f"directories (capabilities.working_dir=False)."
             )
 
+        # session_key: a provider that ignores it would start a fresh session
+        # every execution, silently discarding the accumulated context the
+        # author asked to carry across loop-backs — same class as working_dir.
+        if agent.session_key is not None and not caps.session_continuity:
+            errors.append(
+                f"Agent '{agent.name}' sets session_key={agent.session_key!r} but "
+                f"provider '{provider_name}' does not support session continuity "
+                f"(capabilities.session_continuity=False). Remove the session_key, "
+                f"or override the agent to a provider that supports it."
+            )
+
         # skills: a provider that cannot surface skill content would drop it
         # silently — the agent still runs, just without the knowledge the
         # author asked for. An empty list is an explicit opt-out, so only a

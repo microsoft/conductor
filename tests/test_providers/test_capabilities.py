@@ -27,6 +27,7 @@ def _stable_capabilities(**overrides: object) -> ProviderCapabilities:
         "usage_tracking": True,
         "concurrent_safe": True,
         "skills": True,
+        "session_continuity": True,
         "upstream_pin": None,
         "maintainer": None,
     }
@@ -152,6 +153,7 @@ class TestDeclaredLimitations:
             usage_tracking=False,
             concurrent_safe=False,
             skills=False,
+            session_continuity=False,
         )
         lims = caps.declared_limitations()
         # Every "off" capability shows up in the human-readable list.
@@ -167,6 +169,7 @@ class TestDeclaredLimitations:
         assert "no usage tracking" in lims
         assert "not safe to run in parallel" in lims
         assert "no skills support" in lims
+        assert "no session_key continuity" in lims
 
     def test_prompt_injection_structured_output_listed_as_limitation(self) -> None:
         caps = _stable_capabilities(

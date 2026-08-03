@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import json
 import os
-import uuid
 from contextlib import contextmanager
 from typing import Any
 from unittest.mock import Mock, patch
@@ -314,204 +313,19 @@ class TestCheckpointRoundTrip:
 
 
 class TestCapability:
-    def test_declares_checkpoint_resume(self) -> None:
-        assert ClaudeAgentSdkProvider.CAPABILITIES.checkpoint_resume is True
+    def test_declares_session_continuity(self) -> None:
+        assert ClaudeAgentSdkProvider.CAPABILITIES.session_continuity is True
 
-    def test_checkpoint_resume_is_not_listed_as_a_limitation(self) -> None:
+    def test_session_continuity_is_not_listed_as_a_limitation(self) -> None:
         assert (
-            "no checkpoint resume" not in ClaudeAgentSdkProvider.CAPABILITIES.declared_limitations()
+            "no session_key continuity"
+            not in ClaudeAgentSdkProvider.CAPABILITIES.declared_limitations()
         )
 
+    def test_under_claims_blanket_checkpoint_resume(self) -> None:
+        """Sessions do survive resume, but only for agents that opted in.
 
-class _Hook:
-    """A hook frame. Carries its own ``session_id``, unrelated to the conversation."""
-
-    def __init__(self, session_id: str) -> None:
-        self.session_id = session_id
-        self.hook_name = "SessionStart:resume"
-
-
-class TestSessionIdProvenance:
-    async def test_hook_frames_do_not_shadow_the_real_session(self) -> None:
-        """Regression guard.
-
-        A ``SessionStart`` hook emits frames carrying a session id of their
-        own before the first assistant turn. Recording one would point the
-        map at an id with no transcript, silently breaking continuity for
-        every later pass.
+        The flag is a blanket promise the startup banner reads out, so it
+        stays False; ``session_continuity`` carries the granular claim.
         """
-        rec = _Recorder(["sess-real"])
-        rec.prefix_messages = [_Hook("hook-stray")]
-        with _sdk(rec):
-            provider = ClaudeAgentSdkProvider()
-            await _run(provider, "analyze", "investigation")
-
-        assert provider.get_session_ids() == {_ck("investigation"): "sess-real"}
-
-    async def test_hook_frame_alone_records_nothing(self) -> None:
-        rec = _Recorder(["sess-real"], stop_after_prefix=True)
-        rec.prefix_messages = [_Hook("hook-stray")]
-        with _sdk(rec):
-            provider = ClaudeAgentSdkProvider()
-            with pytest.raises(ProviderError):
-                await _run(provider, "analyze", "investigation")
-
-        assert provider.get_session_ids() == {}
-
-    async def test_session_recorded_when_interrupted(self) -> None:
-        """An interrupted agent is one whose context is worth resuming."""
-        import asyncio
-
-        rec = _Recorder(["sess-1"])
-        interrupt = asyncio.Event()
-        interrupt.set()
-        with _sdk(rec):
-            provider = ClaudeAgentSdkProvider()
-            agent = AgentDef(name="analyze", prompt="go", session_key="investigation")
-            out = await provider.execute(
-                agent=agent,
-                context={},
-                rendered_prompt="go",
-                interrupt_signal=interrupt,
-            )
-
-        assert out.partial is True
-        assert provider.get_session_ids() == {_ck("investigation"): "sess-1"}
-
-
-class TestWorkingDirScoping:
-    async def test_same_key_under_different_cwds_does_not_stomp(self, tmp_path: Any) -> None:
-        """Transcripts are stored per directory, so these cannot share a session.
-
-        Keying on the label alone made each execution overwrite the other's
-        id, so neither ever resumed.
-        """
-        dir_a = tmp_path / "a"
-        dir_b = tmp_path / "b"
-        dir_a.mkdir()
-        dir_b.mkdir()
-        rec = _Recorder(["sess-a", "sess-b"])
-        with _sdk(rec):
-            provider = ClaudeAgentSdkProvider()
-            for cwd in (str(dir_a), str(dir_b), str(dir_a), str(dir_b)):
-                agent = AgentDef(name="analyze", prompt="go", session_key="shared", working_dir=cwd)
-                await provider.execute(agent=agent, context={}, rendered_prompt="go")
-
-        assert rec.resumes == [None, None, "sess-a", "sess-b"]
-        assert provider.get_session_ids() == {
-            _ck("shared", str(dir_a)): "sess-a",
-            _ck("shared", str(dir_b)): "sess-b",
-        }
-
-
-class TestMapHygiene:
-    async def test_unkeyed_execution_does_not_clear_the_map(self) -> None:
-        rec = _Recorder(["sess-1", "sess-2"])
-        with _sdk(rec):
-            provider = ClaudeAgentSdkProvider()
-            await _run(provider, "analyze", "investigation")
-            await _run(provider, "analyze", None)
-
-        assert provider.get_session_ids() == {_ck("investigation"): "sess-1"}
-
-    async def test_empty_restore_map_is_harmless(self) -> None:
-        rec = _Recorder(["sess-1"])
-        with _sdk(rec):
-            provider = ClaudeAgentSdkProvider()
-            provider.set_resume_session_ids({})
-            await _run(provider, "analyze", "investigation")
-
-        assert rec.resumes == [None]
-
-    async def test_malformed_restore_entries_are_ignored(self) -> None:
-        rec = _Recorder(["sess-1"])
-        with _sdk(rec):
-            provider = ClaudeAgentSdkProvider()
-            provider.set_resume_session_ids({f"{_SESSION_KEY_NAMESPACE}not-json": "sess-x"})
-            await _run(provider, "analyze", "investigation")
-
-        assert rec.resumes == [None]
-
-    async def test_probe_is_skipped_when_there_is_nothing_to_resume(self) -> None:
-        rec = _Recorder(["sess-1"])
-        with _sdk(rec) as probe:
-            provider = ClaudeAgentSdkProvider()
-            await _run(provider, "analyze", "investigation")
-
-        probe.assert_not_called()
-
-
-class TestTranscriptProbe:
-    """The probe against real transcripts and the real SDK path helpers."""
-
-    @staticmethod
-    def _write(project_dir: Any, session_id: str, prompt: str) -> None:
-        rows = [
-            {
-                "type": "user",
-                "uuid": str(uuid.uuid4()),
-                "parentUuid": None,
-                "sessionId": session_id,
-                "timestamp": "2026-08-01T00:00:00.000Z",
-                "message": {"role": "user", "content": prompt},
-            }
-        ]
-        (project_dir / f"{session_id}.jsonl").write_text(
-            "\n".join(json.dumps(r) for r in rows) + "\n"
-        )
-
-    @pytest.fixture
-    def claude_home(self, tmp_path: Any, monkeypatch: Any):
-        from claude_agent_sdk import project_key_for_directory
-
-        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "cfg"))
-        repo = tmp_path / "repo"
-        repo.mkdir()
-        project_dir = tmp_path / "cfg" / "projects" / project_key_for_directory(str(repo))
-        project_dir.mkdir(parents=True)
-        return repo, project_dir
-
-    def test_finds_a_real_transcript(self, claude_home: Any) -> None:
-        repo, project_dir = claude_home
-        sid = str(uuid.uuid4())
-        self._write(project_dir, sid, "hello")
-        assert ClaudeAgentSdkProvider._session_transcript_exists(sid, str(repo)) is True
-
-    def test_missing_transcript_is_reported_absent(self, claude_home: Any) -> None:
-        repo, _ = claude_home
-        assert (
-            ClaudeAgentSdkProvider._session_transcript_exists(str(uuid.uuid4()), str(repo)) is False
-        )
-
-    def test_large_first_prompt_is_still_found(self, claude_home: Any) -> None:
-        """``get_session_info`` reads only the first 64 KiB and would say None.
-
-        Accumulate-mode context and eager-injected skills clear that easily,
-        and treating it as "transcript gone" disabled continuity permanently.
-        """
-        repo, project_dir = claude_home
-        sid = str(uuid.uuid4())
-        self._write(project_dir, sid, "x" * 200_000)
-
-        from claude_agent_sdk import get_session_info
-
-        assert get_session_info(sid, directory=str(repo)) is None
-        assert ClaudeAgentSdkProvider._session_transcript_exists(sid, str(repo)) is True
-
-    def test_transcript_from_another_directory_is_not_claimed(self, claude_home: Any) -> None:
-        """The CLI refuses ``--resume`` across project dirs, so the probe must too.
-
-        ``get_session_info`` searches sibling git worktrees, which would
-        report the session present and turn the graceful fallback into a hard
-        abort when the CLI then rejected it.
-        """
-        repo, project_dir = claude_home
-        sid = str(uuid.uuid4())
-        self._write(project_dir, sid, "hello")
-        other = repo.parent / "other"
-        other.mkdir()
-        assert ClaudeAgentSdkProvider._session_transcript_exists(sid, str(other)) is False
-
-    def test_non_uuid_id_does_not_raise(self, claude_home: Any) -> None:
-        repo, _ = claude_home
-        assert ClaudeAgentSdkProvider._session_transcript_exists("not-a-uuid", str(repo)) is False
+        assert ClaudeAgentSdkProvider.CAPABILITIES.checkpoint_resume is False

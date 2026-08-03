@@ -1007,23 +1007,26 @@ class AgentDef(BaseModel):
     provider maps it to the real session id internally, so no session id ever
     passes through the workflow context.
 
-    Only meaningful when the agent's effective provider is
-    ``claude-agent-sdk``; like :class:`SandboxConfig`, the field validates
-    structurally regardless of provider but is consumed only by that provider
-    at runtime. The session id is persisted in checkpoints, so continuity
-    survives ``conductor resume``. A session whose transcript no longer
-    exists (pruned, or a changed ``working_dir``) falls back to a fresh
-    session with a logged warning rather than failing the run.
+    Gated on the provider's ``session_continuity`` capability: declaring it
+    against a provider that cannot honor it is a ``conductor validate``
+    error, not a silently dropped setting. Only ``claude-agent-sdk``
+    declares it today. The session id is persisted in checkpoints, so
+    continuity survives ``conductor resume``. A session whose transcript is
+    no longer on disk (the CLI prunes on its own schedule, or the
+    ``working_dir`` changed — transcripts are stored per directory) falls
+    back to a fresh session with a logged warning rather than failing the
+    run.
 
-    Concurrency: executions that genuinely overlap — parallel-group members,
-    or for-each iterations with ``max_concurrent > 1`` — must not share a
-    key, since they would interleave turns in one session. A for-each agent
-    with a static key shares one session across every item; that is only
-    sensible when the items are meant to build on each other.
+    Concurrency: executions that genuinely overlap — two members of one
+    parallel group, or a for-each agent with ``max_concurrent > 1`` — are
+    rejected by the validator, since the second would resume a session the
+    first still has open. A *sequential* for-each with a key shares one
+    session across every item, which is only sensible when the items are
+    meant to build on each other.
 
     Not a Jinja2 template. Unlike ``working_dir`` or ``model`` this value is
-    never rendered, so ``{{ ... }}`` is rejected rather than silently used as
-    a literal key (see :meth:`_validate_session_key_is_literal`).
+    never rendered, so ``{{ ... }}`` is rejected rather than silently
+    becoming one literal key (see :meth:`validate_session_key_is_literal`).
 
     Example YAML::
 
@@ -1226,6 +1229,23 @@ class AgentDef(BaseModel):
         """Ensure timeout is positive if set."""
         if v is not None and v <= 0:
             raise ValueError("timeout must be a positive integer")
+        return v
+
+    @field_validator("session_key")
+    @classmethod
+    def validate_session_key_is_literal(cls, v: str | None) -> str | None:
+        """Reject a Jinja2 template.
+
+        ``session_key`` is never rendered, so ``"item-{{ _key }}"`` would
+        become one literal key shared by every iteration rather than the
+        per-item key the author clearly intended. Fail loudly instead.
+        """
+        if v is not None and ("{{" in v or "{%" in v):
+            raise ValueError(
+                f"session_key {v!r} looks like a Jinja2 template, but session_key is "
+                f"never rendered — it would be used verbatim as a single literal key "
+                f"shared by every execution. Use a static label."
+            )
         return v
 
     @field_validator("skills")

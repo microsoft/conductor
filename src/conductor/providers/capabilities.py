@@ -159,6 +159,18 @@ class ProviderCapabilities(BaseModel):
     to ``False`` so providers that have not been audited for skills
     surface the mismatch loudly."""
 
+    session_continuity: bool = False
+    """``True`` when the provider honors an agent's ``session_key``, reusing
+    one underlying provider session across every execution tagged with that
+    key (loop-backs, and hand-offs to a later agent declaring the same key).
+
+    Agents that set ``session_key:`` against a provider with
+    ``session_continuity=False`` fail validation — silently starting a fresh
+    session would drop the accumulated context the author asked to keep, the
+    same class of quietly-discarded operational intent as ``working_dir``.
+    Defaults to ``False`` so providers that have not implemented the key
+    surface the mismatch loudly."""
+
     upstream_pin: str | None = None
     """Upstream package pin surfaced in the experimental banner, e.g.
     ``"claude-agent-sdk>=0.1.0"``. ``None`` for providers that have no
@@ -231,6 +243,8 @@ class ProviderCapabilities(BaseModel):
             items.append("working_dir ignored")
         if not self.skills:
             items.append("no skills support")
+        if not self.session_continuity:
+            items.append("no session_key continuity")
         return items
 
 

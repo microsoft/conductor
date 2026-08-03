@@ -1727,6 +1727,54 @@ class TestAcaSkillsRealCapabilities:
             validate_workflow_config(config)
 
 
+class TestSessionContinuityCrossCheck:
+    """Requirement: ``session_key`` against a provider declaring
+    ``session_continuity=False`` is a hard validate error — the provider would
+    otherwise start a fresh session every execution, silently discarding the
+    context the author asked to carry across loop-backs."""
+
+    def test_session_key_against_unsupported_provider_errors(self, patch_caps: Any) -> None:
+        patch_caps({"copilot": _caps(session_continuity=False)})
+        config = _build_workflow(
+            agents=[AgentDef(name="a", prompt="hi", session_key="investigation")],
+        )
+        with pytest.raises(ConfigurationError, match="does not support session continuity"):
+            validate_workflow_config(config)
+
+    def test_session_key_against_supported_provider_passes(self, patch_caps: Any) -> None:
+        patch_caps({"copilot": _caps(session_continuity=True)})
+        config = _build_workflow(
+            agents=[AgentDef(name="a", prompt="hi", session_key="investigation")],
+        )
+        validate_workflow_config(config)
+
+    def test_omitted_against_unsupported_provider_passes(self, patch_caps: Any) -> None:
+        patch_caps({"copilot": _caps(session_continuity=False)})
+        config = _build_workflow(agents=[AgentDef(name="a", prompt="hi")])
+        validate_workflow_config(config)
+
+    def test_for_each_inline_agent_is_checked_too(self, patch_caps: Any) -> None:
+        """Inline agents inherit the workflow provider and must not escape the gate."""
+        patch_caps({"copilot": _caps(session_continuity=False)})
+        inline = AgentDef(name="inner", prompt="{{ item }}", session_key="investigation")
+        config = _build_workflow(
+            agents=[AgentDef(name="entry", prompt="hi")],
+            for_each=[
+                ForEachDef(
+                    name="loop",
+                    type="for_each",
+                    source="entry.output.items",
+                    **{"as": "item"},
+                    agent=inline,
+                    max_concurrent=1,
+                )
+            ],
+        )
+        config.workflow.entry_point = "loop"
+        with pytest.raises(ConfigurationError, match="does not support session continuity"):
+            validate_workflow_config(config)
+
+
 class TestSharedSessionKeyConcurrency:
     """Concurrent executions must not resume the same session.
 
@@ -1748,7 +1796,8 @@ class TestSharedSessionKeyConcurrency:
         with pytest.raises(ConfigurationError, match="Concurrent executions cannot share"):
             validate_workflow_config(config)
 
-    def test_parallel_members_with_distinct_keys_pass(self) -> None:
+    def test_parallel_members_with_distinct_keys_pass(self, patch_caps: Any) -> None:
+        patch_caps({"copilot": _caps(session_continuity=True)})
         config = _build_workflow(
             agents=[
                 AgentDef(name="a", prompt="hi", session_key="alpha"),
@@ -1778,7 +1827,8 @@ class TestSharedSessionKeyConcurrency:
         with pytest.raises(ConfigurationError, match="Iterations would run concurrently"):
             validate_workflow_config(config)
 
-    def test_serial_for_each_with_a_key_passes(self) -> None:
+    def test_serial_for_each_with_a_key_passes(self, patch_caps: Any) -> None:
+        patch_caps({"copilot": _caps(session_continuity=True)})
         inline = AgentDef(name="inner", prompt="{{ item }}", session_key="shared")
         config = _build_workflow(
             agents=[AgentDef(name="entry", prompt="hi")],

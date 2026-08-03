@@ -21,7 +21,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   workflow context. Sessions are scoped per working directory, since that is
   how the `claude` CLI stores transcripts. The session map is persisted in
   checkpoints, so continuity survives `conductor resume` —
-  `checkpoint_resume` flips to `True` for this provider. A session the
+  the provider declares the new `session_continuity` capability, so
+  declaring `session_key` against a provider that cannot honor it is a
+  `conductor validate` error rather than a silently dropped setting.
+  `checkpoint_resume` stays `False`: agents without a key carry no session
+  state across a resume, and that flag is a blanket promise. A session the
   provider cannot confirm on disk (first execution under a key, a pruned
   transcript, a changed `working_dir`) logs a warning and starts fresh rather
   than failing the run. `session_key` is rejected on `script`, `human_gate`,

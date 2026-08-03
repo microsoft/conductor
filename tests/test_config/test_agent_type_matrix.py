@@ -66,3 +66,21 @@ class TestSessionKeyTypeMatrix:
     def test_session_key_rejected(self, kwargs: dict, match: str) -> None:
         with pytest.raises(PydanticValidationError, match=match):
             AgentDef(**kwargs, session_key="investigation")  # type: ignore[arg-type]
+
+
+class TestSessionKeyLiteral:
+    """``session_key`` is never rendered, so a template must not pass silently."""
+
+    @pytest.mark.parametrize(
+        "value",
+        ["item-{{ _key }}", "{{ workflow.input.id }}", "{% if x %}a{% endif %}"],
+        ids=["expression", "input-ref", "statement"],
+    )
+    def test_template_rejected(self, value: str) -> None:
+        with pytest.raises(PydanticValidationError, match="never rendered"):
+            AgentDef(name="a", prompt="hi", session_key=value)
+
+    def test_static_label_accepted(self) -> None:
+        assert AgentDef(name="a", prompt="hi", session_key="investigation").session_key == (
+            "investigation"
+        )
