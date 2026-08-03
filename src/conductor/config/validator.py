@@ -1956,33 +1956,52 @@ def _validate_provider_capabilities(
     # ----- Concurrent executions must not share a session -----
     # Two executions resuming one session means two CLI processes appending to
     # a single transcript: the first session is orphaned and the file is
-    # written concurrently. Both group shapes are statically decidable.
+    # written concurrently. Sessions are scoped to (session_key, working
+    # directory), so executions under different directories are already
+    # distinct sessions and must NOT be flagged — that separation is what
+    # makes multi-worktree fan-out legal.
+    runtime_working_dir = config.workflow.runtime.working_dir
+
+    def _effective_working_dir(agent: AgentDef) -> str | None:
+        return agent.working_dir or runtime_working_dir
+
     for pg in config.parallel:
-        keys_seen: dict[str, str] = {}
+        # (session_key, effective working_dir) -> first agent claiming it
+        claimed: dict[tuple[str, str | None], str] = {}
         for member_name in pg.agents:
             member = agent_by_name.get(member_name)
             if member is None or member.session_key is None:
                 continue
-            first = keys_seen.get(member.session_key)
+            slot = (member.session_key, _effective_working_dir(member))
+            first = claimed.get(slot)
             if first is not None:
                 errors.append(
                     f"Parallel group '{pg.name}' runs agents '{first}' and "
                     f"'{member_name}' concurrently, but both declare "
-                    f"session_key: '{member.session_key}'. Concurrent executions "
-                    f"cannot share a session — give them distinct keys, or move "
-                    f"one out of the group."
+                    f"session_key: '{member.session_key}' with the same working "
+                    f"directory. Concurrent executions cannot share a session — "
+                    f"give them distinct keys, run them under different "
+                    f"working_dir values, or move one out of the group."
                 )
             else:
-                keys_seen[member.session_key] = member_name
+                claimed[slot] = member_name
 
     for fe in config.for_each:
-        if fe.max_concurrent > 1 and fe.agent.session_key is not None:
-            errors.append(
-                f"For-each group '{fe.name}' has max_concurrent={fe.max_concurrent} "
-                f"and declares session_key: '{fe.agent.session_key}'. Iterations "
-                f"would run concurrently against one session — set max_concurrent: 1, "
-                f"or remove the session_key."
-            )
+        if fe.max_concurrent <= 1 or fe.agent.session_key is None:
+            continue
+        # A per-item working_dir gives each iteration its own session, so
+        # the group is only unsafe when every iteration lands in one directory.
+        working_dir = _effective_working_dir(fe.agent) or ""
+        loop_vars = (f"{{{{ {fe.as_}", f"{{{{{fe.as_}", "_index", "_key")
+        if any(var in working_dir for var in loop_vars):
+            continue
+        errors.append(
+            f"For-each group '{fe.name}' has max_concurrent={fe.max_concurrent} "
+            f"and declares session_key: '{fe.agent.session_key}' without a "
+            f"per-item working_dir. Every iteration would resume one session "
+            f"concurrently — set max_concurrent: 1, remove the session_key, or "
+            f"give each item its own working_dir."
+        )
 
     for fe in config.for_each:
         # A serial for_each (max_concurrent == 1) does not actually run

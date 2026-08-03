@@ -251,9 +251,13 @@ class TestUnresolvableSession:
 
         assert "could not be found" in caplog.text
 
-    async def test_survives_an_sdk_without_session_lookup(self) -> None:
-        """A sub-floor SDK lacking the lookup helpers must not disable resume."""
-        rec = _Recorder(["sess-1"])
+    async def test_sdk_without_session_lookup_does_not_resume_unverified(self) -> None:
+        """A sub-floor SDK must degrade to a fresh session, not an unguarded resume.
+
+        Handing an unverifiable id to ``--resume`` aborts the CLI *before the
+        agent runs*, so silently starting fresh is the safer degradation.
+        """
+        rec = _Recorder(["sess-1", "sess-2"])
         with (
             patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True),
             patch("conductor.providers.claude_agent_sdk.query", rec),
@@ -264,7 +268,7 @@ class TestUnresolvableSession:
             await _run(provider, "analyze", "investigation")
             await _run(provider, "analyze", "investigation")
 
-        assert rec.resumes == [None, "sess-1"]
+        assert rec.resumes == [None, None]
 
 
 class TestCheckpointRoundTrip:
@@ -528,3 +532,33 @@ class TestTranscriptProbe:
     def test_non_uuid_id_does_not_raise(self, claude_home: Any) -> None:
         repo, _ = claude_home
         assert ClaudeAgentSdkProvider._session_transcript_exists("not-a-uuid", str(repo)) is False
+
+
+class TestMultiResume:
+    async def test_restored_ids_are_re_exported(self) -> None:
+        """Continuity must survive more than one resume.
+
+        A second checkpoint taken before the keyed agent runs again would
+        otherwise drop the restored id, and a later loop-back would silently
+        start cold.
+        """
+        provider = ClaudeAgentSdkProvider()
+        stored = {_ck("investigation", "/proj"): "sess-1"}
+        provider.set_resume_session_ids(stored)
+
+        assert provider.get_session_ids() == stored
+
+    async def test_ids_recorded_this_run_override_restored_ones_on_export(self) -> None:
+        """A superseded entry must not linger in the exported map.
+
+        The restored transcript is gone, so a fresh session is started; the
+        next checkpoint must carry the live id, not the dead one.
+        """
+        rec = _Recorder(["sess-live"])
+        with _sdk(rec, session_exists=False):
+            provider = ClaudeAgentSdkProvider()
+            provider.set_resume_session_ids({_ck("investigation"): "sess-stale"})
+            await _run(provider, "analyze", "investigation")
+
+        assert rec.resumes == [None]
+        assert provider.get_session_ids() == {_ck("investigation"): "sess-live"}

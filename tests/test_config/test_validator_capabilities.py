@@ -1808,6 +1808,50 @@ class TestSharedSessionKeyConcurrency:
         config.workflow.entry_point = "grp"
         validate_workflow_config(config)
 
+    def test_parallel_members_sharing_a_key_under_different_cwds_pass(
+        self, patch_caps: Any
+    ) -> None:
+        """Sessions are scoped to (key, working directory).
+
+        These two provably cannot share a session, so rejecting them would
+        block the multi-worktree fan-out that the cwd scoping exists for.
+        """
+        patch_caps({"copilot": _caps(session_continuity=True, working_dir=True)})
+        config = _build_workflow(
+            agents=[
+                AgentDef(name="a", prompt="hi", session_key="shared", working_dir="/tmp"),
+                AgentDef(name="b", prompt="hi", session_key="shared", working_dir="/usr"),
+            ],
+            parallel=[ParallelGroup(name="grp", agents=["a", "b"])],
+        )
+        config.workflow.entry_point = "grp"
+        validate_workflow_config(config)
+
+    def test_concurrent_for_each_with_a_per_item_working_dir_passes(self, patch_caps: Any) -> None:
+        """A per-item directory gives each iteration its own session."""
+        patch_caps({"copilot": _caps(session_continuity=True, working_dir=True)})
+        inline = AgentDef(
+            name="inner",
+            prompt="{{ item }}",
+            session_key="shared",
+            working_dir="/repos/{{ item }}",
+        )
+        config = _build_workflow(
+            agents=[AgentDef(name="entry", prompt="hi")],
+            for_each=[
+                ForEachDef(
+                    name="loop",
+                    type="for_each",
+                    source="entry.output.items",
+                    **{"as": "item"},
+                    agent=inline,
+                    max_concurrent=4,
+                )
+            ],
+        )
+        config.workflow.entry_point = "loop"
+        validate_workflow_config(config)
+
     def test_concurrent_for_each_with_a_key_errors(self) -> None:
         inline = AgentDef(name="inner", prompt="{{ item }}", session_key="shared")
         config = _build_workflow(
@@ -1824,7 +1868,7 @@ class TestSharedSessionKeyConcurrency:
             ],
         )
         config.workflow.entry_point = "loop"
-        with pytest.raises(ConfigurationError, match="Iterations would run concurrently"):
+        with pytest.raises(ConfigurationError, match="without a per-item working_dir"):
             validate_workflow_config(config)
 
     def test_serial_for_each_with_a_key_passes(self, patch_caps: Any) -> None:

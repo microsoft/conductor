@@ -764,12 +764,18 @@ class ClaudeAgentSdkProvider(AgentProvider):
         spaces genuinely collide — ``session_key: investigate`` on an agent
         named ``investigate`` is the obvious thing to write.
 
+        Restored entries are re-exported alongside ones recorded this run,
+        so a session survives more than one resume: a second checkpoint taken
+        before the keyed agent runs again would otherwise drop it and a later
+        loop-back would silently start cold.
+
         Returns:
             Mapping of namespaced ``[session_key, cwd]`` to Claude session id.
         """
+        merged = {**self._resume_session_ids, **self._session_ids}
         return {
             f"{_SESSION_KEY_NAMESPACE}{json.dumps([key, cwd])}": sid
-            for (key, cwd), sid in self._session_ids.items()
+            for (key, cwd), sid in merged.items()
         }
 
     def set_resume_session_ids(self, ids: dict[str, str]) -> None:
@@ -819,7 +825,16 @@ class ClaudeAgentSdkProvider(AgentProvider):
         if session_id is None:
             return None
         if get_session_info is None and project_key_for_directory is None:
-            return session_id
+            # Neither lookup is available (an SDK below the session floor).
+            # Do NOT hand the id over unverified: `--resume` on a transcript
+            # the CLI cannot find aborts it before the agent runs, so a silent
+            # fresh session is strictly the safer degradation.
+            logger.debug(
+                "Session lookup unavailable in this claude-agent-sdk build; "
+                "starting a fresh session for session_key '%s'.",
+                session_key,
+            )
+            return None
 
         # Off the event loop: on a miss ``get_session_info`` falls through to
         # a `git worktree list` subprocess (5s timeout), which would otherwise

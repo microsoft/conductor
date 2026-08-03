@@ -1970,11 +1970,13 @@ class WorkflowEngine:
                     copilot_session_cwds = provider.get_session_cwds()  # type: ignore[union-attr]
             elif self._registry is not None:
                 # Merge across every active provider rather than stopping at
-                # the first: more than one provider exposes these hooks now,
-                # and taking only the first would silently drop the others'
-                # sessions based on which agent happened to run earliest.
-                # Providers namespace their own keys so the flat map cannot
-                # collide, and each ignores entries it does not recognise.
+                # the first: several expose these hooks, and taking only the
+                # first silently dropped the others' sessions depending on
+                # which agent happened to run earliest. Each provider ignores
+                # entries it does not recognise on restore. Note copilot and
+                # hermes both key by bare agent name, so they can still shadow
+                # each other in a workflow that mixes them — pre-existing, and
+                # untouched here; claude-agent-sdk namespaces its own keys.
                 merged_ids: dict[str, str] = {}
                 merged_cwds: dict[str, str] = {}
                 for p in self._registry.get_active_providers().values():
