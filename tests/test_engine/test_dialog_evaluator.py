@@ -115,6 +115,34 @@ class TestEvaluatorTruncation:
         user_message = call_args.kwargs["user_message"]
         assert "…[truncated]" in user_message
 
+    @pytest.mark.asyncio
+    async def test_evaluate_serializes_non_ascii_unescaped(self) -> None:
+        """Non-ASCII output reaches the dialog evaluator unescaped."""
+        # Requirement: the 4000-char evaluator budget must be measured in real
+        # characters for every language — non-ASCII output reaches the
+        # evaluator prompt unescaped and is not truncated when it fits the
+        # budget (issue #356).
+        evaluator = DialogEvaluator()
+        agent = AgentDef(
+            name="test",
+            prompt="test",
+            dialog=DialogConfig(trigger_prompt="Enter dialog if uncertain"),
+        )
+        provider = MagicMock()
+        provider.execute_dialog_turn = AsyncMock(
+            return_value='{"trigger": false, "reason": "clear"}'
+        )
+
+        # 1000 CJK chars: ~1 KB unescaped (fits the 4000 budget),
+        # ~6 KB escaped (would be truncated mid-escape).
+        cjk_output = {"text": "你" * 1000}
+        await evaluator.evaluate(agent, cjk_output, provider)
+
+        user_message = provider.execute_dialog_turn.call_args.kwargs["user_message"]
+        assert "你" * 1000 in user_message
+        assert "\\u4f60" not in user_message
+        assert "…[truncated]" not in user_message
+
 
 class TestDialogEvaluatorEvaluate:
     """Tests for the full evaluate() method."""

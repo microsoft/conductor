@@ -123,7 +123,10 @@ class DialogEvaluator:
             DialogEvaluation with trigger decision and opening question.
         """
         try:
-            output_str = json.dumps(output, indent=2, default=str)
+            # ``ensure_ascii=False`` so the 4000-char budget below is measured
+            # in real characters for every language — same truncation-fairness
+            # fix as the output validator (issue #356).
+            output_str = json.dumps(output, indent=2, default=str, ensure_ascii=False)
         except (TypeError, ValueError):
             output_str = str(output)
 

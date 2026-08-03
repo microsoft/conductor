@@ -233,6 +233,26 @@ class TestValidatorValidate:
         assert "…[truncated]" in rendered
 
     @pytest.mark.asyncio
+    async def test_non_ascii_output_serialized_unescaped(self) -> None:
+        # Requirement: the fixed _OUTPUT_LIMIT budget must be measured in real
+        # characters for every language — non-ASCII output reaches the
+        # validator prompt unescaped and is not truncated when it fits the
+        # budget (issue #356).
+        agent = _agent()
+        provider = MagicMock()
+        provider.execute = AsyncMock(return_value=_agent_output({"passed": True, "issues": []}))
+
+        # 2000 CJK chars: ~2 KB unescaped (fits the 8000 budget),
+        # ~12 KB escaped (would be truncated).
+        cjk_output = {"text": "你" * 2000}
+        await OutputValidator().validate(agent, "p", cjk_output, provider)
+
+        rendered = provider.execute.call_args.kwargs["rendered_prompt"]
+        assert "你" * 2000 in rendered
+        assert "\\u4f60" not in rendered
+        assert "…[truncated]" not in rendered
+
+    @pytest.mark.asyncio
     async def test_validator_runs_without_tools(self) -> None:
         agent = _agent()
         provider = MagicMock()

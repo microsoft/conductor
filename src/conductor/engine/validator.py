@@ -164,7 +164,13 @@ class OutputValidator:
             return ValidationOutcome(passed=True)
 
         try:
-            output_str = json.dumps(primary_output, indent=2, default=str)
+            # ``ensure_ascii=False`` keeps non-ASCII text literal so the fixed
+            # ``_OUTPUT_LIMIT`` budget is measured in real characters for every
+            # language — with the default ``ensure_ascii=True`` each Cyrillic /
+            # CJK code point inflates to 6 (and emoji to 12) ``\uXXXX`` chars
+            # before truncation, shrinking the effective budget ~6x and letting
+            # the cut land inside an escape sequence (issue #356).
+            output_str = json.dumps(primary_output, indent=2, default=str, ensure_ascii=False)
         except (TypeError, ValueError):
             output_str = str(primary_output)
 
