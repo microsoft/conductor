@@ -125,7 +125,6 @@ class MCPManager:
         self.tool_to_server: dict[str, str] = {}  # prefixed_name -> server
         self._connection_tasks: dict[str, asyncio.Task[None]] = {}
         self._connection_stops: dict[str, asyncio.Event] = {}
-        self._initialized = False
         self._tool_output = tool_output or ToolOutputConfig()
 
     async def connect_server(
@@ -214,7 +213,6 @@ class MCPManager:
 
                     self.sessions[name] = session
                     self.tools[name] = tools
-                    self._initialized = True
                     ready.set_result(tools)
                     await stop.wait()
             except asyncio.CancelledError:
@@ -240,12 +238,19 @@ class MCPManager:
                 ready.cancel()
             task.cancel()
             cleanup = asyncio.gather(task, return_exceptions=True)
-            try:
-                results = await asyncio.shield(cleanup)
-            except asyncio.CancelledError:
-                results = await cleanup
+            # Await the owner task's teardown under a re-shielding loop: a
+            # repeated cancellation of connect_server() lands on the shield
+            # instead of the gather, so cleanup still completes and the
+            # bookkeeping below always runs.
+            results: list[BaseException | None] | None = None
+            while results is None:
+                try:
+                    results = list(await asyncio.shield(cleanup))
+                except asyncio.CancelledError:
+                    if cleanup.done():
+                        results = list(cleanup.result())
             for result in results:
-                if isinstance(result, Exception) and not isinstance(result, asyncio.CancelledError):
+                if isinstance(result, Exception):
                     logger.warning(f"Error cancelling MCP connection '{name}': {result}")
             self._connection_tasks.pop(name, None)
             self._connection_stops.pop(name, None)
@@ -256,7 +261,7 @@ class MCPManager:
             self._connection_tasks.pop(name, None)
             self._connection_stops.pop(name, None)
             self._discard_server_state(name)
-            logger.error(f"Failed to connect to MCP server '{name}': {exc}")
+            logger.error(f"Failed to connect to MCP server '{name}': {exc}", exc_info=exc)
             raise RuntimeError(f"Failed to connect to MCP server '{name}': {exc}") from exc
 
         logger.info(
@@ -555,36 +560,36 @@ class MCPManager:
 
         This method should be called when the manager is no longer needed.
         It properly closes all stdio connections and cleans up internal state.
+        Cancellation is deliberately absorbed until owner-task teardown
+        completes, so task-affine MCP contexts are never orphaned.
         """
         if not self._connection_tasks:
             return
 
-        logger.debug(f"Closing {len(self.sessions)} MCP server connection(s)")
+        logger.debug(f"Closing {len(self._connection_tasks)} MCP server connection(s)")
 
         for stop in self._connection_stops.values():
             stop.set()
 
         cleanup = asyncio.gather(*self._connection_tasks.values(), return_exceptions=True)
-        try:
+        # Await teardown under a re-shielding loop: a repeated cancellation of
+        # close() lands on the shield instead of the gather, so cleanup still
+        # completes before bookkeeping is cleared.
+        results: list[BaseException | None] | None = None
+        while results is None:
             try:
-                results = await asyncio.shield(cleanup)
+                results = list(await asyncio.shield(cleanup))
             except asyncio.CancelledError:
-                results = await cleanup
-                for result in results:
-                    if isinstance(result, Exception):
-                        logger.warning(f"Error closing MCP connections: {result}")
-                raise
+                if cleanup.done():
+                    results = list(cleanup.result())
 
-            for result in results:
-                if isinstance(result, Exception):
-                    logger.warning(f"Error closing MCP connections: {result}")
-        finally:
-            if cleanup.done():
-                self.sessions.clear()
-                self.tools.clear()
-                self.tool_to_server.clear()
-                self._connection_tasks.clear()
-                self._connection_stops.clear()
-                self._initialized = False
+        self.sessions.clear()
+        self.tools.clear()
+        self.tool_to_server.clear()
+        self._connection_tasks.clear()
+        self._connection_stops.clear()
+        for result in results:
+            if isinstance(result, Exception):
+                logger.warning(f"Error closing MCP connections: {result}")
 
         logger.debug("MCP manager closed")

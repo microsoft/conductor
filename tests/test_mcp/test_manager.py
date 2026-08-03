@@ -505,6 +505,28 @@ class TestMCPManagerTaskAffinity:
         assert environment.exits == environment.entries
         assert "Error cancelling MCP connection 'fs': cleanup failed" in caplog.messages
 
+    async def test_double_cancelled_connection_clears_bookkeeping(self) -> None:
+        # Requirement: a repeated cancellation cannot leave a stale _connection_tasks entry.
+        async with _task_affine_manager() as (manager, environment):
+            environment.initialize_blocker = asyncio.Event()
+            environment.exit_blocker = asyncio.Event()
+            connection = asyncio.create_task(manager.connect_server(name="fs", command="server"))
+            await environment.initialize_started.wait()
+
+            connection.cancel()
+            await environment.exit_started.wait()
+            connection.cancel()
+            await asyncio.sleep(0)
+            assert not connection.done()
+
+            environment.exit_blocker.set()
+            with pytest.raises(asyncio.CancelledError):
+                await connection
+
+        assert environment.exits == environment.entries
+        assert "fs" not in manager._connection_tasks
+        assert "fs" not in manager._connection_stops
+
     async def test_cancelled_close_finishes_owner_task_cleanup(self) -> None:
         # Requirement: cancelling shutdown cannot interrupt task-affine owner cleanup.
         async with _task_affine_manager() as (manager, environment):
@@ -518,8 +540,28 @@ class TestMCPManagerTaskAffinity:
             assert not closing.done()
 
             environment.exit_blocker.set()
-            with pytest.raises(asyncio.CancelledError):
-                await closing
+            await closing
+
+        assert environment.exits == environment.entries
+        assert manager.sessions == {}
+        assert manager._connection_tasks == {}
+
+    async def test_double_cancelled_close_still_finishes_cleanup(self) -> None:
+        # Requirement: a repeated cancellation of close() cannot orphan teardown either.
+        async with _task_affine_manager() as (manager, environment):
+            environment.exit_blocker = asyncio.Event()
+            await manager.connect_server(name="fs", command="server")
+
+            closing = asyncio.create_task(manager.close())
+            await environment.exit_started.wait()
+            closing.cancel()
+            await asyncio.sleep(0)
+            closing.cancel()
+            await asyncio.sleep(0)
+            assert not closing.done()
+
+            environment.exit_blocker.set()
+            await closing
 
         assert environment.exits == environment.entries
         assert manager.sessions == {}
