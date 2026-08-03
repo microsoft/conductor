@@ -20,9 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   field — inheritance from the CLI subprocess covers it. A missing directory
   still fails before the provider is reached, and `strict_mcp_config` remains
   enabled so a `.mcp.json` sitting in the new directory cannot inject
-  undeclared servers. Note that the `claude` CLI also reads `CLAUDE.md` and
-  `.claude/settings*.json` from its working directory, so pointing an agent at
-  an untrusted checkout means running that checkout's instructions and hooks.
+  undeclared servers. The `claude` CLI would also read `CLAUDE.md` and
+  `.claude/settings*.json` from its working directory, but the same release
+  pins `setting_sources` to an empty list (see the skills entry below), so
+  those are no longer loaded from wherever the agent happens to run.
   Launch failures caused by a bad working directory are now reported as such
   rather than as connection problems, and are no longer treated as retryable.
   See
