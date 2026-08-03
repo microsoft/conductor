@@ -2587,3 +2587,159 @@ class TestSubWorkflowWorkingDir:
         assert result["result"] == "ok"
         assert len(resolved_cwds) == 1
         assert resolved_cwds[0] == str(target_dir.resolve())
+
+
+class TestStaticSubworkflowTopology:
+    """`build_workflow_started_data` eagerly resolves sub-workflow topology (dashboard preview)."""
+
+    @pytest.mark.asyncio
+    async def test_subworkflow_agent_includes_static_topology(self, tmp_workflow_dir: Path) -> None:
+        """A `type: workflow` agent's entry carries the child's topology before it runs."""
+        _write_yaml(
+            tmp_workflow_dir / "sub.yaml",
+            """\
+            workflow:
+              name: child-workflow
+              entry_point: step_one
+              runtime:
+                provider: copilot
+              limits:
+                max_iterations: 5
+            agents:
+              - name: step_one
+                prompt: "hi"
+                routes:
+                  - to: "$end"
+            output:
+              result: "{{ step_one.output.result }}"
+            """,
+        )
+
+        parent_path = tmp_workflow_dir / "parent.yaml"
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="parent-workflow",
+                entry_point="sub_wf",
+                runtime=RuntimeConfig(provider="copilot"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="sub_wf",
+                    type="workflow",
+                    workflow="sub.yaml",
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"result": "{{ sub_wf.output.result }}"},
+        )
+        engine = WorkflowEngine(config, provider=None, workflow_path=parent_path)
+
+        data = await engine.build_workflow_started_data()
+
+        by_name = {a["name"]: a for a in data["agents"]}
+        sub = by_name["sub_wf"]["subworkflow"]
+        assert sub is not None
+        assert sub["name"] == "child-workflow"
+        assert sub["entry_point"] == "step_one"
+        assert [a["name"] for a in sub["agents"]] == ["step_one"]
+
+    @pytest.mark.asyncio
+    async def test_nested_subworkflow_topology_recurses(self, tmp_workflow_dir: Path) -> None:
+        """A sub-workflow that itself has a `type: workflow` step resolves recursively."""
+        _write_yaml(
+            tmp_workflow_dir / "grandchild.yaml",
+            """\
+            workflow:
+              name: grandchild-workflow
+              entry_point: leaf
+              runtime:
+                provider: copilot
+              limits:
+                max_iterations: 5
+            agents:
+              - name: leaf
+                prompt: "hi"
+                routes:
+                  - to: "$end"
+            output:
+              result: "{{ leaf.output.result }}"
+            """,
+        )
+        _write_yaml(
+            tmp_workflow_dir / "child.yaml",
+            """\
+            workflow:
+              name: child-workflow
+              entry_point: mid
+              runtime:
+                provider: copilot
+              limits:
+                max_iterations: 5
+            agents:
+              - name: mid
+                type: workflow
+                workflow: grandchild.yaml
+                routes:
+                  - to: "$end"
+            output:
+              result: "{{ mid.output.result }}"
+            """,
+        )
+
+        parent_path = tmp_workflow_dir / "parent.yaml"
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="parent-workflow",
+                entry_point="sub_wf",
+                runtime=RuntimeConfig(provider="copilot"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="sub_wf",
+                    type="workflow",
+                    workflow="child.yaml",
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"result": "{{ sub_wf.output.result }}"},
+        )
+        engine = WorkflowEngine(config, provider=None, workflow_path=parent_path)
+
+        data = await engine.build_workflow_started_data()
+
+        sub = next(a for a in data["agents"] if a["name"] == "sub_wf")["subworkflow"]
+        assert sub["name"] == "child-workflow"
+        nested = next(a for a in sub["agents"] if a["name"] == "mid")["subworkflow"]
+        assert nested is not None
+        assert nested["name"] == "grandchild-workflow"
+        assert [a["name"] for a in nested["agents"]] == ["leaf"]
+
+    @pytest.mark.asyncio
+    async def test_missing_subworkflow_file_resolves_to_none(self, tmp_workflow_dir: Path) -> None:
+        """A bad `workflow:` reference degrades gracefully to `subworkflow: None`."""
+        parent_path = tmp_workflow_dir / "parent.yaml"
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="parent-workflow",
+                entry_point="sub_wf",
+                runtime=RuntimeConfig(provider="copilot"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="sub_wf",
+                    type="workflow",
+                    workflow="does-not-exist.yaml",
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"result": "{{ sub_wf.output.result }}"},
+        )
+        engine = WorkflowEngine(config, provider=None, workflow_path=parent_path)
+
+        data = await engine.build_workflow_started_data()
+
+        sub_wf_entry = next(a for a in data["agents"] if a["name"] == "sub_wf")
+        assert sub_wf_entry["subworkflow"] is None

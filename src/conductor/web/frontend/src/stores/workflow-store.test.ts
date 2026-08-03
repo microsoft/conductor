@@ -477,3 +477,153 @@ describe('workflow-store processEvent — system log metadata capture (#330)', (
     expect(state.bgStdoutLog).toBe('/tmp/conductor/conductor-root-123.bg.stdout.log');
   });
 });
+
+describe('workflow-store — eager static sub-workflow preview (dashboard expandability)', () => {
+  it('seeds a pending child context from static `subworkflow` topology on workflow_started', () => {
+    const { processEvent } = useWorkflowStore.getState();
+
+    processEvent(event('workflow_started', {
+      name: 'root',
+      agents: [
+        { name: 'planner' },
+        {
+          name: 'sub_wf',
+          type: 'workflow',
+          subworkflow: {
+            name: 'child-workflow',
+            entry_point: 'step_one',
+            agents: [{ name: 'step_one' }],
+            routes: [],
+            parallel_groups: [],
+            for_each_groups: [],
+          },
+        },
+      ],
+      routes: [],
+      parallel_groups: [],
+      for_each_groups: [],
+      entry_point: 'planner',
+    }));
+
+    const state = useWorkflowStore.getState();
+    expect(state.subworkflowContexts).toHaveLength(1);
+    const child = state.subworkflowContexts[0]!;
+    expect(child.slotKey).toBe('sub_wf');
+    expect(child.status).toBe('pending');
+    expect(child.workflowName).toBe('child-workflow');
+    expect(child.agents.map((a) => a.name)).toEqual(['step_one']);
+  });
+
+  it('recurses into nested `type: workflow` agents when seeding static previews', () => {
+    const { processEvent } = useWorkflowStore.getState();
+
+    processEvent(event('workflow_started', {
+      name: 'root',
+      agents: [
+        {
+          name: 'sub_wf',
+          type: 'workflow',
+          subworkflow: {
+            name: 'child-workflow',
+            entry_point: 'mid',
+            agents: [
+              {
+                name: 'mid',
+                type: 'workflow',
+                subworkflow: {
+                  name: 'grandchild-workflow',
+                  entry_point: 'leaf',
+                  agents: [{ name: 'leaf' }],
+                  routes: [],
+                  parallel_groups: [],
+                  for_each_groups: [],
+                },
+              },
+            ],
+            routes: [],
+            parallel_groups: [],
+            for_each_groups: [],
+          },
+        },
+      ],
+      routes: [],
+      parallel_groups: [],
+      for_each_groups: [],
+      entry_point: 'sub_wf',
+    }));
+
+    const child = useWorkflowStore.getState().subworkflowContexts[0]!;
+    expect(child.children).toHaveLength(1);
+    const grandchild = child.children[0]!;
+    expect(grandchild.slotKey).toBe('mid');
+    expect(grandchild.workflowName).toBe('grandchild-workflow');
+    expect(grandchild.agents.map((a) => a.name)).toEqual(['leaf']);
+  });
+
+  it('does not seed a preview when the sub-workflow could not be resolved statically', () => {
+    const { processEvent } = useWorkflowStore.getState();
+
+    processEvent(event('workflow_started', {
+      name: 'root',
+      agents: [{ name: 'sub_wf', type: 'workflow', subworkflow: null }],
+      routes: [],
+      parallel_groups: [],
+      for_each_groups: [],
+      entry_point: 'sub_wf',
+    }));
+
+    expect(useWorkflowStore.getState().subworkflowContexts).toHaveLength(0);
+  });
+
+  it('reuses the static placeholder (instead of pushing a duplicate) once subworkflow_started fires', () => {
+    const { processEvent } = useWorkflowStore.getState();
+
+    processEvent(event('workflow_started', {
+      name: 'root',
+      agents: [
+        {
+          name: 'sub_wf',
+          type: 'workflow',
+          subworkflow: {
+            name: 'child-workflow',
+            entry_point: 'step_one',
+            agents: [{ name: 'step_one' }],
+            routes: [],
+            parallel_groups: [],
+            for_each_groups: [],
+          },
+        },
+      ],
+      routes: [],
+      parallel_groups: [],
+      for_each_groups: [],
+      entry_point: 'sub_wf',
+    }));
+
+    expect(useWorkflowStore.getState().subworkflowContexts).toHaveLength(1);
+
+    processEvent(event('subworkflow_started', {
+      agent_name: 'sub_wf',
+      workflow: 'child.yaml',
+      iteration: 1,
+    }));
+
+    const state = useWorkflowStore.getState();
+    // Still exactly one child — the placeholder was reused, not duplicated.
+    expect(state.subworkflowContexts).toHaveLength(1);
+    expect(state.activeContextPath).toEqual([0]);
+
+    processEvent(event('workflow_started', {
+      name: 'child-workflow',
+      agents: [{ name: 'step_one' }],
+      routes: [],
+      parallel_groups: [],
+      for_each_groups: [],
+      entry_point: 'step_one',
+    }));
+
+    const afterChildStart = useWorkflowStore.getState();
+    expect(afterChildStart.subworkflowContexts).toHaveLength(1);
+    expect(afterChildStart.subworkflowContexts[0]!.status).toBe('running');
+  });
+});

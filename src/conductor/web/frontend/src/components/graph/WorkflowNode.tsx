@@ -16,6 +16,9 @@ import type { NodeStatus } from '@/lib/constants';
  * child DAG inline as a container; the child nodes render inside via React
  * Flow parent/child nesting (see `buildGraphElements`). Double-clicking still
  * drills into the subworkflow as a focused view (handled by `WorkflowGraph`).
+ * Expandable from the moment the dashboard loads — the engine eagerly
+ * resolves and sends the sub-workflow's static topology up front, so its
+ * DAG can be previewed before this step ever actually runs.
  */
 export const WorkflowNode = memo(function WorkflowNode({ data, selected }: NodeProps) {
   const nodeData = data as unknown as GraphNodeData;
@@ -108,9 +111,13 @@ export const WorkflowNode = memo(function WorkflowNode({ data, selected }: NodeP
         >
           {/* Expand-inline chevron on the LEFT, matching the collapse chevron's
               position in the expanded header so it doesn't jump sides on toggle.
-              Once the child DAG is available it becomes an interactive button;
-              before then a dimmed placeholder keeps the pill width stable and
-              hints that the subworkflow will be expandable once it starts. */}
+              The dashboard eagerly resolves the sub-workflow's static topology
+              up front (see `WorkflowEngine._build_static_subworkflow_topology`),
+              so this is normally expandable immediately, before the engine
+              ever reaches this step. The dimmed placeholder below only shows
+              up when that eager resolution failed (e.g. an unresolvable
+              registry ref) — the sub-workflow still runs normally, it just
+              can't be previewed ahead of time. */}
           {canExpand ? (
             <button
               onClick={onToggle}
@@ -122,7 +129,7 @@ export const WorkflowNode = memo(function WorkflowNode({ data, selected }: NodeP
           ) : (
             <div
               className="flex items-center justify-center w-5 h-5 flex-shrink-0 text-[var(--text-muted)] opacity-25"
-              title="Subworkflow not started yet"
+              title="Subworkflow structure not yet known (will be expandable once it starts)"
               aria-hidden="true"
             >
               <ChevronRight className="w-3.5 h-3.5" />

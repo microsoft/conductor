@@ -468,6 +468,17 @@ class WorkflowEngine:
 
         # Sub-workflow depth tracking
         self._subworkflow_depth = _subworkflow_depth
+        # Memoizes `_resolve_subworkflow_path` for the lifetime of this
+        # engine instance, keyed by (base_dir, agent_workflow). Without
+        # this, the eager static-topology resolution done for the
+        # dashboard preview in `build_workflow_started_data` (issue: make
+        # sub-workflows expandable in the dashboard before they run) would
+        # duplicate every registry fetch that the real execution performs
+        # later — doubling network calls and breaking the "resolved once
+        # per run" invariant relied on by resume determinism. A fresh
+        # engine instance (e.g. on resume) gets a fresh cache, preserving
+        # the documented "mutable refs may re-resolve on resume" behavior.
+        self._subworkflow_path_cache: dict[tuple[str, str], Path] = {}
 
         # System metadata fields (set by CLI, used in workflow_started event)
         self._dashboard_port = self._run_context.dashboard_port
@@ -721,7 +732,106 @@ class WorkflowEngine:
 
         return system
 
-    def build_workflow_started_data(self) -> dict[str, Any]:
+    async def _build_static_subworkflow_topology(
+        self,
+        agent_workflow: str,
+        agent_name: str,
+        base_dir: Path,
+        depth: int,
+        visited: frozenset[Path],
+    ) -> dict[str, Any] | None:
+        """Best-effort eager resolution of a sub-workflow's topology.
+
+        Lets the dashboard render — and let the user expand — a sub-workflow's
+        internal DAG before the parent engine ever reaches that step. This is
+        safe to do eagerly because ``workflow:`` is a plain string field,
+        never Jinja-templated (``_execute_workflow_step`` passes
+        ``agent.workflow`` to ``_resolve_subworkflow_path`` unrendered).
+
+        Purely advisory: any failure (missing file, registry fetch error,
+        parse error, cyclic reference, depth limit) is swallowed and returns
+        ``None`` — the sub-workflow still resolves normally, synchronously,
+        when the engine actually reaches it.
+
+        Args:
+            agent_workflow: The ``workflow:`` field value from the agent def.
+            agent_name: Name of the containing agent (for error messages).
+            base_dir: Directory of the parent workflow file for relative
+                path resolution.
+            depth: Current recursion depth (mirrors ``_subworkflow_depth``).
+            visited: Resolved paths already seen on this recursion chain,
+                to guard against cyclic sub-workflow references.
+
+        Returns:
+            A dict with the same ``agents``/``routes``/``parallel_groups``/
+            ``for_each_groups``/``name``/``entry_point`` shape as the main
+            ``workflow_started`` payload, or ``None`` if it could not be
+            resolved statically.
+        """
+        from conductor.config.loader import load_config
+
+        if depth >= MAX_SUBWORKFLOW_DEPTH:
+            return None
+        try:
+            sub_path = await self._resolve_subworkflow_path(agent_workflow, agent_name, base_dir)
+            if not sub_path.is_file():
+                return None
+            resolved = sub_path.resolve()
+            if resolved in visited:
+                return None
+            sub_config = load_config(sub_path)
+        except Exception:
+            logger.debug(
+                "Could not eagerly resolve sub-workflow '%s' (agent '%s') for the dashboard "
+                "preview; it will still resolve normally when the engine reaches this step.",
+                agent_workflow,
+                agent_name,
+                exc_info=True,
+            )
+            return None
+
+        next_visited = visited | {resolved}
+        next_base_dir = resolved.parent
+
+        agents_out: list[dict[str, Any]] = []
+        for a in sub_config.agents:
+            entry: dict[str, Any] = {"name": a.name, "type": a.type or "agent"}
+            if a.type == "workflow" and a.workflow:
+                entry["subworkflow"] = await self._build_static_subworkflow_topology(
+                    a.workflow, a.name, next_base_dir, depth + 1, next_visited
+                )
+            agents_out.append(entry)
+
+        return {
+            "name": sub_config.workflow.name,
+            "entry_point": sub_config.workflow.entry_point,
+            "agents": agents_out,
+            "parallel_groups": [{"name": p.name, "agents": p.agents} for p in sub_config.parallel],
+            "for_each_groups": [{"name": f.name, "source": f.source} for f in sub_config.for_each],
+            "routes": [
+                {"from": a.name, "to": r.to, "when": r.when}
+                for a in sub_config.agents
+                for r in a.routes
+            ]
+            + [
+                {"from": a.name, "to": o.route, "when": f"selection == '{o.value}'"}
+                for a in sub_config.agents
+                if a.type == "human_gate" and a.options
+                for o in a.options
+            ]
+            + [
+                {"from": p.name, "to": r.to, "when": r.when}
+                for p in sub_config.parallel
+                for r in p.routes
+            ]
+            + [
+                {"from": f.name, "to": r.to, "when": r.when}
+                for f in sub_config.for_each
+                for r in f.routes
+            ],
+        }
+
+    async def build_workflow_started_data(self) -> dict[str, Any]:
         """Build the ``workflow_started`` event payload from the current config.
 
         Extracted from :meth:`_execute_loop` so the CLI resume path can
@@ -818,28 +928,50 @@ class WorkflowEngine:
         for fe in self.config.for_each:
             _record_provider(fe.agent.provider or default_provider_name)
 
+        # Base dir for eager sub-workflow resolution (relative `workflow:`
+        # paths are resolved against the parent workflow file's directory).
+        subworkflow_base_dir = (
+            Path(self.workflow_path).resolve().parent if self.workflow_path else Path.cwd()
+        )
+        subworkflow_visited: frozenset[Path] = (
+            frozenset({Path(self.workflow_path).resolve()}) if self.workflow_path else frozenset()
+        )
+
+        agents_list: list[dict[str, Any]] = []
+        for a in self.config.agents:
+            entry: dict[str, Any] = {
+                "name": a.name,
+                "type": a.type or "agent",
+                "model": a.model,
+                # Provider that this agent will actually use at runtime
+                # — populated for every agent (including non-LLM types
+                # for consistency; consumers can filter on `type`).
+                "provider_name": _provider_for(a.name),
+                "reasoning_effort": (
+                    a.reasoning.effort if a.reasoning is not None else default_effort
+                ),
+                "context_tier": (a.context_tier if a.context_tier is not None else default_tier),
+            }
+            if a.type == "workflow" and a.workflow:
+                # Eagerly resolve the sub-workflow's topology so the
+                # dashboard can render it (and let the user expand it)
+                # before the engine ever reaches this step. Best-effort:
+                # `None` on any failure, in which case the dashboard falls
+                # back to its existing "not started yet" behavior.
+                entry["subworkflow"] = await self._build_static_subworkflow_topology(
+                    a.workflow,
+                    a.name,
+                    subworkflow_base_dir,
+                    self._subworkflow_depth,
+                    subworkflow_visited,
+                )
+            agents_list.append(entry)
+
         return {
             "name": self.config.workflow.name,
             "version": self._conductor_version(),
             "entry_point": self.config.workflow.entry_point,
-            "agents": [
-                {
-                    "name": a.name,
-                    "type": a.type or "agent",
-                    "model": a.model,
-                    # Provider that this agent will actually use at runtime
-                    # — populated for every agent (including non-LLM types
-                    # for consistency; consumers can filter on `type`).
-                    "provider_name": _provider_for(a.name),
-                    "reasoning_effort": (
-                        a.reasoning.effort if a.reasoning is not None else default_effort
-                    ),
-                    "context_tier": (
-                        a.context_tier if a.context_tier is not None else default_tier
-                    ),
-                }
-                for a in self.config.agents
-            ],
+            "agents": agents_list,
             "parallel_groups": [
                 {
                     "name": p.name,
@@ -1275,6 +1407,33 @@ class WorkflowEngine:
     ) -> Path:
         """Resolve a sub-workflow reference to a local filesystem path.
 
+        Thin memoizing wrapper around :meth:`_resolve_subworkflow_path_uncached`
+        (keyed by ``(base_dir, agent_workflow)`` for this engine instance's
+        lifetime). Both the eager dashboard-preview resolution in
+        :meth:`build_workflow_started_data` and the real sub-workflow
+        execution path call this method for the same agent, and without
+        memoization that would fetch every registry-backed sub-workflow
+        twice per run. See :meth:`_resolve_subworkflow_path_uncached` for
+        the full resolution algorithm and error semantics.
+        """
+        cache_key = (str(base_dir), agent_workflow)
+        cached = self._subworkflow_path_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        resolved = await self._resolve_subworkflow_path_uncached(
+            agent_workflow, agent_name, base_dir
+        )
+        self._subworkflow_path_cache[cache_key] = resolved
+        return resolved
+
+    async def _resolve_subworkflow_path_uncached(
+        self,
+        agent_workflow: str,
+        agent_name: str,
+        base_dir: Path,
+    ) -> Path:
+        """Resolve a sub-workflow reference to a local filesystem path.
+
         Handles both local file paths and registry references
         (``workflow[@registry][#ref]`` syntax).
 
@@ -1299,14 +1458,16 @@ class WorkflowEngine:
         4. For registry refs, fetch the workflow (with caching) and return
            the cached local path.
 
-        Note on checkpoint/resume: this helper is called on every
-        sub-workflow execution, including after :meth:`resume`. Pinned
-        registry refs (``name@registry#v1.2.3`` or ``name@registry#<sha>``)
-        always resolve to the same cached path. Mutable refs
-        (``name@registry#main`` or no ``#ref`` defaulting to "latest") may
-        resolve to a different commit on resume if the upstream branch has
-        moved. Use pinned tags or commit SHAs in production workflows when
-        deterministic resume is required.
+        Note on checkpoint/resume: this helper is called (at most once per
+        distinct ``(base_dir, agent_workflow)`` pair, see the memoizing
+        ``_resolve_subworkflow_path`` wrapper) on every sub-workflow
+        execution, including after :meth:`resume`, since resume constructs a
+        fresh engine instance with an empty cache. Pinned registry refs
+        (``name@registry#v1.2.3`` or ``name@registry#<sha>``) always resolve
+        to the same cached path. Mutable refs (``name@registry#main`` or no
+        ``#ref`` defaulting to "latest") may resolve to a different commit on
+        resume if the upstream branch has moved. Use pinned tags or commit
+        SHAs in production workflows when deterministic resume is required.
 
         Args:
             agent_workflow: The ``workflow:`` field value from the agent def.
@@ -2991,7 +3152,7 @@ class WorkflowEngine:
                 # resumed run's events into a phantom child workflow context).
                 self._system_metadata = self._build_system_metadata()
                 if not self._suppress_workflow_started_emit:
-                    self._emit("workflow_started", self.build_workflow_started_data())
+                    self._emit("workflow_started", await self.build_workflow_started_data())
 
                 _workflow_start = _time.time()
 

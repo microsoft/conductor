@@ -74,6 +74,30 @@ export interface ProviderMetadata {
   maintainer?: string | null;
 }
 
+/**
+ * Statically-resolved sub-workflow topology, eagerly attached to a
+ * `type: workflow` agent's entry in `WorkflowStartedData.agents` (see
+ * `WorkflowEngine._build_static_subworkflow_topology`). Lets the dashboard
+ * render — and let the user expand — a sub-workflow's internal DAG before
+ * the parent engine ever reaches that step. Recurses into nested
+ * `type: workflow` agents. `null`/absent when the reference could not be
+ * resolved eagerly (e.g. a registry fetch failure); the sub-workflow still
+ * resolves normally, synchronously, once the engine reaches it.
+ */
+export interface StaticSubworkflowTopology {
+  name: string;
+  entry_point?: string;
+  agents: Array<{
+    name: string;
+    type?: string;
+    /** Present only for nested `type: workflow` agents. */
+    subworkflow?: StaticSubworkflowTopology | null;
+  }>;
+  routes: Array<{ from: string; to: string; when?: string }>;
+  parallel_groups?: Array<{ name: string; agents: string[] }>;
+  for_each_groups?: Array<{ name: string }>;
+}
+
 export interface WorkflowStartedData {
   name: string;
   entry_point?: string;
@@ -84,6 +108,8 @@ export interface WorkflowStartedData {
     /** Provider this agent will use at runtime (honors per-agent override). */
     provider_name?: string;
     reasoning_effort?: string | null;
+    /** Present only for `type: workflow` agents; see `StaticSubworkflowTopology`. */
+    subworkflow?: StaticSubworkflowTopology | null;
   }>;
   routes: Array<{ from: string; to: string; when?: string }>;
   parallel_groups?: Array<{ name: string; agents: string[] }>;

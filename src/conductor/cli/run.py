@@ -2334,7 +2334,7 @@ async def resume_workflow_async(
             #      resume — without this the dashboard would see two root
             #      starts and treat the live run as a child workflow.
             if dashboard is not None:
-                dashboard.prepend_workflow_started(engine.build_workflow_started_data())
+                dashboard.prepend_workflow_started(await engine.build_workflow_started_data())
                 replayed = 0
                 if existing_log_path is not None:
                     replayed = dashboard.replay_events_from_jsonl(existing_log_path)

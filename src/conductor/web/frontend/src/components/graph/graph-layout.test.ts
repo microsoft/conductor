@@ -396,6 +396,47 @@ describe('buildGraphElements — namespacing', () => {
 });
 
 describe('buildGraphElements — inline subworkflow expansion', () => {
+  it('is expandable from a static topology preview before the sub-workflow ever starts', () => {
+    const { processEvent } = useWorkflowStore.getState();
+    processEvent(
+      event('workflow_started', {
+        name: 'root',
+        agents: [
+          { name: 'planner' },
+          {
+            name: 'sub_agent',
+            type: 'workflow',
+            subworkflow: {
+              name: 'child-workflow',
+              entry_point: 'childA',
+              agents: [{ name: 'childA' }],
+              routes: [],
+              parallel_groups: [],
+              for_each_groups: [],
+            },
+          },
+        ],
+        routes: [
+          { from: 'planner', to: 'sub_agent' },
+          { from: 'sub_agent', to: '$end' },
+        ],
+        parallel_groups: [],
+        for_each_groups: [],
+        entry_point: 'planner',
+      }),
+    );
+
+    const { nodes } = buildGraphElements(rootBase(), [], new Set());
+    const wf = nodes.find((n) => n.id === nodeKey([], 'sub_agent'));
+    expect(wf).toBeDefined();
+    expect(wf!.type).toBe('workflowNode');
+    expect(wf!.data.expanded).toBe(false);
+    // The key assertion: expandable even though `planner` hasn't run yet
+    // and the engine hasn't reached `sub_agent` at all.
+    expect(wf!.data.canExpand).toBe(true);
+    expect(wf!.data.childContextKey).toBe(contextKey([0]));
+  });
+
   it('renders a subworkflow node collapsed by default (no child nodes)', () => {
     seedRootWithStartedSubworkflow();
     const { nodes } = buildGraphElements(rootBase(), [], new Set());

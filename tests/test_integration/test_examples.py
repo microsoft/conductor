@@ -273,7 +273,8 @@ class TestAcaCodingAgentExample:
         assert config is not None
         assert config.workflow.runtime.provider.name == "aca"
 
-    def test_experimental_banner_metadata_present(self) -> None:
+    @pytest.mark.asyncio
+    async def test_experimental_banner_metadata_present(self) -> None:
         """The workflow_started `providers` block must mark `aca` as experimental.
 
         Mirrors `test_workflow_started_provider_tier.py`'s
@@ -286,7 +287,7 @@ class TestAcaCodingAgentExample:
 
         config = _load_config(self._workflow_file)
         engine = WorkflowEngine(config=config, provider=None)
-        data = engine.build_workflow_started_data()
+        data = await engine.build_workflow_started_data()
 
         assert "aca" in data["providers"]
         aca_meta = data["providers"]["aca"]

@@ -45,6 +45,7 @@ import type {
   SubworkflowStartedData,
   SubworkflowCompletedData,
   SubworkflowFailedData,
+  StaticSubworkflowTopology,
   IterationLimitReachedData,
   IterationLimitResolvedData,
   IterationLimitResponseTarget,
@@ -186,6 +187,8 @@ export interface WorkflowAgent {
   /** Provider this agent will use at runtime. Drives the experimental
    *  badge in the graph (#241). */
   provider_name?: string;
+  /** Present only for `type: workflow` agents; see `StaticSubworkflowTopology`. */
+  subworkflow?: StaticSubworkflowTopology | null;
 }
 
 // ProviderMetadata is defined in types/events.ts (single source of truth)
@@ -512,6 +515,79 @@ function createSubworkflowContext(parentAgent: string, iteration: number, workfl
     workflowOutput: null,
     workflowFailure: null,
   };
+}
+
+/**
+ * Build a `pending` placeholder `SubworkflowContext` from a statically
+ * eager-resolved `StaticSubworkflowTopology` (see `WorkflowStartedData`'s
+ * `subworkflow` field, produced by
+ * `WorkflowEngine._build_static_subworkflow_topology`). This lets the graph
+ * render — and lets the user expand — a sub-workflow's internal DAG before
+ * the engine ever reaches that step, reusing the exact same
+ * `SubworkflowContext` / expansion-key machinery as a runtime child (see
+ * `subworkflow_started`, which locates and reuses this placeholder by
+ * `slotKey` instead of pushing a duplicate once the step actually starts).
+ *
+ * Recurses into nested `type: workflow` agents so multi-level static
+ * previews are expandable all the way down.
+ */
+function buildStaticChildContext(
+  parentAgentName: string,
+  topology: StaticSubworkflowTopology,
+  workflowFile: string,
+): SubworkflowContext {
+  const ctx = createSubworkflowContext(parentAgentName, 1, workflowFile, parentAgentName);
+  ctx.workflowName = topology.name || '';
+  ctx.entryPoint = topology.entry_point || null;
+  ctx.agents = topology.agents;
+  ctx.routes = topology.routes || [];
+  ctx.parallelGroups = topology.parallel_groups || [];
+  ctx.forEachGroups = topology.for_each_groups || [];
+
+  const groupAgents = new Set<string>();
+  const agentNames = new Set<string>();
+  for (const pg of ctx.parallelGroups) {
+    for (const a of pg.agents) groupAgents.add(a);
+    agentNames.add(pg.name);
+    ensureNode(ctx.nodes, pg.name, 'parallel_group');
+    ctx.groupProgress[pg.name] = { total: pg.agents.length, completed: 0, failed: 0 };
+    for (const agentName of pg.agents) ensureNode(ctx.nodes, agentName, 'agent');
+  }
+  for (const fg of ctx.forEachGroups) {
+    agentNames.add(fg.name);
+    ensureNode(ctx.nodes, fg.name, 'for_each_group');
+    ctx.groupProgress[fg.name] = { total: 0, completed: 0, failed: 0 };
+  }
+  for (const a of ctx.agents) {
+    if (agentNames.has(a.name) || groupAgents.has(a.name)) continue;
+    const nodeType = (a.type || 'agent') as NodeType;
+    ensureNode(ctx.nodes, a.name, nodeType);
+    agentNames.add(a.name);
+
+    if (a.type === 'workflow' && a.subworkflow) {
+      ctx.children.push(buildStaticChildContext(a.name, a.subworkflow, ''));
+    }
+  }
+  return ctx;
+}
+
+/**
+ * Push static child-context placeholders (see `buildStaticChildContext`)
+ * for every `type: workflow` agent in `agents` that carries an eagerly
+ * resolved `subworkflow` topology and doesn't already have a runtime or
+ * placeholder child in `children` (matched by slotKey === agent name).
+ * Called from the `workflow_started` handler for both the root workflow
+ * and every child sub-workflow, so previews are built at every depth.
+ */
+function seedStaticSubworkflowChildren(
+  agents: WorkflowAgent[],
+  children: SubworkflowContext[],
+): void {
+  for (const a of agents) {
+    if (a.type !== 'workflow' || !a.subworkflow) continue;
+    if (children.some((c) => c.slotKey === a.name)) continue;
+    children.push(buildStaticChildContext(a.name, a.subworkflow, ''));
+  }
 }
 
 /**
@@ -1186,6 +1262,37 @@ function activeTarget(
   };
 }
 
+/**
+ * Insert `ctx` into `children`, reusing an existing static-preview
+ * placeholder (see `buildStaticChildContext`) in place of pushing a
+ * duplicate when one exists for the same `slotKey`. A placeholder is only
+ * ever `status: 'pending'`; a genuine repeat invocation of the same
+ * sequential sub-workflow step (loop-back route) has already transitioned
+ * its earlier context to `'completed'`/`'failed'` and so won't match here,
+ * preserving the existing multi-iteration-history behavior. Returns the
+ * index of the (possibly reused) entry within `children`.
+ */
+function placeChildContext(children: SubworkflowContext[], ctx: SubworkflowContext): number {
+  const placeholderIdx = children.findIndex((c) => c.slotKey === ctx.slotKey && c.status === 'pending');
+  if (placeholderIdx >= 0) {
+    // Keep the placeholder's statically-known agents/routes/nodes/children
+    // (including nested static previews) — the real `workflow_started` for
+    // this child fires momentarily and overwrites them anyway, but this
+    // keeps the graph stable in the interim if events race. Only take the
+    // lifecycle-identifying fields from the freshly-built `ctx`.
+    const placeholder = children[placeholderIdx]!;
+    children[placeholderIdx] = {
+      ...placeholder,
+      parentAgent: ctx.parentAgent,
+      iteration: ctx.iteration,
+      workflowFile: ctx.workflowFile || placeholder.workflowFile,
+    };
+    return placeholderIdx;
+  }
+  children.push(ctx);
+  return children.length - 1;
+}
+
 const eventHandlers: Record<string, (state: MutableState, data: Record<string, unknown>, timestamp?: number) => void> = {
   workflow_started: (state, _data, timestamp) => {
     const data = _data as unknown as WorkflowStartedData;
@@ -1250,6 +1357,12 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
         }
       }
       state.agentsTotal = agentNames.size;
+
+      // Eagerly seed static sub-workflow previews (see
+      // `buildStaticChildContext`) so `type: workflow` steps are
+      // expandable in the dashboard before the engine ever reaches them.
+      resolveMutableContext(state, []);
+      seedStaticSubworkflowChildren(state.agents, state.subworkflowContexts);
     } else {
       // Child workflow — populate the owning child context. Locate it via
       // the engine-supplied subworkflow_path (slot-key path) when present,
@@ -1305,6 +1418,10 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
           }
         }
         ctx.agentsTotal = agentNames.size;
+
+        // Eagerly seed static sub-workflow previews for this child's own
+        // `type: workflow` steps (see `buildStaticChildContext`).
+        seedStaticSubworkflowChildren(ctx.agents, ctx.children);
       }
     }
     state.wfDepth++;
@@ -1951,13 +2068,13 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
       // a fresh reference (resolveMutableContext with an empty path still
       // clones the top array; it just has no context to descend into).
       resolveMutableContext(state, []);
-      state.subworkflowContexts.push(ctx);
-      newActivePath = [state.subworkflowContexts.length - 1];
+      const idx = placeChildContext(state.subworkflowContexts, ctx);
+      newActivePath = [idx];
     } else {
       parentCtx = resolveMutableContext(state, parentIndexPath);
       if (!parentCtx) return;
-      parentCtx.children.push(ctx);
-      newActivePath = [...parentIndexPath, parentCtx.children.length - 1];
+      const idx = placeChildContext(parentCtx.children, ctx);
+      newActivePath = [...parentIndexPath, idx];
     }
     state.activeContextPath = newActivePath;
     if (wasAtLiveEdge) {
