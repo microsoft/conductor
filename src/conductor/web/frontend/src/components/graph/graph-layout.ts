@@ -145,7 +145,15 @@ export function collectExpandableContextKeys(
   ): void => {
     for (const a of ctxAgents) {
       if ((a.type || 'agent') !== 'workflow') continue;
-      const childIdx = ctxChildren.findIndex((c) => c.slotKey === a.name);
+      // Match newest-first: a loop-back route can re-invoke the same
+      // subworkflow, appending another child with the same slotKey (issue #361).
+      let childIdx = -1;
+      for (let i = ctxChildren.length - 1; i >= 0; i--) {
+        if (ctxChildren[i]!.slotKey === a.name) {
+          childIdx = i;
+          break;
+        }
+      }
       if (childIdx < 0) continue;
       const child = ctxChildren[childIdx]!;
       if (child.agents.length === 0) continue;
@@ -489,8 +497,18 @@ function layoutContext(
     if (nodeType === 'workflow') {
       // Sequential subworkflow: slotKey === agent name. Locate its child
       // context so the node can advertise a stable expansion key and, when
-      // expanded, render the child DAG inline as a container.
-      const childIdx = ctx.children.findIndex((c) => c.slotKey === a.name);
+      // expanded, render the child DAG inline as a container. Match
+      // newest-first: a loop-back route can re-invoke the same subworkflow,
+      // appending a sibling child with the same slotKey (issue #361) — same
+      // precedent as findChildContext/resolveSlotPath (workflow-store.ts) and
+      // resolveSubworkflowPath (use-deep-link.ts), issue #145.
+      let childIdx = -1;
+      for (let i = ctx.children.length - 1; i >= 0; i--) {
+        if (ctx.children[i]!.slotKey === a.name) {
+          childIdx = i;
+          break;
+        }
+      }
       const child = childIdx >= 0 ? ctx.children[childIdx] : undefined;
       const childKey = childIdx >= 0 ? contextKey([...absPath, childIdx]) : undefined;
       const canExpand = !!child && child.agents.length > 0;
