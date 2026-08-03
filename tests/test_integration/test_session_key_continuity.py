@@ -12,7 +12,8 @@ feature silently depends on, neither of which is visible from the provider:
 - The **duck-typed** checkpoint hop (``WorkflowEngine._write_checkpoint``
   → ``copilot_session_ids`` → ``ProviderRegistry.set_resume_session_ids``)
   connects. It is held together by ``hasattr`` calls that no type checker
-  can verify, and it is the whole justification for ``checkpoint_resume``.
+  can verify, and it is what the ``session_continuity`` capability
+  promises.
 """
 
 from __future__ import annotations

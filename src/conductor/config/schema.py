@@ -1011,11 +1011,11 @@ class AgentDef(BaseModel):
     against a provider that cannot honor it is a ``conductor validate``
     error, not a silently dropped setting. Only ``claude-agent-sdk``
     declares it today. The session id is persisted in checkpoints, so
-    continuity survives ``conductor resume``. A session whose transcript is
-    no longer on disk (the CLI prunes on its own schedule, or the
-    ``working_dir`` changed — transcripts are stored per directory) falls
-    back to a fresh session with a logged warning rather than failing the
-    run.
+    continuity survives ``conductor resume``. A recorded session whose
+    transcript is no longer on disk (the CLI prunes on its own schedule)
+    falls back to a fresh session with a logged warning rather than failing
+    the run; a key with nothing recorded against it — the first execution,
+    or one under a different ``working_dir`` — simply starts fresh.
 
     Concurrency: executions that genuinely overlap — two members of one
     parallel group, or a for-each agent with ``max_concurrent > 1`` — are

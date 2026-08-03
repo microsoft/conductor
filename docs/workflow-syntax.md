@@ -389,9 +389,11 @@ agents:
   `<CLAUDE_CONFIG_DIR or ~/.claude>/projects/<project key for the working
   directory>/<session id>.jsonl`, and consults the SDK's own session lookup
   only as a fallback (and only when that lookup agrees the session belongs to
-  this directory). Anything unresolvable — the first execution under a key, a
-  transcript the CLI has pruned on its own schedule, a changed `working_dir`,
-  or a session recorded elsewhere — logs a warning and starts fresh.
+  this directory). If a recorded session has since disappeared — the CLI
+  prunes transcripts on its own schedule — the provider logs a warning and
+  starts fresh. Having nothing recorded for a key is not an error and is not
+  logged: that is simply the first execution under it, or an execution under
+  a different `working_dir`.
 - **Rejected step types:** `script`, `human_gate`, `workflow`, `wait`, `set`,
   and `terminate` — none of them have a provider session to continue.
 - **Providers that cannot honor it fail validation.** `session_key` is gated

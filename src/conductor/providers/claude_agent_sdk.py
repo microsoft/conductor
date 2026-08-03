@@ -849,10 +849,12 @@ class ClaudeAgentSdkProvider(AgentProvider):
         Checks the exact on-disk path the CLI uses,
         ``<config>/projects/<project key for cwd>/<id>.jsonl``, rather than
         asking ``get_session_info``. That helper answers a different question
-        in both directions: it returns ``None`` for a session with no
-        extractable summary and reads only the first 64 KiB of the file, so a
-        large first prompt makes a resumable session look absent; and it falls
-        back to scanning sibling *git worktrees* (via a ``git`` subprocess), so
+        in both directions: it derives a *summary* from a bounded head+tail
+        read and returns ``None`` whenever it cannot — a sidechain session, or
+        a transcript whose first prompt overruns the head buffer with no title
+        or last-prompt record in the tail — so a resumable session can look
+        absent; and it falls back to scanning sibling *git worktrees* (via a
+        ``git`` subprocess), so
         it reports a session as present from a subdirectory or worktree the
         CLI will then refuse to resume it from — turning the graceful
         degradation this guard exists to provide into a hard abort.
