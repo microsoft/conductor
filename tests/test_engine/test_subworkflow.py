@@ -2743,3 +2743,316 @@ class TestStaticSubworkflowTopology:
 
         sub_wf_entry = next(a for a in data["agents"] if a["name"] == "sub_wf")
         assert sub_wf_entry["subworkflow"] is None
+
+    @pytest.mark.asyncio
+    async def test_self_referencing_subworkflow_resolves_to_none(
+        self, tmp_workflow_dir: Path
+    ) -> None:
+        """A sub-workflow that references itself is caught by `visited` and degrades to `None`.
+
+        Without the cycle guard this would recurse until `MAX_SUBWORKFLOW_DEPTH`
+        (still bounded) or raise; either way the eager preview must not crash
+        `build_workflow_started_data`.
+        """
+        _write_yaml(
+            tmp_workflow_dir / "self.yaml",
+            """\
+            workflow:
+              name: self-referencing
+              entry_point: recurse
+              runtime:
+                provider: copilot
+              limits:
+                max_iterations: 5
+            agents:
+              - name: recurse
+                type: workflow
+                workflow: self.yaml
+                routes:
+                  - to: "$end"
+            output:
+              result: "{{ recurse.output.result }}"
+            """,
+        )
+
+        parent_path = tmp_workflow_dir / "parent.yaml"
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="parent-workflow",
+                entry_point="sub_wf",
+                runtime=RuntimeConfig(provider="copilot"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="sub_wf",
+                    type="workflow",
+                    workflow="self.yaml",
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"result": "{{ sub_wf.output.result }}"},
+        )
+        engine = WorkflowEngine(config, provider=None, workflow_path=parent_path)
+
+        data = await engine.build_workflow_started_data()
+
+        sub = next(a for a in data["agents"] if a["name"] == "sub_wf")["subworkflow"]
+        assert sub is not None
+        assert sub["name"] == "self-referencing"
+        # The nested `recurse` agent's own self-reference is caught by the
+        # cycle guard and resolves to None rather than recursing forever.
+        nested = next(a for a in sub["agents"] if a["name"] == "recurse")["subworkflow"]
+        assert nested is None
+
+    @pytest.mark.asyncio
+    async def test_mutually_referencing_subworkflows_resolve_to_none(
+        self, tmp_workflow_dir: Path
+    ) -> None:
+        """A→B→A mutual references are caught by `visited`, not just direct self-reference."""
+        _write_yaml(
+            tmp_workflow_dir / "a.yaml",
+            """\
+            workflow:
+              name: workflow-a
+              entry_point: to_b
+              runtime:
+                provider: copilot
+              limits:
+                max_iterations: 5
+            agents:
+              - name: to_b
+                type: workflow
+                workflow: b.yaml
+                routes:
+                  - to: "$end"
+            output:
+              result: "{{ to_b.output.result }}"
+            """,
+        )
+        _write_yaml(
+            tmp_workflow_dir / "b.yaml",
+            """\
+            workflow:
+              name: workflow-b
+              entry_point: to_a
+              runtime:
+                provider: copilot
+              limits:
+                max_iterations: 5
+            agents:
+              - name: to_a
+                type: workflow
+                workflow: a.yaml
+                routes:
+                  - to: "$end"
+            output:
+              result: "{{ to_a.output.result }}"
+            """,
+        )
+
+        parent_path = tmp_workflow_dir / "parent.yaml"
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="parent-workflow",
+                entry_point="sub_wf",
+                runtime=RuntimeConfig(provider="copilot"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="sub_wf",
+                    type="workflow",
+                    workflow="a.yaml",
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"result": "{{ sub_wf.output.result }}"},
+        )
+        engine = WorkflowEngine(config, provider=None, workflow_path=parent_path)
+
+        data = await engine.build_workflow_started_data()
+
+        a_topology = next(a for a in data["agents"] if a["name"] == "sub_wf")["subworkflow"]
+        assert a_topology is not None
+        assert a_topology["name"] == "workflow-a"
+        b_topology = next(a for a in a_topology["agents"] if a["name"] == "to_b")["subworkflow"]
+        assert b_topology is not None
+        assert b_topology["name"] == "workflow-b"
+        # b.yaml's `to_a` step would re-enter a.yaml — caught by `visited`.
+        a_again = next(a for a in b_topology["agents"] if a["name"] == "to_a")["subworkflow"]
+        assert a_again is None
+
+    @pytest.mark.asyncio
+    async def test_eager_resolution_stops_at_max_subworkflow_depth(
+        self, tmp_workflow_dir: Path
+    ) -> None:
+        """A chain deeper than `MAX_SUBWORKFLOW_DEPTH` truncates cleanly (returns `None`)
+        rather than raising or recursing unboundedly."""
+        # Build a chain of MAX_SUBWORKFLOW_DEPTH + 2 workflows, each pointing to the next.
+        chain_len = MAX_SUBWORKFLOW_DEPTH + 2
+        for i in range(chain_len):
+            is_last = i == chain_len - 1
+            agents_yaml = (
+                """\
+                  - name: leaf
+                    prompt: "hi"
+                    routes:
+                      - to: "$end"
+                """
+                if is_last
+                else f"""\
+                  - name: next_step
+                    type: workflow
+                    workflow: level_{i + 1}.yaml
+                    routes:
+                      - to: "$end"
+                """
+            )
+            entry_name = "leaf" if is_last else "next_step"
+            _write_yaml(
+                tmp_workflow_dir / f"level_{i}.yaml",
+                f"""\
+                workflow:
+                  name: level-{i}
+                  entry_point: {entry_name}
+                  runtime:
+                    provider: copilot
+                  limits:
+                    max_iterations: 5
+                agents:
+                {agents_yaml}
+                output:
+                  result: "{{{{ {entry_name}.output.result }}}}"
+                """,
+            )
+
+        parent_path = tmp_workflow_dir / "parent.yaml"
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="parent-workflow",
+                entry_point="sub_wf",
+                runtime=RuntimeConfig(provider="copilot"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="sub_wf",
+                    type="workflow",
+                    workflow="level_0.yaml",
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"result": "{{ sub_wf.output.result }}"},
+        )
+        engine = WorkflowEngine(config, provider=None, workflow_path=parent_path)
+
+        # Must complete without raising / hanging.
+        data = await engine.build_workflow_started_data()
+
+        # Walk the resolved chain and confirm it truncates to `None` at or
+        # before MAX_SUBWORKFLOW_DEPTH levels deep, rather than resolving
+        # the full (chain_len)-level chain.
+        topology = next(a for a in data["agents"] if a["name"] == "sub_wf")["subworkflow"]
+        depth = 0
+        while topology is not None:
+            depth += 1
+            next_agent = next((a for a in topology["agents"] if a["name"] == "next_step"), None)
+            topology = next_agent["subworkflow"] if next_agent else None
+        assert depth <= MAX_SUBWORKFLOW_DEPTH
+
+    @pytest.mark.asyncio
+    async def test_eager_resolution_dedups_registry_fetch_with_real_execution(
+        self, tmp_workflow_dir: Path
+    ) -> None:
+        """The eager preview and the real sub-workflow execution share one cached
+        resolution — a registry-backed `workflow:` ref is fetched only once per run,
+        not once for the dashboard preview and again when the engine executes it."""
+        from unittest.mock import patch
+
+        from conductor.providers.copilot import CopilotProvider
+        from conductor.registry.config import RegistryEntry, RegistryType
+        from conductor.registry.resolver import ResolvedRef
+
+        cached_sub = tmp_workflow_dir / "cache" / "sub.yaml"
+        cached_sub.parent.mkdir(parents=True)
+        _write_yaml(
+            cached_sub,
+            """\
+            workflow:
+              name: registry-sub
+              entry_point: do_work
+              runtime:
+                provider: copilot
+              limits:
+                max_iterations: 5
+            agents:
+              - name: do_work
+                prompt: do it
+                routes:
+                  - to: "$end"
+            output:
+              result: "{{ do_work.output.result }}"
+            """,
+        )
+
+        parent_path = tmp_workflow_dir / "parent.yaml"
+        parent_path.write_text("dummy", encoding="utf-8")
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="parent",
+                entry_point="sub_wf",
+                runtime=RuntimeConfig(provider="copilot"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="sub_wf",
+                    type="workflow",
+                    workflow="analysis@team-a#v1.0.0",
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"result": "{{ sub_wf.output.result }}"},
+        )
+
+        fetch_calls: list[Path] = []
+
+        def tracked_fetch(*args, **kwargs):
+            fetch_calls.append(cached_sub)
+            return cached_sub
+
+        fake_entry = RegistryEntry(type=RegistryType.github, source="https://github.com/x/y")
+        fake_resolved = ResolvedRef(
+            kind="registry",
+            workflow="analysis",
+            registry_name="team-a",
+            ref="v1.0.0",
+            registry_entry=fake_entry,
+        )
+
+        def mock_handler(agent, prompt, context):
+            return {"result": "ok"}
+
+        provider = CopilotProvider(mock_handler=mock_handler)
+        engine = WorkflowEngine(config, provider, workflow_path=parent_path)
+
+        with (
+            patch("conductor.registry.resolver.resolve_ref", return_value=fake_resolved),
+            patch("conductor.registry.cache.fetch_workflow", side_effect=tracked_fetch),
+        ):
+            data = await engine.build_workflow_started_data()
+            # The eager preview alone must already have triggered exactly
+            # one registry fetch.
+            assert len(fetch_calls) == 1
+            sub = next(a for a in data["agents"] if a["name"] == "sub_wf")["subworkflow"]
+            assert sub is not None
+            assert sub["name"] == "registry-sub"
+
+            result = await engine.run({})
+
+        # The real execution reused the memoized resolution — still just
+        # one fetch for the whole run, not two.
+        assert len(fetch_calls) == 1
+        assert result["result"] == "ok"

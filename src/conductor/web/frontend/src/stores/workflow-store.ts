@@ -563,11 +563,13 @@ function buildStaticChildContext(
     const nodeType = (a.type || 'agent') as NodeType;
     ensureNode(ctx.nodes, a.name, nodeType);
     agentNames.add(a.name);
-
-    if (a.type === 'workflow' && a.subworkflow) {
-      ctx.children.push(buildStaticChildContext(a.name, a.subworkflow, ''));
-    }
   }
+  // Seed nested static previews for every `type: workflow` agent — including
+  // ones that belong to a parallel group — not just "standalone" agents.
+  // Node creation above intentionally skips parallel-group members (they
+  // already got a node from the `pg.agents` loop), but a static preview is
+  // still owed to them regardless of group membership.
+  seedStaticSubworkflowChildren(ctx.agents, ctx.children);
   return ctx;
 }
 

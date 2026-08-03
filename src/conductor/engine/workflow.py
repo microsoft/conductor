@@ -468,16 +468,10 @@ class WorkflowEngine:
 
         # Sub-workflow depth tracking
         self._subworkflow_depth = _subworkflow_depth
-        # Memoizes `_resolve_subworkflow_path` for the lifetime of this
-        # engine instance, keyed by (base_dir, agent_workflow). Without
-        # this, the eager static-topology resolution done for the
-        # dashboard preview in `build_workflow_started_data` (issue: make
-        # sub-workflows expandable in the dashboard before they run) would
-        # duplicate every registry fetch that the real execution performs
-        # later — doubling network calls and breaking the "resolved once
-        # per run" invariant relied on by resume determinism. A fresh
-        # engine instance (e.g. on resume) gets a fresh cache, preserving
-        # the documented "mutable refs may re-resolve on resume" behavior.
+        # Memoizes `_resolve_subworkflow_path` per (base_dir, agent_workflow)
+        # for this engine's lifetime; see `_resolve_subworkflow_path` and
+        # `_resolve_subworkflow_path_uncached` for the full rationale and
+        # resume semantics.
         self._subworkflow_path_cache: dict[tuple[str, str], Path] = {}
 
         # System metadata fields (set by CLI, used in workflow_started event)
@@ -745,13 +739,19 @@ class WorkflowEngine:
         Lets the dashboard render — and let the user expand — a sub-workflow's
         internal DAG before the parent engine ever reaches that step. This is
         safe to do eagerly because ``workflow:`` is a plain string field,
-        never Jinja-templated (``_execute_workflow_step`` passes
-        ``agent.workflow`` to ``_resolve_subworkflow_path`` unrendered).
+        never Jinja-templated (``_execute_subworkflow``/
+        ``_execute_subworkflow_with_inputs`` pass ``agent.workflow`` to
+        ``_resolve_subworkflow_path`` unrendered).
 
         Purely advisory: any failure (missing file, registry fetch error,
-        parse error, cyclic reference, depth limit) is swallowed and returns
-        ``None`` — the sub-workflow still resolves normally, synchronously,
-        when the engine actually reaches it.
+        parse error, cyclic reference, depth limit, or a malformed/unexpected
+        sub-config shape while building the returned dict) is swallowed and
+        returns ``None`` — the sub-workflow still resolves normally,
+        synchronously, when the engine actually reaches it. The entire body
+        (including the recursive call and the final dict construction, not
+        just the initial file/config resolution) is covered by the single
+        broad ``except`` below so this guarantee holds at every recursion
+        depth.
 
         Args:
             agent_workflow: The ``workflow:`` field value from the agent def.
@@ -780,7 +780,52 @@ class WorkflowEngine:
             if resolved in visited:
                 return None
             sub_config = load_config(sub_path)
-        except Exception:
+
+            next_visited = visited | {resolved}
+            next_base_dir = resolved.parent
+
+            agents_out: list[dict[str, Any]] = []
+            for a in sub_config.agents:
+                entry: dict[str, Any] = {"name": a.name, "type": a.type or "agent"}
+                if a.type == "workflow" and a.workflow:
+                    entry["subworkflow"] = await self._build_static_subworkflow_topology(
+                        a.workflow, a.name, next_base_dir, depth + 1, next_visited
+                    )
+                agents_out.append(entry)
+
+            return {
+                "name": sub_config.workflow.name,
+                "entry_point": sub_config.workflow.entry_point,
+                "agents": agents_out,
+                "parallel_groups": [
+                    {"name": p.name, "agents": p.agents} for p in sub_config.parallel
+                ],
+                "for_each_groups": [
+                    {"name": f.name, "source": f.source} for f in sub_config.for_each
+                ],
+                "routes": [
+                    {"from": a.name, "to": r.to, "when": r.when}
+                    for a in sub_config.agents
+                    for r in a.routes
+                ]
+                + [
+                    {"from": a.name, "to": o.route, "when": f"selection == '{o.value}'"}
+                    for a in sub_config.agents
+                    if a.type == "human_gate" and a.options
+                    for o in a.options
+                ]
+                + [
+                    {"from": p.name, "to": r.to, "when": r.when}
+                    for p in sub_config.parallel
+                    for r in p.routes
+                ]
+                + [
+                    {"from": f.name, "to": r.to, "when": r.when}
+                    for f in sub_config.for_each
+                    for r in f.routes
+                ],
+            }
+        except Exception:  # noqa: BLE001 — defensive preview, see docstring
             logger.debug(
                 "Could not eagerly resolve sub-workflow '%s' (agent '%s') for the dashboard "
                 "preview; it will still resolve normally when the engine reaches this step.",
@@ -789,47 +834,6 @@ class WorkflowEngine:
                 exc_info=True,
             )
             return None
-
-        next_visited = visited | {resolved}
-        next_base_dir = resolved.parent
-
-        agents_out: list[dict[str, Any]] = []
-        for a in sub_config.agents:
-            entry: dict[str, Any] = {"name": a.name, "type": a.type or "agent"}
-            if a.type == "workflow" and a.workflow:
-                entry["subworkflow"] = await self._build_static_subworkflow_topology(
-                    a.workflow, a.name, next_base_dir, depth + 1, next_visited
-                )
-            agents_out.append(entry)
-
-        return {
-            "name": sub_config.workflow.name,
-            "entry_point": sub_config.workflow.entry_point,
-            "agents": agents_out,
-            "parallel_groups": [{"name": p.name, "agents": p.agents} for p in sub_config.parallel],
-            "for_each_groups": [{"name": f.name, "source": f.source} for f in sub_config.for_each],
-            "routes": [
-                {"from": a.name, "to": r.to, "when": r.when}
-                for a in sub_config.agents
-                for r in a.routes
-            ]
-            + [
-                {"from": a.name, "to": o.route, "when": f"selection == '{o.value}'"}
-                for a in sub_config.agents
-                if a.type == "human_gate" and a.options
-                for o in a.options
-            ]
-            + [
-                {"from": p.name, "to": r.to, "when": r.when}
-                for p in sub_config.parallel
-                for r in p.routes
-            ]
-            + [
-                {"from": f.name, "to": r.to, "when": r.when}
-                for f in sub_config.for_each
-                for r in f.routes
-            ],
-        }
 
     async def build_workflow_started_data(self) -> dict[str, Any]:
         """Build the ``workflow_started`` event payload from the current config.
@@ -1458,11 +1462,9 @@ class WorkflowEngine:
         4. For registry refs, fetch the workflow (with caching) and return
            the cached local path.
 
-        Note on checkpoint/resume: this helper is called (at most once per
-        distinct ``(base_dir, agent_workflow)`` pair, see the memoizing
-        ``_resolve_subworkflow_path`` wrapper) on every sub-workflow
-        execution, including after :meth:`resume`, since resume constructs a
-        fresh engine instance with an empty cache. Pinned registry refs
+        Note on checkpoint/resume: this helper is called (memoized once per
+        run, see ``_resolve_subworkflow_path``) on every sub-workflow
+        execution, including after :meth:`resume`. Pinned registry refs
         (``name@registry#v1.2.3`` or ``name@registry#<sha>``) always resolve
         to the same cached path. Mutable refs (``name@registry#main`` or no
         ``#ref`` defaulting to "latest") may resolve to a different commit on
