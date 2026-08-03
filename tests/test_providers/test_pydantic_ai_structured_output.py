@@ -122,6 +122,19 @@ class TestValidationFailurePath:
         with pytest.raises(ValidationError, match="wrong type"):
             extract_content(instance, output_schema, "formatter")
 
+    def test_wrapper_object_unwrapped_for_scalar_field(self) -> None:
+        """Requirement: provider parity with copilot/hermes — a wrapper object
+        like {"answer": {"value": "x"}} arriving for a scalar field must be
+        unwrapped by normalize_agent_output before validation."""
+        output_schema = {"answer": OutputField(type="string")}
+        dynamic_model = output_schema_to_pydantic_model("WrapperOutput", output_schema)
+        assert dynamic_model is not None
+        instance = dynamic_model.model_construct(answer={"value": "unwrapped"})
+
+        content = extract_content(instance, output_schema, "formatter")
+
+        assert content == {"answer": "unwrapped"}
+
     def test_non_structured_output_raises_provider_error(self) -> None:
         """A non-dict, non-text result for a structured schema must raise a provider error."""
         output_schema = {"answer": OutputField(type="string")}
@@ -160,3 +173,13 @@ class TestTextFallback:
 
         with pytest.raises(ProviderError, match="could not be parsed as JSON"):
             parse_text_fallback("not valid json", output_schema, "formatter")
+
+    def test_text_fallback_unwraps_scalar_wrapper(self) -> None:
+        """Requirement: provider parity — fallback-parsed JSON with a wrapper
+        object for a scalar field must be unwrapped before validation."""
+        output_schema = {"answer": OutputField(type="string")}
+        text = '{"answer": {"result": "from wrapper"}}'
+
+        content = parse_text_fallback(text, output_schema, "formatter")
+
+        assert content == {"answer": "from wrapper"}

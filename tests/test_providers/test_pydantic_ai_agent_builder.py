@@ -204,6 +204,43 @@ class TestReasoningMapping:
         with pytest.raises(ValidationError):
             build_agent(agent_def, system_prompt="", rendered_prompt="")
 
+    def test_reasoning_validated_against_default_model_when_agent_model_unset(self) -> None:
+        """Requirement: the thinking-support check must use the workflow's
+        default_model when agent.model is unset, not the hardcoded library
+        default, so a thinking-capable default model is accepted."""
+        agent_def = AgentDef(
+            name="thinker",
+            reasoning=ReasoningConfig(effort="low"),
+        )
+
+        pydantic_agent = build_agent(
+            agent_def,
+            system_prompt="",
+            rendered_prompt="",
+            default_model="claude-3-7-sonnet-latest",
+        )
+
+        thinking = pydantic_agent.model_settings["anthropic_thinking"]
+        assert thinking == {"type": "enabled", "budget_tokens": 2048}
+
+    def test_reasoning_rejected_against_non_thinking_default_model(self) -> None:
+        """Requirement: a non-thinking default_model must also be honored, so a
+        workflow whose default model lacks thinking support gets a
+        ValidationError instead of silently validating against the library
+        default."""
+        agent_def = AgentDef(
+            name="thinker",
+            reasoning=ReasoningConfig(effort="low"),
+        )
+
+        with pytest.raises(ValidationError):
+            build_agent(
+                agent_def,
+                system_prompt="",
+                rendered_prompt="",
+                default_model="claude-3-haiku-20240307",
+            )
+
 
 class TestRetries:
     """Tests for Pydantic AI retry budget configuration."""

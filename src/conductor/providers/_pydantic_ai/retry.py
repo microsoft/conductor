@@ -30,8 +30,6 @@ logger = logging.getLogger(__name__)
 
 EventCallback = Callable[[str, dict[str, Any]], None]
 
-EventCallback = Callable[[str, dict[str, Any]], None]
-
 
 class RetryConfig:
     """Configuration for retry behavior.
@@ -241,7 +239,11 @@ async def execute_with_retry[T](
         The result of the coroutine factory.
 
     Raises:
-        ValidationError: Re-raised without retry.
+        ValidationError: Re-raised without retry. Also raised on retry-budget
+            exhaustion when pydantic-ai preserved the underlying
+            ``pydantic.ValidationError`` as ``__cause__`` on
+            ``UnexpectedModelBehavior`` (schema-shape failures name the field
+            and expected type, per the issue #343 parity contract).
         ProviderError: On fatal or exhausted retry errors.
     """
     last_error: Exception | None = None
@@ -339,6 +341,21 @@ async def execute_with_retry[T](
             await asyncio.sleep(delay)
 
     if last_error is not None and type(last_error).__name__ == "UnexpectedModelBehavior":
+        # Issue #343 parity contract: once the retry budget is exhausted on a
+        # structured-output failure, re-raise the original pydantic
+        # ValidationError (it names the field and expected type). pydantic-ai
+        # preserves it as ``__cause__`` on UnexpectedModelBehavior.
+        from pydantic import ValidationError as PydanticValidationError
+
+        cause = getattr(last_error, "__cause__", None)
+        if isinstance(cause, PydanticValidationError):
+            raise ValidationError(
+                f"Structured output validation failed: {cause}",
+                suggestion=(
+                    "Fix the model's output to match the declared schema; "
+                    "retrying will not resolve a shape mismatch."
+                ),
+            ) from cause
         suggestion = (
             "Model repeatedly failed to produce valid structured output (output tool not called); "
             "retry later or simplify the output schema"

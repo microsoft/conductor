@@ -39,8 +39,6 @@ from conductor.providers.base import (
 )
 from conductor.providers.capabilities import ProviderCapabilities
 from conductor.providers.reasoning import (
-    CLAUDE_ANSWER_HEADROOM_TOKENS,
-    CLAUDE_EXTENDED_THINKING_OUTPUT_CAP,
     ReasoningEffort,
     effort_to_budget_tokens,
     is_claude_thinking_model,
@@ -861,24 +859,21 @@ class ClaudeProvider(AgentProvider):
             if event_callback is not None:
                 event_callback(event_type, data)
 
-        try:
-            outcome = await execute_with_retry(
-                coro_factory=lambda: run_with_interrupt(
-                    agent=pydantic_agent,
-                    user_prompt=rendered_prompt,
-                    interrupt_signal=interrupt_signal,
-                    event_callback=intercepting_callback,
-                    has_output_schema=bool(agent.output),
-                    usage_limits=UsageLimits(request_limit=max_iterations),
-                    max_session_seconds=max_session,
-                    max_parse_recovery_attempts=retry_cfg.max_parse_recovery_attempts,
-                ),
-                retry_config=retry_cfg,
+        outcome = await execute_with_retry(
+            coro_factory=lambda: run_with_interrupt(
+                agent=pydantic_agent,
+                user_prompt=rendered_prompt,
+                interrupt_signal=interrupt_signal,
                 event_callback=intercepting_callback,
-                agent_name=agent.name,
-            )
-        finally:
-            pass
+                has_output_schema=bool(agent.output),
+                usage_limits=UsageLimits(request_limit=max_iterations),
+                max_session_seconds=max_session,
+                max_parse_recovery_attempts=retry_cfg.max_parse_recovery_attempts,
+            ),
+            retry_config=retry_cfg,
+            event_callback=intercepting_callback,
+            agent_name=agent.name,
+        )
 
         if outcome.is_cancelled:
             raise asyncio.CancelledError()
@@ -945,73 +940,3 @@ class ClaudeProvider(AgentProvider):
             return {"result": partial_output}
 
         return {"result": partial_output}
-
-    def _coerce_for_thinking(
-        self,
-        temperature: float | None,
-        max_tokens: int,
-        model: str,
-        thinking: dict[str, Any] | None,
-    ) -> tuple[float | None, int]:
-        """Adjust temperature and max_tokens to satisfy thinking constraints.
-
-        When extended thinking is enabled the Anthropic API requires:
-
-        - ``temperature == 1.0`` (or omitted)
-        - ``max_tokens > budget_tokens``
-
-        We force temperature to 1.0 (logging an info note if the caller
-        configured a different non-1.0 value) and bump ``max_tokens`` to
-        at least ``budget_tokens + 4096``, clamped to a per-model cap.
-        Extended-thinking models accept up to 64000 output tokens, which
-        is what we use here.
-
-        When ``thinking`` is ``None`` the inputs are returned unchanged.
-
-        Args:
-            temperature: User-configured temperature (may be ``None``).
-            max_tokens: User-configured max output tokens.
-            model: Resolved model identifier.
-            thinking: Resolved thinking kwarg or ``None``.
-
-        Returns:
-            Tuple of ``(effective_temperature, effective_max_tokens)``.
-        """
-        if thinking is None:
-            return temperature, max_tokens
-
-        budget = int(thinking.get("budget_tokens", 0))
-        # Per-model cap when thinking is enabled. Extended-thinking models
-        # accept up to CLAUDE_EXTENDED_THINKING_OUTPUT_CAP output tokens.
-        per_model_cap = CLAUDE_EXTENDED_THINKING_OUTPUT_CAP
-        required = budget + CLAUDE_ANSWER_HEADROOM_TOKENS
-        effective_max_tokens = max(max_tokens, required)
-        if effective_max_tokens > per_model_cap:
-            logger.info(
-                "Clamping max_tokens %s to %s for extended thinking on model %s "
-                "(Anthropic API per-model cap)",
-                effective_max_tokens,
-                per_model_cap,
-                model,
-            )
-            effective_max_tokens = per_model_cap
-        if effective_max_tokens <= budget:
-            # Defensive: if cap collapses below budget+1, this would still
-            # violate the API constraint. Raise rather than silently send a
-            # request the API will reject.
-            raise ValidationError(
-                f"Cannot satisfy thinking budget_tokens={budget} on model "
-                f"{model!r}: per-model cap {per_model_cap} is not greater "
-                f"than the requested budget.",
-                suggestion="Lower reasoning.effort or use a model with a higher cap.",
-            )
-
-        if temperature is not None and temperature != 1.0:
-            logger.info(
-                "Coercing temperature %s to 1.0 for extended thinking on model %s "
-                "(Anthropic API requirement)",
-                temperature,
-                model,
-            )
-
-        return 1.0, effective_max_tokens

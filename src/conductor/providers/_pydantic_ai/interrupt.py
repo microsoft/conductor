@@ -48,9 +48,10 @@ _INTERRUPTION_USER_PROMPT = (
 )
 
 _INTERRUPTION_TOOL_PROMPT = (
-    "The user has interrupted execution. Please immediately call the "
-    "'final_result' tool with your best partial result based on the work "
-    "completed so far. Return whatever you have, even if incomplete."
+    "The user has interrupted execution. Please immediately provide "
+    "your best partial result based on the work completed so far. "
+    "Return whatever you have, even if incomplete. Respond with plain text; "
+    "do not call any tools."
 )
 
 
@@ -330,7 +331,17 @@ async def _request_partial_output(
     interrupt_message = _make_interrupt_message(has_output_schema)
     partial_history = list(history)
     partial_history.append(ModelRequest(parts=[interrupt_message]))
-    result = await agent.run(user_prompt=None, message_history=partial_history)
+    # Enforce the hard cut this path promises. agent.override(toolsets=[],
+    # tools=[]) is required because the toolsets= run() kwarg is additive in
+    # pydantic-ai (it never clears toolsets registered at construction time);
+    # output_type=str bypasses the ToolOutput schema so the model answers
+    # directly instead of retrying output-tool validation.
+    with agent.override(toolsets=[], tools=[]):
+        result = await agent.run(
+            user_prompt=None,
+            message_history=partial_history,
+            output_type=str,
+        )
     return RunOutcome(
         partial_output=result.output,
         is_partial=True,

@@ -496,6 +496,51 @@ class TestExecuteWithRetry:
         assert "output tool" in suggestion
         assert "Check API key" not in suggestion
 
+    @pytest.mark.asyncio
+    async def test_unexpected_model_behavior_with_validation_cause_reraises_validation(
+        self,
+    ) -> None:
+        """Requirement: issue #343 parity — an exhausted structured-output
+        failure must re-raise the original pydantic ValidationError (naming the
+        field and expected type) preserved as ``__cause__``, not a generic
+        ProviderError."""
+        from pydantic import BaseModel
+        from pydantic import ValidationError as PydanticValidationError
+
+        class Out(BaseModel):
+            answer: str
+            count: int
+
+        umb = UnexpectedModelBehavior("Exceeded maximum output retries (2)")
+        schema_error: PydanticValidationError | None = None
+        try:
+            Out.model_validate({"answer": "x"})
+        except PydanticValidationError as e:
+            schema_error = e
+            umb.__cause__ = e
+        assert schema_error is not None
+
+        config = RetryConfig(max_attempts=2, base_delay=0.0, jitter=0.0)
+        factory = _make_factory([umb, umb])
+
+        with (
+            patch("conductor.providers._pydantic_ai.retry.asyncio.sleep"),
+            pytest.raises(ValidationError) as exc_info,
+        ):
+            await execute_with_retry(
+                factory,
+                retry_config=config,
+                event_callback=None,
+                agent_name="retryer",
+            )
+
+        message = str(exc_info.value)
+        assert "count" in message
+        assert "Field required" in message
+        # The original pydantic ValidationError must be preserved as the cause
+        # so callers can introspect field-level errors (issue #343 contract).
+        assert exc_info.value.__cause__ is schema_error
+
 
 class TestPydanticAIRetriesSplit:
     """Tests that Pydantic AI's retry budgets are split correctly."""

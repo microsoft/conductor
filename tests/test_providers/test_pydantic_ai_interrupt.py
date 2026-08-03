@@ -20,6 +20,8 @@ from typing import Any
 import pytest
 from pydantic_ai import Agent, AgentRetries, UsageLimits
 from pydantic_ai.exceptions import UnexpectedModelBehavior
+from pydantic_ai.messages import ModelResponse, TextPart
+from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.output import ToolOutput
 from pydantic_ai.tools import Tool
@@ -42,23 +44,34 @@ def _make_text_agent() -> Agent[Any, Any]:
 
 
 def _make_structured_agent() -> Agent[Any, Any]:
-    """Build a structured-output Pydantic AI agent using the scripted TestModel."""
+    """Build a structured-output Pydantic AI agent using a text-answering model.
+
+    ``FunctionModel`` is used instead of ``TestModel(custom_output_args=...)``
+    because the interrupt partial path overrides ``output_type=str`` per call,
+    and TestModel's ``custom_output_args`` mode requires the output tool to be
+    present on the request.
+    """
+
+    async def _answer_with_partial(messages: list[Any], info: Any) -> ModelResponse:
+        return ModelResponse(parts=[TextPart(content='{"answer": "partial"}')])
+
     output_schema = {"answer": OutputField(type="string")}
     dynamic_model = output_schema_to_pydantic_model("FormatterOutput", output_schema)
     assert dynamic_model is not None
     return Agent(
-        TestModel(custom_output_args={"answer": "partial"}),
+        FunctionModel(_answer_with_partial),
         output_type=ToolOutput(dynamic_model),
         retries=0,
     )
 
 
-def test_structured_interrupt_requests_registered_output_tool() -> None:
-    # Requirement: structured interrupt recovery names Pydantic AI's registered output tool.
+def test_structured_interrupt_asks_for_plain_text_partial() -> None:
+    # Requirement: structured interrupt recovery asks for a plain-text partial
+    # result because the partial run replaces tools and the output schema.
     message = _make_interrupt_message(has_output_schema=True)
 
-    assert "final_result" in message.content
-    assert "emit_output" not in message.content
+    assert "partial result" in message.content
+    assert "do not call any tools" in message.content
 
 
 class TestInterruptBeforeRun:
@@ -120,11 +133,23 @@ class TestInterruptMidRun:
             signal.set()
             return "interrupted"
 
+        async def _call_tool_then_answer(messages: list[Any], info: Any) -> ModelResponse:
+            # First turn: invoke the tool that sets the interrupt signal. The
+            # partial run after it overrides output_type=str, so this function
+            # only needs to answer with text.
+            if len(messages) == 1:
+                from pydantic_ai.messages import ToolCallPart
+
+                return ModelResponse(
+                    parts=[ToolCallPart(tool_name="set_interrupt_signal", args={})]
+                )
+            return ModelResponse(parts=[TextPart(content='{"answer": "partial"}')])
+
         output_schema = {"answer": OutputField(type="string")}
         dynamic_model = output_schema_to_pydantic_model("MultiTurnOutput", output_schema)
         assert dynamic_model is not None
         agent = Agent(
-            TestModel(custom_output_args={"answer": "partial"}),
+            FunctionModel(_call_tool_then_answer),
             tools=[Tool(set_interrupt_signal)],
             output_type=ToolOutput(dynamic_model),
             retries=0,
@@ -141,6 +166,69 @@ class TestInterruptMidRun:
         assert outcome.is_partial is True
         assert outcome.result is None
         assert outcome.is_cancelled is False
+
+
+class TestPartialRunOverrides:
+    """Requirement: the partial run must disable tools and the output schema."""
+
+    @pytest.mark.asyncio
+    async def test_partial_run_blocks_tool_calls_and_returns_text(self) -> None:
+        """On the partial-result call the model must not be able to invoke
+        tools registered on the agent: a tool call attempt must fail instead
+        of producing a side effect, and a text answer must come back as the
+        partial output. This exercises real pydantic-ai semantics (the
+        ``toolsets=`` run kwarg is additive and cannot clear construction-time
+        toolsets), not just the kwargs we pass."""
+        from pydantic_ai.messages import ToolCallPart
+
+        side_effects: list[str] = []
+
+        def dangerous_tool() -> str:
+            side_effects.append("called")
+            return "done"
+
+        async def _try_tool_then_answer(messages: list[Any], info: Any) -> ModelResponse:
+            tool_attempted = any(
+                getattr(p, "part_kind", "") == "tool-call" and p.tool_name == "dangerous_tool"
+                for m in messages
+                for p in getattr(m, "parts", [])
+            )
+            tool_returned = any(
+                getattr(p, "part_kind", "") == "tool-return"
+                for m in messages
+                for p in getattr(m, "parts", [])
+            )
+            if tool_returned or tool_attempted:
+                return ModelResponse(parts=[TextPart(content="final partial text")])
+            return ModelResponse(parts=[ToolCallPart(tool_name="dangerous_tool", args={})])
+
+        output_schema = {"answer": OutputField(type="string")}
+        dynamic_model = output_schema_to_pydantic_model("PartialOutput", output_schema)
+        assert dynamic_model is not None
+        agent = Agent(
+            FunctionModel(_try_tool_then_answer),
+            tools=[Tool(dangerous_tool)],
+            output_type=ToolOutput(dynamic_model),
+            # A small retry budget lets the model recover from the rejected
+            # tool call and answer with text, exercising the real override
+            # semantics instead of surfacing UnexpectedModelBehavior.
+            retries=2,
+        )
+
+        signal = asyncio.Event()
+        signal.set()
+
+        outcome = await run_with_interrupt(
+            agent,
+            "format this",
+            interrupt_signal=signal,
+            event_callback=None,
+            has_output_schema=True,
+        )
+
+        assert side_effects == []
+        assert outcome.is_partial is True
+        assert isinstance(outcome.partial_output, str)
 
 
 class TestNormalCompletion:

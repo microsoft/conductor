@@ -7,6 +7,7 @@ spill-to-file conventions.
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any
 
 from pydantic_ai import AbstractToolset, RunContext
@@ -17,6 +18,8 @@ from pydantic_core import SchemaValidator, core_schema
 
 from conductor.mcp.manager import MCPManager
 from conductor.providers._pydantic_ai.events import EventCallback, maybe_emit_tool_truncation
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from pydantic_ai import Agent
@@ -121,6 +124,11 @@ class MCPManagerToolset(AbstractToolset[Any]):
         try:
             result = await self._manager.call_tool(name, tool_args)
         except Exception as e:
+            # The model will see this failure in its transcript, but operator
+            # logs need it too: without this warning a genuine adapter bug is
+            # indistinguishable from a legitimate tool-level failure unless
+            # someone digs through model transcripts.
+            logger.warning("MCP tool call %r failed: %s: %s", name, type(e).__name__, e)
             raise ToolFailed(f"Error executing tool {name!r}: {e}") from e
         if self._event_callback is not None and ctx.agent is not None:
             maybe_emit_tool_truncation(ctx.agent, name, result, self._event_callback)

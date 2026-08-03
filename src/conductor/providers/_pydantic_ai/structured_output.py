@@ -18,6 +18,7 @@ from pydantic import BaseModel
 from conductor.config.schema import OutputField
 from conductor.exceptions import ProviderError, ValidationError
 from conductor.executor.output import parse_json_output, validate_output
+from conductor.providers._output_shape import normalize_agent_output
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +56,7 @@ def extract_content(
 
     if isinstance(output, BaseModel):
         content = output.model_dump()
+        content = normalize_agent_output(content, output_schema)
         validate_output(content, output_schema)
         return content
 
@@ -108,5 +110,9 @@ def parse_text_fallback(
             suggestion=f"{e.suggestion} Ensure the model uses the structured output tool.",
         ) from e
 
+    # Provider parity: apply the same shape normalization (e.g. single-field
+    # {"value": ...} wrappers) that copilot.py and hermes.py apply before
+    # validating, so this fallback path honors the issue #343 contract.
+    content = normalize_agent_output(content, output_schema)
     validate_output(content, output_schema)
     return content

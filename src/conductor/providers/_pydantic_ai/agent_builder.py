@@ -251,6 +251,7 @@ def _build_model_settings(
     default_temperature: float | None,
     default_max_tokens: int | None,
     default_reasoning_effort: ReasoningEffort | None,
+    default_model: str | None = None,
     timeout: float | None = None,
 ) -> AnthropicModelSettings:
     """Build ``AnthropicModelSettings`` from the agent and runtime defaults.
@@ -260,6 +261,9 @@ def _build_model_settings(
         default_temperature: Workflow-level default temperature.
         default_max_tokens: Workflow-level default ``max_tokens``.
         default_reasoning_effort: Workflow-wide default reasoning effort.
+        default_model: Fallback model identifier when ``agent.model`` is unset.
+            Used for the thinking-support check so it matches the model the run
+            will actually use instead of the hardcoded library default.
         timeout: Optional per-request timeout in seconds. When set, it is
             forwarded to the model settings so individual model calls are
             bounded even when the caller does not wrap the run in its own
@@ -268,11 +272,11 @@ def _build_model_settings(
     Returns:
         A TypedDict of Anthropic-specific settings ready for ``Agent``.
     """
-    model_name = (agent.model or None) or None
+    model_name = (agent.model or default_model) or DEFAULT_ANTHROPIC_MODEL
 
     thinking = _resolve_anthropic_thinking(
         agent,
-        model_name or DEFAULT_ANTHROPIC_MODEL,
+        model_name,
         default_reasoning_effort,
     )
 
@@ -285,7 +289,7 @@ def _build_model_settings(
         temperature,
         max_tokens,
         thinking,
-        model_name or DEFAULT_ANTHROPIC_MODEL,
+        model_name,
     )
 
     settings: AnthropicModelSettings = AnthropicModelSettings()
@@ -336,10 +340,9 @@ def build_agent(
         base_url: Optional custom API endpoint.
         timeout: Request timeout in seconds. ``None`` lets the Anthropic SDK use
             its own default.
-        toolsets: Optional Pydantic AI toolsets to register. Used by Phase 4 to
-            inject MCP toolsets without changing this signature.
-        tools: Optional plain Pydantic AI tools to register. Also reserved for
-            Phase 4 passthrough.
+        toolsets: Optional Pydantic AI toolsets to register (e.g. the MCP tool
+            bridge).
+        tools: Optional plain Pydantic AI tools to register.
 
     Returns:
         A configured Pydantic AI ``Agent`` ready to run.
@@ -357,6 +360,7 @@ def build_agent(
         default_temperature,
         default_max_tokens,
         default_reasoning_effort,
+        default_model=default_model,
         timeout=timeout,
     )
 
