@@ -219,7 +219,9 @@ class DialogHandler:
 
         # Build the system prompt with full agent output context
         try:
-            output_str = json.dumps(agent_output, indent=2, default=str)
+            # ``ensure_ascii=False`` so the dialog-mode LLM sees non-ASCII
+            # output literally instead of as \uXXXX escapes (issue #356).
+            output_str = json.dumps(agent_output, indent=2, default=str, ensure_ascii=False)
         except (TypeError, ValueError):
             output_str = str(agent_output)
 
@@ -385,7 +387,9 @@ class DialogHandler:
 
         # Build the system prompt with full agent output context
         try:
-            output_str = json.dumps(agent_output, indent=2, default=str)
+            # ``ensure_ascii=False`` so the dialog-mode LLM sees non-ASCII
+            # output literally instead of as \uXXXX escapes (issue #356).
+            output_str = json.dumps(agent_output, indent=2, default=str, ensure_ascii=False)
         except (TypeError, ValueError):
             output_str = str(agent_output)
 
@@ -609,7 +613,9 @@ class DialogHandler:
 
         # Show agent output with full context
         try:
-            output_str = json.dumps(agent_output, indent=2, default=str)
+            # ``ensure_ascii=False`` so the console panel shows real non-ASCII
+            # text instead of \uXXXX escapes (issue #356).
+            output_str = json.dumps(agent_output, indent=2, default=str, ensure_ascii=False)
         except (TypeError, ValueError):
             output_str = str(agent_output)
 

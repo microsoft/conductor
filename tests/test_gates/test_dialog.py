@@ -626,3 +626,105 @@ class TestWebDialogFlow:
         assert result.agent_proposed_continue is True
         assert not result.user_dismissed
         assert not result.user_declined
+
+
+class TestDialogNonAsciiOutput:
+    """Non-ASCII agent output must reach the dialog LLM and the console unescaped."""
+
+    @pytest.mark.asyncio
+    async def test_cli_system_prompt_serializes_non_ascii_unescaped(self) -> None:
+        # Requirement: the dialog-mode system prompt embeds the agent output
+        # literally for every language — Cyrillic/CJK output must not reach the
+        # model as \uXXXX escape sequences (issue #356, PR #359 review).
+        handler = DialogHandler(console=MagicMock())
+        agent = AgentDef(
+            name="test",
+            prompt="test",
+            dialog=DialogConfig(trigger_prompt="test"),
+        )
+        provider = MagicMock()
+        provider.execute_dialog_turn = AsyncMock(return_value="answer")
+
+        with (
+            patch.object(handler, "_ask_engagement", new_callable=AsyncMock, return_value="engage"),
+            patch.object(
+                handler,
+                "_get_user_input",
+                new_callable=AsyncMock,
+                side_effect=["привет", "done"],
+            ),
+        ):
+            await handler.handle_dialog(
+                agent=agent,
+                agent_output={"result": "你好 мир"},
+                opening_question="?",
+                provider=provider,
+            )
+
+        system_prompt = provider.execute_dialog_turn.call_args.kwargs["system_prompt"]
+        assert "你好 мир" in system_prompt
+        assert "\\u4f60" not in system_prompt
+        assert "\\u043f" not in system_prompt
+
+    @pytest.mark.asyncio
+    async def test_web_system_prompt_serializes_non_ascii_unescaped(self) -> None:
+        # Requirement: the web-mode dialog builds the same system prompt — the
+        # non-ASCII output must be embedded literally there too (issue #356,
+        # PR #359 review).
+        dashboard = MagicMock()
+        dashboard.wait_for_dialog_message = AsyncMock(
+            side_effect=[
+                {"type": "dialog_message", "agent_name": "test", "content": "расскажи"},
+                {"type": "dialog_message", "agent_name": "test", "content": "done"},
+            ]
+        )
+        handler = DialogHandler(console=MagicMock(), web_dashboard=dashboard)
+        agent = AgentDef(
+            name="test",
+            prompt="test",
+            dialog=DialogConfig(trigger_prompt="test"),
+        )
+        provider = MagicMock()
+        provider.execute_dialog_turn = AsyncMock(return_value="answer")
+
+        await handler.handle_dialog(
+            agent=agent,
+            agent_output={"result": "你好 мир"},
+            opening_question="?",
+            provider=provider,
+        )
+
+        provider.execute_dialog_turn.assert_called_once()
+        system_prompt = provider.execute_dialog_turn.call_args.kwargs["system_prompt"]
+        assert "你好 мир" in system_prompt
+        assert "\\u4f60" not in system_prompt
+        assert "\\u043f" not in system_prompt
+
+    def test_console_panel_renders_non_ascii_unescaped(self) -> None:
+        # Requirement: the "Agent Output" console panel a human reads during a
+        # CLI dialog session must show real non-ASCII text, not \uXXXX escapes
+        # (issue #356, PR #359 review).
+        console = MagicMock()
+        handler = DialogHandler(console=console)
+        agent = AgentDef(
+            name="test",
+            prompt="test",
+            dialog=DialogConfig(trigger_prompt="test"),
+        )
+
+        handler._display_dialog_start(agent, {"result": "你好 мир"}, "?", base_dir=None)
+
+        # Panels render lazily, so inspect the RichMarkdown renderable inside
+        # the "Agent Output" panel rather than str() of the Panel itself.
+        from rich.markdown import Markdown as RichMarkdown
+        from rich.panel import Panel
+
+        panels = [call.args[0] for call in console.print.call_args_list if call.args]
+        markdown_bodies = [
+            p.renderable.markup
+            for p in panels
+            if isinstance(p, Panel) and isinstance(p.renderable, RichMarkdown)
+        ]
+        assert any("你好 мир" in body for body in markdown_bodies)
+        assert all("\\u4f60" not in body for body in markdown_bodies)
+        assert all("\\u043f" not in body for body in markdown_bodies)

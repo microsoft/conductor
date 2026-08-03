@@ -2432,7 +2432,9 @@ class WorkflowEngine:
         last_output_preview: str | None = None
         if last_output is not None:
             try:
-                preview = json.dumps(last_output, indent=2, default=str)
+                # ``ensure_ascii=False`` so the preview shows real non-ASCII
+                # text instead of \uXXXX escapes (issue #356).
+                preview = json.dumps(last_output, indent=2, default=str, ensure_ascii=False)
                 last_output_preview = preview[:500]
             except (TypeError, ValueError):
                 last_output_preview = str(last_output)[:500]
@@ -2502,7 +2504,11 @@ class WorkflowEngine:
             return False
 
         try:
-            preview = json.dumps(partial_output.content, indent=2, default=str)[:500]
+            # ``ensure_ascii=False`` so the preview shows real non-ASCII
+            # text instead of \uXXXX escapes (issue #356).
+            preview = json.dumps(partial_output.content, indent=2, default=str, ensure_ascii=False)[
+                :500
+            ]
         except (TypeError, ValueError):
             preview = str(partial_output.content)[:500]
 
@@ -2627,7 +2633,11 @@ class WorkflowEngine:
 
         # Build preview from partial output
         try:
-            preview = json.dumps(partial_output.content, indent=2, default=str)[:500]
+            # ``ensure_ascii=False`` so the preview shows real non-ASCII
+            # text instead of \uXXXX escapes (issue #356).
+            preview = json.dumps(partial_output.content, indent=2, default=str, ensure_ascii=False)[
+                :500
+            ]
         except (TypeError, ValueError):
             preview = str(partial_output.content)[:500]
 
