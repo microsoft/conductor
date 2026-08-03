@@ -91,3 +91,43 @@ class TestRuntimeConfigSkills:
     def test_empty_string_rejected(self) -> None:
         with pytest.raises(ValidationError, match="non-empty strings"):
             RuntimeConfig(skills=[""])
+
+
+class TestPathEntriesAtSchemaLevel:
+    """Path entries (issue #350) need the workflow file's directory to
+    resolve, which the schema does not have — so they are shape-checked
+    here and resolved in ``conductor validate`` / ``AgentExecutor``.
+
+    Bare *names* keep their eager check, so an unknown built-in still fails
+    at load time exactly as it did before paths existed.
+    """
+
+    @pytest.mark.parametrize(
+        "entry",
+        ["./team-skills/acme", "../shared/acme", "~/scratch/skills", "/abs/acme", "team/acme"],
+    )
+    def test_path_entries_are_accepted_unresolved(self, entry: str) -> None:
+        assert AgentDef(name="r", prompt="p", skills=[entry]).skills == [entry]
+        assert RuntimeConfig(skills=[entry]).skills == [entry]
+
+    def test_unknown_bare_name_still_fails_at_load_time(self) -> None:
+        """The pre-existing error timing must not regress: a typo'd built-in
+        name needs no base directory to detect."""
+        with pytest.raises(ValidationError, match="Unknown skill"):
+            AgentDef(name="r", prompt="p", skills=["conductorr"])
+
+    def test_unknown_name_error_mentions_the_path_form(self) -> None:
+        with pytest.raises(ValidationError, match=r"\./team-skills/my-skill"):
+            AgentDef(name="r", prompt="p", skills=["nope"])
+
+    def test_names_and_paths_can_be_mixed(self) -> None:
+        entries = ["conductor", "./team-skills/acme"]
+        assert AgentDef(name="r", prompt="p", skills=entries).skills == entries
+
+    def test_whitespace_only_entry_still_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="non-empty strings"):
+            AgentDef(name="r", prompt="p", skills=["   "])
+
+    def test_path_entries_still_forbidden_on_non_provider_steps(self) -> None:
+        with pytest.raises(ValidationError, match="cannot have 'skills'"):
+            AgentDef(name="s", type="script", command="echo hi", skills=["./a/b"])

@@ -418,6 +418,8 @@ class WorkflowEngine:
                 workflow_tools=config.tools,
                 instructions_preamble=self._instructions_preamble,
                 workflow_skills=self._workflow_skills,
+                workflow_dir=self._workflow_dir,
+                skill_injection=config.workflow.runtime.skill_injection,
             )
             self.provider = provider  # Keep for backward compatibility
         else:
@@ -968,6 +970,8 @@ class WorkflowEngine:
                 workflow_tools=self.config.tools,
                 instructions_preamble=self._instructions_preamble,
                 workflow_skills=self._workflow_skills,
+                workflow_dir=self._workflow_dir,
+                skill_injection=self.config.workflow.runtime.skill_injection,
             )
         elif self.executor is not None:
             # Single provider mode (backward compatibility)

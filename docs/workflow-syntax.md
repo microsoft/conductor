@@ -11,6 +11,7 @@ This document provides a comprehensive reference for the Conductor workflow YAML
 - [Inputs and Outputs](#inputs-and-outputs)
 - [Limits and Safety](#limits-and-safety)
 - [Tools](#tools)
+- [Skills](#skills)
 - [External File References](#external-file-references)
 - [Hooks](#hooks)
 
@@ -1418,6 +1419,154 @@ agents:
 ```
 
 For full MCP configuration details, see the [MCP Tools guide](mcp-tools.md).
+
+## Skills
+
+A **skill** is a directory of reusable knowledge an agent can opt into: a
+`SKILL.md` describing what the skill covers, plus an optional `references/`
+tree of supporting docs. Conductor consumes the same format the GitHub
+Copilot CLI and Anthropic Claude Code use, so a skill written for either
+works here unchanged.
+
+### Enabling skills
+
+Set a workflow-wide default and override it per agent:
+
+```yaml
+workflow:
+  runtime:
+    skills:
+      - conductor                     # built-in, ships in the wheel
+      - ./team-skills/acme-widgets    # versioned alongside the workflow
+      - ~/scratch/skills              # a skills root — loads everything under it
+
+agents:
+  - name: reviewer
+    prompt: "Review this workflow."
+    # inherits runtime.skills
+
+  - name: summarizer
+    prompt: "Summarize the review."
+    skills: []                        # explicit opt-out — no skills
+
+  - name: widget_expert
+    prompt: "Check the widget conventions."
+    skills: [./team-skills/acme-widgets]   # overrides the workflow default
+```
+
+The per-agent field is tri-state:
+
+| Value | Meaning |
+|---|---|
+| omitted | inherit `runtime.skills` |
+| `[]` | explicit opt-out — no skills, ignores the workflow default |
+| `[...]` | explicit set — replaces the workflow default |
+
+Skills apply only to provider-backed agents. They are rejected on `script`,
+`wait`, `set`, `terminate`, `workflow`, and `human_gate` steps.
+
+### Names and paths
+
+Each entry is either a **registered built-in name** or a **filesystem path**.
+The distinction is syntactic — an entry is a path when it starts with `./`,
+`../`, or `~/`, or contains a path separator. Everything else must be a
+built-in name, so a bare `conductor` can never be shadowed by a directory
+that happens to share its name.
+
+Conductor ships one built-in skill:
+
+| Name | Contents |
+|---|---|
+| `conductor` | Conductor's YAML schema, execution model, authoring patterns, and CLI commands |
+
+A path may point at either granularity:
+
+* a **skill directory** — one containing `SKILL.md`
+* a **skills root** — a directory of skill directories, which expands to
+  every immediate child containing a `SKILL.md` (not recursive)
+
+Relative paths resolve against the **workflow file's directory**, the same
+rule `working_dir` uses, so a workflow validates and runs identically from
+any working directory. This is what lets a team version a skill next to the
+workflow that uses it, with no per-developer install step.
+
+> **Trust:** a `SKILL.md` is injected into the agent's context, so treat
+> skill paths as trusted input. Conductor applies no additional allowlist —
+> the same workflow file can already declare `type: script` steps that run
+> arbitrary shell, so a skill path grants strictly less.
+
+### `SKILL.md` frontmatter
+
+Every resolved skill must declare a `name` and a `description` in valid YAML
+frontmatter:
+
+```yaml
+---
+name: acme-widgets
+description: |
+  Internal ACME widget conventions. Triggers: widget, acme widget.
+---
+```
+
+Use a block scalar (`description: |`) whenever the text contains a colon
+followed by a space. This is invalid YAML and is the single most common
+mistake:
+
+```yaml
+# Wrong — 'Triggers:' makes this unparseable
+description: Internal ACME widget conventions. Triggers: widget, acme widget.
+```
+
+Both the Copilot CLI and Claude Code **silently skip** a skill whose
+frontmatter fails to parse — no warning, no error, the skill is simply
+absent. Conductor parses it itself and fails loudly instead, both at
+`conductor validate` and at run time.
+
+### How skills reach the model
+
+The contract is the same everywhere — *the agent has access to the named
+skill* — but the mechanism and its cost differ:
+
+| Provider | Mechanism | Cost |
+|---|---|---|
+| `copilot` | `skill_directories` on the SDK session | progressive — frontmatter only, body loaded on demand |
+| `claude-agent-sdk` | owning plugin registered, skill enabled by `<plugin>:<skill>` | progressive |
+| `claude` | eager injection into the rendered prompt | **full body on every call** |
+| `hermes` | eager injection into the rendered prompt | **full body on every call** |
+| `aca` | not supported (`skills=False`) — skill paths are host paths the sandbox cannot read | n/a |
+
+Two consequences worth knowing:
+
+* **`claude-agent-sdk` requires a plugin.** The SDK has no bare
+  skill-directory option, so a skill must live inside a Claude Code plugin
+  (a `.claude-plugin/plugin.json` with the skill under `<plugin>/skills/`).
+  `conductor validate` reports a path skill that is not, rather than letting
+  it fail mid-run. The same skill works on `copilot` untouched.
+* **Eager injection is expensive.** The bundled `conductor` skill alone is
+  ~117KB (~29K tokens), prepended to *every* call, every retry, and every
+  `validator:` call.
+
+### Limiting eager injection
+
+`runtime.skill_injection` bounds what eager-injection providers prepend. It
+has no effect on providers with progressive disclosure.
+
+```yaml
+workflow:
+  runtime:
+    skill_injection:
+      warn_bytes: 65536      # Default: 65536 (64KB). null disables the warning.
+      max_bytes: 131072      # Default: 131072 (128KB). null disables the limit.
+```
+
+Exceeding `warn_bytes` logs a warning and reports it from `conductor
+validate`; exceeding `max_bytes` fails the agent. Both are measured against
+the exact string being prepended and report a per-skill breakdown, so the
+offender is named. The defaults sit either side of the bundled `conductor`
+skill: enabling it on `claude` warns rather than breaking, while
+accumulating several large skills errors.
+
+See `examples/skills-self-improving-workflow.yaml` for a complete example.
 
 ## External File References
 

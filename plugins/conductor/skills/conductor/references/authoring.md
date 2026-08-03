@@ -220,6 +220,18 @@ See `examples/validator.yaml` for a complete example.
 
 `skills` enables reusable knowledge or capability bundles for provider-backed agents. The Conductor distribution ships one built-in skill — `conductor` — which packages the YAML schema, execution model, and authoring patterns (the same content this reference doc covers) so an agent can evaluate, improve, debug, or generate Conductor workflows.
 
+**Names and paths.** Each entry is either a registered built-in name or a filesystem path. The distinction is syntactic: an entry is a path when it starts with `./`, `../`, or `~/`, or contains a path separator — everything else must be a built-in name, so a bare `conductor` is never shadowed by a same-named local directory. A path points at either a single skill directory (one holding `SKILL.md`) or a root of them, which expands to every immediate child holding one (not recursive). Relative paths resolve against the **workflow file's directory**, the same rule `working_dir` uses, so a skill can be versioned alongside the workflow with no per-developer install step and the workflow behaves identically from any working directory. Skill paths are trusted input — no allowlist applies, since the same file can already run arbitrary shell via `type: script`.
+
+**`SKILL.md` frontmatter.** Every resolved skill must declare a non-empty `name` and `description` in valid YAML frontmatter. Use a block scalar whenever the text contains a colon followed by a space — `description: Does things. Triggers: a, b` is invalid YAML, and both the Copilot CLI and Claude Code skip such a skill *silently*. Conductor parses it and fails loudly instead, at validate time and at run time:
+
+```yaml
+---
+name: acme-widgets
+description: |
+  Internal ACME widget conventions. Triggers: widget, acme widget.
+---
+```
+
 **Tri-state per-agent field (resolved via list presence):**
 - Omit `skills:` — inherit from `runtime.skills`
 - `skills: []` — explicit opt-out (no skills for this agent, regardless of workflow default)
@@ -230,18 +242,27 @@ See `examples/validator.yaml` for a complete example.
 **Provider mechanism (same observable contract — "the agent has access to the named skill"):**
 - **Copilot** — the resolved skill directory is registered on the SDK session via `skill_directories`, so the agent discovers and loads skill content natively (progressive disclosure via `SKILL.md` frontmatter). This is more token-efficient than eager injection.
 - **Claude Agent SDK** — also native, through the Claude Code plugin surface: the plugin owning the skill is registered on the session and the skill enabled by its `<plugin>:<skill>` name. Skills the workflow did not declare are suppressed, so `skills: []` really is an opt-out and ambient skills from the machine never load.
-- **Claude** — the loader reads `SKILL.md` plus every `references/*.md` file in the skill directory and prepends them to the agent's rendered prompt inside `<skills><skill name="...">...</skill></skills>` tags. Inserted between workspace instructions and the user prompt.
+- **Claude** and **hermes** — the loader reads `SKILL.md` plus every `references/*.md` file in the skill directory and prepends them to the agent's rendered prompt inside `<skills><skill name="...">...</skill></skills>` tags. Inserted between workspace instructions and the user prompt.
 
-Not allowed on `script`, `human_gate`, `workflow`, `wait`, `set`, or `terminate` agent types. Unknown skill names fail at workflow validation time.
+**Two provider-specific limits worth knowing:**
+- `claude-agent-sdk` has **no bare skill-directory option** — a skill is enabled by name through the plugin that ships it. A path skill outside a Claude Code plugin is therefore rejected at validation time, with both remedies named (package it as a plugin, or run that agent on `copilot`, which accepts the identical skill untouched).
+- Eager injection has no progressive disclosure: the whole body is prepended on every call, every retry, and every `validator:` call. The bundled `conductor` skill alone is ~117KB (~29K tokens). `runtime.skill_injection` bounds it — `warn_bytes` (default 64KB) warns, `max_bytes` (default 128KB) fails the agent, either can be `null` to disable. Providers with progressive disclosure are unaffected.
+
+Not allowed on `script`, `human_gate`, `workflow`, `wait`, `set`, or `terminate` agent types. Unknown built-in names fail when the config loads; unresolvable paths and malformed `SKILL.md` files fail at workflow validation time and again at run time.
 
 ```yaml
 workflow:
   runtime:
-    skills: [conductor]             # all provider-backed agents get the conductor skill
+    skills:
+      - conductor                   # built-in: ships in the wheel
+      - ./team-skills/acme-widgets  # path: versioned next to this workflow
+    skill_injection:                # only bounds eager-injection providers
+      warn_bytes: 65536
+      max_bytes: 131072
 
 agents:
   - name: workflow_reviewer
-    skills: [conductor]             # per-agent opt-in (redundant here, kept for clarity)
+    skills: [conductor]             # explicit set, replaces the workflow default
     prompt: "Review this workflow for correctness..."
 
   - name: simple_agent

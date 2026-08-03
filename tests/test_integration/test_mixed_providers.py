@@ -102,6 +102,9 @@ agents:
             # is None and excluded by exclude_none.
             "checkpoint": {"every_agent": False, "keep_last": 5},
             "skills": [],
+            # Eager skill-injection budget (issue #350). Bounds only providers
+            # without progressive disclosure; copilot is unaffected.
+            "skill_injection": {"warn_bytes": 65536, "max_bytes": 131072},
         }
 
     def test_provider_parameter_isolation(self, tmp_path):

@@ -9,6 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`skills:` now accepts filesystem paths, not just built-in names**
+  (issue #350) — an entry is treated as a path when it starts with `./`,
+  `../`, or `~/`, or contains a path separator; everything else must still be
+  a registered built-in, so a bare `conductor` can never be shadowed by a
+  same-named local directory. A path may point at a single skill directory
+  (one holding `SKILL.md`) or at a root of them, which expands to every
+  immediate child that holds one. Relative paths resolve against the workflow
+  file's directory — the same rule `working_dir` uses — so a team can version
+  a skill alongside the workflow that uses it with no per-developer install
+  step, and the workflow resolves identically from any working directory.
+  Conductor expands roots itself rather than handing them to a provider,
+  because eager injection needs a name per skill and `claude-agent-sdk` needs
+  a `<plugin>:<skill>` name; doing it centrally keeps every provider seeing
+  the same set. Skill paths are trusted input by design: the same workflow
+  file can already declare `type: script` steps running arbitrary shell, so
+  no additional allowlist applies.
+- **`runtime.skill_injection` bounds eagerly injected skill content**
+  (issue #350) — `warn_bytes` (default 64KB) logs a warning and reports from
+  `conductor validate`; `max_bytes` (default 128KB) fails the agent. Either
+  can be set to `null` to disable it. Providers without a native skill
+  surface (`claude`, `hermes`) have no progressive disclosure: `AgentExecutor`
+  prepends each enabled skill's `SKILL.md` **plus its entire `references/`
+  tree** on every call, every retry, and every `validator:` call, and there
+  was previously no ceiling at all. The bundled `conductor` skill alone is
+  ~117KB (~29K tokens), so the defaults deliberately straddle it — enabling
+  it on `claude` now warns instead of breaking, while accumulating several
+  large skills errors. Both limits are measured against the exact string
+  being prepended and report a per-skill breakdown naming the offender.
+  Providers with progressive disclosure (`copilot`, `claude-agent-sdk`) are
+  unaffected.
+- **`hermes` declares `skills=True`** (issue #350) — the provider omitted
+  `skills` from its `CAPABILITIES`, which defaults to `False`, so
+  `conductor validate` rejected `skills:` on it while its own `execute()`
+  docstring described eager injection working. Injection happens in
+  `AgentExecutor`, upstream of every provider, so the path was always
+  reachable and the declaration was simply inaccurate. Now bounded by
+  `runtime.skill_injection` like `claude`.
+
 - **`claude-agent-sdk` provider now honors `working_dir`** — the directory
   resolved from `agent.working_dir` / `runtime.working_dir` is forwarded to
   `ClaudeAgentOptions.cwd`, so the `claude` CLI runs there and every stdio MCP
@@ -80,6 +118,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   carry secrets. ([#343](https://github.com/microsoft/conductor/issues/343))
 
 ### Fixed
+
+- **A malformed `SKILL.md` no longer fails silently** (issue #350) — both the
+  Copilot CLI and Claude Code skip a skill whose YAML frontmatter cannot be
+  parsed, with no warning and no error, leaving an agent running without the
+  knowledge its author asked for. The trap is ordinary: a `description`
+  containing `Triggers: ...` as an unquoted plain scalar is invalid YAML.
+  Conductor now parses the frontmatter itself, requires a non-empty `name`
+  and `description`, and reports the underlying YAML error along with the
+  `description: |` block-scalar fix. Enforced during resolution rather than
+  only in `conductor validate`, because `conductor run` never invokes the
+  static validator.
+- **`conductor validate` rejects a `claude-agent-sdk` skill outside a plugin**
+  (issue #350) — that SDK exposes no bare skill-directory option, only plugin
+  roots plus skill names, so such a skill is unreachable there even though
+  `copilot` loads it fine. It previously surfaced as a runtime
+  `ProviderError` on first execution; it is now reported before the run
+  starts, naming the directory and offering both remedies (package it as a
+  plugin, or run the agent on `copilot`).
 
 - **`skills: []` is now a real opt-out on `claude-agent-sdk`, and agents no
   longer inherit ambient skills from the machine.** The provider left the SDK's

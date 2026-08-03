@@ -157,6 +157,15 @@ the environment instead.
 Note the SDK treats the enabled-skill list as a context filter rather than a sandbox:
 undeclared skills are hidden from the model's listing and rejected by the `Skill`
 tool, but their files remain readable on disk through `Read`/`Bash`.
+
+Because the SDK exposes **no bare skill-directory option** — a skill is enabled by
+name through the plugin that ships it — a skill directory that is not inside a
+Claude Code plugin cannot be loaded here at all. `conductor validate` reports such
+a `skills:` entry before the run starts, naming the directory and both remedies:
+package it as a plugin (a `.claude-plugin/plugin.json` with the skill under
+`<plugin>/skills/`), or run that agent on `copilot`, which registers skill
+directories directly and accepts the identical skill untouched. See the
+[Skills section of the workflow syntax guide](../workflow-syntax.md#skills).
 - `temperature` and `max_tokens` are **rejected at the factory** — sampling behavior is controlled by the CLI.
 
 ### Example Claude Agent SDK Workflow

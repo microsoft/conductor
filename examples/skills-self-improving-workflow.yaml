@@ -16,13 +16,24 @@
 #     by its `<plugin>:<skill>` name.
 #   * Claude: SKILL.md + references/*.md are eagerly prepended to the
 #     agent's rendered prompt inside <skills><skill name="conductor">
-#     ... </skill></skills> tags.
+#     ... </skill></skills> tags. That is ~117KB (~29K tokens) for this
+#     skill, paid on every call — `runtime.skill_injection` bounds it.
 #
 # Tri-state opt-in via list presence:
 #   * Omit `skills:`     → inherit `runtime.skills`
 #   * `skills: []`       → explicit opt-out (e.g. the `formatter` agent
 #                          below, which doesn't need workflow knowledge)
 #   * `skills: [name]`   → explicit set, replaces the workflow default
+#
+# Entries may also be filesystem paths, not just built-in names — see
+# `docs/workflow-syntax.md` (Skills). A path starts with ./ ../ or ~/ or
+# contains a separator, resolves against THIS FILE's directory, and may
+# point at a single skill directory or a root of them:
+#
+#   runtime:
+#     skills:
+#       - conductor                     # built-in, ships in the wheel
+#       - ./team-skills/acme-widgets    # versioned next to the workflow
 #
 # Usage:
 #   conductor run examples/skills-self-improving-workflow.yaml \

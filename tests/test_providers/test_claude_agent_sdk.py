@@ -2435,14 +2435,18 @@ class TestSkillsWiring:
         (root / ".claude-plugin" / "plugin.json").write_text(f'{{"name": "{plugin_name}"}}')
         for skill in skills:
             (root / "skills" / skill).mkdir(parents=True)
-            (root / "skills" / skill / "SKILL.md").write_text(f"---\nname: {skill}\n---\n")
+            (root / "skills" / skill / "SKILL.md").write_text(
+                # ``description`` is required frontmatter; without it the
+                # manifest parser rejects the skill before plugin resolution.
+                f"---\nname: {skill}\ndescription: A test skill.\n---\n"
+            )
         return root
 
     @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
     async def test_skill_outside_a_plugin_is_refused(self, tmp_path: Path) -> None:
         orphan = tmp_path / "skills" / "lonely"
         orphan.mkdir(parents=True)
-        (orphan / "SKILL.md").write_text("---\nname: lonely\n---\n")
+        (orphan / "SKILL.md").write_text("---\nname: lonely\ndescription: A test skill.\n---\n")
 
         with pytest.raises(ProviderError, match="not part of a Claude Code plugin"):
             await self._capture_options(
@@ -2472,7 +2476,7 @@ class TestSkillsWiring:
         heuristic, which sniffs the message text."""
         orphan = tmp_path / "connection-hub" / "skills" / "lonely"
         orphan.mkdir(parents=True)
-        (orphan / "SKILL.md").write_text("---\nname: lonely\n---\n")
+        (orphan / "SKILL.md").write_text("---\nname: lonely\ndescription: A test skill.\n---\n")
 
         with pytest.raises(ProviderError) as exc:
             await self._capture_options(

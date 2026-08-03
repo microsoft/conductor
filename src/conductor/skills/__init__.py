@@ -34,8 +34,14 @@ user-defined skill directories, executable skill resources, and
 progressive disclosure via MCP.
 """
 
+from conductor.skills.frontmatter import (
+    SkillFrontmatter,
+    SkillManifestError,
+    read_skill_frontmatter,
+)
 from conductor.skills.loader import load_skill_content
 from conductor.skills.registry import (
+    ResolvedSkill,
     SkillNotFoundError,
     SkillPlugin,
     SkillPluginError,
@@ -43,15 +49,21 @@ from conductor.skills.registry import (
     list_builtin_skills,
     resolve_skill_directories,
     resolve_skill_plugin,
+    resolve_skills,
 )
 
 __all__ = [
+    "ResolvedSkill",
+    "SkillFrontmatter",
+    "SkillManifestError",
     "SkillNotFoundError",
     "SkillPlugin",
     "SkillPluginError",
     "get_skill_directory",
     "list_builtin_skills",
     "load_skill_content",
+    "read_skill_frontmatter",
     "resolve_skill_directories",
     "resolve_skill_plugin",
+    "resolve_skills",
 ]

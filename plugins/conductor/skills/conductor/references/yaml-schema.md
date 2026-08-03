@@ -37,11 +37,23 @@ workflow:
     max_session_seconds: float      # Wall-clock timeout per agent session in seconds (optional)
     default_reasoning_effort: string # Workflow-wide reasoning/thinking effort: low, medium, high, xhigh, max (optional)
     skills: [string]                # Skills enabled for every provider-backed agent (default: [])
-                                    # Currently registered built-ins: "conductor"
+                                    # Each entry is a built-in NAME or a filesystem PATH.
+                                    #   name:  "conductor" (the only registered built-in)
+                                    #   path:  starts with ./ ../ ~/ or contains a separator
+                                    #          -> a skill dir (holds SKILL.md), or a root of them
+                                    #             which expands to every immediate child holding one
+                                    # Relative paths resolve against the workflow FILE's directory.
+                                    # Every resolved SKILL.md must declare `name` and `description`
+                                    # in valid YAML frontmatter (use `description: |` if it contains
+                                    # a colon) -- both CLIs skip an unparseable skill silently.
                                     # Copilot loads natively via `skill_directories`;
-                                    # claude-agent-sdk loads natively via its plugin surface;
-                                    # Claude eagerly injects SKILL.md + references/*.md into the prompt.
-    mcp_servers:                    # MCP server configurations (ignored by claude-agent-sdk — uses CLI config)
+                                    # claude-agent-sdk loads natively via its plugin surface, so a
+                                    #   path skill OUTSIDE a Claude Code plugin is rejected there;
+                                    # Claude and hermes eagerly inject SKILL.md + references/*.md.
+    skill_injection:                # Bounds EAGERLY injected skill content (claude, hermes only).
+      warn_bytes: integer           # Warn above this many bytes (default: 65536; null disables)
+      max_bytes: integer            # Fail above this many bytes (default: 131072; null disables)
+    mcp_servers:                    # MCP server configurations
       <server_name>:
         type: string                # "stdio" (default), "http", or "sse"
         command: string             # Command to run (required for stdio)
@@ -164,7 +176,8 @@ agents:
     #   - omit:           inherit runtime.skills
     #   - skills: []      explicit opt-out (no skills for this agent)
     #   - skills: [a, b]  explicit set, replaces the workflow default
-    skills: [string]                # Skill names enabled for this agent (built-ins: "conductor")
+    skills: [string]                # Built-in names and/or paths (see runtime.skills above)
+                                    # e.g. [conductor, ./team-skills/acme-widgets]
 
     # Per-agent retry policy (optional, not allowed for script, human_gate, workflow, or wait agents)
     retry:

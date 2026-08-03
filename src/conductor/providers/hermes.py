@@ -99,6 +99,16 @@ class HermesProvider(AgentProvider):
         checkpoint_resume=True,
         usage_tracking=True,
         concurrent_safe=True,
+        # Hermes has no native skill surface, but skills are not an allowed
+        # experimental carve-out: ``AgentExecutor`` eagerly injects SKILL.md
+        # plus references/*.md into the rendered prompt for any provider whose
+        # ``supports_native_skills`` is False, entirely upstream of this class.
+        # That path is provider-agnostic and already works here, so declaring
+        # False would be inaccurate — and would make the ``skill_directories``
+        # docstring on ``execute()`` describe an unreachable branch, since
+        # config/validator.py rejects ``skills:`` on a skills=False provider.
+        # Injected size is bounded by ``runtime.skill_injection``.
+        skills=True,
         # Hermes runs its own internal toolsets (mcp_tools=False); a
         # per-agent working directory has no meaning for the session.
         working_dir=False,

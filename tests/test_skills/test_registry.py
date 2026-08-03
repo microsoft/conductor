@@ -87,7 +87,12 @@ def _make_plugin(
     skill_dir = root / "skills" / nest / skill if nest else root / "skills" / skill
     skill_dir.mkdir(parents=True)
     if frontmatter_name is not None:
-        (skill_dir / "SKILL.md").write_text(f"---\nname: {frontmatter_name}\n---\n")
+        # ``description`` is required frontmatter — without it the manifest
+        # parser rejects the skill before any plugin resolution happens, and
+        # these tests would stop covering what they name.
+        (skill_dir / "SKILL.md").write_text(
+            f"---\nname: {frontmatter_name}\ndescription: A test skill.\n---\n"
+        )
     return skill_dir
 
 
@@ -162,7 +167,7 @@ class TestResolveSkillPlugin:
         (root / ".claude-plugin" / "plugin.json").write_text('{"name": "unrelated"}')
         stray = root / "elsewhere" / "mySkill"
         stray.mkdir(parents=True)
-        (stray / "SKILL.md").write_text("---\nname: mySkill\n---\n")
+        (stray / "SKILL.md").write_text("---\nname: mySkill\ndescription: Stray.\n---\n")
         assert resolve_skill_plugin(stray) is None
 
     @pytest.mark.parametrize(
@@ -201,7 +206,7 @@ class TestResolveSkillPlugin:
     def test_frontmatter_without_name_raises(self, tmp_path: Path) -> None:
         skill = _make_plugin(tmp_path, frontmatter_name=None)
         (skill / "SKILL.md").write_text("---\ndescription: no name here\n---\n")
-        with pytest.raises(SkillPluginError, match="no 'name'"):
+        with pytest.raises(SkillPluginError, match="no usable 'name'"):
             resolve_skill_plugin(skill)
 
     def test_frontmatter_name_disagreeing_with_directory_raises(self, tmp_path: Path) -> None:

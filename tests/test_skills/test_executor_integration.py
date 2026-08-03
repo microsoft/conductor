@@ -11,6 +11,7 @@ Covers both provider variants of the parity contract:
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -152,6 +153,61 @@ class TestSkillDirectoriesReachTheProvider:
         executor = AgentExecutor(provider, workflow_skills=["conductor"])
         asyncio.run(executor.execute(AgentDef(name="a", model="m", prompt="p"), {}))
         assert provider.captured is None
+
+
+class TestPathSkillsReachTheProvider:
+    """Path entries ride the same executor -> provider seam as built-in names
+    (issue #350). ``workflow_dir`` is the only thing that makes a relative
+    entry resolvable, so a dropped constructor argument would silently turn
+    every team-local skill into a resolution error."""
+
+    def setup_method(self) -> None:
+        _cached_skill_payload.cache_clear()
+
+    @staticmethod
+    def _make_skill(directory: Path) -> Path:
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "SKILL.md").write_text(
+            f"---\nname: {directory.name}\ndescription: A test skill.\n---\nBody text\n"
+        )
+        return directory
+
+    def test_absolute_path_reaches_provider(self, tmp_path: Path) -> None:
+        skill = self._make_skill(tmp_path / "acme")
+        provider = _CapturingNativeProvider()
+        executor = AgentExecutor(provider, workflow_skills=[str(skill)])
+        asyncio.run(executor.execute(AgentDef(name="a", model="m", prompt="p"), {}))
+        assert provider.captured == [str(skill)]
+
+    def test_relative_path_resolves_against_workflow_dir(self, tmp_path: Path) -> None:
+        skill = self._make_skill(tmp_path / "team-skills" / "acme")
+        provider = _CapturingNativeProvider()
+        executor = AgentExecutor(
+            provider, workflow_skills=["./team-skills/acme"], workflow_dir=tmp_path
+        )
+        asyncio.run(executor.execute(AgentDef(name="a", model="m", prompt="p"), {}))
+        assert provider.captured == [str(skill)]
+
+    def test_skills_root_expands_before_reaching_provider(self, tmp_path: Path) -> None:
+        """Conductor expands a root itself so every provider — including the
+        eager-injection ones, which need a name per skill — sees the same set."""
+        root = tmp_path / "skills"
+        for name in ("beta", "alpha"):
+            self._make_skill(root / name)
+        provider = _CapturingNativeProvider()
+        executor = AgentExecutor(provider, workflow_skills=[str(root)])
+        asyncio.run(executor.execute(AgentDef(name="a", model="m", prompt="p"), {}))
+        assert provider.captured == [str(root / "alpha"), str(root / "beta")]
+
+    def test_path_skill_content_is_eagerly_injected(self, tmp_path: Path) -> None:
+        skill = self._make_skill(tmp_path / "acme")
+        provider = _StubNonNativeProvider()
+        executor = AgentExecutor(provider, workflow_skills=["./acme"], workflow_dir=tmp_path)
+        output = asyncio.run(executor.execute(AgentDef(name="a", model="m", prompt="p"), {}))
+        prompt = output.content["echo"]
+        assert '<skill name="acme">' in prompt
+        assert "Body text" in prompt
+        assert skill.name in prompt
 
 
 class TestClaudeAgentSdkNativeSkills:

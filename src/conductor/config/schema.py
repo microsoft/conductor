@@ -650,6 +650,43 @@ class SandboxConfig(BaseModel):
     """
 
 
+def _validate_skill_entries(entries: list[str]) -> list[str]:
+    """Validate the shape of ``skills:`` entries at config-load time.
+
+    Bare **names** are checked eagerly against the built-in registry —
+    they need no base directory, so an unknown name still surfaces at
+    load time exactly as it did before path entries existed.
+
+    **Path** entries are only shape-checked here. Resolving them needs
+    the workflow file's directory, which the schema does not have, so
+    that happens in :func:`conductor.config.validator.validate_workflow_config`
+    (statically) and in ``AgentExecutor`` (at run time).
+
+    Args:
+        entries: The raw ``skills:`` list.
+
+    Returns:
+        The list unchanged.
+
+    Raises:
+        ValueError: If an entry is not a non-empty string, or is a bare
+            name that no built-in skill matches.
+    """
+    from conductor.skills import SkillNotFoundError, get_skill_directory
+    from conductor.skills.registry import _is_path_entry
+
+    for entry in entries:
+        if not isinstance(entry, str) or not entry.strip():
+            raise ValueError(f"skills entries must be non-empty strings, got {entry!r}")
+        if _is_path_entry(entry):
+            continue
+        try:
+            get_skill_directory(entry)
+        except SkillNotFoundError as exc:
+            raise ValueError(str(exc)) from exc
+    return entries
+
+
 class AgentDef(BaseModel):
     """Definition for a single agent in the workflow.
 
@@ -1083,9 +1120,29 @@ class AgentDef(BaseModel):
     """
 
     skills: list[str] | None = None
-    """Opt this agent into a list of named built-in skills.
+    """Opt this agent into a list of skills.
 
-    Each entry is a skill name registered in :mod:`conductor.skills`.
+    Each entry is either a **registered built-in name** (e.g.
+    ``conductor``) or a **filesystem path**. An entry is treated as a
+    path when it starts with ``./``, ``../``, or ``~/``, or contains a
+    path separator; everything else must be a built-in name, so a bare
+    name can never be shadowed by a same-named local directory.
+
+    A path may point at either granularity:
+
+    * a **skill directory** — one containing ``SKILL.md``
+    * a **skills root** — a directory of skill directories, which
+      expands to every immediate child containing a ``SKILL.md``
+
+    Relative paths resolve against the workflow file's directory
+    (consistent with ``working_dir``), so a skill can be versioned
+    alongside the workflow with no per-developer install step.
+
+    Skill paths are trusted input: a ``SKILL.md`` is injected into the
+    agent's context, but the same workflow file can already declare
+    ``type: script`` steps running arbitrary shell, so no additional
+    allowlist applies.
+
     The agent receives that skill's content via whichever mechanism the
     provider supports natively:
 
@@ -1097,12 +1154,13 @@ class AgentDef(BaseModel):
       ``<plugin>:<skill>`` name, so the CLI loads only the ``SKILL.md``
       frontmatter up front. Skills the workflow did not declare are
       filtered out of the model's listing instead of being inherited
-      from the machine.
+      from the machine. The SDK has no bare skill-directory surface, so
+      a path skill that is not inside a Claude Code plugin is rejected.
     * **Claude** — ``SKILL.md`` plus ``references/*.md`` is eagerly
       injected into the agent's rendered prompt, wrapped in
       ``<skill name="...">`` tags. There is no native skill surface on
       the Anthropic API without adopting the container/code-execution
-      beta.
+      beta. Injected size is bounded by ``runtime.skill_injection``.
 
     Tri-state semantics via list presence:
 
@@ -1118,13 +1176,20 @@ class AgentDef(BaseModel):
       Enables agents to evaluate, improve, debug, or generate Conductor
       workflows.
 
+    Every resolved skill's ``SKILL.md`` must have valid YAML frontmatter
+    declaring ``name`` and ``description``; both Copilot and Claude Code
+    skip an unparseable skill in silence, so Conductor fails loudly
+    instead.
+
     Only applies to provider-backed agents (type='agent' or None).
 
     Example YAML::
 
         agents:
           - name: workflow_reviewer
-            skills: [conductor]
+            skills:
+              - conductor                     # built-in
+              - ./team-skills/acme-widgets    # versioned with the workflow
             prompt: "Review this workflow for correctness..."
     """
 
@@ -1197,24 +1262,16 @@ class AgentDef(BaseModel):
     @field_validator("skills")
     @classmethod
     def validate_skills(cls, v: list[str] | None) -> list[str] | None:
-        """Ensure every skill name resolves to a known built-in.
+        """Validate ``skills:`` entry shape and built-in names.
 
-        Validates at load time so unknown skill names surface in
-        ``conductor validate`` and ``conductor run`` startup rather than
-        at execute time. Empty lists are allowed (explicit opt-out).
+        Unknown built-in names surface at load time as before. Path
+        entries need the workflow file's directory to resolve, so they
+        are only shape-checked here — see :func:`_validate_skill_entries`.
+        Empty lists are allowed (explicit opt-out).
         """
         if v is None:
             return v
-        from conductor.skills import SkillNotFoundError, get_skill_directory
-
-        for name in v:
-            if not isinstance(name, str) or not name.strip():
-                raise ValueError(f"skills entries must be non-empty strings, got {name!r}")
-            try:
-                get_skill_directory(name)
-            except SkillNotFoundError as exc:
-                raise ValueError(str(exc)) from exc
-        return v
+        return _validate_skill_entries(v)
 
     @field_validator("duration", mode="before")
     @classmethod
@@ -2362,6 +2419,72 @@ class ToolOutputConfig(BaseModel):
         return v.strip() or None
 
 
+# Rough bytes-per-token ratio used only to annotate size messages. English
+# prose sits near 4; the exact figure is model- and tokenizer-specific, so
+# every message derived from it says "approximately".
+_BYTES_PER_TOKEN_ESTIMATE = 4
+
+
+class SkillInjectionConfig(BaseModel):
+    """Size limits for eagerly injected skill content.
+
+    Providers without a native skill surface (``claude``, ``hermes``)
+    have no progressive disclosure: :class:`~conductor.executor.agent.AgentExecutor`
+    prepends every enabled skill's ``SKILL.md`` **plus its entire
+    ``references/`` tree** to the rendered prompt, on every agent call,
+    every retry, and every ``validator:`` call. The bundled ``conductor``
+    skill alone is ~117KB (~29K tokens), so an unbounded list is easy to
+    turn into most of a context window by accident.
+
+    Both limits are measured against the exact string that gets
+    prepended. Setting either to ``null`` disables that limit.
+
+    Example YAML::
+
+        runtime:
+            skill_injection:
+                warn_bytes: 65536     # warn above 64KB
+                max_bytes: 131072     # fail above 128KB
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    warn_bytes: int | None = Field(default=64 * 1024, ge=0)
+    """Log a warning when injected skill content exceeds this many bytes.
+
+    ``None`` disables the warning. The 64KB default is below the bundled
+    ``conductor`` skill's ~117KB so that combination is surfaced rather
+    than passing silently.
+    """
+
+    max_bytes: int | None = Field(default=128 * 1024, ge=0)
+    """Fail the agent when injected skill content exceeds this many bytes.
+
+    ``None`` disables the limit. The 128KB default is above the bundled
+    ``conductor`` skill's ~117KB, so enabling it does not break an
+    existing single-skill workflow — it catches accumulation.
+    """
+
+    @model_validator(mode="after")
+    def validate_thresholds(self) -> SkillInjectionConfig:
+        """Reject a warning threshold above the hard limit.
+
+        Such a config can never warn: the error fires first, so the
+        warning is unreachable and the author's intent is ambiguous.
+        """
+        if (
+            self.warn_bytes is not None
+            and self.max_bytes is not None
+            and self.warn_bytes > self.max_bytes
+        ):
+            raise ValueError(
+                f"skill_injection.warn_bytes ({self.warn_bytes}) must not exceed "
+                f"max_bytes ({self.max_bytes}); the error would fire before the "
+                "warning could ever be emitted."
+            )
+        return self
+
+
 class RuntimeConfig(BaseModel):
     """Provider and runtime configuration."""
 
@@ -2509,10 +2632,11 @@ class RuntimeConfig(BaseModel):
     skills: list[str] = Field(default_factory=list)
     """Workflow-wide default skills for every provider-backed agent.
 
-    Each entry is a skill name registered in :mod:`conductor.skills` (e.g.
-    ``conductor``). Every provider-backed agent inherits this list as its
-    default; individual agents override by setting their own ``skills:``
-    field (use ``skills: []`` for explicit opt-out).
+    Each entry is either a registered built-in name (e.g. ``conductor``)
+    or a filesystem path — see :attr:`AgentDef.skills` for the full
+    resolution rules. Every provider-backed agent inherits this list as
+    its default; individual agents override by setting their own
+    ``skills:`` field (use ``skills: []`` for explicit opt-out).
 
     Skill content reaches the model differently per provider:
 
@@ -2521,32 +2645,35 @@ class RuntimeConfig(BaseModel):
       ``--plugin-dir`` and the skill enabled by its ``<plugin>:<skill>``
       name, so the CLI loads it on demand
     * **Claude** — eagerly injected into the rendered prompt inside
-      ``<skills><skill name="...">...</skill></skills>`` tags
+      ``<skills><skill name="...">...</skill></skills>`` tags, bounded by
+      :attr:`skill_injection`
 
-    Defaults to an empty list (no skills). Phase 1 ships one built-in
-    skill (``conductor``); user-defined skill directories will be added
-    in a follow-up.
+    Defaults to an empty list (no skills). Conductor ships one built-in
+    skill (``conductor``); anything else is referenced by path.
 
     Example YAML::
 
         runtime:
-            skills: [conductor]
+            skills:
+              - conductor
+              - ./team-skills/acme-widgets
+    """
+
+    skill_injection: SkillInjectionConfig = Field(default_factory=lambda: SkillInjectionConfig())
+    """Size limits for *eagerly injected* skill content.
+
+    Only affects providers without a native skill surface (``claude``,
+    ``hermes``), where the full skill body is prepended to every agent
+    call. Providers with progressive disclosure (``copilot``,
+    ``claude-agent-sdk``) send only frontmatter up front and are
+    unaffected.
     """
 
     @field_validator("skills")
     @classmethod
     def validate_skills(cls, v: list[str]) -> list[str]:
-        """Ensure every workflow-default skill name resolves to a known built-in."""
-        from conductor.skills import SkillNotFoundError, get_skill_directory
-
-        for name in v:
-            if not isinstance(name, str) or not name.strip():
-                raise ValueError(f"skills entries must be non-empty strings, got {name!r}")
-            try:
-                get_skill_directory(name)
-            except SkillNotFoundError as exc:
-                raise ValueError(str(exc)) from exc
-        return v
+        """Validate workflow-default ``skills:`` entry shape and built-in names."""
+        return _validate_skill_entries(v)
 
 
 class WorkflowDef(BaseModel):

@@ -8,15 +8,23 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 from typing import TYPE_CHECKING, Any, get_args
 
-from conductor.exceptions import ValidationError
+from conductor.exceptions import ExecutionError, ValidationError
 from conductor.executor.output import parse_json_output, validate_output
 from conductor.executor.template import TemplateRenderer
 from conductor.providers.base import AgentOutput, EventCallback
 from conductor.providers.context_tier import ContextTier
 from conductor.providers.reasoning import ReasoningEffort
 from conductor.templating import is_jinja_template
+
+logger = logging.getLogger(__name__)
+
+# Rough bytes-per-token ratio used only to annotate skill-size messages.
+# The exact figure is model- and tokenizer-specific, so every message
+# derived from it is phrased as an approximation.
+_BYTES_PER_TOKEN_ESTIMATE = 4
 
 
 def _verbose_log(message: str, style: str = "dim") -> None:
@@ -34,8 +42,11 @@ def _verbose_log_section(title: str, content: str) -> None:
 
 
 if TYPE_CHECKING:
-    from conductor.config.schema import AgentDef
+    from pathlib import Path
+
+    from conductor.config.schema import AgentDef, SkillInjectionConfig
     from conductor.providers.base import AgentProvider
+    from conductor.skills import ResolvedSkill
 
 
 def resolve_agent_tools(
@@ -102,6 +113,8 @@ class AgentExecutor:
         workflow_tools: list[str] | None = None,
         instructions_preamble: str | None = None,
         workflow_skills: list[str] | None = None,
+        workflow_dir: Path | None = None,
+        skill_injection: SkillInjectionConfig | None = None,
     ) -> None:
         """Initialize the AgentExecutor.
 
@@ -114,11 +127,23 @@ class AgentExecutor:
                 ``runtime.skills``). Agents inherit this list unless they
                 set their own ``skills:`` field — ``[]`` opts out
                 explicitly, ``[name, ...]`` overrides the default.
+            workflow_dir: Directory of the workflow file, used as the base
+                for relative skill paths (consistent with ``working_dir``).
+                Falls back to the process working directory.
+            skill_injection: Size limits for eager skill-content injection
+                (from ``runtime.skill_injection``). Defaults apply when
+                omitted.
         """
         self.provider = provider
         self.workflow_tools = workflow_tools or []
         self.instructions_preamble = instructions_preamble
         self._workflow_skills: list[str] = list(workflow_skills or [])
+        self._workflow_dir = workflow_dir
+        if skill_injection is None:
+            from conductor.config.schema import SkillInjectionConfig
+
+            skill_injection = SkillInjectionConfig()
+        self._skill_injection = skill_injection
         self.renderer = TemplateRenderer()
 
     def _render_enum_field(
@@ -298,12 +323,11 @@ class AgentExecutor:
         # rendered_prompt above and ignore this).
         skill_dirs: list[str] | None = None
         if getattr(self.provider, "supports_native_skills", False):
-            skill_names = self._resolve_skills_for_agent(agent)
-            if skill_names:
-                from conductor.skills import resolve_skill_directories
-
-                skill_dirs = [str(p) for p in resolve_skill_directories(skill_names)]
-                _verbose_log(f"  Skills: {skill_names}")
+            skill_entries = self._resolve_skills_for_agent(agent)
+            if skill_entries:
+                resolved = self._resolve_skills(skill_entries)
+                skill_dirs = [str(item.directory) for item in resolved]
+                _verbose_log(f"  Skills: {[item.name for item in resolved]}")
 
         # Execute via provider
         output = await self.provider.execute(
@@ -383,6 +407,81 @@ class AgentExecutor:
             return list(agent.skills)
         return list(self._workflow_skills)
 
+    def _resolve_skills(self, entries: list[str]) -> list[ResolvedSkill]:
+        """Resolve ``skills:`` entries against the workflow file's directory.
+
+        Both delivery paths — native ``skill_directories`` and eager
+        preamble injection — go through here so names, paths, and
+        ``skills/`` roots behave identically regardless of provider.
+        """
+        from conductor.skills import resolve_skills
+
+        return resolve_skills(entries, base_dir=self._workflow_dir)
+
+    def _enforce_injection_budget(
+        self, agent: AgentDef, resolved: list[ResolvedSkill], content: str
+    ) -> None:
+        """Apply ``runtime.skill_injection`` limits to eager skill content.
+
+        Measured against the exact string being prepended, so the number
+        reported is the number actually paid — on every call to this
+        agent, every retry, and every ``validator:`` call.
+
+        Args:
+            agent: The agent the content is being injected for.
+            resolved: The skills that produced the content, used to give
+                a per-skill breakdown when a limit is hit.
+            content: The rendered skill preamble.
+
+        Raises:
+            ExecutionError: If the content exceeds ``max_bytes``.
+        """
+        limits = self._skill_injection
+        size = len(content.encode("utf-8"))
+        if limits.max_bytes is not None and size > limits.max_bytes:
+            raise ExecutionError(
+                f"Agent '{agent.name}': eagerly injected skill content is "
+                f"{size:,} bytes (~{size // _BYTES_PER_TOKEN_ESTIMATE:,} tokens), "
+                f"over the runtime.skill_injection.max_bytes limit of "
+                f"{limits.max_bytes:,}. Provider "
+                f"'{type(self.provider).__name__}' has no native skill surface, so "
+                f"this is prepended to every call, retry, and validator call.\n"
+                f"{self._skill_size_breakdown(resolved)}",
+                agent_name=agent.name,
+                suggestion=(
+                    "Enable fewer skills on this agent, trim the skills' "
+                    "references/ trees, run it on a provider with progressive "
+                    "disclosure (copilot, claude-agent-sdk), or raise "
+                    "runtime.skill_injection.max_bytes."
+                ),
+            )
+        if limits.warn_bytes is not None and size > limits.warn_bytes:
+            logger.warning(
+                "Agent %r: eagerly injecting %s bytes (~%s tokens) of skill content "
+                "on every call — provider %r has no progressive disclosure. %s",
+                agent.name,
+                f"{size:,}",
+                f"{size // _BYTES_PER_TOKEN_ESTIMATE:,}",
+                type(self.provider).__name__,
+                self._skill_size_breakdown(resolved),
+            )
+
+    @staticmethod
+    def _skill_size_breakdown(resolved: list[ResolvedSkill]) -> str:
+        """Summarise each skill's on-disk injected size, largest first."""
+        sizes: list[tuple[str, int]] = []
+        for item in resolved:
+            total = 0
+            for path in (
+                item.directory / "SKILL.md",
+                *sorted((item.directory / "references").glob("*.md")),
+            ):
+                with contextlib.suppress(OSError):
+                    total += path.stat().st_size
+            sizes.append((item.name, total))
+        sizes.sort(key=lambda pair: pair[1], reverse=True)
+        return "Per skill: " + ", ".join(f"{name} {size:,}B" for name, size in sizes)
+
     def _build_prompt_prefix(self, agent: AgentDef) -> str:
         """Build the prefix to prepend before an agent's rendered prompt.
 
@@ -401,12 +500,13 @@ class AgentExecutor:
         if self.instructions_preamble:
             parts.append(self.instructions_preamble)
         if not getattr(self.provider, "supports_native_skills", False):
-            skill_names = self._resolve_skills_for_agent(agent)
-            if skill_names:
-                from conductor.skills import load_skill_content, resolve_skill_directories
+            skill_entries = self._resolve_skills_for_agent(agent)
+            if skill_entries:
+                from conductor.skills import load_skill_content
 
-                dirs = resolve_skill_directories(skill_names)
-                content = load_skill_content(list(zip(skill_names, dirs, strict=True)))
+                resolved = self._resolve_skills(skill_entries)
+                content = load_skill_content([(item.name, item.directory) for item in resolved])
                 if content:
+                    self._enforce_injection_budget(agent, resolved, content)
                     parts.append(content)
         return "".join(parts)
