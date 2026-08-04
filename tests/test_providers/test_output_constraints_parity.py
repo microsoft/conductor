@@ -3,7 +3,8 @@
 These tests assert that a single shared output schema containing every
 constraint keyword (enum, pattern, range, length, optional, nullable) is
 translated consistently across all provider surfaces. They do not repeat the
-per-constraint unit tests from Todos 2-4; they verify parity.
+individual constraint checks of the validator and schema builders; they verify
+parity.
 """
 
 from __future__ import annotations
