@@ -728,3 +728,119 @@ describe('workflow-store — eager static sub-workflow preview (dashboard expand
     expect(child.children[0]!.workflowName).toBe('grandchild-workflow');
   });
 });
+
+describe('workflow-store — navigating to a specific historical subworkflow iteration (#365)', () => {
+  function startRootWithLoopBackSubworkflow() {
+    const { processEvent } = useWorkflowStore.getState();
+    processEvent(event('workflow_started', {
+      name: 'root',
+      agents: [
+        {
+          name: 'sub_wf',
+          type: 'workflow',
+          subworkflow: {
+            name: 'child-workflow',
+            entry_point: 'step_one',
+            agents: [{ name: 'step_one' }],
+            routes: [],
+            parallel_groups: [],
+            for_each_groups: [],
+          },
+        },
+      ],
+      routes: [{ from: 'sub_wf', to: 'sub_wf' }],
+      parallel_groups: [],
+      for_each_groups: [],
+      entry_point: 'sub_wf',
+    }));
+    return processEvent;
+  }
+
+  it('resolves distinct iteration data when navigating by index instead of by slotKey', () => {
+    const processEvent = startRootWithLoopBackSubworkflow();
+
+    // Iteration 1: one agent (`step_one`), then completes.
+    processEvent(event('subworkflow_started', { agent_name: 'sub_wf', workflow: 'child.yaml', iteration: 1, parent_path: [] }));
+    processEvent(event('workflow_started', {
+      name: 'child-workflow',
+      agents: [{ name: 'step_one' }],
+      routes: [],
+      parallel_groups: [],
+      for_each_groups: [],
+      entry_point: 'step_one',
+    }));
+    processEvent(event('workflow_completed', { output: {}, subworkflow_path: ['sub_wf'] }));
+    processEvent(event('subworkflow_completed', { agent_name: 'sub_wf', elapsed: 1.0, parent_path: [] }));
+
+    // Iteration 2 (loop-back re-invocation): a *different* inner agent
+    // (`step_two`), so the two iterations are distinguishable by content.
+    processEvent(event('subworkflow_started', { agent_name: 'sub_wf', workflow: 'child.yaml', iteration: 2, parent_path: [] }));
+    processEvent(event('workflow_started', {
+      name: 'child-workflow',
+      agents: [{ name: 'step_two' }],
+      routes: [],
+      parallel_groups: [],
+      for_each_groups: [],
+      entry_point: 'step_two',
+    }));
+
+    const { subworkflowContexts, navigateToContext, getViewedContext } = useWorkflowStore.getState();
+    expect(subworkflowContexts).toHaveLength(2);
+    expect(subworkflowContexts[0]!.status).toBe('completed');
+    expect(subworkflowContexts[1]!.status).toBe('running');
+    // Both siblings share the same slotKey — this is exactly the ambiguity
+    // that `navigateIntoSubworkflow(slotKey)` cannot resolve.
+    expect(subworkflowContexts[0]!.slotKey).toBe('sub_wf');
+    expect(subworkflowContexts[1]!.slotKey).toBe('sub_wf');
+
+    // Navigating by explicit index reaches iteration 1 (the older, completed
+    // run), not whichever sibling is newest.
+    navigateToContext([0]);
+    const iter1View = useWorkflowStore.getState().getViewedContext();
+    expect(iter1View.agents.map((a) => a.name)).toEqual(['step_one']);
+    expect(iter1View.subworkflowContexts).toBe(subworkflowContexts[0]!.children);
+
+    // Navigating to index 1 reaches iteration 2's distinct content.
+    navigateToContext([1]);
+    const iter2View = useWorkflowStore.getState().getViewedContext();
+    expect(iter2View.agents.map((a) => a.name)).toEqual(['step_two']);
+
+    // Re-confirm index 0 is still reachable and unaffected by having viewed
+    // index 1 in between (no accidental "always latest" collapsing).
+    navigateToContext([0]);
+    expect(getViewedContext().agents.map((a) => a.name)).toEqual(['step_one']);
+  });
+
+  it('labels breadcrumbs with the iteration number only once a slotKey repeats across siblings', () => {
+    const processEvent = startRootWithLoopBackSubworkflow();
+
+    processEvent(event('subworkflow_started', { agent_name: 'sub_wf', workflow: 'child.yaml', iteration: 1, parent_path: [] }));
+
+    // A single invocation so far — no disambiguation needed yet.
+    useWorkflowStore.getState().navigateToContext([0]);
+    const singleRunCrumbs = useWorkflowStore.getState().getBreadcrumbs();
+    expect(singleRunCrumbs[singleRunCrumbs.length - 1]!.label).toBe('sub_wf');
+
+    processEvent(event('workflow_started', {
+      name: 'child-workflow',
+      agents: [{ name: 'step_one' }],
+      routes: [],
+      parallel_groups: [],
+      for_each_groups: [],
+      entry_point: 'step_one',
+    }));
+    processEvent(event('workflow_completed', { output: {}, subworkflow_path: ['sub_wf'] }));
+    processEvent(event('subworkflow_completed', { agent_name: 'sub_wf', elapsed: 1.0, parent_path: [] }));
+    processEvent(event('subworkflow_started', { agent_name: 'sub_wf', workflow: 'child.yaml', iteration: 2, parent_path: [] }));
+
+    // Two siblings now share the slotKey `sub_wf` — breadcrumbs for each
+    // must disambiguate by iteration number.
+    useWorkflowStore.getState().navigateToContext([0]);
+    const iter1Crumbs = useWorkflowStore.getState().getBreadcrumbs();
+    expect(iter1Crumbs[iter1Crumbs.length - 1]!.label).toBe('sub_wf (iteration 1)');
+
+    useWorkflowStore.getState().navigateToContext([1]);
+    const iter2Crumbs = useWorkflowStore.getState().getBreadcrumbs();
+    expect(iter2Crumbs[iter2Crumbs.length - 1]!.label).toBe('sub_wf (iteration 2)');
+  });
+});

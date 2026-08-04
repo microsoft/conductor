@@ -14,9 +14,17 @@ interface SubworkflowDetailProps {
 export function SubworkflowDetail({ node }: SubworkflowDetailProps) {
   const status = node.status as NodeStatus;
   const statusColor = NODE_STATUS_HEX[status] || NODE_STATUS_HEX.pending;
-  const navigateIntoSubworkflow = useWorkflowStore((s) => s.navigateIntoSubworkflow);
+  const navigateToContext = useWorkflowStore((s) => s.navigateToContext);
+  const viewContextPath = useWorkflowStore((s) => s.viewContextPath);
   const allSubContexts = useViewedSubworkflowContexts();
-  const subContexts = allSubContexts.filter((c) => c.parentAgent === node.name);
+  // Keep each context's index in the *full* sibling array (not the
+  // post-filter position) — that index is what `navigateToContext` needs to
+  // target this specific historical invocation rather than re-resolving by
+  // slotKey (which collapses every same-named re-invocation onto the
+  // newest one, see issue #365).
+  const subContexts = allSubContexts
+    .map((c, index) => ({ ctx: c, index }))
+    .filter(({ ctx }) => ctx.parentAgent === node.name);
 
   const items: Array<{ label: string; value: string | number | null | undefined }> = [];
   if (node.elapsed != null) items.push({ label: 'Elapsed', value: formatElapsed(node.elapsed) });
@@ -45,11 +53,12 @@ export function SubworkflowDetail({ node }: SubworkflowDetailProps) {
             Subworkflow Runs ({subContexts.length})
           </div>
           <div className="space-y-1">
-            {subContexts.map((ctx, idx) => (
+            {subContexts.map(({ ctx, index }) => (
               <SubworkflowRunRow
-                key={`${ctx.slotKey}-${ctx.iteration}-${idx}`}
+                key={`${ctx.slotKey}-${ctx.iteration}-${index}`}
                 ctx={ctx}
-                onClick={() => navigateIntoSubworkflow(ctx.slotKey)}
+                showIteration={subContexts.length > 1}
+                onClick={() => navigateToContext([...viewContextPath, index])}
               />
             ))}
           </div>
@@ -73,7 +82,16 @@ export function SubworkflowDetail({ node }: SubworkflowDetailProps) {
   );
 }
 
-function SubworkflowRunRow({ ctx, onClick }: { ctx: SubworkflowContext; onClick: () => void }) {
+function SubworkflowRunRow({
+  ctx,
+  showIteration,
+  onClick,
+}: {
+  ctx: SubworkflowContext;
+  /** Show the iteration number — only meaningful once a slotKey repeats across runs. */
+  showIteration: boolean;
+  onClick: () => void;
+}) {
   const statusColor = NODE_STATUS_HEX[ctx.status] || NODE_STATUS_HEX.pending;
 
   return (
@@ -85,6 +103,11 @@ function SubworkflowRunRow({ ctx, onClick }: { ctx: SubworkflowContext; onClick:
       <div className="flex flex-col min-w-0 flex-1">
         <span className="text-xs font-medium text-[var(--text)] truncate">
           {ctx.workflowName || ctx.workflowFile || 'Subworkflow'}
+          {showIteration && (
+            <span className="ml-1.5 text-[var(--text-muted)] font-normal">
+              · Iteration {ctx.iteration}
+            </span>
+          )}
         </span>
         <div className="flex items-center gap-2 text-[10px] text-[var(--text-muted)]">
           {ctx.agentsTotal > 0 && (
