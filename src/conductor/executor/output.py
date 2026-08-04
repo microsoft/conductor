@@ -135,6 +135,8 @@ def _validate_field(field_name: str, value: Any, field_def: OutputField) -> None
 
     if field_def.type == "array" and field_def.items and isinstance(value, list):
         for i, item in enumerate(value):
+            if item is None and field_def.items.nullable:
+                continue
             if not check_type(item, field_def.items.type):
                 raise ValidationError(
                     f"Array item {i} in '{field_name}' has wrong type: "

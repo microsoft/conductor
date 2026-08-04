@@ -17,6 +17,7 @@ from conductor.config.schema import OutputField
 from conductor.exceptions import ValidationError as ConductorValidationError
 from conductor.providers._pydantic_ai.converters import (
     _map_output_field_type,
+    _sanitize_json_schema,
     output_schema_to_pydantic_model,
 )
 
@@ -415,11 +416,13 @@ class TestDescriptionPreservation:
         schema = model.model_json_schema()
         findings = schema["properties"]["findings"]
         assert findings["description"] == "Top-level findings list."
-        item_ref = findings["items"]["$ref"]
-        item_key = item_ref.split("/")[-1]
-        item_schema = schema["$defs"][item_key]
+        _sanitize_json_schema(schema)
+        item_schema = findings["items"]
+        assert "description" in item_schema
         assert item_schema["description"] == "A single finding."
         assert item_schema["properties"]["title"]["description"] == "Finding title."
+        assert "$ref" not in schema
+        assert "$defs" not in schema
 
 
 class TestValidationParity:

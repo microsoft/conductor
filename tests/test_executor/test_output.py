@@ -623,6 +623,112 @@ class TestValidateOutputConstraints:
             )
 
 
+class TestValidateOutputNullableArrayItems:
+    """Regression tests for nullable array items (F1 round 2)."""
+
+    def test_nullable_array_item_null_passes(self) -> None:
+        """A nullable string array item must accept None."""
+        schema = {
+            "values": OutputField(
+                type="array",
+                items=OutputField(type="string", nullable=True),
+            )
+        }
+        validate_output({"values": [None]}, schema)
+
+    def test_nullable_array_item_mixed_passes(self) -> None:
+        """A nullable array must accept both null and non-null values."""
+        schema = {
+            "values": OutputField(
+                type="array",
+                items=OutputField(type="string", nullable=True),
+            )
+        }
+        validate_output({"values": [None, "a", None, "b"]}, schema)
+
+    def test_nullable_array_item_false_rejects_null(self) -> None:
+        """A non-nullable array item must still reject None with the index-aware message."""
+        schema = {
+            "values": OutputField(
+                type="array",
+                items=OutputField(type="string", nullable=False),
+            )
+        }
+        with pytest.raises(
+            ValidationError,
+            match="Array item 0 in 'values' has wrong type: expected string, got NoneType",
+        ):
+            validate_output({"values": [None]}, schema)
+
+    def test_nullable_array_item_object_passes(self) -> None:
+        """A nullable object array item must accept None."""
+        schema = {
+            "items": OutputField(
+                type="array",
+                items=OutputField(
+                    type="object",
+                    nullable=True,
+                    properties={"name": OutputField(type="string")},
+                ),
+            )
+        }
+        validate_output({"items": [None, {"name": "x"}, None]}, schema)
+
+    def test_nullable_array_item_nested_object(self) -> None:
+        """Nullable array items inside a nested object must accept None."""
+        schema = {
+            "data": OutputField(
+                type="object",
+                properties={
+                    "tags": OutputField(
+                        type="array",
+                        items=OutputField(type="string", nullable=True),
+                    )
+                },
+            )
+        }
+        validate_output({"data": {"tags": [None, "ok", None]}}, schema)
+
+    def test_nullable_array_item_constraints_still_enforced(self) -> None:
+        """Non-null nullable array items must still validate constraints."""
+        schema = {
+            "codes": OutputField(
+                type="array",
+                items=OutputField(type="string", nullable=True, pattern=r"^[ab]$"),
+            )
+        }
+        with pytest.raises(ValidationError, match="does not match pattern"):
+            validate_output({"codes": [None, "c", None]}, schema)
+
+    def test_nullable_array_item_required_property_inside_object(self) -> None:
+        """A non-null object array item must still enforce required properties."""
+        schema = {
+            "items": OutputField(
+                type="array",
+                items=OutputField(
+                    type="object",
+                    nullable=True,
+                    properties={"name": OutputField(type="string")},
+                ),
+            )
+        }
+        with pytest.raises(ValidationError, match="Missing required output field: name"):
+            validate_output({"items": [{"name": "ok"}, {}]}, schema)
+
+    def test_nullable_array_item_deeply_nested_array(self) -> None:
+        """Nullable array items at depth must accept None."""
+        schema = {
+            "matrix": OutputField(
+                type="array",
+                items=OutputField(
+                    type="array",
+                    items=OutputField(type="number", nullable=True),
+                ),
+            )
+        }
+        validate_output({"matrix": [[1, None, 3], [None, 2]]}, schema)
+
+
 class TestValidationErrorValueDescription:
     """The error names the offending value, without echoing secrets.
 

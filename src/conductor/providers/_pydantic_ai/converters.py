@@ -7,6 +7,7 @@ This module provides helpers for recursively translating workflow
 
 from __future__ import annotations
 
+import copy
 import re
 from typing import Annotated, Any
 
@@ -36,32 +37,108 @@ IntegerType = Annotated[int, BeforeValidator(_reject_bool)]
 
 
 class _NoDefaultBaseModel(BaseModel):
-    """Dynamic model base that strips ``default`` keys from JSON schemas.
+    """Dynamic model base that sanitizes generated JSON schemas.
 
-    Pydantic v2 emits ``"default": null`` for ``Field(default=None)``.
-    Pydantic AI's tool schema must not include the JSON Schema ``default``
-    keyword (it is not allowed on tool parameters), so this base removes it
-    recursively from the generated schema, including nested ``$defs``.
+    Pydantic v2 emits ``"default": null`` for ``Field(default=None)`` and uses
+    ``anyOf`` for nullable unions and ``$ref``/``$defs`` for nested models.
+    Pydantic AI's tool schema must not include the JSON Schema ``default``,
+    ``anyOf``, ``$ref``, or ``$defs`` keywords, so this base removes them and
+    flattens nullable unions into ``{type: [T, "null"]}``.
     """
 
     model_config = ConfigDict(extra="allow")
 
     @classmethod
-    def __get_pydantic_json_schema__(cls, core_schema: Any, handler: Any) -> dict[str, Any]:
-        schema = handler(core_schema)
-        _strip_default_keys(schema)
+    def model_json_schema(cls, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        schema = super().model_json_schema(*args, **kwargs)
+        _sanitize_json_schema(schema)
         return schema
 
 
-def _strip_default_keys(schema: Any) -> None:
-    """Recursively remove ``default`` keys from a JSON schema dict in place."""
-    if isinstance(schema, dict):
-        schema.pop("default", None)
-        for value in schema.values():
-            _strip_default_keys(value)
-    elif isinstance(schema, list):
-        for item in schema:
-            _strip_default_keys(item)
+def _convert_anyof_nullable(node: dict[str, Any]) -> dict[str, Any]:
+    """Convert a nullable ``anyOf`` union to a flat schema with ``type: [T, "null"]``.
+
+    Pydantic emits ``{"anyOf": [{"type": "T", ...}, {"type": "null"}]}`` for
+    ``T | None``. The output tool schema must not contain ``anyOf``, so this
+    helper merges the non-null branch's constraints into a single schema while
+    preserving siblings such as ``title`` or ``description``.
+    """
+    any_of = node.get("anyOf", [])
+    if len(any_of) != 2:
+        return node
+
+    null_branch: dict[str, Any] | None = None
+    value_branch: dict[str, Any] | None = None
+    for branch in any_of:
+        if isinstance(branch, dict) and branch.get("type") == "null":
+            null_branch = branch
+        elif isinstance(branch, dict):
+            value_branch = branch
+
+    if null_branch is None or value_branch is None:
+        return node
+
+    merged = dict(value_branch)
+    value_type = merged.pop("type", None)
+    if value_type is not None:
+        merged["type"] = [value_type, "null"]
+
+    for key, val in node.items():
+        if key != "anyOf":
+            merged[key] = val
+
+    return merged
+
+
+def _sanitize_json_schema(schema: dict[str, Any]) -> None:
+    """Recursively sanitize a JSON schema in place.
+
+    Removes ``default``, ``$ref``, and ``$defs`` keywords and flattens nullable
+    ``anyOf`` unions so the generated Pydantic-AI tool schema contains only the
+    agreed structural keywords.
+    """
+    defs = schema.pop("$defs", {})
+    _sanitize_schema_node(schema, defs)
+    schema.pop("$defs", None)
+
+
+def _sanitize_schema_node(node: Any, defs: dict[str, Any]) -> None:
+    """Recursively sanitize a JSON schema node in place.
+
+    ``$ref`` targets that cannot be resolved are left untouched so a caller with
+    a complete view of ``$defs`` (e.g. after Pydantic-AI builds the tool schema)
+    can perform a final inlining pass.
+    """
+    if isinstance(node, dict):
+        nested_defs = node.pop("$defs", None)
+        if nested_defs:
+            defs = {**defs, **nested_defs}
+
+        if "$ref" in node:
+            ref_name = node["$ref"].split("/")[-1]
+            if ref_name in defs:
+                inlined = copy.deepcopy(defs[ref_name])
+                node.clear()
+                node.update(inlined)
+                _sanitize_schema_node(node, defs)
+            return
+
+        if "anyOf" in node:
+            for branch in node["anyOf"]:
+                if isinstance(branch, dict) and "$ref" in branch:
+                    _sanitize_schema_node(branch, defs)
+            converted = _convert_anyof_nullable(node)
+            if converted is not node:
+                node.clear()
+                node.update(converted)
+
+        node.pop("default", None)
+
+        for value in node.values():
+            _sanitize_schema_node(value, defs)
+    elif isinstance(node, list):
+        for item in node:
+            _sanitize_schema_node(item, defs)
 
 
 def _make_enum_validator(enum_values: list[Any], field_type: str) -> Any:
@@ -202,6 +279,38 @@ def _build_field_info(field: OutputField) -> Any:
     return Field(**field_kwargs)
 
 
+def _build_array_item_type(
+    field: OutputField,
+    *,
+    prefix: str = "Output",
+    depth: int = 0,
+    max_depth: int = 10,
+) -> Any:
+    """Build a Pydantic type for an array item, applying scalar constraints.
+
+    Array elements are validated individually, so the item's ``nullable`` flag
+    and scalar constraints (enum, pattern, length, range) are applied exactly
+    like top-level scalar fields. Object and array items delegate constraint
+    enforcement to the recursive type builder.
+    """
+    if depth > max_depth:
+        raise ValueError(f"Maximum output schema nesting depth of {max_depth} exceeded")
+
+    base_type = _map_output_field_type(
+        field,
+        prefix=prefix,
+        depth=depth,
+        max_depth=max_depth,
+    )
+
+    if field.type in ("string", "number", "integer", "boolean"):
+        base_type = _wrap_scalar_field_type(field, base_type)
+        field_info = _build_field_info(field)
+        return Annotated[base_type, field_info]
+
+    return base_type
+
+
 def _map_output_field_type(
     field: OutputField,
     *,
@@ -245,7 +354,7 @@ def _map_output_field_type(
         return bool
     if field.type == "array":
         if field.items:
-            item_type = _map_output_field_type(
+            item_type = _build_array_item_type(
                 field.items,
                 prefix=f"{prefix}Item",
                 depth=depth + 1,

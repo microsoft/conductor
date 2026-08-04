@@ -272,6 +272,71 @@ class TestRetries:
         assert pydantic_agent._max_output_retries == 4
 
 
+class TestArrayItemConstraintOutputRetry:
+    """Requirement: array-item constraint violations trigger pydantic-ai output retries."""
+
+    @pytest.mark.asyncio
+    async def test_array_item_constraint_violation_triggers_output_retry(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """When the model first returns a tool call with an array item that
+        violates an enum/pattern constraint, pydantic-ai's output retry must
+        recover and return valid structured output after exactly one retry."""
+        calls: list[int] = []
+
+        async def _fake_model(
+            messages: list[Any],
+            info: Any,
+        ) -> ModelResponse:
+            calls.append(len(calls))
+            output_tool_name = info.output_tools[0].name
+            if len(calls) == 1:
+                return ModelResponse(
+                    parts=[
+                        ToolCallPart(
+                            tool_name=output_tool_name,
+                            args={"values": ["bad"]},
+                        )
+                    ]
+                )
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name=output_tool_name,
+                        args={"values": ["ok"]},
+                    )
+                ]
+            )
+
+        monkeypatch.setattr(
+            "conductor.providers._pydantic_ai.agent_builder._resolve_anthropic_model",
+            lambda *_args, **_kwargs: FunctionModel(_fake_model),
+        )
+
+        agent_def = AgentDef(
+            name="formatter",
+            output={
+                "values": OutputField(
+                    type="array",
+                    items=OutputField(
+                        type="string",
+                        enum=["ok"],
+                        pattern="^o.*$",
+                        minLength=2,
+                        maxLength=2,
+                    ),
+                )
+            },
+        )
+        pydantic_agent = build_agent(agent_def, system_prompt="sys", rendered_prompt="go")
+
+        result = await pydantic_agent.run("go")
+
+        assert len(calls) == 2
+        assert result.output.values == ["ok"]
+
+
 class TestOutputRecovery:
     """Regression tests for structured-output recovery from plain-text responses."""
 

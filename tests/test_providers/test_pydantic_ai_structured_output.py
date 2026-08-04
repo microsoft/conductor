@@ -386,3 +386,175 @@ class TestOmittedOptionalMaterialization:
 
         instance = dynamic_model.model_construct(score=1)
         assert instance.model_dump(exclude_unset=True) == {"score": 1}
+
+
+class TestArrayItemConstraints:
+    """Requirement: array-item scalar constraints are enforced like top-level fields."""
+
+    def _model(self, output_schema: dict[str, OutputField]) -> type[BaseModel]:
+        dynamic_model = output_schema_to_pydantic_model("ArrayItemOutput", output_schema)
+        assert dynamic_model is not None
+        return dynamic_model
+
+    def test_array_item_enum_rejects_non_member(self) -> None:
+        """An array of strings with an enum must reject a non-member item."""
+        output_schema = {
+            "values": OutputField(
+                type="array",
+                items=OutputField(type="string", enum=["ok"]),
+            )
+        }
+        dynamic_model = self._model(output_schema)
+
+        assert dynamic_model(values=["ok"]).values == ["ok"]
+        with pytest.raises(PydanticValidationError):
+            dynamic_model(values=["bad"])
+
+    def test_array_item_pattern_and_length_reject_violations(self) -> None:
+        """Array-item pattern and length constraints must reject violating items."""
+        output_schema = {
+            "values": OutputField(
+                type="array",
+                items=OutputField(type="string", pattern="^o+$", minLength=2, maxLength=2),
+            )
+        }
+        dynamic_model = self._model(output_schema)
+
+        assert dynamic_model(values=["oo"]).values == ["oo"]
+        with pytest.raises(PydanticValidationError):
+            dynamic_model(values=["bad"])  # pattern fail
+        with pytest.raises(PydanticValidationError):
+            dynamic_model(values=["o"])  # length fail
+        with pytest.raises(PydanticValidationError):
+            dynamic_model(values=["ooo"])  # length fail
+
+    def test_array_item_number_range_reject_violations(self) -> None:
+        """Array-item number range constraints must reject out-of-bounds values."""
+        output_schema = {
+            "values": OutputField(
+                type="array",
+                items=OutputField(type="number", minimum=0, maximum=10),
+            )
+        }
+        dynamic_model = self._model(output_schema)
+
+        assert dynamic_model(values=[0, 10]).values == [0, 10]
+        with pytest.raises(PydanticValidationError):
+            dynamic_model(values=[-1])
+        with pytest.raises(PydanticValidationError):
+            dynamic_model(values=[11])
+
+    def test_array_item_nullable_accepts_none(self) -> None:
+        """An array of nullable strings must accept ``None`` items."""
+        output_schema = {
+            "values": OutputField(
+                type="array",
+                items=OutputField(type="string", nullable=True),
+            )
+        }
+        dynamic_model = self._model(output_schema)
+
+        instance = dynamic_model(values=["ok", None])
+        assert instance.values == ["ok", None]
+
+    def test_array_item_non_nullable_rejects_none(self) -> None:
+        """An array of non-nullable strings must reject ``None`` items."""
+        output_schema = {
+            "values": OutputField(
+                type="array",
+                items=OutputField(type="string", nullable=False),
+            )
+        }
+        dynamic_model = self._model(output_schema)
+
+        with pytest.raises(PydanticValidationError):
+            dynamic_model(values=[None])
+
+
+class TestToolSchemaForbiddenKeywords:
+    """Requirement: generated tool JSON schemas contain no forbidden keywords."""
+
+    def _schema(self, output_schema: dict[str, OutputField]) -> dict[str, Any]:
+        """Build an agent and return the final_result tool JSON schema."""
+        agent_def = AgentDef(name="formatter", output=output_schema)
+        pydantic_agent = build_agent(agent_def, system_prompt="", rendered_prompt="")
+        assert isinstance(pydantic_agent.output_type, ToolOutput)
+        toolset = pydantic_agent._output_schema.toolset
+        assert toolset is not None
+        assert len(toolset._tool_defs) == 1
+        return toolset._tool_defs[0].parameters_json_schema
+
+    def _collect_keywords(self, node: Any, found: set[str]) -> None:
+        if isinstance(node, dict):
+            found.update(node.keys())
+            for value in node.values():
+                self._collect_keywords(value, found)
+        elif isinstance(node, list):
+            for item in node:
+                self._collect_keywords(item, found)
+
+    def test_schema_has_no_anyof_ref_defs_for_nullable_object(self) -> None:
+        """A nullable nested object must not produce anyOf, $ref, or $defs and must
+        preserve the nested object structure and nullability."""
+        output_schema = {
+            "wrapper": OutputField(
+                type="object",
+                properties={
+                    "item": OutputField(
+                        type="object",
+                        nullable=True,
+                        properties={
+                            "tag": OutputField(type="string", enum=["a", "b"]),
+                        },
+                    )
+                },
+            )
+        }
+        schema = self._schema(output_schema)
+        keywords: set[str] = set()
+        self._collect_keywords(schema, keywords)
+
+        assert "anyOf" not in keywords
+        assert "$ref" not in keywords
+        assert "$defs" not in keywords
+
+        item_schema = schema["properties"]["wrapper"]["properties"]["item"]
+        assert set(item_schema["type"]) == {"object", "null"}
+        assert item_schema["properties"]["tag"]["enum"] == ["a", "b"]
+
+    def test_array_item_constraints_appear_in_schema(self) -> None:
+        """Array-item constraints must be advertised in the generated tool schema."""
+        output_schema = {
+            "values": OutputField(
+                type="array",
+                items=OutputField(
+                    type="string",
+                    enum=["ok"],
+                    pattern="^o$",
+                    minLength=2,
+                    maxLength=2,
+                ),
+            )
+        }
+        schema = self._schema(output_schema)
+        item_schema = schema["properties"]["values"]["items"]
+
+        assert item_schema["type"] == "string"
+        assert item_schema["enum"] == ["ok"]
+        assert item_schema["pattern"] == "^o$"
+        assert item_schema["minLength"] == 2
+        assert item_schema["maxLength"] == 2
+
+    def test_array_item_nullable_schema_uses_null_type(self) -> None:
+        """Nullable array items must be represented as type ["string", "null"]."""
+        output_schema = {
+            "values": OutputField(
+                type="array",
+                items=OutputField(type="string", nullable=True),
+            )
+        }
+        schema = self._schema(output_schema)
+        item_schema = schema["properties"]["values"]["items"]
+
+        assert "anyOf" not in item_schema
+        assert set(item_schema["type"]) == {"string", "null"}
