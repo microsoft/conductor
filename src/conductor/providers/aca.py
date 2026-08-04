@@ -694,7 +694,10 @@ class AcaRuntimeProvider(AgentProvider):
         reasoning_effort = resolve_reasoning_effort(agent, self._default_reasoning_effort)
         working_dir = agent.sandbox.working_dir if agent.sandbox is not None else None
         output_schema = (
-            {name: field.model_dump(exclude_none=True) for name, field in agent.output.items()}
+            {
+                name: field.model_dump(mode="json", exclude_none=True, exclude_defaults=True)
+                for name, field in agent.output.items()
+            }
             if agent.output
             else None
         )
