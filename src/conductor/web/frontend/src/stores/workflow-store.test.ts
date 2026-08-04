@@ -811,6 +811,20 @@ describe('workflow-store — navigating to a specific historical subworkflow ite
     expect(getViewedContext().agents.map((a) => a.name)).toEqual(['step_one']);
   });
 
+  it('falls back to the root view for an out-of-range context index (stale click target)', () => {
+    const processEvent = startRootWithLoopBackSubworkflow();
+    processEvent(event('subworkflow_started', { agent_name: 'sub_wf', workflow: 'child.yaml', iteration: 1, parent_path: [] }));
+
+    const { navigateToContext, getViewedContext } = useWorkflowStore.getState();
+    // Only one sibling exists (index 0) — index 5 doesn't resolve to
+    // anything, e.g. if the clicked row's context was pruned/replaced
+    // between render and click.
+    navigateToContext([5]);
+    const view = getViewedContext();
+    expect(view.workflowName).toBe(useWorkflowStore.getState().workflowName);
+    expect(view.agents).toEqual(useWorkflowStore.getState().agents);
+  });
+
   it('labels breadcrumbs with the iteration number only once a slotKey repeats across siblings', () => {
     const processEvent = startRootWithLoopBackSubworkflow();
 

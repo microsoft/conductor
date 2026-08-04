@@ -1197,16 +1197,13 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
       if (!ctx) break;
       // Prefer the slot key (e.g. "plan_children_group[2]") so concurrent
       // for_each iterations are distinguishable; fall back to workflow name.
-      let label = ctx.slotKey || ctx.workflowName || ctx.workflowFile || ctx.parentAgent;
-      // A sequential subworkflow's slotKey is just its agent name, so a
-      // repeated loop-back invocation shares the same slotKey across every
-      // sibling (see issue #365) — append the iteration number whenever
-      // more than one sibling shares this slotKey so the breadcrumb itself
-      // tells you which historical run you're viewing.
+      const baseLabel = ctx.slotKey || ctx.workflowName || ctx.workflowFile || ctx.parentAgent;
+      // Sequential subworkflows share slotKey === agentName, so a loop-back
+      // re-invocation collides with its earlier sibling (issue #365) —
+      // append the iteration number when siblings share a slotKey.
       const sameSlotSiblingCount = contexts.filter((c) => c.slotKey === ctx.slotKey).length;
-      if (sameSlotSiblingCount > 1) {
-        label = `${label} (iteration ${ctx.iteration})`;
-      }
+      const label =
+        sameSlotSiblingCount > 1 ? `${baseLabel} (iteration ${ctx.iteration})` : baseLabel;
       crumbs.push({ label, path: state.viewContextPath.slice(0, i + 1) });
       contexts = ctx.children;
     }

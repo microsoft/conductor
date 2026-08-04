@@ -23,8 +23,16 @@ export function SubworkflowDetail({ node }: SubworkflowDetailProps) {
   // slotKey (which collapses every same-named re-invocation onto the
   // newest one, see issue #365).
   const subContexts = allSubContexts
-    .map((c, index) => ({ ctx: c, index }))
+    .map((ctx, index) => ({ ctx, index }))
     .filter(({ ctx }) => ctx.parentAgent === node.name);
+  // A repeated sequential loop-back invocation shares its slotKey with every
+  // prior sibling (see issue #365); only disambiguate with an iteration
+  // number once that's actually the case, not merely because this parent
+  // agent has more than one recorded run.
+  const sameSlotSiblingCounts = new Map<string, number>();
+  for (const { ctx } of subContexts) {
+    sameSlotSiblingCounts.set(ctx.slotKey, (sameSlotSiblingCounts.get(ctx.slotKey) ?? 0) + 1);
+  }
 
   const items: Array<{ label: string; value: string | number | null | undefined }> = [];
   if (node.elapsed != null) items.push({ label: 'Elapsed', value: formatElapsed(node.elapsed) });
@@ -57,7 +65,7 @@ export function SubworkflowDetail({ node }: SubworkflowDetailProps) {
               <SubworkflowRunRow
                 key={`${ctx.slotKey}-${ctx.iteration}-${index}`}
                 ctx={ctx}
-                showIteration={subContexts.length > 1}
+                showIteration={(sameSlotSiblingCounts.get(ctx.slotKey) ?? 0) > 1}
                 onClick={() => navigateToContext([...viewContextPath, index])}
               />
             ))}
@@ -88,7 +96,7 @@ function SubworkflowRunRow({
   onClick,
 }: {
   ctx: SubworkflowContext;
-  /** Show the iteration number — only meaningful once a slotKey repeats across runs. */
+  /** Whether this row's slotKey repeats across sibling runs (loop-back re-invocation) — shows the iteration number to disambiguate. */
   showIteration: boolean;
   onClick: () => void;
 }) {
