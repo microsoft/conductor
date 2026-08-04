@@ -513,7 +513,12 @@ class CheckpointManager:
             candidates = CheckpointManager._periodic_checkpoints_for_run(workflow_path, run_id)
         except Exception as exc:
             logger.warning(
-                "Failed to list checkpoints for %s (%s: %s)", action, type(exc).__name__, exc
+                "Failed to list checkpoints for %s (run_id=%s, workflow=%s) (%s: %s)",
+                action,
+                run_id,
+                workflow_path,
+                type(exc).__name__,
+                exc,
             )
             logger.debug("Checkpoint listing traceback", exc_info=True)
             return

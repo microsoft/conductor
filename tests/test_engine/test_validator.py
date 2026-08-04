@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -206,6 +207,42 @@ class TestValidatorValidate:
         assert outcome.passed is True
         assert outcome.errored is True
         assert outcome.output is None
+
+    @pytest.mark.asyncio
+    async def test_provider_error_logs_concise_warning_and_debug_traceback(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Requirement (issue #357): the handled fail-open path must not print a
+        traceback at WARNING level — a concise warning names the exception, and
+        the full traceback is only available at DEBUG level."""
+        agent = _agent()
+        provider = MagicMock()
+        provider.execute = AsyncMock(side_effect=RuntimeError("boom"))
+
+        with caplog.at_level(logging.DEBUG, logger="conductor.engine.validator"):
+            outcome = await OutputValidator().validate(agent, "p", {"summary": "x"}, provider)
+
+        assert outcome.passed is True
+        assert outcome.errored is True
+
+        warnings = [
+            r
+            for r in caplog.records
+            if r.name == "conductor.engine.validator"
+            and r.levelno == logging.WARNING
+            and "Validator call failed" in r.getMessage()
+        ]
+        assert len(warnings) == 1
+        assert warnings[0].exc_info is None
+        assert "RuntimeError" in warnings[0].getMessage()
+        assert "boom" in warnings[0].getMessage()
+        assert "reviewer" in warnings[0].getMessage()
+        debugs = [
+            r
+            for r in caplog.records
+            if r.name == "conductor.engine.validator" and r.levelno == logging.DEBUG
+        ]
+        assert any(r.exc_info is not None for r in debugs)
 
     @pytest.mark.asyncio
     async def test_malformed_output_fails_open(self) -> None:
