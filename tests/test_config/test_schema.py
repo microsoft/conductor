@@ -109,6 +109,152 @@ class TestOutputField:
         assert "name" in output.properties
         assert output.properties["name"].type == "string"
 
+    def test_output_field_constraint_defaults(self) -> None:
+        """Test that new constraint fields have the expected defaults."""
+        output = OutputField(type="string")
+        assert output.enum is None
+        assert output.pattern is None
+        assert output.minimum is None
+        assert output.maximum is None
+        assert output.minLength is None
+        assert output.maxLength is None
+        assert output.required is True
+        assert output.nullable is False
+
+    def test_output_field_constraint_happy_path(self) -> None:
+        """Test that all constraint fields are accepted on matching types."""
+        output = OutputField.model_validate(
+            {
+                "type": "string",
+                "enum": ["a", "b"],
+                "pattern": "^a",
+                "minLength": 1,
+                "maxLength": 5,
+                "required": True,
+                "nullable": False,
+            }
+        )
+        assert output.type == "string"
+        assert output.enum == ["a", "b"]
+        assert output.pattern == "^a"
+        assert output.minLength == 1
+        assert output.maxLength == 5
+        assert output.required is True
+        assert output.nullable is False
+
+    def test_output_field_model_dump_round_trip(self) -> None:
+        """Test model_dump preserves constraint fields for reconstruction."""
+        original = OutputField.model_validate(
+            {
+                "type": "number",
+                "enum": [1, 2, 3],
+                "minimum": 0,
+                "maximum": 10,
+                "required": False,
+                "nullable": True,
+            }
+        )
+        dumped = original.model_dump()
+        rebuilt = OutputField.model_validate(dumped)
+        assert rebuilt.type == "number"
+        assert rebuilt.enum == [1, 2, 3]
+        assert rebuilt.minimum == 0
+        assert rebuilt.maximum == 10
+        assert rebuilt.required is False
+        assert rebuilt.nullable is True
+
+    def test_output_field_string_constraints_reject_non_string(self) -> None:
+        """Test that pattern, minLength, and maxLength are rejected for non-string types."""
+        for field_name, value in [
+            ("pattern", "^a"),
+            ("minLength", 1),
+            ("maxLength", 5),
+        ]:
+            with pytest.raises(ValidationError) as exc_info:
+                OutputField.model_validate({"type": "number", field_name: value})
+            assert field_name in str(exc_info.value)
+
+    def test_output_field_number_constraints_reject_non_number(self) -> None:
+        """Test that minimum and maximum are rejected for non-number types."""
+        for field_name, value in [("minimum", 0.0), ("maximum", 10.0)]:
+            with pytest.raises(ValidationError) as exc_info:
+                OutputField.model_validate({"type": "string", field_name: value})
+            assert field_name in str(exc_info.value)
+
+    def test_output_field_enum_rejects_array_and_object(self) -> None:
+        """Test that enum is rejected for array and object types."""
+        for scalar_type in ("array", "object"):
+            with pytest.raises(ValidationError) as exc_info:
+                OutputField.model_validate({"type": scalar_type, "enum": ["a"]})
+            assert "enum" in str(exc_info.value)
+
+    def test_output_field_empty_enum_rejected(self) -> None:
+        """Test that an empty enum list is rejected."""
+        with pytest.raises(ValidationError) as exc_info:
+            OutputField.model_validate({"type": "string", "enum": []})
+        assert "enum" in str(exc_info.value)
+
+    def test_output_field_negative_length_rejected(self) -> None:
+        """Test that negative minLength and maxLength values are rejected."""
+        with pytest.raises(ValidationError) as exc_info:
+            OutputField.model_validate({"type": "string", "minLength": -1})
+        assert "minLength" in str(exc_info.value)
+
+        with pytest.raises(ValidationError) as exc_info:
+            OutputField.model_validate({"type": "string", "maxLength": -1})
+        assert "maxLength" in str(exc_info.value)
+
+    def test_output_field_min_length_exceeds_max_length_rejected(self) -> None:
+        """Test that minLength greater than maxLength is rejected."""
+        with pytest.raises(ValidationError) as exc_info:
+            OutputField.model_validate(
+                {"type": "string", "minLength": 5, "maxLength": 1}
+            )
+        assert "minLength" in str(exc_info.value)
+        assert "maxLength" in str(exc_info.value)
+
+    def test_output_field_minimum_exceeds_maximum_rejected(self) -> None:
+        """Test that minimum greater than maximum is rejected."""
+        with pytest.raises(ValidationError) as exc_info:
+            OutputField.model_validate(
+                {"type": "number", "minimum": 10, "maximum": 0}
+            )
+        assert "minimum" in str(exc_info.value)
+        assert "maximum" in str(exc_info.value)
+
+    def test_output_field_invalid_pattern_rejected(self) -> None:
+        """Test that a pattern that does not compile as a regex is rejected."""
+        with pytest.raises(ValidationError) as exc_info:
+            OutputField.model_validate({"type": "string", "pattern": "["})
+        assert "pattern" in str(exc_info.value)
+
+    def test_output_field_enum_type_mismatch_rejected(self) -> None:
+        """Test that enum entries must match the declared scalar type."""
+        # String field with a numeric enum entry.
+        with pytest.raises(ValidationError) as exc_info:
+            OutputField.model_validate({"type": "string", "enum": ["a", 1]})
+        assert "enum" in str(exc_info.value)
+
+        # Number field with a string enum entry (booleans also count as invalid).
+        with pytest.raises(ValidationError) as exc_info:
+            OutputField.model_validate({"type": "number", "enum": [1, True]})
+        assert "enum" in str(exc_info.value)
+
+        # Boolean field with a string enum entry.
+        with pytest.raises(ValidationError) as exc_info:
+            OutputField.model_validate({"type": "boolean", "enum": [True, "false"]})
+        assert "enum" in str(exc_info.value)
+
+    def test_output_field_enum_null_rejected(self) -> None:
+        """Test that None values inside enum are rejected with a precise message."""
+        with pytest.raises(ValidationError) as exc_info:
+            OutputField.model_validate(
+                {"type": "string", "enum": ["a", None], "nullable": True}
+            )
+        assert "enum cannot contain null; use nullable: true to allow null values" in str(
+            exc_info.value
+        )
+
 
 class TestRouteDef:
     """Tests for RouteDef model."""

@@ -6,6 +6,7 @@ workflow YAML configuration files.
 
 from __future__ import annotations
 
+import re
 from typing import Any, Literal, get_args
 from urllib.parse import urlparse
 
@@ -99,15 +100,105 @@ class OutputField(BaseModel):
     properties: dict[str, OutputField] | None = None
     """For object types, the schema of object properties."""
 
+    enum: list[Any] | None = None
+    """Allowed values for scalar types."""
+
+    pattern: str | None = None
+    """Regular expression pattern for string types."""
+
+    minimum: float | None = None
+    """Minimum value for number types."""
+
+    maximum: float | None = None
+    """Maximum value for number types."""
+
+    minLength: int | None = None
+    """Minimum length for string types."""
+
+    maxLength: int | None = None
+    """Maximum length for string types."""
+
+    required: bool = True
+    """Whether the field is required when used as an object property."""
+
+    nullable: bool = False
+    """Whether the field value may be null."""
+
     @model_validator(mode="after")
     def validate_type_specific_fields(self) -> OutputField:
-        """Ensure type-specific fields are properly set."""
+        """Ensure type-specific fields are properly set and consistent."""
         if self.type == "array" and self.items is None:
             # Items are optional but recommended for arrays
             pass
         if self.type == "object" and self.properties is None:
             # Properties are optional but recommended for objects
             pass
+
+        # String-only constraints.
+        if self.type != "string":
+            for field_name in ("pattern", "minLength", "maxLength"):
+                value = getattr(self, field_name)
+                if value is not None:
+                    raise ValueError(f"{field_name} can only be set when type is 'string'")
+
+        # Number-only constraints.
+        if self.type != "number":
+            for field_name in ("minimum", "maximum"):
+                value = getattr(self, field_name)
+                if value is not None:
+                    raise ValueError(f"{field_name} can only be set when type is 'number'")
+
+        # Enum validation.
+        if self.enum is not None:
+            if self.type in ("array", "object"):
+                raise ValueError("enum can only be set for scalar types")
+
+            if len(self.enum) == 0:
+                raise ValueError("enum must contain at least one value")
+
+            if any(value is None for value in self.enum):
+                raise ValueError(
+                    "enum cannot contain null; use nullable: true to allow null values"
+                )
+
+            type_checks = {
+                "string": lambda x: isinstance(x, str),
+                "number": lambda x: isinstance(x, int | float) and not isinstance(x, bool),
+                "boolean": lambda x: isinstance(x, bool),
+            }
+            check = type_checks.get(self.type)
+            if check is not None and not all(check(value) for value in self.enum):
+                raise ValueError(
+                    f"enum values must match the declared type '{self.type}'"
+                )
+
+        # String length validation.
+        if self.minLength is not None and self.minLength < 0:
+            raise ValueError("minLength must be non-negative")
+        if self.maxLength is not None and self.maxLength < 0:
+            raise ValueError("maxLength must be non-negative")
+        if (
+            self.minLength is not None
+            and self.maxLength is not None
+            and self.minLength > self.maxLength
+        ):
+            raise ValueError("minLength cannot be greater than maxLength")
+
+        # Number range validation.
+        if (
+            self.minimum is not None
+            and self.maximum is not None
+            and self.minimum > self.maximum
+        ):
+            raise ValueError("minimum cannot be greater than maximum")
+
+        # Pattern compilation.
+        if self.pattern is not None:
+            try:
+                re.compile(self.pattern)
+            except re.error as exc:
+                raise ValueError(f"pattern is not a valid regular expression: {exc}") from exc
+
         return self
 
 
