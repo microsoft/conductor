@@ -168,9 +168,7 @@ class OutputField(BaseModel):
             }
             check = type_checks.get(self.type)
             if check is not None and not all(check(value) for value in self.enum):
-                raise ValueError(
-                    f"enum values must match the declared type '{self.type}'"
-                )
+                raise ValueError(f"enum values must match the declared type '{self.type}'")
 
         # String length validation.
         if self.minLength is not None and self.minLength < 0:
@@ -185,11 +183,7 @@ class OutputField(BaseModel):
             raise ValueError("minLength cannot be greater than maxLength")
 
         # Number range validation.
-        if (
-            self.minimum is not None
-            and self.maximum is not None
-            and self.minimum > self.maximum
-        ):
+        if self.minimum is not None and self.maximum is not None and self.minimum > self.maximum:
             raise ValueError("minimum cannot be greater than maximum")
 
         # Pattern compilation.

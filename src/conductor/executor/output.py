@@ -57,14 +57,12 @@ def _check_constraints(field_name: str, value: Any, field_def: OutputField) -> N
         if isinstance(value, bool):
             if not (field_def.type == "boolean" and value in field_def.enum):
                 raise ValidationError(
-                    f"Output field '{field_name}' must be one of {field_def.enum!r}, "
-                    f"got {value!r}",
+                    f"Output field '{field_name}' must be one of {field_def.enum!r}, got {value!r}",
                     suggestion=f"Ensure '{field_name}' is one of {field_def.enum!r}",
                 )
         elif value not in field_def.enum:
             raise ValidationError(
-                f"Output field '{field_name}' must be one of {field_def.enum!r}, "
-                f"got {value!r}",
+                f"Output field '{field_name}' must be one of {field_def.enum!r}, got {value!r}",
                 suggestion=f"Ensure '{field_name}' is one of {field_def.enum!r}",
             )
 

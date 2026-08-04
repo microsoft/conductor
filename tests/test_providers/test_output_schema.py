@@ -891,9 +891,7 @@ class TestSharedSchemaBuilder:
 
         def _no_default_keys(value: Any) -> bool:
             if isinstance(value, dict):
-                return "default" not in value and all(
-                    _no_default_keys(v) for v in value.values()
-                )
+                return "default" not in value and all(_no_default_keys(v) for v in value.values())
             if isinstance(value, list):
                 return all(_no_default_keys(item) for item in value)
             return True

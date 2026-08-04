@@ -207,18 +207,14 @@ class TestOutputField:
     def test_output_field_min_length_exceeds_max_length_rejected(self) -> None:
         """Test that minLength greater than maxLength is rejected."""
         with pytest.raises(ValidationError) as exc_info:
-            OutputField.model_validate(
-                {"type": "string", "minLength": 5, "maxLength": 1}
-            )
+            OutputField.model_validate({"type": "string", "minLength": 5, "maxLength": 1})
         assert "minLength" in str(exc_info.value)
         assert "maxLength" in str(exc_info.value)
 
     def test_output_field_minimum_exceeds_maximum_rejected(self) -> None:
         """Test that minimum greater than maximum is rejected."""
         with pytest.raises(ValidationError) as exc_info:
-            OutputField.model_validate(
-                {"type": "number", "minimum": 10, "maximum": 0}
-            )
+            OutputField.model_validate({"type": "number", "minimum": 10, "maximum": 0})
         assert "minimum" in str(exc_info.value)
         assert "maximum" in str(exc_info.value)
 
@@ -248,9 +244,7 @@ class TestOutputField:
     def test_output_field_enum_null_rejected(self) -> None:
         """Test that None values inside enum are rejected with a precise message."""
         with pytest.raises(ValidationError) as exc_info:
-            OutputField.model_validate(
-                {"type": "string", "enum": ["a", None], "nullable": True}
-            )
+            OutputField.model_validate({"type": "string", "enum": ["a", None], "nullable": True})
         assert "enum cannot contain null; use nullable: true to allow null values" in str(
             exc_info.value
         )
