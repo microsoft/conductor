@@ -348,17 +348,60 @@ class TestSkillDiscoveryThroughTheEngine:
         )
         assert provider.skill_directories == [str(skill)]
 
-    def test_discovery_reaches_eager_injection_too(self, tmp_path: Path, fake_home: Path) -> None:
+    def test_discovery_is_refused_on_an_eager_injection_provider(
+        self, tmp_path: Path, fake_home: Path
+    ) -> None:
+        """The validator's refusal must hold at run time too.
+
+        ``conductor run`` never calls the static validator, so without a
+        matching check here the refusal would apply to ``conductor
+        validate`` alone while the run injected the whole ambient set into
+        every prompt. ``runtime.skill_injection`` is not a backstop: a set
+        under ``max_bytes`` passes it silently.
+        """
         _write_skill(fake_home / ".copilot" / "skills" / "acme")
         path = tmp_path / "wf.yaml"
         path.write_text("# placeholder\n")
         provider = _EagerProvider()
+        with pytest.raises(ExecutionError, match="no native skill surface"):
+            _run(
+                _config([], skill_discovery=SkillDiscoveryConfig(sources=["personal"])),
+                provider,
+                path,
+            )
+        assert "<skills>" not in provider.rendered_prompt
+
+    def test_declared_skills_still_reach_eager_injection(
+        self, tmp_path: Path, fake_home: Path
+    ) -> None:
+        """Only *discovery* is refused — the injection path itself is fine."""
+        _write_skill(tmp_path / "team-skills" / "acme")
+        path = tmp_path / "wf.yaml"
+        path.write_text("# placeholder\n")
+        provider = _EagerProvider()
+        _run(_config(["./team-skills/acme"]), provider, path)
+        assert '<skill name="acme">' in provider.rendered_prompt
+
+    def test_agent_override_escapes_the_run_time_refusal(
+        self, tmp_path: Path, fake_home: Path
+    ) -> None:
+        """Discovery joins the inherited set, so an override sidesteps it."""
+        _write_skill(tmp_path / "team-skills" / "acme")
+        _write_skill(fake_home / ".copilot" / "skills" / "ambient")
+        path = tmp_path / "wf.yaml"
+        path.write_text("# placeholder\n")
+        provider = _EagerProvider()
         _run(
-            _config([], skill_discovery=SkillDiscoveryConfig(sources=["personal"])),
+            _config(
+                [],
+                skill_discovery=SkillDiscoveryConfig(sources=["personal"]),
+                agent_skills=["./team-skills/acme"],
+            ),
             provider,
             path,
         )
         assert '<skill name="acme">' in provider.rendered_prompt
+        assert "ambient" not in provider.rendered_prompt
 
     def test_disabled_discovery_finds_nothing(self, tmp_path: Path, fake_home: Path) -> None:
         _write_skill(fake_home / ".copilot" / "skills" / "acme")

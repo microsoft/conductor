@@ -166,8 +166,9 @@ class ResolvedSkill:
     For an explicitly declared skill, the ``skills:`` entry verbatim — a
     ``skills/`` root expands to several :class:`ResolvedSkill` objects
     that share one ``source``, so errors can name what the user actually
-    wrote. For a discovered skill (:attr:`discovered`), the location it
-    was found in, since there is no entry to quote.
+    wrote. For a discovered skill (:attr:`discovered`), the **scanned
+    root** it was found under — not its own directory, which is
+    :attr:`directory`.
     """
 
     discovered: bool = False
@@ -221,7 +222,7 @@ def is_path_entry(entry: str) -> bool:
     return entry.startswith(("~", ".")) or "/" in entry or "\\" in entry
 
 
-def expand_skills_root(root: Path) -> tuple[list[Path], list[str]]:
+def expand_skills_root(root: Path) -> tuple[list[Path], list[str], list[str]]:
     """Split a skills root into the skill directories it holds.
 
     The one definition of "what counts as a skill directory", shared by
@@ -229,40 +230,52 @@ def expand_skills_root(root: Path) -> tuple[list[Path], list[str]]:
     :mod:`conductor.skills.discovery` — the discovery locations are all
     skills roots, so they expand by exactly these rules.
 
+    A child that cannot be read is reported rather than allowed to
+    propagate. Letting it escape would discard every *readable* sibling
+    over one stray directory, and the resulting message would name the
+    root, which the user can list perfectly well.
+
     Deliberately makes no judgement about an empty result: a path entry
     naming an empty root is a user error, while a discovery location that
-    happens to hold nothing is the ordinary case. Each caller decides.
+    happens to hold nothing is the ordinary case. Each caller decides —
+    a path entry naming an empty root raises, while discovery defers the
+    judgement to :func:`~conductor.skills.discovery.discover_skills`,
+    which warns only when a whole *source* came up empty.
 
     Args:
-        root: An existing, readable directory to look inside.
+        root: An existing directory to look inside.
 
     Returns:
-        A ``(children, skipped)`` tuple. ``children`` is every immediate
-        subdirectory holding a ``SKILL.md``, sorted by name; ``skipped``
-        is the names of the subdirectories that do not, so callers can
-        report near-misses instead of silently yielding one fewer skill.
+        A ``(children, skipped, unreadable)`` tuple. ``children`` is every
+        immediate subdirectory holding a ``SKILL.md``, sorted by name;
+        ``skipped`` is the names of the subdirectories that do not, so
+        callers can report near-misses instead of silently yielding one
+        fewer skill; ``unreadable`` is the names of those that could not
+        be inspected at all.
 
     Raises:
-        OSError: If ``root`` cannot be listed. Callers translate this
-            into their own message — there is no single phrasing that
-            suits both a user-written path and an ambient location.
+        OSError: If ``root`` itself cannot be listed. Callers translate
+            this into their own message — there is no single phrasing
+            that suits both a user-written path and an ambient location.
     """
-    entries = list(root.iterdir())
-    children = sorted(
-        (child for child in entries if (child / "SKILL.md").is_file()),
-        key=lambda child: child.name,
-    )
-    # Subdirectories that look like skills but have no SKILL.md. Files
-    # (a README, a LICENSE) are not reported — only a directory can
-    # plausibly have been *meant* as a skill. Without this, pointing at
-    # a root turns the loud "no SKILL.md" error you would get from
-    # naming the directory directly into silence: a mis-cased
-    # ``Skill.md`` or a file someone forgot to commit simply yields one
-    # fewer skill.
-    skipped = sorted(
-        child.name for child in entries if child.is_dir() and not (child / "SKILL.md").is_file()
-    )
-    return children, skipped
+    children: list[Path] = []
+    skipped: list[str] = []
+    unreadable: list[str] = []
+    for child in sorted(root.iterdir(), key=lambda path: path.name):
+        try:
+            if (child / "SKILL.md").is_file():
+                children.append(child)
+            # Files (a README, a LICENSE) are not reported as near-misses —
+            # only a directory can plausibly have been *meant* as a skill.
+            # Without this, pointing at a root turns the loud "no SKILL.md"
+            # error you would get from naming the directory directly into
+            # silence: a mis-cased ``Skill.md`` or a file someone forgot to
+            # commit simply yields one fewer skill.
+            elif child.is_dir():
+                skipped.append(child.name)
+        except OSError:
+            unreadable.append(child.name)
+    return children, skipped, unreadable
 
 
 def _resolve_path_entry(
@@ -310,7 +323,7 @@ def _resolve_path_entry(
             )
         if (resolved / "SKILL.md").is_file():
             return [resolved]
-        children, skipped = expand_skills_root(resolved)
+        children, skipped, unreadable = expand_skills_root(resolved)
     except OSError as exc:
         # A path Conductor can name but not inspect — an unreadable directory,
         # or one whose parent is unreadable. Python re-raises EACCES from
@@ -320,6 +333,15 @@ def _resolve_path_entry(
         raise SkillNotFoundError(
             f"Skill path {entry!r} resolved to {resolved!s}, which could not be read: {exc}"
         ) from exc
+
+    if unreadable:
+        # Strict for a path the user wrote, matching every other failure
+        # here — discovery is the caller that downgrades this to a warning.
+        raise SkillNotFoundError(
+            f"Skill path {entry!r} resolved to {resolved!s}, whose "
+            f"subdirector{'y' if len(unreadable) == 1 else 'ies'} {unreadable!r} "
+            "could not be read. Fix the permissions, or remove them."
+        )
 
     if children:
         if skipped and on_warning is not None:

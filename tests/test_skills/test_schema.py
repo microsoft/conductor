@@ -143,7 +143,7 @@ class TestSkillDiscoveryConfig:
 
     def test_defaults_to_disabled(self) -> None:
         config = RuntimeConfig()
-        assert config.skill_discovery.sources == []
+        assert config.skill_discovery.sources == ()
         assert config.skill_discovery.is_enabled is False
 
     def test_enabled_when_a_source_is_set(self) -> None:
@@ -152,7 +152,7 @@ class TestSkillDiscoveryConfig:
 
     @pytest.mark.parametrize("source", ["personal", "project", "plugins"])
     def test_known_sources_accepted(self, source: str) -> None:
-        assert SkillDiscoveryConfig(sources=[source]).sources == [source]
+        assert SkillDiscoveryConfig(sources=[source]).sources == (source,)
 
     def test_unknown_source_rejected(self) -> None:
         with pytest.raises(ValidationError):
@@ -178,6 +178,15 @@ class TestSkillDiscoveryConfig:
         config = SkillDiscoveryConfig(sources=["personal"])
         with pytest.raises(ValidationError):
             config.sources = ["plugins"]
+
+    def test_sources_are_immutable_and_hashable(self) -> None:
+        # Tuples, not lists: ``frozen=True`` would otherwise still allow
+        # ``config.sources.append(...)``, and Pydantic generates a
+        # ``__hash__`` that a list field makes raise.
+        config = SkillDiscoveryConfig(sources=["personal"], exclude=["x"])
+        assert isinstance(config.sources, tuple)
+        assert isinstance(config.exclude, tuple)
+        assert hash(config) == hash(SkillDiscoveryConfig(sources=["personal"], exclude=["x"]))
 
     def test_exclude_does_not_enable_discovery(self) -> None:
         # An exclude list on its own is inert, not an implicit opt-in.

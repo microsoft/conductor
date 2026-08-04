@@ -35,9 +35,11 @@
 #                         makes it safe. Name skills in `runtime.skills`.
 #
 # Run `conductor validate` on this file first: it prints every skill
-# discovery found, where it came from, and the total injected size. An
-# ambient set is the one part of a workflow the YAML does not capture, so
-# seeing it is the point.
+# discovery put in effect, where it came from, and the total injected size.
+# An ambient set is the one part of a workflow the YAML does not capture, so
+# seeing it is the point. On a machine with no ~/.copilot/skills or
+# ~/.claude/skills it will report that the source found nothing — that
+# warning is the feature working, not a misconfiguration.
 #
 # Usage:
 #   conductor validate examples/skills-discovery.yaml
@@ -55,18 +57,18 @@ workflow:
     max_agent_iterations: 20
 
     # Declared skills are authoritative. A discovered skill with the same
-    # name is skipped with a warning — which happens immediately in
-    # practice, since installing Conductor's own plugin puts a second
-    # `conductor` skill on the machine.
+    # name is skipped with a warning — which happens as soon as you add
+    # `plugins` below, since installing Conductor's own plugin puts a
+    # second `conductor` skill on the machine.
     skills:
       - conductor
 
     skill_discovery:
-      # Start with `personal` alone; add `plugins` once you have seen what
-      # `conductor validate` reports for it.
+      # Starts with `personal` alone. Add `project` and `plugins` once you
+      # have seen what `conductor validate` reports for them — every source
+      # warns when it finds nothing, so enable the ones you have skills in.
       sources:
         - personal
-        - project
       # Drop individual skills by name. Useful for a large skill you do not
       # want in context, or one your provider cannot load.
       exclude: []

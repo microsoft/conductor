@@ -9,12 +9,11 @@ under ``~/.copilot``, Claude Code under ``~/.claude`` — so the obvious
 design (one flag, each provider asked to discover its own) would surface
 **different skill sets to different agents inside a single run**,
 depending on which provider each agent happens to resolve to. That is
-non-determinism within one run, and it is why issue #362 exists
-separately from #215 and #350.
+non-determinism within one run.
 
 Conductor therefore does the scanning itself, over the *union* of both
-CLIs' locations, and feeds the result through the same
-:func:`~conductor.skills.registry.resolve_skills` pipeline that explicit
+CLIs' locations, and hands the result to the same
+:func:`~conductor.skills.registry.resolve_skills` machinery that explicit
 entries use. Every agent sees the identical discovered set whatever its
 provider. The providers' own discovery stays off — ``copilot`` is never
 given ``enable_config_discovery`` (it would also auto-load MCP servers
@@ -122,20 +121,21 @@ class DiscoveredSkill:
     """
 
 
-def _project_roots(base_dir: Path) -> list[Path]:
+def _project_roots(base_dir: Path, on_warning: WarningSink | None = None) -> list[Path]:
     """Candidate project skill roots, from ``base_dir`` up to the repo root.
 
     Mirrors what both CLIs do from their working directory, anchored on
     the workflow file instead so that ``conductor validate`` and
     ``conductor run`` agree no matter where either was invoked from.
 
-    The walk stops at the first ancestor containing ``.git``. When there
-    is no repository at all, only ``base_dir`` itself is considered —
+    The walk stops at the first ancestor containing ``.git``. When no
+    ancestor has one, the result collapses to ``base_dir`` alone —
     climbing to the filesystem root on an unversioned tree would sweep in
     whatever happens to sit above it.
 
     Args:
         base_dir: The workflow file's directory.
+        on_warning: Sink for non-fatal diagnostics.
 
     Returns:
         Candidate roots, nearest directory first, so a repo-root skill is
@@ -144,7 +144,7 @@ def _project_roots(base_dir: Path) -> list[Path]:
     ancestors: list[Path] = []
     for directory in (base_dir, *base_dir.parents):
         ancestors.append(directory)
-        if _has_repo_marker(directory):
+        if _has_repo_marker(directory, on_warning):
             break
     else:
         ancestors = [base_dir]
@@ -152,15 +152,27 @@ def _project_roots(base_dir: Path) -> list[Path]:
     return [ancestor / relative for ancestor in ancestors for relative in _PROJECT_ROOTS]
 
 
-def _has_repo_marker(directory: Path) -> bool:
+def _has_repo_marker(directory: Path, on_warning: WarningSink | None = None) -> bool:
     """Whether ``directory`` looks like a repository root.
 
-    An unreadable directory reads as "not the root" so the walk climbs
-    past it rather than stopping early on a permissions quirk.
+    An unreadable directory reads as "not the root", so the walk keeps
+    climbing. That trades a rare false negative — reaching an ancestor
+    the stop condition exists to exclude — for never aborting a scan on a
+    permissions error. It is reported either way, because the more common
+    outcome is worse than it sounds: if the *real* repo root is the
+    unreadable one, :func:`_project_roots` finds no marker at all and
+    collapses to ``base_dir``, silently dropping the repository's own
+    skills.
     """
     try:
         return (directory / _REPO_MARKER).exists()
-    except OSError:
+    except OSError as exc:
+        _warn(
+            on_warning,
+            f"Skill discovery could not check {directory / _REPO_MARKER} ({exc}), so "
+            f"{directory} was not treated as a repository root. Skills at the "
+            "repository root may have been missed.",
+        )
         return False
 
 
@@ -198,7 +210,12 @@ def _unique(paths: Iterable[Path]) -> list[Path]:
     return out
 
 
-def _roots_for_source(source: DiscoverySource, base_dir: Path | None, home: Path) -> list[Path]:
+def _roots_for_source(
+    source: DiscoverySource,
+    base_dir: Path | None,
+    home: Path,
+    on_warning: WarningSink | None = None,
+) -> list[Path]:
     """Map one category onto the concrete directories to scan.
 
     Args:
@@ -209,6 +226,7 @@ def _roots_for_source(source: DiscoverySource, base_dir: Path | None, home: Path
             the user happened to invoke the CLI from).
         home: The home directory ``personal`` and ``plugins`` resolve
             against.
+        on_warning: Sink for non-fatal diagnostics.
 
     Returns:
         Candidate roots, which may or may not exist.
@@ -216,7 +234,7 @@ def _roots_for_source(source: DiscoverySource, base_dir: Path | None, home: Path
     if source == "personal":
         return [home / relative for relative in _PERSONAL_ROOTS]
     if source == "project":
-        return [] if base_dir is None else _project_roots(base_dir)
+        return [] if base_dir is None else _project_roots(base_dir, on_warning)
     return _glob_roots(home, _PLUGIN_ROOT_GLOBS)
 
 
@@ -239,7 +257,8 @@ def discover_skills(
     only one or two of these directories, and that is the ordinary case
     rather than a misconfiguration. A category that yields *nothing at
     all* does warn, because that config did nothing and the author almost
-    certainly expected otherwise.
+    certainly expected otherwise — unless the scan already reported why,
+    in which case "found nothing" would contradict it.
 
     Args:
         sources: The enabled categories. Empty means discovery is off.
@@ -256,55 +275,114 @@ def discover_skills(
         The discovered skills in canonical order, with duplicates by
         directory removed and the first of any two same-named skills
         kept.
+
+    Raises:
+        SkillError: If a source is not a recognised category.
     """
     if not sources:
         return []
 
     unknown = [source for source in sources if source not in get_args(DiscoverySource)]
-    if unknown:  # pragma: no cover - the schema rejects these first
+    if unknown:
         raise SkillError(f"Unknown skill discovery source(s): {sorted(unknown)!r}")
 
-    home = Path(home) if home is not None else Path.home()
+    # Absolutise here rather than trusting callers. ``ResolvedSkill``
+    # requires an absolute directory, so a relative ``home`` or
+    # ``base_dir`` would otherwise surface as a raise out of the
+    # warn-and-skip path that promises never to raise.
+    home = Path(home).expanduser().absolute() if home is not None else Path.home()
+    if base_dir is not None:
+        base_dir = base_dir.absolute()
     excluded = set(exclude)
     enabled: list[DiscoverySource] = [source for source in _SOURCE_ORDER if source in sources]
 
     by_name: dict[str, DiscoveredSkill] = {}
     out: list[DiscoveredSkill] = []
     for source in enabled:
-        found_here = 0
-        for root in _roots_for_source(source, base_dir, home):
-            for directory in _scan_root(root, source, on_warning):
-                found_here += 1
-                name = directory.name
-                if name in excluded:
-                    continue
-                seen = by_name.get(name)
-                if seen is not None:
-                    if seen.directory != directory:
-                        _warn(
-                            on_warning,
-                            f"Skill discovery found two skills named {name!r}: keeping "
-                            f"{seen.directory} (from {seen.root}) and ignoring "
-                            f"{directory} (from {root}). Exclude one by name with "
-                            "runtime.skill_discovery.exclude, or narrow 'sources'.",
-                        )
-                    continue
-                discovered = DiscoveredSkill(
-                    name=name, directory=directory, source=source, root=root
-                )
-                by_name[name] = discovered
-                out.append(discovered)
-        if found_here == 0:
-            _warn(
-                on_warning,
-                f"Skill discovery source {source!r} found no skills. Searched: "
-                f"{[str(root) for root in _roots_for_source(source, base_dir, home)]!r}. "
-                "Remove it from runtime.skill_discovery.sources, or install skills there.",
-            )
+        # Computed once and reused in the diagnostic below, so the message
+        # cannot describe a different scan than the one that just ran.
+        roots = _roots_for_source(source, base_dir, home, on_warning)
+        candidates, scan_failed = _scan_source(source, roots, on_warning)
+        if not candidates and not scan_failed:
+            # Suppressed after a read failure: "found nothing" would
+            # contradict the warning just emitted, and its advice — remove
+            # the source — would make a permissions problem permanent.
+            _warn(on_warning, _empty_source_message(source, roots, base_dir))
+        for root, directory in candidates:
+            name = directory.name
+            if name in excluded:
+                continue
+            seen = by_name.get(name)
+            if seen is not None:
+                if seen.directory != directory:
+                    _warn(
+                        on_warning,
+                        f"Skill discovery found two skills named {name!r}: keeping "
+                        f"{seen.directory} (from {seen.root}) and ignoring "
+                        f"{directory} (from {root}). Exclude one by name with "
+                        "runtime.skill_discovery.exclude, or narrow 'sources'.",
+                    )
+                continue
+            discovered = DiscoveredSkill(name=name, directory=directory, source=source, root=root)
+            by_name[name] = discovered
+            out.append(discovered)
     return out
 
 
-def _scan_root(root: Path, source: DiscoverySource, on_warning: WarningSink | None) -> list[Path]:
+def _scan_source(
+    source: DiscoverySource, roots: Sequence[Path], on_warning: WarningSink | None
+) -> tuple[list[tuple[Path, Path]], bool]:
+    """Scan every location one category maps to.
+
+    Args:
+        source: The category being scanned, for warning text.
+        roots: Its candidate locations, which may not exist.
+        on_warning: Sink for non-fatal diagnostics.
+
+    Returns:
+        A ``(candidates, failed)`` tuple. ``candidates`` pairs each skill
+        directory with the root it was found under, in scan order and
+        before exclusions or name deduplication — so an empty list means
+        the category genuinely turned up nothing. ``failed`` is True when
+        any root could not be read, so an empty list on its own is not
+        grounds to report the category as empty.
+    """
+    candidates: list[tuple[Path, Path]] = []
+    failed = False
+    for root in roots:
+        skills, root_failed = _scan_root(root, source, on_warning)
+        failed = failed or root_failed
+        candidates.extend((root, directory) for directory in skills)
+    return candidates, failed
+
+
+def _empty_source_message(source: DiscoverySource, roots: list[Path], base_dir: Path | None) -> str:
+    """Explain why a source found nothing, distinguishing the two causes.
+
+    "Found no skills" is misleading when there was nowhere to look, and
+    the natural remedy differs: install skills somewhere, versus supply
+    the anchor the search needed.
+    """
+    if roots:
+        return (
+            f"Skill discovery source {source!r} found no skills. Searched: "
+            f"{[str(root) for root in roots]!r}. Remove it from "
+            "runtime.skill_discovery.sources, or install skills there."
+        )
+    if source == "project" and base_dir is None:
+        return (
+            "Skill discovery source 'project' was skipped because no workflow file "
+            "path was supplied, so there is no directory to search upward from."
+        )
+    return (
+        f"Skill discovery source {source!r} had no locations to search. Remove it "
+        "from runtime.skill_discovery.sources."
+    )
+
+
+def _scan_root(
+    root: Path, source: DiscoverySource, on_warning: WarningSink | None
+) -> tuple[list[Path], bool]:
     """List the skill directories inside one discovery location.
 
     Args:
@@ -313,13 +391,15 @@ def _scan_root(root: Path, source: DiscoverySource, on_warning: WarningSink | No
         on_warning: Sink for non-fatal diagnostics.
 
     Returns:
-        Skill directories, or an empty list when the root is absent,
-        is not a directory, or cannot be read.
+        A ``(skills, failed)`` tuple. ``failed`` distinguishes "there was
+        nothing here" from "something here could not be read", so the
+        caller does not report an empty source when the real cause was a
+        permissions error and the remedy is the opposite.
     """
     try:
         if not root.is_dir():
-            return []
-        children, skipped = expand_skills_root(root)
+            return [], False
+        children, skipped, unreadable = expand_skills_root(root)
     except OSError as exc:
         # Unlike a path the user wrote, an unreadable ambient location is
         # not worth failing a run over — but it is worth saying, since the
@@ -329,7 +409,7 @@ def _scan_root(root: Path, source: DiscoverySource, on_warning: WarningSink | No
             f"Skill discovery could not read {root} (source {source!r}): {exc}. "
             "Any skills installed there were skipped.",
         )
-        return []
+        return [], True
     if skipped:
         _warn(
             on_warning,
@@ -337,7 +417,17 @@ def _scan_root(root: Path, source: DiscoverySource, on_warning: WarningSink | No
             f"{'y' if len(skipped) == 1 else 'ies'} of {root} with no SKILL.md: "
             f"{skipped!r}.",
         )
-    return children
+    if unreadable:
+        # Named individually, and the readable siblings are kept: one
+        # stray directory should not turn off every skill in the root.
+        _warn(
+            on_warning,
+            f"Skill discovery could not read {len(unreadable)} subdirector"
+            f"{'y' if len(unreadable) == 1 else 'ies'} of {root}: {unreadable!r}. "
+            "Any skills there were skipped; the rest of the directory was read "
+            "normally.",
+        )
+    return children, bool(unreadable)
 
 
 def _warn(on_warning: WarningSink | None, message: str) -> None:
@@ -348,8 +438,7 @@ def _warn(on_warning: WarningSink | None, message: str) -> None:
     ``logger.warning`` would print every discovery diagnostic twice, since
     Conductor installs no logging handlers and ``logging.lastResort``
     writes straight to stderr. With no sink the logger is the only place
-    left for it to go. Matches ``registry._resolve_path_entry``, which
-    reports through its sink alone.
+    left for it to go.
     """
     if on_warning is not None:
         on_warning(message)
@@ -447,16 +536,23 @@ def _to_resolved(
 
     try:
         read_skill_frontmatter(candidate.directory)
+        # Inside the ``try`` on purpose: ``ResolvedSkill.__post_init__``
+        # raises ``SkillNotFoundError``, which is a ``SkillError`` — so
+        # constructing outside would be an escape hatch out of the very
+        # warn-and-skip contract this function documents.
+        return ResolvedSkill(
+            name=candidate.name,
+            directory=candidate.directory,
+            source=str(candidate.root),
+            discovered=True,
+        )
     except SkillError as exc:
+        # Names the source category as well as the path: that is the
+        # granularity of the lever the user has (narrow ``sources``), and
+        # it is not recoverable from the path alone.
         _warn(
             on_warning,
-            f"Skill discovery skipped {candidate.name!r} at {candidate.directory} "
-            f"(from {candidate.root}): {exc}",
+            f"Skill discovery skipped {candidate.name!r} (source "
+            f"{candidate.source!r}) at {candidate.directory}: {exc}",
         )
         return None
-    return ResolvedSkill(
-        name=candidate.name,
-        directory=candidate.directory,
-        source=str(candidate.root),
-        discovered=True,
-    )

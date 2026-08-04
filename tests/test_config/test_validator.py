@@ -1921,6 +1921,20 @@ class TestOutputTemplateValidation:
 class TestExamplesRegression:
     """Every example workflow under examples/ must still validate."""
 
+    @pytest.fixture(autouse=True)
+    def _isolated_home(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Keep the sweep off the developer's real home directory.
+
+        ``examples/skills-discovery.yaml`` enables ``runtime.skill_discovery``,
+        and validation resolves it — so without this the result of a
+        general-purpose regression test would depend on which skills the
+        machine running it happens to have installed.
+        """
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("USERPROFILE", str(home))
+
     def test_all_bundled_examples_validate(self) -> None:
         from conductor.config.loader import load_config
 

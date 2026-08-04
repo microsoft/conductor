@@ -58,7 +58,7 @@ def _make_plugin(root: Path, plugin_name: str, skill_name: str) -> Path:
 
 def _workflow(
     *,
-    provider: str = "copilot",
+    provider: str | dict[str, Any] = "copilot",
     agent_skills: list[str] | None = None,
     runtime_skills: list[str] | None = None,
     skill_injection: SkillInjectionConfig | None = None,
@@ -457,7 +457,8 @@ class TestDiscoveryOnEagerInjectionProviders:
             agent_skills=[],
             skill_discovery=SkillDiscoveryConfig(sources=["personal"]),
         )
-        assert _validate(config, _wf_path(tmp_path)) is not None
+        warnings = _validate(config, _wf_path(tmp_path))
+        assert not any("no native skill surface" in w for w in warnings)
 
     def test_disabled_discovery_is_fine(self, tmp_path: Path, fake_home: Path) -> None:
         config = _workflow(provider="claude", skill_discovery=SkillDiscoveryConfig())
@@ -545,3 +546,72 @@ class TestDiscoveryResolutionIsShared:
         )
         warnings = _validate(config, _wf_path(tmp_path))
         assert not any("'loose'" in w and "skipped" in w for w in warnings)
+
+
+class TestDiscoveryAgainstUnsupportedProviders:
+    """``aca`` declares ``capabilities.skills=False``."""
+
+    def test_aca_rejects_inherited_discovery(self, tmp_path: Path, fake_home: Path) -> None:
+        _make_skill(fake_home / ".copilot" / "skills" / "acme")
+        config = _workflow(
+            provider={"name": "aca", "pool_endpoint": "https://pool.example.com"},
+            skill_discovery=SkillDiscoveryConfig(sources=["personal"]),
+        )
+        with pytest.raises(ConfigurationError, match="does not support skills"):
+            _validate(config, _wf_path(tmp_path))
+
+    def test_aca_run_time_message_does_not_blame_the_opt_out_syntax(self) -> None:
+        """``skills=[]`` is the documented opt-out, so naming it as the cause
+        would tell the user the remedy is already in effect."""
+        from conductor.providers.aca import AcaRuntimeProvider
+
+        executor = AgentExecutor(
+            AcaRuntimeProvider.__new__(AcaRuntimeProvider),
+            skill_discovery=SkillDiscoveryConfig(sources=["personal"]),
+        )
+        agent = AgentDef(name="a", model="gpt-4", prompt="p")
+        with pytest.raises(ExecutionError) as excinfo:
+            executor._resolve_skills_for_agent(agent)
+        assert "runtime.skill_discovery" in str(excinfo.value)
+        assert "skills=[]" not in str(excinfo.value)
+
+
+class TestSkillCacheKeying:
+    """One agent's resolution must not be served to another with a different set."""
+
+    def test_inheriting_and_overriding_agents_do_not_share_a_cache_entry(
+        self, tmp_path: Path, fake_home: Path
+    ) -> None:
+        """Both resolve from an empty entry list, but only one gets discovery.
+
+        A cache keyed on entries alone would hand the second agent the
+        first's result.
+        """
+        _make_skill(fake_home / ".copilot" / "skills" / "ambient")
+        executor = AgentExecutor(
+            _EagerProvider(),
+            workflow_skills=[],
+            skill_discovery=SkillDiscoveryConfig(sources=["personal"]),
+        )
+        # ``skills: []`` — overrides, so no discovery.
+        opted_out = AgentDef(name="out", model="gpt-4", prompt="p", skills=[])
+        assert executor._resolve_skills_for_agent(opted_out) == []
+        # Inherits, so discovery applies. Refused on this provider, which
+        # is itself proof the cached empty result was not reused.
+        inheriting = AgentDef(name="in", model="gpt-4", prompt="p")
+        with pytest.raises(ExecutionError, match="no native skill surface"):
+            executor._resolve_skills_for_agent(inheriting)
+
+    def test_validator_distinguishes_the_same_entries_with_and_without_discovery(
+        self, tmp_path: Path, fake_home: Path
+    ) -> None:
+        _make_skill(fake_home / ".copilot" / "skills" / "loose")
+        config = _workflow(
+            provider="claude-agent-sdk",
+            skill_discovery=SkillDiscoveryConfig(sources=["personal"]),
+            for_each_skills=[],
+        )
+        warnings = _validate(config, _wf_path(tmp_path))
+        # The inheriting top-level agent sees the discovered skill; the
+        # for_each agent opted out and must not inherit its cached result.
+        assert any("'loose'" in w and "skipped" in w for w in warnings)

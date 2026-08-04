@@ -1713,10 +1713,13 @@ def _validate_provider_capabilities(
         starts rather than on first execution.
 
         Discovered skills are held to a laxer standard than declared ones: a
-        skill the author never named should not fail their workflow, so a
-        provider that cannot deliver it produces a warning and a skip rather
-        than an error. That asymmetry is the same one
-        :mod:`conductor.skills.discovery` applies to broken manifests.
+        skill the author never named should not fail their workflow, so one
+        ``claude-agent-sdk`` cannot load is a warning and a skip. The one
+        exception is a provider with no native skill surface at all
+        (``claude``, ``hermes``) — skipping there would drop the entire
+        discovered set, so the combination is refused outright below. That
+        asymmetry is the same one :mod:`conductor.skills.discovery` applies to
+        broken manifests.
         """
         overridden = agent.skills is not None
         # Repeat the ``is not None`` rather than reusing ``overridden``: the
@@ -1790,53 +1793,60 @@ def _validate_provider_capabilities(
             return
 
         if provider_name == "claude-agent-sdk":
-            usable: list[ResolvedSkill] = []
             for item in resolved:
-                try:
-                    plugin = resolve_skill_plugin(item.directory)
-                except SkillPluginError as exc:
-                    if item.discovered:
-                        warnings.append(
-                            f"Agent '{agent.name}': discovered skill {item.name!r} at "
-                            f"{item.directory} was skipped — its Claude Code plugin "
-                            f"cannot be loaded: {exc}"
-                        )
-                    else:
-                        errors.append(
-                            f"Agent '{agent.name}': skill {item.source!r} resolves to "
-                            f"{item.directory}, whose Claude Code plugin cannot be "
-                            f"loaded: {exc}"
-                        )
-                    continue
-                if plugin is None:
-                    if item.discovered:
-                        warnings.append(
-                            f"Agent '{agent.name}': discovered skill {item.name!r} at "
-                            f"{item.directory} (found in {item.source}) was skipped — "
-                            f"provider 'claude-agent-sdk' can only load a skill that "
-                            f"lives inside a Claude Code plugin. The same skill works "
-                            f"on 'copilot'. Add it to "
-                            f"runtime.skill_discovery.exclude to silence this."
-                        )
-                    else:
-                        errors.append(
-                            f"Agent '{agent.name}': skill {item.source!r} resolves to "
-                            f"{item.directory}, which is not inside a Claude Code "
-                            f"plugin. Provider 'claude-agent-sdk' can only enable a "
-                            f"skill through the plugin that owns it — it has no "
-                            f"skill-directory option. Package the skill as a plugin "
-                            f"(add ../.claude-plugin/plugin.json and move the skill "
-                            f"under <plugin>/skills/), or run this agent on 'copilot', "
-                            f"which loads skill directories directly."
-                        )
-                    continue
-                usable.append(item)
-            # Discovered skills this provider cannot load are dropped, so the
-            # budget below measures what would actually be sent.
-            resolved = usable
+                _check_claude_agent_sdk_skill(agent, item)
 
+        # Only the eager-injection providers reach this; the claude-agent-sdk
+        # drops above cannot affect it, since that provider is native.
         if uses_native_skills(provider_name) is False:
             _check_skill_injection_budget(agent, provider_name, resolved)
+
+    def _check_claude_agent_sdk_skill(agent: AgentDef, item: ResolvedSkill) -> None:
+        """Check one resolved skill against ``claude-agent-sdk``'s plugin-only surface.
+
+        That provider has no bare skill-directory option, so a skill only
+        reaches it through the Claude Code plugin that owns it. A skill the
+        author named is an error; a discovered one is a warning and a skip,
+        the same asymmetry the rest of skill handling applies.
+        """
+        try:
+            plugin = resolve_skill_plugin(item.directory)
+        except SkillPluginError as exc:
+            if item.discovered:
+                warnings.append(
+                    f"Agent '{agent.name}': discovered skill {item.name!r} at "
+                    f"{item.directory} was skipped — its Claude Code plugin "
+                    f"cannot be loaded: {exc}"
+                )
+            else:
+                errors.append(
+                    f"Agent '{agent.name}': skill {item.source!r} resolves to "
+                    f"{item.directory}, whose Claude Code plugin cannot be "
+                    f"loaded: {exc}"
+                )
+            return
+
+        if plugin is None:
+            if item.discovered:
+                warnings.append(
+                    f"Agent '{agent.name}': discovered skill {item.name!r} at "
+                    f"{item.directory} (found in {item.source}) was skipped — "
+                    f"provider 'claude-agent-sdk' can only load a skill that "
+                    f"lives inside a Claude Code plugin. The same skill works "
+                    f"on 'copilot'. Add it to "
+                    f"runtime.skill_discovery.exclude to silence this."
+                )
+            else:
+                errors.append(
+                    f"Agent '{agent.name}': skill {item.source!r} resolves to "
+                    f"{item.directory}, which is not inside a Claude Code "
+                    f"plugin. Provider 'claude-agent-sdk' can only enable a "
+                    f"skill through the plugin that owns it — it has no "
+                    f"skill-directory option. Package the skill as a plugin "
+                    f"(add ../.claude-plugin/plugin.json and move the skill "
+                    f"under <plugin>/skills/), or run this agent on 'copilot', "
+                    f"which loads skill directories directly."
+                )
 
     def _check_skill_injection_budget(
         agent: AgentDef, provider_name: str, resolved: list[ResolvedSkill]

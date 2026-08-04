@@ -1589,12 +1589,12 @@ its own:
 | Source | Locations scanned |
 |---|---|
 | `personal` | `~/.copilot/skills`, `~/.claude/skills` |
-| `project` | `.github/skills` and `.claude/skills`, in the workflow file's directory and each ancestor up to the repository root |
+| `project` | `.github/skills` and `.claude/skills`, in the workflow file's directory and each ancestor up to the repository root — or that directory alone when it is not inside a repository |
 | `plugins` | the `skills/` directory of every installed plugin (`~/.copilot/installed-plugins/*/*/skills`, `~/.claude/plugins/*/*/skills`) |
 
 Conductor doing the scanning is the point rather than an implementation
 detail. Discovery locations are provider-specific, so a flag that asked each
-provider to find its own would give a `copilot` agent and a `claude` agent
+provider to find its own would give a `copilot` agent and a `claude-agent-sdk` agent
 **different skill sets inside a single run**. Scanning centrally means every
 agent sees the same set whatever provider it resolves to. It also keeps the
 providers' own discovery switched off, which matters because Copilot's would
@@ -1612,7 +1612,8 @@ which of two same-named skills wins.
 #### Declared skills win
 
 A skill named in `skills:` always beats a discovered one of the same name —
-the discovered copy is skipped with a warning. This comes up immediately:
+the discovered copy is skipped, with a warning unless both resolve to the same
+directory, in which case there is nothing to report. This comes up immediately:
 installing Conductor's own plugin puts a second `conductor` skill on the
 machine, and `skills: [conductor]` must keep meaning the built-in one.
 
@@ -1626,7 +1627,11 @@ happens to be installed. So the same problem is reported differently:
 | Broken `SKILL.md` frontmatter | error | warning, skipped |
 | Name already taken | error | warning, skipped |
 | Directory unreadable | error | warning, skipped |
-| Provider cannot load it | error | warning, skipped |
+| `claude-agent-sdk` cannot load it | error | warning, skipped |
+
+The one exception is a provider with **no native skill surface at all**
+(`claude`, `hermes`). Skipping there would drop the entire discovered set, so
+that combination is an error either way — see below.
 
 #### Provider support
 

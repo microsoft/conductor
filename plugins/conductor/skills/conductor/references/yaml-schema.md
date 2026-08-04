@@ -58,7 +58,8 @@ workflow:
       sources: [string]             # personal | project | plugins (default: [] = disabled)
                                     #   personal -> ~/.copilot/skills, ~/.claude/skills
                                     #   project  -> .github/skills and .claude/skills, from the
-                                    #               workflow file's dir up to the repo root
+                                    #               workflow file's dir up to the repo root (or that
+                                    #               dir alone when not inside a repository)
                                     #   plugins  -> every installed plugin's skills/ directory
                                     # Conductor scans the union of both CLIs' locations itself, so
                                     #   every agent sees the same set whatever provider it uses.
@@ -67,7 +68,8 @@ workflow:
                                     # Discovered skills join runtime.skills, so an agent's own
                                     #   `skills:` (including []) overrides them too.
                                     # A skill named in `skills:` beats a discovered one of the same
-                                    #   name; the discovered copy is skipped with a warning.
+                                    #   name; the discovered copy is skipped, with a warning unless
+                                    #   both resolve to the same directory.
                                     # REJECTED on claude/hermes -- they inject every body into every
                                     #   prompt and a discovered set cannot be bounded.
       exclude: [string]             # Skill names to drop from the discovered set (default: [])

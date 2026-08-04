@@ -26,9 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   declaring its own `skills:` (including `skills: []`) still overrides
   them; a skill named in `skills:` beats a discovered one of the same name.
   Discovered content is held to a laxer standard than declared content —
-  broken frontmatter, a taken name, an unreadable directory, or a provider
-  that cannot load it are errors for a declared skill and warning-plus-skip
-  for a discovered one. Rejected at validation time on `claude` and
+  broken frontmatter, a taken name, an unreadable directory, or a skill
+  `claude-agent-sdk` cannot load are errors for a declared skill and
+  warning-plus-skip for a discovered one (a provider with no native skill
+  surface at all is the exception, and errors either way). Rejected at validation time on `claude` and
   `hermes`, which inject every skill body into every prompt and cannot
   bound a machine-dependent set; on `claude-agent-sdk` only discovered
   skills inside a Claude Code plugin are loaded and the rest are skipped

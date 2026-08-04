@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 
 from conductor.skills import (
+    SkillError,
     SkillNotFoundError,
     discover_skills,
     resolve_effective_skills,
@@ -309,6 +310,9 @@ class TestResolveEffectiveSkills:
         )
         assert [skill.name for skill in resolved] == ["good"]
         assert any("skipped 'broken'" in warning for warning in warnings)
+        # Names the source category: that is the granularity of the lever
+        # the user has for narrowing what gets picked up.
+        assert any("'personal'" in warning for warning in warnings)
 
     def test_broken_explicit_manifest_still_raises(self, tmp_path: Path, home: Path) -> None:
         broken = tmp_path / "team" / "broken"
@@ -332,3 +336,84 @@ class TestResolveEffectiveSkills:
             base_dir=tmp_path,
         )
         assert [skill.name for skill in resolved] == ["declared"]
+
+
+class TestResilience:
+    """A stray directory must not take the whole scan down with it."""
+
+    def test_git_as_a_file_stops_the_walk(self, tmp_path: Path, home: Path) -> None:
+        """Worktrees and submodules write ``.git`` as a file, not a directory."""
+        repo = tmp_path / "worktree"
+        repo.mkdir()
+        (repo / ".git").write_text("gitdir: /elsewhere/.git/worktrees/wt\n")
+        _make_skill(repo / ".github" / "skills" / "inside")
+        _make_skill(tmp_path / ".github" / "skills" / "outside")
+        found = discover_skills(["project"], base_dir=repo, home=home)
+        assert [skill.name for skill in found] == ["inside"]
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission semantics")
+    def test_one_unreadable_child_does_not_hide_its_siblings(self, home: Path) -> None:
+        root = home / ".copilot" / "skills"
+        _make_skill(root / "alpha")
+        _make_skill(root / "beta")
+        locked = root / "locked"
+        locked.mkdir()
+        locked.chmod(0o000)
+        try:
+            warnings: list[str] = []
+            found = discover_skills(["personal"], home=home, on_warning=warnings.append)
+            # The readable siblings survive; only the stray directory is lost.
+            assert [skill.name for skill in found] == ["alpha", "beta"]
+            assert any("locked" in warning for warning in warnings)
+        finally:
+            locked.chmod(0o755)
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission semantics")
+    def test_unreadable_root_does_not_also_claim_the_source_is_empty(self, home: Path) -> None:
+        """ "Found nothing" would contradict the read failure and mis-advise."""
+        root = home / ".copilot" / "skills"
+        _make_skill(root / "alpha")
+        root.chmod(0o000)
+        try:
+            warnings: list[str] = []
+            discover_skills(["personal"], home=home, on_warning=warnings.append)
+            assert any("could not read" in warning for warning in warnings)
+            assert not any("found no skills" in warning for warning in warnings)
+        finally:
+            root.chmod(0o755)
+
+    def test_project_without_a_base_dir_says_why(self, home: Path) -> None:
+        # Not "found no skills … install skills there" — there is no
+        # "there", and installing skills would not help.
+        warnings: list[str] = []
+        discover_skills(["project"], base_dir=None, home=home, on_warning=warnings.append)
+        assert any("no workflow file path was supplied" in warning for warning in warnings)
+
+    def test_relative_home_does_not_raise_from_the_lenient_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``ResolvedSkill`` demands an absolute directory.
+
+        Constructing one from a relative ``home`` would raise
+        ``SkillNotFoundError`` straight out of the warn-and-skip path that
+        promises never to raise.
+        """
+        _make_skill(tmp_path / "home" / ".copilot" / "skills" / "mine")
+        monkeypatch.chdir(tmp_path)
+        resolved = resolve_effective_skills([], sources=["personal"], home=Path("home"))
+        assert [skill.name for skill in resolved] == ["mine"]
+        assert resolved[0].directory.is_absolute()
+
+    def test_relative_base_dir_does_not_raise_from_the_lenient_path(
+        self, tmp_path: Path, home: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _make_skill(tmp_path / "wf" / ".github" / "skills" / "mine")
+        monkeypatch.chdir(tmp_path)
+        resolved = resolve_effective_skills([], sources=["project"], base_dir=Path("wf"), home=home)
+        assert [skill.name for skill in resolved] == ["mine"]
+        assert resolved[0].directory.is_absolute()
+
+    def test_unknown_source_is_rejected(self, home: Path) -> None:
+        # Reachable without the schema: this is a public, exported function.
+        with pytest.raises(SkillError, match="Unknown skill discovery source"):
+            discover_skills(["everywhere"], home=home)  # ty: ignore[invalid-argument-type]

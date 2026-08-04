@@ -437,7 +437,9 @@ class AgentExecutor:
 
         Raises:
             ExecutionError: If skills are enabled for an agent whose
-                provider declares ``capabilities.skills=False``.
+                provider declares ``capabilities.skills=False``, or if
+                discovery is enabled for a provider with no native skill
+                surface.
             SkillNotFoundError: If an explicit entry cannot be resolved.
             SkillManifestError: If an explicit entry's ``SKILL.md`` is
                 missing, unparseable, or incomplete.
@@ -448,11 +450,50 @@ class AgentExecutor:
         # Repeat the ``is not None`` rather than reusing ``overridden``: the
         # type checker does not narrow through an intermediate boolean.
         entries = list(agent.skills) if agent.skills is not None else list(self._workflow_skills)
-        discovery = None if overridden else self._skill_discovery
-        if not entries and not (discovery and discovery.is_enabled):
+        discovery = (
+            self._skill_discovery if not overridden and self._skill_discovery.is_enabled else None
+        )
+        if not entries and discovery is None:
             return []
-        self._reject_unsupported_skills(agent, entries)
+        self._reject_unsupported_skills(agent, entries, discovery is not None)
+        if discovery is not None:
+            self._reject_discovery_without_native_skills(agent, discovery)
         return self._resolve_skills(entries, discovery)
+
+    def _reject_discovery_without_native_skills(
+        self, agent: AgentDef, discovery: SkillDiscoveryConfig
+    ) -> None:
+        """Refuse discovery on a provider that eagerly injects skill bodies.
+
+        Mirrors the same check in
+        :func:`conductor.config.validator.validate_workflow_config`.
+        ``conductor validate`` rejects the combination, but ``conductor
+        run`` never invokes the static validator — so without this the
+        refusal holds in one command while the other quietly injects the
+        whole ambient set into every prompt. ``runtime.skill_injection``
+        is not a backstop: it only fires above ``max_bytes``, so a set
+        under the limit passes silently and a set over it reports a budget
+        problem rather than the real one.
+
+        Raises:
+            ExecutionError: If discovery is enabled for this agent and the
+                provider has no native skill surface.
+        """
+        if getattr(self.provider, "supports_native_skills", False):
+            return
+        raise ExecutionError(
+            f"Agent '{agent.name}': provider '{type(self.provider).__name__}' has no "
+            f"native skill surface, but 'runtime.skill_discovery' is enabled "
+            f"(sources={list(discovery.sources)!r}). Discovered skills would be injected "
+            f"in full into every prompt, and the discovered set varies by machine, so "
+            f"its size cannot be bounded.",
+            agent_name=agent.name,
+            suggestion=(
+                "Name the skills you want in 'runtime.skills' (or this agent's "
+                "'skills:'), or run this agent on a provider with progressive "
+                "disclosure (copilot, claude-agent-sdk)."
+            ),
+        )
 
     def _resolve_skills(
         self, entries: list[str], discovery: SkillDiscoveryConfig | None
@@ -629,7 +670,9 @@ class AgentExecutor:
                     parts.append(content)
         return "".join(parts)
 
-    def _reject_unsupported_skills(self, agent: AgentDef, skill_entries: list[str]) -> None:
+    def _reject_unsupported_skills(
+        self, agent: AgentDef, skill_entries: list[str], discovery_on: bool = False
+    ) -> None:
         """Refuse skills on a provider that declares it does not support them.
 
         Mirrors the ``capabilities.skills`` check in
@@ -644,18 +687,36 @@ class AgentExecutor:
         raises at import time unless a subclass either declares
         ``CAPABILITIES`` or opts out with ``abstract=True``, so a real
         provider cannot reach this branch by forgetting to declare one.
+
+        Args:
+            agent: The agent whose skills are enabled.
+            skill_entries: The declared entries, which may be empty when
+                discovery alone enabled skills.
+            discovery_on: Whether discovery contributed. Changes the
+                message, because reporting ``skills=[]`` would name the
+                documented *opt-out* syntax as the cause and suggest a
+                remedy that is already in effect.
+
+        Raises:
+            ExecutionError: If the provider declares
+                ``capabilities.skills=False``.
         """
         capabilities = getattr(type(self.provider), "CAPABILITIES", None)
         if capabilities is None or capabilities.skills:
             return
+        if skill_entries:
+            cause = f"declares skills={skill_entries!r}"
+            remedy = "Remove the skills, opt out with 'skills: []', or override the "
+        else:
+            cause = "has skills enabled via 'runtime.skill_discovery'"
+            remedy = "Disable runtime.skill_discovery, or override the "
         raise ExecutionError(
-            f"Agent '{agent.name}' declares skills={skill_entries!r} but provider "
+            f"Agent '{agent.name}' {cause} but provider "
             f"'{type(self.provider).__name__}' does not support skills "
             f"(capabilities.skills=False).",
             agent_name=agent.name,
             suggestion=(
-                "Remove the skills, opt out with 'skills: []', or override the "
-                "agent to a skill-aware provider. 'conductor validate' reports "
-                "this before a run starts."
+                f"{remedy}agent to a skill-aware provider. 'conductor validate' "
+                "reports this before a run starts."
             ),
         )

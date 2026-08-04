@@ -2501,8 +2501,8 @@ class SkillDiscoveryConfig(BaseModel):
     **Off by default**, and worth leaving off unless you want it: an
     ambient set makes the same YAML behave differently on a different
     machine or in CI, which is the opposite of a reproducible run.
-    ``conductor validate`` prints what it resolved so the set is at least
-    inspectable.
+    ``conductor validate`` prints the set it puts in effect, so it is at
+    least inspectable before you commit the workflow.
 
     Not usable on every provider. ``claude`` and ``hermes`` have no
     native skill surface and would eagerly inject the entire discovered
@@ -2521,16 +2521,19 @@ class SkillDiscoveryConfig(BaseModel):
     # Frozen for the reason ``SkillInjectionConfig`` and ``ProviderSettings``
     # document: the field validators below are shape checks that do not
     # re-fire on per-attribute assignment under the enclosing
-    # ``RuntimeConfig``'s ``validate_assignment=True``.
+    # ``RuntimeConfig``'s ``validate_assignment=True``. The fields are
+    # tuples rather than lists so ``frozen`` means what it says — a list
+    # would still allow ``config.sources.append(...)``, and would make the
+    # model unhashable despite Pydantic generating ``__hash__`` for it.
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    sources: list[DiscoverySource] = Field(default_factory=list)
+    sources: tuple[DiscoverySource, ...] = ()
     """Which categories of location to scan. Empty disables discovery.
 
     * ``personal`` — ``~/.copilot/skills``, ``~/.claude/skills``
     * ``project`` — ``.github/skills`` and ``.claude/skills``, in the
       workflow file's directory and each ancestor up to the repository
-      root
+      root, or that directory alone when it is not inside a repository
     * ``plugins`` — the ``skills/`` directory of every installed plugin
 
     Scanned in a fixed order (``project``, ``personal``, ``plugins``)
@@ -2538,7 +2541,7 @@ class SkillDiscoveryConfig(BaseModel):
     change which of two same-named skills wins.
     """
 
-    exclude: list[str] = Field(default_factory=list)
+    exclude: tuple[str, ...] = ()
     """Skill names to drop from the discovered set.
 
     Applies to discovered skills only. Removing an explicitly declared
@@ -2547,7 +2550,7 @@ class SkillDiscoveryConfig(BaseModel):
 
     @field_validator("sources")
     @classmethod
-    def validate_sources(cls, v: list[DiscoverySource]) -> list[DiscoverySource]:
+    def validate_sources(cls, v: tuple[DiscoverySource, ...]) -> tuple[DiscoverySource, ...]:
         """Reject a repeated source.
 
         Listing one twice has no effect, so it always means the author
@@ -2563,10 +2566,10 @@ class SkillDiscoveryConfig(BaseModel):
 
     @field_validator("exclude")
     @classmethod
-    def validate_exclude(cls, v: list[str]) -> list[str]:
+    def validate_exclude(cls, v: tuple[str, ...]) -> tuple[str, ...]:
         """Reject blank exclusions, which match no skill name."""
         for name in v:
-            if not isinstance(name, str) or not name.strip():
+            if not name.strip():
                 raise ValueError(
                     f"skill_discovery.exclude entries must be non-empty skill names, got {name!r}"
                 )

@@ -199,7 +199,7 @@ async def test_schema_changes_dont_affect_copilot_provider():
         "skill_injection": {"warn_bytes": 65536, "max_bytes": 131072},
         # Skill discovery is off by default (issue #362): ambient skills
         # would make the same YAML behave differently per machine.
-        "skill_discovery": {"sources": [], "exclude": []},
+        "skill_discovery": {"sources": (), "exclude": ()},
     }
 
     # Verify provider can be instantiated
