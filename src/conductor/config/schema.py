@@ -3019,3 +3019,31 @@ class WorkflowConfig(BaseModel):
                     )
 
         return self
+
+    @model_validator(mode="after")
+    def validate_root_level_output_required(self) -> WorkflowConfig:
+        """Reject top-level optional output fields on agents and for-each agents.
+
+        Object properties may still be optional; the policy only applies to the
+        root output dict of an agent definition.
+        """
+        for agent in self.agents:
+            if agent.output:
+                for field_name, field in agent.output.items():
+                    if not field.required:
+                        raise ValueError(
+                            f"Agent '{agent.name}' output field '{field_name}': "
+                            "root-level output fields cannot be optional "
+                            "(required: false is only allowed inside object properties)"
+                        )
+        for for_each_group in self.for_each:
+            agent = for_each_group.agent
+            if agent.output:
+                for field_name, field in agent.output.items():
+                    if not field.required:
+                        raise ValueError(
+                            f"Agent '{agent.name}' output field '{field_name}': "
+                            "root-level output fields cannot be optional "
+                            "(required: false is only allowed inside object properties)"
+                        )
+        return self

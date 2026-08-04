@@ -441,6 +441,188 @@ class TestParseJsonOutput:
         assert result == {"a": 1}
 
 
+class TestValidateOutputConstraints:
+    """Tests for output field constraint validation."""
+
+    def test_nullable_null_passes(self) -> None:
+        """A nullable field must accept an explicit null value."""
+        schema = {"value": OutputField(type="string", nullable=True)}
+        validate_output({"value": None}, schema)
+
+    def test_nullable_null_rejected_when_not_nullable(self) -> None:
+        """A non-nullable field must reject an explicit null value."""
+        schema = {"value": OutputField(type="string", nullable=False)}
+        with pytest.raises(ValidationError, match="Output field 'value' must not be null"):
+            validate_output({"value": None}, schema)
+
+    def test_enum_passes_when_value_is_member(self) -> None:
+        """A value listed in enum must pass."""
+        schema = {"color": OutputField(type="string", enum=["red", "blue"])}
+        validate_output({"color": "blue"}, schema)
+
+    def test_enum_rejects_non_member(self) -> None:
+        """A value not listed in enum must raise a precise error."""
+        schema = {"color": OutputField(type="string", enum=["red", "blue"])}
+        with pytest.raises(
+            ValidationError,
+            match="Output field 'color' must be one of \\['red', 'blue'\\], got 'green'",
+        ):
+            validate_output({"color": "green"}, schema)
+
+    def test_enum_number_accepts_float_int_equality(self) -> None:
+        """A number enum [1] must accept 1.0 using plain Python equality."""
+        schema = {"value": OutputField(type="number", enum=[1])}
+        validate_output({"value": 1.0}, schema)
+
+    def test_enum_number_rejects_boolean(self) -> None:
+        """A number enum [1] rejects True at the type layer (bool is not a number),
+
+        mirroring the _reject_bool BeforeValidator on the pydantic path.
+        """
+        schema = {"value": OutputField(type="number", enum=[1])}
+        with pytest.raises(ValidationError, match="has wrong type"):
+            validate_output({"value": True}, schema)
+
+    def test_enum_boolean_only_matches_boolean_enum(self) -> None:
+        """A boolean value must only match a boolean enum, not a number enum."""
+        schema = {"value": OutputField(type="boolean", enum=[True])}
+        validate_output({"value": True}, schema)
+
+    def test_pattern_passes(self) -> None:
+        """A string matching the regex pattern must pass."""
+        schema = {"value": OutputField(type="string", pattern=r"^a")}
+        validate_output({"value": "abc"}, schema)
+
+    def test_pattern_rejects_non_matching(self) -> None:
+        """A string not matching the regex pattern must raise a precise error."""
+        schema = {"value": OutputField(type="string", pattern=r"^a")}
+        with pytest.raises(
+            ValidationError,
+            match="Output field 'value' does not match pattern '\\^a'",
+        ):
+            validate_output({"value": "xyz"}, schema)
+
+    def test_min_length_passes(self) -> None:
+        """A string meeting minLength must pass."""
+        schema = {"value": OutputField(type="string", minLength=2)}
+        validate_output({"value": "ab"}, schema)
+
+    def test_min_length_rejects_too_short(self) -> None:
+        """A string shorter than minLength must raise a precise error."""
+        schema = {"value": OutputField(type="string", minLength=2)}
+        with pytest.raises(
+            ValidationError,
+            match="Output field 'value' is shorter than minLength 2",
+        ):
+            validate_output({"value": "a"}, schema)
+
+    def test_max_length_passes(self) -> None:
+        """A string meeting maxLength must pass."""
+        schema = {"value": OutputField(type="string", maxLength=3)}
+        validate_output({"value": "abc"}, schema)
+
+    def test_max_length_rejects_too_long(self) -> None:
+        """A string longer than maxLength must raise a precise error."""
+        schema = {"value": OutputField(type="string", maxLength=3)}
+        with pytest.raises(
+            ValidationError,
+            match="Output field 'value' is longer than maxLength 3",
+        ):
+            validate_output({"value": "abcd"}, schema)
+
+    def test_minimum_passes(self) -> None:
+        """A number meeting minimum must pass."""
+        schema = {"value": OutputField(type="number", minimum=0)}
+        validate_output({"value": 0}, schema)
+
+    def test_minimum_rejects_below(self) -> None:
+        """A number below minimum must raise a precise error."""
+        schema = {"value": OutputField(type="number", minimum=0)}
+        with pytest.raises(
+            ValidationError,
+            match="Output field 'value' is below minimum 0",
+        ):
+            validate_output({"value": -1}, schema)
+
+    def test_maximum_passes(self) -> None:
+        """A number meeting maximum must pass."""
+        schema = {"value": OutputField(type="number", maximum=10)}
+        validate_output({"value": 10}, schema)
+
+    def test_maximum_rejects_above(self) -> None:
+        """A number above maximum must raise a precise error."""
+        schema = {"value": OutputField(type="number", maximum=10)}
+        with pytest.raises(
+            ValidationError,
+            match="Output field 'value' is above maximum 10",
+        ):
+            validate_output({"value": 11}, schema)
+
+    def test_optional_field_absent_is_allowed(self) -> None:
+        """An optional object property omitted from content must not raise."""
+        schema = {
+            "value": OutputField(type="string"),
+            "extra": OutputField(type="string", required=False),
+        }
+        validate_output({"value": "present"}, schema)
+
+    def test_optional_field_present_is_validated(self) -> None:
+        """An optional object property present must still pass validation."""
+        schema = {
+            "value": OutputField(type="string"),
+            "extra": OutputField(type="string", required=False, maxLength=3),
+        }
+        validate_output({"value": "present", "extra": "ok"}, schema)
+
+    def test_optional_field_present_violates_constraints(self) -> None:
+        """An optional object property present with a bad value must raise."""
+        schema = {
+            "value": OutputField(type="string"),
+            "extra": OutputField(type="string", required=False, maxLength=3),
+        }
+        with pytest.raises(ValidationError, match="longer than maxLength 3"):
+            validate_output({"value": "present", "extra": "too long"}, schema)
+
+    def test_constraints_inside_array_object_items(self) -> None:
+        """Constraints inside array<object> items must be enforced recursively."""
+        schema = {
+            "items": OutputField(
+                type="array",
+                items=OutputField(
+                    type="object",
+                    properties={
+                        "tag": OutputField(type="string", pattern=r"^[ab]$"),
+                        "score": OutputField(type="number", minimum=0, maximum=1),
+                    },
+                ),
+            )
+        }
+        validate_output(
+            {"items": [{"tag": "a", "score": 0.5}, {"tag": "b", "score": 1.0}]},
+            schema,
+        )
+
+    def test_constraints_inside_array_object_items_rejected(self) -> None:
+        """A nested item constraint violation inside array<object> must raise."""
+        schema = {
+            "items": OutputField(
+                type="array",
+                items=OutputField(
+                    type="object",
+                    properties={
+                        "tag": OutputField(type="string", pattern=r"^[ab]$"),
+                        "score": OutputField(type="number", minimum=0, maximum=1),
+                    },
+                ),
+            )
+        }
+        with pytest.raises(ValidationError, match="does not match pattern"):
+            validate_output(
+                {"items": [{"tag": "c", "score": 0.5}]},
+                schema,
+            )
+
+
 class TestValidationErrorValueDescription:
     """The error names the offending value, without echoing secrets.
 

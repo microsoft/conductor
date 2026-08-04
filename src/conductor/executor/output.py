@@ -6,6 +6,7 @@ declared output schemas.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from conductor.config.schema import OutputField
@@ -36,12 +37,65 @@ def validate_output(
     """
     for field_name, field_def in schema.items():
         if field_name not in content:
+            if not field_def.required:
+                continue
             raise ValidationError(
                 f"Missing required output field: {field_name}",
                 suggestion=f"Ensure agent returns '{field_name}' in output",
             )
 
         _validate_field(field_name, content[field_name], field_def)
+
+
+def _check_constraints(field_name: str, value: Any, field_def: OutputField) -> None:
+    """Validate scalar constraints (enum, pattern, length, range) for a field.
+
+    Called after the type check has passed, so ``value`` is known to match
+    ``field_def.type``. Raises ``ValidationError`` with a suggestion on failure.
+    """
+    if field_def.enum is not None:
+        if isinstance(value, bool):
+            if not (field_def.type == "boolean" and value in field_def.enum):
+                raise ValidationError(
+                    f"Output field '{field_name}' must be one of {field_def.enum!r}, "
+                    f"got {value!r}",
+                    suggestion=f"Ensure '{field_name}' is one of {field_def.enum!r}",
+                )
+        elif value not in field_def.enum:
+            raise ValidationError(
+                f"Output field '{field_name}' must be one of {field_def.enum!r}, "
+                f"got {value!r}",
+                suggestion=f"Ensure '{field_name}' is one of {field_def.enum!r}",
+            )
+
+    if field_def.pattern is not None and re.search(field_def.pattern, value) is None:
+        raise ValidationError(
+            f"Output field '{field_name}' does not match pattern '{field_def.pattern}'",
+            suggestion=f"Ensure '{field_name}' matches the pattern '{field_def.pattern}'",
+        )
+
+    if field_def.type == "string":
+        if field_def.minLength is not None and len(value) < field_def.minLength:
+            raise ValidationError(
+                f"Output field '{field_name}' is shorter than minLength {field_def.minLength}",
+                suggestion=f"Ensure '{field_name}' has at least {field_def.minLength} characters",
+            )
+        if field_def.maxLength is not None and len(value) > field_def.maxLength:
+            raise ValidationError(
+                f"Output field '{field_name}' is longer than maxLength {field_def.maxLength}",
+                suggestion=f"Ensure '{field_name}' has at most {field_def.maxLength} characters",
+            )
+    elif field_def.type == "number":
+        if field_def.minimum is not None and value < field_def.minimum:
+            raise ValidationError(
+                f"Output field '{field_name}' is below minimum {field_def.minimum}",
+                suggestion=f"Ensure '{field_name}' is at least {field_def.minimum}",
+            )
+        if field_def.maximum is not None and value > field_def.maximum:
+            raise ValidationError(
+                f"Output field '{field_name}' is above maximum {field_def.maximum}",
+                suggestion=f"Ensure '{field_name}' is at most {field_def.maximum}",
+            )
 
 
 def _validate_field(field_name: str, value: Any, field_def: OutputField) -> None:
@@ -60,6 +114,14 @@ def _validate_field(field_name: str, value: Any, field_def: OutputField) -> None
     Raises:
         ValidationError: If the value or any nested value doesn't match.
     """
+    if value is None:
+        if field_def.nullable:
+            return
+        raise ValidationError(
+            f"Output field '{field_name}' must not be null",
+            suggestion=f"Ensure '{field_name}' is not null or set nullable: true",
+        )
+
     if not check_type(value, field_def.type):
         raise ValidationError(
             f"Output field '{field_name}' has wrong type: "
@@ -67,6 +129,8 @@ def _validate_field(field_name: str, value: Any, field_def: OutputField) -> None
             f"(received: {_describe_value(value)})",
             suggestion=f"Ensure agent returns correct type for '{field_name}'",
         )
+
+    _check_constraints(field_name, value, field_def)
 
     if field_def.type == "object" and field_def.properties and isinstance(value, dict):
         validate_output(value, field_def.properties)
