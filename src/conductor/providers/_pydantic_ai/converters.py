@@ -7,9 +7,10 @@ This module provides helpers for recursively translating workflow
 
 from __future__ import annotations
 
+import re
 from typing import Annotated, Any
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, create_model
+from pydantic import AfterValidator, BaseModel, BeforeValidator, ConfigDict, Field, create_model
 
 from conductor.config.schema import OutputField
 
@@ -34,6 +35,80 @@ IntegerType = Annotated[int, BeforeValidator(_reject_bool)]
 """Conductor ``integer`` type: accepts integers, rejects booleans."""
 
 
+class _NoDefaultBaseModel(BaseModel):
+    """Dynamic model base that strips ``default`` keys from JSON schemas.
+
+    Pydantic v2 emits ``"default": null`` for ``Field(default=None)``.
+    Pydantic AI's tool schema must not include the JSON Schema ``default``
+    keyword (it is not allowed on tool parameters), so this base removes it
+    recursively from the generated schema, including nested ``$defs``.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    @classmethod
+    def __get_pydantic_json_schema__(cls, core_schema: Any, handler: Any) -> dict[str, Any]:
+        schema = handler(core_schema)
+        _strip_default_keys(schema)
+        return schema
+
+
+def _strip_default_keys(schema: Any) -> None:
+    """Recursively remove ``default`` keys from a JSON schema dict in place."""
+    if isinstance(schema, dict):
+        schema.pop("default", None)
+        for value in schema.values():
+            _strip_default_keys(value)
+    elif isinstance(schema, list):
+        for item in schema:
+            _strip_default_keys(item)
+
+
+def _make_enum_validator(enum_values: list[Any], field_type: str) -> Any:
+    """Return an AfterValidator that enforces enum membership.
+
+    Matches the shared semantics used by ``validate_output``:
+
+    - A boolean value only passes when the field type is ``boolean`` and the
+      value is present in the enum.
+    - For all other values, plain Python membership is used (so ``1.0``
+      satisfies a number enum ``[1]``).
+    """
+
+    def _validate(value: Any) -> Any:
+        if value is None:
+            return value
+        if isinstance(value, bool):
+            if field_type == "boolean" and value in enum_values:
+                return value
+            raise ValueError(f"{value!r} is not a valid boolean enum value")
+        if value in enum_values:
+            return value
+        raise ValueError(f"{value!r} is not one of {enum_values!r}")
+
+    return _validate
+
+
+def _make_pattern_validator(pattern: str) -> Any:
+    """Return an AfterValidator that runs Python ``re.search``.
+
+    Mirrors ``validate_output`` so Python-only regex constructs (lookarounds,
+    backreferences) are evaluated by Python's regex engine, not pydantic's
+    Rust-based default.
+    """
+
+    def _validate(value: Any) -> Any:
+        if value is None:
+            return value
+        if not isinstance(value, str):
+            raise ValueError("pattern can only be applied to strings")
+        if re.search(pattern, value) is None:
+            raise ValueError(f"value does not match pattern {pattern!r}")
+        return value
+
+    return _validate
+
+
 def _to_pascal(snake: str) -> str:
     """Convert a snake_case identifier to PascalCase.
 
@@ -47,6 +122,84 @@ def _to_pascal(snake: str) -> str:
         The PascalCase equivalent.
     """
     return "".join(part.capitalize() for part in snake.split("_"))
+
+
+def _field_json_schema_extra(field: OutputField) -> dict[str, Any] | None:
+    """Build ``json_schema_extra`` advertising Conductor constraints.
+
+    Pydantic AI attaches this to the generated tool schema so the model sees
+    the same ``enum``/``pattern``/length/range keywords as the shared JSON
+    Schema builders.
+    """
+    extra: dict[str, Any] = {}
+    if field.enum is not None:
+        extra["enum"] = field.enum
+    if field.pattern is not None:
+        extra["pattern"] = field.pattern
+    if field.minLength is not None:
+        extra["minLength"] = field.minLength
+    if field.maxLength is not None:
+        extra["maxLength"] = field.maxLength
+    if field.minimum is not None:
+        extra["minimum"] = field.minimum
+    if field.maximum is not None:
+        extra["maximum"] = field.maximum
+    return extra if extra else None
+
+
+def _wrap_scalar_field_type(field: OutputField, base_type: Any) -> Any:
+    """Wrap a scalar base type with validators and nullability.
+
+    Adds enum/pattern validators via ``AfterValidator`` and unions with
+    ``None`` for nullable fields. Optional fields are handled at the
+    ``Field`` level (``default=None``); the type union only changes when the
+    field is explicitly nullable.
+    """
+    annotated = base_type
+    if field.enum is not None:
+        annotated = Annotated[
+            annotated,
+            AfterValidator(_make_enum_validator(field.enum, field.type)),
+        ]
+    if field.pattern is not None:
+        annotated = Annotated[annotated, AfterValidator(_make_pattern_validator(field.pattern))]
+
+    if field.nullable:
+        annotated = annotated | None
+
+    return annotated
+
+
+def _build_field_info(field: OutputField) -> Any:
+    """Build a Pydantic ``FieldInfo`` for a Conductor output field.
+
+    Length/range constraints are enforced by ``Field`` itself (no regex
+    involved). Optional fields get ``default=None``; required fields stay
+    required with ``default=...``. The description is included when present,
+    and constraint metadata is mirrored in ``json_schema_extra`` so the
+    generated tool schema advertises them.
+    """
+    extra = _field_json_schema_extra(field)
+    field_kwargs: dict[str, Any] = {}
+    if field.description:
+        field_kwargs["description"] = field.description
+    if extra is not None:
+        field_kwargs["json_schema_extra"] = extra
+
+    if field.type == "string":
+        if field.minLength is not None:
+            field_kwargs["min_length"] = field.minLength
+        if field.maxLength is not None:
+            field_kwargs["max_length"] = field.maxLength
+    elif field.type in ("number", "integer"):
+        if field.minimum is not None:
+            field_kwargs["ge"] = field.minimum
+        if field.maximum is not None:
+            field_kwargs["le"] = field.maximum
+
+    field_kwargs["default"] = ... if field.required else None
+
+    return Field(**field_kwargs)
 
 
 def _map_output_field_type(
@@ -152,17 +305,15 @@ def _build_pydantic_model(
             depth=depth,
             max_depth=max_depth,
         )
-        field_info = (
-            Field(description=field.description) if field.description else Field(default=...)
-        )
+        field_type = _wrap_scalar_field_type(field, field_type)
+        field_info = _build_field_info(field)
         model_fields[field_name] = (field_type, field_info)
 
     return create_model(
         name,
         **model_fields,
-        __base__=BaseModel,
+        __base__=_NoDefaultBaseModel,
         __doc__=description,
-        __config__=ConfigDict(extra="allow"),
     )
 
 

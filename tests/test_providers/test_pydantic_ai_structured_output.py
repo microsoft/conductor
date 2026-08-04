@@ -13,6 +13,7 @@ from typing import Any
 
 import pytest
 from pydantic import BaseModel
+from pydantic import ValidationError as PydanticValidationError
 from pydantic_ai import Agent
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.output import ToolOutput
@@ -183,3 +184,205 @@ class TestTextFallback:
         content = parse_text_fallback(text, output_schema, "formatter")
 
         assert content == {"answer": "from wrapper"}
+
+
+class TestEnumConstraint:
+    """Requirement: enum membership matches validate_output semantics."""
+
+    def test_number_enum_rejects_bool(self) -> None:
+        """A number enum [1] must reject a boolean value; bool is not an int."""
+        output_schema = {"value": OutputField(type="number", enum=[1])}
+        dynamic_model = output_schema_to_pydantic_model("EnumOutput", output_schema)
+        assert dynamic_model is not None
+
+        with pytest.raises(PydanticValidationError):
+            dynamic_model(value=True)
+
+    def test_number_enum_accepts_float_int_equality(self) -> None:
+        """A number enum [1] must accept 1.0 using Python equality."""
+        output_schema = {"value": OutputField(type="number", enum=[1])}
+        dynamic_model = output_schema_to_pydantic_model("EnumOutput", output_schema)
+        assert dynamic_model is not None
+
+        instance = dynamic_model(value=1.0)
+        assert instance.value == 1.0
+
+    def test_string_enum_rejects_non_member(self) -> None:
+        """A string enum must reject a value not listed in enum."""
+        output_schema = {"value": OutputField(type="string", enum=["a", "b"])}
+        dynamic_model = output_schema_to_pydantic_model("EnumOutput", output_schema)
+        assert dynamic_model is not None
+
+        with pytest.raises(PydanticValidationError):
+            dynamic_model(value="c")
+
+
+class TestPatternConstraint:
+    """Requirement: pattern is validated with Python regex, not Rust regex."""
+
+    def test_lookahead_pattern_builds_and_validates(self) -> None:
+        """A Python-only lookahead pattern must build cleanly and reject values
+        that do not match."""
+        output_schema = {"value": OutputField(type="string", pattern=r"^(?=.*A).*$")}
+        dynamic_model = output_schema_to_pydantic_model("PatternOutput", output_schema)
+        assert dynamic_model is not None
+
+        assert dynamic_model(value="Abc").value == "Abc"
+        with pytest.raises(PydanticValidationError):
+            dynamic_model(value="bc")
+
+
+class TestLengthAndRangeConstraints:
+    """Requirement: minLength/maxLength/minimum/maximum are enforced."""
+
+    def test_min_length_and_max_length_reject_violations(self) -> None:
+        """String length constraints must reject too-short or too-long values."""
+        output_schema = {"value": OutputField(type="string", minLength=2, maxLength=3)}
+        dynamic_model = output_schema_to_pydantic_model("LengthOutput", output_schema)
+        assert dynamic_model is not None
+
+        assert dynamic_model(value="ab").value == "ab"
+        assert dynamic_model(value="abc").value == "abc"
+        with pytest.raises(PydanticValidationError):
+            dynamic_model(value="a")
+        with pytest.raises(PydanticValidationError):
+            dynamic_model(value="abcd")
+
+    def test_minimum_and_maximum_reject_violations(self) -> None:
+        """Number range constraints must reject out-of-bounds values."""
+        output_schema = {"value": OutputField(type="number", minimum=0, maximum=10)}
+        dynamic_model = output_schema_to_pydantic_model("RangeOutput", output_schema)
+        assert dynamic_model is not None
+
+        assert dynamic_model(value=0).value == 0
+        assert dynamic_model(value=10).value == 10
+        with pytest.raises(PydanticValidationError):
+            dynamic_model(value=-1)
+        with pytest.raises(PydanticValidationError):
+            dynamic_model(value=11)
+
+
+class TestNullableAndOptional:
+    """Requirement: nullable and optional fields behave as specified."""
+
+    def test_explicit_none_nullable_passes(self) -> None:
+        """A nullable field must accept an explicit None value."""
+        output_schema = {"value": OutputField(type="string", nullable=True)}
+        dynamic_model = output_schema_to_pydantic_model("NullableOutput", output_schema)
+        assert dynamic_model is not None
+
+        instance = dynamic_model(value=None)
+        assert instance.value is None
+
+    def test_explicit_none_non_nullable_optional_fails(self) -> None:
+        """A non-nullable optional field must reject an explicit None."""
+        output_schema = {"value": OutputField(type="string", required=False, nullable=False)}
+        dynamic_model = output_schema_to_pydantic_model("OptionalOutput", output_schema)
+        assert dynamic_model is not None
+
+        with pytest.raises(PydanticValidationError):
+            dynamic_model(value=None)
+
+    def test_omitted_optional_excluded_from_extract_content(self) -> None:
+        """An omitted optional field must not appear in the extracted content dict."""
+        output_schema = {
+            "score": OutputField(type="number"),
+            "extra": OutputField(type="string", required=False, nullable=False),
+        }
+        dynamic_model = output_schema_to_pydantic_model("OptionalOmitOutput", output_schema)
+        assert dynamic_model is not None
+
+        instance = dynamic_model.model_construct(score=1)
+        content = extract_content(instance, output_schema, "formatter")
+        assert "extra" not in content
+        assert content == {"score": 1}
+
+
+class TestCombinedConstraints:
+    """Requirement: enum, pattern, and length constraints compose."""
+
+    def test_combined_constraints_reject_partial_matches(self) -> None:
+        """A value must satisfy every constraint; enum-pass/pattern-fail and
+        pattern-pass/enum-fail must both be rejected."""
+        output_schema = {
+            "value": OutputField(
+                type="string",
+                enum=["abc"],
+                pattern=r"^a",
+                minLength=3,
+                maxLength=3,
+            )
+        }
+        dynamic_model = output_schema_to_pydantic_model("CombinedOutput", output_schema)
+        assert dynamic_model is not None
+
+        assert dynamic_model(value="abc").value == "abc"
+        with pytest.raises(PydanticValidationError):
+            dynamic_model(value="abd")  # enum fail
+        with pytest.raises(PydanticValidationError):
+            dynamic_model(value="abcd")  # pattern pass-ish, length fail
+
+
+class TestToolSchemaKeywords:
+    """Requirement: the generated tool JSON schema exposes constraints and omits defaults."""
+
+    def _schema(self, output_schema: dict[str, OutputField]) -> dict[str, Any]:
+        """Build an agent and return the final_result tool JSON schema."""
+        agent_def = AgentDef(name="formatter", output=output_schema)
+        pydantic_agent = build_agent(agent_def, system_prompt="", rendered_prompt="")
+        assert isinstance(pydantic_agent.output_type, ToolOutput)
+        toolset = pydantic_agent._output_schema.toolset
+        assert toolset is not None
+        assert len(toolset._tool_defs) == 1
+        return toolset._tool_defs[0].parameters_json_schema
+
+    def test_enum_pattern_length_range_in_schema(self) -> None:
+        """The tool schema must contain enum/pattern/minLength/maxLength/minimum/maximum."""
+        output_schema = {
+            "tag": OutputField(
+                type="string",
+                enum=["a", "b"],
+                pattern=r"^[ab]$",
+                minLength=1,
+                maxLength=1,
+            ),
+            "count": OutputField(type="number", minimum=0, maximum=5),
+        }
+        schema = self._schema(output_schema)
+        props = schema["properties"]
+        assert props["tag"]["enum"] == ["a", "b"]
+        assert props["tag"]["pattern"] == r"^[ab]$"
+        assert props["tag"]["minLength"] == 1
+        assert props["tag"]["maxLength"] == 1
+        assert props["count"]["minimum"] == 0
+        assert props["count"]["maximum"] == 5
+
+    def test_optional_field_has_no_default_and_not_required(self) -> None:
+        """Optional fields must not have a default key and must not be in the required array."""
+        output_schema = {
+            "required_value": OutputField(type="string"),
+            "optional_value": OutputField(type="string", required=False),
+        }
+        schema = self._schema(output_schema)
+        props = schema["properties"]
+        assert "default" not in props["optional_value"]
+        assert "optional_value" not in schema.get("required", [])
+        assert "required_value" in schema["required"]
+
+
+class TestOmittedOptionalMaterialization:
+    """Requirement: model_dump(exclude_unset=True) drops omitted optional keys."""
+
+    def test_unset_optional_field_is_dropped(self) -> None:
+        """An optional field the model never set must be absent from
+        ``model_dump(exclude_unset=True)`` so ``extract_content`` does not
+        materialize it as ``None``."""
+        output_schema = {
+            "score": OutputField(type="number"),
+            "extra": OutputField(type="string", required=False, nullable=False),
+        }
+        dynamic_model = output_schema_to_pydantic_model("DumpOutput", output_schema)
+        assert dynamic_model is not None
+
+        instance = dynamic_model.model_construct(score=1)
+        assert instance.model_dump(exclude_unset=True) == {"score": 1}

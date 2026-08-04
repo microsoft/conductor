@@ -352,6 +352,72 @@ class TestOutputRecovery:
             await agent.run("go")
 
 
+class TestConstraintOutputRetry:
+    """Tests that structured-output constraint violations trigger pydantic-ai output retries."""
+
+    @pytest.mark.asyncio
+    async def test_constraint_violation_triggers_output_retry(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """When the model first returns a tool call that violates an output
+        constraint, pydantic-ai's output retry must recover and return valid
+        structured output after exactly one retry."""
+        calls: list[int] = []
+
+        async def _fake_model(
+            messages: list[Any],
+            info: Any,
+        ) -> ModelResponse:
+            calls.append(len(calls))
+            output_tool_name = info.output_tools[0].name
+            if len(calls) == 1:
+                return ModelResponse(
+                    parts=[
+                        ToolCallPart(
+                            tool_name=output_tool_name,
+                            args={"value": "bad"},
+                        )
+                    ]
+                )
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name=output_tool_name,
+                        args={"value": "abc"},
+                    )
+                ]
+            )
+
+        monkeypatch.setattr(
+            "conductor.providers._pydantic_ai.agent_builder._resolve_anthropic_model",
+            lambda *_args, **_kwargs: FunctionModel(_fake_model),
+        )
+
+        agent_def = AgentDef(
+            name="formatter",
+            output={
+                "value": OutputField(
+                    type="string",
+                    enum=["abc"],
+                    pattern=r"^a",
+                    minLength=3,
+                    maxLength=3,
+                )
+            },
+        )
+        pydantic_agent = build_agent(agent_def, system_prompt="sys", rendered_prompt="go")
+
+        result = await pydantic_agent.run("go")
+
+        assert len(calls) == 2
+        assert result.output.value == "abc"
+        # Inspect the message history to confirm one output retry took place.
+        messages = result.all_messages()
+        model_responses = [m for m in messages if isinstance(m, ModelResponse)]
+        assert len(model_responses) == 2
+
+
 class TestApiKey:
     """Tests for API key and auth token resolution."""
 
