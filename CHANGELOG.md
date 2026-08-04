@@ -5,9 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.26...HEAD)
+## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.27...HEAD)
+
+## [0.1.27](https://github.com/microsoft/conductor/compare/v0.1.26...v0.1.27) - 2026-08-04
 
 ### Added
+
+- **Skills: `runtime.skills` and per-agent `skills:` give agents opt-in
+  knowledge bases** ([#180](https://github.com/microsoft/conductor/issues/180))
+  — `runtime.skills` enables a list of skills for every provider-backed agent
+  in the workflow, and any agent can override it with its own `skills:`
+  (omitted = inherit, `[]` = explicit opt-out, a list = explicit set).
+  Conductor ships a built-in `conductor` skill covering its own YAML schema,
+  execution model, authoring patterns, and CLI commands, so an agent that
+  writes or reviews workflows can be made Conductor-aware without pasting
+  documentation into its prompt. The observable contract is the same on every
+  provider — the agent has access to the named skill — but the mechanism
+  differs: `copilot` registers the skill directory on the SDK session, so only
+  the frontmatter is read up front and the body is loaded on demand, while
+  providers with no native skill surface receive the skill content injected
+  into the prompt. Providers declare whether they can load skills at all, and
+  `conductor validate` rejects a workflow that enables skills on one that
+  cannot, rather than letting the content be silently dropped at run time.
+  Skills are rejected on step types with no model behind them (`script`,
+  `set`, `wait`, `terminate`, `workflow`, `human_gate`). See
+  [`examples/skills-self-improving-workflow.yaml`](examples/skills-self-improving-workflow.yaml)
+  and [`docs/workflow-syntax.md`](docs/workflow-syntax.md) (Skills).
 
 - **Skill discovery: `runtime.skill_discovery` picks up skills already
   installed on the machine** (issue #362) — `sources: [personal, project,
@@ -146,6 +169,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   since `validate_output` also runs on `set` and `script` step output that may
   carry secrets. ([#343](https://github.com/microsoft/conductor/issues/343))
 
+- **Sub-workflow nodes in the dashboard are expandable before they run.** A
+  `type: workflow` node previously became expandable only once the engine
+  actually reached that step, so the inner DAG of a sub-workflow that had not
+  started yet was invisible. Conductor now resolves each sub-workflow's static
+  topology up front and attaches it to the graph, so the real inner DAG can be
+  expanded — recursively, for nested sub-workflows — from the moment the run
+  starts. Resolution is best-effort: a missing file, registry error, cycle, or
+  depth limit simply leaves the node collapsed until the engine reaches it.
+  ([#360](https://github.com/microsoft/conductor/pull/360))
+
 ### Fixed
 
 - **A malformed `SKILL.md` no longer fails silently** (issue #350) — both the
@@ -220,7 +253,80 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hardcoded module constant of 3 and silently ignored the YAML value that
   Copilot and Claude both respect. ([#343](https://github.com/microsoft/conductor/issues/343))
 
+- **Nested `array` item schemas in `output:` are now enforced.** `validate_output`
+  type-checked only the top level of an array, so an `array<object>` output whose
+  items were missing declared fields — or had the wrong types — passed validation
+  silently, even though the full nested schema had been sent to the model.
+  Validation now recurses through both `object.properties` and `array.items` at
+  every depth, for LLM agents, `set` steps, and `script` steps alike.
+  **Behavior change:** a workflow that was quietly emitting output violating its
+  own declared nested schema will now fail with `ValidationError` instead of
+  passing. Flat schemas and `object` nesting are unaffected, and arrays declared
+  without `items` keep their existing passthrough.
+  ([#337](https://github.com/microsoft/conductor/pull/337))
+
+- **MCP server connections are now closed by the task that opened them.** Each
+  stdio/session lifecycle is held in its own owner task and signalled at
+  shutdown, so AnyIO cancel scopes always exit in the task that entered them.
+  Previously a connection opened in a worker task and closed from the root task
+  could raise a cancel-scope error during teardown, surfacing as a spurious
+  failure at the end of an otherwise successful run. Cleanup failures are logged
+  rather than masking the caller's own cancellation, and registering a duplicate
+  server name is now rejected instead of orphaning the existing connection.
+  ([#353](https://github.com/microsoft/conductor/issues/353))
+
+- **Non-ASCII agent output is no longer truncated ~6x too aggressively before
+  semantic validation.** The `validator:` grader and the dialog-trigger evaluator
+  serialized the agent output with ASCII escaping before applying their fixed
+  character budget, so every Cyrillic or CJK code point cost 6 characters and
+  every emoji 12. Non-English output reached the grader with a fraction of the
+  source material an equivalent English output would get, and the cut could land
+  mid-escape, leaving malformed JSON in the prompt. Both now serialize without
+  escaping, so the budget is measured in real characters for every language.
+  ([#356](https://github.com/microsoft/conductor/issues/356))
+
+- **An inline-expanded sub-workflow now follows the live run after a loop-back.**
+  When a loop-back route re-invoked the same sequential sub-workflow, the inline
+  graph expansion stayed pinned to the first, already-completed invocation, even
+  though double-click navigation and the Activity tab correctly tracked the live
+  one. Inline expansion now resolves newest-first, matching the rest of the
+  dashboard. ([#361](https://github.com/microsoft/conductor/issues/361))
+
+- **Every historical sub-workflow iteration is now reachable from the
+  dashboard.** In the "Subworkflow Runs (N)" list, each row resolved by slot
+  rather than by position, and every re-invocation of a sequential sub-workflow
+  shares a slot — so clicking an older, completed run always landed on the most
+  recent one. Rows now navigate to the exact run clicked, are labelled
+  `Iteration N` once a slot repeats, and the breadcrumb trail says which
+  iteration is being viewed. Following the live run (double-click, inline
+  expansion, deep links) is deliberately unchanged.
+  ([#365](https://github.com/microsoft/conductor/issues/365))
+
+- **Handled fail-open paths no longer print a full traceback at WARNING level.**
+  When a semantic validator rejected an output and the retry itself failed,
+  Conductor correctly kept the original output and carried on — but logged the
+  warning with a complete Python traceback, making a recovered run look like a
+  crash. The warning is now a single line naming the exception type and message,
+  with the traceback kept at DEBUG. The same treatment was applied to the sibling
+  best-effort paths: validator call failures and timeouts, provider session-ID
+  collection for checkpoints, checkpoint save and rotation failures, and
+  event-callback errors in `hermes`.
+  ([#357](https://github.com/microsoft/conductor/issues/357))
+
 ### Changed
+
+- **The `claude` provider now runs its agentic loop through Pydantic AI.** The
+  hand-written inner loop was replaced with a Pydantic AI runtime while keeping
+  Conductor's provider contract at the boundary — the same `AgentOutput`, event
+  vocabulary, retry and interrupt semantics, usage accounting, MCP policy, and
+  output validation. The visible gain is streaming: `claude` now emits model,
+  reasoning, and tool events as they happen rather than only at completion, so
+  the dashboard, console, and event log follow a Claude agent live the way they
+  already followed Copilot. Structured output is produced natively by the
+  runtime and still re-validated against the declared `output:` schema.
+  **This adds `pydantic-ai>=1.44.0` as a required runtime dependency**, so a
+  `conductor` upgrade pulls in a larger dependency set than before.
+  ([#355](https://github.com/microsoft/conductor/pull/355))
 
 - **`claude-agent-sdk` now loads skills natively instead of injecting them into
   every prompt.** The provider previously took the eager preamble path on the
