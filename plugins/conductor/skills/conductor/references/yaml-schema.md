@@ -54,6 +54,23 @@ workflow:
     skill_injection:                # Bounds EAGERLY injected skill content (claude, hermes only).
       warn_bytes: integer           # Warn above this many bytes (default: 65536; null disables)
       max_bytes: integer            # Fail above this many bytes (default: 131072; null disables)
+    skill_discovery:                # Pick up skills already installed on the machine (OFF by default)
+      sources: [string]             # personal | project | plugins (default: [] = disabled)
+                                    #   personal -> ~/.copilot/skills, ~/.claude/skills
+                                    #   project  -> .github/skills and .claude/skills, from the
+                                    #               workflow file's dir up to the repo root
+                                    #   plugins  -> every installed plugin's skills/ directory
+                                    # Conductor scans the union of both CLIs' locations itself, so
+                                    #   every agent sees the same set whatever provider it uses.
+                                    # Scanned in a fixed order (project, personal, plugins) whatever
+                                    #   order they are written in.
+                                    # Discovered skills join runtime.skills, so an agent's own
+                                    #   `skills:` (including []) overrides them too.
+                                    # A skill named in `skills:` beats a discovered one of the same
+                                    #   name; the discovered copy is skipped with a warning.
+                                    # REJECTED on claude/hermes -- they inject every body into every
+                                    #   prompt and a discovered set cannot be bounded.
+      exclude: [string]             # Skill names to drop from the discovered set (default: [])
     mcp_servers:                    # MCP server configurations
       <server_name>:
         type: string                # "stdio" (default), "http", or "sse"

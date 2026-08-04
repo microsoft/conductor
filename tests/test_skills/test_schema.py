@@ -5,7 +5,12 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from conductor.config.schema import AgentDef, GateOption, RuntimeConfig
+from conductor.config.schema import (
+    AgentDef,
+    GateOption,
+    RuntimeConfig,
+    SkillDiscoveryConfig,
+)
 
 
 class TestAgentDefSkills:
@@ -131,3 +136,49 @@ class TestPathEntriesAtSchemaLevel:
     def test_path_entries_still_forbidden_on_non_provider_steps(self) -> None:
         with pytest.raises(ValidationError, match="cannot have 'skills'"):
             AgentDef(name="s", type="script", command="echo hi", skills=["./a/b"])
+
+
+class TestSkillDiscoveryConfig:
+    """``runtime.skill_discovery`` — off unless asked for."""
+
+    def test_defaults_to_disabled(self) -> None:
+        config = RuntimeConfig()
+        assert config.skill_discovery.sources == []
+        assert config.skill_discovery.is_enabled is False
+
+    def test_enabled_when_a_source_is_set(self) -> None:
+        config = RuntimeConfig(skill_discovery={"sources": ["personal"]})
+        assert config.skill_discovery.is_enabled is True
+
+    @pytest.mark.parametrize("source", ["personal", "project", "plugins"])
+    def test_known_sources_accepted(self, source: str) -> None:
+        assert SkillDiscoveryConfig(sources=[source]).sources == [source]
+
+    def test_unknown_source_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            SkillDiscoveryConfig(sources=["everywhere"])
+
+    def test_duplicate_source_rejected(self) -> None:
+        # Listing one twice has no effect, so it always means the author
+        # believed it would.
+        with pytest.raises(ValidationError, match="duplicate entries"):
+            SkillDiscoveryConfig(sources=["personal", "personal"])
+
+    def test_blank_exclude_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="non-empty skill names"):
+            SkillDiscoveryConfig(exclude=["  "])
+
+    def test_unknown_field_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            SkillDiscoveryConfig(source=["personal"])
+
+    def test_frozen(self) -> None:
+        # Same reason ``SkillInjectionConfig`` is frozen: the field
+        # validators do not re-fire on per-attribute assignment.
+        config = SkillDiscoveryConfig(sources=["personal"])
+        with pytest.raises(ValidationError):
+            config.sources = ["plugins"]
+
+    def test_exclude_does_not_enable_discovery(self) -> None:
+        # An exclude list on its own is inert, not an implicit opt-in.
+        assert SkillDiscoveryConfig(exclude=["a"]).is_enabled is False

@@ -1568,7 +1568,103 @@ offender is named. The defaults sit either side of the bundled `conductor`
 skill: enabling it on `claude` warns rather than breaking, while
 accumulating several large skills errors.
 
-See `examples/skills-self-improving-workflow.yaml` for a complete example.
+### Discovering installed skills
+
+`runtime.skill_discovery` picks up skills already installed on the machine,
+so a workflow can use a personal or team skill library without listing each
+one. It is **off by default**.
+
+```yaml
+workflow:
+  runtime:
+    skill_discovery:
+      sources: [personal, project, plugins]   # default: [] (disabled)
+      exclude: [scratch-notes]                # optional, by skill name
+```
+
+Each source is a category of location. Conductor scans them itself and
+unions both CLIs' conventions, rather than asking each provider to discover
+its own:
+
+| Source | Locations scanned |
+|---|---|
+| `personal` | `~/.copilot/skills`, `~/.claude/skills` |
+| `project` | `.github/skills` and `.claude/skills`, in the workflow file's directory and each ancestor up to the repository root |
+| `plugins` | the `skills/` directory of every installed plugin (`~/.copilot/installed-plugins/*/*/skills`, `~/.claude/plugins/*/*/skills`) |
+
+Conductor doing the scanning is the point rather than an implementation
+detail. Discovery locations are provider-specific, so a flag that asked each
+provider to find its own would give a `copilot` agent and a `claude` agent
+**different skill sets inside a single run**. Scanning centrally means every
+agent sees the same set whatever provider it resolves to. It also keeps the
+providers' own discovery switched off, which matters because Copilot's would
+additionally auto-load MCP servers from any `.mcp.json` in the working
+directory.
+
+Discovered skills join the workflow-level default set, so the per-agent
+tri-state is unchanged — an agent that declares its own `skills:` (including
+`skills: []`) overrides discovery along with `runtime.skills`.
+
+Ordering is fixed: `project`, then `personal`, then `plugins`, regardless of
+the order written in `sources`. Reordering the list therefore cannot change
+which of two same-named skills wins.
+
+#### Declared skills win
+
+A skill named in `skills:` always beats a discovered one of the same name —
+the discovered copy is skipped with a warning. This comes up immediately:
+installing Conductor's own plugin puts a second `conductor` skill on the
+machine, and `skills: [conductor]` must keep meaning the built-in one.
+
+#### Discovered skills are held to a laxer standard
+
+The author asked for the entries in `skills:`; they did not ask for whatever
+happens to be installed. So the same problem is reported differently:
+
+| Problem | Declared skill | Discovered skill |
+|---|---|---|
+| Broken `SKILL.md` frontmatter | error | warning, skipped |
+| Name already taken | error | warning, skipped |
+| Directory unreadable | error | warning, skipped |
+| Provider cannot load it | error | warning, skipped |
+
+#### Provider support
+
+Discovery is realistically a `copilot` feature today:
+
+* **`copilot`** — fully supported.
+* **`claude-agent-sdk`** — only loads a discovered skill that lives inside a
+  Claude Code plugin, because the SDK has no bare skill-directory option.
+  Most installed Copilot plugins are not Claude Code plugins, so expect a
+  warning per skipped skill. Use `exclude` to silence the ones you know
+  about.
+* **`claude` / `hermes`** — **rejected by `conductor validate`.** These
+  inject every skill body into every prompt, and a discovered set is
+  unbounded and varies by machine, so there is no limit to tune that makes
+  it work. Name the skills you want in `runtime.skills` instead, or run
+  those agents on a provider with progressive disclosure.
+
+#### Seeing what was found
+
+`conductor validate` lists every discovered skill, the location it came
+from, and the total size if it were eagerly injected:
+
+```
+Skill discovery (personal, plugins): 3 skill(s)
+  • acme-widgets — /home/dev/.copilot/skills
+  • release-notes — /home/dev/.copilot/skills
+  • triage — /home/dev/.copilot/installed-plugins/team/tools/skills
+  Total if eagerly injected: 41,204 bytes (~10,301 tokens)
+```
+
+Worth running before committing a workflow that uses discovery. An ambient
+set is the one part of a workflow that is not captured by the YAML, so the
+same file can behave differently on a teammate's machine or in CI — listing
+it is how that stays visible. If reproducibility matters more than
+convenience, leave discovery off and name the skills explicitly.
+
+See `examples/skills-self-improving-workflow.yaml` and
+`examples/skills-discovery.yaml` for complete examples.
 
 ## External File References
 

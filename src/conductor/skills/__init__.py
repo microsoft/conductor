@@ -34,12 +34,20 @@ Provider-parity contract:
 A ``skills:`` entry is either a **built-in name** or a **filesystem
 path** — see :func:`conductor.skills.registry.resolve_skills`. Conductor
 ships one built-in skill, ``conductor``, sourced from
-``plugins/conductor/skills/conductor/``. Discovering skills already
-installed in the user's environment is tracked separately in issue #362;
-discovery locations differ per provider, so a single switch would hand
-different skill sets to different agents inside one run.
+``plugins/conductor/skills/conductor/``. Skills already installed in the
+user's environment can additionally be picked up via
+``runtime.skill_discovery`` — see :mod:`conductor.skills.discovery`,
+which scans the union of both CLIs' locations centrally rather than
+letting each provider find its own, since a single per-provider switch
+would hand different skill sets to different agents inside one run.
 """
 
+from conductor.skills.discovery import (
+    DiscoveredSkill,
+    DiscoverySource,
+    discover_skills,
+    resolve_effective_skills,
+)
 from conductor.skills.errors import SkillError
 from conductor.skills.frontmatter import (
     SkillFrontmatter,
@@ -53,6 +61,7 @@ from conductor.skills.registry import (
     SkillPlugin,
     SkillPluginError,
     WarningSink,
+    expand_skills_root,
     get_skill_directory,
     is_path_entry,
     list_builtin_skills,
@@ -62,6 +71,8 @@ from conductor.skills.registry import (
 
 __all__ = [
     "BYTES_PER_TOKEN_ESTIMATE",
+    "DiscoveredSkill",
+    "DiscoverySource",
     "ResolvedSkill",
     "SkillError",
     "SkillFrontmatter",
@@ -70,11 +81,14 @@ __all__ = [
     "SkillPlugin",
     "SkillPluginError",
     "WarningSink",
+    "discover_skills",
+    "expand_skills_root",
     "get_skill_directory",
     "is_path_entry",
     "list_builtin_skills",
     "load_skill_content",
     "read_skill_frontmatter",
+    "resolve_effective_skills",
     "resolve_skill_plugin",
     "resolve_skills",
 ]

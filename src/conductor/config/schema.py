@@ -24,6 +24,7 @@ from conductor.duration import parse_duration
 from conductor.file_string import FileString
 from conductor.providers.context_tier import ContextTier
 from conductor.providers.reasoning import ReasoningEffort
+from conductor.skills.discovery import DiscoverySource
 from conductor.templating import is_jinja_template
 
 BudgetMode = Literal["audit", "enforce"]
@@ -2482,6 +2483,101 @@ class SkillInjectionConfig(BaseModel):
         return self
 
 
+class SkillDiscoveryConfig(BaseModel):
+    """Opt in to skills already installed in the user's environment.
+
+    ``skills:`` names skills one at a time. Discovery is the alternative
+    for someone who already keeps a personal or team skill library: point
+    at *categories* of well-known location and pick up whatever is there.
+
+    Conductor scans the union of both CLIs' locations itself rather than
+    asking each provider to discover its own — see
+    :mod:`conductor.skills.discovery` for why that distinction is the
+    whole point of the feature. Discovered skills join the workflow-level
+    default set, so an agent that declares its own ``skills:`` (including
+    ``skills: []``) overrides discovery exactly as it overrides
+    :attr:`RuntimeConfig.skills`.
+
+    **Off by default**, and worth leaving off unless you want it: an
+    ambient set makes the same YAML behave differently on a different
+    machine or in CI, which is the opposite of a reproducible run.
+    ``conductor validate`` prints what it resolved so the set is at least
+    inspectable.
+
+    Not usable on every provider. ``claude`` and ``hermes`` have no
+    native skill surface and would eagerly inject the entire discovered
+    set into every prompt, so ``conductor validate`` rejects the
+    combination; ``claude-agent-sdk`` can only load a discovered skill
+    that lives inside a Claude Code plugin, and warns about the rest.
+
+    Example YAML::
+
+        runtime:
+            skill_discovery:
+                sources: [personal, project]
+                exclude: [scratch-notes]
+    """
+
+    # Frozen for the reason ``SkillInjectionConfig`` and ``ProviderSettings``
+    # document: the field validators below are shape checks that do not
+    # re-fire on per-attribute assignment under the enclosing
+    # ``RuntimeConfig``'s ``validate_assignment=True``.
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    sources: list[DiscoverySource] = Field(default_factory=list)
+    """Which categories of location to scan. Empty disables discovery.
+
+    * ``personal`` — ``~/.copilot/skills``, ``~/.claude/skills``
+    * ``project`` — ``.github/skills`` and ``.claude/skills``, in the
+      workflow file's directory and each ancestor up to the repository
+      root
+    * ``plugins`` — the ``skills/`` directory of every installed plugin
+
+    Scanned in a fixed order (``project``, ``personal``, ``plugins``)
+    whatever order they are written in, so reordering this list cannot
+    change which of two same-named skills wins.
+    """
+
+    exclude: list[str] = Field(default_factory=list)
+    """Skill names to drop from the discovered set.
+
+    Applies to discovered skills only. Removing an explicitly declared
+    skill is a matter of deleting its line from ``skills:``.
+    """
+
+    @field_validator("sources")
+    @classmethod
+    def validate_sources(cls, v: list[DiscoverySource]) -> list[DiscoverySource]:
+        """Reject a repeated source.
+
+        Listing one twice has no effect, so it always means the author
+        believed it would — most likely a merge artefact.
+        """
+        duplicates = sorted({source for source in v if v.count(source) > 1})
+        if duplicates:
+            raise ValueError(
+                f"skill_discovery.sources contains duplicate entries: {duplicates!r}. "
+                "Each source is scanned once regardless."
+            )
+        return v
+
+    @field_validator("exclude")
+    @classmethod
+    def validate_exclude(cls, v: list[str]) -> list[str]:
+        """Reject blank exclusions, which match no skill name."""
+        for name in v:
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError(
+                    f"skill_discovery.exclude entries must be non-empty skill names, got {name!r}"
+                )
+        return v
+
+    @property
+    def is_enabled(self) -> bool:
+        """Whether any discovery source is active."""
+        return bool(self.sources)
+
+
 class RuntimeConfig(BaseModel):
     """Provider and runtime configuration."""
 
@@ -2664,6 +2760,15 @@ class RuntimeConfig(BaseModel):
     call. Providers with progressive disclosure (``copilot``,
     ``claude-agent-sdk``) send only frontmatter up front and are
     unaffected.
+    """
+
+    skill_discovery: SkillDiscoveryConfig = Field(default_factory=SkillDiscoveryConfig)
+    """Opt in to skills already installed in the user's environment.
+
+    Off by default. When enabled, the discovered skills join this
+    workflow-level default set, so an agent declaring its own ``skills:``
+    overrides them along with :attr:`skills`. See
+    :class:`SkillDiscoveryConfig`.
     """
 
     @field_validator("skills")

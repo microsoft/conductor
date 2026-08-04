@@ -40,7 +40,7 @@ def _verbose_log_section(title: str, content: str) -> None:
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from conductor.config.schema import AgentDef, SkillInjectionConfig
+    from conductor.config.schema import AgentDef, SkillDiscoveryConfig, SkillInjectionConfig
     from conductor.providers.base import AgentProvider
     from conductor.skills import ResolvedSkill
 
@@ -111,6 +111,7 @@ class AgentExecutor:
         workflow_skills: list[str] | None = None,
         workflow_dir: Path | None = None,
         skill_injection: SkillInjectionConfig | None = None,
+        skill_discovery: SkillDiscoveryConfig | None = None,
     ) -> None:
         """Initialize the AgentExecutor.
 
@@ -129,6 +130,11 @@ class AgentExecutor:
             skill_injection: Size limits for eager skill-content injection
                 (from ``runtime.skill_injection``). Defaults apply when
                 omitted.
+            skill_discovery: Which categories of installed skill to pick up
+                (from ``runtime.skill_discovery``). Applies only to agents
+                that inherit the workflow-level list, so it is part of the
+                default set rather than a separate axis. Disabled when
+                omitted.
         """
         self.provider = provider
         self.workflow_tools = workflow_tools or []
@@ -140,6 +146,16 @@ class AgentExecutor:
 
             skill_injection = SkillInjectionConfig()
         self._skill_injection = skill_injection
+        if skill_discovery is None:
+            from conductor.config.schema import SkillDiscoveryConfig
+
+            skill_discovery = SkillDiscoveryConfig()
+        self._skill_discovery = skill_discovery
+        # Keyed by (entries, sources, exclude): discovery globs the
+        # filesystem and resolution runs once per agent per call.
+        self._skill_cache: dict[
+            tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]], list[ResolvedSkill]
+        ] = {}
         self.renderer = TemplateRenderer()
 
     def _render_enum_field(
@@ -319,9 +335,8 @@ class AgentExecutor:
         # rendered_prompt above and ignore this).
         skill_dirs: list[str] | None = None
         if getattr(self.provider, "supports_native_skills", False):
-            skill_entries = self._resolve_skills_for_agent(agent)
-            if skill_entries:
-                resolved = self._resolve_skills(skill_entries)
+            resolved = self._resolve_skills_for_agent(agent)
+            if resolved:
                 skill_dirs = [str(item.directory) for item in resolved]
                 _verbose_log(f"  Skills: {[item.name for item in resolved]}")
 
@@ -394,14 +409,20 @@ class AgentExecutor:
             rendered = prefix + rendered
         return rendered
 
-    def _resolve_skills_for_agent(self, agent: AgentDef) -> list[str]:
-        """Resolve the effective skill list for an agent.
+    def _resolve_skills_for_agent(self, agent: AgentDef) -> list[ResolvedSkill]:
+        """Resolve the effective, on-disk skills for an agent.
 
         Resolution order:
         - If the agent explicitly sets ``skills`` (including ``[]``),
-          that value wins.
-        - Otherwise, inherit the workflow-level default
-          (``runtime.skills``).
+          that value wins and discovery does not apply. An agent that
+          names its skills has said which ones it wants.
+        - Otherwise it inherits the workflow-level default
+          (``runtime.skills``) *plus* anything ``runtime.skill_discovery``
+          turns up. Discovery joins the default set rather than forming a
+          second axis, so ``skills: []`` remains the one opt-out.
+
+        Note the inherited case can produce skills from an *empty*
+        ``runtime.skills``: discovery alone is enough to enable them.
 
         Returns an empty list when no skills are enabled, or when the
         agent is not a provider-backed type (script / wait / set /
@@ -417,28 +438,60 @@ class AgentExecutor:
         Raises:
             ExecutionError: If skills are enabled for an agent whose
                 provider declares ``capabilities.skills=False``.
+            SkillNotFoundError: If an explicit entry cannot be resolved.
+            SkillManifestError: If an explicit entry's ``SKILL.md`` is
+                missing, unparseable, or incomplete.
         """
         if agent.type not in (None, "agent"):
             return []
+        overridden = agent.skills is not None
+        # Repeat the ``is not None`` rather than reusing ``overridden``: the
+        # type checker does not narrow through an intermediate boolean.
         entries = list(agent.skills) if agent.skills is not None else list(self._workflow_skills)
-        if entries:
-            self._reject_unsupported_skills(agent, entries)
-        return entries
+        discovery = None if overridden else self._skill_discovery
+        if not entries and not (discovery and discovery.is_enabled):
+            return []
+        self._reject_unsupported_skills(agent, entries)
+        return self._resolve_skills(entries, discovery)
 
-    def _resolve_skills(self, entries: list[str]) -> list[ResolvedSkill]:
-        """Resolve ``skills:`` entries against the workflow file's directory.
+    def _resolve_skills(
+        self, entries: list[str], discovery: SkillDiscoveryConfig | None
+    ) -> list[ResolvedSkill]:
+        """Resolve entries and discovery against the workflow file's directory.
 
         Both delivery paths — native ``skill_directories`` and eager
-        preamble injection — go through here so names, paths, and
-        ``skills/`` roots behave identically regardless of provider.
-        """
-        from conductor.skills import resolve_skills
+        preamble injection — go through here so names, paths,
+        ``skills/`` roots and discovered skills behave identically
+        regardless of provider.
 
-        return resolve_skills(
+        The result is memoized per ``(entries, discovery)`` because
+        discovery globs the filesystem and this runs once per agent.
+        """
+        from conductor.skills import resolve_effective_skills
+
+        sources = tuple(discovery.sources) if discovery else ()
+        exclude = tuple(discovery.exclude) if discovery else ()
+        key = (tuple(entries), sources, exclude)
+        cached = self._skill_cache.get(key)
+        if cached is not None:
+            return list(cached)
+
+        resolved = resolve_effective_skills(
             entries,
+            sources=sources,
+            exclude=exclude,
             base_dir=self._workflow_dir,
             on_warning=lambda message: _verbose_log(f"  Skills: {message}", style="yellow"),
         )
+        if sources:
+            _verbose_log(
+                f"  Skills: discovery enabled ({', '.join(sources)}) — "
+                f"{len(resolved)} skill(s) in effect: "
+                f"{', '.join(item.name for item in resolved) or '(none)'}",
+                style="dim",
+            )
+        self._skill_cache[key] = list(resolved)
+        return resolved
 
     def _enforce_injection_budget(
         self,
@@ -566,11 +619,10 @@ class AgentExecutor:
         if self.instructions_preamble:
             parts.append(self.instructions_preamble)
         if not getattr(self.provider, "supports_native_skills", False):
-            skill_entries = self._resolve_skills_for_agent(agent)
-            if skill_entries:
+            resolved = self._resolve_skills_for_agent(agent)
+            if resolved:
                 from conductor.skills import load_skill_content
 
-                resolved = self._resolve_skills(skill_entries)
                 content = load_skill_content([(item.name, item.directory) for item in resolved])
                 if content:
                     self._enforce_injection_budget(agent, resolved, content, event_callback)

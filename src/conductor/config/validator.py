@@ -26,8 +26,8 @@ from conductor.skills import (
     SkillPluginError,
     is_path_entry,
     load_skill_content,
+    resolve_effective_skills,
     resolve_skill_plugin,
-    resolve_skills,
 )
 from conductor.templating import is_jinja_template
 
@@ -1609,10 +1609,15 @@ def _validate_provider_capabilities(
     runtime_working_dir = config.workflow.runtime.working_dir
     runtime_skills = config.workflow.runtime.skills
     skill_limits = config.workflow.runtime.skill_injection
+    discovery = config.workflow.runtime.skill_discovery
     skill_base_dir = workflow_path.resolve().parent if workflow_path is not None else None
-    # Keyed by the entry tuple, so agents sharing a skill list resolve once.
+    # Keyed by (entries, discovery sources, discovery excludes), so agents
+    # sharing a skill list resolve once but an agent that overrides the list
+    # (and so opts out of discovery) cannot collide with one that inherits it.
     # A ``str`` value is a cached resolution failure.
-    skill_cache: dict[tuple[str, ...], list[ResolvedSkill] | str] = {}
+    skill_cache: dict[
+        tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]], list[ResolvedSkill] | str
+    ] = {}
 
     # Cache per provider name so we don't re-resolve for every agent.
     cache: dict[str, ProviderCapabilities] = {}
@@ -1706,12 +1711,43 @@ def _validate_provider_capabilities(
         Eager-injection providers additionally get the ``runtime.skill_injection``
         budget applied here, so an oversized preamble is reported before a run
         starts rather than on first execution.
+
+        Discovered skills are held to a laxer standard than declared ones: a
+        skill the author never named should not fail their workflow, so a
+        provider that cannot deliver it produces a warning and a skip rather
+        than an error. That asymmetry is the same one
+        :mod:`conductor.skills.discovery` applies to broken manifests.
         """
-        entries = agent.skills if agent.skills is not None else runtime_skills
+        overridden = agent.skills is not None
+        # Repeat the ``is not None`` rather than reusing ``overridden``: the
+        # type checker does not narrow through an intermediate boolean.
+        entries = list(agent.skills) if agent.skills is not None else list(runtime_skills)
+        # Discovery joins the workflow-level default set, so an agent that
+        # declares its own ``skills:`` overrides it along with runtime.skills.
+        discovery_on = discovery.is_enabled and not overridden
         # A provider that declares skills=False already produced an error
         # above; re-reporting resolution failures for it would be noise.
-        if not entries or not caps.skills:
+        if (not entries and not discovery_on) or not caps.skills:
             return
+
+        if discovery_on and uses_native_skills(provider_name) is False:
+            # Eager injection prepends every skill body to every call, and a
+            # discovered set is unbounded and machine-dependent — the measured
+            # set on a developer machine is several times the default budget.
+            # There is no limit to tune that makes this work, so refuse the
+            # combination rather than fail on first execution.
+            errors.append(
+                f"Agent '{agent.name}' uses provider '{provider_name}', which has no "
+                f"native skill surface, but 'runtime.skill_discovery' is enabled "
+                f"(sources={discovery.sources!r}). Discovered skills would be "
+                f"injected in full into every prompt, and the discovered set varies "
+                f"by machine, so its size cannot be bounded. Name the skills you "
+                f"want in 'runtime.skills' (or this agent's 'skills:'), or run this "
+                f"agent on a provider with progressive disclosure (copilot, "
+                f"claude-agent-sdk)."
+            )
+            return
+
         # Only *relative* entries need a base directory. ``~/skills`` becomes
         # absolute under expanduser(), so it is checkable too — narrowing here
         # rather than on is_path_entry() keeps absolute entries validated
@@ -1734,11 +1770,17 @@ def _validate_provider_capabilities(
             )
             return
 
-        key = tuple(entries)
+        sources = tuple(discovery.sources) if discovery_on else ()
+        exclude = tuple(discovery.exclude) if discovery_on else ()
+        key = (tuple(entries), sources, exclude)
         if key not in skill_cache:
             try:
-                skill_cache[key] = resolve_skills(
-                    list(entries), base_dir=skill_base_dir, on_warning=warnings.append
+                skill_cache[key] = resolve_effective_skills(
+                    list(entries),
+                    sources=sources,
+                    exclude=exclude,
+                    base_dir=skill_base_dir,
+                    on_warning=warnings.append,
                 )
             except SkillError as exc:
                 skill_cache[key] = str(exc)
@@ -1748,27 +1790,50 @@ def _validate_provider_capabilities(
             return
 
         if provider_name == "claude-agent-sdk":
+            usable: list[ResolvedSkill] = []
             for item in resolved:
                 try:
                     plugin = resolve_skill_plugin(item.directory)
                 except SkillPluginError as exc:
-                    errors.append(
-                        f"Agent '{agent.name}': skill {item.source!r} resolves to "
-                        f"{item.directory}, whose Claude Code plugin cannot be "
-                        f"loaded: {exc}"
-                    )
+                    if item.discovered:
+                        warnings.append(
+                            f"Agent '{agent.name}': discovered skill {item.name!r} at "
+                            f"{item.directory} was skipped — its Claude Code plugin "
+                            f"cannot be loaded: {exc}"
+                        )
+                    else:
+                        errors.append(
+                            f"Agent '{agent.name}': skill {item.source!r} resolves to "
+                            f"{item.directory}, whose Claude Code plugin cannot be "
+                            f"loaded: {exc}"
+                        )
                     continue
                 if plugin is None:
-                    errors.append(
-                        f"Agent '{agent.name}': skill {item.source!r} resolves to "
-                        f"{item.directory}, which is not inside a Claude Code "
-                        f"plugin. Provider 'claude-agent-sdk' can only enable a "
-                        f"skill through the plugin that owns it — it has no "
-                        f"skill-directory option. Package the skill as a plugin "
-                        f"(add ../.claude-plugin/plugin.json and move the skill "
-                        f"under <plugin>/skills/), or run this agent on 'copilot', "
-                        f"which loads skill directories directly."
-                    )
+                    if item.discovered:
+                        warnings.append(
+                            f"Agent '{agent.name}': discovered skill {item.name!r} at "
+                            f"{item.directory} (found in {item.source}) was skipped — "
+                            f"provider 'claude-agent-sdk' can only load a skill that "
+                            f"lives inside a Claude Code plugin. The same skill works "
+                            f"on 'copilot'. Add it to "
+                            f"runtime.skill_discovery.exclude to silence this."
+                        )
+                    else:
+                        errors.append(
+                            f"Agent '{agent.name}': skill {item.source!r} resolves to "
+                            f"{item.directory}, which is not inside a Claude Code "
+                            f"plugin. Provider 'claude-agent-sdk' can only enable a "
+                            f"skill through the plugin that owns it — it has no "
+                            f"skill-directory option. Package the skill as a plugin "
+                            f"(add ../.claude-plugin/plugin.json and move the skill "
+                            f"under <plugin>/skills/), or run this agent on 'copilot', "
+                            f"which loads skill directories directly."
+                        )
+                    continue
+                usable.append(item)
+            # Discovered skills this provider cannot load are dropped, so the
+            # budget below measures what would actually be sent.
+            resolved = usable
 
         if uses_native_skills(provider_name) is False:
             _check_skill_injection_budget(agent, provider_name, resolved)
@@ -2033,7 +2098,7 @@ def _validate_provider_capabilities(
     # override). A provider that cannot surface skill content would drop it
     # silently, so error against every resolved provider that actually
     # receives the setting.
-    if runtime_skills:
+    if runtime_skills or discovery.is_enabled:
         providers_inheriting_skills: dict[str, list[str]] = {}
         for agent in all_llm_agents:
             # Any per-agent ``skills:`` — including the empty-list opt-out —
@@ -2046,8 +2111,13 @@ def _validate_provider_capabilities(
         for pname, agent_names in providers_inheriting_skills.items():
             pcaps = _caps_for(pname)
             if pcaps is not None and not pcaps.skills:
+                declared = (
+                    f"'runtime.skills'={sorted(runtime_skills)!r}"
+                    if runtime_skills
+                    else f"'runtime.skill_discovery.sources'={discovery.sources!r}"
+                )
                 errors.append(
-                    f"Workflow declares 'runtime.skills'={sorted(runtime_skills)!r} "
+                    f"Workflow declares {declared} "
                     f"but provider '{pname}' does not support skills "
                     f"(capabilities.skills=False) and is used by agent(s): "
                     f"{sorted(agent_names)!r}. Override these agents to a "

@@ -24,6 +24,7 @@ from conductor.config.schema import (
     ForEachDef,
     OutputField,
     RuntimeConfig,
+    SkillDiscoveryConfig,
     SkillInjectionConfig,
     WorkflowConfig,
     WorkflowDef,
@@ -61,6 +62,7 @@ def _workflow(
     agent_skills: list[str] | None = None,
     runtime_skills: list[str] | None = None,
     skill_injection: SkillInjectionConfig | None = None,
+    skill_discovery: SkillDiscoveryConfig | None = None,
     for_each_skills: list[str] | None = None,
 ) -> WorkflowConfig:
     runtime_kwargs: dict[str, Any] = {"provider": provider}
@@ -68,6 +70,8 @@ def _workflow(
         runtime_kwargs["skills"] = runtime_skills
     if skill_injection is not None:
         runtime_kwargs["skill_injection"] = skill_injection
+    if skill_discovery is not None:
+        runtime_kwargs["skill_discovery"] = skill_discovery
 
     agents = [
         AgentDef(
@@ -391,3 +395,153 @@ class TestStaticAndRuntimeBudgetAgree:
         else:
             _validate(config, _wf_path(tmp_path))
             assert self._runtime_executor(tmp_path, limits)._build_prompt_prefix(agent)
+
+
+@pytest.fixture
+def fake_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Point ``Path.home()`` at an empty directory.
+
+    Discovery reads the real home directory in production. Letting it do
+    so here would make results depend on what the machine running the
+    suite has installed.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    return home
+
+
+class TestDiscoveryOnEagerInjectionProviders:
+    """``claude`` and ``hermes`` cannot bound an ambient set, so they refuse it.
+
+    Measured against a real installed set, discovery pulls in several times
+    the default ``skill_injection.max_bytes``, and the size varies by
+    machine — there is no limit to tune that makes this work. Refusing it
+    statically is the same call #350 made for a non-plugin path skill on
+    ``claude-agent-sdk``.
+    """
+
+    @pytest.mark.parametrize("provider", ["claude", "hermes"])
+    def test_refused(self, tmp_path: Path, fake_home: Path, provider: str) -> None:
+        _make_skill(fake_home / ".copilot" / "skills" / "acme")
+        config = _workflow(
+            provider=provider,
+            skill_discovery=SkillDiscoveryConfig(sources=["personal"]),
+        )
+        with pytest.raises(ConfigurationError, match="no native skill surface"):
+            _validate(config, _wf_path(tmp_path))
+
+    def test_error_names_the_remedy(self, tmp_path: Path, fake_home: Path) -> None:
+        config = _workflow(
+            provider="claude", skill_discovery=SkillDiscoveryConfig(sources=["personal"])
+        )
+        with pytest.raises(ConfigurationError, match="runtime.skills"):
+            _validate(config, _wf_path(tmp_path))
+
+    def test_agent_override_escapes_the_refusal(self, tmp_path: Path, fake_home: Path) -> None:
+        """Discovery joins the *inherited* set, so an override sidesteps it."""
+        skill = _make_skill(tmp_path / "team" / "acme")
+        config = _workflow(
+            provider="claude",
+            agent_skills=[str(skill)],
+            skill_discovery=SkillDiscoveryConfig(sources=["personal"]),
+        )
+        assert not any(
+            "no native skill surface" in w for w in _validate(config, _wf_path(tmp_path))
+        )
+
+    def test_agent_opt_out_escapes_the_refusal(self, tmp_path: Path, fake_home: Path) -> None:
+        config = _workflow(
+            provider="claude",
+            agent_skills=[],
+            skill_discovery=SkillDiscoveryConfig(sources=["personal"]),
+        )
+        assert _validate(config, _wf_path(tmp_path)) is not None
+
+    def test_disabled_discovery_is_fine(self, tmp_path: Path, fake_home: Path) -> None:
+        config = _workflow(provider="claude", skill_discovery=SkillDiscoveryConfig())
+        assert not any(
+            "no native skill surface" in w for w in _validate(config, _wf_path(tmp_path))
+        )
+
+    def test_native_providers_accept_discovery(self, tmp_path: Path, fake_home: Path) -> None:
+        _make_skill(fake_home / ".copilot" / "skills" / "acme")
+        config = _workflow(
+            provider="copilot", skill_discovery=SkillDiscoveryConfig(sources=["personal"])
+        )
+        assert not any(
+            "no native skill surface" in w for w in _validate(config, _wf_path(tmp_path))
+        )
+
+
+class TestDiscoveryOnClaudeAgentSdk:
+    """A discovered skill the provider cannot load is dropped, not fatal.
+
+    Most installed plugins are not Claude Code plugins, so erroring would
+    bury the user in failures for content they never wrote. An explicitly
+    declared skill still errors — they asked for that one by name.
+    """
+
+    def test_non_plugin_discovered_skill_warns(self, tmp_path: Path, fake_home: Path) -> None:
+        _make_skill(fake_home / ".copilot" / "skills" / "loose")
+        config = _workflow(
+            provider="claude-agent-sdk",
+            skill_discovery=SkillDiscoveryConfig(sources=["personal"]),
+        )
+        warnings = _validate(config, _wf_path(tmp_path))
+        assert any("'loose'" in w and "skipped" in w for w in warnings)
+
+    def test_non_plugin_declared_skill_still_errors(self, tmp_path: Path, fake_home: Path) -> None:
+        skill = _make_skill(tmp_path / "team" / "loose")
+        config = _workflow(
+            provider="claude-agent-sdk",
+            runtime_skills=[str(skill)],
+            skill_discovery=SkillDiscoveryConfig(sources=["personal"]),
+        )
+        with pytest.raises(ConfigurationError, match="not inside a Claude Code"):
+            _validate(config, _wf_path(tmp_path))
+
+    def test_discovered_plugin_skill_is_accepted(self, tmp_path: Path, fake_home: Path) -> None:
+        _make_plugin(
+            fake_home / ".copilot" / "installed-plugins" / "market" / "tools",
+            "tools",
+            "packaged",
+        )
+        config = _workflow(
+            provider="claude-agent-sdk",
+            skill_discovery=SkillDiscoveryConfig(sources=["plugins"]),
+        )
+        warnings = _validate(config, _wf_path(tmp_path))
+        assert not any("packaged" in w and "skipped" in w for w in warnings)
+
+
+class TestDiscoveryResolutionIsShared:
+    """Validation must resolve the same set the run will."""
+
+    def test_broken_discovered_manifest_warns(self, tmp_path: Path, fake_home: Path) -> None:
+        _make_skill(
+            fake_home / ".copilot" / "skills" / "broken",
+            frontmatter="---\nname: broken\ndescription: Oops. Triggers: a, b\n---\n",
+        )
+        config = _workflow(
+            provider="copilot", skill_discovery=SkillDiscoveryConfig(sources=["personal"])
+        )
+        warnings = _validate(config, _wf_path(tmp_path))
+        assert any("broken" in w for w in warnings)
+
+    def test_empty_source_warns(self, tmp_path: Path, fake_home: Path) -> None:
+        config = _workflow(
+            provider="copilot", skill_discovery=SkillDiscoveryConfig(sources=["personal"])
+        )
+        warnings = _validate(config, _wf_path(tmp_path))
+        assert any("found no skills" in w for w in warnings)
+
+    def test_exclude_is_honoured(self, tmp_path: Path, fake_home: Path) -> None:
+        _make_skill(fake_home / ".copilot" / "skills" / "loose")
+        config = _workflow(
+            provider="claude-agent-sdk",
+            skill_discovery=SkillDiscoveryConfig(sources=["personal"], exclude=["loose"]),
+        )
+        warnings = _validate(config, _wf_path(tmp_path))
+        assert not any("'loose'" in w and "skipped" in w for w in warnings)

@@ -67,7 +67,73 @@ def validate_workflow(
         display_validation_error(e, workflow_path, output_console)
         return False, None
 
+    _report_skill_discovery(config, workflow_path, output_console)
+
     return True, config
+
+
+def _report_skill_discovery(
+    config: WorkflowConfig,
+    workflow_path: Path,
+    console: Console,
+) -> None:
+    """Print what ``runtime.skill_discovery`` finds on this machine.
+
+    Discovery's one real cost is that the same YAML picks up a different
+    skill set on a different machine or in CI. That is only defensible if
+    the author can see the set, so listing it is part of the feature
+    rather than a debugging aid.
+
+    Silent when discovery is off, and never fatal — a broken ambient
+    location has already been reported as a warning by the validator, and
+    failing the command here would turn a reporting step into a second
+    source of validation errors.
+
+    Args:
+        config: The validated workflow configuration.
+        workflow_path: Path to the workflow file, anchoring ``project``.
+        console: Rich console for output.
+    """
+    discovery = config.workflow.runtime.skill_discovery
+    if not discovery.is_enabled:
+        return
+
+    from conductor.skills import BYTES_PER_TOKEN_ESTIMATE, discover_skills, load_skill_content
+
+    # Diagnostics are dropped rather than reported: this summary re-runs a
+    # scan the validator has already run and printed warnings for, so
+    # forwarding them would duplicate every line. Anything genuinely wrong
+    # is visible in the listing below as a missing skill.
+    try:
+        found = discover_skills(
+            discovery.sources,
+            base_dir=workflow_path.resolve().parent,
+            exclude=discovery.exclude,
+            on_warning=lambda _message: None,
+        )
+    except Exception as exc:  # pragma: no cover - defensive; discovery warns instead
+        console.print(f"  [yellow]⚠[/yellow] Skill discovery could not be summarized: {exc}")
+        return
+
+    sources = ", ".join(discovery.sources)
+    if not found:
+        console.print(f"  [dim]Skill discovery ({sources}): no skills found[/dim]")
+        return
+
+    console.print(f"  [dim]Skill discovery ({sources}): {len(found)} skill(s)[/dim]")
+    for skill in found:
+        console.print(f"    [dim]• {skill.name} — {skill.root}[/dim]")
+
+    try:
+        content = load_skill_content([(skill.name, skill.directory) for skill in found])
+    except Exception:
+        # Unreadable content is the validator's business, not this summary's.
+        return
+    size = len(content.encode("utf-8"))
+    console.print(
+        f"    [dim]Total if eagerly injected: {size:,} bytes "
+        f"(~{size // BYTES_PER_TOKEN_ESTIMATE:,} tokens)[/dim]"
+    )
 
 
 def display_validation_error(

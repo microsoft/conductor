@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Skill discovery: `runtime.skill_discovery` picks up skills already
+  installed on the machine** (issue #362) — `sources: [personal, project,
+  plugins]` scans `~/.copilot/skills` and `~/.claude/skills`,
+  `.github/skills` and `.claude/skills` from the workflow file's directory
+  up to the repository root, and every installed plugin's `skills/`
+  directory, so a workflow can use a personal or team skill library without
+  enumerating it. Off by default. `exclude:` drops individual skills by
+  name. Conductor scans the union of both CLIs' locations itself rather
+  than enabling each provider's own discovery: locations are
+  provider-specific, so a per-provider flag would give a `copilot` agent
+  and a `claude-agent-sdk` agent different skill sets inside a single run.
+  Scanning centrally also keeps Copilot's `enable_config_discovery` off,
+  which would otherwise auto-load MCP servers from any `.mcp.json` in the
+  working directory. Discovered skills join `runtime.skills`, so an agent
+  declaring its own `skills:` (including `skills: []`) still overrides
+  them; a skill named in `skills:` beats a discovered one of the same name.
+  Discovered content is held to a laxer standard than declared content —
+  broken frontmatter, a taken name, an unreadable directory, or a provider
+  that cannot load it are errors for a declared skill and warning-plus-skip
+  for a discovered one. Rejected at validation time on `claude` and
+  `hermes`, which inject every skill body into every prompt and cannot
+  bound a machine-dependent set; on `claude-agent-sdk` only discovered
+  skills inside a Claude Code plugin are loaded and the rest are skipped
+  with a warning. `conductor validate` lists what was found, where each
+  skill came from, and the total size if eagerly injected. See
+  `examples/skills-discovery.yaml` and `docs/workflow-syntax.md`
+  (Discovering installed skills).
+
 - **`skills:` now accepts filesystem paths, not just built-in names**
   (issue #350) — an entry is treated as a path when it starts with `.`
   or `~`, or contains `/` or `\`; everything else must still be

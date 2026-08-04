@@ -1,0 +1,113 @@
+# Discovering skills already installed on the machine
+#
+# `runtime.skill_discovery` picks up skills from well-known locations so a
+# workflow can use a personal or team skill library without listing each
+# one. It is OFF by default — leaving it off is what keeps a workflow
+# reproducible across machines.
+#
+# Why Conductor scans instead of asking each provider to discover its own:
+# discovery locations are provider-specific (Copilot keeps skills under
+# ~/.copilot, Claude Code under ~/.claude), so a per-provider flag would
+# give a `copilot` agent and a `claude-agent-sdk` agent DIFFERENT skill
+# sets inside a single run. Conductor scans the union centrally, so every
+# agent sees the same set whatever provider it resolves to. It also leaves
+# the providers' own discovery switched off — Copilot's would additionally
+# auto-load MCP servers from any .mcp.json in the working directory.
+#
+# Sources:
+#   personal → ~/.copilot/skills, ~/.claude/skills
+#   project  → .github/skills and .claude/skills, in THIS FILE's directory
+#              and each ancestor up to the repository root
+#   plugins  → the skills/ directory of every installed plugin
+#
+# Scanned in a fixed order (project, personal, plugins) whatever order they
+# are written in, so reordering `sources` cannot change which of two
+# same-named skills wins.
+#
+# Provider support — discovery is realistically a `copilot` feature today:
+#   * copilot           → fully supported
+#   * claude-agent-sdk  → only loads a discovered skill that lives inside a
+#                         Claude Code plugin; the rest are skipped with a
+#                         warning (the SDK has no bare skill-directory option)
+#   * claude / hermes   → REJECTED by `conductor validate`. They inject every
+#                         skill body into every prompt, and a discovered set
+#                         is unbounded and varies by machine, so no limit
+#                         makes it safe. Name skills in `runtime.skills`.
+#
+# Run `conductor validate` on this file first: it prints every skill
+# discovery found, where it came from, and the total injected size. An
+# ambient set is the one part of a workflow the YAML does not capture, so
+# seeing it is the point.
+#
+# Usage:
+#   conductor validate examples/skills-discovery.yaml
+#   conductor run examples/skills-discovery.yaml \
+#     --input task="Summarize what skills are available to you"
+
+workflow:
+  name: skills-discovery
+  description: Use skills installed in the environment alongside a declared one
+  version: 1.0.0
+  entry_point: worker
+
+  runtime:
+    provider: copilot
+    max_agent_iterations: 20
+
+    # Declared skills are authoritative. A discovered skill with the same
+    # name is skipped with a warning — which happens immediately in
+    # practice, since installing Conductor's own plugin puts a second
+    # `conductor` skill on the machine.
+    skills:
+      - conductor
+
+    skill_discovery:
+      # Start with `personal` alone; add `plugins` once you have seen what
+      # `conductor validate` reports for it.
+      sources:
+        - personal
+        - project
+      # Drop individual skills by name. Useful for a large skill you do not
+      # want in context, or one your provider cannot load.
+      exclude: []
+
+  limits:
+    max_iterations: 5
+
+  input:
+    task:
+      type: string
+      required: true
+      description: What the agent should do
+
+agents:
+  # Inherits `runtime.skills` PLUS everything discovery found.
+  - name: worker
+    model: gpt-5
+    prompt: |
+      {{ task }}
+
+      List the skills available to you and say which you used.
+    output:
+      summary:
+        type: string
+        description: What was done and which skills were used
+    routes:
+      - to: reporter
+
+  # Declaring `skills:` overrides the workflow default AND discovery —
+  # an agent that names its skills has said which ones it wants.
+  - name: reporter
+    model: gpt-5
+    prompt: |
+      Rewrite this as a single short paragraph:
+
+      {{ worker.output.summary }}
+    skills: []
+    output:
+      report:
+        type: string
+        description: The final summary
+
+output:
+  report: "{{ reporter.output.report }}"

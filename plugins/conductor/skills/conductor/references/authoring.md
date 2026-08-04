@@ -259,6 +259,9 @@ workflow:
     skill_injection:                # only bounds eager-injection providers
       warn_bytes: 65536
       max_bytes: 131072
+    skill_discovery:                # off by default
+      sources: [personal, project]
+      exclude: [scratch-notes]
 
 agents:
   - name: workflow_reviewer
@@ -270,7 +273,23 @@ agents:
     prompt: "Do something simple."
 ```
 
-See `examples/skills-self-improving-workflow.yaml` for a complete example.
+**Discovering installed skills.** `runtime.skill_discovery` picks up skills already installed on the machine so a workflow need not enumerate a personal or team library. It is **off by default**, because an ambient set is the one part of a workflow the YAML does not capture — the same file can behave differently on a teammate's machine or in CI.
+
+Conductor scans the locations itself and unions both CLIs' conventions, rather than asking each provider to discover its own. That is the substance of the feature, not an implementation detail: discovery locations are provider-specific, so a per-provider flag would give a `copilot` agent and a `claude-agent-sdk` agent **different skill sets inside a single run**. Scanning centrally also keeps the providers' own discovery off, which matters because Copilot's would additionally auto-load MCP servers from any `.mcp.json` in the working directory.
+
+- `personal` → `~/.copilot/skills`, `~/.claude/skills`
+- `project` → `.github/skills` and `.claude/skills`, in the workflow file's directory and each ancestor up to the repository root
+- `plugins` → the `skills/` directory of every installed plugin
+
+Discovered skills join `runtime.skills`, so the tri-state is unchanged: an agent that declares its own `skills:` overrides discovery too. Sources are scanned in a fixed order (`project`, `personal`, `plugins`) whatever order they are written in, so reordering cannot change which of two same-named skills wins. A skill named in `skills:` always beats a discovered one of the same name — which comes up immediately, since installing Conductor's own plugin puts a second `conductor` skill on the machine.
+
+Discovered content is held to a laxer standard than declared content: broken frontmatter, a taken name, an unreadable directory, or a provider that cannot load it are all errors for a declared skill and warning-plus-skip for a discovered one. The author asked for one by name and not the other.
+
+Provider support is narrower than for declared skills. `copilot` is fully supported. `claude-agent-sdk` only loads a discovered skill that lives inside a Claude Code plugin, and most installed Copilot plugins are not — expect a warning per skipped skill, silenced with `exclude`. `claude` and `hermes` **reject discovery at validation time**: they inject every body into every prompt, and a discovered set is unbounded and machine-dependent, so no `skill_injection` limit makes it safe.
+
+Run `conductor validate` to see what discovery found — it lists every skill, the location it came from, and the total size if eagerly injected.
+
+See `examples/skills-self-improving-workflow.yaml` and `examples/skills-discovery.yaml` for complete examples.
 
 ## Routing Patterns
 

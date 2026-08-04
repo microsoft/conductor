@@ -285,12 +285,12 @@ class TestResolveSkillsForAgent:
     def test_agent_none_inherits_workflow(self) -> None:
         executor = AgentExecutor(CopilotProvider(), workflow_skills=["conductor"])
         agent = AgentDef(name="a", model="gpt-4", prompt="p")
-        assert executor._resolve_skills_for_agent(agent) == ["conductor"]
+        assert [s.name for s in executor._resolve_skills_for_agent(agent)] == ["conductor"]
 
     def test_agent_list_overrides_workflow(self) -> None:
         executor = AgentExecutor(CopilotProvider(), workflow_skills=[])
         agent = AgentDef(name="a", model="gpt-4", prompt="p", skills=["conductor"])
-        assert executor._resolve_skills_for_agent(agent) == ["conductor"]
+        assert [s.name for s in executor._resolve_skills_for_agent(agent)] == ["conductor"]
 
     def test_agent_empty_list_opts_out(self) -> None:
         executor = AgentExecutor(CopilotProvider(), workflow_skills=["conductor"])

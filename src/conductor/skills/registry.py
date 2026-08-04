@@ -13,10 +13,11 @@ editable installs and tests.
 
 Entries written in ``skills:`` are resolved here: a bare name must be a
 registered built-in, while anything path-shaped is resolved against the
-workflow file's directory. Discovering skills already installed in the
+workflow file's directory. Picking up skills already installed in the
 user's environment (``~/.copilot/skills``, ``.github/skills``, plugin
-roots) is deliberately out of scope — discovery locations differ per
-provider, so it is tracked separately in issue #362.
+roots) is opt-in and lives in :mod:`conductor.skills.discovery`, which
+reuses :func:`expand_skills_root` from here so a discovered directory and
+a written path are judged by the same rules.
 """
 
 from __future__ import annotations
@@ -160,11 +161,22 @@ class ResolvedSkill:
     """Absolute path to the directory holding ``SKILL.md``."""
 
     source: str
-    """The ``skills:`` entry this was resolved from, verbatim.
+    """Where this skill came from, for use in messages.
 
-    A ``skills/`` root expands to several :class:`ResolvedSkill` objects
-    that share one ``source``, so error messages can name what the user
-    actually wrote.
+    For an explicitly declared skill, the ``skills:`` entry verbatim — a
+    ``skills/`` root expands to several :class:`ResolvedSkill` objects
+    that share one ``source``, so errors can name what the user actually
+    wrote. For a discovered skill (:attr:`discovered`), the location it
+    was found in, since there is no entry to quote.
+    """
+
+    discovered: bool = False
+    """Whether this skill was found by scanning rather than declared.
+
+    Callers treat the two differently on purpose: a problem with a skill
+    the author named is an error, while the same problem with one that
+    merely happened to be installed is a warning and a skip. See
+    :mod:`conductor.skills.discovery`.
     """
 
     def __post_init__(self) -> None:
@@ -207,6 +219,50 @@ def is_path_entry(entry: str) -> bool:
     already contains a separator.
     """
     return entry.startswith(("~", ".")) or "/" in entry or "\\" in entry
+
+
+def expand_skills_root(root: Path) -> tuple[list[Path], list[str]]:
+    """Split a skills root into the skill directories it holds.
+
+    The one definition of "what counts as a skill directory", shared by
+    ``skills:`` path entries and by
+    :mod:`conductor.skills.discovery` — the discovery locations are all
+    skills roots, so they expand by exactly these rules.
+
+    Deliberately makes no judgement about an empty result: a path entry
+    naming an empty root is a user error, while a discovery location that
+    happens to hold nothing is the ordinary case. Each caller decides.
+
+    Args:
+        root: An existing, readable directory to look inside.
+
+    Returns:
+        A ``(children, skipped)`` tuple. ``children`` is every immediate
+        subdirectory holding a ``SKILL.md``, sorted by name; ``skipped``
+        is the names of the subdirectories that do not, so callers can
+        report near-misses instead of silently yielding one fewer skill.
+
+    Raises:
+        OSError: If ``root`` cannot be listed. Callers translate this
+            into their own message — there is no single phrasing that
+            suits both a user-written path and an ambient location.
+    """
+    entries = list(root.iterdir())
+    children = sorted(
+        (child for child in entries if (child / "SKILL.md").is_file()),
+        key=lambda child: child.name,
+    )
+    # Subdirectories that look like skills but have no SKILL.md. Files
+    # (a README, a LICENSE) are not reported — only a directory can
+    # plausibly have been *meant* as a skill. Without this, pointing at
+    # a root turns the loud "no SKILL.md" error you would get from
+    # naming the directory directly into silence: a mis-cased
+    # ``Skill.md`` or a file someone forgot to commit simply yields one
+    # fewer skill.
+    skipped = sorted(
+        child.name for child in entries if child.is_dir() and not (child / "SKILL.md").is_file()
+    )
+    return children, skipped
 
 
 def _resolve_path_entry(
@@ -254,21 +310,7 @@ def _resolve_path_entry(
             )
         if (resolved / "SKILL.md").is_file():
             return [resolved]
-        entries = list(resolved.iterdir())
-        children = sorted(
-            (child for child in entries if (child / "SKILL.md").is_file()),
-            key=lambda child: child.name,
-        )
-        # Subdirectories that look like skills but have no SKILL.md. Files
-        # (a README, a LICENSE) are not reported — only a directory can
-        # plausibly have been *meant* as a skill. Without this, pointing at
-        # a root turns the loud "no SKILL.md" error you would get from
-        # naming the directory directly into silence: a mis-cased
-        # ``Skill.md`` or a file someone forgot to commit simply yields one
-        # fewer skill.
-        skipped = sorted(
-            child.name for child in entries if child.is_dir() and not (child / "SKILL.md").is_file()
-        )
+        children, skipped = expand_skills_root(resolved)
     except OSError as exc:
         # A path Conductor can name but not inspect — an unreadable directory,
         # or one whose parent is unreadable. Python re-raises EACCES from

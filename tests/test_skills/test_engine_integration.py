@@ -23,6 +23,7 @@ from conductor.config.schema import (
     AgentDef,
     OutputField,
     RuntimeConfig,
+    SkillDiscoveryConfig,
     SkillInjectionConfig,
     WorkflowConfig,
     WorkflowDef,
@@ -83,11 +84,16 @@ def _write_skill(directory: Path, filler: int = 0) -> Path:
 
 
 def _config(
-    skills: list[str], skill_injection: SkillInjectionConfig | None = None
+    skills: list[str],
+    skill_injection: SkillInjectionConfig | None = None,
+    skill_discovery: SkillDiscoveryConfig | None = None,
+    agent_skills: list[str] | None = None,
 ) -> WorkflowConfig:
     runtime_kwargs: dict[str, Any] = {"provider": "copilot", "skills": skills}
     if skill_injection is not None:
         runtime_kwargs["skill_injection"] = skill_injection
+    if skill_discovery is not None:
+        runtime_kwargs["skill_discovery"] = skill_discovery
     return WorkflowConfig(
         workflow=WorkflowDef(
             name="wf", entry_point="worker", runtime=RuntimeConfig(**runtime_kwargs)
@@ -97,6 +103,7 @@ def _config(
                 name="worker",
                 prompt="Do the thing.",
                 output={"result": OutputField(type="string")},
+                skills=agent_skills,
             )
         ],
         output={"result": "{{ worker.output.result }}"},
@@ -181,3 +188,182 @@ class TestInjectionBudgetThroughTheEngine:
         provider = _EagerProvider()
         _run(config, provider, path)
         assert '<skill name="acme">' in provider.rendered_prompt
+
+
+class _StubRegistry:
+    """Minimal stand-in for ``ProviderRegistry``.
+
+    Registry mode is the engine's *second* ``AgentExecutor`` construction
+    site. Only a test that goes through it can catch that site drifting
+    out of sync with the first — which is exactly the mutation that
+    escaped review in #350.
+    """
+
+    def __init__(self, provider: AgentProvider) -> None:
+        self._provider = provider
+
+    async def get_provider(self, agent: AgentDef) -> AgentProvider:
+        return self._provider
+
+    def get_active_providers(self) -> dict[str, AgentProvider]:
+        return {"copilot": self._provider}
+
+
+def _run_via_registry(
+    config: WorkflowConfig, provider: AgentProvider, workflow_path: Path | None
+) -> None:
+    engine = WorkflowEngine(config, registry=_StubRegistry(provider), workflow_path=workflow_path)
+    asyncio.run(engine.run({}))
+
+
+@pytest.fixture
+def fake_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Point ``Path.home()`` at an empty directory.
+
+    Discovery reads the real home directory in production. A test that
+    let it do so would pass or fail according to what the machine running
+    the suite happens to have installed.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    return home
+
+
+class TestSkillDiscoveryThroughTheEngine:
+    """``runtime.skill_discovery`` has to survive the trip to the provider."""
+
+    def test_discovered_skill_reaches_the_provider(self, tmp_path: Path, fake_home: Path) -> None:
+        """Fails if the engine stops passing ``skill_discovery``."""
+        skill = _write_skill(fake_home / ".copilot" / "skills" / "acme")
+        path = tmp_path / "wf.yaml"
+        path.write_text("# placeholder\n")
+        provider = _CapturingProvider()
+        _run(
+            _config([], skill_discovery=SkillDiscoveryConfig(sources=["personal"])),
+            provider,
+            path,
+        )
+        assert provider.skill_directories == [str(skill)]
+
+    def test_discovered_skill_reaches_the_provider_in_registry_mode(
+        self, tmp_path: Path, fake_home: Path
+    ) -> None:
+        """Same assertion through the engine's other executor site."""
+        skill = _write_skill(fake_home / ".copilot" / "skills" / "acme")
+        path = tmp_path / "wf.yaml"
+        path.write_text("# placeholder\n")
+        provider = _CapturingProvider()
+        _run_via_registry(
+            _config([], skill_discovery=SkillDiscoveryConfig(sources=["personal"])),
+            provider,
+            path,
+        )
+        assert provider.skill_directories == [str(skill)]
+
+    def test_discovery_joins_the_declared_skills(self, tmp_path: Path, fake_home: Path) -> None:
+        declared = _write_skill(tmp_path / "team-skills" / "declared")
+        found = _write_skill(fake_home / ".copilot" / "skills" / "found")
+        path = tmp_path / "wf.yaml"
+        path.write_text("# placeholder\n")
+        provider = _CapturingProvider()
+        _run(
+            _config(
+                ["./team-skills/declared"],
+                skill_discovery=SkillDiscoveryConfig(sources=["personal"]),
+            ),
+            provider,
+            path,
+        )
+        assert provider.skill_directories == [str(declared), str(found)]
+
+    def test_agent_skills_override_discovery(self, tmp_path: Path, fake_home: Path) -> None:
+        """An agent that names its skills has said which ones it wants."""
+        declared = _write_skill(tmp_path / "team-skills" / "declared")
+        _write_skill(fake_home / ".copilot" / "skills" / "found")
+        path = tmp_path / "wf.yaml"
+        path.write_text("# placeholder\n")
+        provider = _CapturingProvider()
+        _run(
+            _config(
+                [],
+                skill_discovery=SkillDiscoveryConfig(sources=["personal"]),
+                agent_skills=["./team-skills/declared"],
+            ),
+            provider,
+            path,
+        )
+        assert provider.skill_directories == [str(declared)]
+
+    def test_agent_opt_out_beats_discovery(self, tmp_path: Path, fake_home: Path) -> None:
+        """``skills: []`` stays the single opt-out."""
+        _write_skill(fake_home / ".copilot" / "skills" / "found")
+        path = tmp_path / "wf.yaml"
+        path.write_text("# placeholder\n")
+        provider = _CapturingProvider()
+        _run(
+            _config(
+                [],
+                skill_discovery=SkillDiscoveryConfig(sources=["personal"]),
+                agent_skills=[],
+            ),
+            provider,
+            path,
+        )
+        assert provider.skill_directories is None
+
+    def test_exclude_reaches_the_executor(self, tmp_path: Path, fake_home: Path) -> None:
+        keep = _write_skill(fake_home / ".copilot" / "skills" / "keep")
+        _write_skill(fake_home / ".copilot" / "skills" / "drop")
+        path = tmp_path / "wf.yaml"
+        path.write_text("# placeholder\n")
+        provider = _CapturingProvider()
+        _run(
+            _config(
+                [],
+                skill_discovery=SkillDiscoveryConfig(sources=["personal"], exclude=["drop"]),
+            ),
+            provider,
+            path,
+        )
+        assert provider.skill_directories == [str(keep)]
+
+    def test_project_source_anchors_on_the_workflow_file(
+        self, tmp_path: Path, fake_home: Path
+    ) -> None:
+        """Relative to the workflow, not the process working directory."""
+        repo = tmp_path / "repo"
+        (repo / ".git").mkdir(parents=True)
+        skill = _write_skill(repo / ".github" / "skills" / "acme")
+        flows = repo / "flows"
+        flows.mkdir()
+        path = flows / "wf.yaml"
+        path.write_text("# placeholder\n")
+        provider = _CapturingProvider()
+        _run(
+            _config([], skill_discovery=SkillDiscoveryConfig(sources=["project"])),
+            provider,
+            path,
+        )
+        assert provider.skill_directories == [str(skill)]
+
+    def test_discovery_reaches_eager_injection_too(self, tmp_path: Path, fake_home: Path) -> None:
+        _write_skill(fake_home / ".copilot" / "skills" / "acme")
+        path = tmp_path / "wf.yaml"
+        path.write_text("# placeholder\n")
+        provider = _EagerProvider()
+        _run(
+            _config([], skill_discovery=SkillDiscoveryConfig(sources=["personal"])),
+            provider,
+            path,
+        )
+        assert '<skill name="acme">' in provider.rendered_prompt
+
+    def test_disabled_discovery_finds_nothing(self, tmp_path: Path, fake_home: Path) -> None:
+        _write_skill(fake_home / ".copilot" / "skills" / "acme")
+        path = tmp_path / "wf.yaml"
+        path.write_text("# placeholder\n")
+        provider = _CapturingProvider()
+        _run(_config([]), provider, path)
+        assert provider.skill_directories is None
