@@ -8,6 +8,7 @@ Tests cover:
 - JSON parsing from raw responses
 """
 
+import time
 from typing import Any
 
 import pytest
@@ -622,9 +623,84 @@ class TestValidateOutputConstraints:
                 schema,
             )
 
+    def test_pattern_timeout_raises_instead_of_hanging(self) -> None:
+        """A pathological regex must raise a ValidationError naming the field and
+        the configured time limit, and must complete well under the test deadline."""
+        schema = {"value": OutputField(type="string", pattern=r"^(a|aa)+$")}
+        content = {"value": "a" * 60 + "b"}
+
+        start = time.monotonic()
+        with pytest.raises(
+            ValidationError,
+            match="Output field 'value' pattern match exceeded the 1.0s time limit",
+        ):
+            validate_output(content, schema)
+        elapsed = time.monotonic() - start
+
+        assert elapsed < 5.0
+
+    def test_length_checked_before_pattern(self) -> None:
+        """When a string violates both maxLength and pattern, the cheaper length
+        check must run first and name the length violation."""
+        schema = {"value": OutputField(type="string", pattern=r"^[a-z]+$", maxLength=3)}
+        content = {"value": "xyz!"}
+
+        with pytest.raises(ValidationError, match="longer than maxLength 3"):
+            validate_output(content, schema)
+
+    def test_array_item_constraint_failure_names_index(self) -> None:
+        """A constraint failure on the third array element must name the index in
+        the error message, matching the existing array type-error convention."""
+        schema = {
+            "values": OutputField(
+                type="array",
+                items=OutputField(type="string", pattern=r"^[ab]$"),
+            )
+        }
+        content = {"values": ["a", "b", "c"]}
+
+        with pytest.raises(
+            ValidationError,
+            match=r"array item 2 in 'values'.*does not match pattern",
+        ):
+            validate_output(content, schema)
+
+    def test_undeclared_keys_warn(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Extra keys not present in the schema must log a warning naming the
+        suspect keys so typos in optional output fields are visible."""
+        schema = {"declared": OutputField(type="string")}
+        content = {"declared": "x", "declred": "typo"}
+
+        with caplog.at_level("WARNING"):
+            validate_output(content, schema)
+
+        assert "declred" in caplog.text
+        assert "undeclared fields not present in the output schema" in caplog.text
+
+    def test_declared_keys_do_not_warn(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Content whose keys exactly match the schema must not emit a warning."""
+        schema = {"declared": OutputField(type="string")}
+        content = {"declared": "x"}
+
+        with caplog.at_level("WARNING"):
+            validate_output(content, schema)
+
+        assert "undeclared fields" not in caplog.text
+
+    def test_enum_number_still_rejects_boolean_and_accepts_float(self) -> None:
+        """A number enum [1] must reject True via the type check and accept 1.0 via
+        plain equality, preserving the pre-existing pinned semantics."""
+        schema = {"value": OutputField(type="number", enum=[1])}
+
+        with pytest.raises(ValidationError, match="has wrong type"):
+            validate_output({"value": True}, schema)
+
+        # Should not raise
+        validate_output({"value": 1.0}, schema)
+
 
 class TestValidateOutputNullableArrayItems:
-    """Regression tests for nullable array items (F1 round 2)."""
+    """Regression tests for nullable array items in validate_output."""
 
     def test_nullable_array_item_null_passes(self) -> None:
         """A nullable string array item must accept None."""

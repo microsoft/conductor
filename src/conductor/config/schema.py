@@ -6,10 +6,11 @@ workflow YAML configuration files.
 
 from __future__ import annotations
 
-import re
+import functools
 from typing import Any, Literal, get_args
 from urllib.parse import urlparse
 
+import regex
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -38,6 +39,12 @@ so the literal type is defined in exactly one place.
 # Maximum allowed wait-step duration (24 hours). Anything longer almost
 # certainly wants ``limits.timeout_seconds`` reconsidered first.
 MAX_WAIT_DURATION_SECONDS = 24 * 60 * 60
+
+# Wall-clock bound for a single pattern match. Model output is untrusted input
+# and Python ``re`` has no timeout, so matching uses the third-party ``regex``
+# engine which supports deadlines (and releases the GIL, so a pathological
+# pattern cannot stall the event loop and neighboring parallel agents).
+PATTERN_MATCH_TIMEOUT_SECONDS = 1.0
 
 
 class InputDef(BaseModel):
@@ -88,6 +95,8 @@ class InputDef(BaseModel):
 class OutputField(BaseModel):
     """Schema for a single output field from an agent."""
 
+    model_config = ConfigDict(extra="forbid")
+
     type: Literal["string", "number", "boolean", "array", "object"]
     """The type of the output field."""
 
@@ -106,10 +115,10 @@ class OutputField(BaseModel):
     pattern: str | None = None
     """Regular expression pattern for string types."""
 
-    minimum: float | None = None
+    minimum: int | float | None = None
     """Minimum value for number types."""
 
-    maximum: float | None = None
+    maximum: int | float | None = None
     """Maximum value for number types."""
 
     minLength: int | None = None
@@ -123,6 +132,19 @@ class OutputField(BaseModel):
 
     nullable: bool = False
     """Whether the field value may be null."""
+
+    @functools.cached_property
+    def compiled_pattern(self) -> Any:
+        """Return a compiled regex pattern, or ``None`` when no pattern is set.
+
+        Annotated as ``Any`` because the repo type checker (ty) does not yet
+        read the ``regex`` package stubs; the runtime object is always a
+        ``regex.Pattern`` or ``None``.
+        """
+
+        if self.pattern is None:
+            return None
+        return regex.compile(self.pattern)
 
     @model_validator(mode="after")
     def validate_type_specific_fields(self) -> OutputField:
@@ -186,11 +208,12 @@ class OutputField(BaseModel):
         if self.minimum is not None and self.maximum is not None and self.minimum > self.maximum:
             raise ValueError("minimum cannot be greater than maximum")
 
-        # Pattern compilation.
+        # Pattern compilation. ``regex`` is a strict superset of the stdlib
+        # ``re`` module, so every previously valid pattern still compiles.
         if self.pattern is not None:
             try:
-                re.compile(self.pattern)
-            except re.error as exc:
+                regex.compile(self.pattern)
+            except regex.error as exc:
                 raise ValueError(f"pattern is not a valid regular expression: {exc}") from exc
 
         return self

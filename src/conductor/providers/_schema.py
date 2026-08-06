@@ -72,7 +72,9 @@ def build_json_schema_field(
         schema["description"] = field.description
 
     if field.enum is not None:
-        schema["enum"] = field.enum
+        # YAML `enum` cannot contain null (schema.py rejects it); append None
+        # here so the generated schema is honest when type is ["string", "null"].
+        schema["enum"] = [*field.enum, None] if field.nullable else field.enum
 
     if field.type == "string":
         if field.pattern is not None:
@@ -160,7 +162,9 @@ def build_prompt_schema_field(
         schema["description"] = description
 
     if field.enum is not None:
-        schema["enum"] = field.enum
+        # YAML `enum` cannot contain null (schema.py rejects it); append None
+        # here so the generated schema is honest when type is ["string", "null"].
+        schema["enum"] = [*field.enum, None] if field.nullable else field.enum
 
     if field.type == "string":
         if field.pattern is not None:

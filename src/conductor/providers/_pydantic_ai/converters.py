@@ -8,12 +8,11 @@ This module provides helpers for recursively translating workflow
 from __future__ import annotations
 
 import copy
-import re
 from typing import Annotated, Any
 
 from pydantic import AfterValidator, BaseModel, BeforeValidator, ConfigDict, Field, create_model
 
-from conductor.config.schema import OutputField
+from conductor.config.schema import PATTERN_MATCH_TIMEOUT_SECONDS, OutputField
 
 
 def _reject_bool(value: Any) -> Any:
@@ -36,23 +35,17 @@ IntegerType = Annotated[int, BeforeValidator(_reject_bool)]
 """Conductor ``integer`` type: accepts integers, rejects booleans."""
 
 
-class _NoDefaultBaseModel(BaseModel):
-    """Dynamic model base that sanitizes generated JSON schemas.
+class _OutputBaseModel(BaseModel):
+    """Dynamic model base that tolerates extra output keys.
 
-    Pydantic v2 emits ``"default": null`` for ``Field(default=None)`` and uses
-    ``anyOf`` for nullable unions and ``$ref``/``$defs`` for nested models.
-    Pydantic AI's tool schema must not include the JSON Schema ``default``,
-    ``anyOf``, ``$ref``, or ``$defs`` keywords, so this base removes them and
-    flattens nullable unions into ``{type: [T, "null"]}``.
+    ``extra="allow"`` matches Conductor's ``validate_output``, which ignores
+    undeclared keys rather than rejecting them. Tool-schema sanitization is
+    performed separately in :func:`agent_builder.build_agent` so that the
+    schema attached to the Pydantic AI tool definition contains only the
+    agreed structural keywords.
     """
 
     model_config = ConfigDict(extra="allow")
-
-    @classmethod
-    def model_json_schema(cls, *args: Any, **kwargs: Any) -> dict[str, Any]:
-        schema = super().model_json_schema(*args, **kwargs)
-        _sanitize_json_schema(schema)
-        return schema
 
 
 def _convert_anyof_nullable(node: dict[str, Any]) -> dict[str, Any]:
@@ -62,6 +55,13 @@ def _convert_anyof_nullable(node: dict[str, Any]) -> dict[str, Any]:
     ``T | None``. The output tool schema must not contain ``anyOf``, so this
     helper merges the non-null branch's constraints into a single schema while
     preserving siblings such as ``title`` or ``description``.
+
+    The value branch may itself be a union (e.g. Conductor ``number`` is
+    ``int | float``), in which case pydantic emits a nested ``anyOf`` with no
+    top-level ``type`` key. In that case the inner union types are collected
+    into ``type: [T1, T2, "null"]`` when every inner branch declares a type;
+    otherwise the original ``anyOf`` node is returned unchanged so the null
+    branch is never silently dropped.
     """
     any_of = node.get("anyOf", [])
     if len(any_of) != 2:
@@ -82,6 +82,15 @@ def _convert_anyof_nullable(node: dict[str, Any]) -> dict[str, Any]:
     value_type = merged.pop("type", None)
     if value_type is not None:
         merged["type"] = [value_type, "null"]
+    elif "anyOf" in merged:
+        inner = merged.pop("anyOf")
+        types = [b["type"] for b in inner if isinstance(b, dict) and "type" in b]
+        if len(types) == len(inner):
+            merged["type"] = [*types, "null"]
+        else:
+            merged["anyOf"] = [*inner, null_branch]
+    else:
+        return node
 
     for key, val in node.items():
         if key != "anyOf":
@@ -93,9 +102,10 @@ def _convert_anyof_nullable(node: dict[str, Any]) -> dict[str, Any]:
 def _sanitize_json_schema(schema: dict[str, Any]) -> None:
     """Recursively sanitize a JSON schema in place.
 
-    Removes ``default``, ``$ref``, and ``$defs`` keywords and flattens nullable
-    ``anyOf`` unions so the generated Pydantic-AI tool schema contains only the
-    agreed structural keywords.
+    Removes ``default``, ``$ref``, and ``$defs`` keywords, strips the raw
+    non-standard ``ge``/``le`` keys pydantic emits for union numeric ranges,
+    and flattens nullable ``anyOf`` unions so the generated Pydantic-AI tool
+    schema contains only the agreed structural keywords.
     """
     defs = schema.pop("$defs", {})
     _sanitize_schema_node(schema, defs)
@@ -105,9 +115,9 @@ def _sanitize_json_schema(schema: dict[str, Any]) -> None:
 def _sanitize_schema_node(node: Any, defs: dict[str, Any]) -> None:
     """Recursively sanitize a JSON schema node in place.
 
-    ``$ref`` targets that cannot be resolved are left untouched so a caller with
-    a complete view of ``$defs`` (e.g. after Pydantic-AI builds the tool schema)
-    can perform a final inlining pass.
+    ``$ref`` targets that cannot be resolved are left untouched defensively;
+    the caller in ``agent_builder.py`` already has the complete ``$defs`` view
+    at the time of sanitization, so unresolved references should not occur.
     """
     if isinstance(node, dict):
         nested_defs = node.pop("$defs", None)
@@ -133,6 +143,8 @@ def _sanitize_schema_node(node: Any, defs: dict[str, Any]) -> None:
                 node.update(converted)
 
         node.pop("default", None)
+        node.pop("ge", None)
+        node.pop("le", None)
 
         for value in node.values():
             _sanitize_schema_node(value, defs)
@@ -141,24 +153,16 @@ def _sanitize_schema_node(node: Any, defs: dict[str, Any]) -> None:
             _sanitize_schema_node(item, defs)
 
 
-def _make_enum_validator(enum_values: list[Any], field_type: str) -> Any:
+def _make_enum_validator(enum_values: list[Any]) -> Any:
     """Return an AfterValidator that enforces enum membership.
 
-    Matches the shared semantics used by ``validate_output``:
-
-    - A boolean value only passes when the field type is ``boolean`` and the
-      value is present in the enum.
-    - For all other values, plain Python membership is used (so ``1.0``
-      satisfies a number enum ``[1]``).
+    Matches the shared semantics used by ``validate_output``: plain Python
+    membership is used (so ``1.0`` satisfies a number enum ``[1]``), and
+    booleans are rejected for non-boolean fields by the base-type validators
+    before reaching this validator.
     """
 
     def _validate(value: Any) -> Any:
-        if value is None:
-            return value
-        if isinstance(value, bool):
-            if field_type == "boolean" and value in enum_values:
-                return value
-            raise ValueError(f"{value!r} is not a valid boolean enum value")
         if value in enum_values:
             return value
         raise ValueError(f"{value!r} is not one of {enum_values!r}")
@@ -166,21 +170,27 @@ def _make_enum_validator(enum_values: list[Any], field_type: str) -> Any:
     return _validate
 
 
-def _make_pattern_validator(pattern: str) -> Any:
-    """Return an AfterValidator that runs Python ``re.search``.
+def _make_pattern_validator(compiled: Any) -> Any:
+    """Return an AfterValidator that runs ``regex.search`` with a timeout.
 
     Mirrors ``validate_output`` so Python-only regex constructs (lookarounds,
     backreferences) are evaluated by Python's regex engine, not pydantic's
-    Rust-based default.
+    Rust-based default. A match that exceeds the wall-clock bound is raised as
+    a ``ValueError`` so pydantic-ai retries the output instead of hanging on a
+    pathological pattern.
     """
 
     def _validate(value: Any) -> Any:
-        if value is None:
-            return value
         if not isinstance(value, str):
             raise ValueError("pattern can only be applied to strings")
-        if re.search(pattern, value) is None:
-            raise ValueError(f"value does not match pattern {pattern!r}")
+        try:
+            if compiled.search(value, timeout=PATTERN_MATCH_TIMEOUT_SECONDS) is None:
+                raise ValueError(f"value does not match pattern {compiled.pattern!r}")
+        except TimeoutError as exc:
+            raise ValueError(
+                f"pattern match exceeded the {PATTERN_MATCH_TIMEOUT_SECONDS}s time limit "
+                "(catastrophic backtracking risk)"
+            ) from exc
         return value
 
     return _validate
@@ -205,18 +215,17 @@ def _field_json_schema_extra(field: OutputField) -> dict[str, Any] | None:
     """Build ``json_schema_extra`` advertising Conductor constraints.
 
     Pydantic AI attaches this to the generated tool schema so the model sees
-    the same ``enum``/``pattern``/length/range keywords as the shared JSON
-    Schema builders.
+    the same ``enum``/``pattern``/range keywords as the shared JSON Schema
+    builders. Length constraints are already emitted by pydantic from the
+    ``min_length``/``max_length`` ``Field`` kwargs, so they are not duplicated
+    here. Nullable fields advertise ``None`` in the enum so the schema matches
+    the values accepted at validation time.
     """
     extra: dict[str, Any] = {}
     if field.enum is not None:
-        extra["enum"] = field.enum
+        extra["enum"] = [*field.enum, None] if field.nullable else field.enum
     if field.pattern is not None:
         extra["pattern"] = field.pattern
-    if field.minLength is not None:
-        extra["minLength"] = field.minLength
-    if field.maxLength is not None:
-        extra["maxLength"] = field.maxLength
     if field.minimum is not None:
         extra["minimum"] = field.minimum
     if field.maximum is not None:
@@ -232,14 +241,17 @@ def _wrap_scalar_field_type(field: OutputField, base_type: Any) -> Any:
     ``Field`` level (``default=None``); the type union only changes when the
     field is explicitly nullable.
     """
-    annotated = base_type
+    annotated: Any = base_type
     if field.enum is not None:
         annotated = Annotated[
             annotated,
-            AfterValidator(_make_enum_validator(field.enum, field.type)),
+            AfterValidator(_make_enum_validator(field.enum)),
         ]
-    if field.pattern is not None:
-        annotated = Annotated[annotated, AfterValidator(_make_pattern_validator(field.pattern))]
+    if field.compiled_pattern is not None:
+        annotated = Annotated[
+            annotated,
+            AfterValidator(_make_pattern_validator(field.compiled_pattern)),
+        ]
 
     if field.nullable:
         annotated = annotated | None
@@ -268,7 +280,7 @@ def _build_field_info(field: OutputField) -> Any:
             field_kwargs["min_length"] = field.minLength
         if field.maxLength is not None:
             field_kwargs["max_length"] = field.maxLength
-    elif field.type in ("number", "integer"):
+    elif field.type == "number":
         if field.minimum is not None:
             field_kwargs["ge"] = field.minimum
         if field.maximum is not None:
@@ -286,12 +298,12 @@ def _build_array_item_type(
     depth: int = 0,
     max_depth: int = 10,
 ) -> Any:
-    """Build a Pydantic type for an array item, applying scalar constraints.
+    """Build a Pydantic type for an array item, applying constraints.
 
     Array elements are validated individually, so the item's ``nullable`` flag
     and scalar constraints (enum, pattern, length, range) are applied exactly
-    like top-level scalar fields. Object and array items delegate constraint
-    enforcement to the recursive type builder.
+    like top-level scalar fields. Object and array items are built recursively;
+    their nullability is applied as a union with ``None`` when requested.
     """
     if depth > max_depth:
         raise ValueError(f"Maximum output schema nesting depth of {max_depth} exceeded")
@@ -303,10 +315,13 @@ def _build_array_item_type(
         max_depth=max_depth,
     )
 
-    if field.type in ("string", "number", "integer", "boolean"):
+    if field.type in ("string", "number", "boolean"):
         base_type = _wrap_scalar_field_type(field, base_type)
         field_info = _build_field_info(field)
         return Annotated[base_type, field_info]
+
+    if field.nullable:
+        base_type = base_type | None
 
     return base_type
 
@@ -421,7 +436,7 @@ def _build_pydantic_model(
     return create_model(
         name,
         **model_fields,
-        __base__=_NoDefaultBaseModel,
+        __base__=_OutputBaseModel,
         __doc__=description,
     )
 

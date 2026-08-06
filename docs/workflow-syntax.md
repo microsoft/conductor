@@ -222,7 +222,7 @@ Output field definitions support optional validation constraints to enforce valu
 | Field | Applicable Type | Description | Semantics |
 |-------|-----------------|-------------|-----------|
 | `enum` | `string`, `number`, `boolean` | List of allowed scalar values | Uses exact value comparison. Cannot contain `null` (use `nullable: true` instead). |
-| `pattern` | `string` | Regular expression pattern | Python `re.search` matching (unanchored by default; use `^` and `$` to anchor). Evaluated consistently on all providers. |
+| `pattern` | `string` | Regular expression pattern | Python `re.search` matching (unanchored by default; use `^` and `$` to anchor). Evaluated consistently on all providers. Matching is time-bounded (1 second); a pathological pattern fails validation instead of hanging the run. |
 | `minimum` | `number` | Inclusive minimum numeric bound | Value must be greater than or equal to `minimum`. |
 | `maximum` | `number` | Inclusive maximum numeric bound | Value must be less than or equal to `maximum`. |
 | `minLength` | `string` | Inclusive minimum string length | String length must be greater than or equal to `minLength`. |
@@ -233,7 +233,7 @@ Output field definitions support optional validation constraints to enforce valu
 #### JSON Schema and Validation Semantics
 
 - **Inclusive Bounds**: `minimum`, `maximum`, `minLength`, and `maxLength` represent inclusive bounds.
-- **Regex Pattern Matching**: `pattern` uses Python `re.search` semantics across all providers (including Claude). It matches anywhere in the target string unless explicitly anchored with `^` and `$`.
+- **Regex Pattern Matching**: `pattern` uses Python `re.search` semantics across all providers (including Claude). It matches anywhere in the target string unless explicitly anchored with `^` and `$`. Matching runs on a `re`-compatible engine with a 1-second wall-clock deadline per check: model output is untrusted input, so a pattern with catastrophic backtracking raises a validation error (which drives the provider's output-recovery loop) instead of stalling the workflow.
 - **Nullable Fields**: Setting `nullable: true` renders the JSON Schema type as `type: [T, "null"]`, allowing the field to hold `null` or a value matching `type`.
 - **Optional Object Properties**: The `required: false` constraint is permitted **only inside nested object properties** (e.g. `properties.details.required: false`). All root-level output fields must be required, so setting `required: false` on a root-level agent output field will be rejected during workflow validation (`conductor validate`).
 

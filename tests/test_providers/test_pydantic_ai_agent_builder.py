@@ -46,6 +46,28 @@ def _extract_output_model(agent: Agent[Any, Any]) -> type[BaseModel] | None:
     return None
 
 
+def _extract_output_tool_schema(agent: Agent[Any, Any]) -> dict[str, Any] | None:
+    """Return the sanitized parameters_json_schema for the output tool."""
+    if not isinstance(agent.output_type, ToolOutput):
+        return None
+    toolset = agent._output_schema.toolset
+    if toolset is None or not toolset._tool_defs:
+        return None
+    return toolset._tool_defs[0].parameters_json_schema
+
+
+def _assert_no_keys(node: Any, *keys: str) -> None:
+    """Recursively assert that none of the given JSON Schema keys appear."""
+    if isinstance(node, dict):
+        for key in keys:
+            assert key not in node, f"forbidden key {key!r} found in schema: {node}"
+        for value in node.values():
+            _assert_no_keys(value, *keys)
+    elif isinstance(node, list):
+        for item in node:
+            _assert_no_keys(item, *keys)
+
+
 class TestModelMapping:
     """Tests for resolving the Anthropic model identifier."""
 
@@ -574,3 +596,74 @@ class TestClientConstruction:
 
         assert isinstance(pydantic_agent.model, AnthropicModel)
         assert pydantic_agent.model.client.auth_token == "bearer-token"
+
+
+class TestToolSchemaSanitization:
+    """Regression tests for the JSON schema attached to the Pydantic AI output tool."""
+
+    def test_nullable_ranged_number_advertises_null_and_strips_internal_keys(self) -> None:
+        """A nullable number with minimum/maximum must be advertised to the model
+        as a type list that includes ``null``, must keep the ``minimum``/``maximum``
+        keywords, and must never expose pydantic-internal ``ge``/``le``/``default``
+        keys."""
+        agent_def = AgentDef(
+            name="ratio",
+            output={
+                "ratio": OutputField(
+                    type="number",
+                    minimum=0,
+                    maximum=10,
+                    nullable=True,
+                )
+            },
+        )
+
+        pydantic_agent = build_agent(
+            agent_def,
+            system_prompt="sys",
+            rendered_prompt="p",
+            default_model="claude-sonnet-5",
+            api_key="sk-test-dummy",
+        )
+
+        schema = _extract_output_tool_schema(pydantic_agent)
+        assert schema is not None
+        ratio_schema = schema["properties"]["ratio"]
+        assert "type" in ratio_schema
+        assert isinstance(ratio_schema["type"], list)
+        assert "null" in ratio_schema["type"]
+        assert ratio_schema["minimum"] == 0
+        assert ratio_schema["maximum"] == 10
+        _assert_no_keys(schema, "ge", "le", "default")
+
+    def test_ranged_number_never_exposes_ge_le(self) -> None:
+        """A non-nullable ranged number must advertise ``minimum``/``maximum``
+        while keeping the raw ``ge``/``le`` keys out of the tool schema."""
+        agent_def = AgentDef(
+            name="score",
+            output={
+                "score": OutputField(
+                    type="number",
+                    minimum=0,
+                    maximum=10,
+                )
+            },
+        )
+
+        pydantic_agent = build_agent(
+            agent_def,
+            system_prompt="sys",
+            rendered_prompt="p",
+            default_model="claude-sonnet-5",
+            api_key="sk-test-dummy",
+        )
+
+        schema = _extract_output_tool_schema(pydantic_agent)
+        assert schema is not None
+        score_schema = schema["properties"]["score"]
+        # NumberType is ``int | float``, so the non-nullable schema keeps pydantic's
+        # ``anyOf: [integer, number]`` shape rather than a single ``type``.
+        assert "anyOf" in score_schema
+        assert score_schema["minimum"] == 0
+        assert score_schema["maximum"] == 10
+        _assert_no_keys(schema, "ge", "le", "default")

@@ -142,6 +142,35 @@ class TestOutputField:
         assert output.required is True
         assert output.nullable is False
 
+    def test_output_field_extra_keys_rejected(self) -> None:
+        """Unknown keys like a typo in minlength are rejected instead of ignored."""
+        with pytest.raises(ValidationError) as exc_info:
+            OutputField.model_validate({"type": "string", "minlength": 5})
+        assert "minlength" in str(exc_info.value)
+
+    def test_output_field_minimum_integer_round_trips(self) -> None:
+        """An integral minimum round-trips through model_dump as an int, not 0.0."""
+        output = OutputField.model_validate({"type": "number", "minimum": 0, "maximum": 10})
+        dumped = output.model_dump()
+        assert dumped["minimum"] == 0
+        assert type(dumped["minimum"]) is int
+        assert dumped["maximum"] == 10
+        assert type(dumped["maximum"]) is int
+
+    def test_output_field_compiled_pattern_and_dump_exclusion(self) -> None:
+        """compiled_pattern returns a usable regex and is excluded from model_dump."""
+        output = OutputField.model_validate({"type": "string", "pattern": "^a+$"})
+        assert output.compiled_pattern is not None
+        assert output.compiled_pattern.match("aaa") is not None
+        assert output.compiled_pattern.match("bbb") is None
+        assert "compiled_pattern" not in output.model_dump()
+
+    def test_output_field_lookahead_pattern_compiles(self) -> None:
+        """A Python-only lookahead pattern passes load-time validation."""
+        output = OutputField.model_validate({"type": "string", "pattern": r"^(?=.*A).*$"})
+        assert output.pattern == r"^(?=.*A).*$"
+        assert output.compiled_pattern is not None
+
     def test_output_field_model_dump_round_trip(self) -> None:
         """Test model_dump preserves constraint fields for reconstruction."""
         original = OutputField.model_validate(

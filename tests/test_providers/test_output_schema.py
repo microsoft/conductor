@@ -975,3 +975,41 @@ class TestSharedSchemaBuilder:
                 "opt": {"type": "string"},
             },
         }
+
+    def test_json_schema_nullable_enum_appends_none(self) -> None:
+        """A nullable string field with enum must emit enum including None so the
+        JSON schema honestly allows null alongside the listed values."""
+        field = OutputField(type="string", enum=["a", "b"], nullable=True)
+
+        actual = build_json_schema_field(field)
+
+        assert actual["type"] == ["string", "null"]
+        assert actual["enum"] == ["a", "b", None]
+
+    def test_json_schema_non_nullable_enum_unchanged(self) -> None:
+        """A non-nullable enum must be emitted exactly as declared."""
+        field = OutputField(type="string", enum=["a", "b"], nullable=False)
+
+        actual = build_json_schema_field(field)
+
+        assert actual["type"] == "string"
+        assert actual["enum"] == ["a", "b"]
+
+    def test_prompt_schema_nullable_enum_appends_none(self) -> None:
+        """A nullable string field with enum must include None in the prompt schema
+        enum just as in the JSON schema."""
+        field = OutputField(type="string", enum=["a", "b"], nullable=True)
+
+        actual = build_prompt_schema_field(field)
+
+        assert actual["type"] == ["string", "null"]
+        assert actual["enum"] == ["a", "b", None]
+
+    def test_prompt_schema_non_nullable_enum_unchanged(self) -> None:
+        """A non-nullable enum in the prompt schema must remain exactly as declared."""
+        field = OutputField(type="string", enum=["a", "b"], nullable=False)
+
+        actual = build_prompt_schema_field(field)
+
+        assert actual["type"] == "string"
+        assert actual["enum"] == ["a", "b"]

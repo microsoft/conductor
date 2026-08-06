@@ -6,11 +6,14 @@ declared output schemas.
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any
 
-from conductor.config.schema import OutputField
+from conductor.config.schema import PATTERN_MATCH_TIMEOUT_SECONDS, OutputField
 from conductor.exceptions import ValidationError
+
+logger = logging.getLogger(__name__)
 
 
 def validate_output(
@@ -46,52 +49,71 @@ def validate_output(
 
         _validate_field(field_name, content[field_name], field_def)
 
+    undeclared_keys = [k for k in content if k not in schema]
+    if undeclared_keys:
+        logger.warning(
+            "Output contains undeclared fields not present in the output schema: %s — "
+            "check for typos against the declared output fields",
+            undeclared_keys,
+        )
+
 
 def _check_constraints(field_name: str, value: Any, field_def: OutputField) -> None:
-    """Validate scalar constraints (enum, pattern, length, range) for a field.
+    """Validate scalar constraints (enum, length, pattern, range) for a field.
 
     Called after the type check has passed, so ``value`` is known to match
     ``field_def.type``. Raises ``ValidationError`` with a suggestion on failure.
     """
-    if field_def.enum is not None:
-        if isinstance(value, bool):
-            if not (field_def.type == "boolean" and value in field_def.enum):
-                raise ValidationError(
-                    f"Output field '{field_name}' must be one of {field_def.enum!r}, got {value!r}",
-                    suggestion=f"Ensure '{field_name}' is one of {field_def.enum!r}",
-                )
-        elif value not in field_def.enum:
-            raise ValidationError(
-                f"Output field '{field_name}' must be one of {field_def.enum!r}, got {value!r}",
-                suggestion=f"Ensure '{field_name}' is one of {field_def.enum!r}",
-            )
-
-    if field_def.pattern is not None and re.search(field_def.pattern, value) is None:
+    if field_def.enum is not None and value not in field_def.enum:
         raise ValidationError(
-            f"Output field '{field_name}' does not match pattern '{field_def.pattern}'",
-            suggestion=f"Ensure '{field_name}' matches the pattern '{field_def.pattern}'",
+            f"Output field '{field_name}' must be one of {field_def.enum!r}, got {value!r}",
+            suggestion=f"Ensure '{field_name}' is one of {field_def.enum!r}",
         )
 
     if field_def.type == "string":
         if field_def.minLength is not None and len(value) < field_def.minLength:
             raise ValidationError(
-                f"Output field '{field_name}' is shorter than minLength {field_def.minLength}",
+                f"Output field '{field_name}' is shorter than minLength {field_def.minLength} "
+                f"(received: {_describe_value(value)})",
                 suggestion=f"Ensure '{field_name}' has at least {field_def.minLength} characters",
             )
         if field_def.maxLength is not None and len(value) > field_def.maxLength:
             raise ValidationError(
-                f"Output field '{field_name}' is longer than maxLength {field_def.maxLength}",
+                f"Output field '{field_name}' is longer than maxLength {field_def.maxLength} "
+                f"(received: {_describe_value(value)})",
                 suggestion=f"Ensure '{field_name}' has at most {field_def.maxLength} characters",
             )
-    elif field_def.type == "number":
+
+    if field_def.pattern is not None:
+        try:
+            match = field_def.compiled_pattern.search(value, timeout=PATTERN_MATCH_TIMEOUT_SECONDS)
+        except TimeoutError as e:
+            raise ValidationError(
+                f"Output field '{field_name}' pattern match exceeded the "
+                f"{PATTERN_MATCH_TIMEOUT_SECONDS}s time limit",
+                suggestion=(
+                    f"Simplify the pattern for '{field_name}' "
+                    "or check for catastrophic backtracking"
+                ),
+            ) from e
+        if match is None:
+            raise ValidationError(
+                f"Output field '{field_name}' does not match pattern '{field_def.pattern}' "
+                f"(received: {_describe_value(value)})",
+                suggestion=f"Ensure '{field_name}' matches the pattern '{field_def.pattern}'",
+            )
+
+    if field_def.type == "number":
         if field_def.minimum is not None and value < field_def.minimum:
             raise ValidationError(
-                f"Output field '{field_name}' is below minimum {field_def.minimum}",
+                f"Output field '{field_name}' is below minimum {field_def.minimum} "
+                f"(received: {_describe_value(value)})",
                 suggestion=f"Ensure '{field_name}' is at least {field_def.minimum}",
             )
         if field_def.maximum is not None and value > field_def.maximum:
             raise ValidationError(
-                f"Output field '{field_name}' is above maximum {field_def.maximum}",
+                f"Output field '{field_name}' is above maximum {field_def.maximum} "
+                f"(received: {_describe_value(value)})",
                 suggestion=f"Ensure '{field_name}' is at most {field_def.maximum}",
             )
 
@@ -144,7 +166,7 @@ def _validate_field(field_name: str, value: Any, field_def: OutputField) -> None
                     f"(received: {_describe_value(item)})",
                     suggestion=f"Ensure all items in '{field_name}' have correct type",
                 )
-            _validate_field(field_name, item, field_def.items)
+            _validate_field(f"array item {i} in '{field_name}'", item, field_def.items)
 
 
 def _describe_value(value: Any, max_chars: int = 200) -> str:
@@ -223,7 +245,6 @@ def parse_json_output(raw_response: str) -> dict[str, Any]:
         ValidationError: If JSON parsing fails.
     """
     import json
-    import re
 
     text = raw_response.strip()
 
