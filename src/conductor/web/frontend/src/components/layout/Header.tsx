@@ -18,8 +18,9 @@ export function Header() {
 
   // `ReplayDashboard` serves no /api/stop|resume|kill, so these controls
   // would 404 against a recorded log.
-  const isRunning = !replayMode && (workflowStatus === 'running' || workflowStatus === 'pending');
   const showPauseControls = !replayMode && isPaused;
+  const showStopControl =
+    !replayMode && !isPaused && (workflowStatus === 'running' || workflowStatus === 'pending');
 
   // Reset button states when transitioning out of paused
   useEffect(() => {
@@ -33,25 +34,21 @@ export function Header() {
   // `fetch` resolves on 4xx/5xx, so an unchecked response leaves the button
   // latched in its disabled pending state with no console entry and no way
   // back except a page reload. Check the status explicitly.
-  const postControl = async (
-    path: string,
-    action: string,
-    setPending: (v: boolean) => void
-  ) => {
+  const postControl = async (path: string, action: string, setPending: (v: boolean) => void) => {
     setPending(true);
     setControlError(null);
     try {
       const res = await fetch(path, { method: 'POST' });
-      if (!res.ok) {
-        console.error(`Failed to ${action}: HTTP ${res.status} from ${path}`);
-        setControlError(`Could not ${action} — server returned HTTP ${res.status}.`);
-        setPending(false);
-      }
+      // On success the pending flag stays set — the effect above clears it
+      // once the run leaves the paused state.
+      if (res.ok) return;
+      console.error(`Failed to ${action}: HTTP ${res.status} from ${path}`);
+      setControlError(`Could not ${action} — server returned HTTP ${res.status}.`);
     } catch (err) {
       console.error(`Failed to ${action}:`, err);
       setControlError(`Could not ${action} — the dashboard is unreachable.`);
-      setPending(false);
     }
+    setPending(false);
   };
 
   const handleStop = () => postControl('/api/stop', 'stop the agent', setStopping);
@@ -77,7 +74,7 @@ export function Header() {
             {controlError}
           </span>
         )}
-        {showPauseControls ? (
+        {showPauseControls && (
           <>
             <button
               onClick={handleResume}
@@ -106,7 +103,8 @@ export function Header() {
               {killing ? 'Killing...' : 'Kill'}
             </button>
           </>
-        ) : isRunning ? (
+        )}
+        {showStopControl && (
           <button
             onClick={handleStop}
             disabled={stopping}
@@ -120,7 +118,7 @@ export function Header() {
             <Square className="w-3 h-3" />
             {stopping ? 'Stopping...' : 'Stop'}
           </button>
-        ) : null}
+        )}
         {workflowYaml && (
           <button
             onClick={() => setShowYaml(true)}

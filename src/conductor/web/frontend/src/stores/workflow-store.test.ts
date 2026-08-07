@@ -883,8 +883,8 @@ describe('workflow-store — navigating to a specific historical subworkflow ite
  * is exactly what the resume path seeds. Driving the real entry point is what
  * makes these fail if a client-side clamp ever makes the server filter moot.
  */
-describe('workflow-store — a replayed history latches the global interaction flags', () => {
-  const started = event('workflow_started', {
+function rootStartedEvent() {
+  return event('workflow_started', {
     name: 'root',
     agents: [{ name: 'architect_questions' }],
     routes: [],
@@ -892,10 +892,11 @@ describe('workflow-store — a replayed history latches the global interaction f
     for_each_groups: [],
     entry_point: 'architect_questions',
   });
-
+}
+describe('workflow-store — a replayed history latches the global interaction flags', () => {
   it('leaves isPaused latched when a seeded history ends on an unresolved agent_paused', () => {
     useWorkflowStore.getState().replayState([
-      started,
+      rootStartedEvent(),
       event('agent_started', { agent_name: 'architect_questions', iteration: 1 }),
       event('agent_paused', { agent_name: 'architect_questions', partial_content: '{}' }),
       // The resumed run re-executes the agent — which must not be mistaken
@@ -908,7 +909,7 @@ describe('workflow-store — a replayed history latches the global interaction f
 
   it('leaves iterationLimitGate latched when a seeded history ends on an unresolved gate', () => {
     useWorkflowStore.getState().replayState([
-      started,
+      rootStartedEvent(),
       event('iteration_limit_reached', {
         agent_name: 'architect_questions',
         gate_id: 'g1',
@@ -923,7 +924,7 @@ describe('workflow-store — a replayed history latches the global interaction f
 
   it('leaves activeDialog latched when a seeded history ends on an unclosed dialog', () => {
     useWorkflowStore.getState().replayState([
-      started,
+      rootStartedEvent(),
       event('dialog_started', { agent_name: 'architect_questions', dialog_id: 'd1' }),
       event('agent_started', { agent_name: 'architect_questions', iteration: 2 }),
     ]);
@@ -934,14 +935,7 @@ describe('workflow-store — a replayed history latches the global interaction f
 describe('workflow-store — a counterpart event clears its latch', () => {
   function startWorkflow() {
     const { processEvent } = useWorkflowStore.getState();
-    processEvent(event('workflow_started', {
-      name: 'root',
-      agents: [{ name: 'architect_questions' }],
-      routes: [],
-      parallel_groups: [],
-      for_each_groups: [],
-      entry_point: 'architect_questions',
-    }));
+    processEvent(rootStartedEvent());
     return processEvent;
   }
 

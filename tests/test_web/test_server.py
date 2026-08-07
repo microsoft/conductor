@@ -1313,7 +1313,7 @@ class TestReplayEventsFromJsonl:
         assert count == 1
         assert [ev["type"] for ev in dashboard._event_history] == [event_type]
 
-    def test_preserves_dialog_message_events(self, tmp_path: Path) -> None:
+    def test_preserves_dialog_message_when_dialog_started_is_skipped(self, tmp_path: Path) -> None:
         """Only the dialog's lifecycle bookends are skipped, not every dialog event.
 
         ``dialog_message`` carries no global latch, so the skip set stays as
