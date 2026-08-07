@@ -3538,6 +3538,7 @@ class WorkflowEngine:
                                     "value": o.value,
                                     "route": o.route,
                                     "prompt_for": o.prompt_for,
+                                    "multiline": o.multiline,
                                 }
                                 for o in (agent.options or [])
                             ]

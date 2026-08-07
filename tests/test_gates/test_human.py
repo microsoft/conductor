@@ -603,3 +603,121 @@ class TestGatePromptMarkdownRendering:
         # skip_gates auto-selects the first option
         assert result.selected_option == sample_options[0]
         assert result.route == "next_agent"
+
+
+class TestMultilineAdditionalInput:
+    """Multi-line prompt_for input (issue #376, commit 1).
+
+    ``GateOption.multiline`` is opt-in, so the default single-line path must
+    stay byte-identical — that is covered by the untouched tests above.
+    """
+
+    @pytest.fixture
+    def multiline_agent(self) -> AgentDef:
+        """A gate whose only option collects multi-line feedback."""
+        return AgentDef(
+            name="review_gate",
+            type="human_gate",
+            prompt="Review it",
+            options=[
+                GateOption(
+                    label="Approve with feedback",
+                    value="approved",
+                    route="next_agent",
+                    prompt_for="feedback",
+                    multiline=True,
+                )
+            ],
+        )
+
+    def test_multiline_defaults_to_false(self) -> None:
+        """Existing gates keep single-line behavior without opting in."""
+        option = GateOption(label="Approve", value="ok", route="next", prompt_for="why")
+        assert option.multiline is False
+
+    @pytest.mark.asyncio
+    async def test_sentinel_terminates_and_preserves_internal_newlines(
+        self, mock_console: MagicMock, multiline_agent: AgentDef
+    ) -> None:
+        """A lone '.' ends input; newlines inside the answer survive."""
+        handler = HumanGateHandler(console=mock_console, skip_gates=False)
+
+        with (
+            patch("conductor.gates.human.Prompt.ask", return_value="1"),
+            patch("conductor.gates.human.sys.stdin.isatty", return_value=True),
+            patch("builtins.input", side_effect=["line one", "line two", ".", "unreachable"]),
+        ):
+            result = await handler.handle_gate(multiline_agent, {})
+
+        assert result.additional_input == {"feedback": "line one\nline two"}
+
+    @pytest.mark.asyncio
+    async def test_eof_terminates(self, mock_console: MagicMock, multiline_agent: AgentDef) -> None:
+        """Ctrl-D (EOFError from input()) ends input without losing content."""
+        handler = HumanGateHandler(console=mock_console, skip_gates=False)
+
+        with (
+            patch("conductor.gates.human.Prompt.ask", return_value="1"),
+            patch("conductor.gates.human.sys.stdin.isatty", return_value=True),
+            patch("builtins.input", side_effect=["only line", EOFError()]),
+        ):
+            result = await handler.handle_gate(multiline_agent, {})
+
+        assert result.additional_input == {"feedback": "only line"}
+
+    @pytest.mark.asyncio
+    async def test_immediate_sentinel_yields_empty_string(
+        self, mock_console: MagicMock, multiline_agent: AgentDef
+    ) -> None:
+        """Submitting nothing is allowed and is not an error."""
+        handler = HumanGateHandler(console=mock_console, skip_gates=False)
+
+        with (
+            patch("conductor.gates.human.Prompt.ask", return_value="1"),
+            patch("conductor.gates.human.sys.stdin.isatty", return_value=True),
+            patch("builtins.input", side_effect=["."]),
+        ):
+            result = await handler.handle_gate(multiline_agent, {})
+
+        assert result.additional_input == {"feedback": ""}
+
+    @pytest.mark.asyncio
+    async def test_trailing_blank_lines_stripped(
+        self, mock_console: MagicMock, multiline_agent: AgentDef
+    ) -> None:
+        """Blank lines typed before the sentinel are not kept."""
+        handler = HumanGateHandler(console=mock_console, skip_gates=False)
+
+        with (
+            patch("conductor.gates.human.Prompt.ask", return_value="1"),
+            patch("conductor.gates.human.sys.stdin.isatty", return_value=True),
+            patch("builtins.input", side_effect=["answer", "", "", "."]),
+        ):
+            result = await handler.handle_gate(multiline_agent, {})
+
+        assert result.additional_input == {"feedback": "answer"}
+
+    @pytest.mark.asyncio
+    async def test_non_tty_falls_back_to_single_line(
+        self, mock_console: MagicMock, multiline_agent: AgentDef
+    ) -> None:
+        """Without a TTY the single-line path is used, unchanged.
+
+        Multi-line editing is meaningless on a pipe, and the single-line
+        path's EOFError-on-closed-stdin behavior is what
+        ``_handle_gate_with_web`` is built around.
+        """
+        handler = HumanGateHandler(console=mock_console, skip_gates=False)
+
+        with (
+            patch(
+                "conductor.gates.human.Prompt.ask",
+                side_effect=["1", "piped answer"],
+            ) as mock_ask,
+            patch("conductor.gates.human.sys.stdin.isatty", return_value=False),
+            patch("builtins.input", side_effect=AssertionError("must not read raw stdin")),
+        ):
+            result = await handler.handle_gate(multiline_agent, {})
+
+        assert result.additional_input == {"feedback": "piped answer"}
+        assert mock_ask.call_count == 2

@@ -301,6 +301,14 @@ class GateOption(BaseModel):
     prompt_for: str | None = None
     """Optional: field name to prompt for text input."""
 
+    multiline: bool = False
+    """Whether the ``prompt_for`` input accepts multi-line text.
+
+    Defaults to False so existing gates keep single-line behavior (Enter
+    submits). When True, the terminal reads until a lone ``.`` or EOF and
+    the dashboard renders a textarea where Enter inserts a newline.
+    """
+
 
 class ContextConfig(BaseModel):
     """Configuration for context accumulation behavior."""

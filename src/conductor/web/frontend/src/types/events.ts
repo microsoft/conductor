@@ -332,6 +332,7 @@ export interface GateOptionDetail {
   value: string;
   route: string;
   prompt_for?: string | null;
+  multiline?: boolean;
 }
 
 export interface GatePresentedData {

@@ -7,6 +7,7 @@ for user selection via Rich interactive prompts.
 from __future__ import annotations
 
 import asyncio
+import sys
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -23,6 +24,15 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from conductor.config.schema import AgentDef, GateOption
+
+
+MULTILINE_SENTINEL = "."
+"""Line that terminates a multi-line answer when typed on its own."""
+
+
+def _eof_key_hint() -> str:
+    """Return the platform-appropriate EOF keystroke for display."""
+    return "Ctrl-Z then Enter" if sys.platform == "win32" else "Ctrl-D"
 
 
 @dataclass
@@ -115,7 +125,9 @@ class HumanGateHandler:
         # Handle prompt_for if specified
         additional_input: dict[str, str] = {}
         if selected.prompt_for:
-            additional_input = await self._collect_additional_input(selected.prompt_for)
+            additional_input = await self._collect_additional_input(
+                selected.prompt_for, multiline=selected.multiline
+            )
 
         return GateResult(
             selected_option=selected,
@@ -178,7 +190,9 @@ class HumanGateHandler:
                 pass
             self.console.print("[red]Invalid selection. Please try again.[/red]")
 
-    async def _collect_additional_input(self, field_name: str) -> dict[str, str]:
+    async def _collect_additional_input(
+        self, field_name: str, multiline: bool = False
+    ) -> dict[str, str]:
         """Collect additional text input from user.
 
         Prompts the user for additional text input as specified by the
@@ -186,6 +200,8 @@ class HumanGateHandler:
 
         Args:
             field_name: The name of the field to prompt for.
+            multiline: If True and stdin is a TTY, read until a lone ``.``
+                or EOF instead of stopping at the first newline.
 
         Returns:
             Dictionary with the field name and collected value.
@@ -193,11 +209,43 @@ class HumanGateHandler:
         self.console.print()
         self.console.print(f"[bold]Please provide {field_name}:[/bold]")
 
+        # Multi-line editing is meaningless without a TTY, and the single-line
+        # path's EOFError-on-closed-stdin behavior is what _handle_gate_with_web
+        # is built around. Fall back so every non-TTY path stays byte-identical.
+        if multiline and sys.stdin.isatty():
+            value = await asyncio.to_thread(self._read_multiline)
+            return {field_name: value}
+
         def _ask_value() -> str:
             return Prompt.ask(f"  {field_name}")
 
         value = await asyncio.to_thread(_ask_value)
         return {field_name: value}
+
+    def _read_multiline(self) -> str:
+        """Read a multi-line answer from stdin (blocking; call in a thread).
+
+        Terminates on a line containing only ``.`` or on EOF. The sentinel is
+        listed first in the hint because Ctrl-D/Ctrl-Z differs by platform.
+
+        Returns:
+            The collected text with trailing blank lines stripped. Internal
+            newlines are preserved.
+        """
+        self.console.print(
+            f"  [dim]Enter your answer. Finish with '{MULTILINE_SENTINEL}' on its own line"
+            f" (or {_eof_key_hint()}).[/dim]"
+        )
+        lines: list[str] = []
+        while True:
+            try:
+                line = input()
+            except EOFError:
+                break
+            if line.strip() == MULTILINE_SENTINEL:
+                break
+            lines.append(line)
+        return "\n".join(lines).rstrip("\n")
 
     def _auto_select(self, option: GateOption) -> GateResult:
         """Auto-select an option (for --skip-gates mode).
