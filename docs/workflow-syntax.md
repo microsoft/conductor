@@ -114,8 +114,16 @@ agents:
     
     output:                         # Optional: Output schema for validation
       field_name:
-        type: string
+        type: string                # string | number | boolean | array | object
         description: "Field purpose"
+        enum: ["a", "b"]             # Optional: Allowed scalar values (string/number/boolean)
+        pattern: "^[a-z]+$"          # Optional: Regex pattern (string type only)
+        minimum: 0                   # Optional: Inclusive minimum (number type only)
+        maximum: 100                 # Optional: Inclusive maximum (number type only)
+        minLength: 1                 # Optional: Minimum string length (string type only)
+        maxLength: 50                # Optional: Maximum string length (string type only)
+        nullable: true               # Optional: Allow null value (default: false)
+        required: false              # Optional: Only inside object properties (default: true)
 
     output_mode: raw                # Optional: raw | envelope (default: inferred)
                                     # raw: skip JSON extraction, wrap response
@@ -206,6 +214,67 @@ A response that parses as JSON but isn't an object at all (a bare `42` or an arr
 This is useful when you know an agent's output is simple and a single attempt should suffice, or when you want to fail fast instead of burning tokens on recovery loops.
 
 When the budget runs out, a schema-shape failure raises the specific validation error naming the offending field and its expected type, while a syntax failure raises a provider error. Each recovery attempt emits an `agent_parse_recovery` event, visible in the dashboard activity stream and the structured event log.
+
+### Field Constraints
+
+Output field definitions support optional validation constraints to enforce value boundaries and formatting rules.
+
+| Field | Applicable Type | Description | Semantics |
+|-------|-----------------|-------------|-----------|
+| `enum` | `string`, `number`, `boolean` | List of allowed scalar values | Uses exact value comparison. Cannot contain `null` (use `nullable: true` instead). |
+| `pattern` | `string` | Regular expression pattern | Python `re.search` matching (unanchored by default; use `^` and `$` to anchor). Evaluated consistently on all providers. Matching is time-bounded (1 second); a pathological pattern fails validation instead of hanging the run. |
+| `minimum` | `number` | Inclusive minimum numeric bound | Value must be greater than or equal to `minimum`. |
+| `maximum` | `number` | Inclusive maximum numeric bound | Value must be less than or equal to `maximum`. |
+| `minLength` | `string` | Inclusive minimum string length | String length must be greater than or equal to `minLength`. |
+| `maxLength` | `string` | Inclusive maximum string length | String length must be less than or equal to `maxLength`. |
+| `required` | Any (object property only) | Whether the object property must be present | Default: `true`. **Must be `true` for root-level fields**; setting `required: false` at the root level is rejected by `conductor validate`. |
+| `nullable` | Any | Whether `null` is an acceptable value | Default: `false`. When `true`, renders as `type: [T, "null"]` in JSON Schema. |
+
+#### JSON Schema and Validation Semantics
+
+- **Inclusive Bounds**: `minimum`, `maximum`, `minLength`, and `maxLength` represent inclusive bounds.
+- **Regex Pattern Matching**: `pattern` uses Python `re.search` semantics across all providers (including Claude). It matches anywhere in the target string unless explicitly anchored with `^` and `$`. Matching runs on a `re`-compatible engine with a 1-second wall-clock deadline per check: model output is untrusted input, so a pattern with catastrophic backtracking raises a validation error (which drives the provider's output-recovery loop) instead of stalling the workflow.
+- **Nullable Fields**: Setting `nullable: true` renders the JSON Schema type as `type: [T, "null"]`, allowing the field to hold `null` or a value matching `type`.
+- **Optional Object Properties**: The `required: false` constraint is permitted **only inside nested object properties** (e.g. `properties.details.required: false`). All root-level output fields must be required, so setting `required: false` on a root-level agent output field will be rejected during workflow validation (`conductor validate`).
+
+#### Field Constraints Example
+
+```yaml
+agents:
+  - name: evaluator
+    prompt: "Evaluate the artifact and return structured metrics."
+    output:
+      status:
+        type: string
+        enum: ["passed", "failed", "pending"]
+        description: "Execution status"
+      score:
+        type: number
+        minimum: 0
+        maximum: 100
+        description: "Evaluation score between 0 and 100"
+      code:
+        type: string
+        pattern: "^ERR-[0-9]{3}$"
+        minLength: 7
+        maxLength: 7
+        description: "Error code in format ERR-123"
+      notes:
+        type: string
+        nullable: true
+        description: "Optional notes or null when absent"
+      metadata:
+        type: object
+        description: "Additional execution metadata"
+        properties:
+          reviewer:
+            type: string
+            description: "Reviewer identifier"
+          comments:
+            type: string
+            required: false
+            description: "Optional comments property inside object"
+```
 ### Choosing whether to declare `output:`
 
 Declaring `output:` does two things at once: it asks the model to return JSON matching the schema, and it parses the response as structured JSON. For some agents that's what you want. For others it produces parse-recovery loops and burns tokens.

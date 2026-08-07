@@ -55,7 +55,7 @@ def extract_content(
         return _wrap_text_output(output)
 
     if isinstance(output, BaseModel):
-        content = output.model_dump()
+        content = output.model_dump(exclude_unset=True)
         content = normalize_agent_output(content, output_schema)
         validate_output(content, output_schema)
         return content

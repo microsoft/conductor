@@ -6,9 +6,11 @@ workflow YAML configuration files.
 
 from __future__ import annotations
 
+import functools
 from typing import Any, Literal, get_args
 from urllib.parse import urlparse
 
+import regex
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -37,6 +39,12 @@ so the literal type is defined in exactly one place.
 # Maximum allowed wait-step duration (24 hours). Anything longer almost
 # certainly wants ``limits.timeout_seconds`` reconsidered first.
 MAX_WAIT_DURATION_SECONDS = 24 * 60 * 60
+
+# Wall-clock bound for a single pattern match. Model output is untrusted input
+# and Python ``re`` has no timeout, so matching uses the third-party ``regex``
+# engine which supports deadlines (and releases the GIL, so a pathological
+# pattern cannot stall the event loop and neighboring parallel agents).
+PATTERN_MATCH_TIMEOUT_SECONDS = 1.0
 
 
 class InputDef(BaseModel):
@@ -87,6 +95,8 @@ class InputDef(BaseModel):
 class OutputField(BaseModel):
     """Schema for a single output field from an agent."""
 
+    model_config = ConfigDict(extra="forbid")
+
     type: Literal["string", "number", "boolean", "array", "object"]
     """The type of the output field."""
 
@@ -99,15 +109,113 @@ class OutputField(BaseModel):
     properties: dict[str, OutputField] | None = None
     """For object types, the schema of object properties."""
 
+    enum: list[Any] | None = None
+    """Allowed values for scalar types."""
+
+    pattern: str | None = None
+    """Regular expression pattern for string types."""
+
+    minimum: int | float | None = None
+    """Minimum value for number types."""
+
+    maximum: int | float | None = None
+    """Maximum value for number types."""
+
+    minLength: int | None = None
+    """Minimum length for string types."""
+
+    maxLength: int | None = None
+    """Maximum length for string types."""
+
+    required: bool = True
+    """Whether the field is required when used as an object property."""
+
+    nullable: bool = False
+    """Whether the field value may be null."""
+
+    @functools.cached_property
+    def compiled_pattern(self) -> Any:
+        """Return a compiled regex pattern, or ``None`` when no pattern is set.
+
+        Annotated as ``Any`` because the repo type checker (ty) does not yet
+        read the ``regex`` package stubs; the runtime object is always a
+        ``regex.Pattern`` or ``None``.
+        """
+
+        if self.pattern is None:
+            return None
+        return regex.compile(self.pattern)
+
     @model_validator(mode="after")
     def validate_type_specific_fields(self) -> OutputField:
-        """Ensure type-specific fields are properly set."""
+        """Ensure type-specific fields are properly set and consistent."""
         if self.type == "array" and self.items is None:
             # Items are optional but recommended for arrays
             pass
         if self.type == "object" and self.properties is None:
             # Properties are optional but recommended for objects
             pass
+
+        # String-only constraints.
+        if self.type != "string":
+            for field_name in ("pattern", "minLength", "maxLength"):
+                value = getattr(self, field_name)
+                if value is not None:
+                    raise ValueError(f"{field_name} can only be set when type is 'string'")
+
+        # Number-only constraints.
+        if self.type != "number":
+            for field_name in ("minimum", "maximum"):
+                value = getattr(self, field_name)
+                if value is not None:
+                    raise ValueError(f"{field_name} can only be set when type is 'number'")
+
+        # Enum validation.
+        if self.enum is not None:
+            if self.type in ("array", "object"):
+                raise ValueError("enum can only be set for scalar types")
+
+            if len(self.enum) == 0:
+                raise ValueError("enum must contain at least one value")
+
+            if any(value is None for value in self.enum):
+                raise ValueError(
+                    "enum cannot contain null; use nullable: true to allow null values"
+                )
+
+            type_checks = {
+                "string": lambda x: isinstance(x, str),
+                "number": lambda x: isinstance(x, int | float) and not isinstance(x, bool),
+                "boolean": lambda x: isinstance(x, bool),
+            }
+            check = type_checks.get(self.type)
+            if check is not None and not all(check(value) for value in self.enum):
+                raise ValueError(f"enum values must match the declared type '{self.type}'")
+
+        # String length validation.
+        if self.minLength is not None and self.minLength < 0:
+            raise ValueError("minLength must be non-negative")
+        if self.maxLength is not None and self.maxLength < 0:
+            raise ValueError("maxLength must be non-negative")
+        if (
+            self.minLength is not None
+            and self.maxLength is not None
+            and self.minLength > self.maxLength
+        ):
+            raise ValueError("minLength cannot be greater than maxLength")
+
+        # Number range validation.
+        if self.minimum is not None and self.maximum is not None and self.minimum > self.maximum:
+            raise ValueError("minimum cannot be greater than maximum")
+
+        # Pattern compilation. ``regex`` is a strict superset of the stdlib
+        # ``re`` module, so every previously valid pattern still compiles.
+        if self.pattern is not None:
+            try:
+                regex.compile(self.pattern)
+            except regex.error as exc:
+                raise ValueError(f"pattern is not a valid regular expression: {exc}") from exc
+
         return self
 
 
@@ -2927,4 +3035,32 @@ class WorkflowConfig(BaseModel):
                         f"routes to unknown target '{route.to}'"
                     )
 
+        return self
+
+    @model_validator(mode="after")
+    def validate_root_level_output_required(self) -> WorkflowConfig:
+        """Reject top-level optional output fields on agents and for-each agents.
+
+        Object properties may still be optional; the policy only applies to the
+        root output dict of an agent definition.
+        """
+        for agent in self.agents:
+            if agent.output:
+                for field_name, field in agent.output.items():
+                    if not field.required:
+                        raise ValueError(
+                            f"Agent '{agent.name}' output field '{field_name}': "
+                            "root-level output fields cannot be optional "
+                            "(required: false is only allowed inside object properties)"
+                        )
+        for for_each_group in self.for_each:
+            agent = for_each_group.agent
+            if agent.output:
+                for field_name, field in agent.output.items():
+                    if not field.required:
+                        raise ValueError(
+                            f"Agent '{agent.name}' output field '{field_name}': "
+                            "root-level output fields cannot be optional "
+                            "(required: false is only allowed inside object properties)"
+                        )
         return self

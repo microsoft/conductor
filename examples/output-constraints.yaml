@@ -1,0 +1,81 @@
+# Output Field Constraints Workflow
+#
+# Demonstrates structured output schema constraints:
+# - `enum`: allowed scalar values
+# - `pattern`: regular expression matching (Python re.search semantics)
+# - `minimum` and `maximum`: numeric range boundaries
+# - `minLength` and `maxLength`: string length boundaries
+# - `required`: optional object properties (`required: false` inside object)
+# - `nullable`: fields that permit null values (`nullable: true`)
+#
+# Usage:
+#   conductor run examples/output-constraints.yaml
+#   conductor validate examples/output-constraints.yaml
+
+workflow:
+  name: output-constraints
+  description: Workflow demonstrating all eight output field schema constraints
+  version: "1.0.0"
+  entry_point: audit_evaluator
+
+  runtime:
+    provider: copilot
+
+  input:
+    ticket_id:
+      type: string
+      required: false
+      default: "TICK-1234"
+      description: Ticket identifier to evaluate
+
+agents:
+  - name: audit_evaluator
+    description: Evaluates a system audit ticket and returns structured metrics with schema constraints
+    model: gpt-5.5
+    prompt: |
+      Evaluate the audit ticket {{ workflow.input.ticket_id }}.
+      Return the verdict, score, reference ticket, summary, optional notes, and metadata object.
+    output:
+      verdict:
+        type: string
+        enum: ["passed", "failed", "inconclusive"]
+        description: Audit verdict (enum constraint)
+      ticket_ref:
+        type: string
+        pattern: "^TICK-[0-9]{4}$"
+        description: Formatted ticket reference matching pattern TICK-1234
+      score:
+        type: number
+        minimum: 0.0
+        maximum: 100.0
+        description: Numeric evaluation score between 0 and 100
+      summary:
+        type: string
+        minLength: 5
+        maxLength: 200
+        description: Brief summary string between 5 and 200 characters
+      notes:
+        type: string
+        nullable: true
+        description: Optional notes string or null when omitted
+      details:
+        type: object
+        description: Execution details object with an optional property
+        properties:
+          reviewer:
+            type: string
+            description: Identifier of the reviewer
+          comments:
+            type: string
+            required: false
+            description: Optional comments property inside object
+
+    routes:
+      - to: $end
+
+output:
+  verdict: "{{ audit_evaluator.output.verdict }}"
+  ticket_ref: "{{ audit_evaluator.output.ticket_ref }}"
+  score: "{{ audit_evaluator.output.score }}"
+  summary: "{{ audit_evaluator.output.summary }}"
+  notes: "{{ audit_evaluator.output.notes }}"
