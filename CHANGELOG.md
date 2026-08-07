@@ -54,6 +54,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the button disabled and reading "Stopping…" indefinitely, with nothing
   logged and no way back except reloading the page. The response status is now
   checked explicitly and surfaced next to the controls.
+- **Dashboard: expanding a subworkflow no longer slides the graph out from
+  under you** ([#375](https://github.com/microsoft/conductor/issues/375)) —
+  the graph layout normalizes its bounding box to the origin on every rebuild,
+  so growing one container repositioned every node while the camera stayed
+  where it was. Expanding or collapsing a subworkflow now pans the viewport by
+  the same amount the toggled container moved, so that container stays pinned
+  under the cursor and the surrounding nodes visibly move out of its way
+  instead. Collapsing that same subworkflow returns you to the view you
+  started from. Expand-all, and any other change that toggles several
+  subworkflows at once, anchors on whatever sits nearest the center of the
+  pane; the view is not refit in either case. The same compensation steadies
+  the graph when a running workflow's topology grows — a `for_each` fanning
+  out or a subworkflow's DAG arriving.
 
 ## [0.1.27](https://github.com/microsoft/conductor/compare/v0.1.26...v0.1.27) - 2026-08-04
 
