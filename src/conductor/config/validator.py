@@ -178,6 +178,20 @@ def validate_workflow_config(
                             f"routes to unknown agent or parallel group '{option.route}'"
                         )
 
+        # Validate the questions abort route. It is a real graph edge taken
+        # only after the human has worked through the node, so an unknown
+        # target must not wait until then to surface.
+        if (
+            agent.type == "questions"
+            and agent.abort_route is not None
+            and agent.abort_route != "$end"
+            and agent.abort_route not in all_names
+        ):
+            errors.append(
+                f"Agent '{agent.name}' abort_route targets unknown agent or "
+                f"parallel group '{agent.abort_route}'"
+            )
+
         # Validate input references
         input_errors, input_warnings = _validate_input_references(
             agent.name,
@@ -236,6 +250,13 @@ def validate_workflow_config(
                 f"For-each group '{for_each_group.name}' uses a terminate step as its "
                 "inline agent. Terminate steps cannot run inside a for_each iteration; "
                 "route to a terminate step from the for_each group's routes instead."
+            )
+        if for_each_group.agent.type == "questions":
+            errors.append(
+                f"For-each group '{for_each_group.name}' uses a questions step as its "
+                "inline agent. Concurrent iterations would compete for one terminal and "
+                "one dashboard prompt slot; route to a questions step from the for_each "
+                "group's routes instead."
             )
 
     # Validate sub-workflow references (local paths and registry refs).
@@ -648,6 +669,10 @@ def _build_routing_graph(config: WorkflowConfig) -> dict[str, list[tuple[str, bo
         elif agent.type == "human_gate" and agent.options:
             for option in agent.options:
                 edges.append((option.route, True))
+        # An abort route is a conditional edge like any other; without it an
+        # agent reachable only via abort is invisible to path analysis.
+        if agent.type == "questions" and agent.allow_abort:
+            edges.append((agent.abort_route or "$end", True))
         graph[agent.name] = edges
     for pg in config.parallel:
         graph[pg.name] = [(r.to, r.when is not None) for r in pg.routes]

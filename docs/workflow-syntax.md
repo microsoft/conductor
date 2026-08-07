@@ -502,7 +502,7 @@ agents:
     allow_skip: true          # skip one question (default: true)
     allow_skip_all: true      # skip everything remaining (default: true)
     allow_abort: false        # abandon the node (default: false)
-    abort_route: $end         # where to go on abort (requires allow_abort)
+    # abort_route: rescue     # where to go on abort; requires allow_abort: true
 
     routes:
       - to: finalize
@@ -518,8 +518,8 @@ agents:
 | `choices` | — | Suggested answers, offered as selectable options. |
 | `allow_free_text` | `true` | Offer "write your own" alongside `choices`. |
 | `default` | — | Recorded when the question is skipped. Counts as answered. |
-| `required` | `false` | Blocks *submission*, never navigation — a user is never trapped on one question. |
-| `multiline` | `true` | Whether the free-text path accepts multi-line input. |
+| `required` | `false` | Blocks *submission*, never navigation — a user is never trapped on one question. Skip and skip-all are both refused while a required question is unanswered. A question with a `default` is always skippable, since the default answers it. |
+| `multiline` | `true` | Whether the free-text path accepts multi-line input. Inert when `allow_free_text: false`. |
 
 #### Resolving questions from an agent
 
@@ -530,6 +530,11 @@ plain strings **or** objects:
 open_questions: ["Why?", "When?"]                            # each becomes a question
 open_questions: [{question: "Why?", choices: ["A", "B"]}]    # with candidate answers
 ```
+
+Question text from `source:` is used **verbatim**, not rendered as a template —
+`Should this use {{ user.id }}?` is an ordinary question for a developer tool,
+and rendering it would abort the step. Inline `questions:` are author-written
+and validated at `conductor validate` time, so they keep full Jinja2 support.
 
 Because plain strings work, an agent already emitting `open_questions` as an
 `array of string` needs no changes; adding `choices` later is a
@@ -547,7 +552,7 @@ Stored under the node name:
 | `transcript` | `string` | Pre-formatted `Q1. ...\nA: ...` block for prompts. |
 | `answered_count` / `skipped_count` | `int` | Counts. |
 | `answered_any` | `bool` | Cheap check for "did the human engage at all". |
-| `outcome` | `string` | `completed` / `skipped_remaining` / `aborted`. |
+| `outcome` | `string` | `completed` / `skipped_remaining` / `aborted`. A mid-node checkpoint additionally carries `in_progress`. |
 
 `answers` being a keyed dict rather than an appended string is what makes going
 back work: revisiting question 3 overwrites `answers.q3`.
@@ -584,10 +589,13 @@ are skipped, and `outcome` is `skipped_remaining`.
 #### Restrictions
 
 - Cannot be used inside parallel or for-each groups (concurrent prompts would
-  compete for one terminal and one dashboard slot, the same reason gates are
-  refused).
+  compete for one terminal and one dashboard prompt slot, the same reason gates
+  are refused). Route to a `questions` step from the group's `routes:` instead.
 - Cannot set `options`, `model`, `provider`, `tools`, `output`, `dialog`,
-  `validator`, `reasoning`, `skills`, or `working_dir` — no provider is invoked.
+  `validator`, `reasoning`, `skills`, `context_tier`, `input_mapping`,
+  `sandbox`, `max_depth`, `timeout_seconds`, `output_mode`, or `working_dir` —
+  no provider is invoked. Note `timeout_seconds` in particular: there is no
+  bound on how long a human may take.
 - `abort_route` requires `allow_abort: true`.
 
 See [`examples/questions.yaml`](../examples/questions.yaml).

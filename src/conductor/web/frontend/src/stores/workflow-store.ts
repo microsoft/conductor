@@ -139,6 +139,8 @@ export interface NodeData {
   questions_total?: number;
   questions_answered_count?: number;
   questions_skipped_count?: number;
+  /** Per-question outcome, keyed by id, so Back cannot double-count. */
+  questions_outcomes?: Record<string, 'answered' | 'skipped'>;
   questions_outcome?: string;
   questions_reject_reason?: string | null;
   selected_option?: string;
@@ -1760,7 +1762,6 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     nd.option_details = data.option_details;
     nd.prompt = data.prompt;
     nd.gate_prompt_id = data.prompt_id ?? null;
-    nd.questions_reject_reason = null;
     replaceNode(t.nodes, data.agent_name);
   },
 
@@ -1784,6 +1785,7 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     nd.questions_total = data.total;
     nd.questions_answered_count = 0;
     nd.questions_skipped_count = 0;
+    nd.questions_outcomes = {};
     nd.questions_outcome = undefined;
     replaceNode(t.nodes, data.agent_name);
   },
@@ -1793,11 +1795,15 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     const t = activeTarget(state, _data);
     const nd = ensureNode(t.nodes, data.agent_name, 'questions');
     nd.questions_total = data.total;
-    if (data.skipped) {
-      nd.questions_skipped_count = (nd.questions_skipped_count || 0) + 1;
-    } else {
-      nd.questions_answered_count = (nd.questions_answered_count || 0) + 1;
-    }
+    // Track per-question outcomes rather than incrementing counters: going
+    // back and re-answering emits a second event for the same question, so
+    // a running count would exceed `total` and drive progress past 100%.
+    const outcomes = { ...(nd.questions_outcomes || {}) };
+    outcomes[data.question_id] = data.skipped ? 'skipped' : 'answered';
+    nd.questions_outcomes = outcomes;
+    const values = Object.values(outcomes);
+    nd.questions_answered_count = values.filter((v) => v === 'answered').length;
+    nd.questions_skipped_count = values.filter((v) => v === 'skipped').length;
     nd.questions_reject_reason = null;
     replaceNode(t.nodes, data.agent_name);
   },

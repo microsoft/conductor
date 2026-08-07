@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -573,7 +574,7 @@ class TestGatePromptMarkdownRendering:
 
 
 class TestMultilineAdditionalInput:
-    """Multi-line prompt_for input (issue #376, commit 1).
+    """Multi-line prompt_for input (issue #376).
 
     ``GateOption.multiline`` is opt-in, so the default single-line path must
     stay byte-identical — that is covered by the untouched tests above.
@@ -688,3 +689,66 @@ class TestMultilineAdditionalInput:
 
         assert result.additional_input == {"feedback": "piped answer"}
         assert mock_ask.call_count == 2
+
+
+class TestDaemonThreadReader:
+    """Abandoned stdin reads must not exhaust the shared executor (issue #376).
+
+    The gate flow cancels the losing CLI arm on every dashboard-answered
+    prompt, and a questions node does that once per question.
+    """
+
+    @pytest.mark.asyncio
+    async def test_cancelled_reads_leave_the_default_executor_usable(self) -> None:
+        """A cancelled read must not hold a slot in the shared pool.
+
+        With ``asyncio.to_thread`` the abandoned worker keeps its slot, so
+        after enough prompts every unrelated ``to_thread`` in the process
+        blocks forever with no error.
+        """
+        import asyncio
+        import threading
+
+        from conductor.gates.human import read_on_daemon_thread
+
+        blocker = threading.Event()
+        try:
+            for _ in range(12):
+                task = asyncio.create_task(read_on_daemon_thread(blocker.wait))
+                await asyncio.sleep(0)
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+
+            result = await asyncio.wait_for(asyncio.to_thread(lambda: "usable"), timeout=5)
+            assert result == "usable"
+
+            leaked = [t for t in threading.enumerate() if t.name == "conductor-gate-stdin"]
+            # Daemon threads are abandoned harmlessly; non-daemon ones would
+            # hang loop.shutdown_default_executor() at interpreter exit.
+            assert leaked
+            assert all(t.daemon for t in leaked)
+        finally:
+            blocker.set()
+
+    @pytest.mark.asyncio
+    async def test_exceptions_are_relayed_to_the_awaiter(self) -> None:
+        """A blocking read that raises must surface, not hang."""
+        import asyncio
+
+        from conductor.gates.human import read_on_daemon_thread
+
+        def _boom() -> str:
+            raise EOFError("no stdin")
+
+        with pytest.raises(EOFError, match="no stdin"):
+            await asyncio.wait_for(read_on_daemon_thread(_boom), timeout=5)
+
+    @pytest.mark.asyncio
+    async def test_returns_the_value(self) -> None:
+        """The happy path still returns normally."""
+        import asyncio
+
+        from conductor.gates.human import read_on_daemon_thread
+
+        assert await asyncio.wait_for(read_on_daemon_thread(lambda: "ok"), timeout=5) == "ok"

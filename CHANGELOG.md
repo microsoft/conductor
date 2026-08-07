@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.27...HEAD)
 
+### Added
+
+- **`type: questions` — ask a human a set of questions in one step** (#376).
+  `human_gate` handles a single decision; asking N questions previously meant
+  hand-rolling a gate that loops back through a `set` step accumulating a
+  string transcript. That loop cannot support going back — a workflow step
+  cannot be un-executed, and a concatenated transcript has no addressable
+  per-question answer to overwrite — and it costs two engine iterations per
+  question. A `questions` node holds the cursor and answers internally, so the
+  whole set costs one iteration and answers land in a keyed dict where
+  revisiting question 3 overwrites `answers.q3`. Questions come from an inline
+  `questions:` list or a `source:` dotted path; entries may be plain strings or
+  objects with `choices`, so an agent already emitting `array of string`
+  migrates unchanged while gaining candidate answers is a backward-compatible
+  upgrade. Supports back/skip/skip-all/abort, `required`, per-question
+  `default`s, a closing review, and partial answers that survive a checkpoint.
+  `--skip-gates` never selects a suggested answer — those come from the agent,
+  so recording one would feed invented input back as though a human gave it.
+  See `examples/questions.yaml` and the Questions section of
+  `docs/workflow-syntax.md`.
+- **Opt-in multi-line text for human gates** — `GateOption.multiline` (default
+  `false`, so existing gates are unchanged). The terminal reads until a lone
+  `.` or EOF; the dashboard renders a textarea where Enter inserts a newline
+  and Ctrl/Cmd+Enter submits. Previously a multi-paragraph answer to a
+  `prompt_for` input was silently truncated at the first newline.
+
 ### Fixed
 
 - **`conductor resume --web` no longer shows a running workflow as stopped** —

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import threading
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -21,6 +22,7 @@ from conductor.executor.linkify import linkify_markdown
 from conductor.executor.template import TemplateRenderer
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
     from conductor.config.schema import AgentDef, GateOption
@@ -33,6 +35,50 @@ MULTILINE_SENTINEL = "."
 def _eof_key_hint() -> str:
     """Return the platform-appropriate EOF keystroke for display."""
     return "Ctrl-Z then Enter" if sys.platform == "win32" else "Ctrl-D"
+
+
+async def read_on_daemon_thread[T](fn: Callable[[], T]) -> T:
+    """Run a blocking stdin read on a daemon thread and await its result.
+
+    ``asyncio.to_thread`` would be simpler, but cancelling the returned task
+    does not stop the worker: it stays blocked in ``input()`` holding a slot in
+    the *shared default* executor. The gate flow cancels the losing CLI arm on
+    every dashboard-answered prompt, and a ``questions`` node does that once per
+    question — so the default executor's slots drain away, every unrelated
+    ``asyncio.to_thread`` in the process eventually blocks forever with no
+    error, and ``loop.shutdown_default_executor()`` hangs on exit joining them.
+
+    A dedicated daemon thread is abandoned harmlessly instead: it holds no
+    shared slot and does not keep the interpreter alive. Same reasoning as
+    ``interrupt/listener.py``.
+
+    Args:
+        fn: The blocking callable to run.
+
+    Returns:
+        Whatever ``fn`` returns.
+    """
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[T] = loop.create_future()
+
+    def _settle_result(value: T) -> None:
+        if not future.done():
+            future.set_result(value)
+
+    def _settle_error(exc: BaseException) -> None:
+        if not future.done():
+            future.set_exception(exc)
+
+    def _runner() -> None:
+        try:
+            result = fn()
+        except BaseException as exc:  # noqa: BLE001 — relayed to the awaiter
+            loop.call_soon_threadsafe(_settle_error, exc)
+        else:
+            loop.call_soon_threadsafe(_settle_result, result)
+
+    threading.Thread(target=_runner, daemon=True, name="conductor-gate-stdin").start()
+    return await future
 
 
 def option_for_value(agent: AgentDef, value: str) -> GateOption:
@@ -97,8 +143,8 @@ class GatePrompt:
     name: str
     """Agent name this prompt is attributed to.
 
-    Used as the target for ``_gate_waiting_agent`` and ``conductor gate
-    respond``. A ``questions`` node reuses its node name for every question,
+    The name the dashboard and ``conductor gate respond`` address a waiting
+    prompt by. A ``questions`` node reuses its node name for every question,
     which is why ``prompt_id`` exists.
     """
 
@@ -182,7 +228,10 @@ class HumanGateHandler:
 
         Args:
             console: Rich console for output. Creates one if not provided.
-            skip_gates: If True, auto-selects first option without prompting.
+            skip_gates: If True, resolve a prompt without asking, by selecting
+                its ``auto_select`` value. Prompts that set no ``auto_select``
+                (auto-selecting would invent an answer) are still presented,
+                so such callers must short-circuit before reaching here.
         """
         self.console = console or Console()
         self.skip_gates = skip_gates
@@ -243,8 +292,8 @@ class HumanGateHandler:
 
         Returns:
             A GatePrompt whose ``auto_select`` is the first option, matching
-            the long-standing ``--skip-gates`` behavior for gates. That is a
-            declared route on a real gate, not an invented human answer.
+            ``--skip-gates`` behavior for gates. That is a declared route on a
+            real gate, not an invented human answer.
         """
         prompt_text = self.renderer.render(agent.prompt, context)
         prompt_text = linkify_markdown(prompt_text, base_dir=base_dir)
@@ -376,7 +425,7 @@ class HumanGateHandler:
                     show_choices=True,
                 )
 
-            choice_input = await asyncio.to_thread(_ask_choice)
+            choice_input = await read_on_daemon_thread(_ask_choice)
             try:
                 index = int(choice_input) - 1
                 if 0 <= index < len(choices):
@@ -406,17 +455,17 @@ class HumanGateHandler:
         self.console.print()
         self.console.print(f"[bold]Please provide {field_name}:[/bold]")
 
-        # Multi-line editing is meaningless without a TTY, and the single-line
-        # path's EOFError-on-closed-stdin behavior is what _handle_gate_with_web
-        # is built around. Fall back so every non-TTY path stays byte-identical.
+        # Without a TTY, fall back: _read_multiline treats EOF as "submit" and
+        # would return "" instantly on a DEVNULL stdin, letting the CLI arm win
+        # the race in _resolve_human_prompt with an empty answer.
         if multiline and sys.stdin.isatty():
-            value = await asyncio.to_thread(self._read_multiline)
+            value = await read_on_daemon_thread(self._read_multiline)
             return {field_name: value}
 
         def _ask_value() -> str:
             return Prompt.ask(f"  {field_name}")
 
-        value = await asyncio.to_thread(_ask_value)
+        value = await read_on_daemon_thread(_ask_value)
         return {field_name: value}
 
     def _read_multiline(self) -> str:
@@ -601,7 +650,7 @@ class MaxIterationsHandler:
                     default=0,
                 )
 
-            value = await asyncio.to_thread(_ask_int)
+            value = await read_on_daemon_thread(_ask_int)
             return max(0, value)  # Ensure non-negative
         except (ValueError, KeyboardInterrupt, EOFError):
             # EOFError fires when stdin is not a TTY (CI, ``< /dev/null``,

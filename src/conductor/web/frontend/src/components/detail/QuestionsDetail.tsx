@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Check, ListChecks, SkipForward } from 'lucide-react';
+import { Ban, Check, ListChecks, SkipForward } from 'lucide-react';
 import { GateDetail, PromptMarkdown } from './GateDetail';
 import { FileViewer } from './FileViewer';
 import { MetadataGrid } from './MetadataGrid';
@@ -12,8 +12,8 @@ interface QuestionsDetailProps {
 /**
  * Detail view for a `type: questions` node.
  *
- * While waiting, each question is presented through the same gate channel the
- * engine already uses, so `GateDetail` renders it unchanged — the progress
+ * While waiting, each question is presented through the same gate response
+ * channel the engine already uses, so `GateDetail` renders it — the progress
  * header travels inside the prompt markdown and Back/Skip arrive as ordinary
  * choices. Only the completed state differs: a gate resolves to one choice,
  * whereas this node resolves to a set of answers.
@@ -58,13 +58,28 @@ export function QuestionsDetail({ node }: QuestionsDetailProps) {
   const answered = node.questions_answered_count ?? 0;
   const skipped = node.questions_skipped_count ?? 0;
   const outcome = node.questions_outcome ?? 'completed';
+  const aborted = outcome === 'aborted';
 
   return (
     <div className="space-y-3">
-      <div className="flex items-center gap-2.5 px-3 py-2 rounded-lg bg-green-500/10 border border-green-500/30">
-        <Check className="w-3.5 h-3.5 text-green-400 flex-shrink-0" />
-        <span className="text-xs font-semibold text-green-400 tracking-wide">
-          {outcome === 'aborted'
+      <div
+        className={`flex items-center gap-2.5 px-3 py-2 rounded-lg border ${
+          aborted
+            ? 'bg-amber-500/10 border-amber-500/30'
+            : 'bg-green-500/10 border-green-500/30'
+        }`}
+      >
+        {aborted ? (
+          <Ban className="w-3.5 h-3.5 text-amber-400 flex-shrink-0" />
+        ) : (
+          <Check className="w-3.5 h-3.5 text-green-400 flex-shrink-0" />
+        )}
+        <span
+          className={`text-xs font-semibold tracking-wide ${
+            aborted ? 'text-amber-400' : 'text-green-400'
+          }`}
+        >
+          {aborted
             ? 'Questions Aborted'
             : outcome === 'skipped_remaining'
               ? 'Remaining Questions Skipped'
@@ -79,8 +94,6 @@ export function QuestionsDetail({ node }: QuestionsDetailProps) {
           { label: 'Outcome', value: outcome },
         ]}
       />
-
-      {viewingFile && <FileViewer filePath={viewingFile} onClose={() => setViewingFile(null)} />}
     </div>
   );
 }

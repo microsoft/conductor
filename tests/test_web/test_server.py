@@ -937,6 +937,85 @@ class TestWaitForGateResponse:
         assert dashboard._gate_response_queue.empty()
 
 
+class TestGatePromptIdStaleness:
+    """prompt_id staleness filtering for questions nodes (issue #376).
+
+    A questions node presents every question under the SAME agent name, so
+    the name alone cannot tell one prompt from the next.
+    """
+
+    @pytest.mark.asyncio
+    async def test_discards_a_response_for_an_earlier_prompt(self) -> None:
+        """A click on Q3 landing after Q4 opened must not resolve Q4."""
+        _, dashboard = _make_dashboard()
+        await dashboard._gate_response_queue.put(
+            {"agent_name": "ask", "selected_value": "stale", "prompt_id": "ask:run:2"}
+        )
+        await dashboard._gate_response_queue.put(
+            {"agent_name": "ask", "selected_value": "fresh", "prompt_id": "ask:run:3"}
+        )
+
+        msg = await asyncio.wait_for(
+            dashboard.wait_for_gate_response("ask", "ask:run:3"), timeout=1.0
+        )
+
+        assert msg["selected_value"] == "fresh"
+
+    @pytest.mark.asyncio
+    async def test_accepts_a_response_carrying_no_token(self) -> None:
+        """`conductor gate respond` sends no prompt_id and must still work."""
+        _, dashboard = _make_dashboard()
+        await dashboard._gate_response_queue.put(
+            {"agent_name": "ask", "selected_value": "from_cli"}
+        )
+
+        msg = await asyncio.wait_for(
+            dashboard.wait_for_gate_response("ask", "ask:run:3"), timeout=1.0
+        )
+
+        assert msg["selected_value"] == "from_cli"
+
+    @pytest.mark.asyncio
+    async def test_waiting_prompt_id_is_cleared_after_resolution(self) -> None:
+        """A resolved prompt must not leave its token latched."""
+        _, dashboard = _make_dashboard()
+        await dashboard._gate_response_queue.put(
+            {"agent_name": "ask", "selected_value": "x", "prompt_id": "ask:run:1"}
+        )
+
+        await asyncio.wait_for(dashboard.wait_for_gate_response("ask", "ask:run:1"), timeout=1.0)
+
+        assert dashboard._gate_waiting_prompt_id is None
+        assert dashboard._gate_waiting_agent is None
+
+    def test_validate_rejects_a_mismatched_prompt_id(self) -> None:
+        """The HTTP path refuses a response aimed at a superseded prompt."""
+        _, dashboard = _make_dashboard()
+        dashboard._gate_waiting_agent = "ask"
+        dashboard._gate_waiting_prompt_id = "ask:run:3"
+
+        error = dashboard._validate_gate_target("ask", "ask:run:2")
+
+        assert error is not None
+        assert "ask:run:2" in error
+
+    def test_validate_accepts_a_matching_prompt_id(self) -> None:
+        """The matching token passes."""
+        _, dashboard = _make_dashboard()
+        dashboard._gate_waiting_agent = "ask"
+        dashboard._gate_waiting_prompt_id = "ask:run:3"
+
+        assert dashboard._validate_gate_target("ask", "ask:run:3") is None
+
+    def test_validate_accepts_a_missing_prompt_id(self) -> None:
+        """A token-less response stays valid so the CLI keeps working."""
+        _, dashboard = _make_dashboard()
+        dashboard._gate_waiting_agent = "ask"
+        dashboard._gate_waiting_prompt_id = "ask:run:3"
+
+        assert dashboard._validate_gate_target("ask", None) is None
+
+
 class TestWaitForIterationLimitResponse:
     """Tests for WebDashboard.wait_for_iteration_limit_response (issue #198)."""
 

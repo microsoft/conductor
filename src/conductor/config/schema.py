@@ -168,6 +168,35 @@ class ParallelGroup(BaseModel):
         return v
 
 
+def validate_dotted_source(v: str) -> str:
+    """Validate a dotted context reference (``agent_name.output.field``).
+
+    Shared by ``ForEachDef.source`` and ``AgentDef.source`` so the two stay
+    enforced identically — a reference that names the convention without
+    inheriting its checks is the worst of both.
+
+    Args:
+        v: The dotted path to check.
+
+    Returns:
+        The path unchanged.
+
+    Raises:
+        ValueError: If the path has fewer than three parts or its first
+            segment is not a valid identifier. This is a format check only;
+            actual resolution happens at runtime.
+    """
+    parts = v.split(".")
+    if len(parts) < 3:
+        raise ValueError(
+            f"Invalid source format: '{v}'. "
+            f"Expected format: 'agent_name.output.field' (minimum 3 parts)"
+        )
+    if not parts[0].isidentifier():
+        raise ValueError(f"Invalid agent name in source: '{parts[0]}' is not a valid identifier")
+    return v
+
+
 class ForEachDef(BaseModel):
     """Definition for a dynamic parallel (for-each) agent group.
 
@@ -256,22 +285,8 @@ class ForEachDef(BaseModel):
     @field_validator("source")
     @classmethod
     def validate_source_format(cls, v: str) -> str:
-        """Validate source reference format (agent_name.output.field).
-
-        This is a basic format check - actual resolution happens at runtime.
-        """
-        parts = v.split(".")
-        if len(parts) < 3:
-            raise ValueError(
-                f"Invalid source format: '{v}'. "
-                f"Expected format: 'agent_name.output.field' (minimum 3 parts)"
-            )
-        # First part should be a valid identifier
-        if not parts[0].isidentifier():
-            raise ValueError(
-                f"Invalid agent name in source: '{parts[0]}' is not a valid identifier"
-            )
-        return v
+        """Validate source reference format (agent_name.output.field)."""
+        return validate_dotted_source(v)
 
     @field_validator("max_concurrent")
     @classmethod
@@ -354,7 +369,32 @@ class QuestionDef(BaseModel):
     """
 
     multiline: bool = True
-    """Whether the free-text path accepts multi-line input."""
+    """Whether the free-text path accepts multi-line input.
+
+    Inert when ``allow_free_text`` is false — there is no free-text path.
+    """
+
+    @model_validator(mode="after")
+    def validate_answerable(self) -> QuestionDef:
+        """Reject a question the user has no way to answer.
+
+        Without choices and without free text there is nothing to select. At
+        runtime that surfaces either as an empty-choice ``HumanGateError`` or,
+        worse, as a question whose only control is Skip — which is refused
+        when ``required`` is set, leaving the user with no way forward.
+
+        Returns:
+            The validated model.
+
+        Raises:
+            ValueError: If the question offers neither choices nor free text.
+        """
+        if not self.choices and not self.allow_free_text:
+            raise ValueError(
+                f"Question {self.id or self.text!r} is unanswerable: it has no 'choices' "
+                "and 'allow_free_text' is false. Add choices or allow free text."
+            )
+        return self
 
 
 class ContextConfig(BaseModel):
@@ -904,8 +944,8 @@ class AgentDef(BaseModel):
     """Dotted path to an array of questions (``type: questions`` only).
 
     Same convention as ``ForEachDef.source`` (e.g.
-    ``architect.output.open_questions``). Entries may be plain strings or
-    objects matching :class:`QuestionDef`.
+    ``architect.output.open_questions``), including its format validation.
+    Entries may be plain strings or objects matching :class:`QuestionDef`.
     """
 
     allow_back: bool | None = None
@@ -1447,8 +1487,9 @@ class AgentDef(BaseModel):
         # Fields exclusive to ``type: questions``. A standalone guard, like the
         # terminate/script ones above, so it also covers types with no branch
         # of their own. The nav flags are tri-state (``bool | None``) precisely
-        # so an explicit value is distinguishable here — a plain ``bool``
-        # default would make "set to False" and "not set" identical.
+        # so an explicit value is distinguishable here — with a plain ``bool``
+        # default, a value equal to that default is indistinguishable from a
+        # field the user never wrote.
         if self.type != "questions":
             for field_name in (
                 "questions",
@@ -1517,6 +1558,8 @@ class AgentDef(BaseModel):
                 raise ValueError(
                     "questions agents cannot set 'abort_route' without 'allow_abort: true'"
                 )
+            if self.source is not None:
+                validate_dotted_source(self.source)
             if self.input_mapping is not None:
                 raise ValueError("questions agents cannot have 'input_mapping'")
             if self.dialog is not None:

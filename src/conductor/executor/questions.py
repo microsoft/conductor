@@ -1,4 +1,4 @@
-"""Execution of ``type: questions`` steps.
+"""Execution of ``type: questions`` steps (issue #376).
 
 A ``questions`` node presents N prompts to a human inside **one** engine step,
 holding the cursor and answers internally. That "one step" property is the
@@ -12,8 +12,9 @@ overwrites ``answers.q3`` instead of appending a second entry.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from conductor.exceptions import ExecutionError
 from conductor.gates.human import GateChoice, GatePrompt
@@ -23,8 +24,11 @@ if TYPE_CHECKING:
 
     from conductor.config.schema import AgentDef, QuestionDef
 
-# Control values are prefixed so they cannot collide with a suggested answer,
-# which is passed through verbatim as its own choice value.
+logger = logging.getLogger(__name__)
+
+# Control values are dunder-prefixed to keep them clear of suggested answers,
+# which become choice values verbatim. `resolve_questions` rejects a suggested
+# answer that lands on one anyway, so the separation is enforced, not assumed.
 NAV_BACK = "__back__"
 NAV_SKIP = "__skip__"
 NAV_SKIP_ALL = "__skip_all__"
@@ -35,7 +39,15 @@ FREE_TEXT = "__free_text__"
 FREE_TEXT_FIELD = "answer"
 """``prompt_for`` field name used for the write-your-own path."""
 
-_NAV_VALUES = frozenset({NAV_BACK, NAV_SKIP, NAV_SKIP_ALL, NAV_ABORT, NAV_FINISH})
+_RESERVED_VALUES = frozenset({NAV_BACK, NAV_SKIP, NAV_SKIP_ALL, NAV_ABORT, NAV_FINISH, FREE_TEXT})
+"""Choice values reserved for controls; a suggested answer may not use one."""
+
+AnswerSource = Literal["choice", "free_text", "default", "skipped"]
+"""Where an answer came from. Mirrors ``CheckpointTrigger``'s Literal style."""
+
+QuestionsOutcome = Literal["completed", "skipped_remaining", "aborted", "in_progress"]
+"""Terminal state of a questions node. ``in_progress`` appears only in a
+mid-node checkpoint, never in a completed node's output."""
 
 
 @dataclass
@@ -59,10 +71,38 @@ class AnswerRecord:
     id: str
     question: str
     answer: str | None
-    source: str
-    """One of ``choice`` / ``free_text`` / ``default`` / ``skipped``."""
+    source: AnswerSource
 
-    skipped: bool
+    @property
+    def skipped(self) -> bool:
+        """Whether this question was skipped without an answer.
+
+        Derived rather than stored so ``skipped=True`` can never contradict a
+        non-null ``answer`` — a state reachable through checkpoint restore,
+        where it produced an answer visible in ``transcript`` but absent from
+        ``answers``.
+        """
+        return self.source == "skipped"
+
+    @classmethod
+    def for_skip(cls, question: ResolvedQuestion) -> AnswerRecord:
+        """Build the record for a skipped question, applying its default.
+
+        A declared default is a real answer, so it is recorded as one. Three
+        call sites derived this pairing independently before.
+
+        Args:
+            question: The question being skipped.
+
+        Returns:
+            The answer record.
+        """
+        return cls(
+            id=question.id,
+            question=question.text,
+            answer=question.default,
+            source="default" if question.default is not None else "skipped",
+        )
 
 
 @dataclass(frozen=True)
@@ -160,6 +200,7 @@ def resolve_questions(
     *,
     render: Callable[[str], str],
     agent_name: str,
+    trusted: bool = True,
 ) -> list[ResolvedQuestion]:
     """Render question text and assign stable answer keys.
 
@@ -167,13 +208,36 @@ def resolve_questions(
         definitions: The question definitions.
         render: Jinja2 renderer bound to the current workflow context.
         agent_name: Node name, for error messages.
+        trusted: Whether the text was authored in the workflow file. Inline
+            ``questions:`` are, and are validated at ``conductor validate``
+            time, so they render normally. Text resolved from ``source:``
+            came out of a model, where ``{{ user.id }}`` or ``{% if %}`` is
+            an ordinary thing to ask about — rendering it would abort the
+            step with a TemplateError just as the human was about to be
+            asked. Untrusted text falls back to itself verbatim, matching
+            ``for_each``, which injects source items as values and never
+            renders them.
 
     Returns:
         Resolved questions in presentation order.
 
     Raises:
-        ExecutionError: If two questions claim the same id.
+        ExecutionError: If two questions claim the same id, or a suggested
+            answer collides with a reserved control value.
     """
+
+    def _render(text: str) -> str:
+        if trusted:
+            return render(text)
+        try:
+            return render(text)
+        except Exception:  # noqa: BLE001 — any template failure falls back
+            logger.debug(
+                "Question text from a source: array is not a valid template; using it verbatim: %r",
+                text,
+            )
+            return text
+
     resolved: list[ResolvedQuestion] = []
     seen: set[str] = set()
     for index, definition in enumerate(definitions):
@@ -187,12 +251,22 @@ def resolve_questions(
                 ),
             )
         seen.add(question_id)
+        rendered_choices = [_render(c) for c in (definition.choices or [])]
+        reserved_hit = _RESERVED_VALUES.intersection(rendered_choices)
+        if reserved_hit:
+            raise ExecutionError(
+                f"Question '{question_id}' in '{agent_name}' offers reserved choice "
+                f"value(s) {sorted(reserved_hit)}",
+                suggestion=(
+                    "These values are used for navigation controls. Reword the suggested answer."
+                ),
+            )
         resolved.append(
             ResolvedQuestion(
                 id=question_id,
-                text=render(definition.text),
-                hint=render(definition.hint) if definition.hint else None,
-                choices=[render(c) for c in (definition.choices or [])],
+                text=_render(definition.text),
+                hint=_render(definition.hint) if definition.hint else None,
+                choices=rendered_choices,
                 allow_free_text=definition.allow_free_text,
                 default=definition.default,
                 required=definition.required,
@@ -213,6 +287,7 @@ def build_prompt(
     skipped: int,
     prompt_id: str,
     intro: str | None = None,
+    rejection: str | None = None,
 ) -> GatePrompt:
     """Build the prompt for a single question.
 
@@ -226,6 +301,10 @@ def build_prompt(
         skipped: How many are skipped so far.
         prompt_id: Staleness token for this specific presentation.
         intro: Optional rendered node-level intro, shown on the first question.
+        rejection: Why the previous attempt at this question was refused.
+            Carried in the prompt body because a re-presentation otherwise
+            looks identical to the first, on both the terminal and the
+            dashboard.
 
     Returns:
         A GatePrompt with suggested answers, a write-your-own option, and the
@@ -243,6 +322,8 @@ def build_prompt(
         body += ["", f"_{question.hint}_"]
     if question.required:
         body += ["", "_An answer is required._"]
+    if rejection:
+        body += ["", f"**{rejection}**"]
     if intro and cursor == 0:
         body = [intro, "", *body]
 
@@ -329,15 +410,15 @@ def build_review_prompt(
 def build_output(
     records: dict[str, AnswerRecord],
     order: list[ResolvedQuestion],
-    outcome: str,
+    outcome: QuestionsOutcome,
 ) -> dict[str, Any]:
     """Assemble the node's output from the answers collected so far.
 
     Args:
         records: Answer records keyed by question id.
         order: All questions, in presentation order.
-        outcome: ``completed`` / ``skipped_remaining`` / ``aborted`` /
-            ``in_progress`` (the last only in a mid-node checkpoint).
+        outcome: Terminal state; ``in_progress`` only in a mid-node
+            checkpoint.
 
     Returns:
         The node output dict.
@@ -377,11 +458,6 @@ def build_output(
     }
 
 
-def is_nav(value: str) -> bool:
-    """Return True if a response value is a navigation control."""
-    return value in _NAV_VALUES
-
-
 __all__ = [
     "FREE_TEXT",
     "FREE_TEXT_FIELD",
@@ -391,12 +467,13 @@ __all__ = [
     "NAV_SKIP",
     "NAV_SKIP_ALL",
     "AnswerRecord",
+    "AnswerSource",
     "NavFlags",
+    "QuestionsOutcome",
     "ResolvedQuestion",
     "build_output",
     "build_review_prompt",
     "build_prompt",
     "coerce_questions",
-    "is_nav",
     "resolve_questions",
 ]

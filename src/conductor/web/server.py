@@ -90,7 +90,8 @@ class WebDashboard:
         # can report whether a gate is currently waiting for a response.
         self._gate_waiting_agent: str | None = None
 
-        # Staleness token for the currently-waiting prompt. A `questions` node
+        # Staleness token for the currently-waiting prompt (issue #376). A
+        # `questions` node
         # presents every one of its prompts under the SAME agent name, so the
         # name alone cannot distinguish them: a slow click meant for Q3 that
         # lands after Q4 is presented would otherwise resolve Q4 with Q3's

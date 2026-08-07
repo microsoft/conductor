@@ -231,8 +231,8 @@ class TestBuildOutput:
         """A keyed dict is what makes an answer addressable, therefore revisable."""
         order = self._order()
         records = {
-            "q1": AnswerRecord("q1", "First?", "A", "choice", False),
-            "q2": AnswerRecord("q2", "Second?", "B", "free_text", False),
+            "q1": AnswerRecord("q1", "First?", "A", "choice"),
+            "q2": AnswerRecord("q2", "Second?", "B", "free_text"),
         }
 
         output = build_output(records, order, "completed")
@@ -243,8 +243,8 @@ class TestBuildOutput:
         """A skipped question must not look answered downstream."""
         order = self._order()
         records = {
-            "q1": AnswerRecord("q1", "First?", "A", "choice", False),
-            "q2": AnswerRecord("q2", "Second?", None, "skipped", True),
+            "q1": AnswerRecord("q1", "First?", "A", "choice"),
+            "q2": AnswerRecord("q2", "Second?", None, "skipped"),
         }
 
         output = build_output(records, order, "completed")
@@ -257,7 +257,7 @@ class TestBuildOutput:
     def test_default_answer_counts_as_answered(self) -> None:
         """A declared default is a real answer, not a skip."""
         order = self._order()
-        records = {"q1": AnswerRecord("q1", "First?", "fallback", "default", False)}
+        records = {"q1": AnswerRecord("q1", "First?", "fallback", "default")}
 
         output = build_output(records, order, "completed")
 
@@ -268,8 +268,8 @@ class TestBuildOutput:
         """The transcript numbers questions as presented, not as answered."""
         order = self._order()
         records = {
-            "q2": AnswerRecord("q2", "Second?", "B", "choice", False),
-            "q1": AnswerRecord("q1", "First?", "A", "choice", False),
+            "q2": AnswerRecord("q2", "Second?", "B", "choice"),
+            "q1": AnswerRecord("q1", "First?", "A", "choice"),
         }
 
         output = build_output(records, order, "completed")
@@ -279,7 +279,7 @@ class TestBuildOutput:
     def test_unanswered_questions_are_absent(self) -> None:
         """A partially-answered node reports only what it has."""
         order = self._order()
-        records = {"q1": AnswerRecord("q1", "First?", "A", "choice", False)}
+        records = {"q1": AnswerRecord("q1", "First?", "A", "choice")}
 
         output = build_output(records, order, "in_progress")
 

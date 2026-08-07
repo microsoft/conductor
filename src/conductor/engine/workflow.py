@@ -54,6 +54,7 @@ from conductor.executor.set_step import (
 from conductor.executor.template import TemplateRenderer
 from conductor.executor.wait import WaitExecutor, WaitOutput
 from conductor.gates.human import (
+    GateChoice,
     GatePrompt,
     GateResponse,
     GateResult,
@@ -270,6 +271,10 @@ class ExecutionPlan:
     """Possible execution paths through the workflow."""
 
 
+_ANSWER_SOURCES = frozenset({"choice", "free_text", "default", "skipped"})
+"""Legal ``AnswerRecord.source`` values, for validating restored checkpoints."""
+
+
 def _answer_counts(output: dict[str, Any]) -> dict[str, int]:
     """Project a questions output down to the counts events carry.
 
@@ -479,6 +484,10 @@ class WorkflowEngine:
         # (issue #244) also set _last_checkpoint_path, so it can no longer
         # double as "the dashboard-stop handler already ran".
         self._dashboard_stop_handled: bool = False
+
+        # True only for the first questions node reached via resume(), so a
+        # loop-back re-asks rather than replaying the prior pass's answers.
+        self._resuming_questions: bool = False
         # Monotonic timestamp of the last periodic checkpoint (issue #244),
         # used to evaluate the runtime.checkpoint.every_seconds throttle at
         # step boundaries. None until the first periodic checkpoint is saved.
@@ -2078,6 +2087,11 @@ class WorkflowEngine:
             MaxIterationsError: If max iterations limit is exceeded.
             TimeoutError: If timeout limit is exceeded.
         """
+        # A questions node restores its partial answers only here. On an
+        # ordinary loop-back the node must ask its new questions, not replay
+        # the previous pass's answers under the same positional ids.
+        self._resuming_questions = True
+
         # Fresh timeout window for resumed execution
         self.limits.start_time = _time.monotonic()
 
@@ -2441,12 +2455,16 @@ class WorkflowEngine:
     async def _run_questions_step(self, agent: AgentDef) -> dict[str, Any]:
         """Present a set of questions to a human and collect their answers.
 
-        Runs the whole cursor loop inside one engine step. Partial answers are
-        committed to the workflow context after every response, so a checkpoint
-        taken mid-node (dashboard stop, periodic save) already carries them and
-        a resumed run continues at the right question — this needs no
-        checkpoint schema change, because checkpoints serialize
-        ``WorkflowContext.to_dict()``.
+        Runs the whole cursor loop inside one engine step (issue #376).
+
+        Partial answers are committed to the workflow context after every
+        response, so a checkpoint taken while the node is parked on a human —
+        a dashboard stop, Ctrl-C, or an unhandled failure — already carries
+        them and a resumed run continues at the right question. They live in
+        the node's ordinary context entry, which ``WorkflowContext.to_dict()``
+        already serializes. Note a *periodic* checkpoint cannot fire here: it
+        is taken at the top of the execution loop, which this step has not
+        returned to.
 
         Args:
             agent: The questions node definition.
@@ -2466,24 +2484,33 @@ class WorkflowEngine:
         if agent.source:
             raw = self._resolve_array_reference(agent.source)
             definitions = questions_mod.coerce_questions(raw, agent_name=agent.name)
+            trusted = False
         else:
             definitions = list(agent.questions or [])
+            trusted = True
 
-        order = questions_mod.resolve_questions(definitions, render=_render, agent_name=agent.name)
+        order = questions_mod.resolve_questions(
+            definitions, render=_render, agent_name=agent.name, trusted=trusted
+        )
 
         intro: str | None = None
         if agent.prompt:
             intro = linkify_markdown(_render(agent.prompt), base_dir=self._workflow_dir)
 
         # Resume support: prior answers for this node survive in context.
+        # Consumed once, so a later loop-back re-asks instead of replaying —
+        # question ids default to positional q1..qN, so a new question set
+        # would otherwise silently inherit the previous pass's answers.
         records: dict[str, questions_mod.AnswerRecord] = {}
-        prior = self.context.agent_outputs.get(agent.name)
-        if isinstance(prior, dict):
-            records = self._restore_question_records(prior, order)
+        if self._resuming_questions:
+            self._resuming_questions = False
+            prior = self.context.agent_outputs.get(agent.name)
+            if isinstance(prior, dict):
+                records = self._restore_question_records(prior, order)
 
-        if not order:
-            return questions_mod.build_output(records, order, "completed")
-
+        # Emitted before the empty-set early return below, so a node whose
+        # source resolved to [] still completes on the dashboard instead of
+        # sitting at 'pending' forever.
         self._emit(
             "questions_presented",
             {
@@ -2497,6 +2524,18 @@ class WorkflowEngine:
             },
         )
 
+        if not order:
+            output = questions_mod.build_output(records, order, "completed")
+            self._emit(
+                "questions_completed",
+                {
+                    "agent_name": agent.name,
+                    "outcome": output["outcome"],
+                    **_answer_counts(output),
+                },
+            )
+            return output
+
         # --skip-gates must not auto-select a suggested answer: those come from
         # the upstream agent, so recording one would feed invented human input
         # back as real. Skipping honestly is the only safe automation.
@@ -2504,13 +2543,7 @@ class WorkflowEngine:
             for question in order:
                 records.setdefault(
                     question.id,
-                    questions_mod.AnswerRecord(
-                        id=question.id,
-                        question=question.text,
-                        answer=question.default,
-                        source="default" if question.default is not None else "skipped",
-                        skipped=question.default is None,
-                    ),
+                    questions_mod.AnswerRecord.for_skip(question),
                 )
             output = questions_mod.build_output(records, order, "skipped_remaining")
             self._emit(
@@ -2533,7 +2566,7 @@ class WorkflowEngine:
         order: list[questions_mod.ResolvedQuestion],
         records: dict[str, questions_mod.AnswerRecord],
         intro: str | None,
-    ) -> str:
+    ) -> questions_mod.QuestionsOutcome:
         """Drive the question cursor until the user finishes, skips, or aborts.
 
         Args:
@@ -2553,6 +2586,7 @@ class WorkflowEngine:
 
         nav = questions_mod.NavFlags.resolve(agent)
         presentation = 0
+        rejection: str | None = None
 
         def _next_prompt_id() -> str:
             return f"{agent.name}:{self._run_id}:{presentation}"
@@ -2585,14 +2619,16 @@ class WorkflowEngine:
                     skipped=skipped,
                     prompt_id=_next_prompt_id(),
                     intro=intro,
+                    rejection=rejection,
                 )
+            rejection = None
 
             await self._suspend_listener()
             try:
-                # Reuse the gate presentation channel so the dashboard's
-                # existing prompt UI drives each question. The progress header
-                # and nav controls travel inside the prompt/choices, so no new
-                # client-side interaction path is needed.
+                # Reuse the gate response channel rather than adding a second
+                # one: the progress header and nav controls travel inside the
+                # prompt and choices. The client still had to learn prompt_id,
+                # since a questions node presents repeatedly under one name.
                 self._emit(
                     "gate_presented",
                     {
@@ -2621,9 +2657,15 @@ class WorkflowEngine:
                 return "completed"
 
             if response.value == questions_mod.NAV_BACK:
+                # Back is only offered from question 2 onward and at the review;
+                # a duplicate or late click could still deliver it at cursor 0,
+                # where decrementing is a no-op and the pop would silently
+                # discard an answer the user already gave.
+                if cursor == 0:
+                    continue
                 # Clear the answer being revisited so the resume scan above and
                 # the "answered" counter both reflect reality.
-                cursor = max(0, cursor - 1)
+                cursor -= 1
                 records.pop(order[cursor].id, None)
                 self._store_questions_progress(agent, records, order)
                 continue
@@ -2632,54 +2674,66 @@ class WorkflowEngine:
                 return "aborted"
 
             if response.value == questions_mod.NAV_SKIP_ALL:
+                # Skip-all must honour `required` too, or it is a one-click
+                # bypass of the per-question check below and `required` means
+                # nothing. The user can still answer, or abort when enabled.
+                blocking = [q for q in order[cursor:] if q.required and q.default is None]
+                if blocking:
+                    rejection = (
+                        f"{len(blocking)} required question(s) still need an answer "
+                        "and cannot be skipped."
+                    )
+                    self._emit(
+                        "questions_answer_rejected",
+                        {
+                            "agent_name": agent.name,
+                            "question_id": blocking[0].id,
+                            "reason": rejection,
+                        },
+                    )
+                    continue
                 for remaining in order[cursor:]:
                     records.setdefault(
                         remaining.id,
-                        questions_mod.AnswerRecord(
-                            id=remaining.id,
-                            question=remaining.text,
-                            answer=remaining.default,
-                            source="default" if remaining.default is not None else "skipped",
-                            skipped=remaining.default is None,
-                        ),
+                        questions_mod.AnswerRecord.for_skip(remaining),
                     )
                 self._store_questions_progress(agent, records, order)
                 return "skipped_remaining"
 
             if at_review:
-                # The review prompt offers only Finish/Back/Abort, all handled
-                # above. Anything else is a stale response for a question that
-                # has already been answered; re-present rather than misfile it.
-                continue
+                # build_review_prompt offers only Finish/Back/Abort, all handled
+                # above, so this is unreachable today. Fail loudly rather than
+                # falling through — order[cursor] would IndexError here, and
+                # silently re-presenting would hide a future choice added to
+                # the review without a matching handler.
+                raise AssertionError(
+                    f"Unhandled review response {response.value!r} for '{agent.name}'"
+                )
 
             question = order[cursor]
             if response.value == questions_mod.NAV_SKIP:
                 if question.required and question.default is None:
+                    rejection = "This question is required and cannot be skipped."
                     self._emit(
                         "questions_answer_rejected",
                         {
                             "agent_name": agent.name,
                             "question_id": question.id,
-                            "reason": "This question is required and cannot be skipped.",
+                            "reason": rejection,
                         },
                     )
                     continue
-                records[question.id] = questions_mod.AnswerRecord(
-                    id=question.id,
-                    question=question.text,
-                    answer=question.default,
-                    source="default" if question.default is not None else "skipped",
-                    skipped=question.default is None,
-                )
+                records[question.id] = questions_mod.AnswerRecord.for_skip(question)
             elif response.value == questions_mod.FREE_TEXT:
                 text = response.additional_input.get(questions_mod.FREE_TEXT_FIELD, "").strip()
                 if question.required and not text:
+                    rejection = "This question is required; please provide an answer."
                     self._emit(
                         "questions_answer_rejected",
                         {
                             "agent_name": agent.name,
                             "question_id": question.id,
-                            "reason": "This question is required; please provide an answer.",
+                            "reason": rejection,
                         },
                     )
                     continue
@@ -2688,7 +2742,6 @@ class WorkflowEngine:
                     question=question.text,
                     answer=text,
                     source="free_text",
-                    skipped=False,
                 )
             else:
                 records[question.id] = questions_mod.AnswerRecord(
@@ -2696,7 +2749,6 @@ class WorkflowEngine:
                     question=question.text,
                     answer=response.value,
                     source="choice",
-                    skipped=False,
                 )
 
             self._emit(
@@ -2713,8 +2765,6 @@ class WorkflowEngine:
             self._store_questions_progress(agent, records, order)
             cursor += 1
 
-        return "completed"
-
     def _store_questions_progress(
         self,
         agent: AgentDef,
@@ -2728,7 +2778,14 @@ class WorkflowEngine:
             records: Answers collected so far.
             order: All questions, in presentation order.
         """
-        self.context.store(agent.name, questions_mod.build_output(records, order, "in_progress"))
+        # Assign directly rather than via ``store``: this fires after every
+        # answer, and ``store`` appends to execution_history and bumps
+        # current_iteration, which would leak N entries into downstream
+        # prompts, the interrupt panel, and the dashboard's synthetic replay.
+        # The main loop's single ``store`` remains the node's one history entry.
+        self.context.agent_outputs[agent.name] = questions_mod.build_output(
+            records, order, "in_progress"
+        )
 
     @staticmethod
     def _restore_question_records(
@@ -2737,9 +2794,13 @@ class WorkflowEngine:
     ) -> dict[str, questions_mod.AnswerRecord]:
         """Rebuild answer records from a resumed node's stored output.
 
-        Only ids still present in the current question set are restored, so a
-        workflow edited between the checkpoint and the resume does not
-        resurrect answers to questions that no longer exist.
+        A record is kept only when both its id **and** its question text still
+        match. Ids default to positional ``q1..qN``, so matching on id alone
+        would re-attach an old answer to a different question whenever the
+        workflow was edited or an upstream agent produced a different set —
+        the common case, not an exotic one. Every drop is logged, because a
+        silently unanswered question is asked again while a silently
+        *misattached* one never is.
 
         Args:
             prior: The node's previously stored output.
@@ -2748,20 +2809,43 @@ class WorkflowEngine:
         Returns:
             Restored answer records keyed by question id.
         """
-        known = {q.id for q in order}
+        current = {q.id: q.text for q in order}
         restored: dict[str, questions_mod.AnswerRecord] = {}
         for item in prior.get("items", []):
             if not isinstance(item, dict):
                 continue
             item_id = item.get("id")
-            if item_id not in known:
+            if item_id not in current:
+                logger.info(
+                    "Dropping restored answer %r: that question is no longer in the set.",
+                    item_id,
+                )
                 continue
+            if item.get("question") != current[item_id]:
+                logger.warning(
+                    "Dropping restored answer for %r: the question text changed since "
+                    "the checkpoint (was %r, now %r). It will be asked again.",
+                    item_id,
+                    item.get("question"),
+                    current[item_id],
+                )
+                continue
+            # Validate against the literal set: a hand-edited or partially
+            # written checkpoint must not smuggle an unknown source through to
+            # the dashboard, and `skipped` is derived from it.
+            source = item.get("source")
+            if source not in _ANSWER_SOURCES:
+                logger.warning(
+                    "Restored answer %r has unknown source %r; treating it as skipped.",
+                    item_id,
+                    source,
+                )
+                source = "skipped"
             restored[item_id] = questions_mod.AnswerRecord(
                 id=item_id,
                 question=item.get("question", ""),
-                answer=item.get("answer"),
-                source=item.get("source", "skipped"),
-                skipped=bool(item.get("skipped", False)),
+                answer=None if source == "skipped" else item.get("answer"),
+                source=source,
             )
         return restored
 
@@ -2901,6 +2985,37 @@ class WorkflowEngine:
         winner = done.pop()
         return winner.result()
 
+    @staticmethod
+    def _coerce_additional_input(raw: Any, choice: GateChoice) -> dict[str, str]:
+        """Normalize a client's ``additional_input`` into a field mapping.
+
+        ``conductor gate respond --input`` sends a bare string, which used to
+        be dropped on the floor: for a ``human_gate`` that lost an occasional
+        ``prompt_for``, but for a ``questions`` node free text *is* the primary
+        answer, so the operator's typed answer vanished and the CLI still
+        printed success. A string is mapped onto the selected choice's declared
+        field instead. Values are stringified because the payload is untrusted:
+        a JSON number would otherwise reach ``.strip()`` and raise mid-node.
+
+        Args:
+            raw: The client-supplied value.
+            choice: The choice that was selected.
+
+        Returns:
+            A field-name to text mapping, empty when there is nothing to carry.
+        """
+        if isinstance(raw, dict):
+            return {str(k): str(v) for k, v in raw.items()}
+        if isinstance(raw, str) and raw and choice.prompt_for:
+            return {choice.prompt_for: raw}
+        if raw is not None and not isinstance(raw, (dict, str)):
+            logger.warning(
+                "Discarding additional_input of unsupported type %s for choice %r",
+                type(raw).__name__,
+                choice.value,
+            )
+        return {}
+
     async def _wait_for_web_gate(self, gate_prompt: GatePrompt) -> GateResponse:
         """Wait for a gate response from the web dashboard.
 
@@ -2930,9 +3045,9 @@ class WorkflowEngine:
         # Find matching choice
         for choice in gate_prompt.choices:
             if choice.value == selected_value:
-                additional_input = msg.get("additional_input", {})
-                if not isinstance(additional_input, dict):
-                    additional_input = {}
+                additional_input = self._coerce_additional_input(
+                    msg.get("additional_input"), choice
+                )
                 return GateResponse(
                     value=choice.value,
                     label=choice.label,

@@ -1076,6 +1076,23 @@ class ConsoleEventSubscriber:
             if breakdown := d.get("breakdown"):
                 verbose_log(f"    {breakdown}", style="dim")
 
+        elif t == "questions_answer_rejected":
+            # The terminal has no other signal here: the same prompt simply
+            # re-appears, so without this the user cannot tell a refusal from
+            # a glitch. The dashboard shows it via questions_reject_reason.
+            verbose_log(
+                f"  {d.get('reason', 'Answer rejected.')}",
+                style="yellow",
+            )
+
+        elif t == "questions_completed":
+            verbose_log(
+                f"  Questions {d.get('outcome', 'completed')}: "
+                f"{d.get('answered_count', 0)} answered, "
+                f"{d.get('skipped_count', 0)} skipped",
+                style="dim",
+            )
+
         elif t == "checkpoint_save_failed":
             n = d.get("consecutive_failures", 1)
             # Avoid spamming when every boundary fails (e.g. disk full): warn on

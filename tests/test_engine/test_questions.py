@@ -13,6 +13,7 @@ import pytest
 
 from conductor.config.schema import (
     AgentDef,
+    InputDef,
     OutputField,
     QuestionDef,
     RouteDef,
@@ -563,6 +564,8 @@ class TestQuestionsDurability:
                 "outcome": "in_progress",
             },
         )
+        # What resume() sets; an ordinary loop-back deliberately does not.
+        engine._resuming_questions = True
         resolve, seen = _scripted(
             [
                 GateResponse(value="__free_text__", label="w", additional_input={"answer": "B"}),
@@ -584,7 +587,11 @@ class TestQuestionsDurability:
 
     @pytest.mark.asyncio
     async def test_resume_drops_answers_to_removed_questions(self) -> None:
-        """Editing the workflow must not resurrect an orphaned answer."""
+        """Editing the workflow must not resurrect an orphaned answer.
+
+        The removed entry is marked skipped so it is observable: without the
+        filter it would inflate ``skipped_count``.
+        """
         agent = AgentDef(
             name="ask",
             type="questions",
@@ -599,13 +606,14 @@ class TestQuestionsDurability:
                     {
                         "id": "removed",
                         "question": "Gone?",
-                        "answer": "stale",
-                        "source": "free_text",
-                        "skipped": False,
+                        "answer": None,
+                        "source": "skipped",
+                        "skipped": True,
                     }
                 ]
             },
         )
+        engine._resuming_questions = True
         resolve, seen = _scripted(
             [
                 GateResponse(
@@ -618,8 +626,198 @@ class TestQuestionsDurability:
         with patch.object(WorkflowEngine, "_resolve_human_prompt", resolve):
             await engine.run({})
 
+        output = engine.context.agent_outputs["ask"]
         assert len(seen) == 2
-        assert engine.context.agent_outputs["ask"]["answers"] == {"kept": "fresh"}
+        assert output["answers"] == {"kept": "fresh"}
+        assert output["skipped_count"] == 0
+        assert [i["id"] for i in output["items"]] == ["kept"]
+
+    @pytest.mark.asyncio
+    async def test_resume_rejects_an_unknown_answer_source(self) -> None:
+        """A hand-edited checkpoint must not smuggle an unknown source through."""
+        agent = AgentDef(
+            name="ask",
+            type="questions",
+            questions=[QuestionDef(id="q", text="Q?"), QuestionDef(id="q2", text="Q2?")],
+            routes=[RouteDef(to="after")],
+        )
+        engine = _engine(_config(agent))
+        engine.context.store(
+            "ask",
+            {"items": [{"id": "q", "question": "Q?", "answer": "leaked", "source": "banana"}]},
+        )
+        engine._resuming_questions = True
+        resolve, _ = _scripted(
+            [
+                GateResponse(value="__skip__", label="skip"),
+                GateResponse(value="__finish__", label="finish"),
+            ]
+        )
+
+        with patch.object(WorkflowEngine, "_resolve_human_prompt", resolve):
+            await engine.run({})
+
+        output = engine.context.agent_outputs["ask"]
+        assert output["items"][0]["source"] == "skipped"
+        # The answer is dropped with the source, so it cannot appear in the
+        # transcript while being absent from `answers`.
+        assert output["items"][0]["answer"] is None
+        assert "leaked" not in output["transcript"]
+
+
+class TestQuestionsLoopBack:
+    """Re-entering the node must ask again, not replay the previous pass."""
+
+    @pytest.mark.asyncio
+    async def test_loop_back_asks_the_new_questions(self) -> None:
+        """Ids default to positional q1..qN, so a second pass over a different
+        question set would otherwise inherit the first pass's answers and
+        report answers the human never gave."""
+        agent = AgentDef(
+            name="ask",
+            type="questions",
+            source="architect.output.open_questions",
+            routes=[RouteDef(to="architect")],
+        )
+        config = WorkflowConfig(
+            workflow=WorkflowDef(name="q", entry_point="architect"),
+            agents=[
+                AgentDef(
+                    name="architect",
+                    model="gpt-4",
+                    prompt="ask",
+                    output={
+                        "open_questions": OutputField(type="array"),
+                        "round": OutputField(type="string"),
+                    },
+                    routes=[
+                        RouteDef(to="ask", when="{{ architect.output.round != '3' }}"),
+                        RouteDef(to="$end"),
+                    ],
+                ),
+                agent,
+            ],
+            output={"answers": "{{ ask.output.answers | tojson }}"},
+        )
+
+        rounds = iter([("1", ["First?"]), ("2", ["Totally different?"]), ("3", [])])
+
+        def _handler(a, _p, _c):
+            if a.name != "architect":
+                return {"received": "ok"}
+            round_id, questions = next(rounds)
+            return {"open_questions": questions, "round": round_id}
+
+        provider = CopilotProvider(mock_handler=_handler)
+        engine = WorkflowEngine(config, provider, skip_gates=False)
+        resolve, seen = _scripted(
+            [
+                GateResponse(value="__free_text__", label="w", additional_input={"answer": "A"}),
+                GateResponse(value="__finish__", label="finish"),
+                GateResponse(value="__free_text__", label="w", additional_input={"answer": "B"}),
+                GateResponse(value="__finish__", label="finish"),
+            ]
+        )
+
+        with patch.object(WorkflowEngine, "_resolve_human_prompt", resolve):
+            await engine.run({})
+
+        # The second pass must present its own question, not skip straight to
+        # a review pre-filled with the first pass's answer.
+        assert "Totally different?" in seen[2].prompt
+        assert engine.context.agent_outputs["ask"]["answers"] == {"q1": "B"}
+
+    @pytest.mark.asyncio
+    async def test_mid_node_progress_does_not_inflate_execution_history(self) -> None:
+        """Committing after every answer must not add N history entries.
+
+        ``context.store`` appends to execution_history and bumps
+        current_iteration, which downstream prompts, the interrupt panel, and
+        the dashboard's synthetic replay all read.
+        """
+        agent = AgentDef(
+            name="ask",
+            type="questions",
+            questions=[QuestionDef(text=f"Q{i}?") for i in range(4)],
+            allow_back=False,
+            routes=[RouteDef(to="after")],
+        )
+        engine = _engine(_config(agent))
+        resolve, _ = _scripted([GateResponse(value="__skip__", label="skip")] * 4)
+
+        with patch.object(WorkflowEngine, "_resolve_human_prompt", resolve):
+            await engine.run({})
+
+        assert engine.context.execution_history.count("ask") == 1
+
+
+class TestQuestionsSourceIsNotATemplate:
+    """Model-authored question text must not be treated as a template."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Should the template use {{ user.id }} or the numeric id?",
+            "Is the syntax {% if x %} supported?",
+            "Use { { partial or unbalanced {{ ?",
+        ],
+    )
+    async def test_jinja_in_a_model_authored_question_is_shown_verbatim(self, text: str) -> None:
+        """These are ordinary questions for a developer tool; rendering them
+        would abort the step just as the human was about to be asked."""
+        agent = AgentDef(
+            name="ask",
+            type="questions",
+            source="seed.output.open_questions",
+            allow_back=False,
+            routes=[RouteDef(to="after")],
+        )
+        config = _config(agent)
+        config.workflow.entry_point = "seed"
+        config.agents.insert(
+            0,
+            AgentDef(
+                name="seed",
+                model="gpt-4",
+                prompt="seed",
+                output={"open_questions": OutputField(type="array")},
+                routes=[RouteDef(to="ask")],
+            ),
+        )
+        provider = CopilotProvider(
+            mock_handler=lambda a, p, c: (
+                {"open_questions": [text]} if a.name == "seed" else {"received": "ok"}
+            )
+        )
+        engine = WorkflowEngine(config, provider, skip_gates=False)
+        resolve, seen = _scripted([GateResponse(value="__skip__", label="skip")])
+
+        with patch.object(WorkflowEngine, "_resolve_human_prompt", resolve):
+            await engine.run({})
+
+        assert len(seen) == 1
+        assert text in seen[0].prompt
+
+    @pytest.mark.asyncio
+    async def test_inline_question_text_is_still_rendered(self) -> None:
+        """Author-written questions keep full template support."""
+        agent = AgentDef(
+            name="ask",
+            type="questions",
+            questions=[QuestionDef(text="Ship {{ workflow.input.topic }}?")],
+            allow_back=False,
+            routes=[RouteDef(to="after")],
+        )
+        config = _config(agent)
+        config.workflow.input = {"topic": InputDef(type="string", required=True, description="t")}
+        engine = _engine(config)
+        resolve, seen = _scripted([GateResponse(value="__skip__", label="skip")])
+
+        with patch.object(WorkflowEngine, "_resolve_human_prompt", resolve):
+            await engine.run({"topic": "rate limiting"})
+
+        assert "Ship rate limiting?" in seen[0].prompt
 
 
 class TestQuestionsRoutingAndCost:
@@ -646,14 +844,48 @@ class TestQuestionsRoutingAndCost:
         assert engine.limits.get_agent_execution_count("ask") == 1
 
     @pytest.mark.asyncio
-    async def test_abort_routes_to_abort_route(self) -> None:
-        """Aborting leaves via the declared route, not the normal one."""
+    async def test_abort_routes_to_the_declared_route(self) -> None:
+        """Aborting leaves via abort_route, not the normal route.
+
+        Uses a distinct third agent: pointing abort_route at ``$end`` would
+        match the fallback and prove nothing.
+        """
         agent = AgentDef(
             name="ask",
             type="questions",
             questions=[QuestionDef(text="Why?")],
             allow_abort=True,
-            abort_route="$end",
+            abort_route="rescue",
+            routes=[RouteDef(to="after")],
+        )
+        config = _config(agent)
+        config.agents.append(
+            AgentDef(
+                name="rescue",
+                model="gpt-4",
+                prompt="rescue",
+                output={"received": OutputField(type="string")},
+                routes=[RouteDef(to="$end")],
+            )
+        )
+        engine = _engine(config)
+        resolve, _ = _scripted([GateResponse(value="__abort__", label="abort")])
+
+        with patch.object(WorkflowEngine, "_resolve_human_prompt", resolve):
+            await engine.run({})
+
+        assert engine.context.agent_outputs["ask"]["outcome"] == "aborted"
+        assert "rescue" in engine.context.agent_outputs
+        assert "after" not in engine.context.agent_outputs
+
+    @pytest.mark.asyncio
+    async def test_abort_without_a_route_ends_the_workflow(self) -> None:
+        """`allow_abort` with no abort_route falls back to $end."""
+        agent = AgentDef(
+            name="ask",
+            type="questions",
+            questions=[QuestionDef(text="Why?")],
+            allow_abort=True,
             routes=[RouteDef(to="after")],
         )
         engine = _engine(_config(agent))
@@ -662,8 +894,6 @@ class TestQuestionsRoutingAndCost:
         with patch.object(WorkflowEngine, "_resolve_human_prompt", resolve):
             result = await engine.run({})
 
-        assert engine.context.agent_outputs["ask"]["outcome"] == "aborted"
-        # ``after`` never ran, so the normal route was not taken.
         assert "after" not in engine.context.agent_outputs
         assert result["outcome"] == "aborted"
 
