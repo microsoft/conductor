@@ -353,6 +353,7 @@ def _finalize_background_launch(
     web_port: int,
     pid_workflow_ref: Path,
     stderr_log: Path,
+    run_id: str = "",
 ) -> None:
     """Wait for the dashboard to come up and write the PID file.
 
@@ -369,6 +370,10 @@ def _finalize_background_launch(
             inside it for ``conductor stop`` to display.
         stderr_log: Path to the file capturing the child's stderr. Included
             in failure messages so users know where to look.
+        run_id: The run id propagated to the child via ``CONDUCTOR_RUN_ID``.
+            Recorded in the PID file so ``conductor stop`` can confirm that
+            the dashboard answering on ``web_port`` really is this run before
+            escalating to a forceful kill (issue #344).
 
     Raises:
         RuntimeError: If the child died early, the dashboard didn't start
@@ -391,7 +396,7 @@ def _finalize_background_launch(
     from conductor.cli.pid import write_pid_file
 
     try:
-        write_pid_file(proc.pid, web_port, pid_workflow_ref)
+        write_pid_file(proc.pid, web_port, pid_workflow_ref, run_id=run_id)
     except Exception as exc:
         _terminate_child(proc)
         raise RuntimeError(
@@ -481,7 +486,7 @@ def _spawn_bg_child(
                 f"Failed to start background process: {exc}. See child stderr log: {stderr_path}"
             ) from exc
 
-        _finalize_background_launch(proc, web_port, pid_workflow_ref, stderr_path)
+        _finalize_background_launch(proc, web_port, pid_workflow_ref, stderr_path, run_id=run_id)
     finally:
         # The child has its own duplicated OS handles by now (or never got
         # them, if Popen raised) — either way the parent's Python file
