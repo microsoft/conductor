@@ -225,7 +225,11 @@ describe('gate prompt_id round-trip', () => {
 
   it('sends the token back with the response', () => {
     const sent: Record<string, unknown>[] = [];
-    useWorkflowStore.setState({ _wsSend: (msg: Record<string, unknown>) => sent.push(msg) });
+    useWorkflowStore.setState({
+      _wsSend: (msg: object) => {
+        sent.push(msg as Record<string, unknown>);
+      },
+    });
 
     useWorkflowStore.getState().sendGateResponse('ask', 'a', { answer: 'x' }, 'ask:run:3');
 
@@ -241,7 +245,11 @@ describe('gate prompt_id round-trip', () => {
 
   it('sends null when there is no token, so standalone gates still resolve', () => {
     const sent: Record<string, unknown>[] = [];
-    useWorkflowStore.setState({ _wsSend: (msg: Record<string, unknown>) => sent.push(msg) });
+    useWorkflowStore.setState({
+      _wsSend: (msg: object) => {
+        sent.push(msg as Record<string, unknown>);
+      },
+    });
 
     useWorkflowStore.getState().sendGateResponse('approval', 'approve');
 
