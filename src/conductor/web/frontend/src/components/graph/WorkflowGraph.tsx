@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef } from 'react';
 import {
   ReactFlow,
+  ReactFlowProvider,
   MiniMap,
   Controls,
   Background,
@@ -20,6 +21,7 @@ import { useViewedGraphData } from '@/hooks/use-viewed-context';
 import { useDeepLink } from '@/hooks/use-deep-link';
 import { buildGraphElements, collectExpandableContextKeys, type GraphNodeData, type GraphContextInput } from './graph-layout';
 import { nodeKey, parseNodeKey, isGroupExpansionKey, parseForEachSlotKey } from '@/lib/node-id';
+import { anchoredViewport, nextAnchorHint } from '@/lib/graph-anchor';
 import { AgentNode } from './AgentNode';
 import { ScriptNode } from './ScriptNode';
 import { SetNode } from './SetNode';
@@ -100,7 +102,24 @@ function resolveContextByPath(
   return ctx ?? null;
 }
 
+/**
+ * Workflow DAG view.
+ *
+ * Wrapped in its own `ReactFlowProvider` so the rebuild effect — which lives
+ * *outside* `<ReactFlow>` — can read and write the viewport (see
+ * {@link anchoredViewport}). Provider and `<ReactFlow>` mount together, so the
+ * hoisted store has the same lifetime as the component and the initial
+ * `fitView` still runs once per mount.
+ */
 export function WorkflowGraph() {
+  return (
+    <ReactFlowProvider>
+      <WorkflowGraphInner />
+    </ReactFlowProvider>
+  );
+}
+
+function WorkflowGraphInner() {
   const viewCtx = useViewedGraphData();
   const viewContextPath = useWorkflowStore((s) => s.viewContextPath);
   const selectNode = useWorkflowStore((s) => s.selectNode);
@@ -137,6 +156,19 @@ export function WorkflowGraph() {
   const [flowEdges, setFlowEdges, onEdgesChange] = useEdgesState<Edge>([]);
 
   const prevBuildKey = useRef<string>('');
+
+  const { getViewport, setViewport } = useReactFlow();
+  /** Wrapper element, measured to locate the pane center for anchor selection. */
+  const containerRef = useRef<HTMLDivElement>(null);
+  /** Node array from the previous rebuild — the "before" side of the anchor. */
+  const builtNodesRef = useRef<Node<GraphNodeData>[]>([]);
+  /** Container preferred as the anchor, and how long it has been held over. */
+  const anchorHintRef = useRef<{ hint: string | null; stickyRebuilds: number }>({
+    hint: null,
+    stickyRebuilds: 0,
+  });
+  const prevExpandedRef = useRef<Set<string>>(new Set());
+  const prevViewPathKeyRef = useRef<string | null>(null);
 
   const viewPathKey = JSON.stringify(viewContextPath);
 
@@ -176,6 +208,10 @@ export function WorkflowGraph() {
       // Clear stale graph elements when navigated to an empty context
       if (prevBuildKey.current !== structureKey) {
         prevBuildKey.current = structureKey;
+        builtNodesRef.current = [];
+        prevExpandedRef.current = new Set(expandedContexts);
+        prevViewPathKeyRef.current = viewPathKey;
+        anchorHintRef.current = { hint: null, stickyRebuilds: 0 };
         setFlowNodes([]);
         setFlowEdges([]);
       }
@@ -184,6 +220,21 @@ export function WorkflowGraph() {
 
     if (prevBuildKey.current === structureKey) return;
     prevBuildKey.current = structureKey;
+
+    // On a context switch `FitViewOnContextSwitch` owns the camera; anchoring
+    // would fight it, and the previous context's layout is not comparable.
+    const contextSwitched = prevViewPathKeyRef.current !== viewPathKey;
+    prevViewPathKeyRef.current = viewPathKey;
+
+    const prevExpanded = prevExpandedRef.current;
+    prevExpandedRef.current = new Set(expandedContexts);
+    anchorHintRef.current = nextAnchorHint({
+      previousKeys: prevExpanded,
+      currentKeys: expandedContexts,
+      currentHint: anchorHintRef.current.hint,
+      stickyRebuilds: anchorHintRef.current.stickyRebuilds,
+      contextSwitched,
+    });
 
     const base: GraphContextInput = {
       agents,
@@ -197,8 +248,26 @@ export function WorkflowGraph() {
       children: subworkflowContexts,
     };
     const { nodes, edges } = buildGraphElements(base, basePath, expandedContexts);
+    const prevNodes = builtNodesRef.current;
+    builtNodesRef.current = nodes;
     setFlowNodes(nodes);
     setFlowEdges(edges);
+
+    // `layoutTopLevel` normalizes each layout's bounding box to origin, so
+    // growing one container shifts every node. Pan by the same amount the
+    // anchor moved, and the graph appears to grow around a fixed point instead
+    // of sliding out from under the camera (issue #375).
+    if (contextSwitched || prevNodes.length === 0) return;
+    const rect = containerRef.current?.getBoundingClientRect();
+    const next = anchoredViewport({
+      prevNodes,
+      nextNodes: nodes,
+      anchorKeyHint: anchorHintRef.current.hint,
+      viewport: getViewport(),
+      paneSize: { width: rect?.width ?? 0, height: rect?.height ?? 0 },
+    });
+    // Instant, not animated: the point is that nothing appears to move.
+    if (next) setViewport(next);
   }, [
     structureKey,
     agents,
@@ -212,6 +281,9 @@ export function WorkflowGraph() {
     subworkflowContexts,
     basePath,
     expandedContexts,
+    viewPathKey,
+    getViewport,
+    setViewport,
     setFlowNodes,
     setFlowEdges,
   ]);
@@ -364,7 +436,7 @@ export function WorkflowGraph() {
   })();
 
   return (
-    <div className="w-full h-full relative">
+    <div ref={containerRef} className="w-full h-full relative">
       <EdgeMarkers />
       {/* Workflow status banners */}
       <WorkflowErrorBanner />
