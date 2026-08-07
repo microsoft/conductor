@@ -298,39 +298,6 @@ class TestHumanGateHandlerInteractive:
             assert "Generated content here" in rendered_prompt.markup
 
 
-class TestHumanGateHandlerAutoSelect:
-    """Tests for the _auto_select method."""
-
-    def test_auto_select_returns_gate_result(
-        self,
-        mock_console: MagicMock,
-        sample_options: list[GateOption],
-    ) -> None:
-        """Test that _auto_select returns a proper GateResult."""
-        handler = HumanGateHandler(console=mock_console, skip_gates=True)
-
-        result = handler._auto_select(sample_options[0])
-
-        assert isinstance(result, GateResult)
-        assert result.selected_option == sample_options[0]
-        assert result.route == "next_agent"
-        assert result.additional_input == {}
-
-    def test_auto_select_prints_message(
-        self,
-        mock_console: MagicMock,
-        sample_options: list[GateOption],
-    ) -> None:
-        """Test that _auto_select prints an informative message."""
-        handler = HumanGateHandler(console=mock_console, skip_gates=True)
-
-        handler._auto_select(sample_options[0])
-
-        mock_console.print.assert_called()
-        call_args = str(mock_console.print.call_args)
-        assert "--skip-gates" in call_args or "Auto-selecting" in call_args
-
-
 class TestMaxIterationsPromptResult:
     """Tests for MaxIterationsPromptResult dataclass."""
 

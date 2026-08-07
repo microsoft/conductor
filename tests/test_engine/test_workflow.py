@@ -1538,7 +1538,7 @@ class TestWorkflowEngineHumanGates:
 
         from unittest.mock import patch
 
-        with patch.object(engine.gate_handler, "handle_gate", side_effect=_never_returns):
+        with patch.object(engine.gate_handler, "prompt", side_effect=_never_returns):
             await engine.run({})
 
         gate_output = captured_context.get("approval_gate", {})  # type: ignore[assignment]
@@ -1658,7 +1658,7 @@ class TestWorkflowEngineHumanGates:
             run_context=RunContext(bg_mode=True),
         )
 
-        with patch.object(engine.gate_handler, "handle_gate") as mock_cli_handle:
+        with patch.object(engine.gate_handler, "prompt") as mock_cli_handle:
             result = await engine.run({})
 
         assert result["received"] == "ok"
@@ -1727,7 +1727,7 @@ class TestWorkflowEngineHumanGates:
         with (
             patch("sys.stdin.isatty", return_value=True),
             patch.object(
-                engine.gate_handler, "handle_gate", side_effect=_never_returns
+                engine.gate_handler, "prompt", side_effect=_never_returns
             ) as mock_cli_handle,
         ):
             result = await engine.run({})
@@ -1784,7 +1784,7 @@ class TestWorkflowEngineHumanGates:
         )
 
         with (
-            patch.object(engine.gate_handler, "handle_gate") as mock_cli_handle,
+            patch.object(engine.gate_handler, "prompt") as mock_cli_handle,
             pytest.raises(HumanGateError, match="approval_gate"),
         ):
             await engine.run({})

@@ -35,6 +35,112 @@ def _eof_key_hint() -> str:
     return "Ctrl-Z then Enter" if sys.platform == "win32" else "Ctrl-D"
 
 
+def option_for_value(agent: AgentDef, value: str) -> GateOption:
+    """Map a response value back to a gate agent's declared option.
+
+    Lives at module level because routing belongs to whoever owns the
+    workflow graph — both the handler and the engine need this mapping, and
+    neither should reach into the other for it.
+
+    Args:
+        agent: The human_gate agent definition.
+        value: The selected choice value.
+
+    Returns:
+        The matching GateOption.
+
+    Raises:
+        HumanGateError: If no option carries that value.
+    """
+    for option in agent.options or []:
+        if option.value == value:
+            return option
+    raise HumanGateError(
+        f"Gate response value '{value}' does not match any option for gate '{agent.name}'",
+        suggestion="Check the option values in the workflow YAML",
+    )
+
+
+@dataclass(frozen=True)
+class GateChoice:
+    """One selectable choice in a human prompt.
+
+    Deliberately has no ``route`` — routing is a workflow-graph concern, not
+    an interaction concern. Callers that route (``human_gate``) keep their own
+    ``value -> route`` map; callers that merely record an answer
+    (``questions``) would otherwise be forced to invent a meaningless
+    sentinel route for every synthesized choice.
+    """
+
+    label: str
+    """Display text for the choice."""
+
+    value: str
+    """Value reported back when this choice is selected."""
+
+    prompt_for: str | None = None
+    """Optional field name to collect free text for after selection."""
+
+    multiline: bool = False
+    """Whether that free-text collection accepts multi-line input."""
+
+
+@dataclass(frozen=True)
+class GatePrompt:
+    """A single human prompt, independent of any workflow graph.
+
+    This is the unit both ``human_gate`` and ``questions`` present. It carries
+    only what an interaction needs: who is asking, the rendered text, the
+    choices, and the two policy knobs that differ between callers.
+    """
+
+    name: str
+    """Agent name this prompt is attributed to.
+
+    Used as the target for ``_gate_waiting_agent`` and ``conductor gate
+    respond``. A ``questions`` node reuses its node name for every question,
+    which is why ``prompt_id`` exists.
+    """
+
+    prompt: str
+    """Prompt text, already rendered and linkified by the caller."""
+
+    choices: list[GateChoice]
+    """Choices to present, in display order."""
+
+    prompt_id: str | None = None
+    """Staleness token distinguishing successive prompts under one name.
+
+    ``None`` for a standalone gate, which is never presented back-to-back
+    under the same name.
+    """
+
+    auto_select: str | None = None
+    """Choice value to select under ``--skip-gates``.
+
+    Callers for which auto-selecting would fabricate a human answer (rather
+    than take a declared default path) must not reach the prompt at all under
+    ``--skip-gates``; they short-circuit instead of setting this.
+    """
+
+
+@dataclass(frozen=True)
+class GateResponse:
+    """A human's answer to a single :class:`GatePrompt`."""
+
+    value: str
+    """The selected choice's value."""
+
+    label: str
+    """The selected choice's label."""
+
+    additional_input: dict[str, str] = field(default_factory=dict)
+    """Free text collected via the choice's ``prompt_for``, if any."""
+
+    prompt_id: str | None = None
+    """Echo of the prompt's staleness token."""
+
+
 @dataclass
 class GateResult:
     """Result of a human gate interaction.
@@ -111,45 +217,136 @@ class HumanGateHandler:
                 suggestion="Add 'options' list to the human_gate agent",
             )
 
-        # Render the prompt with context and auto-linkify paths/URLs
+        gate_prompt = self.build_gate_prompt(agent, context, base_dir=base_dir)
+        response = await self.prompt(gate_prompt)
+
+        selected = option_for_value(agent, response.value)
+        return GateResult(
+            selected_option=selected,
+            route=selected.route,
+            additional_input=response.additional_input,
+        )
+
+    def build_gate_prompt(
+        self,
+        agent: AgentDef,
+        context: dict[str, Any],
+        base_dir: Path | None = None,
+    ) -> GatePrompt:
+        """Render a ``human_gate`` agent into a graph-agnostic prompt.
+
+        Args:
+            agent: The human_gate agent definition.
+            context: Current workflow context for template rendering.
+            base_dir: Optional directory for resolving relative file paths
+                in the rendered prompt into clickable markdown links.
+
+        Returns:
+            A GatePrompt whose ``auto_select`` is the first option, matching
+            the long-standing ``--skip-gates`` behavior for gates. That is a
+            declared route on a real gate, not an invented human answer.
+        """
         prompt_text = self.renderer.render(agent.prompt, context)
         prompt_text = linkify_markdown(prompt_text, base_dir=base_dir)
+        options = agent.options or []
+        return GatePrompt(
+            name=agent.name,
+            prompt=prompt_text,
+            choices=[
+                GateChoice(
+                    label=o.label,
+                    value=o.value,
+                    prompt_for=o.prompt_for,
+                    multiline=o.multiline,
+                )
+                for o in options
+            ],
+            auto_select=options[0].value if options else None,
+        )
 
-        # If skip_gates is enabled, auto-select first option
-        if self.skip_gates:
-            return self._auto_select(agent.options[0])
+    async def prompt(self, gate_prompt: GatePrompt) -> GateResponse:
+        """Present one prompt to the user and collect their answer.
 
-        # Display prompt and options, get user selection
-        selected = await self._display_and_select(prompt_text, agent.options)
+        Knows nothing about the workflow graph — no routes, no agent
+        definitions. Both ``human_gate`` and ``questions`` funnel through
+        here so terminal behavior stays identical between them.
 
-        # Handle prompt_for if specified
+        Args:
+            gate_prompt: The prompt to present.
+
+        Returns:
+            GateResponse with the selected value, label, and any free text.
+
+        Raises:
+            HumanGateError: If the prompt has no choices.
+        """
+        if not gate_prompt.choices:
+            raise HumanGateError(
+                f"Human prompt '{gate_prompt.name}' has no choices to present",
+                suggestion="Provide at least one selectable choice",
+            )
+
+        if self.skip_gates and gate_prompt.auto_select is not None:
+            return self._auto_select_choice(gate_prompt)
+
+        selected = await self._display_and_select(gate_prompt.prompt, gate_prompt.choices)
+
         additional_input: dict[str, str] = {}
         if selected.prompt_for:
             additional_input = await self._collect_additional_input(
                 selected.prompt_for, multiline=selected.multiline
             )
 
-        return GateResult(
-            selected_option=selected,
-            route=selected.route,
+        return GateResponse(
+            value=selected.value,
+            label=selected.label,
             additional_input=additional_input,
+            prompt_id=gate_prompt.prompt_id,
+        )
+
+    def _auto_select_choice(self, gate_prompt: GatePrompt) -> GateResponse:
+        """Resolve a prompt without user interaction (``--skip-gates``).
+
+        Args:
+            gate_prompt: The prompt being auto-resolved. Its ``auto_select``
+                must be set.
+
+        Returns:
+            GateResponse for the auto-selected choice.
+
+        Raises:
+            HumanGateError: If ``auto_select`` names no known choice.
+        """
+        for choice in gate_prompt.choices:
+            if choice.value == gate_prompt.auto_select:
+                self.console.print(f"\n[dim]Auto-selecting: {choice.label} (--skip-gates)[/dim]")
+                return GateResponse(
+                    value=choice.value,
+                    label=choice.label,
+                    additional_input={},  # No input collection in skip mode
+                    prompt_id=gate_prompt.prompt_id,
+                )
+        raise HumanGateError(
+            f"auto_select value '{gate_prompt.auto_select}' does not match any "
+            f"choice for prompt '{gate_prompt.name}'",
+            suggestion="This is an internal error; please report it",
         )
 
     async def _display_and_select(
         self,
         prompt_text: str,
-        options: list[GateOption],
-    ) -> GateOption:
+        choices: list[GateChoice],
+    ) -> GateChoice:
         """Display prompt and get user selection.
 
         Uses Rich for beautiful terminal UI with numbered options.
 
         Args:
             prompt_text: The rendered prompt to display.
-            options: List of options to choose from.
+            choices: List of choices to select from.
 
         Returns:
-            The selected GateOption.
+            The selected GateChoice.
         """
         # Display the prompt in a styled panel (render as Markdown for rich formatting)
         self.console.print()
@@ -164,12 +361,12 @@ class HumanGateHandler:
         # Display options as numbered list
         self.console.print()
         self.console.print("[bold]Options:[/bold]")
-        for i, option in enumerate(options, 1):
-            self.console.print(f"  [cyan][{i}][/cyan] {option.label}")
+        for i, choice in enumerate(choices, 1):
+            self.console.print(f"  [cyan][{i}][/cyan] {choice.label}")
 
         # Get user selection — run in thread to avoid blocking the event loop
         # (blocking here prevents the web dashboard from updating)
-        valid_choices = [str(i) for i in range(1, len(options) + 1)]
+        valid_choices = [str(i) for i in range(1, len(choices) + 1)]
         while True:
 
             def _ask_choice() -> str:
@@ -179,11 +376,11 @@ class HumanGateHandler:
                     show_choices=True,
                 )
 
-            choice = await asyncio.to_thread(_ask_choice)
+            choice_input = await asyncio.to_thread(_ask_choice)
             try:
-                index = int(choice) - 1
-                if 0 <= index < len(options):
-                    selected = options[index]
+                index = int(choice_input) - 1
+                if 0 <= index < len(choices):
+                    selected = choices[index]
                     self.console.print(f"\n[green]Selected:[/green] {selected.label}")
                     return selected
             except ValueError:
@@ -246,25 +443,6 @@ class HumanGateHandler:
                 break
             lines.append(line)
         return "\n".join(lines).rstrip("\n")
-
-    def _auto_select(self, option: GateOption) -> GateResult:
-        """Auto-select an option (for --skip-gates mode).
-
-        In automation mode, this method selects the first option without
-        user interaction. Useful for CI/CD pipelines and testing.
-
-        Args:
-            option: The option to auto-select (usually the first one).
-
-        Returns:
-            GateResult with the auto-selected option.
-        """
-        self.console.print(f"\n[dim]Auto-selecting: {option.label} (--skip-gates)[/dim]")
-        return GateResult(
-            selected_option=option,
-            route=option.route,
-            additional_input={},  # No input collection in skip mode
-        )
 
 
 @dataclass

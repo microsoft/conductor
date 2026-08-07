@@ -53,10 +53,13 @@ from conductor.executor.set_step import (
 from conductor.executor.template import TemplateRenderer
 from conductor.executor.wait import WaitExecutor, WaitOutput
 from conductor.gates.human import (
+    GatePrompt,
+    GateResponse,
     GateResult,
     HumanGateHandler,
     MaxIterationsHandler,
     MaxIterationsPromptResult,
+    option_for_value,
 )
 from conductor.gates.interrupt import InterruptAction, InterruptHandler, InterruptResult
 from conductor.providers.base import AgentOutput, EventCallback
@@ -2424,7 +2427,48 @@ class WorkflowEngine:
         agent: AgentDef,
         agent_context: dict[str, Any],
     ) -> GateResult:
-        """Handle a human gate, choosing CLI / web / race per environment.
+        """Handle a ``human_gate``, mapping the shared prompt back onto routes.
+
+        Thin adapter over :meth:`_resolve_human_prompt`, which owns the
+        environment policy. Routing stays here because it is a workflow-graph
+        concern that the shared interaction layer deliberately knows nothing
+        about.
+
+        Args:
+            agent: The human_gate agent definition.
+            agent_context: Current workflow context for template rendering.
+
+        Returns:
+            GateResult with the selected option, route, and any additional
+            input.
+
+        Raises:
+            HumanGateError: If the gate has no options, if bg mode is active
+                with no web dashboard attached, or if the response value
+                matches no declared option.
+        """
+        from conductor.exceptions import HumanGateError
+
+        if not agent.options:
+            raise HumanGateError(
+                f"Human gate '{agent.name}' has no options defined",
+                suggestion="Add 'options' list to the human_gate agent",
+            )
+
+        gate_prompt = self.gate_handler.build_gate_prompt(
+            agent, agent_context, base_dir=self._workflow_dir
+        )
+        response = await self._resolve_human_prompt(gate_prompt)
+
+        selected = option_for_value(agent, response.value)
+        return GateResult(
+            selected_option=selected,
+            route=selected.route,
+            additional_input=response.additional_input,
+        )
+
+    async def _resolve_human_prompt(self, gate_prompt: GatePrompt) -> GateResponse:
+        """Resolve one human prompt, choosing CLI / web / race per environment.
 
         Resolution policy (issue #286, extending the #198/#202 max-iterations
         gate fix in ``_resolve_max_iterations_gate``):
@@ -2451,11 +2495,10 @@ class WorkflowEngine:
           ``wait_for_stop()`` race is needed here.
 
         Args:
-            agent: The human_gate agent definition.
-            agent_context: Current workflow context for template rendering.
+            gate_prompt: The prompt to resolve.
 
         Returns:
-            GateResult from whichever input source responded first.
+            GateResponse from whichever input source responded first.
 
         Raises:
             HumanGateError: If bg mode is active and no web dashboard is
@@ -2466,26 +2509,24 @@ class WorkflowEngine:
                 from conductor.exceptions import HumanGateError
 
                 raise HumanGateError(
-                    f"Cannot resolve human_gate '{agent.name}': no web dashboard is "
+                    f"Cannot resolve human_gate '{gate_prompt.name}': no web dashboard is "
                     "available and stdin cannot be prompted in background mode.",
                     suggestion=(
                         "Restart with --web in the foreground, or resolve the gate "
                         "with `conductor gate respond` once the dashboard is reachable."
                     ),
-                    gate_name=agent.name,
+                    gate_name=gate_prompt.name,
                 )
             # Not bg mode: use CLI only (foreground, or non-TTY without a
             # dashboard — e.g. piped stdin, tests).
-            return await self.gate_handler.handle_gate(
-                agent, agent_context, base_dir=self._workflow_dir
-            )
+            return await self.gate_handler.prompt(gate_prompt)
 
         # Web dashboard + bg or non-TTY → web-only wait (skip the CLI arm; it
         # would EOFError-and-crash on a DEVNULL stdin, cancelling the web arm
         # before a dashboard user could respond).
         cli_usable = not self._bg_mode and sys.stdin.isatty()
         if not cli_usable:
-            return await self._wait_for_web_gate(agent)
+            return await self._wait_for_web_gate(gate_prompt)
 
         # Race CLI vs web input. We start the web task unconditionally (not only
         # when a client is currently connected), because the human often opens
@@ -2494,11 +2535,11 @@ class WorkflowEngine:
         # in the dashboard pushes a message to ``_gate_response_queue`` that
         # nobody is awaiting, and the workflow hangs forever.
         cli_task = asyncio.create_task(
-            self.gate_handler.handle_gate(agent, agent_context, base_dir=self._workflow_dir),
+            self.gate_handler.prompt(gate_prompt),
             name="gate_cli",
         )
         web_task = asyncio.create_task(
-            self._wait_for_web_gate(agent),
+            self._wait_for_web_gate(gate_prompt),
             name="gate_web",
         )
 
@@ -2517,45 +2558,46 @@ class WorkflowEngine:
         winner = done.pop()
         return winner.result()
 
-    async def _wait_for_web_gate(self, agent: AgentDef) -> GateResult:
+    async def _wait_for_web_gate(self, gate_prompt: GatePrompt) -> GateResponse:
         """Wait for a gate response from the web dashboard.
 
         Translates the raw JSON message from the web client into a
-        ``GateResult`` by matching ``selected_value`` against the
-        agent's options.
+        ``GateResponse`` by matching ``selected_value`` against the
+        prompt's choices.
 
         Args:
-            agent: The human_gate agent definition with options.
+            gate_prompt: The prompt awaiting a response.
 
         Returns:
-            GateResult with the selected option, route, and any
-            additional input from the web client.
+            GateResponse with the selected choice and any additional input
+            from the web client.
 
         Raises:
-            HumanGateError: If the selected value doesn't match any option.
+            HumanGateError: If the selected value doesn't match any choice.
         """
         from conductor.exceptions import HumanGateError
 
         assert self._web_dashboard is not None  # noqa: S101
 
-        msg = await self._web_dashboard.wait_for_gate_response(agent.name)
+        msg = await self._web_dashboard.wait_for_gate_response(gate_prompt.name)
         selected_value = msg.get("selected_value", "")
 
-        # Find matching option
-        for option in agent.options or []:
-            if option.value == selected_value:
+        # Find matching choice
+        for choice in gate_prompt.choices:
+            if choice.value == selected_value:
                 additional_input = msg.get("additional_input", {})
                 if not isinstance(additional_input, dict):
                     additional_input = {}
-                return GateResult(
-                    selected_option=option,
-                    route=option.route,
+                return GateResponse(
+                    value=choice.value,
+                    label=choice.label,
                     additional_input=additional_input,
+                    prompt_id=gate_prompt.prompt_id,
                 )
 
         raise HumanGateError(
             f"Web gate response value '{selected_value}' does not match any option "
-            f"for gate '{agent.name}'",
+            f"for gate '{gate_prompt.name}'",
             suggestion="Check the option values in the workflow YAML",
         )
 
