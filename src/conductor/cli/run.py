@@ -2065,6 +2065,8 @@ def build_dry_run_plan(workflow_path: Path) -> ExecutionPlan:
             interrupt_signal: asyncio.Event | None = None,
             event_callback: Any = None,
             skill_directories: list[str] | None = None,
+            custom_agents: list[dict[str, Any]] | None = None,
+            extra_mcp_servers: dict[str, Any] | None = None,
         ) -> AgentOutput:
             return AgentOutput(content={}, raw_response="")
 

@@ -9,6 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Plugins as the unit of opt-in** (#378). Conductor loaded a plugin's
+  `skills/` and dropped everything else it shipped. That is a problem because
+  a plugin's parts are written to work together: its `SKILL.md` routinely
+  tells the agent to hand work to `prs:code-reviewer`, or to call an `ado` MCP
+  tool. The skill loaded, the agent read those instructions, reached for a
+  subagent that was never registered — and said nothing. `runtime.plugins`
+  (and per-agent `plugins:`) now opts into the whole unit: skills,
+  `agents/*.agent.md` subagents, and declared MCP servers. Entries take a
+  string shorthand or an object with per-component switches (`skills`,
+  `agents`, `mcp`), all defaulting on, because defaulting one off would
+  recreate the partial load the feature exists to fix. An entry is an
+  installed plugin name or a path, classified by the same syntactic rule
+  `skills:` uses; an uninstalled name errors naming where it looked, and an
+  ambiguous one errors rather than picking a winner. Conductor
+  **deconstructs** a plugin rather than handing its root to the SDK: both
+  SDKs' whole-plugin surfaces are all-or-nothing, and on Copilot hiding an
+  MCP tool from the model does **not** stop its server subprocess launching
+  with the user's credentials — so `mcp: false` built that way would be a
+  guarantee that isn't one. Deconstructed, a plugin's MCP servers also pick
+  up the same `tools:` filters, `runtime.tool_output` limits, and dashboard
+  tool events as a workflow-declared server. Supported on `copilot` and
+  `claude-agent-sdk`; `claude`, `hermes` and `aca` reject `plugins:` at
+  validation time, since injecting text into a prompt cannot produce a
+  subagent or an MCP server. `conductor validate` prints what each plugin
+  contributes, including every subagent by name, so a change in what a plugin
+  ships is visible before the run rather than during it. See
+  `examples/plugins.yaml` and the Plugins section of `docs/workflow-syntax.md`.
+
+- **Copilot-convention plugin manifests are recognised** (#378).
+  `.github/plugin/plugin.json` now resolves alongside
+  `.claude-plugin/plugin.json`. Both have always worked at runtime, so
+  recognising only the latter was Conductor's own gap — on an ordinary
+  machine it stranded 12 of 13 installed plugins, which on
+  `claude-agent-sdk` meant a packaged skill was rejected outright and on
+  `copilot` meant it was silently demoted to a bare directory.
+
 - **`type: questions` — ask a human a set of questions in one step** (#376).
   `human_gate` handles a single decision; asking N questions previously meant
   hand-rolling a gate that loops back through a `set` step accumulating a
@@ -32,6 +68,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `.` or EOF; the dashboard renders a textarea where Enter inserts a newline
   and Ctrl/Cmd+Enter submits. Previously a multi-paragraph answer to a
   `prompt_for` input was silently truncated at the first newline.
+
+### Removed
+
+- **`skill_discovery.sources: [plugins]`** (#378). The source scanned every
+  installed plugin's `skills/` directory — reaching into a plugin and taking
+  exactly one of the three things it ships, which is the bug `runtime.plugins`
+  fixes rather than a feature with a gap. It was also wrong more often than it
+  looked: of 13 plugins on an ordinary machine, 3 loaded their instructions
+  without the subagents those instructions dispatch to, and the 3 most
+  plugin-like — MCP and subagent toolkits with no `skills/` at all — were never
+  discovered by it. Nothing distinguished the working set from the broken set
+  at authoring time, on a machine the workflow author may not even be using.
+  `personal` and `project` are unchanged. Replace `sources: [plugins]` with
+  `runtime.plugins`, which brings the whole plugin and, unlike a scan,
+  reproduces on another machine.
 
 ### Fixed
 

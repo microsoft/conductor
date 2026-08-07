@@ -23,35 +23,25 @@ Conductor parses the block itself so the failure surfaces at
 ``conductor validate`` time with the fix spelled out, instead of as an
 agent that quietly never received its skill.
 
-Parsing uses ``ruamel.yaml`` — the project's YAML library. PyYAML is
-not a dependency.
+The ``---`` block itself is split by :mod:`conductor.frontmatter`, which
+a plugin's ``agents/<name>.agent.md`` shares — same format, same silent
+downstream skip, so one parser rather than two.
 """
 
 from __future__ import annotations
 
-import io
-import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from ruamel.yaml import YAML
-from ruamel.yaml.error import YAMLError
-
-from conductor.skills.errors import SkillError
-
-# The leading ``---`` fenced block. Anchored at the start of the file:
-# a ``---`` further down is a thematic break in the body, not metadata.
-_FRONTMATTER = re.compile(r"\A---[ \t]*\r?\n(.*?)\r?\n---[ \t]*(?:\r?\n|\Z)", re.DOTALL)
-
-# Appended to every parse failure: the block-scalar form sidesteps the
-# colon-in-a-plain-scalar trap entirely.
-_BLOCK_SCALAR_HINT = (
-    "A ':' followed by a space inside an unquoted value (e.g. "
-    "'description: Does things. Triggers: a, b') is invalid YAML. Use a "
-    "block scalar instead:\n"
-    "    description: |\n"
-    "      Does things. Triggers: a, b"
+from conductor.frontmatter import (
+    BLOCK_SCALAR_HINT as _BLOCK_SCALAR_HINT,
 )
+from conductor.frontmatter import (
+    FrontmatterShapeError,
+    FrontmatterSyntaxError,
+    split_frontmatter,
+)
+from conductor.skills.errors import SkillError
 
 
 class SkillManifestError(SkillError):
@@ -104,27 +94,23 @@ def read_skill_frontmatter(skill_dir: Path) -> SkillFrontmatter:
     except (OSError, UnicodeDecodeError) as exc:
         raise SkillManifestError(f"Skill manifest at {skill_md} could not be read: {exc}") from exc
 
-    match = _FRONTMATTER.match(text)
-    if match is None:
+    try:
+        parsed, _body = split_frontmatter(text)
+    except FrontmatterSyntaxError as exc:
+        raise SkillManifestError(
+            f"Skill manifest at {skill_md} has {exc}\n\n{_BLOCK_SCALAR_HINT}"
+        ) from exc
+    except FrontmatterShapeError as exc:
+        raise SkillManifestError(
+            f"Skill manifest at {skill_md} has {exc}. It must declare 'name' "
+            "and 'description' as keys."
+        ) from exc
+
+    if parsed is None:
         raise SkillManifestError(
             f"Skill manifest at {skill_md} has no YAML frontmatter. It must begin "
             "with a '---' line, followed by 'name' and 'description', followed by "
             "a closing '---' line."
-        )
-
-    try:
-        parsed = YAML(typ="safe").load(io.StringIO(match.group(1)))
-    except YAMLError as exc:
-        raise SkillManifestError(
-            f"Skill manifest at {skill_md} has invalid YAML frontmatter: {exc}\n\n"
-            f"{_BLOCK_SCALAR_HINT}"
-        ) from exc
-
-    if not isinstance(parsed, dict):
-        raise SkillManifestError(
-            f"Skill manifest at {skill_md} has frontmatter that is not a YAML "
-            f"mapping (parsed as {type(parsed).__name__}). It must declare 'name' "
-            "and 'description' as keys."
         )
 
     values: dict[str, str] = {}

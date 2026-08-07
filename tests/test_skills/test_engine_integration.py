@@ -56,6 +56,8 @@ class _CapturingProvider(AgentProvider, abstract=True):
         interrupt_signal: asyncio.Event | None = None,
         event_callback: EventCallback | None = None,
         skill_directories: list[str] | None = None,
+        custom_agents: list[dict[str, Any]] | None = None,
+        extra_mcp_servers: dict[str, Any] | None = None,
     ) -> AgentOutput:
         self.skill_directories = skill_directories
         self.rendered_prompt = rendered_prompt

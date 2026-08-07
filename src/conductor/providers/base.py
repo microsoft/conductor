@@ -240,6 +240,43 @@ class AgentProvider(ABC):
         """
         return False
 
+    @property
+    def supports_native_plugins(self) -> bool:
+        """Whether the provider can register a plugin's subagents.
+
+        Plugins are **deconstructed** rather than handed to the SDK
+        whole: skills reach the provider through ``skill_directories``
+        (which :attr:`supports_native_skills` already governs), MCP
+        servers through ``extra_mcp_servers``, and subagents through
+        ``custom_agents``. This property covers the last of those,
+        because it is the one surface with no fallback — a subagent
+        cannot be approximated by injecting text into a prompt.
+
+        Providers MUST also declare ``plugins=True`` on their
+        :class:`ProviderCapabilities` descriptor. As with skills, the
+        capability flag asserts the user-facing contract and this
+        property selects the mechanism.
+        """
+        return False
+
+    @property
+    def skills_require_plugin_root(self) -> bool:
+        """Whether reaching a skill means registering its whole plugin root.
+
+        ``True`` on providers whose SDK has no bare skill-directory
+        surface (``claude-agent-sdk``), where a skill is enabled by
+        registering the plugin that owns it. That registration is not
+        filterable — the SDK documents it as also providing the plugin's
+        commands, agents, and hooks — so on such a provider a plugin's
+        subagents cannot be declined while its skills are enabled, and
+        its hooks are exposed rather than dropped.
+
+        Both :mod:`conductor.config.validator` and
+        :class:`~conductor.executor.agent.AgentExecutor` branch on this
+        so the two agree about what a plugin actually delivers.
+        """
+        return False
+
     def __init_subclass__(cls, *, abstract: bool = False, **kwargs: Any) -> None:
         """Enforce that every production subclass declares ``CAPABILITIES``.
 
@@ -274,6 +311,8 @@ class AgentProvider(ABC):
         interrupt_signal: asyncio.Event | None = None,
         event_callback: EventCallback | None = None,
         skill_directories: list[str] | None = None,
+        custom_agents: list[dict[str, Any]] | None = None,
+        extra_mcp_servers: dict[str, Any] | None = None,
     ) -> AgentOutput:
         """Execute an agent and return normalized output.
 
@@ -299,6 +338,18 @@ class AgentProvider(ABC):
                 may ignore this parameter (the executor will have
                 eager-injected the skill content into
                 ``rendered_prompt`` instead).
+            custom_agents: Optional subagent definitions resolved from
+                the agent's effective ``plugins`` list, each shaped like
+                the Copilot SDK's ``CustomAgentConfig`` and named
+                ``<plugin>:<agent>``. Providers that set
+                :attr:`supports_native_plugins` to ``True`` should
+                register these so the model can dispatch to them.
+            extra_mcp_servers: Optional MCP servers contributed by the
+                agent's effective ``plugins`` list, merged on top of the
+                workflow-level ``runtime.mcp_servers`` for this call
+                only. Per-call rather than per-provider because
+                ``plugins:`` is a per-agent field and providers are
+                cached per type.
 
         Returns:
             Normalized AgentOutput with structured content.

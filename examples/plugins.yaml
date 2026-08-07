@@ -1,0 +1,119 @@
+# Opting into whole plugins
+#
+# A skill is one file of instructions. A PLUGIN is the unit people actually
+# install, and it ships up to three things Conductor can use:
+#
+#   <plugin>/
+#     .claude-plugin/plugin.json   or  .github/plugin/plugin.json
+#     skills/<skill>/SKILL.md      → instructions
+#     agents/<agent>.agent.md      → subagents the model can dispatch to
+#     .mcp.json                    → MCP servers
+#
+# Those parts are written to work together. A plugin's SKILL.md routinely
+# tells the agent to hand work to `prs:code-reviewer`, or to call an `ado`
+# MCP tool. Loading only the instructions gives you an agent that reads them
+# correctly and then reaches for something that was never registered — and
+# says nothing about it.
+#
+# ENTRY GRAMMAR
+#   prs                → an installed plugin, looked up under
+#                        ~/.copilot/installed-plugins/*/ and ~/.claude/plugins/*/
+#   ./tools/my-plugin  → a path, resolved against THIS FILE's directory
+#
+# Classification is syntactic (a path starts with ~ or . or contains a
+# separator), so a same-named local directory can never shadow an installed
+# plugin, and resolution never depends on what happens to exist.
+#
+# COMPONENTS — all default to ON. Defaulting one off would reproduce the
+# partial load this feature exists to fix.
+#
+#   skills: false   → do not load the plugin's skills/
+#   agents: false   → do not register its subagents
+#   mcp:    false   → do not start its MCP servers
+#
+# `mcp: false` is the one worth thinking about. An MCP server is a
+# subprocess launched with your credentials — the `ado` plugin authenticates
+# through `az` at process start, before any tool is called. Conductor starts
+# one only because this file named the plugin.
+#
+# hooks/ and commands/ are never loaded. `conductor validate` warns when a
+# plugin ships them rather than leaving the difference from the CLI silent.
+#
+# PROVIDER SUPPORT
+#   copilot            → yes, each component registered individually
+#   claude-agent-sdk   → yes, except `agents: false` alongside `skills: true`
+#                        (its only skill surface is the plugin root, which
+#                        carries every subagent with it)
+#   claude / hermes    → REJECTED. Injecting a skill's text into a prompt
+#   aca                  cannot produce a subagent or an MCP server, so a
+#                        plugin would load only partially.
+#
+# PLUGINS ARE NEVER DISCOVERED. There is no plugin equivalent of
+# `skill_discovery`. A plugin loads because this file named it, so a missing
+# one is a hard error at validate time rather than quietly less capability.
+#
+# Run `conductor validate` on this file first: it prints exactly what each
+# plugin contributes, including every subagent by name. A plugin name says
+# nothing about how much it carries, and that listing is how a change in
+# what a plugin ships becomes visible before the run rather than during it.
+#
+# Usage:
+#   conductor validate examples/plugins.yaml
+#   conductor run examples/plugins.yaml \
+#     --input changes="Resume now restores dashboard state; fixed a crash on empty input"
+#
+# This example ships its own plugin (examples/demo-plugin/) so it runs
+# anywhere. To use one you installed instead, replace the path entry with
+# its bare name — `conductor validate` names the search locations when it
+# cannot find it.
+
+workflow:
+  name: plugins
+  description: Opt into a whole plugin, not just its skills
+  version: 1.0.0
+  entry_point: reviewer
+
+  runtime:
+    provider: copilot
+    default_model: claude-sonnet-4.5
+    max_agent_iterations: 30
+
+    # Workflow-wide default. Every provider-backed agent inherits this
+    # unless it declares its own `plugins:` (`[]` opts out).
+    plugins:
+      # String shorthand: everything the plugin ships. Here that is one
+      # skill (release-notes) and one subagent (demo:editor) — and the
+      # skill's instructions dispatch to the subagent, which is the point.
+      - ./demo-plugin
+
+      # Object form, for a plugin you want only part of. Uncomment with a
+      # plugin you have installed:
+      # - name: ado
+      #   mcp: false     # skills and subagents, but do not start its server
+
+agents:
+  - name: reviewer
+    # No `plugins:` here, so this agent inherits the workflow default above.
+    # Adding `plugins: []` would opt out entirely; adding a list would
+    # replace the default rather than extend it.
+    prompt: |
+      Write release notes for these changes:
+
+      {{ changes }}
+
+      Use the release-notes skill. It will tell you to hand the draft to
+      the `demo:editor` subagent before returning it — do that. If the
+      subagent is not available, say so explicitly rather than editing the
+      draft yourself, so a dropped plugin component is visible instead of
+      silently worked around.
+    output:
+      notes:
+        type: string
+        description: The edited release notes
+      editor_available:
+        type: boolean
+        description: Whether the demo:editor subagent could be dispatched to
+
+output:
+  notes: "{{ reviewer.output.notes }}"
+  editor_available: "{{ reviewer.output.editor_available }}"

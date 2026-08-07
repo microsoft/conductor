@@ -746,6 +746,89 @@ class SandboxConfig(BaseModel):
     """
 
 
+class PluginDef(BaseModel):
+    """One entry in a ``plugins:`` list.
+
+    Accepts either a string shorthand (``- prs``) or an object with
+    per-component switches, mirroring the ``provider:`` string/object
+    precedent::
+
+        plugins:
+          - prs                      # everything the plugin ships
+          - name: ado
+            mcp: false               # skills and agents only
+
+    ``name`` is either an **installed plugin name** or a **filesystem
+    path**, classified by the same syntactic rule ``skills:`` uses (path
+    when it starts with ``~``/``.`` or contains a separator). Resolution
+    needs the workflow file's directory, which the schema does not have,
+    so only the entry's shape is checked here.
+
+    Every component defaults to **on**. Defaulting one off would
+    reproduce the partial-loading bug this feature exists to fix — a
+    plugin that loads its instructions but not the subagents or MCP
+    tools those instructions call for.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    """Installed plugin name, or a path to a plugin root."""
+
+    skills: bool = True
+    """Load the plugin's ``skills/``."""
+
+    agents: bool = True
+    """Register the plugin's ``agents/*.agent.md`` as subagents."""
+
+    mcp: bool = True
+    """Register the MCP servers the plugin declares.
+
+    Worth a moment's thought before leaving on: an MCP server is a
+    subprocess launched with the user's credentials, not text injected
+    into a prompt. Conductor starts it only because the workflow named
+    the plugin — never because it happened to be installed.
+    """
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, v: str) -> str:
+        """Reject an empty or whitespace-only entry."""
+        if not v.strip():
+            raise ValueError("plugins entries must be non-empty strings")
+        return v.strip()
+
+
+def _coerce_plugin_entries(value: Any) -> Any:
+    """Expand string shorthands in a ``plugins:`` list.
+
+    Mirrors :meth:`RuntimeConfig._coerce_provider`: a bare string is the
+    common case and should not require the object form.
+    """
+    if not isinstance(value, list):
+        return value
+    return [{"name": entry} if isinstance(entry, str) else entry for entry in value]
+
+
+def _validate_plugin_entries(entries: list[PluginDef]) -> list[PluginDef]:
+    """Reject a ``plugins:`` list that names the same entry twice.
+
+    Duplicate entries are refused rather than deduplicated because the
+    two may disagree about components — ``[prs, {name: prs, mcp: false}]``
+    has no correct merge, and silently keeping one would be the wrong
+    kind of quiet.
+    """
+    seen: set[str] = set()
+    for entry in entries:
+        if entry.name in seen:
+            raise ValueError(
+                f"plugins contains duplicate entry {entry.name!r}. List each plugin "
+                "once, with the components you want on that single entry."
+            )
+        seen.add(entry.name)
+    return entries
+
+
 def _validate_skill_entries(entries: list[str]) -> list[str]:
     """Validate the shape of ``skills:`` entries at config-load time.
 
@@ -1339,6 +1422,50 @@ class AgentDef(BaseModel):
             prompt: "Review this workflow for correctness..."
     """
 
+    plugins: list[PluginDef] | None = None
+    """Opt this agent into whole plugins.
+
+    A plugin is the unit a user actually installs, and it ships up to
+    three things Conductor can use: ``skills/``, ``agents/*.agent.md``,
+    and MCP servers. Enabling the plugin brings all three by default, so
+    a skill whose instructions dispatch to ``prs:code-reviewer`` or call
+    an ``ado`` MCP tool finds them there.
+
+    Each entry is either an **installed plugin name** or a **filesystem
+    path** — the same syntactic rule as ``skills:``. Entries take a
+    string shorthand or an object with per-component switches; see
+    :class:`PluginDef`.
+
+    Tri-state semantics via list presence, matching :attr:`skills`:
+
+    * ``None`` (omitted): inherit from ``workflow.runtime.plugins``
+    * ``[]`` (empty list): explicit none — overrides any workflow default
+    * ``[entry, ...]``: explicit set — overrides any workflow default
+
+    Requires a provider with a native skill and subagent surface
+    (``copilot``, ``claude-agent-sdk``). Providers that reach skills by
+    injecting their text into the prompt have nowhere to put a subagent
+    or an MCP server, so a plugin there would load partially — exactly
+    the failure this field exists to remove — and is rejected instead.
+
+    Plugins are never discovered. Nothing is registered because it
+    happened to be installed; a plugin is loaded only because a workflow
+    named it, and a missing one is an error rather than quietly less
+    capability.
+
+    Only applies to provider-backed agents (type='agent' or None).
+
+    Example YAML::
+
+        agents:
+          - name: reviewer
+            plugins:
+              - prs                           # skills + 7 subagents
+              - name: ado
+                mcp: false                    # skills and agents only
+            prompt: "Review this pull request..."
+    """
+
     status: Literal["success", "failed"] | None = None
     """Outcome status for ``type: terminate`` steps.
 
@@ -1418,6 +1545,26 @@ class AgentDef(BaseModel):
         if v is None:
             return v
         return _validate_skill_entries(v)
+
+    @field_validator("plugins", mode="before")
+    @classmethod
+    def coerce_plugins(cls, v: Any) -> Any:
+        """Expand ``- prs`` string shorthands into ``{name: prs}``."""
+        return _coerce_plugin_entries(v)
+
+    @field_validator("plugins")
+    @classmethod
+    def validate_plugins(cls, v: list[PluginDef] | None) -> list[PluginDef] | None:
+        """Reject duplicate ``plugins:`` entries.
+
+        Nothing else can be checked here: unlike a built-in skill name,
+        a plugin name is only resolvable against installed roots or the
+        workflow file's directory, neither of which the schema has.
+        Empty lists are allowed (explicit opt-out).
+        """
+        if v is None:
+            return v
+        return _validate_plugin_entries(v)
 
     @field_validator("duration", mode="before")
     @classmethod
@@ -1527,6 +1674,8 @@ class AgentDef(BaseModel):
                 raise ValueError("human_gate agents cannot have 'context_tier'")
             if self.skills is not None:
                 raise ValueError("human_gate agents cannot have 'skills'")
+            if self.plugins is not None:
+                raise ValueError("human_gate agents cannot have 'plugins'")
             if self.timeout_seconds is not None:
                 raise ValueError("human_gate agents cannot have 'timeout_seconds'")
             if self.value is not None:
@@ -1576,6 +1725,8 @@ class AgentDef(BaseModel):
                 raise ValueError("questions agents cannot have 'context_tier'")
             if self.skills is not None:
                 raise ValueError("questions agents cannot have 'skills'")
+            if self.plugins is not None:
+                raise ValueError("questions agents cannot have 'plugins'")
             if self.timeout_seconds is not None:
                 raise ValueError("questions agents cannot have 'timeout_seconds'")
             if self.model:
@@ -1637,6 +1788,8 @@ class AgentDef(BaseModel):
                 raise ValueError("script agents cannot have 'context_tier'")
             if self.skills is not None:
                 raise ValueError("script agents cannot have 'skills'")
+            if self.plugins is not None:
+                raise ValueError("script agents cannot have 'plugins'")
             if self.timeout_seconds is not None:
                 raise ValueError(
                     "script agents cannot have 'timeout_seconds' "
@@ -1740,6 +1893,8 @@ class AgentDef(BaseModel):
                 raise ValueError("wait agents cannot have 'context_tier'")
             if self.skills is not None:
                 raise ValueError("wait agents cannot have 'skills'")
+            if self.plugins is not None:
+                raise ValueError("wait agents cannot have 'plugins'")
             if self.timeout_seconds is not None:
                 raise ValueError("wait agents cannot have 'timeout_seconds'")
             if self.output is not None:
@@ -1809,6 +1964,8 @@ class AgentDef(BaseModel):
                 raise ValueError("set agents cannot have 'context_tier'")
             if self.skills is not None:
                 raise ValueError("set agents cannot have 'skills'")
+            if self.plugins is not None:
+                raise ValueError("set agents cannot have 'plugins'")
             if self.timeout_seconds is not None:
                 raise ValueError("set agents cannot have 'timeout_seconds'")
             if self.duration is not None:
@@ -1877,6 +2034,8 @@ class AgentDef(BaseModel):
                 raise ValueError("terminate agents cannot have 'context_tier'")
             if self.skills is not None:
                 raise ValueError("terminate agents cannot have 'skills'")
+            if self.plugins is not None:
+                raise ValueError("terminate agents cannot have 'plugins'")
             if self.workflow:
                 raise ValueError("terminate agents cannot have 'workflow'")
             if self.input_mapping is not None:
@@ -1937,6 +2096,8 @@ class AgentDef(BaseModel):
             raise ValueError("workflow agents cannot have 'context_tier'")
         if self.type == "workflow" and self.skills is not None:
             raise ValueError("workflow agents cannot have 'skills'")
+        if self.type == "workflow" and self.plugins is not None:
+            raise ValueError("workflow agents cannot have 'plugins'")
 
         # Wait-only fields are forbidden on every other type. ``reason`` is
         # shared with ``type: terminate`` (which has its own required-non-
@@ -2761,11 +2922,15 @@ class SkillDiscoveryConfig(BaseModel):
     * ``project`` — ``.github/skills`` and ``.claude/skills``, in the
       workflow file's directory and each ancestor up to the repository
       root, or that directory alone when it is not inside a repository
-    * ``plugins`` — the ``skills/`` directory of every installed plugin
 
-    Scanned in a fixed order (``project``, ``personal``, ``plugins``)
-    whatever order they are written in, so reordering this list cannot
-    change which of two same-named skills wins.
+    Scanned in a fixed order (``project``, then ``personal``) whatever
+    order they are written in, so reordering this list cannot change
+    which of two same-named skills wins.
+
+    There is no ``plugins`` source: taking a plugin's ``skills/`` and
+    leaving its subagents and MCP servers behind is the partial load
+    ``runtime.plugins`` exists to fix. Name plugins there instead — that
+    also reproduces on another machine, which a scan does not.
     """
 
     exclude: tuple[str, ...] = ()
@@ -3000,6 +3165,39 @@ class RuntimeConfig(BaseModel):
     overrides them along with :attr:`skills`. See
     :class:`SkillDiscoveryConfig`.
     """
+
+    plugins: list[PluginDef] = Field(default_factory=list)
+    """Workflow-wide default plugins for every provider-backed agent.
+
+    Every provider-backed agent inherits this list unless it sets its own
+    ``plugins:`` field (use ``plugins: []`` for explicit opt-out). See
+    :attr:`AgentDef.plugins` for entry grammar and per-component
+    switches.
+
+    Enabling a plugin here registers its skills, its subagents, and the
+    MCP servers it declares — the whole unit the user installed, rather
+    than the one component of it Conductor used to load.
+
+    Example YAML::
+
+        runtime:
+            plugins:
+              - prs
+              - name: ado
+                mcp: false
+    """
+
+    @field_validator("plugins", mode="before")
+    @classmethod
+    def _coerce_plugins(cls, value: Any) -> Any:
+        """Expand ``- prs`` string shorthands into ``{name: prs}``."""
+        return _coerce_plugin_entries(value)
+
+    @field_validator("plugins")
+    @classmethod
+    def validate_plugins(cls, v: list[PluginDef]) -> list[PluginDef]:
+        """Reject duplicate workflow-default ``plugins:`` entries."""
+        return _validate_plugin_entries(v)
 
     @field_validator("skills")
     @classmethod

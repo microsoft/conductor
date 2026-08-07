@@ -68,8 +68,70 @@ def validate_workflow(
         return False, None
 
     _report_skill_discovery(config, workflow_path, output_console, already_reported=warnings)
+    _report_plugins(config, workflow_path, output_console)
 
     return True, config
+
+
+def _report_plugins(
+    config: WorkflowConfig,
+    workflow_path: Path,
+    console: Console,
+) -> None:
+    """Print what each enabled plugin actually contributes.
+
+    A plugin name in the YAML says nothing about how much it brings — the
+    installed plugins on one machine range from a single skill to seven
+    subagents plus an MCP server that authenticates with the user's own
+    credentials. Printing the component counts is what turns "I enabled
+    ``prs``" into something the author can review, and makes a change in
+    what a plugin ships visible on the next validate rather than at run
+    time.
+
+    Reports the workflow-level set only. Per-agent ``plugins:`` overrides
+    are resolved and reported by the validator, which knows each agent's
+    provider; repeating them here without that context would list
+    components a given agent never receives.
+
+    Never fatal — every resolution failure has already been reported as a
+    validation error by the time this runs, and turning a summary into a
+    second source of errors would be worse than an incomplete summary.
+
+    Args:
+        config: The validated workflow configuration.
+        workflow_path: Path to the workflow file, anchoring relative
+            plugin paths.
+        console: Rich console for output.
+    """
+    entries = config.workflow.runtime.plugins
+    if not entries:
+        return
+
+    from conductor.plugins.registry import resolve_plugins
+
+    try:
+        resolved = resolve_plugins(entries, base_dir=workflow_path.resolve().parent)
+    except Exception as exc:  # pragma: no cover - defensive; a report must not crash
+        console.print(f"  [yellow]⚠[/yellow] Plugins could not be summarized: {exc}")
+        return
+
+    console.print(f"  [dim]Plugins: {len(resolved)} enabled[/dim]")
+    for plugin in resolved:
+        parts = [
+            f"{len(plugin.skills)} skill(s)",
+            f"{len(plugin.agents)} agent(s)",
+            f"{len(plugin.mcp_servers)} MCP server(s)",
+        ]
+        console.print(f"    [dim]• {plugin.name} — {', '.join(parts)} — {plugin.root}[/dim]")
+        if plugin.agents:
+            names = ", ".join(item.qualified_name for item in plugin.agents)
+            console.print(f"      [dim]agents: {names}[/dim]")
+        if plugin.mcp_servers:
+            console.print(f"      [dim]mcp: {', '.join(sorted(plugin.mcp_servers))}[/dim]")
+        if plugin.disabled:
+            console.print(
+                f"      [dim]disabled by this workflow: {', '.join(plugin.disabled)}[/dim]"
+            )
 
 
 def _report_skill_discovery(

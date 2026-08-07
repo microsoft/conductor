@@ -22,15 +22,19 @@ a written path are judged by the same rules.
 
 from __future__ import annotations
 
-import json
 import logging
 import os
-import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
+from conductor.plugins.manifest import (
+    PLUGIN_SKILLS_DIR,
+    SAFE_NAME,
+    find_manifest,
+    read_manifest_name,
+)
 from conductor.skills.errors import SkillError
 
 logger = logging.getLogger(__name__)
@@ -434,13 +438,14 @@ def resolve_skills(
     return out
 
 
-# Marker file identifying a Claude Code plugin root. A skill directory
-# that lives under one can be registered natively with the
-# claude-agent-sdk via ``--plugin-dir``.
-_PLUGIN_MANIFEST: Path = Path(".claude-plugin") / "plugin.json"
-
-# Directory a plugin keeps its skills in, relative to the plugin root.
-_PLUGIN_SKILLS_DIR: str = "skills"
+# What counts as a plugin root, and what its parts are called, is defined
+# once in :mod:`conductor.plugins.manifest` and imported here. Keeping a
+# second copy is what stranded Copilot-convention plugins: this module
+# used to hardcode ``.claude-plugin/plugin.json``, so a skill inside a
+# plugin using ``.github/plugin/plugin.json`` had no reachable plugin
+# root and claude-agent-sdk refused it — 12 of 13 plugins on an ordinary
+# machine.
+_PLUGIN_SKILLS_DIR: str = PLUGIN_SKILLS_DIR
 
 # How far above a skill directory to look for the plugin manifest. The
 # layout is ``<root>/skills/<skill>/``, so two levels is the exact
@@ -451,7 +456,7 @@ _PLUGIN_SEARCH_DEPTH: int = 3
 # ``:`` into a qualified name, which the SDK expands to ``Skill(<name>)``
 # and joins with ``,`` into a single ``--allowedTools`` value — so a name
 # containing either delimiter would split into extra permission rules.
-_SAFE_NAME = re.compile(r"\A[A-Za-z0-9_.-]+\Z")
+_SAFE_NAME = SAFE_NAME
 
 
 @dataclass(frozen=True)
@@ -524,8 +529,14 @@ class SkillPlugin:
 def _read_plugin_name(manifest: Path) -> str:
     """Read the ``name`` a plugin manifest declares.
 
+    Delegates to :func:`conductor.plugins.manifest.read_manifest_name` so
+    both manifest conventions are recognised here exactly as they are
+    when resolving a ``plugins:`` entry, and re-raises as
+    :class:`SkillPluginError` because that is the class this module's
+    callers catch.
+
     Args:
-        manifest: Path to an existing ``.claude-plugin/plugin.json``.
+        manifest: Path to an existing plugin manifest.
 
     Returns:
         The declared plugin name.
@@ -534,22 +545,12 @@ def _read_plugin_name(manifest: Path) -> str:
         SkillPluginError: If the file cannot be read, is not a JSON
             object, or declares no usable ``name``.
     """
+    from conductor.plugins.errors import PluginManifestError
+
     try:
-        parsed = json.loads(manifest.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        raise SkillPluginError(f"Plugin manifest at {manifest} could not be read: {exc}") from exc
-    # Anything that parses to something other than an object (a bare
-    # array, string, or null) is as unusable as a parse failure.
-    name = parsed.get("name") if isinstance(parsed, dict) else None
-    if not isinstance(name, str) or not name:
-        raise SkillPluginError(f"Plugin manifest at {manifest} declares no usable 'name'.")
-    if not _SAFE_NAME.match(name):
-        raise SkillPluginError(
-            f"Plugin manifest at {manifest} declares name {name!r}, which contains "
-            f"characters outside {_SAFE_NAME.pattern}. The name is joined into the "
-            "CLI's delimiter-separated tool list, so it must not contain ':' or ','."
-        )
-    return name
+        return read_manifest_name(manifest)
+    except PluginManifestError as exc:
+        raise SkillPluginError(str(exc)) from exc
 
 
 def _declared_skill_name(skill_dir: Path) -> str:
@@ -609,8 +610,8 @@ def resolve_skill_plugin(skill_dir: Path) -> SkillPlugin | None:
     """
     skill_dir = skill_dir.resolve()
     for candidate in skill_dir.parents[:_PLUGIN_SEARCH_DEPTH]:
-        manifest = candidate / _PLUGIN_MANIFEST
-        if not manifest.is_file():
+        manifest = find_manifest(candidate)
+        if manifest is None:
             continue
         if not skill_dir.is_relative_to(candidate / _PLUGIN_SKILLS_DIR):
             # A plugin root that does not ship this skill. Keep walking:

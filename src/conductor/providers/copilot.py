@@ -254,6 +254,11 @@ class CopilotProvider(AgentProvider):
         # ``session_kwargs["skill_directories"]`` and the agent discovers
         # skill content natively (progressive disclosure).
         skills=True,
+        # Whole plugins are supported by deconstruction: ``skill_directories``
+        # for skills, ``custom_agents`` for subagents, and the session's own
+        # ``mcp_servers`` for MCP. The SDK's ``plugin_directories`` is
+        # deliberately unused — see conductor.plugins for why.
+        plugins=True,
         upstream_pin=None,
         maintainer="@microsoft/conductor",
     )
@@ -267,6 +272,18 @@ class CopilotProvider(AgentProvider):
         :meth:`execute` ``skill_directories`` kwarg and skips eager
         preamble injection — the SDK is expected to discover skills via
         their ``SKILL.md`` frontmatter (progressive disclosure).
+        """
+        return True
+
+    @property
+    def supports_native_plugins(self) -> bool:
+        """Plugin subagents register as SDK ``custom_agents``.
+
+        Verified against a live session: a ``custom_agents`` entry named
+        ``myplug:quokka`` appears among the agent types the model can
+        launch, so a plugin's ``<plugin>:<agent>`` namespacing survives
+        deconstruction and two plugins shipping a same-named agent do not
+        collide.
         """
         return True
 
@@ -665,6 +682,8 @@ class CopilotProvider(AgentProvider):
         interrupt_signal: asyncio.Event | None = None,
         event_callback: EventCallback | None = None,
         skill_directories: list[str] | None = None,
+        custom_agents: list[dict[str, Any]] | None = None,
+        extra_mcp_servers: dict[str, Any] | None = None,
     ) -> AgentOutput:
         """Execute an agent using the Copilot SDK.
 
@@ -684,6 +703,13 @@ class CopilotProvider(AgentProvider):
                 ``skill_directories`` on the SDK session so the Copilot
                 agent can discover and load skills natively (progressive
                 disclosure).
+            custom_agents: Optional subagent definitions from the agent's
+                effective ``plugins:``, registered as the session's
+                ``custom_agents`` so the model can dispatch to them by
+                their ``<plugin>:<agent>`` name.
+            extra_mcp_servers: Optional MCP servers contributed by the
+                agent's effective ``plugins:``, merged on top of the
+                workflow's own ``runtime.mcp_servers`` for this call.
 
         Returns:
             Normalized AgentOutput with structured content.
@@ -715,6 +741,8 @@ class CopilotProvider(AgentProvider):
             interrupt_signal=interrupt_signal,
             event_callback=event_callback,
             skill_directories=skill_directories,
+            custom_agents=custom_agents,
+            extra_mcp_servers=extra_mcp_servers,
         )
 
     def _resolve_retry_config(self, agent: AgentDef) -> RetryConfig:
@@ -758,6 +786,8 @@ class CopilotProvider(AgentProvider):
         interrupt_signal: asyncio.Event | None = None,
         event_callback: EventCallback | None = None,
         skill_directories: list[str] | None = None,
+        custom_agents: list[dict[str, Any]] | None = None,
+        extra_mcp_servers: dict[str, Any] | None = None,
     ) -> AgentOutput:
         """Execute with exponential backoff retry logic.
 
@@ -773,6 +803,10 @@ class CopilotProvider(AgentProvider):
             event_callback: Optional callback for streaming SDK events upstream.
             skill_directories: Optional skill directories forwarded to the
                 SDK session for native skill discovery.
+            custom_agents: Optional plugin subagent definitions forwarded
+                to the SDK session.
+            extra_mcp_servers: Optional plugin MCP servers merged into the
+                session's server set for this call.
 
         Returns:
             Normalized AgentOutput with structured content.
@@ -794,6 +828,8 @@ class CopilotProvider(AgentProvider):
                     event_callback=event_callback,
                     retry_config=config,
                     skill_directories=skill_directories,
+                    custom_agents=custom_agents,
+                    extra_mcp_servers=extra_mcp_servers,
                 )
                 # Extract usage data from SDK response if available
                 input_tokens = sdk_response.input_tokens if sdk_response else None
@@ -939,6 +975,8 @@ class CopilotProvider(AgentProvider):
         event_callback: EventCallback | None = None,
         retry_config: RetryConfig | None = None,
         skill_directories: list[str] | None = None,
+        custom_agents: list[dict[str, Any]] | None = None,
+        extra_mcp_servers: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], SDKResponse | None]:
         """Execute the actual SDK call or mock handler.
 
@@ -955,6 +993,12 @@ class CopilotProvider(AgentProvider):
                 the Copilot agent can discover and load bundled skills
                 natively (progressive disclosure via ``SKILL.md``
                 frontmatter).
+            custom_agents: Optional plugin subagent definitions registered
+                on the SDK session via ``session_kwargs["custom_agents"]``
+                so the model can dispatch to them by their
+                ``<plugin>:<agent>`` name.
+            extra_mcp_servers: Optional plugin MCP servers merged on top of
+                the workflow's own for this session.
 
         Returns:
             Tuple of (content dict, SDKResponse with usage data or None for mock).
@@ -1037,13 +1081,24 @@ class CopilotProvider(AgentProvider):
             # per-execution copy stamped with the resolved working directory;
             # the shared ``self._mcp_servers`` mapping is never mutated and
             # remote (http/sse) servers are left untouched.
-            if self._mcp_servers:
-                session_kwargs["mcp_servers"] = self._mcp_servers_for_cwd(resolved_cwd)
+            # Plugin-contributed servers merge on top for this call only:
+            # ``plugins:`` is a per-agent field while providers are cached
+            # per type, so they cannot live on ``self._mcp_servers``.
+            merged_servers = self._merge_mcp_servers(resolved_cwd, extra_mcp_servers)
+            if merged_servers:
+                session_kwargs["mcp_servers"] = merged_servers
 
             # Register skill directories so the SDK agent can discover
             # bundled skills (progressive disclosure via SKILL.md frontmatter).
             if skill_directories:
                 session_kwargs["skill_directories"] = list(skill_directories)
+
+            # Register plugin subagents. The SDK accepts the qualified
+            # ``<plugin>:<agent>`` name verbatim, so a plugin's namespace
+            # survives deconstruction and two plugins shipping a same-named
+            # agent do not collide.
+            if custom_agents:
+                session_kwargs["custom_agents"] = [dict(spec) for spec in custom_agents]
 
             # Apply custom provider routing (Ollama / vLLM / Azure / etc.)
             # when runtime.provider opted into it.
@@ -1125,9 +1180,19 @@ class CopilotProvider(AgentProvider):
                             "on_permission_request": self._default_permission_handler,
                             "working_directory": resolved_cwd,
                         }
-                        if self._mcp_servers:
-                            resume_kwargs["mcp_servers"] = self._mcp_servers_for_cwd(resolved_cwd)
+                        if self._mcp_servers or extra_mcp_servers:
+                            resume_kwargs["mcp_servers"] = self._merge_mcp_servers(
+                                resolved_cwd, extra_mcp_servers
+                            )
                         resume_kwargs["large_output"] = self._large_output_config()
+                        # Skills and plugin subagents are session-scoped, so a
+                        # resumed session that omits them silently runs with
+                        # less than the workflow declared — the same quiet
+                        # divergence plugins exist to remove.
+                        if skill_directories:
+                            resume_kwargs["skill_directories"] = list(skill_directories)
+                        if custom_agents:
+                            resume_kwargs["custom_agents"] = [dict(spec) for spec in custom_agents]
                         self._apply_github_token(resume_kwargs)
                         session = await self._client.resume_session(resume_sid, **resume_kwargs)
                         logger.info(
@@ -2808,6 +2873,70 @@ class CopilotProvider(AgentProvider):
             max_context_window_tokens=getattr(limits, "max_context_window_tokens", None),
         )
 
+    def _merge_mcp_servers(self, resolved_cwd: str, extra: dict[str, Any] | None) -> dict[str, Any]:
+        """Combine workflow-declared and plugin-contributed MCP servers.
+
+        Both go through :meth:`_stamp_cwd`'s rules, so a plugin's stdio
+        server picks up the agent's working directory exactly as a
+        workflow-declared one does.
+
+        A name collision is **refused**, not resolved by precedence. The
+        server name prefixes the tool names the model sees, so one of the
+        two would be unreachable — and silently dropping a declared
+        component is the failure this feature exists to remove.
+        ``conductor validate`` reports the same clash, but ``conductor
+        run`` never invokes the static validator, so the guard has to
+        exist here too.
+
+        Args:
+            resolved_cwd: Absolute working directory resolved by the engine.
+            extra: Plugin-contributed servers for this call, or ``None``.
+
+        Returns:
+            A new mapping of server name to config dict, empty when
+            neither source contributes anything.
+
+        Raises:
+            ProviderError: If a plugin server and a workflow server share
+                a name.
+        """
+        if not extra:
+            return self._mcp_servers_for_cwd(resolved_cwd) if self._mcp_servers else {}
+
+        clashes = sorted(set(extra) & set(self._mcp_servers))
+        if clashes:
+            raise ProviderError(
+                f"MCP server name(s) {clashes!r} are declared by both an enabled "
+                f"plugin and the workflow's 'runtime.mcp_servers'. The server name "
+                f"prefixes the tool names the model sees, so one would be unreachable.",
+                suggestion="Rename the workflow's server, or set 'mcp: false' on the plugin.",
+                is_retryable=False,
+            )
+
+        merged: dict[str, Any] = self._stamp_cwd(extra, resolved_cwd)
+        if self._mcp_servers:
+            merged.update(self._mcp_servers_for_cwd(resolved_cwd))
+        return merged
+
+    @staticmethod
+    def _stamp_cwd(servers: dict[str, Any], resolved_cwd: str) -> dict[str, Any]:
+        """Stamp ``working_directory`` onto every stdio server in ``servers``.
+
+        Split out of :meth:`_mcp_servers_for_cwd` so plugin-contributed
+        servers are stamped by the same rule rather than a second copy of
+        it. Never mutates the input or its nested dicts, so parallel
+        agents with different cwds cannot race each other.
+        """
+        stamped: dict[str, Any] = {}
+        for name, config in servers.items():
+            if isinstance(config, dict) and config.get("type") in ("stdio", "local", None):
+                server_copy = dict(config)
+                server_copy["working_directory"] = resolved_cwd
+                stamped[name] = server_copy
+            else:
+                stamped[name] = config
+        return stamped
+
     def _mcp_servers_for_cwd(self, resolved_cwd: str) -> dict[str, Any]:
         """Build a per-execution MCP server mapping stamped with ``resolved_cwd``.
 
@@ -2825,15 +2954,7 @@ class CopilotProvider(AgentProvider):
         Returns:
             A new mapping of server name to config dict.
         """
-        stamped: dict[str, Any] = {}
-        for name, config in self._mcp_servers.items():
-            if isinstance(config, dict) and config.get("type") in ("stdio", "local", None):
-                server_copy = dict(config)
-                server_copy["working_directory"] = resolved_cwd
-                stamped[name] = server_copy
-            else:
-                stamped[name] = config
-        return stamped
+        return self._stamp_cwd(self._mcp_servers, resolved_cwd)
 
     def get_session_ids(self) -> dict[str, str]:
         """Get tracked session IDs for all executed agents.
