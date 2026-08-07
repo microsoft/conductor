@@ -862,22 +862,76 @@ describe('workflow-store — navigating to a specific historical subworkflow ite
 /**
  * The store-side half of the resumed-workflow-looks-stopped bug: `isPaused`,
  * `iterationLimitGate` and `activeDialog` are *global* "the engine is blocked
- * waiting on you" flags that only their counterpart event or a root
- * `workflow_completed` / `workflow_failed` can clear.
+ * waiting on you" flags cleared only by their counterpart event — plus, for
+ * `isPaused` / `iterationLimitGate` only, a root `workflow_completed` /
+ * `workflow_failed`. (Nothing clears `activeDialog` on a root terminal.)
  *
  * That makes them unrecoverable from a replayed history — on resume the CLI
  * seeds the dashboard from the original run's JSONL, and the root terminal
  * events are deliberately filtered out (they would make the run look finished
  * before it starts). So a run killed while paused would latch `isPaused` on
- * for the whole resumed run, hiding the Stop button behind Resume/Kill wired
- * to a dead process.
+ * for the whole resumed run, hiding the Stop button behind a Resume/Kill pair
+ * that drives the live resumed engine.
  *
  * The fix lives server-side in `WebDashboard._REPLAY_INTERACTIVE_SKIP_TYPES`.
  * These tests pin the store behaviour that filter depends on: if a latch ever
  * becomes self-healing, the corresponding entry can be dropped — and if a new
  * global latch is added, it needs a new entry.
+ *
+ * They drive `replayState` rather than `processEvent` because `replayState` is
+ * what consumes GET /api/state (`hooks/use-websocket.ts`), and GET /api/state
+ * is exactly what the resume path seeds. Driving the real entry point is what
+ * makes these fail if a client-side clamp ever makes the server filter moot.
  */
-describe('workflow-store — global interaction latches are not self-healing', () => {
+describe('workflow-store — a replayed history latches the global interaction flags', () => {
+  const started = event('workflow_started', {
+    name: 'root',
+    agents: [{ name: 'architect_questions' }],
+    routes: [],
+    parallel_groups: [],
+    for_each_groups: [],
+    entry_point: 'architect_questions',
+  });
+
+  it('leaves isPaused latched when a seeded history ends on an unresolved agent_paused', () => {
+    useWorkflowStore.getState().replayState([
+      started,
+      event('agent_started', { agent_name: 'architect_questions', iteration: 1 }),
+      event('agent_paused', { agent_name: 'architect_questions', partial_content: '{}' }),
+      // The resumed run re-executes the agent — which must not be mistaken
+      // for a mechanism that unsticks the header.
+      event('agent_started', { agent_name: 'architect_questions', iteration: 2 }),
+      event('agent_completed', { agent_name: 'architect_questions', iteration: 2 }),
+    ]);
+    expect(useWorkflowStore.getState().isPaused).toBe(true);
+  });
+
+  it('leaves iterationLimitGate latched when a seeded history ends on an unresolved gate', () => {
+    useWorkflowStore.getState().replayState([
+      started,
+      event('iteration_limit_reached', {
+        agent_name: 'architect_questions',
+        gate_id: 'g1',
+        current_iteration: 10,
+        max_iterations: 10,
+        skip_gates: false,
+      }),
+      event('agent_started', { agent_name: 'architect_questions', iteration: 11 }),
+    ]);
+    expect(useWorkflowStore.getState().iterationLimitGate).not.toBeNull();
+  });
+
+  it('leaves activeDialog latched when a seeded history ends on an unclosed dialog', () => {
+    useWorkflowStore.getState().replayState([
+      started,
+      event('dialog_started', { agent_name: 'architect_questions', dialog_id: 'd1' }),
+      event('agent_started', { agent_name: 'architect_questions', iteration: 2 }),
+    ]);
+    expect(useWorkflowStore.getState().activeDialog).not.toBeNull();
+  });
+});
+
+describe('workflow-store — a counterpart event clears its latch', () => {
   function startWorkflow() {
     const { processEvent } = useWorkflowStore.getState();
     processEvent(event('workflow_started', {
@@ -903,6 +957,9 @@ describe('workflow-store — global interaction latches are not self-healing', (
     processEvent(event('agent_started', { agent_name: 'architect_questions', iteration: 2 }));
     processEvent(event('agent_completed', { agent_name: 'architect_questions', iteration: 2 }));
     expect(useWorkflowStore.getState().isPaused).toBe(true);
+
+    processEvent(event('agent_resumed', { agent_name: 'architect_questions' }));
+    expect(useWorkflowStore.getState().isPaused).toBe(false);
   });
 
   it('leaves iterationLimitGate set after iteration_limit_reached until it is explicitly resolved', () => {

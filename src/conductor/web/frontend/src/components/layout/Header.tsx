@@ -14,9 +14,10 @@ export function Header() {
   const [resuming, setResuming] = useState(false);
   const [killing, setKilling] = useState(false);
   const [showYaml, setShowYaml] = useState(false);
+  const [controlError, setControlError] = useState<string | null>(null);
 
   // `ReplayDashboard` serves no /api/stop|resume|kill, so these controls
-  // would 404 against a recorded log. Gate them on the live dashboard.
+  // would 404 against a recorded log.
   const isRunning = !replayMode && (workflowStatus === 'running' || workflowStatus === 'pending');
   const showPauseControls = !replayMode && isPaused;
 
@@ -29,35 +30,33 @@ export function Header() {
     }
   }, [isPaused]);
 
-  const handleStop = async () => {
-    setStopping(true);
+  // `fetch` resolves on 4xx/5xx, so an unchecked response leaves the button
+  // latched in its disabled pending state with no console entry and no way
+  // back except a page reload. Check the status explicitly.
+  const postControl = async (
+    path: string,
+    action: string,
+    setPending: (v: boolean) => void
+  ) => {
+    setPending(true);
+    setControlError(null);
     try {
-      await fetch('/api/stop', { method: 'POST' });
+      const res = await fetch(path, { method: 'POST' });
+      if (!res.ok) {
+        console.error(`Failed to ${action}: HTTP ${res.status} from ${path}`);
+        setControlError(`Could not ${action} — server returned HTTP ${res.status}.`);
+        setPending(false);
+      }
     } catch (err) {
-      console.error('Failed to stop agent:', err);
-      setStopping(false);
+      console.error(`Failed to ${action}:`, err);
+      setControlError(`Could not ${action} — the dashboard is unreachable.`);
+      setPending(false);
     }
   };
 
-  const handleResume = async () => {
-    setResuming(true);
-    try {
-      await fetch('/api/resume', { method: 'POST' });
-    } catch (err) {
-      console.error('Failed to resume agent:', err);
-      setResuming(false);
-    }
-  };
-
-  const handleKill = async () => {
-    setKilling(true);
-    try {
-      await fetch('/api/kill', { method: 'POST' });
-    } catch (err) {
-      console.error('Failed to kill workflow:', err);
-      setKilling(false);
-    }
-  };
+  const handleStop = () => postControl('/api/stop', 'stop the agent', setStopping);
+  const handleResume = () => postControl('/api/resume', 'resume the agent', setResuming);
+  const handleKill = () => postControl('/api/kill', 'kill the workflow', setKilling);
 
   return (
     <header className="flex items-center justify-between px-4 py-2 bg-[var(--surface)] border-b border-[var(--border)] flex-shrink-0">
@@ -73,6 +72,11 @@ export function Header() {
         )}
       </div>
       <div className="flex items-center gap-3">
+        {controlError && (
+          <span className="text-xs text-red-400" role="alert">
+            {controlError}
+          </span>
+        )}
         {showPauseControls ? (
           <>
             <button

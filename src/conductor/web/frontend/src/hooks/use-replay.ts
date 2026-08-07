@@ -4,6 +4,7 @@ import type { WorkflowEvent } from '@/types/events';
 
 export function useReplay() {
   const setReplayMode = useWorkflowStore((s) => s.setReplayMode);
+  const markReplayMode = useWorkflowStore((s) => s.markReplayMode);
   const setWsStatus = useWorkflowStore((s) => s.setWsStatus);
   const replayPlaying = useWorkflowStore((s) => s.replayPlaying);
   const replayPosition = useWorkflowStore((s) => s.replayPosition);
@@ -14,9 +15,19 @@ export function useReplay() {
 
   // Load events on mount
   useEffect(() => {
+    // This hook only mounts once App's /api/replay/info probe confirmed a
+    // recorded-log server, so that — not the /api/state result — is the
+    // authoritative signal. Latching here keeps Header's live controls hidden
+    // even if the event fetch is slow or fails outright.
+    markReplayMode();
     setWsStatus('connecting');
     fetch('/api/state')
-      .then((r) => r.json())
+      .then((r) => {
+        // `fetch` resolves on 4xx/5xx; without this an HTML error page would
+        // surface as an opaque JSON parse error instead of the real status.
+        if (!r.ok) throw new Error(`HTTP ${r.status} from /api/state`);
+        return r.json();
+      })
       .then((events: WorkflowEvent[]) => {
         setReplayMode(events);
         setWsStatus('connected');
@@ -25,7 +36,7 @@ export function useReplay() {
         console.error('Failed to load replay events:', err);
         setWsStatus('disconnected');
       });
-  }, [setReplayMode, setWsStatus]);
+  }, [setReplayMode, markReplayMode, setWsStatus]);
 
   // Auto-play timer
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);

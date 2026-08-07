@@ -419,6 +419,7 @@ interface WorkflowState {
 
   // Replay actions
   setReplayMode: (events: WorkflowEvent[]) => void;
+  markReplayMode: () => void;
   setReplayPosition: (position: number) => void;
   setReplayPlaying: (playing: boolean) => void;
   setReplaySpeed: (speed: number) => void;
@@ -975,6 +976,14 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
       }
       return changed ? { expandedContexts: next } : {};
     });
+  },
+
+  // Latch replay mode without waiting on the event payload. `setReplayMode`
+  // only runs once GET /api/state resolves, so a slow or failed fetch would
+  // otherwise leave `replayMode` false and let Header render live controls
+  // against a server that serves no /api/stop|resume|kill.
+  markReplayMode: () => {
+    set({ replayMode: true });
   },
 
   setReplayMode: (events: WorkflowEvent[]) => {

@@ -517,21 +517,26 @@ class WebDashboard:
     #
     # Each of these sets a global "the engine is blocked waiting for you to
     # click something" flag in the frontend store (``isPaused``,
-    # ``iterationLimitGate``, ``activeDialog``), and each is only cleared by
-    # its counterpart event or by a root ``workflow_completed`` /
-    # ``workflow_failed`` — all of which are either absent from a killed run's
-    # log or filtered by ``_REPLAY_ROOT_SKIP_TYPES`` above. Replaying the
-    # opening half therefore latches the flag on for the whole resumed run:
-    # the dashboard renders Resume/Kill (or the iteration-limit modal, or a
-    # dialog composer) for a process that no longer exists, and — because the
-    # header swaps Stop out for Resume/Kill — the live run cannot be stopped
-    # at all (issue: resumed workflow appears stopped in the dashboard).
+    # ``iterationLimitGate``, ``activeDialog``), and each is cleared only by
+    # its counterpart event — plus, for ``isPaused`` / ``iterationLimitGate``
+    # only, a root ``workflow_completed`` / ``workflow_failed``. All of those
+    # are either absent from a killed run's log or filtered by
+    # ``_REPLAY_ROOT_SKIP_TYPES`` above. Replaying the opening half therefore
+    # latches the flag on for the whole resumed run: the dashboard shows
+    # Resume/Kill (or the iteration-limit modal, or a dead dialog-engagement
+    # prompt) for a pause that never happened in this run. Those buttons drive
+    # the *live* resumed engine, so the header swapping Stop out for Resume/
+    # Kill hides the only graceful stop behind a Kill that hard-stops a
+    # healthy workflow (issue #373).
     #
     # Unlike ``_REPLAY_ROOT_SKIP_TYPES`` these are filtered regardless of
     # ``subworkflow_path``: the control channel is the root dashboard's
     # ``resume_event`` / ``kill_event`` / gate id no matter which engine
-    # emitted the event, so depth is irrelevant. Any pause, gate, or dialog
-    # the resumed run genuinely re-enters emits its own fresh event.
+    # emitted the event, so depth is irrelevant — and their store handlers
+    # resolve nodes via ``ensureNode(state.nodes, ...)`` rather than
+    # ``activeTarget``, so a subworkflow-stamped one would also fabricate an
+    # orphan node in the root DAG. Any pause, gate, or dialog the resumed run
+    # genuinely re-enters emits its own fresh event.
     _REPLAY_INTERACTIVE_SKIP_TYPES = frozenset(
         {
             "agent_paused",

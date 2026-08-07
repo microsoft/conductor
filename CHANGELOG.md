@@ -14,15 +14,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `agent_paused` event in its event log with no `agent_resumed` counterpart.
   On resume the CLI seeds the dashboard from that log, so the pause replayed
   and latched the dashboard's global paused state for the entire resumed run:
-  the header rendered Resume/Kill instead of Stop, both wired to a process
-  that no longer existed, leaving the live run with no way to be stopped and
-  Kill able to terminate a healthy workflow. Pause, iteration-limit-gate, and
-  dialog events are now dropped on replay at every workflow depth, alongside
-  the root lifecycle events already filtered; a gate the resumed run genuinely
-  re-enters emits its own fresh event. Prior agent output, messages, and
-  dialog transcripts are still replayed. The dashboard's live-control buttons
-  are also hidden in `conductor replay` mode, where the recorded-log server
-  serves no `/api/stop`, `/api/resume`, or `/api/kill` endpoint.
+  the header showed Resume/Kill instead of Stop for a pause that never
+  happened, hiding the only graceful stop behind a Kill that would hard-stop
+  the healthy resumed run. Pause, iteration-limit-gate, and dialog events are
+  now dropped on replay at every workflow depth, alongside the root lifecycle
+  events already filtered; a gate the resumed run genuinely re-enters emits
+  its own fresh event. Prior agent output and messages are still replayed.
+  The dashboard's live-control buttons are also hidden in `conductor replay`
+  mode, where the recorded-log server serves no `/api/stop`, `/api/resume`,
+  or `/api/kill` endpoint.
+- **Dashboard Stop/Resume/Kill no longer hang on a failed request** — `fetch`
+  resolves rather than rejects on a 4xx/5xx response, so a non-2xx reply left
+  the button disabled and reading "Stopping…" indefinitely, with nothing
+  logged and no way back except reloading the page. The response status is now
+  checked explicitly and surfaced next to the controls.
 
 ## [0.1.27](https://github.com/microsoft/conductor/compare/v0.1.26...v0.1.27) - 2026-08-04
 
