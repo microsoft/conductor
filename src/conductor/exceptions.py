@@ -7,7 +7,10 @@ to help users resolve issues.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from conductor.error_envelope import ErrorEnvelope
 
 
 class ConductorError(Exception):
@@ -329,6 +332,28 @@ class ExecutionError(ConductorError):
         """
         self.agent_name = agent_name
         super().__init__(message, suggestion, file_path, line_number)
+
+
+class UnhandledNodeError(ExecutionError):
+    """Raised when a typed node failure has no matching error route."""
+
+    def __init__(
+        self,
+        *,
+        agent_name: str,
+        error: ErrorEnvelope,
+        output: dict[str, Any],
+    ) -> None:
+        """Initialize an unhandled typed failure."""
+        self.error = error
+        self.output = output
+        super().__init__(
+            f"Step '{agent_name}' raised unhandled error '{error.kind}': {error.message}",
+            agent_name=agent_name,
+            suggestion=(
+                f"Add an on_error route for '{error.kind}' or a catch-all on_error: true route"
+            ),
+        )
 
 
 class MaxIterationsError(ExecutionError):
