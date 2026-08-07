@@ -858,3 +858,86 @@ describe('workflow-store — navigating to a specific historical subworkflow ite
     expect(iter2Crumbs[iter2Crumbs.length - 1]!.label).toBe('sub_wf (iteration 2)');
   });
 });
+
+/**
+ * The store-side half of the resumed-workflow-looks-stopped bug: `isPaused`,
+ * `iterationLimitGate` and `activeDialog` are *global* "the engine is blocked
+ * waiting on you" flags that only their counterpart event or a root
+ * `workflow_completed` / `workflow_failed` can clear.
+ *
+ * That makes them unrecoverable from a replayed history — on resume the CLI
+ * seeds the dashboard from the original run's JSONL, and the root terminal
+ * events are deliberately filtered out (they would make the run look finished
+ * before it starts). So a run killed while paused would latch `isPaused` on
+ * for the whole resumed run, hiding the Stop button behind Resume/Kill wired
+ * to a dead process.
+ *
+ * The fix lives server-side in `WebDashboard._REPLAY_INTERACTIVE_SKIP_TYPES`.
+ * These tests pin the store behaviour that filter depends on: if a latch ever
+ * becomes self-healing, the corresponding entry can be dropped — and if a new
+ * global latch is added, it needs a new entry.
+ */
+describe('workflow-store — global interaction latches are not self-healing', () => {
+  function startWorkflow() {
+    const { processEvent } = useWorkflowStore.getState();
+    processEvent(event('workflow_started', {
+      name: 'root',
+      agents: [{ name: 'architect_questions' }],
+      routes: [],
+      parallel_groups: [],
+      for_each_groups: [],
+      entry_point: 'architect_questions',
+    }));
+    return processEvent;
+  }
+
+  it('leaves isPaused set after agent_paused, and a later agent_started does not clear it', () => {
+    const processEvent = startWorkflow();
+
+    processEvent(event('agent_started', { agent_name: 'architect_questions', iteration: 1 }));
+    processEvent(event('agent_paused', { agent_name: 'architect_questions', partial_content: '{}' }));
+    expect(useWorkflowStore.getState().isPaused).toBe(true);
+
+    // The resumed run re-executes the agent — which must not be mistaken for
+    // a mechanism that unsticks the header.
+    processEvent(event('agent_started', { agent_name: 'architect_questions', iteration: 2 }));
+    processEvent(event('agent_completed', { agent_name: 'architect_questions', iteration: 2 }));
+    expect(useWorkflowStore.getState().isPaused).toBe(true);
+  });
+
+  it('leaves iterationLimitGate set after iteration_limit_reached until it is explicitly resolved', () => {
+    const processEvent = startWorkflow();
+
+    processEvent(event('iteration_limit_reached', {
+      agent_name: 'architect_questions',
+      gate_id: 'g1',
+      current_iteration: 10,
+      max_iterations: 10,
+      skip_gates: false,
+    }));
+    expect(useWorkflowStore.getState().iterationLimitGate).not.toBeNull();
+
+    processEvent(event('agent_started', { agent_name: 'architect_questions', iteration: 11 }));
+    expect(useWorkflowStore.getState().iterationLimitGate).not.toBeNull();
+
+    processEvent(event('iteration_limit_resolved', {
+      agent_name: 'architect_questions',
+      continue_execution: true,
+      additional_iterations: 5,
+    }));
+    expect(useWorkflowStore.getState().iterationLimitGate).toBeNull();
+  });
+
+  it('leaves activeDialog set after dialog_started until the dialog completes', () => {
+    const processEvent = startWorkflow();
+
+    processEvent(event('dialog_started', { agent_name: 'architect_questions', dialog_id: 'd1' }));
+    expect(useWorkflowStore.getState().activeDialog).not.toBeNull();
+
+    processEvent(event('agent_started', { agent_name: 'architect_questions', iteration: 2 }));
+    expect(useWorkflowStore.getState().activeDialog).not.toBeNull();
+
+    processEvent(event('dialog_completed', { agent_name: 'architect_questions', dialog_id: 'd1' }));
+    expect(useWorkflowStore.getState().activeDialog).toBeNull();
+  });
+});

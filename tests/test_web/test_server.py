@@ -1209,6 +1209,116 @@ class TestReplayEventsFromJsonl:
             "agent_completed",
         ]
 
+    def test_skips_paused_events_so_resume_does_not_look_stopped(self, tmp_path: Path) -> None:
+        """A pause left unresolved in the original log must not replay.
+
+        ``agent_paused`` latches the frontend's global ``isPaused`` flag,
+        which swaps the header's Stop button for Resume/Kill. Its only
+        counterparts (``agent_resumed``, root ``workflow_completed`` /
+        ``workflow_failed``) are absent from a killed run's log or filtered
+        here, so replaying it makes a healthy resumed run look stopped and
+        leaves it with no way to be stopped.
+        """
+        emitter, dashboard = _make_dashboard()
+        log = tmp_path / "test.events.jsonl"
+        self._write_jsonl(
+            log,
+            [
+                {"type": "agent_started", "timestamp": 1.0, "data": {"agent_name": "a"}},
+                {
+                    "type": "agent_paused",
+                    "timestamp": 1.5,
+                    "data": {"agent_name": "a", "partial_content": "{}"},
+                },
+                {"type": "workflow_failed", "timestamp": 2.0, "data": {"error": "stopped"}},
+            ],
+        )
+
+        count = dashboard.replay_events_from_jsonl(log)
+
+        assert count == 1
+        assert [ev["type"] for ev in dashboard._event_history] == ["agent_started"]
+
+    def test_skips_interactive_events_at_every_depth(self, tmp_path: Path) -> None:
+        """Interaction events are dropped even when stamped with a subworkflow path.
+
+        The pause/gate/dialog control channel belongs to the root dashboard
+        regardless of which engine emitted the event, so — unlike the root
+        lifecycle events — depth must not exempt them.
+        """
+        emitter, dashboard = _make_dashboard()
+        log = tmp_path / "test.events.jsonl"
+        self._write_jsonl(
+            log,
+            [
+                {
+                    "type": "agent_paused",
+                    "timestamp": 1.0,
+                    "data": {"agent_name": "a", "subworkflow_path": ["sub"]},
+                },
+                {
+                    "type": "agent_resumed",
+                    "timestamp": 1.1,
+                    "data": {"agent_name": "a", "subworkflow_path": ["sub"]},
+                },
+                {
+                    "type": "iteration_limit_reached",
+                    "timestamp": 1.2,
+                    "data": {"agent_name": "a", "gate_id": "g1"},
+                },
+                {
+                    "type": "iteration_limit_resolved",
+                    "timestamp": 1.3,
+                    "data": {"agent_name": "a", "continue_execution": True},
+                },
+                {
+                    "type": "dialog_started",
+                    "timestamp": 1.4,
+                    "data": {"agent_name": "a", "dialog_id": "d1"},
+                },
+                {
+                    "type": "dialog_completed",
+                    "timestamp": 1.5,
+                    "data": {"agent_name": "a", "dialog_id": "d1"},
+                },
+                {"type": "agent_completed", "timestamp": 2.0, "data": {"agent_name": "a"}},
+            ],
+        )
+
+        count = dashboard.replay_events_from_jsonl(log)
+
+        assert count == 1
+        assert [ev["type"] for ev in dashboard._event_history] == ["agent_completed"]
+
+    def test_preserves_dialog_message_history(self, tmp_path: Path) -> None:
+        """Only the dialog's lifecycle bookends are dropped — the transcript stays.
+
+        ``dialog_message`` initialises its own node message list, so the
+        conversation still renders in the resumed dashboard's detail panel.
+        """
+        emitter, dashboard = _make_dashboard()
+        log = tmp_path / "test.events.jsonl"
+        self._write_jsonl(
+            log,
+            [
+                {
+                    "type": "dialog_started",
+                    "timestamp": 1.0,
+                    "data": {"agent_name": "a", "dialog_id": "d1"},
+                },
+                {
+                    "type": "dialog_message",
+                    "timestamp": 1.1,
+                    "data": {"agent_name": "a", "role": "agent", "content": "hi"},
+                },
+            ],
+        )
+
+        count = dashboard.replay_events_from_jsonl(log)
+
+        assert count == 1
+        assert [ev["type"] for ev in dashboard._event_history] == ["dialog_message"]
+
     def test_preserves_subworkflow_lifecycle_events(self, tmp_path: Path) -> None:
         """Subworkflow-level workflow_started/completed (identified by a non-empty
         ``data.subworkflow_path``) must be preserved so frontend wfDepth stays

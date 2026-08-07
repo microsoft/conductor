@@ -513,6 +513,36 @@ class WebDashboard:
         }
     )
 
+    # Interaction events that must be dropped on replay *at every depth*.
+    #
+    # Each of these sets a global "the engine is blocked waiting for you to
+    # click something" flag in the frontend store (``isPaused``,
+    # ``iterationLimitGate``, ``activeDialog``), and each is only cleared by
+    # its counterpart event or by a root ``workflow_completed`` /
+    # ``workflow_failed`` — all of which are either absent from a killed run's
+    # log or filtered by ``_REPLAY_ROOT_SKIP_TYPES`` above. Replaying the
+    # opening half therefore latches the flag on for the whole resumed run:
+    # the dashboard renders Resume/Kill (or the iteration-limit modal, or a
+    # dialog composer) for a process that no longer exists, and — because the
+    # header swaps Stop out for Resume/Kill — the live run cannot be stopped
+    # at all (issue: resumed workflow appears stopped in the dashboard).
+    #
+    # Unlike ``_REPLAY_ROOT_SKIP_TYPES`` these are filtered regardless of
+    # ``subworkflow_path``: the control channel is the root dashboard's
+    # ``resume_event`` / ``kill_event`` / gate id no matter which engine
+    # emitted the event, so depth is irrelevant. Any pause, gate, or dialog
+    # the resumed run genuinely re-enters emits its own fresh event.
+    _REPLAY_INTERACTIVE_SKIP_TYPES = frozenset(
+        {
+            "agent_paused",
+            "agent_resumed",
+            "iteration_limit_reached",
+            "iteration_limit_resolved",
+            "dialog_started",
+            "dialog_completed",
+        }
+    )
+
     @staticmethod
     def _is_root_event(event_dict: dict[str, Any]) -> bool:
         """Return True when *event_dict* came from the root engine.
@@ -565,8 +595,10 @@ class WebDashboard:
         first ``/api/state`` request returns the populated history.
 
         Root-level lifecycle events listed in
-        ``_REPLAY_ROOT_SKIP_TYPES`` are filtered out — see the comment
-        on that constant for the rationale.
+        ``_REPLAY_ROOT_SKIP_TYPES`` are filtered out, as are the
+        interaction events listed in ``_REPLAY_INTERACTIVE_SKIP_TYPES``
+        (at every depth) — see the comments on those constants for the
+        rationale.
 
         Args:
             path: Path to the original JSONL log file.
@@ -599,12 +631,11 @@ class WebDashboard:
             if not isinstance(event_dict, dict):
                 continue
             event_type = event_dict.get("type")
-            if (
-                isinstance(event_type, str)
-                and event_type in self._REPLAY_ROOT_SKIP_TYPES
-                and self._is_root_event(event_dict)
-            ):
-                continue
+            if isinstance(event_type, str):
+                if event_type in self._REPLAY_INTERACTIVE_SKIP_TYPES:
+                    continue
+                if event_type in self._REPLAY_ROOT_SKIP_TYPES and self._is_root_event(event_dict):
+                    continue
             self._event_history.append(event_dict)
             count += 1
 

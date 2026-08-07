@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.27...HEAD)
 
+### Fixed
+
+- **`conductor resume --web` no longer shows a running workflow as stopped** —
+  a workflow that was paused from the dashboard (Stop, then Kill) recorded an
+  `agent_paused` event in its event log with no `agent_resumed` counterpart.
+  On resume the CLI seeds the dashboard from that log, so the pause replayed
+  and latched the dashboard's global paused state for the entire resumed run:
+  the header rendered Resume/Kill instead of Stop, both wired to a process
+  that no longer existed, leaving the live run with no way to be stopped and
+  Kill able to terminate a healthy workflow. Pause, iteration-limit-gate, and
+  dialog events are now dropped on replay at every workflow depth, alongside
+  the root lifecycle events already filtered; a gate the resumed run genuinely
+  re-enters emits its own fresh event. Prior agent output, messages, and
+  dialog transcripts are still replayed. The dashboard's live-control buttons
+  are also hidden in `conductor replay` mode, where the recorded-log server
+  serves no `/api/stop`, `/api/resume`, or `/api/kill` endpoint.
+
 ## [0.1.27](https://github.com/microsoft/conductor/compare/v0.1.26...v0.1.27) - 2026-08-04
 
 ### Added

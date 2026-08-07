@@ -9,12 +9,16 @@ export function Header() {
   const isPaused = useWorkflowStore((s) => s.isPaused);
   const workflowYaml = useWorkflowStore((s) => s.workflowYaml);
   const conductorVersion = useWorkflowStore((s) => s.conductorVersion);
+  const replayMode = useWorkflowStore((s) => s.replayMode);
   const [stopping, setStopping] = useState(false);
   const [resuming, setResuming] = useState(false);
   const [killing, setKilling] = useState(false);
   const [showYaml, setShowYaml] = useState(false);
 
-  const isRunning = workflowStatus === 'running' || workflowStatus === 'pending';
+  // `ReplayDashboard` serves no /api/stop|resume|kill, so these controls
+  // would 404 against a recorded log. Gate them on the live dashboard.
+  const isRunning = !replayMode && (workflowStatus === 'running' || workflowStatus === 'pending');
+  const showPauseControls = !replayMode && isPaused;
 
   // Reset button states when transitioning out of paused
   useEffect(() => {
@@ -69,7 +73,7 @@ export function Header() {
         )}
       </div>
       <div className="flex items-center gap-3">
-        {isPaused ? (
+        {showPauseControls ? (
           <>
             <button
               onClick={handleResume}
