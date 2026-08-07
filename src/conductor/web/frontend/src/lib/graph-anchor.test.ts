@@ -77,8 +77,9 @@ describe('toAbsolutePositions', () => {
   });
 
   it('resolves a deep chain correctly from either end', () => {
-    // The memoized fold has no depth cap, so nesting far past anything
-    // `buildGraphElements` emits still resolves exactly rather than truncating.
+    // A 40-deep chain is far past anything `buildGraphElements` emits;
+    // resolving it exactly from either iteration order proves the fold is
+    // depth-independent.
     const depth = 40;
     const nodes: AnchorNode[] = [];
     for (let i = 0; i < depth; i++) {
@@ -148,6 +149,17 @@ describe('resolveAnchorId', () => {
     expect(anchor).toBe('group');
   });
 
+  it('matches a hint carried only by the incoming layout', () => {
+    // The mirror of the case above: a group becomes expandable as this rebuild
+    // lands, so only `nextNodes` carries the key.
+    const prevNodes = [node('near', 500, 400), node('group', 5000, 4000)];
+    const nextNodes = [
+      node('near', 500, 400),
+      node('group', 5000, 4000, { data: { groupExpansionKey: '::batch' } }),
+    ];
+    expect(resolveAnchorId(input({ prevNodes, nextNodes, anchorKeyHint: '::batch' }))).toBe('group');
+  });
+
   it('falls back to the nearest node when the hinted container is not shared', () => {
     const prevNodes = [
       node('near', 500, 400),
@@ -180,6 +192,24 @@ describe('resolveAnchorId', () => {
     expect(anchor).toBe('b');
   });
 
+  it('converts the pane center into flow space at the current zoom', () => {
+    // Same viewport as above: (750, 600) is the true flow-space center, and
+    // (1500, 1200) is where it would land if the zoom divisor were dropped.
+    const viewport: Viewport = { x: -1000, y: -800, zoom: 2 };
+    const prevNodes = [node('scaled', 750, 600), node('unscaled', 1500, 1200)];
+    expect(resolveAnchorId(input({ prevNodes, nextNodes: prevNodes, viewport }))).toBe('scaled');
+  });
+
+  it('ranks candidates by true distance, not by either axis alone', () => {
+    // Center is (500, 400). `vertical` wins on x alone, `horizontal` on y alone.
+    const prevNodes = [
+      node('vertical', 500, 600), // dx   0, dy 200 -> 40000
+      node('horizontal', 690, 400), // dx 190, dy   0 -> 36100
+      node('diag', 620, 520), // dx 120, dy 120 -> 28800
+    ];
+    expect(resolveAnchorId(input({ prevNodes, nextNodes: prevNodes }))).toBe('diag');
+  });
+
   it('breaks ties deterministically on node id', () => {
     // Both are equidistant from the center (500, 400).
     const prevNodes = [node('zulu', 400, 400), node('alpha', 600, 400)];
@@ -193,13 +223,16 @@ describe('resolveAnchorId', () => {
 
   it('declines to anchor on an unmeasured pane with no hint', () => {
     const prevNodes = [node('a', 0, 0), node('b', 100, 100)];
-    const anchor = resolveAnchorId(
-      input({ prevNodes, nextNodes: prevNodes, paneSize: { width: 0, height: 0 } }),
-    );
-    expect(anchor).toBeNull();
+    for (const paneSize of [
+      { width: 0, height: 0 },
+      { width: 1000, height: 0 }, // a panel collapsed to zero height at full width
+      { width: 0, height: 800 },
+    ]) {
+      expect(resolveAnchorId(input({ prevNodes, nextNodes: prevNodes, paneSize }))).toBeNull();
+    }
   });
 
-  it('still honours the hint on an unmeasured pane', () => {
+  it('still honors the hint on an unmeasured pane', () => {
     const prevNodes = [node('a', 0, 0, { data: { childContextKey: '0' } })];
     const anchor = resolveAnchorId(
       input({
@@ -223,6 +256,26 @@ describe('anchoredViewport', () => {
   it('returns null when the anchor did not move', () => {
     const nodes = [node('a', 10, 10)];
     expect(anchoredViewport(input({ prevNodes: nodes, nextNodes: nodes }))).toBeNull();
+  });
+
+  it('returns null rather than emitting a non-finite viewport', () => {
+    // NaN fails the zero-delta test, so without an explicit finiteness check it
+    // would reach d3 as an invalid transform and poison every later rebuild.
+    const prevNodes = [node('a', 0, 0)];
+    const nextNodes = [node('a', Number.NaN, 0)];
+    expect(anchoredViewport(input({ prevNodes, nextNodes }))).toBeNull();
+  });
+
+  it('resolves the anchor against the previous layout, not the incoming one', () => {
+    // `a` sits at the pane center before the rebuild, so the pan compensates
+    // `a`'s move rather than `b`'s equal-and-opposite one.
+    const prevNodes = [node('a', 500, 400), node('b', 5000, 4000)];
+    const nextNodes = [node('a', 5000, 4000), node('b', 500, 400)];
+    expect(anchoredViewport(input({ prevNodes, nextNodes }))).toEqual({
+      x: -4500,
+      y: -3600,
+      zoom: 1,
+    });
   });
 
   it('pans by the negated delta so the anchor stays put on screen', () => {
@@ -277,6 +330,7 @@ describe('anchoredViewport', () => {
       input({ prevNodes: collapsed, nextNodes: expanded, anchorKeyHint: '0', viewport: start }),
     );
     expect(afterExpand).not.toBeNull();
+    expect(afterExpand).not.toEqual(start);
 
     const afterCollapse = anchoredViewport(
       input({
@@ -312,16 +366,27 @@ describe('nextAnchorHint', () => {
     ).toEqual({ hint: '0', stickyRebuilds: 0 });
   });
 
-  it('drops the hint when several keys toggle at once', () => {
-    expect(nextAnchorHint({ ...base, currentKeys: new Set(['0', '1', '2']) })).toEqual({
-      hint: null,
-      stickyRebuilds: 0,
-    });
+  it('drops a live hint when several keys toggle at once', () => {
+    expect(
+      nextAnchorHint({
+        ...base,
+        previousKeys: new Set(['0']),
+        currentKeys: new Set(['0', '1', '2']),
+        currentHint: '0',
+        stickyRebuilds: 1,
+      }),
+    ).toEqual({ hint: null, stickyRebuilds: 0 });
   });
 
-  it('drops the hint on a context switch even when a key toggled', () => {
+  it('drops a live hint on a context switch even when a key toggled', () => {
     expect(
-      nextAnchorHint({ ...base, currentKeys: new Set(['0']), contextSwitched: true }),
+      nextAnchorHint({
+        ...base,
+        currentKeys: new Set(['0']),
+        currentHint: '5',
+        stickyRebuilds: 1,
+        contextSwitched: true,
+      }),
     ).toEqual({ hint: null, stickyRebuilds: 0 });
   });
 
@@ -335,6 +400,7 @@ describe('nextAnchorHint', () => {
   });
 
   it('releases the hint once the sticky budget is exhausted', () => {
+    expect(MAX_STICKY_ANCHOR_REBUILDS).toBe(2);
     const keys = new Set(['0']);
     let state = { hint: '0' as string | null, stickyRebuilds: 0 };
     for (let i = 0; i < MAX_STICKY_ANCHOR_REBUILDS; i++) {
@@ -377,10 +443,12 @@ describe('nextAnchorHint', () => {
 // shapes the layout actually emits.
 //
 // Each fixture expands a *second* container while a first is already expanded.
-// That is deliberate: expanding the only container leaves it at the layout's
-// min-x/min-y, so it does not move and there is nothing to compensate — an
-// assertion there would hold against a `anchoredViewport` that always returned
-// null. A container that starts beside a wider sibling does move.
+// That is deliberate: in these single-column fixtures the sole expanded
+// container is the widest node, so it owns `minX`, normalizes to x = 0 both
+// before and after, and does not move — an assertion there would hold against
+// an `anchoredViewport` that always returned null. Once a wider sibling exists
+// anywhere in the layout, a narrower container's normalized x is inset by the
+// width difference and changes when that difference does.
 // ---------------------------------------------------------------------------
 
 function event(
@@ -404,6 +472,43 @@ function rootBase(): GraphContextInput {
     parentAgent: null,
     children: s.subworkflowContexts,
   };
+}
+
+/**
+ * Emit the `subworkflow_started` + child `workflow_started` pair that makes one
+ * inline subworkflow expandable. `extra` patches the start event — a `for_each`
+ * iteration's `agent_name` is its group, not its slot key.
+ */
+function seedSubworkflow(
+  slotKey: string,
+  [first, second]: [string, string],
+  extra: Record<string, unknown> = {},
+): void {
+  const { processEvent } = useWorkflowStore.getState();
+  processEvent(
+    event('subworkflow_started', {
+      agent_name: slotKey,
+      workflow: 'sub.yaml',
+      iteration: 1,
+      slot_key: slotKey,
+      parent_path: [],
+      ...extra,
+    }),
+  );
+  processEvent(
+    event('workflow_started', {
+      name: 'child-workflow',
+      agents: [{ name: first }, { name: second }],
+      routes: [
+        { from: first, to: second },
+        { from: second, to: '$end' },
+      ],
+      parallel_groups: [],
+      for_each_groups: [],
+      entry_point: first,
+      subworkflow_path: [slotKey],
+    }),
+  );
 }
 
 /** Root workflow with two sequential `type: workflow` steps, both started. */
@@ -431,31 +536,7 @@ function seedTwoSubworkflows(): void {
     }),
   );
 
-  for (const name of ['subA', 'subB']) {
-    processEvent(
-      event('subworkflow_started', {
-        agent_name: name,
-        workflow: 'sub.yaml',
-        iteration: 1,
-        slot_key: name,
-        parent_path: [],
-      }),
-    );
-    processEvent(
-      event('workflow_started', {
-        name: 'child-workflow',
-        agents: [{ name: 'childA' }, { name: 'childB' }],
-        routes: [
-          { from: 'childA', to: 'childB' },
-          { from: 'childB', to: '$end' },
-        ],
-        parallel_groups: [],
-        for_each_groups: [],
-        entry_point: 'childA',
-        subworkflow_path: [name],
-      }),
-    );
-  }
+  for (const name of ['subA', 'subB']) seedSubworkflow(name, ['childA', 'childB']);
 }
 
 /** Root workflow with a `for_each`-of-workflow group plus a sequential one. */
@@ -478,55 +559,14 @@ function seedForEachBesideSubworkflow(iterations = 2): void {
     }),
   );
 
-  processEvent(
-    event('subworkflow_started', {
-      agent_name: 'wide',
-      workflow: 'sub.yaml',
-      iteration: 1,
-      slot_key: 'wide',
-      parent_path: [],
-    }),
-  );
-  processEvent(
-    event('workflow_started', {
-      name: 'child-workflow',
-      agents: [{ name: 'w1' }, { name: 'w2' }],
-      routes: [
-        { from: 'w1', to: 'w2' },
-        { from: 'w2', to: '$end' },
-      ],
-      parallel_groups: [],
-      for_each_groups: [],
-      entry_point: 'w1',
-      subworkflow_path: ['wide'],
-    }),
-  );
+  seedSubworkflow('wide', ['w1', 'w2']);
 
   for (let i = 0; i < iterations; i++) {
-    processEvent(
-      event('subworkflow_started', {
-        agent_name: 'batch',
-        workflow: 'sub.yaml',
-        iteration: i + 1,
-        slot_key: `batch[${i}]`,
-        item_key: String(i),
-        parent_path: [],
-      }),
-    );
-    processEvent(
-      event('workflow_started', {
-        name: 'child-workflow',
-        agents: [{ name: 'childA' }, { name: 'childB' }],
-        routes: [
-          { from: 'childA', to: 'childB' },
-          { from: 'childB', to: '$end' },
-        ],
-        parallel_groups: [],
-        for_each_groups: [],
-        entry_point: 'childA',
-        subworkflow_path: [`batch[${i}]`],
-      }),
-    );
+    seedSubworkflow(`batch[${i}]`, ['childA', 'childB'], {
+      agent_name: 'batch',
+      iteration: i + 1,
+      item_key: String(i),
+    });
   }
 }
 
@@ -556,22 +596,16 @@ describe('anchoring real layouts', () => {
     const keyB = contextKey([1]);
     const containerId = nodeKey([], 'subB');
 
-    const one = buildGraphElements(rootBase(), [], new Set([keyA])).nodes as AnchorNode[];
-    const two = buildGraphElements(rootBase(), [], new Set([keyA, keyB])).nodes as AnchorNode[];
+    const one = buildGraphElements(rootBase(), [], new Set([keyA])).nodes;
+    const two = buildGraphElements(rootBase(), [], new Set([keyA, keyB])).nodes;
 
     // Sanity: this is the scenario under test — the container really grows.
     const grown = two.find((n) => n.id === containerId)!;
-    expect(grown.data!.expanded).toBe(true);
-    expect(typeof (grown as { style?: { width?: unknown } }).style?.width).toBe('number');
+    expect(grown.data.expanded).toBe(true);
+    expect(typeof grown.style?.width).toBe('number');
 
     const viewport: Viewport = { x: -120, y: -60, zoom: 0.9 };
-    const next = anchoredViewport({
-      prevNodes: one,
-      nextNodes: two,
-      anchorKeyHint: keyB,
-      viewport,
-      paneSize: PANE,
-    });
+    const next = anchoredViewport(input({ prevNodes: one, nextNodes: two, anchorKeyHint: keyB, viewport }));
 
     expect(next).not.toBeNull();
     expectPinned(one, two, containerId, viewport, next!);
@@ -582,26 +616,17 @@ describe('anchoring real layouts', () => {
     const keyA = contextKey([0]);
     const keyB = contextKey([1]);
 
-    const one = buildGraphElements(rootBase(), [], new Set([keyA])).nodes as AnchorNode[];
-    const two = buildGraphElements(rootBase(), [], new Set([keyA, keyB])).nodes as AnchorNode[];
+    const one = buildGraphElements(rootBase(), [], new Set([keyA])).nodes;
+    const two = buildGraphElements(rootBase(), [], new Set([keyA, keyB])).nodes;
 
     const start: Viewport = { x: -120, y: -60, zoom: 0.9 };
-    const afterExpand = anchoredViewport({
-      prevNodes: one,
-      nextNodes: two,
-      anchorKeyHint: keyB,
-      viewport: start,
-      paneSize: PANE,
-    });
+    const afterExpand = anchoredViewport(input({ prevNodes: one, nextNodes: two, anchorKeyHint: keyB, viewport: start }));
     expect(afterExpand).not.toBeNull();
+    expect(afterExpand).not.toEqual(start);
 
-    const afterCollapse = anchoredViewport({
-      prevNodes: two,
-      nextNodes: one,
-      anchorKeyHint: keyB,
-      viewport: afterExpand!,
-      paneSize: PANE,
-    });
+    const afterCollapse = anchoredViewport(
+      input({ prevNodes: two, nextNodes: one, anchorKeyHint: keyB, viewport: afterExpand! }),
+    );
     expect(afterCollapse).not.toBeNull();
 
     expect(afterCollapse!.x).toBeCloseTo(start.x, 6);
@@ -609,29 +634,56 @@ describe('anchoring real layouts', () => {
     expect(afterCollapse!.zoom).toBe(start.zoom);
   });
 
-  it('pins a for_each group whose iteration pills get re-parented on expand', () => {
+  it('pins a node inside an already-expanded container, which moves only via its parent', () => {
+    seedTwoSubworkflows();
+    const one = buildGraphElements(rootBase(), [], new Set([contextKey([1])])).nodes;
+    const two = buildGraphElements(
+      rootBase(),
+      [],
+      new Set([contextKey([0]), contextKey([1])]),
+    ).nodes;
+    const innerId = nodeKey([1], 'childA');
+
+    // Its container-relative `position` is byte-identical in both layouts; only
+    // the parent-chain fold sees that it moved. Center the pane on it so the
+    // hintless fallback selects it.
+    const inner = one.find((n) => n.id === innerId)!;
+    const innerAfter = two.find((n) => n.id === innerId)!;
+    expect(inner.parentId).toBeDefined();
+    expect(innerAfter.position).toEqual(inner.position);
+
+    const abs = toAbsolutePositions(one).get(innerId)!;
+    const viewport: Viewport = {
+      x: PANE.width / 2 - abs.x,
+      y: PANE.height / 2 - abs.y,
+      zoom: 1,
+    };
+    const args = input({ prevNodes: one, nextNodes: two, anchorKeyHint: null, viewport });
+    expect(resolveAnchorId(args)).toBe(innerId);
+
+    const next = anchoredViewport(args);
+    expect(next).not.toBeNull();
+    expectPinned(one, two, innerId, viewport, next!);
+  });
+
+  it('pins a for_each group whose iterations appear nested on expand', () => {
     seedForEachBesideSubworkflow(2);
     const wideKey = contextKey([0]);
     const groupKey = forEachGroupKey([], 'batch');
     const groupId = nodeKey([], 'batch');
 
-    const one = buildGraphElements(rootBase(), [], new Set([wideKey])).nodes as AnchorNode[];
+    const one = buildGraphElements(rootBase(), [], new Set([wideKey])).nodes;
     const two = buildGraphElements(rootBase(), [], new Set([wideKey, groupKey]))
-      .nodes as AnchorNode[];
+      .nodes;
 
-    // Sanity: expansion really does re-parent the iteration pills.
+    // Sanity: the pills exist only once expanded, and arrive already parented
+    // to the group container.
     const pill = two.find((n) => n.id === nodeKey([], 'batch[0]'))!;
     expect(pill.parentId).toBe(groupId);
     expect(one.some((n) => n.id === pill.id)).toBe(false);
 
     const viewport: Viewport = { x: 33, y: -77, zoom: 1.1 };
-    const next = anchoredViewport({
-      prevNodes: one,
-      nextNodes: two,
-      anchorKeyHint: groupKey,
-      viewport,
-      paneSize: PANE,
-    });
+    const next = anchoredViewport(input({ prevNodes: one, nextNodes: two, anchorKeyHint: groupKey, viewport }));
 
     expect(next).not.toBeNull();
     expectPinned(one, two, groupId, viewport, next!);

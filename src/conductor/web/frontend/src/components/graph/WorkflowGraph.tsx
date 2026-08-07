@@ -21,7 +21,8 @@ import { useViewedGraphData } from '@/hooks/use-viewed-context';
 import { useDeepLink } from '@/hooks/use-deep-link';
 import { buildGraphElements, collectExpandableContextKeys, type GraphNodeData, type GraphContextInput } from './graph-layout';
 import { nodeKey, parseNodeKey, isGroupExpansionKey, parseForEachSlotKey } from '@/lib/node-id';
-import { anchoredViewport, nextAnchorHint } from '@/lib/graph-anchor';
+import { anchoredViewport, nextAnchorHint, type AnchorHintResult } from '@/lib/graph-anchor';
+import { claimCameraForAnimation, isCameraAnimating } from '@/lib/camera-authority';
 import { AgentNode } from './AgentNode';
 import { ScriptNode } from './ScriptNode';
 import { SetNode } from './SetNode';
@@ -63,6 +64,21 @@ const edgeTypes: EdgeTypes = {
 const defaultEdgeOptions = {
   type: 'animatedEdge',
 };
+
+/** Duration of every animated `fitView`, and the delay before the context-switch one. */
+const FIT_VIEW_DURATION_MS = 300;
+/** How long `FitViewOnContextSwitch` waits for the new layout before fitting. */
+const FIT_VIEW_DELAY_MS = 50;
+
+/**
+ * Animated fit, with the camera claim that keeps a graph rebuild from
+ * interrupting it. Always fit through this — a bare `fitView` can be cancelled
+ * mid-animation by the rebuild effect's instant `setViewport`.
+ */
+function claimedFitView(fitView: ReturnType<typeof useReactFlow>['fitView']): void {
+  claimCameraForAnimation(FIT_VIEW_DURATION_MS);
+  fitView({ padding: 0.2, duration: FIT_VIEW_DURATION_MS });
+}
 
 // Custom marker definitions for edge arrows
 function EdgeMarkers() {
@@ -107,9 +123,9 @@ function resolveContextByPath(
  *
  * Wrapped in its own `ReactFlowProvider` so the rebuild effect — which lives
  * *outside* `<ReactFlow>` — can read and write the viewport (see
- * {@link anchoredViewport}). Provider and `<ReactFlow>` mount together, so the
- * hoisted store has the same lifetime as the component and the initial
- * `fitView` still runs once per mount.
+ * {@link anchoredViewport}). The provider and `<ReactFlow>` share a mount, so
+ * the store lives exactly as long as the component and the initial `fitView`
+ * runs once per mount.
  */
 export function WorkflowGraph() {
   return (
@@ -160,14 +176,12 @@ function WorkflowGraphInner() {
   const { getViewport, setViewport } = useReactFlow();
   /** Wrapper element, measured to locate the pane center for anchor selection. */
   const containerRef = useRef<HTMLDivElement>(null);
-  /** Node array from the previous rebuild — the "before" side of the anchor. */
+  /** Last *built* layout — the "before" side of the anchor. Not `flowNodes`, which drags and status updates mutate. */
   const builtNodesRef = useRef<Node<GraphNodeData>[]>([]);
   /** Container preferred as the anchor, and how long it has been held over. */
-  const anchorHintRef = useRef<{ hint: string | null; stickyRebuilds: number }>({
-    hint: null,
-    stickyRebuilds: 0,
-  });
+  const anchorHintRef = useRef<AnchorHintResult>({ hint: null, stickyRebuilds: 0 });
   const prevExpandedRef = useRef<Set<string>>(new Set());
+  /** `null` until the first build, so the initial rebuild counts as a switch and never anchors. */
   const prevViewPathKeyRef = useRef<string | null>(null);
 
   const viewPathKey = JSON.stringify(viewContextPath);
@@ -221,8 +235,9 @@ function WorkflowGraphInner() {
     if (prevBuildKey.current === structureKey) return;
     prevBuildKey.current = structureKey;
 
-    // On a context switch `FitViewOnContextSwitch` owns the camera; anchoring
-    // would fight it, and the previous context's layout is not comparable.
+    // The first build and a context switch both take this branch: on a switch
+    // `FitViewOnContextSwitch` owns the camera, and the outgoing context's
+    // layout is not comparable to the incoming one either way.
     const contextSwitched = prevViewPathKeyRef.current !== viewPathKey;
     prevViewPathKeyRef.current = viewPathKey;
 
@@ -253,13 +268,17 @@ function WorkflowGraphInner() {
     setFlowNodes(nodes);
     setFlowEdges(edges);
 
-    // `layoutTopLevel` normalizes each layout's bounding box to origin, so
-    // growing one container shifts every node. Pan by the same amount the
-    // anchor moved, and the graph appears to grow around a fixed point instead
-    // of sliding out from under the camera (issue #375).
-    if (contextSwitched || prevNodes.length === 0) return;
+    // Compensate the camera for the layout's origin shift so the graph grows
+    // around a fixed point instead of sliding out from under the view
+    // (issue #375; see `lib/graph-anchor` for why the layout is left alone).
+    //
+    // An animated fit reframes the whole graph, so it outranks compensation —
+    // and an instant `setViewport` would cancel its d3 transition mid-flight.
+    if (contextSwitched || prevNodes.length === 0 || isCameraAnimating()) return;
     const rect = containerRef.current?.getBoundingClientRect();
-    const next = anchoredViewport({
+    // Read after `setFlowNodes`: React state is async, but the React Flow
+    // viewport lives in its own store and is already current.
+    const nextViewport = anchoredViewport({
       prevNodes,
       nextNodes: nodes,
       anchorKeyHint: anchorHintRef.current.hint,
@@ -267,7 +286,7 @@ function WorkflowGraphInner() {
       paneSize: { width: rect?.width ?? 0, height: rect?.height ?? 0 },
     });
     // Instant, not animated: the point is that nothing appears to move.
-    if (next) setViewport(next);
+    if (nextViewport) setViewport(nextViewport);
   }, [
     structureKey,
     agents,
@@ -498,7 +517,7 @@ function FitViewButton() {
   const { fitView } = useReactFlow();
 
   const handleFitView = useCallback(() => {
-    fitView({ padding: 0.2, duration: 300 });
+    claimedFitView(fitView);
   }, [fitView]);
 
   return (
@@ -580,7 +599,7 @@ function FitViewKeyboardShortcut() {
       const tag = (e.target as HTMLElement)?.tagName;
       if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
       if (e.key === 'f' && !e.ctrlKey && !e.metaKey && !e.altKey) {
-        fitView({ padding: 0.2, duration: 300 });
+        claimedFitView(fitView);
       }
     };
     window.addEventListener('keydown', handleKeyDown);
@@ -598,7 +617,9 @@ function FitViewOnContextSwitch({ viewPathKey }: { viewPathKey: string }) {
   useEffect(() => {
     if (prevKey.current !== viewPathKey) {
       prevKey.current = viewPathKey;
-      setTimeout(() => fitView({ padding: 0.2, duration: 300 }), 50);
+      // Claim across the delay too, so a rebuild in the gap can't pan first.
+      claimCameraForAnimation(FIT_VIEW_DELAY_MS + FIT_VIEW_DURATION_MS);
+      setTimeout(() => claimedFitView(fitView), FIT_VIEW_DELAY_MS);
     }
   }, [viewPathKey, fitView]);
 
