@@ -2525,7 +2525,7 @@ class WorkflowEngine:
         )
 
         if not order:
-            output = questions_mod.build_output(records, order, "completed")
+            output = questions_mod.build_output(records, order, questions_mod.OUTCOME_COMPLETED)
             self._emit(
                 "questions_completed",
                 {
@@ -2545,7 +2545,9 @@ class WorkflowEngine:
                     question.id,
                     questions_mod.AnswerRecord.for_skip(question),
                 )
-            output = questions_mod.build_output(records, order, "skipped_remaining")
+            output = questions_mod.build_output(
+                records, order, questions_mod.OUTCOME_SKIPPED_REMAINING
+            )
             self._emit(
                 "questions_completed",
                 {"agent_name": agent.name, "outcome": output["outcome"], **_answer_counts(output)},
@@ -2604,7 +2606,7 @@ class WorkflowEngine:
                 # question; with Back disabled it would be a pointless extra
                 # click, so finish immediately.
                 if not nav.back:
-                    return "completed"
+                    return questions_mod.OUTCOME_COMPLETED
                 gate_prompt = questions_mod.build_review_prompt(
                     agent, records, order, nav=nav, prompt_id=_next_prompt_id()
                 )
@@ -2654,7 +2656,7 @@ class WorkflowEngine:
                 await self._resume_listener()
 
             if response.value == questions_mod.NAV_FINISH:
-                return "completed"
+                return questions_mod.OUTCOME_COMPLETED
 
             if response.value == questions_mod.NAV_BACK:
                 # Back is only offered from question 2 onward and at the review;
@@ -2671,7 +2673,7 @@ class WorkflowEngine:
                 continue
 
             if response.value == questions_mod.NAV_ABORT:
-                return "aborted"
+                return questions_mod.OUTCOME_ABORTED
 
             if response.value == questions_mod.NAV_SKIP_ALL:
                 # Skip-all must honour `required` too, or it is a one-click
@@ -2698,7 +2700,7 @@ class WorkflowEngine:
                         questions_mod.AnswerRecord.for_skip(remaining),
                     )
                 self._store_questions_progress(agent, records, order)
-                return "skipped_remaining"
+                return questions_mod.OUTCOME_SKIPPED_REMAINING
 
             if at_review:
                 # build_review_prompt offers only Finish/Back/Abort, all handled
@@ -2784,7 +2786,7 @@ class WorkflowEngine:
         # prompts, the interrupt panel, and the dashboard's synthetic replay.
         # The main loop's single ``store`` remains the node's one history entry.
         self.context.agent_outputs[agent.name] = questions_mod.build_output(
-            records, order, "in_progress"
+            records, order, questions_mod.OUTCOME_IN_PROGRESS
         )
 
     @staticmethod
@@ -4114,7 +4116,7 @@ class WorkflowEngine:
                             self.limits.record_execution(agent.name)
                             self.limits.check_timeout()
 
-                            if questions_output["outcome"] == "aborted":
+                            if questions_output["outcome"] == questions_mod.OUTCOME_ABORTED:
                                 route_target = agent.abort_route or "$end"
                                 output_transform = None
                             else:

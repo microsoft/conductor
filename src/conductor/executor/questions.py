@@ -49,6 +49,15 @@ QuestionsOutcome = Literal["completed", "skipped_remaining", "aborted", "in_prog
 """Terminal state of a questions node. ``in_progress`` appears only in a
 mid-node checkpoint, never in a completed node's output."""
 
+# Named so callers compare against a symbol rather than a bare string: the
+# output crosses a Jinja/JSON boundary as a plain dict, so a mistyped literal
+# would silently stop matching (disabling the abort route) where a mistyped
+# name is an immediate NameError.
+OUTCOME_COMPLETED: QuestionsOutcome = "completed"
+OUTCOME_SKIPPED_REMAINING: QuestionsOutcome = "skipped_remaining"
+OUTCOME_ABORTED: QuestionsOutcome = "aborted"
+OUTCOME_IN_PROGRESS: QuestionsOutcome = "in_progress"
+
 
 @dataclass
 class ResolvedQuestion:
@@ -468,6 +477,10 @@ __all__ = [
     "NAV_SKIP_ALL",
     "AnswerRecord",
     "AnswerSource",
+    "OUTCOME_ABORTED",
+    "OUTCOME_COMPLETED",
+    "OUTCOME_IN_PROGRESS",
+    "OUTCOME_SKIPPED_REMAINING",
     "NavFlags",
     "QuestionsOutcome",
     "ResolvedQuestion",
