@@ -26,6 +26,9 @@ export function GateDetail({ node }: GateDetailProps) {
   const isCompleted = node.status === 'completed';
 
   // Reset local state when the gate transitions back to 'waiting' (re-entry in a loop)
+  // Also keyed on gate_prompt_id: a questions node presents every question
+  // under the same name and stays 'waiting' throughout, so isWaiting alone
+  // never changes and the form would stay locked after the first answer.
   useEffect(() => {
     if (isWaiting) {
       setSelectedValue(null);
@@ -34,7 +37,7 @@ export function GateDetail({ node }: GateDetailProps) {
       setPendingMultiline(false);
       setIsSending(false);
     }
-  }, [isWaiting]);
+  }, [isWaiting, node.gate_prompt_id]);
 
   const canInteract = isWaiting && wsStatus === 'connected' && selectedValue === null;
 
@@ -52,14 +55,14 @@ export function GateDetail({ node }: GateDetailProps) {
     // Send immediately
     setSelectedValue(value);
     setIsSending(true);
-    sendGateResponse(node.name, value);
+    sendGateResponse(node.name, value, undefined, node.gate_prompt_id);
   };
 
   const handlePromptForSubmit = () => {
     if (selectedValue === null || pendingPromptFor === null) return;
     const additionalInput: Record<string, string> = { [pendingPromptFor]: promptForValue };
     setIsSending(true);
-    sendGateResponse(node.name, selectedValue, additionalInput);
+    sendGateResponse(node.name, selectedValue, additionalInput, node.gate_prompt_id);
     setPendingPromptFor(null);
     setPendingMultiline(false);
   };
@@ -143,11 +146,11 @@ export function GateDetail({ node }: GateDetailProps) {
                           </span>
                         </div>
                         {/* Route hint */}
-                        {opt.route && (
+                        {opt.route ? (
                           <span className="text-[10px] text-[var(--text-muted)] flex-shrink-0">
                             → {opt.route}
                           </span>
-                        )}
+                        ) : null}
                       </div>
                     </button>
                   );
@@ -360,7 +363,7 @@ function isRelativeFileLink(href: string | undefined): href is string {
 }
 
 /** Renders prompt text as markdown with dashboard-consistent styling. */
-function PromptMarkdown({
+export function PromptMarkdown({
   text,
   muted,
   onFileClick,

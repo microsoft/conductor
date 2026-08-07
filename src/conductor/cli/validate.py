@@ -213,6 +213,7 @@ def display_validation_success(
     # Build summary info
     agent_count = len(config.agents)
     human_gate_count = sum(1 for a in config.agents if a.type == "human_gate")
+    questions_count = sum(1 for a in config.agents if a.type == "questions")
     parallel_group_count = len(config.parallel)
     for_each_group_count = len(config.for_each)
 
@@ -243,6 +244,9 @@ def display_validation_success(
     if human_gate_count > 0:
         patterns.append("human gates")
 
+    if questions_count > 0:
+        patterns.append("questions")
+
     if config.tools:
         patterns.append("tools")
 
@@ -258,6 +262,8 @@ def display_validation_success(
     table.add_row("Agents", str(agent_count))
     if human_gate_count > 0:
         table.add_row("Human Gates", str(human_gate_count))
+    if questions_count > 0:
+        table.add_row("Questions", str(questions_count))
     if parallel_group_count > 0:
         table.add_row("Parallel Groups", str(parallel_group_count))
     if for_each_group_count > 0:

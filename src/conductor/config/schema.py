@@ -310,6 +310,53 @@ class GateOption(BaseModel):
     """
 
 
+class QuestionDef(BaseModel):
+    """One question in a ``type: questions`` node.
+
+    A ``source:`` that resolves to plain strings is coerced into these with
+    only ``text`` populated, so an agent emitting ``array of string`` needs no
+    change to gain choices later.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str | None = None
+    """Stable key for this question's answer. Defaults to ``q1``..``qN``.
+
+    Set it explicitly when downstream templates reference a specific answer,
+    so inserting a question upstream doesn't renumber the keys under them.
+    """
+
+    text: str
+    """The question, rendered as a Jinja2 template."""
+
+    hint: str | None = None
+    """Optional clarifying text shown beneath the question."""
+
+    choices: list[str] | None = None
+    """Suggested answers to offer as selectable options.
+
+    Lets an agent propose candidate answers rather than only asking
+    open-ended questions, which is a far lower-effort interaction.
+    """
+
+    allow_free_text: bool = True
+    """Whether to offer a "write your own" option alongside ``choices``."""
+
+    default: str | None = None
+    """Answer recorded when the question is skipped."""
+
+    required: bool = False
+    """Whether an answer is mandatory.
+
+    Blocks *submission*, never navigation — otherwise a user could be trapped
+    on a question they cannot answer yet.
+    """
+
+    multiline: bool = True
+    """Whether the free-text path accepts multi-line input."""
+
+
 class ContextConfig(BaseModel):
     """Configuration for context accumulation behavior."""
 
@@ -736,7 +783,17 @@ class AgentDef(BaseModel):
     """Human-readable description of agent's purpose."""
 
     type: (
-        Literal["agent", "human_gate", "script", "set", "terminate", "wait", "workflow"] | None
+        Literal[
+            "agent",
+            "human_gate",
+            "questions",
+            "script",
+            "set",
+            "terminate",
+            "wait",
+            "workflow",
+        ]
+        | None
     ) = None
     """Agent type. Defaults to 'agent' if not specified."""
 
@@ -836,6 +893,47 @@ class AgentDef(BaseModel):
 
     options: list[GateOption] | None = None
     """Options for human_gate type agents."""
+
+    questions: list[QuestionDef] | None = None
+    """Inline questions for ``type: questions`` agents.
+
+    Mutually exclusive with ``source``; exactly one is required.
+    """
+
+    source: str | None = None
+    """Dotted path to an array of questions (``type: questions`` only).
+
+    Same convention as ``ForEachDef.source`` (e.g.
+    ``architect.output.open_questions``). Entries may be plain strings or
+    objects matching :class:`QuestionDef`.
+    """
+
+    allow_back: bool | None = None
+    """Whether the user can revisit the previous question (questions type).
+
+    Tri-state so an explicit value is distinguishable from the default, which
+    is what lets the schema reject these flags on other step types. Defaults
+    to True; resolve via ``executor.questions.NavFlags``.
+    """
+
+    allow_skip: bool | None = None
+    """Whether individual questions can be skipped (questions type). Defaults to True."""
+
+    allow_skip_all: bool | None = None
+    """Whether the remaining questions can be skipped at once (questions type).
+
+    Defaults to True.
+    """
+
+    allow_abort: bool | None = None
+    """Whether the user can abandon the node entirely (questions type).
+
+    Defaults to False because it routes away from the normal flow; enabling it
+    without an ``abort_route`` ends the workflow.
+    """
+
+    abort_route: str | None = None
+    """Where to route when the user aborts (questions type). Defaults to ``$end``."""
 
     command: str | None = None
     """Command to execute (required for script type). Supports Jinja2 templating."""
@@ -1346,6 +1444,27 @@ class AgentDef(BaseModel):
                 "(only 'script' agents support this field)"
             )
 
+        # Fields exclusive to ``type: questions``. A standalone guard, like the
+        # terminate/script ones above, so it also covers types with no branch
+        # of their own. The nav flags are tri-state (``bool | None``) precisely
+        # so an explicit value is distinguishable here — a plain ``bool``
+        # default would make "set to False" and "not set" identical.
+        if self.type != "questions":
+            for field_name in (
+                "questions",
+                "source",
+                "allow_back",
+                "allow_skip",
+                "allow_skip_all",
+                "allow_abort",
+                "abort_route",
+            ):
+                if getattr(self, field_name) is not None:
+                    raise ValueError(
+                        f"'{self.type or 'agent'}' agents cannot have '{field_name}' "
+                        "(only 'questions' agents support this field)"
+                    )
+
         if self.type == "human_gate":
             if not self.options:
                 raise ValueError("human_gate agents require 'options'")
@@ -1381,6 +1500,63 @@ class AgentDef(BaseModel):
                 raise ValueError("human_gate agents cannot have 'output_mode'")
             if self.working_dir:
                 raise ValueError("human_gate agents cannot have 'working_dir'")
+        elif self.type == "questions":
+            if not self.questions and not self.source:
+                raise ValueError("questions agents require either 'questions' or 'source'")
+            if self.questions and self.source:
+                raise ValueError(
+                    "questions agents cannot set both 'questions' and 'source' "
+                    "(use one or the other)"
+                )
+            if self.options is not None:
+                raise ValueError(
+                    "questions agents cannot have 'options' (only 'human_gate' agents do); "
+                    "per-question choices go in 'questions[].choices'"
+                )
+            if self.abort_route is not None and not self.allow_abort:
+                raise ValueError(
+                    "questions agents cannot set 'abort_route' without 'allow_abort: true'"
+                )
+            if self.input_mapping is not None:
+                raise ValueError("questions agents cannot have 'input_mapping'")
+            if self.dialog is not None:
+                raise ValueError("questions agents cannot have 'dialog'")
+            if self.validator is not None:
+                raise ValueError("questions agents cannot have 'validator'")
+            if self.sandbox is not None:
+                raise ValueError("questions agents cannot have 'sandbox'")
+            if self.max_depth is not None:
+                raise ValueError("questions agents cannot have 'max_depth'")
+            if self.reasoning is not None:
+                raise ValueError("questions agents cannot have 'reasoning'")
+            if self.context_tier is not None:
+                raise ValueError("questions agents cannot have 'context_tier'")
+            if self.skills is not None:
+                raise ValueError("questions agents cannot have 'skills'")
+            if self.timeout_seconds is not None:
+                raise ValueError("questions agents cannot have 'timeout_seconds'")
+            if self.model:
+                raise ValueError("questions agents cannot have 'model' (no provider is invoked)")
+            if self.provider:
+                raise ValueError("questions agents cannot have 'provider'")
+            if self.tools is not None:
+                raise ValueError("questions agents cannot have 'tools'")
+            if self.output:
+                raise ValueError(
+                    "questions agents cannot have 'output' (the answer shape is fixed)"
+                )
+            if self.value is not None:
+                raise ValueError("questions agents cannot have 'value' (only 'set' agents do)")
+            if self.values is not None:
+                raise ValueError("questions agents cannot have 'values' (only 'set' agents do)")
+            if self.output_type is not None:
+                raise ValueError(
+                    "questions agents cannot have 'output_type' (only 'set' agents do)"
+                )
+            if self.output_mode is not None:
+                raise ValueError("questions agents cannot have 'output_mode'")
+            if self.working_dir:
+                raise ValueError("questions agents cannot have 'working_dir'")
         elif self.type == "script":
             if not self.command:
                 raise ValueError("script agents require 'command'")

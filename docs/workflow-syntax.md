@@ -98,7 +98,7 @@ Agents are defined in the `agents` list. Each agent represents a unit of work.
 agents:
   - name: string                    # Required: Unique agent identifier
     description: string             # Optional: Purpose description
-    type: agent                     # agent | human_gate | script | workflow | wait | terminate (default: agent)
+    type: agent                     # agent | human_gate | questions | script | workflow | wait | terminate (default: agent)
     model: string                   # Optional: Model identifier (e.g., 'claude-sonnet-4.5')
     
     prompt: |                       # Required for type=agent: Agent instructions
@@ -132,7 +132,7 @@ agents:
       effort: high                  # low | medium | high | xhigh | max
                                     # Overrides runtime.default_reasoning_effort.
                                     # Only valid on type=agent (rejected on
-                                    # script, human_gate, workflow).
+                                    # script, human_gate, questions, workflow).
                                     # See docs/configuration.md#reasoning-effort.
 
     retry:                          # Optional: per-agent retry policy
@@ -149,7 +149,7 @@ agents:
                                     # Overrides runtime.default_context_tier.
                                     # Composes with reasoning. Only valid on
                                     # type=agent (rejected on script,
-                                    # human_gate, workflow).
+                                    # human_gate, questions, workflow).
                                     # See docs/configuration.md#context-tier.
 
     routes:                         # Optional: Routing logic
@@ -289,7 +289,7 @@ agents:
         type: number
 ```
 
-`output_mode` is only valid on provider-backed agents (the default type). It cannot be set on `script`, `human_gate`, or `workflow` agents.
+`output_mode` is only valid on provider-backed agents (the default type). It cannot be set on `script`, `human_gate`, `questions`, or `workflow` agents.
 
 ### Working Directory
 
@@ -320,7 +320,7 @@ Because paths are normalized lexically instead of resolving to their real paths:
 
 #### Key Restrictions and Exclusions
 
-- **Rejected Step Types:** The `working_dir` field is strictly rejected on `wait`, `set`, `terminate`, `human_gate`, and `workflow` (sub-workflow) step types. Defining `working_dir` on these steps raises a `ValidationError` at load time.
+- **Rejected Step Types:** The `working_dir` field is strictly rejected on `wait`, `set`, `terminate`, `human_gate`, `questions`, and `workflow` (sub-workflow) step types. Defining `working_dir` on these steps raises a `ValidationError` at load time.
 - **Script Steps:** `script` steps honor only their own `working_dir` field, rendered as a Jinja2 template. `workflow.runtime.working_dir` is not applied; relative paths are passed to the subprocess as-is and therefore resolve against the Conductor process cwd, not the workflow file directory; missing directories surface as subprocess startup `ExecutionError`s rather than the LLM-agent pre-provider working-dir check.
 - **Dialog Turns:** The working directory isn't applied to dialog turns in the current version. Multi-turn interactions run in the process default directory.
 - **Sub-Workflows:** A sub-workflow doesn't inherit the parent's working directory configuration. Instead, any relative paths in the child workflow resolve against the child workflow's own file directory.
@@ -434,6 +434,163 @@ agents:
 ```
 
 The auto-linkify processor is Markdown-aware: it skips fenced code blocks, inline code spans, and existing markdown links. File paths are validated against the workflow root directory (path traversal is blocked).
+
+#### Collecting text with `prompt_for`
+
+An option may collect free text after it is selected:
+
+```yaml
+    options:
+      - label: "Request revisions"
+        value: revise
+        route: reviser
+        prompt_for: feedback     # field name; stored under additional_input
+        multiline: true          # optional, default false
+```
+
+The collected text is available as
+`{{ approval_gate.output.additional_input.feedback }}`.
+
+`multiline` is opt-in so existing gates keep single-line behavior. When
+enabled, the terminal reads until a line containing only `.` (or EOF —
+Ctrl-D, Ctrl-Z then Enter on Windows) and the dashboard renders a textarea
+where Enter inserts a newline and Ctrl/Cmd+Enter submits. Without a TTY the
+single-line path is used regardless, since multi-line editing is meaningless
+on a pipe.
+
+For asking a *set* of questions rather than collecting one blob of text, see
+[Questions](#questions).
+
+### Questions
+
+A `questions` step asks a human a **set** of questions inside one workflow step,
+holding the cursor and the answers internally.
+
+That "one step" property is the whole point. The obvious alternative — a
+`human_gate` that loops back through a `set` step accumulating a transcript —
+cannot support going back, because a workflow step cannot be un-executed and a
+concatenated transcript has no addressable per-question answer to overwrite. It
+also costs 2 iterations per question against `limits.max_iterations`, where a
+`questions` node costs 1 for the whole set.
+
+**Use a gate when the choice changes where the workflow goes; use `questions`
+when you just need the answers recorded.** `human_gate` *routes* on the
+selection, `questions` *records* it.
+
+```yaml
+agents:
+  - name: ask_questions
+    type: questions
+
+    # Exactly one of `source:` or `questions:`.
+    source: architect.output.open_questions   # dotted path, same as for_each
+    # questions:
+    #   - text: "Server-side or client-side?"
+    #     choices: ["Server-side", "Client-side"]
+    #   - id: rollout                          # stable answer key
+    #     text: "How should this roll out?"
+    #     hint: "Think about the migration window."
+    #     required: true
+    #     default: "Behind a flag"
+    #     multiline: true
+    #     allow_free_text: true
+
+    prompt: |                                 # Optional intro, shown once
+      Unanswered questions become silent assumptions.
+
+    allow_back: true          # revise the previous answer (default: true)
+    allow_skip: true          # skip one question (default: true)
+    allow_skip_all: true      # skip everything remaining (default: true)
+    allow_abort: false        # abandon the node (default: false)
+    abort_route: $end         # where to go on abort (requires allow_abort)
+
+    routes:
+      - to: finalize
+```
+
+#### Question fields
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `id` | `q1`..`qN` | Answer key. Set it explicitly so inserting a question upstream doesn't renumber the keys below it. |
+| `text` | required | The question. Jinja2-rendered. |
+| `hint` | — | Clarifying text shown beneath the question. |
+| `choices` | — | Suggested answers, offered as selectable options. |
+| `allow_free_text` | `true` | Offer "write your own" alongside `choices`. |
+| `default` | — | Recorded when the question is skipped. Counts as answered. |
+| `required` | `false` | Blocks *submission*, never navigation — a user is never trapped on one question. |
+| `multiline` | `true` | Whether the free-text path accepts multi-line input. |
+
+#### Resolving questions from an agent
+
+`source:` uses the same dotted-path convention as `for_each`. Entries may be
+plain strings **or** objects:
+
+```yaml
+open_questions: ["Why?", "When?"]                            # each becomes a question
+open_questions: [{question: "Why?", choices: ["A", "B"]}]    # with candidate answers
+```
+
+Because plain strings work, an agent already emitting `open_questions` as an
+`array of string` needs no changes; adding `choices` later is a
+backward-compatible upgrade that turns "answer this" into "pick one, or write
+your own" — a far lower-effort interaction.
+
+#### Output
+
+Stored under the node name:
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `answers` | `dict` | `{question_id: answer}`, skipped questions omitted. |
+| `items` | `list` | `{id, question, answer, source, skipped}` in presentation order. `source` is `choice` / `free_text` / `default` / `skipped`. |
+| `transcript` | `string` | Pre-formatted `Q1. ...\nA: ...` block for prompts. |
+| `answered_count` / `skipped_count` | `int` | Counts. |
+| `answered_any` | `bool` | Cheap check for "did the human engage at all". |
+| `outcome` | `string` | `completed` / `skipped_remaining` / `aborted`. |
+
+`answers` being a keyed dict rather than an appended string is what makes going
+back work: revisiting question 3 overwrites `answers.q3`.
+
+```yaml
+routes:
+  - to: finalize
+    when: "{{ ask_questions.output.answered_any }}"
+  - to: $end
+```
+
+#### Navigation
+
+Questions are presented one at a time. After the last one, a closing review
+lists every answer and offers **Finish** or **Back** — without it, answering
+the final question would end the node instantly and Back would be unusable
+exactly where it is most wanted. The review is skipped when `allow_back: false`.
+
+#### Partial answers survive a checkpoint
+
+Answers are committed to the workflow context after each response, so a
+checkpoint taken mid-node already carries them and `conductor resume` continues
+at the first unanswered question. Answers whose questions no longer exist (the
+workflow was edited between the checkpoint and the resume) are dropped rather
+than resurrected.
+
+#### `--skip-gates`
+
+`--skip-gates` **never selects a suggested answer.** Those come from the
+upstream agent, so recording one would feed invented input back as though a
+human had provided it. Questions with a `default` take that default; the rest
+are skipped, and `outcome` is `skipped_remaining`.
+
+#### Restrictions
+
+- Cannot be used inside parallel or for-each groups (concurrent prompts would
+  compete for one terminal and one dashboard slot, the same reason gates are
+  refused).
+- Cannot set `options`, `model`, `provider`, `tools`, `output`, `dialog`,
+  `validator`, `reasoning`, `skills`, or `working_dir` — no provider is invoked.
+- `abort_route` requires `allow_abort: true`.
+
+See [`examples/questions.yaml`](../examples/questions.yaml).
 
 ### Script Steps
 
@@ -891,7 +1048,7 @@ After the conversation, the agent re-executes with the dialog transcript as addi
 | `dialog.trigger_prompt` | string | Yes | Criteria for the LLM evaluator to decide when dialog is needed |
 
 **Behavior notes:**
-- Dialog is supported on regular `agent` type only (not `human_gate`, `script`, `workflow`, or `wait`)
+- Dialog is supported on regular `agent` type only (not `human_gate`, `questions`, `script`, `workflow`, or `wait`)
 - In web dashboard mode, the dialog temporarily replaces the graph area with a chat interface
 - When `--skip-gates` is set (e.g., CI/automation), dialogs are automatically skipped
 - The evaluator prompt should describe *when* to trigger dialog, not *what* to ask — the evaluator generates the opening question from the agent's output context
@@ -932,7 +1089,7 @@ agents:
 | `validator.max_retries` | int | No | Re-runs on failure. Default `1`, **hard-capped at 1**. `0` = validate-and-report without re-running. |
 
 **Behavior notes:**
-- Supported on provider-backed `agent` steps only (not `human_gate`, `script`, `workflow`, `wait`, `set`, or `terminate`). Works in the main loop, parallel groups, and for-each loops.
+- Supported on provider-backed `agent` steps only (not `human_gate`, `questions`, `script`, `workflow`, `wait`, `set`, or `terminate`). Works in the main loop, parallel groups, and for-each loops.
 - The validator uses the primary agent's provider; only `model` is overridable.
 - **Fail-open:** if the validator call errors or returns unparseable output, it is treated as a pass (with a logged warning) so a flaky grader never blocks the workflow.
 - The validator sees only the agent's prompt + output + criteria, not other agents' outputs — keeping validation focused and cheap.
@@ -1466,7 +1623,7 @@ The per-agent field is tri-state:
 | `[...]` | explicit set — replaces the workflow default |
 
 Skills apply only to provider-backed agents. They are rejected on `script`,
-`wait`, `set`, `terminate`, `workflow`, and `human_gate` steps.
+`wait`, `set`, `terminate`, `workflow`, `human_gate`, and `questions` steps.
 
 ### Names and paths
 

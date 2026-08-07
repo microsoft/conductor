@@ -30,6 +30,10 @@ export type EventType =
   | 'set_failed'
   | 'gate_presented'
   | 'gate_resolved'
+  | 'questions_presented'
+  | 'questions_answered'
+  | 'questions_completed'
+  | 'questions_answer_rejected'
   | 'route_taken'
   | 'parallel_started'
   | 'parallel_agent_completed'
@@ -340,6 +344,39 @@ export interface GatePresentedData {
   prompt?: string;
   options?: string[];
   option_details?: GateOptionDetail[];
+  /** Staleness token; echoed back so a late click can't resolve a later prompt. */
+  prompt_id?: string | null;
+  /** 'questions' when this prompt is one question of a questions node. */
+  step_type?: string;
+}
+
+export interface QuestionsPresentedData {
+  agent_name: string;
+  total: number;
+  prompt?: string | null;
+  questions?: Array<{ id: string; text: string; hint?: string | null; choices?: string[] }>;
+}
+
+export interface QuestionsAnsweredData {
+  agent_name: string;
+  question_id: string;
+  cursor: number;
+  total: number;
+  source: string;
+  skipped: boolean;
+}
+
+export interface QuestionsCompletedData {
+  agent_name: string;
+  outcome: string;
+  answered_count: number;
+  skipped_count: number;
+}
+
+export interface QuestionsAnswerRejectedData {
+  agent_name: string;
+  question_id: string;
+  reason: string;
 }
 
 export interface GateResolvedData {

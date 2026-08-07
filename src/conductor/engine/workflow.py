@@ -41,6 +41,7 @@ from conductor.exceptions import (
 from conductor.exceptions import (
     TimeoutError as ConductorTimeoutError,
 )
+from conductor.executor import questions as questions_mod
 from conductor.executor.agent import AgentExecutor
 from conductor.executor.linkify import linkify_markdown
 from conductor.executor.output import validate_output
@@ -267,6 +268,21 @@ class ExecutionPlan:
 
     possible_paths: list[list[str]] = field(default_factory=list)
     """Possible execution paths through the workflow."""
+
+
+def _answer_counts(output: dict[str, Any]) -> dict[str, int]:
+    """Project a questions output down to the counts events carry.
+
+    Args:
+        output: A questions node output.
+
+    Returns:
+        The answered/skipped counts.
+    """
+    return {
+        "answered_count": output["answered_count"],
+        "skipped_count": output["skipped_count"],
+    }
 
 
 class WorkflowEngine:
@@ -2422,6 +2438,333 @@ class WorkflowEngine:
         if self._keyboard_listener is not None:
             await self._keyboard_listener.resume()
 
+    async def _run_questions_step(self, agent: AgentDef) -> dict[str, Any]:
+        """Present a set of questions to a human and collect their answers.
+
+        Runs the whole cursor loop inside one engine step. Partial answers are
+        committed to the workflow context after every response, so a checkpoint
+        taken mid-node (dashboard stop, periodic save) already carries them and
+        a resumed run continues at the right question — this needs no
+        checkpoint schema change, because checkpoints serialize
+        ``WorkflowContext.to_dict()``.
+
+        Args:
+            agent: The questions node definition.
+
+        Returns:
+            The node output (see ``executor/questions.py::build_output``).
+
+        Raises:
+            ExecutionError: If the question source cannot be resolved or an
+                entry is malformed.
+        """
+        agent_context = self.context.get_for_template()
+
+        def _render(text: str) -> str:
+            return self.renderer.render(text, agent_context)
+
+        if agent.source:
+            raw = self._resolve_array_reference(agent.source)
+            definitions = questions_mod.coerce_questions(raw, agent_name=agent.name)
+        else:
+            definitions = list(agent.questions or [])
+
+        order = questions_mod.resolve_questions(definitions, render=_render, agent_name=agent.name)
+
+        intro: str | None = None
+        if agent.prompt:
+            intro = linkify_markdown(_render(agent.prompt), base_dir=self._workflow_dir)
+
+        # Resume support: prior answers for this node survive in context.
+        records: dict[str, questions_mod.AnswerRecord] = {}
+        prior = self.context.agent_outputs.get(agent.name)
+        if isinstance(prior, dict):
+            records = self._restore_question_records(prior, order)
+
+        if not order:
+            return questions_mod.build_output(records, order, "completed")
+
+        self._emit(
+            "questions_presented",
+            {
+                "agent_name": agent.name,
+                "total": len(order),
+                "prompt": intro,
+                "questions": [
+                    {"id": q.id, "text": q.text, "hint": q.hint, "choices": q.choices}
+                    for q in order
+                ],
+            },
+        )
+
+        # --skip-gates must not auto-select a suggested answer: those come from
+        # the upstream agent, so recording one would feed invented human input
+        # back as real. Skipping honestly is the only safe automation.
+        if self.gate_handler.skip_gates:
+            for question in order:
+                records.setdefault(
+                    question.id,
+                    questions_mod.AnswerRecord(
+                        id=question.id,
+                        question=question.text,
+                        answer=question.default,
+                        source="default" if question.default is not None else "skipped",
+                        skipped=question.default is None,
+                    ),
+                )
+            output = questions_mod.build_output(records, order, "skipped_remaining")
+            self._emit(
+                "questions_completed",
+                {"agent_name": agent.name, "outcome": output["outcome"], **_answer_counts(output)},
+            )
+            return output
+
+        outcome = await self._run_questions_loop(agent, order, records, intro)
+        output = questions_mod.build_output(records, order, outcome)
+        self._emit(
+            "questions_completed",
+            {"agent_name": agent.name, "outcome": outcome, **_answer_counts(output)},
+        )
+        return output
+
+    async def _run_questions_loop(
+        self,
+        agent: AgentDef,
+        order: list[questions_mod.ResolvedQuestion],
+        records: dict[str, questions_mod.AnswerRecord],
+        intro: str | None,
+    ) -> str:
+        """Drive the question cursor until the user finishes, skips, or aborts.
+
+        Args:
+            agent: The questions node definition.
+            order: Resolved questions in presentation order.
+            records: Answer store, mutated in place so partial progress
+                survives even if this raises.
+            intro: Optional rendered node-level intro.
+
+        Returns:
+            The terminal outcome string.
+        """
+        cursor = 0
+        # Resume at the first unanswered question rather than restarting.
+        while cursor < len(order) and order[cursor].id in records:
+            cursor += 1
+
+        nav = questions_mod.NavFlags.resolve(agent)
+        presentation = 0
+
+        def _next_prompt_id() -> str:
+            return f"{agent.name}:{self._run_id}:{presentation}"
+
+        while True:
+            answered = sum(1 for r in records.values() if not r.skipped)
+            skipped = sum(1 for r in records.values() if r.skipped)
+            presentation += 1
+
+            # Past the last question: confirm before finishing, so Back stays
+            # reachable from the final question.
+            at_review = cursor >= len(order)
+            if at_review:
+                # The review exists solely to keep Back reachable from the last
+                # question; with Back disabled it would be a pointless extra
+                # click, so finish immediately.
+                if not nav.back:
+                    return "completed"
+                gate_prompt = questions_mod.build_review_prompt(
+                    agent, records, order, nav=nav, prompt_id=_next_prompt_id()
+                )
+            else:
+                gate_prompt = questions_mod.build_prompt(
+                    agent,
+                    order[cursor],
+                    nav=nav,
+                    cursor=cursor,
+                    total=len(order),
+                    answered=answered,
+                    skipped=skipped,
+                    prompt_id=_next_prompt_id(),
+                    intro=intro,
+                )
+
+            await self._suspend_listener()
+            try:
+                # Reuse the gate presentation channel so the dashboard's
+                # existing prompt UI drives each question. The progress header
+                # and nav controls travel inside the prompt/choices, so no new
+                # client-side interaction path is needed.
+                self._emit(
+                    "gate_presented",
+                    {
+                        "agent_name": agent.name,
+                        "options": [c.value for c in gate_prompt.choices],
+                        "option_details": [
+                            {
+                                "label": c.label,
+                                "value": c.value,
+                                "route": "",
+                                "prompt_for": c.prompt_for,
+                                "multiline": c.multiline,
+                            }
+                            for c in gate_prompt.choices
+                        ],
+                        "prompt": gate_prompt.prompt,
+                        "prompt_id": gate_prompt.prompt_id,
+                        "step_type": "questions",
+                    },
+                )
+                response = await self._resolve_human_prompt(gate_prompt)
+            finally:
+                await self._resume_listener()
+
+            if response.value == questions_mod.NAV_FINISH:
+                return "completed"
+
+            if response.value == questions_mod.NAV_BACK:
+                # Clear the answer being revisited so the resume scan above and
+                # the "answered" counter both reflect reality.
+                cursor = max(0, cursor - 1)
+                records.pop(order[cursor].id, None)
+                self._store_questions_progress(agent, records, order)
+                continue
+
+            if response.value == questions_mod.NAV_ABORT:
+                return "aborted"
+
+            if response.value == questions_mod.NAV_SKIP_ALL:
+                for remaining in order[cursor:]:
+                    records.setdefault(
+                        remaining.id,
+                        questions_mod.AnswerRecord(
+                            id=remaining.id,
+                            question=remaining.text,
+                            answer=remaining.default,
+                            source="default" if remaining.default is not None else "skipped",
+                            skipped=remaining.default is None,
+                        ),
+                    )
+                self._store_questions_progress(agent, records, order)
+                return "skipped_remaining"
+
+            if at_review:
+                # The review prompt offers only Finish/Back/Abort, all handled
+                # above. Anything else is a stale response for a question that
+                # has already been answered; re-present rather than misfile it.
+                continue
+
+            question = order[cursor]
+            if response.value == questions_mod.NAV_SKIP:
+                if question.required and question.default is None:
+                    self._emit(
+                        "questions_answer_rejected",
+                        {
+                            "agent_name": agent.name,
+                            "question_id": question.id,
+                            "reason": "This question is required and cannot be skipped.",
+                        },
+                    )
+                    continue
+                records[question.id] = questions_mod.AnswerRecord(
+                    id=question.id,
+                    question=question.text,
+                    answer=question.default,
+                    source="default" if question.default is not None else "skipped",
+                    skipped=question.default is None,
+                )
+            elif response.value == questions_mod.FREE_TEXT:
+                text = response.additional_input.get(questions_mod.FREE_TEXT_FIELD, "").strip()
+                if question.required and not text:
+                    self._emit(
+                        "questions_answer_rejected",
+                        {
+                            "agent_name": agent.name,
+                            "question_id": question.id,
+                            "reason": "This question is required; please provide an answer.",
+                        },
+                    )
+                    continue
+                records[question.id] = questions_mod.AnswerRecord(
+                    id=question.id,
+                    question=question.text,
+                    answer=text,
+                    source="free_text",
+                    skipped=False,
+                )
+            else:
+                records[question.id] = questions_mod.AnswerRecord(
+                    id=question.id,
+                    question=question.text,
+                    answer=response.value,
+                    source="choice",
+                    skipped=False,
+                )
+
+            self._emit(
+                "questions_answered",
+                {
+                    "agent_name": agent.name,
+                    "question_id": question.id,
+                    "cursor": cursor,
+                    "total": len(order),
+                    "source": records[question.id].source,
+                    "skipped": records[question.id].skipped,
+                },
+            )
+            self._store_questions_progress(agent, records, order)
+            cursor += 1
+
+        return "completed"
+
+    def _store_questions_progress(
+        self,
+        agent: AgentDef,
+        records: dict[str, questions_mod.AnswerRecord],
+        order: list[questions_mod.ResolvedQuestion],
+    ) -> None:
+        """Commit partial answers to context so a checkpoint captures them.
+
+        Args:
+            agent: The questions node definition.
+            records: Answers collected so far.
+            order: All questions, in presentation order.
+        """
+        self.context.store(agent.name, questions_mod.build_output(records, order, "in_progress"))
+
+    @staticmethod
+    def _restore_question_records(
+        prior: dict[str, Any],
+        order: list[questions_mod.ResolvedQuestion],
+    ) -> dict[str, questions_mod.AnswerRecord]:
+        """Rebuild answer records from a resumed node's stored output.
+
+        Only ids still present in the current question set are restored, so a
+        workflow edited between the checkpoint and the resume does not
+        resurrect answers to questions that no longer exist.
+
+        Args:
+            prior: The node's previously stored output.
+            order: The current resolved questions.
+
+        Returns:
+            Restored answer records keyed by question id.
+        """
+        known = {q.id for q in order}
+        restored: dict[str, questions_mod.AnswerRecord] = {}
+        for item in prior.get("items", []):
+            if not isinstance(item, dict):
+                continue
+            item_id = item.get("id")
+            if item_id not in known:
+                continue
+            restored[item_id] = questions_mod.AnswerRecord(
+                id=item_id,
+                question=item.get("question", ""),
+                answer=item.get("answer"),
+                source=item.get("source", "skipped"),
+                skipped=bool(item.get("skipped", False)),
+            )
+        return restored
+
     async def _handle_gate_with_web(
         self,
         agent: AgentDef,
@@ -2579,7 +2922,9 @@ class WorkflowEngine:
 
         assert self._web_dashboard is not None  # noqa: S101
 
-        msg = await self._web_dashboard.wait_for_gate_response(gate_prompt.name)
+        msg = await self._web_dashboard.wait_for_gate_response(
+            gate_prompt.name, gate_prompt.prompt_id
+        )
         selected_value = msg.get("selected_value", "")
 
         # Find matching choice
@@ -3643,6 +3988,46 @@ class WorkflowEngine:
                                 self._execute_hook("on_complete", result=result)
                                 return result
                             current_agent_name = gate_result.route
+                            continue
+
+                        # Handle questions steps. N human prompts inside ONE
+                        # engine step, so the cursor can move backwards and the
+                        # node costs 1 iteration rather than 2N.
+                        if agent.type == "questions":
+                            questions_output = await self._run_questions_step(agent)
+                            self.context.store(agent.name, questions_output)
+                            self.limits.record_execution(agent.name)
+                            self.limits.check_timeout()
+
+                            if questions_output["outcome"] == "aborted":
+                                route_target = agent.abort_route or "$end"
+                                output_transform = None
+                            else:
+                                route_result = self._evaluate_routes(agent, questions_output)
+                                route_target = route_result.target
+                                output_transform = route_result.output_transform
+
+                            self._emit(
+                                "route_taken",
+                                {
+                                    "from_agent": agent.name,
+                                    "to_agent": route_target,
+                                },
+                            )
+
+                            if route_target == "$end":
+                                result = self._build_final_output(output_transform)
+                                self._emit(
+                                    "workflow_completed",
+                                    {
+                                        "elapsed": _time.time() - _workflow_start,
+                                        "output": result,
+                                    },
+                                )
+                                self._execute_hook("on_complete", result=result)
+                                return result
+
+                            current_agent_name = route_target
                             continue
 
                         # Handle script steps

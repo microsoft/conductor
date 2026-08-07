@@ -24,6 +24,10 @@ import type {
   GatePresentedData,
   GateResolvedData,
   GateOptionDetail,
+  QuestionsPresentedData,
+  QuestionsAnsweredData,
+  QuestionsCompletedData,
+  QuestionsAnswerRejectedData,
   RouteTakenData,
   ParallelStartedData,
   ParallelAgentCompletedData,
@@ -129,6 +133,14 @@ export interface NodeData {
   // Gate-specific
   options?: string[];
   option_details?: GateOptionDetail[];
+  /** Staleness token of the currently-presented prompt (questions nodes). */
+  gate_prompt_id?: string | null;
+  /** Progress + results for a `type: questions` node. */
+  questions_total?: number;
+  questions_answered_count?: number;
+  questions_skipped_count?: number;
+  questions_outcome?: string;
+  questions_reject_reason?: string | null;
   selected_option?: string;
   route?: string;
   additional_input?: string;
@@ -427,7 +439,7 @@ interface WorkflowState {
   // WebSocket send function (set by use-websocket hook)
   _wsSend: ((data: object) => void) | null;
   setWsSend: (fn: ((data: object) => void) | null) => void;
-  sendGateResponse: (agentName: string, selectedValue: string, additionalInput?: Record<string, string>) => void;
+  sendGateResponse: (agentName: string, selectedValue: string, additionalInput?: Record<string, string>, promptId?: string | null) => void;
   // Dialog state
   activeDialog: { agentName: string; dialogId: string } | null;
   dialogEngaged: boolean;
@@ -801,7 +813,7 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
     set({ _wsSend: fn });
   },
 
-  sendGateResponse: (agentName, selectedValue, additionalInput) => {
+  sendGateResponse: (agentName, selectedValue, additionalInput, promptId) => {
     const send = useWorkflowStore.getState()._wsSend;
     if (send) {
       send({
@@ -809,6 +821,9 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
         agent_name: agentName,
         selected_value: selectedValue,
         additional_input: additionalInput || {},
+        // Echoed so the engine can drop a click that lands after the next
+        // question opened — every prompt in a questions node shares one name.
+        prompt_id: promptId ?? null,
       });
     }
   },
@@ -1744,6 +1759,8 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     nd.options = data.options;
     nd.option_details = data.option_details;
     nd.prompt = data.prompt;
+    nd.gate_prompt_id = data.prompt_id ?? null;
+    nd.questions_reject_reason = null;
     replaceNode(t.nodes, data.agent_name);
   },
 
@@ -1756,6 +1773,53 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     nd.selected_option = data.selected_option;
     nd.route = data.route;
     nd.additional_input = data.additional_input;
+    replaceNode(t.nodes, data.agent_name);
+  },
+
+  questions_presented: (state, _data) => {
+    const data = _data as unknown as QuestionsPresentedData;
+    const t = activeTarget(state, _data);
+    const nd = ensureNode(t.nodes, data.agent_name, 'questions');
+    nd.status = 'waiting';
+    nd.questions_total = data.total;
+    nd.questions_answered_count = 0;
+    nd.questions_skipped_count = 0;
+    nd.questions_outcome = undefined;
+    replaceNode(t.nodes, data.agent_name);
+  },
+
+  questions_answered: (state, _data) => {
+    const data = _data as unknown as QuestionsAnsweredData;
+    const t = activeTarget(state, _data);
+    const nd = ensureNode(t.nodes, data.agent_name, 'questions');
+    nd.questions_total = data.total;
+    if (data.skipped) {
+      nd.questions_skipped_count = (nd.questions_skipped_count || 0) + 1;
+    } else {
+      nd.questions_answered_count = (nd.questions_answered_count || 0) + 1;
+    }
+    nd.questions_reject_reason = null;
+    replaceNode(t.nodes, data.agent_name);
+  },
+
+  questions_answer_rejected: (state, _data) => {
+    const data = _data as unknown as QuestionsAnswerRejectedData;
+    const t = activeTarget(state, _data);
+    const nd = ensureNode(t.nodes, data.agent_name, 'questions');
+    nd.questions_reject_reason = data.reason;
+    replaceNode(t.nodes, data.agent_name);
+  },
+
+  questions_completed: (state, _data) => {
+    const data = _data as unknown as QuestionsCompletedData;
+    const t = activeTarget(state, _data);
+    const nd = ensureNode(t.nodes, data.agent_name, 'questions');
+    nd.status = 'completed';
+    t.incrCompleted();
+    nd.questions_outcome = data.outcome;
+    nd.questions_answered_count = data.answered_count;
+    nd.questions_skipped_count = data.skipped_count;
+    nd.questions_reject_reason = null;
     replaceNode(t.nodes, data.agent_name);
   },
 
@@ -2482,6 +2546,18 @@ function buildLogEntry(event: WorkflowEvent): LogEntry | null {
 
     case 'gate_resolved':
       return { timestamp: ts, level: 'success', source: String(d.agent_name), message: `Gate resolved → ${d.selected_option || 'continue'}` };
+
+    case 'questions_presented':
+      return { timestamp: ts, level: 'warning', source: String(d.agent_name), message: `Asking ${d.total} question(s)…` };
+
+    case 'questions_answered':
+      return { timestamp: ts, level: 'info', source: String(d.agent_name), message: `${d.skipped ? 'Skipped' : 'Answered'} ${d.question_id} (${(d.cursor as number) + 1}/${d.total})` };
+
+    case 'questions_answer_rejected':
+      return { timestamp: ts, level: 'warning', source: String(d.agent_name), message: String(d.reason) };
+
+    case 'questions_completed':
+      return { timestamp: ts, level: 'success', source: String(d.agent_name), message: `Questions ${d.outcome} — ${d.answered_count} answered, ${d.skipped_count} skipped` };
 
     case 'route_taken':
       return { timestamp: ts, level: 'debug', source: 'router', message: `${d.from_agent} → ${d.to_agent}` };

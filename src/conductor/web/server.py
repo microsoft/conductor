@@ -90,6 +90,14 @@ class WebDashboard:
         # can report whether a gate is currently waiting for a response.
         self._gate_waiting_agent: str | None = None
 
+        # Staleness token for the currently-waiting prompt. A `questions` node
+        # presents every one of its prompts under the SAME agent name, so the
+        # name alone cannot distinguish them: a slow click meant for Q3 that
+        # lands after Q4 is presented would otherwise resolve Q4 with Q3's
+        # answer. None for standalone gates, which are never presented
+        # back-to-back under one name.
+        self._gate_waiting_prompt_id: str | None = None
+
         # Dialog response channel (web client → engine)
         self._dialog_response_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
 
@@ -263,7 +271,13 @@ class WebDashboard:
         async def gate_status() -> JSONResponse:
             """Return whether a human gate is currently waiting for a response."""
             agent = self._gate_waiting_agent
-            return JSONResponse({"waiting": agent is not None, "agent_name": agent})
+            return JSONResponse(
+                {
+                    "waiting": agent is not None,
+                    "agent_name": agent,
+                    "prompt_id": self._gate_waiting_prompt_id,
+                }
+            )
 
         @app.post("/api/gate-respond")
         async def gate_respond_api(request: Request) -> JSONResponse:
@@ -305,7 +319,7 @@ class WebDashboard:
             # check a mismatched agent_name would be accepted here (200) and then
             # silently discarded by wait_for_gate_response, parking the workflow
             # forever while the CLI reports success.
-            target_error = self._validate_gate_target(body["agent_name"])
+            target_error = self._validate_gate_target(body["agent_name"], body.get("prompt_id"))
             if target_error is not None:
                 return JSONResponse({"error": target_error}, status_code=409)
 
@@ -316,6 +330,7 @@ class WebDashboard:
                     "agent_name": body["agent_name"],
                     "selected_value": body["selected_value"],
                     "additional_input": body.get("additional_input"),
+                    "prompt_id": body.get("prompt_id"),
                 }
             )
             return JSONResponse({"status": "accepted"})
@@ -420,7 +435,8 @@ class WebDashboard:
                                 )
                             elif (
                                 target_error := self._validate_gate_target(
-                                    str(msg.get("agent_name", ""))
+                                    str(msg.get("agent_name", "")),
+                                    msg.get("prompt_id"),
                                 )
                             ) is not None:
                                 logger.warning("Rejecting WS gate_response: %s", target_error)
@@ -917,15 +933,20 @@ class WebDashboard:
         scheme, _, presented = (auth_header or "").partition(" ")
         return scheme.lower() == "bearer" and hmac.compare_digest(presented, expected_token)
 
-    def _validate_gate_target(self, agent_name: str) -> str | None:
-        """Validate that a gate response targets the currently-waiting gate.
+    def _validate_gate_target(self, agent_name: str, prompt_id: str | None = None) -> str | None:
+        """Validate that a gate response targets the currently-waiting prompt.
 
         Args:
             agent_name: The agent name the response is addressed to.
+            prompt_id: The prompt the response is addressed to, when the
+                client supplied one. A response with no token is accepted
+                against any prompt so ``conductor gate respond`` keeps
+                working without having to discover one.
 
         Returns:
-            An error message string if no gate is waiting or the name does
-            not match the waiting gate, otherwise None.
+            An error message string if no gate is waiting, the name does not
+            match, or the response targets a prompt that has already moved
+            on; otherwise None.
         """
         waiting_agent = self._gate_waiting_agent
         if waiting_agent is None:
@@ -935,9 +956,17 @@ class WebDashboard:
                 f"Gate response targets agent {agent_name!r} but the "
                 f"waiting gate is {waiting_agent!r}"
             )
+        waiting_prompt = self._gate_waiting_prompt_id
+        if prompt_id is not None and waiting_prompt is not None and prompt_id != waiting_prompt:
+            return (
+                f"Gate response targets prompt {prompt_id!r} but the "
+                f"waiting prompt is {waiting_prompt!r}"
+            )
         return None
 
-    async def wait_for_gate_response(self, agent_name: str) -> dict[str, Any]:
+    async def wait_for_gate_response(
+        self, agent_name: str, prompt_id: str | None = None
+    ) -> dict[str, Any]:
         """Wait for a gate response from a web client.
 
         Blocks until a ``gate_response`` message is received via WebSocket
@@ -952,16 +981,26 @@ class WebDashboard:
 
         Args:
             agent_name: The name of the human_gate agent to wait for.
+            prompt_id: Staleness token for this specific presentation. When
+                set, a response carrying a *different* token is discarded —
+                this is what stops a late click on question N-1 resolving
+                question N inside a ``questions`` node, where every prompt
+                shares the node's name. A response with no token is still
+                accepted, so ``conductor gate respond`` keeps working.
 
         Returns:
             The gate response payload dict with keys ``selected_value``
             and optionally ``additional_input``.
         """
         self._gate_waiting_agent = agent_name
+        self._gate_waiting_prompt_id = prompt_id
         try:
             while True:
                 msg = await self._gate_response_queue.get()
-                if msg.get("agent_name") == agent_name:
+                msg_prompt_id = msg.get("prompt_id")
+                if msg.get("agent_name") == agent_name and (
+                    prompt_id is None or msg_prompt_id is None or msg_prompt_id == prompt_id
+                ):
                     # Drain any responses still queued on resolution. Two
                     # concurrent submits for this same gate can both pass the
                     # waiting-state check and enqueue; we consume one here and
@@ -976,12 +1015,16 @@ class WebDashboard:
                         )
                     return msg
                 logger.warning(
-                    "Discarding stale gate_response for agent %r while waiting on %r",
+                    "Discarding stale gate_response for agent %r (prompt_id=%r) "
+                    "while waiting on %r (prompt_id=%r)",
                     msg.get("agent_name"),
+                    msg_prompt_id,
                     agent_name,
+                    prompt_id,
                 )
         finally:
             self._gate_waiting_agent = None
+            self._gate_waiting_prompt_id = None
 
     async def wait_for_dialog_message(self, agent_name: str, dialog_id: str) -> dict[str, Any]:
         """Wait for a dialog message or decline from the web client.

@@ -1662,7 +1662,7 @@ class TestWorkflowEngineHumanGates:
             result = await engine.run({})
 
         assert result["received"] == "ok"
-        mock_dashboard.wait_for_gate_response.assert_awaited_once_with("approval_gate")
+        mock_dashboard.wait_for_gate_response.assert_awaited_once_with("approval_gate", None)
         mock_cli_handle.assert_not_called()
 
     @pytest.mark.asyncio
@@ -1733,7 +1733,7 @@ class TestWorkflowEngineHumanGates:
             result = await engine.run({})
 
         assert result["received"] == "ok"
-        mock_dashboard.wait_for_gate_response.assert_awaited_once_with("approval_gate")
+        mock_dashboard.wait_for_gate_response.assert_awaited_once_with("approval_gate", None)
         # Prove the CLI arm was actually started (not just that the web
         # dashboard eventually won) — this is what distinguishes "raced" from
         # "took the web-only shortcut," which would also produce this result.
