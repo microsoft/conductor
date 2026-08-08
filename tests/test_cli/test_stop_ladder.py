@@ -38,7 +38,14 @@ import pytest
 from rich.console import Console
 from typer.testing import CliRunner
 
-from conductor.cli.app import Identity, _confirm_identity, _stop_process, app
+from conductor.cli.app import (
+    Identity,
+    _confirm_identity,
+    _request_graceful_kill,
+    _signal_process,
+    _stop_process,
+    app,
+)
 from conductor.cli.pid import (
     Liveness,
     remove_pid_file_at,
@@ -420,6 +427,71 @@ class TestIdentityConfirmation:
             get.return_value.raise_for_status.return_value = None
             assert _confirm_identity(_entry(run_id=""), _quiet()) is Identity.UNCONFIRMED
 
+    def test_non_dict_response_is_unconfirmed(self) -> None:
+        """A proxy or captive portal answering on the port must not be trusted."""
+        with patch("httpx.get") as get:
+            get.return_value.json.return_value = ["not", "a", "dict"]
+            get.return_value.raise_for_status.return_value = None
+            assert _confirm_identity(_entry(), _quiet()) is Identity.UNCONFIRMED
+
+    def test_http_error_status_is_unconfirmed(self) -> None:
+        with patch("httpx.get") as get:
+            get.return_value.raise_for_status.side_effect = RuntimeError("404")
+            assert _confirm_identity(_entry(), _quiet()) is Identity.UNCONFIRMED
+
+
+class TestGracefulKillRequest:
+    """Rung 1 talks to the run's own dashboard."""
+
+    def test_posts_to_api_kill_and_reports_acceptance(self) -> None:
+        with patch("httpx.post") as post:
+            post.return_value.raise_for_status.return_value = None
+            assert _request_graceful_kill(8080) is True
+        assert post.call_args.args[0] == "http://127.0.0.1:8080/api/kill"
+
+    def test_unreachable_dashboard_reports_failure(self) -> None:
+        with patch("httpx.post", side_effect=OSError("connection refused")):
+            assert _request_graceful_kill(8080) is False
+
+    def test_error_status_reports_failure(self) -> None:
+        with patch("httpx.post") as post:
+            post.return_value.raise_for_status.side_effect = RuntimeError("500")
+            assert _request_graceful_kill(8080) is False
+
+
+class TestSignalProcess:
+    """Rung 2 is best-effort and must never raise."""
+
+    def test_posix_sends_sigterm(self) -> None:
+        import signal
+
+        with (
+            patch("sys.platform", "linux"),
+            patch("conductor.cli.app.os.kill") as kill,
+        ):
+            _signal_process(4242)
+        kill.assert_called_once_with(4242, signal.SIGTERM)
+
+    def test_windows_sends_ctrl_break(self) -> None:
+        import signal
+
+        with (
+            patch("sys.platform", "win32"),
+            patch("conductor.cli.app.os.kill") as kill,
+        ):
+            _signal_process(4242)
+        kill.assert_called_once_with(4242, signal.CTRL_BREAK_EVENT)
+
+    def test_oserror_is_swallowed(self) -> None:
+        """On Windows this fails routinely (WinError 87, no shared console).
+        It must not abort the ladder before the forceful rung."""
+        with patch("conductor.cli.app.os.kill", side_effect=OSError(87, "bad parameter")):
+            _signal_process(4242)  # must not raise
+
+    def test_valueerror_is_swallowed(self) -> None:
+        with patch("conductor.cli.app.os.kill", side_effect=ValueError("bad signal")):
+            _signal_process(4242)  # must not raise
+
 
 class TestRemovePidFileAt:
     """Removal must be identity-checked, not port-keyed."""
@@ -447,9 +519,42 @@ class TestRemovePidFileAt:
     def test_missing_file_is_not_an_error(self, pid_tmpdir: Path) -> None:
         assert remove_pid_file_at(pid_tmpdir / "gone-8080.pid", 4242) is False
 
+    def test_unreadable_file_is_left_in_place(self, pid_tmpdir: Path) -> None:
+        """A corrupt PID file is not proof the run ended.
+
+        Identity cannot be established, so the safe action is to leave the
+        registration alone rather than deregister a possibly-live workflow.
+        """
+        corrupt = pid_tmpdir / "wf-8080.pid"
+        corrupt.write_text("{ this is not json")
+
+        assert remove_pid_file_at(corrupt, 4242) is False
+        assert corrupt.exists()
+
 
 class TestJsonOutput:
     """``--json`` exists so automation stops having to parse prose."""
+
+    def test_json_when_nothing_is_running(self, pid_tmpdir: Path) -> None:
+        result = runner.invoke(app, ["stop", "--json"])
+        assert result.exit_code == 0
+        assert json.loads(result.stdout) == {"stopped": [], "failed": []}
+
+    def test_json_reports_unknown_port_as_an_error(self, pid_tmpdir: Path) -> None:
+        write_pid_file(4242, 8080, "/tmp/wf.yaml", run_id=_RUN_ID)
+        with patch("conductor.cli.pid._is_process_alive", return_value=True):
+            result = runner.invoke(app, ["stop", "--port", "9999", "--json"])
+        assert result.exit_code == 1
+        assert "error" in json.loads(result.stdout)
+
+    def test_json_reports_ambiguous_target_as_an_error(self, pid_tmpdir: Path) -> None:
+        write_pid_file(1, 8080, "/tmp/wf1.yaml", run_id=_RUN_ID)
+        write_pid_file(2, 9090, "/tmp/wf2.yaml", run_id="ffffffff")
+        with patch("conductor.cli.pid._is_process_alive", return_value=True):
+            result = runner.invoke(app, ["stop", "--json"])
+        # Nothing was stopped, so this must not look like success.
+        assert result.exit_code == 1
+        assert "error" in json.loads(result.stdout)
 
     def test_json_lists_stopped_runs(self, pid_tmpdir: Path) -> None:
         write_pid_file(4242, 8080, "/tmp/wf.yaml", run_id=_RUN_ID)
