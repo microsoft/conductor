@@ -675,7 +675,12 @@ class TestLaunchBackgroundResumeFailures:
                 workflow_path=wf_path, checkpoint_path=None, web_port=9201
             )
 
-        mock_write.assert_called_once_with(5555, 9201, wf_path)
+        mock_write.assert_called_once()
+        args, kwargs = mock_write.call_args
+        assert args == (5555, 9201, wf_path)
+        # The run id must reach the PID file, or ``conductor stop`` has no way
+        # to confirm identity before force-terminating (issue #344).
+        assert kwargs["run_id"], "run_id must be recorded in the PID file"
 
     def test_pid_file_falls_back_to_checkpoint_path(self, tmp_path: Path) -> None:
         """When only checkpoint_path is given, it is used for the PID file ref."""
@@ -697,7 +702,10 @@ class TestLaunchBackgroundResumeFailures:
                 workflow_path=None, checkpoint_path=cp_path, web_port=9202
             )
 
-        mock_write.assert_called_once_with(5556, 9202, cp_path)
+        mock_write.assert_called_once()
+        args, kwargs = mock_write.call_args
+        assert args == (5556, 9202, cp_path)
+        assert kwargs["run_id"], "run_id must be recorded in the PID file"
 
     def test_subprocess_detachment_kwargs(self, tmp_path: Path) -> None:
         """Verify Popen is called with detachment + bg env vars + redirected stdout/stderr.

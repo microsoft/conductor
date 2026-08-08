@@ -52,6 +52,17 @@ app.add_typer(checkpoint_app, rich_help_panel="State")
 console = Console(stderr=True)
 output_console = Console()
 
+# Stop-ladder timings (issue #344). A stop request is only an acknowledgement,
+# so each rung is followed by a bounded wait before escalating. The graceful
+# rung gets the longest budget because it is the only one that lets the run
+# flush a resume checkpoint. Mirrors the child-termination timings already used
+# at launch in ``bg_runner._terminate_child`` (5s polite, 2s forceful).
+_GRACEFUL_TIMEOUT = 5.0
+_SIGNAL_TIMEOUT = 5.0
+_TERMINATE_TIMEOUT = 2.0
+# Localhost HTTP calls to the run's own dashboard; matches ``cli/gate.py``.
+_IDENTITY_TIMEOUT = 5.0
+
 # Context variable for verbose mode (default True - show progress output)
 verbose_mode: contextvars.ContextVar[bool] = contextvars.ContextVar("verbose_mode", default=True)
 
@@ -1126,6 +1137,23 @@ def stop(
             help="Stop all background conductor workflows.",
         ),
     ] = False,
+    force: Annotated[
+        bool,
+        typer.Option(
+            "--force",
+            help=(
+                "Force-terminate even when the run's identity cannot be confirmed. "
+                "Dangerous: the recorded PID may have been recycled onto another process."
+            ),
+        ),
+    ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option(
+            "--json",
+            help="Emit a machine-readable result per workflow instead of prose.",
+        ),
+    ] = False,
 ) -> None:
     """Stop background workflow processes launched with --web-bg.
 
@@ -1133,98 +1161,334 @@ def stop(
     is found, stops it automatically. If multiple are found, prints the
     list and asks you to specify --port.
 
+    Each workflow is stopped by escalating until it is confirmed gone: a
+    graceful cancel via the dashboard (which lets the run checkpoint), then a
+    platform signal, then forceful termination. A PID file is only removed
+    once its process is confirmed dead, so a workflow that survives stays
+    discoverable instead of becoming an untracked orphan.
+
+    Forceful termination requires confirming the run's identity against its
+    dashboard, because a recorded PID may since have been recycled onto an
+    unrelated process. Use --force to override that check.
+
+    \b
+    Exit codes:
+        0  every targeted workflow is confirmed stopped (or was already gone)
+        1  --port matched no running workflow, or the target was ambiguous
+        2  at least one workflow survived or could not be confirmed stopped
+
     \b
     Examples:
         conductor stop
         conductor stop --port 8080
         conductor stop --all
+        conductor stop --all --json
     """
-    from conductor.cli.pid import read_pid_files, remove_pid_file
+    import json
+
+    from conductor.cli.pid import read_pid_files, remove_pid_file_at
 
     running = read_pid_files()
 
     if not running:
-        console.print("[dim]No background workflows are currently running.[/dim]")
+        if json_output:
+            output_console.print_json(json.dumps({"stopped": [], "failed": []}), ensure_ascii=True)
+        else:
+            console.print("[dim]No background workflows are currently running.[/dim]")
         return
 
     if all_workflows:
-        for entry in running:
-            _stop_process(entry, console)
-            remove_pid_file(entry["port"])
-        return
-
-    if port is not None:
-        # Find the entry for the specified port
-        match = [e for e in running if e["port"] == port]
-        if not match:
-            console.print(
-                f"[bold red]Error:[/bold red] No background workflow found on port {port}."
-            )
-            console.print("[dim]Running workflows:[/dim]")
-            _print_running_list(running, console)
+        targets = running
+    elif port is not None:
+        targets = [e for e in running if e["port"] == port]
+        if not targets:
+            if json_output:
+                output_console.print_json(
+                    json.dumps({"error": f"no background workflow on port {port}"}),
+                    ensure_ascii=True,
+                )
+            else:
+                console.print(
+                    f"[bold red]Error:[/bold red] No background workflow found on port {port}."
+                )
+                console.print("[dim]Running workflows:[/dim]")
+                _print_running_list(running, console)
             raise typer.Exit(code=1)
-        _stop_process(match[0], console)
-        remove_pid_file(port)
-        return
-
-    # No flags: auto-stop if exactly one, otherwise list
-    if len(running) == 1:
-        entry = running[0]
-        _stop_process(entry, console)
-        remove_pid_file(entry["port"])
+    elif len(running) == 1:
+        targets = running
     else:
-        console.print(
-            f"[bold yellow]Multiple background workflows running ({len(running)}).[/bold yellow]"
-        )
-        console.print("[dim]Specify --port to stop a specific one, or --all to stop all.[/dim]\n")
-        _print_running_list(running, console)
+        # Ambiguous: list rather than guess which run the user meant. This is
+        # a failure to act, so it must not report success to automation.
+        if json_output:
+            output_console.print_json(
+                json.dumps({"error": "multiple workflows running; specify --port or --all"}),
+                ensure_ascii=True,
+            )
+        else:
+            console.print(
+                f"[bold yellow]Multiple background workflows running "
+                f"({len(running)}).[/bold yellow]"
+            )
+            console.print(
+                "[dim]Specify --port to stop a specific one, or --all to stop all.[/dim]\n"
+            )
+            _print_running_list(running, console)
+        raise typer.Exit(code=1)
+
+    # Prose goes to ``console`` (stderr); JSON goes to ``output_console``
+    # (stdout). They cannot corrupt each other, so diagnostics stay visible
+    # even in --json mode.
+    results = [_stop_process(entry, console, force=force) for entry in targets]
+
+    for entry, result in zip(targets, results, strict=True):
+        if result["outcome"] in ("stopped", "already-exited"):
+            # Identity-checked: only remove the file if it still describes the
+            # process we just stopped, never merely "the file for this port".
+            remove_pid_file_at(entry["file"], entry["pid"])
+
+    if json_output:
+        payload = {
+            "stopped": [r for r in results if r["outcome"] in ("stopped", "already-exited")],
+            "failed": [r for r in results if r["outcome"] not in ("stopped", "already-exited")],
+        }
+        output_console.print_json(json.dumps(payload), ensure_ascii=True)
+
+    if any(r["outcome"] not in ("stopped", "already-exited") for r in results):
+        raise typer.Exit(code=2)
 
 
-def _stop_process(entry: dict, con: Console) -> None:
-    """Send SIGTERM (or equivalent) to a background workflow process.
+class Identity(str, Enum):
+    """Result of checking that a PID file describes the process on its port.
+
+    The distinction between :attr:`UNCONFIRMED` and :attr:`MISMATCHED` is
+    load-bearing. ``UNCONFIRMED`` means "no evidence either way" (an older PID
+    file, or a dashboard that isn't answering) — the polite signal is still
+    reasonable, since that is all the previous implementation ever did.
+    ``MISMATCHED`` means "positive evidence this PID belongs to someone else",
+    which must block *every* PID-directed action, not just the forceful one.
+    """
+
+    CONFIRMED = "confirmed"
+    UNCONFIRMED = "unconfirmed"
+    MISMATCHED = "mismatched"
+
+
+def _confirm_identity(entry: dict, con: Console) -> Identity:
+    """Check that the process on ``entry['port']`` is the one ``entry`` describes.
+
+    Between a PID file being written and ``conductor stop`` reading it, the
+    process may have exited and the OS may have recycled its PID onto something
+    unrelated — at which point terminating that PID kills an innocent process.
+    Asking the dashboard who it is closes that gap, because the answer comes
+    from the running process itself.
+
+    ``pid`` is the primary signal: the dashboard runs in the same process as
+    the workflow, so a matching ``os.getpid()`` is direct proof. It is also
+    available immediately, whereas ``run_id`` is empty until the workflow
+    emits ``workflow_started``, and legitimately *differs* from the launcher's
+    id on resume (the child reuses the checkpoint's run id). ``run_id`` is
+    kept as a secondary signal so a dashboard from an older conductor, which
+    does not report ``pid``, can still be identified.
 
     Args:
-        entry: A PID-file dict with ``pid``, ``port``, ``workflow`` keys.
+        entry: A PID-file dict.
         con: Rich Console for output.
+
+    Returns:
+        :class:`Identity`.
+    """
+    import httpx
+
+    port = entry["port"]
+    try:
+        resp = httpx.get(f"http://127.0.0.1:{port}/api/info", timeout=_IDENTITY_TIMEOUT)
+        resp.raise_for_status()
+        info = resp.json()
+    except Exception as exc:  # noqa: BLE001 - any failure means "cannot confirm"
+        logger.debug("Identity probe on port %s failed: %s", port, exc)
+        return Identity.UNCONFIRMED
+
+    if not isinstance(info, dict):
+        return Identity.UNCONFIRMED
+
+    reported_pid = info.get("pid")
+    if isinstance(reported_pid, int):
+        if reported_pid == entry["pid"]:
+            return Identity.CONFIRMED
+        con.print(
+            f"[bold yellow]Warning:[/bold yellow] the dashboard on port {port} is PID "
+            f"{reported_pid}, but the PID file records {entry['pid']}. Refusing to act on it."
+        )
+        return Identity.MISMATCHED
+
+    # Older dashboard: fall back to run_id when both sides have one.
+    expected = str(entry.get("run_id") or "")
+    actual = str(info.get("run_id") or "")
+    if not expected or not actual:
+        return Identity.UNCONFIRMED
+    return Identity.CONFIRMED if actual == expected else Identity.MISMATCHED
+
+
+def _request_graceful_kill(port: int) -> bool:
+    """Ask the dashboard to cancel its workflow via ``POST /api/kill``.
+
+    Returns:
+        True if the request was accepted. This is an **acknowledgement, not a
+        death certificate** — the endpoint sets an asyncio event and returns
+        immediately, and the drain that follows it is unbounded, so the caller
+        must still confirm the process actually exited.
+    """
+    import httpx
+
+    try:
+        resp = httpx.post(f"http://127.0.0.1:{port}/api/kill", timeout=_IDENTITY_TIMEOUT)
+        resp.raise_for_status()
+    except Exception as exc:  # noqa: BLE001 - fall through to the next rung
+        logger.debug("POST /api/kill on port %s failed: %s", port, exc)
+        return False
+    return True
+
+
+def _signal_process(pid: int) -> None:
+    """Send the platform's polite termination signal, ignoring failures.
+
+    Neither platform's signal is reliable for conductor: on Windows
+    ``CTRL_BREAK_EVENT`` requires a shared console, which a separate
+    ``conductor stop`` invocation does not have; on POSIX the background child
+    runs ``--no-interactive`` and installs no SIGTERM handler. This rung is
+    therefore best-effort — it costs nothing and occasionally works.
     """
     import signal
     import sys
-
-    pid = entry["pid"]
-    port = entry["port"]
-    workflow = Path(entry.get("workflow", "unknown")).stem
 
     try:
         if sys.platform == "win32":
             os.kill(pid, signal.CTRL_BREAK_EVENT)
         else:
             os.kill(pid, signal.SIGTERM)
-        con.print(
-            f"[green]Stopped[/green] workflow [cyan]'{workflow}'[/cyan] (PID {pid}, port {port})"
-        )
-    except ProcessLookupError:
+    except (OSError, ValueError) as exc:
+        logger.debug("Polite signal to PID %s failed: %s", pid, exc)
+
+
+def _stop_process(entry: dict, con: Console, force: bool = False) -> dict:
+    """Stop one background workflow, escalating until it is confirmed dead.
+
+    The ladder is graceful → polite signal → forceful, with a bounded wait
+    after each rung. It never reports success on the strength of a request
+    having been *accepted*: every rung is followed by a liveness check, and
+    the caller only removes the PID file when the process is confirmed gone.
+
+    Args:
+        entry: A PID-file dict with ``pid``, ``port``, ``workflow``, and
+            ideally ``run_id`` keys.
+        con: Rich Console for output.
+        force: Permit forceful termination even when identity could not be
+            confirmed. Dangerous — the PID may have been recycled.
+
+    Returns:
+        A result dict with ``pid``, ``port``, ``workflow``, ``run_id``,
+        ``outcome`` and ``rung`` keys. ``outcome`` is one of ``stopped``,
+        ``already-exited``, ``survived`` or ``unconfirmed``.
+    """
+    from conductor.cli.pid import Liveness, process_liveness, terminate_process, wait_for_exit
+
+    pid = entry["pid"]
+    port = entry["port"]
+    workflow = Path(entry.get("workflow", "unknown")).stem
+
+    def _result(outcome: str, rung: str) -> dict:
+        return {
+            "pid": pid,
+            "port": port,
+            "workflow": workflow,
+            "run_id": entry.get("run_id", ""),
+            "outcome": outcome,
+            "rung": rung,
+        }
+
+    if process_liveness(pid) is Liveness.DEAD:
         con.print(
             f"[dim]Process already exited:[/dim] workflow '{workflow}' (PID {pid}, port {port})"
         )
-    except PermissionError:
+        return _result("already-exited", "none")
+
+    identity = _confirm_identity(entry, con)
+
+    # Rung 1 — ask the workflow to cancel itself. This is the only rung that
+    # lets the run write a resume checkpoint, so it is always tried first, and
+    # only when we are sure we are talking to the right run.
+    if (
+        identity is Identity.CONFIRMED
+        and _request_graceful_kill(port)
+        and wait_for_exit(pid, _GRACEFUL_TIMEOUT) is Liveness.DEAD
+    ):
         con.print(
-            f"[bold red]Permission denied:[/bold red] could not stop PID {pid}. "
-            f"Try running with elevated privileges."
+            f"[green]Stopped[/green] workflow [cyan]'{workflow}'[/cyan] (PID {pid}, port {port})"
         )
-    except OSError as exc:
-        # Defensive catch (companion to the fix for issue #166): on Windows,
-        # ``os.kill`` can raise OSError subclasses for edge cases such as the
-        # target not being a console process group leader, or a probe-failing
-        # PID that the "assume alive" fallback in ``_is_process_alive_windows``
-        # let through.  Treating these as "already exited" lets ``conductor
-        # stop`` continue and clean up the PID file rather than crash.
-        logger.warning(
-            "Unexpected OSError stopping PID %s; treating as already exited", pid, exc_info=True
+        return _result("stopped", "api-kill")
+
+    # Rung 2 — polite signal. Best-effort on both platforms. Skipped only on a
+    # positive mismatch: an unconfirmable identity is not evidence of anything,
+    # and refusing to signal there would be a regression for PID files written
+    # by older versions, where a signal is all the previous code ever sent.
+    if identity is Identity.MISMATCHED and not force:
+        con.print(
+            f"[bold red]Could not stop[/bold red] workflow [cyan]'{workflow}'[/cyan] "
+            f"(PID {pid}, port {port}): the process on that port is a different run, "
+            f"so nothing was signalled."
+        )
+        con.print("[dim]The PID file has been left in place.[/dim]")
+        return _result("unconfirmed", "refused")
+
+    _signal_process(pid)
+    if wait_for_exit(pid, _SIGNAL_TIMEOUT) is Liveness.DEAD:
+        con.print(
+            f"[green]Stopped[/green] workflow [cyan]'{workflow}'[/cyan] (PID {pid}, port {port})"
+        )
+        return _result("stopped", "signal")
+
+    # Rung 3 — forceful, and irreversible. Re-confirm identity immediately
+    # beforehand: several seconds of waiting have elapsed since the first
+    # check, and if the target died in that window its PID could now belong to
+    # an unrelated process.
+    if not force:
+        identity = _confirm_identity(entry, con)
+    if not (identity is Identity.CONFIRMED or force):
+        con.print(
+            f"[bold red]Could not stop[/bold red] workflow [cyan]'{workflow}'[/cyan] "
+            f"(PID {pid}, port {port}): it is still running, and its identity could not be "
+            f"confirmed, so it was not force-terminated."
         )
         con.print(
-            f"[yellow]Could not signal PID {pid} ({exc}); "
-            f"removing PID file for workflow '{workflow}' anyway.[/yellow]"
+            "[dim]Re-run with --force if you are certain this PID is the workflow. "
+            "The PID file has been left in place.[/dim]"
         )
+        return _result("unconfirmed", "refused")
+
+    state = terminate_process(pid, _TERMINATE_TIMEOUT)
+    if state is Liveness.DEAD:
+        con.print(
+            f"[green]Stopped[/green] workflow [cyan]'{workflow}'[/cyan] "
+            f"(PID {pid}, port {port}) [dim]— required forceful termination[/dim]"
+        )
+        return _result("stopped", "terminate")
+
+    if state is Liveness.ALIVE:
+        con.print(
+            f"[bold red]Could not stop[/bold red] workflow [cyan]'{workflow}'[/cyan] "
+            f"(PID {pid}, port {port}): the process survived forceful termination."
+        )
+        con.print("[dim]The PID file has been left in place so the run stays discoverable.[/dim]")
+        return _result("survived", "terminate")
+
+    # Liveness.UNKNOWN — the probe itself failed, so we genuinely do not know
+    # whether it died. Reporting "survived" here would assert more than we know.
+    con.print(
+        f"[bold yellow]Could not confirm[/bold yellow] whether workflow "
+        f"[cyan]'{workflow}'[/cyan] (PID {pid}, port {port}) stopped: the liveness probe failed."
+    )
+    con.print("[dim]The PID file has been left in place so the run stays discoverable.[/dim]")
+    return _result("unconfirmed", "terminate")
 
 
 def _print_running_list(entries: list[dict], con: Console) -> None:
