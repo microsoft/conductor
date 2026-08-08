@@ -304,6 +304,7 @@ def test_end_to_end_with_real_manager_truncate(
     adapter delegates to ``call_tool`` and the truncation/spill behavior is
     preserved without reimplementation.
     """
+    import os
     import stat
     from types import SimpleNamespace
 
@@ -345,7 +346,8 @@ def test_end_to_end_with_real_manager_truncate(
     spill_file = next((tmp_path / "conductor" / "tool-output").glob("*.txt"))
     assert spill_file.exists()
     assert spill_file.read_text() == "x" * 5000
-    assert stat.S_IMODE(spill_file.stat().st_mode) == 0o600
+    if os.name != "nt":
+        assert stat.S_IMODE(spill_file.stat().st_mode) == 0o600
 
 
 def test_end_to_end_with_real_manager_explicit_spill_dir(tmp_path: Any) -> None:
@@ -355,6 +357,7 @@ def test_end_to_end_with_real_manager_explicit_spill_dir(tmp_path: Any) -> None:
     configured; the adapter must still delegate truncation to ``MCPManager`` and
     the resulting spill file must land under the requested directory.
     """
+    import os
     import stat
     from types import SimpleNamespace
 
@@ -394,12 +397,15 @@ def test_end_to_end_with_real_manager_explicit_spill_dir(tmp_path: Any) -> None:
 
     assert "[output truncated: 5000 chars -> 1000 kept" in result.output
     assert "full output saved to:" in result.output
-    assert str(custom_dir) in result.output
+    # The manager resolves spill_dir before writing, so compare the resolved form:
+    # on Windows resolve() also expands any 8.3 short components in tmp_path.
+    assert str(custom_dir.resolve()) in result.output
 
     spill_file = next(custom_dir.glob("*.txt"))
     assert spill_file.exists()
     assert spill_file.read_text() == "x" * 5000
-    assert stat.S_IMODE(spill_file.stat().st_mode) == 0o600
+    if os.name != "nt":
+        assert stat.S_IMODE(spill_file.stat().st_mode) == 0o600
 
 
 def test_attach_mcp_toolset_with_none_manager() -> None:
