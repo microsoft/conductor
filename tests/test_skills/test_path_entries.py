@@ -202,8 +202,8 @@ class TestOrderingAndDeduplication:
 
 class TestUnreadableDirectory:
     @pytest.mark.skipif(
-        hasattr(os, "geteuid") and os.geteuid() == 0,
-        reason="root bypasses directory permissions",
+        os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+        reason="POSIX permission semantics; chmod(0o000) blocks neither Windows owners nor root",
     )
     def test_unreadable_directory_is_reported_not_raised_raw(self, tmp_path: Path) -> None:
         """A stat-able but unreadable directory must name the entry rather than
@@ -261,8 +261,8 @@ class TestNameCollisions:
 
 class TestUnreadableParent:
     @pytest.mark.skipif(
-        hasattr(os, "geteuid") and os.geteuid() == 0,
-        reason="root bypasses directory permissions",
+        os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+        reason="POSIX permission semantics; chmod(0o000) blocks neither Windows owners nor root",
     )
     def test_unreadable_parent_is_reported_not_raised_raw(self, tmp_path: Path) -> None:
         """``exists`` and ``is_dir`` sit inside the OSError guard for this case;
@@ -297,6 +297,11 @@ class TestSkillsRootDiagnostics:
     used to turn that same mistake into silence — one fewer skill, no message.
     """
 
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="Windows filesystems are case-insensitive, so 'Skill.md' resolves as SKILL.md "
+        "and the mis-cased-filename scenario cannot occur",
+    )
     def test_subdirectory_without_skill_md_is_reported(self, tmp_path: Path) -> None:
         root = tmp_path / "skills"
         _make_skill(root / "alpha")

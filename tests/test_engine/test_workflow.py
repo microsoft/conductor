@@ -3969,6 +3969,9 @@ class TestAgentWorkingDirResolution:
         fake_home = tmp_path / "home"
         (fake_home / "proj").mkdir(parents=True)
         monkeypatch.setenv("HOME", str(fake_home))
+        # Windows resolves ``~`` from USERPROFILE, not HOME, so setting HOME alone
+        # leaves expanduser() pointing at the real user profile.
+        monkeypatch.setenv("USERPROFILE", str(fake_home))
         provider = _RecordingWorkingDirProvider()
         engine = WorkflowEngine(
             _single_agent_config(working_dir="~/proj"),

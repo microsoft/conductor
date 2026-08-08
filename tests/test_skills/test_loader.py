@@ -91,8 +91,8 @@ class TestUnreadableContentFailsLoudly:
             load_skill_content([("acme", skill)])
 
     @pytest.mark.skipif(
-        hasattr(os, "geteuid") and os.geteuid() == 0,
-        reason="root bypasses file permissions",
+        os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+        reason="POSIX permission semantics; chmod(0o000) blocks neither Windows owners nor root",
     )
     def test_unreadable_reference_raises(self, tmp_path: Path) -> None:
         skill = self._make_skill(tmp_path / "acme")

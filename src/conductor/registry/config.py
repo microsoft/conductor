@@ -135,18 +135,49 @@ def save_config(config: RegistriesConfig) -> None:
         raise
 
 
+def _toml_escape(value: str) -> str:
+    """Escape ``value`` for use inside a TOML basic string.
+
+    TOML basic strings process backslash escapes, so a Windows path such as
+    ``C:\\Users\\alice`` interpolated verbatim produces ``\\U``, which TOML reads as a
+    Unicode escape and rejects with "Invalid hex value" — writing a config file that
+    can never be read back. Escape per the TOML v1.0 spec.
+    """
+    out: list[str] = []
+    for ch in value:
+        if ch == "\\":
+            out.append("\\\\")
+        elif ch == '"':
+            out.append('\\"')
+        elif ch == "\b":
+            out.append("\\b")
+        elif ch == "\t":
+            out.append("\\t")
+        elif ch == "\n":
+            out.append("\\n")
+        elif ch == "\f":
+            out.append("\\f")
+        elif ch == "\r":
+            out.append("\\r")
+        elif ch < " " or ch == "\x7f":
+            out.append(f"\\u{ord(ch):04X}")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
 def _format_toml(config: RegistriesConfig) -> str:
     """Format a ``RegistriesConfig`` as TOML text."""
     lines: list[str] = []
 
     if config.default is not None:
-        lines.append(f'default = "{config.default}"')
+        lines.append(f'default = "{_toml_escape(config.default)}"')
 
     for name, entry in config.registries.items():
         lines.append("")
         lines.append(f"[registries.{name}]")
-        lines.append(f'type = "{entry.type}"')
-        lines.append(f'source = "{entry.source}"')
+        lines.append(f'type = "{_toml_escape(entry.type)}"')
+        lines.append(f'source = "{_toml_escape(entry.source)}"')
 
     # Ensure trailing newline
     lines.append("")
