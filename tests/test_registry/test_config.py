@@ -134,6 +134,50 @@ class TestSaveConfig:
         assert loaded.registries["dev"].type == RegistryType.path
         assert loaded.registries["dev"].source == "/dev/workflows"
 
+    def test_roundtrip_survives_backslashes_in_source(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A Windows path must survive the TOML round-trip.
+
+        ``_format_toml`` writes values into TOML *basic* strings, which process
+        backslash escapes. ``C:\\Users\\...`` therefore reaches the parser as ``\\U``,
+        a Unicode escape, and TOML rejects it with "Invalid hex value" — so the
+        config could be written but never read back. Not Windows-only: any source
+        containing a backslash corrupts the file on every platform.
+        """
+        _setup_config_home(tmp_path, monkeypatch)
+
+        windows_source = r"C:\Users\alice\AppData\Local\workflows"
+        save_config(
+            RegistriesConfig(
+                registries={"local": RegistryEntry(type=RegistryType.path, source=windows_source)}
+            )
+        )
+
+        loaded = load_config()
+        assert loaded.registries["local"].source == windows_source
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            r"C:\Users\alice",  # \U -> "invalid hex value"
+            r"C:\temp\new",  # \t and \n -> silent corruption, not an error
+            r"D:\x41\backup",  # \x -> hex escape
+            'has"a"quote',  # closes the basic string early
+            "trailing\\",  # escapes the closing quote
+        ],
+    )
+    def test_roundtrip_survives_toml_metacharacters(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str
+    ) -> None:
+        _setup_config_home(tmp_path, monkeypatch)
+
+        save_config(
+            RegistriesConfig(registries={"r": RegistryEntry(type=RegistryType.path, source=source)})
+        )
+
+        assert load_config().registries["r"].source == source
+
     def test_save_creates_parent_dirs(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

@@ -81,12 +81,27 @@ jobs:
         run: uv run ty check src
 
   test:
-    name: Test (Python ${{ matrix.python-version }})
-    runs-on: ubuntu-latest
+    name: Test (Python ${{ matrix.python-version }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     needs: [lint, typecheck]
     strategy:
       matrix:
+        os: [ubuntu-latest]
         python-version: ["3.12", "3.13"]
+        # Windows carries a substantial amount of platform-specific code —
+        # cli/pid.py is an entire OpenProcess/GetExitCodeProcess ctypes
+        # implementation, cli/bg_runner.py handles process groups and job-object
+        # breakaway — and none of it was executed anywhere. The existing tests
+        # cover that logic on Linux by monkey-patching a `_kernel32` mock, which
+        # is good design but means nothing validates the real ctypes signatures.
+        #
+        # Deliberately ONE Python version on Windows rather than a full 2x2: the
+        # platform is the variable here, not the interpreter, and the
+        # install-scripts job already provisions a Windows runner on every PR so
+        # this is incremental cost rather than a new platform commitment.
+        include:
+          - os: windows-latest
+            python-version: "3.13"
       fail-fast: false
 
     steps:
@@ -109,11 +124,18 @@ jobs:
         run: uv sync --group dev --extra claude-agent-sdk
 
       - name: Remove bundled Copilot CLI binary
+        # `shell: bash` so this runs identically on the Windows runner (Git Bash
+        # is preinstalled). Without it the step fails on Windows, since `find`
+        # is not a native command there.
+        shell: bash
         run: |
           # The github-copilot-sdk >=0.1.23 bundles a CLI binary that tries to
           # authenticate with GitHub on startup. Remove it so tests that invoke
           # the real CLI path fail fast instead of hanging on auth.
+          # The Windows venv puts scripts under Scripts/ rather than lib/, and
+          # the binary carries a .exe suffix, so match both layouts.
           find .venv -path '*/copilot/bin/copilot*' -delete 2>/dev/null || true
+          find .venv -iname 'copilot.exe' -delete 2>/dev/null || true
 
       - name: Run tests with coverage
         timeout-minutes: 10
@@ -128,7 +150,9 @@ jobs:
 
       - name: Upload coverage reports
         uses: codecov/codecov-action@v4
-        if: matrix.python-version == '3.12'
+        # One upload per commit. Without the os guard a second runner would
+        # upload a partial report for the same commit and skew the totals.
+        if: matrix.python-version == '3.12' && matrix.os == 'ubuntu-latest'
         with:
           file: ./coverage.xml
           fail_ci_if_error: false

@@ -99,7 +99,11 @@ class TestValidateConnection:
     @patch("conductor.providers.claude_agent_sdk.query", lambda **kwargs: None)
     @patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", Mock)
     async def test_validate_connection_returns_true_when_bundled_cli_present(self) -> None:
-        """The SDK ships a bundled CLI under _bundled/claude — detection should succeed."""
+        """The SDK ships a bundled CLI under ``_bundled/`` — detection should succeed.
+
+        The binary is named per-platform (``claude.exe`` on Windows, ``claude``
+        elsewhere), matching the SDK's own ``_find_bundled_cli``.
+        """
         provider = ClaudeAgentSdkProvider()
         # The installed claude-agent-sdk extra includes the bundled binary,
         # so this should return True in any env where the test runs.
@@ -1819,7 +1823,10 @@ class TestMcpConfigFile:
             _remove_mcp_config(path)
 
         # 0600: resolved env values and Authorization headers live in here.
-        assert mode == 0o600
+        # Windows has no POSIX mode bits — S_IMODE reports 0o666 whatever was requested —
+        # so the exact-mode guarantee is asserted on POSIX only.
+        if os.name != "nt":
+            assert mode == 0o600
         # The CLI rejects a bare mapping: "mcpServers: Invalid input:
         # expected record, received undefined".
         assert payload == {"mcpServers": servers}

@@ -782,15 +782,21 @@ class ClaudeAgentSdkProvider(AgentProvider):
         if not CLAUDE_AGENT_SDK_AVAILABLE:
             return False
 
+        import platform
         import shutil
         from pathlib import Path
 
-        # Bundled CLI takes precedence (matches the SDK's own resolution).
+        is_windows = platform.system() == "Windows"
+
+        # Bundled CLI takes precedence (matches the SDK's own resolution). The SDK names
+        # the bundled binary per-platform — see _find_bundled_cli — so probing only
+        # "claude" reports "no CLI" on Windows even when the bundled one is present.
         try:
             import claude_agent_sdk  # ty: ignore[unresolved-import]
 
             sdk_dir = Path(claude_agent_sdk.__file__).parent
-            for candidate in (sdk_dir / "_bundled" / "claude",):
+            bundled_name = "claude.exe" if is_windows else "claude"
+            for candidate in (sdk_dir / "_bundled" / bundled_name,):
                 if candidate.exists() and candidate.is_file():
                     return True
         except Exception:
@@ -798,17 +804,32 @@ class ClaudeAgentSdkProvider(AgentProvider):
 
         if shutil.which("claude"):
             return True
+        # On Windows, PATH may hold npm's claude.cmd shim while the native claude.exe
+        # lives elsewhere; the SDK probes the .exe name explicitly for the same reason.
+        if is_windows and shutil.which("claude.exe"):
+            return True
 
         # SDK's hardcoded fallback locations — keep in sync with
         # claude_agent_sdk._internal.transport.subprocess_cli._find_cli.
-        for path in (
-            Path.home() / ".npm-global/bin/claude",
-            Path("/usr/local/bin/claude"),
-            Path.home() / ".local/bin/claude",
-            Path.home() / "node_modules/.bin/claude",
-            Path.home() / ".yarn/bin/claude",
-            Path.home() / ".claude/local/claude",
-        ):
+        #
+        # The POSIX-shaped entries are deliberately NOT probed on Windows. A rooted but
+        # driveless path such as "/usr/local/bin/claude" resolves against the current
+        # drive (C:\usr\local\bin\claude) — a location any unprivileged local user can
+        # create — so probing it would let a planted file report the CLI as available.
+        # The SDK refuses these on Windows for exactly this reason.
+        fallbacks: tuple[Path, ...]
+        if is_windows:
+            fallbacks = (Path.home() / ".local/bin/claude.exe",)
+        else:
+            fallbacks = (
+                Path.home() / ".npm-global/bin/claude",
+                Path("/usr/local/bin/claude"),
+                Path.home() / ".local/bin/claude",
+                Path.home() / "node_modules/.bin/claude",
+                Path.home() / ".yarn/bin/claude",
+                Path.home() / ".claude/local/claude",
+            )
+        for path in fallbacks:
             if path.exists() and path.is_file():
                 return True
 
