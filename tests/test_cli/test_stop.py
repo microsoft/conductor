@@ -20,7 +20,7 @@ from unittest.mock import patch
 import pytest
 from typer.testing import CliRunner
 
-from conductor.cli.app import app
+from conductor.cli.app import Identity, app
 from conductor.cli.pid import Liveness
 
 runner = CliRunner()
@@ -72,7 +72,7 @@ def _stops_cleanly() -> Iterator[None]:
         patch("conductor.cli.pid._is_process_alive", return_value=True),
         patch("conductor.cli.pid.process_liveness", return_value=Liveness.ALIVE),
         patch("conductor.cli.pid.wait_for_exit", return_value=Liveness.DEAD),
-        patch("conductor.cli.app._confirm_identity", return_value=True),
+        patch("conductor.cli.app._confirm_identity", return_value=Identity.CONFIRMED),
         patch("conductor.cli.app._request_graceful_kill", return_value=True),
     ):
         yield
@@ -158,7 +158,9 @@ class TestStopAutoDetect:
         with patch("conductor.cli.pid._is_process_alive", return_value=True):
             result = runner.invoke(app, ["stop"])
 
-        assert result.exit_code == 0
+        # Ambiguous target: nothing was stopped, so this must not report
+        # success to a script that only checks the exit code.
+        assert result.exit_code == 1
         assert "Multiple background workflows" in result.output
         assert "8080" in result.output
         assert "9090" in result.output
@@ -199,7 +201,7 @@ class TestStopProcessUnexpectedOSError:
             patch("conductor.cli.pid.process_liveness", return_value=Liveness.ALIVE),
             patch("conductor.cli.pid.wait_for_exit", return_value=Liveness.ALIVE),
             patch("conductor.cli.pid.terminate_process", return_value=Liveness.DEAD),
-            patch("conductor.cli.app._confirm_identity", return_value=True),
+            patch("conductor.cli.app._confirm_identity", return_value=Identity.CONFIRMED),
             patch("conductor.cli.app._request_graceful_kill", return_value=False),
             patch(
                 "conductor.cli.app.os.kill",
@@ -218,13 +220,18 @@ class TestStopProcessUnexpectedOSError:
 
     def test_pid_file_is_removed_when_process_confirmed_gone(self, pid_tmpdir: Path) -> None:
         # A PID file for a process that no longer exists must be cleaned up so
-        # ``conductor stop`` listings don't accumulate phantom entries — even
-        # though the signal path would have raised.
+        # ``conductor stop`` listings don't accumulate phantom entries.
+        #
+        # ``process_liveness`` is patched explicitly rather than relying on a
+        # bogus PID: ``patch("conductor.cli.app.os.kill")`` mutates the shared
+        # ``os`` module object, so on POSIX it would also break ``pid.py``'s
+        # own probe (turning DEAD into UNKNOWN) and this test would fail on
+        # Linux CI while passing on Windows.
         _write_pid(pid_tmpdir, 99999999, 8080)
 
         with (
             patch("conductor.cli.pid._is_process_alive", return_value=True),
-            patch("conductor.cli.app.os.kill", side_effect=OSError(11, "boom")),
+            patch("conductor.cli.pid.process_liveness", return_value=Liveness.DEAD),
         ):
             result = runner.invoke(app, ["stop", "--port", "8080"])
 

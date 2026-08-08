@@ -38,7 +38,7 @@ import pytest
 from rich.console import Console
 from typer.testing import CliRunner
 
-from conductor.cli.app import _confirm_identity, _stop_process, app
+from conductor.cli.app import Identity, _confirm_identity, _stop_process, app
 from conductor.cli.pid import (
     Liveness,
     remove_pid_file_at,
@@ -89,7 +89,7 @@ class TestSurvivingRunIsNotOrphaned:
             patch("conductor.cli.pid.process_liveness", return_value=Liveness.ALIVE),
             patch("conductor.cli.pid.wait_for_exit", return_value=Liveness.ALIVE),
             patch("conductor.cli.pid.terminate_process", return_value=Liveness.ALIVE),
-            patch("conductor.cli.app._confirm_identity", return_value=True),
+            patch("conductor.cli.app._confirm_identity", return_value=Identity.CONFIRMED),
             patch("conductor.cli.app._request_graceful_kill", return_value=True),
             patch("conductor.cli.app._signal_process"),
         ):
@@ -108,7 +108,7 @@ class TestSurvivingRunIsNotOrphaned:
             patch("conductor.cli.pid._is_process_alive", return_value=True),
             patch("conductor.cli.pid.process_liveness", return_value=Liveness.ALIVE),
             patch("conductor.cli.pid.wait_for_exit", return_value=Liveness.DEAD),
-            patch("conductor.cli.app._confirm_identity", return_value=True),
+            patch("conductor.cli.app._confirm_identity", return_value=Identity.CONFIRMED),
             patch("conductor.cli.app._request_graceful_kill", return_value=True),
         ):
             result = runner.invoke(app, ["stop", "--port", "8080"])
@@ -120,17 +120,19 @@ class TestSurvivingRunIsNotOrphaned:
         write_pid_file(1, 8080, "/tmp/wf1.yaml", run_id=_RUN_ID)
         write_pid_file(2, 9090, "/tmp/wf2.yaml", run_id="ffffffff")
 
-        # First target dies on the graceful rung; the second survives every
-        # rung.  ``wait_for_exit`` is called once per rung attempted.
+        # Port 8080's run dies on the graceful rung; 9090's survives every
+        # rung. Keyed off the pid rather than call order, because
+        # ``read_pid_files`` iterates ``Path.glob`` whose order is
+        # filesystem-dependent.
+        def _wait(pid: int, timeout: float, interval: float = 0.1) -> Liveness:
+            return Liveness.DEAD if pid == 1 else Liveness.ALIVE
+
         with (
             patch("conductor.cli.pid._is_process_alive", return_value=True),
             patch("conductor.cli.pid.process_liveness", return_value=Liveness.ALIVE),
-            patch(
-                "conductor.cli.pid.wait_for_exit",
-                side_effect=[Liveness.DEAD, Liveness.ALIVE, Liveness.ALIVE],
-            ),
+            patch("conductor.cli.pid.wait_for_exit", side_effect=_wait),
             patch("conductor.cli.pid.terminate_process", return_value=Liveness.ALIVE),
-            patch("conductor.cli.app._confirm_identity", return_value=True),
+            patch("conductor.cli.app._confirm_identity", return_value=Identity.CONFIRMED),
             patch("conductor.cli.app._request_graceful_kill", return_value=True),
             patch("conductor.cli.app._signal_process"),
         ):
@@ -148,12 +150,17 @@ class TestLadderOutcomes:
         with (
             patch("conductor.cli.pid.process_liveness", return_value=Liveness.ALIVE),
             patch("conductor.cli.pid.wait_for_exit", return_value=Liveness.DEAD),
-            patch("conductor.cli.app._confirm_identity", return_value=True),
-            patch("conductor.cli.app._request_graceful_kill", return_value=True),
+            patch("conductor.cli.app._confirm_identity", return_value=Identity.CONFIRMED),
+            patch("conductor.cli.app._request_graceful_kill", return_value=True) as graceful,
+            patch("conductor.cli.app._signal_process") as sig,
         ):
             result = _stop_process(_entry(), _quiet())
         assert result["outcome"] == "stopped"
         assert result["rung"] == "api-kill"
+        # The graceful rung must actually have been attempted, not merely
+        # skipped past into a lucky liveness read.
+        graceful.assert_called_once_with(8080)
+        sig.assert_not_called()
 
     def test_signal_rung_used_when_graceful_fails(self) -> None:
         with (
@@ -162,7 +169,7 @@ class TestLadderOutcomes:
                 "conductor.cli.pid.wait_for_exit",
                 side_effect=[Liveness.ALIVE, Liveness.DEAD],
             ),
-            patch("conductor.cli.app._confirm_identity", return_value=True),
+            patch("conductor.cli.app._confirm_identity", return_value=Identity.CONFIRMED),
             patch("conductor.cli.app._request_graceful_kill", return_value=True),
             patch("conductor.cli.app._signal_process") as sig,
         ):
@@ -184,10 +191,47 @@ class TestLadderOutcomes:
             patch("conductor.cli.pid.process_liveness", return_value=Liveness.DEAD),
             patch("conductor.cli.app._signal_process") as sig,
             patch("conductor.cli.pid.terminate_process") as term,
+            patch("conductor.cli.app._confirm_identity") as ident,
+            patch("conductor.cli.app._request_graceful_kill") as graceful,
         ):
             _stop_process(_entry(), _quiet())
         sig.assert_not_called()
         term.assert_not_called()
+        # Nor should we bother the network for a process we know is gone.
+        ident.assert_not_called()
+        graceful.assert_not_called()
+
+    def test_unknown_after_terminate_is_not_reported_as_survived(self) -> None:
+        """A failed probe is not evidence the process lived.
+
+        ``terminate_process`` returns UNKNOWN when the probe itself failed
+        (e.g. ``WaitForSingleObject`` returned an unexpected value, or SIGKILL
+        raised ``PermissionError``). Reporting ``survived`` there would assert
+        more than is known; JSON consumers would read "definitely still alive".
+        """
+        with (
+            patch("conductor.cli.pid.process_liveness", return_value=Liveness.ALIVE),
+            patch("conductor.cli.pid.wait_for_exit", return_value=Liveness.ALIVE),
+            patch("conductor.cli.pid.terminate_process", return_value=Liveness.UNKNOWN),
+            patch("conductor.cli.app._confirm_identity", return_value=Identity.CONFIRMED),
+            patch("conductor.cli.app._request_graceful_kill", return_value=True),
+            patch("conductor.cli.app._signal_process"),
+        ):
+            result = _stop_process(_entry(), _quiet())
+        assert result["outcome"] == "unconfirmed"
+        assert result["rung"] == "terminate"
+
+    def test_alive_after_terminate_is_reported_as_survived(self) -> None:
+        with (
+            patch("conductor.cli.pid.process_liveness", return_value=Liveness.ALIVE),
+            patch("conductor.cli.pid.wait_for_exit", return_value=Liveness.ALIVE),
+            patch("conductor.cli.pid.terminate_process", return_value=Liveness.ALIVE),
+            patch("conductor.cli.app._confirm_identity", return_value=Identity.CONFIRMED),
+            patch("conductor.cli.app._request_graceful_kill", return_value=True),
+            patch("conductor.cli.app._signal_process"),
+        ):
+            result = _stop_process(_entry(), _quiet())
+        assert result["outcome"] == "survived"
 
 
 class TestForcefulTerminationRequiresIdentity:
@@ -197,7 +241,7 @@ class TestForcefulTerminationRequiresIdentity:
         with (
             patch("conductor.cli.pid.process_liveness", return_value=Liveness.ALIVE),
             patch("conductor.cli.pid.wait_for_exit", return_value=Liveness.ALIVE),
-            patch("conductor.cli.app._confirm_identity", return_value=False),
+            patch("conductor.cli.app._confirm_identity", return_value=Identity.UNCONFIRMED),
             patch("conductor.cli.app._signal_process"),
             patch("conductor.cli.pid.terminate_process") as terminate,
         ):
@@ -210,7 +254,7 @@ class TestForcefulTerminationRequiresIdentity:
         with (
             patch("conductor.cli.pid.process_liveness", return_value=Liveness.ALIVE),
             patch("conductor.cli.pid.wait_for_exit", return_value=Liveness.ALIVE),
-            patch("conductor.cli.app._confirm_identity", return_value=False),
+            patch("conductor.cli.app._confirm_identity", return_value=Identity.UNCONFIRMED),
             patch("conductor.cli.app._signal_process"),
             patch("conductor.cli.pid.terminate_process", return_value=Liveness.DEAD) as terminate,
         ):
@@ -224,7 +268,7 @@ class TestForcefulTerminationRequiresIdentity:
         with (
             patch("conductor.cli.pid.process_liveness", return_value=Liveness.ALIVE),
             patch("conductor.cli.pid.wait_for_exit", return_value=Liveness.ALIVE),
-            patch("conductor.cli.app._confirm_identity", return_value=True),
+            patch("conductor.cli.app._confirm_identity", return_value=Identity.CONFIRMED),
             patch("conductor.cli.app._request_graceful_kill", return_value=True),
             patch("conductor.cli.app._signal_process"),
             patch("conductor.cli.pid.terminate_process", return_value=Liveness.DEAD) as terminate,
@@ -239,7 +283,7 @@ class TestForcefulTerminationRequiresIdentity:
         with (
             patch("conductor.cli.pid.process_liveness", return_value=Liveness.ALIVE),
             patch("conductor.cli.pid.wait_for_exit", return_value=Liveness.DEAD),
-            patch("conductor.cli.app._confirm_identity", return_value=False),
+            patch("conductor.cli.app._confirm_identity", return_value=Identity.UNCONFIRMED),
             patch("conductor.cli.app._signal_process"),
             patch("conductor.cli.app._request_graceful_kill") as graceful,
         ):
@@ -247,38 +291,134 @@ class TestForcefulTerminationRequiresIdentity:
 
         graceful.assert_not_called()
 
+    def test_positive_mismatch_signals_nothing_at_all(self) -> None:
+        """A confirmed mismatch means this PID is somebody else's process.
+
+        Refusing only the *forceful* rung would be incoherent: on POSIX the
+        polite rung is ``SIGTERM``, which is perfectly capable of killing the
+        bystander the identity gate exists to protect.
+        """
+        with (
+            patch("conductor.cli.pid.process_liveness", return_value=Liveness.ALIVE),
+            patch("conductor.cli.pid.wait_for_exit", return_value=Liveness.ALIVE),
+            patch("conductor.cli.app._confirm_identity", return_value=Identity.MISMATCHED),
+            patch("conductor.cli.app._signal_process") as sig,
+            patch("conductor.cli.pid.terminate_process") as term,
+        ):
+            result = _stop_process(_entry(), _quiet())
+
+        assert result["outcome"] == "unconfirmed"
+        sig.assert_not_called()
+        term.assert_not_called()
+
+    def test_unconfirmed_identity_still_sends_the_polite_signal(self) -> None:
+        """ "Cannot confirm" is not evidence of anything.
+
+        PID files written by older conductor have no ``run_id``, so identity is
+        unconfirmable. Refusing to signal them would be a regression: a signal
+        is all the previous implementation ever sent, and on POSIX it works.
+        """
+        with (
+            patch("conductor.cli.pid.process_liveness", return_value=Liveness.ALIVE),
+            patch("conductor.cli.pid.wait_for_exit", return_value=Liveness.DEAD),
+            patch("conductor.cli.app._confirm_identity", return_value=Identity.UNCONFIRMED),
+            patch("conductor.cli.app._signal_process") as sig,
+        ):
+            result = _stop_process(_entry(run_id=""), _quiet())
+
+        assert result["outcome"] == "stopped"
+        assert result["rung"] == "signal"
+        sig.assert_called_once_with(4242)
+
+    def test_identity_is_reconfirmed_before_forceful_termination(self) -> None:
+        """Seconds elapse between the first check and the irreversible rung.
+
+        If the target dies during those waits, its PID can be recycled onto an
+        unrelated process — so the check is repeated immediately before
+        terminating rather than trusting the stale result.
+        """
+        with (
+            patch("conductor.cli.pid.process_liveness", return_value=Liveness.ALIVE),
+            patch("conductor.cli.pid.wait_for_exit", return_value=Liveness.ALIVE),
+            patch("conductor.cli.pid.terminate_process") as term,
+            patch(
+                "conductor.cli.app._confirm_identity",
+                side_effect=[Identity.CONFIRMED, Identity.MISMATCHED],
+            ) as ident,
+            patch("conductor.cli.app._request_graceful_kill", return_value=True),
+            patch("conductor.cli.app._signal_process"),
+        ):
+            result = _stop_process(_entry(), _quiet())
+
+        assert ident.call_count == 2
+        assert result["outcome"] == "unconfirmed"
+        term.assert_not_called()
+
 
 class TestIdentityConfirmation:
-    """``/api/info`` is the only party that can prove who owns a PID."""
+    """Only the running process itself can prove it owns a PID and a port."""
 
-    def test_matching_run_id_confirms(self) -> None:
+    def _info(self, payload: dict) -> object:
+        resp = patch("httpx.get")
+        return resp
+
+    def test_matching_pid_confirms(self) -> None:
+        with patch("httpx.get") as get:
+            get.return_value.json.return_value = {"pid": 4242, "run_id": _RUN_ID}
+            get.return_value.raise_for_status.return_value = None
+            assert _confirm_identity(_entry(), _quiet()) is Identity.CONFIRMED
+
+    def test_pid_wins_over_run_id(self) -> None:
+        """A resumed run legitimately reports a *different* run_id than the
+        launcher recorded, so a PID match must be decisive on its own.
+
+        Regression guard for the resume path: ``bg_runner`` generates a fresh
+        run id for the PID file, but a resumed child reuses the checkpoint's
+        original run id (``event_log.py`` returns early on ``existing_run_id``
+        before consulting ``CONDUCTOR_RUN_ID``). Comparing run ids alone marked
+        every resumed ``--web-bg`` run as somebody else's, which on Windows
+        blocked the forceful rung and left the run unstoppable.
+        """
+        with patch("httpx.get") as get:
+            get.return_value.json.return_value = {"pid": 4242, "run_id": "different"}
+            get.return_value.raise_for_status.return_value = None
+            assert _confirm_identity(_entry(), _quiet()) is Identity.CONFIRMED
+
+    def test_mismatched_pid_is_a_positive_mismatch(self) -> None:
+        with patch("httpx.get") as get:
+            get.return_value.json.return_value = {"pid": 9999, "run_id": _RUN_ID}
+            get.return_value.raise_for_status.return_value = None
+            assert _confirm_identity(_entry(), _quiet()) is Identity.MISMATCHED
+
+    def test_older_dashboard_falls_back_to_run_id(self) -> None:
+        """A dashboard from before this change reports no ``pid``."""
         with patch("httpx.get") as get:
             get.return_value.json.return_value = {"run_id": _RUN_ID}
             get.return_value.raise_for_status.return_value = None
-            assert _confirm_identity(_entry(), _quiet()) is True
+            assert _confirm_identity(_entry(), _quiet()) is Identity.CONFIRMED
 
-    def test_mismatched_run_id_rejects(self) -> None:
+    def test_older_dashboard_mismatched_run_id(self) -> None:
         with patch("httpx.get") as get:
             get.return_value.json.return_value = {"run_id": "deadbeef"}
             get.return_value.raise_for_status.return_value = None
-            assert _confirm_identity(_entry(), _quiet()) is False
+            assert _confirm_identity(_entry(), _quiet()) is Identity.MISMATCHED
 
-    def test_empty_info_is_not_a_pass(self) -> None:
-        """``/api/info`` returns {} before the first workflow_started event."""
+    def test_empty_info_is_unconfirmed_not_mismatched(self) -> None:
+        """An old dashboard returns ``{}`` until ``workflow_started`` fires."""
         with patch("httpx.get") as get:
             get.return_value.json.return_value = {}
             get.return_value.raise_for_status.return_value = None
-            assert _confirm_identity(_entry(), _quiet()) is False
+            assert _confirm_identity(_entry(), _quiet()) is Identity.UNCONFIRMED
 
-    def test_unreachable_dashboard_is_not_a_pass(self) -> None:
+    def test_unreachable_dashboard_is_unconfirmed(self) -> None:
         with patch("httpx.get", side_effect=OSError("connection refused")):
-            assert _confirm_identity(_entry(), _quiet()) is False
+            assert _confirm_identity(_entry(), _quiet()) is Identity.UNCONFIRMED
 
-    def test_missing_run_id_in_pid_file_is_not_a_pass(self) -> None:
-        """Upgrade path: PID files written by older conductor have no run_id."""
+    def test_legacy_pid_file_without_run_id_is_unconfirmed(self) -> None:
         with patch("httpx.get") as get:
-            assert _confirm_identity(_entry(run_id=""), _quiet()) is False
-            get.assert_not_called()
+            get.return_value.json.return_value = {"run_id": _RUN_ID}
+            get.return_value.raise_for_status.return_value = None
+            assert _confirm_identity(_entry(run_id=""), _quiet()) is Identity.UNCONFIRMED
 
 
 class TestRemovePidFileAt:
@@ -318,7 +458,7 @@ class TestJsonOutput:
             patch("conductor.cli.pid._is_process_alive", return_value=True),
             patch("conductor.cli.pid.process_liveness", return_value=Liveness.ALIVE),
             patch("conductor.cli.pid.wait_for_exit", return_value=Liveness.DEAD),
-            patch("conductor.cli.app._confirm_identity", return_value=True),
+            patch("conductor.cli.app._confirm_identity", return_value=Identity.CONFIRMED),
             patch("conductor.cli.app._request_graceful_kill", return_value=True),
         ):
             result = runner.invoke(app, ["stop", "--port", "8080", "--json"])
@@ -342,7 +482,7 @@ class TestJsonOutput:
             patch("conductor.cli.pid.process_liveness", return_value=Liveness.ALIVE),
             patch("conductor.cli.pid.wait_for_exit", return_value=Liveness.ALIVE),
             patch("conductor.cli.pid.terminate_process", return_value=Liveness.ALIVE),
-            patch("conductor.cli.app._confirm_identity", return_value=True),
+            patch("conductor.cli.app._confirm_identity", return_value=Identity.CONFIRMED),
             patch("conductor.cli.app._request_graceful_kill", return_value=True),
             patch("conductor.cli.app._signal_process"),
         ):
