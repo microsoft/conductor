@@ -31,7 +31,6 @@ from pathlib import Path
 import pytest
 from rich.console import Console
 
-
 # Characters that are valid UTF-8 but *unencodable* in cp1252. Each is asserted
 # to be a genuine trigger by ``test_samples_are_genuinely_unencodable`` below.
 #
@@ -65,14 +64,6 @@ class _Cp1252Console:
     def text(self) -> str:
         self.console.file.flush()
         return self._raw.getvalue().decode("cp1252")
-
-
-@pytest.fixture
-def cp1252_output_console(monkeypatch: pytest.MonkeyPatch) -> _Cp1252Console:
-    """Replace ``conductor.cli.app.output_console`` with a strict cp1252 one."""
-    holder = _Cp1252Console()
-    monkeypatch.setattr(app_module, "output_console", holder.console)
-    return holder
 
 
 def test_samples_are_genuinely_unencodable() -> None:
