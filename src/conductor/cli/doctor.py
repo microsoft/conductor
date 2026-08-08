@@ -91,7 +91,7 @@ def run_doctor(
     report = _gather_report(sections=sections, provider=provider, check=check, models=models)
 
     if as_json:
-        console.print_json(data=report.to_dict())
+        console.print_json(data=report.to_dict(), ensure_ascii=True)
         return _compute_exit_code(report.providers, check=check, provider=provider)
 
     if report.env is not None:
