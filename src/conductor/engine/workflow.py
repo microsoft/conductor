@@ -417,6 +417,17 @@ class WorkflowEngine:
         # at debug level — otherwise table-priced models still show a normal
         # cost and the broken live pricing is invisible (see #265).
         self._pricing_hook_failed_warned = False
+        # The companion case: a hook that never raises but returns ``None`` for
+        # everything. That is what happens when the provider SDK stops
+        # publishing the field the hook reads — ``github-copilot-sdk`` 1.0.1
+        # dropped ``ModelBilling.token_prices``, so the hook resolves ``None``
+        # for all models and every run silently falls back to the static table.
+        # A single ``None`` is ordinary (one unknown model); ``None`` for
+        # everything with nothing ever priced means the mechanism is dead, and
+        # the two are indistinguishable without this. See #386.
+        self._pricing_hook_none_models: set[str] = set()
+        self._pricing_hook_priced_any = False
+        self._pricing_hook_silent_warned = False
 
         # One-time latch so the "budget set but no pricing" degraded warning
         # is emitted at most once per workflow run (see _check_budget).
@@ -1913,6 +1924,49 @@ class WorkflowEngine:
                 return None
         return self._single_provider
 
+    def _note_pricing_hook_result(self, model: str, pricing: object | None) -> None:
+        """Warn once if the provider pricing hook is silent for everything.
+
+        A hook returning ``None`` for a single model is ordinary — that model
+        simply is not priced, and the static table covers it. A hook returning
+        ``None`` for *every* model it is asked about, having priced nothing, is
+        a different condition: the mechanism is not working, and every cost in
+        the run is coming from the static fallback table.
+
+        Those two are indistinguishable today, which is how a provider SDK
+        dropping the field the hook reads (``github-copilot-sdk`` 1.0.1 removed
+        ``ModelBilling.token_prices``) can go unnoticed — nothing raises,
+        nothing logs, and table-priced models still report a plausible cost.
+        See #386.
+
+        Args:
+            model: The model whose pricing was just resolved.
+            pricing: The hook's result — ``None`` when it declined to price.
+        """
+        if pricing is not None:
+            self._pricing_hook_priced_any = True
+            return
+
+        self._pricing_hook_none_models.add(model)
+        # Require more than one distinct model before concluding the hook is
+        # systemically silent, so a single unpriced model stays quiet.
+        if (
+            self._pricing_hook_silent_warned
+            or self._pricing_hook_priced_any
+            or len(self._pricing_hook_none_models) < 2
+        ):
+            return
+
+        self._pricing_hook_silent_warned = True
+        logger.warning(
+            "Provider pricing hook returned no pricing for any of %d models (%s); "
+            "live pricing is unavailable and costs fall back to the static table "
+            "or show as unpriced. This usually means the provider SDK no longer "
+            "publishes the pricing field the hook reads.",
+            len(self._pricing_hook_none_models),
+            ", ".join(sorted(self._pricing_hook_none_models)),
+        )
+
     async def _ensure_pricing_resolved(self, agent: AgentDef, model: str | None) -> None:
         """Resolve provider-supplied pricing for ``model`` and cache it.
 
@@ -1983,6 +2037,7 @@ class WorkflowEngine:
                         )
                 else:
                     self.usage_tracker.set_provider_pricing(model, pricing)
+                    self._note_pricing_hook_result(model, pricing)
             # Mark resolved only now — after the attempt completes — even on a
             # provider-None / failure / None result, so it isn't retried on every
             # record and the model stays unpriced via the static-table fallback.
