@@ -357,6 +357,7 @@ def test_end_to_end_with_real_manager_explicit_spill_dir(tmp_path: Any) -> None:
     configured; the adapter must still delegate truncation to ``MCPManager`` and
     the resulting spill file must land under the requested directory.
     """
+    import json
     import os
     import stat
     from types import SimpleNamespace
@@ -397,9 +398,12 @@ def test_end_to_end_with_real_manager_explicit_spill_dir(tmp_path: Any) -> None:
 
     assert "[output truncated: 5000 chars -> 1000 kept" in result.output
     assert "full output saved to:" in result.output
-    # The manager resolves spill_dir before writing, so compare the resolved form:
-    # on Windows resolve() also expands any 8.3 short components in tmp_path.
-    assert str(custom_dir.resolve()) in result.output
+    # The manager resolves spill_dir before writing, so compare the resolved form: on
+    # Windows resolve() also expands any 8.3 short components in tmp_path. result.output is
+    # a JSON document, so a Windows path appears with its backslashes JSON-escaped —
+    # accept either encoding rather than weakening the assertion to a substring.
+    expected_dir = str(custom_dir.resolve())
+    assert expected_dir in result.output or json.dumps(expected_dir)[1:-1] in result.output
 
     spill_file = next(custom_dir.glob("*.txt"))
     assert spill_file.exists()
