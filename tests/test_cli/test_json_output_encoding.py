@@ -23,19 +23,14 @@ They deliberately *simulate* the platform rather than detect it: CI runs on
 from __future__ import annotations
 
 import ast
+import importlib
 import io
 import json
 from pathlib import Path
-from typing import Any
 
 import pytest
 from rich.console import Console
-from typer.testing import CliRunner
 
-from conductor.cli import app as app_module
-
-_REPO_ROOT = Path(app_module.__file__).resolve().parents[2]
-from conductor.cli.app import app as cli_app
 
 # Characters that are valid UTF-8 but *unencodable* in cp1252. Each is asserted
 # to be a genuine trigger by ``test_samples_are_genuinely_unencodable`` below.
@@ -62,9 +57,7 @@ class _Cp1252Console:
 
     def __init__(self) -> None:
         self._raw = io.BytesIO()
-        stream = io.TextIOWrapper(
-            self._raw, encoding="cp1252", errors="strict", newline=""
-        )
+        stream = io.TextIOWrapper(self._raw, encoding="cp1252", errors="strict", newline="")
         # force_terminal=False suppresses ANSI, so the captured bytes are the
         # JSON document and nothing else.
         self.console = Console(file=stream, force_terminal=False, width=200)
@@ -97,7 +90,6 @@ def test_samples_are_genuinely_unencodable() -> None:
     assert "\u2014".encode("cp1252") == b"\x97"
 
 
-
 @pytest.mark.parametrize("char", NON_CP1252_SAMPLES)
 def test_negative_control_unfixed_sink_still_raises(char: str) -> None:
     """Prove the fix is load-bearing rather than incidental.
@@ -125,7 +117,7 @@ def test_negative_control_unfixed_sink_still_raises(char: str) -> None:
 # workflow execution, which belongs in an end-to-end subprocess test (tracked
 # as follow-up on #342) rather than a unit test.
 
-_JSON_SINK_MODULES = ["conductor/cli/app.py", "conductor/cli/doctor.py"]
+_JSON_SINK_MODULES = ["conductor.cli.app", "conductor.cli.doctor"]
 
 
 def _print_json_calls(source: str) -> list[ast.Call]:
@@ -139,8 +131,8 @@ def _print_json_calls(source: str) -> list[ast.Call]:
     ]
 
 
-@pytest.mark.parametrize("module_path", _JSON_SINK_MODULES)
-def test_every_print_json_sink_forces_ascii(module_path: str) -> None:
+@pytest.mark.parametrize("module_name", _JSON_SINK_MODULES)
+def test_every_print_json_sink_forces_ascii(module_name: str) -> None:
     """Every ``print_json`` call must pass ``ensure_ascii=True``.
 
     Rich defaults it to ``False``, which re-introduces the literal character
@@ -148,19 +140,21 @@ def test_every_print_json_sink_forces_ascii(module_path: str) -> None:
     keyword reopens issue #342, so this fails on the omission rather than
     waiting for a Windows user to hit it.
     """
-    source = (_REPO_ROOT / module_path).read_text(encoding="utf-8")
+    module = importlib.import_module(module_name)
+    assert module.__file__ is not None, f"{module_name} has no source file"
+    source = Path(module.__file__).read_text(encoding="utf-8")
     calls = _print_json_calls(source)
 
-    assert calls, f"no print_json call found in {module_path}"
+    assert calls, f"no print_json call found in {module_name}"
 
     for call in calls:
         keywords = {kw.arg: kw.value for kw in call.keywords}
         assert "ensure_ascii" in keywords, (
-            f"{module_path}:{call.lineno} calls print_json without "
+            f"{module_name}:{call.lineno} calls print_json without "
             "ensure_ascii=True; rich defaults it to False and the JSON result "
             "will crash on a non-UTF-8 stdout (issue #342)"
         )
         value = keywords["ensure_ascii"]
         assert isinstance(value, ast.Constant) and value.value is True, (
-            f"{module_path}:{call.lineno} must pass ensure_ascii=True"
+            f"{module_name}:{call.lineno} must pass ensure_ascii=True"
         )
