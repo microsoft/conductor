@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 
@@ -124,7 +125,16 @@ def init_file_logging(log_path: Path) -> None:
     global _file_console, _file_handle
     log_path.parent.mkdir(parents=True, exist_ok=True)
     _file_handle = open(log_path, "w", encoding="utf-8")  # noqa: SIM115
-    _file_console = Console(file=_file_handle, no_color=True, highlight=False, width=200)
+    # markup=False because this console renders agent-supplied text (prompts,
+    # tool output, model responses) verbatim. Rich would otherwise parse a
+    # bracketed token such as ``[/nestedType]`` -- ordinary technical prose --
+    # as a closing tag and raise MarkupError, killing the run (see #382). The
+    # log is already ``no_color=True`` plain text, so it has no use for markup;
+    # every styled write in this module goes to ``_verbose_console`` or passes a
+    # pre-built ``rich.text.Text``, neither of which is affected by this flag.
+    _file_console = Console(
+        file=_file_handle, no_color=True, highlight=False, width=200, markup=False
+    )
 
 
 def close_file_logging() -> None:
@@ -376,7 +386,14 @@ def verbose_log_section(title: str, content: str) -> None:
         return
 
     if should_console:
-        _verbose_console.print(Panel(content, title=f"[cyan]{title}[/cyan]", border_style="dim"))
+        # ``content`` is agent-supplied (rendered prompts, tool output, model
+        # responses) and must not be parsed as markup -- a bracketed token like
+        # ``[/nestedType]`` in ordinary technical prose would raise MarkupError
+        # and kill the run (#382). ``title`` is conductor-controlled, so it keeps
+        # its styling.
+        _verbose_console.print(
+            Panel(escape(content), title=f"[cyan]{title}[/cyan]", border_style="dim")
+        )
 
     # File always gets full untruncated content
     if _file_console is not None:
