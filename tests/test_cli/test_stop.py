@@ -203,6 +203,10 @@ class TestStopProcessUnexpectedOSError:
             patch("conductor.cli.pid.terminate_process", return_value=Liveness.DEAD),
             patch("conductor.cli.app._confirm_identity", return_value=Identity.CONFIRMED),
             patch("conductor.cli.app._request_graceful_kill", return_value=False),
+            # Pin the platform so the signal rung is deterministic; otherwise
+            # this exercises CTRL_BREAK_EVENT on Windows and SIGTERM on Linux,
+            # and only one of them is what CI actually runs.
+            patch("sys.platform", "linux"),
             patch(
                 "conductor.cli.app.os.kill",
                 side_effect=OSError(

@@ -268,7 +268,11 @@ class TestTerminateProcessWindows:
         k = _kernel32_mock(open_handle=0)
         with (
             patch("conductor.cli.pid._kernel32", k),
-            patch("ctypes.get_last_error", return_value=_ERROR_INVALID_PARAMETER, create=True),
+            patch(
+                "conductor.cli.pid.ctypes.get_last_error",
+                create=True,
+                return_value=_ERROR_INVALID_PARAMETER,
+            ),
         ):
             assert _terminate_process_windows(42, 2.0) is Liveness.DEAD
         k.TerminateProcess.assert_not_called()
@@ -278,7 +282,14 @@ class TestTerminateProcessWindows:
         k = _kernel32_mock(open_handle=0)
         with (
             patch("conductor.cli.pid._kernel32", k),
-            patch("ctypes.get_last_error", return_value=_ERROR_ACCESS_DENIED, create=True),
+            patch(
+                "conductor.cli.pid.ctypes.get_last_error",
+                create=True,
+                return_value=_ERROR_ACCESS_DENIED,
+            ),
+            # ``ctypes.FormatError`` is Windows-only; the warning path would
+            # otherwise raise AttributeError on Linux CI.
+            patch("conductor.cli.pid.ctypes.FormatError", create=True, return_value="msg"),
             patch("conductor.cli.pid._liveness_windows", return_value=Liveness.ALIVE) as probe,
         ):
             assert _terminate_process_windows(42, 2.0) is Liveness.ALIVE
@@ -289,7 +300,8 @@ class TestTerminateProcessWindows:
         k = _kernel32_mock(open_handle=0x1000, terminate_ok=False)
         with (
             patch("conductor.cli.pid._kernel32", k),
-            patch("ctypes.get_last_error", return_value=5, create=True),
+            patch("conductor.cli.pid.ctypes.get_last_error", create=True, return_value=5),
+            patch("conductor.cli.pid.ctypes.FormatError", create=True, return_value="msg"),
             patch("conductor.cli.pid._liveness_windows", return_value=Liveness.ALIVE),
         ):
             assert _terminate_process_windows(42, 2.0) is Liveness.ALIVE

@@ -477,19 +477,30 @@ class TestSignalProcess:
 
         with (
             patch("sys.platform", "win32"),
+            # CTRL_BREAK_EVENT is Windows-only; inject it so the branch is
+            # verified on Linux CI too rather than silently skipped.
+            patch.object(signal, "CTRL_BREAK_EVENT", 1, create=True),
             patch("conductor.cli.app.os.kill") as kill,
         ):
             _signal_process(4242)
-        kill.assert_called_once_with(4242, signal.CTRL_BREAK_EVENT)
+            # Asserted inside the patch: the sentinel does not exist on Linux
+            # once the patch is undone.
+            kill.assert_called_once_with(4242, signal.CTRL_BREAK_EVENT)
 
     def test_oserror_is_swallowed(self) -> None:
         """On Windows this fails routinely (WinError 87, no shared console).
         It must not abort the ladder before the forceful rung."""
-        with patch("conductor.cli.app.os.kill", side_effect=OSError(87, "bad parameter")):
+        with (
+            patch("sys.platform", "linux"),
+            patch("conductor.cli.app.os.kill", side_effect=OSError(87, "bad parameter")),
+        ):
             _signal_process(4242)  # must not raise
 
     def test_valueerror_is_swallowed(self) -> None:
-        with patch("conductor.cli.app.os.kill", side_effect=ValueError("bad signal")):
+        with (
+            patch("sys.platform", "linux"),
+            patch("conductor.cli.app.os.kill", side_effect=ValueError("bad signal")),
+        ):
             _signal_process(4242)  # must not raise
 
 
