@@ -1239,7 +1239,7 @@ class CopilotProvider(AgentProvider):
                     try:
                         parsed_content = self._extract_json(response_content)
                         parsed_content = normalize_agent_output(parsed_content, output_schema)
-                        validate_output(parsed_content, output_schema)
+                        validate_output(parsed_content, output_schema, warn_undeclared_keys=True)
                         final_usage = SDKResponse(
                             content=response_content,
                             input_tokens=total_input_tokens,

@@ -665,16 +665,46 @@ class TestValidateOutputConstraints:
         ):
             validate_output(content, schema)
 
-    def test_undeclared_keys_warn(self, caplog: pytest.LogCaptureFixture) -> None:
-        """Extra keys not present in the schema must log a warning naming the
-        suspect keys so typos in optional output fields are visible."""
+    def test_undeclared_keys_default_silent(self, caplog: pytest.LogCaptureFixture) -> None:
+        """By default undeclared-key warnings are silent (engine step callers
+        such as script and set steps must not emit warning noise)."""
         schema = {"declared": OutputField(type="string")}
         content = {"declared": "x", "declred": "typo"}
 
         with caplog.at_level("WARNING"):
             validate_output(content, schema)
 
+        assert "undeclared fields" not in caplog.text
+
+    def test_undeclared_keys_warn_when_enabled(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Extra keys not present in the schema must log a warning naming the
+        suspect keys so typos in optional output fields are visible."""
+        schema = {"declared": OutputField(type="string")}
+        content = {"declared": "x", "declred": "typo"}
+
+        with caplog.at_level("WARNING"):
+            validate_output(content, schema, warn_undeclared_keys=True)
+
         assert "declred" in caplog.text
+        assert "undeclared fields not present in the output schema" in caplog.text
+
+    def test_undeclared_keys_nested_object_warns_when_enabled(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An undeclared key inside a nested object's ``properties`` warns too,
+        proving the flag threads through recursive validation."""
+        schema = {
+            "person": OutputField(
+                type="object",
+                properties={"name": OutputField(type="string")},
+            )
+        }
+        content = {"person": {"name": "Alice", "age": 30}}
+
+        with caplog.at_level("WARNING"):
+            validate_output(content, schema, warn_undeclared_keys=True)
+
+        assert "age" in caplog.text
         assert "undeclared fields not present in the output schema" in caplog.text
 
     def test_declared_keys_do_not_warn(self, caplog: pytest.LogCaptureFixture) -> None:
@@ -683,7 +713,7 @@ class TestValidateOutputConstraints:
         content = {"declared": "x"}
 
         with caplog.at_level("WARNING"):
-            validate_output(content, schema)
+            validate_output(content, schema, warn_undeclared_keys=True)
 
         assert "undeclared fields" not in caplog.text
 

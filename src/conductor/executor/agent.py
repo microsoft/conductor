@@ -372,7 +372,7 @@ class AgentExecutor:
 
         # Validate output against schema (skip for partial output from interrupts)
         if agent.output and not output.partial:
-            validate_output(output.content, agent.output)
+            validate_output(output.content, agent.output, warn_undeclared_keys=True)
 
         return output
 

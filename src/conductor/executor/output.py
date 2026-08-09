@@ -19,6 +19,8 @@ logger = logging.getLogger(__name__)
 def validate_output(
     content: dict[str, Any],
     schema: dict[str, OutputField],
+    *,
+    warn_undeclared_keys: bool = False,
 ) -> None:
     """Validate agent output against declared schema.
 
@@ -28,6 +30,14 @@ def validate_output(
     Args:
         content: Agent's output content as a dictionary.
         schema: Expected output schema with field definitions.
+        warn_undeclared_keys: When ``True``, log a warning for any keys in
+            ``content`` that are not declared in ``schema``. This is useful for
+            provider-backed (LLM) agents, where a typo in an optional field
+            name silently drops data. Engine step types such as ``script`` and
+            ``set`` intentionally leave this off: scripts always carry the
+            injected ``stdout``/``stderr``/``exit_code`` baseline keys, and both
+            step types are deterministic/author-controlled rather than produced
+            by a non-deterministic model.
 
     Raises:
         ValidationError: If output doesn't match schema (missing fields or wrong types).
@@ -47,15 +57,18 @@ def validate_output(
                 suggestion=f"Ensure agent returns '{field_name}' in output",
             )
 
-        _validate_field(field_name, content[field_name], field_def)
-
-    undeclared_keys = [k for k in content if k not in schema]
-    if undeclared_keys:
-        logger.warning(
-            "Output contains undeclared fields not present in the output schema: %s — "
-            "check for typos against the declared output fields",
-            undeclared_keys,
+        _validate_field(
+            field_name, content[field_name], field_def, warn_undeclared_keys=warn_undeclared_keys
         )
+
+    if warn_undeclared_keys:
+        undeclared_keys = [k for k in content if k not in schema]
+        if undeclared_keys:
+            logger.warning(
+                "Output contains undeclared fields not present in the output schema: %s — "
+                "check for typos against the declared output fields",
+                undeclared_keys,
+            )
 
 
 def _check_constraints(field_name: str, value: Any, field_def: OutputField) -> None:
@@ -118,7 +131,13 @@ def _check_constraints(field_name: str, value: Any, field_def: OutputField) -> N
             )
 
 
-def _validate_field(field_name: str, value: Any, field_def: OutputField) -> None:
+def _validate_field(
+    field_name: str,
+    value: Any,
+    field_def: OutputField,
+    *,
+    warn_undeclared_keys: bool = False,
+) -> None:
     """Validate a single value against its output field definition.
 
     Recursively validates nested object properties and array items so
@@ -130,6 +149,9 @@ def _validate_field(field_name: str, value: Any, field_def: OutputField) -> None
             parent array's name, matching the existing message style).
         value: The value to validate.
         field_def: The field definition to validate against.
+        warn_undeclared_keys: Forwarded to nested ``validate_output`` calls so
+            undeclared-key warnings are threaded through object properties and
+            array items consistently.
 
     Raises:
         ValidationError: If the value or any nested value doesn't match.
@@ -153,7 +175,7 @@ def _validate_field(field_name: str, value: Any, field_def: OutputField) -> None
     _check_constraints(field_name, value, field_def)
 
     if field_def.type == "object" and field_def.properties and isinstance(value, dict):
-        validate_output(value, field_def.properties)
+        validate_output(value, field_def.properties, warn_undeclared_keys=warn_undeclared_keys)
 
     if field_def.type == "array" and field_def.items and isinstance(value, list):
         for i, item in enumerate(value):
@@ -166,7 +188,12 @@ def _validate_field(field_name: str, value: Any, field_def: OutputField) -> None
                     f"(received: {_describe_value(item)})",
                     suggestion=f"Ensure all items in '{field_name}' have correct type",
                 )
-            _validate_field(f"array item {i} in '{field_name}'", item, field_def.items)
+            _validate_field(
+                f"array item {i} in '{field_name}'",
+                item,
+                field_def.items,
+                warn_undeclared_keys=warn_undeclared_keys,
+            )
 
 
 def _describe_value(value: Any, max_chars: int = 200) -> str:

@@ -671,7 +671,11 @@ class HermesProvider(AgentProvider):
 
         try:
             normalized = normalize_agent_output(parsed, agent.output)  # type: ignore[arg-type]
-            validate_output(normalized, agent.output)  # type: ignore[arg-type]
+            validate_output(
+                normalized,
+                agent.output,  # type: ignore[arg-type]
+                warn_undeclared_keys=True,
+            )
         except ValidationError as exc:
             return (None, exc, exc)
 

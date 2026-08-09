@@ -57,7 +57,7 @@ def extract_content(
     if isinstance(output, BaseModel):
         content = output.model_dump(exclude_unset=True)
         content = normalize_agent_output(content, output_schema)
-        validate_output(content, output_schema)
+        validate_output(content, output_schema, warn_undeclared_keys=True)
         return content
 
     if isinstance(output, str):
@@ -114,5 +114,5 @@ def parse_text_fallback(
     # {"value": ...} wrappers) that copilot.py and hermes.py apply before
     # validating, so this fallback path honors the issue #343 contract.
     content = normalize_agent_output(content, output_schema)
-    validate_output(content, output_schema)
+    validate_output(content, output_schema, warn_undeclared_keys=True)
     return content
