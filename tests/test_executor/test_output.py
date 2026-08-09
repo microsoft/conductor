@@ -707,6 +707,28 @@ class TestValidateOutputConstraints:
         assert "age" in caplog.text
         assert "undeclared fields not present in the output schema" in caplog.text
 
+    def test_undeclared_keys_array_item_object_warns_when_enabled(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An undeclared key inside an object nested in an array item warns too,
+        proving the flag threads through array-item recursion."""
+        schema = {
+            "rows": OutputField(
+                type="array",
+                items=OutputField(
+                    type="object",
+                    properties={"name": OutputField(type="string")},
+                ),
+            )
+        }
+        content = {"rows": [{"name": "Alice", "agge": 30}]}
+
+        with caplog.at_level("WARNING"):
+            validate_output(content, schema, warn_undeclared_keys=True)
+
+        assert "agge" in caplog.text
+        assert "undeclared fields not present in the output schema" in caplog.text
+
     def test_declared_keys_do_not_warn(self, caplog: pytest.LogCaptureFixture) -> None:
         """Content whose keys exactly match the schema must not emit a warning."""
         schema = {"declared": OutputField(type="string")}
