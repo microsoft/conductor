@@ -109,6 +109,10 @@ class HermesProvider(AgentProvider):
         # config/validator.py rejects ``skills:`` on a skills=False provider.
         # Injected size is bounded by ``runtime.skill_injection``.
         skills=True,
+        # No plugin support: hermes has no MCP surface (mcp_tools=False)
+        # and no subagent surface, so a plugin could only ever load its
+        # skills — the partial load ``plugins:`` exists to prevent.
+        plugins=False,
         # Hermes runs its own internal toolsets (mcp_tools=False); a
         # per-agent working directory has no meaning for the session.
         working_dir=False,
@@ -200,6 +204,8 @@ class HermesProvider(AgentProvider):
         interrupt_signal: asyncio.Event | None = None,
         event_callback: EventCallback | None = None,
         skill_directories: list[str] | None = None,
+        custom_agents: list[dict[str, Any]] | None = None,
+        extra_mcp_servers: dict[str, Any] | None = None,
     ) -> AgentOutput:
         """Execute an agent via the hermes-agent library.
 
@@ -221,6 +227,10 @@ class HermesProvider(AgentProvider):
                 so :class:`AgentExecutor` has already eager-injected the
                 skill content into ``rendered_prompt`` for this provider
                 (see :attr:`AgentProvider.supports_native_skills`).
+            custom_agents: Ignored. Declares ``plugins=False``, so
+                :class:`AgentExecutor` refuses ``plugins:`` on this
+                provider before reaching here and this is always ``None``.
+            extra_mcp_servers: Ignored, for the same reason.
 
         Returns:
             Normalized AgentOutput with structured content.
@@ -671,7 +681,11 @@ class HermesProvider(AgentProvider):
 
         try:
             normalized = normalize_agent_output(parsed, agent.output)  # type: ignore[arg-type]
-            validate_output(normalized, agent.output)  # type: ignore[arg-type]
+            validate_output(
+                normalized,
+                agent.output,  # type: ignore[arg-type]
+                warn_undeclared_keys=True,
+            )
         except ValidationError as exc:
             return (None, exc, exc)
 

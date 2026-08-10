@@ -654,7 +654,7 @@ class TestScriptOutputSchema:
 
     @pytest.mark.asyncio
     async def test_valid_json_matches_schema(self) -> None:
-        """Happy path: stdout JSON matches declared schema → fields available."""
+        """Happy path: stdout JSON matches declared schema -> fields available."""
         config = self._config_with_schema(
             args=[
                 "-c",
@@ -675,6 +675,50 @@ class TestScriptOutputSchema:
         assert out["exit_code"] == 0
         assert "stdout" in out
         assert "stderr" in out
+
+    @pytest.mark.asyncio
+    async def test_script_output_schema_no_warning_for_baseline_keys(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A script whose stdout JSON exactly matches the declared schema must not
+        emit an undeclared-fields warning for the injected stdout/stderr/exit_code
+        baseline keys."""
+        config = self._config_with_schema(
+            args=[
+                "-c",
+                'import json; print(json.dumps({"route": "planning", "count": 3}))',
+            ],
+            output={
+                "route": OutputField(type="string"),
+                "count": OutputField(type="number"),
+            },
+        )
+        engine = WorkflowEngine(config, MagicMock())
+
+        with caplog.at_level("WARNING"):
+            await engine.run({})
+
+        assert "undeclared fields" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_script_output_schema_superset_no_warning(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A script that intentionally emits a superset JSON payload must not
+        trigger an undeclared-fields warning."""
+        config = self._config_with_schema(
+            args=[
+                "-c",
+                'import json; print(json.dumps({"route": "planning", "extra": "ok"}))',
+            ],
+            output={"route": OutputField(type="string")},
+        )
+        engine = WorkflowEngine(config, MagicMock())
+
+        with caplog.at_level("WARNING"):
+            await engine.run({})
+
+        assert "undeclared fields" not in caplog.text
 
     @pytest.mark.asyncio
     async def test_non_json_stdout_raises_validation_error(self) -> None:

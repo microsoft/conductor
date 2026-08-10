@@ -35,7 +35,7 @@ discovery unusable.
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, get_args
@@ -50,26 +50,35 @@ from conductor.skills.registry import (
 
 logger = logging.getLogger(__name__)
 
-DiscoverySource = Literal["personal", "project", "plugins"]
+DiscoverySource = Literal["personal", "project"]
 """A category of well-known location to scan for installed skills.
 
 * ``personal`` — skills the user installed for themselves, in their home
   directory.
 * ``project`` — skills committed alongside the code, found by walking up
   from the workflow file to the repository root.
-* ``plugins`` — skills shipped by installed plugins.
 
 Deliberately *not* provider names. The categories are what the user
-recognises ("my skills", "this repo's skills", "my plugins"); which CLI
-happens to own each concrete path is an implementation detail that
-Conductor unions over.
+recognises ("my skills", "this repo's skills"); which CLI happens to own
+each concrete path is an implementation detail that Conductor unions
+over.
+
+There is deliberately no ``plugins`` source. Scanning a plugin's
+``skills/`` reaches into a plugin and takes exactly one of the three
+things it ships, leaving its subagents and MCP servers behind — that is
+not a feature with a gap but the bug ``plugins:`` exists to fix (issue
+#378). Scanning them is also wrong more often than it looks: of 13
+plugins on one ordinary machine, 3 would be silently degraded and the 3
+most plugin-like (MCP and subagent toolkits with no ``skills/`` at all)
+would never be discovered at all. Name plugins in ``runtime.plugins`` instead, which
+brings the whole unit and reproduces on another machine.
 """
 
 # Canonical scan order, most specific to most ambient. Used instead of
 # the order written in YAML so that reordering ``sources:`` can never
 # change which of two same-named skills wins, and so a discovered set is
 # reproducible from the filesystem alone.
-_SOURCE_ORDER: tuple[DiscoverySource, ...] = ("project", "personal", "plugins")
+_SOURCE_ORDER: tuple[DiscoverySource, ...] = ("project", "personal")
 
 # Home-relative roots holding standalone skill directories.
 _PERSONAL_ROOTS: tuple[str, ...] = (
@@ -83,14 +92,6 @@ _PERSONAL_ROOTS: tuple[str, ...] = (
 _PROJECT_ROOTS: tuple[str, ...] = (
     ".github/skills",
     ".claude/skills",
-)
-
-# Home-relative glob patterns matching a plugin's ``skills/`` directory.
-# The ``*/*`` is load-bearing: plugins are stored two levels deep, as
-# ``<marketplace>/<plugin>/``, and globbing one level finds nothing.
-_PLUGIN_ROOT_GLOBS: tuple[str, ...] = (
-    ".copilot/installed-plugins/*/*/skills",
-    ".claude/plugins/*/*/skills",
 )
 
 # Marker identifying a repository root, where the project walk stops.
@@ -176,40 +177,6 @@ def _has_repo_marker(directory: Path, on_warning: WarningSink | None = None) -> 
         return False
 
 
-def _glob_roots(home: Path, patterns: Iterable[str]) -> list[Path]:
-    """Expand home-relative glob patterns to existing directories.
-
-    Args:
-        home: The home directory to resolve patterns against.
-        patterns: Home-relative glob patterns.
-
-    Returns:
-        Matching directories, sorted, with duplicates removed.
-    """
-    found: list[Path] = []
-    for pattern in patterns:
-        try:
-            matches = sorted(home.glob(pattern))
-        except OSError as exc:
-            # A glob crossing an unreadable directory. Nothing here is
-            # user-authored, so drop the pattern rather than fail a run.
-            logger.debug("Skill discovery glob %r under %s failed: %s", pattern, home, exc)
-            continue
-        found.extend(match for match in matches if match.is_dir())
-    return _unique(found)
-
-
-def _unique(paths: Iterable[Path]) -> list[Path]:
-    """Deduplicate paths preserving order."""
-    seen: set[Path] = set()
-    out: list[Path] = []
-    for path in paths:
-        if path not in seen:
-            seen.add(path)
-            out.append(path)
-    return out
-
-
 def _roots_for_source(
     source: DiscoverySource,
     base_dir: Path | None,
@@ -224,8 +191,7 @@ def _roots_for_source(
             ``None`` the project walk is skipped — there is no anchor,
             and the process working directory is not one (it is wherever
             the user happened to invoke the CLI from).
-        home: The home directory ``personal`` and ``plugins`` resolve
-            against.
+        home: The home directory ``personal`` resolves against.
         on_warning: Sink for non-fatal diagnostics.
 
     Returns:
@@ -233,9 +199,7 @@ def _roots_for_source(
     """
     if source == "personal":
         return [home / relative for relative in _PERSONAL_ROOTS]
-    if source == "project":
-        return [] if base_dir is None else _project_roots(base_dir, on_warning)
-    return _glob_roots(home, _PLUGIN_ROOT_GLOBS)
+    return [] if base_dir is None else _project_roots(base_dir, on_warning)
 
 
 def discover_skills(
@@ -249,7 +213,7 @@ def discover_skills(
     """Scan the enabled categories for installed skills.
 
     Categories are scanned in a fixed canonical order — ``project``,
-    ``personal``, ``plugins`` — regardless of the order they were written
+    ``personal`` — regardless of the order they were written
     in, so that reordering ``sources:`` cannot change which of two
     same-named skills wins.
 
@@ -264,7 +228,7 @@ def discover_skills(
         sources: The enabled categories. Empty means discovery is off.
         base_dir: The workflow file's directory, used to anchor the
             ``project`` walk. ``project`` is skipped when ``None``.
-        home: Home directory to resolve ``personal`` and ``plugins``
+        home: Home directory to resolve ``personal``
             against. Defaults to the real one. Always pass an explicit
             path in tests — otherwise results depend on what the machine
             running them happens to have installed.
@@ -479,7 +443,7 @@ def resolve_effective_skills(
             of deleting the line.
         base_dir: Directory relative entries and the ``project`` walk
             resolve against, normally the workflow file's.
-        home: Home directory for ``personal`` and ``plugins``.
+        home: Home directory for ``personal``.
         on_warning: Sink for non-fatal diagnostics.
 
     Returns:

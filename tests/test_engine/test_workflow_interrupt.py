@@ -13,6 +13,7 @@ Tests cover:
 """
 
 import asyncio
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -986,6 +987,8 @@ class TestPartialOutputHandling:
                 interrupt_signal: asyncio.Event | None = None,
                 event_callback=None,
                 skill_directories: list[str] | None = None,
+                custom_agents: list[dict[str, Any]] | None = None,
+                extra_mcp_servers: dict[str, Any] | None = None,
             ) -> AgentOutput:
                 return AgentOutput(content={"result": "mock"}, raw_response="mock")
 

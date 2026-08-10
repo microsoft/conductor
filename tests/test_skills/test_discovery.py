@@ -139,26 +139,25 @@ class TestProjectSource:
         assert discover_skills(["project"], base_dir=None, home=home) == []
 
 
-class TestPluginsSource:
-    """``plugins`` needs the two-level marketplace/plugin glob."""
+class TestPluginsSourceIsGone:
+    """Discovery must not reach into installed plugins (issue #378).
 
-    def test_finds_skills_two_levels_deep(self, home: Path) -> None:
+    Scanning a plugin's ``skills/`` took one of the three things a plugin
+    ships and silently dropped its subagents and MCP servers. Plugins are
+    named in ``runtime.plugins`` instead, which brings the whole unit.
+    """
+
+    def test_plugins_is_not_a_valid_source(self) -> None:
+        with pytest.raises(SkillError, match="Unknown skill discovery source"):
+            discover_skills(["plugins"], home=Path("/nonexistent"))
+
+    def test_installed_plugin_skills_are_not_discovered(self, home: Path) -> None:
+        # The exact layout the removed source used to match.
         _make_skill(home / ".copilot" / "installed-plugins" / "market" / "tools" / "skills" / "a")
         _make_skill(home / ".claude" / "plugins" / "market" / "tools" / "skills" / "b")
-        found = discover_skills(["plugins"], home=home)
-        assert [skill.name for skill in found] == ["a", "b"]
-
-    def test_ignores_a_plugin_root_without_skills(self, home: Path) -> None:
-        plugin = home / ".copilot" / "installed-plugins" / "market" / "agents-only"
-        (plugin / "agents").mkdir(parents=True)
-        _make_skill(home / ".copilot" / "installed-plugins" / "market" / "tools" / "skills" / "a")
-        assert [skill.name for skill in discover_skills(["plugins"], home=home)] == ["a"]
-
-    def test_one_level_deep_is_not_matched(self, home: Path) -> None:
-        # Globbing a single level finds nothing — the layout really is
-        # <marketplace>/<plugin>/skills/<skill>.
-        _make_skill(home / ".copilot" / "installed-plugins" / "tools" / "skills" / "a")
-        assert discover_skills(["plugins"], home=home) == []
+        _make_skill(home / ".copilot" / "skills" / "personal-one")
+        found = discover_skills(["personal"], home=home)
+        assert [skill.name for skill in found] == ["personal-one"]
 
 
 class TestOrdering:
@@ -169,12 +168,10 @@ class TestOrdering:
         (repo / ".git").mkdir(parents=True)
         _make_skill(repo / ".github" / "skills" / "from-project")
         _make_skill(home / ".copilot" / "skills" / "from-personal")
-        _make_skill(home / ".copilot" / "installed-plugins" / "m" / "p" / "skills" / "from-plugin")
-        expected = ["from-project", "from-personal", "from-plugin"]
+        expected = ["from-project", "from-personal"]
         for written in (
-            ["personal", "project", "plugins"],
-            ["plugins", "personal", "project"],
-            ["project", "plugins", "personal"],
+            ["personal", "project"],
+            ["project", "personal"],
         ):
             found = discover_skills(written, base_dir=repo, home=home)
             assert [skill.name for skill in found] == expected

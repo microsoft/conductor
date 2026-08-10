@@ -150,13 +150,19 @@ class TestSkillDiscoveryConfig:
         config = RuntimeConfig(skill_discovery={"sources": ["personal"]})
         assert config.skill_discovery.is_enabled is True
 
-    @pytest.mark.parametrize("source", ["personal", "project", "plugins"])
+    @pytest.mark.parametrize("source", ["personal", "project"])
     def test_known_sources_accepted(self, source: str) -> None:
         assert SkillDiscoveryConfig(sources=[source]).sources == (source,)
 
     def test_unknown_source_rejected(self) -> None:
         with pytest.raises(ValidationError):
             SkillDiscoveryConfig(sources=["everywhere"])
+
+    def test_plugins_source_rejected(self) -> None:
+        # Removed with issue #378: it took a plugin's skills/ and dropped
+        # its subagents and MCP servers. `runtime.plugins` replaces it.
+        with pytest.raises(ValidationError):
+            SkillDiscoveryConfig(sources=["plugins"])
 
     def test_duplicate_source_rejected(self) -> None:
         # Listing one twice has no effect, so it always means the author
