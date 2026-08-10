@@ -1,13 +1,13 @@
 # Claude provider with a custom / bring-your-own endpoint
 #
 # Demonstrates structured ``runtime.provider`` configuration for the Claude
-# provider (issue #353). Use this when you need to route Anthropic Claude API
+# provider. Use this when you need to route Anthropic Claude API
 # calls through a custom gateway, proxy, or region-specific endpoint instead of
 # the default https://api.anthropic.com.
 #
 # Usage:
 #
-#   export ANTHROPIC_AUTH_TOKEN=sk-ant-...
+#   export ANTHROPIC_API_KEY=sk-ant-...
 #   conductor run examples/claude-custom-endpoint.yaml --input question="What is Python?"
 #
 # Security: never commit real API keys or tokens in this file. Always pass
@@ -27,8 +27,8 @@ workflow:
     provider:
       name: claude
       base_url: ${ANTHROPIC_BASE_URL:-https://api.anthropic.com}
-      auth_token: ${ANTHROPIC_AUTH_TOKEN:-placeholder-token}
-    default_model: claude-sonnet-4
+      api_key: ${ANTHROPIC_API_KEY:-placeholder-key}
+    default_model: claude-sonnet-4-5
 
   input:
     question:
@@ -56,11 +56,14 @@ agents:
 output:
   answer: "{{ answerer.output.answer }}"
 
-# Alternative BYOK variant using ``api_key`` instead of ``auth_token`` (commented out):
+# Gateway variant: to authenticate against a bearer-token proxy (LiteLLM,
+# Databricks AI Gateway), replace the ``runtime:`` block above (lines 26-31)
+# with the following. Note that supplying auth_token means ANTHROPIC_API_KEY
+# is ignored.
 #
 #   runtime:
 #     provider:
 #       name: claude
-#       base_url: ${ANTHROPIC_BASE_URL:-https://api.anthropic.com}
-#       api_key: ${ANTHROPIC_API_KEY:-placeholder-key}
-#     default_model: claude-sonnet-4
+#       base_url: ${ANTHROPIC_BASE_URL:-https://gateway.example.com/v1}
+#       auth_token: ${ANTHROPIC_AUTH_TOKEN:-placeholder-token}
+#     default_model: claude-sonnet-4-5

@@ -190,16 +190,14 @@ class TestCreateProvider:
     @patch("conductor.providers.claude.AsyncAnthropic")
     @patch("conductor.providers.claude.anthropic")
     @pytest.mark.asyncio
-    async def test_create_claude_provider_yaml_api_key_takes_precedence_over_env(
+    async def test_create_claude_provider_forwards_api_key_to_sdk_client(
         self,
         mock_anthropic_module: Any,
         mock_anthropic_class: Any,
-        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """When both YAML api_key and ANTHROPIC_API_KEY are set, YAML wins."""
+        """The YAML api_key reaches the Anthropic client as api_key, not as a bearer token."""
         from unittest.mock import AsyncMock
 
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-env")
         mock_anthropic_module.__version__ = "0.77.0"
         mock_client = MagicMock()
         mock_client.models.list = AsyncMock(return_value=MagicMock(data=[]))
@@ -213,7 +211,9 @@ class TestCreateProvider:
             provider_settings=settings,
         )
         assert isinstance(provider, ClaudeProvider)
-        assert provider._api_key == "sk-yaml"
+        assert mock_anthropic_class.call_count == 1
+        assert mock_anthropic_class.call_args.kwargs["api_key"] == "sk-yaml"
+        assert "auth_token" not in mock_anthropic_class.call_args.kwargs
         await provider.close()
 
     @patch("conductor.providers.factory.ANTHROPIC_SDK_AVAILABLE", True)

@@ -232,12 +232,12 @@ for env-var fallbacks, validator rules, and the security rationale.
 
 Route the Claude provider through a custom Anthropic-compatible endpoint or proxy. Demonstrates:
 - Object form of `runtime.provider` for the `claude` provider
-- `base_url` and `auth_token` (or `api_key`) forwarded to the Anthropic client
-- Secret hygiene via `${ANTHROPIC_AUTH_TOKEN:-placeholder-token}` / `${ANTHROPIC_API_KEY:-placeholder-key}` interpolation
-- BYOK `api_key` variant shown in a commented block
+- `base_url` and `api_key` forwarded to the Anthropic client
+- Secret hygiene via `${ANTHROPIC_API_KEY:-placeholder-key}` interpolation
+- Bearer-token gateway variant (`auth_token`) shown in a commented block at the bottom of the file
 
 ```bash
-# Requires ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN to be set in the environment
+# Requires ANTHROPIC_API_KEY (the bearer-token gateway variant is at the bottom of the example file)
 conductor run examples/claude-custom-endpoint.yaml --input question="What is Python?"
 ```
 

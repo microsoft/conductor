@@ -169,6 +169,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   three of the five sinks; two of those were reachable on a bare `conductor run`
   with no flags. Opening tags such as `[bold]` were the quieter half of the same
   bug: rich consumed them without raising and the text simply disappeared.
+- **Structured `runtime.provider` for `name: claude` no longer drops a
+  YAML-declared `api_key`** — the schema accepted `api_key` (alongside
+  `base_url` and `auth_token`) but the provider factory silently discarded it,
+  so only the `ANTHROPIC_API_KEY` env var ever reached the Anthropic client.
+  The factory now forwards it. Two credential-semantics fixes ride along so
+  the documented behavior is what the code does: the Claude provider's model
+  path now resolves credentials as a unit like the Anthropic SDK does —
+  setting either credential in YAML suppresses both `ANTHROPIC_API_KEY` and
+  `ANTHROPIC_AUTH_TOKEN`, where previously a YAML `auth_token` still let an
+  ambient `ANTHROPIC_API_KEY` ride along and the SDK sent both `X-Api-Key`
+  and `Authorization: Bearer` headers to whatever `base_url` pointed at
+  (a credential leak against gateway endpoints). And when both credentials
+  are set, Conductor now logs a warning naming that behavior instead of
+  shipping both headers silently — the same parity warning the Copilot
+  provider already logs for `api_key` + `bearer_token`. New example:
+  [`examples/claude-custom-endpoint.yaml`](examples/claude-custom-endpoint.yaml);
+  see [`docs/providers/claude.md`](docs/providers/claude.md) (Custom
+  Endpoints and Gateways).
 - **`conductor resume --web` no longer shows a running workflow as stopped** —
   a workflow that was paused from the dashboard (Stop, then Kill) recorded an
   `agent_paused` event in its event log with no `agent_resumed` counterpart.

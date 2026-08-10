@@ -137,8 +137,10 @@ workflow:
     provider:
       name: claude
       base_url: "https://gateway.example.com/v1"
-      api_key: "${ANTHROPIC_API_KEY}"
       auth_token: "${GATEWAY_TOKEN}"
+      # For an endpoint that expects an Anthropic key instead, use api_key
+      # and omit auth_token. Do not set both.
+      # api_key: "${ANTHROPIC_API_KEY}"
 ```
 
 | Field | Description | Env Fallback |
@@ -149,8 +151,9 @@ workflow:
 
 ### Configuration Rules and Precedence
 
-- **YAML precedence over environment variables**: Setting a field in YAML overrides its corresponding environment variable (`api_key` in YAML overrides `ANTHROPIC_API_KEY`, `auth_token` overrides `ANTHROPIC_AUTH_TOKEN`, and `base_url` overrides `ANTHROPIC_BASE_URL`).
-- **Authentication header selection**: Use `api_key` for standard Anthropic keys (`x-api-key` header). Use `auth_token` for gateways expecting bearer authentication (`Authorization: Bearer` header). If both `api_key` and `auth_token` are configured, Conductor passes both parameters directly to the Anthropic SDK, which handles client authorization. Pick the single option your endpoint requires; `auth_token` is designed for bearer proxies.
+- **`base_url` precedence**: YAML `base_url` overrides `ANTHROPIC_BASE_URL`; when omitted, the env var is used.
+- **Credential precedence**: `api_key` and `auth_token` are resolved together, not independently. Setting **either** in YAML makes the Anthropic SDK skip environment-variable credential resolution entirely, so a YAML `auth_token` also suppresses `ANTHROPIC_API_KEY`, and vice versa. If you set one credential in YAML and expect the other from the environment, it resolves to `None` with no warning.
+- **Authentication header selection**: Use `api_key` for standard Anthropic keys (`x-api-key` header). Use `auth_token` for gateways expecting bearer authentication (`Authorization: Bearer` header). **Set exactly one.** If both are configured, the Anthropic SDK does not choose between them: it sends `X-Api-Key` and `Authorization: Bearer` on every request, so your Anthropic key reaches whatever `base_url` points at. Conductor forwards both without arbitrating and logs a warning.
 
 ### Security Warning
 

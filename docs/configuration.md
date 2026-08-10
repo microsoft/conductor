@@ -175,6 +175,10 @@ For `name: claude`, missing fields fall back to Anthropic environment variables:
 | `api_key` | `ANTHROPIC_API_KEY` |
 | `auth_token` | `ANTHROPIC_AUTH_TOKEN` |
 
+Unlike the Copilot chains above, the two credential rows are not independent.
+The Anthropic SDK resolves them as a unit: set either one in YAML and it reads
+neither env var. Only `base_url` falls back on its own.
+
 #### Field compatibility by provider
 
 | Field | `copilot` | `claude` |

@@ -114,6 +114,29 @@ class TestClaudeProviderInitialization:
     @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
     @patch("conductor.providers.claude.AsyncAnthropic")
     @patch("conductor.providers.claude.anthropic")
+    def test_init_with_both_credentials_warns(
+        self,
+        mock_anthropic_module: Mock,
+        mock_anthropic_class: Mock,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Both api_key and auth_token must log a both-headers-sent warning."""
+        # Requirement: when both credentials reach the SDK client, Conductor
+        # warns instead of silently shipping X-Api-Key + Authorization: Bearer
+        # on every request (parity with the Copilot provider warning).
+        mock_anthropic_module.__version__ = "0.77.0"
+        mock_client = Mock()
+        mock_client.models.list = AsyncMock(return_value=Mock(data=[]))
+        mock_anthropic_class.return_value = mock_client
+
+        with caplog.at_level("WARNING"):
+            ClaudeProvider(api_key="sk-key", auth_token="bearer-token")
+
+        assert any("Both api_key and auth_token" in r.message for r in caplog.records)
+
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
     @patch("conductor.providers.claude.logger")
     def test_sdk_version_warning_old_version(
         self,
