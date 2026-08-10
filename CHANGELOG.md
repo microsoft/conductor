@@ -158,6 +158,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Agent text containing bracketed tokens no longer kills a run** (#382). A
+  step whose output contained ordinary technical prose such as
+  `{provider}/{type}[/{nestedType}...]/read` was parsed by rich as a closing
+  markup tag, raising `MarkupError` and ending the workflow — unresumably,
+  since the crash happened while rendering rather than while running. Every
+  console sink that renders agent-supplied text now passes it as `rich.text.Text`
+  rather than interpolating it into markup, and the file-log console disables
+  markup entirely. `style=` does not turn markup parsing off, which is what hid
+  three of the five sinks; two of those were reachable on a bare `conductor run`
+  with no flags. Opening tags such as `[bold]` were the quieter half of the same
+  bug: rich consumed them without raising and the text simply disappeared.
 - **`conductor resume --web` no longer shows a running workflow as stopped** —
   a workflow that was paused from the dashboard (Stop, then Kill) recorded an
   `agent_paused` event in its event log with no `agent_resumed` counterpart.

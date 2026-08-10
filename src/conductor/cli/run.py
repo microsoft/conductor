@@ -20,7 +20,6 @@ from typing import TYPE_CHECKING, Any
 
 import typer
 from rich.console import Console
-from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 
@@ -125,10 +124,9 @@ def init_file_logging(log_path: Path) -> None:
     # markup=False because this console renders agent-supplied text (prompts,
     # tool output, model responses) verbatim. Rich would otherwise parse a
     # bracketed token such as ``[/nestedType]`` -- ordinary technical prose --
-    # as a closing tag and raise MarkupError, killing the run (see #382). The
-    # log is already ``no_color=True`` plain text, so it has no use for markup;
-    # every styled write in this module goes to ``_verbose_console`` or passes a
-    # pre-built ``rich.text.Text``, neither of which is affected by this flag.
+    # as a closing tag and raise MarkupError, killing the run (see #382).
+    # Consequence: a markup-bearing renderable now prints its tags literally
+    # here, so style file output with ``rich.text.Text`` rather than markup.
     _file_console = Console(
         file=_file_handle, no_color=True, highlight=False, width=200, markup=False
     )
@@ -153,7 +151,13 @@ def verbose_log(message: str, style: str = "dim") -> None:
     from conductor.cli.app import is_verbose
 
     if is_verbose():
-        _verbose_console.print(f"[{style}]{message}[/{style}]")
+        # ``Text`` not an f-string: ``message`` is agent-supplied, and
+        # interpolating it into markup makes a bracketed token like
+        # ``[/nestedType]`` a closing tag and raises MarkupError (#382).
+        # ``style=`` does not disable markup parsing, so it is not a substitute.
+        from rich.text import Text
+
+        _verbose_console.print(Text(message), style=style)
     if _file_console is not None:
         _file_console.print(message)
 
@@ -331,6 +335,8 @@ def verbose_log_section(title: str, content: str) -> None:
         title: Section title.
         content: Section content.
     """
+    from rich.text import Text
+
     from conductor.cli.app import is_full, is_verbose
 
     # Sections are detail-level: show on console only in FULL mode
@@ -343,14 +349,18 @@ def verbose_log_section(title: str, content: str) -> None:
         # ``content`` is agent-supplied (rendered prompts, tool output, model
         # responses) and must not be parsed as markup -- a bracketed token like
         # ``[/nestedType]`` in ordinary technical prose would raise MarkupError
-        # and kill the run (#382). ``title`` is conductor-controlled, so it keeps
-        # its styling.
+        # and kill the run (#382). ``Text`` rather than ``escape``: escaping is
+        # not byte-exact for input that already contains a backslash before a
+        # bracket (``\[0-9\]+`` renders as ``[0-9\]+``). ``title`` is
+        # conductor-controlled, so it keeps its styling.
         _verbose_console.print(
-            Panel(escape(content), title=f"[cyan]{title}[/cyan]", border_style="dim")
+            Panel(Text(content), title=f"[cyan]{title}[/cyan]", border_style="dim")
         )
 
     # File always gets full untruncated content
     if _file_console is not None:
+        # Deliberately not escaped: ``_file_console`` has ``markup=False``, so
+        # escaping here would write literal backslashes into the log.
         _file_console.print(Panel(content, title=title, border_style="dim"))
 
 
@@ -475,7 +485,10 @@ def verbose_log_parallel_agent_failed(
 
     if should_console:
         _verbose_console.print(text)
-        _verbose_console.print(error_msg, style="red dim")
+        # ``Text``: ``error_msg`` carries a provider exception message, so a run
+        # that is already failing would otherwise have its real error replaced
+        # by a MarkupError. ``style=`` does not disable markup parsing (#382).
+        _verbose_console.print(Text(error_msg), style="red dim")
     if _file_console is not None:
         _file_console.print(text)
         _file_console.print(error_msg)
@@ -714,7 +727,10 @@ def verbose_log_for_each_item_failed(
 
     if should_console:
         _verbose_console.print(text)
-        _verbose_console.print(error_msg, style="red dim")
+        # ``Text``: ``error_msg`` carries a provider exception message, so a run
+        # that is already failing would otherwise have its real error replaced
+        # by a MarkupError. ``style=`` does not disable markup parsing (#382).
+        _verbose_console.print(Text(error_msg), style="red dim")
     if _file_console is not None:
         _file_console.print(text)
         _file_console.print(error_msg)
@@ -809,6 +825,7 @@ def _maybe_print_experimental_banner(data: dict[str, Any]) -> None:
     )
 
     from rich.panel import Panel
+    from rich.text import Text
 
     for provider_name, meta in providers.items():
         if not isinstance(meta, dict):
@@ -857,8 +874,13 @@ def _maybe_print_experimental_banner(data: dict[str, Any]) -> None:
             body_lines.append("Limitations: " + ", ".join(limitations) + ".")
         body_lines.append("See [link]docs/providers/experimental.md[/link] for stability policy.")
 
+        # ``Text.from_markup`` rather than a markup-bearing string: this panel
+        # goes to both consoles, and ``_file_console`` has ``markup=False``, so
+        # a raw string would write ``[bold]``/``[dim]`` tags literally into the
+        # log instead of styling them. Resolving the markup once here renders
+        # identically on both sinks.
         panel = Panel(
-            "\n".join(body_lines),
+            Text.from_markup("\n".join(body_lines)),
             border_style="yellow",
             expand=False,
         )
